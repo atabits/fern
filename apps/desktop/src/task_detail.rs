@@ -1,6 +1,6 @@
 use std::rc::Rc;
 
-use amin_core::{Id, Priority, Store, Task};
+use amin_core::{Id, Priority, Store, Tag, Task};
 use chrono::{Datelike, Duration, Local, NaiveDate};
 use gpui::{
     Anchor, AnyElement, Context, Entity, EventEmitter, Focusable, MouseButton, Rgba, SharedString,
@@ -8,14 +8,17 @@ use gpui::{
 };
 
 use crate::calendar;
+use crate::lists_panel;
 use crate::task_rows;
 use crate::text_input::{Changed, Mode, Submitted, TextInput};
 use crate::theme;
+use crate::widgets;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Popup {
     Due,
     Priority,
+    Tags,
 }
 
 /// Правая панель с подробностями задачи, как в TickTick.
@@ -24,6 +27,9 @@ pub struct TaskDetail {
     task: Option<Task>,
     title: Entity<TextInput>,
     notes: Entity<TextInput>,
+    tag_input: Entity<TextInput>,
+    /// Все теги — для выбора в окне тегов и цветов чипов.
+    all_tags: Vec<Tag>,
     popup: Option<Popup>,
     /// Месяц, открытый в календаре выбора срока.
     calendar_month: NaiveDate,
@@ -39,6 +45,7 @@ impl TaskDetail {
     pub fn new(store: Rc<Store>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let title = cx.new(|cx| TextInput::new(Mode::Wrapped, "Без названия", cx));
         let notes = cx.new(|cx| TextInput::new(Mode::MultiLine, "Напиши что-нибудь", cx));
+        let tag_input = cx.new(|cx| TextInput::new(Mode::SingleLine, "Новый тег", cx));
 
         let subscriptions = vec![
             cx.subscribe(&title, |this, input, _: &Changed, cx| {
@@ -53,6 +60,13 @@ impl TaskDetail {
                 let text = input.read(cx).text().to_owned();
                 this.save(cx, |store, id| store.set_notes(id, &text));
             }),
+            cx.subscribe_in(&tag_input, window, |this, input, Submitted(text), window, cx| {
+                let name = text.trim().trim_start_matches('#').to_owned();
+                if !name.is_empty() {
+                    this.add_tag(name, cx);
+                }
+                input.update(cx, |input, cx| input.clear(window, cx));
+            }),
         ];
 
         Self {
@@ -60,6 +74,8 @@ impl TaskDetail {
             task: None,
             title,
             notes,
+            tag_input,
+            all_tags: Vec::new(),
             popup: None,
             calendar_month: calendar::month_start(Local::now().date_naive()),
             _subscriptions: subscriptions,
@@ -79,6 +95,7 @@ impl TaskDetail {
         self.notes.update(cx, |input, cx| input.set_text(notes, cx));
         self.task = task;
         self.popup = None;
+        self.all_tags = self.store.tags().unwrap_or_default();
         cx.notify();
     }
 
@@ -116,8 +133,131 @@ impl TaskDetail {
         match popup {
             "due" => self.open_popup(Popup::Due, cx),
             "priority" => self.open_popup(Popup::Priority, cx),
+            "tags" => {
+                self.all_tags = self.store.tags().unwrap_or_default();
+                self.open_popup(Popup::Tags, cx);
+            }
             _ => {}
         }
+    }
+
+    fn open_tags(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.all_tags = self.store.tags().unwrap_or_default();
+        self.popup = Some(Popup::Tags);
+        window.focus(&self.tag_input.focus_handle(cx), cx);
+        cx.notify();
+    }
+
+    fn task_tags(&self) -> Vec<String> {
+        self.task.as_ref().map(|t| t.tags.clone()).unwrap_or_default()
+    }
+
+    fn add_tag(&mut self, name: String, cx: &mut Context<Self>) {
+        let mut tags = self.task_tags();
+        if !tags.iter().any(|t| t.to_lowercase() == name.to_lowercase()) {
+            tags.push(name);
+            self.save(cx, |store, id| store.set_tags(id, &tags));
+            self.all_tags = self.store.tags().unwrap_or_default();
+        }
+    }
+
+    fn remove_tag(&mut self, name: &str, cx: &mut Context<Self>) {
+        let tags: Vec<String> = self.task_tags().into_iter().filter(|t| t != name).collect();
+        self.save(cx, |store, id| store.set_tags(id, &tags));
+    }
+
+    fn toggle_tag(&mut self, name: String, cx: &mut Context<Self>) {
+        if self.task_tags().contains(&name) {
+            self.remove_tag(&name, cx);
+        } else {
+            self.add_tag(name, cx);
+        }
+    }
+
+    fn tag_color(&self, name: &str) -> Rgba {
+        let color = self.all_tags.iter().find(|t| t.name == name).and_then(|t| t.color.as_deref());
+        lists_panel::tag_color(color)
+    }
+
+    fn render_tags_popup(&self, cx: &mut Context<Self>) -> AnyElement {
+        let current = self.task_tags();
+        popover_frame()
+            .w(px(220.))
+            .gap_1()
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_popup(cx)))
+            .child(
+                div()
+                    .h(px(30.))
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .rounded(px(4.))
+                    .bg(theme::background())
+                    .child(self.tag_input.clone()),
+            )
+            .children(self.all_tags.iter().map(|tag| {
+                let name = tag.name.clone();
+                let checked = current.contains(&tag.name);
+                div()
+                    .id(SharedString::from(format!("tag-option-{}", tag.name)))
+                    .h(px(30.))
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .rounded(px(4.))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme::surface_hover()))
+                    .child(colored_icon("icons/tag.svg", lists_panel::tag_color(tag.color.as_deref())))
+                    .child(div().flex_1().child(tag.name.clone()))
+                    .when(checked, |el| el.child(div().text_color(theme::accent()).child("✓")))
+                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_tag(name.clone(), cx)))
+            }))
+            .into_any_element()
+    }
+
+    fn render_tags_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let tags = self.task_tags();
+        div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap_1()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .children(tags.into_iter().map(|tag| {
+                let name = tag.clone();
+                widgets::tag_chip(&tag, self.tag_color(&tag))
+                    .id(SharedString::from(format!("detail-tag-{tag}")))
+                    .group("detail-tag")
+                    .child(
+                        div()
+                            .id("remove-tag")
+                            .cursor_pointer()
+                            .opacity(0.6)
+                            .hover(|s| s.opacity(1.))
+                            .child("×")
+                            .on_click(cx.listener(move |this, _, _, cx| this.remove_tag(&name, cx))),
+                    )
+            }))
+            .child(
+                div()
+                    .id("add-tag")
+                    .relative()
+                    .h(px(18.))
+                    .px(px(6.))
+                    .flex()
+                    .items_center()
+                    .rounded_full()
+                    .text_size(px(11.))
+                    .text_color(theme::text_muted())
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme::surface_hover()).text_color(theme::text()))
+                    .child("+ Тег")
+                    .on_click(cx.listener(|this, _, window, cx| this.open_tags(window, cx)))
+                    .when(self.popup == Some(Popup::Tags), |el| {
+                        el.child(popover_below(Anchor::TopLeft, self.render_tags_popup(cx)))
+                    }),
+            )
     }
 
     fn close_popup(&mut self, cx: &mut Context<Self>) {
@@ -353,6 +493,7 @@ impl Render for TaskDetail {
             .flex()
             .flex_col()
             .bg(theme::background())
+            .text_color(theme::text())
             .border_l_1()
             .border_color(theme::border());
 
@@ -477,6 +618,7 @@ impl Render for TaskDetail {
                             )
                             .child(div().pt_1().child(icon_button("checklist", "icons/list-checks.svg"))),
                     )
+                    .child(self.render_tags_row(cx))
                     .child(
                         div()
                             .text_size(px(15.))

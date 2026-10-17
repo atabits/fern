@@ -8,6 +8,7 @@ mod task_rows;
 mod text_input;
 mod theme;
 mod todo_view;
+mod widgets;
 
 use anyhow::{Context as _, Result};
 use amin_core::Store;

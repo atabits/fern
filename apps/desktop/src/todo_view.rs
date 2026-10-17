@@ -13,6 +13,7 @@ use crate::task_detail::{TaskDetail, TaskUpdated};
 use crate::task_rows::{self, Row, Section};
 use crate::text_input::{Mode, Submitted, TextInput};
 use crate::theme;
+use crate::widgets;
 
 const DETAIL_WIDTH: f32 = 400.;
 const ROW_HEIGHT: f32 = 40.;
@@ -311,7 +312,7 @@ impl TodoView {
                     )
                     .children(task.tags.iter().map(|tag| {
                         let color = tag_colors.get(tag).copied().unwrap_or_else(theme::text_muted);
-                        tag_chip(tag, color)
+                        widgets::tag_chip(tag, color)
                     }))
                     .when_some(due, |el, (label, overdue)| {
                         el.child(
@@ -348,22 +349,6 @@ const INDENT: f32 = 24.;
 fn chevron(collapsed: bool) -> impl IntoElement {
     let path = if collapsed { "icons/chevron-right.svg" } else { "icons/chevron-down.svg" };
     svg().path(path).size(px(12.)).flex_none().text_color(theme::text_muted())
-}
-
-/// Чип тега: фон — цвет тега с прозрачностью, текст — тот же цвет, осветлённый.
-fn tag_chip(name: &str, color: Rgba) -> impl IntoElement {
-    let text = Rgba { r: (color.r + 1.) / 2., g: (color.g + 1.) / 2., b: (color.b + 1.) / 2., a: 1. };
-    div()
-        .flex_none()
-        .h(px(18.))
-        .px(px(6.))
-        .flex()
-        .items_center()
-        .rounded_full()
-        .bg(color.opacity(0.3))
-        .text_color(text)
-        .text_size(px(11.))
-        .child(name.to_owned())
 }
 
 fn header_icon(id: &'static str, path: &'static str) -> gpui::Stateful<gpui::Div> {

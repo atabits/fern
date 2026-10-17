@@ -73,13 +73,19 @@ impl TodoView {
         this
     }
 
-    /// Только для отладочной сборки: `AMIN_DEV_STATE="select=<часть названия>;popup=due|priority"`
+    /// Только для отладочной сборки:
+    /// `AMIN_DEV_STATE="add=<текст быстрого ввода>;select=<часть названия>;popup=due|priority|tags"`
     /// открывает нужное состояние без кликов — так проверяются скриншоты интерфейса.
     #[cfg(debug_assertions)]
     fn apply_dev_state(&mut self, cx: &mut Context<Self>) {
         let Ok(state) = std::env::var("AMIN_DEV_STATE") else { return };
         for part in state.split(';') {
             match part.split_once('=') {
+                Some(("add", text)) => {
+                    let result = self.add_task(text);
+                    self.check(result);
+                    self.reload(cx);
+                }
                 Some(("select", needle)) => {
                     if let Some(id) = self.tasks.iter().find(|t| t.title.contains(needle)).map(|t| t.id) {
                         self.select(id, cx);
@@ -116,15 +122,34 @@ impl TodoView {
         cx.notify();
     }
 
-    /// Новая задача получает свойства текущего списка: срок в «Сегодня»/«Завтра», тег в списке тега.
-    fn add_task(&self, title: &str) -> anyhow::Result<Task> {
-        let task = self.store.add_task(title)?;
+    /// Новая задача: из текста разбираются срок, время, теги и приоритет («завтра 18:00 #дом !1»),
+    /// а недостающее берётся из текущего списка — срок в «Сегодня»/«Завтра», тег в списке тега.
+    fn add_task(&self, input: &str) -> anyhow::Result<Task> {
         let today = Self::today();
-        match &self.view {
-            View::Today | View::Next7Days => self.store.set_due(task.id, Some(today), None)?,
-            View::Tomorrow => self.store.set_due(task.id, Some(today + Duration::days(1)), None)?,
-            View::Tag(tag) => self.store.set_tags(task.id, std::slice::from_ref(tag))?,
-            View::Inbox | View::All | View::Completed => {}
+        let parsed = amin_core::parse_quick_add(input, today);
+        let title = if parsed.title.is_empty() { input.trim() } else { parsed.title.as_str() };
+        let task = self.store.add_task(title)?;
+
+        let view_due = match &self.view {
+            View::Today | View::Next7Days => Some(today),
+            View::Tomorrow => Some(today + Duration::days(1)),
+            _ => None,
+        };
+        if let Some(date) = parsed.due_date.or(view_due) {
+            self.store.set_due(task.id, Some(date), parsed.due_time)?;
+        }
+
+        let mut tags = parsed.tags;
+        if let View::Tag(tag) = &self.view
+            && !tags.iter().any(|t| t.to_lowercase() == tag.to_lowercase())
+        {
+            tags.push(tag.clone());
+        }
+        if !tags.is_empty() {
+            self.store.set_tags(task.id, &tags)?;
+        }
+        if let Some(priority) = parsed.priority {
+            self.store.set_priority(task.id, priority)?;
         }
         Ok(task)
     }

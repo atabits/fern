@@ -1,0 +1,519 @@
+use std::rc::Rc;
+
+use amin_core::{Id, Priority, Store, Task};
+use chrono::{Datelike, Duration, Local, NaiveDate};
+use gpui::{
+    Anchor, AnyElement, Context, Entity, EventEmitter, Focusable, MouseButton, Rgba, SharedString,
+    Subscription, Window, anchored, deferred, div, prelude::*, px, svg,
+};
+
+use crate::calendar;
+use crate::task_rows;
+use crate::text_input::{Changed, Mode, Submitted, TextInput};
+use crate::theme;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Popup {
+    Due,
+    Priority,
+}
+
+/// Правая панель с подробностями задачи, как в TickTick.
+pub struct TaskDetail {
+    store: Rc<Store>,
+    task: Option<Task>,
+    title: Entity<TextInput>,
+    notes: Entity<TextInput>,
+    popup: Option<Popup>,
+    /// Месяц, открытый в календаре выбора срока.
+    calendar_month: NaiveDate,
+    _subscriptions: Vec<Subscription>,
+}
+
+/// Задача изменена в панели — списку нужно перечитать данные.
+pub struct TaskUpdated;
+
+impl EventEmitter<TaskUpdated> for TaskDetail {}
+
+impl TaskDetail {
+    pub fn new(store: Rc<Store>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let title = cx.new(|cx| TextInput::new(Mode::Wrapped, "Без названия", cx));
+        let notes = cx.new(|cx| TextInput::new(Mode::MultiLine, "Напиши что-нибудь", cx));
+
+        let subscriptions = vec![
+            cx.subscribe(&title, |this, input, _: &Changed, cx| {
+                let text = input.read(cx).text().to_owned();
+                this.save(cx, |store, id| store.set_title(id, &text));
+            }),
+            // Enter в заголовке переводит к заметке.
+            cx.subscribe_in(&title, window, |this, _, _: &Submitted, window, cx| {
+                window.focus(&this.notes.focus_handle(cx), cx);
+            }),
+            cx.subscribe(&notes, |this, input, _: &Changed, cx| {
+                let text = input.read(cx).text().to_owned();
+                this.save(cx, |store, id| store.set_notes(id, &text));
+            }),
+        ];
+
+        Self {
+            store,
+            task: None,
+            title,
+            notes,
+            popup: None,
+            calendar_month: calendar::month_start(Local::now().date_naive()),
+            _subscriptions: subscriptions,
+        }
+    }
+
+    pub fn task_id(&self) -> Option<Id> {
+        self.task.as_ref().map(|t| t.id)
+    }
+
+    /// Показать задачу (или пустую панель для `None`).
+    pub fn show(&mut self, task: Option<Task>, cx: &mut Context<Self>) {
+        let (title, notes) = task
+            .as_ref()
+            .map_or((String::new(), String::new()), |t| (t.title.clone(), t.notes.clone()));
+        self.title.update(cx, |input, cx| input.set_text(title, cx));
+        self.notes.update(cx, |input, cx| input.set_text(notes, cx));
+        self.task = task;
+        self.popup = None;
+        cx.notify();
+    }
+
+    /// Обновить данные задачи, не трогая поля ввода (чтобы не сбить курсор).
+    pub fn refresh(&mut self, task: Option<Task>, cx: &mut Context<Self>) {
+        match task {
+            Some(task) if self.task_id() == Some(task.id) => {
+                self.task = Some(task);
+                cx.notify();
+            }
+            other => self.show(other, cx),
+        }
+    }
+
+    fn save(&mut self, cx: &mut Context<Self>, write: impl FnOnce(&Store, Id) -> anyhow::Result<()>) {
+        let Some(id) = self.task_id() else { return };
+        if let Err(err) = write(&self.store, id) {
+            eprintln!("не удалось сохранить задачу: {err:#}");
+            return;
+        }
+        cx.emit(TaskUpdated);
+    }
+
+    fn open_popup(&mut self, popup: Popup, cx: &mut Context<Self>) {
+        if popup == Popup::Due {
+            let shown = self.task.as_ref().and_then(|t| t.due_date).unwrap_or_else(|| Local::now().date_naive());
+            self.calendar_month = calendar::month_start(shown);
+        }
+        self.popup = Some(popup);
+        cx.notify();
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn dev_open_popup(&mut self, popup: &str, cx: &mut Context<Self>) {
+        match popup {
+            "due" => self.open_popup(Popup::Due, cx),
+            "priority" => self.open_popup(Popup::Priority, cx),
+            _ => {}
+        }
+    }
+
+    fn close_popup(&mut self, cx: &mut Context<Self>) {
+        self.popup = None;
+        cx.notify();
+    }
+
+    fn set_due(&mut self, date: Option<NaiveDate>, cx: &mut Context<Self>) {
+        let time = self.task.as_ref().and_then(|t| t.due_time);
+        self.save(cx, |store, id| store.set_due(id, date, time));
+        self.close_popup(cx);
+    }
+
+    fn set_priority(&mut self, priority: Priority, cx: &mut Context<Self>) {
+        self.save(cx, |store, id| store.set_priority(id, priority));
+        self.close_popup(cx);
+    }
+
+    fn shift_month(&mut self, delta: i32, cx: &mut Context<Self>) {
+        self.calendar_month = calendar::add_months(self.calendar_month, delta);
+        cx.notify();
+    }
+
+    fn render_due_popup(&self, cx: &mut Context<Self>) -> AnyElement {
+        let today = Local::now().date_naive();
+        let selected = self.task.as_ref().and_then(|t| t.due_date);
+        let month = self.calendar_month;
+
+        let quick = |id: &'static str, label: &'static str, date: Option<NaiveDate>, cx: &mut Context<Self>| {
+            div()
+                .id(id)
+                .flex_1()
+                .py_1()
+                .flex()
+                .justify_center()
+                .rounded(px(4.))
+                .text_xs()
+                .cursor_pointer()
+                .bg(theme::surface_hover())
+                .hover(|s| s.bg(theme::row_selected()))
+                .child(label)
+                .on_click(cx.listener(move |this, _, _, cx| this.set_due(date, cx)))
+        };
+
+        let days: Vec<_> = calendar::month_grid(month).into_iter().map(|date| {
+            let in_month = date.month() == month.month();
+            let is_selected = selected == Some(date);
+            let is_today = date == today;
+            div()
+                .id(SharedString::from(format!("day-{date}")))
+                .size(px(32.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_full()
+                .cursor_pointer()
+                .text_xs()
+                .text_color(if !in_month {
+                    theme::text_muted()
+                } else if is_today {
+                    theme::accent()
+                } else {
+                    theme::text()
+                })
+                .when(is_selected, |el| el.bg(theme::accent()).text_color(theme::text()))
+                .when(!is_selected, |el| el.hover(|s| s.bg(theme::surface_hover())))
+                .child(date.day().to_string())
+                .on_click(cx.listener(move |this, _, _, cx| this.set_due(Some(date), cx)))
+        }).collect();
+
+        popover_frame()
+            .w(px(240.))
+            .gap_2()
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_popup(cx)))
+            .child(
+                div()
+                    .flex()
+                    .gap_1()
+                    .child(quick("due-today", "Сегодня", Some(today), cx))
+                    .child(quick("due-tomorrow", "Завтра", Some(today + Duration::days(1)), cx))
+                    .child(quick("due-week", "Через неделю", Some(today + Duration::days(7)), cx)),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .pt_1()
+                    .child(div().flex_1().font_weight(gpui::FontWeight::SEMIBOLD).child(calendar::month_title(month)))
+                    .child(
+                        small_icon_button("prev-month", "icons/chevron-left.svg")
+                            .on_click(cx.listener(|this, _, _, cx| this.shift_month(-1, cx))),
+                    )
+                    .child(
+                        small_icon_button("next-month", "icons/chevron-right.svg")
+                            .on_click(cx.listener(|this, _, _, cx| this.shift_month(1, cx))),
+                    ),
+            )
+            .child(
+                div().flex().children(calendar::WEEKDAYS.iter().map(|day| {
+                    div()
+                        .w(px(32.))
+                        .flex()
+                        .justify_center()
+                        .text_xs()
+                        .text_color(theme::text_muted())
+                        .child(*day)
+                })),
+            )
+            .child(div().flex().flex_wrap().w(px(224.)).children(days))
+            .when(selected.is_some(), |el| {
+                el.child(
+                    div()
+                        .id("due-clear")
+                        .py_1()
+                        .flex()
+                        .justify_center()
+                        .rounded(px(4.))
+                        .text_xs()
+                        .text_color(theme::text_muted())
+                        .cursor_pointer()
+                        .hover(|s| s.bg(theme::surface_hover()).text_color(theme::text()))
+                        .child("Убрать срок")
+                        .on_click(cx.listener(|this, _, _, cx| this.set_due(None, cx))),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn render_priority_popup(&self, cx: &mut Context<Self>) -> AnyElement {
+        let current = self.task.as_ref().map(|t| t.priority).unwrap_or_default();
+        let items = [
+            (Priority::High, "Высокий"),
+            (Priority::Medium, "Средний"),
+            (Priority::Low, "Низкий"),
+            (Priority::None, "Без приоритета"),
+        ];
+        popover_frame()
+            .w(px(190.))
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_popup(cx)))
+            .children(items.into_iter().map(|(priority, label)| {
+                div()
+                    .id(label)
+                    .h(px(32.))
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .rounded(px(4.))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme::surface_hover()))
+                    .child(colored_icon("icons/flag.svg", theme::priority(priority)))
+                    .child(div().flex_1().child(label))
+                    .when(priority == current, |el| el.child(div().text_color(theme::accent()).child("✓")))
+                    .on_click(cx.listener(move |this, _, _, cx| this.set_priority(priority, cx)))
+            }))
+            .into_any_element()
+    }
+
+    fn toggle_completed(&mut self, cx: &mut Context<Self>) {
+        let Some(task) = self.task.as_mut() else { return };
+        let completed = !task.is_completed();
+        if let Err(err) = self.store.set_completed(task.id, completed) {
+            eprintln!("не удалось обновить задачу: {err:#}");
+            return;
+        }
+        if let Ok(Some(fresh)) = self.store.task(task.id) {
+            *task = fresh;
+        }
+        cx.emit(TaskUpdated);
+        cx.notify();
+    }
+}
+
+fn icon(path: &'static str) -> impl IntoElement {
+    colored_icon(path, theme::text_muted())
+}
+
+fn colored_icon(path: &'static str, color: Rgba) -> impl IntoElement {
+    svg().path(path).size(px(18.)).flex_none().text_color(color)
+}
+
+fn small_icon_button(id: &'static str, path: &'static str) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .p_1()
+        .rounded(px(4.))
+        .cursor_pointer()
+        .hover(|s| s.bg(theme::surface_hover()))
+        .child(svg().path(path).size(px(14.)).text_color(theme::text_muted()))
+}
+
+fn popover_frame() -> gpui::Div {
+    div()
+        .flex()
+        .flex_col()
+        .p_2()
+        .rounded(px(8.))
+        .bg(theme::surface())
+        .border_1()
+        .border_color(theme::border())
+        .shadow_lg()
+        .text_color(theme::text())
+        .text_size(px(13.))
+}
+
+/// Всплывающее окно под кнопкой: рисуется поверх остального интерфейса.
+fn popover_below(anchor: Anchor, content: AnyElement) -> impl IntoElement {
+    let attach = div().absolute().top(px(30.));
+    let attach = match anchor {
+        Anchor::TopRight => attach.right_0(),
+        _ => attach.left_0(),
+    };
+    attach.child(
+        deferred(anchored().anchor(anchor).snap_to_window_with_margin(px(8.)).child(content))
+            .priority(1),
+    )
+}
+
+fn icon_button(id: &'static str, path: &'static str) -> impl IntoElement {
+    div()
+        .id(id)
+        .p_1()
+        .rounded_md()
+        .cursor_pointer()
+        .hover(|s| s.bg(theme::surface_hover()))
+        .child(icon(path))
+}
+
+impl Render for TaskDetail {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let panel = div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(theme::background())
+            .border_l_1()
+            .border_color(theme::border());
+
+        let Some(task) = self.task.as_ref() else {
+            return panel
+                .items_center()
+                .justify_center()
+                .text_color(theme::text_muted())
+                .child("Выбери задачу, чтобы увидеть подробности");
+        };
+        let done = task.is_completed();
+        let notes_focus = self.notes.focus_handle(cx);
+        let today = Local::now().date_naive();
+        let (due_text, due_color): (SharedString, Rgba) = match task.due_date {
+            Some(date) => {
+                let (label, overdue) = task_rows::due_label(date, task.due_time, today);
+                (label.into(), if overdue && !done { theme::danger() } else { theme::accent() })
+            }
+            None => ("Срок".into(), theme::text_muted()),
+        };
+        let priority_color = match task.priority {
+            Priority::None => theme::text_muted(),
+            other => theme::priority(other),
+        };
+
+        panel
+            // Верхняя строка: чекбокс | срок ……… приоритет
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .h(px(48.))
+                    .px_5()
+                    .border_b_1()
+                    .border_color(theme::border())
+                    .child(
+                        div()
+                            .id("detail-checkbox")
+                            .size(px(18.))
+                            .flex_none()
+                            .rounded(px(4.))
+                            .border_1()
+                            .border_color(if done { theme::accent() } else { theme::text_muted() })
+                            .when(done, |el| el.bg(theme::accent()))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_xs()
+                            .text_color(theme::background())
+                            .when(done, |el| el.child("✓"))
+                            .cursor_pointer()
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_completed(cx))),
+                    )
+                    .child(div().w(px(1.)).h(px(16.)).bg(theme::border()))
+                    .child(
+                        div()
+                            .id("due-date")
+                            .relative()
+                            .flex()
+                            .items_center()
+                            .gap_1p5()
+                            .px_1()
+                            .py_0p5()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .hover(|s| s.bg(theme::surface_hover()))
+                            .text_color(due_color)
+                            .child(colored_icon("icons/calendar-days.svg", due_color))
+                            .child(due_text)
+                            .on_click(cx.listener(|this, _, _, cx| this.open_popup(Popup::Due, cx)))
+                            .when(self.popup == Some(Popup::Due), |el| {
+                                el.child(popover_below(Anchor::TopLeft, self.render_due_popup(cx)))
+                            }),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .id("priority")
+                            .relative()
+                            .p_1()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .hover(|s| s.bg(theme::surface_hover()))
+                            .child(colored_icon("icons/flag.svg", priority_color))
+                            .on_click(cx.listener(|this, _, _, cx| this.open_popup(Popup::Priority, cx)))
+                            .when(self.popup == Some(Popup::Priority), |el| {
+                                el.child(popover_below(Anchor::TopRight, self.render_priority_popup(cx)))
+                            }),
+                    ),
+            )
+            // Заголовок и заметка; клик по пустому месту ставит курсор в заметку.
+            .child(
+                div()
+                    .id("detail-body")
+                    .flex_1()
+                    .overflow_y_scroll()
+                    .px_5()
+                    .pt_4()
+                    .pb_6()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                        window.focus(&notes_focus, cx);
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .items_start()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_size(px(20.))
+                                    .line_height(px(28.))
+                                    .font_weight(gpui::FontWeight::BOLD)
+                                    .when(done, |el| el.text_color(theme::text_muted()))
+                                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                    .child(self.title.clone()),
+                            )
+                            .child(div().pt_1().child(icon_button("checklist", "icons/list-checks.svg"))),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(15.))
+                            .line_height(px(22.))
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .child(self.notes.clone()),
+                    ),
+            )
+            // Нижняя строка: список ……… форматирование, комментарии, ещё
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .h(px(44.))
+                    .px_5()
+                    .border_t_1()
+                    .border_color(theme::border())
+                    .child(
+                        div()
+                            .id("list")
+                            .flex()
+                            .items_center()
+                            .gap_1p5()
+                            .px_1()
+                            .py_0p5()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .hover(|s| s.bg(theme::surface_hover()))
+                            .text_color(theme::text_muted())
+                            .child(icon("icons/inbox.svg"))
+                            .child(SharedString::new_static("Входящие")),
+                    )
+                    .child(div().flex_1())
+                    .child(icon_button("format", "icons/baseline.svg"))
+                    .child(icon_button("comments", "icons/message-square-text.svg"))
+                    .child(icon_button("more", "icons/ellipsis.svg")),
+            )
+    }
+}

@@ -1,0 +1,21 @@
+[package]
+name = "amin_desktop"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "amin"
+path = "src/main.rs"
+
+[dependencies]
+amin_core.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
+dirs.workspace = true
+gpui.workspace = true
+gpui_platform.workspace = true
+unicode-segmentation.workspace = true
+
+[dev-dependencies]
+uuid.workspace = true

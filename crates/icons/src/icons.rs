@@ -7,6 +7,7 @@ use strum::{EnumIter, IntoStaticStr};
 #[derive(Debug, PartialEq, Eq, Hash, Copy, Clone, EnumIter, IntoStaticStr)]
 #[strum(serialize_all = "snake_case")]
 pub enum IconName {
+    ArchiveRestore,
     ArrowDownUp,
     Baseline,
     Bell,

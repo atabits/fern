@@ -1,6 +1,6 @@
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    App, ClickEvent, ElementId, InteractiveElement, IntoElement, ParentElement, Pixels,
+    AnyView, App, ClickEvent, ElementId, InteractiveElement, IntoElement, ParentElement, Pixels,
     RenderOnce, StatefulInteractiveElement, Styled, Window, div, px,
 };
 use icons::IconName;
@@ -19,6 +19,7 @@ pub struct IconButton {
     size: Pixels,
     selected: bool,
     on_click: Option<ClickHandler>,
+    tooltip: Option<Box<dyn Fn(&mut Window, &mut App) -> AnyView + 'static>>,
 }
 
 impl IconButton {
@@ -31,6 +32,7 @@ impl IconButton {
             size: px(26.),
             selected: false,
             on_click: None,
+            tooltip: None,
         }
     }
 
@@ -41,6 +43,12 @@ impl IconButton {
 
     pub fn icon_color(mut self, color: impl Into<Color>) -> Self {
         self.icon_color = color.into();
+        self
+    }
+
+    /// Shows a tooltip on hover, e.g. `Tooltip::text("…")`.
+    pub fn tooltip(mut self, tooltip: impl Fn(&mut Window, &mut App) -> AnyView + 'static) -> Self {
+        self.tooltip = Some(Box::new(tooltip));
         self
     }
 
@@ -81,6 +89,7 @@ impl RenderOnce for IconButton {
             .when(self.selected, |el| el.bg(colors.element_selected))
             .hover(|style| style.bg(colors.element_hover))
             .when_some(self.on_click, |el, handler| el.on_click(handler))
+            .when_some(self.tooltip, |el, tooltip| el.tooltip(tooltip))
             .child(Icon::new(self.icon).size(self.icon_size).color(icon_color))
     }
 }

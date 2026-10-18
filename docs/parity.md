@@ -35,7 +35,7 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 | Lists (projects), Inbox | ✅ | create, delete, move tasks with subtasks |
 | Custom sections inside a list (columns) | ⬜ | groups are by kind for now |
 | Manual ordering (`sortOrder`) | ✅ | new tasks on top; renumbered with gaps on move |
-| Trash, "Won't Do" | 🟡 | trash matched to the original: flat list, broom button empties it, trashed tasks open in the normal panel; restore and delete-forever on row hover; no "Won't Do" |
+| Trash, "Won't Do" | 🟡 | trash matched to the original: flat list, broom button empties it; a trashed task's panel has "Restore" and "Delete forever" in its bottom bar; no "Won't Do" |
 | Reminders | ⬜ | |
 | Settings (UI language) | ✅ | |
 

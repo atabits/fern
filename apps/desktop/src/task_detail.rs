@@ -380,6 +380,14 @@ impl TaskDetail {
         lists_panel::color(color, cx)
     }
 
+    fn restore(&mut self, cx: &mut Context<Self>) {
+        self.save(cx, |store, id| store.restore_task(id));
+    }
+
+    fn delete_forever(&mut self, cx: &mut Context<Self>) {
+        self.save(cx, |store, id| store.purge_task(id));
+    }
+
     fn toggle_completed(&mut self, cx: &mut Context<Self>) {
         let Some(task) = self.task.as_mut() else { return };
         let completed = !task.is_completed();
@@ -1002,7 +1010,8 @@ impl Render for TaskDetail {
                     .child(div().pt_2().child(Divider::horizontal()))
                     .child(self.render_subtasks(strings, cx)),
             )
-            // Bottom bar: list ……… formatting, comments, more
+            // Bottom bar: list ……… formatting, comments, more; for a trashed task, as in the
+            // original: Restore ……… delete forever.
             .child(
                 h_flex()
                     .gap_2()
@@ -1010,20 +1019,35 @@ impl Render for TaskDetail {
                     .px_5()
                     .border_t_1()
                     .border_color(theme.colors().border)
-                    .child(
-                        label_button("list", list_icon, list_name, Color::Muted, cx)
-                            .on_click(cx.listener(|this, _, _, cx| this.open_popup(Popup::List, cx)))
-                            .when(self.popup == Some(Popup::List), |el| {
-                                el.child(PopoverAttachment::new(
-                                    Placement::BelowLeft,
-                                    self.render_list_popup(strings, cx),
-                                ))
-                            }),
-                    )
-                    .child(div().flex_1())
-                    .child(IconButton::new("format", IconName::Baseline))
-                    .child(IconButton::new("comments", IconName::MessageSquareText))
-                    .child(IconButton::new("more", IconName::Ellipsis)),
+                    .map(|bar| {
+                        if task.is_deleted() {
+                            bar.child(
+                                label_button("restore-task", IconName::ArchiveRestore, strings.restore.into(), Color::Default, cx)
+                                    .on_click(cx.listener(|this, _, _, cx| this.restore(cx))),
+                            )
+                            .child(div().flex_1())
+                            .child(
+                                IconButton::new("delete-forever", IconName::Trash)
+                                    .tooltip(Tooltip::text(strings.delete_forever))
+                                    .on_click(cx.listener(|this, _, _, cx| this.delete_forever(cx))),
+                            )
+                        } else {
+                            bar.child(
+                                label_button("list", list_icon, list_name, Color::Muted, cx)
+                                    .on_click(cx.listener(|this, _, _, cx| this.open_popup(Popup::List, cx)))
+                                    .when(self.popup == Some(Popup::List), |el| {
+                                        el.child(PopoverAttachment::new(
+                                            Placement::BelowLeft,
+                                            self.render_list_popup(strings, cx),
+                                        ))
+                                    }),
+                            )
+                            .child(div().flex_1())
+                            .child(IconButton::new("format", IconName::Baseline))
+                            .child(IconButton::new("comments", IconName::MessageSquareText))
+                            .child(IconButton::new("more", IconName::Ellipsis))
+                        }
+                    }),
             )
     }
 }

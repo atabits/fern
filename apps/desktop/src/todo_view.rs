@@ -60,12 +60,13 @@ struct FilterEdit {
 }
 
 /// What the add field's "▾" menu set for the next task.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct AddDraft {
     priority: Option<Priority>,
     /// `Some(None)` is the Inbox.
     list: Option<Option<Id>>,
     note: bool,
+    tags: Vec<String>,
 }
 
 pub struct TodoView {
@@ -125,6 +126,9 @@ pub struct TodoView {
     add_menu_open: bool,
     add_list_side: bool,
     add_draft: AddDraft,
+    /// The "▾" menu's Tags picker while open, with the tags ticked so far, and its search field.
+    add_tags: Option<Vec<String>>,
+    add_tag_input: Entity<TextInput>,
     /// The section whose "…" menu is open.
     section_menu: Option<Id>,
     /// A section being renamed, with its field.
@@ -184,6 +188,21 @@ impl TodoView {
         })
         .detach();
 
+        let add_tag_input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.type_in_tag, cx));
+        cx.subscribe(&add_tag_input, |_, _, _: &Changed, cx| cx.notify()).detach();
+        // Enter ticks the typed tag, a new one too.
+        cx.subscribe(&add_tag_input, |this, input, Submitted(text), cx| {
+            let tag = text.trim().trim_start_matches('#').to_owned();
+            if let Some(picked) = this.add_tags.as_mut()
+                && !tag.is_empty()
+                && !picked.iter().any(|t| t.to_lowercase() == tag.to_lowercase())
+            {
+                picked.push(tag);
+            }
+            input.update(cx, |input, cx| input.set_text("", cx));
+            cx.notify();
+        })
+        .detach();
         let search_input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.search_placeholder, cx));
         cx.subscribe(&search_input, |this, input, _: &Changed, cx| {
             let query = input.read(cx).text().to_owned();
@@ -242,6 +261,8 @@ impl TodoView {
             add_menu_open: false,
             add_list_side: false,
             add_draft: AddDraft::default(),
+            add_tags: None,
+            add_tag_input,
             list_activity: None,
             filters: Vec::new(),
             preferences: Default::default(),
@@ -394,6 +415,9 @@ impl TodoView {
                     }
                 }
                 Some(("menu", "templates")) => self.templates_open = true,
+                Some(("menu", "add-tags")) => {
+                    self.add_tags = Some(vec!["home".to_owned()]);
+                }
                 Some(("menu", "add")) => {
                     self.add_menu_open = true;
                     self.add_list_side = true;
@@ -673,6 +697,11 @@ impl TodoView {
         {
             tags.push(tag.clone());
         }
+        for tag in &self.add_draft.tags {
+            if !tags.iter().any(|t| t.to_lowercase() == tag.to_lowercase()) {
+                tags.push(tag.clone());
+            }
+        }
         if !tags.is_empty() {
             self.store.set_tags(task.id, &tags)?;
         }
@@ -724,7 +753,7 @@ impl TodoView {
     /// The add field's "▾" menu, as in the original.
     fn render_add_menu(&self, strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
-        let draft = self.add_draft;
+        let draft = self.add_draft.clone();
         let flags = [Priority::High, Priority::Medium, Priority::Low, Priority::None].map(|priority| {
             let selected = draft.priority == Some(priority);
             let color = task_rows::priority_color(priority, &theme).unwrap_or(theme.colors().text_muted);
@@ -784,6 +813,22 @@ impl TodoView {
                     .items(list_items),
             )
             .child(
+                ListItem::new("add-tags")
+                    .start_slot(Icon::new(IconName::Tag).color(Color::Muted))
+                    .child(Label::new(strings.tags))
+                    .when(!draft.tags.is_empty(), |item| {
+                        item.end_slot(Label::new(draft.tags.len().to_string()).size(LabelSize::XSmall).color(Color::Accent))
+                    })
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.add_menu_open = false;
+                        this.add_tags = Some(this.add_draft.tags.clone());
+                        this.add_tag_input.update(cx, |input, cx| input.set_text("", cx));
+                        let focus = this.add_tag_input.read(cx).focus_handle(cx);
+                        window.focus(&focus, cx);
+                        cx.notify();
+                    })),
+            )
+            .child(
                 ListItem::new("add-from-template")
                     .start_slot(Icon::new(IconName::LayoutTemplate).color(Color::Muted))
                     .child(Label::new(strings.add_from_template))
@@ -802,6 +847,83 @@ impl TodoView {
                         this.add_menu_open = false;
                         cx.notify();
                     })),
+            )
+            .into_any_element()
+    }
+
+    /// The "▾" menu's Tags, as in the original: a search field over the tags, ticked by a click
+    /// (Enter ticks a typed one, new tags too), then Cancel or OK; they go on the next task added.
+    fn render_add_tags(&self, picked: &[String], strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let query = self.add_tag_input.read(cx).text().trim().to_lowercase();
+        let mut names: Vec<String> = self.tags.iter().map(|t| t.name.clone()).collect();
+        for tag in picked {
+            if !names.iter().any(|n| n.to_lowercase() == tag.to_lowercase()) {
+                names.push(tag.clone());
+            }
+        }
+        let rows = names.into_iter().filter(|name| name.to_lowercase().contains(&query)).map(|name| {
+            let ticked = picked.iter().any(|t| t.to_lowercase() == name.to_lowercase());
+            ListItem::new(SharedString::from(format!("add-tag-{name}")))
+                .start_slot(Icon::new(IconName::Tag).color(Color::Muted))
+                .child(Label::new(name.clone()))
+                .when(ticked, |item| item.end_slot(Icon::new(IconName::Check).size(IconSize::Small).color(Color::Accent)))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if let Some(picked) = this.add_tags.as_mut() {
+                        if let Some(i) = picked.iter().position(|t| t.to_lowercase() == name.to_lowercase()) {
+                            picked.remove(i);
+                        } else {
+                            picked.push(name.clone());
+                        }
+                    }
+                    cx.notify();
+                }))
+        });
+        let button = |id: &'static str, label: &'static str, primary: bool| {
+            div()
+                .id(id)
+                .flex_1()
+                .h(px(28.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(6.))
+                .cursor_pointer()
+                .when(primary, |el| el.bg(theme.colors().accent))
+                .when(!primary, |el| el.border_1().border_color(theme.colors().border))
+                .child(Label::new(label).size(LabelSize::Small))
+        };
+        popover(cx)
+            .w(px(240.))
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.add_tags = None;
+                cx.notify();
+            }))
+            .child(
+                h_flex()
+                    .px_2()
+                    .pb_1()
+                    .gap_2()
+                    .border_b_1()
+                    .border_color(theme.colors().border_variant)
+                    .child(Icon::new(IconName::Search).size(IconSize::Small).color(Color::Muted))
+                    .child(div().flex_1().child(self.add_tag_input.clone())),
+            )
+            .child(v_flex().id("add-tag-list").max_h(px(240.)).overflow_y_scroll().py_1().children(rows))
+            .child(
+                h_flex()
+                    .p_2()
+                    .gap_2()
+                    .child(button("add-tags-cancel", strings.cancel, false).on_click(cx.listener(|this, _, _, cx| {
+                        this.add_tags = None;
+                        cx.notify();
+                    })))
+                    .child(button("add-tags-ok", strings.ok, true).on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(picked) = this.add_tags.take() {
+                            this.add_draft.tags = picked;
+                        }
+                        cx.notify();
+                    }))),
             )
             .into_any_element()
     }
@@ -2918,6 +3040,9 @@ impl Render for TodoView {
                             )
                             .when(self.add_menu_open, |el| {
                                 el.child(PopoverAttachment::new(Placement::BelowRight, self.render_add_menu(strings, cx)))
+                            })
+                            .when_some(self.add_tags.clone(), |el, picked| {
+                                el.child(PopoverAttachment::new(Placement::BelowRight, self.render_add_tags(&picked, strings, cx)))
                             })
                             .when(self.templates_open, |el| {
                                 el.child(PopoverAttachment::new(Placement::BelowRight, self.render_templates(strings, cx)))

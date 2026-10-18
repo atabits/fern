@@ -85,7 +85,11 @@ pub struct HabitView {
     /// The header's Active / Archived switch.
     show_archived: bool,
     header_menu_open: bool,
+    /// The header's list button: habits as full-width rows instead of cards (kept in settings).
+    list_layout: bool,
 }
+
+const LAYOUT_SETTING: &str = "habit_layout";
 
 impl HabitView {
     pub fn new(store: Rc<Store>, cx: &mut Context<Self>) -> Self {
@@ -116,7 +120,9 @@ impl HabitView {
             detail_menu_open: false,
             show_archived: false,
             header_menu_open: false,
+            list_layout: false,
         };
+        this.list_layout = this.store.setting(LAYOUT_SETTING).ok().flatten().as_deref() == Some("list");
         this.reload(cx);
         this
     }
@@ -715,6 +721,9 @@ impl HabitView {
             self.store.set_habit_section(id, HabitSection::from_key(section)).ok();
         } else if command == "archive" {
             self.store.set_habit_archived(id, true).ok();
+        } else if command == "list" {
+            self.set_list_layout(true, cx);
+            return;
         } else if command == "show-archived" {
             self.show_archived = true;
         } else if command == "picker" {
@@ -880,6 +889,14 @@ impl HabitView {
         done as f32 / active.len() as f32
     }
 
+    fn set_list_layout(&mut self, list: bool, cx: &mut Context<Self>) {
+        self.list_layout = list;
+        if let Err(err) = self.store.set_setting(LAYOUT_SETTING, if list { "list" } else { "grid" }) {
+            eprintln!("failed to save the habit layout: {err:#}");
+        }
+        cx.notify();
+    }
+
     fn set_archived(&mut self, habit: Id, archived: bool, cx: &mut Context<Self>) {
         self.detail_menu_open = false;
         if let Err(err) = self.store.set_habit_archived(habit, archived) {
@@ -897,15 +914,21 @@ impl HabitView {
         let checked = self.checkins.get(&id).unwrap_or(&empty);
         let stats = habit::stats_for(&habit.frequency, checked, today);
         let group = SharedString::from(format!("habit-{id}"));
+        let list = self.list_layout;
 
-        v_flex()
+        div()
             .id(group)
             .relative()
-            .w(px(CARD_WIDTH))
-            .h(px(CARD_HEIGHT))
+            .flex()
+            .map(|el| {
+                if list {
+                    el.flex_row().items_center().w_full().h(px(72.)).gap_4()
+                } else {
+                    el.flex_col().w(px(CARD_WIDTH)).h(px(CARD_HEIGHT)).gap_2()
+                }
+            })
             .flex_none()
             .p_3()
-            .gap_2()
             .rounded(px(8.))
             .border_1()
             .border_color(if self.selected == Some(id) { theme.colors().accent } else { gpui::transparent_black() })
@@ -915,6 +938,7 @@ impl HabitView {
             .child(
                 h_flex()
                     .gap_2()
+                    .when(list, |el| el.flex_1().min_w_0())
                     .child(
                         avatar(habit, px(30.), cx),
                     )
@@ -951,7 +975,7 @@ impl HabitView {
                             ),
                     ),
             )
-            .child(h_flex().justify_between().px_1().children(week.map(|date| {
+            .child(h_flex().justify_between().px_1().when(list, |el| el.w(px(260.)).flex_none()).children(week.map(|date| {
                 div()
                     .id(SharedString::from(format!("checkin-{id}-{date}")))
                     .size(px(16.))
@@ -1330,7 +1354,10 @@ impl Render for HabitView {
                             }),
                     )
                     .child(div().flex_1())
-                    .child(IconButton::new("habit-list", IconName::List))
+                    .child(
+                        IconButton::new("habit-list", if self.list_layout { IconName::LayoutGrid } else { IconName::List })
+                            .on_click(cx.listener(|this, _, _, cx| this.set_list_layout(!this.list_layout, cx))),
+                    )
                     .child(
                         div()
                             .relative()

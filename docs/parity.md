@@ -66,15 +66,14 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 | Drag and drop | 🟡 | reorder rows by dragging (drop before the target); no dragging into lists or onto tasks to nest |
 | Keyboard shortcuts | ✅ | JSON keymap (Zed format): new task, search, smart lists, list navigation, complete, delete |
 | Search | 🟡 | live search by title, notes and tags from the sidebar; no checklist-item or date filters |
-| Calendar | 🟡 | month grid with tasks by due date, priority tint, "+N" overflow, open a task from a cell; no week/day views or dragging tasks between days |
+| Calendar | 🟡 | month grid matched to a screenshot of the original: only the weeks of the month, "Oct 1" labels, today circle, task bars with checkboxes, "+ / Month / ‹ Today ›" header; no week/day views, view switcher is static, no dragging between days |
 | Pomodoro, Habits, Matrix, Countdown | ⬜ | |
 | Sync between devices | ⬜ | |
 
 ## How changes are checked
 
 - Every feature is checked against a screenshot of the same TickTick screen before and after it
-  is built. Features built before this rule (calendar, trash, search, repeat picker) still need
-  that comparison.
+  is built. Features built before this rule (trash, search, repeat picker) still need that comparison.
 
 - `cargo test` covers the core (storage, smart views, tags, subtasks, lists, quick add) and the
   desktop's row, date and calendar logic in both languages.

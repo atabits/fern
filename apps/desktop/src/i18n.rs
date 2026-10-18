@@ -74,6 +74,7 @@ pub struct Strings {
     pub all: &'static str,
     pub today: &'static str,
     pub tomorrow: &'static str,
+    pub month: &'static str,
     pub next_7_days: &'static str,
     /// Shorter label for the lists column, where the full title may not fit.
     pub next_7_days_short: &'static str,
@@ -153,6 +154,7 @@ pub static EN: Strings = Strings {
     all: "All",
     today: "Today",
     tomorrow: "Tomorrow",
+    month: "Month",
     next_7_days: "Next 7 Days",
     next_7_days_short: "Next 7 Days",
     completed: "Completed",
@@ -229,6 +231,7 @@ pub static RU: Strings = Strings {
     all: "Все",
     today: "Сегодня",
     tomorrow: "Завтра",
+    month: "Месяц",
     next_7_days: "Следующие 7 дней",
     next_7_days_short: "7 дней",
     completed: "Выполненные",

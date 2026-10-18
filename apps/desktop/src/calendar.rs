@@ -18,6 +18,19 @@ pub fn add_months(month: NaiveDate, delta: i32) -> NaiveDate {
     }
 }
 
+/// The weeks (Monday to Sunday) that contain days of `month`: four to six of them.
+pub fn month_weeks(month: NaiveDate) -> Vec<[NaiveDate; 7]> {
+    let first = month_start(month);
+    let next_month = add_months(first, 1);
+    let mut weeks = Vec::new();
+    let mut monday = week_of(first)[0];
+    while monday < next_month {
+        weeks.push(week_of(monday));
+        monday += Duration::days(7);
+    }
+    weeks
+}
+
 /// 42 days (six weeks starting on Monday) covering `month`.
 pub fn month_grid(month: NaiveDate) -> Vec<NaiveDate> {
     let first = month_start(month);
@@ -53,6 +66,17 @@ mod tests {
         assert_eq!(grid[0], d(2026, 9, 28));
         assert_eq!(grid[3], d(2026, 10, 1));
         assert!(grid.contains(&d(2026, 10, 31)));
+    }
+
+    #[test]
+    fn month_weeks_cover_only_the_month() {
+        // October 2026 spans five weeks: Sep 28 – Nov 1.
+        let weeks = month_weeks(d(2026, 10, 18));
+        assert_eq!(weeks.len(), 5);
+        assert_eq!(weeks[0][0], d(2026, 9, 28));
+        assert_eq!(weeks[4][6], d(2026, 11, 1));
+        // February 2027 starts on a Monday and fits in four weeks.
+        assert_eq!(month_weeks(d(2027, 2, 1)).len(), 4);
     }
 
     #[test]

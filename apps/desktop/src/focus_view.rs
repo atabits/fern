@@ -1543,9 +1543,8 @@ impl FocusView {
                     cx.listener(move |this, _, _, cx| this.update_stats(cx, forward)),
                 ))
         };
-        let signed = |n: i64, text: String| if n > 0 { format!("+{text}") } else { text };
         // As the original's: numbers large with a duration's "h" and "m" small beside them.
-        let overview_item = |parts: Vec<(i64, Option<char>)>, label: &'static str, change: Option<String>| {
+        let overview_item = |parts: Vec<(i64, Option<char>)>, label: &'static str, change: Option<(String, i64)>| {
             v_flex()
                 .flex_1()
                 .items_center()
@@ -1557,7 +1556,7 @@ impl FocusView {
                         .children(unit.map(|u| div().text_size(px(15.)).line_height(px(15.)).mb(px(5.)).mx_0p5().child(u.to_string())))
                 })))
                 .child(Label::new(label).size(LabelSize::Small).color(Color::Muted))
-                .children(change.map(|c| Label::new(c).size(LabelSize::XSmall).color(Color::Muted)))
+                .children(change.map(|(text, delta): (String, i64)| change_line(text, delta)))
         };
         let rule = || div().w(px(1.)).h(px(38.)).flex_none().bg(theme.colors().border);
         let full = |m: i64| fern_core::focus::duration_parts_full(m).into_iter().map(|(n, u)| (n, Some(u))).collect::<Vec<_>>();
@@ -1568,7 +1567,7 @@ impl FocusView {
                     .child(overview_item(
                         vec![(stats.today_count as i64, None)],
                         strings.focus_today_pomo,
-                        Some(strings.stats_from_yesterday.replace("{n}", &signed(count_change, count_change.to_string()))),
+                        Some((strings.stats_from_yesterday.replace("{n}", &count_change.abs().to_string()), count_change)),
                     ))
                     .child(rule())
                     .child(overview_item(vec![(stats.total_count as i64, None)], strings.focus_total_pomo, None))
@@ -1576,9 +1575,9 @@ impl FocusView {
                     .child(overview_item(
                         full(stats.today_minutes),
                         strings.focus_today_focus,
-                        Some(strings.stats_from_yesterday.replace(
-                            "{n}",
-                            &signed(minutes_change, if minutes_change < 0 { format!("-{}", format_minutes(-minutes_change)) } else { format_minutes(minutes_change) }),
+                        Some((
+                            strings.stats_from_yesterday.replace("{n}", &format!("{}h{}m", minutes_change.abs() / 60, minutes_change.abs() % 60)),
+                            minutes_change,
                         )),
                     ))
                     .child(rule())
@@ -1952,13 +1951,13 @@ impl FocusView {
                 .id(id)
                 .relative()
                 .px_2()
-                .h(px(22.))
+                .h(px(27.))
                 .gap_0p5()
-                .rounded(px(11.))
+                .rounded(px(14.))
                 .border_1()
                 .border_color(if open { theme.colors().accent } else { theme.colors().border })
                 .cursor_pointer()
-                .child(Label::new(text).size(LabelSize::XSmall))
+                .child(Label::new(text).size(LabelSize::Small))
                 .child(Icon::new(IconName::ChevronDown).size(IconSize::XSmall).color(Color::Muted))
                 .on_click(cx.listener(move |this, _, _, cx| this.update_stats(cx, |p| p.details_menu = (!open).then_some(menu))))
                 .children(dropdown)
@@ -2142,13 +2141,13 @@ impl FocusView {
                                 .id(SharedString::from(format!("curve-period-{curve}")))
                                 .relative()
                                 .px_2()
-                                .h(px(22.))
+                                .h(px(27.))
                                 .gap_0p5()
-                                .rounded(px(11.))
+                                .rounded(px(14.))
                                 .border_1()
                                 .border_color(if open { theme.colors().accent } else { theme.colors().border })
                                 .cursor_pointer()
-                                .child(Label::new(names[index]).size(LabelSize::XSmall))
+                                .child(Label::new(names[index]).size(LabelSize::Small))
                                 .child(Icon::new(IconName::ChevronDown).size(IconSize::XSmall).color(Color::Muted))
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.update_stats(cx, |p| p.curve_menu = (!open).then_some(curve))
@@ -2305,7 +2304,6 @@ impl FocusView {
         let (prev_first, prev_last) = range(first - chrono::Duration::days(1));
         let count = |a: NaiveDate, b: NaiveDate| stats::completed_in(&tasks, &[(a, b)])[0] as i64;
         let rate = |a: NaiveDate, b: NaiveDate| stats::completion_rate_in(&tasks, &[(a, b)])[0] as i64;
-        let signed = |n: i64, unit: &str| if n > 0 { format!("+{n}{unit}") } else { format!("{n}{unit}") };
         let from = match period {
             Bucket::Day => strings.stats_from_yesterday,
             Bucket::Week => strings.stats_from_last_week,
@@ -2313,13 +2311,13 @@ impl FocusView {
         };
         // As the original's, the Task tab's cards are as tall as the Overview's.
         let card = || v_flex().min_w_0().min_h(px(CARD_HEIGHT)).p_4().gap_2().rounded(px(10.)).bg(theme.colors().surface_background);
-        let value = |v: String, label: &'static str, change: String| {
+        let value = |v: String, label: &'static str, change: String, delta: i64| {
             v_flex()
                 .flex_1()
                 .items_center()
                 .child(div().text_size(px(26.)).font_weight(FontWeight::SEMIBOLD).text_color(theme.colors().accent).child(v))
                 .child(Label::new(label).size(LabelSize::XSmall).color(Color::Muted))
-                .child(Label::new(from.replace("{n}", &change)).size(LabelSize::XSmall).color(Color::Muted))
+                .child(change_line(from.replace("{n}", &change), delta))
         };
         let current = range(today) == (first, last);
         let period_label = match period {
@@ -2473,13 +2471,15 @@ impl FocusView {
                             h_flex()
                                 .flex_1()
                                 .items_center()
-                                .child(value(count(first, last).to_string(), strings.stats_completed_tasks, signed(count(first, last) - count(prev_first, prev_last), "")))
+                                .child({
+                                    let delta = count(first, last) as i64 - count(prev_first, prev_last) as i64;
+                                    value(count(first, last).to_string(), strings.stats_completed_tasks, delta.abs().to_string(), delta)
+                                })
                                 .child(div().w(px(1.)).h(px(38.)).flex_none().bg(theme.colors().border))
-                                .child(value(
-                                    format!("{}%", rate(first, last)),
-                                    strings.stats_completion_rate,
-                                    signed(rate(first, last) - rate(prev_first, prev_last), "%"),
-                                )),
+                                .child({
+                                    let delta = rate(first, last) as i64 - rate(prev_first, prev_last) as i64;
+                                    value(format!("{}%", rate(first, last)), strings.stats_completion_rate, format!("{}%", delta.abs()), delta)
+                                }),
                         ),
                 )
                 .child(top_right)
@@ -2520,13 +2520,13 @@ impl FocusView {
                                         .id("classify-by")
                                         .relative()
                                         .px_2()
-                                        .h(px(22.))
+                                        .h(px(27.))
                                         .gap_0p5()
-                                        .rounded(px(11.))
+                                        .rounded(px(14.))
                                         .border_1()
                                         .border_color(if page.classify_menu { theme.colors().accent } else { theme.colors().border })
                                         .cursor_pointer()
-                                        .child(Label::new(names[page.by_tag as usize]).size(LabelSize::XSmall))
+                                        .child(Label::new(names[page.by_tag as usize]).size(LabelSize::Small))
                                         .child(Icon::new(IconName::ChevronDown).size(IconSize::XSmall).color(Color::Muted))
                                         .on_click(cx.listener(|this, _, _, cx| this.update_stats(cx, |p| p.classify_menu = !p.classify_menu)))
                                         .children(menu)
@@ -3564,4 +3564,13 @@ mod tests {
         let ru = summary_parts("Задач: {tasks}", &counts);
         assert_eq!(ru, [("Задач: ".into(), false), ("14".into(), true)]);
     }
+}
+
+/// A change against the period before, as the original's: the amount, then a green arrow up, or a
+/// red one down when it fell.
+fn change_line(text: String, delta: i64) -> impl IntoElement {
+    h_flex()
+        .gap_0p5()
+        .child(Label::new(text).size(LabelSize::XSmall).color(Color::Muted))
+        .child(Icon::new(if delta < 0 { IconName::ArrowDown } else { IconName::ArrowUp }).size(IconSize::XSmall).color(if delta < 0 { Color::Error } else { Color::Success }))
 }

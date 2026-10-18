@@ -59,7 +59,7 @@ fn open_store() -> Result<Store> {
     let mut store = Store::open(dir.join("tasks.db"))?;
     let pending = pending_restore_path()?;
     if pending.exists() {
-        match store.restore_from(&pending) {
+        match store.restore_from(&pending, attachments_dir().ok().as_deref()) {
             Ok(()) => eprintln!("restored the backup"),
             Err(err) => eprintln!("failed to restore the backup: {err:#}"),
         }

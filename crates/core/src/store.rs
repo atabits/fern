@@ -358,17 +358,58 @@ impl Store {
         Ok(())
     }
 
-    /// "Generate Backup": a copy of all data in one SQLite file at `path`.
-    pub fn backup_to(&self, path: &std::path::Path) -> Result<()> {
+    /// "Generate Backup": a copy of all data in one SQLite file at `path`. With `attachments`
+    /// (the attachment folder), the attached files go into the copy too, in a `backup_files`
+    /// table, so that the backup stays one file.
+    pub fn backup_to(&self, path: &std::path::Path, attachments: Option<&std::path::Path>) -> Result<()> {
         self.conn.backup(rusqlite::MAIN_DB, path, None)?;
+        if let Some(dir) = attachments.filter(|dir| dir.is_dir()) {
+            let copy = Connection::open(path)?;
+            copy.execute_batch("CREATE TABLE backup_files (name TEXT PRIMARY KEY, data BLOB NOT NULL);")?;
+            for entry in std::fs::read_dir(dir)? {
+                let entry = entry?;
+                if entry.file_type()?.is_file()
+                    && let Some(name) = entry.file_name().to_str()
+                {
+                    copy.execute(
+                        "INSERT INTO backup_files (name, data) VALUES (?1, ?2)",
+                        params![name, std::fs::read(entry.path())?],
+                    )?;
+                }
+            }
+        }
         Ok(())
     }
 
     /// "Import Backups": replaces all data with a backup made by `backup_to`, bringing an older
-    /// backup up to date. A file that is not a Fern backup is refused and nothing changes.
-    pub fn restore_from(&mut self, path: &std::path::Path) -> Result<()> {
+    /// backup up to date. A file that is not a Fern backup is refused and nothing changes. When
+    /// the backup carries attached files, the attachment folder `attachments` is replaced by them.
+    pub fn restore_from(&mut self, path: &std::path::Path, attachments: Option<&std::path::Path>) -> Result<()> {
         Self::check_backup(path)?;
         self.conn.restore(rusqlite::MAIN_DB, path, None::<fn(rusqlite::backup::Progress)>)?;
+        let has_files: bool = self
+            .conn
+            .query_row("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'backup_files'", [], |_| Ok(true))
+            .optional()?
+            .unwrap_or(false);
+        if has_files {
+            if let Some(dir) = attachments {
+                if dir.is_dir() {
+                    std::fs::remove_dir_all(dir)?;
+                }
+                std::fs::create_dir_all(dir)?;
+                let mut stmt = self.conn.prepare("SELECT name, data FROM backup_files")?;
+                let files = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)))?;
+                for file in files {
+                    let (name, data) = file?;
+                    // Only plain names: a backup must not write outside the folder.
+                    if !name.contains(['/', '\\']) && name != ".." {
+                        std::fs::write(dir.join(name), data)?;
+                    }
+                }
+            }
+            self.conn.execute_batch("DROP TABLE backup_files;")?;
+        }
         Self::migrate(&self.conn)
     }
 
@@ -2600,19 +2641,37 @@ mod tests {
         let file = dir.join("backup.db");
 
         let store = Store::open_in_memory()?;
-        store.add_task("kept in the backup")?;
-        store.backup_to(&file)?;
+        let task = store.add_task("kept in the backup")?;
+        let source = dir.join("ticket.txt");
+        std::fs::write(&source, "seat 14C")?;
+        let attachments = dir.join("attachments");
+        let attachment = store.add_attachment(task.id, &source, &attachments)?;
+        store.backup_to(&file, Some(&attachments))?;
 
+        // Restoring elsewhere brings the tasks and the attached files back, and the folder
+        // loses what the backup does not have.
         let mut other = Store::open_in_memory()?;
         other.add_task("replaced")?;
-        other.restore_from(&file)?;
+        let other_files = dir.join("other-attachments");
+        std::fs::create_dir_all(&other_files)?;
+        std::fs::write(other_files.join("stale.txt"), "old")?;
+        other.restore_from(&file, Some(&other_files))?;
         let titles: Vec<String> = other.tasks()?.into_iter().map(|t| t.title).collect();
         assert_eq!(titles, ["kept in the backup"]);
+        assert_eq!(other.attachments(task.id)?, [attachment.clone()]);
+        assert_eq!(std::fs::read_to_string(attachment.path(&other_files))?, "seat 14C");
+        assert!(!other_files.join("stale.txt").exists());
+        let leftover: bool = other
+            .conn
+            .query_row("SELECT 1 FROM sqlite_master WHERE name = 'backup_files'", [], |_| Ok(true))
+            .optional()?
+            .unwrap_or(false);
+        assert!(!leftover, "the files table does not stay in the data");
 
         // Something that is not a backup changes nothing.
         let junk = dir.join("junk.db");
         Connection::open(&junk)?.execute_batch("CREATE TABLE notes (x TEXT);")?;
-        assert!(other.restore_from(&junk).is_err());
+        assert!(other.restore_from(&junk, None).is_err());
         assert_eq!(other.tasks()?.len(), 1);
         std::fs::remove_dir_all(&dir).ok();
         Ok(())

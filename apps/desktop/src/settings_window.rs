@@ -115,7 +115,8 @@ impl SettingsWindow {
     /// "Generate Backup": all data in one file, saved where the user chooses.
     fn generate_backup(&mut self, cx: &mut Context<Self>) {
         let temp = std::env::temp_dir().join(format!("fern-backup-{}.db", std::process::id()));
-        let contents = self.store.backup_to(&temp).and_then(|()| Ok(std::fs::read(&temp)?));
+        let attachments = crate::attachments_dir().ok();
+        let contents = self.store.backup_to(&temp, attachments.as_deref()).and_then(|()| Ok(std::fs::read(&temp)?));
         std::fs::remove_file(&temp).ok();
         match contents {
             Ok(bytes) => {

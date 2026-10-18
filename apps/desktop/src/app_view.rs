@@ -73,6 +73,13 @@ impl AppView {
         .detach();
         let countdown = cx.new(|cx| CountdownView::new(store.clone(), cx));
         let habits = cx.new(|cx| HabitView::new(store.clone(), cx));
+        // "Start Focus" in a habit's menu starts a Pomodoro or a stopwatch named after it.
+        cx.subscribe_in(&habits, window, |this, _, event: &crate::habit_view::StartFocus, window, cx| {
+            let (title, stopwatch) = (event.title.clone(), event.stopwatch);
+            this.select(Section::Pomodoro, window, cx);
+            this.focus.update(cx, |focus, cx| focus.start_named(title, stopwatch, cx));
+        })
+        .detach();
         let focus = cx.new(|cx| FocusView::new(store.clone(), cx));
         cx.subscribe(&focus, |this, _, crate::focus_view::StatsClosed, cx| {
             this.statistics_open = false;

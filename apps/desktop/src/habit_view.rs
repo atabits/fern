@@ -45,6 +45,21 @@ pub fn avatar(habit: &Habit, size: Pixels, cx: &App) -> Div {
 }
 const CARD_HEIGHT: f32 = 107.;
 
+/// The items of the details' "…" menu that open a choice, as in the original.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DetailSubmenu {
+    StartFocus,
+    CheckinStyle,
+}
+
+/// "Start Focus" on a habit: a Pomodoro or a stopwatch named after it.
+pub struct StartFocus {
+    pub title: String,
+    pub stopwatch: bool,
+}
+
+impl gpui::EventEmitter<StartFocus> for HabitView {}
+
 /// The "Edit Habit" popover: name and daily goal.
 struct HabitEdit {
     name: Entity<TextInput>,
@@ -84,6 +99,8 @@ pub struct HabitView {
     /// The month shown in the details panel's calendar.
     month: NaiveDate,
     detail_menu_open: bool,
+    /// The expanded item of the details' "…" menu.
+    detail_submenu: Option<DetailSubmenu>,
     /// The header's Active / Archived switch.
     show_archived: bool,
     header_menu_open: bool,
@@ -139,6 +156,7 @@ impl HabitView {
             selected: None,
             month: calendar::month_start(Local::now().date_naive()),
             detail_menu_open: false,
+            detail_submenu: None,
             show_archived: false,
             header_menu_open: false,
             list_layout: false,
@@ -743,6 +761,23 @@ impl HabitView {
             return;
         }
         let Some(id) = self.selected else { return };
+        // `menu=focus|style`: the details' "…" menu with a choice open; `icon-checkins`: the
+        // "Habit icon" checked-in style.
+        if let Some(submenu) = command.strip_prefix("menu=") {
+            self.detail_menu_open = true;
+            self.detail_submenu = match submenu {
+                "focus" => Some(DetailSubmenu::StartFocus),
+                "style" => Some(DetailSubmenu::CheckinStyle),
+                _ => None,
+            };
+            cx.notify();
+            return;
+        }
+        if command == "icon-checkins" {
+            self.store.set_habit_icon_checkins(id, true).ok();
+            self.reload(cx);
+            return;
+        }
         let name = self.habits.iter().find(|h| h.id == id).map(|h| h.name.clone()).unwrap_or_default();
         if let Some(goal) = command.strip_prefix("goal=") {
             let (amount, unit) = goal.split_once(' ').unwrap_or((goal, ""));
@@ -839,6 +874,39 @@ impl HabitView {
         } else {
             colors.element_hover
         }
+    }
+
+    fn submenu_item(&self, id: &'static str, icon: IconName, label: &'static str, submenu: DetailSubmenu, cx: &mut Context<Self>) -> ListItem {
+        let open = self.detail_submenu == Some(submenu);
+        ListItem::new(id)
+            .start_slot(Icon::new(icon).color(Color::Muted))
+            .child(Label::new(label))
+            .end_slot(Icon::new(if open { IconName::ChevronDown } else { IconName::ChevronRight }).size(IconSize::Small).color(Color::Muted))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.detail_submenu = (!open).then_some(submenu);
+                cx.notify();
+            }))
+    }
+
+    /// A day's check-in circle: a checkmark on a filled circle when done, or the habit's own icon
+    /// with "Checked-in Style" set to "Habit icon", as in the original.
+    fn checkin_mark(&self, habit: Id, date: NaiveDate, size: Pixels, cx: &App) -> Div {
+        let done = self.checkins.get(&habit).is_some_and(|days| days.contains(&date));
+        let found = self.habits.iter().find(|h| h.id == habit);
+        if done && let Some(habit) = found.filter(|h| h.icon_checkins) {
+            return avatar(habit, size, cx);
+        }
+        div()
+            .size(size)
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_full()
+            .bg(self.dot_color(habit, date, cx))
+            .when(done, |el| {
+                el.child(Icon::new(IconName::Check).size(if size > px(20.) { IconSize::Small } else { IconSize::XSmall }).color(Color::Custom(gpui::white())))
+            })
     }
 
     /// TickTick's "Daily Goals" chart: the amount per day over the last days, with the goal line.
@@ -1273,12 +1341,9 @@ impl HabitView {
                     ),
             )
             .child(h_flex().justify_between().px_1().when(list, |el| el.w(px(260.)).flex_none()).children(week.map(|date| {
-                div()
+                self.checkin_mark(id, date, px(16.), cx)
                     .id(SharedString::from(format!("checkin-{id}-{date}")))
-                    .size(px(16.))
-                    .rounded_full()
                     .cursor_pointer()
-                    .bg(self.dot_color(id, date, cx))
                     .when(date > today, |el| el.opacity(0.4))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
@@ -1342,7 +1407,6 @@ impl HabitView {
                 h_flex()
                     .children(week.iter().map(|&date| {
                         let in_month = date.month() == self.month.month();
-                        let dot = self.dot_color(id, date, cx);
                         let future = date > today;
                         v_flex()
                             .flex_1()
@@ -1356,11 +1420,8 @@ impl HabitView {
                                     .color(if date == today { Color::Accent } else { Color::Default }),
                             )
                             .child(
-                                div()
+                                self.checkin_mark(id, date, px(26.), cx)
                                     .id(SharedString::from(format!("detail-checkin-{date}")))
-                                    .size(px(26.))
-                                    .rounded_full()
-                                    .bg(dot)
                                     .when(!future, |el| {
                                         el.cursor_pointer()
                                             .on_click(cx.listener(move |this, _, _, cx| this.toggle(id, date, cx)))
@@ -1405,8 +1466,9 @@ impl HabitView {
                                 el.child(PopoverAttachment::new(
                                     Placement::BelowRight,
                                     popover(cx)
-                                        .w(px(180.))
+                                        .w(px(200.))
                                         .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                                            this.detail_submenu = None;
                                             this.detail_menu_open = false;
                                             cx.notify();
                                         }))
@@ -1416,6 +1478,42 @@ impl HabitView {
                                                 .child(Label::new(strings.edit))
                                                 .on_click(cx.listener(|this, _, window, cx| this.start_edit(window, cx))),
                                         )
+                                        .child(self.submenu_item("habit-start-focus", IconName::CircleDot, strings.start_focus, DetailSubmenu::StartFocus, cx))
+                                        .when(self.detail_submenu == Some(DetailSubmenu::StartFocus), |el| {
+                                            let title = habit.name.clone();
+                                            el.children([(false, strings.start_pomo), (true, strings.start_stopwatch)].map(|(stopwatch, label)| {
+                                                let title = title.clone();
+                                                ListItem::new(SharedString::from(format!("habit-focus-{stopwatch}")))
+                                                    .start_slot(div().w(px(16.)))
+                                                    .child(Label::new(label))
+                                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                                        this.detail_menu_open = false;
+                                                        this.detail_submenu = None;
+                                                        cx.emit(StartFocus { title: title.clone(), stopwatch });
+                                                        cx.notify();
+                                                    }))
+                                            }))
+                                        })
+                                        .child(self.submenu_item("habit-checkin-style", IconName::SquareCheck, strings.checked_in_style, DetailSubmenu::CheckinStyle, cx))
+                                        .when(self.detail_submenu == Some(DetailSubmenu::CheckinStyle), |el| {
+                                            let current = habit.icon_checkins;
+                                            el.children([(false, strings.checkin_style_checkmark), (true, strings.checkin_style_icon)].map(|(icon, label)| {
+                                                ListItem::new(SharedString::from(format!("habit-style-{icon}")))
+                                                    .start_slot(div().w(px(16.)))
+                                                    .child(Label::new(label).color(if icon == current { Color::Accent } else { Color::Default }))
+                                                    .when(icon == current, |item| {
+                                                        item.end_slot(Icon::new(IconName::Check).size(IconSize::Small).color(Color::Accent))
+                                                    })
+                                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                                        if let Err(err) = this.store.set_habit_icon_checkins(id, icon) {
+                                                            eprintln!("failed to save the checked-in style: {err:#}");
+                                                        }
+                                                        this.detail_menu_open = false;
+                                                        this.detail_submenu = None;
+                                                        this.reload(cx);
+                                                    }))
+                                            }))
+                                        })
                                         .child({
                                             let archived = habit.archived;
                                             ListItem::new("habit-archive")

@@ -266,6 +266,9 @@ const MIGRATIONS: &[&str] = &[
     "
     ALTER TABLE filters ADD COLUMN match_any INTEGER NOT NULL DEFAULT 0;
     ",
+    "
+    ALTER TABLE habits ADD COLUMN icon_checkins INTEGER NOT NULL DEFAULT 0;
+    ",
 ];
 
 const TASK_COLUMNS: &str = "id, parent_id, kind, title, notes, priority, due_date, due_time, \
@@ -1078,7 +1081,7 @@ impl Store {
 
     pub fn habits(&self) -> Result<Vec<Habit>> {
         let mut stmt =
-            self.conn.prepare("SELECT id, name, goal_amount, goal_unit, reminders, frequency, icon, color, start_date, goal_days, section, archived_at FROM habits ORDER BY created_at, rowid")?;
+            self.conn.prepare("SELECT id, name, goal_amount, goal_unit, reminders, frequency, icon, color, start_date, goal_days, section, archived_at, icon_checkins FROM habits ORDER BY created_at, rowid")?;
         let habits = stmt
             .query_map([], |row| {
                 let goal = row.get::<_, Option<u32>>(2)?.map(|amount| Goal { amount, unit: row.get::<_, Option<String>>(3).ok().flatten().unwrap_or_default() });
@@ -1109,6 +1112,7 @@ impl Store {
                         .map(|s| crate::habit::HabitSection::from_key(&s))
                         .unwrap_or_default(),
                     archived: row.get::<_, Option<i64>>(11)?.is_some(),
+                    icon_checkins: row.get(12)?,
                 })
             })?
             .collect::<Result<_, _>>()?;
@@ -1130,6 +1134,7 @@ impl Store {
             goal_days: None,
             section: Default::default(),
             archived: false,
+            icon_checkins: false,
         };
         self.conn.execute(
             "INSERT INTO habits (id, name, created_at) VALUES (?1, ?2, ?3)",
@@ -1202,6 +1207,12 @@ impl Store {
         let key = crate::habit::HabitSection::Custom(id).key();
         self.conn.execute("UPDATE habits SET section = NULL WHERE section = ?1", [key])?;
         self.conn.execute("DELETE FROM habit_sections WHERE id = ?1", [id.to_string()])?;
+        Ok(())
+    }
+
+    /// "Checked-in Style": show checked-in days with the habit's icon instead of a checkmark.
+    pub fn set_habit_icon_checkins(&self, id: Id, on: bool) -> Result<()> {
+        self.conn.execute("UPDATE habits SET icon_checkins = ?2 WHERE id = ?1", params![id.to_string(), on])?;
         Ok(())
     }
 
@@ -2182,6 +2193,9 @@ mod tests {
         store.set_habit_archived(water.id, true)?;
         let habit = store.habits()?.remove(0);
         assert_eq!((habit.section, habit.archived), (crate::habit::HabitSection::Morning, true));
+        assert!(!habit.icon_checkins);
+        store.set_habit_icon_checkins(water.id, true)?;
+        assert!(store.habits()?[0].icon_checkins);
         store.set_habit_archived(water.id, false)?;
         assert!(!store.habits()?[0].archived);
 

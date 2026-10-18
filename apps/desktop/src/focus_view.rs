@@ -30,7 +30,8 @@ fn now_ms() -> i64 {
 
 struct Running {
     timer: FocusTimer,
-    task: Option<(Id, String)>,
+    /// What the session is for: a task, or a name alone (a habit).
+    task: Option<(Option<Id>, String)>,
     /// A break after a finished Pomodoro; breaks are not recorded.
     on_break: Option<BreakKind>,
     _ticker: GpuiTask<()>,
@@ -212,7 +213,19 @@ impl FocusView {
         } else {
             FocusTimer::start(now_ms(), self.minutes(POMO_SETTING) * 60_000)
         };
-        self.start_timer(task, None, timer, cx);
+        self.start_timer(task.map(|(id, title)| (Some(id), title)), None, timer, cx);
+    }
+
+    /// "Start Focus" on a habit: a Pomodoro or a stopwatch named after it, in that mode.
+    pub fn start_named(&mut self, title: String, stopwatch: bool, cx: &mut Context<Self>) {
+        self.finish(cx);
+        self.set_stopwatch_mode(stopwatch, cx);
+        let timer = if stopwatch {
+            FocusTimer::stopwatch(now_ms())
+        } else {
+            FocusTimer::start(now_ms(), self.minutes(POMO_SETTING) * 60_000)
+        };
+        self.start_timer(Some((None, title)), None, timer, cx);
     }
 
     fn stopwatch_mode(&self) -> bool {
@@ -226,7 +239,7 @@ impl FocusView {
         cx.notify();
     }
 
-    fn start_timer(&mut self, task: Option<(Id, String)>, on_break: Option<BreakKind>, timer: FocusTimer, cx: &mut Context<Self>) {
+    fn start_timer(&mut self, task: Option<(Option<Id>, String)>, on_break: Option<BreakKind>, timer: FocusTimer, cx: &mut Context<Self>) {
         let ticker = cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(Duration::from_secs(1)).await;
@@ -272,7 +285,7 @@ impl FocusView {
         let elapsed = running.timer.elapsed(now);
         if running.on_break.is_none() && elapsed >= MIN_RECORDED_MS {
             let strings = i18n::t(cx);
-            let (task_id, title) = running.task.map_or((None, strings.focus.to_owned()), |(id, t)| (Some(id), t));
+            let (task_id, title) = running.task.map_or((None, strings.focus.to_owned()), |(id, t)| (id, t));
             let start = running.timer.started_at;
             if let Err(err) = self.store.add_focus_session(task_id, &title, start, start + elapsed) {
                 eprintln!("failed to record the focus session: {err:#}");

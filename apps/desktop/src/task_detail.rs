@@ -24,12 +24,46 @@ enum Popup {
     More,
     /// "Link Parent Task": a searchable list of tasks to nest this one under.
     LinkParent,
+    /// Start Focus → "Estimation": the expected pomos or duration.
+    Estimate,
+}
+
+/// The Estimation popover's draft: minutes instead of pomos, and the amount.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct EstimateDraft {
+    minutes: bool,
+    amount: u32,
+}
+
+impl EstimateDraft {
+    fn from(estimate: Option<fern_core::Estimate>) -> Self {
+        match estimate {
+            Some(fern_core::Estimate::Minutes(n)) => Self { minutes: true, amount: n },
+            Some(fern_core::Estimate::Pomos(n)) => Self { minutes: false, amount: n },
+            None => Self { minutes: false, amount: 0 },
+        }
+    }
+
+    /// One step of the stepper: a pomo, or a quarter of an hour.
+    fn step(&mut self, up: bool) {
+        let step = if self.minutes { 15 } else { 1 };
+        self.amount = if up { self.amount + step } else { self.amount.saturating_sub(step) };
+    }
+
+    fn estimate(self) -> Option<fern_core::Estimate> {
+        match (self.amount, self.minutes) {
+            (0, _) => None,
+            (n, true) => Some(fern_core::Estimate::Minutes(n)),
+            (n, false) => Some(fern_core::Estimate::Pomos(n)),
+        }
+    }
 }
 
 pub struct TaskDetail {
     store: Rc<Store>,
     /// The "…" menu's Start Focus side menu, while hovered open.
     focus_submenu: bool,
+    estimate_draft: EstimateDraft,
     task: Option<Task>,
     title: Entity<TextInput>,
     notes: Entity<TextInput>,
@@ -158,6 +192,7 @@ impl TaskDetail {
         Self {
             store,
             focus_submenu: false,
+            estimate_draft: EstimateDraft { minutes: false, amount: 0 },
             task: None,
             title,
             notes,
@@ -316,6 +351,7 @@ impl TaskDetail {
             Popup::Tags => self.all_tags = self.store.tags().unwrap_or_default(),
             Popup::Priority | Popup::List | Popup::More => {}
             Popup::LinkParent => self.link_search.update(cx, |input, cx| input.set_text("", cx)),
+            Popup::Estimate => self.estimate_draft = EstimateDraft::from(self.task.as_ref().and_then(|t| t.estimate)),
         }
         self.popup = Some(popup);
         cx.notify();
@@ -348,6 +384,7 @@ impl TaskDetail {
                 return;
             }
             "link-parent" => Popup::LinkParent,
+            "estimate" => Popup::Estimate,
             "checklist" => {
                 self.start_checklist(cx);
                 return;
@@ -573,7 +610,10 @@ impl TaskDetail {
                                     cx.emit(StartFocus(task.id, task.title.clone(), stopwatch));
                                 }
                             }))
-                    })),
+                    }))
+                    .items([ListItem::new("more-focus-estimate")
+                        .child(Label::new(strings.estimation))
+                        .on_click(cx.listener(|this, _, _, cx| this.open_popup(Popup::Estimate, cx)))]),
             )
             .child(div().py_1().child(Divider::horizontal()))
             .child(self.close_side_menu_on_hover(item("more-activities", IconName::ListTree, strings.task_activities).on_click(cx.listener(
@@ -679,6 +719,95 @@ impl TaskDetail {
 
     /// The "Link Parent Task" picker: open tasks other than this one and its subtasks, filtered by
     /// the search field, each with its list.
+    /// The original's Estimation popover: Estimated Pomo or Estimated Duration, with Cancel / OK.
+    fn render_estimate(&self, strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {
+        let draft = self.estimate_draft;
+        let theme = cx.theme().clone();
+        let kind = |minutes: bool, label: &'static str| {
+            div()
+                .id(if minutes { "estimate-duration" } else { "estimate-pomo" })
+                .flex_1()
+                .h(px(26.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(6.))
+                .cursor_pointer()
+                .when(draft.minutes == minutes, |el| el.bg(theme.colors().element_selected))
+                .child(Label::new(label).size(LabelSize::Small).color(if draft.minutes == minutes { Color::Default } else { Color::Muted }))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if this.estimate_draft.minutes != minutes {
+                        this.estimate_draft = EstimateDraft { minutes, amount: 0 };
+                        cx.notify();
+                    }
+                }))
+        };
+        let step = |id: &'static str, icon: IconName, up: bool| {
+            IconButton::new(id, icon).size(px(24.)).icon_size(IconSize::Small).on_click(cx.listener(move |this, _, _, cx| {
+                this.estimate_draft.step(up);
+                cx.notify();
+            }))
+        };
+        let value = if draft.minutes { fern_core::format_minutes(draft.amount as i64) } else { draft.amount.to_string() };
+        let button = |id: &'static str, label: &'static str, primary: bool| {
+            div()
+                .id(id)
+                .flex_1()
+                .h(px(28.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(6.))
+                .cursor_pointer()
+                .when(primary, |el| el.bg(theme.colors().accent))
+                .when(!primary, |el| el.border_1().border_color(theme.colors().border))
+                .child(Label::new(label).size(LabelSize::Small).when(primary, |l| l.color(Color::Custom(gpui::white()))))
+        };
+        popover(cx)
+            .w(px(280.))
+            .p_3()
+            .gap_3()
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_popup(cx)))
+            .child(
+                h_flex()
+                    .p_0p5()
+                    .rounded(px(8.))
+                    .bg(theme.colors().surface_background)
+                    .child(kind(false, strings.estimated_pomo))
+                    .child(kind(true, strings.estimated_duration)),
+            )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(step("estimate-less", IconName::Minus, false))
+                    .child(
+                        div()
+                            .min_w(px(64.))
+                            .h(px(28.))
+                            .px_2()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(6.))
+                            .border_1()
+                            .border_color(theme.colors().border)
+                            .child(Label::new(value)),
+                    )
+                    .child(step("estimate-more", IconName::Plus, true))
+                    .when(!draft.minutes, |el| el.child(Label::new(strings.pomo_unit).color(Color::Muted))),
+            )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(button("estimate-cancel", strings.cancel, false).on_click(cx.listener(|this, _, _, cx| this.close_popup(cx))))
+                    .child(button("estimate-ok", strings.ok, true).on_click(cx.listener(|this, _, _, cx| {
+                        let estimate = this.estimate_draft.estimate();
+                        this.menu_action(cx, move |store, id| store.set_estimate(id, estimate));
+                    }))),
+            )
+            .into_any_element()
+    }
+
     fn render_link_parent(&self, strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
         let Some(task) = self.task.as_ref() else { return div().into_any_element() };
@@ -1885,6 +2014,12 @@ impl Render for TaskDetail {
                                         el.child(PopoverAttachment::new(
                                             Placement::AboveRight,
                                             self.render_more_popup(strings, cx),
+                                        ))
+                                    })
+                                    .when(self.popup == Some(Popup::Estimate), |el| {
+                                        el.child(PopoverAttachment::new(
+                                            Placement::AboveRight,
+                                            self.render_estimate(strings, cx),
                                         ))
                                     })
                                     .when(self.popup == Some(Popup::LinkParent), |el| {

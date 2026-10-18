@@ -562,6 +562,7 @@ mod tests {
             pinned_at: None,
             section_id: None,
             reminders: Vec::new(),
+            estimate: None,
             created_at: 0,
         }
     }

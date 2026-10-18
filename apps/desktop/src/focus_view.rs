@@ -1369,7 +1369,23 @@ impl Render for FocusView {
                         h_flex()
                             .gap_2()
                             .child(
-                                Label::new(format_minutes(focused.get(&task.id).copied().unwrap_or(0)))
+                                // With an Estimation, the progress towards it over all sessions.
+                                Label::new(match task.estimate {
+                                    Some(fern_core::Estimate::Pomos(n)) => {
+                                        let done = self.sessions.iter().filter(|s| s.task_id == Some(task.id)).count();
+                                        format!("{done}/{n} {}", strings.pomo_unit)
+                                    }
+                                    Some(fern_core::Estimate::Minutes(n)) => {
+                                        let done: i64 = self
+                                            .sessions
+                                            .iter()
+                                            .filter(|s| s.task_id == Some(task.id))
+                                            .map(|s| (s.ended_at - s.started_at) / 60_000)
+                                            .sum();
+                                        format!("{}/{}", format_minutes(done), format_minutes(n as i64))
+                                    }
+                                    None => format_minutes(focused.get(&task.id).copied().unwrap_or(0)),
+                                })
                                     .size(LabelSize::Small)
                                     .color(Color::Muted),
                             )

@@ -93,7 +93,36 @@ pub struct Task {
     pub modified_at: Option<i64>,
     /// Reminders as minutes before the due time (09:00 on the due day for all-day tasks).
     pub reminders: Vec<i64>,
+    /// "Estimation" from Start Focus: how much focus the task is expected to take.
+    pub estimate: Option<Estimate>,
     pub created_at: i64,
+}
+
+/// The original's "Estimated Pomo" or "Estimated Duration".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Estimate {
+    Pomos(u32),
+    Minutes(u32),
+}
+
+impl Estimate {
+    /// Stored as "p:3" or "m:90".
+    pub fn to_storage(self) -> String {
+        match self {
+            Estimate::Pomos(n) => format!("p:{n}"),
+            Estimate::Minutes(n) => format!("m:{n}"),
+        }
+    }
+
+    pub fn from_storage(value: &str) -> Option<Self> {
+        let (kind, n) = value.split_once(':')?;
+        let n = n.parse().ok().filter(|n| *n > 0)?;
+        match kind {
+            "p" => Some(Estimate::Pomos(n)),
+            "m" => Some(Estimate::Minutes(n)),
+            _ => None,
+        }
+    }
 }
 
 /// One entry of a task's activity: when and what ("created", "renamed", "completed", "reopened",

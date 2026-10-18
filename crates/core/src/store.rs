@@ -269,11 +269,14 @@ const MIGRATIONS: &[&str] = &[
     "
     ALTER TABLE habits ADD COLUMN icon_checkins INTEGER NOT NULL DEFAULT 0;
     ",
+    "
+    ALTER TABLE tasks ADD COLUMN estimate TEXT;
+    ",
 ];
 
 const TASK_COLUMNS: &str = "id, parent_id, kind, title, notes, priority, due_date, due_time, \
                             completed_at, created_at, list_id, deleted_at, repeat, wont_do_at, reminders, end_date, end_time, modified_at, \
-                            pinned_at, section_id";
+                            pinned_at, section_id, estimate";
 
 const DATE_FORMAT: &str = "%Y-%m-%d";
 const TIME_FORMAT: &str = "%H:%M";
@@ -459,6 +462,7 @@ impl Store {
             pinned_at: None,
             section_id: None,
             reminders: Vec::new(),
+            estimate: None,
             created_at: now_ms(),
         };
         let order = if top {
@@ -796,6 +800,11 @@ impl Store {
     }
 
     /// Pins a task to the top of its lists, or unpins it.
+    /// "Estimation": the expected pomos or minutes; `None` clears it.
+    pub fn set_estimate(&self, id: Id, estimate: Option<crate::model::Estimate>) -> Result<()> {
+        self.update(id, "estimate", estimate.map(crate::model::Estimate::to_storage))
+    }
+
     pub fn set_pinned(&self, id: Id, pinned: bool) -> Result<()> {
         self.update(id, "pinned_at", pinned.then(now_ms))
     }
@@ -1567,6 +1576,7 @@ fn task_from_row(row: &Row) -> rusqlite::Result<Task> {
         modified_at: row.get(17)?,
         pinned_at: row.get(18)?,
         section_id: row.get::<_, Option<String>>(19)?.map(|s| parse_uuid(&s, 19)).transpose()?,
+        estimate: row.get::<_, Option<String>>(20)?.and_then(|e| crate::model::Estimate::from_storage(&e)),
     })
 }
 
@@ -2282,6 +2292,22 @@ mod tests {
         // The copy sits right below the original.
         assert_eq!(titles(&store.tasks()?), ["other", "pack", "pack"]);
         let _ = other;
+        Ok(())
+    }
+
+    #[test]
+    fn estimates() -> Result<()> {
+        use crate::model::Estimate;
+        let store = Store::open_in_memory()?;
+        let task = store.add_task("write the report")?;
+        assert_eq!(store.task(task.id)?.unwrap().estimate, None);
+        store.set_estimate(task.id, Some(Estimate::Pomos(3)))?;
+        assert_eq!(store.task(task.id)?.unwrap().estimate, Some(Estimate::Pomos(3)));
+        store.set_estimate(task.id, Some(Estimate::Minutes(90)))?;
+        assert_eq!(store.task(task.id)?.unwrap().estimate, Some(Estimate::Minutes(90)));
+        store.set_estimate(task.id, None)?;
+        assert_eq!(store.task(task.id)?.unwrap().estimate, None);
+        assert_eq!(Estimate::from_storage("p:0"), None);
         Ok(())
     }
 

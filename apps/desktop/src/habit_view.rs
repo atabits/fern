@@ -53,6 +53,10 @@ struct HabitEdit {
     amount: Option<u32>,
     reminders: Vec<chrono::NaiveTime>,
     frequency: HabitFrequency,
+    start_date: NaiveDate,
+    goal_days: Option<u32>,
+    /// The start date's calendar month, while it is open.
+    start_calendar: Option<NaiveDate>,
     icon: Option<String>,
     color: Option<String>,
     /// The icon picker, with its tab (0 emoji, 1 text), while open.
@@ -172,6 +176,9 @@ impl HabitView {
         self.editing = Some(HabitEdit {
             icon: habit.icon.clone(),
             color: habit.color.clone(),
+            start_date: habit.start_date.unwrap_or_else(|| Local::now().date_naive()),
+            goal_days: habit.goal_days,
+            start_calendar: None,
             icon_picker: None,
             icon_text,
             name,
@@ -195,6 +202,7 @@ impl HabitView {
             .and_then(|()| self.store.set_habit_reminders(id, &edit.reminders))
             .and_then(|()| self.store.set_habit_frequency(id, edit.frequency))
             .and_then(|()| self.store.set_habit_look(id, edit.icon.as_deref(), edit.color.as_deref()))
+            .and_then(|()| self.store.set_habit_span(id, Some(edit.start_date), edit.goal_days))
         {
             eprintln!("failed to update the habit: {err:#}");
         }
@@ -271,6 +279,7 @@ impl HabitView {
             .when_some(edit.icon_picker, |el, tab| el.child(self.render_icon_picker(edit, tab, cx)))
             .child(Label::new(strings.habit_frequency).size(LabelSize::Small).color(Color::Muted))
             .child(self.render_frequency(edit.frequency, cx))
+            .child(self.render_span(edit, cx))
             .child(Label::new(strings.habit_goal).size(LabelSize::Small).color(Color::Muted))
             .child(
                 option("goal-all", strings.habit_goal_all, amount.is_none())
@@ -334,6 +343,128 @@ impl HabitView {
                     })))
                     .child(button("edit-save", strings.save, true).on_click(cx.listener(|this, _, _, cx| this.save_edit(cx)))),
             )
+            .into_any_element()
+    }
+
+    /// "Start Date" with a calendar, and "Goal Days": Forever, the presets or a custom number.
+    fn render_span(&self, edit: &HabitEdit, cx: &mut Context<Self>) -> AnyElement {
+        let strings = i18n::t(cx);
+        let theme = cx.theme().clone();
+        let today = Local::now().date_naive();
+        let start = edit.start_date;
+        let calendar_view = edit.start_calendar.map(|month| {
+            v_flex()
+                .gap_1()
+                .child(
+                    h_flex()
+                        .child(div().flex_1().child(Label::new(calendar::month_title(month, strings)).size(LabelSize::Small)))
+                        .child(IconButton::new("start-prev", IconName::ChevronLeft).size(px(22.)).on_click(cx.listener(
+                            |this, _, _, cx| this.update_edit(cx, |e| e.start_calendar = e.start_calendar.map(|m| calendar::add_months(m, -1))),
+                        )))
+                        .child(IconButton::new("start-next", IconName::ChevronRight).size(px(22.)).on_click(cx.listener(
+                            |this, _, _, cx| this.update_edit(cx, |e| e.start_calendar = e.start_calendar.map(|m| calendar::add_months(m, 1))),
+                        ))),
+                )
+                .children(calendar::month_grid(month).chunks(7).map(|week| {
+                    h_flex().children(week.iter().map(|&date| {
+                        let selected = date == start;
+                        div()
+                            .id(SharedString::from(format!("start-day-{date}")))
+                            .flex_1()
+                            .h(px(24.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_full()
+                            .cursor_pointer()
+                            .when(selected, |el| el.bg(theme.colors().accent))
+                            .when(!selected, |el| el.hover(|s| s.bg(theme.colors().element_hover)))
+                            .child(Label::new(date.day().to_string()).size(LabelSize::XSmall).color(
+                                if selected || date.month() == month.month() { Color::Default } else { Color::Muted },
+                            ))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.update_edit(cx, |e| {
+                                    e.start_date = date;
+                                    e.start_calendar = None;
+                                })
+                            }))
+                    }))
+                }))
+        });
+        let chip = |id: SharedString, label: String, selected: bool| {
+            div()
+                .id(id)
+                .h(px(24.))
+                .px_2()
+                .flex()
+                .items_center()
+                .rounded(px(12.))
+                .cursor_pointer()
+                .when(selected, |el| el.bg(theme.colors().accent.opacity(0.25)))
+                .when(!selected, |el| el.bg(theme.colors().element_hover))
+                .child(Label::new(label).size(LabelSize::XSmall).color(if selected { Color::Accent } else { Color::Default }))
+        };
+        let custom = edit.goal_days.filter(|n| !habit::GOAL_DAYS_PRESETS.contains(n));
+        let start_label = if start == today {
+            strings.today.to_owned()
+        } else {
+            format!("{}, {}", crate::task_rows::short_date(start, strings), start.year())
+        };
+        v_flex()
+            .gap_2()
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(div().flex_1().child(Label::new(strings.habit_start_date).size(LabelSize::Small).color(Color::Muted)))
+                    .child(
+                        div()
+                            .id("habit-start")
+                            .h(px(26.))
+                            .px_2()
+                            .flex()
+                            .items_center()
+                            .rounded(px(6.))
+                            .border_1()
+                            .border_color(if edit.start_calendar.is_some() { theme.colors().accent } else { theme.colors().border })
+                            .cursor_pointer()
+                            .child(Label::new(start_label).size(LabelSize::Small))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.update_edit(cx, |e| {
+                                    e.start_calendar = if e.start_calendar.is_some() { None } else { Some(calendar::month_start(start)) }
+                                })
+                            })),
+                    ),
+            )
+            .children(calendar_view)
+            .child(Label::new(strings.habit_goal_days).size(LabelSize::Small).color(Color::Muted))
+            .child(
+                h_flex()
+                    .flex_wrap()
+                    .gap_1()
+                    .child(chip("goal-days-forever".into(), strings.habit_forever.to_owned(), edit.goal_days.is_none()).on_click(
+                        cx.listener(|this, _, _, cx| this.update_edit(cx, |e| e.goal_days = None)),
+                    ))
+                    .children(habit::GOAL_DAYS_PRESETS.into_iter().map(|n| {
+                        chip(SharedString::from(format!("goal-days-{n}")), n.to_string(), edit.goal_days == Some(n))
+                            .on_click(cx.listener(move |this, _, _, cx| this.update_edit(cx, |e| e.goal_days = Some(n))))
+                    }))
+                    .child(chip("goal-days-custom".into(), strings.habit_custom.to_owned(), custom.is_some()).on_click(
+                        cx.listener(|this, _, _, cx| this.update_edit(cx, |e| e.goal_days = Some(50))),
+                    )),
+            )
+            .when_some(custom, |el, days| {
+                el.child(
+                    h_flex()
+                        .gap_2()
+                        .child(div().flex_1().child(Label::new(format!("{days} {}", strings.habit_days)).size(LabelSize::Small)))
+                        .child(IconButton::new("goal-days-fewer", IconName::Minus).on_click(cx.listener(|this, _, _, cx| {
+                            this.update_edit(cx, |e| e.goal_days = e.goal_days.map(|n| n.saturating_sub(1).max(1)))
+                        })))
+                        .child(IconButton::new("goal-days-more", IconName::Plus).on_click(cx.listener(|this, _, _, cx| {
+                            this.update_edit(cx, |e| e.goal_days = e.goal_days.map(|n| (n + 1).min(9999)))
+                        }))),
+                )
+            })
             .into_any_element()
     }
 
@@ -550,6 +681,11 @@ impl HabitView {
         } else if let Some(look) = command.strip_prefix("look=") {
             let (icon, color) = look.split_once('|').unwrap_or((look, ""));
             self.store.set_habit_look(id, Some(icon), (!color.is_empty()).then_some(color)).ok();
+        } else if let Some(span) = command.strip_prefix("span=") {
+            // `span=<start days ago>,<goal days or 0>`.
+            let (ago, days) = span.split_once(',').unwrap_or((span, "0"));
+            let start = Local::now().date_naive() - chrono::Duration::days(ago.parse().unwrap_or(0));
+            self.store.set_habit_span(id, Some(start), days.parse().ok()).ok();
         } else if command == "picker" {
             self.update_edit(cx, |e| e.icon_picker = Some(0));
             return;
@@ -590,13 +726,13 @@ impl HabitView {
         let colors = cx.theme().colors();
         let empty = HashSet::new();
         let done = self.checkins.get(&habit).unwrap_or(&empty);
-        let frequency = self.habits.iter().find(|h| h.id == habit).map(|h| h.frequency).unwrap_or_default();
+        let due = self.habits.iter().find(|h| h.id == habit).is_none_or(|h| h.is_due(date, done));
         if done.contains(&date) {
             colors.accent
         } else if self.amount(habit, date) > 0 {
             colors.accent.opacity(0.4)
-        } else if !frequency.is_due(date, done) {
-            // Not scheduled that day.
+        } else if !due {
+            // Not scheduled that day, or before the habit starts.
             colors.element_hover.opacity(0.35)
         } else {
             colors.element_hover
@@ -753,7 +889,10 @@ impl HabitView {
                                             .gap_0p5()
                                             .child(Icon::new(IconName::MapPin).size(IconSize::XSmall).color(Color::Accent))
                                             .child(
-                                                Label::new(format!("{} {}", stats.total_days, strings.habit_days))
+                                                Label::new(match habit.goal_days {
+                                                    Some(goal) => format!("{}/{goal} {}", stats.total_days, strings.habit_days),
+                                                    None => format!("{} {}", stats.total_days, strings.habit_days),
+                                                })
                                                     .size(LabelSize::XSmall)
                                                     .color(Color::Muted),
                                             ),

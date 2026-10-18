@@ -137,6 +137,10 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE habits ADD COLUMN icon TEXT;
     ALTER TABLE habits ADD COLUMN color TEXT;
     ",
+    "
+    ALTER TABLE habits ADD COLUMN start_date TEXT;
+    ALTER TABLE habits ADD COLUMN goal_days INTEGER;
+    ",
 ];
 
 const TASK_COLUMNS: &str = "id, parent_id, kind, title, notes, priority, due_date, due_time, \
@@ -712,7 +716,7 @@ impl Store {
 
     pub fn habits(&self) -> Result<Vec<Habit>> {
         let mut stmt =
-            self.conn.prepare("SELECT id, name, goal_amount, goal_unit, reminders, frequency, icon, color FROM habits ORDER BY created_at, rowid")?;
+            self.conn.prepare("SELECT id, name, goal_amount, goal_unit, reminders, frequency, icon, color, start_date, goal_days FROM habits ORDER BY created_at, rowid")?;
         let habits = stmt
             .query_map([], |row| {
                 let goal = row.get::<_, Option<u32>>(2)?.map(|amount| Goal { amount, unit: row.get::<_, Option<String>>(3).ok().flatten().unwrap_or_default() });
@@ -734,6 +738,10 @@ impl Store {
                     frequency,
                     icon: row.get(6)?,
                     color: row.get(7)?,
+                    start_date: row
+                        .get::<_, Option<String>>(8)?
+                        .and_then(|d| NaiveDate::parse_from_str(&d, DATE_FORMAT).ok()),
+                    goal_days: row.get(9)?,
                 })
             })?
             .collect::<Result<_, _>>()?;
@@ -751,6 +759,8 @@ impl Store {
             frequency: Default::default(),
             icon: None,
             color: None,
+            start_date: None,
+            goal_days: None,
         };
         self.conn.execute(
             "INSERT INTO habits (id, name, created_at) VALUES (?1, ?2, ?3)",
@@ -771,6 +781,15 @@ impl Store {
         self.conn.execute(
             "UPDATE habits SET icon = ?2, color = ?3 WHERE id = ?1",
             params![id.to_string(), icon, color],
+        )?;
+        Ok(())
+    }
+
+    /// Sets when a habit starts and its "Goal Days" (`None`: from creation, forever).
+    pub fn set_habit_span(&self, id: Id, start: Option<NaiveDate>, goal_days: Option<u32>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE habits SET start_date = ?2, goal_days = ?3 WHERE id = ?1",
+            params![id.to_string(), start.map(|d| d.format(DATE_FORMAT).to_string()), goal_days.filter(|n| *n > 0)],
         )?;
         Ok(())
     }
@@ -1530,6 +1549,13 @@ mod tests {
         assert_eq!(store.habits()?[0].icon.as_deref(), Some("Wa"));
         store.set_habit_look(water.id, Some(""), None)?;
         assert_eq!(store.habits()?[0].icon, None);
+
+        store.set_habit_span(water.id, Some(d(2026, 10, 1)), Some(21))?;
+        let habit = store.habits()?.remove(0);
+        assert_eq!((habit.start_date, habit.goal_days), (Some(d(2026, 10, 1)), Some(21)));
+        store.set_habit_span(water.id, None, Some(0))?;
+        let habit = store.habits()?.remove(0);
+        assert_eq!((habit.start_date, habit.goal_days), (None, None));
         Ok(())
     }
 

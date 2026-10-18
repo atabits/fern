@@ -21,6 +21,20 @@ pub struct Habit {
     pub icon: Option<String>,
     /// The icon's background, a hex color.
     pub color: Option<String>,
+    /// The habit is not due before this day.
+    pub start_date: Option<NaiveDate>,
+    /// "Goal Days": the number of check-in days to reach; `None` is "Forever".
+    pub goal_days: Option<u32>,
+}
+
+/// The original's "Goal Days" presets; "Custom" allows any number.
+pub const GOAL_DAYS_PRESETS: [u32; 5] = [7, 21, 30, 100, 365];
+
+impl Habit {
+    /// Whether the habit should be done on `date`: on or after its start, per its frequency.
+    pub fn is_due(&self, date: NaiveDate, done: &HashSet<NaiveDate>) -> bool {
+        self.start_date.is_none_or(|start| date >= start) && self.frequency.is_due(date, done)
+    }
 }
 
 /// How often a habit is meant to be done, as in the original's Frequency menu.
@@ -92,7 +106,7 @@ pub fn reminders_between<'a>(
         while day <= until.date() {
             let days_done = done.get(&habit.id);
             let done_today = days_done.is_some_and(|days| days.contains(&day))
-                || !habit.frequency.is_due(day, days_done.unwrap_or(&HashSet::new()));
+                || !habit.is_due(day, days_done.unwrap_or(&HashSet::new()));
             for time in &habit.reminders {
                 let at = day.and_time(*time);
                 if at > after && at <= until && !done_today {
@@ -244,6 +258,8 @@ mod tests {
             frequency: Frequency::default(),
             icon: None,
             color: None,
+            start_date: None,
+            goal_days: None,
         };
         let habits = [habit.clone()];
         let mut done = HashMap::new();
@@ -252,6 +268,11 @@ mod tests {
         assert_eq!(times, [at(17, 9), at(17, 21), at(18, 9)]);
         done.insert(habit.id, HashSet::from([d(17)]));
         assert_eq!(reminders_between(&habits, &done, at(17, 8), at(18, 10)).len(), 1);
+
+        // Nothing before the start date.
+        let later = [Habit { start_date: Some(d(19)), ..habit.clone() }];
+        assert!(reminders_between(&later, &HashMap::new(), at(17, 8), at(18, 23)).is_empty());
+        assert!(!later[0].is_due(d(18), &HashSet::new()) && later[0].is_due(d(19), &HashSet::new()));
     }
 
     #[test]

@@ -2,9 +2,10 @@
 //! days and items the calendar shows.
 
 use anyhow::Result;
-use chrono::{Datelike, NaiveDate, Weekday};
+use chrono::{DateTime, Datelike, Local, NaiveDate, Weekday};
 
 use crate::countdown::Countdown;
+use crate::focus::FocusSession;
 use crate::model::Task;
 use crate::store::Store;
 
@@ -36,6 +37,23 @@ impl ColorBy {
     }
 }
 
+/// The Color page's Habit tab: habits in the theme's color, one fixed color, or each in its own.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HabitColor {
+    #[default]
+    Theme,
+    Fixed,
+    Habit,
+}
+
+/// The Color page's Countdown tab: one fixed color (orange by default), or each its own.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CountdownColor {
+    #[default]
+    Fixed,
+    Countdown,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CalendarOptions {
     pub color_by: ColorBy,
@@ -48,6 +66,14 @@ pub struct CalendarOptions {
     /// "Show All Repeat Cycle": a repeating task on each of its coming dates, not only the next.
     pub show_repeats: bool,
     pub show_countdowns: bool,
+    /// Today's habits on today, and focus records on the days they were made.
+    pub show_habits: bool,
+    pub show_focus: bool,
+    pub habit_color: HabitColor,
+    pub countdown_color: CountdownColor,
+    /// The fixed colors, as indexes into the palette the Color page offers.
+    pub habit_fixed: u8,
+    pub countdown_fixed: u8,
 }
 
 impl Default for CalendarOptions {
@@ -61,23 +87,33 @@ impl Default for CalendarOptions {
             show_completed: true,
             show_repeats: true,
             show_countdowns: true,
+            show_habits: false,
+            show_focus: false,
+            habit_color: HabitColor::Theme,
+            countdown_color: CountdownColor::Fixed,
+            habit_fixed: 0,
+            countdown_fixed: 0,
         }
     }
 }
 
 const COLOR_BY: &str = "calendar_color_by";
+const HABIT_COLOR: &str = "calendar_habit_color";
+const COUNTDOWN_COLOR: &str = "calendar_countdown_color";
 /// The switches, in the order of `CalendarOptions::flags`.
-const FLAGS: [&str; 6] = [
+const FLAGS: [&str; 8] = [
     "calendar_modern",
     "calendar_heatmap",
     "calendar_weekends",
     "calendar_completed",
     "calendar_repeats",
     "calendar_countdowns",
+    "calendar_habits",
+    "calendar_focus",
 ];
 
 impl CalendarOptions {
-    fn flags(&mut self) -> [&mut bool; 6] {
+    fn flags(&mut self) -> [&mut bool; 8] {
         [
             &mut self.modern,
             &mut self.heatmap,
@@ -85,7 +121,22 @@ impl CalendarOptions {
             &mut self.show_completed,
             &mut self.show_repeats,
             &mut self.show_countdowns,
+            &mut self.show_habits,
+            &mut self.show_focus,
         ]
+    }
+
+    /// Focus records shown on a day: those started on it, in local time, in order.
+    pub fn focus_on<'a>(&self, sessions: &'a [FocusSession], date: NaiveDate) -> Vec<&'a FocusSession> {
+        if !self.show_focus {
+            return Vec::new();
+        }
+        let mut on: Vec<&FocusSession> = sessions
+            .iter()
+            .filter(|s| DateTime::from_timestamp_millis(s.started_at).is_some_and(|t| t.with_timezone(&Local).date_naive() == date))
+            .collect();
+        on.sort_by_key(|s| s.started_at);
+        on
     }
 
     /// Whether a day has a column: weekends go when they are not shown.
@@ -133,11 +184,44 @@ impl Store {
                 *flag = value == "1";
             }
         }
+        // "theme", "habit" or "fixed:<palette index>"; "countdown" or "fixed:<index>".
+        if let Some(code) = self.setting(HABIT_COLOR)? {
+            match code.as_str() {
+                "theme" => options.habit_color = HabitColor::Theme,
+                "habit" => options.habit_color = HabitColor::Habit,
+                fixed => {
+                    if let Some(index) = fixed.strip_prefix("fixed:").and_then(|i| i.parse().ok()) {
+                        (options.habit_color, options.habit_fixed) = (HabitColor::Fixed, index);
+                    }
+                }
+            }
+        }
+        if let Some(code) = self.setting(COUNTDOWN_COLOR)? {
+            match code.as_str() {
+                "countdown" => options.countdown_color = CountdownColor::Countdown,
+                fixed => {
+                    if let Some(index) = fixed.strip_prefix("fixed:").and_then(|i| i.parse().ok()) {
+                        options.countdown_fixed = index;
+                    }
+                }
+            }
+        }
         Ok(options)
     }
 
     pub fn save_calendar_options(&self, options: &CalendarOptions) -> Result<()> {
         self.set_setting(COLOR_BY, options.color_by.code())?;
+        let habit = match options.habit_color {
+            HabitColor::Theme => "theme".to_owned(),
+            HabitColor::Habit => "habit".to_owned(),
+            HabitColor::Fixed => format!("fixed:{}", options.habit_fixed),
+        };
+        self.set_setting(HABIT_COLOR, &habit)?;
+        let countdown = match options.countdown_color {
+            CountdownColor::Countdown => "countdown".to_owned(),
+            CountdownColor::Fixed => format!("fixed:{}", options.countdown_fixed),
+        };
+        self.set_setting(COUNTDOWN_COLOR, &countdown)?;
         let mut options = *options;
         for (key, flag) in FLAGS.iter().zip(options.flags()) {
             self.set_setting(key, if *flag { "1" } else { "0" })?;
@@ -162,7 +246,36 @@ mod tests {
         let options = CalendarOptions { color_by: ColorBy::Priority, modern: true, show_weekends: false, ..Default::default() };
         store.save_calendar_options(&options)?;
         assert_eq!(store.calendar_options()?, options);
+        let colors = CalendarOptions {
+            show_habits: true,
+            habit_color: HabitColor::Fixed,
+            habit_fixed: 3,
+            countdown_color: CountdownColor::Countdown,
+            ..Default::default()
+        };
+        store.save_calendar_options(&colors)?;
+        assert_eq!(store.calendar_options()?, colors);
         Ok(())
+    }
+
+    #[test]
+    fn focus_records_on_their_day() {
+        let at = |day: u32, hour: u32| {
+            NaiveDate::from_ymd_opt(2026, 10, day).unwrap().and_hms_opt(hour, 0, 0).unwrap().and_local_timezone(Local).unwrap().timestamp_millis()
+        };
+        let session = |day: u32, hour: u32| FocusSession {
+            id: uuid::Uuid::now_v7(),
+            task_id: None,
+            title: format!("{day} {hour}"),
+            started_at: at(day, hour),
+            ended_at: at(day, hour) + 25 * 60_000,
+            stopwatch: false,
+            note: String::new(),
+        };
+        let sessions = [session(15, 14), session(15, 9), session(16, 9)];
+        let shown = CalendarOptions { show_focus: true, ..Default::default() };
+        assert_eq!(shown.focus_on(&sessions, d(10, 15)).iter().map(|s| s.title.as_str()).collect::<Vec<_>>(), ["15 9", "15 14"]);
+        assert!(CalendarOptions::default().focus_on(&sessions, d(10, 15)).is_empty(), "off by default, as the original's");
     }
 
     #[test]

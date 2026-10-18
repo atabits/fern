@@ -3,7 +3,7 @@
 
 use std::rc::Rc;
 
-use fern_core::{CalendarOptions, ColorBy, Priority, Store};
+use fern_core::{CalendarOptions, ColorBy, CountdownColor, HabitColor, Priority, Store};
 use gpui::{EventEmitter, FontWeight, Hsla};
 use ui::prelude::*;
 use ui::{Placement, PopoverAttachment, Switch, popover};
@@ -14,6 +14,14 @@ use crate::task_rows;
 
 /// The original's dialog width.
 const WIDTH: f32 = 440.;
+
+/// The fixed colors the Color page offers for habits and countdowns, as the original's: orange,
+/// lime, green, teal, blue, purple, pink and red.
+pub const PALETTE: [u32; 8] = [0xf5a54a, 0xb5cf2f, 0x76c95a, 0x4bbfae, 0x6b9cf2, 0xae8cf0, 0xee7fb6, 0xee6458];
+
+pub fn palette(index: u8) -> gpui::Hsla {
+    gpui::rgb(PALETTE[index as usize % PALETTE.len()]).into()
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Page {
@@ -32,6 +40,8 @@ pub struct CalendarOptionsDialog {
     options: CalendarOptions,
     page: Page,
     color_menu: bool,
+    /// The Color page's tab: Task, Habit or Countdown.
+    color_tab: usize,
 }
 
 impl EventEmitter<OptionsEvent> for CalendarOptionsDialog {}
@@ -39,10 +49,15 @@ impl EventEmitter<OptionsEvent> for CalendarOptionsDialog {}
 impl CalendarOptionsDialog {
     pub fn new(store: Rc<Store>, page: Page) -> Self {
         let options = store.calendar_options().unwrap_or_default();
-        Self { store, options, page, color_menu: false }
+        Self { store, options, page, color_menu: false, color_tab: 0 }
     }
 
     /// Opens the Color By dropdown, for the debug-build dev state.
+    #[cfg(debug_assertions)]
+    pub fn dev_color_tab(&mut self, tab: usize) {
+        self.color_tab = tab;
+    }
+
     #[cfg(debug_assertions)]
     pub fn dev_color_menu(&mut self) {
         self.color_menu = true;
@@ -104,14 +119,20 @@ impl CalendarOptionsDialog {
                     .child(switch("calendar-completed", strings.show_completed, o.show_completed, |o| o.show_completed = !o.show_completed, cx))
                     .child(switch("calendar-repeats", strings.show_all_repeats, o.show_repeats, |o| o.show_repeats = !o.show_repeats, cx)),
             )
-            .child(group().child(switch("calendar-countdowns", strings.show_countdowns, o.show_countdowns, |o| o.show_countdowns = !o.show_countdowns, cx)))
+            .child(
+                group()
+                    .child(switch("calendar-habits", strings.show_habits, o.show_habits, |o| o.show_habits = !o.show_habits, cx))
+                    .child(switch("calendar-focus", strings.show_focus, o.show_focus, |o| o.show_focus = !o.show_focus, cx))
+                    .child(switch("calendar-countdowns", strings.show_countdowns, o.show_countdowns, |o| o.show_countdowns = !o.show_countdowns, cx)),
+            )
     }
 
-    /// The Color page: Color By, what it means, and the colors it takes.
+    /// The Color page, as the original's: Task, Habit and Countdown tabs, each with its "Color By",
+    /// what it means, and the colors it takes.
     fn render_color(&self, strings: &'static Strings, cx: &mut Context<Self>) -> Div {
         let theme = cx.theme().clone();
-        let color_by = self.options.color_by;
-        let index = ColorBy::ALL.iter().position(|c| *c == color_by).unwrap_or(0);
+        let accent = theme.colors().accent;
+        let o = self.options;
         let swatch = |color: Hsla| div().size(px(14.)).rounded_full().bg(color);
         let row = |icon: IconName, label: SharedString, color: Hsla| {
             h_flex()
@@ -122,26 +143,53 @@ impl CalendarOptionsDialog {
                 .child(div().flex_1().child(Label::new(label).truncate()))
                 .child(swatch(color))
         };
-        let accent = theme.colors().accent;
-        let rows: Vec<_> = match color_by {
-            ColorBy::List => std::iter::once(row(IconName::Inbox, strings.inbox.into(), accent))
-                .chain(self.store.lists().unwrap_or_default().into_iter().filter(|l| !l.archived).map(|l| {
-                    row(IconName::List, l.name.clone().into(), parse_color(l.color.as_deref()).unwrap_or(accent))
-                }))
-                .collect(),
-            ColorBy::Tag => self
-                .store
-                .tags()
-                .unwrap_or_default()
-                .into_iter()
-                .map(|t| row(IconName::Tag, t.name.clone().into(), parse_color(t.color.as_deref()).unwrap_or(accent)))
-                .collect(),
-            ColorBy::Priority => [Priority::High, Priority::Medium, Priority::Low, Priority::None]
-                .into_iter()
-                .zip([strings.priority_high, strings.priority_medium, strings.priority_low, strings.priority_none])
-                .map(|(p, label)| row(IconName::Flag, label.into(), task_rows::priority_color(p, &theme).unwrap_or(accent)))
-                .collect(),
+        // The tab's choices, the chosen one, what it means, and what follows it.
+        let (choices, chosen, hint, rows): (Vec<&'static str>, usize, Option<&'static str>, Vec<AnyElement>) = match self.color_tab {
+            0 => {
+                let index = ColorBy::ALL.iter().position(|c| *c == o.color_by).unwrap_or(0);
+                let rows = match o.color_by {
+                    ColorBy::List => std::iter::once(row(IconName::Inbox, strings.inbox.into(), accent))
+                        .chain(self.store.lists().unwrap_or_default().into_iter().filter(|l| !l.archived).map(|l| {
+                            row(IconName::List, l.name.clone().into(), parse_color(l.color.as_deref()).unwrap_or(accent))
+                        }))
+                        .map(IntoElement::into_any_element)
+                        .collect(),
+                    ColorBy::Tag => self
+                        .store
+                        .tags()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|t| row(IconName::Tag, t.name.clone().into(), parse_color(t.color.as_deref()).unwrap_or(accent)).into_any_element())
+                        .collect(),
+                    ColorBy::Priority => [Priority::High, Priority::Medium, Priority::Low, Priority::None]
+                        .into_iter()
+                        .zip([strings.priority_high, strings.priority_medium, strings.priority_low, strings.priority_none])
+                        .map(|(p, label)| row(IconName::Flag, label.into(), task_rows::priority_color(p, &theme).unwrap_or(accent)).into_any_element())
+                        .collect(),
+                };
+                (strings.color_by_options.to_vec(), index, Some(strings.color_by_hints[index]), rows)
+            }
+            1 => {
+                let index = match o.habit_color {
+                    HabitColor::Theme => 0,
+                    HabitColor::Fixed => 1,
+                    HabitColor::Habit => 2,
+                };
+                let hint = match o.habit_color {
+                    HabitColor::Theme => None,
+                    HabitColor::Fixed => Some(strings.habit_fixed_hint),
+                    HabitColor::Habit => Some(strings.habit_own_hint),
+                };
+                let rows = if o.habit_color == HabitColor::Fixed { vec![self.palette_row(o.habit_fixed, true, strings, cx)] } else { Vec::new() };
+                (strings.habit_color_options.to_vec(), index, hint, rows)
+            }
+            _ => {
+                let fixed = o.countdown_color == CountdownColor::Fixed;
+                let rows = if fixed { vec![self.palette_row(o.countdown_fixed, false, strings, cx)] } else { Vec::new() };
+                (strings.countdown_color_options.to_vec(), usize::from(!fixed), Some(if fixed { strings.countdown_fixed_hint } else { strings.countdown_own_hint }), rows)
+            }
         };
+        let tab = self.color_tab;
         let menu = self.color_menu.then(|| {
             PopoverAttachment::new(
                 Placement::BelowRight,
@@ -151,22 +199,47 @@ impl CalendarOptionsDialog {
                         this.color_menu = false;
                         cx.notify();
                     }))
-                    .children(ColorBy::ALL.into_iter().zip(strings.color_by_options).map(|(choice, label)| {
-                        let on = choice == color_by;
-                        ListItem::new(SharedString::from(format!("color-by-{label}")))
+                    .children(choices.iter().enumerate().map(|(i, label)| {
+                        let on = i == chosen;
+                        ListItem::new(SharedString::from(format!("color-by-{tab}-{i}")))
                             .height(px(34.))
-                            .child(Label::new(label).color(if on { Color::Accent } else { Color::Default }))
+                            .child(Label::new(*label).color(if on { Color::Accent } else { Color::Default }))
                             .when(on, |item| item.end_slot(Icon::new(IconName::Check).size(IconSize::Small).color(Color::Accent)))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.color_menu = false;
-                                this.change(cx, |o| o.color_by = choice);
+                                this.change(cx, |o| match tab {
+                                    0 => o.color_by = ColorBy::ALL[i],
+                                    1 => o.habit_color = [HabitColor::Theme, HabitColor::Fixed, HabitColor::Habit][i],
+                                    _ => o.countdown_color = [CountdownColor::Fixed, CountdownColor::Countdown][i],
+                                });
                             }))
                     })),
             )
         });
+        let tabs = h_flex().flex_1().justify_center().gap_2().children(strings.color_tabs.iter().enumerate().map(|(i, label)| {
+            let on = i == tab;
+            div()
+                .id(SharedString::from(format!("color-tab-{i}")))
+                .px_3()
+                .py_1()
+                .rounded_full()
+                .cursor_pointer()
+                .bg(if on { accent.opacity(0.15) } else { theme.colors().element_selected })
+                .child(Label::new(*label).color(if on { Color::Accent } else { Color::Muted }))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.color_tab = i;
+                    this.color_menu = false;
+                    cx.notify();
+                }))
+        }));
         v_flex()
             .gap_3()
-            .child(self.header(strings.calendar_color, cx))
+            .child(
+                h_flex()
+                    .child(div().w(px(26.)))
+                    .child(tabs)
+                    .child(IconButton::new("calendar-options-x", IconName::X).icon_color(Color::Muted).on_click(cx.listener(|_, _, _, cx| cx.emit(OptionsEvent::Closed)))),
+            )
             .child(
                 h_flex()
                     .h(px(48.))
@@ -184,7 +257,7 @@ impl CalendarOptionsDialog {
                                 .rounded(px(4.))
                                 .cursor_pointer()
                                 .when(self.color_menu, |el| el.bg(theme.colors().element_hover))
-                                .child(Label::new(strings.color_by_options[index]).color(Color::Muted))
+                                .child(Label::new(choices[chosen]).color(Color::Muted))
                                 .child(Icon::new(IconName::ChevronsUpDown).size(IconSize::XSmall).color(Color::Muted))
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.color_menu = !this.color_menu;
@@ -194,8 +267,36 @@ impl CalendarOptionsDialog {
                         .children(menu),
                     ),
             )
-            .child(div().px_4().child(Label::new(strings.color_by_hints[index]).size(LabelSize::Small).color(Color::Muted)))
-            .child(v_flex().id("color-rows").max_h(px(320.)).overflow_y_scroll().py_1().rounded(px(8.)).bg(theme.colors().element_selected).children(rows))
+            .when_some(hint, |el, hint| el.child(div().px_4().child(Label::new(hint).size(LabelSize::Small).color(Color::Muted))))
+            .when(!rows.is_empty(), |el| {
+                el.child(v_flex().id("color-rows").max_h(px(320.)).overflow_y_scroll().py_1().rounded(px(8.)).bg(theme.colors().element_selected).children(rows))
+            })
+    }
+
+    /// The "Color" row of fixed colors, the chosen one ringed.
+    fn palette_row(&self, chosen: u8, habit: bool, strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {
+        h_flex()
+            .h(px(48.))
+            .px_4()
+            .gap_2()
+            .child(div().flex_1().child(Label::new(strings.calendar_color)))
+            .children((0..PALETTE.len() as u8).map(|i| {
+                let color = palette(i);
+                div()
+                    .id(SharedString::from(format!("palette-{habit}-{i}")))
+                    .size(px(20.))
+                    .rounded_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .when(i == chosen, |el| el.border_2().border_color(color))
+                    .child(div().size(px(if i == chosen { 12. } else { 18. })).rounded_full().bg(color))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.change(cx, |o| if habit { o.habit_fixed = i } else { o.countdown_fixed = i })
+                    }))
+            }))
+            .into_any_element()
     }
 
     /// The Style page: Item Style (Modern or Classic, each with a sketch) and the Year view's

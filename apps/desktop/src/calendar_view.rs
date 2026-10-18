@@ -98,6 +98,9 @@ pub struct CalendarView {
     list_colors: std::collections::HashMap<Id, gpui::Hsla>,
     tag_colors: std::collections::HashMap<String, gpui::Hsla>,
     list_names: Vec<(Id, String)>,
+    /// With Show Habit, the habits due today; with Show Focus Records, the focus sessions.
+    habits_today: Vec<fern_core::Habit>,
+    focus_sessions: Vec<fern_core::FocusSession>,
 }
 
 /// The original's task card: 402 px wide, 301 px tall.
@@ -161,6 +164,8 @@ impl CalendarView {
             list_colors: Default::default(),
             tag_colors: Default::default(),
             list_names: Vec::new(),
+            habits_today: Vec::new(),
+            focus_sessions: Vec::new(),
         };
         this.reload(cx);
         this
@@ -188,6 +193,61 @@ impl CalendarView {
             ColorBy::Tag => task.tags.first().and_then(|t| self.tag_colors.get(&t.to_lowercase()).copied()).unwrap_or(accent),
             ColorBy::Priority => task_rows::priority_color(task.priority, theme).unwrap_or(accent),
         }
+    }
+
+    /// The extra items of a day, as View Options say: today's habits (as the original's calendar,
+    /// on today only), the day's focus records, and its countdowns.
+    fn day_extras(&self, date: NaiveDate, cx: &App) -> Vec<AnyElement> {
+        let theme = cx.theme();
+        let today = Local::now().date_naive();
+        let bar = |tint: gpui::Hsla| h_flex().h(px(18.)).flex_none().gap_1().px_1().rounded(px(3.)).bg(tint.opacity(0.28));
+        let mut items: Vec<AnyElement> = Vec::new();
+        if date == today {
+            for habit in &self.habits_today {
+                let tint = match self.options.habit_color {
+                    fern_core::HabitColor::Theme => theme.colors().accent,
+                    fern_core::HabitColor::Fixed => crate::calendar_options_view::palette(self.options.habit_fixed),
+                    fern_core::HabitColor::Habit => crate::lists_panel::parse_color(habit.color.as_deref()).unwrap_or(theme.colors().accent),
+                };
+                items.push(
+                    bar(tint)
+                        .child(Icon::new(IconName::FernHabit).size(IconSize::XSmall).color(Color::Muted))
+                        .child(Label::new(habit.name.clone()).size(LabelSize::XSmall).truncate())
+                        .into_any_element(),
+                );
+            }
+        }
+        // A focus record: an outlined bar with a timer, the task and the time it started.
+        for session in self.options.focus_on(&self.focus_sessions, date) {
+            let start = chrono::DateTime::from_timestamp_millis(session.started_at).map(|t| t.with_timezone(&Local).time());
+            items.push(
+                h_flex()
+                    .h(px(18.))
+                    .flex_none()
+                    .gap_1()
+                    .px_1()
+                    .rounded(px(3.))
+                    .border_1()
+                    .border_color(theme.colors().accent.opacity(0.4))
+                    .child(Icon::new(IconName::Timer).size(IconSize::XSmall).color(Color::Muted))
+                    .child(div().flex_1().min_w_0().child(Label::new(session.title.clone()).size(LabelSize::XSmall).color(Color::Muted).truncate()))
+                    .when_some(start, |el, start| el.child(Label::new(calendar::format_time(start)).size(LabelSize::XSmall).color(Color::Muted)))
+                    .into_any_element(),
+            );
+        }
+        for countdown in self.countdowns.iter().filter(|c| !c.archived && self.options.shows_countdown(c, date)) {
+            let tint = match self.options.countdown_color {
+                fern_core::CountdownColor::Fixed => crate::calendar_options_view::palette(self.options.countdown_fixed),
+                fern_core::CountdownColor::Countdown => crate::lists_panel::parse_color(countdown.color.as_deref()).unwrap_or(theme.status().warning),
+            };
+            items.push(
+                bar(tint)
+                    .child(div().size(px(6.)).flex_none().rounded_full().bg(tint))
+                    .child(Label::new(countdown.name.clone()).size(LabelSize::XSmall).truncate())
+                    .into_any_element(),
+            );
+        }
+        items
     }
 
     fn open_options(&mut self, page: Page, cx: &mut Context<Self>) {
@@ -357,7 +417,7 @@ impl CalendarView {
     }
 
     /// The header's "…" menu and what it opens, for the debug-build dev state
-    /// (`calendar-more=menu|options|color|color-by|style|arrange|arrange-tags`).
+    /// (`calendar-more=menu|options|color|color-by|style|arrange|arrange-tags|extras`).
     #[cfg(debug_assertions)]
     pub fn dev_more(&mut self, what: &str, cx: &mut Context<Self>) {
         match what {
@@ -371,8 +431,20 @@ impl CalendarView {
                 }
             }
             "style" => self.open_options(Page::Style, cx),
+            "color-habit" | "color-countdown" => {
+                self.open_options(Page::Color, cx);
+                let tab = if what == "color-habit" { 1 } else { 2 };
+                if let Some(dialog) = &self.options_dialog {
+                    dialog.update(cx, |d, _| d.dev_color_tab(tab));
+                }
+            }
             "arrange" => self.arrange = Some(0),
             "arrange-tags" => self.arrange = Some(1),
+            // Show Habit and Show Focus Records turned on.
+            "extras" => {
+                let options = CalendarOptions { show_habits: true, show_focus: true, ..self.store.calendar_options().unwrap_or_default() };
+                self.store.save_calendar_options(&options).ok();
+            }
             _ => {}
         }
         self.reload(cx);
@@ -548,6 +620,18 @@ impl CalendarView {
         }
         self.undated = all.into_iter().filter(|t| t.due_date.is_none() && !t.is_closed() && !t.is_deleted() && t.parent_id.is_none()).collect();
         self.countdowns = self.store.countdowns().unwrap_or_default();
+        let today = Local::now().date_naive();
+        self.habits_today = if self.options.show_habits {
+            self.store
+                .habits()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|h| !h.archived && h.is_due(today, &self.store.checkins(h.id).unwrap_or_default()))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        self.focus_sessions = if self.options.show_focus { self.store.focus_sessions().unwrap_or_default() } else { Vec::new() };
         cx.notify();
     }
 
@@ -628,8 +712,9 @@ impl CalendarView {
         let strings = i18n::t(cx);
         let theme = cx.theme().clone();
         let tasks = self.tasks_on(date);
-        let countdowns: Vec<&fern_core::Countdown> = self.countdowns.iter().filter(|c| !c.archived && self.options.shows_countdown(c, date)).collect();
-        let hidden = (tasks.len() + countdowns.len()).saturating_sub(TASKS_PER_DAY);
+        let extras = self.day_extras(date, cx);
+        let hidden = (tasks.len() + extras.len()).saturating_sub(TASKS_PER_DAY);
+        let room = TASKS_PER_DAY.saturating_sub(tasks.len());
         // The first day of a month carries the month name, as in the original: "Oct 1".
         let number = if date.day() == 1 {
             let month = strings.months_short[date.month0() as usize];
@@ -674,19 +759,8 @@ impl CalendarView {
                 ),
             )
             .children(tasks.iter().take(TASKS_PER_DAY).map(|task| self.task_bar(task, Some(date), cx)))
-            // Countdowns, as in the original's month: an orange bar with the countdown's name.
-            .children(countdowns.iter().take(TASKS_PER_DAY.saturating_sub(tasks.len())).map(|c| {
-                let orange = theme.status().warning;
-                h_flex()
-                    .h(px(18.))
-                    .flex_none()
-                    .gap_1()
-                    .px_1()
-                    .rounded(px(3.))
-                    .bg(orange.opacity(0.28))
-                    .child(div().size(px(6.)).flex_none().rounded_full().bg(orange))
-                    .child(Label::new(c.name.clone()).size(LabelSize::XSmall).truncate())
-            }))
+            // Habits, focus records and countdowns, as in the original's month.
+            .children(extras.into_iter().take(room))
             .when(hidden > 0, |el| {
                 el.child(div().px_1().child(Label::new(format!("+{hidden}")).size(LabelSize::XSmall).color(Color::Muted)))
             })
@@ -771,6 +845,9 @@ impl CalendarView {
                     .iter()
                     .filter(|t| self.options.shows_task(t, date) && t.due_time.is_none())
                     .map(|t| self.task_bar(t, Some(date), cx).into_any_element())
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .chain(self.day_extras(date, cx))
                     .collect();
                 v_flex()
                     .id(SharedString::from(format!("week-allday-{date}")))

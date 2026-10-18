@@ -24,7 +24,7 @@ pub mod summary;
 pub mod sync;
 pub mod timeline;
 
-pub use calendar_options::{CalendarOptions, ColorBy};
+pub use calendar_options::{CalendarOptions, ColorBy, CountdownColor, HabitColor};
 pub use countdown::{Countdown, CountdownKind, Span, span};
 pub use filter::{DateRule, Field, Join, Link, SmartFilter};
 pub use focus::{FocusSession, FocusStats, focus_stats, format_minutes};

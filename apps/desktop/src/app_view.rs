@@ -268,6 +268,8 @@ impl AppView {
                     this.focus.update(cx, |view, cx| view.dev_record(title, ago, minutes, stopwatch, cx));
                 }
             }
+            // The calendar shows the habits and focus records added above.
+            this.calendar.update(cx, |view, cx| view.reload(cx));
             // `focus-timer=<name>[><emoji>[>#color]]`, repeatable: a timer in the Pomodoro list;
             // `focus-timer-add` opens "Add Timer", `focus-timer-add=icons` with its icon picker.
             for spec in state.split(';').filter_map(|part| part.strip_prefix("focus-timer=")) {

@@ -5300,7 +5300,7 @@ impl Render for TodoView {
                                     .gap_1()
                                     .cursor_pointer()
                                     .child(Icon::new(IconName::Plus).size(IconSize::Small).color(Color::Accent))
-                                    .child(Label::new(strings.add_section).color(Color::Accent))
+                                    .child(Label::new(strings.new_section).color(Color::Accent))
                                     .on_click(cx.listener(|this, _, window, cx| this.start_new_section(window, cx))),
                             ),
                         }),

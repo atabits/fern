@@ -7,7 +7,7 @@ use chrono::{Datelike, Local, NaiveDate};
 use fern_core::{Id, Store, Task};
 use gpui::{EventEmitter, FontWeight};
 use ui::prelude::*;
-use ui::{Placement, PopoverAttachment, popover};
+use ui::{Placement, PopoverAttachment, SubmenuItem, popover};
 
 use crate::actions::{NewTask, ToggleSidebar};
 use crate::calendar::{self, week_axis};
@@ -26,8 +26,19 @@ pub struct OpenTask(pub Id);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CalendarMode {
+    /// One day on the hour axis, as the original's Day view.
+    Day,
     Week,
     Month,
+    /// The original's Multi-Day: this many days from the anchor on the hour axis.
+    MultiDay(u8),
+}
+
+impl CalendarMode {
+    /// Whether the days are drawn on the hour axis (all but Month).
+    pub fn is_timed(self) -> bool {
+        self != CalendarMode::Month
+    }
 }
 
 pub struct CalendarView {
@@ -38,6 +49,8 @@ pub struct CalendarView {
     /// A day of the shown week in week mode.
     anchor: NaiveDate,
     mode_menu_open: bool,
+    /// The mode menu's Multi-Day side menu, while hovered open.
+    multi_day_menu: bool,
     tasks: Vec<Task>,
 }
 
@@ -52,22 +65,32 @@ impl CalendarView {
             month: calendar::month_start(today),
             anchor: today,
             mode_menu_open: false,
+            multi_day_menu: false,
             tasks: Vec::new(),
         };
         this.reload(cx);
         this
     }
 
-    /// Re-reads the tasks of the shown weeks.
+    /// The days on the hour axis: the anchor's week, the anchor, or several days from it.
+    fn shown_days(&self) -> Vec<NaiveDate> {
+        match self.mode {
+            CalendarMode::Day => vec![self.anchor],
+            CalendarMode::MultiDay(n) => (0..n as i64).map(|i| self.anchor + chrono::Duration::days(i)).collect(),
+            _ => calendar::week_of(self.anchor).to_vec(),
+        }
+    }
+
+    /// Re-reads the tasks of the shown days.
     pub fn reload(&mut self, cx: &mut Context<Self>) {
         let (start, end) = match self.mode {
             CalendarMode::Month => {
                 let weeks = calendar::month_weeks(self.month);
                 (weeks[0][0], weeks[weeks.len() - 1][6])
             }
-            CalendarMode::Week => {
-                let week = calendar::week_of(self.anchor);
-                (week[0], week[6])
+            _ => {
+                let days = self.shown_days();
+                (days[0], days[days.len() - 1])
             }
         };
         match self.store.tasks_due_between(start, end) {
@@ -80,8 +103,13 @@ impl CalendarView {
     fn shift(&mut self, delta: i32, cx: &mut Context<Self>) {
         match self.mode {
             CalendarMode::Month => self.month = calendar::add_months(self.month, delta),
-            CalendarMode::Week => {
-                self.anchor += chrono::Duration::days(7 * delta as i64);
+            mode => {
+                let step = match mode {
+                    CalendarMode::Day => 1,
+                    CalendarMode::MultiDay(n) => n as i64,
+                    _ => 7,
+                };
+                self.anchor += chrono::Duration::days(step * delta as i64);
                 self.month = calendar::month_start(self.anchor);
             }
         }
@@ -91,10 +119,18 @@ impl CalendarView {
     pub fn set_mode(&mut self, mode: CalendarMode, cx: &mut Context<Self>) {
         self.mode = mode;
         self.mode_menu_open = false;
-        if mode == CalendarMode::Week && calendar::month_start(self.anchor) != self.month {
+        if mode.is_timed() && calendar::month_start(self.anchor) != self.month {
             self.anchor = self.month;
         }
         self.reload(cx);
+    }
+
+    /// The mode menu with its Multi-Day side menu open, for the debug-build dev state.
+    #[cfg(debug_assertions)]
+    pub fn dev_open_menu(&mut self, cx: &mut Context<Self>) {
+        self.mode_menu_open = true;
+        self.multi_day_menu = true;
+        cx.notify();
     }
 
     /// Moves a dropped task to `date`, keeping its time of day.
@@ -233,7 +269,7 @@ impl CalendarView {
     fn render_week(&self, today: NaiveDate, cx: &mut Context<Self>) -> AnyElement {
         let strings = i18n::t(cx);
         let theme = cx.theme().clone();
-        let week = calendar::week_of(self.anchor);
+        let week = self.shown_days();
         let gutter = px(56.);
         let line = theme.colors().border_variant;
 
@@ -245,7 +281,7 @@ impl CalendarView {
             .border_b_1()
             .border_color(line)
             .child(div().w(gutter).flex_none())
-            .children(week.map(|date| {
+            .children(week.iter().copied().map(|date| {
                 let accent = theme.colors().accent;
                 let tasks: Vec<AnyElement> = self
                     .tasks
@@ -319,7 +355,7 @@ impl CalendarView {
                 .child(Label::new(format!("– {}", calendar::format_hour(0))).size(LabelSize::XSmall).color(Color::Muted)),
         );
 
-        let columns = week.map(|date| {
+        let columns = week.iter().copied().map(|date| {
             let accent = theme.colors().accent;
             let timed: Vec<AnyElement> = self
                 .tasks
@@ -378,7 +414,12 @@ impl CalendarView {
 
     fn render_mode_menu(&self, cx: &mut Context<Self>) -> AnyElement {
         let strings = i18n::t(cx);
-        let items = [(CalendarMode::Week, strings.week, "W/2"), (CalendarMode::Month, strings.month, "M/3")];
+        let items = [
+            (CalendarMode::Day, strings.day, "D/1"),
+            (CalendarMode::Week, strings.week, "W/2"),
+            (CalendarMode::Month, strings.month, "M/3"),
+        ];
+
         popover(cx)
             .w(px(170.))
             .on_mouse_down_out(cx.listener(|this, _, _, cx| {
@@ -393,6 +434,29 @@ impl CalendarView {
                     .end_slot(Label::new(hint).size(LabelSize::XSmall).color(Color::Muted))
                     .on_click(cx.listener(move |this, _, _, cx| this.set_mode(mode, cx)))
             }))
+            .child(div().py_1().child(Divider::horizontal()))
+            // The original's Multi-Day, with the number of days in a side menu.
+            .child(
+                SubmenuItem::new("multi-day", strings.multi_day)
+                    .open(self.multi_day_menu)
+                    .placement(Placement::LeftSide)
+                    .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                        if *hovered && !this.multi_day_menu {
+                            this.multi_day_menu = true;
+                            cx.notify();
+                        }
+                    }))
+                    .items((2..=6u8).map(|n| {
+                        let selected = self.mode == CalendarMode::MultiDay(n);
+                        ListItem::new(SharedString::from(format!("multi-day-{n}")))
+                            .child(Label::new(strings.n_days.replace("{n}", &n.to_string())).color(if selected { Color::Accent } else { Color::Default }))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.multi_day_menu = false;
+                                this.set_mode(CalendarMode::MultiDay(n), cx)
+                            }))
+                    }))
+
+            )
             .into_any_element()
     }
 }
@@ -456,6 +520,7 @@ impl Render for CalendarView {
                                 match self.mode {
                                     CalendarMode::Month => self.month,
                                     CalendarMode::Week => calendar::week_of(self.anchor)[0],
+                                    _ => self.anchor,
                                 },
                                 strings,
                             ))
@@ -489,6 +554,8 @@ impl Render for CalendarView {
                                     .child(
                                         Label::new(match self.mode {
                                             CalendarMode::Week => strings.week,
+                                            CalendarMode::Day => strings.day,
+                                            CalendarMode::MultiDay(_) => strings.multi_day,
                                             CalendarMode::Month => strings.month,
                                         })
                                         .size(LabelSize::Small),
@@ -532,16 +599,28 @@ impl Render for CalendarView {
                 h_flex()
                     .flex_none()
                     .h(px(22.))
-                    .when(self.mode == CalendarMode::Week, |el| el.child(div().w(px(56.)).flex_none()))
+                    .when(self.mode.is_timed(), |el| el.child(div().w(px(56.)).flex_none()))
                     .when(self.mode == CalendarMode::Month && calendar::week_numbers(), |el| {
                         el.child(div().w(px(WEEK_NUMBER_WIDTH)).flex_none())
                     })
-                    .children(crate::calendar::weekday_labels(&strings.weekdays_short).iter().map(|day| {
+                    // The days' weekday names: the week's, or those of the shown days.
+                    .children(match self.mode {
+                        CalendarMode::Month | CalendarMode::Week => {
+                            crate::calendar::weekday_labels(&strings.weekdays_short).to_vec()
+                        }
+                        _ => self
+                            .shown_days()
+                            .iter()
+                            .map(|d| strings.weekdays_short[d.weekday().num_days_from_monday() as usize])
+                            .collect(),
+                    }
+                    .into_iter()
+                    .map(|day| {
                         div()
                             .flex_1()
                             .flex()
                             .justify_center()
-                            .child(Label::new(*day).size(LabelSize::Small).color(Color::Muted))
+                            .child(Label::new(day).size(LabelSize::Small).color(Color::Muted))
                     })),
             )
             .map(|el| match self.mode {
@@ -553,7 +632,7 @@ impl Render for CalendarView {
                         .border_color(theme.colors().border_variant)
                         .children(weeks),
                 ),
-                CalendarMode::Week => el.child(self.render_week(today, cx)),
+                _ => el.child(self.render_week(today, cx)),
             })
     }
 }

@@ -123,6 +123,15 @@ impl AppView {
             if state.contains("calendar=week") {
                 this.calendar.update(cx, |c, cx| c.set_mode(crate::calendar_view::CalendarMode::Week, cx));
             }
+            if state.contains("calendar=day") {
+                this.calendar.update(cx, |c, cx| c.set_mode(crate::calendar_view::CalendarMode::Day, cx));
+            }
+            if state.contains("calendar=multi") {
+                this.calendar.update(cx, |c, cx| c.set_mode(crate::calendar_view::CalendarMode::MultiDay(3), cx));
+            }
+            if state.contains("calendar-menu=open") {
+                this.calendar.update(cx, |c, cx| c.dev_open_menu(cx));
+            }
             if state.contains("section=matrix") {
                 this.select(Section::Matrix, window, cx);
             }

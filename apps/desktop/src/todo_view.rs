@@ -96,6 +96,8 @@ pub struct TodoView {
     undo: Option<(crate::undo::UndoAction, String, gpui::Task<()>)>,
     /// Saved filters with their task counts, for the lists column.
     filters: Vec<(fern_core::SmartFilter, usize)>,
+    /// Settings → Smart List, read on reload.
+    preferences: fern_core::Preferences,
     /// The "Add Filter" / "Edit Filter" dialog, while it is open.
     filter_edit: Option<FilterEdit>,
     /// The "List Activities" panel, shown in place of the details while open.
@@ -211,6 +213,7 @@ impl TodoView {
             templates_open: false,
             list_activity: None,
             filters: Vec::new(),
+            preferences: Default::default(),
             filter_edit: None,
             undo: None,
             renaming_section: None,
@@ -417,6 +420,7 @@ impl TodoView {
     }
 
     pub fn reload(&mut self, cx: &mut Context<Self>) {
+        self.preferences = self.store.preferences().unwrap_or_default();
         self.show_details = self.view_flag("show_details", false);
         self.kanban = self.view_flag("kanban", false);
         let today = Self::today();
@@ -2782,6 +2786,7 @@ impl Render for TodoView {
                 el.child(lists_panel::render(
                     lists_panel::Props {
                         filters: &self.filters,
+                        preferences: &self.preferences,
                         active: &self.view,
                         counts: &self.counts,
                         lists: &self.lists,

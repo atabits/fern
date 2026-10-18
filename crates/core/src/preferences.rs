@@ -32,6 +32,96 @@ impl ThemeMode {
     }
 }
 
+/// An entry of the lists column that Settings → Smart List can show or hide.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SmartList {
+    All,
+    Today,
+    Tomorrow,
+    Next7Days,
+    Inbox,
+    Tags,
+    Filters,
+    Completed,
+    WontDo,
+    Trash,
+}
+
+impl SmartList {
+    /// In the order of the Settings page, grouped as there.
+    pub const ALL: [SmartList; 10] = [
+        SmartList::All,
+        SmartList::Today,
+        SmartList::Tomorrow,
+        SmartList::Next7Days,
+        SmartList::Inbox,
+        SmartList::Tags,
+        SmartList::Filters,
+        SmartList::Completed,
+        SmartList::WontDo,
+        SmartList::Trash,
+    ];
+
+    pub fn code(self) -> &'static str {
+        match self {
+            SmartList::All => "all",
+            SmartList::Today => "today",
+            SmartList::Tomorrow => "tomorrow",
+            SmartList::Next7Days => "next_7_days",
+            SmartList::Inbox => "inbox",
+            SmartList::Tags => "tags",
+            SmartList::Filters => "filters",
+            SmartList::Completed => "completed",
+            SmartList::WontDo => "wont_do",
+            SmartList::Trash => "trash",
+        }
+    }
+
+    /// The choices the original offers: task lists can hide while empty, the Tags section can
+    /// omit tags without open tasks, and the closed-task lists are only shown or hidden.
+    pub fn options(self) -> &'static [Visibility] {
+        match self {
+            SmartList::Completed | SmartList::WontDo | SmartList::Trash | SmartList::Filters => {
+                &[Visibility::Show, Visibility::Hide]
+            }
+            SmartList::Tags => &[Visibility::Show, Visibility::IfNotEmpty, Visibility::Hide],
+            _ => &[Visibility::IfNotEmpty, Visibility::Show, Visibility::Hide],
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Visibility {
+    #[default]
+    Show,
+    /// "Show if not empty"; for Tags, "Show (Omit Empty Tags)".
+    IfNotEmpty,
+    Hide,
+}
+
+impl Visibility {
+    pub fn code(self) -> &'static str {
+        match self {
+            Visibility::Show => "show",
+            Visibility::IfNotEmpty => "if_not_empty",
+            Visibility::Hide => "hide",
+        }
+    }
+
+    pub fn from_code(code: &str) -> Option<Self> {
+        [Visibility::Show, Visibility::IfNotEmpty, Visibility::Hide].into_iter().find(|v| v.code() == code)
+    }
+
+    /// Whether an entry with `count` items (open tasks, or tags with open tasks) is listed.
+    pub fn shows(self, count: usize) -> bool {
+        match self {
+            Visibility::Show => true,
+            Visibility::IfNotEmpty => count > 0,
+            Visibility::Hide => false,
+        }
+    }
+}
+
 /// The days a week can start on, as in the original's "Start Week on".
 pub const WEEK_STARTS: [Weekday; 3] = [Weekday::Mon, Weekday::Sun, Weekday::Sat];
 
@@ -41,11 +131,33 @@ pub struct Preferences {
     pub week_start: Weekday,
     /// Where tasks added outside a list go (smart lists, tags, filters); `None` is the Inbox.
     pub default_list: Option<Id>,
+    /// Settings → Smart List, in the order of `SmartList::ALL`.
+    pub smart_lists: [Visibility; 10],
+}
+
+impl Preferences {
+    pub fn visibility(&self, list: SmartList) -> Visibility {
+        let index = SmartList::ALL.iter().position(|l| *l == list).expect("every smart list is in ALL");
+        self.smart_lists[index]
+    }
+
+    /// Sets a list's visibility, ignoring choices the list does not offer.
+    pub fn set_visibility(&mut self, list: SmartList, visibility: Visibility) {
+        if list.options().contains(&visibility) {
+            let index = SmartList::ALL.iter().position(|l| *l == list).expect("every smart list is in ALL");
+            self.smart_lists[index] = visibility;
+        }
+    }
 }
 
 impl Default for Preferences {
     fn default() -> Self {
-        Self { theme: ThemeMode::default(), week_start: Weekday::Mon, default_list: None }
+        Self {
+            theme: ThemeMode::default(),
+            week_start: Weekday::Mon,
+            default_list: None,
+            smart_lists: [Visibility::Show; 10],
+        }
     }
 }
 
@@ -71,15 +183,28 @@ impl Store {
                 .map(|_| id),
             None => None,
         };
-        Ok(Preferences { theme, week_start, default_list })
+        let mut preferences = Preferences { theme, week_start, default_list, ..defaults };
+        for list in SmartList::ALL {
+            if let Some(visibility) = self.setting(&smart_list_key(list))?.and_then(|c| Visibility::from_code(&c)) {
+                preferences.set_visibility(list, visibility);
+            }
+        }
+        Ok(preferences)
     }
 
     pub fn save_preferences(&self, preferences: &Preferences) -> Result<()> {
         self.set_setting(THEME, preferences.theme.code())?;
         self.set_setting(WEEK_START, &preferences.week_start.to_string())?;
         self.set_setting(DEFAULT_LIST, &preferences.default_list.map(|id| id.to_string()).unwrap_or_default())?;
+        for list in SmartList::ALL {
+            self.set_setting(&smart_list_key(list), preferences.visibility(list).code())?;
+        }
         Ok(())
     }
+}
+
+fn smart_list_key(list: SmartList) -> String {
+    format!("smart_list.{}", list.code())
 }
 
 #[cfg(test)]
@@ -98,7 +223,7 @@ mod tests {
         let store = Store::open_in_memory()?;
         let list = store.create_list("Work")?;
         let preferences =
-            Preferences { theme: ThemeMode::Light, week_start: Weekday::Sun, default_list: Some(list.id) };
+            Preferences { theme: ThemeMode::Light, week_start: Weekday::Sun, default_list: Some(list.id), ..Default::default() };
         store.save_preferences(&preferences)?;
         assert_eq!(store.preferences()?, preferences);
 
@@ -114,6 +239,26 @@ mod tests {
         store.save_preferences(&Preferences { default_list: Some(list.id), ..Default::default() })?;
         store.delete_list(list.id)?;
         assert_eq!(store.preferences()?.default_list, None);
+        Ok(())
+    }
+
+    #[test]
+    fn smart_list_visibility() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let mut preferences = Preferences::default();
+        preferences.set_visibility(SmartList::Tomorrow, Visibility::Hide);
+        preferences.set_visibility(SmartList::Today, Visibility::IfNotEmpty);
+        // The Trash is only shown or hidden.
+        preferences.set_visibility(SmartList::Trash, Visibility::IfNotEmpty);
+        store.save_preferences(&preferences)?;
+
+        let loaded = store.preferences()?;
+        assert_eq!(loaded.visibility(SmartList::Tomorrow), Visibility::Hide);
+        assert_eq!(loaded.visibility(SmartList::Today), Visibility::IfNotEmpty);
+        assert_eq!(loaded.visibility(SmartList::Trash), Visibility::Show);
+        assert!(!Visibility::IfNotEmpty.shows(0));
+        assert!(Visibility::IfNotEmpty.shows(2));
+        assert!(!Visibility::Hide.shows(5));
         Ok(())
     }
 

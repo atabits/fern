@@ -186,6 +186,19 @@ impl AppView {
                 this.store.save_preferences(&preferences).ok();
                 settings_window::apply(&preferences, window, cx);
             }
+            // `visibility=<smart list>><show|if_not_empty|hide>`, repeatable: Settings → Smart List.
+            for spec in state.split(';').filter_map(|part| part.strip_prefix("visibility=")) {
+                let (list, visibility) = spec.split_once('>').unwrap_or((spec, ""));
+                if let (Some(list), Some(visibility)) = (
+                    fern_core::SmartList::ALL.into_iter().find(|l| l.code() == list),
+                    fern_core::Visibility::from_code(visibility),
+                ) {
+                    let mut preferences = this.store.preferences().unwrap_or_default();
+                    preferences.set_visibility(list, visibility);
+                    this.store.save_preferences(&preferences).ok();
+                    this.todo.update(cx, |todo, cx| todo.reload(cx));
+                }
+            }
             // `settings=<page>[><menu>]` opens the Settings window (see `SettingsWindow::dev_open`).
             if let Some(spec) = state.split(';').find_map(|part| part.strip_prefix("settings=")) {
                 this.open_settings(window, cx);

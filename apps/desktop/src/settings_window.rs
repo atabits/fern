@@ -3,7 +3,7 @@
 
 use std::rc::Rc;
 
-use fern_core::{Preferences, Store, ThemeMode, WEEK_STARTS};
+use fern_core::{Preferences, SmartList, Store, ThemeMode, Visibility, WEEK_STARTS};
 use gpui::{EventEmitter, FocusHandle, Focusable, FontWeight, WindowAppearance};
 use theme::Theme;
 use ui::prelude::*;
@@ -15,6 +15,7 @@ use crate::i18n::{self, CurrentLocale, Locale};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Page {
+    SmartList,
     #[default]
     DateTime,
     Appearance,
@@ -25,6 +26,7 @@ pub enum Page {
 /// The open dropdown, if any.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Menu {
+    Visibility(SmartList),
     WeekStart,
     Language,
     DefaultList,
@@ -107,6 +109,7 @@ impl SettingsWindow {
     pub fn dev_open(&mut self, spec: &str, cx: &mut Context<Self>) {
         let (page, menu) = spec.split_once('>').unwrap_or((spec, ""));
         self.page = match page {
+            "smart-list" => Page::SmartList,
             "appearance" => Page::Appearance,
             "more" => Page::More,
             "about" => Page::About,
@@ -114,6 +117,8 @@ impl SettingsWindow {
         };
         self.menu = match menu {
             "week" => Some(Menu::WeekStart),
+            "today" => Some(Menu::Visibility(SmartList::Today)),
+            "tags" => Some(Menu::Visibility(SmartList::Tags)),
             "language" => Some(Menu::Language),
             "list" => Some(Menu::DefaultList),
             _ => None,
@@ -140,21 +145,23 @@ impl SettingsWindow {
             .border_r_1()
             .border_color(cx.theme().colors().border)
             .child(div().px_2().pt_2().pb_3().child(Label::new(strings.settings).size(LabelSize::Large).weight(FontWeight::SEMIBOLD)))
-            .child(page("settings-date-time", IconName::Clock, 0, Page::DateTime))
-            .child(page("settings-appearance", IconName::PaintRoller, 1, Page::Appearance))
-            .child(page("settings-more", IconName::ToggleRight, 2, Page::More))
+            .child(page("settings-smart-list", IconName::Funnel, 0, Page::SmartList))
+            .child(page("settings-date-time", IconName::Clock, 1, Page::DateTime))
+            .child(page("settings-appearance", IconName::PaintRoller, 2, Page::Appearance))
+            .child(page("settings-more", IconName::ToggleRight, 3, Page::More))
             .child(div().h(px(12.)))
             .child(
-                item("settings-shortcuts", IconName::Keyboard, strings.settings_pages[3], false)
+                item("settings-shortcuts", IconName::Keyboard, strings.settings_pages[4], false)
                     .on_click(cx.listener(|_, _, _, cx| cx.emit(SettingsEvent::ShowShortcuts))),
             )
             .child(div().h(px(12.)))
-            .child(page("settings-about", IconName::Info, 4, Page::About))
+            .child(page("settings-about", IconName::Info, 5, Page::About))
     }
 
     /// A row whose value opens a dropdown of `options` (label, selected, what picking it does).
     fn select_row(
         &self,
+        icon: Option<IconName>,
         label: &'static str,
         value: SharedString,
         menu: Menu,
@@ -183,6 +190,8 @@ impl SettingsWindow {
         h_flex()
             .h(px(36.))
             .px_4()
+            .gap_2()
+            .children(icon.map(|icon| Icon::new(icon).color(Color::Muted)))
             .child(div().flex_1().child(Label::new(label)))
             .child(
                 h_flex()
@@ -205,6 +214,36 @@ impl SettingsWindow {
         let title = |text: &'static str| div().pb_3().child(Label::new(text).weight(FontWeight::SEMIBOLD));
         let body = v_flex().flex_1().min_w_0().h_full().bg(colors.background).pt(px(48.)).px_6().pb_6().gap_4();
         match self.page {
+            Page::SmartList => {
+                let row = |this: &Self, list: SmartList, cx: &mut Context<Self>| {
+                    let (icon, label) = smart_list_label(list, strings);
+                    let current = this.preferences.visibility(list);
+                    let options = list
+                        .options()
+                        .iter()
+                        .map(|&visibility| {
+                            let pick: Box<dyn Fn(&mut Self, &mut Window, &mut Context<Self>)> = Box::new(
+                                move |this, window, cx| this.update(window, cx, |p| p.set_visibility(list, visibility)),
+                            );
+                            (visibility_label(list, visibility, strings).into(), visibility == current, pick)
+                        })
+                        .collect();
+                    this.select_row(
+                        Some(icon),
+                        label,
+                        visibility_label(list, current, strings).into(),
+                        Menu::Visibility(list),
+                        options,
+                        cx,
+                    )
+                };
+                let [all, today, tomorrow, next7, inbox, tags, filters, completed, wont_do, trash] = SmartList::ALL;
+                body.child(title(strings.settings_pages[0]))
+                    .child(group().children([all, today, tomorrow, next7, inbox].map(|l| row(self, l, cx))))
+                    .child(group().children([tags, filters].map(|l| row(self, l, cx))))
+                    .child(group().children([completed, wont_do, trash].map(|l| row(self, l, cx))))
+                    .into_any_element()
+            }
             Page::DateTime => {
                 let week_start = self.preferences.week_start;
                 let options = WEEK_STARTS
@@ -219,8 +258,9 @@ impl SettingsWindow {
                 let current = WEEK_STARTS.iter().position(|d| *d == week_start).unwrap_or(0);
                 body.child(
                     v_flex()
-                        .child(title(strings.settings_pages[0]))
+                        .child(title(strings.settings_pages[1]))
                         .child(group().child(self.select_row(
+                            None,
                             strings.start_week_on,
                             strings.week_start_names[current].into(),
                             Menu::WeekStart,
@@ -342,6 +382,7 @@ impl SettingsWindow {
                     (SharedString::from(list.name.clone()), default_list == Some(id), pick)
                 }));
                 body.child(group().child(self.select_row(
+                    None,
                     strings.language,
                     current.native_name().into(),
                     Menu::Language,
@@ -352,6 +393,7 @@ impl SettingsWindow {
                     v_flex()
                         .child(title(strings.task_default))
                         .child(group().child(self.select_row(
+                            None,
                             strings.default_list,
                             list_name,
                             Menu::DefaultList,
@@ -423,5 +465,29 @@ impl Render for SettingsWindow {
                         .on_click(cx.listener(|_, _, _, cx| cx.emit(SettingsEvent::Dismissed))),
                 ),
             )
+    }
+}
+
+fn smart_list_label(list: SmartList, strings: &i18n::Strings) -> (IconName, &'static str) {
+    match list {
+        SmartList::All => (IconName::Layers, strings.all),
+        SmartList::Today => (IconName::CalendarCheck, strings.today),
+        SmartList::Tomorrow => (IconName::Sunrise, strings.tomorrow),
+        SmartList::Next7Days => (IconName::CalendarRange, strings.next_7_days_short),
+        SmartList::Inbox => (IconName::Inbox, strings.inbox),
+        SmartList::Tags => (IconName::Tag, strings.tags),
+        SmartList::Filters => (IconName::Funnel, strings.filters),
+        SmartList::Completed => (IconName::SquareCheckBig, strings.completed),
+        SmartList::WontDo => (IconName::SquareX, strings.wont_do),
+        SmartList::Trash => (IconName::Trash, strings.trash),
+    }
+}
+
+fn visibility_label(list: SmartList, visibility: Visibility, strings: &i18n::Strings) -> &'static str {
+    match visibility {
+        Visibility::Show => strings.visibility_names[0],
+        Visibility::IfNotEmpty if list == SmartList::Tags => strings.visibility_names[3],
+        Visibility::IfNotEmpty => strings.visibility_names[1],
+        Visibility::Hide => strings.visibility_names[2],
     }
 }

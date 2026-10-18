@@ -382,8 +382,10 @@ pub struct Strings {
     pub months_short: [&'static str; 12],
     /// "13 Nov" (`true`) or "Nov 13" (`false`).
     pub day_before_month: bool,
-    /// Settings window pages: Date & Time, Appearance, More, Shortcuts, About.
-    pub settings_pages: [&'static str; 5],
+    /// Settings window pages: Smart List, Date & Time, Appearance, More, Shortcuts, About.
+    pub settings_pages: [&'static str; 6],
+    /// Show, Show if not empty, Hide, and Show (Omit Empty Tags) for the Tags section.
+    pub visibility_names: [&'static str; 4],
     pub start_week_on: &'static str,
     /// Monday, Sunday, Saturday, as in `fern_core::WEEK_STARTS`.
     pub week_start_names: [&'static str; 3],
@@ -708,7 +710,8 @@ pub static EN: Strings = Strings {
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ],
     day_before_month: false,
-    settings_pages: ["Date & Time", "Appearance", "More", "Shortcuts", "About"],
+    settings_pages: ["Smart List", "Date & Time", "Appearance", "More", "Shortcuts", "About"],
+    visibility_names: ["Show", "Show if not empty", "Hide", "Show (Omit Empty Tags)"],
     start_week_on: "Start Week on",
     week_start_names: ["Monday", "Sunday", "Saturday"],
     color_series: "Color Series",
@@ -1032,7 +1035,8 @@ pub static RU: Strings = Strings {
         "дек.",
     ],
     day_before_month: true,
-    settings_pages: ["Дата и время", "Оформление", "Ещё", "Горячие клавиши", "О программе"],
+    settings_pages: ["Смарт-списки", "Дата и время", "Оформление", "Ещё", "Горячие клавиши", "О программе"],
+    visibility_names: ["Показывать", "Показывать, если не пусто", "Скрыть", "Показывать (без пустых меток)"],
     start_week_on: "Начало недели",
     week_start_names: ["Понедельник", "Воскресенье", "Суббота"],
     color_series: "Цветовые темы",

@@ -1,7 +1,7 @@
 //! The lists column between the narrow sidebar and the task list, modeled on TickTick's.
 
 use chrono::{Datelike, Local};
-use fern_core::{List, Tag, View, ViewCounts};
+use fern_core::{List, Preferences, SmartList, Tag, View, ViewCounts};
 use gpui::{ClickEvent, rgb};
 use ui::prelude::*;
 
@@ -57,6 +57,8 @@ pub struct Props<'a> {
     pub new_list_input: Option<AnyElement>,
     /// Saved filters with their task counts.
     pub filters: &'a [(fern_core::SmartFilter, usize)],
+    /// Which smart lists Settings → Smart List shows.
+    pub preferences: &'a Preferences,
 }
 
 pub fn render(
@@ -67,7 +69,8 @@ pub fn render(
     on_add_filter: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     cx: &App,
 ) -> impl IntoElement {
-    let Props { active, counts, lists, tags, strings, new_list_input, filters } = props;
+    let Props { active, counts, lists, tags, strings, new_list_input, filters, preferences } = props;
+    let shows = |list: SmartList, count: usize| preferences.visibility(list).shows(count);
     let colors = cx.theme().colors();
 
     let item = |id: String,
@@ -124,16 +127,26 @@ pub fn render(
         .overflow_y_scroll()
         .px_2()
         .py_2()
-        .child(smart(View::Inbox, strings.inbox, IconName::Inbox, Some(counts.inbox)))
-        .child(smart(View::All, strings.all, IconName::Layers, Some(counts.all)))
-        .child(smart(View::Today, strings.today, IconName::CalendarCheck, Some(counts.today)))
-        .child(smart(View::Tomorrow, strings.tomorrow, IconName::Sunrise, Some(counts.tomorrow)))
-        .child(smart(
-            View::Next7Days,
-            strings.next_7_days_short,
-            IconName::CalendarRange,
-            Some(counts.next_7_days),
-        ))
+        .when(shows(SmartList::Inbox, counts.inbox), |el| {
+            el.child(smart(View::Inbox, strings.inbox, IconName::Inbox, Some(counts.inbox)))
+        })
+        .when(shows(SmartList::All, counts.all), |el| {
+            el.child(smart(View::All, strings.all, IconName::Layers, Some(counts.all)))
+        })
+        .when(shows(SmartList::Today, counts.today), |el| {
+            el.child(smart(View::Today, strings.today, IconName::CalendarCheck, Some(counts.today)))
+        })
+        .when(shows(SmartList::Tomorrow, counts.tomorrow), |el| {
+            el.child(smart(View::Tomorrow, strings.tomorrow, IconName::Sunrise, Some(counts.tomorrow)))
+        })
+        .when(shows(SmartList::Next7Days, counts.next_7_days), |el| {
+            el.child(smart(
+                View::Next7Days,
+                strings.next_7_days_short,
+                IconName::CalendarRange,
+                Some(counts.next_7_days),
+            ))
+        })
         .child(separator())
         .child(
             heading(strings.lists).child(
@@ -165,9 +178,9 @@ pub fn render(
                 .child(input)
         }))
         .child(separator())
-        .when(!tags.is_empty(), |el| {
+        .when(tags.iter().any(|tag| shows(SmartList::Tags, tag.open_count)), |el| {
             el.child(heading(strings.tags))
-                .children(tags.iter().map(|tag| {
+                .children(tags.iter().filter(|tag| shows(SmartList::Tags, tag.open_count)).map(|tag| {
                     item(
                         format!("tag-{}", tag.name),
                         View::Tag(tag.name.clone()),
@@ -180,7 +193,7 @@ pub fn render(
                 .child(separator())
         })
         // Filters, as in the original: a hint until there is one.
-        .child(
+        .when(shows(SmartList::Filters, 1), |el| el.child(
             heading(strings.filters).child(
                 IconButton::new("add-filter", IconName::Plus)
                     .size(px(20.))
@@ -188,8 +201,8 @@ pub fn render(
                     .tooltip(Tooltip::text(strings.add_filter))
                     .on_click(on_add_filter),
             ),
-        )
-        .when(filters.is_empty(), |el| {
+        ))
+        .when(filters.is_empty() && shows(SmartList::Filters, 1), |el| {
             el.child(
                 div()
                     .mx_1()
@@ -200,7 +213,7 @@ pub fn render(
                     .child(Label::new(strings.filters_hint).size(LabelSize::XSmall).color(Color::Muted)),
             )
         })
-        .children(filters.iter().map(|(filter, count)| {
+        .children(filters.iter().filter(|_| shows(SmartList::Filters, 1)).map(|(filter, count)| {
             item(
                 format!("filter-{}", filter.id),
                 View::Filter(filter.id),
@@ -210,10 +223,12 @@ pub fn render(
                 None,
             )
         }))
-        .child(separator())
-        .child(smart(View::Completed, strings.completed, IconName::SquareCheckBig, None))
-        .child(smart(View::WontDo, strings.wont_do, IconName::SquareX, None))
-        .child(smart(View::Trash, strings.trash, IconName::Trash, None));
+        .when(shows(SmartList::Filters, 1), |el| el.child(separator()))
+        .when(shows(SmartList::Completed, 1), |el| {
+            el.child(smart(View::Completed, strings.completed, IconName::SquareCheckBig, None))
+        })
+        .when(shows(SmartList::WontDo, 1), |el| el.child(smart(View::WontDo, strings.wont_do, IconName::SquareX, None)))
+        .when(shows(SmartList::Trash, 1), |el| el.child(smart(View::Trash, strings.trash, IconName::Trash, None)));
 
     v_flex()
         .flex_none()

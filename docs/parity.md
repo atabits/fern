@@ -54,7 +54,7 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 | "Add task" field | ✅ | parses date, time, repeat, tags, priority and `^list`; no live highlighting yet; `^list` matches one-word list names only |
 | Rows by the measurements (40 px, separators) | ✅ | |
 | Tag chips, due date and repeat in rows | ✅ | overdue dates in red |
-| Subtasks with indentation and collapsing | ✅ | creating subtasks from the UI comes later |
+| Subtasks with indentation and collapsing | ✅ | created from the details panel |
 | Groups "Tasks" / "Notes" with counters and collapsing | ✅ | plus a collapsed "Completed" group |
 | Details: checkbox, title, notes | ✅ | |
 | Details: due date | 🟡 | quick options, month calendar, preset times, daily/weekly/monthly/yearly repeat; no custom time or "every N" in the picker |
@@ -62,6 +62,7 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 | Details: tags | ✅ | chips under the title, picker with "+ Tag" |
 | Details: list | ✅ | list button in the bottom bar |
 | Details: checklist | ✅ | Enter adds the next item; progress "1/3" in rows |
+| Details: subtasks | ✅ | list with checkboxes, open a subtask, "Add subtask" |
 | Drag and drop | ⬜ | |
 | Calendar, Pomodoro, Habits, Matrix, Countdown, Search | ⬜ | |
 | Sync between devices | ⬜ | |
@@ -79,8 +80,8 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 
 ## Next
 
-1. Creating subtasks from the UI.
-2. Search.
-3. Manual ordering and drag and drop.
-4. "Won't Do" status.
-5. Custom time and "every N" in the due-date picker.
+1. Search.
+2. Manual ordering and drag and drop.
+3. "Won't Do" status.
+4. Custom time and "every N" in the due-date picker.
+5. Keyboard shortcuts (actions and a keymap, Zed-style).

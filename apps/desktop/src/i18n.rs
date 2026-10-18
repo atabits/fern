@@ -118,6 +118,7 @@ pub struct Strings {
     pub add_tag: &'static str,
     pub new_tag: &'static str,
     pub add_item: &'static str,
+    pub add_subtask: &'static str,
 
     // Dates.
     pub yesterday: &'static str,
@@ -187,6 +188,7 @@ pub static EN: Strings = Strings {
     add_tag: "+ Tag",
     new_tag: "New tag",
     add_item: "Add item",
+    add_subtask: "Add subtask",
 
     yesterday: "Yesterday",
     weekdays_short: ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"],
@@ -258,6 +260,7 @@ pub static RU: Strings = Strings {
     add_tag: "+ Тег",
     new_tag: "Новый тег",
     add_item: "Добавить пункт",
+    add_subtask: "Добавить подзадачу",
 
     yesterday: "Вчера",
     weekdays_short: ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"],

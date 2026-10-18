@@ -35,6 +35,9 @@ pub struct TaskDetail {
     /// Checklist items with an input each, in display order.
     checklist: Vec<ChecklistRow>,
     new_item: Entity<TextInput>,
+    /// Direct subtasks of the shown task.
+    subtasks: Vec<Task>,
+    subtask_input: Entity<TextInput>,
     /// The checklist is shown when it has items or the user asked to start one.
     show_checklist: bool,
     /// An input to focus on the next render (focusing needs the window).
@@ -60,7 +63,11 @@ enum FocusTarget {
 /// The task was changed in the panel; the list needs to reload.
 pub struct TaskUpdated;
 
+/// The user asked to open another task (a subtask) in the panel.
+pub struct OpenTask(pub Id);
+
 impl EventEmitter<TaskUpdated> for TaskDetail {}
+impl EventEmitter<OpenTask> for TaskDetail {}
 
 impl TaskDetail {
     pub fn new(store: Rc<Store>, window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -69,6 +76,7 @@ impl TaskDetail {
         let notes = cx.new(|cx| TextInput::new(Mode::MultiLine, strings.notes_placeholder, cx));
         let tag_input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.new_tag, cx));
         let new_item = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.add_item, cx));
+        let subtask_input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.add_subtask, cx));
 
         let subscriptions = vec![
             cx.subscribe(&title, |this, input, _: &Changed, cx| {
@@ -98,12 +106,21 @@ impl TaskDetail {
                     this.sync_checklist(cx);
                 }
             }),
+            cx.subscribe_in(&subtask_input, window, |this, input, Submitted(text), window, cx| {
+                if !text.trim().is_empty() {
+                    let text = text.clone();
+                    this.save(cx, |store, id| store.add_subtask(id, &text).map(|_| ()));
+                    input.update(cx, |input, cx| input.clear(window, cx));
+                    this.sync_subtasks();
+                }
+            }),
             cx.observe_global::<CurrentLocale>(|this, cx| {
                 let strings = i18n::t(cx);
                 this.title.update(cx, |input, cx| input.set_placeholder(strings.untitled, cx));
                 this.notes.update(cx, |input, cx| input.set_placeholder(strings.notes_placeholder, cx));
                 this.tag_input.update(cx, |input, cx| input.set_placeholder(strings.new_tag, cx));
                 this.new_item.update(cx, |input, cx| input.set_placeholder(strings.add_item, cx));
+                this.subtask_input.update(cx, |input, cx| input.set_placeholder(strings.add_subtask, cx));
             }),
         ];
 
@@ -117,6 +134,8 @@ impl TaskDetail {
             lists: Vec::new(),
             checklist: Vec::new(),
             new_item,
+            subtasks: Vec::new(),
+            subtask_input,
             show_checklist: false,
             pending_focus: None,
             popup: None,
@@ -146,6 +165,20 @@ impl TaskDetail {
         self.checklist.clear();
         self.sync_checklist(cx);
         self.show_checklist = !self.checklist.is_empty();
+        self.sync_subtasks();
+        cx.notify();
+    }
+
+    fn sync_subtasks(&mut self) {
+        self.subtasks = match self.task_id() {
+            Some(id) => self.store.subtasks(id).unwrap_or_default(),
+            None => Vec::new(),
+        };
+    }
+
+    fn toggle_subtask(&mut self, id: Id, completed: bool, cx: &mut Context<Self>) {
+        self.save(cx, |store, _| store.set_completed(id, completed));
+        self.sync_subtasks();
         cx.notify();
     }
 
@@ -222,6 +255,7 @@ impl TaskDetail {
             Some(task) if self.task_id() == Some(task.id) => {
                 self.task = Some(task);
                 self.sync_checklist(cx);
+                self.sync_subtasks();
             }
             other => self.show(other, cx),
         }
@@ -406,6 +440,46 @@ impl TaskDetail {
                     .gap_2()
                     .child(Icon::new(IconName::Plus).size(IconSize::Small))
                     .child(div().flex_1().child(self.new_item.clone())),
+            )
+    }
+
+    fn render_subtasks(&self, strings: &'static Strings, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .children(self.subtasks.iter().map(|subtask| {
+                let id = subtask.id;
+                let done = subtask.is_completed();
+                ListItem::new(SharedString::from(format!("subtask-{id}")))
+                    .height(px(30.))
+                    .start_slot(
+                        Checkbox::new("subtask-checkbox")
+                            .size(px(14.))
+                            .toggle_state(done)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.toggle_subtask(id, !done, cx);
+                            })),
+                    )
+                    .child(
+                        Label::new(if subtask.title.is_empty() {
+                            SharedString::new_static(strings.untitled)
+                        } else {
+                            subtask.title.clone().into()
+                        })
+                        .color(if done { Color::Muted } else { Color::Default })
+                        .strikethrough(done)
+                        .truncate(),
+                    )
+                    .end_slot(Icon::new(IconName::ChevronRight).size(IconSize::XSmall))
+                    .on_click(cx.listener(move |_, _, _, cx| cx.emit(OpenTask(id))))
+            }))
+            .child(
+                h_flex()
+                    .min_h(px(30.))
+                    .px_2()
+                    .gap_2()
+                    .child(Icon::new(IconName::Plus).size(IconSize::Small))
+                    .child(div().flex_1().child(self.subtask_input.clone())),
             )
     }
 
@@ -882,7 +956,9 @@ impl Render for TaskDetail {
                             .line_height(px(22.))
                             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                             .child(self.notes.clone()),
-                    ),
+                    )
+                    .child(div().pt_2().child(Divider::horizontal()))
+                    .child(self.render_subtasks(strings, cx)),
             )
             // Bottom bar: list ……… formatting, comments, more
             .child(

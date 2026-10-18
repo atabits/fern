@@ -196,6 +196,30 @@ impl Store {
     /// Completes or reopens a task. Completing a repeating task with a due date does not close
     /// it: a completed copy is kept for history, and the task moves to its next occurrence with
     /// its checklist reset — the way TickTick handles repeats.
+    /// Direct subtasks of `parent` that are not in the trash, oldest first.
+    pub fn subtasks(&self, parent: Id) -> Result<Vec<Task>> {
+        let mut subtasks: Vec<Task> = self
+            .tasks()?
+            .into_iter()
+            .filter(|t| t.parent_id == Some(parent) && !t.is_deleted())
+            .collect();
+        subtasks.reverse();
+        Ok(subtasks)
+    }
+
+    /// Creates a subtask in the parent's list.
+    pub fn add_subtask(&self, parent: Id, title: &str) -> Result<Task> {
+        let list = self.task(parent)?.ok_or_else(|| anyhow::anyhow!("parent task not found"))?.list_id;
+        let mut task = self.add_task(title)?;
+        self.set_parent(task.id, Some(parent))?;
+        if list.is_some() {
+            self.set_list(task.id, list)?;
+        }
+        task.parent_id = Some(parent);
+        task.list_id = list;
+        Ok(task)
+    }
+
     pub fn set_completed(&self, id: Id, completed: bool) -> Result<()> {
         if completed
             && let Some(task) = self.task(id)?
@@ -889,6 +913,23 @@ mod tests {
         store.set_setting("locale", "ru")?;
         store.set_setting("locale", "en")?;
         assert_eq!(store.setting("locale")?.as_deref(), Some("en"));
+        Ok(())
+    }
+
+    #[test]
+    fn subtasks_are_created_in_the_parent_list() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let list = store.create_list("Trip")?;
+        let parent = store.add_task("pack")?;
+        store.set_list(parent.id, Some(list.id))?;
+        let first = store.add_subtask(parent.id, "passport")?;
+        let second = store.add_subtask(parent.id, "charger")?;
+        assert_eq!(store.task(first.id)?.unwrap().list_id, Some(list.id));
+        assert_eq!(titles(&store.subtasks(parent.id)?), ["passport", "charger"]);
+
+        store.delete_task(second.id)?;
+        assert_eq!(titles(&store.subtasks(parent.id)?), ["passport"]);
+        assert!(store.add_subtask(Uuid::now_v7(), "orphan").is_err());
         Ok(())
     }
 

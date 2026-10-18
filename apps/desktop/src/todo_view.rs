@@ -9,7 +9,7 @@ use ui::{Placement, PopoverAttachment, popover};
 
 use crate::i18n::{self, CurrentLocale, Strings};
 use crate::lists_panel::{self, LIST_COLORS};
-use crate::task_detail::{TaskDetail, TaskUpdated};
+use crate::task_detail::{OpenTask, TaskDetail, TaskUpdated};
 use crate::task_rows::{self, Row, Section};
 use crate::text_input::{Cancelled, Mode, Submitted, TextInput};
 
@@ -88,6 +88,7 @@ impl TodoView {
 
         let detail = cx.new(|cx| TaskDetail::new(store.clone(), window, cx));
         cx.subscribe(&detail, |this, _, _: &TaskUpdated, cx| this.reload(cx)).detach();
+        cx.subscribe(&detail, |this, _, OpenTask(id), cx| this.select(*id, cx)).detach();
 
         let mut this = Self {
             store,
@@ -354,7 +355,13 @@ impl TodoView {
             return;
         }
         self.selected = Some(id);
-        let task = self.tasks.iter().find(|t| t.id == id).cloned();
+        // The task may be outside the current view, for example a subtask opened from the panel.
+        let task = self
+            .tasks
+            .iter()
+            .find(|t| t.id == id)
+            .cloned()
+            .or_else(|| self.store.task(id).ok().flatten());
         self.detail.update(cx, |detail, cx| detail.show(task, cx));
         cx.notify();
     }

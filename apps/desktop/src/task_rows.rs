@@ -166,17 +166,26 @@ pub enum ClosedRange {
     ThisWeek,
     LastWeek,
     ThisMonth,
+    /// "Other Date": both days included.
+    Custom(NaiveDate, NaiveDate),
 }
 
 impl ClosedRange {
-    pub const ALL: [Self; 4] = [Self::All, Self::ThisWeek, Self::LastWeek, Self::ThisMonth];
+    /// The preset ranges of the menu; "Other Date" comes after them.
+    pub const PRESETS: [Self; 4] = [Self::All, Self::ThisWeek, Self::LastWeek, Self::ThisMonth];
 
-    pub fn label(self, strings: &Strings) -> &'static str {
+    /// A custom range in either order.
+    pub fn custom(a: NaiveDate, b: NaiveDate) -> Self {
+        Self::Custom(a.min(b), a.max(b))
+    }
+
+    pub fn label(self, strings: &Strings) -> String {
         match self {
-            Self::All => strings.all_dates,
-            Self::ThisWeek => strings.this_week,
-            Self::LastWeek => strings.last_week,
-            Self::ThisMonth => strings.this_month,
+            Self::All => strings.all_dates.to_owned(),
+            Self::ThisWeek => strings.this_week.to_owned(),
+            Self::LastWeek => strings.last_week.to_owned(),
+            Self::ThisMonth => strings.this_month.to_owned(),
+            Self::Custom(start, end) => format!("{} - {}", short_date(start, strings), short_date(end, strings)),
         }
     }
 
@@ -187,8 +196,15 @@ impl ClosedRange {
             Self::ThisWeek => day >= monday && day < monday + chrono::Duration::weeks(1),
             Self::LastWeek => day >= monday - chrono::Duration::weeks(1) && day < monday,
             Self::ThisMonth => day.year() == today.year() && day.month() == today.month(),
+            Self::Custom(start, end) => day >= start && day <= end,
         }
     }
+}
+
+/// "Oct 18" / "18 окт".
+pub fn short_date(date: NaiveDate, strings: &Strings) -> String {
+    let month = strings.months_short[date.month0() as usize];
+    if strings.day_before_month { format!("{} {month}", date.day()) } else { format!("{month} {}", date.day()) }
 }
 
 /// The local day of a timestamp in milliseconds.
@@ -383,6 +399,10 @@ mod tests {
         assert!(!r(ClosedRange::LastWeek, d(2026, 10, 12)) && !r(ClosedRange::LastWeek, d(2026, 10, 4)));
         assert!(r(ClosedRange::ThisMonth, d(2026, 10, 1)) && !r(ClosedRange::ThisMonth, d(2025, 10, 1)));
         assert!(r(ClosedRange::All, d(2000, 1, 1)));
+        let custom = ClosedRange::custom(d(2026, 10, 9), d(2026, 9, 28));
+        assert_eq!(custom, ClosedRange::Custom(d(2026, 9, 28), d(2026, 10, 9)));
+        assert!(r(custom, d(2026, 9, 28)) && r(custom, d(2026, 10, 9)) && !r(custom, d(2026, 10, 10)));
+        assert_eq!(custom.label(&EN), "Sep 28 - Oct 9");
     }
 
     #[test]

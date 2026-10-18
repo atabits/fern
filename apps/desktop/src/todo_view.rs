@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use fern_core::{Id, Kind, List, Store, Tag, Task, View, ViewCounts};
-use chrono::{Duration, Local, NaiveDate};
+use chrono::{Datelike, Duration, Local, NaiveDate};
 use gpui::{ElementId, Entity, FocusHandle, Focusable, FontWeight, MouseButton};
 use ui::prelude::*;
 
@@ -27,7 +27,15 @@ const INDENT: f32 = 24.;
 #[derive(Clone, Debug, PartialEq)]
 enum ClosedMenu {
     Dates,
+    /// "Other Date": the range being picked and the calendar shown for one of its ends.
+    OtherDate { start: Option<NaiveDate>, end: Option<NaiveDate>, picking: Option<RangeEnd>, month: NaiveDate },
     Lists(Option<Vec<Option<Id>>>),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RangeEnd {
+    Start,
+    End,
 }
 
 pub struct TodoView {
@@ -227,6 +235,13 @@ impl TodoView {
                 }
                 Some(("menu", "header")) => self.header_menu_open = true,
                 Some(("menu", "dates")) => self.closed_menu = Some(ClosedMenu::Dates),
+                Some(("menu", "other-date")) => {
+                    self.open_other_date(cx);
+                    self.update_other_date(cx, |start, _, picking, _| {
+                        *start = Some(Self::today() - Duration::days(7));
+                        *picking = Some(RangeEnd::End);
+                    });
+                }
                 Some(("menu", "lists")) => self.closed_menu = Some(ClosedMenu::Lists(self.closed_lists.clone())),
                 Some(("range", "this-week")) => self.closed_range = ClosedRange::ThisWeek,
                 Some(("delete", needle)) => {
@@ -836,6 +851,162 @@ impl TodoView {
         cx.notify();
     }
 
+    fn open_other_date(&mut self, cx: &mut Context<Self>) {
+        let (start, end) = match self.closed_range {
+            ClosedRange::Custom(start, end) => (Some(start), Some(end)),
+            _ => (None, None),
+        };
+        let month = crate::calendar::month_start(start.unwrap_or_else(Self::today));
+        self.set_closed_menu(Some(ClosedMenu::OtherDate { start, end, picking: None, month }), cx);
+    }
+
+    fn update_other_date(
+        &mut self,
+        cx: &mut Context<Self>,
+        change: impl FnOnce(&mut Option<NaiveDate>, &mut Option<NaiveDate>, &mut Option<RangeEnd>, &mut NaiveDate),
+    ) {
+        if let Some(ClosedMenu::OtherDate { start, end, picking, month }) = self.closed_menu.as_mut() {
+            change(start, end, picking, month);
+        }
+        cx.notify();
+    }
+
+    /// The "Other Date" popover: Start and End fields, a calendar for the one being picked.
+    fn render_other_date(
+        &self,
+        start: Option<NaiveDate>,
+        end: Option<NaiveDate>,
+        picking: Option<RangeEnd>,
+        month: NaiveDate,
+        strings: &'static Strings,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = cx.theme().clone();
+        let today = Self::today();
+        let field = |which: RangeEnd, value: Option<NaiveDate>, placeholder: &'static str| {
+            let label: SharedString =
+                value.map_or(placeholder.into(), |date| task_rows::short_date(date, strings).into());
+            h_flex()
+                .id(if which == RangeEnd::Start { "range-start" } else { "range-end" })
+                .h(px(30.))
+                .px_2()
+                .rounded(px(6.))
+                .border_1()
+                .border_color(if picking == Some(which) { theme.colors().accent } else { theme.colors().border })
+                .cursor_pointer()
+                .child(Label::new(label).color(if value.is_some() { Color::Default } else { Color::Muted }))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.update_other_date(cx, |_, _, picking, _| *picking = Some(which))
+                }))
+        };
+        let calendar = picking.map(|which| {
+            let selected = if which == RangeEnd::Start { start } else { end };
+            v_flex()
+                .gap_1()
+                .child(
+                    h_flex()
+                        .child(div().flex_1().child(Label::new(crate::calendar::month_title(month, strings)).weight(FontWeight::SEMIBOLD)))
+                        .child(IconButton::new("range-prev", IconName::ChevronLeft).size(px(22.)).on_click(cx.listener(
+                            |this, _, _, cx| this.update_other_date(cx, |_, _, _, month| *month = crate::calendar::add_months(*month, -1)),
+                        )))
+                        .child(IconButton::new("range-next", IconName::ChevronRight).size(px(22.)).on_click(cx.listener(
+                            |this, _, _, cx| this.update_other_date(cx, |_, _, _, month| *month = crate::calendar::add_months(*month, 1)),
+                        ))),
+                )
+                .child(h_flex().children(strings.weekdays_narrow.iter().map(|day| {
+                    div().flex_1().flex().justify_center().child(Label::new(*day).size(LabelSize::XSmall).color(Color::Muted))
+                })))
+                .children(crate::calendar::month_grid(month).chunks(7).map(|week| {
+                    h_flex().children(week.iter().map(|&date| {
+                        let is_selected = selected == Some(date);
+                        div()
+                            .id(SharedString::from(format!("range-day-{date}")))
+                            .flex_1()
+                            .h(px(26.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_full()
+                            .cursor_pointer()
+                            .when(is_selected, |el| el.bg(theme.colors().accent))
+                            .when(!is_selected, |el| el.hover(|s| s.bg(theme.colors().element_hover)))
+                            .child(
+                                Label::new(date.day().to_string()).size(LabelSize::Small).color(if is_selected {
+                                    Color::Default
+                                } else if date == today {
+                                    Color::Accent
+                                } else if date.month() != month.month() {
+                                    Color::Muted
+                                } else {
+                                    Color::Default
+                                }),
+                            )
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.update_other_date(cx, |start, end, picking, _| {
+                                    match which {
+                                        RangeEnd::Start => *start = Some(date),
+                                        RangeEnd::End => *end = Some(date),
+                                    }
+                                    *picking = None;
+                                })
+                            }))
+                    }))
+                }))
+        });
+        let (start_calendar, end_calendar) =
+            if picking == Some(RangeEnd::Start) { (calendar, None) } else { (None, calendar) };
+        let ready = start.is_some() && end.is_some();
+        popover(cx)
+            .w(px(240.))
+            .p_2()
+            .gap_2()
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.set_closed_menu(None, cx)))
+            .child(field(RangeEnd::Start, start, strings.range_start))
+            .children(start_calendar)
+            .child(field(RangeEnd::End, end, strings.range_end))
+            .children(end_calendar)
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        div()
+                            .id("range-cancel")
+                            .flex_1()
+                            .h(px(26.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(6.))
+                            .border_1()
+                            .border_color(theme.colors().border)
+                            .cursor_pointer()
+                            .child(Label::new(strings.cancel).size(LabelSize::Small))
+                            .on_click(cx.listener(|this, _, _, cx| this.set_closed_menu(None, cx))),
+                    )
+                    .child(
+                        div()
+                            .id("range-confirm")
+                            .flex_1()
+                            .h(px(26.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(6.))
+                            .bg(theme.colors().accent)
+                            .when(!ready, |el| el.opacity(0.5))
+                            .when(ready, |el| el.cursor_pointer())
+                            .child(Label::new(strings.confirm).size(LabelSize::Small))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if let (Some(start), Some(end)) = (start, end) {
+                                    this.closed_range = ClosedRange::custom(start, end);
+                                    this.set_closed_menu(None, cx);
+                                }
+                            })),
+                    ),
+            )
+            .into_any_element()
+    }
+
     /// Toggles a list in the lists-filter draft; "All Lists" is `None`.
     fn toggle_closed_list(&mut self, list: Option<Option<Id>>, cx: &mut Context<Self>) {
         if let Some(ClosedMenu::Lists(draft)) = self.closed_menu.as_mut() {
@@ -886,7 +1057,7 @@ impl TodoView {
         let dates_menu = popover(cx)
             .w(px(180.))
             .on_mouse_down_out(cx.listener(|this, _, _, cx| this.set_closed_menu(None, cx)))
-            .children(ClosedRange::ALL.into_iter().map(|range| {
+            .children(ClosedRange::PRESETS.into_iter().map(|range| {
                 let selected = range == self.closed_range;
                 ListItem::new(SharedString::from(format!("closed-range-{range:?}")))
                     .child(Label::new(range.label(strings)).color(if selected { Color::Accent } else { Color::Default }))
@@ -895,7 +1066,20 @@ impl TodoView {
                         this.closed_range = range;
                         this.set_closed_menu(None, cx);
                     }))
-            }));
+            }))
+            .child({
+                let custom = matches!(self.closed_range, ClosedRange::Custom(..));
+                ListItem::new("closed-range-other")
+                    .child(Label::new(strings.other_date).color(if custom { Color::Accent } else { Color::Default }))
+                    .when(custom, |item| item.end_slot(check()))
+                    .on_click(cx.listener(|this, _, _, cx| this.open_other_date(cx)))
+            });
+        let other_menu = match &open {
+            Some(ClosedMenu::OtherDate { start, end, picking, month }) => {
+                Some(self.render_other_date(*start, *end, *picking, *month, strings, cx))
+            }
+            _ => None,
+        };
 
         let draft = match &open {
             Some(ClosedMenu::Lists(draft)) => draft.clone(),
@@ -975,12 +1159,17 @@ impl TodoView {
                 div()
                     .relative()
                     .child(
-                        filter_button("closed-dates", self.closed_range.label(strings).into(), open == Some(ClosedMenu::Dates))
+                        filter_button(
+                            "closed-dates",
+                            self.closed_range.label(strings).into(),
+                            matches!(open, Some(ClosedMenu::Dates | ClosedMenu::OtherDate { .. })),
+                        )
                             .on_click(cx.listener(|this, _, _, cx| this.set_closed_menu(Some(ClosedMenu::Dates), cx))),
                     )
                     .when(open == Some(ClosedMenu::Dates), |el| {
                         el.child(PopoverAttachment::new(Placement::BelowLeft, dates_menu))
-                    }),
+                    })
+                    .when_some(other_menu, |el, menu| el.child(PopoverAttachment::new(Placement::BelowLeft, menu))),
             )
             .child(
                 div()

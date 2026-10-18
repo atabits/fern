@@ -4366,24 +4366,30 @@ impl TodoView {
                                         })),
                                 ),
                         )
-                    })
-                    // As the original: "…" on a hovered row opens the task's menu there.
-                    .child(
-                        div()
-                            .id("row-more")
-                            .flex_none()
-                            .opacity(0.)
-                            .group_hover(group.clone(), |s| s.opacity(1.))
-                            .child(Icon::new(IconName::Ellipsis).size(IconSize::Small).color(Color::Muted))
-                            .on_mouse_down(MouseButton::Left, cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
-                                cx.stop_propagation();
-                                window.focus(&this.list_focus, cx);
-                                this.select(id, cx);
-                                this.context_menu = Some((id, event.position));
-                                this.context_side = None;
-                                cx.notify();
-                            })),
-                    ),
+                    }),
+            )
+            // As the original's, "…" right of a hovered row, outside its highlight, opens the
+            // task's menu there.
+            .child(
+                div()
+                    .id("row-more")
+                    .absolute()
+                    .right(px(-17.))
+                    .top_0()
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .opacity(0.)
+                    .group_hover(group.clone(), |s| s.opacity(1.))
+                    .child(Icon::new(IconName::Ellipsis).size(IconSize::XSmall).color(Color::Muted))
+                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                        cx.stop_propagation();
+                        window.focus(&this.list_focus, cx);
+                        this.select(id, cx);
+                        this.context_menu = Some((id, event.position));
+                        this.context_side = None;
+                        cx.notify();
+                    })),
             )
             // And the drag handle left of a hovered row, as the original's.
             .when(draggable, |el| {

@@ -43,7 +43,7 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 
 | Feature | Status | Notes |
 |---|---|---|
-| Narrow sections sidebar | 🟡 | only Tasks works; outline icons where TickTick uses filled ones; no notification badge |
+| Narrow sections sidebar | 🟡 | Tasks and Search work; outline icons where TickTick uses filled ones; no notification badge |
 | Account menu with language switch | ✅ | English (default) and Russian |
 | Lists column: Inbox / All / Today / Tomorrow / Next 7 Days | ✅ | counters; a new task gets the due date or tag of the current view |
 | Lists column: user lists | ✅ | create inline; rename, color and delete from the "…" menu; no drag and drop |
@@ -64,7 +64,8 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 | Details: checklist | ✅ | Enter adds the next item; progress "1/3" in rows |
 | Details: subtasks | ✅ | list with checkboxes, open a subtask, "Add subtask" |
 | Drag and drop | ⬜ | |
-| Calendar, Pomodoro, Habits, Matrix, Countdown, Search | ⬜ | |
+| Search | 🟡 | live search by title, notes and tags from the sidebar; no checklist-item or date filters |
+| Calendar, Pomodoro, Habits, Matrix, Countdown | ⬜ | |
 | Sync between devices | ⬜ | |
 
 ## How changes are checked
@@ -80,8 +81,8 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 
 ## Next
 
-1. Search.
+1. Keyboard shortcuts (actions and a keymap, Zed-style).
 2. Manual ordering and drag and drop.
 3. "Won't Do" status.
 4. Custom time and "every N" in the due-date picker.
-5. Keyboard shortcuts (actions and a keymap, Zed-style).
+5. Eisenhower matrix view.

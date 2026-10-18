@@ -21,7 +21,12 @@ impl AppView {
         Self { store, section: Section::Tasks, todo, account_menu_open: false }
     }
 
-    fn select(&mut self, section: Section, cx: &mut Context<Self>) {
+    fn select(&mut self, section: Section, window: &mut Window, cx: &mut Context<Self>) {
+        // Search shows its results in the task list, so it reuses the tasks view.
+        match section {
+            Section::Search => self.todo.update(cx, |todo, cx| todo.start_search(window, cx)),
+            _ => self.todo.update(cx, |todo, cx| todo.stop_search(cx)),
+        }
         self.section = section;
         cx.notify();
     }
@@ -69,8 +74,8 @@ impl Render for AppView {
         let strings = i18n::t(cx);
         let theme = cx.theme().clone();
         let this = cx.entity().downgrade();
-        let on_select = move |section, _: &mut Window, cx: &mut App| {
-            this.update(cx, |this, cx| this.select(section, cx)).ok();
+        let on_select = move |section, window: &mut Window, cx: &mut App| {
+            this.update(cx, |this, cx| this.select(section, window, cx)).ok();
         };
         let on_avatar = cx.listener(|this, _, _, cx| this.set_account_menu(true, cx));
         let account_menu = self.account_menu_open.then(|| {
@@ -84,7 +89,7 @@ impl Render for AppView {
             .text_color(theme.colors().text)
             .child(sidebar::render(self.section, on_select, on_avatar, account_menu, cx))
             .child(match self.section {
-                Section::Tasks => div().flex_1().h_full().child(self.todo.clone()),
+                Section::Tasks | Section::Search => div().flex_1().h_full().child(self.todo.clone()),
                 other => v_flex()
                     .flex_1()
                     .h_full()

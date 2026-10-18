@@ -606,6 +606,13 @@ fn matches_view(task: &Task, view: &View, today: NaiveDate) -> bool {
         View::Completed => task.is_completed(),
         View::Trash => true,
         View::Tag(tag) => task.tags.iter().any(|t| t.to_lowercase() == tag.to_lowercase()),
+        View::Search(query) => {
+            let query = query.trim().to_lowercase();
+            !query.is_empty()
+                && (task.title.to_lowercase().contains(&query)
+                    || task.notes.to_lowercase().contains(&query)
+                    || task.tags.iter().any(|t| t.to_lowercase().contains(&query)))
+        }
     }
 }
 
@@ -903,6 +910,29 @@ mod tests {
         store.set_repeat(task.id, None, today)?;
         store.set_completed(task.id, true)?;
         assert!(store.task(task.id)?.unwrap().is_completed());
+        Ok(())
+    }
+
+    #[test]
+    fn search_matches_title_notes_and_tags() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let today = d(2026, 10, 18);
+        let a = store.add_task("Buy Milk")?;
+        let b = store.add_task("Call the bank")?;
+        let c = store.add_task("Купить хлеб")?;
+        let gone = store.add_task("milk in the trash")?;
+        store.set_notes(b.id, "ask about the milk subscription")?;
+        store.set_tags(c.id, &["Groceries".into()])?;
+        store.set_completed(a.id, true)?;
+        store.delete_task(gone.id)?;
+
+        let search = |q: &str| -> Result<Vec<String>> {
+            Ok(store.tasks_in(&View::Search(q.into()), today)?.into_iter().map(|t| t.title).collect())
+        };
+        assert_eq!(search("MILK")?, ["Call the bank", "Buy Milk"]);
+        assert_eq!(search("ХЛЕБ")?, ["Купить хлеб"]);
+        assert_eq!(search("grocer")?, ["Купить хлеб"]);
+        assert!(search("   ")?.is_empty());
         Ok(())
     }
 

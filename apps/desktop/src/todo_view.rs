@@ -11,7 +11,7 @@ use crate::i18n::{self, CurrentLocale, Strings};
 use crate::lists_panel::{self, LIST_COLORS};
 use crate::task_detail::{OpenTask, TaskDetail, TaskUpdated};
 use crate::task_rows::{self, Row, Section};
-use crate::text_input::{Cancelled, Mode, Submitted, TextInput};
+use crate::text_input::{Cancelled, Changed, Mode, Submitted, TextInput};
 
 const DETAIL_WIDTH: f32 = 400.;
 const ROW_HEIGHT: f32 = 40.;
@@ -34,6 +34,7 @@ pub struct TodoView {
     creating_list: bool,
     rename_input: Entity<TextInput>,
     renaming_list: bool,
+    search_input: Entity<TextInput>,
     header_menu_open: bool,
     detail: Entity<TaskDetail>,
     selected: Option<Id>,
@@ -78,11 +79,20 @@ impl TodoView {
         })
         .detach();
 
+        let search_input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.search_placeholder, cx));
+        cx.subscribe(&search_input, |this, input, _: &Changed, cx| {
+            let query = input.read(cx).text().to_owned();
+            this.view = View::Search(query);
+            this.reload(cx);
+        })
+        .detach();
+
         // Placeholders live inside the inputs, so they are updated when the language changes.
         cx.observe_global::<CurrentLocale>(|this, cx| {
             let strings = i18n::t(cx);
             this.input.update(cx, |input, cx| input.set_placeholder(strings.add_task, cx));
             this.new_list.update(cx, |input, cx| input.set_placeholder(strings.new_list, cx));
+            this.search_input.update(cx, |input, cx| input.set_placeholder(strings.search_placeholder, cx));
         })
         .detach();
 
@@ -106,6 +116,7 @@ impl TodoView {
             creating_list: false,
             rename_input,
             renaming_list: false,
+            search_input,
             header_menu_open: false,
             detail,
             selected: None,
@@ -132,6 +143,11 @@ impl TodoView {
                 }
                 Some(("list", name)) => self.create_list(name, cx),
                 Some(("view", "trash")) => self.set_view(View::Trash, cx),
+                Some(("search", query)) => {
+                    let query = query.to_owned();
+                    self.search_input.update(cx, |input, cx| input.set_text(query, cx));
+                    self.start_search(window, cx);
+                }
                 Some(("view", name)) => {
                     if let Some(id) = self.lists.iter().find(|l| l.name == name).map(|l| l.id) {
                         self.set_view(View::List(id), cx);
@@ -248,6 +264,21 @@ impl TodoView {
         if self.view != view {
             self.view = view;
             self.reload(cx);
+        }
+    }
+
+    /// Switches the list to search results and focuses the search field.
+    pub fn start_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let query = self.search_input.read(cx).text().to_owned();
+        self.set_view(View::Search(query), cx);
+        window.focus(&self.search_input.focus_handle(cx), cx);
+        cx.notify();
+    }
+
+    /// Leaves search results for the Inbox.
+    pub fn stop_search(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.view, View::Search(_)) {
+            self.set_view(View::Inbox, cx);
         }
     }
 
@@ -398,7 +429,7 @@ impl TodoView {
 
     /// Views where new tasks cannot be added.
     fn is_read_only_view(&self) -> bool {
-        matches!(self.view, View::Completed | View::Trash)
+        matches!(self.view, View::Completed | View::Trash | View::Search(_))
     }
 
     fn render_section(
@@ -703,7 +734,16 @@ impl Render for TodoView {
                             .text_size(px(20.))
                             .font_weight(FontWeight::BOLD)
                             .map(|el| {
-                                if self.renaming_list {
+                                if matches!(self.view, View::Search(_)) {
+                                    el.child(
+                                        h_flex()
+                                            .gap_2()
+                                            .text_size(px(16.))
+                                            .font_weight(FontWeight::NORMAL)
+                                            .child(Icon::new(IconName::Search).size(IconSize::Large))
+                                            .child(self.search_input.clone()),
+                                    )
+                                } else if self.renaming_list {
                                     el.child(self.rename_input.clone())
                                 } else {
                                     el.truncate().child(lists_panel::title(&self.view, &self.lists, strings))
@@ -753,9 +793,11 @@ impl Render for TodoView {
                     .pb_4()
                     .when(self.tasks.is_empty(), |el| {
                         el.child(div().px_3().pt_8().child(
-                            Label::new(match self.view {
+                            Label::new(match &self.view {
                                 View::Completed => strings.no_completed_tasks,
                                 View::Trash => strings.trash_is_empty,
+                                View::Search(query) if query.trim().is_empty() => strings.search_hint,
+                                View::Search(_) => strings.nothing_found,
                                 _ => strings.no_tasks,
                             })
                             .color(Color::Muted),

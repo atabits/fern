@@ -64,6 +64,9 @@ pub struct Strings {
     pub section_matrix: &'static str,
     pub section_countdown: &'static str,
     pub coming_soon: &'static str,
+    pub search_placeholder: &'static str,
+    pub search_hint: &'static str,
+    pub nothing_found: &'static str,
     pub language: &'static str,
 
     // Smart lists and the lists column.
@@ -139,6 +142,9 @@ pub static EN: Strings = Strings {
     section_matrix: "Eisenhower Matrix",
     section_countdown: "Countdown",
     coming_soon: "Coming soon",
+    search_placeholder: "Search tasks",
+    search_hint: "Search by title, notes or tags",
+    nothing_found: "Nothing found",
     language: "Language",
 
     inbox: "Inbox",
@@ -211,6 +217,9 @@ pub static RU: Strings = Strings {
     section_matrix: "Матрица Эйзенхауэра",
     section_countdown: "Обратный отсчёт",
     coming_soon: "Скоро",
+    search_placeholder: "Поиск задач",
+    search_hint: "Ищет по названию, заметке и тегам",
+    nothing_found: "Ничего не найдено",
     language: "Язык",
 
     inbox: "Входящие",

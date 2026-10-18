@@ -137,6 +137,8 @@ pub enum View {
     Trash,
     List(Id),
     Tag(String),
+    /// Tasks whose title, notes or tags contain the text, ignoring case.
+    Search(String),
 }
 
 /// Open-task counters for the lists column.

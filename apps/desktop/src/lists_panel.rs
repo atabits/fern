@@ -26,6 +26,7 @@ pub fn title(view: &View, lists: &[List], strings: &Strings) -> SharedString {
             lists.iter().find(|l| l.id == *id).map(|l| l.name.clone()).unwrap_or_default().into()
         }
         View::Tag(name) => name.clone().into(),
+        View::Search(_) => strings.section_search.into(),
     }
 }
 

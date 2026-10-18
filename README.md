@@ -79,3 +79,5 @@ Third-party components:
 - [GPUI](https://github.com/zed-industries/zed) — Apache-2.0. `apps/desktop/src/text_input.rs`
   started from GPUI's `examples/input.rs`.
 - Icons from [Lucide](https://lucide.dev) — ISC, see `assets/icons/LICENSE`.
+- The UI font, [IBM Plex Sans](https://github.com/IBM/plex) — SIL Open Font License 1.1, see
+  `assets/fonts/OFL.txt`.

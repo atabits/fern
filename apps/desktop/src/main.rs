@@ -82,6 +82,9 @@ fn main() -> Result<()> {
 
     gpui_platform::application().with_assets(Assets).run(move |cx: &mut App| {
         theme::init(cx);
+        if let Err(err) = Assets.load_fonts(cx) {
+            eprintln!("failed to load the fonts: {err:#}");
+        }
         cx.set_global(CurrentLocale(locale));
         match keymap::load_default(&Assets, cx) {
             Ok(errors) => errors.iter().for_each(|err| eprintln!("keymap: {err}")),

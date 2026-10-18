@@ -543,22 +543,27 @@ impl CalendarView {
                 );
             }
             let is_today = date == today;
+            // The original's day label: the number semibold, the weekday beside it on its baseline
+            // (the boxes' bottoms, less the number's deeper descent).
             let day = h_flex()
                 .w(px(120.))
                 .flex_none()
                 .gap_2()
-                .items_baseline()
+                .items_end()
                 .child(
                     div()
                         .text_size(px(22.))
-                        .font_weight(FontWeight::BOLD)
+                        .font_weight(FontWeight::SEMIBOLD)
                         .text_color(if is_today { theme.colors().accent } else { theme.colors().text })
                         .child(date.day().to_string()),
                 )
                 .child(
-                    Label::new(strings.weekdays_short[date.weekday().num_days_from_monday() as usize])
-                        .size(LabelSize::XSmall)
-                        .color(if is_today { Color::Accent } else { Color::Muted }),
+                    div().pb(px(4.)).child(
+                        Label::new(strings.weekdays_short[date.weekday().num_days_from_monday() as usize])
+                            .size(LabelSize::XSmall)
+                            .weight(FontWeight::MEDIUM)
+                            .color(if is_today { Color::Accent } else { Color::Muted }),
+                    ),
                 );
             let entries: Vec<AnyElement> = if items.is_empty() {
                 vec![

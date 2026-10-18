@@ -1023,18 +1023,6 @@ impl HabitView {
                 )
                 .into_any_element(),
             HeaderMore::Settings => {
-                let toggle = |on: bool| {
-                    div()
-                        .w(px(30.))
-                        .h(px(18.))
-                        .p(px(2.))
-                        .flex_none()
-                        .rounded_full()
-                        .flex()
-                        .when(on, |el| el.justify_end().bg(theme.colors().accent))
-                        .when(!on, |el| el.bg(theme.colors().element_hover))
-                        .child(div().size(px(14.)).rounded_full().bg(gpui::white()))
-                };
                 let in_today = self.flag(IN_TODAY_SETTING, true);
                 let by_status = self.flag(SORT_SETTING, false);
                 popover(cx)
@@ -1049,7 +1037,7 @@ impl HabitView {
                             .gap_2()
                             .cursor_pointer()
                             .child(div().flex_1().child(Label::new(strings.habits_in_today).size(LabelSize::Small)))
-                            .child(toggle(in_today))
+                            .child(Switch::new().toggle_state(in_today))
                             .on_click(cx.listener(move |this, _, _, cx| this.set_flag(IN_TODAY_SETTING, !in_today, cx))),
                     )
                     .child(
@@ -1072,7 +1060,7 @@ impl HabitView {
                                             .child(strings.habits_sort_hint),
                                     ),
                             )
-                            .child(toggle(by_status))
+                            .child(Switch::new().toggle_state(by_status))
                             .on_click(cx.listener(move |this, _, _, cx| this.set_flag(SORT_SETTING, !by_status, cx))),
                     )
                     .into_any_element()
@@ -1227,7 +1215,7 @@ impl HabitView {
                 )
         };
 
-        let weekdays = h_flex().children(strings.weekdays_short.iter().map(|day| {
+        let weekdays = h_flex().children(crate::calendar::weekday_labels(&strings.weekdays_short).iter().map(|day| {
             div().flex_1().flex().justify_center().child(Label::new(*day).size(LabelSize::Small).color(Color::Muted))
         }));
         let grid: Vec<AnyElement> = calendar::month_grid(self.month)

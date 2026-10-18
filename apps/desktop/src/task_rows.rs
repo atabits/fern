@@ -423,7 +423,7 @@ impl ClosedRange {
     }
 
     pub fn contains(self, day: NaiveDate, today: NaiveDate) -> bool {
-        let monday = today - chrono::Duration::days(today.weekday().num_days_from_monday() as i64);
+        let monday = crate::calendar::week_of(today)[0];
         match self {
             Self::All => true,
             Self::ThisWeek => day >= monday && day < monday + chrono::Duration::weeks(1),

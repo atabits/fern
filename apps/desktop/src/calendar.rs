@@ -1,6 +1,8 @@
 //! Date math for the due-date calendar.
 
-use chrono::{Datelike, Duration, Months, NaiveDate, NaiveTime, Timelike};
+use std::cell::Cell;
+
+use chrono::{Datelike, Duration, Months, NaiveDate, NaiveTime, Timelike, Weekday};
 
 use crate::i18n::Strings;
 
@@ -18,31 +20,55 @@ pub fn add_months(month: NaiveDate, delta: i32) -> NaiveDate {
     }
 }
 
-/// The weeks (Monday to Sunday) that contain days of `month`: four to six of them.
+thread_local! {
+    /// The first day of the week from the Settings ("Start Week on"). The UI runs on one thread,
+    /// so every calendar reads it without threading it through each view.
+    static WEEK_START: Cell<Weekday> = const { Cell::new(Weekday::Mon) };
+}
+
+pub fn set_week_start(day: Weekday) {
+    WEEK_START.with(|start| start.set(day));
+}
+
+pub fn week_start() -> Weekday {
+    WEEK_START.with(Cell::get)
+}
+
+/// Weekday labels (given Monday first) in display order, starting with the first day of the week.
+pub fn weekday_labels<T: Copy>(monday_first: &[T; 7]) -> [T; 7] {
+    let offset = week_start().num_days_from_monday() as usize;
+    std::array::from_fn(|i| monday_first[(i + offset) % 7])
+}
+
+/// The weeks that contain days of `month`: four to six of them.
 pub fn month_weeks(month: NaiveDate) -> Vec<[NaiveDate; 7]> {
     let first = month_start(month);
     let next_month = add_months(first, 1);
     let mut weeks = Vec::new();
-    let mut monday = week_of(first)[0];
-    while monday < next_month {
-        weeks.push(week_of(monday));
-        monday += Duration::days(7);
+    let mut start = week_of(first)[0];
+    while start < next_month {
+        weeks.push(week_of(start));
+        start += Duration::days(7);
     }
     weeks
 }
 
-/// 42 days (six weeks starting on Monday) covering `month`.
+/// 42 days (six weeks) covering `month`.
 pub fn month_grid(month: NaiveDate) -> Vec<NaiveDate> {
-    let first = month_start(month);
-    let offset = first.weekday().num_days_from_monday() as i64;
-    let start = first - Duration::days(offset);
+    let start = week_of(month_start(month))[0];
     (0..42).map(|i| start + Duration::days(i)).collect()
 }
 
-/// The seven days (Monday to Sunday) of the week that contains `date`.
+/// The seven days of the week that contains `date`.
 pub fn week_of(date: NaiveDate) -> [NaiveDate; 7] {
-    let monday = date - Duration::days(date.weekday().num_days_from_monday() as i64);
-    std::array::from_fn(|i| monday + Duration::days(i as i64))
+    week_from(date, week_start())
+}
+
+/// The seven days of the week that contains `date`, for weeks starting on `start`.
+pub fn week_from(date: NaiveDate, start: Weekday) -> [NaiveDate; 7] {
+    let offset = (date.weekday().num_days_from_monday() + 7 - start.num_days_from_monday()) % 7;
+    let first = date - Duration::days(offset as i64);
+    std::array::from_fn(|i| first + Duration::days(i as i64))
 }
 
 /// The week view's time axis, as in the original: the night is folded into two short blocks
@@ -169,6 +195,19 @@ mod tests {
         assert_eq!(week[0], d(2026, 10, 12));
         assert_eq!(week[6], d(2026, 10, 18));
         assert_eq!(week_of(d(2026, 10, 12))[0], d(2026, 10, 12));
+    }
+
+    #[test]
+    fn weeks_can_start_on_sunday_or_saturday() {
+        let sunday = d(2026, 10, 18);
+        assert_eq!(week_from(sunday, Weekday::Sun)[0], sunday);
+        assert_eq!(week_from(d(2026, 10, 24), Weekday::Sun)[6], d(2026, 10, 24));
+        assert_eq!(week_from(sunday, Weekday::Sat)[0], d(2026, 10, 17));
+
+        set_week_start(Weekday::Sun);
+        assert_eq!(month_grid(d(2026, 10, 1))[0], d(2026, 9, 27));
+        assert_eq!(weekday_labels(&["M", "T", "W", "T", "F", "S", "Su"])[0], "Su");
+        set_week_start(Weekday::Mon);
     }
 
     #[test]

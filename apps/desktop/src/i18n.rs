@@ -223,7 +223,7 @@ pub struct Strings {
     pub copy_link: &'static str,
     pub shortcuts: &'static str,
     /// Labels of `keymap::LISTED_ACTIONS`, in order.
-    pub shortcut_labels: [&'static str; 23],
+    pub shortcut_labels: [&'static str; 24],
     pub shortcut_groups: [&'static str; 4],
     /// Quick add syntax: (what, example).
     pub quick_add_help: [(&'static str, &'static str); 4],
@@ -382,6 +382,21 @@ pub struct Strings {
     pub months_short: [&'static str; 12],
     /// "13 Nov" (`true`) or "Nov 13" (`false`).
     pub day_before_month: bool,
+    /// Settings window pages: Date & Time, Appearance, More, Shortcuts, About.
+    pub settings_pages: [&'static str; 5],
+    pub start_week_on: &'static str,
+    /// Monday, Sunday, Saturday, as in `fern_core::WEEK_STARTS`.
+    pub week_start_names: [&'static str; 3],
+    pub color_series: &'static str,
+    /// The light and the dark theme.
+    pub theme_names: [&'static str; 2],
+    pub follow_system_dark_mode: &'static str,
+    pub task_default: &'static str,
+    pub default_list: &'static str,
+    pub default_list_hint: &'static str,
+    pub about_tagline: &'static str,
+    pub version: &'static str,
+    pub license: &'static str,
 }
 
 pub static EN: Strings = Strings {
@@ -540,7 +555,7 @@ pub static EN: Strings = Strings {
     shortcuts: "Shortcuts",
     shortcut_labels: [
         "Add task", "Search", "Toggle sidebar", "Go to Inbox", "Go to Today", "Go to Tomorrow", "Go to Next 7 Days",
-        "Shortcuts", "Quit", "Next task", "Previous task", "Complete task", "Delete task", "Pin task", "Set date",
+        "Shortcuts", "Settings", "Quit", "Next task", "Previous task", "Complete task", "Delete task", "Pin task", "Set date",
         "Clear date", "Set today", "Set tomorrow", "Set next week", "No priority", "Low priority",
         "Medium priority", "High priority",
     ],
@@ -693,6 +708,18 @@ pub static EN: Strings = Strings {
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ],
     day_before_month: false,
+    settings_pages: ["Date & Time", "Appearance", "More", "Shortcuts", "About"],
+    start_week_on: "Start Week on",
+    week_start_names: ["Monday", "Sunday", "Saturday"],
+    color_series: "Color Series",
+    theme_names: ["Default", "Dark"],
+    follow_system_dark_mode: "Follow System Dark Mode",
+    task_default: "Task Default",
+    default_list: "Default List",
+    default_list_hint: "Where new tasks go when added outside a list, such as in Today or a tag.",
+    about_tagline: "A self-hosted task tracker.",
+    version: "Version",
+    license: "License",
 };
 
 pub static RU: Strings = Strings {
@@ -851,7 +878,7 @@ pub static RU: Strings = Strings {
     shortcuts: "Горячие клавиши",
     shortcut_labels: [
         "Новая задача", "Поиск", "Скрыть/показать панель", "Входящие", "Сегодня", "Завтра", "Следующие 7 дней",
-        "Горячие клавиши", "Выйти", "Следующая задача", "Предыдущая задача", "Выполнить задачу", "Удалить задачу",
+        "Горячие клавиши", "Настройки", "Выйти", "Следующая задача", "Предыдущая задача", "Выполнить задачу", "Удалить задачу",
         "Закрепить задачу", "Выбрать дату", "Убрать дату", "На сегодня", "На завтра", "На следующую неделю",
         "Без приоритета", "Низкий приоритет", "Средний приоритет", "Высокий приоритет",
     ],
@@ -1005,4 +1032,16 @@ pub static RU: Strings = Strings {
         "дек.",
     ],
     day_before_month: true,
+    settings_pages: ["Дата и время", "Оформление", "Ещё", "Горячие клавиши", "О программе"],
+    start_week_on: "Начало недели",
+    week_start_names: ["Понедельник", "Воскресенье", "Суббота"],
+    color_series: "Цветовые темы",
+    theme_names: ["Светлая", "Тёмная"],
+    follow_system_dark_mode: "Тёмная тема как в системе",
+    task_default: "Задачи по умолчанию",
+    default_list: "Список по умолчанию",
+    default_list_hint: "Куда попадают новые задачи, добавленные не в списке — например, в «Сегодня» или в метке.",
+    about_tagline: "Трекер задач на собственном сервере.",
+    version: "Версия",
+    license: "Лицензия",
 };

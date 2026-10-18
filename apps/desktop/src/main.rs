@@ -16,6 +16,7 @@ mod matrix_view;
 mod print;
 mod reminders;
 mod search_modal;
+mod settings_window;
 mod sidebar;
 mod task_detail;
 mod task_rows;

@@ -511,7 +511,7 @@ impl Render for CalendarView {
                     .flex_none()
                     .h(px(22.))
                     .when(self.mode == CalendarMode::Week, |el| el.child(div().w(px(56.)).flex_none()))
-                    .children(strings.weekdays_short.iter().map(|day| {
+                    .children(crate::calendar::weekday_labels(&strings.weekdays_short).iter().map(|day| {
                         div()
                             .flex_1()
                             .flex()

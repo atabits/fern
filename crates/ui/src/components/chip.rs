@@ -1,10 +1,11 @@
+use theme::ActiveTheme;
 use gpui::{
     AnyElement, App, Hsla, IntoElement, ParentElement, RenderOnce, SharedString, Styled, Window,
     div, px,
 };
 
-/// A small rounded label, used for tags: the color at low opacity as the background and a lighter
-/// shade of it as the text.
+/// A small rounded label, used for tags: the color at low opacity as the background and a shade
+/// of it as the text, lighter on a dark theme and darker on a light one.
 #[derive(IntoElement)]
 pub struct Chip {
     label: SharedString,
@@ -24,9 +25,9 @@ impl Chip {
 }
 
 impl RenderOnce for Chip {
-    fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
+    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let mut text = self.color;
-        text.l = (text.l + 1.) / 2.;
+        text.l = if cx.theme().is_light() { text.l * 0.6 } else { (text.l + 1.) / 2. };
         text.a = 1.;
         div()
             .flex_none()

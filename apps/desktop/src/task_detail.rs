@@ -883,17 +883,7 @@ impl TaskDetail {
                     .id("range-all-day")
                     .cursor_pointer()
                     .child(div().flex_1().child(Label::new(strings.range_all_day).size(LabelSize::Small)))
-                    .child(
-                        div()
-                            .w(px(30.))
-                            .h(px(18.))
-                            .p(px(2.))
-                            .rounded_full()
-                            .flex()
-                            .when(all_day, |el| el.justify_end().bg(theme.colors().accent))
-                            .when(!all_day, |el| el.bg(theme.colors().element_hover))
-                            .child(div().size(px(14.)).rounded_full().bg(gpui::white())),
-                    )
+                    .child(Switch::new().toggle_state(all_day))
                     .on_click(cx.listener(move |this, _, _, cx| this.update_draft(cx, |d| d.set_all_day(!all_day)))),
             )
             .child(Divider::horizontal())
@@ -1189,7 +1179,7 @@ impl TaskDetail {
                             .on_click(cx.listener(|this, _, _, cx| this.shift_month(1, cx))),
                     ),
             )
-            .child(h_flex().children(strings.weekdays_narrow.iter().map(|day| {
+            .child(h_flex().children(crate::calendar::weekday_labels(&strings.weekdays_narrow).iter().map(|day| {
                 div().flex_1().flex().justify_center().child(Label::new(*day).size(LabelSize::XSmall).color(Color::Muted))
             })))
             .child(v_flex().gap_0p5().children(weeks))

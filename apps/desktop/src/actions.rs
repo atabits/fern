@@ -14,8 +14,11 @@ actions!(
         ShowTomorrow,
         ShowNext7Days,
         ShowShortcuts,
+        OpenSettings,
     ]
 );
+
+actions!(settings, [DismissSettings]);
 
 actions!(
     task_list,

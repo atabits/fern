@@ -7,6 +7,7 @@ mod label;
 mod list_item;
 mod popover;
 mod stack;
+mod switch;
 mod tooltip;
 
 pub use checkbox::*;
@@ -18,4 +19,5 @@ pub use label::*;
 pub use list_item::*;
 pub use popover::*;
 pub use stack::*;
+pub use switch::*;
 pub use tooltip::*;

@@ -9,5 +9,5 @@ pub use theme::ActiveTheme;
 
 pub use crate::{
     Checkbox, Chip, Clickable, Color, Divider, Icon, IconButton, IconName, IconSize, Label,
-    LabelSize, ListItem, Toggleable, Tooltip, h_flex, v_flex,
+    LabelSize, ListItem, Switch, Toggleable, Tooltip, h_flex, v_flex,
 };

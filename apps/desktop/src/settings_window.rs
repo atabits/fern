@@ -1,0 +1,427 @@
+//! The Settings window from the account menu, modeled on the original's: pages on the left,
+//! grouped rows on the right, values picked from small dropdowns.
+
+use std::rc::Rc;
+
+use fern_core::{Preferences, Store, ThemeMode, WEEK_STARTS};
+use gpui::{EventEmitter, FocusHandle, Focusable, FontWeight, WindowAppearance};
+use theme::Theme;
+use ui::prelude::*;
+use ui::{Placement, PopoverAttachment, popover};
+
+use crate::actions::DismissSettings;
+use crate::calendar;
+use crate::i18n::{self, CurrentLocale, Locale};
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Page {
+    #[default]
+    DateTime,
+    Appearance,
+    More,
+    About,
+}
+
+/// The open dropdown, if any.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Menu {
+    WeekStart,
+    Language,
+    DefaultList,
+}
+
+pub enum SettingsEvent {
+    Dismissed,
+    /// The "Shortcuts" page, which is the Shortcuts panel.
+    ShowShortcuts,
+}
+
+pub struct SettingsWindow {
+    store: Rc<Store>,
+    preferences: Preferences,
+    page: Page,
+    menu: Option<Menu>,
+    focus_handle: FocusHandle,
+}
+
+impl EventEmitter<SettingsEvent> for SettingsWindow {}
+
+impl Focusable for SettingsWindow {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+/// Installs the theme and the first day of the week from `preferences`.
+pub fn apply(preferences: &Preferences, window: &Window, cx: &mut App) {
+    let dark = match preferences.theme {
+        ThemeMode::Dark => true,
+        ThemeMode::Light => false,
+        ThemeMode::System => matches!(window.appearance(), WindowAppearance::Dark | WindowAppearance::VibrantDark),
+    };
+    let theme = if dark { Theme::dark() } else { Theme::light() };
+    if theme.name != cx.theme().name {
+        theme::set(theme, cx);
+    }
+    calendar::set_week_start(preferences.week_start);
+    cx.refresh_windows();
+}
+
+impl SettingsWindow {
+    pub fn new(store: Rc<Store>, cx: &mut Context<Self>) -> Self {
+        let preferences = store.preferences().unwrap_or_default();
+        Self { store, preferences, page: Page::default(), menu: None, focus_handle: cx.focus_handle() }
+    }
+
+    pub fn set_page(&mut self, page: Page, cx: &mut Context<Self>) {
+        self.page = page;
+        self.menu = None;
+        cx.notify();
+    }
+
+    fn set_menu(&mut self, menu: Option<Menu>, cx: &mut Context<Self>) {
+        self.menu = menu;
+        cx.notify();
+    }
+
+    fn update(&mut self, window: &mut Window, cx: &mut Context<Self>, change: impl FnOnce(&mut Preferences)) {
+        change(&mut self.preferences);
+        self.menu = None;
+        if let Err(err) = self.store.save_preferences(&self.preferences) {
+            eprintln!("failed to save the settings: {err:#}");
+        }
+        apply(&self.preferences, window, cx);
+    }
+
+    fn set_locale(&mut self, locale: Locale, cx: &mut Context<Self>) {
+        if let Err(err) = self.store.set_setting("locale", locale.code()) {
+            eprintln!("failed to save the language: {err:#}");
+        }
+        cx.set_global(CurrentLocale(locale));
+        self.menu = None;
+        cx.refresh_windows();
+    }
+
+    /// Opens a dropdown from the debug-build dev state: `settings=<page>[>menu]`.
+    #[cfg(debug_assertions)]
+    pub fn dev_open(&mut self, spec: &str, cx: &mut Context<Self>) {
+        let (page, menu) = spec.split_once('>').unwrap_or((spec, ""));
+        self.page = match page {
+            "appearance" => Page::Appearance,
+            "more" => Page::More,
+            "about" => Page::About,
+            _ => Page::DateTime,
+        };
+        self.menu = match menu {
+            "week" => Some(Menu::WeekStart),
+            "language" => Some(Menu::Language),
+            "list" => Some(Menu::DefaultList),
+            _ => None,
+        };
+        cx.notify();
+    }
+
+    fn render_nav(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let strings = i18n::t(cx);
+        let item = |id: &'static str, icon: IconName, label: &'static str, selected: bool| {
+            ListItem::new(id).height(px(34.)).toggle_state(selected).start_slot(Icon::new(icon)).child(Label::new(label))
+        };
+        let page = |id, icon, index: usize, target: Page| {
+            item(id, icon, strings.settings_pages[index], self.page == target)
+                .on_click(cx.listener(move |this, _, _, cx| this.set_page(target, cx)))
+        };
+        v_flex()
+            .flex_none()
+            .w(px(200.))
+            .h_full()
+            .p_2()
+            .gap_0p5()
+            .bg(cx.theme().colors().panel_background)
+            .border_r_1()
+            .border_color(cx.theme().colors().border)
+            .child(div().px_2().pt_2().pb_3().child(Label::new(strings.settings).size(LabelSize::Large).weight(FontWeight::SEMIBOLD)))
+            .child(page("settings-date-time", IconName::Clock, 0, Page::DateTime))
+            .child(page("settings-appearance", IconName::PaintRoller, 1, Page::Appearance))
+            .child(page("settings-more", IconName::ToggleRight, 2, Page::More))
+            .child(div().h(px(12.)))
+            .child(
+                item("settings-shortcuts", IconName::Keyboard, strings.settings_pages[3], false)
+                    .on_click(cx.listener(|_, _, _, cx| cx.emit(SettingsEvent::ShowShortcuts))),
+            )
+            .child(div().h(px(12.)))
+            .child(page("settings-about", IconName::Info, 4, Page::About))
+    }
+
+    /// A row whose value opens a dropdown of `options` (label, selected, what picking it does).
+    fn select_row(
+        &self,
+        label: &'static str,
+        value: SharedString,
+        menu: Menu,
+        options: Vec<(SharedString, bool, Box<dyn Fn(&mut Self, &mut Window, &mut Context<Self>)>)>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let open = self.menu == Some(menu);
+        let dropdown = open.then(|| {
+            let options = Rc::new(options);
+            let items = (0..options.len()).map(|i| {
+                let (label, selected, _) = &options[i];
+                let options = options.clone();
+                ListItem::new(SharedString::from(format!("option-{i}")))
+                    .child(Label::new(label.clone()))
+                    .when(*selected, |item| item.end_slot(Icon::new(IconName::Check).color(Color::Accent).size(IconSize::Small)))
+                    .on_click(cx.listener(move |this, _, window, cx| (options[i].2)(this, window, cx)))
+            });
+            PopoverAttachment::new(
+                Placement::BelowRight,
+                popover(cx)
+                    .min_w(px(180.))
+                    .on_mouse_down_out(cx.listener(|this, _, _, cx| this.set_menu(None, cx)))
+                    .children(items),
+            )
+        });
+        h_flex()
+            .h(px(36.))
+            .px_4()
+            .child(div().flex_1().child(Label::new(label)))
+            .child(
+                h_flex()
+                    .id(SharedString::from(format!("settings-value-{label}")))
+                    .relative()
+                    .gap_1()
+                    .cursor_pointer()
+                    .child(Label::new(value).color(Color::Muted))
+                    .child(Icon::new(IconName::ChevronsUpDown).size(IconSize::XSmall).color(Color::Muted))
+                    .on_click(cx.listener(move |this, _, _, cx| this.set_menu((!open).then_some(menu), cx)))
+                    .children(dropdown),
+            )
+            .into_any_element()
+    }
+
+    fn render_page(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let strings = i18n::t(cx);
+        let colors = cx.theme().colors().clone();
+        let group = || v_flex().py_1p5().rounded(px(8.)).bg(colors.surface_background);
+        let title = |text: &'static str| div().pb_3().child(Label::new(text).weight(FontWeight::SEMIBOLD));
+        let body = v_flex().flex_1().min_w_0().h_full().bg(colors.background).pt(px(48.)).px_6().pb_6().gap_4();
+        match self.page {
+            Page::DateTime => {
+                let week_start = self.preferences.week_start;
+                let options = WEEK_STARTS
+                    .into_iter()
+                    .zip(strings.week_start_names)
+                    .map(|(day, name)| {
+                        let pick: Box<dyn Fn(&mut Self, &mut Window, &mut Context<Self>)> =
+                            Box::new(move |this, window, cx| this.update(window, cx, |p| p.week_start = day));
+                        (SharedString::from(name), day == week_start, pick)
+                    })
+                    .collect();
+                let current = WEEK_STARTS.iter().position(|d| *d == week_start).unwrap_or(0);
+                body.child(
+                    v_flex()
+                        .child(title(strings.settings_pages[0]))
+                        .child(group().child(self.select_row(
+                            strings.start_week_on,
+                            strings.week_start_names[current].into(),
+                            Menu::WeekStart,
+                            options,
+                            cx,
+                        ))),
+                )
+                .into_any_element()
+            }
+            Page::Appearance => {
+                let mode = self.preferences.theme;
+                let follow = mode == ThemeMode::System;
+                let dark_now = !cx.theme().is_light();
+                let swatch = |id: &'static str, label: &'static str, dark: bool| {
+                    let selected = dark == dark_now;
+                    let (fill, dots) = if dark { (Theme::dark(), true) } else { (Theme::light(), false) };
+                    v_flex()
+                        .id(id)
+                        .items_center()
+                        .gap_1p5()
+                        .cursor_pointer()
+                        .child(
+                            div()
+                                .relative()
+                                .size(px(48.))
+                                .rounded(px(8.))
+                                .border_1()
+                                .border_color(colors.border)
+                                .bg(fill.colors().background)
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .when(dots, |el| {
+                                    el.child(h_flex().gap(px(3.)).children((0..3).map(|_| {
+                                        div().size(px(5.)).rounded_full().bg(colors.accent)
+                                    })))
+                                })
+                                .when(selected, |el| {
+                                    el.child(
+                                        div()
+                                            .absolute()
+                                            .right(px(-5.))
+                                            .bottom(px(-5.))
+                                            .size(px(16.))
+                                            .rounded_full()
+                                            .bg(colors.accent)
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .child(Icon::new(IconName::Check).size(IconSize::XSmall).color(Color::Custom(gpui::white()))),
+                                    )
+                                }),
+                        )
+                        .child(Label::new(label).size(LabelSize::Small).color(Color::Muted))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.update(window, cx, |p| p.theme = if dark { ThemeMode::Dark } else { ThemeMode::Light })
+                        }))
+                };
+                let system_dark = matches!(window.appearance(), WindowAppearance::Dark | WindowAppearance::VibrantDark);
+                body.child(
+                    group().child(
+                        h_flex()
+                            .id("follow-system")
+                            .h(px(36.))
+                            .px_4()
+                            .cursor_pointer()
+                            .child(div().flex_1().child(Label::new(strings.follow_system_dark_mode)))
+                            .child(Switch::new().toggle_state(follow))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.update(window, cx, |p| {
+                                    p.theme = match (follow, system_dark) {
+                                        (false, _) => ThemeMode::System,
+                                        (true, true) => ThemeMode::Dark,
+                                        (true, false) => ThemeMode::Light,
+                                    }
+                                })
+                            })),
+                    ),
+                )
+                .child(
+                    v_flex()
+                        .gap_3()
+                        .child(Label::new(strings.color_series).weight(FontWeight::SEMIBOLD))
+                        .child(
+                            h_flex()
+                                .gap_4()
+                                .child(swatch("theme-light", strings.theme_names[0], false))
+                                .child(swatch("theme-dark", strings.theme_names[1], true)),
+                        ),
+                )
+                .into_any_element()
+            }
+            Page::More => {
+                let current = i18n::locale(cx);
+                let languages = Locale::ALL
+                    .into_iter()
+                    .map(|locale| {
+                        let pick: Box<dyn Fn(&mut Self, &mut Window, &mut Context<Self>)> =
+                            Box::new(move |this, _, cx| this.set_locale(locale, cx));
+                        (SharedString::from(locale.native_name()), locale == current, pick)
+                    })
+                    .collect();
+                let lists = self.store.lists().unwrap_or_default();
+                let default_list = self.preferences.default_list;
+                let list_name = default_list
+                    .and_then(|id| lists.iter().find(|l| l.id == id))
+                    .map(|l| SharedString::from(l.name.clone()))
+                    .unwrap_or(strings.inbox.into());
+                let mut list_options: Vec<(SharedString, bool, Box<dyn Fn(&mut Self, &mut Window, &mut Context<Self>)>)> =
+                    vec![(
+                        strings.inbox.into(),
+                        default_list.is_none(),
+                        Box::new(|this, window, cx| this.update(window, cx, |p| p.default_list = None)),
+                    )];
+                list_options.extend(lists.iter().map(|list| {
+                    let id = list.id;
+                    let pick: Box<dyn Fn(&mut Self, &mut Window, &mut Context<Self>)> =
+                        Box::new(move |this, window, cx| this.update(window, cx, |p| p.default_list = Some(id)));
+                    (SharedString::from(list.name.clone()), default_list == Some(id), pick)
+                }));
+                body.child(group().child(self.select_row(
+                    strings.language,
+                    current.native_name().into(),
+                    Menu::Language,
+                    languages,
+                    cx,
+                )))
+                .child(
+                    v_flex()
+                        .child(title(strings.task_default))
+                        .child(group().child(self.select_row(
+                            strings.default_list,
+                            list_name,
+                            Menu::DefaultList,
+                            list_options,
+                            cx,
+                        )))
+                        .child(
+                            div()
+                                .w_full()
+                                .pt_1p5()
+                                .px_1()
+                                .text_size(px(11.))
+                                .text_color(colors.text_muted)
+                                .child(strings.default_list_hint),
+                        ),
+                )
+                .into_any_element()
+            }
+            Page::About => {
+                let row = |label: &'static str, value: &'static str| {
+                    h_flex()
+                        .h(px(36.))
+                        .px_4()
+                        .child(div().flex_1().child(Label::new(label)))
+                        .child(Label::new(value).color(Color::Muted))
+                };
+                body.child(
+                    v_flex()
+                        .items_center()
+                        .gap_1()
+                        .py_4()
+                        .child(Label::new("Fern").size(LabelSize::Large).weight(FontWeight::SEMIBOLD))
+                        .child(Label::new(strings.about_tagline).color(Color::Muted)),
+                )
+                .child(
+                    group()
+                        .child(row(strings.version, env!("CARGO_PKG_VERSION")))
+                        .child(row(strings.license, "AGPL-3.0-or-later")),
+                )
+                .into_any_element()
+            }
+        }
+    }
+}
+
+impl Render for SettingsWindow {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = cx.theme().colors();
+        h_flex()
+            .id("settings-window")
+            .track_focus(&self.focus_handle)
+            .key_context("Settings")
+            .on_action(cx.listener(|_, _: &DismissSettings, _, cx| cx.emit(SettingsEvent::Dismissed)))
+            .w(px(800.))
+            .h(px(680.))
+            .relative()
+            .rounded(px(12.))
+            .overflow_hidden()
+            .bg(colors.elevated_surface_background)
+            .border_1()
+            .border_color(colors.border)
+            .shadow_lg()
+            .text_color(colors.text)
+            .child(self.render_nav(cx))
+            .child(self.render_page(window, cx))
+            .child(
+                div().absolute().top_3().right_3().child(
+                    IconButton::new("close-settings", IconName::X)
+                        .on_click(cx.listener(|_, _, _, cx| cx.emit(SettingsEvent::Dismissed))),
+                ),
+            )
+    }
+}

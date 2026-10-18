@@ -416,7 +416,7 @@ impl TodoView {
         Local::now().date_naive()
     }
 
-    fn reload(&mut self, cx: &mut Context<Self>) {
+    pub fn reload(&mut self, cx: &mut Context<Self>) {
         self.show_details = self.view_flag("show_details", false);
         self.kanban = self.view_flag("kanban", false);
         let today = Self::today();
@@ -584,7 +584,12 @@ impl TodoView {
             View::List(id) => Some(id),
             _ => None,
         };
-        if let Some(list) = parsed_list.or(view_list) {
+        // Outside the Inbox and lists, new tasks go to the default list from the Settings.
+        let default_list = match self.view {
+            View::Inbox | View::List(_) => None,
+            _ => self.store.preferences().ok().and_then(|p| p.default_list),
+        };
+        if let Some(list) = parsed_list.or(view_list).or(default_list) {
             self.store.set_list(task.id, Some(list))?;
         }
         Ok(task)
@@ -2030,7 +2035,7 @@ impl TodoView {
                             |this, _, _, cx| this.update_other_date(cx, |_, _, _, month| *month = crate::calendar::add_months(*month, 1)),
                         ))),
                 )
-                .child(h_flex().children(strings.weekdays_narrow.iter().map(|day| {
+                .child(h_flex().children(crate::calendar::weekday_labels(&strings.weekdays_narrow).iter().map(|day| {
                     div().flex_1().flex().justify_center().child(Label::new(*day).size(LabelSize::XSmall).color(Color::Muted))
                 })))
                 .children(crate::calendar::month_grid(month).chunks(7).map(|week| {

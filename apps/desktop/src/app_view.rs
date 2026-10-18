@@ -5,15 +5,18 @@ use gpui::Focusable as _;
 use ui::prelude::*;
 use ui::{Placement, PopoverAttachment, popover};
 
-use crate::actions::{NewTask, Search, ShowInbox, ShowNext7Days, ShowShortcuts, ShowToday, ShowTomorrow, ToggleSidebar};
+use crate::actions::{
+    NewTask, OpenSettings, Search, ShowInbox, ShowNext7Days, ShowShortcuts, ShowToday, ShowTomorrow, ToggleSidebar,
+};
 use crate::calendar_view::{self, CalendarView};
 use crate::countdown_view::CountdownView;
 use crate::focus_view::FocusView;
 use crate::habit_view::HabitView;
-use crate::i18n::{self, CurrentLocale, Locale};
+use crate::i18n;
 use crate::matrix_view::{self, MatrixView};
 use crate::reminders::{self, Notice, Notices, Target};
 use crate::search_modal::{SearchEvent, SearchModal};
+use crate::settings_window::{self, SettingsEvent, SettingsWindow};
 use crate::sidebar::{self, Section};
 use crate::todo_view::TodoView;
 
@@ -32,6 +35,7 @@ pub struct AppView {
     notices_open: bool,
     /// The "Shortcuts" panel on the right, while open.
     shortcuts_open: bool,
+    settings: Option<gpui::Entity<SettingsWindow>>,
 }
 
 impl AppView {
@@ -84,8 +88,18 @@ impl AppView {
             notices: Notices::default(),
             notices_open: false,
             shortcuts_open: false,
+            settings: None,
         };
         reminders::start(this.store.clone(), cx);
+        settings_window::apply(&this.store.preferences().unwrap_or_default(), window, cx);
+        // "Follow System Dark Mode" tracks the system's appearance while the app runs.
+        cx.observe_window_appearance(window, |this, window, cx| {
+            let preferences = this.store.preferences().unwrap_or_default();
+            if preferences.theme == fern_core::ThemeMode::System {
+                settings_window::apply(&preferences, window, cx);
+            }
+        })
+        .detach();
         #[cfg(debug_assertions)]
         if let Ok(state) = std::env::var("FERN_DEV_STATE") {
             if state.contains("section=calendar") {
@@ -156,6 +170,19 @@ impl AppView {
                 if let Some(task) = this.store.tasks().unwrap_or_default().into_iter().find(|t| t.title.contains(needle)) {
                     let at = chrono::Local::now().naive_local() - chrono::Duration::hours(ago.parse().unwrap_or(0));
                     this.add_notices(vec![Notice { target: Target::Task(task.id), title: task.title, at }], cx);
+                }
+            }
+            // `theme=light|dark|system`, saved like a pick in the Settings.
+            if let Some(mode) = state.split(';').find_map(|part| part.strip_prefix("theme=")).and_then(fern_core::ThemeMode::from_code) {
+                let preferences = fern_core::Preferences { theme: mode, ..this.store.preferences().unwrap_or_default() };
+                this.store.save_preferences(&preferences).ok();
+                settings_window::apply(&preferences, window, cx);
+            }
+            // `settings=<page>[><menu>]` opens the Settings window (see `SettingsWindow::dev_open`).
+            if let Some(spec) = state.split(';').find_map(|part| part.strip_prefix("settings=")) {
+                this.open_settings(window, cx);
+                if let Some(settings) = &this.settings {
+                    settings.update(cx, |settings, cx| settings.dev_open(spec, cx));
                 }
             }
             if state.contains("shortcuts=open") {
@@ -256,36 +283,37 @@ impl AppView {
         cx.notify();
     }
 
-    fn set_locale(&mut self, locale: Locale, cx: &mut Context<Self>) {
-        if let Err(err) = self.store.set_setting("locale", locale.code()) {
-            eprintln!("failed to save the language: {err:#}");
-        }
-        cx.set_global(CurrentLocale(locale));
-        self.account_menu_open = false;
-        cx.refresh_windows();
-    }
-
     fn render_account_menu(&self, cx: &mut Context<Self>) -> AnyElement {
-        let current = i18n::locale(cx);
         let strings = i18n::t(cx);
         popover(cx)
-            .w(px(200.))
+            .w(px(180.))
             .on_mouse_down_out(cx.listener(|this, _, _, cx| this.set_account_menu(false, cx)))
             .child(
-                h_flex()
-                    .px_2()
-                    .py_1()
-                    .gap_2()
-                    .child(Icon::new(IconName::Languages).size(IconSize::Small))
-                    .child(Label::new(strings.language).size(LabelSize::Small).color(Color::Muted)),
+                ListItem::new("account-settings")
+                    .start_slot(Icon::new(IconName::Settings))
+                    .child(Label::new(strings.settings))
+                    .on_click(cx.listener(|this, _, window, cx| this.open_settings(window, cx))),
             )
-            .children(Locale::ALL.into_iter().map(|locale| {
-                ListItem::new(locale.code())
-                    .child(Label::new(locale.native_name()))
-                    .when(locale == current, |item| item.end_slot(Label::new("✓").color(Color::Accent)))
-                    .on_click(cx.listener(move |this, _, _, cx| this.set_locale(locale, cx)))
-            }))
             .into_any_element()
+    }
+
+    fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.account_menu_open = false;
+        let settings = cx.new(|cx| SettingsWindow::new(self.store.clone(), cx));
+        cx.subscribe_in(&settings, window, |this, _, event, window, cx| {
+            this.settings = None;
+            if let SettingsEvent::ShowShortcuts = event {
+                this.shortcuts_open = true;
+            }
+            // The default list and the week start show up in the views.
+            this.todo.update(cx, |todo, cx| todo.reload(cx));
+            window.focus(&this.todo.focus_handle(cx), cx);
+            cx.notify();
+        })
+        .detach();
+        window.focus(&settings.focus_handle(cx), cx);
+        self.settings = Some(settings);
+        cx.notify();
     }
 }
 
@@ -462,6 +490,7 @@ impl Render for AppView {
             .on_action(cx.listener(Self::search))
             .on_action(cx.listener(Self::toggle_sidebar))
             .on_action(cx.listener(|this, _: &ShowShortcuts, _, cx| this.toggle_shortcuts(cx)))
+            .on_action(cx.listener(|this, _: &OpenSettings, window, cx| this.open_settings(window, cx)))
             .on_action(cx.listener(|this, _: &ShowInbox, window, cx| this.show_view(fern_core::View::Inbox, window, cx)))
             .on_action(cx.listener(|this, _: &ShowToday, window, cx| this.show_view(fern_core::View::Today, window, cx)))
             .on_action(cx.listener(|this, _: &ShowTomorrow, window, cx| {
@@ -485,6 +514,20 @@ impl Render for AppView {
 
             })
             .when(self.shortcuts_open, |el| el.child(self.render_shortcuts(cx)))
+            .when_some(self.settings.clone(), |el, settings| {
+                el.child(
+                    div()
+                        .id("settings-backdrop")
+                        .absolute()
+                        .inset_0()
+                        .occlude()
+                        .bg(gpui::black().opacity(0.35))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(settings),
+                )
+            })
             .when_some(self.search.clone(), |el, search| {
                 el.child(div().absolute().top(px(160.)).left_0().right_0().flex().justify_center().child(search))
             })

@@ -495,7 +495,7 @@ impl FocusView {
             .child(bars(
                 week,
                 week_top,
-                strings.weekdays_short.iter().map(|d| (*d).to_owned()).collect(),
+                crate::calendar::weekday_labels(&strings.weekdays_short).iter().map(|d| (*d).to_owned()).collect(),
                 (0..7).contains(&today_index).then_some(today_index as usize),
             ));
 
@@ -658,7 +658,7 @@ impl FocusView {
         let done: Vec<std::collections::HashSet<NaiveDate>> =
             habits.iter().map(|h| self.store.checkins(h.id).unwrap_or_default()).collect();
         let week = crate::calendar::week_of(today);
-        let habit_week = h_flex().justify_between().children(week.iter().enumerate().map(|(i, date)| {
+        let habit_week = h_flex().justify_between().children(week.iter().map(|date| {
             let share = if habits.is_empty() { 0. } else { done.iter().filter(|d| d.contains(date)).count() as f32 / habits.len() as f32 };
             v_flex()
                 .items_center()
@@ -672,7 +672,7 @@ impl FocusView {
                         .when(share > 0. && share < 1., |el| el.bg(theme.colors().accent.opacity(0.3)))
                         .when(share >= 1., |el| el.bg(theme.colors().accent.opacity(0.6))),
                 )
-                .child(Label::new(strings.weekdays_short[i]).size(LabelSize::XSmall).color(Color::Muted))
+                .child(Label::new(strings.weekdays_short[date.weekday().num_days_from_monday() as usize]).size(LabelSize::XSmall).color(Color::Muted))
         }));
 
         vec![

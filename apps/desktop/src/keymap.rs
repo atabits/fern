@@ -12,7 +12,7 @@ use serde::Deserialize;
 pub const DEFAULT_KEYMAP_PATH: &str = "keymaps/default.json";
 
 /// Actions shown in the shortcut list, in order; text editing keys are left out.
-pub const LISTED_ACTIONS: [&str; 23] = [
+pub const LISTED_ACTIONS: [&str; 24] = [
     "fern::NewTask",
     "fern::Search",
     "fern::ToggleSidebar",
@@ -21,6 +21,7 @@ pub const LISTED_ACTIONS: [&str; 23] = [
     "fern::ShowTomorrow",
     "fern::ShowNext7Days",
     "fern::ShowShortcuts",
+    "fern::OpenSettings",
     "fern::Quit",
     "task_list::SelectNext",
     "task_list::SelectPrevious",

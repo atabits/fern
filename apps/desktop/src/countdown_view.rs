@@ -305,7 +305,7 @@ impl CountdownView {
                             .on_click(cx.listener(shift(1))),
                     ),
             )
-            .child(h_flex().children(strings.weekdays_narrow.iter().map(|day| {
+            .child(h_flex().children(crate::calendar::weekday_labels(&strings.weekdays_narrow).iter().map(|day| {
                 div().flex_1().flex().justify_center().child(Label::new(*day).size(LabelSize::XSmall).color(Color::Muted))
             })))
             .child(v_flex().children(days))

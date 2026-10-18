@@ -9,7 +9,8 @@
       "secondary-2": "fern::ShowToday",
       "secondary-3": "fern::ShowTomorrow",
       "secondary-4": "fern::ShowNext7Days",
-      "secondary-/": "fern::ShowShortcuts"
+      "secondary-/": "fern::ShowShortcuts",
+      "secondary-,": "fern::OpenSettings"
     }
   },
   {
@@ -33,6 +34,12 @@
       "alt-1": "task_list::PriorityLow",
       "alt-2": "task_list::PriorityMedium",
       "alt-3": "task_list::PriorityHigh"
+    }
+  },
+  {
+    "context": "Settings",
+    "bindings": {
+      "escape": "settings::DismissSettings"
     }
   },
   {

@@ -1,6 +1,5 @@
 //! The color theme. Views read colors through [`ActiveTheme`]: `cx.theme().colors().text`.
-//! Colors are semantic (what an element is), not literal, so a light theme can be added later
-//! without touching the views.
+//! Colors are semantic (what an element is), not literal, so views look right in both themes.
 
 use std::sync::Arc;
 
@@ -98,6 +97,45 @@ impl Theme {
             },
         }
     }
+
+    /// The light theme, after TickTick's default light look.
+    pub fn light() -> Self {
+        Self {
+            name: "Fern Light",
+            colors: ThemeColors {
+                background: rgb(0xffffff).into(),
+                sidebar_background: rgb(0xf1f2f4).into(),
+                panel_background: rgb(0xf7f7f8).into(),
+                surface_background: rgb(0xeff0f2).into(),
+                elevated_surface_background: rgb(0xffffff).into(),
+                border: rgb(0xdcdee3).into(),
+                border_variant: rgb(0xeceef1).into(),
+                element_hover: rgb(0xe7e8ec).into(),
+                element_selected: rgb(0xe3e8fb).into(),
+                ghost_element_hover: rgb(0xf0f1f3).into(),
+                ghost_element_selected: rgb(0xe8ecfb).into(),
+                text: rgb(0x191919).into(),
+                text_muted: rgb(0x8a8d94).into(),
+                text_placeholder: rgb(0xa3a6ad).into(),
+                text_accent: rgb(0x4772fa).into(),
+                icon: rgb(0x3c3e44).into(),
+                icon_muted: rgb(0x8a8d94).into(),
+                checkbox_border: rgb(0x9a9ca3).into(),
+                accent: rgb(0x4772fa).into(),
+                text_selection: rgba(0x4772fa40).into(),
+            },
+            status: StatusColors {
+                error: rgb(0xe03131).into(),
+                warning: rgb(0xf08c00).into(),
+                info: rgb(0x4772fa).into(),
+                success: rgb(0x2f9e44).into(),
+            },
+        }
+    }
+
+    pub fn is_light(&self) -> bool {
+        self.colors.background.l > 0.5
+    }
 }
 
 struct GlobalTheme(Arc<Theme>);
@@ -107,6 +145,11 @@ impl Global for GlobalTheme {}
 /// Installs the default theme. Call once at startup.
 pub fn init(cx: &mut App) {
     cx.set_global(GlobalTheme(Arc::new(Theme::dark())));
+}
+
+/// Replaces the active theme; call `cx.refresh_windows()` afterwards.
+pub fn set(theme: Theme, cx: &mut App) {
+    cx.set_global(GlobalTheme(Arc::new(theme)));
 }
 
 pub trait ActiveTheme {

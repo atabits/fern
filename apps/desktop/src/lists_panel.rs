@@ -409,6 +409,7 @@ pub fn render(
             )
             .into_any_element()
     };
+    let mut tags_block = any_tags.then_some((tags_heading, tag_entries));
     let lists_column = v_flex()
         .id("lists-panel")
         .flex_1()
@@ -438,6 +439,11 @@ pub fn render(
         })
         .when(shows(SmartList::Summary, 1), |el| el.child(smart(View::Summary, strings.summary, IconName::FileText, None)))
         .child(separator())
+        // As the original's: without lists, Tags come before the Lists hint.
+        .when(lists.is_empty(), |el| match tags_block.take() {
+            Some((heading, entries)) => el.child(heading).children(entries),
+            None => el,
+        })
         .child({
             // Dropping a list on the heading puts it first, out of any folder.
             let on_panel = on_panel.clone();
@@ -467,14 +473,15 @@ pub fn render(
                 div()
                     .mx_1()
                     .mb_1()
-                    .p_2()
+                    .px(px(14.))
+                    .py(px(10.))
                     .rounded(px(6.))
                     .bg(colors.surface_background)
-                    .child(Label::new(strings.lists_hint).size(LabelSize::XSmall).color(Color::Muted)),
+                    .child(Label::new(strings.lists_hint).size(LabelSize::Small).color(Color::Muted)),
             )
         })
         .children(list_entries)
-        .when(any_tags, |el| el.child(tags_heading).children(tag_entries))
+        .when_some(tags_block.take(), |el, (heading, entries)| el.child(heading).children(entries))
         // Filters, as in the original: a hint until there is one.
         .when(shows(SmartList::Filters, 1), |el| el.child(
             heading(strings.filters).child(on_hover_only(
@@ -491,10 +498,11 @@ pub fn render(
                 div()
                     .mx_1()
                     .mb_1()
-                    .p_2()
+                    .px(px(14.))
+                    .py(px(10.))
                     .rounded(px(6.))
                     .bg(colors.surface_background)
-                    .child(Label::new(strings.filters_hint).size(LabelSize::XSmall).color(Color::Muted)),
+                    .child(Label::new(strings.filters_hint).size(LabelSize::Small).color(Color::Muted)),
             )
         })
         .children(filters.iter().filter(|_| shows(SmartList::Filters, 1)).map(|(filter, count)| {

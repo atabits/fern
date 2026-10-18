@@ -250,7 +250,7 @@ impl TodoView {
                 Some(("view", "today")) => self.set_view(View::Today, cx),
                 Some(("view", "summary")) => self.set_view(View::Summary, cx),
                 // `summary=<period|status|grouping|fields>` opens a Summary dropdown.
-                Some(("summary", menu)) => self.summary.update(cx, |summary, cx| summary.dev_open(menu, cx)),
+                Some(("summary", menu)) => self.summary.update(cx, |summary, cx| summary.dev_open(menu, window, cx)),
                 Some(("drop", spec)) => {
                     // `drop=<title part>><today|tomorrow|inbox|completed|trash|list:Name|tag:Name>`:
                     // the same path as dropping a task on the lists column.

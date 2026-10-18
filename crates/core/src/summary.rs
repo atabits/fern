@@ -17,6 +17,8 @@ pub enum Period {
     LastWeek,
     ThisMonth,
     LastMonth,
+    /// The original's "Custom": the first and last day, both included.
+    Custom(NaiveDate, NaiveDate),
 }
 
 impl Period {
@@ -49,6 +51,22 @@ impl Period {
             Period::LastMonth => {
                 let first = month - Months::new(1);
                 (first, month_end(first))
+            }
+            Period::Custom(first, last) => (first.min(last), first.max(last)),
+        }
+    }
+
+    /// The period right after this one, of the same kind: "Next Period Tasks".
+    pub fn next_range(self, today: NaiveDate, week_start: Weekday) -> (NaiveDate, NaiveDate) {
+        let (first, last) = self.range(today, week_start);
+        match self {
+            Period::ThisMonth | Period::LastMonth => {
+                let start = first + Months::new(1);
+                (start, start + Months::new(1) - Duration::days(1))
+            }
+            _ => {
+                let length = (last - first).num_days() + 1;
+                (last + Duration::days(1), last + Duration::days(length))
             }
         }
     }
@@ -113,6 +131,10 @@ pub struct SummaryOptions {
     pub grouping: Grouping,
     /// The original's default: completion time (and the title, always shown).
     pub fields: Vec<Field>,
+    /// The original's Lists filter: `None` is "All Lists"; `Some(None)` in the set is the Inbox.
+    pub lists: Option<Vec<Option<Id>>>,
+    /// "Next Period Tasks": add the open tasks due in the following period.
+    pub next_period: bool,
 }
 
 impl Default for SummaryOptions {
@@ -122,6 +144,8 @@ impl Default for SummaryOptions {
             status: StatusFilter::default(),
             grouping: Grouping::default(),
             fields: vec![Field::CompletionTime],
+            lists: None,
+            next_period: false,
         }
     }
 }
@@ -132,6 +156,8 @@ pub enum GroupKey {
     Completed,
     Uncompleted,
     WontDo,
+    /// "Next Period Tasks", after every other group.
+    NextPeriod,
     List(Option<Id>),
     Date(Option<NaiveDate>),
     Tag(Option<String>),
@@ -159,6 +185,7 @@ pub fn summarize(tasks: &[Task], options: &SummaryOptions, today: NaiveDate, wee
     let mut picked: Vec<&Task> = tasks
         .iter()
         .filter(|t| !t.is_deleted())
+        .filter(|t| options.lists.as_ref().is_none_or(|lists| lists.contains(&t.list_id)))
         .filter(|t| report_date(t).is_some_and(|d| d >= first && d <= last))
         .filter(|t| match options.status {
             StatusFilter::All => true,
@@ -202,6 +229,20 @@ pub fn summarize(tasks: &[Task], options: &SummaryOptions, today: NaiveDate, wee
         (GroupKey::Tag(x), GroupKey::Tag(y)) => x.is_none().cmp(&y.is_none()).then(x.cmp(y)),
         (x, y) => x.cmp(y),
     });
+    if options.next_period {
+        let (first, last) = options.period.next_range(today, week_start);
+        let mut next: Vec<Task> = tasks
+            .iter()
+            .filter(|t| !t.is_deleted() && !t.is_closed())
+            .filter(|t| options.lists.as_ref().is_none_or(|lists| lists.contains(&t.list_id)))
+            .filter(|t| t.due_date.is_some_and(|d| d >= first && d <= last))
+            .cloned()
+            .collect();
+        next.sort_by_key(|t| (t.due_date, t.due_time));
+        if !next.is_empty() {
+            groups.push(SummaryGroup { key: GroupKey::NextPeriod, tasks: next });
+        }
+    }
     groups
 }
 
@@ -224,6 +265,35 @@ mod tests {
         assert_eq!(Period::ThisMonth.range(sunday, Weekday::Mon), (d(2026, 10, 1), d(2026, 10, 31)));
         assert_eq!(Period::LastMonth.range(sunday, Weekday::Mon), (d(2026, 9, 1), d(2026, 9, 30)));
         assert_eq!(Period::Yesterday.range(sunday, Weekday::Mon), (d(2026, 10, 17), d(2026, 10, 17)));
+    }
+
+    #[test]
+    fn custom_periods_lists_and_next_period() {
+        let sunday = d(2026, 10, 18);
+        assert_eq!(Period::Custom(d(2026, 10, 20), d(2026, 10, 1)).range(sunday, Weekday::Mon), (d(2026, 10, 1), d(2026, 10, 20)));
+        assert_eq!(Period::ThisWeek.next_range(sunday, Weekday::Mon), (d(2026, 10, 19), d(2026, 10, 25)));
+        assert_eq!(Period::ThisMonth.next_range(sunday, Weekday::Mon), (d(2026, 11, 1), d(2026, 11, 30)));
+
+        let store = Store::open_in_memory().unwrap();
+        let today = Local::now().date_naive();
+        let work = store.create_list("Work").unwrap();
+        let inbox_task = store.add_task("inbox").unwrap();
+        store.set_due(inbox_task.id, Some(today), None).unwrap();
+        let work_task = store.add_task("work").unwrap();
+        store.set_list(work_task.id, Some(work.id)).unwrap();
+        store.set_due(work_task.id, Some(today), None).unwrap();
+        let tomorrow = store.add_task("tomorrow").unwrap();
+        store.set_due(tomorrow.id, Some(today + Duration::days(1)), None).unwrap();
+        let tasks = store.tasks().unwrap();
+
+        let only_work = SummaryOptions { period: Period::Today, lists: Some(vec![Some(work.id)]), ..Default::default() };
+        let groups = summarize(&tasks, &only_work, today, Weekday::Mon);
+        assert_eq!(groups[0].tasks.iter().map(|t| t.title.as_str()).collect::<Vec<_>>(), ["work"]);
+
+        let with_next = SummaryOptions { period: Period::Today, next_period: true, ..Default::default() };
+        let groups = summarize(&tasks, &with_next, today, Weekday::Mon);
+        let last = groups.last().unwrap();
+        assert_eq!((last.key.clone(), last.tasks[0].title.as_str()), (GroupKey::NextPeriod, "tomorrow"));
     }
 
     #[test]

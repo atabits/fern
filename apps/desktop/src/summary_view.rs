@@ -6,18 +6,23 @@ use std::rc::Rc;
 use chrono::{Local, NaiveDate};
 use fern_core::summary::{Field, GroupKey, Grouping, Period, StatusFilter, SummaryGroup, SummaryOptions, summarize};
 use fern_core::{List, Priority, Store, Task};
-use gpui::{ClipboardItem, FontWeight};
+use gpui::{ClipboardItem, Entity, Focusable as _, FontWeight};
 use ui::prelude::*;
 use ui::{Placement, PopoverAttachment, popover};
 
 use crate::calendar;
 use crate::i18n::{self, Strings};
 use crate::task_rows::{local_day, short_date};
+use crate::text_input::{Mode, TextInput};
+
+/// What picking a dropdown option does.
+type Pick = Box<dyn Fn(&mut SummaryView, &mut Window, &mut Context<SummaryView>)>;
 
 /// The open dropdown, if any.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Menu {
     Period,
+    Lists,
     Status,
     Grouping,
     Fields,
@@ -29,6 +34,8 @@ pub struct SummaryView {
     menu: Option<Menu>,
     /// "Copied" shows on the button after a copy.
     copied: bool,
+    /// The "Custom" date fields, while open.
+    custom: Option<(Entity<TextInput>, Entity<TextInput>)>,
 }
 
 /// A rendered summary: the period's heading and each group's heading and lines.
@@ -52,7 +59,10 @@ impl Report {
 }
 
 pub fn period_label(period: Period, today: NaiveDate, strings: &Strings) -> String {
-    let index = Period::ALL.iter().position(|p| *p == period).unwrap_or(0);
+    let Some(index) = Period::ALL.iter().position(|p| *p == period) else {
+        let (first, last) = period.range(today, calendar::week_start());
+        return format!("{} - {}", short_date(first, strings), short_date(last, strings));
+    };
     let name = strings.summary_periods[index];
     match period {
         Period::ThisWeek | Period::NextWeek | Period::LastWeek => {
@@ -68,6 +78,7 @@ fn group_title(key: &GroupKey, lists: &[List], strings: &Strings) -> String {
         GroupKey::Completed => strings.completed.to_owned(),
         GroupKey::Uncompleted => strings.summary_statuses[2].to_owned(),
         GroupKey::WontDo => strings.wont_do.to_owned(),
+        GroupKey::NextPeriod => strings.summary_next_period.to_owned(),
         GroupKey::List(None) => strings.inbox.to_owned(),
         GroupKey::List(Some(id)) => lists.iter().find(|l| l.id == *id).map(|l| l.name.clone()).unwrap_or_default(),
         GroupKey::Date(Some(date)) => short_date(*date, strings),
@@ -132,7 +143,38 @@ pub fn report(groups: &[SummaryGroup], options: &SummaryOptions, lists: &[List],
 
 impl SummaryView {
     pub fn new(store: Rc<Store>) -> Self {
-        Self { store, options: SummaryOptions::default(), menu: None, copied: false }
+        Self { store, options: SummaryOptions::default(), menu: None, copied: false, custom: None }
+    }
+
+    /// "Custom" in the Date menu: Start and End fields with Cancel and Confirm.
+    fn open_custom(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let strings = i18n::t(cx);
+        let today = Local::now().date_naive();
+        let (first, last) = self.options.period.range(today, calendar::week_start());
+        let field = |placeholder: &'static str, date: NaiveDate, cx: &mut Context<Self>| {
+            cx.new(|cx| {
+                let mut input = TextInput::new(Mode::SingleLine, placeholder, cx);
+                input.set_text(calendar::format_date(date, strings), cx);
+                input
+            })
+        };
+        let start = field(strings.summary_start, first, cx);
+        let end = field(strings.summary_end, last, cx);
+        window.focus(&start.focus_handle(cx), cx);
+        self.menu = None;
+        self.custom = Some((start, end));
+        cx.notify();
+    }
+
+    fn confirm_custom(&mut self, cx: &mut Context<Self>) {
+        let Some((start, end)) = &self.custom else { return };
+        let strings = i18n::t(cx);
+        let today = Local::now().date_naive();
+        let parse = |input: &Entity<TextInput>| calendar::parse_date(input.read(cx).text(), today, strings);
+        if let (Some(first), Some(last)) = (parse(start), parse(end)) {
+            self.custom = None;
+            self.update(cx, |o| o.period = Period::Custom(first, last));
+        }
     }
 
     fn set_menu(&mut self, menu: Option<Menu>, cx: &mut Context<Self>) {
@@ -146,16 +188,25 @@ impl SummaryView {
         cx.notify();
     }
 
-    /// Opens a dropdown from the debug-build dev state: `summary=<period|status|grouping|fields>`.
+    /// Opens a dropdown from the debug-build dev state: `summary=<period|lists|status|grouping|fields>`,
+    /// `summary=custom` (the Custom date fields) or `summary=next` (Next Period Tasks on).
     #[cfg(debug_assertions)]
-    pub fn dev_open(&mut self, menu: &str, cx: &mut Context<Self>) {
+    pub fn dev_open(&mut self, menu: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if menu == "custom" {
+            self.open_custom(window, cx);
+            return;
+        }
         self.menu = match menu {
             "period" => Some(Menu::Period),
+            "lists" => Some(Menu::Lists),
             "status" => Some(Menu::Status),
             "grouping" => Some(Menu::Grouping),
             "fields" => Some(Menu::Fields),
             _ => None,
         };
+        if menu == "next" {
+            self.options.next_period = true;
+        }
         cx.notify();
     }
 
@@ -174,7 +225,7 @@ impl SummaryView {
         label: &'static str,
         value: String,
         menu: Menu,
-        options: Vec<(String, bool, Box<dyn Fn(&mut Self, &mut Context<Self>)>)>,
+        options: Vec<(String, bool, Pick)>,
         // Fields stay open to pick several.
         keep_open: bool,
         cx: &mut Context<Self>,
@@ -188,8 +239,8 @@ impl SummaryView {
                 ListItem::new(SharedString::from(format!("summary-option-{i}")))
                     .child(Label::new(label.clone()).color(if *selected { Color::Accent } else { Color::Default }))
                     .when(*selected, |item| item.end_slot(Icon::new(IconName::Check).color(Color::Accent).size(IconSize::Small)))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        (options[i].2)(this, cx);
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        (options[i].2)(this, window, cx);
                         if !keep_open {
                             this.set_menu(None, cx);
                         }
@@ -228,18 +279,58 @@ impl SummaryView {
         let group = || v_flex().py_1().rounded(px(8.)).bg(colors.surface_background);
         let heading = |text: &'static str| div().pt_3().pb_1p5().child(Label::new(text).weight(FontWeight::SEMIBOLD));
 
-        let periods = Period::ALL
+        let mut periods: Vec<(String, bool, Pick)> = Period::ALL
             .into_iter()
             .map(|period| {
-                let pick: Box<dyn Fn(&mut Self, &mut Context<Self>)> = Box::new(move |this, cx| this.update(cx, |o| o.period = period));
+                let pick: Pick = Box::new(move |this, _, cx| this.update(cx, |o| o.period = period));
                 (period_label(period, today, strings), period == options.period, pick)
             })
             .collect();
+        let custom = matches!(options.period, Period::Custom(..));
+        periods.push((
+            strings.summary_custom.to_owned(),
+            custom,
+            Box::new(|this, window, cx| this.open_custom(window, cx)),
+        ));
+        let lists = self.store.lists().unwrap_or_default();
+        let list_label = match &options.lists {
+            None => strings.summary_all_lists.to_owned(),
+            Some(chosen) => chosen
+                .iter()
+                .map(|id| match id {
+                    None => strings.inbox.to_owned(),
+                    Some(id) => lists.iter().find(|l| l.id == *id).map(|l| l.name.clone()).unwrap_or_default(),
+                })
+                .collect::<Vec<_>>()
+                .join(", "),
+        };
+        let mut list_options: Vec<(String, bool, Pick)> = vec![(
+            strings.summary_all_lists.to_owned(),
+            options.lists.is_none(),
+            Box::new(|this, _, cx| this.update(cx, |o| o.lists = None)),
+        )];
+        let choices = std::iter::once((None, strings.inbox.to_owned())).chain(lists.iter().map(|l| (Some(l.id), l.name.clone())));
+        list_options.extend(choices.map(|(id, name)| {
+            let selected = options.lists.as_ref().is_some_and(|chosen| chosen.contains(&id));
+            let pick: Pick = Box::new(move |this, _, cx| {
+                this.update(cx, |o| {
+                    let mut chosen = o.lists.take().unwrap_or_default();
+                    match chosen.iter().position(|c| *c == id) {
+                        Some(i) => {
+                            chosen.remove(i);
+                        }
+                        None => chosen.push(id),
+                    }
+                    o.lists = (!chosen.is_empty()).then_some(chosen);
+                })
+            });
+            (name, selected, pick)
+        }));
         let statuses = StatusFilter::ALL
             .into_iter()
             .zip(strings.summary_statuses)
             .map(|(status, name)| {
-                let pick: Box<dyn Fn(&mut Self, &mut Context<Self>)> = Box::new(move |this, cx| this.update(cx, |o| o.status = status));
+                let pick: Pick = Box::new(move |this, _, cx| this.update(cx, |o| o.status = status));
                 (name.to_owned(), status == options.status, pick)
             })
             .collect();
@@ -247,7 +338,7 @@ impl SummaryView {
             .into_iter()
             .zip(strings.summary_groupings)
             .map(|(grouping, name)| {
-                let pick: Box<dyn Fn(&mut Self, &mut Context<Self>)> = Box::new(move |this, cx| this.update(cx, |o| o.grouping = grouping));
+                let pick: Pick = Box::new(move |this, _, cx| this.update(cx, |o| o.grouping = grouping));
                 (name.to_owned(), grouping == options.grouping, pick)
             })
             .collect();
@@ -255,7 +346,7 @@ impl SummaryView {
             .into_iter()
             .zip(strings.summary_fields)
             .map(|(field, name)| {
-                let pick: Box<dyn Fn(&mut Self, &mut Context<Self>)> = Box::new(move |this, cx| {
+                let pick: Pick = Box::new(move |this, _, cx| {
                     this.update(cx, |o| match o.fields.iter().position(|f| *f == field) {
                         Some(i) => {
                             o.fields.remove(i);
@@ -281,6 +372,53 @@ impl SummaryView {
             .child(
                 group()
                     .child(self.row(strings.summary_date, period_label(options.period, today, strings), Menu::Period, periods, false, cx))
+                    .children(self.custom.clone().map(|(start, end)| {
+                        let field = |input: Entity<TextInput>| {
+                            h_flex().h(px(28.)).px_2().rounded(px(6.)).bg(colors.background).child(input)
+                        };
+                        v_flex()
+                            .mx_3()
+                            .mb_2()
+                            .gap_1p5()
+                            .child(field(start))
+                            .child(field(end))
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .justify_end()
+                                    .child(
+                                        div()
+                                            .id("summary-custom-cancel")
+                                            .px_3()
+                                            .h(px(26.))
+                                            .flex()
+                                            .items_center()
+                                            .rounded(px(6.))
+                                            .border_1()
+                                            .border_color(colors.border)
+                                            .cursor_pointer()
+                                            .child(Label::new(strings.cancel).size(LabelSize::Small))
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.custom = None;
+                                                cx.notify();
+                                            })),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("summary-custom-confirm")
+                                            .px_3()
+                                            .h(px(26.))
+                                            .flex()
+                                            .items_center()
+                                            .rounded(px(6.))
+                                            .bg(colors.accent)
+                                            .cursor_pointer()
+                                            .child(Label::new(strings.confirm).size(LabelSize::Small).color(Color::Custom(gpui::white())))
+                                            .on_click(cx.listener(|this, _, _, cx| this.confirm_custom(cx))),
+                                    ),
+                            )
+                    }))
+                    .child(self.row(strings.summary_lists, list_label, Menu::Lists, list_options, true, cx))
                     .child(self.row(strings.summary_status, strings.summary_statuses[status_index].to_owned(), Menu::Status, statuses, false, cx)),
             )
             .child(heading(strings.summary_display_options))
@@ -295,6 +433,15 @@ impl SummaryView {
                         true,
                         cx,
                     )),
+            )
+            .child(
+                h_flex()
+                    .id("summary-next-period")
+                    .pt_3()
+                    .cursor_pointer()
+                    .child(div().flex_1().child(Label::new(strings.summary_next_period).weight(FontWeight::SEMIBOLD)))
+                    .child(Switch::new().toggle_state(options.next_period))
+                    .on_click(cx.listener(|this, _, _, cx| this.update(cx, |o| o.next_period = !o.next_period))),
             )
     }
 }

@@ -67,6 +67,27 @@ pub fn format_day_month(date: NaiveDate, strings: &Strings) -> String {
     format_date_as(date, DATE_FORMAT.with(Cell::get), strings.dotted_dates, false)
 }
 
+/// A typed date: ISO ("2026-10-18"), or the numeric format dates are shown in, with or without
+/// the year (the current year then).
+pub fn parse_date(text: &str, today: NaiveDate, strings: &Strings) -> Option<NaiveDate> {
+    let text = text.trim();
+    if let Ok(date) = NaiveDate::parse_from_str(text, "%Y-%m-%d") {
+        return Some(date);
+    }
+    let parts: Vec<u32> = text.split(['.', '/', '-']).map(|p| p.trim().parse().ok()).collect::<Option<_>>()?;
+    use fern_core::DateFormat::*;
+    let format = DATE_FORMAT.with(Cell::get).unwrap_or(if strings.dotted_dates { DayMonthYear } else { MonthDayYear });
+    let (y, m, d) = match (format, parts.as_slice()) {
+        (YearMonthDay, &[y, m, d]) => (y as i32, m, d),
+        (DayMonthYear, &[d, m, y]) => (y as i32, m, d),
+        (MonthDayYear, &[m, d, y]) => (y as i32, m, d),
+        (DayMonthYear, &[d, m]) => (today.year(), m, d),
+        (_, &[m, d]) => (today.year(), m, d),
+        _ => return None,
+    };
+    NaiveDate::from_ymd_opt(y, m, d)
+}
+
 pub fn format_date_as(date: NaiveDate, format: Option<fern_core::DateFormat>, dotted: bool, year: bool) -> String {
     use fern_core::DateFormat::*;
     let pattern = match (format, year) {
@@ -295,6 +316,16 @@ mod tests {
         // October 12–18, 2026 is ISO week 42, whichever day the row starts on.
         assert_eq!(week_number(&week_from(d(2026, 10, 18), Weekday::Mon)), 42);
         assert_eq!(week_number(&week_from(d(2026, 10, 14), Weekday::Sun)), 42);
+    }
+
+    #[test]
+    fn parses_typed_dates() {
+        let today = d(2026, 10, 18);
+        assert_eq!(parse_date("2026-11-02", today, &crate::i18n::EN), Some(d(2026, 11, 2)));
+        assert_eq!(parse_date("11/02/2026", today, &crate::i18n::EN), Some(d(2026, 11, 2)));
+        assert_eq!(parse_date("11/2", today, &crate::i18n::EN), Some(d(2026, 11, 2)));
+        assert_eq!(parse_date("2.11.2026", today, &crate::i18n::RU), Some(d(2026, 11, 2)));
+        assert_eq!(parse_date("someday", today, &crate::i18n::EN), None);
     }
 
     #[test]

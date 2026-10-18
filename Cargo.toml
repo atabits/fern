@@ -1,19 +1,33 @@
 [workspace]
 resolver = "3"
-members = ["crates/core", "apps/desktop"]
+members = [
+    "crates/assets",
+    "crates/core",
+    "crates/icons",
+    "crates/theme",
+    "crates/ui",
+    "apps/desktop",
+]
 
 [workspace.package]
 edition = "2024"
 version = "0.1.0"
-license = "MIT"
+license = "AGPL-3.0-or-later"
 
 [workspace.dependencies]
+assets = { path = "crates/assets" }
 fern_core = { path = "crates/core" }
+icons = { path = "crates/icons" }
+theme = { path = "crates/theme" }
+ui = { path = "crates/ui" }
 
 anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 dirs = "6"
+rust-embed = { version = "8", features = ["include-exclude"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
+smallvec = "1"
+strum = { version = "0.27", features = ["derive"] }
 unicode-segmentation = "1"
 uuid = { version = "1", features = ["v7"] }
 

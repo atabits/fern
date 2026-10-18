@@ -1,5 +1,5 @@
 mod app_view;
-mod assets;
+
 mod calendar;
 mod i18n;
 mod lists_panel;
@@ -7,9 +7,7 @@ mod sidebar;
 mod task_detail;
 mod task_rows;
 mod text_input;
-mod theme;
 mod todo_view;
-mod widgets;
 
 use std::rc::Rc;
 
@@ -21,7 +19,7 @@ use gpui::{
 };
 
 use crate::app_view::AppView;
-use crate::assets::Assets;
+use assets::Assets;
 use crate::i18n::{CurrentLocale, Locale};
 
 actions!(fern, [Quit]);
@@ -42,6 +40,7 @@ fn main() -> Result<()> {
         .unwrap_or_default();
 
     gpui_platform::application().with_assets(Assets).run(move |cx: &mut App| {
+        theme::init(cx);
         cx.set_global(CurrentLocale(locale));
         text_input::bind_keys(cx);
         cx.bind_keys([KeyBinding::new("secondary-q", Quit, None)]);

@@ -19,8 +19,9 @@ with mobile clients and sync planned.
 
 ```
 crates/core      shared core: data model, SQLite storage, quick-add parser
+crates/ui        UI components (Zed-style), with crates/theme, crates/icons, crates/assets
 apps/desktop     desktop app built with GPUI (the UI framework behind the Zed editor)
-docs/parity.md   feature parity with TickTick and the roadmap
+docs/            architecture notes and feature parity with TickTick
 ```
 
 The core is meant to be shared by every client: the desktop app uses it directly, and the
@@ -49,5 +50,13 @@ Code, comments, docs and commit messages are in English. UI strings live in
 
 ## License
 
-MIT, see [LICENSE](LICENSE). Icons are from [Lucide](https://lucide.dev) (ISC), see
-`apps/desktop/assets/icons/LICENSE`.
+Fern is free software under the GNU Affero General Public License v3.0 or later
+([LICENSE](LICENSE)). If you distribute a modified version, or run a modified version as a
+network service (for example, a sync server), you must make its source code available under
+the same license.
+
+Third-party components:
+
+- [GPUI](https://github.com/zed-industries/zed) — Apache-2.0. `apps/desktop/src/text_input.rs`
+  started from GPUI's `examples/input.rs`.
+- Icons from [Lucide](https://lucide.dev) — ISC, see `assets/icons/LICENSE`.

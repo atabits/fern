@@ -1,0 +1,11 @@
+[package]
+name = "icons"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/icons.rs"
+
+[dependencies]
+strum.workspace = true

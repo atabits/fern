@@ -1,15 +1,16 @@
 //! The lists column between the narrow sidebar and the task list, modeled on TickTick's.
 
 use fern_core::{List, Tag, View, ViewCounts};
-use gpui::{
-    AnyElement, App, ClickEvent, IntoElement, ParentElement, Rgba, SharedString, Styled, Window,
-    div, prelude::*, px, rgb, svg,
-};
+use gpui::{ClickEvent, rgb};
+use ui::prelude::*;
 
 use crate::i18n::Strings;
-use crate::theme;
 
 pub const WIDTH: f32 = 212.;
+
+/// Colors offered for lists, as stored in the database.
+pub const LIST_COLORS: [&str; 8] =
+    ["#EF4444", "#F97316", "#EAB308", "#22C55E", "#06B6D4", "#3B82F6", "#A855F7", "#EC4899"];
 
 /// The title of a view for the list header.
 pub fn title(view: &View, lists: &[List], strings: &Strings) -> SharedString {
@@ -27,12 +28,16 @@ pub fn title(view: &View, lists: &[List], strings: &Strings) -> SharedString {
     }
 }
 
-/// A tag or list color from `#RRGGBB`; neutral gray when unset or invalid.
-pub fn color(value: Option<&str>) -> Rgba {
+/// A tag or list color parsed from `#RRGGBB`.
+pub fn parse_color(value: Option<&str>) -> Option<Hsla> {
     value
         .and_then(|c| u32::from_str_radix(c.trim_start_matches('#'), 16).ok())
-        .map(rgb)
-        .unwrap_or_else(theme::text_muted)
+        .map(|c| rgb(c).into())
+}
+
+/// A tag or list color, or the muted text color when unset.
+pub fn color(value: Option<&str>, cx: &App) -> Hsla {
+    parse_color(value).unwrap_or(cx.theme().colors().text_muted)
 }
 
 pub struct Props<'a> {
@@ -49,86 +54,76 @@ pub fn render(
     props: Props,
     on_select: impl Fn(View, &mut Window, &mut App) + Clone + 'static,
     on_add_list: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    cx: &App,
 ) -> impl IntoElement {
     let Props { active, counts, lists, tags, strings, new_list_input } = props;
+    let colors = cx.theme().colors();
 
-    let item = |id: String, view: View, label: SharedString, icon: &'static str, count: Option<usize>, dot: Option<Rgba>| {
+    let item = |id: String,
+                view: View,
+                label: SharedString,
+                icon: IconName,
+                count: Option<usize>,
+                dot: Option<Hsla>| {
         let on_select = on_select.clone();
-        let selected = &view == active;
-        div()
-            .id(SharedString::from(id))
-            .h(px(36.))
-            .flex_none()
-            .flex()
-            .items_center()
-            .gap_2()
-            .px_3()
-            .rounded(px(6.))
-            .cursor_pointer()
-            .when(selected, |el| el.bg(theme::row_selected()))
-            .when(!selected, |el| el.hover(|s| s.bg(theme::row_hover())))
+        ListItem::new(SharedString::from(id))
+            .height(px(36.))
+            .toggle_state(&view == active)
+            .start_slot(Icon::new(icon))
+            .child(Label::new(label).truncate())
+            .end_slot(
+                h_flex()
+                    .gap_2()
+                    .when_some(dot, |el, color| el.child(div().size(px(6.)).rounded_full().bg(color)))
+                    .when_some(count.filter(|c| *c > 0), |el, count| {
+                        el.child(
+                            div().min_w(px(18.)).flex().justify_end().child(
+                                Label::new(count.to_string()).size(LabelSize::Small).color(Color::Muted),
+                            ),
+                        )
+                    }),
+            )
             .on_click(move |_, window, cx| on_select(view.clone(), window, cx))
-            .child(svg().path(icon).size(px(16.)).flex_none().text_color(theme::text_muted()))
-            .child(div().flex_1().min_w_0().truncate().child(label))
-            .when_some(dot, |el, color| el.child(div().size(px(6.)).rounded_full().bg(color)))
-            .when_some(count.filter(|c| *c > 0), |el, count| {
-                el.child(
-                    div()
-                        .min_w(px(18.))
-                        .flex()
-                        .justify_end()
-                        .text_xs()
-                        .text_color(theme::text_muted())
-                        .child(count.to_string()),
-                )
-            })
     };
-    let smart = |view: View, label: &'static str, icon: &'static str, count: Option<usize>| {
+    let smart = |view: View, label: &'static str, icon: IconName, count: Option<usize>| {
         item(format!("view-{label}"), view, label.into(), icon, count, None)
     };
-
-    let separator = || div().my_2().mx_3().h(px(1.)).flex_none().bg(theme::border());
+    let separator = || div().my_2().mx_2().child(Divider::horizontal());
     let heading = |text: &'static str| {
-        div()
+        h_flex()
             .h(px(28.))
-            .px_3()
-            .flex()
-            .items_center()
-            .text_xs()
-            .font_weight(gpui::FontWeight::MEDIUM)
-            .text_color(theme::text_muted())
-            .child(div().flex_1().child(text))
+            .px_2()
+            .child(div().flex_1().child(Label::new(text).size(LabelSize::Small).color(Color::Muted)))
     };
 
-    div()
+    v_flex()
         .id("lists-panel")
         .flex_none()
         .w(px(WIDTH))
         .h_full()
         .overflow_y_scroll()
-        .flex()
-        .flex_col()
         .px_2()
         .py_2()
-        .bg(theme::lists_panel())
+        .bg(colors.panel_background)
         .border_r_1()
-        .border_color(theme::border())
-        .child(smart(View::Inbox, strings.inbox, "icons/inbox.svg", Some(counts.inbox)))
-        .child(smart(View::All, strings.all, "icons/layers.svg", Some(counts.all)))
-        .child(smart(View::Today, strings.today, "icons/calendar-check.svg", Some(counts.today)))
-        .child(smart(View::Tomorrow, strings.tomorrow, "icons/sunrise.svg", Some(counts.tomorrow)))
-        .child(smart(View::Next7Days, strings.next_7_days_short, "icons/calendar-range.svg", Some(counts.next_7_days)))
+        .border_color(colors.border)
+        .child(smart(View::Inbox, strings.inbox, IconName::Inbox, Some(counts.inbox)))
+        .child(smart(View::All, strings.all, IconName::Layers, Some(counts.all)))
+        .child(smart(View::Today, strings.today, IconName::CalendarCheck, Some(counts.today)))
+        .child(smart(View::Tomorrow, strings.tomorrow, IconName::Sunrise, Some(counts.tomorrow)))
+        .child(smart(
+            View::Next7Days,
+            strings.next_7_days_short,
+            IconName::CalendarRange,
+            Some(counts.next_7_days),
+        ))
         .child(separator())
         .child(
             heading(strings.lists).child(
-                div()
-                    .id("add-list")
-                    .p_0p5()
-                    .rounded(px(4.))
-                    .cursor_pointer()
-                    .hover(|s| s.bg(theme::surface_hover()))
-                    .on_click(on_add_list)
-                    .child(svg().path("icons/plus.svg").size(px(14.)).text_color(theme::text_muted())),
+                IconButton::new("add-list", IconName::Plus)
+                    .size(px(20.))
+                    .icon_size(IconSize::Small)
+                    .on_click(on_add_list),
             ),
         )
         .children(lists.iter().map(|list| {
@@ -136,22 +131,20 @@ pub fn render(
                 format!("list-{}", list.id),
                 View::List(list.id),
                 list.name.clone().into(),
-                "icons/list.svg",
+                IconName::List,
                 Some(list.open_count),
-                list.color.as_deref().map(|c| color(Some(c))),
+                parse_color(list.color.as_deref()),
             )
         }))
         .children(new_list_input.map(|input| {
-            div()
+            h_flex()
                 .h(px(36.))
                 .flex_none()
-                .flex()
-                .items_center()
                 .gap_2()
-                .px_3()
+                .px_2()
                 .rounded(px(6.))
-                .bg(theme::surface())
-                .child(svg().path("icons/list.svg").size(px(16.)).flex_none().text_color(theme::text_muted()))
+                .bg(colors.surface_background)
+                .child(Icon::new(IconName::List))
                 .child(input)
         }))
         .child(separator())
@@ -162,12 +155,12 @@ pub fn render(
                         format!("tag-{}", tag.name),
                         View::Tag(tag.name.clone()),
                         tag.name.clone().into(),
-                        "icons/tag.svg",
+                        IconName::Tag,
                         Some(tag.open_count),
-                        Some(color(tag.color.as_deref())),
+                        Some(color(tag.color.as_deref(), cx)),
                     )
                 }))
                 .child(separator())
         })
-        .child(smart(View::Completed, strings.completed, "icons/square-check-big.svg", None))
+        .child(smart(View::Completed, strings.completed, IconName::SquareCheckBig, None))
 }

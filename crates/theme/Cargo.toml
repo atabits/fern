@@ -1,0 +1,11 @@
+[package]
+name = "theme"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/theme.rs"
+
+[dependencies]
+gpui.workspace = true

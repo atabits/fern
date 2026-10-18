@@ -14,7 +14,7 @@ use gpui::{
 };
 use unicode_segmentation::*;
 
-use crate::theme;
+use theme::ActiveTheme;
 
 actions!(
     text_input,
@@ -685,11 +685,15 @@ impl IntoElement for TextElement {
 }
 
 /// The text to display and its style runs (placeholder, IME underline).
-fn display_runs(input: &TextInput, window: &Window) -> (SharedString, Vec<TextRun>, bool) {
+fn display_runs(
+    input: &TextInput,
+    window: &Window,
+    placeholder_color: gpui::Hsla,
+) -> (SharedString, Vec<TextRun>, bool) {
     let style = window.text_style();
     let is_placeholder = input.content.is_empty();
     let (text, color) = if is_placeholder {
-        (input.placeholder.clone(), theme::text_muted().into())
+        (input.placeholder.clone(), placeholder_color)
     } else {
         (input.content.clone(), style.color)
     };
@@ -759,6 +763,7 @@ impl Element for TextElement {
         let mut style = Style::default();
         style.size.width = relative(1.).into();
         let line_height = window.line_height();
+        let placeholder_color = cx.theme().colors().text_placeholder;
         let input = self.input.read(cx);
         if !input.mode.wraps() {
             style.size.height = line_height.into();
@@ -766,7 +771,7 @@ impl Element for TextElement {
         }
 
         // The height depends on the width, so it is measured during layout.
-        let (text, runs, _) = display_runs(input, window);
+        let (text, runs, _) = display_runs(input, window, placeholder_color);
         let font_size = window.text_style().font_size.to_pixels(window.rem_size());
         let layout_id = window.request_measured_layout(style, move |known, available, window, _| {
             let width = known.width.or(match available.width {
@@ -793,9 +798,10 @@ impl Element for TextElement {
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
+        let theme = cx.theme().clone();
         let input = self.input.read(cx);
         let line_height = window.line_height();
-        let (text, runs, is_placeholder) = display_runs(input, window);
+        let (text, runs, is_placeholder) = display_runs(input, window, theme.colors().text_placeholder);
         let font_size = window.text_style().font_size.to_pixels(window.rem_size());
         let wrap_width = input.mode.wraps().then_some(bounds.size.width);
         let lines = shape(text, &runs, font_size, wrap_width, window);
@@ -818,7 +824,7 @@ impl Element for TextElement {
             let position = layout.position_for_offset(input.cursor_offset());
             cursor = Some(fill(
                 Bounds::new(bounds.origin + position, size(px(2.), line_height)),
-                theme::accent(),
+                theme.colors().accent,
             ));
         } else {
             let start = layout.position_for_offset(selected_range.start);
@@ -829,7 +835,7 @@ impl Element for TextElement {
                         bounds.origin + from,
                         bounds.origin + point(to_x, from.y + line_height),
                     ),
-                    theme::selection(),
+                    theme.colors().text_selection,
                 )
             };
             if start.y == end.y {

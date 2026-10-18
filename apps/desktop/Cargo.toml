@@ -9,7 +9,11 @@ name = "fern"
 path = "src/main.rs"
 
 [dependencies]
+assets.workspace = true
 fern_core.workspace = true
+icons.workspace = true
+theme.workspace = true
+ui.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 dirs.workspace = true

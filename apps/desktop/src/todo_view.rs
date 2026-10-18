@@ -1,20 +1,17 @@
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
-use fern_core::{Id, Kind, List, Priority, Store, Tag, Task, View, ViewCounts};
+use fern_core::{Id, Kind, List, Store, Tag, Task, View, ViewCounts};
 use chrono::{Duration, Local, NaiveDate};
-use gpui::{
-    AnyElement, Context, Entity, FocusHandle, Focusable, MouseButton, Rgba, SharedString, Window,
-    div, prelude::*, px, svg,
-};
+use gpui::{ElementId, Entity, FocusHandle, Focusable, FontWeight, MouseButton};
+use ui::prelude::*;
+use ui::{Placement, PopoverAttachment, popover};
 
 use crate::i18n::{self, CurrentLocale, Strings};
-use crate::lists_panel;
+use crate::lists_panel::{self, LIST_COLORS};
 use crate::task_detail::{TaskDetail, TaskUpdated};
 use crate::task_rows::{self, Row, Section};
 use crate::text_input::{Cancelled, Mode, Submitted, TextInput};
-use crate::theme;
-use crate::widgets::{self, Placement};
 
 const DETAIL_WIDTH: f32 = 400.;
 const ROW_HEIGHT: f32 = 40.;
@@ -373,22 +370,15 @@ impl TodoView {
         strings: &Strings,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        div()
+        h_flex()
             .id(SharedString::from(format!("group-{section:?}")))
             .h(px(36.))
-            .flex()
-            .items_center()
             .gap_1()
             .cursor_pointer()
             .on_click(cx.listener(move |this, _, _, cx| this.toggle_section(section, cx)))
             .child(chevron(collapsed))
-            .child(
-                div()
-                    .font_weight(gpui::FontWeight::BOLD)
-                    .text_size(px(13.))
-                    .child(section.title(strings)),
-            )
-            .child(div().pl_1().text_xs().text_color(theme::text_muted()).child(count.to_string()))
+            .child(Label::new(section.title(strings)).weight(FontWeight::BOLD))
+            .child(div().pl_1().child(Label::new(count.to_string()).size(LabelSize::Small).color(Color::Muted)))
             .into_any_element()
     }
 
@@ -399,57 +389,43 @@ impl TodoView {
         depth: usize,
         has_children: bool,
         collapsed: bool,
-        tag_colors: &HashMap<String, Rgba>,
+        tag_colors: &HashMap<String, Hsla>,
         today: NaiveDate,
         strings: &Strings,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let theme = cx.theme().clone();
         let id = task.id;
         let done = task.is_completed();
         let selected = self.selected == Some(id);
         let group = format!("task-{id}");
 
         let marker = if task.kind == Kind::Note {
-            div()
-                .id("marker")
-                .flex_none()
-                .child(svg().path("icons/file-text.svg").size(px(16.)).text_color(theme::checkbox()))
+            Icon::new(IconName::FileText).into_any_element()
         } else {
-            let color = if done { theme::accent() } else { theme::priority(task.priority) };
-            div()
-                .id("marker")
-                .size(px(16.))
-                .flex_none()
-                .rounded(px(3.))
-                .border_1()
-                .border_color(color)
-                .when(done, |el| el.bg(theme::accent()))
-                .when(!done && task.priority != Priority::None, |el| el.bg(color.opacity(0.15)))
-                .flex()
-                .items_center()
-                .justify_center()
-                .text_xs()
-                .text_color(theme::background())
-                .when(done, |el| el.child("✓"))
+            Checkbox::new("marker")
+                .toggle_state(done)
+                .tint(task_rows::priority_color(task.priority, &theme))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     cx.stop_propagation();
                     this.toggle(id, !done, cx);
                 }))
+                .into_any_element()
         };
 
         let due = task.due_date.map(|date| task_rows::due_label(date, task.due_time, today, strings));
 
         // The separator starts at the checkbox; the gutter to its left holds the chevron.
         div()
-            .id(gpui::ElementId::Uuid(id))
+            .id(ElementId::Uuid(id))
             .group(group.clone())
             .h(px(ROW_HEIGHT))
             .flex()
             .pl(px(depth as f32 * INDENT))
             .rounded(px(6.))
             .cursor_pointer()
-            .when(selected, |el| el.bg(theme::row_selected()))
-            .when(!selected, |el| el.hover(|s| s.bg(theme::row_hover())))
+            .when(selected, |el| el.bg(theme.colors().ghost_element_selected))
+            .when(!selected, |el| el.hover(|s| s.bg(theme.colors().ghost_element_hover)))
             .on_click(cx.listener(move |this, _, _, cx| this.select(id, cx)))
             .child(
                 div()
@@ -468,54 +444,49 @@ impl TodoView {
                     }),
             )
             .child(
-                div()
+                h_flex()
                     .flex_1()
                     .min_w_0()
                     .h_full()
-                    .flex()
-                    .items_center()
                     .gap(px(10.))
                     .pr_3()
                     .border_b_1()
-                    .border_color(theme::row_separator())
+                    .border_color(theme.colors().border_variant)
                     .child(marker)
                     .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .when(done, |el| el.line_through().text_color(theme::text_muted()))
-                            .when(task.title.is_empty(), |el| el.text_color(theme::text_muted()))
-                            .child(if task.title.is_empty() {
-                                strings.untitled.to_owned()
+                        div().flex_1().min_w_0().child(
+                            Label::new(if task.title.is_empty() {
+                                SharedString::new_static(strings.untitled)
                             } else {
-                                task.title.clone()
-                            }),
+                                task.title.clone().into()
+                            })
+                            .color(if done || task.title.is_empty() { Color::Muted } else { Color::Default })
+                            .strikethrough(done)
+                            .truncate(),
+                        ),
                     )
                     .children(task.tags.iter().map(|tag| {
-                        let color = tag_colors.get(tag).copied().unwrap_or_else(theme::text_muted);
-                        widgets::tag_chip(tag, color)
+                        let color = tag_colors.get(tag).copied().unwrap_or(theme.colors().text_muted);
+                        Chip::new(tag.clone(), color)
                     }))
                     .when_some(task.checklist, |el, (done_items, total)| {
                         el.child(
-                            div()
+                            h_flex()
                                 .flex_none()
-                                .flex()
-                                .items_center()
                                 .gap_1()
-                                .text_xs()
-                                .text_color(theme::text_muted())
-                                .child(svg().path("icons/list-checks.svg").size(px(12.)).text_color(theme::text_muted()))
-                                .child(format!("{done_items}/{total}")),
+                                .child(Icon::new(IconName::ListChecks).size(IconSize::XSmall))
+                                .child(
+                                    Label::new(format!("{done_items}/{total}"))
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted),
+                                ),
                         )
                     })
                     .when_some(due, |el, (label, overdue)| {
                         el.child(
-                            div()
-                                .flex_none()
-                                .text_xs()
-                                .text_color(if overdue && !done { theme::danger() } else { theme::accent() })
-                                .child(label),
+                            Label::new(label)
+                                .size(LabelSize::Small)
+                                .color(if overdue && !done { Color::Error } else { Color::Accent }),
                         )
                     })
                     .child(
@@ -523,10 +494,10 @@ impl TodoView {
                             .id("delete")
                             .flex_none()
                             .px_1()
-                            .text_color(theme::text_muted())
+                            .text_color(theme.colors().text_muted)
                             .opacity(0.)
                             .group_hover(group, |s| s.opacity(1.))
-                            .hover(|s| s.text_color(theme::danger()))
+                            .hover(|s| s.text_color(theme.status().error))
                             .child("✕")
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 cx.stop_propagation();
@@ -539,7 +510,7 @@ impl TodoView {
 
     fn render_header_menu(&self, strings: &Strings, cx: &mut Context<Self>) -> AnyElement {
         let in_list = matches!(self.view, View::List(_));
-        widgets::popover_frame()
+        popover(cx)
             .w(px(236.))
             .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                 this.header_menu_open = false;
@@ -548,77 +519,64 @@ impl TodoView {
             .when(in_list, |el| {
                 let current = self.current_list().and_then(|l| l.color.clone());
                 el.child(
-                    widgets::menu_item("rename-list")
-                        .child(svg().path("icons/pencil.svg").size(px(16.)).text_color(theme::text_muted()))
-                        .child(strings.rename_list)
+                    ListItem::new("rename-list")
+                        .start_slot(Icon::new(IconName::Pencil))
+                        .child(Label::new(strings.rename_list))
                         .on_click(cx.listener(|this, _, window, cx| this.start_rename(window, cx))),
                 )
-                .child(div().px_2().pt_1().text_xs().text_color(theme::text_muted()).child(strings.color))
+                .child(div().px_2().pt_1().child(Label::new(strings.color).size(LabelSize::Small).color(Color::Muted)))
                 .child(
-                    div()
+                    h_flex()
                         .px_2()
                         .py_1()
-                        .flex()
                         .flex_wrap()
                         .gap_1p5()
                         .child(
-                            color_swatch("color-none", None, current.is_none())
+                            color_swatch("color-none", None, current.is_none(), cx)
                                 .on_click(cx.listener(|this, _, _, cx| this.set_current_list_color(None, cx))),
                         )
-                        .children(theme::LIST_COLORS.into_iter().map(|color| {
-                            color_swatch(color, Some(color), current.as_deref() == Some(color)).on_click(
+                        .children(LIST_COLORS.into_iter().map(|color| {
+                            color_swatch(color, Some(color), current.as_deref() == Some(color), cx).on_click(
                                 cx.listener(move |this, _, _, cx| this.set_current_list_color(Some(color), cx)),
                             )
                         })),
                 )
-                .child(div().my_1().h(px(1.)).bg(theme::border()))
+                .child(div().my_1().child(Divider::horizontal()))
                 .child(
-                    widgets::menu_item("delete-list")
-                        .text_color(theme::danger())
-                        .child(svg().path("icons/trash-2.svg").size(px(16.)).text_color(theme::danger()))
-                        .child(strings.delete_list)
+                    ListItem::new("delete-list")
+                        .start_slot(Icon::new(IconName::Trash).color(Color::Error))
+                        .child(Label::new(strings.delete_list).color(Color::Error))
                         .on_click(cx.listener(|this, _, _, cx| this.delete_current_list(cx))),
                 )
             })
             .when(!in_list, |el| {
-                el.child(div().px_2().py_1().text_color(theme::text_muted()).child(strings.no_actions))
+                el.child(div().px_2().py_1().child(Label::new(strings.no_actions).color(Color::Muted)))
             })
             .into_any_element()
     }
 }
 
 /// A round color option; `None` is "no color", drawn as an outlined circle.
-fn color_swatch(id: &'static str, color: Option<&str>, selected: bool) -> gpui::Stateful<gpui::Div> {
+fn color_swatch(id: &'static str, color: Option<&str>, selected: bool, cx: &App) -> Stateful<Div> {
+    let colors = cx.theme().colors();
+    let ring = if selected { colors.text } else { gpui::transparent_black() };
     div()
         .id(id)
         .size(px(18.))
         .rounded_full()
         .cursor_pointer()
-        .border_2()
-        .border_color(if selected { theme::text() } else { gpui::transparent_black().into() })
-        .map(|el| match color {
-            Some(color) => el.bg(lists_panel::color(Some(color))),
-            None => el.border_1().border_color(if selected { theme::text() } else { theme::text_muted() }),
+        .map(|el| match lists_panel::parse_color(color) {
+            Some(fill) => el.bg(fill).border_2().border_color(ring),
+            None => el.border_1().border_color(if selected { colors.text } else { colors.text_muted }),
         })
 }
 
-fn chevron(collapsed: bool) -> impl IntoElement {
-    let path = if collapsed { "icons/chevron-right.svg" } else { "icons/chevron-down.svg" };
-    svg().path(path).size(px(12.)).flex_none().text_color(theme::text_muted())
-}
-
-fn header_icon(id: &'static str, path: &'static str) -> gpui::Stateful<gpui::Div> {
-    div()
-        .id(id)
-        .p_1()
-        .rounded_md()
-        .cursor_pointer()
-        .hover(|s| s.bg(theme::surface_hover()))
-        .child(svg().path(path).size(px(18.)).text_color(theme::text_muted()))
+fn chevron(collapsed: bool) -> Icon {
+    Icon::new(if collapsed { IconName::ChevronRight } else { IconName::ChevronDown }).size(IconSize::XSmall)
 }
 
 impl Focusable for TodoView {
-    fn focus_handle(&self, cx: &gpui::App) -> FocusHandle {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
         self.input.focus_handle(cx)
     }
 }
@@ -626,12 +584,13 @@ impl Focusable for TodoView {
 impl Render for TodoView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let strings = i18n::t(cx);
+        let theme = cx.theme().clone();
         let input_focus = self.input.focus_handle(cx);
         let today = Self::today();
-        let tag_colors: HashMap<String, Rgba> = self
+        let tag_colors: HashMap<String, Hsla> = self
             .tags
             .iter()
-            .map(|t| (t.name.clone(), lists_panel::color(t.color.as_deref())))
+            .map(|t| (t.name.clone(), lists_panel::color(t.color.as_deref(), cx)))
             .collect();
         let rows = task_rows::build_rows(&self.tasks, &self.collapsed_tasks, &self.collapsed_sections);
         let rows: Vec<_> = rows
@@ -653,50 +612,47 @@ impl Render for TodoView {
             })
             .collect();
 
-        let list = div()
+        let list = v_flex()
             .flex_1()
             .min_w_0()
             .h_full()
-            .flex()
-            .flex_col()
             .child(
-                div()
+                h_flex()
                     .h(px(60.))
                     .flex_none()
-                    .flex()
-                    .items_center()
                     .gap_2()
                     .pl(px(24.))
                     .pr(px(16.))
                     .child(
-                        header_icon("toggle-sidebar", "icons/panel-left.svg")
+                        IconButton::new("toggle-sidebar", IconName::PanelLeft)
                             .on_click(cx.listener(|this, _, _, cx| this.toggle_lists(cx))),
                     )
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
-                            .truncate()
                             .text_size(px(20.))
-                            .font_weight(gpui::FontWeight::BOLD)
+                            .font_weight(FontWeight::BOLD)
                             .map(|el| {
                                 if self.renaming_list {
                                     el.child(self.rename_input.clone())
                                 } else {
-                                    el.child(lists_panel::title(&self.view, &self.lists, strings))
+                                    el.truncate().child(lists_panel::title(&self.view, &self.lists, strings))
                                 }
                             }),
                     )
-                    .child(header_icon("sort", "icons/arrow-down-up.svg"))
+                    .child(IconButton::new("sort", IconName::ArrowDownUp))
                     .child(
-                        header_icon("more", "icons/ellipsis.svg")
+                        div()
                             .relative()
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.header_menu_open = true;
-                                cx.notify();
-                            }))
+                            .child(IconButton::new("more", IconName::Ellipsis).on_click(cx.listener(
+                                |this, _, _, cx| {
+                                    this.header_menu_open = true;
+                                    cx.notify();
+                                },
+                            )))
                             .when(self.header_menu_open, |el| {
-                                el.child(widgets::popover(
+                                el.child(PopoverAttachment::new(
                                     Placement::BelowRight,
                                     self.render_header_menu(strings, cx),
                                 ))
@@ -704,21 +660,19 @@ impl Render for TodoView {
                     ),
             )
             .child(
-                div()
+                h_flex()
                     .mx_2()
                     .mb_2()
                     .h(px(38.))
                     .flex_none()
-                    .flex()
-                    .items_center()
                     .gap_2()
                     .px_3()
                     .rounded(px(6.))
-                    .bg(theme::surface())
+                    .bg(theme.colors().surface_background)
                     .on_mouse_down(MouseButton::Left, move |_, window, cx| {
                         window.focus(&input_focus, cx);
                     })
-                    .child(svg().path("icons/plus.svg").size(px(16.)).flex_none().text_color(theme::text_muted()))
+                    .child(Icon::new(IconName::Plus))
                     .child(self.input.clone()),
             )
             .child(
@@ -729,17 +683,14 @@ impl Render for TodoView {
                     .px_2()
                     .pb_4()
                     .when(self.tasks.is_empty(), |el| {
-                        el.child(
-                            div()
-                                .px_3()
-                                .pt_8()
-                                .text_color(theme::text_muted())
-                                .child(if self.view == View::Completed {
-                                    strings.no_completed_tasks
-                                } else {
-                                    strings.no_tasks
-                                }),
-                        )
+                        el.child(div().px_3().pt_8().child(
+                            Label::new(if self.view == View::Completed {
+                                strings.no_completed_tasks
+                            } else {
+                                strings.no_tasks
+                            })
+                            .color(Color::Muted),
+                        ))
                     })
                     .children(rows),
             )
@@ -749,23 +700,22 @@ impl Render for TodoView {
                         .px_6()
                         .py_2()
                         .border_t_1()
-                        .border_color(theme::border())
-                        .text_color(theme::danger())
-                        .child(error),
+                        .border_color(theme.colors().border)
+                        .child(Label::new(error).color(Color::Error)),
                 )
             });
 
         let this = cx.entity().downgrade();
-        let on_select = move |view, _: &mut Window, cx: &mut gpui::App| {
+        let on_select = move |view, _: &mut Window, cx: &mut App| {
             this.update(cx, |this, cx| this.set_view(view, cx)).ok();
         };
         let on_add_list = cx.listener(|this, _, window, cx| this.start_new_list(window, cx));
 
-        div()
+        h_flex()
             .size_full()
-            .flex()
-            .bg(theme::background())
-            .text_color(theme::text())
+            .items_start()
+            .bg(theme.colors().background)
+            .text_color(theme.colors().text)
             .text_size(px(14.))
             .when(self.show_lists, |el| {
                 el.child(lists_panel::render(
@@ -779,6 +729,7 @@ impl Render for TodoView {
                     },
                     on_select,
                     on_add_list,
+                    cx,
                 ))
             })
             .child(list)

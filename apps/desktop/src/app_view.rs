@@ -1,18 +1,17 @@
 use std::rc::Rc;
 
 use fern_core::Store;
-use gpui::{AnyElement, Context, Entity, Window, div, prelude::*, px, svg};
+use ui::prelude::*;
+use ui::{Placement, PopoverAttachment, popover};
 
 use crate::i18n::{self, CurrentLocale, Locale};
 use crate::sidebar::{self, Section};
-use crate::theme;
 use crate::todo_view::TodoView;
-use crate::widgets::{self, Placement};
 
 pub struct AppView {
     store: Rc<Store>,
     section: Section,
-    todo: Entity<TodoView>,
+    todo: gpui::Entity<TodoView>,
     account_menu_open: bool,
 }
 
@@ -44,25 +43,21 @@ impl AppView {
     fn render_account_menu(&self, cx: &mut Context<Self>) -> AnyElement {
         let current = i18n::locale(cx);
         let strings = i18n::t(cx);
-        widgets::popover_frame()
+        popover(cx)
             .w(px(200.))
             .on_mouse_down_out(cx.listener(|this, _, _, cx| this.set_account_menu(false, cx)))
             .child(
-                div()
+                h_flex()
                     .px_2()
                     .py_1()
-                    .flex()
-                    .items_center()
                     .gap_2()
-                    .text_xs()
-                    .text_color(theme::text_muted())
-                    .child(svg().path("icons/languages.svg").size(px(14.)).text_color(theme::text_muted()))
-                    .child(strings.language),
+                    .child(Icon::new(IconName::Languages).size(IconSize::Small))
+                    .child(Label::new(strings.language).size(LabelSize::Small).color(Color::Muted)),
             )
             .children(Locale::ALL.into_iter().map(|locale| {
-                widgets::menu_item(locale.code())
-                    .child(div().flex_1().child(locale.native_name()))
-                    .when(locale == current, |el| el.child(div().text_color(theme::accent()).child("✓")))
+                ListItem::new(locale.code())
+                    .child(Label::new(locale.native_name()))
+                    .when(locale == current, |item| item.end_slot(Label::new("✓").color(Color::Accent)))
                     .on_click(cx.listener(move |this, _, _, cx| this.set_locale(locale, cx)))
             }))
             .into_any_element()
@@ -72,33 +67,32 @@ impl AppView {
 impl Render for AppView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let strings = i18n::t(cx);
+        let theme = cx.theme().clone();
         let this = cx.entity().downgrade();
-        let on_select = move |section, _: &mut Window, cx: &mut gpui::App| {
+        let on_select = move |section, _: &mut Window, cx: &mut App| {
             this.update(cx, |this, cx| this.select(section, cx)).ok();
         };
         let on_avatar = cx.listener(|this, _, _, cx| this.set_account_menu(true, cx));
-        let account_menu = self
-            .account_menu_open
-            .then(|| widgets::popover(Placement::RightTop, self.render_account_menu(cx)).into_any_element());
+        let account_menu = self.account_menu_open.then(|| {
+            PopoverAttachment::new(Placement::RightTop, self.render_account_menu(cx)).into_any_element()
+        });
 
-        div()
+        h_flex()
             .size_full()
-            .flex()
-            .bg(theme::background())
-            .text_color(theme::text())
-            .child(sidebar::render(self.section, on_select, on_avatar, account_menu))
+            .items_start()
+            .bg(theme.colors().background)
+            .text_color(theme.colors().text)
+            .child(sidebar::render(self.section, on_select, on_avatar, account_menu, cx))
             .child(match self.section {
                 Section::Tasks => div().flex_1().h_full().child(self.todo.clone()),
-                other => div()
+                other => v_flex()
                     .flex_1()
                     .h_full()
-                    .flex()
-                    .flex_col()
                     .items_center()
                     .justify_center()
                     .gap_2()
-                    .child(div().text_xl().child(other.title(strings)))
-                    .child(div().text_color(theme::text_muted()).child(strings.coming_soon)),
+                    .child(Label::new(other.title(strings)).size(LabelSize::Large))
+                    .child(Label::new(strings.coming_soon).color(Color::Muted)),
             })
     }
 }

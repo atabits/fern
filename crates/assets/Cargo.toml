@@ -1,0 +1,13 @@
+[package]
+name = "assets"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/assets.rs"
+
+[dependencies]
+anyhow.workspace = true
+gpui.workspace = true
+rust-embed.workspace = true

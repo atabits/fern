@@ -3,7 +3,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use fern_core::{Id, Kind, Task};
+use fern_core::{Id, Kind, Priority, Task};
+use gpui::Hsla;
+use theme::Theme;
 use chrono::{Datelike, NaiveDate, NaiveTime};
 
 use crate::i18n::Strings;
@@ -105,6 +107,16 @@ pub fn build_rows(
     rows
 }
 
+/// The checkbox and flag tint for a priority; `None` for no priority.
+pub fn priority_color(priority: Priority, theme: &Theme) -> Option<Hsla> {
+    match priority {
+        Priority::High => Some(theme.status().error),
+        Priority::Medium => Some(theme.status().warning),
+        Priority::Low => Some(theme.status().info),
+        Priority::None => None,
+    }
+}
+
 /// The due-date label for a row and whether it is overdue:
 /// "Today", "Tomorrow", "Sat", "Nov 13", "Nov 13 2027" (or the localized equivalents).
 pub fn due_label(
@@ -140,7 +152,6 @@ pub fn due_label(
 mod tests {
     use super::*;
     use crate::i18n::{EN, RU};
-    use fern_core::Priority;
     use uuid::Uuid;
 
     fn task(title: &str) -> Task {

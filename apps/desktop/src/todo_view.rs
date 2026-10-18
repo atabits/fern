@@ -147,6 +147,8 @@ pub struct TodoView {
     /// whether Move to's side menu is open), and a section being renamed.
     column_add: Option<(usize, DropTarget, Entity<TextInput>)>,
     column_menu: Option<(Id, bool)>,
+    /// The Timeline's groups folded up, by name.
+    timeline_folded: HashSet<String>,
     section_rename: Option<(Id, Entity<TextInput>)>,
     /// The "Undo" toast after completing or deleting a task, with its timer.
     undo: Option<(crate::undo::UndoAction, String, gpui::Task<()>)>,
@@ -293,6 +295,7 @@ impl TodoView {
             new_section_index: None,
             column_add: None,
             column_menu: None,
+            timeline_folded: HashSet::new(),
             section_rename: None,
             section_menu: None,
             templates_open: false,
@@ -2882,7 +2885,7 @@ impl TodoView {
         let scale = self.timeline_scale;
         let days_shown = [10usize, 22, 45][scale];
         let step = [7i64, 14, 30][scale];
-        const LABEL_WIDTH: f32 = 150.;
+        const LABEL_WIDTH: f32 = 108.;
         let theme = cx.theme().clone();
         let today = Self::today();
         let from = self.timeline_from;
@@ -2906,8 +2909,6 @@ impl TodoView {
                     .id(SharedString::from(format!("timeline-day-{row}-{date}")))
                     .flex_1()
                     .h_full()
-                    .border_l_1()
-                    .border_color(theme.colors().border_variant)
                     .when(weekend(&date), |el| el.bg(theme.colors().element_hover.opacity(0.5)))
                     // Week and Month mark today with a red line, as the original does.
                     .when(scale > 0 && date == today, |el| el.border_l_2().border_color(today_line))
@@ -2953,7 +2954,7 @@ impl TodoView {
             )
             .child(
                 h_flex()
-                    .h(px(28.))
+                    .h(px(34.))
                     .border_b_1()
                     .border_color(theme.colors().border_variant)
                     .child(
@@ -2967,20 +2968,23 @@ impl TodoView {
                         let is_today = *date == today;
                         // Month shows every seventh day's number, so that they fit.
                         let labelled = scale < 2 || (date.day() - 1) % 7 == 0;
+                        // As in the original: the numbers centered over their days, semibold, and
+                        // the weekend's muted.
                         let color = match (is_today, scale) {
                             (true, 0) => Color::Accent,
                             (true, _) => Color::Custom(today_line),
+                            _ if weekend(date) => Color::Muted,
                             _ => Color::Default,
                         };
                         div()
                             .flex_1()
                             .min_w_0()
                             .h_full()
-                            .px(px(if scale == 0 { 8. } else { 2. }))
                             .flex()
                             .items_center()
+                            .justify_center()
                             .when(weekend(date), |el| el.bg(theme.colors().element_hover.opacity(0.5)))
-                            .when(labelled || is_today, |el| el.child(Label::new(date.day().to_string()).size(LabelSize::Small).color(color)))
+                            .when(labelled || is_today, |el| el.child(Label::new(date.day().to_string()).weight(FontWeight::SEMIBOLD).color(color)))
                     })))
                     .child(IconButton::new("timeline-next", IconName::ChevronRight).size(px(20.)).icon_size(IconSize::XSmall).on_click(shift(step))),
             );
@@ -2990,19 +2994,34 @@ impl TodoView {
                 .flat_map(|(task, subtasks)| std::iter::once(task).chain(subtasks))
                 .filter_map(|task| fern_core::timeline::bar(&task, from, days_shown).map(|(first, span)| (task, first, span)))
                 .collect();
-            let height = px(16. + 32. * bars.len().max(1) as f32);
+            // A group folds up with the arrow before its name, as in the original.
+            let folded = self.timeline_folded.contains(&label);
+            let bars = if folded { Vec::new() } else { bars };
+            let height = px(if folded { 40. } else { 20. + 40. * bars.len().max(1) as f32 });
+            let fold_label = label.clone();
             h_flex()
                 .h(height)
                 .border_b_1()
                 .border_color(theme.colors().border_variant)
                 .child(
-                    div()
+                    h_flex()
+                        .id(SharedString::from(format!("timeline-group-{i}")))
                         .w(px(LABEL_WIDTH))
                         .flex_none()
                         .h_full()
-                        .px_3()
-                        .pt_2()
-                        .child(Label::new(label).size(LabelSize::Small).weight(FontWeight::SEMIBOLD)),
+                        .items_start()
+                        .gap_1()
+                        .pl_2()
+                        .pt(px(14.))
+                        .cursor_pointer()
+                        .child(Icon::new(if folded { IconName::ChevronRight } else { IconName::ChevronDown }).size(IconSize::XSmall).color(Color::Muted))
+                        .child(Label::new(label).size(LabelSize::Small).weight(FontWeight::SEMIBOLD))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if !this.timeline_folded.remove(&fold_label) {
+                                this.timeline_folded.insert(fold_label.clone());
+                            }
+                            cx.notify();
+                        })),
                 )
                 .child(
                     div()
@@ -3019,27 +3038,33 @@ impl TodoView {
                                 .id(SharedString::from(format!("timeline-{i}-{id}")))
                                 .on_drag(dragged, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
                                 .absolute()
-                                .top(px(8. + 32. * n as f32))
+                                .top(px(8. + 40. * n as f32))
                                 .left(gpui::relative(first as f32 / days_shown as f32))
                                 .w(gpui::relative(span as f32 / days_shown as f32))
-                                .h(px(26.))
-                                .px_1()
+                                .h(px(32.))
+                                .px_0p5()
                                 .child(
                                     div()
                                         .size_full()
                                         .px_2()
                                         .flex()
                                         .items_center()
-                                        .rounded(px(6.))
+                                        .rounded(px(8.))
                                         .bg(tint.opacity(if task.is_completed() { 0.3 } else { 0.75 }))
                                         .cursor_pointer()
-                                        .child(Label::new(task.title.clone()).size(LabelSize::Small).truncate()),
+                                        .child(Label::new(task.title.clone()).truncate()),
                                 )
                                 .on_click(cx.listener(move |this, _, _, cx| this.select(id, cx)))
                         })),
                 )
-        });
-        let timeline = v_flex().id("timeline").flex_1().min_w_0().min_h_0().overflow_y_scroll().child(header).children(rows);
+        }).collect::<Vec<_>>();
+        // Under the groups the weekends stay shaded down to the bottom, as in the original.
+        let filler = h_flex()
+            .flex_1()
+            .min_h(px(200.))
+            .child(div().w(px(LABEL_WIDTH)).flex_none())
+            .child(div().flex_1().h_full().mr(px(20.)).relative().overflow_hidden().child(backdrop(usize::MAX, px(4000.), cx)));
+        let timeline = v_flex().id("timeline").flex_1().min_w_0().h_full().overflow_y_scroll().child(header).children(rows).child(filler);
         h_flex()
             .flex_1()
             .min_h_0()
@@ -4688,7 +4713,8 @@ impl Render for TodoView {
             && !matches!(self.view, View::Trash | View::Completed | View::WontDo | View::Search(_));
         let kanban_view = (self.kanban || timeline_view)
             && !matches!(self.view, View::Trash | View::Completed | View::WontDo | View::Search(_));
-        // The original's kanban has no add field on top: each column has its own "+".
+        // The original's kanban and timeline have no add field on top: a kanban column has its
+        // own "+".
         let kanban_only = kanban_view && !timeline_view;
         let board: Option<AnyElement> = if timeline_view {
             Some(self.render_timeline(strings, cx))
@@ -4876,8 +4902,8 @@ impl Render for TodoView {
             .when(matches!(self.view, View::Completed | View::WontDo), |el| {
                 el.child(self.render_closed_filters(strings, cx))
             })
-            .when(!self.is_read_only_view() && !kanban_only && self.preferences.detailed_input, |el| el.child(self.render_detailed_add(strings, cx)))
-            .when(!self.is_read_only_view() && !kanban_only && !self.preferences.detailed_input, |el| el.child(
+            .when(!self.is_read_only_view() && !kanban_view && self.preferences.detailed_input, |el| el.child(self.render_detailed_add(strings, cx)))
+            .when(!self.is_read_only_view() && !kanban_view && !self.preferences.detailed_input, |el| el.child(
                 h_flex()
                     .mx_2()
                     .mb_2()

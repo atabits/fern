@@ -92,5 +92,8 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 
 ## Next
 
+1. Sync: a masked token field in Settings → Sync (a password mode for the text input).
+2. Sync: keep the change log small (drop entries the server has acknowledged, keeping the latest per row).
+3. Sync: attachments' files (now only their records travel).
 
 Not checkable under the reference rules: whether the original asks for a note when a focus session ends (finding out means running a focus timer in the reference account). Fern's record dialog takes a note afterwards.

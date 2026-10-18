@@ -24,6 +24,7 @@ pub enum IconName {
     ChevronDown,
     ChevronLeft,
     ChevronRight,
+    ChevronUp,
     ChevronsUpDown,
     Circle,
     CircleCheck,

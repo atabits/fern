@@ -98,6 +98,10 @@ pub struct TodoView {
     filters: Vec<(fern_core::SmartFilter, usize)>,
     /// Settings → Smart List, read on reload.
     preferences: fern_core::Preferences,
+    /// The mini calendar: expanded to a month, which month, and the days with open tasks.
+    mini_expanded: bool,
+    mini_month: NaiveDate,
+    busy_days: HashSet<NaiveDate>,
     /// The Summary smart list's report.
     summary: Entity<crate::summary_view::SummaryView>,
     /// The "Add Filter" / "Edit Filter" dialog, while it is open.
@@ -119,6 +123,7 @@ impl TodoView {
     pub fn new(store: Rc<Store>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let strings = i18n::t(cx);
         let summary = cx.new(|_| crate::summary_view::SummaryView::new(store.clone()));
+        let mini_expanded = store.setting("mini_expanded").ok().flatten().as_deref() == Some("1");
         let input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.add_task, cx));
         cx.subscribe_in(&input, window, |this, input, Submitted(text), window, cx| {
             if text.trim().is_empty() {
@@ -217,6 +222,9 @@ impl TodoView {
             list_activity: None,
             filters: Vec::new(),
             preferences: Default::default(),
+            mini_expanded,
+            mini_month: crate::calendar::month_start(Self::today()),
+            busy_days: HashSet::new(),
             summary,
             filter_edit: None,
             undo: None,
@@ -249,6 +257,8 @@ impl TodoView {
                 Some(("view", "wontdo")) => self.set_view(View::WontDo, cx),
                 Some(("view", "today")) => self.set_view(View::Today, cx),
                 Some(("view", "summary")) => self.set_view(View::Summary, cx),
+                // `mini=month`: the mini calendar expanded to the month.
+                Some(("mini", "month")) => self.mini_expanded = true,
                 // `view=day+N`: the mini calendar's day N days from today.
                 Some(("view", day)) if day.starts_with("day") => {
                     let offset: i64 = day.trim_start_matches("day").trim_start_matches('+').parse().unwrap_or(0);
@@ -442,8 +452,31 @@ impl TodoView {
         Local::now().date_naive()
     }
 
+    /// The mini calendar's tab and arrows; whether it is expanded is remembered.
+    fn mini_action(&mut self, action: lists_panel::MiniAction, cx: &mut Context<Self>) {
+        match action {
+            lists_panel::MiniAction::Toggle => {
+                self.mini_expanded = !self.mini_expanded;
+                let value = if self.mini_expanded { "1" } else { "0" };
+                let result = self.store.set_setting("mini_expanded", value);
+                self.check(result);
+            }
+            lists_panel::MiniAction::Shift(delta) => self.mini_month = crate::calendar::add_months(self.mini_month, delta),
+            lists_panel::MiniAction::ThisMonth => self.mini_month = crate::calendar::month_start(Self::today()),
+        }
+        cx.notify();
+    }
+
     pub fn reload(&mut self, cx: &mut Context<Self>) {
         self.preferences = self.store.preferences().unwrap_or_default();
+        self.busy_days = self
+            .store
+            .tasks()
+            .unwrap_or_default()
+            .iter()
+            .filter(|t| !t.is_closed() && !t.is_deleted())
+            .filter_map(|t| t.due_date)
+            .collect();
         self.show_details = self.view_flag("show_details", false);
         self.kanban = self.view_flag("kanban", false);
         let today = Self::today();
@@ -2841,11 +2874,18 @@ impl Render for TodoView {
                         tags: &self.tags,
                         strings,
                         new_list_input: self.creating_list.then(|| self.new_list.clone().into_any_element()),
+                        mini: lists_panel::MiniCalendar { expanded: self.mini_expanded, month: self.mini_month, busy: &self.busy_days },
                     },
                     on_select,
                     on_add_list,
                     on_drop_task,
                     cx.listener(|this, _, window, cx| this.open_filter_edit(None, window, cx)),
+                    {
+                        let this = cx.entity().downgrade();
+                        move |action, _: &mut Window, cx: &mut App| {
+                            this.update(cx, |this, cx| this.mini_action(action, cx)).ok();
+                        }
+                    },
                     cx,
                 ))
             })

@@ -1,6 +1,8 @@
 //! The lists column between the narrow sidebar and the task list, modeled on TickTick's.
 
-use chrono::{Datelike, Local};
+use std::collections::HashSet;
+
+use chrono::{Datelike, Local, NaiveDate};
 use fern_core::{List, Preferences, SmartList, Tag, View, ViewCounts};
 use gpui::{ClickEvent, rgb};
 use ui::prelude::*;
@@ -61,6 +63,7 @@ pub struct Props<'a> {
     pub filters: &'a [(fern_core::SmartFilter, usize)],
     /// Which smart lists Settings → Smart List shows.
     pub preferences: &'a Preferences,
+    pub mini: MiniCalendar<'a>,
 }
 
 pub fn render(
@@ -69,9 +72,10 @@ pub fn render(
     on_add_list: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     on_drop_task: impl Fn(View, fern_core::Id, &mut Window, &mut App) + Clone + 'static,
     on_add_filter: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    on_mini: impl Fn(MiniAction, &mut Window, &mut App) + Clone + 'static,
     cx: &App,
 ) -> impl IntoElement {
-    let Props { active, counts, lists, tags, strings, new_list_input, filters, preferences } = props;
+    let Props { active, counts, lists, tags, strings, new_list_input, filters, preferences, mini } = props;
     let shows = |list: SmartList, count: usize| preferences.visibility(list).shows(count);
     let colors = cx.theme().colors();
 
@@ -241,52 +245,132 @@ pub fn render(
         .border_r_1()
         .border_color(colors.border)
         .child(lists_column)
-        .when(preferences.mini_calendar, |el| el.child(mini_week(active, on_select.clone(), strings, cx)))
+        .when(preferences.mini_calendar, |el| el.child(mini_calendar(active, mini, on_select.clone(), on_mini, strings, cx)))
 }
 
-/// The current week pinned to the bottom of the column, as in TickTick.
-/// Clicking a day opens its tasks (`View::Day`), as in the original; that day stays marked.
-fn mini_week(
+/// What the mini calendar shows: the week, or — expanded with its hover tab — a month.
+pub struct MiniCalendar<'a> {
+    pub expanded: bool,
+    /// The first day of the expanded month.
+    pub month: NaiveDate,
+    /// Days with open tasks, marked with a dot when expanded.
+    pub busy: &'a HashSet<NaiveDate>,
+}
+
+/// The mini calendar's buttons.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MiniAction {
+    /// The hover tab: expand to a month or collapse to the week.
+    Toggle,
+    /// The month arrows.
+    Shift(i32),
+    /// The circle between them: back to this month.
+    ThisMonth,
+}
+
+/// The calendar pinned to the bottom of the column, as in TickTick: the current week, or a month
+/// with arrows once expanded. Clicking a day opens its tasks (`View::Day`); that day stays marked.
+fn mini_calendar(
     active: &View,
+    mini: MiniCalendar,
     on_select: impl Fn(View, &mut Window, &mut App) + Clone + 'static,
+    on_mini: impl Fn(MiniAction, &mut Window, &mut App) + Clone + 'static,
     strings: &Strings,
     cx: &App,
 ) -> impl IntoElement {
     let colors = cx.theme().colors();
     let today = Local::now().date_naive();
-    v_flex()
-        .flex_none()
-        .h(px(76.))
+    let day_cell = |date: NaiveDate, faded: bool| {
+        let is_today = date == today;
+        let selected = *active == View::Day(date);
+        let busy = mini.expanded && mini.busy.contains(&date);
+        let on_select = on_select.clone();
+        div().flex_1().flex().justify_center().child(
+            v_flex()
+                .id(SharedString::from(format!("mini-day-{date}")))
+                .size(px(28.))
+                .cursor_pointer()
+                .hover(|s| s.bg(colors.ghost_element_hover))
+                .when(selected, |el| el.bg(colors.accent))
+                .on_click(move |_, window, cx| on_select(View::Day(date), window, cx))
+                .items_center()
+                .justify_center()
+                .rounded_full()
+                .when(is_today && !selected, |el| el.bg(colors.element_hover))
+                .child(
+                    Label::new(date.day().to_string())
+                        .size(LabelSize::Small)
+                        .color(if selected {
+                            Color::Custom(gpui::white())
+                        } else if is_today {
+                            Color::Accent
+                        } else if faded {
+                            Color::Muted
+                        } else {
+                            Color::Default
+                        }),
+                )
+                .child(div().size(px(3.)).rounded_full().when(busy, |el| el.bg(colors.accent))),
+        )
+    };
+    let weekdays = h_flex().children(crate::calendar::weekday_labels(&strings.weekdays_narrow).iter().map(|day| {
+        div().flex_1().flex().justify_center().child(Label::new(*day).size(LabelSize::Small).color(Color::Muted))
+    }));
+    let toggle = on_mini.clone();
+    // The hover tab on the top border: "^" expands, "v" collapses.
+    let tab = div()
+        .absolute()
+        .top(px(-9.))
+        .left_0()
+        .right_0()
+        .flex()
         .justify_center()
-        .gap_2()
+        .invisible()
+        .group_hover("mini-calendar", |s| s.visible())
+        .child(
+            div()
+                .id("mini-calendar-toggle")
+                .w(px(40.))
+                .h(px(16.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(4.))
+                .bg(colors.element_hover)
+                .cursor_pointer()
+                .child(Icon::new(if mini.expanded { IconName::ChevronDown } else { IconName::ChevronUp }).size(IconSize::XSmall))
+                .on_click(move |_, window, cx| toggle(MiniAction::Toggle, window, cx)),
+        );
+    let body = if mini.expanded {
+        let arrows = |id: &'static str, icon: IconName, action: MiniAction| {
+            let on_mini = on_mini.clone();
+            IconButton::new(id, icon).size(px(20.)).icon_size(IconSize::XSmall).on_click(move |_, window, cx| on_mini(action, window, cx))
+        };
+        v_flex()
+            .gap_1()
+            .child(
+                h_flex()
+                    .child(div().flex_1().child(Label::new(calendar::month_title(mini.month, strings)).size(LabelSize::Small)))
+                    .child(arrows("mini-back", IconName::ChevronLeft, MiniAction::Shift(-1)))
+                    .child(arrows("mini-this-month", IconName::Circle, MiniAction::ThisMonth))
+                    .child(arrows("mini-forward", IconName::ChevronRight, MiniAction::Shift(1))),
+            )
+            .child(weekdays)
+            .children(calendar::month_grid(mini.month).chunks(7).map(|week| {
+                h_flex().children(week.iter().map(|&date| day_cell(date, date.month() != mini.month.month())))
+            }))
+    } else {
+        v_flex().gap_2().child(weekdays).child(h_flex().children(calendar::week_of(today).map(|date| day_cell(date, false))))
+    };
+    v_flex()
+        .id("mini-calendar")
+        .group("mini-calendar")
+        .relative()
+        .flex_none()
+        .py_2()
         .px_3()
         .border_t_1()
         .border_color(colors.border)
-        .child(h_flex().children(crate::calendar::weekday_labels(&strings.weekdays_narrow).iter().map(|day| {
-            div().flex_1().flex().justify_center().child(Label::new(*day).size(LabelSize::Small).color(Color::Muted))
-        })))
-        .child(h_flex().children(calendar::week_of(today).map(|date| {
-            let is_today = date == today;
-            let selected = *active == View::Day(date);
-            let on_select = on_select.clone();
-            div().flex_1().flex().justify_center().child(
-                div()
-                    .id(SharedString::from(format!("mini-day-{date}")))
-                    .size(px(28.))
-                    .cursor_pointer()
-                    .hover(|s| s.bg(colors.ghost_element_hover))
-                    .when(selected, |el| el.bg(colors.accent))
-                    .on_click(move |_, window, cx| on_select(View::Day(date), window, cx))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded_full()
-                    .when(is_today && !selected, |el| el.bg(colors.element_hover))
-                    .child(
-                        Label::new(date.day().to_string())
-                            .size(LabelSize::Small)
-                            .color(if selected { Color::Custom(gpui::white()) } else if is_today { Color::Accent } else { Color::Default }),
-                    ),
-            )
-        })))
+        .child(tab)
+        .child(body)
 }

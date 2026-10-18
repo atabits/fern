@@ -793,7 +793,30 @@ impl FocusView {
                 1 => el.children(self.render_task_tab(page, today, cx)),
                 _ => el
                     .child(overview)
-                    .child(self.render_focus_details(page, today, cx))
+                    .child(
+                        h_flex()
+                            .items_stretch()
+                            .gap_4()
+                            .child(div().flex_1().min_w_0().child(self.render_focus_details(page, today, cx)))
+                            // Focus Record beside Details, as in the original.
+                            .child(
+                                v_flex()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .p_4()
+                                    .gap_2()
+                                    .rounded(px(10.))
+                                    .bg(theme.colors().surface_background)
+                                    .child(self.render_record_header(false, cx))
+                                    .child(
+                                        v_flex()
+                                            .id("stats-focus-record")
+                                            .max_h(px(200.))
+                                            .overflow_y_scroll()
+                                            .children(self.render_record(strings, cx)),
+                                    ),
+                            ),
+                    )
                     .child(h_flex().items_start().gap_4().child(trends).child(timeline))
                     .child(h_flex().items_start().gap_4().child(most_focused).child(div().flex_1()))
                     .child(year_grid),
@@ -1584,6 +1607,39 @@ impl FocusView {
             )
     }
 
+    /// "Focus Record" with its "+" and "…" menus; `large` for the Focus section, smaller on the
+    /// Statistics page's Focus tab.
+    fn render_record_header(&self, large: bool, cx: &mut Context<Self>) -> impl IntoElement {
+        let strings = i18n::t(cx);
+        h_flex()
+                    .when(large, |el| el.pt_5())
+                    .child(div().flex_1().child(
+                        Label::new(strings.focus_record)
+                            .size(if large { LabelSize::Large } else { LabelSize::Default })
+                            .weight(FontWeight::SEMIBOLD),
+                    ))
+                    .child(
+                        div()
+                            .relative()
+                            .child(IconButton::new("record-add", IconName::Plus).on_click(cx.listener(|this, _, _, cx| {
+                                this.set_record_menu(Some(RecordMenu::Add), cx)
+                            })))
+                            .when(self.record_menu == Some(RecordMenu::Add), |el| {
+                                el.child(PopoverAttachment::new(Placement::BelowRight, self.render_record_menu(RecordMenu::Add, cx)))
+                            }),
+                    )
+                    .child(
+                        div()
+                            .relative()
+                            .child(IconButton::new("record-more", IconName::Ellipsis).on_click(cx.listener(|this, _, _, cx| {
+                                this.set_record_menu(Some(RecordMenu::More), cx)
+                            })))
+                            .when(self.record_menu == Some(RecordMenu::More), |el| {
+                                el.child(PopoverAttachment::new(Placement::BelowRight, self.render_record_menu(RecordMenu::More, cx)))
+                            }),
+                    )
+    }
+
     fn render_record(&self, strings: &Strings, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let theme = cx.theme();
         let today = Local::now().date_naive();
@@ -1832,31 +1888,7 @@ impl Render for FocusView {
             .px_4()
             .child(h_flex().h(px(52.)).child(Label::new(strings.focus_overview).size(LabelSize::Large).weight(FontWeight::SEMIBOLD)))
             .child(self.render_overview(strings, cx))
-            .child(
-                h_flex()
-                    .pt_5()
-                    .child(div().flex_1().child(Label::new(strings.focus_record).size(LabelSize::Large).weight(FontWeight::SEMIBOLD)))
-                    .child(
-                        div()
-                            .relative()
-                            .child(IconButton::new("record-add", IconName::Plus).on_click(cx.listener(|this, _, _, cx| {
-                                this.set_record_menu(Some(RecordMenu::Add), cx)
-                            })))
-                            .when(self.record_menu == Some(RecordMenu::Add), |el| {
-                                el.child(PopoverAttachment::new(Placement::BelowRight, self.render_record_menu(RecordMenu::Add, cx)))
-                            }),
-                    )
-                    .child(
-                        div()
-                            .relative()
-                            .child(IconButton::new("record-more", IconName::Ellipsis).on_click(cx.listener(|this, _, _, cx| {
-                                this.set_record_menu(Some(RecordMenu::More), cx)
-                            })))
-                            .when(self.record_menu == Some(RecordMenu::More), |el| {
-                                el.child(PopoverAttachment::new(Placement::BelowRight, self.render_record_menu(RecordMenu::More, cx)))
-                            }),
-                    ),
-            )
+            .child(self.render_record_header(true, cx))
             .when_some(self.message.clone(), |el, message| {
                 el.child(Label::new(message).size(LabelSize::XSmall).color(Color::Muted))
             })

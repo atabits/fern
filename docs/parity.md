@@ -31,7 +31,7 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 | Subtasks (`parentId`) | ✅ | cascade delete, no cycles |
 | Item kind: task / note / checklist (`kind`) | 🟡 | task and note; checklist later |
 | Checklist items (`items`) | ✅ | ordered items, insert after, completion, progress |
-| Repeat (`repeatFlag`, RRULE) | 🟡 | FREQ + INTERVAL; completing moves the task to the next date and keeps a completed copy; no BYDAY/BYMONTHDAY yet |
+| Repeat (`repeatFlag`, RRULE) | 🟡 | FREQ, INTERVAL and weekly BYDAY (every weekday); completing moves the task to the next date and keeps a completed copy; no BYMONTHDAY or custom rules yet |
 | Lists (projects), Inbox | ✅ | create, delete, move tasks with subtasks |
 | Custom sections inside a list (columns) | ⬜ | groups are by kind for now |
 | Manual ordering (`sortOrder`) | ✅ | new tasks on top; renumbered with gaps on move |
@@ -57,7 +57,7 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 | Subtasks with indentation and collapsing | ✅ | created from the details panel |
 | Groups "Tasks" / "Notes" with counters and collapsing | ✅ | plus a collapsed "Completed" group |
 | Details: checkbox, title, notes | ✅ | |
-| Details: due date | 🟡 | quick options, month calendar, preset times, daily/weekly/monthly/yearly repeat; no custom time or "every N" in the picker |
+| Details: due date | 🟡 | popover matched to the original: quick picks with tooltips, month calendar, Time (30-minute list) and Repeat (with date hints and "Every Weekday"), Clear/OK with a draft; no Duration tab, Reminder or Custom repeat |
 | Details: priority (flag) | ✅ | |
 | Details: tags | ✅ | chips under the notes as in the original; the "+ Tag" picker is our addition (TickTick adds tags with "#" in the text) |
 | Details: list | ✅ | list button in the bottom bar |
@@ -73,7 +73,7 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 ## How changes are checked
 
 - Every feature is checked against a screenshot of the same TickTick screen before and after it
-  is built. Features built before this rule (the repeat picker) still need that comparison.
+  is built.
 
 - `cargo test` covers the core (storage, smart views, tags, subtasks, lists, quick add) and the
   desktop's row, date and calendar logic in both languages.

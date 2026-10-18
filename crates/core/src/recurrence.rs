@@ -1,10 +1,11 @@
-//! Repeating tasks. Rules are stored as a subset of RFC 5545 RRULE (`FREQ` and `INTERVAL`),
+//! Repeating tasks. Rules are stored as a subset of RFC 5545 RRULE (`FREQ`, `INTERVAL` and, for
+//! weekly rules, `BYDAY`),
 //! the format TickTick uses too, so imports keep working and richer rules can come later.
 
 use std::fmt;
 use std::str::FromStr;
 
-use chrono::{Duration, Months, NaiveDate};
+use chrono::{Datelike, Duration, Months, NaiveDate, Weekday};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Frequency {
@@ -18,11 +19,28 @@ pub enum Frequency {
 pub struct Recurrence {
     pub frequency: Frequency,
     pub interval: u32,
+    /// For weekly rules: the weekdays it falls on, bit 0 = Monday. Empty means "the same weekday".
+    pub weekdays: u8,
 }
+
+const BYDAY_CODES: [&str; 7] = ["MO", "TU", "WE", "TH", "FR", "SA", "SU"];
 
 impl Recurrence {
     pub fn new(frequency: Frequency, interval: u32) -> Self {
-        Self { frequency, interval: interval.max(1) }
+        Self { frequency, interval: interval.max(1), weekdays: 0 }
+    }
+
+    /// Monday to Friday, every week.
+    pub fn weekdays() -> Self {
+        Self { frequency: Frequency::Weekly, interval: 1, weekdays: 0b0001_1111 }
+    }
+
+    pub fn is_weekdays(&self) -> bool {
+        self.frequency == Frequency::Weekly && self.interval == 1 && self.weekdays == 0b0001_1111
+    }
+
+    fn falls_on(&self, day: Weekday) -> bool {
+        self.weekdays & (1 << day.num_days_from_monday()) != 0
     }
 
     /// The next occurrence after `from`. Months clamp to the last day: Jan 31 → Feb 28.
@@ -30,6 +48,11 @@ impl Recurrence {
         let n = self.interval.max(1);
         match self.frequency {
             Frequency::Daily => from + Duration::days(n as i64),
+            // With BYDAY: the next listed weekday (the interval is assumed to be 1 week).
+            Frequency::Weekly if self.weekdays != 0 => (1..=7)
+                .map(|offset| from + Duration::days(offset))
+                .find(|day| self.falls_on(day.weekday()))
+                .unwrap_or(from),
             Frequency::Weekly => from + Duration::weeks(n as i64),
             Frequency::Monthly => from.checked_add_months(Months::new(n)).unwrap_or(from),
             Frequency::Yearly => from.checked_add_months(Months::new(12 * n)).unwrap_or(from),
@@ -45,7 +68,13 @@ impl fmt::Display for Recurrence {
             Frequency::Monthly => "MONTHLY",
             Frequency::Yearly => "YEARLY",
         };
-        write!(f, "FREQ={frequency};INTERVAL={}", self.interval)
+        write!(f, "FREQ={frequency};INTERVAL={}", self.interval)?;
+        if self.weekdays != 0 {
+            let days: Vec<&str> =
+                (0..7).filter(|i| self.weekdays & (1 << i) != 0).map(|i| BYDAY_CODES[i]).collect();
+            write!(f, ";BYDAY={}", days.join(","))?;
+        }
+        Ok(())
     }
 }
 
@@ -68,6 +97,7 @@ impl FromStr for Recurrence {
         let error = || ParseRecurrenceError(rule.to_owned());
         let mut frequency = None;
         let mut interval = 1;
+        let mut weekdays = 0u8;
         for part in rule.split(';').filter(|p| !p.is_empty()) {
             let (key, value) = part.split_once('=').ok_or_else(error)?;
             match key {
@@ -81,11 +111,23 @@ impl FromStr for Recurrence {
                     })
                 }
                 "INTERVAL" => interval = value.parse().map_err(|_| error())?,
+                "BYDAY" => {
+                    for code in value.split(',') {
+                        // Drop ordinal prefixes such as "1MO"; they are not supported yet.
+                        let code = code.trim_start_matches(|c: char| c.is_ascii_digit() || c == '-' || c == '+');
+                        let index = BYDAY_CODES.iter().position(|c| *c == code).ok_or_else(error)?;
+                        weekdays |= 1 << index;
+                    }
+                }
                 // Other RRULE parts (BYDAY, BYMONTHDAY, …) are ignored for now.
                 _ => {}
             }
         }
-        Ok(Recurrence::new(frequency.ok_or_else(error)?, interval))
+        let mut rule = Recurrence::new(frequency.ok_or_else(error)?, interval);
+        if rule.frequency == Frequency::Weekly {
+            rule.weekdays = weekdays;
+        }
+        Ok(rule)
     }
 }
 
@@ -107,6 +149,18 @@ mod tests {
         );
         assert!("FREQ=HOURLY".parse::<Recurrence>().is_err());
         assert!("INTERVAL=2".parse::<Recurrence>().is_err());
+    }
+
+    #[test]
+    fn every_weekday() {
+        let rule = Recurrence::weekdays();
+        assert_eq!(rule.to_string(), "FREQ=WEEKLY;INTERVAL=1;BYDAY=MO,TU,WE,TH,FR");
+        assert_eq!(rule.to_string().parse::<Recurrence>(), Ok(rule));
+        assert!(rule.is_weekdays());
+        // Friday → Monday, Saturday → Monday, Monday → Tuesday.
+        assert_eq!(rule.next_after(d(2026, 10, 23)), d(2026, 10, 26));
+        assert_eq!(rule.next_after(d(2026, 10, 24)), d(2026, 10, 26));
+        assert_eq!(rule.next_after(d(2026, 10, 26)), d(2026, 10, 27));
     }
 
     #[test]

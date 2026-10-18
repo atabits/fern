@@ -236,7 +236,8 @@ pub struct Strings {
     pub habit_goal_days: &'static str,
     pub habit_forever: &'static str,
     pub habit_custom: &'static str,
-    pub habit_icon_tabs: [&'static str; 2],
+    /// The habit icon picker's tabs: Icon (emoji on colored circles), Emoji, Text.
+    pub habit_icon_tabs: [&'static str; 3],
     pub habit_text_placeholder: &'static str,
     pub habit_frequency_kinds: [&'static str; 3],
     /// "{n}" is replaced by the number of days.
@@ -789,7 +790,7 @@ pub static EN: Strings = Strings {
     habit_goal_days: "Goal Days",
     habit_forever: "Forever",
     habit_custom: "Custom",
-    habit_icon_tabs: ["Emoji", "Text"],
+    habit_icon_tabs: ["Icon", "Emoji", "Text"],
     habit_text_placeholder: "Up to 2 characters",
     habit_frequency_kinds: ["Daily", "Weekly", "Interval"],
     habit_days_per_week: "{n} days per week",
@@ -1318,7 +1319,7 @@ pub static RU: Strings = Strings {
     habit_goal_days: "Цель в днях",
     habit_forever: "Бессрочно",
     habit_custom: "Своё",
-    habit_icon_tabs: ["Эмодзи", "Текст"],
+    habit_icon_tabs: ["Иконка", "Эмодзи", "Текст"],
     habit_text_placeholder: "До 2 символов",
     habit_frequency_kinds: ["Ежедневно", "Еженедельно", "Интервал"],
     habit_days_per_week: "{n} дн. в неделю",

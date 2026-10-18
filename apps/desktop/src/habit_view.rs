@@ -339,8 +339,10 @@ impl HabitView {
                 .when(!primary, |el| el.border_1().border_color(theme.colors().border))
                 .child(Label::new(label).size(LabelSize::Small))
         };
+        let picker = edit.icon_picker.map(|tab| self.render_icon_picker(edit, tab, cx));
+        // The original's width, so the icon picker under the icon stays inside the dialog.
         popover(cx)
-            .w(px(300.))
+            .w(px(425.))
             .p_3()
             .gap_2()
             .on_mouse_down_out(cx.listener(|this, _, _, cx| {
@@ -353,20 +355,25 @@ impl HabitView {
                     .gap_2()
                     .child(
                         div()
-                            .id("habit-icon-button")
-                            .cursor_pointer()
-                            .child(avatar(
-                                &Habit { icon: edit.icon.clone(), color: edit.color.clone(), ..preview.clone() },
-                                px(34.),
-                                cx,
-                            ))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.update_edit(cx, |e| e.icon_picker = if e.icon_picker.is_some() { None } else { Some(0) })
-                            })),
+                            .relative()
+                            .child(
+                                div()
+                                    .id("habit-icon-button")
+                                    .cursor_pointer()
+                                    .child(avatar(
+                                        &Habit { icon: edit.icon.clone(), color: edit.color.clone(), ..preview.clone() },
+                                        px(34.),
+                                        cx,
+                                    ))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.update_edit(cx, |e| e.icon_picker = if e.icon_picker.is_some() { None } else { Some(0) })
+                                    })),
+                            )
+                            // As in the original, the picker hangs under the icon over the form.
+                            .children(picker.map(|picker| PopoverAttachment::new(Placement::BelowLeft, picker))),
                     )
                     .child(div().flex_1().child(field(edit.name.clone().into_any_element()))),
             )
-            .when_some(edit.icon_picker, |el, tab| el.child(self.render_icon_picker(edit, tab, cx)))
             .child(Label::new(strings.habit_frequency).size(LabelSize::Small).color(Color::Muted))
             .child(self.render_frequency(edit.frequency, cx))
             .child(self.render_span(edit, cx))
@@ -591,32 +598,84 @@ impl HabitView {
             .into_any_element()
     }
 
-    /// The icon picker: emoji or text, and the background color.
+    /// The icon picker, as the original's: Icon, Emoji and Text tabs on top; Icon is a grid of
+    /// seven colored circles a row (emoji on the palette's colors stand in for the original's
+    /// artwork, and picking one takes its color too), Emoji the plain emoji with a background
+    /// color, Text a short text on that color.
     fn render_icon_picker(&self, edit: &HabitEdit, tab: usize, cx: &mut Context<Self>) -> AnyElement {
+        const COLORS: [&str; 8] = crate::lists_panel::LIST_COLORS;
         let strings = i18n::t(cx);
         let theme = cx.theme().clone();
-        let tabs = h_flex().p_0p5().rounded(px(6.)).bg(theme.colors().background).children(
-            strings.habit_icon_tabs.iter().enumerate().map(|(i, label)| {
+        let tabs = h_flex()
+            .w(px(242.))
+            .h(px(28.))
+            .p_0p5()
+            .rounded(px(6.))
+            .bg(theme.colors().element_hover)
+            .children(strings.habit_icon_tabs.iter().enumerate().map(|(i, label)| {
                 div()
                     .id(SharedString::from(format!("icon-tab-{i}")))
                     .flex_1()
-                    .h(px(24.))
+                    .h_full()
                     .flex()
                     .items_center()
                     .justify_center()
                     .rounded(px(5.))
                     .cursor_pointer()
                     .when(i == tab, |el| el.bg(theme.colors().element_selected))
-                    .child(Label::new(*label).size(LabelSize::Small))
+                    .child(Label::new(*label).size(LabelSize::Small).color(if i == tab { Color::Default } else { Color::Muted }))
                     .on_click(cx.listener(move |this, _, _, cx| this.update_edit(cx, |e| e.icon_picker = Some(i))))
-            }),
-        );
-        let body: AnyElement = if tab == 0 {
+            }));
+        let colors = h_flex().gap_1p5().children(std::iter::once(None).chain(COLORS.iter().map(|c| Some(*c))).map(|color| {
+            let selected = edit.color.as_deref() == color;
+            let fill = crate::lists_panel::parse_color(color).unwrap_or(theme.colors().accent);
             div()
-                .flex()
-                .flex_wrap()
-                .gap_1()
-                .children(HABIT_EMOJI.iter().map(|emoji| {
+                .id(SharedString::from(format!("habit-color-{}", color.unwrap_or("none"))))
+                .size(px(20.))
+                .rounded_full()
+                .cursor_pointer()
+                .bg(fill.opacity(if color.is_none() { 0.35 } else { 1. }))
+                .when(selected, |el| el.border_2().border_color(theme.colors().text))
+                .on_click(cx.listener(move |this, _, _, cx| this.update_edit(cx, |e| e.color = color.map(str::to_owned))))
+        }));
+        let body: AnyElement = match tab {
+            0 => div()
+                .id("habit-icon-grid")
+                .h(px(225.))
+                .overflow_y_scroll()
+                .child(div().flex().flex_wrap().gap_y(px(15.)).children(HABIT_EMOJI.iter().enumerate().map(|(i, emoji)| {
+                    let color = COLORS[i % COLORS.len()];
+                    let selected = edit.icon.as_deref() == Some(*emoji) && edit.color.as_deref() == Some(color);
+                    div()
+                        .id(SharedString::from(format!("icon-{emoji}")))
+                        .w(px(45.))
+                        .flex()
+                        .justify_center()
+                        .cursor_pointer()
+                        .child(
+                            div()
+                                .size(px(30.))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded_full()
+                                .bg(crate::lists_panel::parse_color(Some(color)).unwrap_or(theme.colors().accent).opacity(0.45))
+                                .when(selected, |el| el.border_2().border_color(theme.colors().accent))
+                                .text_size(px(16.))
+                                .child(*emoji),
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.update_edit(cx, |e| {
+                                e.icon = Some((*emoji).to_owned());
+                                e.color = Some(color.to_owned());
+                                e.icon_picker = None;
+                            })
+                        }))
+                })))
+                .into_any_element(),
+            1 => v_flex()
+                .gap_2()
+                .child(div().flex().flex_wrap().gap_1().children(HABIT_EMOJI.iter().map(|emoji| {
                     let selected = edit.icon.as_deref() == Some(*emoji);
                     div()
                         .id(SharedString::from(format!("emoji-{emoji}")))
@@ -636,40 +695,22 @@ impl HabitView {
                                 e.icon_picker = None;
                             })
                         }))
-                }))
-                .into_any_element()
-        } else {
-            h_flex()
-                .h(px(30.))
-                .px_2()
-                .rounded(px(6.))
-                .bg(theme.colors().background)
-                .child(edit.icon_text.clone())
-                .into_any_element()
+                })))
+                .child(colors)
+                .into_any_element(),
+            _ => v_flex()
+                .gap_2()
+                .child(h_flex().h(px(30.)).px_2().rounded(px(6.)).bg(theme.colors().background).child(edit.icon_text.clone()))
+                .child(colors)
+                .into_any_element(),
         };
-        let colors = h_flex().gap_1p5().children(
-            std::iter::once(None).chain(crate::lists_panel::LIST_COLORS.iter().map(|c| Some(*c))).map(|color| {
-                let selected = edit.color.as_deref() == color;
-                let fill = crate::lists_panel::parse_color(color).unwrap_or(theme.colors().accent);
-                div()
-                    .id(SharedString::from(format!("habit-color-{}", color.unwrap_or("none"))))
-                    .size(px(20.))
-                    .rounded_full()
-                    .cursor_pointer()
-                    .bg(fill.opacity(if color.is_none() { 0.35 } else { 1. }))
-                    .when(selected, |el| el.border_2().border_color(theme.colors().text))
-                    .on_click(cx.listener(move |this, _, _, cx| this.update_edit(cx, |e| e.color = color.map(str::to_owned))))
-            }),
-        );
-        v_flex()
-            .gap_2()
-            .p_2()
-            .rounded(px(6.))
-            .border_1()
-            .border_color(theme.colors().border)
-            .child(tabs)
+        popover(cx)
+            .w(px(371.))
+            .px(px(16.))
+            .py(px(16.))
+            .gap(px(16.))
+            .child(h_flex().justify_center().child(tabs))
             .child(body)
-            .child(colors)
             .into_any_element()
     }
 

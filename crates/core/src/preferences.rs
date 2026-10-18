@@ -243,6 +243,11 @@ pub struct Preferences {
     pub default_list: Option<Id>,
     /// Settings → Smart List, in the order of `SmartList::ALL`.
     pub smart_lists: [Visibility; 11],
+    /// The list's View Options, as the original's: "Show Date by" Countdown ("in 3 days")
+    /// rather than Task Time, and the "Pop-up" task detail layout for a narrow window rather
+    /// than "Side peek".
+    pub countdown_dates: bool,
+    pub popup_details: bool,
 }
 
 impl Preferences {
@@ -276,6 +281,8 @@ impl Default for Preferences {
             task_defaults: TaskDefaults::default(),
             default_list: None,
             smart_lists: [Visibility::Show; 11],
+            countdown_dates: false,
+            popup_details: false,
         }
     }
 }
@@ -287,6 +294,8 @@ const DATE_FORMAT: &str = "date_format";
 const WEEK_NUMBERS: &str = "week_numbers";
 const MINI_CALENDAR: &str = "mini_calendar";
 const INPUT_BOX: &str = "input_box";
+const SHOW_DATE_BY: &str = "show_date_by";
+const DETAIL_LAYOUT: &str = "detail_layout";
 const FEATURES: &str = "features";
 const DAILY_NOTIFICATION: &str = "daily_notification";
 const DESKTOP_REMINDERS: &str = "desktop_reminders";
@@ -397,6 +406,8 @@ impl Store {
         let week_numbers = self.setting(WEEK_NUMBERS)?.as_deref() == Some("1");
         let mini_calendar = self.setting(MINI_CALENDAR)?.as_deref() != Some("0");
         let detailed_input = self.setting(INPUT_BOX)?.as_deref() == Some("detailed");
+        let countdown_dates = self.setting(SHOW_DATE_BY)?.as_deref() == Some("countdown");
+        let popup_details = self.setting(DETAIL_LAYOUT)?.as_deref() == Some("popup");
         let features = self.setting(FEATURES)?.map(|t| Features::from_storage(&t)).unwrap_or_default();
         let notifications = Notifications {
             daily: self.setting(DAILY_NOTIFICATION)?.and_then(|t| chrono::NaiveTime::parse_from_str(&t, "%H:%M").ok()),
@@ -445,6 +456,8 @@ impl Store {
             week_numbers,
             mini_calendar,
             detailed_input,
+            countdown_dates,
+            popup_details,
             features,
             notifications,
             recognition,
@@ -473,6 +486,8 @@ impl Store {
         self.set_setting(DESKTOP_REMINDERS, if n.desktop { "1" } else { "0" })?;
         self.set_setting(CONSTANT_REMINDERS, if n.constant { "1" } else { "0" })?;
         self.set_setting(INPUT_BOX, if preferences.detailed_input { "detailed" } else { "simple" })?;
+        self.set_setting(SHOW_DATE_BY, if preferences.countdown_dates { "countdown" } else { "task_time" })?;
+        self.set_setting(DETAIL_LAYOUT, if preferences.popup_details { "popup" } else { "side" })?;
         let t = &preferences.task_defaults;
         let offset = |o: Option<i64>| o.map_or("none".to_owned(), |o| o.to_string());
         self.set_setting(DEFAULT_DATE, t.date.map_or("", DefaultDate::code))?;
@@ -523,6 +538,8 @@ mod tests {
             week_numbers: true,
             mini_calendar: false,
             detailed_input: true,
+            countdown_dates: true,
+            popup_details: true,
             features: Features { matrix: false, countdown: false, ..Features::default() },
             notifications: Notifications { daily: chrono::NaiveTime::from_hms_opt(8, 0, 0), desktop: false, constant: true },
             recognition: Recognition { remove_date_text: false, tags: false, ..Default::default() },

@@ -534,6 +534,18 @@ pub fn due_label(
     (label, days < 0)
 }
 
+/// A task row's date with the View Options' "Show Date by": Task Time is `due_label`; Countdown
+/// says how far away the date is ("in 3 days", "2 days ago"), today, tomorrow and yesterday
+/// keeping their names.
+pub fn row_due_label(date: NaiveDate, time: Option<NaiveTime>, today: NaiveDate, strings: &Strings, countdown: bool) -> (String, bool) {
+    let days = (date - today).num_days();
+    if !countdown || (-1..=1).contains(&days) {
+        return due_label(date, time, today, strings);
+    }
+    let text = if days > 0 { strings.in_days.replace("{n}", &days.to_string()) } else { strings.days_ago.replace("{n}", &(-days).to_string()) };
+    (text, days < 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -798,6 +810,9 @@ mod tests {
     #[test]
     fn due_labels_russian() {
         let today = d(2026, 10, 18);
+        assert_eq!(row_due_label(today + chrono::Duration::days(3), None, today, &EN, true).0, "in 3 days");
+        assert_eq!(row_due_label(today - chrono::Duration::days(2), None, today, &EN, true), ("2 days ago".to_owned(), true));
+        assert_eq!(row_due_label(today, None, today, &EN, true).0, "Today");
         let label = |date| due_label(date, None, today, &RU).0;
         assert_eq!(label(today), "Сегодня");
         assert_eq!(label(d(2026, 10, 24)), "Сб");

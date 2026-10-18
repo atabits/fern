@@ -102,6 +102,7 @@ pub enum IconName {
     Search,
     SeparatorHorizontal,
     Settings,
+    Settings2,
     Share,
     Smile,
     Square,

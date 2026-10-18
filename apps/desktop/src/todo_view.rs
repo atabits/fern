@@ -27,6 +27,8 @@ use crate::text_input::{Cancelled, Changed, Mode, Submitted, TextInput};
 const NEST_ZONE: f32 = 0.6;
 const DETAIL_WIDTH: f32 = 400.;
 const ROW_HEIGHT: f32 = 40.;
+/// Below this width the window is narrow, for View Options' Task Detail Layout.
+const NARROW_WINDOW: f32 = 1200.;
 /// Space left of the checkbox for the subtask chevron.
 const GUTTER: f32 = 20.;
 const INDENT: f32 = 24.;
@@ -149,6 +151,8 @@ pub struct TodoView {
     column_menu: Option<(Id, bool)>,
     /// The Timeline's groups folded up, by name.
     timeline_folded: HashSet<String>,
+    /// The header menu's View Options dialog and its Show Date by dropdown, while open.
+    view_options: Option<bool>,
     section_rename: Option<(Id, Entity<TextInput>)>,
     /// The "Undo" toast after completing or deleting a task, with its timer.
     undo: Option<(crate::undo::UndoAction, String, gpui::Task<()>)>,
@@ -296,6 +300,7 @@ impl TodoView {
             column_add: None,
             column_menu: None,
             timeline_folded: HashSet::new(),
+            view_options: None,
             section_rename: None,
             section_menu: None,
             templates_open: false,
@@ -473,6 +478,9 @@ impl TodoView {
                 Some(("menu", "input-box")) => self.input_box_open = true,
                 Some(("menu", "timeline")) => self.set_layout(false, true, cx),
                 Some(("menu", "kanban")) => self.set_layout(true, false, cx),
+                Some(("menu", "view-options")) => self.view_options = Some(false),
+                Some(("menu", "view-options-date")) => self.view_options = Some(true),
+                Some(("show-date", "countdown")) => self.save_preferences(|p| p.countdown_dates = true, cx),
                 Some(("menu", "arrange")) => {
                     self.set_layout(false, true, cx);
                     self.arrange_open = true;
@@ -1769,7 +1777,7 @@ impl TodoView {
                 )
         };
         let id = task.id;
-        let due = task.due_date.map(|date| task_rows::due_label(date, task.due_time, today, strings));
+        let due = task.due_date.map(|date| task_rows::row_due_label(date, task.due_time, today, strings, self.preferences.countdown_dates));
         let dragged = DraggedTask { id, title: task.title.clone().into() };
         v_flex()
             .id(ElementId::Uuid(id))
@@ -2595,6 +2603,174 @@ impl TodoView {
         self.new_section = Some(input);
         self.header_menu_open = false;
         cx.notify();
+    }
+
+    fn save_preferences(&mut self, change: impl FnOnce(&mut fern_core::Preferences), cx: &mut Context<Self>) {
+        change(&mut self.preferences);
+        let result = self.store.save_preferences(&self.preferences);
+        self.check(result);
+        cx.notify();
+    }
+
+    /// The original's View Options: Show Date by (Task Time or Countdown) and the Task Detail
+    /// Layout for a narrow window (Side peek or Pop-up), each drawn as the original's sketches.
+    fn render_view_options(&self, menu_open: bool, strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let countdown = self.preferences.countdown_dates;
+        let popup = self.preferences.popup_details;
+        let choice = |id: &'static str, label: &'static str, on: bool| {
+            ListItem::new(id)
+                .height(px(34.))
+                .child(Label::new(label).color(if on { Color::Accent } else { Color::Default }))
+                .when(on, |item| item.end_slot(Icon::new(IconName::Check).size(IconSize::Small).color(Color::Accent)))
+        };
+        let menu = menu_open.then(|| {
+            PopoverAttachment::new(
+                Placement::BelowRight,
+                popover(cx)
+                    .w(px(196.))
+                    .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                        this.view_options = Some(false);
+                        cx.notify();
+                    }))
+                    .child(choice("show-date-time", strings.task_time, !countdown).on_click(cx.listener(|this, _, _, cx| {
+                        this.view_options = Some(false);
+                        this.save_preferences(|p| p.countdown_dates = false, cx);
+                    })))
+                    .child(choice("show-date-countdown", strings.date_countdown, countdown).on_click(cx.listener(|this, _, _, cx| {
+                        this.view_options = Some(false);
+                        this.save_preferences(|p| p.countdown_dates = true, cx);
+                    }))),
+            )
+        });
+        // A small sketch of the window: the details beside the list, or over it.
+        let sketch = |over: bool| {
+            let line = |w: f32| div().w(px(w)).h(px(3.)).rounded(px(1.)).bg(theme.colors().text_muted.opacity(0.3));
+            div()
+                .relative()
+                .w(px(140.))
+                .h(px(92.))
+                .rounded(px(6.))
+                .border_1()
+                .border_color(theme.colors().border)
+                .bg(theme.colors().background)
+                .child(div().absolute().left(px(6.)).top(px(8.)).child(v_flex().gap_1().children([40., 30., 36., 28.].map(line))))
+                .child(if over {
+                    div()
+                        .absolute()
+                        .left(px(40.))
+                        .top(px(18.))
+                        .w(px(80.))
+                        .h(px(58.))
+                        .rounded(px(4.))
+                        .border_1()
+                        .border_color(theme.colors().border)
+                        .bg(theme.colors().elevated_surface_background)
+                        .p_1p5()
+                        .child(v_flex().gap_1().children([50., 60., 40.].map(line)))
+                } else {
+                    div()
+                        .absolute()
+                        .right_0()
+                        .top_0()
+                        .w(px(64.))
+                        .h_full()
+                        .border_l_1()
+                        .border_color(theme.colors().border)
+                        .p_1p5()
+                        .child(v_flex().gap_1().children([40., 50., 30.].map(line)))
+                })
+        };
+        let layout = |id: &'static str, label: &'static str, over: bool, cx: &mut Context<Self>| {
+            let on = popup == over;
+            v_flex()
+                .id(id)
+                .items_center()
+                .gap_2()
+                .cursor_pointer()
+                .child(sketch(over))
+                .child(
+                    h_flex()
+                        .gap_1p5()
+                        .child(
+                            div()
+                                .size(px(16.))
+                                .rounded_full()
+                                .border_1()
+                                .border_color(if on { theme.colors().accent } else { theme.colors().border })
+                                .when(on, |el| el.bg(theme.colors().accent).flex().items_center().justify_center().child(Icon::new(IconName::Check).size(IconSize::XSmall).color(Color::Custom(gpui::white())))),
+                        )
+                        .child(Label::new(label)),
+                )
+                .on_click(cx.listener(move |this, _, _, cx| this.save_preferences(|p| p.popup_details = over, cx)))
+        };
+        let section = || v_flex().p_4().gap_1().rounded(px(8.)).bg(theme.colors().surface_background);
+        div()
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(gpui::black().opacity(0.35))
+            .occlude()
+            .child(
+                v_flex()
+                    .id("view-options")
+                    .w(px(440.))
+                    .p_5()
+                    .gap_3()
+                    .rounded(px(10.))
+                    .bg(theme.colors().elevated_surface_background)
+                    .border_1()
+                    .border_color(theme.colors().border)
+                    .shadow_lg()
+                    .child(
+                        h_flex()
+                            .child(div().flex_1().text_size(px(16.)).font_weight(FontWeight::SEMIBOLD).child(strings.view_options))
+                            .child(IconButton::new("view-options-x", IconName::X).icon_color(Color::Muted).on_click(cx.listener(|this, _, _, cx| {
+                                this.view_options = None;
+                                cx.notify();
+                            }))),
+                    )
+                    .child(
+                        h_flex()
+                            .h(px(48.))
+                            .px_4()
+                            .rounded(px(8.))
+                            .bg(theme.colors().surface_background)
+                            .child(div().flex_1().child(Label::new(strings.show_date_by)))
+                            .child(
+                                div()
+                                    .relative()
+                                    .child(
+                                        h_flex()
+                                            .id("show-date-by")
+                                            .gap_1()
+                                            .cursor_pointer()
+                                            .child(Label::new(if countdown { strings.date_countdown } else { strings.task_time }).color(Color::Muted))
+                                            .child(Icon::new(IconName::ChevronsUpDown).size(IconSize::XSmall).color(Color::Muted))
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.view_options = Some(!this.view_options.unwrap_or(false));
+                                                cx.notify();
+                                            })),
+                                    )
+                                    .children(menu),
+                            ),
+                    )
+                    .child(
+                        section()
+                            .child(Label::new(strings.task_detail_layout))
+                            .child(Label::new(strings.task_detail_layout_hint).size(LabelSize::Small).color(Color::Muted))
+                            .child(
+                                h_flex()
+                                    .pt_3()
+                                    .justify_around()
+                                    .child(layout("layout-side", strings.side_peek, false, cx))
+                                    .child(layout("layout-popup", strings.pop_up, true, cx)),
+                            ),
+                    ),
+            )
+            .into_any_element()
     }
 
     /// A kanban column's "+": a field at the column's top; the task it adds takes the column's
@@ -3852,7 +4028,7 @@ impl TodoView {
                 .into_any_element()
         };
 
-        let due = task.due_date.map(|date| task_rows::due_label(date, task.due_time, today, strings));
+        let due = task.due_date.map(|date| task_rows::row_due_label(date, task.due_time, today, strings, self.preferences.countdown_dates));
 
         let draggable = self.view != View::Trash;
         let dragged = DraggedTask { id, title: task.title.clone().into() };
@@ -4655,6 +4831,16 @@ impl TodoView {
                             .child(Label::new(if details { strings.hide_details } else { strings.show_details }))
                             .on_click(cx.listener(|this, _, _, cx| this.toggle_view_flag("show_details", false, cx))),
                     )
+                    .child(
+                        ListItem::new("view-options")
+                            .start_slot(Icon::new(IconName::Settings2).color(Color::Muted))
+                            .child(Label::new(strings.view_options))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.header_menu_open = false;
+                                this.view_options = Some(false);
+                                cx.notify();
+                            })),
+                    )
                     .child(div().my_1().child(Divider::horizontal()))
                     .when(in_list, |el| {
                         el.child(
@@ -4698,7 +4884,7 @@ impl Focusable for TodoView {
 }
 
 impl Render for TodoView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let strings = i18n::t(cx);
         let theme = cx.theme().clone();
         let input_focus = self.input.focus_handle(cx);
@@ -4708,6 +4894,8 @@ impl Render for TodoView {
             .iter()
             .map(|t| (t.name.clone(), lists_panel::color(t.color.as_deref(), cx)))
             .collect();
+        // The original's "too narrow" window: the details then follow View Options' layout.
+        let popup_details = self.preferences.popup_details && window.viewport_size().width < px(NARROW_WINDOW);
         let timeline_view = self.timeline
             && !self.kanban
             && !matches!(self.view, View::Trash | View::Completed | View::WontDo | View::Search(_));
@@ -5082,6 +5270,44 @@ impl Render for TodoView {
                 if (timeline_view || kanban_only) && self.selected.is_none() && self.list_activity.is_none() {
                     return el.child(list);
                 }
+                // View Options' Pop-up: in a narrow window an opened task shows over the list.
+                if popup_details {
+                    if self.selected.is_none() && self.list_activity.is_none() {
+                        return el.child(list);
+                    }
+                    return el.child(list).child(
+                        div()
+                            .id("detail-popup")
+                            .absolute()
+                            .inset_0()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .bg(gpui::black().opacity(0.35))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.selected = None;
+                                this.list_activity = None;
+                                cx.notify();
+                            }))
+                            .child(
+                                div()
+                                    .id("detail-popup-card")
+                                    .w(px(DETAIL_WIDTH))
+                                    .h(gpui::relative(0.8))
+                                    .rounded(px(10.))
+                                    .overflow_hidden()
+                                    .border_1()
+                                    .border_color(theme.colors().border)
+                                    .bg(theme.colors().background)
+                                    .shadow_lg()
+                                    .on_click(|_, _, cx| cx.stop_propagation())
+                                    .map(|el| match self.list_activity.clone() {
+                                        Some(entries) => el.child(self.render_list_activity(&entries, cx)),
+                                        None => el.child(self.detail.clone()),
+                                    }),
+                            ),
+                    );
+                }
                 el.child(list).child(div().flex_none().w(px(DETAIL_WIDTH)).h_full().pt(px(crate::TOP_INSET)).map(|el| match self.list_activity.clone() {
                     Some(entries) => el.child(self.render_list_activity(&entries, cx)),
                     None => el.child(self.detail.clone()),
@@ -5114,6 +5340,7 @@ impl Render for TodoView {
             })
             .children(self.render_context_menu(strings, cx))
             .children(self.render_list_menu(strings, cx))
+            .children(self.view_options.map(|menu| self.render_view_options(menu, strings, cx)))
             .children(self.list_dialog.clone())
             .children(self.folder_dialog.clone())
             .children(self.tag_dialog.clone())

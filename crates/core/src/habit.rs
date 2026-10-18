@@ -30,30 +30,52 @@ pub struct Habit {
     pub archived: bool,
 }
 
-/// The original's default habit sections, in their order.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+/// A habit's section: the original's default ones or one the user added ("Add Section").
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum HabitSection {
     Morning,
     Afternoon,
     Night,
+    /// A section from the habit sections table.
+    Custom(crate::model::Id),
     #[default]
     Others,
 }
 
-impl HabitSection {
-    pub const ALL: [Self; 4] = [Self::Morning, Self::Afternoon, Self::Night, Self::Others];
+/// A section the user added.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CustomSection {
+    pub id: crate::model::Id,
+    pub name: String,
+}
 
-    pub fn key(self) -> &'static str {
+impl HabitSection {
+    /// The default sections; custom ones go between Night and Others.
+    pub const DEFAULTS: [Self; 4] = [Self::Morning, Self::Afternoon, Self::Night, Self::Others];
+
+    /// All sections in display order.
+    pub fn ordered(custom: &[CustomSection]) -> Vec<Self> {
+        let mut sections = vec![Self::Morning, Self::Afternoon, Self::Night];
+        sections.extend(custom.iter().map(|c| Self::Custom(c.id)));
+        sections.push(Self::Others);
+        sections
+    }
+
+    pub fn key(self) -> String {
         match self {
-            Self::Morning => "morning",
-            Self::Afternoon => "afternoon",
-            Self::Night => "night",
-            Self::Others => "others",
+            Self::Morning => "morning".into(),
+            Self::Afternoon => "afternoon".into(),
+            Self::Night => "night".into(),
+            Self::Custom(id) => format!("custom:{id}"),
+            Self::Others => "others".into(),
         }
     }
 
     pub fn from_key(key: &str) -> Self {
-        Self::ALL.into_iter().find(|s| s.key() == key).unwrap_or_default()
+        if let Some(id) = key.strip_prefix("custom:").and_then(|id| id.parse().ok()) {
+            return Self::Custom(id);
+        }
+        Self::DEFAULTS.into_iter().find(|s| s.key() == key).unwrap_or_default()
     }
 }
 
@@ -311,6 +333,10 @@ mod tests {
         assert!(reminders_between(&archived, &HashMap::new(), at(17, 8), at(18, 23)).is_empty());
         assert_eq!(HabitSection::from_key("night"), HabitSection::Night);
         assert_eq!(HabitSection::from_key("custom"), HabitSection::Others);
+        let custom = CustomSection { id: uuid::Uuid::now_v7(), name: "Pets".into() };
+        let section = HabitSection::Custom(custom.id);
+        assert_eq!(HabitSection::from_key(&section.key()), section);
+        assert_eq!(HabitSection::ordered(&[custom])[3], section);
     }
 
     #[test]

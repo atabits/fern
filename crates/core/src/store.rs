@@ -145,6 +145,13 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE habits ADD COLUMN section TEXT;
     ALTER TABLE habits ADD COLUMN archived_at INTEGER;
     ",
+    "
+    CREATE TABLE habit_sections (
+        id         TEXT PRIMARY KEY,
+        name       TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+    );
+    ",
 ];
 
 const TASK_COLUMNS: &str = "id, parent_id, kind, title, notes, priority, due_date, due_time, \
@@ -807,6 +814,36 @@ impl Store {
 
     pub fn set_habit_section(&self, id: Id, section: crate::habit::HabitSection) -> Result<()> {
         self.conn.execute("UPDATE habits SET section = ?2 WHERE id = ?1", params![id.to_string(), section.key()])?;
+        Ok(())
+    }
+
+    /// Sections the user added, oldest first.
+    pub fn habit_sections(&self) -> Result<Vec<crate::habit::CustomSection>> {
+        let mut stmt = self.conn.prepare("SELECT id, name FROM habit_sections ORDER BY created_at, rowid")?;
+        let sections = stmt
+            .query_map([], |row| {
+                Ok(crate::habit::CustomSection { id: parse_uuid(&row.get::<_, String>(0)?, 0)?, name: row.get(1)? })
+            })?
+            .collect::<Result<_, _>>()?;
+        Ok(sections)
+    }
+
+    pub fn add_habit_section(&self, name: &str) -> Result<crate::habit::CustomSection> {
+        let name = name.trim();
+        anyhow::ensure!(!name.is_empty(), "a section needs a name");
+        let section = crate::habit::CustomSection { id: Uuid::now_v7(), name: name.to_owned() };
+        self.conn.execute(
+            "INSERT INTO habit_sections (id, name, created_at) VALUES (?1, ?2, ?3)",
+            params![section.id.to_string(), section.name, now_ms()],
+        )?;
+        Ok(section)
+    }
+
+    /// Deletes a section; its habits move to Others.
+    pub fn delete_habit_section(&self, id: Id) -> Result<()> {
+        let key = crate::habit::HabitSection::Custom(id).key();
+        self.conn.execute("UPDATE habits SET section = NULL WHERE section = ?1", [key])?;
+        self.conn.execute("DELETE FROM habit_sections WHERE id = ?1", [id.to_string()])?;
         Ok(())
     }
 
@@ -1583,6 +1620,15 @@ mod tests {
         assert_eq!((habit.section, habit.archived), (crate::habit::HabitSection::Morning, true));
         store.set_habit_archived(water.id, false)?;
         assert!(!store.habits()?[0].archived);
+
+        assert!(store.add_habit_section(" ").is_err());
+        let pets = store.add_habit_section(" Pets ")?;
+        assert_eq!(store.habit_sections()?, [pets.clone()]);
+        store.set_habit_section(water.id, crate::habit::HabitSection::Custom(pets.id))?;
+        assert_eq!(store.habits()?[0].section, crate::habit::HabitSection::Custom(pets.id));
+        store.delete_habit_section(pets.id)?;
+        assert!(store.habit_sections()?.is_empty());
+        assert_eq!(store.habits()?[0].section, crate::habit::HabitSection::Others);
         store.set_habit_span(water.id, None, Some(0))?;
         let habit = store.habits()?.remove(0);
         assert_eq!((habit.start_date, habit.goal_days), (None, None));

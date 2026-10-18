@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use chrono::{Datelike, Local, NaiveDate};
-use fern_core::{Checkin, Goal, Habit, HabitFrequency, HabitSection, Id, Store, habit};
+use fern_core::{Checkin, CustomSection, Goal, Habit, HabitFrequency, HabitSection, Id, Store, habit};
 use gpui::{Entity, Focusable as _, FontWeight};
 use ui::prelude::*;
 use ui::{Placement, PopoverAttachment, popover};
@@ -54,6 +54,8 @@ struct HabitEdit {
     reminders: Vec<chrono::NaiveTime>,
     frequency: HabitFrequency,
     section: HabitSection,
+    /// The "Add Section" field, while it is shown.
+    new_section: Option<Entity<TextInput>>,
     start_date: NaiveDate,
     goal_days: Option<u32>,
     /// The start date's calendar month, while it is open.
@@ -85,6 +87,8 @@ pub struct HabitView {
     /// The header's Active / Archived switch.
     show_archived: bool,
     header_menu_open: bool,
+    /// Sections the user added.
+    sections: Vec<CustomSection>,
     /// The header's list button: habits as full-width rows instead of cards (kept in settings).
     list_layout: bool,
 }
@@ -121,6 +125,7 @@ impl HabitView {
             show_archived: false,
             header_menu_open: false,
             list_layout: false,
+            sections: Vec::new(),
         };
         this.list_layout = this.store.setting(LAYOUT_SETTING).ok().flatten().as_deref() == Some("list");
         this.reload(cx);
@@ -129,6 +134,7 @@ impl HabitView {
 
     pub fn reload(&mut self, cx: &mut Context<Self>) {
         self.habits = self.store.habits().unwrap_or_default();
+        self.sections = self.store.habit_sections().unwrap_or_default();
         self.records =
             self.habits.iter().map(|h| (h.id, self.store.checkin_records(h.id).unwrap_or_default())).collect();
         self.checkins = self.habits.iter().map(|h| (h.id, self.store.checkins(h.id).unwrap_or_default())).collect();
@@ -199,6 +205,7 @@ impl HabitView {
             reminders: habit.reminders.clone(),
             frequency: habit.frequency,
             section: habit.section,
+            new_section: None,
             reminder_input,
         });
         self.detail_menu_open = false;
@@ -295,11 +302,11 @@ impl HabitView {
             .child(self.render_frequency(edit.frequency, cx))
             .child(self.render_span(edit, cx))
             .child(Label::new(strings.habit_section).size(LabelSize::Small).color(Color::Muted))
-            .child(h_flex().gap_1().children(HabitSection::ALL.into_iter().enumerate().map(|(i, section)| {
+            .child(h_flex().flex_wrap().gap_1().children(HabitSection::ordered(&self.sections).into_iter().enumerate().map(|(i, section)| {
                 let selected = edit.section == section;
                 div()
                     .id(SharedString::from(format!("habit-section-{i}")))
-                    .flex_1()
+                    .px_2()
                     .h(px(24.))
                     .flex()
                     .items_center()
@@ -308,9 +315,25 @@ impl HabitView {
                     .cursor_pointer()
                     .when(selected, |el| el.bg(theme.colors().accent.opacity(0.25)))
                     .when(!selected, |el| el.bg(theme.colors().element_hover))
-                    .child(Label::new(strings.habit_sections[i]).size(LabelSize::XSmall).color(if selected { Color::Accent } else { Color::Default }))
+                    .child(Label::new(self.section_label(section, cx)).size(LabelSize::XSmall).color(if selected { Color::Accent } else { Color::Default }))
                     .on_click(cx.listener(move |this, _, _, cx| this.update_edit(cx, |e| e.section = section)))
-            })))
+            })).child(
+                div()
+                    .id("habit-section-add")
+                    .px_2()
+                    .h(px(24.))
+                    .flex()
+                    .items_center()
+                    .rounded(px(12.))
+                    .cursor_pointer()
+                    .border_1()
+                    .border_color(theme.colors().border)
+                    .child(Label::new(format!("+ {}", strings.habit_add_section)).size(LabelSize::XSmall))
+                    .on_click(cx.listener(|this, _, window, cx| this.start_new_section(window, cx))),
+            ))
+            .when_some(edit.new_section.clone(), |el, input| {
+                el.child(h_flex().h(px(30.)).px_2().rounded(px(6.)).bg(theme.colors().background).child(input))
+            })
             .child(Label::new(strings.habit_goal).size(LabelSize::Small).color(Color::Muted))
             .child(
                 option("goal-all", strings.habit_goal_all, amount.is_none())
@@ -718,7 +741,11 @@ impl HabitView {
             let start = Local::now().date_naive() - chrono::Duration::days(ago.parse().unwrap_or(0));
             self.store.set_habit_span(id, Some(start), days.parse().ok()).ok();
         } else if let Some(section) = command.strip_prefix("section=") {
-            self.store.set_habit_section(id, HabitSection::from_key(section)).ok();
+            let section = match section.strip_prefix("new:") {
+                Some(name) => self.store.add_habit_section(name).map(|s| HabitSection::Custom(s.id)).unwrap_or_default(),
+                None => HabitSection::from_key(section),
+            };
+            self.store.set_habit_section(id, section).ok();
         } else if command == "archive" {
             self.store.set_habit_archived(id, true).ok();
         } else if command == "list" {
@@ -887,6 +914,38 @@ impl HabitView {
         }
         let done = active.iter().filter(|h| self.checkins.get(&h.id).is_some_and(|c| c.contains(&date))).count();
         done as f32 / active.len() as f32
+    }
+
+    /// A section's name: the default ones are translated, custom ones are the user's.
+    fn section_label(&self, section: HabitSection, cx: &App) -> String {
+        let strings = i18n::t(cx);
+        match section {
+            HabitSection::Morning => strings.habit_sections[0].to_owned(),
+            HabitSection::Afternoon => strings.habit_sections[1].to_owned(),
+            HabitSection::Night => strings.habit_sections[2].to_owned(),
+            HabitSection::Others => strings.habit_sections[3].to_owned(),
+            HabitSection::Custom(id) => {
+                self.sections.iter().find(|s| s.id == id).map_or_else(|| strings.habit_sections[3].to_owned(), |s| s.name.clone())
+            }
+        }
+    }
+
+    fn start_new_section(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let strings = i18n::t(cx);
+        let input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.habit_section_name, cx));
+        cx.subscribe(&input, |this, _, Submitted(name), cx| match this.store.add_habit_section(name) {
+            Ok(section) => {
+                this.sections = this.store.habit_sections().unwrap_or_default();
+                this.update_edit(cx, |e| {
+                    e.section = HabitSection::Custom(section.id);
+                    e.new_section = None;
+                });
+            }
+            Err(err) => eprintln!("failed to add the section: {err:#}"),
+        })
+        .detach();
+        window.focus(&input.focus_handle(cx), cx);
+        self.update_edit(cx, |e| e.new_section = Some(input));
     }
 
     fn set_list_layout(&mut self, list: bool, cx: &mut Context<Self>) {
@@ -1237,12 +1296,13 @@ impl Render for HabitView {
         let visible: Vec<&Habit> = habits.iter().filter(|h| h.archived == self.show_archived).collect();
         let grouped = visible.iter().any(|h| h.section != HabitSection::Others);
         let mut cards: Vec<AnyElement> = Vec::new();
-        for (i, section) in HabitSection::ALL.into_iter().enumerate() {
+        for (i, section) in HabitSection::ordered(&self.sections).into_iter().enumerate() {
             let in_section: Vec<&Habit> =
                 visible.iter().copied().filter(|h| !grouped || h.section == section).collect();
             if in_section.is_empty() || (!grouped && i > 0) {
                 continue;
             }
+            let title = self.section_label(section, cx);
             let section_cards: Vec<AnyElement> = in_section.iter().map(|h| self.render_card(h, week, today, cx)).collect();
             cards.push(
                 v_flex()
@@ -1253,7 +1313,7 @@ impl Render for HabitView {
                             h_flex()
                                 .gap_1()
                                 .pt_2()
-                                .child(Label::new(strings.habit_sections[i]).size(LabelSize::Small).weight(FontWeight::SEMIBOLD))
+                                .child(Label::new(title).size(LabelSize::Small).weight(FontWeight::SEMIBOLD))
                                 .child(Label::new(in_section.len().to_string()).size(LabelSize::XSmall).color(Color::Muted)),
                         )
                     })

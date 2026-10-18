@@ -92,5 +92,8 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 
 ## Next
 
+1. Eisenhower Matrix: the quadrant menu's Group by, Sort by and Order.
+2. Countdown: the card's pin (pinned countdowns first).
+3. Timeline: dragging a bar moves the task's dates.
 
 Not checkable under the reference rules: whether the original asks for a note when a focus session ends (finding out means running a focus timer in the reference account). Fern's record dialog takes a note afterwards.

@@ -6,6 +6,7 @@ mod actions;
 mod app_view;
 
 mod calendar;
+mod calendar_options_view;
 mod calendar_view;
 mod countdown_view;
 mod drag;

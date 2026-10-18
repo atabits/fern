@@ -2,6 +2,7 @@
 //! Used by the desktop app and, later, by the mobile clients.
 
 pub mod agenda;
+pub mod calendar_options;
 pub mod countdown;
 pub mod filter;
 pub mod focus;
@@ -23,6 +24,7 @@ pub mod summary;
 pub mod sync;
 pub mod timeline;
 
+pub use calendar_options::{CalendarOptions, ColorBy};
 pub use countdown::{Countdown, CountdownKind, Span, span};
 pub use filter::{DateRule, Field, Join, Link, SmartFilter};
 pub use focus::{FocusSession, FocusStats, focus_stats, format_minutes};

@@ -229,6 +229,9 @@ impl AppView {
             if let Some(needle) = state.split(';').find_map(|part| part.strip_prefix("calendar-context=")) {
                 this.calendar.update(cx, |view, cx| view.dev_context(needle, cx));
             }
+            if let Some(what) = state.split(';').find_map(|part| part.strip_prefix("calendar-more=")) {
+                this.calendar.update(cx, |view, cx| view.dev_more(what, cx));
+            }
             // `calendar-card=<title part>` opens that task's card in the calendar.
             if let Some(needle) = state.split(';').find_map(|part| part.strip_prefix("calendar-card=")) {
                 this.calendar.update(cx, |view, cx| view.dev_card(needle, cx));

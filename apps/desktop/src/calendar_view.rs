@@ -4,7 +4,7 @@
 use std::rc::Rc;
 
 use chrono::{Datelike, Local, NaiveDate};
-use fern_core::{Id, Store, Task};
+use fern_core::{CalendarOptions, ColorBy, Id, Priority, Store, Task};
 use gpui::{EventEmitter, FontWeight};
 use ui::prelude::*;
 use ui::{Placement, PopoverAttachment, SubmenuItem, popover};
@@ -13,6 +13,7 @@ use crate::actions::{AgendaView, DayView, MonthView, NewTask, ToggleSidebar, Wee
 use crate::calendar::{self, week_axis};
 use crate::drag::DraggedTask;
 use crate::i18n;
+use crate::calendar_options_view::{CalendarOptionsDialog, OptionsEvent, Page};
 use crate::task_detail::{StartFocus, TaskDetail, TaskUpdated};
 use crate::task_rows;
 
@@ -85,6 +86,18 @@ pub struct CalendarView {
     /// it was clicked on, and the details it shows.
     card: Option<(Id, NaiveDate)>,
     detail: gpui::Entity<TaskDetail>,
+    /// View Options, the header's "…" menu and the dialog it opens.
+    options: CalendarOptions,
+    more_menu: bool,
+    options_dialog: Option<gpui::Entity<CalendarOptionsDialog>>,
+    /// The "Arrange tasks" panel: the open tasks without a date, grouped by the tab's choice
+    /// (lists, tags or priority), to drag onto a day.
+    arrange: Option<usize>,
+    undated: Vec<Task>,
+    /// The colors tasks take with Color By List or Tag.
+    list_colors: std::collections::HashMap<Id, gpui::Hsla>,
+    tag_colors: std::collections::HashMap<String, gpui::Hsla>,
+    list_names: Vec<(Id, String)>,
 }
 
 /// The original's task card: 402 px wide, 301 px tall.
@@ -140,6 +153,14 @@ impl CalendarView {
             context_side: None,
             card: None,
             detail,
+            options: CalendarOptions::default(),
+            more_menu: false,
+            options_dialog: None,
+            arrange: None,
+            undated: Vec::new(),
+            list_colors: Default::default(),
+            tag_colors: Default::default(),
+            list_names: Vec::new(),
         };
         this.reload(cx);
         this
@@ -150,8 +171,159 @@ impl CalendarView {
         match self.mode {
             CalendarMode::Day => vec![self.anchor],
             CalendarMode::MultiDay(n) => (0..n as i64).map(|i| self.anchor + chrono::Duration::days(i)).collect(),
-            _ => calendar::week_of(self.anchor).to_vec(),
+            _ => calendar::week_of(self.anchor).into_iter().filter(|d| self.options.shows_day(*d)).collect(),
         }
+    }
+
+    /// The tasks a day shows, as View Options say.
+    fn tasks_on(&self, date: NaiveDate) -> Vec<&Task> {
+        self.tasks.iter().filter(|t| self.options.shows_task(t, date)).collect()
+    }
+
+    /// A task's color, by its list, first tag or priority as View Options → Color By says.
+    fn task_tint(&self, task: &Task, theme: &theme::Theme) -> gpui::Hsla {
+        let accent = theme.colors().accent;
+        match self.options.color_by {
+            ColorBy::List => task.list_id.and_then(|id| self.list_colors.get(&id).copied()).unwrap_or(accent),
+            ColorBy::Tag => task.tags.first().and_then(|t| self.tag_colors.get(&t.to_lowercase()).copied()).unwrap_or(accent),
+            ColorBy::Priority => task_rows::priority_color(task.priority, theme).unwrap_or(accent),
+        }
+    }
+
+    fn open_options(&mut self, page: Page, cx: &mut Context<Self>) {
+        let store = self.store.clone();
+        let dialog = cx.new(|_| CalendarOptionsDialog::new(store, page));
+        cx.subscribe(&dialog, |this, _, event: &OptionsEvent, cx| {
+            match event {
+                OptionsEvent::Changed(options) => this.options = *options,
+                OptionsEvent::Closed => this.options_dialog = None,
+            }
+            this.reload(cx);
+        })
+        .detach();
+        self.options_dialog = Some(dialog);
+        self.more_menu = false;
+        cx.notify();
+    }
+
+    /// The header's "…" menu, as the original's: View Options and Arrange Tasks.
+    fn render_more_menu(&self, cx: &mut Context<Self>) -> AnyElement {
+        let strings = i18n::t(cx);
+        let row = |id: &'static str, icon: IconName, label: &'static str| {
+            ListItem::new(id).height(px(34.)).start_slot(Icon::new(icon).color(Color::Muted)).child(Label::new(label))
+        };
+        popover(cx)
+            .w(px(184.))
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.more_menu = false;
+                cx.notify();
+            }))
+            .child(row("calendar-view-options", IconName::Settings2, strings.view_options).on_click(cx.listener(|this, _, _, cx| this.open_options(Page::Main, cx))))
+            .child(row("calendar-arrange", IconName::ListChecks, strings.arrange_tasks).on_click(cx.listener(|this, _, _, cx| {
+                this.more_menu = false;
+                this.arrange = Some(this.arrange.unwrap_or(0));
+                this.reload(cx);
+            })))
+            .into_any_element()
+    }
+
+    /// The original's "Arrange tasks" panel at the calendar's right: the open tasks without a
+    /// date under Lists, Tags or Priority tabs, dragged onto a day to plan them.
+    fn render_arrange(&self, tab: usize, cx: &mut Context<Self>) -> AnyElement {
+        let strings = i18n::t(cx);
+        let theme = cx.theme().clone();
+        let mut groups: Vec<(String, Vec<&Task>)> = Vec::new();
+        match tab {
+            0 => {
+                let mut keys: Vec<(Option<Id>, String)> = vec![(None, strings.inbox.to_owned())];
+                keys.extend(self.list_names.iter().map(|(id, name)| (Some(*id), name.clone())));
+                for (id, name) in keys {
+                    let tasks: Vec<&Task> = self.undated.iter().filter(|t| t.list_id == id).collect();
+                    if !tasks.is_empty() {
+                        groups.push((name, tasks));
+                    }
+                }
+            }
+            1 => {
+                let mut names: Vec<String> = self.undated.iter().flat_map(|t| t.tags.iter().cloned()).collect();
+                names.sort_by_key(|n| n.to_lowercase());
+                names.dedup_by_key(|n| n.to_lowercase());
+                for name in names {
+                    let tasks: Vec<&Task> = self.undated.iter().filter(|t| t.tags.iter().any(|g| g.eq_ignore_ascii_case(&name))).collect();
+                    groups.push((format!("#{name}"), tasks));
+                }
+                let untagged: Vec<&Task> = self.undated.iter().filter(|t| t.tags.is_empty()).collect();
+                if !untagged.is_empty() {
+                    groups.push((strings.group_no_tags.to_owned(), untagged));
+                }
+            }
+            _ => {
+                for (priority, label) in [Priority::High, Priority::Medium, Priority::Low, Priority::None]
+                    .into_iter()
+                    .zip([strings.priority_high, strings.priority_medium, strings.priority_low, strings.priority_none])
+                {
+                    let tasks: Vec<&Task> = self.undated.iter().filter(|t| t.priority == priority).collect();
+                    if !tasks.is_empty() {
+                        groups.push((label.to_owned(), tasks));
+                    }
+                }
+            }
+        }
+        let tabs = h_flex().p(px(3.)).rounded(px(8.)).bg(theme.colors().surface_background).children(strings.arrange_tabs.iter().enumerate().map(|(i, label)| {
+            div()
+                .id(SharedString::from(format!("arrange-tab-{i}")))
+                .flex_1()
+                .h(px(28.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(6.))
+                .cursor_pointer()
+                .when(i == tab, |el| el.bg(theme.colors().element_selected))
+                .child(Label::new(*label).size(LabelSize::Small).color(if i == tab { Color::Default } else { Color::Muted }))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.arrange = Some(i);
+                    cx.notify();
+                }))
+        }));
+        let mut body: Vec<AnyElement> = Vec::new();
+        for (name, tasks) in groups {
+            body.push(
+                h_flex()
+                    .pt_2()
+                    .pb_1()
+                    .gap_1()
+                    .child(Icon::new(IconName::ChevronDown).size(IconSize::XSmall).color(Color::Muted))
+                    .child(Label::new(name).size(LabelSize::Small).weight(FontWeight::SEMIBOLD))
+                    .child(Label::new(tasks.len().to_string()).size(LabelSize::XSmall).color(Color::Muted))
+                    .into_any_element(),
+            );
+            body.extend(tasks.into_iter().map(|t| self.task_bar(t, None, cx).h(px(20.)).into_any_element()));
+        }
+        if body.is_empty() {
+            body.push(div().pt_4().child(Label::new(strings.arrange_empty).size(LabelSize::Small).color(Color::Muted)).into_any_element());
+        }
+        v_flex()
+            .id("calendar-arrange")
+            .w(px(240.))
+            .flex_none()
+            .h_full()
+            .px_3()
+            .pt_3()
+            .gap_2()
+            .border_l_1()
+            .border_color(theme.colors().border_variant)
+            .child(
+                h_flex()
+                    .child(div().flex_1().child(Label::new(strings.arrange_tasks_title).weight(FontWeight::SEMIBOLD)))
+                    .child(IconButton::new("arrange-close", IconName::X).size(px(22.)).icon_size(IconSize::Small).on_click(cx.listener(|this, _, _, cx| {
+                        this.arrange = None;
+                        cx.notify();
+                    }))),
+            )
+            .child(tabs)
+            .child(v_flex().id("arrange-tasks").flex_1().min_h_0().overflow_y_scroll().gap(px(3.)).children(body))
+            .into_any_element()
     }
 
     /// Opens a task's card beside it, the task as clicked on `day`.
@@ -182,6 +354,28 @@ impl CalendarView {
             Ok(Some(task)) if !task.is_deleted() => self.detail.update(cx, |detail, cx| detail.refresh(Some(task), cx)),
             _ => self.close_card(cx),
         }
+    }
+
+    /// The header's "…" menu and what it opens, for the debug-build dev state
+    /// (`calendar-more=menu|options|color|color-by|style|arrange|arrange-tags`).
+    #[cfg(debug_assertions)]
+    pub fn dev_more(&mut self, what: &str, cx: &mut Context<Self>) {
+        match what {
+            "menu" => self.more_menu = true,
+            "options" => self.open_options(Page::Main, cx),
+            "color" => self.open_options(Page::Color, cx),
+            "color-by" => {
+                self.open_options(Page::Color, cx);
+                if let Some(dialog) = &self.options_dialog {
+                    dialog.update(cx, |d, _| d.dev_color_menu());
+                }
+            }
+            "style" => self.open_options(Page::Style, cx),
+            "arrange" => self.arrange = Some(0),
+            "arrange-tags" => self.arrange = Some(1),
+            _ => {}
+        }
+        self.reload(cx);
     }
 
     /// Opens a task's card from the debug-build dev state (`calendar-card=<title part>`).
@@ -296,13 +490,24 @@ impl CalendarView {
     }
 
     pub fn reload(&mut self, cx: &mut Context<Self>) {
+        self.options = self.store.calendar_options().unwrap_or_default();
+        let lists = self.store.lists().unwrap_or_default();
+        self.list_colors = lists.iter().filter_map(|l| crate::lists_panel::parse_color(l.color.as_deref()).map(|c| (l.id, c))).collect();
+        self.list_names = lists.iter().filter(|l| !l.archived).map(|l| (l.id, l.name.clone())).collect();
+        self.tag_colors = self
+            .store
+            .tags()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|t| crate::lists_panel::parse_color(t.color.as_deref()).map(|c| (t.name.to_lowercase(), c)))
+            .collect();
         if self.mode == CalendarMode::Agenda {
             let from = self.agenda_start();
             self.countdowns = self.store.countdowns().unwrap_or_default();
             match self.store.tasks() {
                 Ok(tasks) => {
-                    self.agenda =
-                        fern_core::agenda::agenda(&tasks, &self.countdowns, from, from + chrono::Duration::days(AGENDA_DAYS))
+                    let countdowns: &[fern_core::Countdown] = if self.options.show_countdowns { &self.countdowns } else { &[] };
+                    self.agenda = fern_core::agenda::agenda(&tasks, countdowns, from, from + chrono::Duration::days(AGENDA_DAYS))
                 }
                 Err(err) => eprintln!("failed to load the agenda: {err:#}"),
             }
@@ -332,6 +537,17 @@ impl CalendarView {
             Ok(tasks) => self.tasks = tasks,
             Err(err) => eprintln!("failed to load calendar tasks: {err:#}"),
         }
+        // Repeating tasks due earlier come back on the shown days ("Show All Repeat Cycle"),
+        // and the Arrange panel lists the undated ones.
+        let all = self.store.tasks().unwrap_or_default();
+        if self.options.show_repeats {
+            let shown: std::collections::HashSet<Id> = self.tasks.iter().map(|t| t.id).collect();
+            self.tasks.extend(
+                all.iter().filter(|t| t.repeat.is_some() && !t.is_closed() && !t.is_deleted() && t.due_date.is_some_and(|d| d < start) && !shown.contains(&t.id)).cloned(),
+            );
+        }
+        self.undated = all.into_iter().filter(|t| t.due_date.is_none() && !t.is_closed() && !t.is_deleted() && t.parent_id.is_none()).collect();
+        self.countdowns = self.store.countdowns().unwrap_or_default();
         cx.notify();
     }
 
@@ -411,8 +627,9 @@ impl CalendarView {
     fn render_day(&self, date: NaiveDate, today: NaiveDate, cx: &mut Context<Self>) -> AnyElement {
         let strings = i18n::t(cx);
         let theme = cx.theme().clone();
-        let tasks: Vec<&Task> = self.tasks.iter().filter(|t| t.occurs_on(date)).collect();
-        let hidden = tasks.len().saturating_sub(TASKS_PER_DAY);
+        let tasks = self.tasks_on(date);
+        let countdowns: Vec<&fern_core::Countdown> = self.countdowns.iter().filter(|c| !c.archived && self.options.shows_countdown(c, date)).collect();
+        let hidden = (tasks.len() + countdowns.len()).saturating_sub(TASKS_PER_DAY);
         // The first day of a month carries the month name, as in the original: "Oct 1".
         let number = if date.day() == 1 {
             let month = strings.months_short[date.month0() as usize];
@@ -457,6 +674,19 @@ impl CalendarView {
                 ),
             )
             .children(tasks.iter().take(TASKS_PER_DAY).map(|task| self.task_bar(task, Some(date), cx)))
+            // Countdowns, as in the original's month: an orange bar with the countdown's name.
+            .children(countdowns.iter().take(TASKS_PER_DAY.saturating_sub(tasks.len())).map(|c| {
+                let orange = theme.status().warning;
+                h_flex()
+                    .h(px(18.))
+                    .flex_none()
+                    .gap_1()
+                    .px_1()
+                    .rounded(px(3.))
+                    .bg(orange.opacity(0.28))
+                    .child(div().size(px(6.)).flex_none().rounded_full().bg(orange))
+                    .child(Label::new(c.name.clone()).size(LabelSize::XSmall).truncate())
+            }))
             .when(hidden > 0, |el| {
                 el.child(div().px_1().child(Label::new(format!("+{hidden}")).size(LabelSize::XSmall).color(Color::Muted)))
             })
@@ -469,7 +699,8 @@ impl CalendarView {
         let theme = cx.theme().clone();
         let id = task.id;
         let done = task.is_completed();
-        let tint = task_rows::priority_color(task.priority, &theme).unwrap_or(theme.colors().accent);
+        let tint = self.task_tint(task, &theme);
+        let modern = self.options.modern;
         let dragged = DraggedTask { id, title: task.title.clone().into() };
         h_flex()
             .id(SharedString::from(format!("calendar-task-{id}")))
@@ -480,7 +711,13 @@ impl CalendarView {
             .px_1()
             .rounded(px(3.))
             .cursor_pointer()
-            .bg(tint.opacity(if done { 0.12 } else { 0.28 }))
+            // Style → Item Style: Classic fills the bar, Modern tints it lighter with a colored edge.
+            .bg(tint.opacity(match (done, modern) {
+                (true, _) => 0.12,
+                (false, true) => 0.16,
+                (false, false) => 0.28,
+            }))
+            .when(modern, |el| el.border_l_2().border_color(tint))
             .hover(|s| s.bg(tint.opacity(0.4)))
             .child(
                 div()
@@ -532,7 +769,7 @@ impl CalendarView {
                 let tasks: Vec<AnyElement> = self
                     .tasks
                     .iter()
-                    .filter(|t| t.occurs_on(date) && t.due_time.is_none())
+                    .filter(|t| self.options.shows_task(t, date) && t.due_time.is_none())
                     .map(|t| self.task_bar(t, Some(date), cx).into_any_element())
                     .collect();
                 v_flex()
@@ -607,6 +844,7 @@ impl CalendarView {
             let timed: Vec<AnyElement> = self
                 .tasks
                 .iter()
+                .filter(|t| self.options.show_completed || !t.is_completed())
                 .filter_map(|t| calendar::timed_segment(t, date).map(|segment| (t, segment)))
                 .map(|(t, (from, to))| {
                     // A span is drawn as a block from its start to its end; a point in time as a bar.
@@ -1034,6 +1272,11 @@ impl CalendarView {
                                         .cursor_pointer()
                                         .when(date == today && !outside, |el| el.bg(theme.colors().accent))
                                         .when(is_open && date != today, |el| el.bg(theme.colors().element_selected))
+                                        // Style → Heatmap: a day tinted by how many items it has.
+                                        .when(self.options.heatmap && !outside && date != today && !is_open, |el| {
+                                            let count = self.tasks_on(date).len();
+                                            el.when(count > 0, |el| el.rounded(px(4.)).bg(theme.colors().accent.opacity((0.2 + 0.15 * count as f32).min(0.8))))
+                                        })
                                         .hover(|s| s.bg(theme.colors().element_hover))
                                         .child(Label::new(date.day().to_string()).color(if outside { Color::Muted } else { Color::Default }))
                                         .on_click(cx.listener(move |this, _, _, cx| {
@@ -1069,7 +1312,7 @@ impl CalendarView {
     /// scheduled."; a task opens as from the month.
     fn render_year_card(&self, date: NaiveDate, cx: &mut Context<Self>) -> AnyElement {
         let strings = i18n::t(cx);
-        let tasks: Vec<Task> = self.tasks.iter().filter(|t| t.occurs_on(date)).cloned().collect();
+        let tasks: Vec<Task> = self.tasks_on(date).into_iter().cloned().collect();
         let bars: Vec<_> = tasks.iter().map(|task| self.task_bar(task, None, cx).h(px(22.))).collect();
         popover(cx)
             .w(px(328.))
@@ -1114,7 +1357,7 @@ impl Render for CalendarView {
                                 .child(Label::new(format!("W{}", calendar::week_number(&week))).size(LabelSize::XSmall).color(Color::Muted)),
                         )
                     })
-                    .children(week.map(|date| self.render_day(date, today, cx)))
+                    .children(week.into_iter().filter(|d| self.options.shows_day(*d)).map(|date| self.render_day(date, today, cx)))
                     .into_any_element()
             })
             .collect();
@@ -1129,18 +1372,11 @@ impl Render for CalendarView {
                 .bg(theme.colors().surface_background)
         };
 
-        v_flex()
-            .track_focus(&self.focus_handle)
-            .key_context("Calendar")
-            // The view menu's keys, as in the original: D/1, W/2, M/3.
-            .on_action(cx.listener(|this, _: &DayView, _, cx| this.set_mode(CalendarMode::Day, cx)))
-            .on_action(cx.listener(|this, _: &WeekView, _, cx| this.set_mode(CalendarMode::Week, cx)))
-            .on_action(cx.listener(|this, _: &MonthView, _, cx| this.set_mode(CalendarMode::Month, cx)))
-            .on_action(cx.listener(|this, _: &AgendaView, _, cx| this.set_mode(CalendarMode::Agenda, cx)))
-            .on_action(cx.listener(|this, _: &YearView, _, cx| this.set_mode(CalendarMode::Year, cx)))
-            .size_full()
-            .bg(theme.colors().background)
-            .text_color(theme.colors().text)
+        let arrange = self.arrange.map(|tab| self.render_arrange(tab, cx));
+        let calendar = v_flex()
+            .flex_1()
+            .min_w_0()
+            .h_full()
             .child(
                 h_flex()
                     .h(px(50.))
@@ -1242,7 +1478,15 @@ impl Render for CalendarView {
                                     .on_click(cx.listener(|this, _, _, cx| this.shift(1, cx))),
                             ),
                     )
-                    .child(IconButton::new("calendar-more", IconName::Ellipsis)),
+                    .child(
+                        div()
+                            .relative()
+                            .child(IconButton::new("calendar-more", IconName::Ellipsis).on_click(cx.listener(|this, _, _, cx| {
+                                this.more_menu = !this.more_menu;
+                                cx.notify();
+                            })))
+                            .when(self.more_menu, |el| el.child(PopoverAttachment::new(Placement::BelowRight, self.render_more_menu(cx)))),
+                    ),
             )
             .when(!matches!(self.mode, CalendarMode::Agenda | CalendarMode::Year), |el| el.child(
                 h_flex()
@@ -1255,7 +1499,8 @@ impl Render for CalendarView {
                     // The days' weekday names: the week's, or those of the shown days.
                     .children(match self.mode {
                         CalendarMode::Month | CalendarMode::Week | CalendarMode::MultiWeek(_) => {
-                            crate::calendar::weekday_labels(&strings.weekdays_short).to_vec()
+                            let shown = calendar::week_of(self.anchor).map(|d| self.options.shows_day(d));
+                            crate::calendar::weekday_labels(&strings.weekdays_short).into_iter().zip(shown).filter(|(_, on)| *on).map(|(l, _)| l).collect::<Vec<_>>()
                         }
                         _ => self
                             .shown_days()
@@ -1284,7 +1529,28 @@ impl Render for CalendarView {
                         .children(weeks),
                 ),
                 _ => el.child(self.render_week(today, cx)),
-            })
+            });
+        h_flex()
+            .relative()
+            .track_focus(&self.focus_handle)
+            .key_context("Calendar")
+            // The view menu's keys, as in the original: D/1, W/2, M/3.
+            .on_action(cx.listener(|this, _: &DayView, _, cx| this.set_mode(CalendarMode::Day, cx)))
+            .on_action(cx.listener(|this, _: &WeekView, _, cx| this.set_mode(CalendarMode::Week, cx)))
+            .on_action(cx.listener(|this, _: &MonthView, _, cx| this.set_mode(CalendarMode::Month, cx)))
+            .on_action(cx.listener(|this, _: &AgendaView, _, cx| this.set_mode(CalendarMode::Agenda, cx)))
+            .on_action(cx.listener(|this, _: &YearView, _, cx| this.set_mode(CalendarMode::Year, cx)))
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                if event.keystroke.key == "escape" && this.options_dialog.take().is_some() {
+                    cx.notify();
+                }
+            }))
+            .size_full()
+            .bg(theme.colors().background)
+            .text_color(theme.colors().text)
+            .child(calendar)
+            .children(arrange)
+            .children(self.options_dialog.clone())
             .children(self.render_context_menu(cx))
     }
 }

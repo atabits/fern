@@ -93,7 +93,11 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 
 ## Next
 
-1. Calendar: the right-click menu's six date icons as the original calendar's, after hovering them in the original for their tooltips.
-2. Interface: re-check the Countdown and Eisenhower Matrix views and the task detail pane against the original for font weights (Inbox, Habits, Calendar, Focus, Settings and Statistics are checked).
+Each item is a whole feature area, done in one pass (it may take several commits).
+
+1. Lists: the original's Add List / Edit List dialog (name, icon, color, view — List, Kanban, Timeline —, task or note list, folder), folders in the lists column (create, collapse, move lists in and out, ungroup), the list's "…" menu as the original's (Edit, Duplicate, Archive, Delete) with Archived Lists, and reordering lists by drag.
+2. Tags: the original's Add / Edit Tag dialog (name, color, parent tag), nested tags in the lists column with collapse, the tag's "…" menu (Edit, Merge, Delete) and the tag view's header as the original's.
+3. Calendar pass: the right-click menu's six date icons (hover the original's for their tooltips), the Time button's behaviour, and the view settings still marked unchecked, re-measured on screenshots in one go.
+4. Interface weights: the Countdown and Eisenhower Matrix views and the task detail pane against the original (Inbox, Habits, Calendar, Focus, Settings and Statistics are checked).
 
 Not checkable under the reference rules: whether the original asks for a note when a focus session ends, and its white noise (the desktop original shows no sound choice on the focus page or in Focus Settings; it would only appear with a timer running in the reference account). Fern's record dialog takes a note afterwards.

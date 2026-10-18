@@ -192,11 +192,17 @@ impl Store {
             "SELECT a.id, a.name, u.name IS NOT NULL FROM task_attachments a
              LEFT JOIN sync_uploaded u ON u.name = a.id || '-' || a.name",
         )?;
-        let rows: Vec<(String, String, bool)> =
-            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<_, _>>()?;
+        let mut files: Vec<(String, bool)> = stmt
+            .query_map([], |r| Ok((format!("{}-{}", r.get::<_, String>(0)?, r.get::<_, String>(1)?), r.get(2)?)))?
+            .collect::<Result<_, _>>()?;
+        // Countdowns' background pictures go the same way.
+        let mut stmt = self.conn.prepare(
+            "SELECT c.background, u.name IS NOT NULL FROM countdowns c
+             LEFT JOIN sync_uploaded u ON u.name = c.background WHERE c.background IS NOT NULL",
+        )?;
+        files.extend(stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<Vec<_>, _>>()?);
         let (mut upload, mut download) = (Vec::new(), Vec::new());
-        for (id, name, uploaded) in rows {
-            let file = format!("{id}-{name}");
+        for (file, uploaded) in files {
             match (dir.join(&file).exists(), uploaded) {
                 (true, false) => upload.push(file),
                 (false, _) => download.push(file),
@@ -493,6 +499,31 @@ mod tests {
         laptop.save_matrix_rule(0, None)?;
         relay(&laptop, sent, &phone);
         assert_eq!(phone.matrix_rules()?[0], QuadrantRule::defaults()[0]);
+        Ok(())
+    }
+
+    #[test]
+    fn countdown_pictures_travel() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("fern-sync-pictures-{}", uuid::Uuid::now_v7()));
+        let (laptop_dir, phone_dir) = (dir.join("laptop"), dir.join("phone"));
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(dir.join("photo.jpg"), "jpeg")?;
+        let laptop = Store::open_in_memory()?;
+        let phone = Store::open_in_memory()?;
+        let wedding = laptop.add_countdown("Wedding", chrono::NaiveDate::from_ymd_opt(2024, 8, 27).unwrap(), crate::CountdownKind::Anniversary)?;
+        let file = laptop.set_countdown_background(wedding.id, Some(&dir.join("photo.jpg")), &laptop_dir)?.unwrap();
+        assert_eq!(laptop.files_to_sync(&laptop_dir)?, (vec![file.clone()], vec![]));
+        laptop.mark_files_synced(&[file.clone()])?;
+
+        // The phone gets the countdown, then has its picture to fetch.
+        relay(&laptop, 0, &phone);
+        assert_eq!(phone.files_to_sync(&phone_dir)?, (vec![], vec![file.clone()]));
+
+        // A new picture is a new file, so it is sent again.
+        let newer = laptop.set_countdown_background(wedding.id, Some(&dir.join("photo.jpg")), &laptop_dir)?.unwrap();
+        assert_ne!(newer, file);
+        assert_eq!(laptop.files_to_sync(&laptop_dir)?.0, [newer]);
+        std::fs::remove_dir_all(&dir)?;
         Ok(())
     }
 

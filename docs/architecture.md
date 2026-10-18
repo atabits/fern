@@ -35,7 +35,7 @@ Devices sync through a self-hosted server, row by row (`crates/core/src/sync.rs`
   device's changes and returns the other devices' changes after the number the device last saw.
   It speaks plain HTTP; a reverse proxy adds TLS.
 
-Attachments' records sync like other rows; their files go through the server's file store
+Attachments' records sync like other rows; their files, and countdowns' background pictures, go through the server's file store
 (`PUT`/`GET /files/<name>`, kept in `<data>.files`): after a sync the app sends the files the
 server lacks and fetches the ones missing here.
 

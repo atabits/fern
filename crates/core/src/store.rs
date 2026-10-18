@@ -1629,12 +1629,13 @@ impl Store {
     }
 
     /// A countdown's background picture: the file is copied into `dir` (the app's attachment
-    /// folder) as `<id>-background.<ext>`; `None` takes the picture off. Returns the file's name.
+    /// folder) as `<id>-background-<unique>.<ext>` — a new name for every picture, so a changed
+    /// one syncs; `None` takes the picture off. Returns the file's name.
     pub fn set_countdown_background(&self, id: Id, file: Option<&std::path::Path>, dir: &std::path::Path) -> Result<Option<String>> {
         let name = match file {
             Some(file) => {
                 let ext = file.extension().and_then(|e| e.to_str()).unwrap_or("png");
-                let name = format!("{id}-background.{ext}");
+                let name = format!("{id}-background-{}.{ext}", Uuid::now_v7().simple());
                 std::fs::create_dir_all(dir)?;
                 std::fs::copy(file, dir.join(&name))?;
                 Some(name)
@@ -3218,7 +3219,7 @@ mod tests {
         let photo = dir.join("photo.jpg");
         std::fs::write(&photo, b"jpeg")?;
         let name = store.set_countdown_background(release.id, Some(&photo), &dir.join("files"))?.unwrap();
-        assert_eq!(name, format!("{}-background.jpg", release.id));
+        assert!(name.starts_with(&format!("{}-background-", release.id)) && name.ends_with(".jpg"));
         assert!(dir.join("files").join(&name).exists());
         assert_eq!(store.countdowns()?.iter().find(|c| c.id == release.id).unwrap().background.as_deref(), Some(name.as_str()));
         store.set_countdown_background(release.id, None, &dir)?;

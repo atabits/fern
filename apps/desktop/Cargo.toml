@@ -24,6 +24,7 @@ gpui.workspace = true
 gpui_platform.workspace = true
 notify-rust.workspace = true
 unicode-segmentation.workspace = true
+sys-locale.workspace = true
 ureq.workspace = true
 
 [target.'cfg(windows)'.build-dependencies]

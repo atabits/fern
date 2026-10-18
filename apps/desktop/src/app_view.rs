@@ -937,11 +937,11 @@ impl Render for AppView {
             PopoverAttachment::new(Placement::RightTop, self.render_account_menu(cx)).into_any_element()
         });
         let features = self.features;
-        let sync_button = sidebar::SyncButton {
+        let sync_button = self.store.sync_config().ok().flatten().map(|_| sidebar::SyncButton {
             tooltip: self.sync_tooltip(i18n::t(cx)),
             failed: matches!(self.sync, crate::sync::SyncStatus::Failed(_)),
             on_click: Box::new(cx.listener(|this, _, _, cx| this.sync_now(cx))),
-        };
+        });
         let bell = sidebar::Bell {
             unread: self.notices.unread,
             on_click: Box::new(cx.listener(|this, _, _, cx| {

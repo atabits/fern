@@ -88,7 +88,8 @@ pub struct Bell {
     pub menu: Option<AnyElement>,
 }
 
-/// The sync button: its tooltip says how the last sync went; a failed one shows in red.
+/// The sync button: its tooltip says how the last sync went; a failed one shows in red. Fern
+/// works locally until a server is set, and until then there is no button.
 pub struct SyncButton {
     pub tooltip: String,
     pub failed: bool,
@@ -104,7 +105,7 @@ pub fn render(
     on_avatar: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     account_menu: Option<AnyElement>,
     bell: Bell,
-    sync: SyncButton,
+    sync: Option<SyncButton>,
     features: fern_core::Features,
     cx: &App,
 ) -> impl IntoElement {
@@ -161,12 +162,12 @@ pub fn render(
                 .when(hovered == Some(section), |el| el.child(side_tooltip(section.title(strings), cx)))
         })))
         .child(div().flex_1())
-        .child(
+        .children(sync.map(|sync| {
             button("sync", IconName::RefreshCw)
                 .when(sync.failed, |b| b.icon_color(Color::Error))
                 .tooltip(Tooltip::text(sync.tooltip))
-                .on_click(sync.on_click),
-        )
+                .on_click(sync.on_click)
+        }))
         .child(
             div()
                 .relative()

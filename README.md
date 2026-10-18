@@ -10,7 +10,8 @@
 [![CI](https://github.com/atabits/fern/actions/workflows/ci.yml/badge.svg)](https://github.com/atabits/fern/actions/workflows/ci.yml)
 
 **Tasks, calendar, habits and focus in one native app.**
-A free, open-source take on TickTick, written in Rust. Your data stays on your machine.
+A free, open-source take on TickTick, written in Rust.
+Download it and start working: no account, no server, your data stays on your machine.
 
 </div>
 
@@ -23,7 +24,8 @@ A free, open-source take on TickTick, written in Rust. Your data stays on your m
 - **⚡️ Native and fast.** Rust and [GPUI](https://github.com/zed-industries/zed), the GPU-rendered UI framework behind the Zed editor. No Electron and no web view.
 - **🗂️ Everything in one place.** Lists, tags, smart views, kanban boards, a calendar, an Eisenhower matrix, habits, a Pomodoro timer, countdowns and statistics.
 - **⌨️ Quick add that understands you.** `Lunch with Sam friday 1pm #personal !2 ^Work` sets the date, time, tag, priority and list as you type.
-- **🔒 Local-first.** One SQLite file on your disk. No account and no cloud. If you want sync, run your own `fern-server`.
+- **🔒 Works out of the box, offline.** Download it and start adding tasks. There is no account, no sign-up and no cloud. Everything lives in one file on your disk, and Fern saves a copy of it every day.
+- **🔄 Sync if you want it.** To use Fern on several devices, run your own `fern-server`. This is optional.
 - **🌍 English and Russian.** Switch the language at runtime.
 - **🆓 Free forever.** AGPL-3.0, no subscriptions, no ads.
 
@@ -100,18 +102,26 @@ The first build compiles GPUI straight from the Zed repository, so it takes a wh
 
 Key bindings are defined in `assets/keymaps/default.json`.
 
-**Your data** is stored in `fern-tasks/tasks.db` in the platform's data directory:
+**Your data** stays on your computer. Fern needs no account or server, and the first start
+adds a few tips to the Inbox. Everything is kept in `tasks.db` in the `fern-tasks` folder of the
+platform's data directory. Settings → Data & Sync shows the folder and has a button to open it.
 - Linux: `~/.local/share/fern-tasks/`
 - macOS: `~/Library/Application Support/fern-tasks/`
 - Windows: `%APPDATA%\fern-tasks\`
 
-**Sync between your devices** works through your own server:
+Every day Fern saves a copy of the data to `backups/` and keeps the last seven. To restore
+one, use Settings → About → Import Backups.
+
+**Coming from TickTick?** Generate a backup in TickTick's settings, which gives you a `.csv` file. Then
+import it in Fern with Settings → About → Import Backups.
+
+**Sync between your devices** is optional. It works through a server you run yourself:
 
 ```bash
 FERN_TOKEN=<a long secret> fern-server --listen 0.0.0.0:8650
 ```
 
-Then open Settings → Sync in the app.
+Then enter the server's address and token in Settings → Data & Sync on each device.
 
 ---
 
@@ -136,7 +146,6 @@ a trademark of its owner and is used here only to describe what Fern is inspired
 
 - **Early days.** Fern is young. Back up `tasks.db` before you trust it with anything important.
 - **Mobile apps are planned.** The core in `crates/core` is meant to be shared with an Android app through UniFFI.
-- **No TickTick import yet.**
 
 ---
 

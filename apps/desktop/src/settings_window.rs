@@ -401,7 +401,7 @@ impl SettingsWindow {
             .child(page("settings-appearance", IconName::PaintRoller, 2, Page::Appearance))
             .child(page("settings-more", IconName::ToggleRight, 3, Page::More))
             .child(
-                item("settings-sync", IconName::RefreshCw, strings.sync, self.page == Page::Sync)
+                item("settings-sync", IconName::RefreshCw, strings.data_and_sync, self.page == Page::Sync)
                     .on_click(cx.listener(|this, _, _, cx| this.set_page(Page::Sync, cx))),
             )
             .child(div().h(px(12.)))
@@ -935,7 +935,31 @@ impl SettingsWindow {
                                 .child(input),
                         )
                 };
-                body.child(title(strings.sync))
+                let folder = crate::data_dir().map(|dir| dir.display().to_string()).unwrap_or_default();
+                body.child(title(strings.data_on_device))
+                    .child(
+                        group().child(
+                            h_flex()
+                                .h(px(ROW_HEIGHT))
+                                .px_4()
+                                .gap_4()
+                                .child(Label::new(strings.data_folder))
+                                .child(div().flex_1().min_w_0().overflow_hidden().child(Label::new(folder).color(Color::Muted).truncate()))
+                                .child(
+                                    div()
+                                        .id("open-data-folder")
+                                        .cursor_pointer()
+                                        .child(Label::new(strings.open_folder).color(Color::Accent))
+                                        .on_click(|_, _, cx| {
+                                            if let Ok(dir) = crate::data_dir() {
+                                                cx.open_with_system(&dir);
+                                            }
+                                        }),
+                                ),
+                        ),
+                    )
+                    .child(div().pt_2().pb_4().px_1().text_size(px(12.)).text_color(colors.text_muted).child(strings.data_hint))
+                    .child(title(strings.sync_optional))
                     .child(
                         group()
                             .child(field(strings.sync_server, self.sync_server.clone()))

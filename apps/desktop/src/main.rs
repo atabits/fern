@@ -67,10 +67,21 @@ pub fn pending_restore_path() -> Result<std::path::PathBuf> {
     Ok(data_dir()?.join("restore.db"))
 }
 
-fn open_store() -> Result<Store> {
+/// Where the daily copies of the data are kept.
+pub fn backups_dir() -> Result<std::path::PathBuf> {
+    Ok(data_dir()?.join("backups"))
+}
+
+/// How many daily copies are kept.
+const DAILY_BACKUPS: usize = 7;
+
+/// Opens the data, and whether it was just created: the first start.
+fn open_store() -> Result<(Store, bool)> {
     let dir = data_dir()?;
     std::fs::create_dir_all(&dir).with_context(|| format!("cannot create {}", dir.display()))?;
-    let mut store = Store::open(dir.join("tasks.db"))?;
+    let path = dir.join("tasks.db");
+    let first_start = !path.exists();
+    let mut store = Store::open(path)?;
     let pending = pending_restore_path()?;
     if pending.exists() {
         match store.restore_from(&pending, attachments_dir().ok().as_deref()) {
@@ -83,15 +94,35 @@ fn open_store() -> Result<Store> {
     if let Err(err) = store.compact_sync_log() {
         eprintln!("failed to compact the sync log: {err:#}");
     }
-    Ok(store)
+    Ok((store, first_start))
+}
+
+/// The first start fills the Inbox with a few tips, the first one on top.
+fn add_welcome_tasks(store: &Store, strings: &i18n::Strings) -> Result<()> {
+    for (title, notes) in strings.welcome_tasks.iter().rev() {
+        let task = store.add_task(title)?;
+        store.set_notes(task.id, notes)?;
+    }
+    Ok(())
 }
 
 fn main() -> Result<()> {
-    let store = Rc::new(open_store()?);
+    let (store, first_start) = open_store()?;
+    let store = Rc::new(store);
     let locale = store
         .setting("locale")?
         .and_then(|code| Locale::from_code(&code))
-        .unwrap_or_default();
+        .unwrap_or_else(Locale::system);
+    if first_start && let Err(err) = add_welcome_tasks(&store, locale.strings()) {
+        eprintln!("failed to add the welcome tasks: {err:#}");
+    }
+    // Fern keeps the data on this device only, so it saves a copy of it once a day (but not
+    // the throwaway data of the debug build's screenshots).
+    if std::env::var_os("FERN_DEV_STATE").is_none()
+        && let Err(err) = backups_dir().and_then(|dir| store.daily_backup(&dir, chrono::Local::now().date_naive(), DAILY_BACKUPS))
+    {
+        eprintln!("failed to back up the data: {err:#}");
+    }
 
     gpui_platform::application().with_assets(Assets).run(move |cx: &mut App| {
         theme::init(cx);

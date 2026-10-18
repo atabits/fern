@@ -24,6 +24,13 @@ impl Locale {
         Self::ALL.into_iter().find(|l| l.code() == code)
     }
 
+    /// The system's language when Fern speaks it, else English: the language of the first start.
+    pub fn system() -> Self {
+        sys_locale::get_locales()
+            .find_map(|tag| Self::from_code(&tag.split(['-', '_']).next().unwrap_or_default().to_lowercase()))
+            .unwrap_or_default()
+    }
+
     /// The language name in that language, for the language menu.
     pub fn native_name(self) -> &'static str {
         match self {
@@ -493,6 +500,15 @@ pub struct Strings {
     pub sync_done: &'static str,
     pub sync_failed: &'static str,
     pub sync_off: &'static str,
+    /// Settings → Sync: the local data folder above the optional server.
+    pub data_and_sync: &'static str,
+    pub data_on_device: &'static str,
+    pub data_folder: &'static str,
+    pub open_folder: &'static str,
+    pub data_hint: &'static str,
+    pub sync_optional: &'static str,
+    /// The tips added to the Inbox on the first start: titles and notes (Markdown).
+    pub welcome_tasks: [(&'static str, &'static str); 6],
     pub sync_running: &'static str,
     pub input_box_setting: &'static str,
     pub input_box_simple: &'static str,
@@ -1179,11 +1195,25 @@ pub static EN: Strings = Strings {
     ],
     sync_server: "Server",
     sync_token: "Token",
-    sync_hint: "Fern syncs through your own fern-server (see docs/architecture.md). Changes are sent as you make them, and other devices' changes are fetched every few minutes and with the sidebar's sync button.",
+    sync_hint: "To use Fern on several devices, run your own fern-server and enter its address and token on each of them. Changes are sent as you make them, and other devices' changes arrive every few minutes. Leave the fields empty to keep Fern on this device only.",
     sync_never: "Not synced yet",
     sync_done: "Synced at {time}",
     sync_failed: "Sync failed: {error}",
-    sync_off: "Sync is off: set a server in Settings → Sync",
+    sync_off: "Sync is off: set a server in Settings → Data & Sync",
+    data_and_sync: "Data & Sync",
+    data_on_device: "On this device",
+    data_folder: "Data folder",
+    open_folder: "Open",
+    data_hint: "Fern works offline and needs no account: your tasks are kept in this folder. Every day Fern saves a copy of them in its backups folder and keeps the last seven.",
+    sync_optional: "Sync (optional)",
+    welcome_tasks: [
+        ("Welcome to Fern 👋", "Fern keeps everything on this computer: no account, no sign-up, and it works offline. Just start adding tasks.\n\nWhen you're done with a tip, tick its checkbox."),
+        ("Add a task: type it in the field above and press Enter", "Quick add understands dates, times, tags, priority and lists as you type:\n\n- **Call Sam tomorrow 6pm**\n- **Pay the rent friday #home !1**\n- **Draft the report ^Work** goes to your Work list"),
+        ("Click a task to see its details", "The panel on the right holds its date, priority, tags, subtasks and notes like these. Notes support **Markdown**."),
+        ("Plan your week in the Calendar", "The icons on the far left switch between Tasks, Calendar, the Eisenhower Matrix, Focus, Habits and Countdowns. Hide the ones you don't need in Settings → Features."),
+        ("Your data stays with you", "Tasks are stored in one file on this computer, and Fern saves a copy of it every day. Settings → Data & Sync shows where.\n\nTo use Fern on several devices, run your own sync server. It's optional."),
+        ("Press Ctrl+N to add a task, Ctrl+F to search", "On a Mac, use Cmd instead of Ctrl. All the shortcuts are in Settings → Shortcuts."),
+    ],
     sync_running: "Syncing…",
     input_box_setting: "Input Box Setting",
     input_box_simple: "Simple",
@@ -1321,7 +1351,7 @@ pub static EN: Strings = Strings {
     default_dates: ["Today", "Tomorrow", "Day after Tomorrow", "Next Week"],
     durations: ["10 mins", "15 mins", "30 mins", "45 mins", "1 hour", "1 hour 30 mins", "2 hours", "2 hours 30 mins", "3 hours", "1 day"],
     default_list_hint: "Where new tasks go when added outside a list, such as in Today or a tag.",
-    about_tagline: "A self-hosted task tracker.",
+    about_tagline: "Tasks, calendar, habits and focus on your computer.",
     backup_restore: "Backup & Restore",
     generate_backup: "Generate Backup",
     import_backups: "Import Backups",
@@ -1845,11 +1875,25 @@ pub static RU: Strings = Strings {
     ],
     sync_server: "Сервер",
     sync_token: "Токен",
-    sync_hint: "Fern синхронизируется через ваш собственный fern-server (см. docs/architecture.md). Изменения отправляются сразу, а изменения с других устройств приходят каждые несколько минут и по кнопке синхронизации в боковой панели.",
+    sync_hint: "Чтобы пользоваться Fern на нескольких устройствах, запустите свой fern-server и укажите его адрес и токен на каждом из них. Изменения отправляются сразу, а изменения с других устройств приходят каждые несколько минут. Оставьте поля пустыми, чтобы Fern работал только на этом устройстве.",
     sync_never: "Ещё не синхронизировано",
     sync_done: "Синхронизировано в {time}",
     sync_failed: "Ошибка синхронизации: {error}",
-    sync_off: "Синхронизация выключена: укажите сервер в Настройки → Синхронизация",
+    sync_off: "Синхронизация выключена: укажите сервер в Настройки → Данные и синхронизация",
+    data_and_sync: "Данные и синхронизация",
+    data_on_device: "На этом устройстве",
+    data_folder: "Папка с данными",
+    open_folder: "Открыть",
+    data_hint: "Fern работает без интернета и без аккаунта: ваши задачи хранятся в этой папке. Каждый день Fern сохраняет их копию в папке backups и хранит последние семь.",
+    sync_optional: "Синхронизация (необязательно)",
+    welcome_tasks: [
+        ("Добро пожаловать в Fern 👋", "Fern хранит всё на этом компьютере: без аккаунта, без регистрации, работает без интернета. Просто начните добавлять задачи.\n\nКогда подсказка больше не нужна, отметьте её галочкой."),
+        ("Добавьте задачу: введите её в поле выше и нажмите Enter", "Быстрое добавление на лету понимает даты, время, теги, приоритет и списки:\n\n- **Позвонить Саше завтра в 18:00**\n- **Оплатить аренду в пятницу #дом !1**\n- **Черновик отчёта ^Работа** попадёт в ваш список «Работа»"),
+        ("Нажмите на задачу, чтобы открыть подробности", "В панели справа — дата, приоритет, теги, подзадачи и заметки вроде этой. Заметки поддерживают **Markdown**."),
+        ("Планируйте неделю в календаре", "Значки слева переключают задачи, календарь, матрицу Эйзенхауэра, фокус, привычки и обратный отсчёт. Ненужные можно скрыть в Настройки → Функции."),
+        ("Ваши данные остаются у вас", "Задачи хранятся в одном файле на этом компьютере, и Fern каждый день сохраняет его копию. Где именно — в Настройки → Данные и синхронизация.\n\nЧтобы пользоваться Fern на нескольких устройствах, запустите свой сервер синхронизации. Это необязательно."),
+        ("Ctrl+N — новая задача, Ctrl+F — поиск", "На Mac вместо Ctrl используйте Cmd. Все сочетания клавиш — в Настройки → Горячие клавиши."),
+    ],
     sync_running: "Синхронизация…",
     input_box_setting: "Вид поля ввода",
     input_box_simple: "Простое",
@@ -1988,7 +2032,7 @@ pub static RU: Strings = Strings {
     default_dates: ["Сегодня", "Завтра", "Послезавтра", "Следующая неделя"],
     durations: ["10 мин", "15 мин", "30 мин", "45 мин", "1 час", "1 ч 30 мин", "2 часа", "2 ч 30 мин", "3 часа", "1 день"],
     default_list_hint: "Куда попадают новые задачи, добавленные не в списке — например, в «Сегодня» или в метке.",
-    about_tagline: "Трекер задач на собственном сервере.",
+    about_tagline: "Задачи, календарь, привычки и фокус на вашем компьютере.",
     backup_restore: "Резервная копия",
     generate_backup: "Создать копию",
     import_backups: "Восстановить из копии",

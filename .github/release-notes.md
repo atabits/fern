@@ -1,3 +1,7 @@
+Fern is a free, open-source task manager: tasks, a calendar, habits, focus and countdowns in one
+native app. Download it and start working: no account, no server, your data stays on your
+computer. Sync between your devices through your own `fern-server` is optional.
+
 ## Downloads
 
 | Platform | Download |

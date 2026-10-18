@@ -829,6 +829,32 @@ impl Store {
         Ok(())
     }
 
+    /// The daily copy of the data: `fern-<date>.db` in `dir`, made once a day, keeping the
+    /// last `keep` copies. Attached files are not copied: they stay in their own folder.
+    pub fn daily_backup(&self, dir: &std::path::Path, date: NaiveDate, keep: usize) -> Result<()> {
+        let path = dir.join(format!("fern-{}.db", date.format(DATE_FORMAT)));
+        if path.exists() {
+            return Ok(());
+        }
+        std::fs::create_dir_all(dir)?;
+        self.backup_to(&path, None)?;
+        let mut copies: Vec<_> = std::fs::read_dir(dir)?
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("fern-") && n.ends_with(".db")))
+            .collect();
+        copies.sort();
+        for old in copies.iter().rev().skip(keep) {
+            std::fs::remove_file(old)?;
+            // What SQLite leaves beside a copy that was opened.
+            for suffix in ["-wal", "-shm"] {
+                let mut side = old.clone().into_os_string();
+                side.push(suffix);
+                std::fs::remove_file(side).ok();
+            }
+        }
+        Ok(())
+    }
+
     /// "Import Backups": replaces all data with a backup made by `backup_to`, bringing an older
     /// backup up to date. A file that is not a Fern backup is refused and nothing changes. When
     /// the backup carries attached files, the attachment folder `attachments` is replaced by them.
@@ -3839,6 +3865,30 @@ mod tests {
         assert_eq!(store.habit_snoozes()?.len(), 1);
         store.delete_habit(water.id)?;
         assert!(store.habit_snoozes()?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn daily_backups() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("fern-daily-test-{}", Uuid::now_v7()));
+        let store = Store::open_in_memory()?;
+        store.add_task("first")?;
+        let day = |d: u32| NaiveDate::from_ymd_opt(2026, 10, d).unwrap();
+        store.daily_backup(&dir, day(1), 2)?;
+        // A second start the same day keeps the morning's copy.
+        store.add_task("second")?;
+        store.daily_backup(&dir, day(1), 2)?;
+        Store::check_backup(&dir.join("fern-2026-10-01.db"))?;
+        let copy = Store::open(dir.join("fern-2026-10-01.db"))?;
+        assert_eq!(copy.tasks()?.len(), 1);
+        drop(copy);
+        // Only the newest copies stay.
+        store.daily_backup(&dir, day(2), 2)?;
+        store.daily_backup(&dir, day(5), 2)?;
+        let mut names: Vec<String> = std::fs::read_dir(&dir)?.map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        names.sort();
+        assert_eq!(names, ["fern-2026-10-02.db", "fern-2026-10-05.db"]);
+        std::fs::remove_dir_all(&dir)?;
         Ok(())
     }
 

@@ -1591,6 +1591,7 @@ dependencies = [
  "notify-rust",
  "serde",
  "serde_json",
+ "sys-locale",
  "theme",
  "tiny_http",
  "ui",

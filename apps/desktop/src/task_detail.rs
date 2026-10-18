@@ -61,6 +61,8 @@ impl EstimateDraft {
 
 pub struct TaskDetail {
     store: Rc<Store>,
+    /// The month the custom repeat's "By Specific Dates" calendar shows.
+    specific_month: Option<NaiveDate>,
     /// The "…" menu's Start Focus side menu, while hovered open.
     focus_submenu: bool,
     estimate_draft: EstimateDraft,
@@ -192,6 +194,7 @@ impl TaskDetail {
         Self {
             store,
             focus_submenu: false,
+            specific_month: None,
             estimate_draft: EstimateDraft { minutes: false, amount: 0 },
             task: None,
             title,
@@ -423,12 +426,16 @@ impl TaskDetail {
                 return;
             }
             // The custom repeat's monthly "Workday", daily "Skip Weekends" and "By Completion Date".
-            "due-custom-workday" | "due-custom-skip" | "due-custom-completion" => {
+            "due-custom-workday" | "due-custom-skip" | "due-custom-completion" | "due-custom-specific" => {
                 self.open_popup(Popup::Due, cx);
                 self.update_draft(cx, |d| {
                     let rule = match popup {
                         "due-custom-workday" => Recurrence { nth_workday: Some(1), ..Recurrence::new(Frequency::Monthly, 1) },
                         "due-custom-skip" => Recurrence { skip_weekends: true, ..Recurrence::new(Frequency::Daily, 1) },
+                        "due-custom-specific" => {
+                            let today = Local::now().date_naive();
+                            Recurrence { dates: vec![today, today + chrono::Duration::days(13)], ..Recurrence::new(Frequency::Daily, 1) }
+                        }
                         _ => Recurrence { from_completion: true, ..Recurrence::new(Frequency::Weekly, 1) },
                     };
                     d.menu = Some(DueMenu::Custom(rule));
@@ -441,7 +448,7 @@ impl TaskDetail {
                 let custom = popup == "due-custom";
                 self.update_draft(cx, |d| {
                     d.menu = Some(if custom {
-                        DueMenu::Custom(due_picker::custom_start(d.repeat, d.date.unwrap_or(today)))
+                        DueMenu::Custom(due_picker::custom_start(d.repeat.clone(), d.date.unwrap_or(today)))
                     } else {
                         DueMenu::Time
                     })
@@ -1165,7 +1172,7 @@ impl TaskDetail {
                 .child(Icon::new(icon).color(if active { Color::Accent } else { Color::Muted }))
                 .child(div().flex_1().child(Label::new(label).size(LabelSize::Small).color(color)))
                 .child(
-                    Icon::new(if draft.menu == Some(menu) || (menu == DueMenu::Repeat && matches!(draft.menu, Some(DueMenu::Custom(_))))
+                    Icon::new(if draft.menu.as_ref() == Some(&menu) || (menu == DueMenu::Repeat && matches!(draft.menu, Some(DueMenu::Custom(_))))
                         || (menu == DueMenu::Reminder && matches!(draft.menu, Some(DueMenu::CustomReminder(_)))) {
                         IconName::ChevronDown
                     } else {
@@ -1174,7 +1181,7 @@ impl TaskDetail {
                         .size(IconSize::XSmall),
                 )
                 .on_click(cx.listener(move |this, _, _, cx| {
-                    this.update_draft(cx, |d| d.menu = if d.menu == Some(menu) { None } else { Some(menu) })
+                    this.update_draft(cx, |d| d.menu = if d.menu.as_ref() == Some(&menu) { None } else { Some(menu.clone()) })
                 }))
         };
         let time_label: SharedString =
@@ -1182,7 +1189,7 @@ impl TaskDetail {
         let repeat_label: SharedString =
             draft.repeat.as_ref().map_or(strings.repeat.into(), |r| due_picker::repeat_label(r, strings).into());
 
-        let menu: Option<AnyElement> = match draft.menu {
+        let menu: Option<AnyElement> = match &draft.menu {
             Some(DueMenu::Time) => Some(
                 v_flex()
                     .gap_1()
@@ -1216,7 +1223,7 @@ impl TaskDetail {
                     ))
                     .into_any_element(),
             ),
-            Some(DueMenu::Custom(rule)) => Some(self.render_custom_repeat(rule, strings, cx)),
+            Some(DueMenu::Custom(rule)) => Some(self.render_custom_repeat(rule.clone(), strings, cx)),
             Some(DueMenu::Reminder) => Some(
                 v_flex()
                     .children(due_picker::reminder_options(draft.time.is_some(), strings).into_iter().map(
@@ -1270,7 +1277,7 @@ impl TaskDetail {
                     )
                     .into_any_element(),
             ),
-            Some(DueMenu::CustomReminder(custom)) => Some(self.render_custom_reminder(custom, &draft, strings, cx)),
+            Some(DueMenu::CustomReminder(custom)) => Some(self.render_custom_reminder(*custom, &draft, strings, cx)),
             Some(DueMenu::Repeat) => {
                 let base = draft.date.unwrap_or(today);
                 let options = due_picker::repeat_options(base, strings, locale);
@@ -1296,9 +1303,9 @@ impl TaskDetail {
                                             el.child(Label::new(format!("({hint})")).size(LabelSize::Small).color(Color::Muted))
                                         }),
                                 )
-                                .when(draft.repeat == Some(rule), |item| item.end_slot(check_mark()))
+                                .when(draft.repeat.as_ref() == Some(&rule), |item| item.end_slot(check_mark()))
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.update_draft(cx, |d| d.pick_repeat(Some(rule), Local::now().date_naive()))
+                                    this.update_draft(cx, |d| d.pick_repeat(Some(rule.clone()), Local::now().date_naive()))
                                 }))
                         }))
                         .child(div().py_1().child(Divider::horizontal()))
@@ -1309,7 +1316,7 @@ impl TaskDetail {
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     let today = Local::now().date_naive();
                                     this.update_draft(cx, |d| {
-                                        d.menu = Some(DueMenu::Custom(due_picker::custom_start(d.repeat, d.date.unwrap_or(today))))
+                                        d.menu = Some(DueMenu::Custom(due_picker::custom_start(d.repeat.clone(), d.date.unwrap_or(today))))
                                     })
                                 })),
                         )
@@ -1318,7 +1325,7 @@ impl TaskDetail {
             }
             None => None,
         };
-        let (time_menu, reminder_menu, repeat_menu) = match draft.menu {
+        let (time_menu, reminder_menu, repeat_menu) = match &draft.menu {
             Some(DueMenu::Time) => (menu, None, None),
             Some(DueMenu::Reminder | DueMenu::CustomReminder(_)) => (None, menu, None),
             Some(DueMenu::Repeat | DueMenu::Custom(_)) => (None, None, menu),
@@ -1643,13 +1650,30 @@ impl TaskDetail {
             .border_1()
             .border_color(theme.colors().border)
             .cursor_pointer()
-            .child(Label::new(if rule.from_completion { strings.repeat_by_completion } else { strings.repeat_by_due }).size(LabelSize::Small))
+            .child(
+                Label::new(if rule.is_specific_dates() {
+                    strings.repeat_by_specific
+                } else if rule.from_completion {
+                    strings.repeat_by_completion
+                } else {
+                    strings.repeat_by_due
+                })
+                .size(LabelSize::Small),
+            )
             .child(Icon::new(IconName::ChevronsUpDown).size(IconSize::XSmall).color(Color::Muted))
+            // Goes through the original's three modes: due dates, completion date, specific dates.
             .on_click(cx.listener(|this, _, _, cx| {
+                let today = Local::now().date_naive();
                 this.update_draft(cx, |d| {
+                    let start = d.date.unwrap_or(today);
                     if let Some(DueMenu::Custom(rule)) = d.menu.as_mut() {
-                        rule.from_completion = !rule.from_completion;
-                        if rule.from_completion {
+                        if rule.is_specific_dates() {
+                            rule.dates.clear();
+                        } else if rule.from_completion {
+                            rule.from_completion = false;
+                            rule.dates = vec![start];
+                        } else {
+                            rule.from_completion = true;
                             rule.weekdays = 0;
                             rule.month_days = 0;
                             rule.nth_weekday = None;
@@ -1673,6 +1697,27 @@ impl TaskDetail {
                 })
             }));
         let by_due = !rule.from_completion;
+        let actions = h_flex()
+            .gap_2()
+            .child(button("repeat-cancel", strings.cancel, false).on_click(cx.listener(|this, _, _, cx| {
+                this.update_draft(cx, |d| d.menu = Some(DueMenu::Repeat))
+            })))
+            .child(button("repeat-ok", strings.ok, true).on_click(cx.listener({
+                let rule = rule.clone();
+                move |this, _, _, cx| this.update_draft(cx, |d| d.pick_repeat(Some(rule.clone()), Local::now().date_naive()))
+            })));
+        if rule.is_specific_dates() {
+            return v_flex()
+                .gap_2()
+                .p_2()
+                .rounded(px(6.))
+                .border_1()
+                .border_color(theme.colors().border)
+                .child(mode)
+                .child(self.render_specific_dates(&rule, cx))
+                .child(actions)
+                .into_any_element();
+        }
         v_flex()
             .gap_2()
             .p_2()
@@ -1714,17 +1759,75 @@ impl TaskDetail {
             .child(units)
             .when(by_due && rule.frequency == Frequency::Daily, |el| el.child(skip_weekends))
             .when(by_due && rule.frequency == Frequency::Weekly, |el| el.child(weekdays))
-            .when(by_due && rule.frequency == Frequency::Monthly, |el| el.child(self.render_monthly_rule(rule, strings, cx)))
+            .when(by_due && rule.frequency == Frequency::Monthly, |el| el.child(self.render_monthly_rule(rule.clone(), strings, cx)))
+            .child(actions)
+            .into_any_element()
+    }
+
+    /// "By Specific Dates", as in the original: a month calendar where each click picks or drops
+    /// a date; past days cannot be picked.
+    fn render_specific_dates(&self, rule: &Recurrence, cx: &mut Context<Self>) -> AnyElement {
+        let strings = i18n::t(cx);
+        let theme = cx.theme().clone();
+        let today = Local::now().date_naive();
+        let month = self.specific_month.unwrap_or_else(|| calendar::month_start(rule.dates.first().copied().unwrap_or(today)));
+        let nav = |id: &'static str, icon: IconName, delta: i32| {
+            IconButton::new(id, icon).size(px(22.)).icon_size(IconSize::XSmall).on_click(cx.listener(move |this, _, _, cx| {
+                this.specific_month = Some(calendar::add_months(month, delta));
+                cx.notify();
+            }))
+        };
+        let days = calendar::month_grid(month);
+        let weeks: Vec<_> = days.chunks(7).map(|week| {
+            h_flex().children(week.iter().map(|&date| {
+                let picked = rule.dates.contains(&date);
+                let past = date < today;
+                let in_month = date.month() == month.month();
+                div().flex_1().flex().justify_center().child(
+                    div()
+                        .id(SharedString::from(format!("specific-{date}")))
+                        .size(px(26.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_full()
+                        .when(picked, |el| el.bg(theme.colors().accent))
+                        .when(!picked && !past, |el| el.cursor_pointer().hover(|s| s.bg(theme.colors().element_hover)))
+                        .child(Label::new(date.day().to_string()).size(LabelSize::Small).color(
+                            if picked || (in_month && !past) { Color::Default } else { Color::Muted },
+                        ))
+                        .when(!past, |el| {
+                            el.on_click(cx.listener(move |this, _, _, cx| {
+                                this.update_draft(cx, |d| {
+                                    if let Some(DueMenu::Custom(rule)) = d.menu.as_mut() {
+                                        if let Some(i) = rule.dates.iter().position(|d| *d == date) {
+                                            // The last date stays: no dates would end "By Specific Dates".
+                                            if rule.dates.len() > 1 {
+                                                rule.dates.remove(i);
+                                            }
+                                        } else {
+                                            rule.dates.push(date);
+                                            rule.dates.sort();
+                                        }
+                                    }
+                                })
+                            }))
+                        }),
+                )
+            }))
+        }).collect();
+        v_flex()
+            .gap_1()
             .child(
                 h_flex()
-                    .gap_2()
-                    .child(button("repeat-cancel", strings.cancel, false).on_click(cx.listener(|this, _, _, cx| {
-                        this.update_draft(cx, |d| d.menu = Some(DueMenu::Repeat))
-                    })))
-                    .child(button("repeat-ok", strings.ok, true).on_click(cx.listener(move |this, _, _, cx| {
-                        this.update_draft(cx, |d| d.pick_repeat(Some(rule), Local::now().date_naive()))
-                    }))),
+                    .child(div().flex_1().child(Label::new(calendar::month_title(month, strings)).size(LabelSize::Small)))
+                    .child(nav("specific-prev", IconName::ChevronLeft, -1))
+                    .child(nav("specific-next", IconName::ChevronRight, 1)),
             )
+            .child(h_flex().children(calendar::weekday_labels(&strings.weekdays_narrow).map(|day| {
+                div().flex_1().flex().justify_center().child(Label::new(day).size(LabelSize::XSmall).color(Color::Muted))
+            })))
+            .children(weeks)
             .into_any_element()
     }
 

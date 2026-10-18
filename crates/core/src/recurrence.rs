@@ -3,7 +3,8 @@
 //! the format TickTick uses too, so imports keep working and richer rules can come later.
 //! The monthly "Workday" rule is `BYDAY=MO,TU,WE,TH,FR;BYSETPOS=1` (or `-1`), as in RFC 5545;
 //! "Skip Weekends" and repeating from the completion date have no RRULE part, so they are kept
-//! as the extension parts `X-SKIP=WEEKEND` and `X-FROM=COMPLETION`.
+//! as the extension parts `X-SKIP=WEEKEND` and `X-FROM=COMPLETION`; "By Specific Dates" keeps
+//! its dates as `X-DATES=20261018,20261031`.
 
 use std::fmt;
 use std::str::FromStr;
@@ -18,7 +19,7 @@ pub enum Frequency {
     Yearly,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Recurrence {
     pub frequency: Frequency,
     pub interval: u32,
@@ -38,6 +39,9 @@ pub struct Recurrence {
     /// The original's "By Completion Date": the next date counts from the day the task was
     /// completed rather than from its due date.
     pub from_completion: bool,
+    /// The original's "By Specific Dates": the task comes back on exactly these dates, in order,
+    /// and the other fields are ignored. Empty for every other rule.
+    pub dates: Vec<NaiveDate>,
 }
 
 /// `month_days`' bit for the last day of the month.
@@ -63,6 +67,7 @@ impl Recurrence {
             nth_workday: None,
             skip_weekends: false,
             from_completion: false,
+            dates: Vec::new(),
         }
     }
 
@@ -105,12 +110,24 @@ impl Recurrence {
 
     /// The next date of a task due `due` and completed on `completed`: counted from the
     /// completion day for "By Completion Date" rules, from the due date otherwise.
-    pub fn next_for(&self, due: NaiveDate, completed: NaiveDate) -> NaiveDate {
-        self.next_after(if self.from_completion { completed } else { due })
+    /// `None` once a "By Specific Dates" rule has no dates left.
+    pub fn next_for(&self, due: NaiveDate, completed: NaiveDate) -> Option<NaiveDate> {
+        let from = if self.from_completion { completed } else { due };
+        let next = self.next_after(from);
+        (next > from).then_some(next)
     }
 
-    /// The next occurrence after `from`. Months clamp to the last day: Jan 31 → Feb 28.
+    /// Whether this is a "By Specific Dates" rule.
+    pub fn is_specific_dates(&self) -> bool {
+        !self.dates.is_empty()
+    }
+
+    /// The next occurrence after `from`. Months clamp to the last day: Jan 31 → Feb 28. A "By
+    /// Specific Dates" rule with no later date returns `from` itself: it has ended.
     pub fn next_after(&self, from: NaiveDate) -> NaiveDate {
+        if self.is_specific_dates() {
+            return self.dates.iter().copied().filter(|d| *d > from).min().unwrap_or(from);
+        }
         let n = self.interval.max(1);
         match self.frequency {
             Frequency::Daily if self.skip_weekends => {
@@ -187,6 +204,10 @@ impl fmt::Display for Recurrence {
         if self.from_completion {
             write!(f, ";X-FROM=COMPLETION")?;
         }
+        if !self.dates.is_empty() {
+            let dates: Vec<String> = self.dates.iter().map(|d| d.format("%Y%m%d").to_string()).collect();
+            write!(f, ";X-DATES={}", dates.join(","))?;
+        }
         Ok(())
     }
 }
@@ -216,6 +237,7 @@ impl FromStr for Recurrence {
         let mut setpos = None;
         let mut skip_weekends = false;
         let mut from_completion = false;
+        let mut dates = Vec::new();
         for part in rule.split(';').filter(|p| !p.is_empty()) {
             let (key, value) = part.split_once('=').ok_or_else(error)?;
             match key {
@@ -256,12 +278,20 @@ impl FromStr for Recurrence {
                 "BYSETPOS" => setpos = Some(value.parse::<i8>().map_err(|_| error())?),
                 "X-SKIP" => skip_weekends = value == "WEEKEND",
                 "X-FROM" => from_completion = value == "COMPLETION",
+                "X-DATES" => {
+                    for date in value.split(',').filter(|d| !d.is_empty()) {
+                        dates.push(NaiveDate::parse_from_str(date, "%Y%m%d").map_err(|_| error())?);
+                    }
+                }
                 // Other RRULE parts are ignored for now.
                 _ => {}
             }
         }
         let mut rule = Recurrence::new(frequency.ok_or_else(error)?, interval);
         rule.from_completion = from_completion;
+        dates.sort();
+        dates.dedup();
+        rule.dates = dates;
         if rule.frequency == Frequency::Daily {
             rule.skip_weekends = skip_weekends;
         }
@@ -292,7 +322,7 @@ mod tests {
     #[test]
     fn roundtrip_and_ticktick_rules() {
         let rule = Recurrence::new(Frequency::Weekly, 2);
-        assert_eq!(rule.to_string().parse::<Recurrence>(), Ok(rule));
+        assert_eq!(rule.to_string().parse::<Recurrence>(), Ok(rule.clone()));
         assert_eq!(
             "RRULE:FREQ=MONTHLY;INTERVAL=1;BYMONTHDAY=13".parse::<Recurrence>(),
             Ok(Recurrence { month_days: 1 << 12, ..Recurrence::new(Frequency::Monthly, 1) })
@@ -305,7 +335,7 @@ mod tests {
     fn every_weekday() {
         let rule = Recurrence::weekdays();
         assert_eq!(rule.to_string(), "FREQ=WEEKLY;INTERVAL=1;BYDAY=MO,TU,WE,TH,FR");
-        assert_eq!(rule.to_string().parse::<Recurrence>(), Ok(rule));
+        assert_eq!(rule.to_string().parse::<Recurrence>(), Ok(rule.clone()));
         assert!(rule.is_weekdays());
         // Friday → Monday, Saturday → Monday, Monday → Tuesday.
         assert_eq!(rule.next_after(d(2026, 10, 23)), d(2026, 10, 26));
@@ -368,15 +398,25 @@ mod tests {
         let daily = Recurrence { skip_weekends: true, ..Recurrence::new(Frequency::Daily, 1) };
         assert_eq!(daily.next_after(d(2026, 10, 16)), d(2026, 10, 19));
         assert_eq!(daily.next_after(d(2026, 10, 19)), d(2026, 10, 20));
-        let every_two = Recurrence { interval: 2, ..daily };
+        let every_two = Recurrence { interval: 2, ..daily.clone() };
         assert_eq!(every_two.next_after(d(2026, 10, 15)), d(2026, 10, 19));
         assert_eq!(daily.to_string().parse::<Recurrence>().unwrap(), daily);
 
         // By completion date: a weekly task due on the 10th, done on the 18th, comes back on the 25th.
         let weekly = Recurrence { from_completion: true, ..Recurrence::new(Frequency::Weekly, 1) };
-        assert_eq!(weekly.next_for(d(2026, 10, 10), d(2026, 10, 18)), d(2026, 10, 25));
-        assert_eq!(Recurrence::new(Frequency::Weekly, 1).next_for(d(2026, 10, 10), d(2026, 10, 18)), d(2026, 10, 17));
+        assert_eq!(weekly.next_for(d(2026, 10, 10), d(2026, 10, 18)), Some(d(2026, 10, 25)));
+        assert_eq!(Recurrence::new(Frequency::Weekly, 1).next_for(d(2026, 10, 10), d(2026, 10, 18)), Some(d(2026, 10, 17)));
         assert_eq!(weekly.to_string(), "FREQ=WEEKLY;INTERVAL=1;X-FROM=COMPLETION");
         assert_eq!(weekly.to_string().parse::<Recurrence>().unwrap(), weekly);
+    }
+
+    #[test]
+    fn specific_dates() {
+        let rule = Recurrence { dates: vec![d(2026, 10, 18), d(2026, 10, 31), d(2026, 12, 1)], ..Recurrence::new(Frequency::Daily, 1) };
+        assert_eq!(rule.next_after(d(2026, 10, 18)), d(2026, 10, 31));
+        assert_eq!(rule.next_after(d(2026, 11, 5)), d(2026, 12, 1));
+        assert_eq!(rule.next_for(d(2026, 12, 1), d(2026, 12, 1)), None, "the last date ends the repeat");
+        assert_eq!(rule.to_string(), "FREQ=DAILY;INTERVAL=1;X-DATES=20261018,20261031,20261201");
+        assert_eq!(rule.to_string().parse::<Recurrence>().unwrap(), rule);
     }
 }

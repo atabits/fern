@@ -36,7 +36,7 @@ pub fn agenda(tasks: &[Task], from: NaiveDate, until: NaiveDate) -> Vec<(NaiveDa
             if date >= from {
                 entries.push((date, item.clone()));
             }
-            match task.repeat {
+            match &task.repeat {
                 Some(repeat) => {
                     let next = repeat.next_after(date);
                     if next <= date {

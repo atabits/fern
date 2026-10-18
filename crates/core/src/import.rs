@@ -254,7 +254,7 @@ impl Store {
                         self.set_due_end(task.id, Some((end.date(), time.map(|_| end.time()))))?;
                     }
                 }
-                if let Some(repeat) = item.repeat {
+                if let Some(repeat) = &item.repeat {
                     self.conn.execute(
                         "UPDATE tasks SET repeat = ?2 WHERE id = ?1",
                         params![task.id.to_string(), repeat.to_string()],
@@ -328,7 +328,7 @@ mod tests {
         assert_eq!(rent.tags, ["home", "money"]);
         assert_eq!(rent.content, "Transfer, then \"save\" the receipt");
         assert_eq!(rent.priority, Priority::High);
-        assert_eq!(rent.repeat.map(|r| r.frequency), Some(Frequency::Monthly));
+        assert_eq!(rent.repeat.as_ref().map(|r| r.frequency), Some(Frequency::Monthly));
         assert!(rent.all_day);
         let chores = &tasks[1];
         assert_eq!(chores.content, "Before guests");

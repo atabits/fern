@@ -609,7 +609,8 @@ impl Store {
     pub fn complete(&self, id: Id, completed: bool) -> Result<Option<Id>> {
         if completed
             && let Some(task) = self.task(id)?
-            && let (Some(repeat), Some(due)) = (task.repeat, task.due_date)
+            && let (Some(repeat), Some(due)) = (task.repeat.clone(), task.due_date)
+            && let Some(next) = repeat.next_for(due, chrono::Local::now().date_naive())
         {
             let tx = self.conn.unchecked_transaction()?;
             let copy = Uuid::now_v7();
@@ -627,7 +628,6 @@ impl Store {
                 "INSERT INTO task_tags (task_id, tag) SELECT ?2, tag FROM task_tags WHERE task_id = ?1",
                 params![id.to_string(), copy.to_string()],
             )?;
-            let next = repeat.next_for(due, chrono::Local::now().date_naive());
             // A duration moves with its start.
             let end = task.end_date.map(|end| (end + (next - due)).format(DATE_FORMAT).to_string());
             tx.execute(

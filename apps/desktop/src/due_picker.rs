@@ -9,7 +9,7 @@ use crate::calendar;
 use crate::i18n::{Locale, Strings};
 
 /// A sub-menu expanded inside the popover.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DueMenu {
     Time,
     Reminder,
@@ -59,7 +59,7 @@ impl DueDraft {
         Self {
             date: task.due_date,
             time: task.due_time,
-            repeat: task.repeat,
+            repeat: task.repeat.clone(),
             reminders: task.reminders.clone(),
             tab: if task.end_date.is_some() { DueTab::Duration } else { DueTab::Date },
             end_date: task.end_date,
@@ -164,8 +164,9 @@ impl DueDraft {
     }
 
     pub fn pick_repeat(&mut self, repeat: Option<Recurrence>, today: NaiveDate) {
+        let repeats = repeat.is_some();
         self.repeat = repeat;
-        if repeat.is_some() && self.date.is_none() {
+        if repeats && self.date.is_none() {
             self.date = Some(today);
         }
         self.menu = None;
@@ -379,6 +380,9 @@ pub fn repeat_options(date: NaiveDate, strings: &Strings, locale: Locale) -> Vec
 
 /// The label of the current repeat rule for the Repeat row.
 pub fn repeat_label(repeat: &Recurrence, strings: &Strings) -> String {
+    if repeat.is_specific_dates() {
+        return strings.repeat_specific_dates.to_owned();
+    }
     if repeat.is_weekdays() {
         return strings.repeat_weekdays.to_owned();
     }

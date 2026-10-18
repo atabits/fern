@@ -20,6 +20,7 @@ mod sidebar;
 mod task_detail;
 mod task_rows;
 mod text_input;
+mod undo;
 mod todo_view;
 
 use std::rc::Rc;

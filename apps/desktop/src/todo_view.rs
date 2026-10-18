@@ -89,6 +89,8 @@ pub struct TodoView {
     sections: Vec<fern_core::ListSection>,
     /// The "Add Section" field, while it is shown.
     new_section: Option<Entity<TextInput>>,
+    /// The "Undo" toast after completing or deleting a task, with its timer.
+    undo: Option<(crate::undo::UndoAction, String, gpui::Task<()>)>,
     /// Saved filters with their task counts, for the lists column.
     filters: Vec<(fern_core::SmartFilter, usize)>,
     /// The "Add Filter" / "Edit Filter" dialog, while it is open.
@@ -203,6 +205,7 @@ impl TodoView {
             list_activity: None,
             filters: Vec::new(),
             filter_edit: None,
+            undo: None,
             renaming_section: None,
             detail,
             selected: None,
@@ -385,6 +388,11 @@ impl TodoView {
                 }
                 Some(("menu", "lists")) => self.closed_menu = Some(ClosedMenu::Lists(self.closed_lists.clone())),
                 Some(("range", "this-week")) => self.closed_range = ClosedRange::ThisWeek,
+                Some(("complete", needle)) => {
+                    if let Some(id) = self.tasks.iter().find(|t| t.title.contains(needle)).map(|t| t.id) {
+                        self.toggle(id, true, cx);
+                    }
+                }
                 Some(("delete", needle)) => {
                     if let Some(id) = self.tasks.iter().find(|t| t.title.contains(needle)).map(|t| t.id) {
                         self.delete(id, cx);
@@ -1525,19 +1533,53 @@ impl TodoView {
     fn toggle(&mut self, id: Id, completed: bool, cx: &mut Context<Self>) {
         // Unchecking a "Won't Do" task reopens it, as in the original.
         let wont_do = self.tasks.iter().any(|t| t.id == id && t.is_wont_do());
+        let task = self.tasks.iter().find(|t| t.id == id).cloned();
         let result = if wont_do { self.store.set_wont_do(id, false) } else { self.store.set_completed(id, completed) };
-        self.check(result);
+        // Completing offers Undo; repeating tasks move on to their next date instead.
+        if self.check(result).is_some()
+            && completed
+            && !wont_do
+            && let Some(task) = task.filter(|t| t.repeat.is_none())
+        {
+            let label = i18n::t(cx).undo_completed.replace("{title}", &task.title);
+            self.offer_undo(crate::undo::UndoAction::Reopen(id), label, cx);
+        }
         self.reload(cx);
+    }
+
+    /// Shows the "Undo" toast for a few seconds.
+    fn offer_undo(&mut self, action: crate::undo::UndoAction, label: String, cx: &mut Context<Self>) {
+        let timer = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(std::time::Duration::from_secs(5)).await;
+            this.update(cx, |this, cx| {
+                if this.undo.as_ref().is_some_and(|(a, _, _)| *a == action) {
+                    this.undo = None;
+                    cx.notify();
+                }
+            })
+            .ok();
+        });
+        self.undo = Some((action, label, timer));
+        cx.notify();
+    }
+
+    fn apply_undo(&mut self, cx: &mut Context<Self>) {
+        if let Some((action, _, _)) = self.undo.take() {
+            let result = action.apply(&self.store);
+            self.check(result);
+            self.reload(cx);
+        }
     }
 
     /// Moves a task to the trash, or deletes it for good when it is already there.
     fn delete(&mut self, id: Id, cx: &mut Context<Self>) {
-        let result = if self.view == View::Trash {
-            self.store.purge_task(id)
-        } else {
-            self.store.delete_task(id)
-        };
-        self.check(result);
+        let in_trash = self.view == View::Trash;
+        let title = self.tasks.iter().find(|t| t.id == id).map(|t| t.title.clone()).unwrap_or_default();
+        let result = if in_trash { self.store.purge_task(id) } else { self.store.delete_task(id) };
+        if self.check(result).is_some() && !in_trash {
+            let label = i18n::t(cx).undo_deleted.replace("{title}", &title);
+            self.offer_undo(crate::undo::UndoAction::Restore(id), label, cx);
+        }
         self.reload(cx);
     }
 
@@ -2701,5 +2743,29 @@ impl Render for TodoView {
                 None => el.child(self.detail.clone()),
             }))
             .when_some(self.filter_edit.as_ref().map(|edit| self.render_filter_edit(edit, cx)), |el, dialog| el.child(dialog))
+            .when_some(self.undo.as_ref().map(|(_, label, _)| label.clone()), |el, label| {
+                el.child(
+                    div().absolute().bottom(px(24.)).left_0().right_0().flex().justify_center().child(
+                        h_flex()
+                            .id("undo-toast")
+                            .h(px(40.))
+                            .px_4()
+                            .gap_4()
+                            .rounded(px(8.))
+                            .bg(theme.colors().elevated_surface_background)
+                            .border_1()
+                            .border_color(theme.colors().border)
+                            .shadow_md()
+                            .child(Label::new(label).size(LabelSize::Small).truncate())
+                            .child(
+                                div()
+                                    .id("undo-button")
+                                    .cursor_pointer()
+                                    .child(Label::new(strings.undo).size(LabelSize::Small).color(Color::Accent))
+                                    .on_click(cx.listener(|this, _, _, cx| this.apply_undo(cx))),
+                            ),
+                    ),
+                )
+            })
     }
 }

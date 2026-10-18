@@ -566,6 +566,9 @@ const MIGRATIONS: &[&str] = &[
     "
     ALTER TABLE countdowns ADD COLUMN repeat TEXT;
     ",
+    "
+    ALTER TABLE countdowns ADD COLUMN pinned_at INTEGER;
+    ",
 ];
 
 const TASK_COLUMNS: &str = "id, parent_id, kind, title, notes, priority, due_date, due_time, \
@@ -1426,7 +1429,8 @@ impl Store {
     /// Countdowns in creation order.
     pub fn countdowns(&self) -> Result<Vec<Countdown>> {
         let mut stmt =
-            self.conn.prepare("SELECT id, name, date, kind, icon, color, repeat FROM countdowns ORDER BY created_at, rowid")?;
+            self.conn.prepare("SELECT id, name, date, kind, icon, color, repeat, pinned_at FROM countdowns
+             ORDER BY pinned_at IS NULL, pinned_at DESC, created_at, rowid")?;
         let rows = stmt
             .query_map([], |row| {
                 let date: String = row.get(2)?;
@@ -1440,6 +1444,7 @@ impl Store {
                     icon: row.get(4)?,
                     color: row.get(5)?,
                     repeat: row.get::<_, Option<String>>(6)?.and_then(|rule| rule.parse().ok()),
+                    pinned_at: row.get(7)?,
                 })
             })?
             .collect::<Result<_, _>>()?;
@@ -1449,7 +1454,7 @@ impl Store {
     pub fn add_countdown(&self, name: &str, date: NaiveDate, kind: CountdownKind) -> Result<Countdown> {
         let name = name.trim();
         anyhow::ensure!(!name.is_empty(), "a countdown needs a name");
-        let countdown = Countdown { id: Uuid::now_v7(), name: name.to_owned(), date, kind, icon: None, color: None, repeat: None };
+        let countdown = Countdown { id: Uuid::now_v7(), name: name.to_owned(), date, kind, icon: None, color: None, repeat: None, pinned_at: None };
         self.conn.execute(
             "INSERT INTO countdowns (id, name, date, kind, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
@@ -1461,6 +1466,15 @@ impl Store {
             ],
         )?;
         Ok(countdown)
+    }
+
+    /// Pins a countdown to the front of the grid (the latest pinned first), or unpins it.
+    pub fn set_countdown_pinned(&self, id: Id, pinned: bool) -> Result<()> {
+        self.conn.execute(
+            "UPDATE countdowns SET pinned_at = ?2 WHERE id = ?1",
+            params![id.to_string(), pinned.then(now_ms)],
+        )?;
+        Ok(())
     }
 
     /// Edits a countdown: its name, date, kind and repeat.
@@ -2897,6 +2911,14 @@ mod tests {
         let edited = store.countdowns()?.remove(0);
         assert_eq!((edited.name.as_str(), edited.repeat), ("Release day", Some(monthly)));
         assert!(store.update_countdown(release.id, " ", saved.date, CountdownKind::Countdown, None).is_err());
+        let other = store.add_countdown("Trip", saved.date, CountdownKind::Countdown)?;
+        assert_eq!(store.countdowns()?[1].id, other.id);
+        store.set_countdown_pinned(other.id, true)?;
+        let pinned = store.countdowns()?;
+        assert_eq!(pinned[0].id, other.id, "a pinned countdown comes first");
+        assert!(pinned[0].pinned_at.is_some());
+        store.set_countdown_pinned(other.id, false)?;
+        assert_eq!(store.countdowns()?[0].id, release.id);
         store.set_countdown_look(release.id, Some("  "), None)?;
         let saved = store.countdowns()?.remove(0);
         assert_eq!((saved.icon, saved.color), (None, None));

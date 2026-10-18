@@ -44,6 +44,8 @@ pub struct Countdown {
     pub color: Option<String>,
     /// The original's Repeat: the date comes back by this rule.
     pub repeat: Option<crate::recurrence::Recurrence>,
+    /// When the countdown was pinned to the front of the grid.
+    pub pinned_at: Option<i64>,
 }
 
 impl Countdown {
@@ -134,6 +136,7 @@ mod tests {
             icon: None,
             color: None,
             repeat: None,
+            pinned_at: None,
         };
         assert_eq!(once.next_date(d(2026, 10, 18)), d(2026, 9, 13), "without a repeat the date stays");
         let monthly = Countdown { repeat: Some(Recurrence::new(Frequency::Monthly, 1)), ..once.clone() };

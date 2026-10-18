@@ -299,6 +299,29 @@ impl CountdownView {
                     .child(numbers),
             )
             .child(Label::new(subtitle).size(LabelSize::XSmall).color(Color::Muted))
+            // The original's pin, beside the "…": a pinned card stays first and shows it.
+            .child({
+                let pinned = countdown.pinned_at.is_some();
+                div()
+                    .absolute()
+                    .top(px(6.))
+                    .right(px(32.))
+                    .opacity(if pinned { 1. } else { 0. })
+                    .group_hover(group.clone(), |s| s.opacity(1.))
+                    .child(
+                        IconButton::new("countdown-pin", IconName::Pin)
+                            .size(px(22.))
+                            .icon_size(IconSize::Small)
+                            .icon_color(if pinned { Color::Accent } else { Color::Muted })
+                            .tooltip(Tooltip::text(if pinned { strings.unpin } else { strings.pin }))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if let Err(err) = this.store.set_countdown_pinned(id, !pinned) {
+                                    eprintln!("failed to pin the countdown: {err:#}");
+                                }
+                                this.reload(cx);
+                            })),
+                    )
+            })
             .child(
                 div()
                     .absolute()

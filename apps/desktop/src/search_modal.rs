@@ -483,6 +483,7 @@ impl Render for SearchModal {
                         .hover(|s| s.bg(theme.colors().ghost_element_hover))
                         .child(
                             h_flex()
+                                .h(px(24.))
                                 .gap_2()
                                 .child(Checkbox::new("search-checkbox").size(px(14.)).toggle_state(task.is_completed()))
                                 .child(
@@ -566,15 +567,36 @@ impl Render for SearchModal {
                 h_flex()
                     .gap_2()
                     .px_1()
-                    .h(px(32.))
+                    .h(px(36.))
                     .child(Icon::new(IconName::Search).size(IconSize::Large))
                     .child(div().flex_1().text_size(px(15.)).child(self.input.clone()))
+                    // As the original's: a round clear button once something is typed.
+                    .when(has_query, |el| {
+                        el.child(
+                            div()
+                                .id("clear-search")
+                                .size(px(16.))
+                                .rounded_full()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .cursor_pointer()
+                                .bg(theme.colors().text_muted.opacity(0.5))
+                                .child(Icon::new(IconName::X).size(IconSize::Custom(px(10.))).color(Color::Custom(theme.colors().elevated_surface_background)))
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.input.update(cx, |input, cx| input.set_text("", cx));
+                                    window.focus(&this.input.focus_handle(cx), cx);
+                                })),
+                        )
+                    })
                     .child(
                         IconButton::new("close-search", IconName::X)
                             .icon_size(IconSize::Medium)
                             .on_click(cx.listener(|_, _, _, cx| cx.emit(SearchEvent::Dismissed))),
                     ),
             )
+            // As the original's: the line under the field, then the chips.
+            .child(Divider::horizontal())
             .child(
                 h_flex()
                     .gap_1p5()
@@ -583,7 +605,6 @@ impl Render for SearchModal {
                     .when(self.filter == Filter::All || self.filter == Filter::Tags, |el| el.child(chip(Filter::Tags, strings.search_filter_tag, cx)))
                     .when(self.filter == Filter::All || self.filter == Filter::Lists, |el| el.child(chip(Filter::Lists, strings.search_filter_list, cx))),
             )
-            .child(Divider::horizontal())
             .child(
                 v_flex()
                     .id("search-results")

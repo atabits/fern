@@ -229,6 +229,9 @@ pub struct Preferences {
     pub week_numbers: bool,
     /// Settings → More → "Show Mini Calendar in Sidebar": the week under the lists column.
     pub mini_calendar: bool,
+    /// The add field's "Input Box Setting": "Detailed" (a taller box with a toolbar and an Add
+    /// button) rather than "Simple".
+    pub detailed_input: bool,
     /// Settings → More → Smart Recognition, for quick add.
     pub recognition: Recognition,
     pub task_defaults: TaskDefaults,
@@ -262,6 +265,7 @@ impl Default for Preferences {
             date_format: None,
             week_numbers: false,
             mini_calendar: true,
+            detailed_input: false,
             recognition: Recognition::default(),
             task_defaults: TaskDefaults::default(),
             default_list: None,
@@ -276,6 +280,7 @@ const TIME_FORMAT: &str = "time_format";
 const DATE_FORMAT: &str = "date_format";
 const WEEK_NUMBERS: &str = "week_numbers";
 const MINI_CALENDAR: &str = "mini_calendar";
+const INPUT_BOX: &str = "input_box";
 const DEFAULT_DATE: &str = "default_date";
 const DEFAULT_DURATION: &str = "default_duration";
 const DEFAULT_TIMED_REMINDER: &str = "default_timed_reminder";
@@ -311,6 +316,7 @@ impl Store {
         let date_format = self.setting(DATE_FORMAT)?.and_then(|c| DateFormat::from_code(&c));
         let week_numbers = self.setting(WEEK_NUMBERS)?.as_deref() == Some("1");
         let mini_calendar = self.setting(MINI_CALENDAR)?.as_deref() != Some("0");
+        let detailed_input = self.setting(INPUT_BOX)?.as_deref() == Some("detailed");
         let flag = |key: &str| -> Result<bool> { Ok(self.setting(key)?.as_deref() != Some("0")) };
         let recognition = Recognition {
             dates: flag(RECOGNITION[0])?,
@@ -352,6 +358,7 @@ impl Store {
             date_format,
             week_numbers,
             mini_calendar,
+            detailed_input,
             recognition,
             task_defaults,
             default_list,
@@ -372,6 +379,7 @@ impl Store {
         self.set_setting(DATE_FORMAT, preferences.date_format.map_or("", DateFormat::code))?;
         self.set_setting(WEEK_NUMBERS, if preferences.week_numbers { "1" } else { "0" })?;
         self.set_setting(MINI_CALENDAR, if preferences.mini_calendar { "1" } else { "0" })?;
+        self.set_setting(INPUT_BOX, if preferences.detailed_input { "detailed" } else { "simple" })?;
         let t = &preferences.task_defaults;
         let offset = |o: Option<i64>| o.map_or("none".to_owned(), |o| o.to_string());
         self.set_setting(DEFAULT_DATE, t.date.map_or("", DefaultDate::code))?;
@@ -421,6 +429,7 @@ mod tests {
             date_format: Some(DateFormat::YearMonthDay),
             week_numbers: true,
             mini_calendar: false,
+            detailed_input: true,
             recognition: Recognition { remove_date_text: false, tags: false, ..Default::default() },
             task_defaults: TaskDefaults {
                 date: Some(DefaultDate::Tomorrow),

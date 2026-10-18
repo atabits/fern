@@ -129,6 +129,8 @@ pub struct TodoView {
     /// The "▾" menu's Tags picker while open, with the tags ticked so far, and its search field.
     add_tags: Option<Vec<String>>,
     add_tag_input: Entity<TextInput>,
+    /// The "▾" menu's "Input Box Setting" chooser, while open.
+    input_box_open: bool,
     /// The section whose "…" menu is open.
     section_menu: Option<Id>,
     /// A section being renamed, with its field.
@@ -144,19 +146,8 @@ impl TodoView {
         let summary = cx.new(|_| crate::summary_view::SummaryView::new(store.clone()));
         let mini_expanded = store.setting("mini_expanded").ok().flatten().as_deref() == Some("1");
         let input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.add_task, cx));
-        cx.subscribe_in(&input, window, |this, input, Submitted(text), window, cx| {
-            if text.trim().is_empty() {
-                return;
-            }
-            let result = this.add_task(text);
-            if this.check(result).is_some() {
-                input.update(cx, |input, cx| input.clear(window, cx));
-                this.quick_add_due = None;
-                this.add_draft = AddDraft::default();
-                this.reload(cx);
-            }
-        })
-        .detach();
+        cx.subscribe_in(&input, window, |this, _, Submitted(text), window, cx| this.submit_new_task(text, window, cx))
+            .detach();
         // As the user types, the recognized date, tags and list are highlighted and the date is
         // shown at the end of the field, as in the original.
         cx.subscribe(&input, |this, _, _: &Changed, cx| this.update_quick_add_hint(cx)).detach();
@@ -214,7 +205,7 @@ impl TodoView {
         // Placeholders live inside the inputs, so they are updated when the language changes.
         cx.observe_global::<CurrentLocale>(|this, cx| {
             let strings = i18n::t(cx);
-            this.input.update(cx, |input, cx| input.set_placeholder(strings.add_task, cx));
+            this.sync_input_placeholder(cx);
             this.new_list.update(cx, |input, cx| input.set_placeholder(strings.new_list, cx));
             this.search_input.update(cx, |input, cx| input.set_placeholder(strings.search_placeholder, cx));
         })
@@ -263,6 +254,7 @@ impl TodoView {
             add_draft: AddDraft::default(),
             add_tags: None,
             add_tag_input,
+            input_box_open: false,
             list_activity: None,
             filters: Vec::new(),
             preferences: Default::default(),
@@ -415,6 +407,12 @@ impl TodoView {
                     }
                 }
                 Some(("menu", "templates")) => self.templates_open = true,
+                Some(("menu", "input-box")) => self.input_box_open = true,
+                Some(("menu", "detailed-input")) => {
+                    self.preferences.detailed_input = true;
+                    self.store.save_preferences(&self.preferences).ok();
+                    self.sync_input_placeholder(cx);
+                }
                 Some(("menu", "add-tags")) => {
                     self.add_tags = Some(vec!["home".to_owned()]);
                 }
@@ -526,6 +524,7 @@ impl TodoView {
 
     pub fn reload(&mut self, cx: &mut Context<Self>) {
         self.preferences = self.store.preferences().unwrap_or_default();
+        self.sync_input_placeholder(cx);
         self.busy_days = self
             .store
             .tasks()
@@ -750,6 +749,213 @@ impl TodoView {
         cx.notify();
     }
 
+    /// The add field's placeholder: the Detailed box asks "What would you like to do?".
+    fn sync_input_placeholder(&mut self, cx: &mut Context<Self>) {
+        let strings = i18n::t(cx);
+        let placeholder = if self.preferences.detailed_input { strings.input_box_placeholder } else { strings.add_task };
+        self.input.update(cx, |input, cx| input.set_placeholder(placeholder, cx));
+    }
+
+    /// Adds the typed task, as Enter in the add field or its "Add" button does.
+    fn submit_new_task(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if text.trim().is_empty() {
+            return;
+        }
+        let result = self.add_task(text);
+        if self.check(result).is_some() {
+            self.input.update(cx, |input, cx| input.clear(window, cx));
+            self.quick_add_due = None;
+            self.add_draft = AddDraft::default();
+            self.reload(cx);
+        }
+    }
+
+    /// The popovers the add field's buttons open: the "▾" menu, its Tags and Input Box Setting,
+    /// and the templates.
+    fn add_field_popovers(&self, el: Div, strings: &'static Strings, cx: &mut Context<Self>) -> Div {
+        el.when(self.add_menu_open, |el| {
+            el.child(PopoverAttachment::new(Placement::BelowRight, self.render_add_menu(strings, cx)))
+        })
+        .when_some(self.add_tags.clone(), |el, picked| {
+            el.child(PopoverAttachment::new(Placement::BelowRight, self.render_add_tags(&picked, strings, cx)))
+        })
+        .when(self.input_box_open, |el| {
+            el.child(PopoverAttachment::new(Placement::BelowRight, self.render_input_box_setting(strings, cx)))
+        })
+        .when(self.templates_open, |el| {
+            el.child(PopoverAttachment::new(Placement::BelowRight, self.render_templates(strings, cx)))
+        })
+    }
+
+    /// The original's "Input Box Setting": a preview of the Simple and the Detailed add field;
+    /// a click picks one.
+    fn render_input_box_setting(&self, strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let detailed = self.preferences.detailed_input;
+        let line = |w: f32| div().w(px(w)).h(px(6.)).rounded(px(3.)).bg(theme.colors().text_muted.opacity(0.4));
+        let simple_preview = h_flex()
+            .h(px(28.))
+            .px_2()
+            .gap_1()
+            .rounded(px(5.))
+            .border_1()
+            .border_color(theme.colors().accent)
+            .child(Icon::new(IconName::Plus).size(IconSize::XSmall).color(Color::Muted))
+            .child(line(70.))
+            .child(div().flex_1())
+            .child(Icon::new(IconName::ChevronDown).size(IconSize::XSmall).color(Color::Muted));
+        let detailed_preview = v_flex()
+            .p_1p5()
+            .gap_1p5()
+            .rounded(px(5.))
+            .border_1()
+            .border_color(theme.colors().accent)
+            .child(line(90.))
+            .child(
+                h_flex()
+                    .gap_1()
+                    .child(Icon::new(IconName::Flag).size(IconSize::XSmall).color(Color::Muted))
+                    .child(Icon::new(IconName::Inbox).size(IconSize::XSmall).color(Color::Muted))
+                    .child(Icon::new(IconName::Ellipsis).size(IconSize::XSmall).color(Color::Muted))
+                    .child(div().flex_1())
+                    .child(div().w(px(22.)).h(px(12.)).rounded(px(3.)).bg(theme.colors().accent)),
+            );
+        let option = |id: &'static str, preview: AnyElement, label: &'static str, value: bool| {
+            let selected = detailed == value;
+            v_flex()
+                .id(id)
+                .flex_1()
+                .gap_2()
+                .items_center()
+                .cursor_pointer()
+                .child(
+                    div()
+                        .w_full()
+                        .h(px(76.))
+                        .px_2()
+                        .flex()
+                        .flex_col()
+                        .justify_center()
+                        .rounded(px(6.))
+                        .bg(theme.colors().background)
+                        .child(preview),
+                )
+                .child(
+                    h_flex()
+                        .gap_1p5()
+                        .child(
+                            div()
+                                .size(px(14.))
+                                .rounded_full()
+                                .border_1()
+                                .border_color(if selected { theme.colors().accent } else { theme.colors().text_muted })
+                                .when(selected, |el| el.bg(theme.colors().accent)),
+                        )
+                        .child(Label::new(label).size(LabelSize::Small)),
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.preferences.detailed_input = value;
+                    this.sync_input_placeholder(cx);
+                    if let Err(err) = this.store.save_preferences(&this.preferences) {
+                        eprintln!("failed to save the input box setting: {err:#}");
+                    }
+                    cx.notify();
+                }))
+        };
+        popover(cx)
+            .w(px(380.))
+            .p_3()
+            .gap_3()
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.input_box_open = false;
+                cx.notify();
+            }))
+            .child(
+                h_flex()
+                    .child(div().flex_1().child(Label::new(strings.input_box_setting).weight(FontWeight::SEMIBOLD)))
+                    .child(IconButton::new("input-box-close", IconName::X).size(px(22.)).icon_size(IconSize::Small).on_click(
+                        cx.listener(|this, _, _, cx| {
+                            this.input_box_open = false;
+                            cx.notify();
+                        }),
+                    )),
+            )
+            .child(
+                h_flex()
+                    .gap_3()
+                    .child(option("input-box-simple", simple_preview.into_any_element(), strings.input_box_simple, false))
+                    .child(option("input-box-detailed", detailed_preview.into_any_element(), strings.input_box_detailed, true)),
+            )
+            .into_any_element()
+    }
+
+    /// The original's "Detailed" add field: the text on top, a toolbar under it — priority, list
+    /// and "…" open the options menu — and an "Add" button.
+    fn render_detailed_add(&self, strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let input_focus = self.input.read(cx).focus_handle(cx);
+        let open_menu = |side: bool| {
+            cx.listener(move |this: &mut Self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>| {
+                this.add_menu_open = !this.add_menu_open;
+                this.add_list_side = side;
+                cx.notify();
+            })
+        };
+        let priority_color = self
+            .add_draft
+            .priority
+            .and_then(|p| task_rows::priority_color(p, &theme))
+            .map_or(Color::Muted, Color::Custom);
+        v_flex()
+            .mx_2()
+            .mb_2()
+            .flex_none()
+            .gap_1()
+            .px_3()
+            .py_2()
+            .rounded(px(6.))
+            .border_1()
+            .border_color(theme.colors().border)
+            .bg(theme.colors().surface_background)
+            .on_mouse_down(MouseButton::Left, move |_, window, cx| window.focus(&input_focus, cx))
+            .child(h_flex().gap_2().child(div().flex_1().min_w_0().child(self.input.clone())).children(
+                self.quick_add_due.map(|(date, time)| {
+                    let (label, _) = task_rows::due_label(date, time, Self::today(), strings);
+                    Label::new(label).size(LabelSize::Small).color(Color::Accent)
+                }),
+            ))
+            .child(
+                h_flex()
+                    .gap_1()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(IconButton::new("add-priority", IconName::Flag).size(px(24.)).icon_size(IconSize::Small).icon_color(priority_color).on_click(open_menu(false)))
+                    .child(IconButton::new("add-list", IconName::Inbox).size(px(24.)).icon_size(IconSize::Small).on_click(open_menu(true)))
+                    .child(self.add_field_popovers(
+                        div().relative().child(IconButton::new("add-more", IconName::Ellipsis).size(px(24.)).icon_size(IconSize::Small).on_click(open_menu(false))),
+                        strings,
+                        cx,
+                    ))
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .id("add-submit")
+                            .h(px(24.))
+                            .px_3()
+                            .flex()
+                            .items_center()
+                            .rounded(px(5.))
+                            .cursor_pointer()
+                            .bg(theme.colors().accent)
+                            .child(Label::new(strings.add).size(LabelSize::Small))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                let text = this.input.read(cx).text().to_owned();
+                                this.submit_new_task(&text, window, cx);
+                            })),
+                    ),
+            )
+            .into_any_element()
+    }
+
     /// The add field's "▾" menu, as in the original.
     fn render_add_menu(&self, strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
@@ -845,6 +1051,17 @@ impl TodoView {
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.add_draft.note = !this.add_draft.note;
                         this.add_menu_open = false;
+                        cx.notify();
+                    })),
+            )
+            .child(div().py_1().child(Divider::horizontal()))
+            .child(
+                ListItem::new("add-input-box")
+                    .start_slot(Icon::new(IconName::Settings).color(Color::Muted))
+                    .child(Label::new(strings.input_box_setting))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.add_menu_open = false;
+                        this.input_box_open = true;
                         cx.notify();
                     })),
             )
@@ -3000,7 +3217,8 @@ impl Render for TodoView {
             .when(matches!(self.view, View::Completed | View::WontDo), |el| {
                 el.child(self.render_closed_filters(strings, cx))
             })
-            .when(!self.is_read_only_view(), |el| el.child(
+            .when(!self.is_read_only_view() && self.preferences.detailed_input, |el| el.child(self.render_detailed_add(strings, cx)))
+            .when(!self.is_read_only_view() && !self.preferences.detailed_input, |el| el.child(
                 h_flex()
                     .mx_2()
                     .mb_2()
@@ -3039,15 +3257,7 @@ impl Render for TodoView {
                                         cx.notify();
                                     })),
                             )
-                            .when(self.add_menu_open, |el| {
-                                el.child(PopoverAttachment::new(Placement::BelowRight, self.render_add_menu(strings, cx)))
-                            })
-                            .when_some(self.add_tags.clone(), |el, picked| {
-                                el.child(PopoverAttachment::new(Placement::BelowRight, self.render_add_tags(&picked, strings, cx)))
-                            })
-                            .when(self.templates_open, |el| {
-                                el.child(PopoverAttachment::new(Placement::BelowRight, self.render_templates(strings, cx)))
-                            }),
+                            .map(|el| self.add_field_popovers(el, strings, cx)),
                     ),
             ))
             .children(board)

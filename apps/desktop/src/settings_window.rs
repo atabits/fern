@@ -684,6 +684,21 @@ impl SettingsWindow {
                             )
                         }),
                 )
+                .child({
+                    let on = self.preferences.mini_calendar;
+                    v_flex().child(title(strings.mini_calendar)).child(
+                        group().child(
+                            h_flex()
+                                .id("mini-calendar")
+                                .h(px(36.))
+                                .px_4()
+                                .cursor_pointer()
+                                .child(div().flex_1().child(Label::new(strings.show_mini_calendar)))
+                                .child(Switch::new().toggle_state(on))
+                                .on_click(cx.listener(move |this, _, window, cx| this.update(window, cx, |p| p.mini_calendar = !on))),
+                        ),
+                    )
+                })
                 .into_any_element()
             }
             Page::About => {

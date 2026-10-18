@@ -208,7 +208,7 @@ impl AppView {
             }
             // `hour12` and `week-numbers`: Settings → Time Format set to 12 hours, and week numbers on.
             let flag = |name: &str| state.split(';').any(|part| part == name);
-            if flag("hour12") || flag("week-numbers") || flag("overdue-last") {
+            if flag("hour12") || flag("week-numbers") || flag("overdue-last") || flag("no-mini-calendar") {
                 let defaults = this.store.preferences().unwrap_or_default();
                 let mut preferences = fern_core::Preferences {
                     hour12: flag("hour12") || defaults.hour12,
@@ -216,6 +216,7 @@ impl AppView {
                     ..defaults
                 };
                 preferences.task_defaults.overdue_last |= flag("overdue-last");
+                preferences.mini_calendar &= !flag("no-mini-calendar");
                 this.store.save_preferences(&preferences).ok();
                 settings_window::apply(&preferences, window, cx);
                 this.todo.update(cx, |todo, cx| todo.reload(cx));

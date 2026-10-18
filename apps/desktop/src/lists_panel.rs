@@ -240,7 +240,7 @@ pub fn render(
         .border_r_1()
         .border_color(colors.border)
         .child(lists_column)
-        .child(mini_week(strings, cx))
+        .when(preferences.mini_calendar, |el| el.child(mini_week(strings, cx)))
 }
 
 /// The current week pinned to the bottom of the column, as in TickTick.

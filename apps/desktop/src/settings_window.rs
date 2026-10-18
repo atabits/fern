@@ -15,6 +15,9 @@ use crate::actions::DismissSettings;
 use crate::calendar;
 use crate::i18n::{self, CurrentLocale, Locale};
 
+/// A row of a Settings page, and of the sections column, as the original's.
+const ROW_HEIGHT: f32 = 40.;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Page {
     /// The original's Features: the optional sections on or off.
@@ -369,7 +372,7 @@ impl SettingsWindow {
     fn render_nav(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let strings = i18n::t(cx);
         let item = |id: &'static str, icon: IconName, label: &'static str, selected: bool| {
-            ListItem::new(id).height(px(34.)).toggle_state(selected).start_slot(Icon::new(icon)).child(Label::new(label))
+            ListItem::new(id).height(px(37.)).toggle_state(selected).start_slot(Icon::new(icon)).child(Label::new(label))
         };
         let page = |id, icon, index: usize, target: Page| {
             item(id, icon, strings.settings_pages[index], self.page == target)
@@ -440,7 +443,7 @@ impl SettingsWindow {
             )
         });
         h_flex()
-            .h(px(36.))
+            .h(px(ROW_HEIGHT))
             .px_4()
             .gap_2()
             .children(icon.map(|icon| Icon::new(icon).color(Color::Muted)))
@@ -564,7 +567,7 @@ impl SettingsWindow {
                     group().child(
                         h_flex()
                             .id("week-numbers")
-                            .h(px(36.))
+                            .h(px(ROW_HEIGHT))
                             .px_4()
                             .cursor_pointer()
                             .child(div().flex_1().child(Label::new(strings.show_week_numbers)))
@@ -630,7 +633,7 @@ impl SettingsWindow {
                     group().child(
                         h_flex()
                             .id("follow-system")
-                            .h(px(36.))
+                            .h(px(ROW_HEIGHT))
                             .px_4()
                             .cursor_pointer()
                             .child(div().flex_1().child(Label::new(strings.follow_system_dark_mode)))
@@ -823,7 +826,7 @@ impl SettingsWindow {
                         group().child(
                             h_flex()
                                 .id("mini-calendar")
-                                .h(px(36.))
+                                .h(px(ROW_HEIGHT))
                                 .px_4()
                                 .cursor_pointer()
                                 .child(div().flex_1().child(Label::new(strings.show_mini_calendar)))
@@ -944,7 +947,7 @@ impl SettingsWindow {
             Page::About => {
                 let row = |label: &'static str, value: &'static str| {
                     h_flex()
-                        .h(px(36.))
+                        .h(px(ROW_HEIGHT))
                         .px_4()
                         .child(div().flex_1().child(Label::new(label)))
                         .child(Label::new(value).color(Color::Muted))
@@ -968,7 +971,7 @@ impl SettingsWindow {
                         .child(
                             group().child(
                                 h_flex()
-                                    .h(px(36.))
+                                    .h(px(ROW_HEIGHT))
                                     .px_4()
                                     .gap_4()
                                     .child(div().flex_1().child(Label::new(strings.backup_restore)))

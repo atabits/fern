@@ -44,7 +44,7 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 
 | Feature | Status | Notes |
 |---|---|---|
-| Narrow sections sidebar | 🟡 | order and tooltips match the original; every section works; the bell has the original's red unread badge and lists fired reminders, including ones missed while the app was closed (opening the list marks them read, a click opens the task). The original's notification list was not opened (that would mark the user's notifications read). Outline icons where TickTick uses filled ones |
+| Narrow sections sidebar | 🟡 | order and tooltips match the original; every section works; the bell has the original's red unread badge and lists fired reminders, including ones missed while the app was closed (opening the list marks them read, a click opens the task). The original's notification list was not opened (that would mark the user's notifications read). The section icons are filled glyphs like the original's, drawn for Fern (`assets/icons/fern_*.svg`, not copied), 24px and 50px apart; the open section's icon turns bright with no background, as there; Search stays an outline, as in the original |
 | Account menu | ✅ | the original's Settings and Statistics (the Statistics page over the whole window on its Overview tab, closed with Done; the page keeps the original's centered width); the language is in Settings → More. No Premium or Sign Out (no accounts yet) |
 | Lists column: Inbox / All / Today / Tomorrow / Next 7 Days | ✅ | counters; a new task gets the due date or tag of the current view |
 | Lists column: user lists | ✅ | create inline; rename, color and delete from the "…" menu; no drag and drop |
@@ -92,6 +92,9 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 
 ## Next
 
-1. Filled sidebar icons (needs own filled glyphs; Lucide has none).
+1. Calendar: the Year view (Y/4) and Multi-Week (the original's 2–6 weeks).
+2. Repeat: the original's third mode, "By Specific Dates".
+3. Calendar Agenda: countdowns, as the original lists them there.
+4. Quick add ▾ menu: Tags (the original's tag side menu for the next task).
 
 Not checkable under the reference rules: whether the original asks for a note when a focus session ends (finding out means running a focus timer in the reference account). Fern's record dialog takes a note afterwards.

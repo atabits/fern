@@ -1,0 +1,5 @@
+<!-- Fern's own glyph (AGPL-3.0-or-later): a target, a thick ring around a dot. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
+  <circle cx="12" cy="12" r="8" fill="none" stroke="black" stroke-width="3"/>
+  <circle cx="12" cy="12" r="3.5" fill="black"/>
+</svg>

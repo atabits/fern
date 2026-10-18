@@ -41,14 +41,15 @@ impl Section {
 
     fn icon(self) -> IconName {
         match self {
-            Section::Tasks => IconName::SquareCheck,
-            Section::Calendar => IconName::CalendarDays,
-            // The original uses a target for Focus and a clock-like glyph for Habit.
-            Section::Habits => IconName::Clock,
-            Section::Pomodoro => IconName::CircleDot,
+            // Filled glyphs as in the original, drawn for Fern (`assets/icons/fern_*.svg`): a target
+            // for Focus and a clock for Habit.
+            Section::Tasks => IconName::FernTasks,
+            Section::Calendar => IconName::FernCalendar,
+            Section::Habits => IconName::FernHabit,
+            Section::Pomodoro => IconName::FernFocus,
             Section::Search => IconName::Search,
-            Section::Matrix => IconName::LayoutGrid,
-            Section::Countdown => IconName::CalendarHeart,
+            Section::Matrix => IconName::FernMatrix,
+            Section::Countdown => IconName::FernCountdown,
         }
     }
 
@@ -116,13 +117,17 @@ pub fn render(
                 .child(Icon::new(IconName::User).color(Color::Default))
                 .children(account_menu),
         )
-        .children(Section::ALL.into_iter().map(|section| {
+        // The sections, spaced and sized as in the original (50px apart, 24px glyphs).
+        .child(v_flex().gap(px(10.)).children(Section::ALL.into_iter().map(|section| {
             let on_select = on_select.clone();
-            button(section.id(), section.icon())
+            // As in the original, the open section's icon turns bright, with no background.
+            IconButton::new(section.id(), section.icon())
+                .size(px(40.))
+                .icon_size(IconSize::Custom(px(24.)))
                 .tooltip(Tooltip::text(section.title(strings)))
-                .toggle_state(section == active)
+                .icon_color(if section == active { Color::Default } else { Color::Muted })
                 .on_click(move |_, window, cx| on_select(section, window, cx))
-        }))
+        })))
         .child(div().flex_1())
         .child(button("sync", IconName::RefreshCw))
         .child(

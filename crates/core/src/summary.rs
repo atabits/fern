@@ -156,6 +156,92 @@ impl Default for SummaryOptions {
     }
 }
 
+const PERIOD_CODES: [&str; 8] =
+    ["today", "tomorrow", "yesterday", "this_week", "next_week", "last_week", "this_month", "last_month"];
+const STATUS_CODES: [&str; 4] = ["all", "completed", "uncompleted", "wont_do"];
+const GROUPING_CODES: [&str; 6] = ["status", "list", "completion_date", "task_date", "tag", "priority"];
+const FIELD_CODES: [&str; 5] = ["status", "completion_time", "task_time", "list", "tag"];
+/// Where the options are kept between runs.
+const SETTING: &str = "summary_options";
+
+fn code_of<T: PartialEq + Copy>(all: &[T], codes: &[&'static str], value: T) -> &'static str {
+    all.iter().position(|v| *v == value).map_or(codes[0], |i| codes[i])
+}
+
+fn value_of<T: Copy>(all: &[T], codes: &[&str], code: &str) -> Option<T> {
+    codes.iter().position(|c| *c == code).map(|i| all[i])
+}
+
+impl SummaryOptions {
+    /// A compact `key=value;…` form for the settings table.
+    pub fn to_storage(&self) -> String {
+        let period = match self.period {
+            Period::Custom(first, last) => format!("custom:{first}:{last}"),
+            other => code_of(&Period::ALL, &PERIOD_CODES, other).to_owned(),
+        };
+        let fields: Vec<&str> = self.fields.iter().map(|f| code_of(&Field::ALL, &FIELD_CODES, *f)).collect();
+        let lists = self.lists.as_ref().map(|lists| {
+            lists.iter().map(|l| l.map_or("inbox".to_owned(), |id| id.to_string())).collect::<Vec<_>>().join(",")
+        });
+        format!(
+            "period={period};status={};grouping={};fields={};lists={};next={};habits={}",
+            code_of(&StatusFilter::ALL, &STATUS_CODES, self.status),
+            code_of(&Grouping::ALL, &GROUPING_CODES, self.grouping),
+            fields.join(","),
+            lists.unwrap_or_else(|| "all".to_owned()),
+            self.next_period as u8,
+            self.habits as u8,
+        )
+    }
+
+    /// Reads `to_storage`'s form; unknown or missing parts keep their defaults.
+    pub fn from_storage(text: &str) -> Self {
+        let mut options = Self::default();
+        for (key, value) in text.split(';').filter_map(|part| part.split_once('=')) {
+            match key {
+                "period" => {
+                    if let Some(range) = value.strip_prefix("custom:") {
+                        let dates: Vec<NaiveDate> = range.split(':').filter_map(|d| d.parse().ok()).collect();
+                        if let [first, last] = dates[..] {
+                            options.period = Period::Custom(first, last);
+                        }
+                    } else if let Some(period) = value_of(&Period::ALL, &PERIOD_CODES, value) {
+                        options.period = period;
+                    }
+                }
+                "status" => options.status = value_of(&StatusFilter::ALL, &STATUS_CODES, value).unwrap_or_default(),
+                "grouping" => options.grouping = value_of(&Grouping::ALL, &GROUPING_CODES, value).unwrap_or_default(),
+                "fields" => {
+                    options.fields = value.split(',').filter_map(|c| value_of(&Field::ALL, &FIELD_CODES, c)).collect();
+                }
+                "lists" if value != "all" => {
+                    options.lists = Some(
+                        value
+                            .split(',')
+                            .filter_map(|l| if l == "inbox" { Some(None) } else { l.parse().ok().map(Some) })
+                            .collect(),
+                    );
+                }
+                "next" => options.next_period = value == "1",
+                "habits" => options.habits = value == "1",
+                _ => {}
+            }
+        }
+        options
+    }
+}
+
+impl crate::store::Store {
+    /// The Summary's options as last chosen.
+    pub fn summary_options(&self) -> anyhow::Result<SummaryOptions> {
+        Ok(self.setting(SETTING)?.map(|text| SummaryOptions::from_storage(&text)).unwrap_or_default())
+    }
+
+    pub fn save_summary_options(&self, options: &SummaryOptions) -> anyhow::Result<()> {
+        self.set_setting(SETTING, &options.to_storage())
+    }
+}
+
 /// What a group is about; the desktop turns it into a translated heading.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum GroupKey {
@@ -296,6 +382,27 @@ mod tests {
         let on = SummaryOptions { habits: true, ..off };
         let rows = habit_checkins(&habits, &checkins, &on, today, Weekday::Mon);
         assert_eq!(rows.iter().map(|(h, n)| (h.name.as_str(), *n)).collect::<Vec<_>>(), [("Run", 1)]);
+    }
+
+    #[test]
+    fn options_are_remembered() {
+        let store = Store::open_in_memory().unwrap();
+        assert_eq!(store.summary_options().unwrap(), SummaryOptions::default());
+        let list = store.create_list("Work").unwrap();
+        let options = SummaryOptions {
+            period: Period::Custom(d(2026, 10, 1), d(2026, 10, 20)),
+            status: StatusFilter::Uncompleted,
+            grouping: Grouping::Tag,
+            fields: vec![Field::Status, Field::List],
+            lists: Some(vec![None, Some(list.id)]),
+            next_period: true,
+            habits: true,
+        };
+        store.save_summary_options(&options).unwrap();
+        assert_eq!(store.summary_options().unwrap(), options);
+        let defaults = SummaryOptions::default();
+        assert_eq!(SummaryOptions::from_storage(&defaults.to_storage()), defaults);
+        assert_eq!(SummaryOptions::from_storage("period=nonsense;grouping=list"), SummaryOptions { grouping: Grouping::List, ..defaults });
     }
 
     #[test]

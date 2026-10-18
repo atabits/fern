@@ -143,7 +143,9 @@ pub fn report(groups: &[SummaryGroup], options: &SummaryOptions, lists: &[List],
 
 impl SummaryView {
     pub fn new(store: Rc<Store>) -> Self {
-        Self { store, options: SummaryOptions::default(), menu: None, copied: false, custom: None }
+        // The original keeps the Summary's choices; so does Fern, in the settings table.
+        let options = store.summary_options().unwrap_or_default();
+        Self { store, options, menu: None, copied: false, custom: None }
     }
 
     /// "Custom" in the Date menu: Start and End fields with Cancel and Confirm.
@@ -184,6 +186,9 @@ impl SummaryView {
 
     fn update(&mut self, cx: &mut Context<Self>, change: impl FnOnce(&mut SummaryOptions)) {
         change(&mut self.options);
+        if let Err(err) = self.store.save_summary_options(&self.options) {
+            eprintln!("failed to save the summary options: {err:#}");
+        }
         self.copied = false;
         cx.notify();
     }

@@ -37,6 +37,7 @@ pub enum IconName {
     Copy,
     CornerDownRight,
     Ellipsis,
+    Eye,
     FernCalendar,
     FernCountdown,
     FernFocus,

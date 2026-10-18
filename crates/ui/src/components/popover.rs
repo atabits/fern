@@ -26,6 +26,8 @@ pub fn popover(cx: &App) -> Div {
 pub enum Placement {
     BelowLeft,
     BelowRight,
+    /// Below the parent, centered under it.
+    BelowCenter,
     /// Opens upwards, for buttons at the bottom of a panel.
     AboveRight,
     RightTop,
@@ -56,6 +58,7 @@ impl RenderOnce for PopoverAttachment {
         let (attach, anchor) = match self.placement {
             Placement::BelowLeft => (div().absolute().top(px(30.)).left_0(), Anchor::TopLeft),
             Placement::BelowRight => (div().absolute().top(px(30.)).right_0(), Anchor::TopRight),
+            Placement::BelowCenter => (div().absolute().top(px(30.)).left_1_2(), Anchor::TopCenter),
             Placement::AboveRight => (div().absolute().top(px(-4.)).right_0(), Anchor::BottomRight),
             Placement::RightTop => (div().absolute().top_0().left(px(38.)), Anchor::TopLeft),
             Placement::RightBottom => (div().absolute().bottom_0().left(px(38.)), Anchor::BottomLeft),

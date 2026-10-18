@@ -179,6 +179,13 @@ pub fn timeline(sessions: &[FocusSession], first: NaiveDate) -> Vec<(usize, u32,
     blocks
 }
 
+/// The focus page's picker search: every word of the query is in the name, ignoring case; an
+/// empty query matches everything.
+pub fn matches_search(name: &str, query: &str) -> bool {
+    let name = name.to_lowercase();
+    query.split_whitespace().all(|word| name.contains(&word.to_lowercase()))
+}
+
 /// A day's sessions as minute spans `(from, to)` of that day, for the focus page's hours; a
 /// session over midnight shows its part of the day.
 pub fn day_blocks(sessions: &[FocusSession], day: NaiveDate) -> Vec<(u32, u32, &FocusSession)> {
@@ -391,6 +398,13 @@ mod tests {
         let monday = NaiveDate::from_ymd_opt(2026, 10, 12).unwrap();
         let sessions = [session(at(15, 13, 30), at(15, 16, 0)), session(at(13, 23, 0), at(14, 1, 0)), session(at(20, 9, 0), at(20, 10, 0))];
         assert_eq!(timeline(&sessions, monday), [(3, 810, 960), (1, 1380, 1440), (2, 0, 60)]);
+    }
+
+    #[test]
+    fn picker_search() {
+        assert!(matches_search("Рабочее планирование", ""));
+        assert!(matches_search("Рабочее планирование", "  ПЛАН раб"));
+        assert!(!matches_search("Reading", "read book"));
     }
 
     #[test]

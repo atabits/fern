@@ -63,6 +63,10 @@ pub struct FocusView {
     batch_custom: Option<(u8, Entity<TextInput>, Entity<TextInput>)>,
     /// The original's full focus page, opened from the timer bar.
     expanded: bool,
+    /// The page's picker of what to focus on, while open.
+    picker: Option<Picker>,
+    /// What the page's Start focuses on, picked there.
+    next: Option<NextFocus>,
     add_title: Entity<TextInput>,
     add_start: Entity<TextInput>,
     add_minutes: i64,
@@ -194,6 +198,32 @@ fn line_chart(values: &[i64], labels: Vec<String>, height: f32, from_zero: bool,
         })))
 }
 
+/// The focus page's picker, opened from "Focus >" or the eye over the hours: the original's
+/// Task, Timer and Habit tabs over a search field.
+struct Picker {
+    tab: usize,
+    search: Entity<TextInput>,
+    /// Opened from the eye over the hours rather than from "Focus >".
+    at_eye: bool,
+}
+
+/// What the focus page's Start focuses on.
+#[derive(Clone)]
+enum NextFocus {
+    Task(Id, String),
+    Timer(fern_core::focus::FocusTimer),
+    Habit(String),
+}
+
+impl NextFocus {
+    fn title(&self) -> &str {
+        match self {
+            Self::Task(_, title) | Self::Habit(title) => title,
+            Self::Timer(timer) => &timer.name,
+        }
+    }
+}
+
 /// The Focus Record's "+" form and "…" menu, as in the original.
 /// The "Add Timer" popover: the timer it edits (or a new one), its name, Pomo length and mode.
 struct TimerDraft {
@@ -236,6 +266,8 @@ impl FocusView {
             batch_menu: None,
             batch_custom: None,
             expanded: false,
+            picker: None,
+            next: None,
             add_title,
             add_start,
             add_minutes: 25,
@@ -2314,6 +2346,15 @@ impl FocusView {
                 self.set_expanded(true, cx);
                 return;
             }
+            // The page with its picker open: `page-pick` (Task) or `page-pick-timer`.
+            "page-pick" | "page-pick-timer" => {
+                self.set_expanded(true, cx);
+                self.open_picker(false, window, cx);
+                if let Some(picker) = self.picker.as_mut() {
+                    picker.tab = (menu == "page-pick-timer") as usize;
+                }
+                return;
+            }
             // Batch Management with a filter's Custom fields open: `batch-date` or `batch-minutes`.
             "batch-date" | "batch-minutes" => {
                 self.record_menu = Some(RecordMenu::Batch);
@@ -2545,7 +2586,143 @@ impl FocusView {
     fn set_expanded(&mut self, expanded: bool, cx: &mut Context<Self>) {
         self.expanded = expanded;
         self.record_menu = None;
+        self.picker = None;
         cx.notify();
+    }
+
+    fn open_picker(&mut self, at_eye: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.picker.as_ref().is_some_and(|p| p.at_eye == at_eye) {
+            self.picker = None;
+            cx.notify();
+            return;
+        }
+        let strings = i18n::t(cx);
+        let search = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.focus_picker_search, cx));
+        cx.subscribe(&search, |_, _, _: &crate::text_input::Changed, cx| cx.notify()).detach();
+        cx.subscribe(&search, |this, _, _: &crate::text_input::Cancelled, cx| {
+            this.picker = None;
+            cx.notify();
+        })
+        .detach();
+        window.focus(&search.focus_handle(cx), cx);
+        self.picker = Some(Picker { tab: 0, search, at_eye });
+        cx.notify();
+    }
+
+    fn pick(&mut self, next: NextFocus, cx: &mut Context<Self>) {
+        self.next = Some(next);
+        self.picker = None;
+        cx.notify();
+    }
+
+    /// The page's Start: the picked task, timer or habit, or a plain session.
+    fn start_next(&mut self, cx: &mut Context<Self>) {
+        match self.next.take() {
+            Some(NextFocus::Task(id, title)) => self.start(Some((id, title)), cx),
+            Some(NextFocus::Timer(timer)) => self.start_from_timer(&timer, cx),
+            Some(NextFocus::Habit(name)) => {
+                let stopwatch = self.stopwatch_mode();
+                self.start_named(name, stopwatch, cx)
+            }
+            None => self.start(None, cx),
+        }
+    }
+
+    /// The picker's list: today's tasks and due habits, the active timers, or the active habits,
+    /// narrowed by the search.
+    fn render_picker(&self, picker: &Picker, cx: &mut Context<Self>) -> AnyElement {
+        use fern_core::focus::matches_search;
+        let strings = i18n::t(cx);
+        let theme = cx.theme().clone();
+        let query = picker.search.read(cx).text().to_owned();
+        let today = Local::now().date_naive();
+        let habits: Vec<fern_core::Habit> = self.store.habits().unwrap_or_default().into_iter().filter(|h| !h.archived && matches_search(&h.name, &query)).collect();
+        let item = |id: SharedString, title: String, next: NextFocus, cx: &mut Context<Self>| {
+            ListItem::new(id)
+                .start_slot(Icon::new(IconName::Circle).size(IconSize::Small).color(Color::Muted))
+                .child(Label::new(title).size(LabelSize::Small).truncate())
+                .on_click(cx.listener(move |this, _, _, cx| this.pick(next.clone(), cx)))
+                .into_any_element()
+        };
+        let mut items: Vec<AnyElement> = Vec::new();
+        match picker.tab {
+            0 => {
+                items.push(
+                    h_flex()
+                        .gap_1()
+                        .px_2()
+                        .py_1()
+                        .child(Icon::new(IconName::CalendarDays).size(IconSize::Small).color(Color::Muted))
+                        .child(Label::new(strings.today).size(LabelSize::Small).weight(FontWeight::SEMIBOLD))
+                        .child(Icon::new(IconName::ChevronRight).size(IconSize::XSmall).color(Color::Muted))
+                        .into_any_element(),
+                );
+                for task in self.tasks.iter().filter(|t| matches_search(&t.title, &query)) {
+                    items.push(item(format!("pick-task-{}", task.id).into(), task.title.clone(), NextFocus::Task(task.id, task.title.clone()), cx));
+                }
+                // As in the original, the habits due today follow the tasks.
+                let due: Vec<&fern_core::Habit> =
+                    habits.iter().filter(|h| h.is_due(today, &self.store.checkins(h.id).unwrap_or_default())).collect();
+                if !due.is_empty() {
+                    items.push(div().px_2().pt_1().child(Label::new(strings.focus_picker_tabs[2]).size(LabelSize::XSmall).color(Color::Muted)).into_any_element());
+                }
+                for habit in due {
+                    items.push(item(format!("pick-habit-{}", habit.id).into(), habit.name.clone(), NextFocus::Habit(habit.name.clone()), cx));
+                }
+            }
+            1 => {
+                let timers = self.store.focus_timers(false).unwrap_or_default();
+                for timer in timers.into_iter().filter(|t| matches_search(&t.name, &query)) {
+                    items.push(item(format!("pick-timer-{}", timer.id).into(), timer.name.clone(), NextFocus::Timer(timer), cx));
+                }
+            }
+            _ => {
+                for habit in &habits {
+                    items.push(item(format!("pick-habit-{}", habit.id).into(), habit.name.clone(), NextFocus::Habit(habit.name.clone()), cx));
+                }
+            }
+        }
+        let tabs = h_flex().justify_center().gap_1().children(strings.focus_picker_tabs.iter().enumerate().map(|(i, label)| {
+            let on = picker.tab == i;
+            div()
+                .id(("focus-picker-tab", i))
+                .px_3()
+                .h(px(24.))
+                .flex()
+                .items_center()
+                .rounded(px(12.))
+                .cursor_pointer()
+                .when(on, |el| el.bg(theme.colors().accent.opacity(0.2)))
+                .child(Label::new(*label).size(LabelSize::Small).color(if on { Color::Accent } else { Color::Muted }))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if let Some(picker) = this.picker.as_mut() {
+                        picker.tab = i;
+                    }
+                    cx.notify();
+                }))
+        }));
+        popover(cx)
+            .w(px(300.))
+            .h(px(420.))
+            .p_2()
+            .gap_2()
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.picker = None;
+                cx.notify();
+            }))
+            .child(tabs)
+            .child(
+                h_flex()
+                    .h(px(30.))
+                    .px_2()
+                    .gap_2()
+                    .rounded(px(6.))
+                    .bg(theme.colors().element_hover)
+                    .child(Icon::new(IconName::Search).size(IconSize::Small).color(Color::Muted))
+                    .child(div().flex_1().child(picker.search.clone())),
+            )
+            .child(v_flex().id("focus-picker-items").flex_1().min_h_0().overflow_y_scroll().children(items))
+            .into_any_element()
     }
 
     /// Pomo or Stopwatch, chosen while no timer runs.
@@ -2599,13 +2776,24 @@ impl FocusView {
                 .when(!primary, |el| el.border_1().border_color(theme.colors().border))
                 .child(Label::new(text))
         };
+        // The picked task, timer or habit names the session until it starts.
+        let label: SharedString = match (&self.next, running) {
+            (Some(next), false) => next.title().to_owned().into(),
+            _ => label,
+        };
+        let picker = self.picker.as_ref().map(|p| (p.at_eye, self.render_picker(p, cx)));
+        let (picker_here, picker_eye) = match picker {
+            Some((false, el)) => (Some(PopoverAttachment::new(Placement::BelowCenter, el)), None),
+            Some((true, el)) => (None, Some(PopoverAttachment::new(Placement::BelowRight, el))),
+            None => (None, None),
+        };
         let buttons = if running {
             h_flex()
                 .gap_3()
                 .child(pill("focus-page-pause", if paused { strings.focus_continue } else { strings.focus_pause }, true).on_click(cx.listener(|this, _, _, cx| this.toggle_pause(cx))))
                 .child(pill("focus-page-end", strings.focus_end, false).on_click(cx.listener(|this, _, _, cx| this.finish(cx))))
         } else {
-            h_flex().child(pill("focus-page-start", strings.focus_start, true).on_click(cx.listener(|this, _, _, cx| this.start(None, cx))))
+            h_flex().child(pill("focus-page-start", strings.focus_start, true).on_click(cx.listener(|this, _, _, cx| this.start_next(cx))))
         };
         let left = v_flex()
             .flex_1()
@@ -2647,11 +2835,19 @@ impl FocusView {
                     .items_center()
                     .justify_center()
                     .child(
-                        h_flex()
+                        div()
+                            .relative()
                             .mb(px(110.))
-                            .gap_0p5()
-                            .child(Label::new(label).size(LabelSize::Small).color(Color::Muted))
-                            .child(Icon::new(IconName::ChevronRight).size(IconSize::XSmall).color(Color::Muted)),
+                            .child(
+                                h_flex()
+                                    .id("focus-page-pick")
+                                    .gap_0p5()
+                                    .cursor_pointer()
+                                    .child(Label::new(label).size(LabelSize::Small).color(Color::Muted))
+                                    .child(Icon::new(IconName::ChevronRight).size(IconSize::XSmall).color(Color::Muted))
+                                    .when(!running, |el| el.on_click(cx.listener(|this, _, window, cx| this.open_picker(false, window, cx)))),
+                            )
+                            .children(picker_here),
                     )
                     .child(
                         div()
@@ -2720,7 +2916,17 @@ impl FocusView {
                     .h(px(52.))
                     .gap_2()
                     .child(Icon::new(if stopwatch { IconName::Timer } else { IconName::FernFocus }).color(Color::Accent))
-                    .child(Label::new(strings.focus_modes[stopwatch as usize]).size(LabelSize::Large).color(Color::Muted)),
+                    .child(div().flex_1().child(Label::new(strings.focus_modes[stopwatch as usize]).size(LabelSize::Large).color(Color::Muted)))
+                    .child(
+                        div()
+                            .relative()
+                            .child(
+                                IconButton::new("focus-page-eye", IconName::Eye)
+                                    .icon_color(Color::Muted)
+                                    .on_click(cx.listener(|this, _, window, cx| this.open_picker(true, window, cx))),
+                            )
+                            .children(picker_eye),
+                    ),
             )
             .child(v_flex().id("focus-page-hours").flex_1().min_h_0().overflow_y_scroll().pt_2().child(hours));
         h_flex()

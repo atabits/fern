@@ -178,9 +178,172 @@ fn prefix_lines(text: &str, selection: Range<usize>, format: Format) -> (String,
     (new, range)
 }
 
+/// A block of a description as the original shows it while it is not edited.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BlockKind {
+    Paragraph,
+    Heading(u8),
+    /// A numbered item, with its number.
+    Numbered(u32),
+    Bullet,
+    Check(bool),
+    Quote,
+    Divider,
+}
+
+/// Inline styles of a run of text.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Style {
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub strike: bool,
+    pub highlight: bool,
+    pub code: bool,
+    /// A link's target, for `[text](url)` and bare `http(s)://` addresses.
+    pub link: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Block {
+    pub kind: BlockKind,
+    /// The block's text without its markers, and its styled runs as byte ranges of it.
+    pub text: String,
+    pub runs: Vec<(std::ops::Range<usize>, Style)>,
+}
+
+/// Splits a description into blocks, one per line (blank lines dropped), as the original draws
+/// them: headings, numbered and bulleted items, check items, quotes and lines, with the inline
+/// markers the toolbar writes taken out and turned into styles.
+pub fn blocks(text: &str) -> Vec<Block> {
+    text.lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            let trimmed = line.trim_start();
+            let (kind, rest) = if trimmed == "---" || trimmed == "***" {
+                (BlockKind::Divider, "")
+            } else if let Some(rest) = trimmed.strip_prefix("- [ ] ") {
+                (BlockKind::Check(false), rest)
+            } else if let Some(rest) = trimmed.strip_prefix("- [x] ").or_else(|| trimmed.strip_prefix("- [X] ")) {
+                (BlockKind::Check(true), rest)
+            } else if let Some(rest) = trimmed.strip_prefix("- ").or_else(|| trimmed.strip_prefix("* ")) {
+                (BlockKind::Bullet, rest)
+            } else if let Some(rest) = trimmed.strip_prefix("> ") {
+                (BlockKind::Quote, rest)
+            } else if let Some((level, rest)) = heading(trimmed) {
+                (BlockKind::Heading(level), rest)
+            } else if let Some((n, rest)) = numbered(trimmed) {
+                (BlockKind::Numbered(n), rest)
+            } else {
+                (BlockKind::Paragraph, line)
+            };
+            let (text, runs) = inline(rest);
+            Block { kind, text, runs }
+        })
+        .collect()
+}
+
+fn heading(line: &str) -> Option<(u8, &str)> {
+    let hashes = line.bytes().take_while(|b| *b == b'#').count();
+    (1..=6).contains(&hashes).then(|| line[hashes..].strip_prefix(' ').map(|rest| (hashes as u8, rest))).flatten()
+}
+
+fn numbered(line: &str) -> Option<(u32, &str)> {
+    let digits = line.bytes().take_while(u8::is_ascii_digit).count();
+    if digits == 0 {
+        return None;
+    }
+    let rest = line[digits..].strip_prefix(". ")?;
+    Some((line[..digits].parse().ok()?, rest))
+}
+
+/// Takes the inline markers out of a line: its plain text and the styled runs of it.
+fn inline(line: &str) -> (String, Vec<(std::ops::Range<usize>, Style)>) {
+    // Longer markers first, so `**` is not read as two `*` and `~~` not as two `~`.
+    const MARKERS: [(&str, fn(&mut Style)); 6] = [
+        ("**", |s| s.bold = true),
+        ("~~", |s| s.strike = true),
+        ("::", |s| s.highlight = true),
+        ("*", |s| s.italic = true),
+        ("~", |s| s.underline = true),
+        ("`", |s| s.code = true),
+    ];
+    let mut text = String::new();
+    let mut runs = Vec::new();
+    let mut rest = line;
+    'outer: while !rest.is_empty() {
+        // A link: [text](url).
+        if let Some(after) = rest.strip_prefix('[')
+            && let Some(close) = after.find("](")
+            && let Some(end) = after[close + 2..].find(')')
+        {
+            let label = &after[..close];
+            let url = &after[close + 2..close + 2 + end];
+            let start = text.len();
+            text.push_str(label);
+            runs.push((start..text.len(), Style { link: Some(url.to_owned()), ..Default::default() }));
+            rest = &after[close + 3 + end..];
+            continue;
+        }
+        if rest.starts_with("http://") || rest.starts_with("https://") {
+            let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+            let start = text.len();
+            text.push_str(&rest[..end]);
+            runs.push((start..text.len(), Style { link: Some(rest[..end].to_owned()), ..Default::default() }));
+            rest = &rest[end..];
+            continue;
+        }
+        for (marker, set) in MARKERS {
+            if let Some(after) = rest.strip_prefix(marker)
+                && let Some(end) = after.find(marker)
+                && end > 0
+            {
+                let inner = &after[..end];
+                let start = text.len();
+                text.push_str(inner);
+                let mut style = Style::default();
+                set(&mut style);
+                runs.push((start..text.len(), style));
+                rest = &after[end + marker.len()..];
+                continue 'outer;
+            }
+        }
+        let ch = rest.chars().next().expect("rest is not empty");
+        text.push(ch);
+        rest = &rest[ch.len_utf8()..];
+    }
+    (text, runs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blocks_as_the_original_draws_them() {
+        let text = "# Plan\n1. Keyboard **shortcuts**\n2. A week\n\n- [x] done\n* item with [a link](https://x.org)\n> said\nplain ::bright:: and ~~gone~~";
+        let blocks = blocks(text);
+        let kinds: Vec<_> = blocks.iter().map(|b| b.kind.clone()).collect();
+        assert_eq!(
+            kinds,
+            [
+                BlockKind::Heading(1),
+                BlockKind::Numbered(1),
+                BlockKind::Numbered(2),
+                BlockKind::Check(true),
+                BlockKind::Bullet,
+                BlockKind::Quote,
+                BlockKind::Paragraph
+            ]
+        );
+        assert_eq!(blocks[1].text, "Keyboard shortcuts");
+        assert_eq!(blocks[1].runs, [(9..18, Style { bold: true, ..Default::default() })]);
+        assert_eq!(blocks[4].text, "item with a link");
+        assert_eq!(blocks[4].runs[0].1.link.as_deref(), Some("https://x.org"));
+        assert_eq!(blocks[6].text, "plain bright and gone");
+        assert!(blocks[6].runs[0].1.highlight && blocks[6].runs[1].1.strike);
+        assert_eq!(super::blocks("Привет, мир")[0].text, "Привет, мир", "non-ASCII text is kept");
+    }
 
     fn run(text: &str, selection: Range<usize>, format: Format) -> (String, String) {
         let (new, range) = apply(text, selection, format);

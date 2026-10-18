@@ -2568,6 +2568,8 @@ impl Render for TaskDetail {
         };
         let done = task.is_completed();
         let notes_focus = self.notes.focus_handle(cx);
+        let notes_editing = notes_focus.is_focused(window);
+        let notes_focus_click = notes_focus.clone();
         let today = Local::now().date_naive();
         let repeats = task.repeat.is_some();
         let (due_text, due_color): (SharedString, Color) = match task.due_date {
@@ -2687,13 +2689,29 @@ impl Render for TaskDetail {
                             ),
                     )
                     // As in the original, the description comes first and the checklist under it.
-                    .child(
+                    // While it is not edited, the description is drawn formatted, as the original
+                    // shows it; a click opens it for editing.
+                    .child(if !notes_editing && !task.notes.trim().is_empty() {
+                        div()
+                            .id("notes-formatted")
+                            .cursor_text()
+                            .on_mouse_down(MouseButton::Left, {
+                                let focus = notes_focus_click.clone();
+                                move |_, window, cx| {
+                                    cx.stop_propagation();
+                                    window.focus(&focus, cx);
+                                }
+                            })
+                            .child(render_markdown(&task.notes, cx))
+                            .into_any_element()
+                    } else {
                         div()
                             .text_size(px(15.))
                             .line_height(px(22.))
                             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                            .child(self.notes.clone()),
-                    )
+                            .child(self.notes.clone())
+                            .into_any_element()
+                    })
                     .when(self.show_checklist, |el| el.child(self.render_checklist(cx)))
                     .when(!self.attachments.is_empty(), |el| el.child(self.render_attachments(cx)))
                     // Tags sit under the notes, as in the original.
@@ -2843,4 +2861,83 @@ mod size_tests {
         assert!(super::list_matches("Входящие", "вх"));
         assert!(!super::list_matches("Work", "home"));
     }
+}
+
+/// A description drawn as the original shows it while it is not edited: headings, numbered items
+/// with their numbers in the accent color, bullets, check items, quotes and lines, with bold,
+/// italic, underlined, struck, highlighted, code and link runs.
+fn render_markdown(text: &str, cx: &App) -> AnyElement {
+    use fern_core::markdown::{BlockKind, blocks};
+    let theme = cx.theme();
+    let accent = theme.colors().accent;
+    let muted = theme.colors().text_muted;
+    let styled = |text: String, runs: Vec<(std::ops::Range<usize>, fern_core::markdown::Style)>| {
+        let highlights = runs
+            .into_iter()
+            .map(|(range, style)| {
+                let mut h = gpui::HighlightStyle::default();
+                if style.bold {
+                    h.font_weight = Some(FontWeight::BOLD);
+                }
+                if style.italic {
+                    h.font_style = Some(gpui::FontStyle::Italic);
+                }
+                if style.strike {
+                    h.strikethrough = Some(gpui::StrikethroughStyle { thickness: px(1.), color: None });
+                }
+                if style.underline || style.link.is_some() {
+                    h.underline = Some(gpui::UnderlineStyle { thickness: px(1.), color: None, wavy: false });
+                }
+                if style.link.is_some() {
+                    h.color = Some(accent);
+                }
+                if style.highlight {
+                    h.background_color = Some(theme.status().warning.opacity(0.35));
+                }
+                if style.code {
+                    h.background_color = Some(theme.colors().element_hover);
+                }
+                (range, h)
+            })
+            .collect::<Vec<_>>();
+        gpui::StyledText::new(text).with_highlights(highlights)
+    };
+    v_flex()
+        .gap_1p5()
+        .text_size(px(15.))
+        .line_height(px(22.))
+        .children(blocks(text).into_iter().map(|block| {
+            let body = div().flex_1().min_w_0().child(styled(block.text, block.runs));
+            match block.kind {
+                BlockKind::Heading(level) => div()
+                    .font_weight(FontWeight::BOLD)
+                    .text_size(px(match level {
+                        1 => 20.,
+                        2 => 18.,
+                        _ => 16.,
+                    }))
+                    .child(body)
+                    .into_any_element(),
+                BlockKind::Numbered(n) => h_flex()
+                    .items_start()
+                    .child(div().w(px(19.)).flex_none().text_color(accent).child(format!("{n}.")))
+                    .child(body)
+                    .into_any_element(),
+                BlockKind::Bullet => h_flex()
+                    .items_start()
+                    .child(div().w(px(22.)).flex_none().text_color(accent).child("•"))
+                    .child(body)
+                    .into_any_element(),
+                BlockKind::Check(done) => h_flex()
+                    .items_start()
+                    .gap_2()
+                    .child(div().pt(px(4.)).child(Checkbox::new("md-check").size(px(14.)).toggle_state(done)))
+                    .child(body.when(done, |el| el.text_color(muted)))
+                    .into_any_element(),
+                BlockKind::Quote => div().pl_3().border_l_2().border_color(accent).text_color(muted).child(body).into_any_element(),
+                BlockKind::Divider => div().my_1().h(px(1.)).bg(theme.colors().border).into_any_element(),
+                BlockKind::Paragraph => body.into_any_element(),
+            }
+        }))
+        .into_any_element()
 }

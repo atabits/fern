@@ -25,12 +25,12 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 | Feature | Status | Notes |
 |---|---|---|
 | Task: title, completion | ✅ | |
-| Task notes (`content`) | ✅ | |
+| Task notes (`content`) | ✅ | as the original's, a description is drawn formatted while it is not edited — headings, numbered items with their numbers in the accent color and hanging lines, bullets, check items, quotes and lines, with bold, italic, underlined, struck, highlighted, code and link runs (`[text](url)` and bare addresses) — and a click opens its Markdown for editing (matched to a screenshot of one of the reference account's notes) |
 | Due date (`dueDate`, all-day or with time) | ✅ | |
 | Priority 0/1/3/5 | ✅ | same values as TickTick |
 | Tags with colors | ✅ | case-insensitive, including non-ASCII |
 | Subtasks (`parentId`) | ✅ | cascade delete, no cycles |
-| Item kind: task / note / checklist (`kind`) | ✅ | task and note; the original's checklist kind is a task with checklist items: its box shows lines in the row and in the details, as there; the details' title button (tooltip "Checklist", as in the original) starts one, and the description comes first with the items under it. Converting a description into items and back, which the original's button may do, was not tried — it would change the reference account's task; a note's details as the original's (matched to a screenshot of one of the reference account's notes): no checkbox, "Set Reminder" for its date and the original's "!" in a circle for its priority; a note with text shows a small page at its row's end. The original also draws a note's numbered lists with accent numbers and hanging lines, which Fern's plain-text editor does not |
+| Item kind: task / note / checklist (`kind`) | ✅ | task and note; the original's checklist kind is a task with checklist items: its box shows lines in the row and in the details, as there; the details' title button (tooltip "Checklist", as in the original) starts one, and the description comes first with the items under it. Converting a description into items and back, which the original's button may do, was not tried — it would change the reference account's task; a note's details as the original's (matched to a screenshot of one of the reference account's notes): no checkbox, "Set Reminder" for its date and the original's "!" in a circle for its priority; a note with text shows a small page at its row's end. |
 | Checklist items (`items`) | ✅ | ordered items, insert after, completion, progress |
 | Repeat (`repeatFlag`, RRULE) | ✅ | FREQ, INTERVAL and weekly BYDAY (every weekday); completing moves the task to the next date and keeps a completed copy; monthly rules have the original's "Each" (days of the month and the last day, `BYMONTHDAY`), "On the" (the first to fourth or last weekday, `BYDAY=1SU`) and "Workday" (the first or last, `BYSETPOS`); daily rules "Skip Weekends"; the modes "By Due Dates", "By Completion Date" and "By Specific Dates" (see Details: due date) |
 | Lists (projects), Inbox | ✅ | create, delete, move tasks with subtasks |
@@ -99,9 +99,9 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 
 Each item is a whole feature area, done in one pass (it may take several commits).
 
-1. The description's Markdown shown formatted while not edited, as the original's: numbered and bulleted lists, headings, bold and links drawn in the details and the notes, in one pass.
-2. Summary page against the original's at the same window size: the report, its toolbar and the right column's options, opened without changing anything, in one pass.
-3. Trash and Won't Do against the original's at the same window size: their rows, headers and the Trash's bottom bar for a deleted task, opened without restoring or deleting anything, in one pass.
-4. Completed view against the original's at the same window size: its date groups, rows and the header's range and list filters, opened without changing anything, in one pass.
+1. Summary page against the original's at the same window size: the report, its toolbar and the right column's options, opened without changing anything, in one pass.
+2. Trash and Won't Do against the original's at the same window size: their rows, headers and the Trash's bottom bar for a deleted task, opened without restoring or deleting anything, in one pass.
+3. Completed view against the original's at the same window size: its date groups, rows and the header's range and list filters, opened without changing anything, in one pass.
+4. Links in a formatted description open in the browser on a click, and an image line (`![](…)`) shows the image, as the original's, in one pass.
 
 Not checkable under the reference rules: the search's full results page (typing a query needs TickTick focused, and the search closes when the focus goes back); countdowns in Today (the reference account has none due today); the empty states of Today, Next 7 Days, All, the Inbox and the tags (none of them is empty in the reference account); the original's light theme (the reference account uses a theme with its own photo, which switching might not restore); a saved filter's view (the reference account has none); whether the original asks for a note when a focus session ends, and its white noise (the desktop original shows no sound choice on the focus page or in Focus Settings; it would only appear with a timer running in the reference account). Fern's record dialog takes a note afterwards.

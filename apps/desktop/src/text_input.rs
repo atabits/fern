@@ -84,6 +84,9 @@ pub struct TextInput {
     /// Byte ranges shown in the accent color on a tinted background, such as the date and tags
     /// quick add recognized.
     highlights: Vec<Range<usize>>,
+    /// A password field: the text shows as "*", one per byte so that every offset stays the
+    /// same, and it cannot be copied.
+    masked: bool,
 }
 
 /// The layout from the last frame, used for mouse hit-testing, up/down arrows and IME.
@@ -161,7 +164,14 @@ impl TextInput {
             last_layout: None,
             is_selecting: false,
             highlights: Vec::new(),
+            masked: false,
         }
+    }
+
+    /// Makes this a password field.
+    pub fn masked(mut self) -> Self {
+        self.masked = true;
+        self
     }
 
     pub fn text(&self) -> &str {
@@ -347,7 +357,7 @@ impl TextInput {
     }
 
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
-        if !self.selected_range.is_empty() {
+        if !self.selected_range.is_empty() && !self.masked {
             cx.write_to_clipboard(ClipboardItem::new_string(
                 self.content[self.selected_range.clone()].to_string(),
             ));
@@ -355,7 +365,7 @@ impl TextInput {
     }
 
     fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.selected_range.is_empty() {
+        if !self.selected_range.is_empty() && !self.masked {
             cx.write_to_clipboard(ClipboardItem::new_string(
                 self.content[self.selected_range.clone()].to_string(),
             ));
@@ -677,6 +687,11 @@ impl IntoElement for TextElement {
     }
 }
 
+/// A password field's text: one "*" per byte, so that offsets into it match the real text.
+fn masked_text(text: &str) -> SharedString {
+    "*".repeat(text.len()).into()
+}
+
 /// The text to display and its style runs (placeholder, IME underline).
 fn display_runs(
     input: &TextInput,
@@ -688,6 +703,8 @@ fn display_runs(
     let is_placeholder = input.content.is_empty();
     let (text, color) = if is_placeholder {
         (input.placeholder.clone(), placeholder_color)
+    } else if input.masked {
+        (masked_text(&input.content), style.color)
     } else {
         (input.content.clone(), style.color)
     };
@@ -976,5 +993,16 @@ impl Render for TextInput {
 impl Focusable for TextInput {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus_handle.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn masked_text_keeps_offsets() {
+        let text = "s3cret-é";
+        let masked = super::masked_text(text);
+        assert_eq!(masked.len(), text.len());
+        assert!(masked.chars().all(|c| c == '*'));
     }
 }

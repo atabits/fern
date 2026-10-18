@@ -95,17 +95,20 @@ impl SettingsWindow {
     pub fn new(store: Rc<Store>, cx: &mut Context<Self>) -> Self {
         let preferences = store.preferences().unwrap_or_default();
         let config = store.sync_config().ok().flatten().unwrap_or_default();
-        let field = |placeholder: &'static str, text: String, cx: &mut Context<Self>| {
+        let field = |placeholder: &'static str, text: String, masked: bool, cx: &mut Context<Self>| {
             let input = cx.new(|cx| {
                 let mut input = crate::text_input::TextInput::new(crate::text_input::Mode::SingleLine, placeholder, cx);
+                if masked {
+                    input = input.masked();
+                }
                 input.set_text(text, cx);
                 input
             });
             cx.subscribe(&input, |this: &mut Self, _, _: &crate::text_input::Changed, cx| this.save_sync(cx)).detach();
             input
         };
-        let sync_server = field("https://fern.example.org", config.server, cx);
-        let sync_token = field("", config.token, cx);
+        let sync_server = field("https://fern.example.org", config.server, false, cx);
+        let sync_token = field("", config.token, true, cx);
         Self {
             store,
             preferences,

@@ -266,6 +266,12 @@ impl AppView {
                 settings_window::apply(&preferences, window, cx);
                 this.todo.update(cx, |todo, cx| todo.reload(cx));
             }
+            // `sync-config=<server>|<token>`: Settings → Sync filled in.
+            if let Some(spec) = state.split(';').find_map(|part| part.strip_prefix("sync-config=")) {
+                let (server, token) = spec.split_once('|').unwrap_or((spec, ""));
+                let config = fern_core::sync::SyncConfig { server: server.to_owned(), token: token.to_owned() };
+                this.store.set_sync_config(&config).ok();
+            }
             // `settings=<page>[><menu>]` opens the Settings window (see `SettingsWindow::dev_open`).
             if let Some(spec) = state.split(';').find_map(|part| part.strip_prefix("settings=")) {
                 this.open_settings(window, cx);

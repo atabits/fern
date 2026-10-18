@@ -97,5 +97,5 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 3. Quick add: the field's ▾ (the original's expanded add form with date, priority, list and tags).
 4. Habits: reminders with the original's Snooze / Record / +1 actions in the notification.
 5. Repeat: monthly "Workday" and "Skip Weekends", and "By Completion" (repeat from the completion date).
-6. Focus: a note when a session ends (the original asks for one after a Pomodoro).
+6. Focus: a note when a session ends (check first whether the original asks for one).
 7. Filled sidebar icons (needs own filled glyphs; Lucide has none).

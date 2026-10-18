@@ -239,6 +239,17 @@ const MIGRATIONS: &[&str] = &[
     );
     ALTER TABLE tasks ADD COLUMN section_id TEXT REFERENCES list_sections(id) ON DELETE SET NULL;
     ",
+    "
+    CREATE TABLE templates (
+        id         TEXT PRIMARY KEY,
+        title      TEXT NOT NULL,
+        notes      TEXT NOT NULL,
+        priority   INTEGER NOT NULL,
+        tags       TEXT NOT NULL,
+        checklist  TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+    );
+    ",
 ];
 
 const TASK_COLUMNS: &str = "id, parent_id, kind, title, notes, priority, due_date, due_time, \
@@ -539,6 +550,73 @@ impl Store {
             params![id.to_string(), date, time],
         )?;
         Ok(())
+    }
+
+    /// "Save as Template": keeps a task's title, notes, priority, tags and checklist.
+    pub fn save_template(&self, task: Id) -> Result<crate::model::Template> {
+        let task = self.task(task)?.context("task not found")?;
+        let checklist: Vec<String> = self.checklist(task.id)?.into_iter().map(|item| item.title).collect();
+        let template = crate::model::Template {
+            id: Uuid::now_v7(),
+            title: task.title.clone(),
+            notes: task.notes.clone(),
+            priority: task.priority,
+            tags: task.tags.clone(),
+            checklist,
+        };
+        self.conn.execute(
+            "INSERT INTO templates (id, title, notes, priority, tags, checklist, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                template.id.to_string(),
+                template.title,
+                template.notes,
+                template.priority.to_i64(),
+                template.tags.join("\n"),
+                template.checklist.join("\n"),
+                now_ms()
+            ],
+        )?;
+        Ok(template)
+    }
+
+    /// Templates, newest first.
+    pub fn templates(&self) -> Result<Vec<crate::model::Template>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, title, notes, priority, tags, checklist FROM templates ORDER BY created_at DESC, rowid DESC")?;
+        let lines = |text: String| -> Vec<String> { text.lines().filter(|l| !l.is_empty()).map(str::to_owned).collect() };
+        let templates = stmt
+            .query_map([], |row| {
+                Ok(crate::model::Template {
+                    id: parse_uuid(&row.get::<_, String>(0)?, 0)?,
+                    title: row.get(1)?,
+                    notes: row.get(2)?,
+                    priority: Priority::from_i64(row.get(3)?),
+                    tags: lines(row.get(4)?),
+                    checklist: lines(row.get(5)?),
+                })
+            })?
+            .collect::<Result<_, _>>()?;
+        Ok(templates)
+    }
+
+    pub fn delete_template(&self, id: Id) -> Result<()> {
+        self.conn.execute("DELETE FROM templates WHERE id = ?1", [id.to_string()])?;
+        Ok(())
+    }
+
+    /// A new task from a template, at the top of the inbox.
+    pub fn add_from_template(&self, id: Id) -> Result<Task> {
+        let template = self.templates()?.into_iter().find(|t| t.id == id).context("template not found")?;
+        let task = self.add_task(&template.title)?;
+        self.set_notes(task.id, &template.notes)?;
+        self.set_priority(task.id, template.priority)?;
+        self.set_tags(task.id, &template.tags)?;
+        for item in &template.checklist {
+            self.add_checklist_item(task.id, item, None)?;
+        }
+        self.task(task.id)?.context("task not found")
     }
 
     /// Sections of a list ("Add Section"), oldest first.
@@ -1698,6 +1776,30 @@ mod tests {
         assert!(store.checkins(read.id)?.is_empty());
         store.delete_habit(floss.id)?;
         assert_eq!(store.habits()?.iter().map(|h| h.name.as_str()).collect::<Vec<_>>(), ["Read"]);
+        Ok(())
+    }
+
+    #[test]
+    fn templates() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let task = store.add_task("weekly review")?;
+        store.set_notes(task.id, "Look back, plan ahead")?;
+        store.set_priority(task.id, Priority::Medium)?;
+        store.set_tags(task.id, &["work".to_owned()])?;
+        store.add_checklist_item(task.id, "inbox zero", None)?;
+        store.add_checklist_item(task.id, "plan the week", None)?;
+        let template = store.save_template(task.id)?;
+        assert_eq!(store.templates()?, [template.clone()]);
+
+        let copy = store.add_from_template(template.id)?;
+        assert_ne!(copy.id, task.id);
+        assert_eq!((copy.title.as_str(), copy.notes.as_str(), copy.priority), ("weekly review", "Look back, plan ahead", Priority::Medium));
+        assert_eq!(copy.tags, ["work"]);
+        let items: Vec<String> = store.checklist(copy.id)?.into_iter().map(|i| i.title).collect();
+        assert_eq!(items, ["inbox zero", "plan the week"]);
+
+        store.delete_template(template.id)?;
+        assert!(store.templates()?.is_empty());
         Ok(())
     }
 

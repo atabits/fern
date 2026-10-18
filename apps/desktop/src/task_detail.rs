@@ -518,6 +518,9 @@ impl TaskDetail {
                     this.open_activity(cx);
                 },
             )))
+            .child(item("more-template", IconName::LayoutTemplate, strings.save_as_template).on_click(cx.listener(
+                |this, _, _, cx| this.menu_action(cx, |store, id| store.save_template(id).map(|_| ())),
+            )))
             .child(item("more-duplicate", IconName::Copy, strings.duplicate).on_click(cx.listener(
                 |this, _, _, cx| this.menu_action(cx, |store, id| store.duplicate_task(id).map(|_| ())),
             )))

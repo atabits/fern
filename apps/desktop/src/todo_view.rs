@@ -77,6 +77,8 @@ pub struct TodoView {
     sections: Vec<fern_core::ListSection>,
     /// The "Add Section" field, while it is shown.
     new_section: Option<Entity<TextInput>>,
+    /// The "Add task" field's template picker, while it is open.
+    templates_open: bool,
     /// The section whose "…" menu is open.
     section_menu: Option<Id>,
     /// A section being renamed, with its field.
@@ -178,6 +180,7 @@ impl TodoView {
             sections: Vec::new(),
             new_section: None,
             section_menu: None,
+            templates_open: false,
             renaming_section: None,
             detail,
             selected: None,
@@ -299,6 +302,12 @@ impl TodoView {
                 Some(("section-menu", name)) => {
                     self.section_menu = self.sections.iter().find(|s| s.name == name).map(|s| s.id);
                 }
+                Some(("template", needle)) => {
+                    if let Some(id) = self.tasks.iter().find(|t| t.title.contains(needle)).map(|t| t.id) {
+                        self.store.save_template(id).ok();
+                    }
+                }
+                Some(("menu", "templates")) => self.templates_open = true,
                 Some(("flag", name)) => {
                     let default = name == "show_completed";
                     self.toggle_view_flag(name, default, cx);
@@ -391,6 +400,84 @@ impl TodoView {
     /// Creates a task from the quick-add line: due date, time, tags, priority and list come from
     /// the text ("tomorrow 6pm #home !1 ^work"); anything missing comes from the current view —
     /// a due date in Today/Tomorrow, the tag in a tag view, the list in a list view.
+    /// A task from a template, placed like a typed one: in the current list, tag or day.
+    fn add_from_template(&mut self, template: Id, cx: &mut Context<Self>) {
+        self.templates_open = false;
+        let today = Self::today();
+        let result = (|| -> anyhow::Result<Task> {
+            let task = self.store.add_from_template(template)?;
+            match &self.view {
+                View::Today | View::Next7Days => self.store.set_due(task.id, Some(today), None)?,
+                View::Tomorrow => self.store.set_due(task.id, Some(today + Duration::days(1)), None)?,
+                View::List(list) => self.store.set_list(task.id, Some(*list))?,
+                View::Tag(tag) if !task.tags.iter().any(|t| t.to_lowercase() == tag.to_lowercase()) => {
+                    let mut tags = task.tags.clone();
+                    tags.push(tag.clone());
+                    self.store.set_tags(task.id, &tags)?;
+                }
+                _ => {}
+            }
+            Ok(task)
+        })();
+        if let Some(task) = self.check(result) {
+            self.reload(cx);
+            self.select(task.id, cx);
+        }
+    }
+
+    fn render_templates(&self, strings: &Strings, cx: &mut Context<Self>) -> AnyElement {
+        let templates = self.store.templates().unwrap_or_default();
+        let theme = cx.theme().clone();
+        popover(cx)
+            .w(px(280.))
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.templates_open = false;
+                cx.notify();
+            }))
+            .child(div().px_2().py_1().child(Label::new(strings.templates).weight(FontWeight::SEMIBOLD)))
+            .when(templates.is_empty(), |el| {
+                el.child(div().px_2().py_2().child(Label::new(strings.no_templates).size(LabelSize::Small).color(Color::Muted)))
+            })
+            .children(templates.into_iter().map(|template| {
+                let id = template.id;
+                let group = SharedString::from(format!("template-{id}"));
+                let tags = (!template.tags.is_empty())
+                    .then(|| template.tags.iter().map(|t| format!("#{t}")).collect::<Vec<_>>().join(" "));
+                let checklist = template.checklist.len();
+                h_flex()
+                    .id(group.clone())
+                    .group(group.clone())
+                    .h(px(34.))
+                    .px_2()
+                    .gap_2()
+                    .rounded(px(5.))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme.colors().element_hover))
+                    .child(Icon::new(IconName::LayoutTemplate).size(IconSize::Small).color(Color::Muted))
+                    .child(div().flex_1().min_w_0().child(Label::new(template.title.clone()).truncate()))
+                    .children(tags.map(|t| Label::new(t).size(LabelSize::XSmall).color(Color::Muted)))
+                    .when(checklist > 0, |el| {
+                        el.child(Icon::new(IconName::ListChecks).size(IconSize::XSmall).color(Color::Muted))
+                            .child(Label::new(checklist.to_string()).size(LabelSize::XSmall).color(Color::Muted))
+                    })
+                    .child(
+                        div().opacity(0.).group_hover(group, |s| s.opacity(1.)).child(
+                            IconButton::new(SharedString::from(format!("delete-template-{id}")), IconName::X)
+                                .size(px(20.))
+                                .icon_size(IconSize::XSmall)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    let result = this.store.delete_template(id);
+                                    this.check(result);
+                                    cx.notify();
+                                })),
+                        ),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| this.add_from_template(id, cx)))
+            }))
+            .into_any_element()
+    }
+
     fn add_task(&self, input: &str) -> anyhow::Result<Task> {
         let today = Self::today();
         let list_names: Vec<String> = self.lists.iter().map(|l| l.name.clone()).collect();
@@ -2046,7 +2133,25 @@ impl Render for TodoView {
                         window.focus(&input_focus, cx);
                     })
                     .child(Icon::new(IconName::Plus))
-                    .child(self.input.clone()),
+                    .child(div().flex_1().child(self.input.clone()))
+                    .child(
+                        div()
+                            .relative()
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .child(
+                                IconButton::new("templates", IconName::LayoutTemplate)
+                                    .size(px(24.))
+                                    .icon_size(IconSize::Small)
+                                    .tooltip(Tooltip::text(strings.templates))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.templates_open = true;
+                                        cx.notify();
+                                    })),
+                            )
+                            .when(self.templates_open, |el| {
+                                el.child(PopoverAttachment::new(Placement::BelowRight, self.render_templates(strings, cx)))
+                            }),
+                    ),
             ))
             .children(board)
             .when(!kanban_view, |el| el.child(

@@ -143,6 +143,17 @@ impl Task {
 }
 
 /// A user-defined list (a "project" in TickTick).
+/// "Save as Template": what a new task made from it starts with.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Template {
+    pub id: Id,
+    pub title: String,
+    pub notes: String,
+    pub priority: Priority,
+    pub tags: Vec<String>,
+    pub checklist: Vec<String>,
+}
+
 /// A section of a list: a named group of its tasks, a column in the kanban view.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ListSection {

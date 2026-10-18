@@ -42,6 +42,7 @@ pub enum IconName {
     Languages,
     Layers,
     LayoutGrid,
+    LayoutTemplate,
     List,
     ListChecks,
     ListTree,

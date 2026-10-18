@@ -92,5 +92,8 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 
 ## Next
 
+1. Timeline: the original's "Arrange Tasks" (look at it first).
+2. Focus: the original's "Batch Management" of focus records (look at it first).
+3. Summary: editing the report as a document, as the original's is.
 
 Not checkable under the reference rules: whether the original asks for a note when a focus session ends (finding out means running a focus timer in the reference account). Fern's record dialog takes a note afterwards.

@@ -20,7 +20,7 @@ pub enum DueMenu {
     Custom(Recurrence),
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct DueDraft {
     pub date: Option<NaiveDate>,
     pub time: Option<NaiveTime>,

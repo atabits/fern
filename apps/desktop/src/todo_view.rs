@@ -91,6 +91,8 @@ struct AddDraft {
     repeat: Option<fern_core::Recurrence>,
     /// Files picked with the menu's Attachment, attached once the task is added.
     files: Vec<std::path::PathBuf>,
+    /// The end the picker's Duration tab set, with the start in `date` and `time`.
+    end: Option<(NaiveDate, Option<chrono::NaiveTime>)>,
 }
 
 pub struct TodoView {
@@ -190,6 +192,8 @@ pub struct TodoView {
     /// The field's date picker, while open, with the month it shows, and its expanded row
     /// (0 Time, 1 Reminder, 2 Repeat).
     add_date_month: Option<NaiveDate>,
+    /// The add field's date picker on its Duration tab: the start and end being picked.
+    add_range: Option<crate::due_picker::DueDraft>,
     add_date_row: Option<u8>,
     /// The section whose "…" menu is open.
     section_menu: Option<Id>,
@@ -316,6 +320,7 @@ impl TodoView {
             add_tag_input,
             input_box_open: false,
             add_date_month: None,
+            add_range: None,
             add_date_row: None,
             list_activity: None,
             filters: Vec::new(),
@@ -508,6 +513,13 @@ impl TodoView {
                     self.add_date_row = Some(2);
                 }
                 // `menu=add-date`: the field's date picker open, with tomorrow picked.
+                // The add field's picker on its Duration tab, from the next full hour.
+                Some(("menu", "add-duration")) => {
+                    self.add_date_month = Some(crate::calendar::month_start(Self::today()));
+                    let mut range = crate::due_picker::DueDraft { month: crate::calendar::month_start(Self::today()), ..Default::default() };
+                    range.start_duration(Local::now().naive_local(), self.preferences.task_defaults.duration);
+                    self.add_range = Some(range);
+                }
                 Some(("menu", "add-date")) => {
                     self.add_draft.date = Some(Self::today() + chrono::Duration::days(1));
                     self.add_date_month = Some(crate::calendar::month_start(Self::today()));
@@ -906,6 +918,9 @@ impl TodoView {
         let due_time = if from_picker { self.add_draft.time } else { parsed.due_time };
         if let Some(date) = parsed.due_date.or(self.add_draft.date).or(view_due).or(defaults.date.map(|d| d.date(today))) {
             self.store.set_due(task.id, Some(date), due_time)?;
+            if from_picker && self.add_draft.end.is_some() {
+                self.store.set_due_end(task.id, self.add_draft.end)?;
+            }
             match self.add_draft.reminders.as_ref().filter(|_| from_picker) {
                 Some(reminders) => self.store.set_reminders(task.id, reminders)?,
                 None => {
@@ -1111,8 +1126,12 @@ impl TodoView {
         let repeat_label =
             draft.repeat.as_ref().map_or(strings.repeat.to_owned(), |r| crate::due_picker::repeat_label(r, strings));
         let mut rows = v_flex().gap_0p5();
-        rows = rows.child(row(0, IconName::Clock, time_label, has_time));
-        if open == Some(0) {
+        // On the Duration tab the times are the Start and End fields, as in the original.
+        let duration = self.add_range.is_some();
+        if !duration {
+            rows = rows.child(row(0, IconName::Clock, time_label, has_time));
+        }
+        if open == Some(0) && !duration {
             let times = std::iter::once(None).chain(crate::due_picker::time_options().into_iter().map(Some));
             rows = rows.child(v_flex().id("add-date-times").max_h(px(150.)).overflow_y_scroll().children(times.map(|time| {
                 let label = time.map_or(strings.no_time.to_owned(), crate::calendar::format_time);
@@ -1187,6 +1206,47 @@ impl TodoView {
                 cx.notify();
             }
         };
+        // The original's Date and Duration tabs on top.
+        let on_duration = self.add_range.is_some();
+        let tab = |id: &'static str, label: &'static str, duration: bool, cx: &mut Context<Self>| {
+            let on = on_duration == duration;
+            div()
+                .id(id)
+                .flex_1()
+                .h(px(26.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(5.))
+                .cursor_pointer()
+                .when(on, |el| el.bg(theme.colors().element_selected))
+                .child(Label::new(label).size(LabelSize::Small).color(if on { Color::Default } else { Color::Muted }))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.add_range = duration.then(|| {
+                        let mut draft = crate::due_picker::DueDraft {
+                            date: this.add_draft.date,
+                            time: this.add_draft.time,
+                            month: crate::calendar::month_start(this.add_draft.date.unwrap_or_else(Self::today)),
+                            ..Default::default()
+                        };
+                        if let Some((end, end_time)) = this.add_draft.end {
+                            (draft.end_date, draft.end_time) = (Some(end), end_time);
+                        }
+                        draft.start_duration(Local::now().naive_local(), this.preferences.task_defaults.duration);
+                        draft
+                    });
+                    cx.notify();
+                }))
+        };
+        let tabs = h_flex()
+            .p(px(2.))
+            .rounded(px(7.))
+            .bg(theme.colors().element_hover)
+            .child(tab("add-tab-date", strings.date_tab, false, cx))
+            .child(tab("add-tab-duration", strings.duration_tab, true, cx));
+        if let Some(range) = self.add_range.clone() {
+            return self.render_add_range(range, tabs, strings, cx);
+        }
         let [d_today, d_tomorrow, d_week, d_month] = crate::due_picker::quick_dates(today);
         let quick = |id: &'static str, icon: IconName, tip: &'static str, date: NaiveDate| {
             div()
@@ -1258,8 +1318,10 @@ impl TodoView {
             .gap_1()
             .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                 this.add_date_month = None;
+                this.add_range = None;
                 cx.notify();
             }))
+            .child(tabs)
             .child(
                 h_flex()
                     .child(quick("add-date-today", IconName::Sun, strings.today, d_today))
@@ -1287,6 +1349,184 @@ impl TodoView {
                     .gap_2()
                     .child(button("add-date-clear", strings.clear, false).on_click(cx.listener(pick(None))))
                     .child(button("add-date-ok", strings.ok, true).on_click(cx.listener(|this, _, _, cx| {
+                        this.add_date_month = None;
+                        cx.notify();
+                    }))),
+            )
+            .into_any_element()
+    }
+
+    /// The add field's date picker on the original's Duration tab: Start and End, each a date and
+    /// a time picked from a month or a list, All Day, the reminder and repeat rows, Clear and OK.
+    fn render_add_range(
+        &self,
+        range: crate::due_picker::DueDraft,
+        tabs: gpui::Div,
+        strings: &'static Strings,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        use crate::due_picker::RangeField;
+        let theme = cx.theme().clone();
+        let today = Self::today();
+        let all_day = range.is_all_day();
+        let chip = |id: &'static str, label: SharedString, field: RangeField, cx: &mut Context<Self>| {
+            let active = range.range_field == Some(field);
+            div()
+                .id(id)
+                .flex_1()
+                .h(px(28.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(6.))
+                .border_1()
+                .border_color(if active { theme.colors().accent } else { theme.colors().border })
+                .cursor_pointer()
+                .child(Label::new(label).size(LabelSize::Small))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if let Some(range) = this.add_range.as_mut() {
+                        range.range_field = if range.range_field == Some(field) { None } else { Some(field) };
+                    }
+                    cx.notify();
+                }))
+        };
+        let day = |date: Option<NaiveDate>| -> SharedString { date.map_or(SharedString::default(), |d| task_rows::short_date(d, strings).into()) };
+        let time = |t: Option<chrono::NaiveTime>| -> SharedString { t.map_or(SharedString::default(), |t| crate::calendar::format_time(t).into()) };
+        let line = |label: &'static str, date_chip: AnyElement, time_chip: Option<AnyElement>| {
+            h_flex().gap_2().child(div().w(px(40.)).child(Label::new(label).size(LabelSize::Small))).child(date_chip).children(time_chip)
+        };
+        let start = line(
+            strings.range_start,
+            chip("add-range-start-date", day(range.date), RangeField::StartDate, cx).into_any_element(),
+            (!all_day).then(|| chip("add-range-start-time", time(range.time), RangeField::StartTime, cx).into_any_element()),
+        );
+        let end = line(
+            strings.range_end,
+            chip("add-range-end-date", day(range.end_date), RangeField::EndDate, cx).into_any_element(),
+            (!all_day).then(|| chip("add-range-end-time", time(range.end_time), RangeField::EndTime, cx).into_any_element()),
+        );
+        // The field being picked: a month for a date, a list for a time.
+        let picker: Option<AnyElement> = match range.range_field {
+            Some(field @ (RangeField::StartDate | RangeField::EndDate)) => {
+                let shown = if field == RangeField::EndDate { range.end_date } else { range.date };
+                let month = crate::calendar::month_start(shown.unwrap_or(today));
+                Some(
+                    v_flex()
+                        .children(crate::calendar::month_grid(month).chunks(7).map(|week| {
+                            h_flex().children(week.iter().map(|&date| {
+                                let selected = shown == Some(date);
+                                div().flex_1().flex().justify_center().child(
+                                    div()
+                                        .id(SharedString::from(format!("add-range-day-{date}")))
+                                        .size(px(26.))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded_full()
+                                        .cursor_pointer()
+                                        .when(selected, |el| el.bg(theme.colors().accent))
+                                        .when(!selected, |el| el.hover(|s| s.bg(theme.colors().element_hover)))
+                                        .child(Label::new(date.day().to_string()).size(LabelSize::Small).color(
+                                            if selected || date.month() == month.month() { Color::Default } else { Color::Muted },
+                                        ))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            if let Some(range) = this.add_range.as_mut() {
+                                                range.pick_range_date(date);
+                                            }
+                                            cx.notify();
+                                        })),
+                                )
+                            }))
+                        }))
+                        .into_any_element(),
+                )
+            }
+            Some(field @ (RangeField::StartTime | RangeField::EndTime)) => {
+                let current = if field == RangeField::EndTime { range.end_time } else { range.time };
+                Some(
+                    v_flex()
+                        .id("add-range-times")
+                        .max_h(px(180.))
+                        .overflow_y_scroll()
+                        .children(crate::due_picker::time_options().into_iter().map(|t| {
+                            ListItem::new(SharedString::from(format!("add-range-time-{t}")))
+                                .height(px(28.))
+                                .child(Label::new(crate::calendar::format_time(t)).size(LabelSize::Small))
+                                .when(current == Some(t), |item| item.end_slot(Icon::new(IconName::Check).size(IconSize::Small).color(Color::Accent)))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if let Some(range) = this.add_range.as_mut() {
+                                        range.pick_range_time(t);
+                                    }
+                                    cx.notify();
+                                }))
+                        }))
+                        .into_any_element(),
+                )
+            }
+            None => None,
+        };
+        let button = |id: &'static str, label: &'static str, primary: bool| {
+            div()
+                .id(id)
+                .flex_1()
+                .h(px(28.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(6.))
+                .cursor_pointer()
+                .when(primary, |el| el.bg(theme.colors().accent))
+                .when(!primary, |el| el.border_1().border_color(theme.colors().border))
+                .child(Label::new(label).size(LabelSize::Small))
+        };
+        popover(cx)
+            .w(px(260.))
+            .p_2()
+            .gap_2()
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.add_date_month = None;
+                this.add_range = None;
+                cx.notify();
+            }))
+            .child(tabs)
+            .child(start)
+            .child(end)
+            .children(picker)
+            .child(
+                h_flex()
+                    .id("add-range-all-day")
+                    .h(px(30.))
+                    .px_1()
+                    .cursor_pointer()
+                    .child(div().flex_1().child(Label::new(strings.range_all_day).size(LabelSize::Small)))
+                    .child(ui::Switch::new().toggle_state(all_day))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(range) = this.add_range.as_mut() {
+                            range.set_all_day(!all_day);
+                        }
+                        cx.notify();
+                    })),
+            )
+            .child(self.render_add_date_rows(strings, cx))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(button("add-range-clear", strings.clear, false).on_click(cx.listener(|this, _, _, cx| {
+                        this.add_draft.date = None;
+                        this.add_draft.time = None;
+                        this.add_draft.end = None;
+                        this.add_draft.reminders = None;
+                        this.add_draft.repeat = None;
+                        this.add_range = None;
+                        this.add_date_month = None;
+                        cx.notify();
+                    })))
+                    .child(button("add-range-ok", strings.ok, true).on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(range) = this.add_range.take() {
+                            this.add_draft.date = range.date;
+                            this.add_draft.time = range.time;
+                            this.add_draft.end = range.end();
+                        }
                         this.add_date_month = None;
                         cx.notify();
                     }))),
@@ -1429,6 +1669,10 @@ impl TodoView {
             .child(h_flex().gap_2().child(div().flex_1().min_w_0().child(self.input.clone())).children(
                 self.shown_add_due().map(|(date, time)| {
                     let (label, _) = task_rows::due_label(date, time, Self::today(), strings);
+                    let label = match self.add_draft.end.filter(|_| self.quick_add_due.is_none()) {
+                        Some((end, end_time)) => crate::due_picker::range_label(date, time, end, end_time, strings),
+                        None => label,
+                    };
                     Label::new(label).size(LabelSize::Small).color(Color::Accent)
                 }),
             ))
@@ -5449,6 +5693,11 @@ impl Render for TodoView {
                     .child(div().flex_1().min_w_0().child(self.input.clone()))
                     .children(self.shown_add_due().map(|(date, time)| {
                         let (label, _) = task_rows::due_label(date, time, Self::today(), strings);
+                        // A picked duration shows its span, as the original's "Today, 22:00 - 23:00".
+                        let label = match self.add_draft.end.filter(|_| self.quick_add_due.is_none()) {
+                            Some((end, end_time)) => crate::due_picker::range_label(date, time, end, end_time, strings),
+                            None => label,
+                        };
                         h_flex()
                             .flex_none()
                             .gap_1()

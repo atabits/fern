@@ -289,7 +289,11 @@ impl Store {
         let mut tasks: Vec<Task> = self
             .tasks()?
             .into_iter()
-            .filter(|t| !t.is_deleted() && t.due_date.is_some_and(|d| d >= start && d <= end))
+            .filter(|t| {
+                // Durations count on every day they cover.
+                !t.is_deleted()
+                    && t.due_date.is_some_and(|d| d <= end && t.end_date.unwrap_or(d).max(d) >= start)
+            })
             .collect();
         // Stable sort keeps the manual order within a day; all-day tasks come first.
         tasks.sort_by_key(|t| (t.due_date, t.due_time.is_some(), t.due_time));
@@ -1375,6 +1379,22 @@ mod tests {
         assert!(store.checkins(read.id)?.is_empty());
         store.delete_habit(floss.id)?;
         assert_eq!(store.habits()?.iter().map(|h| h.name.as_str()).collect::<Vec<_>>(), ["Read"]);
+        Ok(())
+    }
+
+    #[test]
+    fn durations_count_on_every_day() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let trip = store.add_task("trip")?;
+        store.set_due(trip.id, Some(d(2026, 10, 20)), None)?;
+        store.set_due_end(trip.id, Some((d(2026, 10, 23), None)))?;
+        let trip = store.task(trip.id)?.unwrap();
+        assert!(!trip.occurs_on(d(2026, 10, 19)));
+        assert!(trip.occurs_on(d(2026, 10, 20)) && trip.occurs_on(d(2026, 10, 22)) && trip.occurs_on(d(2026, 10, 23)));
+        assert!(!trip.occurs_on(d(2026, 10, 24)));
+        // A week view starting after the trip began still shows it.
+        assert_eq!(store.tasks_due_between(d(2026, 10, 22), d(2026, 10, 28))?.len(), 1);
+        assert!(store.tasks_due_between(d(2026, 10, 24), d(2026, 10, 30))?.is_empty());
         Ok(())
     }
 

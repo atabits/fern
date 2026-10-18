@@ -113,7 +113,7 @@ impl CalendarView {
     fn render_day(&self, date: NaiveDate, today: NaiveDate, cx: &mut Context<Self>) -> AnyElement {
         let strings = i18n::t(cx);
         let theme = cx.theme().clone();
-        let tasks: Vec<&Task> = self.tasks.iter().filter(|t| t.due_date == Some(date)).collect();
+        let tasks: Vec<&Task> = self.tasks.iter().filter(|t| t.occurs_on(date)).collect();
         let hidden = tasks.len().saturating_sub(TASKS_PER_DAY);
         // The first day of a month carries the month name, as in the original: "Oct 1".
         let number = if date.day() == 1 {
@@ -247,7 +247,7 @@ impl CalendarView {
                 let tasks: Vec<AnyElement> = self
                     .tasks
                     .iter()
-                    .filter(|t| t.due_date == Some(date) && t.due_time.is_none())
+                    .filter(|t| t.occurs_on(date) && t.due_time.is_none())
                     .map(|t| self.task_bar(t, cx).into_any_element())
                     .collect();
                 v_flex()
@@ -321,15 +321,17 @@ impl CalendarView {
             let timed: Vec<AnyElement> = self
                 .tasks
                 .iter()
-                .filter(|t| t.due_date == Some(date))
-                .filter_map(|t| t.due_time.map(|time| (t, time)))
-                .map(|(t, time)| {
+                .filter_map(|t| calendar::timed_segment(t, date).map(|segment| (t, segment)))
+                .map(|(t, (from, to))| {
+                    // A span is drawn as a block from its start to its end; a point in time as a bar.
+                    let height = (week_axis::offset(to) - week_axis::offset(from)).max(18.);
                     div()
                         .absolute()
-                        .top(px(week_axis::offset(time)))
+                        .top(px(week_axis::offset(from)))
                         .left(px(2.))
                         .right(px(2.))
-                        .child(self.task_bar(t, cx))
+                        .h(px(height))
+                        .child(self.task_bar(t, cx).h(px(height)).items_start().pt(px(1.)))
                         .into_any_element()
                 })
                 .collect();

@@ -75,6 +75,27 @@ pub mod week_axis {
     }
 }
 
+/// The part of a timed task on `date` in the week view: from its start (or midnight) to its end
+/// (or the end of the day). Tasks without a time, or not on that day, have none.
+pub fn timed_segment(task: &fern_core::Task, date: NaiveDate) -> Option<(NaiveTime, NaiveTime)> {
+    let (start_date, start_time) = (task.due_date?, task.due_time?);
+    if !task.occurs_on(date) {
+        return None;
+    }
+    let midnight = NaiveTime::MIN;
+    let last = NaiveTime::from_hms_opt(23, 59, 0).unwrap_or(midnight);
+    let end_date = task.end_date.unwrap_or(start_date);
+    let from = if date == start_date { start_time } else { midnight };
+    let to = match task.end_time {
+        Some(end_time) if date == end_date => end_time,
+        Some(_) => last,
+        None if task.end_date.is_some() && date != end_date => last,
+        // No end: a point in time, drawn as a short block.
+        None => from,
+    };
+    Some((from, to.max(from)))
+}
+
 pub fn month_title(month: NaiveDate, strings: &Strings) -> String {
     format!("{} {}", strings.months[month.month0() as usize], month.year())
 }
@@ -86,6 +107,27 @@ mod tests {
 
     fn d(y: i32, m: u32, day: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(y, m, day).unwrap()
+    }
+
+    #[test]
+    fn timed_segments_split_by_day() {
+        let store = fern_core::Store::open_in_memory().unwrap();
+        let t = |h, m| NaiveTime::from_hms_opt(h, m, 0).unwrap();
+        let task = store.add_task("workshop").unwrap();
+        store.set_due(task.id, Some(d(2026, 10, 20)), Some(t(14, 0))).unwrap();
+        let point = store.task(task.id).unwrap().unwrap();
+        assert_eq!(timed_segment(&point, d(2026, 10, 20)), Some((t(14, 0), t(14, 0))));
+
+        store.set_due_end(task.id, Some((d(2026, 10, 20), Some(t(15, 30))))).unwrap();
+        let hour = store.task(task.id).unwrap().unwrap();
+        assert_eq!(timed_segment(&hour, d(2026, 10, 20)), Some((t(14, 0), t(15, 30))));
+        assert_eq!(timed_segment(&hour, d(2026, 10, 21)), None);
+
+        store.set_due_end(task.id, Some((d(2026, 10, 22), Some(t(11, 0))))).unwrap();
+        let days = store.task(task.id).unwrap().unwrap();
+        assert_eq!(timed_segment(&days, d(2026, 10, 20)), Some((t(14, 0), t(23, 59))));
+        assert_eq!(timed_segment(&days, d(2026, 10, 21)), Some((NaiveTime::MIN, t(23, 59))));
+        assert_eq!(timed_segment(&days, d(2026, 10, 22)), Some((NaiveTime::MIN, t(11, 0))));
     }
 
     #[test]

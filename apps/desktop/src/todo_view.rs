@@ -214,6 +214,24 @@ impl TodoView {
                         self.drop_task(dragged, target, cx);
                     }
                 }
+                Some(("span", spec)) => {
+                    // `span=<title part>><days from today> [HH:MM]><days from today> [HH:MM]`.
+                    let at = |part: &str| {
+                        let mut words = part.split_whitespace();
+                        let days: i64 = words.next()?.parse().ok()?;
+                        let time = words.next().and_then(crate::due_picker::parse_time);
+                        Some((Self::today() + Duration::days(days), time))
+                    };
+                    let parts: Vec<&str> = spec.split('>').collect();
+                    if let [needle, start, end] = parts[..]
+                        && let (Some((start, start_time)), Some(end)) = (at(start), at(end))
+                        && let Some(id) = self.store.tasks().unwrap_or_default().iter().find(|t| t.title.contains(needle)).map(|t| t.id)
+                    {
+                        self.store.set_due(id, Some(start), start_time).ok();
+                        self.store.set_due_end(id, Some(end)).ok();
+                        self.reload(cx);
+                    }
+                }
                 Some(("search", query)) => {
                     let query = query.to_owned();
                     self.search_input.update(cx, |input, cx| input.set_text(query, cx));

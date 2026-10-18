@@ -104,6 +104,11 @@ impl Task {
         self.completed_at.is_some()
     }
 
+    /// Whether the task falls on `date`: its due date, or any day of its duration.
+    pub fn occurs_on(&self, date: NaiveDate) -> bool {
+        self.due_date.is_some_and(|start| start <= date && date <= self.end_date.unwrap_or(start).max(start))
+    }
+
     pub fn is_wont_do(&self) -> bool {
         self.wont_do_at.is_some()
     }

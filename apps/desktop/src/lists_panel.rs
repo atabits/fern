@@ -285,11 +285,13 @@ fn mini_calendar(
         let selected = *active == View::Day(date);
         let busy = mini.expanded && mini.busy.contains(&date);
         let on_select = on_select.clone();
-        // Columns of equal width whatever they hold, so the letters sit over the numbers.
-        div().flex_1().flex_basis(gpui::relative(0.)).flex().justify_center().child(
+        // Columns of equal width that may be narrower than the circle (the column is), so the
+        // letters stay over the numbers.
+        div().flex_1().min_w_0().flex().justify_center().child(
             v_flex()
                 .id(SharedString::from(format!("mini-day-{date}")))
-                .size(px(28.))
+                .flex_none()
+                .size(px(26.))
                 .cursor_pointer()
                 .hover(|s| s.bg(colors.ghost_element_hover))
                 .when(selected, |el| el.bg(colors.accent))
@@ -315,7 +317,7 @@ fn mini_calendar(
         )
     };
     let weekdays = h_flex().children(crate::calendar::weekday_labels(&strings.weekdays_narrow).iter().map(|day| {
-        div().flex_1().flex_basis(gpui::relative(0.)).flex().justify_center().child(Label::new(*day).size(LabelSize::Small).color(Color::Muted))
+        div().flex_1().min_w_0().flex().justify_center().child(Label::new(*day).size(LabelSize::Small).color(Color::Muted))
     }));
     let toggle = on_mini.clone();
     // The hover tab on the top border: "^" expands, "v" collapses.
@@ -369,7 +371,7 @@ fn mini_calendar(
         .relative()
         .flex_none()
         .py_2()
-        .px_3()
+        .px_2()
         .border_t_1()
         .border_color(colors.border)
         .child(tab)

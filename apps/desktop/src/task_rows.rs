@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use fern_core::{Id, Kind, Priority, Task};
+use fern_core::{Id, Kind, ListSection, Priority, Task};
 use gpui::Hsla;
 use theme::Theme;
 use chrono::{Datelike, NaiveDate, NaiveTime};
@@ -257,6 +257,30 @@ pub fn grouped_rows(tasks: &[Task], group: GroupBy, today: NaiveDate, strings: &
     rows
 }
 
+/// Rows of a list with sections: tasks without a section first, then each section (even an
+/// empty one, so it shows as a kanban column), then completed tasks. Subtasks stay nested.
+pub fn section_rows(tasks: &[Task], sections: &[ListSection], collapsed_tasks: &HashSet<Id>, strings: &Strings) -> Vec<Row> {
+    let (open, done): (Vec<Task>, Vec<Task>) = tasks.iter().cloned().partition(|t| !t.is_completed());
+    let mut rows = Vec::new();
+    let group = |label: String, tasks: Vec<Task>, always: bool, rows: &mut Vec<Row>| {
+        if tasks.is_empty() && !always {
+            return;
+        }
+        rows.push(Row::Day { label, count: tasks.len() });
+        rows.extend(build_rows(&tasks, collapsed_tasks, &HashSet::new(), false));
+    };
+    let known: HashSet<Id> = sections.iter().map(|s| s.id).collect();
+    let unsectioned: Vec<Task> =
+        open.iter().filter(|t| t.section_id.is_none_or(|s| !known.contains(&s))).cloned().collect();
+    group(strings.not_sectioned.to_owned(), unsectioned, false, &mut rows);
+    for section in sections {
+        let tasks: Vec<Task> = open.iter().filter(|t| t.section_id == Some(section.id)).cloned().collect();
+        group(section.name.clone(), tasks, true, &mut rows);
+    }
+    group(strings.group_completed.to_owned(), done, false, &mut rows);
+    rows
+}
+
 /// A kanban column: its title and cards, each a top-level task with its subtasks.
 pub type KanbanColumn = (String, Vec<(Task, Vec<Task>)>);
 
@@ -496,6 +520,7 @@ mod tests {
             end_time: None,
             modified_at: None,
             pinned_at: None,
+            section_id: None,
             reminders: Vec::new(),
             created_at: 0,
         }
@@ -561,6 +586,21 @@ mod tests {
         assert_eq!(snippet("short", "sho", 10).as_deref(), Some("short"));
         assert_eq!(snippet("line one\nline two", "two", 20).as_deref(), Some("line one line two"));
         assert_eq!(snippet("nothing", "zzz", 5), None);
+    }
+
+    #[test]
+    fn rows_by_list_section() {
+        let list = Uuid::now_v7();
+        let kitchen = ListSection { id: Uuid::now_v7(), list_id: list, name: "Kitchen".into() };
+        let garden = ListSection { id: Uuid::now_v7(), list_id: list, name: "Garden".into() };
+        let mut tap = task("fix the tap");
+        tap.section_id = Some(kitchen.id);
+        let mut done = task("done");
+        done.completed_at = Some(1);
+        let rows = section_rows(&[task("loose"), tap, done], &[kitchen, garden], &HashSet::new(), &EN);
+        assert_eq!(shape(&rows), [
+            "## Not Sectioned 1", "loose", "## Kitchen 1", "fix the tap", "## Garden 0", "## Completed 1", "done"
+        ]);
     }
 
     #[test]

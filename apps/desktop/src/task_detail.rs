@@ -1473,13 +1473,34 @@ impl TaskDetail {
                     .when(current.is_none(), |item| item.end_slot(check_mark()))
                     .on_click(cx.listener(|this, _, _, cx| this.set_list(None, cx))),
             )
-            .children(self.lists.iter().map(|list| {
+            .children(self.lists.iter().flat_map(|list| {
                 let id = list.id;
-                ListItem::new(SharedString::from(format!("move-to-{id}")))
-                    .start_slot(Icon::new(IconName::List))
-                    .child(Label::new(list.name.clone()).truncate())
-                    .when(current == Some(id), |item| item.end_slot(check_mark()))
-                    .on_click(cx.listener(move |this, _, _, cx| this.set_list(Some(id), cx)))
+                let current_section = self.task.as_ref().and_then(|t| t.section_id);
+                // A list's sections are offered under it, as in the original.
+                let sections = self.store.list_sections(id).unwrap_or_default();
+                std::iter::once(
+                    ListItem::new(SharedString::from(format!("move-to-{id}")))
+                        .start_slot(Icon::new(IconName::List))
+                        .child(Label::new(list.name.clone()).truncate())
+                        .when(current == Some(id) && current_section.is_none(), |item| item.end_slot(check_mark()))
+                        .on_click(cx.listener(move |this, _, _, cx| this.set_list(Some(id), cx)))
+                        .into_any_element(),
+                )
+                .chain(sections.into_iter().map(|section| {
+                    let section_id = section.id;
+                    ListItem::new(SharedString::from(format!("move-to-section-{section_id}")))
+                        .child(div().pl_6().child(Label::new(section.name).size(LabelSize::Small).truncate()))
+                        .when(current_section == Some(section_id), |item| item.end_slot(check_mark()))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.save(cx, |store, task| {
+                                store.set_list(task, Some(id))?;
+                                store.set_section(task, Some(section_id))
+                            });
+                            this.close_popup(cx);
+                        }))
+                        .into_any_element()
+                }))
+                .collect::<Vec<_>>()
             }))
             .into_any_element()
     }

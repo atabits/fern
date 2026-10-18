@@ -230,11 +230,20 @@ const MIGRATIONS: &[&str] = &[
     "
     ALTER TABLE tasks ADD COLUMN pinned_at INTEGER;
     ",
+    "
+    CREATE TABLE list_sections (
+        id         TEXT PRIMARY KEY,
+        list_id    TEXT NOT NULL REFERENCES lists(id) ON DELETE CASCADE,
+        name       TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+    );
+    ALTER TABLE tasks ADD COLUMN section_id TEXT REFERENCES list_sections(id) ON DELETE SET NULL;
+    ",
 ];
 
 const TASK_COLUMNS: &str = "id, parent_id, kind, title, notes, priority, due_date, due_time, \
                             completed_at, created_at, list_id, deleted_at, repeat, wont_do_at, reminders, end_date, end_time, modified_at, \
-                            pinned_at";
+                            pinned_at, section_id";
 
 const DATE_FORMAT: &str = "%Y-%m-%d";
 const TIME_FORMAT: &str = "%H:%M";
@@ -346,6 +355,7 @@ impl Store {
             end_time: None,
             modified_at: None,
             pinned_at: None,
+            section_id: None,
             reminders: Vec::new(),
             created_at: now_ms(),
         };
@@ -438,7 +448,8 @@ impl Store {
                 &format!(
                     "INSERT INTO tasks ({TASK_COLUMNS})
                      SELECT ?2, parent_id, kind, title, notes, priority, due_date, due_time,
-                            ?3, created_at, list_id, NULL, NULL, NULL, NULL, end_date, end_time, ?3, NULL
+                            ?3, created_at, list_id, NULL, NULL, NULL, NULL, end_date, end_time, ?3, NULL,
+                            section_id
                      FROM tasks WHERE id = ?1"
                 ),
                 params![id.to_string(), copy.to_string(), now_ms()],
@@ -527,6 +538,58 @@ impl Store {
             "UPDATE tasks SET end_date = ?2, end_time = ?3 WHERE id = ?1",
             params![id.to_string(), date, time],
         )?;
+        Ok(())
+    }
+
+    /// Sections of a list ("Add Section"), oldest first.
+    pub fn list_sections(&self, list: Id) -> Result<Vec<crate::model::ListSection>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, list_id, name FROM list_sections WHERE list_id = ?1 ORDER BY created_at, rowid",
+        )?;
+        let sections = stmt
+            .query_map([list.to_string()], |row| {
+                Ok(crate::model::ListSection {
+                    id: parse_uuid(&row.get::<_, String>(0)?, 0)?,
+                    list_id: parse_uuid(&row.get::<_, String>(1)?, 1)?,
+                    name: row.get(2)?,
+                })
+            })?
+            .collect::<Result<_, _>>()?;
+        Ok(sections)
+    }
+
+    pub fn add_list_section(&self, list: Id, name: &str) -> Result<crate::model::ListSection> {
+        let name = name.trim();
+        anyhow::ensure!(!name.is_empty(), "a section needs a name");
+        let section = crate::model::ListSection { id: Uuid::now_v7(), list_id: list, name: name.to_owned() };
+        self.conn.execute(
+            "INSERT INTO list_sections (id, list_id, name, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![section.id.to_string(), list.to_string(), section.name, now_ms()],
+        )?;
+        Ok(section)
+    }
+
+    /// Deletes a section; its tasks stay in the list without a section.
+    pub fn delete_list_section(&self, id: Id) -> Result<()> {
+        self.conn.execute("UPDATE tasks SET section_id = NULL WHERE section_id = ?1", [id.to_string()])?;
+        self.conn.execute("DELETE FROM list_sections WHERE id = ?1", [id.to_string()])?;
+        Ok(())
+    }
+
+    /// Puts a task (and its subtasks) into a section of its list, or out of any.
+    pub fn set_section(&self, id: Id, section: Option<Id>) -> Result<()> {
+        if let Some(section) = section {
+            let list: Option<String> = self
+                .conn
+                .query_row("SELECT list_id FROM list_sections WHERE id = ?1", [section.to_string()], |row| row.get(0))
+                .optional()?;
+            let task_list = self.task(id)?.context("task not found")?.list_id.map(|l| l.to_string());
+            anyhow::ensure!(list.is_some() && list == task_list, "the section belongs to another list");
+        }
+        let section = section.map(|s| s.to_string());
+        for task in std::iter::once(id).chain(self.descendants(id)?) {
+            self.conn.execute("UPDATE tasks SET section_id = ?2 WHERE id = ?1", params![task.to_string(), section])?;
+        }
         Ok(())
     }
 
@@ -681,7 +744,11 @@ impl Store {
         let tx = self.conn.unchecked_transaction()?;
         let list = list.map(|l| l.to_string());
         for task in std::iter::once(id).chain(self.descendants(id)?) {
-            tx.execute("UPDATE tasks SET list_id = ?2 WHERE id = ?1", params![task.to_string(), list])?;
+            // A section belongs to its list, so moving to another list leaves it.
+            tx.execute(
+                "UPDATE tasks SET list_id = ?2, section_id = NULL WHERE id = ?1",
+                params![task.to_string(), list],
+            )?;
         }
         tx.commit()?;
         Ok(())
@@ -1261,6 +1328,7 @@ fn task_from_row(row: &Row) -> rusqlite::Result<Task> {
         end_time: row.get::<_, Option<String>>(16)?.and_then(|t| NaiveTime::parse_from_str(&t, TIME_FORMAT).ok()),
         modified_at: row.get(17)?,
         pinned_at: row.get(18)?,
+        section_id: row.get::<_, Option<String>>(19)?.map(|s| parse_uuid(&s, 19)).transpose()?,
     })
 }
 
@@ -1623,6 +1691,33 @@ mod tests {
         assert!(store.checkins(read.id)?.is_empty());
         store.delete_habit(floss.id)?;
         assert_eq!(store.habits()?.iter().map(|h| h.name.as_str()).collect::<Vec<_>>(), ["Read"]);
+        Ok(())
+    }
+
+    #[test]
+    fn list_sections() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let home = store.create_list("Home")?;
+        let work = store.create_list("Work")?;
+        let kitchen = store.add_list_section(home.id, " Kitchen ")?;
+        assert!(store.add_list_section(home.id, " ").is_err());
+        assert_eq!(store.list_sections(home.id)?, [kitchen.clone()]);
+        assert!(store.list_sections(work.id)?.is_empty());
+
+        let task = store.add_task("fix the tap")?;
+        assert!(store.set_section(task.id, Some(kitchen.id)).is_err(), "the task is not in that list");
+        store.set_list(task.id, Some(home.id))?;
+        store.set_section(task.id, Some(kitchen.id))?;
+        assert_eq!(store.task(task.id)?.unwrap().section_id, Some(kitchen.id));
+        // Moving to another list leaves the section.
+        store.set_list(task.id, Some(work.id))?;
+        assert_eq!(store.task(task.id)?.unwrap().section_id, None);
+
+        store.set_list(task.id, Some(home.id))?;
+        store.set_section(task.id, Some(kitchen.id))?;
+        store.delete_list_section(kitchen.id)?;
+        assert_eq!(store.task(task.id)?.unwrap().section_id, None);
+        assert!(store.list_sections(home.id)?.is_empty());
         Ok(())
     }
 

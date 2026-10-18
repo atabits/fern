@@ -16,7 +16,7 @@ pub use focus::{FocusSession, FocusStats, focus_stats, format_minutes};
 pub use habit::{Checkin, Goal, Habit, HabitStats, MonthStats};
 pub use habit::Frequency as HabitFrequency;
 pub use habit::{CustomSection, HabitSection};
-pub use model::{Activity, ChecklistItem, Id, Kind, List, Priority, Tag, Task, View, ViewCounts};
+pub use model::{Activity, ChecklistItem, ListSection, Id, Kind, List, Priority, Tag, Task, View, ViewCounts};
 pub use quick_add::{ParsedTask, parse_quick_add};
 pub use recurrence::{Frequency, Recurrence};
 pub use store::Store;

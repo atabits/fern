@@ -87,6 +87,8 @@ pub struct Task {
     pub end_time: Option<NaiveTime>,
     /// When the task was pinned to the top of its lists.
     pub pinned_at: Option<i64>,
+    /// The section of its list ("Add Section"), if any.
+    pub section_id: Option<Id>,
     /// Unix milliseconds of the last edit; `None` for tasks never edited since they were added.
     pub modified_at: Option<i64>,
     /// Reminders as minutes before the due time (09:00 on the due day for all-day tasks).
@@ -141,6 +143,14 @@ impl Task {
 }
 
 /// A user-defined list (a "project" in TickTick).
+/// A section of a list: a named group of its tasks, a column in the kanban view.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ListSection {
+    pub id: Id,
+    pub list_id: Id,
+    pub name: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct List {
     pub id: Id,

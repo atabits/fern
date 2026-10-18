@@ -73,6 +73,10 @@ pub struct TodoView {
     show_details: bool,
     /// The current list's layout: cards in columns instead of rows (the menu's View).
     kanban: bool,
+    /// The current list's sections.
+    sections: Vec<fern_core::ListSection>,
+    /// The "Add Section" field, while it is shown.
+    new_section: Option<Entity<TextInput>>,
     detail: Entity<TaskDetail>,
     selected: Option<Id>,
     error: Option<String>,
@@ -167,6 +171,8 @@ impl TodoView {
             sort_menu: None,
             show_details: false,
             kanban: false,
+            sections: Vec::new(),
+            new_section: None,
             detail,
             selected: None,
             error: None,
@@ -258,6 +264,20 @@ impl TodoView {
                         self.set_view(View::List(id), cx);
                     }
                 }
+                Some(("section", spec)) => {
+                    // `section=<name>` adds a section to the current list; `section=<name>><task>` also files a task.
+                    let (name, task) = spec.split_once('>').map_or((spec, None), |(n, t)| (n, Some(t)));
+                    if let View::List(list) = self.view {
+                        let existing = self.store.list_sections(list).unwrap_or_default().into_iter().find(|s| s.name == name);
+                        let section = existing.or_else(|| self.store.add_list_section(list, name).ok());
+                        if let (Some(section), Some(task)) = (section, task)
+                            && let Some(id) = self.tasks.iter().find(|t| t.title.contains(task)).map(|t| t.id)
+                        {
+                            self.store.set_section(id, Some(section.id)).ok();
+                        }
+                        self.reload(cx);
+                    }
+                }
                 Some(("flag", name)) => {
                     let default = name == "show_completed";
                     self.toggle_view_flag(name, default, cx);
@@ -312,6 +332,10 @@ impl TodoView {
     fn reload(&mut self, cx: &mut Context<Self>) {
         self.show_details = self.view_flag("show_details", false);
         self.kanban = self.view_flag("kanban", false);
+        self.sections = match self.view {
+            View::List(list) => self.store.list_sections(list).unwrap_or_default(),
+            _ => Vec::new(),
+        };
         let today = Self::today();
         if let Some(lists) = self.check(self.store.lists()) {
             self.lists = lists;
@@ -448,6 +472,9 @@ impl TodoView {
                 task_rows::sort_tasks(&mut tasks, sort);
                 task_rows::pinned_first(&mut tasks);
                 match group {
+                    GroupBy::Custom if !self.sections.is_empty() => {
+                        task_rows::section_rows(&tasks, &self.sections, collapsed_tasks, strings)
+                    }
                     GroupBy::Custom => {
                         task_rows::build_rows(&tasks, collapsed_tasks, collapsed_sections, true)
                     }
@@ -533,6 +560,29 @@ impl TodoView {
                 div().pl(px(16.)).child(line(sub, SharedString::from(format!("card-check-{}", sub.id)), cx))
             }))
             .into_any_element()
+    }
+
+    fn start_new_section(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let strings = i18n::t(cx);
+        let input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.section_name, cx));
+        cx.subscribe(&input, |this, _, Submitted(name), cx| {
+            if let View::List(list) = this.view {
+                let result = this.store.add_list_section(list, name);
+                this.check(result);
+            }
+            this.new_section = None;
+            this.reload(cx);
+        })
+        .detach();
+        cx.subscribe(&input, |this, _, _: &Cancelled, cx| {
+            this.new_section = None;
+            cx.notify();
+        })
+        .detach();
+        window.focus(&input.focus_handle(cx), cx);
+        self.new_section = Some(input);
+        self.header_menu_open = false;
+        cx.notify();
     }
 
     /// A per-list switch of the header's "…" menu ("Show Completed", "Show Details").
@@ -1575,7 +1625,15 @@ impl TodoView {
                         .hover(|s| s.bg(theme.colors().element_hover))
                         .child(Icon::new(icon).color(if on { Color::Accent } else { Color::Muted }))
                 };
-                el.when(in_list, |el| el.child(div().my_1().child(Divider::horizontal())))
+                el.when(in_list, |el| {
+                    el.child(
+                        ListItem::new("add-section")
+                            .start_slot(Icon::new(IconName::Plus).color(Color::Muted))
+                            .child(Label::new(strings.add_section))
+                            .on_click(cx.listener(|this, _, window, cx| this.start_new_section(window, cx))),
+                    )
+                    .child(div().my_1().child(Divider::horizontal()))
+                })
                     .child(div().px_2().pt_1().child(Label::new(strings.view_label).size(LabelSize::Small).color(Color::Muted)))
                     .child(
                         h_flex()
@@ -1691,6 +1749,24 @@ impl Render for TodoView {
                             el.child(div().h(px(40.)).rounded(px(8.)).border_1().border_color(theme.colors().border_variant))
                         })
                 }))
+                .when(matches!(self.view, View::List(_)), |el| {
+                    el.child(
+                        v_flex().w(px(220.)).flex_none().pt_1().map(|el| match self.new_section.clone() {
+                            Some(input) => el.child(
+                                h_flex().h(px(30.)).px_2().rounded(px(6.)).bg(theme.colors().surface_background).child(input),
+                            ),
+                            None => el.child(
+                                h_flex()
+                                    .id("kanban-new-section")
+                                    .gap_1()
+                                    .cursor_pointer()
+                                    .child(Icon::new(IconName::Plus).size(IconSize::Small).color(Color::Accent))
+                                    .child(Label::new(strings.add_section).color(Color::Accent))
+                                    .on_click(cx.listener(|this, _, window, cx| this.start_new_section(window, cx))),
+                            ),
+                        }),
+                    )
+                })
                 .into_any_element()
         });
         let rows = if kanban_view { Vec::new() } else { self.rows(strings) };
@@ -1839,6 +1915,17 @@ impl Render for TodoView {
                             })
                             .color(Color::Muted),
                         ))
+                    })
+                    .when_some(self.new_section.clone().filter(|_| !kanban_view), |el, input| {
+                        el.child(
+                            h_flex()
+                                .h(px(32.))
+                                .mx(px(GUTTER))
+                                .px_2()
+                                .rounded(px(6.))
+                                .bg(cx.theme().colors().surface_background)
+                                .child(input),
+                        )
                     })
                     .children(rows)
                     .children(self.render_habits(strings, cx)),

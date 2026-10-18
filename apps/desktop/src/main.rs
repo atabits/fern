@@ -3,6 +3,7 @@ mod app_view;
 
 mod calendar;
 mod calendar_view;
+mod drag;
 mod due_picker;
 mod i18n;
 mod keymap;

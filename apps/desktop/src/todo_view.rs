@@ -5,6 +5,8 @@ use fern_core::{Id, Kind, List, Store, Tag, Task, View, ViewCounts};
 use chrono::{Duration, Local, NaiveDate};
 use gpui::{ElementId, Entity, FocusHandle, Focusable, FontWeight, MouseButton};
 use ui::prelude::*;
+
+use crate::drag::DraggedTask;
 use ui::{Placement, PopoverAttachment, popover};
 
 use crate::actions::{DeleteTask, SelectNext, SelectPrevious, ToggleComplete};
@@ -13,28 +15,6 @@ use crate::lists_panel::{self, LIST_COLORS};
 use crate::task_detail::{OpenTask, TaskDetail, TaskUpdated};
 use crate::task_rows::{self, Row, Section};
 use crate::text_input::{Cancelled, Changed, Mode, Submitted, TextInput};
-
-/// A task being dragged to a new place in the list; also renders the drag preview.
-#[derive(Clone)]
-struct DraggedTask {
-    id: Id,
-    title: SharedString,
-}
-
-impl Render for DraggedTask {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let colors = cx.theme().colors();
-        div()
-            .px_3()
-            .py_1p5()
-            .rounded(px(6.))
-            .bg(colors.elevated_surface_background)
-            .border_1()
-            .border_color(colors.border)
-            .shadow_lg()
-            .child(Label::new(self.title.clone()))
-    }
-}
 
 const DETAIL_WIDTH: f32 = 400.;
 const ROW_HEIGHT: f32 = 40.;
@@ -174,6 +154,32 @@ impl TodoView {
                 }
                 Some(("list", name)) => self.create_list(name, cx),
                 Some(("view", "trash")) => self.set_view(View::Trash, cx),
+                Some(("drop", spec)) => {
+                    // `drop=<title part>><today|tomorrow|inbox|completed|trash|list:Name|tag:Name>`:
+                    // the same path as dropping a task on the lists column.
+                    let all = self.store.tasks().unwrap_or_default();
+                    if let Some((needle, target)) = spec.split_once('>')
+                        && let Some(id) = all.iter().find(|t| t.title.contains(needle)).map(|t| t.id)
+                    {
+                        let view = match target {
+                            "today" => Some(View::Today),
+                            "tomorrow" => Some(View::Tomorrow),
+                            "inbox" => Some(View::Inbox),
+                            "completed" => Some(View::Completed),
+                            "trash" => Some(View::Trash),
+                            other => other
+                                .strip_prefix("tag:")
+                                .map(|t| View::Tag(t.to_owned()))
+                                .or_else(|| {
+                                    let name = other.strip_prefix("list:")?;
+                                    self.lists.iter().find(|l| l.name == name).map(|l| View::List(l.id))
+                                }),
+                        };
+                        if let Some(view) = view {
+                            self.drop_on_view(view, id, cx);
+                        }
+                    }
+                }
                 Some(("move", spec)) => {
                     // `move=<dragged title part>><target title part>`: same path as a mouse drop.
                     let find = |needle: &str| self.tasks.iter().find(|t| t.title.contains(needle)).map(|t| t.id);
@@ -517,6 +523,32 @@ impl TodoView {
             self.store.purge_task(id)
         } else {
             self.store.delete_task(id)
+        };
+        self.check(result);
+        self.reload(cx);
+    }
+
+    /// A task dropped on an entry of the lists column takes that entry's meaning: a list moves it,
+    /// a tag tags it, Today/Tomorrow set its date, Completed completes it, Trash deletes it.
+    fn drop_on_view(&mut self, view: View, id: Id, cx: &mut Context<Self>) {
+        let today = Self::today();
+        let time = self.store.task(id).ok().flatten().and_then(|t| t.due_time);
+        let result = match &view {
+            View::Inbox => self.store.set_list(id, None),
+            View::List(list) => self.store.set_list(id, Some(*list)),
+            View::Tag(tag) => match self.store.task(id) {
+                Ok(Some(task)) if !task.tags.iter().any(|t| t.to_lowercase() == tag.to_lowercase()) => {
+                    let mut tags = task.tags;
+                    tags.push(tag.clone());
+                    self.store.set_tags(id, &tags)
+                }
+                other => other.map(|_| ()),
+            },
+            View::Today | View::Next7Days => self.store.set_due(id, Some(today), time),
+            View::Tomorrow => self.store.set_due(id, Some(today + Duration::days(1)), time),
+            View::Completed => self.store.set_completed(id, true),
+            View::Trash => self.store.delete_task(id),
+            View::All | View::Search(_) => Ok(()),
         };
         self.check(result);
         self.reload(cx);
@@ -962,6 +994,10 @@ impl Render for TodoView {
             this.update(cx, |this, cx| this.set_view(view, cx)).ok();
         };
         let on_add_list = cx.listener(|this, _, window, cx| this.start_new_list(window, cx));
+        let this = cx.entity().downgrade();
+        let on_drop_task = move |view, id, _: &mut Window, cx: &mut App| {
+            this.update(cx, |this, cx| this.drop_on_view(view, id, cx)).ok();
+        };
 
         h_flex()
             .size_full()
@@ -981,6 +1017,7 @@ impl Render for TodoView {
                     },
                     on_select,
                     on_add_list,
+                    on_drop_task,
                     cx,
                 ))
             })

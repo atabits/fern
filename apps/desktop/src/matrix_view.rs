@@ -9,6 +9,8 @@ use fern_core::{Id, List, Priority, Store, Task, View};
 use gpui::{EventEmitter, FontWeight};
 use ui::prelude::*;
 
+use crate::drag::DraggedTask;
+
 use crate::i18n::{self, Strings};
 use crate::lists_panel;
 use crate::task_rows;
@@ -18,27 +20,6 @@ pub struct OpenTask(pub Id);
 
 /// The four quadrants, in reading order. TickTick's default rules map them to priorities.
 const QUADRANTS: [Priority; 4] = [Priority::High, Priority::Medium, Priority::Low, Priority::None];
-
-#[derive(Clone)]
-struct DraggedTask {
-    id: Id,
-    title: SharedString,
-}
-
-impl Render for DraggedTask {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let colors = cx.theme().colors();
-        div()
-            .px_3()
-            .py_1p5()
-            .rounded(px(6.))
-            .bg(colors.elevated_surface_background)
-            .border_1()
-            .border_color(colors.border)
-            .shadow_lg()
-            .child(Label::new(self.title.clone()))
-    }
-}
 
 pub struct MatrixView {
     store: Rc<Store>,

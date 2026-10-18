@@ -6,6 +6,7 @@ use gpui::{ClickEvent, rgb};
 use ui::prelude::*;
 
 use crate::calendar;
+use crate::drag::DraggedTask;
 use crate::i18n::Strings;
 
 pub const WIDTH: f32 = 212.;
@@ -58,6 +59,7 @@ pub fn render(
     props: Props,
     on_select: impl Fn(View, &mut Window, &mut App) + Clone + 'static,
     on_add_list: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    on_drop_task: impl Fn(View, fern_core::Id, &mut Window, &mut App) + Clone + 'static,
     cx: &App,
 ) -> impl IntoElement {
     let Props { active, counts, lists, tags, strings, new_list_input } = props;
@@ -70,7 +72,11 @@ pub fn render(
                 count: Option<usize>,
                 dot: Option<Hsla>| {
         let on_select = on_select.clone();
-        ListItem::new(SharedString::from(id))
+        let on_drop_task = on_drop_task.clone();
+        let drop_view = view.clone();
+        let accent = colors.accent;
+        // Every entry is also a drop target for dragged tasks.
+        let item = ListItem::new(SharedString::from(id.clone()))
             .height(px(36.))
             .toggle_state(&view == active)
             .start_slot(Icon::new(icon))
@@ -87,7 +93,13 @@ pub fn render(
                         )
                     }),
             )
-            .on_click(move |_, window, cx| on_select(view.clone(), window, cx))
+            .on_click(move |_, window, cx| on_select(view.clone(), window, cx));
+        div()
+            .id(SharedString::from(format!("drop-{id}")))
+            .rounded(px(6.))
+            .drag_over::<DraggedTask>(move |style, _, _, _| style.bg(accent.opacity(0.18)))
+            .on_drop(move |dragged: &DraggedTask, window, cx| on_drop_task(drop_view.clone(), dragged.id, window, cx))
+            .child(item)
     };
     let smart = |view: View, label: &'static str, icon: IconName, count: Option<usize>| {
         item(format!("view-{label}"), view, label.into(), icon, count, None)

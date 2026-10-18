@@ -9,6 +9,7 @@ use ui::prelude::*;
 
 use crate::actions::{NewTask, ToggleSidebar};
 use crate::calendar;
+use crate::drag::DraggedTask;
 use crate::i18n;
 use crate::task_rows;
 
@@ -49,6 +50,15 @@ impl CalendarView {
         self.reload(cx);
     }
 
+    /// Moves a dropped task to `date`, keeping its time of day.
+    fn drop_on_day(&mut self, id: Id, date: NaiveDate, cx: &mut Context<Self>) {
+        let time = self.store.task(id).ok().flatten().and_then(|t| t.due_time);
+        if let Err(err) = self.store.set_due(id, Some(date), time) {
+            eprintln!("failed to move the task: {err:#}");
+        }
+        self.reload(cx);
+    }
+
     fn go_to_today(&mut self, cx: &mut Context<Self>) {
         self.month = calendar::month_start(Local::now().date_naive());
         self.reload(cx);
@@ -67,10 +77,14 @@ impl CalendarView {
             date.day().to_string()
         };
 
+        let accent = theme.colors().accent;
         v_flex()
+            .id(SharedString::from(format!("calendar-day-{date}")))
             .flex_1()
             .min_w_0()
             .h_full()
+            .drag_over::<DraggedTask>(move |style, _, _, _| style.bg(accent.opacity(0.12)))
+            .on_drop(cx.listener(move |this, dragged: &DraggedTask, _, cx| this.drop_on_day(dragged.id, date, cx)))
             .gap(px(2.))
             .px(px(2.))
             .pt_1()
@@ -95,8 +109,10 @@ impl CalendarView {
                 let id = task.id;
                 let done = task.is_completed();
                 let tint = task_rows::priority_color(task.priority, &theme).unwrap_or(theme.colors().accent);
+                let dragged = DraggedTask { id, title: task.title.clone().into() };
                 h_flex()
                     .id(SharedString::from(format!("calendar-task-{id}")))
+                    .on_drag(dragged, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
                     .h(px(18.))
                     .flex_none()
                     .gap_1()

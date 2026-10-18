@@ -446,14 +446,26 @@ impl HabitView {
         };
         let section_text = self.section_label(edit.section, cx).to_string();
         // The original's rows: a label on the left and the value in a field that opens its choices.
-        let row = |label: &'static str, content: AnyElement| {
+        let row_with = |label: AnyElement, content: AnyElement| {
             // With the dialog's 8 px gap, a row every 40 px as in the original.
             h_flex()
                 .min_h(px(32.))
                 .gap_2()
-                .child(div().w(px(101.)).flex_none().child(Label::new(label)))
+                .child(div().w(px(101.)).flex_none().child(label))
                 .child(div().flex_1().min_w_0().child(content))
         };
+        let row = |label: &'static str, content: AnyElement| row_with(Label::new(label).into_any_element(), content);
+        // The original's "?" beside Goal Days, explaining it on hover.
+        let goal_days_label = h_flex()
+            .gap_1()
+            .child(Label::new(strings.habit_goal_days))
+            .child(
+                div()
+                    .id("habit-goal-days-hint")
+                    .child(Icon::new(IconName::CircleQuestionMark).size(IconSize::XSmall).color(Color::Muted))
+                    .tooltip(ui::Tooltip::text(strings.habit_goal_days_hint)),
+            )
+            .into_any_element();
         let open = edit.open;
         let dropdown = |which: EditRow, text: String, menu: AnyElement| -> AnyElement {
             let on = open == Some(which);
@@ -528,7 +540,7 @@ impl HabitView {
             .child(row(strings.habit_frequency, dropdown(EditRow::Frequency, frequency_label(edit.frequency, strings), frequency_menu)))
             .child(row(strings.habit_goal, dropdown(EditRow::Goal, goal_text, goal_menu)))
             .child(row(strings.habit_start_date, dropdown(EditRow::StartDate, start_text, start_menu)))
-            .child(row(strings.habit_goal_days, dropdown(EditRow::GoalDays, goal_days_text, goal_days_menu)))
+            .child(row_with(goal_days_label, dropdown(EditRow::GoalDays, goal_days_text, goal_days_menu)))
             .child(row(strings.habit_section, dropdown(EditRow::Section, section_text, section_menu)))
             .child(row(
                 strings.reminder,
@@ -591,15 +603,18 @@ impl HabitView {
                     .on_click(cx.listener(|this, _, _, cx| this.update_edit(cx, |e| e.constant_reminder = !e.constant_reminder)))
                     .into_any_element(),
             ))
+            // The original's footer: a divider, then Cancel and Save on the right.
+            .child(div().mt_2().h(px(1.)).bg(theme.colors().border))
             .child(
                 h_flex()
-                    .gap_2()
-                    .pt_1()
-                    .child(button("edit-cancel", strings.cancel, false).on_click(cx.listener(|this, _, _, cx| {
+                    .gap(px(10.))
+                    .pt_2()
+                    .justify_end()
+                    .child(button("edit-cancel", strings.cancel, false).w(px(100.)).flex_none().on_click(cx.listener(|this, _, _, cx| {
                         this.editing = None;
                         cx.notify();
                     })))
-                    .child(button("edit-save", strings.save, true).on_click(cx.listener(|this, _, _, cx| this.save_edit(cx)))),
+                    .child(button("edit-save", strings.save, true).w(px(100.)).flex_none().on_click(cx.listener(|this, _, _, cx| this.save_edit(cx)))),
             )
             .into_any_element()
     }

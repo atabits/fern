@@ -234,6 +234,8 @@ pub struct Strings {
     pub habit_no_archived: &'static str,
     pub habit_start_date: &'static str,
     pub habit_goal_days: &'static str,
+    /// The "?" beside Goal Days.
+    pub habit_goal_days_hint: &'static str,
     pub habit_forever: &'static str,
     pub habit_custom: &'static str,
     /// The habit icon picker's tabs: Icon (emoji on colored circles), Emoji, Text.
@@ -789,6 +791,7 @@ pub static EN: Strings = Strings {
     habit_no_archived: "No archived habits",
     habit_start_date: "Start Date",
     habit_goal_days: "Goal Days",
+    habit_goal_days_hint: "Goal Days is the length of a cycle: with 7 days, you keep up the habit for 7 days. When a cycle is done, you can start the next one.",
     habit_forever: "Forever",
     habit_custom: "Custom",
     habit_icon_tabs: ["Icon", "Emoji", "Text"],
@@ -1319,6 +1322,7 @@ pub static RU: Strings = Strings {
     habit_no_archived: "В архиве пусто",
     habit_start_date: "Дата начала",
     habit_goal_days: "Цель в днях",
+    habit_goal_days_hint: "Цель в днях — длина цикла: при 7 днях вы держите привычку 7 дней. Когда цикл пройден, можно начать следующий.",
     habit_forever: "Бессрочно",
     habit_custom: "Своё",
     habit_icon_tabs: ["Иконка", "Эмодзи", "Текст"],

@@ -33,6 +33,7 @@ pub fn title(view: &View, lists: &[List], filters: &[fern_core::SmartFilter], st
         View::Search(_) => strings.section_search.into(),
         View::Filter(id) => filters.iter().find(|f| f.id == *id).map(|f| f.name.clone()).unwrap_or_default().into(),
         View::Summary => strings.summary.into(),
+        View::Day(day) => calendar::format_date(*day, strings).into(),
     }
 }
 
@@ -240,11 +241,17 @@ pub fn render(
         .border_r_1()
         .border_color(colors.border)
         .child(lists_column)
-        .when(preferences.mini_calendar, |el| el.child(mini_week(strings, cx)))
+        .when(preferences.mini_calendar, |el| el.child(mini_week(active, on_select.clone(), strings, cx)))
 }
 
 /// The current week pinned to the bottom of the column, as in TickTick.
-fn mini_week(strings: &Strings, cx: &App) -> impl IntoElement {
+/// Clicking a day opens its tasks (`View::Day`), as in the original; that day stays marked.
+fn mini_week(
+    active: &View,
+    on_select: impl Fn(View, &mut Window, &mut App) + Clone + 'static,
+    strings: &Strings,
+    cx: &App,
+) -> impl IntoElement {
     let colors = cx.theme().colors();
     let today = Local::now().date_naive();
     v_flex()
@@ -260,18 +267,25 @@ fn mini_week(strings: &Strings, cx: &App) -> impl IntoElement {
         })))
         .child(h_flex().children(calendar::week_of(today).map(|date| {
             let is_today = date == today;
+            let selected = *active == View::Day(date);
+            let on_select = on_select.clone();
             div().flex_1().flex().justify_center().child(
                 div()
+                    .id(SharedString::from(format!("mini-day-{date}")))
                     .size(px(28.))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(colors.ghost_element_hover))
+                    .when(selected, |el| el.bg(colors.accent))
+                    .on_click(move |_, window, cx| on_select(View::Day(date), window, cx))
                     .flex()
                     .items_center()
                     .justify_center()
                     .rounded_full()
-                    .when(is_today, |el| el.bg(colors.element_hover))
+                    .when(is_today && !selected, |el| el.bg(colors.element_hover))
                     .child(
                         Label::new(date.day().to_string())
                             .size(LabelSize::Small)
-                            .color(if is_today { Color::Accent } else { Color::Default }),
+                            .color(if selected { Color::Custom(gpui::white()) } else if is_today { Color::Accent } else { Color::Default }),
                     ),
             )
         })))

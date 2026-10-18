@@ -249,6 +249,11 @@ impl TodoView {
                 Some(("view", "wontdo")) => self.set_view(View::WontDo, cx),
                 Some(("view", "today")) => self.set_view(View::Today, cx),
                 Some(("view", "summary")) => self.set_view(View::Summary, cx),
+                // `view=day+N`: the mini calendar's day N days from today.
+                Some(("view", day)) if day.starts_with("day") => {
+                    let offset: i64 = day.trim_start_matches("day").trim_start_matches('+').parse().unwrap_or(0);
+                    self.set_view(View::Day(Self::today() + Duration::days(offset)), cx);
+                }
                 // `summary=<period|status|grouping|fields>` opens a Summary dropdown.
                 Some(("summary", menu)) => self.summary.update(cx, |summary, cx| summary.dev_open(menu, window, cx)),
                 Some(("drop", spec)) => {
@@ -578,6 +583,7 @@ impl TodoView {
         let view_due = match &self.view {
             View::Today | View::Next7Days => Some(today),
             View::Tomorrow => Some(today + Duration::days(1)),
+            View::Day(day) => Some(*day),
             _ => None,
         };
         // Settings → More → Task Default fills in what neither the text nor the view gives.
@@ -1686,6 +1692,7 @@ impl TodoView {
             View::Completed => self.store.set_completed(id, true),
             View::WontDo => self.store.set_wont_do(id, true),
             View::Trash => self.store.delete_task(id),
+            View::Day(day) => self.store.set_due(id, Some(*day), time),
             View::All | View::Search(_) | View::Filter(_) | View::Summary => Ok(()),
         };
         self.check(result);
@@ -2756,7 +2763,19 @@ impl Render for TodoView {
                     .overflow_y_scroll()
                     .px_2()
                     .pb_4()
-                    .when(rows.is_empty(), |el| {
+                    // A free day in the mini calendar, as in the original.
+                    .when(rows.is_empty() && matches!(self.view, View::Day(_)), |el| {
+                        el.child(
+                            v_flex()
+                                .pt(px(160.))
+                                .items_center()
+                                .gap_1()
+                                .child(Icon::new(IconName::CalendarCheck).size(IconSize::Medium).color(Color::Muted))
+                                .child(Label::new(strings.free_day))
+                                .child(Label::new(strings.free_day_hint).size(LabelSize::Small).color(Color::Muted)),
+                        )
+                    })
+                    .when(rows.is_empty() && !matches!(self.view, View::Day(_)), |el| {
                         el.child(div().px_3().pt_8().child(
                             Label::new(match &self.view {
                                 View::Completed => strings.no_completed_tasks,

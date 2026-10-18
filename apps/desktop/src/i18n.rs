@@ -372,6 +372,8 @@ pub struct Strings {
     // Task list.
     pub add_task: &'static str,
     pub no_tasks: &'static str,
+    pub free_day: &'static str,
+    pub free_day_hint: &'static str,
     pub no_completed_tasks: &'static str,
     pub untitled: &'static str,
     pub group_tasks: &'static str,
@@ -809,6 +811,8 @@ pub static EN: Strings = Strings {
 
     add_task: "Add task",
     no_tasks: "No Tasks",
+    free_day: "You have a free day",
+    free_day_hint: "Take it easy",
     no_completed_tasks: "No completed tasks",
     untitled: "Untitled",
     group_tasks: "Tasks",
@@ -1227,6 +1231,8 @@ pub static RU: Strings = Strings {
 
     add_task: "Добавить задачу",
     no_tasks: "Задач нет",
+    free_day: "Свободный день",
+    free_day_hint: "Можно отдохнуть",
     no_completed_tasks: "Выполненных задач нет",
     untitled: "Без названия",
     group_tasks: "Задачи",

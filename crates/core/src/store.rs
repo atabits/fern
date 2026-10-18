@@ -1541,6 +1541,7 @@ fn matches_view(task: &Task, view: &View, today: NaiveDate) -> bool {
         View::Tag(tag) => task.tags.iter().any(|t| t.to_lowercase() == tag.to_lowercase()),
         // Filters are matched in `Store::tasks_in`, which knows their conditions.
         View::Filter(_) | View::Summary => false,
+        View::Day(day) => task.due_date == Some(*day),
         View::Search(query) => {
             let query = query.trim().to_lowercase();
             !query.is_empty()
@@ -2300,6 +2301,23 @@ mod tests {
         // The copy sits right below the original.
         assert_eq!(titles(&store.tasks()?), ["other", "pack", "pack"]);
         let _ = other;
+        Ok(())
+    }
+
+    #[test]
+    fn day_view_lists_the_days_tasks() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let today = chrono::Local::now().date_naive();
+        let day = today + Duration::days(3);
+        let due = store.add_task("due that day")?;
+        store.set_due(due.id, Some(day), None)?;
+        let done = store.add_task("done that day")?;
+        store.set_due(done.id, Some(day), None)?;
+        store.set_completed(done.id, true)?;
+        store.add_task("undated")?;
+        let titles: Vec<String> = store.tasks_in(&View::Day(day), today)?.into_iter().map(|t| t.title).collect();
+        assert_eq!(titles.len(), 2);
+        assert!(titles.contains(&"due that day".to_owned()) && titles.contains(&"done that day".to_owned()));
         Ok(())
     }
 

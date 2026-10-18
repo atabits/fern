@@ -228,6 +228,8 @@ pub enum View {
     Filter(Id),
     /// The Summary report; it lists no tasks of its own.
     Summary,
+    /// A day picked in the mini calendar: the tasks due that day.
+    Day(NaiveDate),
 }
 
 /// Open-task counters for the lists column.

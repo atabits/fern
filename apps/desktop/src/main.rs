@@ -6,6 +6,8 @@ mod calendar_view;
 mod countdown_view;
 mod drag;
 mod due_picker;
+mod focus_timer;
+mod focus_view;
 mod habit_view;
 mod i18n;
 mod keymap;

@@ -3,7 +3,7 @@
 use gpui::{AnyElement, ClickEvent};
 use ui::prelude::*;
 
-use crate::i18n::Strings;
+use crate::i18n::{self, Strings};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Section {
@@ -76,6 +76,7 @@ pub fn render(
     cx: &App,
 ) -> impl IntoElement {
     let colors = cx.theme().colors();
+    let strings = i18n::t(cx);
     let button = |id: &'static str, icon: IconName| {
         IconButton::new(id, icon).size(px(36.)).icon_size(IconSize::XLarge)
     };
@@ -109,6 +110,7 @@ pub fn render(
         .children(Section::ALL.into_iter().map(|section| {
             let on_select = on_select.clone();
             button(section.id(), section.icon())
+                .tooltip(Tooltip::text(section.title(strings)))
                 .toggle_state(section == active)
                 .on_click(move |_, window, cx| on_select(section, window, cx))
         }))

@@ -43,7 +43,7 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 
 | Feature | Status | Notes |
 |---|---|---|
-| Narrow sections sidebar | 🟡 | order matches the original (Focus before Habit); Tasks, Calendar, Habit, Search, Matrix and Countdown work; outline icons where TickTick uses filled ones; no notification badge |
+| Narrow sections sidebar | 🟡 | order and tooltips match the original; every section works; outline icons where TickTick uses filled ones; no notification badge |
 | Account menu with language switch | ✅ | English (default) and Russian |
 | Lists column: Inbox / All / Today / Tomorrow / Next 7 Days | ✅ | counters; a new task gets the due date or tag of the current view |
 | Lists column: user lists | ✅ | create inline; rename, color and delete from the "…" menu; no drag and drop |
@@ -70,7 +70,7 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 | Eisenhower Matrix | 🟡 | matched to the original: quadrants by priority (TickTick's default rules), grouped by list, drag a task to another quadrant to change its priority; no custom quadrant rules |
 | Countdown | 🟡 | matched to the original: filter tabs, card grid with Y/M/D or days-only (click the numbers), until/since colors, add with name, type and date, delete on hover; no background images, editing or repeating dates |
 | Habits | 🟡 | matched to the original: week strip with daily progress rings, cards with total days, streak and this week's check-ins (click a dot to check in), add and delete; no habit details panel, icons, goals or reminders |
-| Focus (Pomodoro) | ⬜ | reference screen captured |
+| Focus (Pomodoro) | 🟡 | matched to the original: today's tasks to focus on, a 25-minute timer bar with pause and stop, Overview (today/total pomos and focus time), Focus Record grouped by day; no Active/Archived focus items, white noise, custom lengths or manual records |
 | Sync between devices | ⬜ | |
 
 ## How changes are checked
@@ -89,9 +89,9 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 
 ## Next
 
-1. Focus (Pomodoro) section.
-2. "Won't Do" status.
-3. Habit details panel.
+1. "Won't Do" status.
+2. Habit details panel.
+3. Filled sidebar icons and the notification badge.
 3. "Won't Do" status.
 4. Custom time and "every N" in the due-date picker.
 5. Eisenhower matrix view.

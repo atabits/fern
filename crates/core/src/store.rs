@@ -8,6 +8,7 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 use uuid::Uuid;
 
 use crate::countdown::{Countdown, CountdownKind};
+use crate::focus::FocusSession;
 use crate::habit::Habit;
 use crate::model::{ChecklistItem, Id, Kind, List, Priority, Tag, Task, View, ViewCounts};
 use crate::recurrence::Recurrence;
@@ -99,6 +100,15 @@ const MIGRATIONS: &[&str] = &[
         habit_id TEXT NOT NULL REFERENCES habits(id) ON DELETE CASCADE,
         date     TEXT NOT NULL,
         PRIMARY KEY (habit_id, date)
+    );
+    ",
+    "
+    CREATE TABLE focus_sessions (
+        id         TEXT PRIMARY KEY,
+        task_id    TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+        title      TEXT NOT NULL,
+        started_at INTEGER NOT NULL,
+        ended_at   INTEGER NOT NULL
     );
     ",
 ];
@@ -672,6 +682,36 @@ impl Store {
         Ok(dates)
     }
 
+    /// Records a finished focus session.
+    pub fn add_focus_session(&self, task_id: Option<Id>, title: &str, started_at: i64, ended_at: i64) -> Result<FocusSession> {
+        anyhow::ensure!(ended_at >= started_at, "a focus session cannot end before it starts");
+        let session = FocusSession { id: Uuid::now_v7(), task_id, title: title.trim().to_owned(), started_at, ended_at };
+        self.conn.execute(
+            "INSERT INTO focus_sessions (id, task_id, title, started_at, ended_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![session.id.to_string(), task_id.map(|t| t.to_string()), session.title, started_at, ended_at],
+        )?;
+        Ok(session)
+    }
+
+    /// Focus sessions, newest first.
+    pub fn focus_sessions(&self) -> Result<Vec<FocusSession>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, task_id, title, started_at, ended_at FROM focus_sessions ORDER BY started_at DESC",
+        )?;
+        let sessions = stmt
+            .query_map([], |row| {
+                Ok(FocusSession {
+                    id: parse_uuid(&row.get::<_, String>(0)?, 0)?,
+                    task_id: row.get::<_, Option<String>>(1)?.map(|t| parse_uuid(&t, 1)).transpose()?,
+                    title: row.get(2)?,
+                    started_at: row.get(3)?,
+                    ended_at: row.get(4)?,
+                })
+            })?
+            .collect::<Result<_, _>>()?;
+        Ok(sessions)
+    }
+
     /// A user setting such as the UI language; `None` when never set.
     pub fn setting(&self, key: &str) -> Result<Option<String>> {
         Ok(self
@@ -1163,6 +1203,22 @@ mod tests {
         assert!(store.checkins(read.id)?.is_empty());
         store.delete_habit(floss.id)?;
         assert_eq!(store.habits()?.iter().map(|h| h.name.as_str()).collect::<Vec<_>>(), ["Read"]);
+        Ok(())
+    }
+
+    #[test]
+    fn focus_sessions_are_stored_newest_first() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let task = store.add_task("write report")?;
+        store.add_focus_session(Some(task.id), "write report", 1_000, 1_500_000)?;
+        store.add_focus_session(None, "reading", 2_000_000, 3_500_000)?;
+        assert!(store.add_focus_session(None, "x", 10, 5).is_err());
+        let sessions = store.focus_sessions()?;
+        assert_eq!(sessions.iter().map(|s| s.title.as_str()).collect::<Vec<_>>(), ["reading", "write report"]);
+        assert_eq!(sessions[1].task_id, Some(task.id));
+        // Deleting the task keeps the record.
+        store.purge_task(task.id)?;
+        assert_eq!(store.focus_sessions()?[1].task_id, None);
         Ok(())
     }
 

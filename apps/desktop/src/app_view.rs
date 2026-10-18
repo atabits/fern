@@ -8,6 +8,7 @@ use ui::{Placement, PopoverAttachment, popover};
 use crate::actions::{NewTask, Search, ShowInbox, ShowNext7Days, ShowToday, ShowTomorrow, ToggleSidebar};
 use crate::calendar_view::{self, CalendarView};
 use crate::countdown_view::CountdownView;
+use crate::focus_view::FocusView;
 use crate::habit_view::HabitView;
 use crate::i18n::{self, CurrentLocale, Locale};
 use crate::matrix_view::{self, MatrixView};
@@ -23,6 +24,7 @@ pub struct AppView {
     matrix: gpui::Entity<MatrixView>,
     countdown: gpui::Entity<CountdownView>,
     habits: gpui::Entity<HabitView>,
+    focus: gpui::Entity<FocusView>,
     search: Option<gpui::Entity<SearchModal>>,
     account_menu_open: bool,
 }
@@ -53,6 +55,7 @@ impl AppView {
         .detach();
         let countdown = cx.new(|cx| CountdownView::new(store.clone(), cx));
         let habits = cx.new(|cx| HabitView::new(store.clone(), cx));
+        let focus = cx.new(|cx| FocusView::new(store.clone(), cx));
         let mut this = Self {
             store,
             section: Section::Tasks,
@@ -61,6 +64,7 @@ impl AppView {
             matrix,
             countdown,
             habits,
+            focus,
             search: None,
             account_menu_open: false,
         };
@@ -91,6 +95,18 @@ impl AppView {
                 let days: Vec<i64> = days.split(',').filter_map(|d| d.parse().ok()).collect();
                 this.habits.update(cx, |view, cx| view.dev_add(name, &days, cx));
             }
+            // `focus=<title>><minutes ago>><minutes>`, repeatable.
+            for spec in state.split(';').filter_map(|part| part.strip_prefix("focus=")) {
+                let parts: Vec<&str> = spec.split('>').collect();
+                if let [title, ago, minutes] = parts[..]
+                    && let (Ok(ago), Ok(minutes)) = (ago.parse(), minutes.parse())
+                {
+                    this.focus.update(cx, |view, cx| view.dev_record(title, ago, minutes, cx));
+                }
+            }
+            if state.contains("section=focus") {
+                this.select(Section::Pomodoro, window, cx);
+            }
             if state.contains("section=habits") {
                 this.select(Section::Habits, window, cx);
             }
@@ -119,6 +135,9 @@ impl AppView {
         }
         if section == Section::Matrix {
             self.matrix.update(cx, |matrix, cx| matrix.reload(cx));
+        }
+        if section == Section::Pomodoro {
+            self.focus.update(cx, |focus, cx| focus.reload(cx));
         }
         if section == Section::Habits {
             self.habits.update(cx, |habits, cx| habits.reload(cx));
@@ -221,7 +240,6 @@ impl AppView {
 
 impl Render for AppView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let strings = i18n::t(cx);
         let theme = cx.theme().clone();
         let this = cx.entity().downgrade();
         let on_select = move |section, window: &mut Window, cx: &mut App| {
@@ -257,14 +275,8 @@ impl Render for AppView {
                 Section::Matrix => div().flex_1().h_full().child(self.matrix.clone()),
                 Section::Countdown => div().flex_1().h_full().child(self.countdown.clone()),
                 Section::Habits => div().flex_1().h_full().child(self.habits.clone()),
-                other => v_flex()
-                    .flex_1()
-                    .h_full()
-                    .items_center()
-                    .justify_center()
-                    .gap_2()
-                    .child(Label::new(other.title(strings)).size(LabelSize::Large))
-                    .child(Label::new(strings.coming_soon).color(Color::Muted)),
+                Section::Pomodoro => div().flex_1().h_full().child(self.focus.clone()),
+
             })
             .when_some(self.search.clone(), |el, search| {
                 el.child(div().absolute().top(px(160.)).left_0().right_0().flex().justify_center().child(search))

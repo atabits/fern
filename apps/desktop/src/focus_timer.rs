@@ -44,6 +44,21 @@ impl FocusTimer {
     }
 }
 
+/// The break after a finished Pomodoro.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BreakKind {
+    Short,
+    Long,
+}
+
+/// Pomodoros between long breaks.
+pub const POMOS_PER_LONG_BREAK: usize = 4;
+
+/// The break after the `pomos_today`-th Pomodoro of the day: every fourth gets a long one.
+pub fn break_after(pomos_today: usize) -> BreakKind {
+    if pomos_today > 0 && pomos_today % POMOS_PER_LONG_BREAK == 0 { BreakKind::Long } else { BreakKind::Short }
+}
+
 /// "25:00", "04:05".
 pub fn format_clock(ms: i64) -> String {
     let seconds = (ms.max(0) + 999) / 1000;
@@ -55,6 +70,13 @@ mod tests {
     use super::*;
 
     const MIN: i64 = 60_000;
+
+    #[test]
+    fn every_fourth_pomo_gets_a_long_break() {
+        let kinds: Vec<BreakKind> = (1..=8).map(break_after).collect();
+        assert_eq!(kinds.iter().filter(|k| **k == BreakKind::Long).count(), 2);
+        assert_eq!((kinds[3], kinds[7], kinds[0]), (BreakKind::Long, BreakKind::Long, BreakKind::Short));
+    }
 
     #[test]
     fn counts_down_and_excludes_pauses() {

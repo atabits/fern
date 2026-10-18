@@ -11,12 +11,14 @@ use gpui::{Entity, FontWeight, Task as GpuiTask};
 use ui::{Placement, PopoverAttachment, popover};
 use ui::prelude::*;
 
-use crate::focus_timer::{FocusTimer, format_clock};
+use crate::focus_timer::{BreakKind, FocusTimer, break_after, format_clock};
 use crate::i18n::{self, Strings};
 use crate::text_input::{Mode, TextInput};
 
-/// The default Pomodoro length.
-const POMO_MS: i64 = 25 * 60_000;
+/// Timer lengths in minutes, from the Focus Settings: (setting, default, minimum, maximum).
+const POMO_SETTING: (&str, i64, i64, i64) = ("focus_pomo_minutes", 25, 5, 180);
+const SHORT_BREAK_SETTING: (&str, i64, i64, i64) = ("focus_short_break_minutes", 5, 1, 60);
+const LONG_BREAK_SETTING: (&str, i64, i64, i64) = ("focus_long_break_minutes", 15, 1, 90);
 /// Shorter sessions are not recorded.
 const MIN_RECORDED_MS: i64 = 60_000;
 
@@ -27,6 +29,8 @@ fn now_ms() -> i64 {
 struct Running {
     timer: FocusTimer,
     task: Option<(Id, String)>,
+    /// A break after a finished Pomodoro; breaks are not recorded.
+    on_break: Option<BreakKind>,
     _ticker: GpuiTask<()>,
 }
 
@@ -50,6 +54,9 @@ pub struct FocusView {
 enum RecordMenu {
     Add,
     More,
+    /// The Pomodoro header's "…" and its Focus Settings.
+    HeaderMore,
+    Settings,
 }
 
 impl FocusView {
@@ -80,8 +87,25 @@ impl FocusView {
         cx.notify();
     }
 
+    fn minutes(&self, (key, default, min, max): (&str, i64, i64, i64)) -> i64 {
+        self.store.setting(key).ok().flatten().and_then(|v| v.parse().ok()).unwrap_or(default).clamp(min, max)
+    }
+
+    fn set_minutes(&mut self, (key, default, min, max): (&str, i64, i64, i64), delta: i64, cx: &mut Context<Self>) {
+        let value = (self.minutes((key, default, min, max)) + delta).clamp(min, max);
+        if let Err(err) = self.store.set_setting(key, &value.to_string()) {
+            eprintln!("failed to save the focus setting: {err:#}");
+        }
+        cx.notify();
+    }
+
     fn start(&mut self, task: Option<(Id, String)>, cx: &mut Context<Self>) {
         self.finish(cx);
+        let length = self.minutes(POMO_SETTING) * 60_000;
+        self.start_timer(task, None, length, cx);
+    }
+
+    fn start_timer(&mut self, task: Option<(Id, String)>, on_break: Option<BreakKind>, length_ms: i64, cx: &mut Context<Self>) {
         let ticker = cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(Duration::from_secs(1)).await;
@@ -90,13 +114,24 @@ impl FocusView {
                 }
             }
         });
-        self.running = Some(Running { timer: FocusTimer::start(now_ms(), POMO_MS), task, _ticker: ticker });
+        self.running = Some(Running { timer: FocusTimer::start(now_ms(), length_ms), task, on_break, _ticker: ticker });
         cx.notify();
     }
 
+    /// A finished Pomodoro is recorded and followed by a break, as in the original; a finished
+    /// break just ends.
     fn tick(&mut self, cx: &mut Context<Self>) {
         if self.running.as_ref().is_some_and(|r| r.timer.finished(now_ms())) {
+            let was_focus = self.running.as_ref().is_some_and(|r| r.on_break.is_none());
             self.finish(cx);
+            if was_focus {
+                let today = Local::now().date_naive();
+                let pomos = self.sessions.iter().filter(|s| s.start_local().date_naive() == today).count();
+                let kind = break_after(pomos);
+                let setting = if kind == BreakKind::Long { LONG_BREAK_SETTING } else { SHORT_BREAK_SETTING };
+                let length = self.minutes(setting) * 60_000;
+                self.start_timer(None, Some(kind), length, cx);
+            }
         }
         cx.notify();
     }
@@ -114,7 +149,7 @@ impl FocusView {
         let Some(running) = self.running.take() else { return };
         let now = now_ms();
         let elapsed = running.timer.elapsed(now);
-        if elapsed >= MIN_RECORDED_MS {
+        if running.on_break.is_none() && elapsed >= MIN_RECORDED_MS {
             let strings = i18n::t(cx);
             let (task_id, title) = running.task.map_or((None, strings.focus.to_owned()), |(id, t)| (Some(id), t));
             let start = running.timer.started_at;
@@ -186,6 +221,44 @@ impl FocusView {
         let theme = cx.theme().clone();
         let close = cx.listener(|this, _, _, cx| this.set_record_menu(None, cx));
         match menu {
+            RecordMenu::HeaderMore => popover(cx)
+                .w(px(200.))
+                .on_mouse_down_out(close)
+                .child(
+                    ListItem::new("focus-settings")
+                        .start_slot(Icon::new(IconName::Settings).color(Color::Muted))
+                        .child(Label::new(strings.focus_settings))
+                        .on_click(cx.listener(|this, _, _, cx| this.set_record_menu(Some(RecordMenu::Settings), cx))),
+                )
+                .into_any_element(),
+            RecordMenu::Settings => {
+                let row = |id: &'static str, label: &'static str, setting: (&'static str, i64, i64, i64), cx: &mut Context<Self>| {
+                    h_flex()
+                        .gap_2()
+                        .child(div().flex_1().child(Label::new(label).size(LabelSize::Small)))
+                        .child(
+                            IconButton::new(SharedString::from(format!("{id}-less")), IconName::Minus)
+                                .on_click(cx.listener(move |this, _, _, cx| this.set_minutes(setting, -5, cx))),
+                        )
+                        .child(div().min_w(px(28.)).flex().justify_center().child(Label::new(self.minutes(setting).to_string())))
+                        .child(
+                            IconButton::new(SharedString::from(format!("{id}-more")), IconName::Plus)
+                                .on_click(cx.listener(move |this, _, _, cx| this.set_minutes(setting, 5, cx))),
+                        )
+                        .child(Label::new(strings.minutes).size(LabelSize::XSmall).color(Color::Muted))
+                };
+                popover(cx)
+                    .w(px(340.))
+                    .p_3()
+                    .gap_2()
+                    .on_mouse_down_out(close)
+                    .child(Label::new(strings.focus_settings).weight(FontWeight::SEMIBOLD))
+                    .child(Label::new(strings.focus_timer_option).size(LabelSize::Small).color(Color::Muted))
+                    .child(row("pomo", strings.focus_pomo_duration, POMO_SETTING, cx))
+                    .child(row("short-break", strings.focus_short_break, SHORT_BREAK_SETTING, cx))
+                    .child(row("long-break", strings.focus_long_break, LONG_BREAK_SETTING, cx))
+                    .into_any_element()
+            }
             RecordMenu::More => popover(cx)
                 .w(px(240.))
                 .on_mouse_down_out(close)
@@ -253,6 +326,7 @@ impl FocusView {
     pub fn dev_menu(&mut self, menu: &str, cx: &mut Context<Self>) {
         let menu = match menu {
             "add" => RecordMenu::Add,
+            "settings" => RecordMenu::Settings,
             _ => RecordMenu::More,
         };
         self.set_record_menu(Some(menu), cx);
@@ -395,11 +469,15 @@ impl Render for FocusView {
         let (clock, label, running, paused) = match &self.running {
             Some(r) => (
                 format_clock(r.timer.remaining(now)),
-                r.task.as_ref().map_or(SharedString::new_static(strings.focus), |(_, t)| t.clone().into()),
+                match r.on_break {
+                    Some(BreakKind::Short) => SharedString::new_static(strings.focus_short_break),
+                    Some(BreakKind::Long) => SharedString::new_static(strings.focus_long_break),
+                    None => r.task.as_ref().map_or(SharedString::new_static(strings.focus), |(_, t)| t.clone().into()),
+                },
                 true,
                 r.timer.is_paused(),
             ),
-            None => (format_clock(POMO_MS), SharedString::new_static(strings.focus), false, false),
+            None => (format_clock(self.minutes(POMO_SETTING) * 60_000), SharedString::new_static(strings.focus), false, false),
         };
 
         let left = v_flex()
@@ -414,7 +492,18 @@ impl Render for FocusView {
                     .flex_none()
                     .px(px(22.))
                     .gap_2()
-                    .child(div().flex_1().child(Label::new(strings.pomodoro).size(LabelSize::Large).weight(FontWeight::BOLD))),
+                    .child(div().flex_1().child(Label::new(strings.pomodoro).size(LabelSize::Large).weight(FontWeight::BOLD)))
+                    .child(
+                        div()
+                            .relative()
+                            .child(IconButton::new("pomo-more", IconName::Ellipsis).on_click(cx.listener(|this, _, _, cx| {
+                                this.set_record_menu(Some(RecordMenu::HeaderMore), cx)
+                            })))
+                            .when_some(
+                                self.record_menu.filter(|m| matches!(m, RecordMenu::HeaderMore | RecordMenu::Settings)),
+                                |el, menu| el.child(PopoverAttachment::new(Placement::BelowRight, self.render_record_menu(menu, cx))),
+                            ),
+                    ),
             )
             .child(
                 v_flex()

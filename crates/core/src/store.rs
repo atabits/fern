@@ -311,12 +311,45 @@ impl Store {
     fn init(conn: Connection) -> Result<Self> {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", true)?;
+        Self::migrate(&conn)?;
+        Ok(Self { conn })
+    }
+
+    fn migrate(conn: &Connection) -> Result<()> {
         let version: usize = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        anyhow::ensure!(version <= MIGRATIONS.len(), "the data comes from a newer version of Fern");
         for (i, sql) in MIGRATIONS.iter().enumerate().skip(version) {
             conn.execute_batch(sql)?;
             conn.pragma_update(None, "user_version", i + 1)?;
         }
-        Ok(Self { conn })
+        Ok(())
+    }
+
+    /// Whether `path` is a Fern backup this version can restore.
+    pub fn check_backup(path: &std::path::Path) -> Result<()> {
+        let backup = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let is_fern: bool = backup
+            .query_row("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'tasks'", [], |_| Ok(true))
+            .optional()?
+            .unwrap_or(false);
+        anyhow::ensure!(is_fern, "not a Fern backup");
+        let version: usize = backup.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        anyhow::ensure!(version <= MIGRATIONS.len(), "the backup comes from a newer version of Fern");
+        Ok(())
+    }
+
+    /// "Generate Backup": a copy of all data in one SQLite file at `path`.
+    pub fn backup_to(&self, path: &std::path::Path) -> Result<()> {
+        self.conn.backup(rusqlite::MAIN_DB, path, None)?;
+        Ok(())
+    }
+
+    /// "Import Backups": replaces all data with a backup made by `backup_to`, bringing an older
+    /// backup up to date. A file that is not a Fern backup is refused and nothing changes.
+    pub fn restore_from(&mut self, path: &std::path::Path) -> Result<()> {
+        Self::check_backup(path)?;
+        self.conn.restore(rusqlite::MAIN_DB, path, None::<fn(rusqlite::backup::Progress)>)?;
+        Self::migrate(&self.conn)
     }
 
     /// All tasks: open ones first (newest on top), then completed ones (most recent on top).
@@ -2381,6 +2414,31 @@ mod tests {
         assert_eq!(store.step_checkin(water.id, day)?, 6);
         store.set_checkin_amount(water.id, day, 0)?;
         assert_eq!(store.step_checkin(water.id, day)?, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn backup_and_restore() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("fern-backup-test-{}", Uuid::now_v7()));
+        std::fs::create_dir_all(&dir)?;
+        let file = dir.join("backup.db");
+
+        let store = Store::open_in_memory()?;
+        store.add_task("kept in the backup")?;
+        store.backup_to(&file)?;
+
+        let mut other = Store::open_in_memory()?;
+        other.add_task("replaced")?;
+        other.restore_from(&file)?;
+        let titles: Vec<String> = other.tasks()?.into_iter().map(|t| t.title).collect();
+        assert_eq!(titles, ["kept in the backup"]);
+
+        // Something that is not a backup changes nothing.
+        let junk = dir.join("junk.db");
+        Connection::open(&junk)?.execute_batch("CREATE TABLE notes (x TEXT);")?;
+        assert!(other.restore_from(&junk).is_err());
+        assert_eq!(other.tasks()?.len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
         Ok(())
     }
 

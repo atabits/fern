@@ -522,6 +522,10 @@ pub struct Strings {
     pub durations: [&'static str; 10],
     pub default_list_hint: &'static str,
     pub about_tagline: &'static str,
+    pub backup_restore: &'static str,
+    pub generate_backup: &'static str,
+    pub import_backups: &'static str,
+    pub restore_on_restart: &'static str,
     pub version: &'static str,
     pub license: &'static str,
 }
@@ -955,6 +959,10 @@ pub static EN: Strings = Strings {
     durations: ["10 mins", "15 mins", "30 mins", "45 mins", "1 hour", "1 hour 30 mins", "2 hours", "2 hours 30 mins", "3 hours", "1 day"],
     default_list_hint: "Where new tasks go when added outside a list, such as in Today or a tag.",
     about_tagline: "A self-hosted task tracker.",
+    backup_restore: "Backup & Restore",
+    generate_backup: "Generate Backup",
+    import_backups: "Import Backups",
+    restore_on_restart: "The backup will replace all data the next time Fern starts.",
     version: "Version",
     license: "License",
 };
@@ -1389,6 +1397,10 @@ pub static RU: Strings = Strings {
     durations: ["10 мин", "15 мин", "30 мин", "45 мин", "1 час", "1 ч 30 мин", "2 часа", "2 ч 30 мин", "3 часа", "1 день"],
     default_list_hint: "Куда попадают новые задачи, добавленные не в списке — например, в «Сегодня» или в метке.",
     about_tagline: "Трекер задач на собственном сервере.",
+    backup_restore: "Резервная копия",
+    generate_backup: "Создать копию",
+    import_backups: "Восстановить из копии",
+    restore_on_restart: "Копия заменит все данные при следующем запуске Fern.",
     version: "Версия",
     license: "Лицензия",
 };

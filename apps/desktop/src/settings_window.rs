@@ -56,6 +56,8 @@ pub struct SettingsWindow {
     page: Page,
     menu: Option<Menu>,
     focus_handle: FocusHandle,
+    /// The outcome of the last backup or import.
+    backup_message: Option<String>,
 }
 
 impl EventEmitter<SettingsEvent> for SettingsWindow {}
@@ -87,7 +89,7 @@ pub fn apply(preferences: &Preferences, window: &Window, cx: &mut App) {
 impl SettingsWindow {
     pub fn new(store: Rc<Store>, cx: &mut Context<Self>) -> Self {
         let preferences = store.preferences().unwrap_or_default();
-        Self { store, preferences, page: Page::default(), menu: None, focus_handle: cx.focus_handle() }
+        Self { store, preferences, page: Page::default(), menu: None, focus_handle: cx.focus_handle(), backup_message: None }
     }
 
     pub fn set_page(&mut self, page: Page, cx: &mut Context<Self>) {
@@ -108,6 +110,47 @@ impl SettingsWindow {
             eprintln!("failed to save the settings: {err:#}");
         }
         apply(&self.preferences, window, cx);
+    }
+
+    /// "Generate Backup": all data in one file, saved where the user chooses.
+    fn generate_backup(&mut self, cx: &mut Context<Self>) {
+        let temp = std::env::temp_dir().join(format!("fern-backup-{}.db", std::process::id()));
+        let contents = self.store.backup_to(&temp).and_then(|()| Ok(std::fs::read(&temp)?));
+        std::fs::remove_file(&temp).ok();
+        match contents {
+            Ok(bytes) => {
+                let name = format!("fern-backup-{}.db", chrono::Local::now().format("%Y-%m-%d"));
+                crate::export::save_as(name, bytes, cx, |this, result, cx| {
+                    this.backup_message = crate::export::outcome(result, i18n::t(cx));
+                    cx.notify();
+                });
+            }
+            Err(err) => self.backup_message = Some(err.to_string()),
+        }
+        cx.notify();
+    }
+
+    /// "Import Backups": a backup is checked now and restored on the next start.
+    fn import_backup(&mut self, cx: &mut Context<Self>) {
+        let chosen = cx.prompt_for_paths(gpui::PathPromptOptions { files: true, directories: false, multiple: false, prompt: None });
+        cx.spawn(async move |this, cx| {
+            let Some(path) = chosen.await.ok().and_then(Result::ok).flatten().and_then(|paths| paths.into_iter().next()) else {
+                return;
+            };
+            let outcome = fern_core::Store::check_backup(&path)
+                .and_then(|()| Ok(std::fs::copy(&path, crate::pending_restore_path()?)?))
+                .map(|_| ());
+            this.update(cx, |this, cx| {
+                let strings = i18n::t(cx);
+                this.backup_message = Some(match outcome {
+                    Ok(()) => strings.restore_on_restart.to_owned(),
+                    Err(err) => format!("{err}"),
+                });
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn set_locale(&mut self, locale: Locale, cx: &mut Context<Self>) {
@@ -721,6 +764,36 @@ impl SettingsWindow {
                     group()
                         .child(row(strings.version, env!("CARGO_PKG_VERSION")))
                         .child(row(strings.license, "AGPL-3.0-or-later")),
+                )
+                .child(
+                    v_flex()
+                        .child(title(strings.backup_restore))
+                        .child(
+                            group().child(
+                                h_flex()
+                                    .h(px(36.))
+                                    .px_4()
+                                    .gap_4()
+                                    .child(div().flex_1().child(Label::new(strings.backup_restore)))
+                                    .child(
+                                        div()
+                                            .id("generate-backup")
+                                            .cursor_pointer()
+                                            .child(Label::new(strings.generate_backup).color(Color::Accent))
+                                            .on_click(cx.listener(|this, _, _, cx| this.generate_backup(cx))),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("import-backup")
+                                            .cursor_pointer()
+                                            .child(Label::new(strings.import_backups).color(Color::Accent))
+                                            .on_click(cx.listener(|this, _, _, cx| this.import_backup(cx))),
+                                    ),
+                            ),
+                        )
+                        .children(self.backup_message.clone().map(|message| {
+                            div().pt_1p5().px_1().text_size(px(11.)).text_color(colors.text_muted).child(message)
+                        })),
                 )
                 .into_any_element()
             }

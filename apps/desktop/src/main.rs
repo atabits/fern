@@ -38,12 +38,29 @@ use assets::Assets;
 use crate::i18n::{CurrentLocale, Locale};
 
 
+/// Where Fern keeps its data.
+pub fn data_dir() -> Result<std::path::PathBuf> {
+    Ok(dirs::data_dir().context("cannot determine the user data directory")?.join("fern-tasks"))
+}
+
+/// A backup chosen with "Import Backups", restored on the next start before anything opens.
+pub fn pending_restore_path() -> Result<std::path::PathBuf> {
+    Ok(data_dir()?.join("restore.db"))
+}
+
 fn open_store() -> Result<Store> {
-    let dir = dirs::data_dir()
-        .context("cannot determine the user data directory")?
-        .join("fern-tasks");
+    let dir = data_dir()?;
     std::fs::create_dir_all(&dir).with_context(|| format!("cannot create {}", dir.display()))?;
-    Store::open(dir.join("tasks.db"))
+    let mut store = Store::open(dir.join("tasks.db"))?;
+    let pending = pending_restore_path()?;
+    if pending.exists() {
+        match store.restore_from(&pending) {
+            Ok(()) => eprintln!("restored the backup"),
+            Err(err) => eprintln!("failed to restore the backup: {err:#}"),
+        }
+        std::fs::remove_file(&pending).ok();
+    }
+    Ok(store)
 }
 
 fn main() -> Result<()> {

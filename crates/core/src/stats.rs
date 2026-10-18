@@ -155,6 +155,53 @@ pub fn more_productive_than(tasks: &[Task], today: NaiveDate) -> u32 {
     (fewer * 100 / days as usize) as u32
 }
 
+/// The Task tab's "Completion Rate Distribution": how the period's tasks ended.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CompletionKinds {
+    /// Completed after the due date.
+    pub overdue: usize,
+    /// Completed by the due date.
+    pub on_time: usize,
+    /// Completed without a due date.
+    pub undated: usize,
+    /// Due in the period and still open.
+    pub uncompleted: usize,
+}
+
+impl CompletionKinds {
+    pub fn total(&self) -> usize {
+        self.overdue + self.on_time + self.undated + self.uncompleted
+    }
+}
+
+pub fn completion_kinds(tasks: &[Task], first: NaiveDate, last: NaiveDate) -> CompletionKinds {
+    let mut kinds = CompletionKinds::default();
+    for task in tasks.iter().filter(|t| !t.is_deleted() && !t.is_wont_do()) {
+        match (completed_on(task), task.due_date) {
+            (Some(day), _) if day < first || day > last => {}
+            (Some(_), None) => kinds.undated += 1,
+            (Some(day), Some(due)) if day <= due => kinds.on_time += 1,
+            (Some(_), Some(_)) => kinds.overdue += 1,
+            (None, Some(due)) if !task.is_completed() && due >= first && due <= last => kinds.uncompleted += 1,
+            (None, _) => {}
+        }
+    }
+    kinds
+}
+
+/// Tasks completed between `first` and `last` per list (`None` is the inbox), most first.
+pub fn completed_by_list_in(tasks: &[Task], first: NaiveDate, last: NaiveDate) -> Vec<(Option<Id>, usize)> {
+    let mut counts: Vec<(Option<Id>, usize)> = Vec::new();
+    for task in tasks.iter().filter(|t| !t.is_deleted() && completed_on(t).is_some_and(|d| d >= first && d <= last)) {
+        match counts.iter_mut().find(|(list, _)| *list == task.list_id) {
+            Some((_, n)) => *n += 1,
+            None => counts.push((task.list_id, 1)),
+        }
+    }
+    counts.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+    counts
+}
+
 /// Points for "My Achievement Score". The original does not publish its rules, so Fern uses its
 /// own: a completed task is worth 2 points and 1 more when finished by its due date, a focus
 /// session 2 points and a habit check-in 1.
@@ -280,5 +327,27 @@ mod tests {
         assert_eq!(completion_rate_in(&tasks, &this_week), [50]);
         // Only today so far: nothing to compare with.
         assert_eq!(more_productive_than(&tasks, today), 0);
+    }
+
+    #[test]
+    fn completion_kinds_of_a_period() {
+        let store = Store::open_in_memory().unwrap();
+        let today = Local::now().date_naive();
+        let on_time = store.add_task("on time").unwrap();
+        store.set_due(on_time.id, Some(today), None).unwrap();
+        store.set_completed(on_time.id, true).unwrap();
+        let late = store.add_task("late").unwrap();
+        store.set_due(late.id, Some(yesterday(today)), None).unwrap();
+        store.set_completed(late.id, true).unwrap();
+        let undated = store.add_task("undated").unwrap();
+        store.set_completed(undated.id, true).unwrap();
+        let open = store.add_task("open").unwrap();
+        store.set_due(open.id, Some(today), None).unwrap();
+        let tasks = store.tasks().unwrap();
+
+        let kinds = completion_kinds(&tasks, today, today);
+        assert_eq!(kinds, CompletionKinds { overdue: 1, on_time: 1, undated: 1, uncompleted: 1 });
+        assert_eq!(kinds.total(), 4);
+        assert_eq!(completed_by_list_in(&tasks, today, today), [(None, 3)]);
     }
 }

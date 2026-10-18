@@ -68,6 +68,9 @@ struct StatsPage {
     curves: [Bucket; 4],
     /// The curve whose period menu is open.
     curve_menu: Option<usize>,
+    /// The Task tab's Daily / Weekly / Monthly report, and whether its menu is open.
+    task_period: Bucket,
+    task_menu: bool,
 }
 
 /// Bars for the statistics charts, with a label under each; `highlight` marks one bar.
@@ -479,6 +482,8 @@ impl FocusView {
             year: today.year(),
             curves: [Bucket::Day; 4],
             curve_menu: None,
+            task_period: Bucket::Day,
+            task_menu: false,
         });
         cx.notify();
     }
@@ -706,7 +711,7 @@ impl FocusView {
             )
             .map(|el| match page.tab {
                 0 => el.children(self.render_overview_tab(page, today, cx)),
-                1 => el.children(self.render_task_tab(page.day, today, cx)),
+                1 => el.children(self.render_task_tab(page, today, cx)),
                 _ => el
                     .child(overview)
                     .child(h_flex().items_start().gap_4().child(trends).child(most_focused))
@@ -939,15 +944,28 @@ impl FocusView {
     }
 
     /// The Statistics page's Task tab: a day's completed tasks and rate, and completion per list.
-    fn render_task_tab(&self, day: NaiveDate, today: NaiveDate, cx: &mut Context<Self>) -> Vec<AnyElement> {
+    /// The Statistics page's Task tab: the original's Daily / Weekly / Monthly report of a period:
+    /// completed tasks and rate with the change from the previous period, the completion per day,
+    /// how the tasks ended, and completion per list.
+    fn render_task_tab(&self, page: StatsPage, today: NaiveDate, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let strings = i18n::t(cx);
         let theme = cx.theme().clone();
         let tasks = self.store.tasks().unwrap_or_default();
         let lists = self.store.lists().unwrap_or_default();
-        let yesterday = fern_core::stats::yesterday(day);
-        let count = |d: NaiveDate| fern_core::stats::completed_by_day(&tasks, d, 1)[0] as i64;
-        let rate = |d: NaiveDate| fern_core::stats::completion_rate(&tasks, d).unwrap_or(0) as i64;
+        let week_start = crate::calendar::week_start();
+        let period = page.task_period;
+        // The period containing a day, and the one before it.
+        let range = |day: NaiveDate| stats::buckets(period, day, week_start, 1)[0];
+        let (first, last) = range(page.day);
+        let (prev_first, prev_last) = range(first - chrono::Duration::days(1));
+        let count = |a: NaiveDate, b: NaiveDate| stats::completed_in(&tasks, &[(a, b)])[0] as i64;
+        let rate = |a: NaiveDate, b: NaiveDate| stats::completion_rate_in(&tasks, &[(a, b)])[0] as i64;
         let signed = |n: i64, unit: &str| if n > 0 { format!("+{n}{unit}") } else { format!("{n}{unit}") };
+        let from = match period {
+            Bucket::Day => strings.stats_from_yesterday,
+            Bucket::Week => strings.stats_from_last_week,
+            Bucket::Month => strings.stats_from_last_month,
+        };
         let card = || v_flex().min_w_0().p_4().gap_2().rounded(px(10.)).bg(theme.colors().surface_background);
         let value = |v: String, label: &'static str, change: String| {
             v_flex()
@@ -955,47 +973,177 @@ impl FocusView {
                 .items_center()
                 .child(div().text_size(px(26.)).text_color(theme.colors().accent).child(v))
                 .child(Label::new(label).size(LabelSize::XSmall).color(Color::Muted))
-                .child(Label::new(strings.stats_from_yesterday.replace("{n}", &change)).size(LabelSize::XSmall).color(Color::Muted))
+                .child(Label::new(from.replace("{n}", &change)).size(LabelSize::XSmall).color(Color::Muted))
         };
-        let day_label = if day == today { strings.today.to_owned() } else { crate::task_rows::short_date(day, strings) };
-        let by_list = fern_core::stats::completed_by_list(&tasks, day);
+        let current = range(today) == (first, last);
+        let period_label = match period {
+            Bucket::Day if current => strings.today.to_owned(),
+            Bucket::Week if current => strings.stats_this_week.to_owned(),
+            Bucket::Month if current => strings.stats_this_month.to_owned(),
+            Bucket::Day => crate::task_rows::short_date(first, strings),
+            Bucket::Week => format!("{} - {}", crate::task_rows::short_date(first, strings), crate::task_rows::short_date(last, strings)),
+            Bucket::Month => format!("{} {}", strings.months_short[first.month0() as usize], first.year()),
+        };
+        let names = [strings.stats_daily, strings.stats_weekly, strings.stats_monthly];
+        let index = Bucket::ALL.iter().position(|b| *b == period).unwrap_or(0);
+        let menu = page.task_menu.then(|| {
+            PopoverAttachment::new(
+                Placement::BelowLeft,
+                popover(cx)
+                    .w(px(140.))
+                    .on_mouse_down_out(cx.listener(|this, _, _, cx| this.update_stats(cx, |p| p.task_menu = false)))
+                    .children(Bucket::ALL.into_iter().zip(names).enumerate().map(|(i, (choice, name))| {
+                        ListItem::new(SharedString::from(format!("task-period-{i}")))
+                            .child(Label::new(name).color(if choice == period { Color::Accent } else { Color::Default }))
+                            .when(choice == period, |item| item.end_slot(Icon::new(IconName::Check).size(IconSize::Small).color(Color::Accent)))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.update_stats(cx, |p| {
+                                    p.task_period = choice;
+                                    p.task_menu = false;
+                                })
+                            }))
+                    })),
+            )
+        });
+        let step = move |day: NaiveDate, forward: bool| -> NaiveDate {
+            let (first, last) = stats::buckets(period, day, week_start, 1)[0];
+            if forward { last + chrono::Duration::days(1) } else { first - chrono::Duration::days(1) }
+        };
+
+        let by_list = stats::completed_by_list_in(&tasks, first, last);
         let most = by_list.first().map_or(1, |(_, n)| *n).max(1) as f32;
-        vec![
-            h_flex()
-                .gap_1()
-                .child(IconButton::new("task-day-back", IconName::ChevronLeft).on_click(cx.listener(|this, _, _, cx| {
-                    this.update_stats(cx, |p| p.day -= chrono::Duration::days(1))
-                })))
-                .child(Label::new(day_label).size(LabelSize::Small))
-                .child(IconButton::new("task-day-forward", IconName::ChevronRight).on_click(cx.listener(|this, _, _, cx| {
-                    this.update_stats(cx, |p| p.day += chrono::Duration::days(1))
-                })))
-                .into_any_element(),
-            card()
-                .child(Label::new(strings.focus_overview).weight(FontWeight::SEMIBOLD))
-                .child(
-                    h_flex()
-                        .child(value(count(day).to_string(), strings.stats_completed_tasks, signed(count(day) - count(yesterday), "")))
-                        .child(value(format!("{}%", rate(day)), strings.stats_completion_rate, signed(rate(day) - rate(yesterday), "%"))),
+        let kinds = stats::completion_kinds(&tasks, first, last);
+        let status = theme.status().clone();
+        let kind_rows = [
+            (status.error, kinds.overdue, strings.stats_overdue),
+            (theme.colors().accent, kinds.on_time, strings.stats_on_time),
+            (status.warning, kinds.undated, strings.stats_undated),
+            (theme.colors().text_muted, kinds.uncompleted, strings.stats_uncompleted),
+        ];
+        let total = kinds.total().max(1) as f32;
+        let rate_card = card()
+            .flex_1()
+            .child(Label::new(strings.stats_rate_distribution).weight(FontWeight::SEMIBOLD))
+            .when(kinds.total() == 0, |el| el.child(Label::new(strings.stats_no_data).color(Color::Muted)))
+            .when(kinds.total() > 0, |el| {
+                el.child(
+                    h_flex().h(px(12.)).w_full().rounded(px(6.)).overflow_hidden().children(
+                        kind_rows.iter().filter(|(_, n, _)| *n > 0).map(|(color, n, _)| div().h_full().w(gpui::relative(*n as f32 / total)).bg(*color)),
+                    ),
                 )
-                .into_any_element(),
-            card()
-                .child(Label::new(strings.stats_by_list).weight(FontWeight::SEMIBOLD))
-                .when(by_list.is_empty(), |el| el.child(Label::new(strings.stats_no_data).color(Color::Muted)))
-                .children(by_list.into_iter().map(|(list, n)| {
-                    let name: SharedString = list
-                        .and_then(|id| lists.iter().find(|l| l.id == id))
-                        .map_or(strings.inbox.into(), |l| l.name.clone().into());
+                .children(kind_rows.iter().map(|(color, n, label)| {
                     h_flex()
                         .gap_2()
-                        .child(div().w(px(140.)).child(Label::new(name).size(LabelSize::Small).truncate()))
-                        .child(
-                            div().flex_1().h(px(10.)).rounded(px(5.)).bg(theme.colors().element_hover).child(
-                                div().h_full().w(gpui::relative(n as f32 / most)).rounded(px(5.)).bg(theme.colors().accent),
-                            ),
-                        )
+                        .child(div().size(px(8.)).rounded_full().bg(*color))
                         .child(Label::new(n.to_string()).size(LabelSize::Small))
+                        .child(Label::new(*label).size(LabelSize::Small).color(Color::Muted))
                 }))
+            });
+        // Weekly and Monthly add the completion per day, as in the original.
+        let distribution = (period != Bucket::Day).then(|| {
+            let days = (last - first).num_days() as usize + 1;
+            let values: Vec<i64> = stats::completed_by_day(&tasks, first, days).into_iter().map(|n| n as i64).collect();
+            let labels: Vec<String> = (0..days)
+                .map(|i| {
+                    let day = first + chrono::Duration::days(i as i64);
+                    match period {
+                        Bucket::Week => strings.weekdays_short[day.weekday().num_days_from_monday() as usize].to_owned(),
+                        // A label every fifth day keeps a month readable.
+                        _ if i % 5 == 0 => day.day().to_string(),
+                        _ => String::new(),
+                    }
+                })
+                .collect();
+            card()
+                .flex_1()
+                .child(Label::new(strings.stats_completion_distribution).weight(FontWeight::SEMIBOLD))
+                .child(bar_chart(&values, labels, None, 120., cx))
+        });
+
+        // Daily shows how tasks ended beside the overview; Weekly and Monthly put the completion
+        // per day there and move it below.
+        let (top_right, lower_rate) = match distribution {
+            Some(distribution) => (distribution, Some(rate_card)),
+            None => (rate_card, None),
+        };
+        vec![
+            h_flex()
+                .gap_2()
+                .child(
+                    h_flex()
+                        .id("task-period")
+                        .relative()
+                        .px_3()
+                        .h(px(28.))
+                        .gap_1()
+                        .rounded(px(8.))
+                        .bg(theme.colors().surface_background)
+                        .cursor_pointer()
+                        .child(Label::new(names[index]).size(LabelSize::Small))
+                        .child(Icon::new(IconName::ChevronDown).size(IconSize::XSmall).color(Color::Muted))
+                        .on_click(cx.listener(|this, _, _, cx| this.update_stats(cx, |p| p.task_menu = !p.task_menu)))
+                        .children(menu),
+                )
+                .child(
+                    h_flex()
+                        .h(px(28.))
+                        .px_1()
+                        .gap_1()
+                        .rounded(px(8.))
+                        .bg(theme.colors().surface_background)
+                        .child(IconButton::new("task-day-back", IconName::ChevronLeft).on_click(cx.listener(move |this, _, _, cx| {
+                            this.update_stats(cx, |p| p.day = step(p.day, false))
+                        })))
+                        .child(div().min_w(px(90.)).flex().justify_center().child(Label::new(period_label).size(LabelSize::Small)))
+                        .child(IconButton::new("task-day-forward", IconName::ChevronRight).on_click(cx.listener(move |this, _, _, cx| {
+                            this.update_stats(cx, |p| p.day = step(p.day, true))
+                        }))),
+                )
+                .into_any_element(),
+            h_flex()
+                .items_stretch()
+                .gap_4()
+                .child(
+                    card()
+                        .flex_1()
+                        .child(Label::new(strings.focus_overview).weight(FontWeight::SEMIBOLD))
+                        .child(
+                            h_flex()
+                                .py_4()
+                                .child(value(count(first, last).to_string(), strings.stats_completed_tasks, signed(count(first, last) - count(prev_first, prev_last), "")))
+                                .child(value(
+                                    format!("{}%", rate(first, last)),
+                                    strings.stats_completion_rate,
+                                    signed(rate(first, last) - rate(prev_first, prev_last), "%"),
+                                )),
+                        ),
+                )
+                .child(top_right)
+                .into_any_element(),
+            h_flex()
+                .items_start()
+                .gap_4()
+                .children(lower_rate)
+                .child(
+                    card()
+                        .flex_1()
+                        .child(Label::new(strings.stats_by_list).weight(FontWeight::SEMIBOLD))
+                        .when(by_list.is_empty(), |el| el.child(Label::new(strings.stats_no_data).color(Color::Muted)))
+                        .children(by_list.into_iter().map(|(list, n)| {
+                            let name: SharedString = list
+                                .and_then(|id| lists.iter().find(|l| l.id == id))
+                                .map_or(strings.inbox.into(), |l| l.name.clone().into());
+                            h_flex()
+                                .gap_2()
+                                .child(div().w(px(140.)).child(Label::new(name).size(LabelSize::Small).truncate()))
+                                .child(
+                                    div().flex_1().h(px(10.)).rounded(px(5.)).bg(theme.colors().element_hover).child(
+                                        div().h_full().w(gpui::relative(n as f32 / most)).rounded(px(5.)).bg(theme.colors().accent),
+                                    ),
+                                )
+                                .child(Label::new(n.to_string()).size(LabelSize::Small))
+                        })),
+                )
                 .into_any_element(),
         ]
     }
@@ -1017,6 +1165,14 @@ impl FocusView {
                     p.curves[0] = Bucket::Week;
                     p.curves[2] = Bucket::Month;
                     p.curve_menu = Some(1);
+                });
+                return;
+            }
+            "stats-task-week" => {
+                self.open_stats(cx);
+                self.update_stats(cx, |p| {
+                    p.tab = 1;
+                    p.task_period = Bucket::Week;
                 });
                 return;
             }

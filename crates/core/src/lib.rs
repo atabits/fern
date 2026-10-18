@@ -15,6 +15,7 @@ pub mod preferences;
 pub mod quick_add;
 pub mod recurrence;
 pub mod reminder;
+pub mod search;
 pub mod stats;
 pub mod store;
 pub mod summary;

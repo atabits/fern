@@ -3,10 +3,12 @@
 
 use std::rc::Rc;
 
-use chrono::Local;
-use fern_core::{Id, List, Store, Tag, Task, View};
+use chrono::{Datelike, Local, NaiveDate};
+use fern_core::search::{DateRange, TagRule, TaskFilter};
+use fern_core::{Id, List, Priority, Store, Tag, Task, View};
 use gpui::{Entity, EventEmitter, FocusHandle, Focusable, FontWeight, HighlightStyle, StyledText};
 use ui::prelude::*;
+use ui::{Placement, PopoverAttachment, popover};
 
 use crate::i18n;
 use crate::lists_panel;
@@ -24,6 +26,15 @@ enum Filter {
     Lists,
 }
 
+/// The Task filter's dropdowns, as the original's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Menu {
+    Lists,
+    Tags,
+    Date,
+    Priority,
+}
+
 pub enum SearchEvent {
     OpenTask(Id),
     OpenView(View),
@@ -38,6 +49,14 @@ pub struct SearchModal {
     tags: Vec<Tag>,
     lists: Vec<List>,
     all_lists: Vec<List>,
+    /// The Task filter's choices, the open dropdown, and the choices being made in it (applied
+    /// with OK, as the original's), with the Custom dates' fields.
+    task_filter: TaskFilter,
+    menu: Option<Menu>,
+    draft: TaskFilter,
+    custom_from: Entity<TextInput>,
+    custom_until: Entity<TextInput>,
+    custom_open: bool,
 }
 
 impl EventEmitter<SearchEvent> for SearchModal {}
@@ -56,7 +75,23 @@ impl SearchModal {
         cx.subscribe(&input, |_, _, _: &Cancelled, cx| cx.emit(SearchEvent::Dismissed)).detach();
         cx.subscribe(&input, |this, _, _: &Submitted, cx| this.open_first(cx)).detach();
         let all_lists = store.lists().unwrap_or_default();
-        Self { store, input, filter: Filter::All, tasks: Vec::new(), tags: Vec::new(), lists: Vec::new(), all_lists }
+        let custom_from = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.range_from, cx));
+        let custom_until = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.range_until, cx));
+        Self {
+            store,
+            input,
+            filter: Filter::All,
+            tasks: Vec::new(),
+            tags: Vec::new(),
+            lists: Vec::new(),
+            all_lists,
+            task_filter: TaskFilter::default(),
+            menu: None,
+            draft: TaskFilter::default(),
+            custom_from,
+            custom_until,
+            custom_open: false,
+        }
     }
 
     #[cfg(debug_assertions)]
@@ -74,6 +109,10 @@ impl SearchModal {
         let query = self.query(cx);
         let today = Local::now().date_naive();
         self.tasks = self.store.tasks_in(&View::Search(query.clone()), today).unwrap_or_default();
+        if self.filter == Filter::Tasks {
+            let week_start = crate::calendar::week_start();
+            self.tasks.retain(|task| self.task_filter.matches(task, today, week_start));
+        }
         let matches = |name: &str| !task_rows::match_ranges(name, &query).is_empty();
         self.tags = self.store.tags().unwrap_or_default().into_iter().filter(|t| matches(&t.name)).collect();
         self.lists = self.all_lists.iter().filter(|l| matches(&l.name)).cloned().collect();
@@ -82,7 +121,249 @@ impl SearchModal {
 
     fn set_filter(&mut self, filter: Filter, cx: &mut Context<Self>) {
         self.filter = filter;
+        self.menu = None;
+        self.task_filter = TaskFilter::default();
+        self.refresh(cx);
+    }
+
+    fn open_menu(&mut self, menu: Menu, cx: &mut Context<Self>) {
+        self.menu = if self.menu == Some(menu) { None } else { Some(menu) };
+        self.draft = self.task_filter.clone();
+        self.custom_open = false;
         cx.notify();
+    }
+
+    /// OK in a dropdown, or a Date choice: the choices apply.
+    fn apply(&mut self, cx: &mut Context<Self>) {
+        self.task_filter = self.draft.clone();
+        self.menu = None;
+        self.custom_open = false;
+        self.refresh(cx);
+    }
+
+    /// For the dev state: `search-filter=task[>lists|tags|date|priority]`.
+    #[cfg(debug_assertions)]
+    pub fn dev_filter(&mut self, spec: &str, cx: &mut Context<Self>) {
+        let (filter, menu) = spec.split_once('>').unwrap_or((spec, ""));
+        if filter == "task" {
+            self.set_filter(Filter::Tasks, cx);
+        }
+        match menu {
+            "lists" => self.open_menu(Menu::Lists, cx),
+            "tags" => self.open_menu(Menu::Tags, cx),
+            "date" => self.open_menu(Menu::Date, cx),
+            "priority" => self.open_menu(Menu::Priority, cx),
+            _ => {}
+        }
+    }
+
+    /// A Date choice's words: "This Week (Oct 12 - Oct 18)", as the original's.
+    fn range_label(range: DateRange, strings: &'static crate::i18n::Strings) -> String {
+        let today = Local::now().date_naive();
+        let short = |d: NaiveDate| {
+            let month = strings.months_short[d.month0() as usize];
+            if strings.day_before_month { format!("{} {month}", d.day()) } else { format!("{month} {}", d.day()) }
+        };
+        let name = match range {
+            DateRange::All => strings.all_option,
+            DateRange::ThisWeek => strings.this_week,
+            DateRange::NextWeek => strings.next_week_range,
+            DateRange::LastWeek => strings.last_week,
+            DateRange::ThisMonth => strings.this_month,
+            DateRange::LastMonth => strings.last_month,
+            DateRange::Custom(..) => strings.custom_range,
+        };
+        match (range, range.days(today, crate::calendar::week_start())) {
+            (DateRange::ThisWeek | DateRange::NextWeek | DateRange::LastWeek | DateRange::Custom(..), Some((from, until))) => {
+                format!("{name} ({} - {})", short(from), short(until))
+            }
+            _ => name.to_owned(),
+        }
+    }
+
+    /// The Task filter's dropdown under its chip: choices with ticks, and Cancel and OK for the
+    /// ones that take several (the original's Lists, Tag and Priority); Date applies on a click.
+    fn render_menu(&self, menu: Menu, cx: &mut Context<Self>) -> AnyElement {
+        let strings = i18n::t(cx);
+        let theme = cx.theme().clone();
+        let row = |id: SharedString, icon: Option<Icon>, label: SharedString, on: bool| {
+            ListItem::new(id)
+                .height(px(30.))
+                .when_some(icon, |item, icon| item.start_slot(icon.size(IconSize::Small).color(if on { Color::Accent } else { Color::Muted })))
+                .child(Label::new(label).size(LabelSize::Small).color(if on { Color::Accent } else { Color::Default }))
+                .when(on, |item| item.end_slot(Icon::new(IconName::Check).size(IconSize::Small).color(Color::Accent)))
+        };
+        // A multi-choice: "All" alone, or any of the others.
+        fn toggle<T: PartialEq + Clone>(choices: &mut Vec<T>, value: T) {
+            match choices.iter().position(|c| *c == value) {
+                Some(i) => {
+                    choices.remove(i);
+                }
+                None => choices.push(value),
+            }
+        }
+        let draft = &self.draft;
+        let mut items: Vec<AnyElement> = Vec::new();
+        let mut buttons = true;
+        match menu {
+            Menu::Lists => {
+                items.push(
+                    row("search-lists-all".into(), Some(Icon::new(IconName::Layers)), strings.all_lists.into(), draft.lists.is_empty())
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.draft.lists.clear();
+                            cx.notify();
+                        }))
+                        .into_any_element(),
+                );
+                let lists = std::iter::once((None, SharedString::new_static(strings.inbox), IconName::Inbox))
+                    .chain(self.all_lists.iter().filter(|l| !l.archived).map(|l| (Some(l.id), l.name.clone().into(), IconName::List)));
+                for (list, name, icon) in lists {
+                    items.push(
+                        row(SharedString::from(format!("search-list-{list:?}")), Some(Icon::new(icon)), name, draft.lists.contains(&list))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                toggle(&mut this.draft.lists, list);
+                                cx.notify();
+                            }))
+                            .into_any_element(),
+                    );
+                }
+            }
+            Menu::Tags => {
+                for (rule, label) in [(TagRule::All, strings.all_option), (TagRule::WithTags, strings.with_tags), (TagRule::NoTags, strings.no_tags)] {
+                    let on = draft.tags == rule;
+                    items.push(
+                        row(SharedString::from(format!("search-tags-{label}")), Some(Icon::new(IconName::Tag)), label.into(), on)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.draft.tags = rule.clone();
+                                cx.notify();
+                            }))
+                            .into_any_element(),
+                    );
+                }
+                for tag in self.store.tags().unwrap_or_default() {
+                    let name = tag.name.clone();
+                    let on = matches!(&draft.tags, TagRule::Any(tags) if tags.contains(&name));
+                    items.push(
+                        row(SharedString::from(format!("search-tag-{name}")), Some(Icon::new(IconName::Tag)), name.clone().into(), on)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                let mut tags = match &this.draft.tags {
+                                    TagRule::Any(tags) => tags.clone(),
+                                    _ => Vec::new(),
+                                };
+                                toggle(&mut tags, name.clone());
+                                this.draft.tags = if tags.is_empty() { TagRule::All } else { TagRule::Any(tags) };
+                                cx.notify();
+                            }))
+                            .into_any_element(),
+                    );
+                }
+            }
+            Menu::Priority => {
+                items.push(
+                    row("search-priority-all".into(), None, strings.all_option.into(), draft.priorities.is_empty())
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.draft.priorities.clear();
+                            cx.notify();
+                        }))
+                        .into_any_element(),
+                );
+                for (priority, label) in [
+                    (Priority::High, strings.priority_high),
+                    (Priority::Medium, strings.priority_medium),
+                    (Priority::Low, strings.priority_low),
+                    (Priority::None, strings.none_option),
+                ] {
+                    items.push(
+                        row(SharedString::from(format!("search-priority-{label}")), None, label.into(), draft.priorities.contains(&priority))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                toggle(&mut this.draft.priorities, priority);
+                                cx.notify();
+                            }))
+                            .into_any_element(),
+                    );
+                }
+            }
+            Menu::Date => {
+                buttons = self.custom_open;
+                let current = self.task_filter.date;
+                for range in [DateRange::All, DateRange::ThisWeek, DateRange::NextWeek, DateRange::LastWeek, DateRange::ThisMonth, DateRange::LastMonth] {
+                    items.push(
+                        row(SharedString::from(format!("search-date-{range:?}")), None, Self::range_label(range, strings).into(), current == range)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.draft.date = range;
+                                this.apply(cx);
+                            }))
+                            .into_any_element(),
+                    );
+                }
+                let custom = matches!(current, DateRange::Custom(..));
+                items.push(
+                    row("search-date-custom".into(), None, Self::range_label(current, strings).replace(strings.all_option, strings.custom_range).into(), custom)
+                        .when(!custom, |item| item.child(div()))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.custom_open = true;
+                            cx.notify();
+                        }))
+                        .into_any_element(),
+                );
+                if self.custom_open {
+                    let field = |input: Entity<TextInput>| h_flex().h(px(28.)).px_2().rounded(px(6.)).bg(theme.colors().element_hover).child(input);
+                    items.push(
+                        v_flex()
+                            .px_2()
+                            .gap_1()
+                            .child(field(self.custom_from.clone()))
+                            .child(field(self.custom_until.clone()))
+                            .into_any_element(),
+                    );
+                }
+            }
+        }
+        let button = |id: &'static str, label: &'static str, primary: bool| {
+            div()
+                .id(id)
+                .flex_1()
+                .h(px(26.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(6.))
+                .cursor_pointer()
+                .when(primary, |el| el.bg(theme.colors().accent).child(Label::new(label).size(LabelSize::Small).color(Color::Custom(gpui::white()))))
+                .when(!primary, |el| el.border_1().border_color(theme.colors().border).child(Label::new(label).size(LabelSize::Small)))
+        };
+        popover(cx)
+            .w(px(if menu == Menu::Date { 250. } else { 210. }))
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.menu = None;
+                cx.notify();
+            }))
+            .child(v_flex().id("search-menu-items").max_h(px(260.)).overflow_y_scroll().children(items))
+            .when(buttons, |el| {
+                el.child(
+                    h_flex()
+                        .pt_2()
+                        .gap_2()
+                        .child(button("search-menu-cancel", strings.cancel, false).on_click(cx.listener(|this, _, _, cx| {
+                            this.menu = None;
+                            this.custom_open = false;
+                            cx.notify();
+                        })))
+                        .child(button("search-menu-ok", strings.ok, true).on_click(cx.listener(|this, _, _, cx| {
+                            if this.menu == Some(Menu::Date) {
+                                let strings = i18n::t(cx);
+                                let today = Local::now().date_naive();
+                                let from = crate::calendar::parse_date(this.custom_from.read(cx).text(), today, strings);
+                                let until = crate::calendar::parse_date(this.custom_until.read(cx).text(), today, strings);
+                                if let (Some(from), Some(until)) = (from, until) {
+                                    this.draft.date = DateRange::Custom(from, until);
+                                }
+                            }
+                            this.apply(cx);
+                        }))),
+                )
+            })
+            .into_any_element()
     }
 
     fn shows(&self, filter: Filter) -> bool {
@@ -126,20 +407,59 @@ impl Render for SearchModal {
         let query = self.query(cx);
         let has_query = !query.is_empty();
 
+        // The original's chips: bordered pills; the chosen one tinted with an × that clears it.
         let chip = |filter: Filter, label: &'static str, cx: &mut Context<Self>| {
             let selected = self.filter == filter;
-            div()
+            h_flex()
                 .id(label)
+                .h(px(24.))
                 .px_2()
-                .py_0p5()
-                .rounded(px(4.))
+                .gap_1()
+                .rounded(px(6.))
                 .cursor_pointer()
-                .bg(if selected { theme.colors().element_selected } else { theme.colors().element_hover })
-                .child(Label::new(label).size(LabelSize::Small))
+                .border_1()
+                .when(selected, |el| el.bg(theme.colors().accent.opacity(0.15)).border_color(theme.colors().accent.opacity(0.3)))
+                .when(!selected, |el| el.border_color(theme.colors().border))
+                .when(selected && filter == Filter::Tasks, |el| el.child(Icon::new(IconName::SquareCheck).size(IconSize::XSmall).color(Color::Accent)))
+                .child(Label::new(label).size(LabelSize::Small).color(if selected { Color::Accent } else { Color::Default }))
+                .when(selected, |el| el.child(Icon::new(IconName::X).size(IconSize::XSmall).color(Color::Accent)))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     let next = if this.filter == filter { Filter::All } else { filter };
                     this.set_filter(next, cx)
                 }))
+        };
+        // With Task chosen, the original's Lists, Tag, Date and Priority dropdowns follow it.
+        let dropdown = |menu: Menu, label: SharedString, active: bool, cx: &mut Context<Self>| {
+            let open = self.menu == Some(menu);
+            div()
+                .relative()
+                .child(
+                    h_flex()
+                        .id(SharedString::from(format!("search-dropdown-{menu:?}")))
+                        .h(px(24.))
+                        .px_2()
+                        .gap_1()
+                        .rounded(px(6.))
+                        .cursor_pointer()
+                        .border_1()
+                        .border_color(if open || active { theme.colors().accent.opacity(0.5) } else { theme.colors().border })
+                        .child(Label::new(label).size(LabelSize::Small).color(if active { Color::Accent } else { Color::Default }))
+                        .child(Icon::new(IconName::ChevronDown).size(IconSize::XSmall).color(Color::Muted))
+                        .on_click(cx.listener(move |this, _, _, cx| this.open_menu(menu, cx))),
+                )
+                .when(open, |el| el.child(PopoverAttachment::new(Placement::BelowLeft, self.render_menu(menu, cx))))
+        };
+        let task_dropdowns: Vec<AnyElement> = if self.filter == Filter::Tasks {
+            let f = &self.task_filter;
+            let date_label: SharedString = if f.date == DateRange::All { strings.filter_date.into() } else { Self::range_label(f.date, strings).into() };
+            vec![
+                dropdown(Menu::Lists, strings.lists.into(), !f.lists.is_empty(), cx).into_any_element(),
+                dropdown(Menu::Tags, strings.search_filter_tag.into(), f.tags != TagRule::All, cx).into_any_element(),
+                dropdown(Menu::Date, date_label, f.date != DateRange::All, cx).into_any_element(),
+                dropdown(Menu::Priority, strings.filter_priority.into(), !f.priorities.is_empty(), cx).into_any_element(),
+            ]
+        } else {
+            Vec::new()
         };
 
         let task_rows: Vec<AnyElement> = if self.shows(Filter::Tasks) {
@@ -257,10 +577,11 @@ impl Render for SearchModal {
             )
             .child(
                 h_flex()
-                    .gap_1()
-                    .child(chip(Filter::Tasks, strings.search_filter_task, cx))
-                    .child(chip(Filter::Tags, strings.search_filter_tag, cx))
-                    .child(chip(Filter::Lists, strings.search_filter_list, cx)),
+                    .gap_1p5()
+                    .when(self.filter == Filter::All || self.filter == Filter::Tasks, |el| el.child(chip(Filter::Tasks, strings.search_filter_task, cx)))
+                    .children(task_dropdowns)
+                    .when(self.filter == Filter::All || self.filter == Filter::Tags, |el| el.child(chip(Filter::Tags, strings.search_filter_tag, cx)))
+                    .when(self.filter == Filter::All || self.filter == Filter::Lists, |el| el.child(chip(Filter::Lists, strings.search_filter_list, cx))),
             )
             .child(Divider::horizontal())
             .child(
@@ -270,9 +591,20 @@ impl Render for SearchModal {
                     .min_h(px(180.))
                     .overflow_y_scroll()
                     .when(!has_query, |el| {
-                        el.items_center().justify_center().gap_2().child(Icon::new(IconName::Search).size(IconSize::XLarge)).child(
-                            Label::new(strings.search_hint).color(Color::Muted),
-                        )
+                        // As in the original, the hint names what the chosen chip searches.
+                        let hint = match self.filter {
+                            Filter::All => strings.search_hint,
+                            Filter::Tasks => strings.search_hint_task,
+                            Filter::Tags => strings.search_hint_tag,
+                            Filter::Lists => strings.search_hint_list,
+                        };
+                        let icon = match self.filter {
+                            Filter::Tasks => IconName::SquareCheck,
+                            Filter::Tags => IconName::Tag,
+                            Filter::Lists => IconName::List,
+                            Filter::All => IconName::Search,
+                        };
+                        el.items_center().justify_center().gap_2().child(Icon::new(icon).size(IconSize::XLarge).color(Color::Muted)).child(Label::new(hint).color(Color::Muted))
                     })
                     .when(nothing, |el| {
                         el.items_center().justify_center().child(Label::new(strings.nothing_found).color(Color::Muted))

@@ -410,6 +410,10 @@ impl AppView {
                 if let Some(search) = &this.search {
                     search.update(cx, |search, cx| search.set_query(query, cx));
                 }
+                // `search-filter=task[>lists|tags|date|priority]` picks the Task chip and a dropdown.
+                if let (Some(search), Some(spec)) = (&this.search, state.split(';').find_map(|part| part.strip_prefix("search-filter="))) {
+                    search.update(cx, |search, cx| search.dev_filter(spec, cx));
+                }
             }
         }
         this

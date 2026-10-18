@@ -1608,10 +1608,13 @@ impl HabitView {
         let goal_unit: SharedString = habit.goal.as_ref().map_or(SharedString::default(), |g| g.unit.clone().into());
 
         let card = |icon: IconName, color: Hsla, label: &'static str, value: String, unit: SharedString| {
+            // The original's 68 px cards: the label, then the value with its unit beside it.
             v_flex()
                 .flex_1()
-                .p_3()
-                .gap_1()
+                .h(px(68.))
+                .px_3()
+                .justify_center()
+                .gap_0p5()
                 .rounded(px(8.))
                 .bg(theme.colors().surface_background)
                 .child(
@@ -1622,10 +1625,10 @@ impl HabitView {
                 )
                 .child(
                     h_flex()
-                        .items_baseline()
+                        .items_end()
                         .gap_1()
-                        .child(div().text_size(px(20.)).font_weight(FontWeight::SEMIBOLD).child(value))
-                        .child(Label::new(unit).size(LabelSize::XSmall)),
+                        .child(div().text_size(px(20.)).line_height(px(24.)).font_weight(FontWeight::MEDIUM).child(value))
+                        .child(div().pb(px(3.)).child(Label::new(unit).size(LabelSize::Small))),
                 )
         };
 
@@ -1970,8 +1973,10 @@ impl Render for HabitView {
         }));
 
         // As in the original, the habits take a left column; the right side is left for details.
+        // As in the original, the habits take about 64% of the width and the details the rest,
+        // whatever the window's size.
         let column = v_flex()
-            .w(px(790.))
+            .w(gpui::relative(0.64))
             .flex_none()
             .h_full()
             .border_r_1()

@@ -9,7 +9,10 @@ use ui::prelude::*;
 use crate::drag::DraggedTask;
 use ui::{Placement, PopoverAttachment, popover};
 
-use crate::actions::{DeleteTask, SelectNext, SelectPrevious, ToggleComplete};
+use crate::actions::{
+    ClearDate, DeleteTask, PinTask, PriorityHigh, PriorityLow, PriorityMedium, PriorityNone, SelectNext, SelectPrevious,
+    SetDate, SetNextWeek, SetToday, SetTomorrow, ToggleComplete,
+};
 use crate::i18n::{self, CurrentLocale, Strings};
 use crate::lists_panel::{self, LIST_COLORS};
 use crate::task_detail::{OpenTask, StartFocus, TaskDetail, TaskUpdated};
@@ -1373,6 +1376,37 @@ impl TodoView {
         }
     }
 
+    /// Applies a change to the selected task, for the task edit shortcuts.
+    fn edit_selected(&mut self, cx: &mut Context<Self>, change: impl FnOnce(&Store, &Task) -> anyhow::Result<()>) {
+        let Some(task) = self.selected.and_then(|id| self.tasks.iter().find(|t| t.id == id)).cloned() else { return };
+        let result = change(&self.store, &task);
+        self.check(result);
+        self.reload(cx);
+        self.select(task.id, cx);
+    }
+
+    fn pin_selected(&mut self, _: &PinTask, _: &mut Window, cx: &mut Context<Self>) {
+        self.edit_selected(cx, |store, task| store.set_pinned(task.id, task.pinned_at.is_none()));
+    }
+
+    fn date_selected(&mut self, _: &SetDate, _: &mut Window, cx: &mut Context<Self>) {
+        if self.selected.is_some() {
+            self.detail.update(cx, |detail, cx| detail.open_due(cx));
+        }
+    }
+
+    fn set_selected_due(&mut self, days: Option<i64>, cx: &mut Context<Self>) {
+        let today = Self::today();
+        self.edit_selected(cx, move |store, task| {
+            let date = days.map(|d| today + Duration::days(d));
+            store.set_due(task.id, date, date.and(task.due_time))
+        });
+    }
+
+    fn set_selected_priority(&mut self, priority: Priority, cx: &mut Context<Self>) {
+        self.edit_selected(cx, move |store, task| store.set_priority(task.id, priority));
+    }
+
     fn delete_selected(&mut self, _: &DeleteTask, _: &mut Window, cx: &mut Context<Self>) {
         let Some(id) = self.selected else { return };
         // Keep a selection so repeated presses keep working down the list.
@@ -1399,6 +1433,7 @@ impl TodoView {
     }
 
     /// Switches the list to search results and focuses the search field.
+    #[cfg(debug_assertions)]
     pub fn start_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let query = self.search_input.read(cx).text().to_owned();
         self.set_view(View::Search(query), cx);
@@ -2669,6 +2704,16 @@ impl Render for TodoView {
                     .on_action(cx.listener(Self::select_previous))
                     .on_action(cx.listener(Self::toggle_selected))
                     .on_action(cx.listener(Self::delete_selected))
+                    .on_action(cx.listener(Self::pin_selected))
+                    .on_action(cx.listener(Self::date_selected))
+                    .on_action(cx.listener(|this, _: &ClearDate, _, cx| this.set_selected_due(None, cx)))
+                    .on_action(cx.listener(|this, _: &SetToday, _, cx| this.set_selected_due(Some(0), cx)))
+                    .on_action(cx.listener(|this, _: &SetTomorrow, _, cx| this.set_selected_due(Some(1), cx)))
+                    .on_action(cx.listener(|this, _: &SetNextWeek, _, cx| this.set_selected_due(Some(7), cx)))
+                    .on_action(cx.listener(|this, _: &PriorityNone, _, cx| this.set_selected_priority(Priority::None, cx)))
+                    .on_action(cx.listener(|this, _: &PriorityLow, _, cx| this.set_selected_priority(Priority::Low, cx)))
+                    .on_action(cx.listener(|this, _: &PriorityMedium, _, cx| this.set_selected_priority(Priority::Medium, cx)))
+                    .on_action(cx.listener(|this, _: &PriorityHigh, _, cx| this.set_selected_priority(Priority::High, cx)))
                     .flex_1()
                     .overflow_y_scroll()
                     .px_2()

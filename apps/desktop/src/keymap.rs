@@ -12,7 +12,7 @@ use serde::Deserialize;
 pub const DEFAULT_KEYMAP_PATH: &str = "keymaps/default.json";
 
 /// Actions shown in the shortcut list, in order; text editing keys are left out.
-pub const LISTED_ACTIONS: [&str; 13] = [
+pub const LISTED_ACTIONS: [&str; 23] = [
     "fern::NewTask",
     "fern::Search",
     "fern::ToggleSidebar",
@@ -26,6 +26,16 @@ pub const LISTED_ACTIONS: [&str; 13] = [
     "task_list::SelectPrevious",
     "task_list::ToggleComplete",
     "task_list::DeleteTask",
+    "task_list::PinTask",
+    "task_list::SetDate",
+    "task_list::ClearDate",
+    "task_list::SetToday",
+    "task_list::SetTomorrow",
+    "task_list::SetNextWeek",
+    "task_list::PriorityNone",
+    "task_list::PriorityLow",
+    "task_list::PriorityMedium",
+    "task_list::PriorityHigh",
 ];
 
 /// The keys bound to each listed action, as they read on screen ("Ctrl+N", "↓"), in the order
@@ -48,6 +58,10 @@ pub fn shortcut_list(source: &str) -> Result<Vec<(&'static str, Vec<String>)>> {
 
 /// "secondary-n" → "Ctrl+N" (⌘N on macOS), "down" → "↓", "space" → "Space".
 pub fn display_keys(keystroke: &str) -> String {
+    // A sequence ("tab m") reads "Tab, M".
+    if keystroke.contains(' ') {
+        return keystroke.split(' ').map(display_keys).collect::<Vec<_>>().join(", ");
+    }
     keystroke
         .split('-')
         .map(|part| match part {
@@ -134,6 +148,7 @@ mod tests {
         let mut next = keys("task_list::SelectNext");
         next.sort();
         assert_eq!(next, ["J", "↓"]);
+        assert_eq!(keys("task_list::PinTask"), ["Tab, P"]);
         if !cfg!(target_os = "macos") {
             assert_eq!(super::display_keys("secondary-shift-p"), "Ctrl+Shift+P");
         }

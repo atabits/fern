@@ -317,6 +317,13 @@ impl TaskDetail {
         cx.notify();
     }
 
+    /// Opens the due-date picker (the "Set date" shortcut).
+    pub fn open_due(&mut self, cx: &mut Context<Self>) {
+        if self.task.is_some() {
+            self.open_popup(Popup::Due, cx);
+        }
+    }
+
     #[cfg(debug_assertions)]
     pub fn dev_open_popup(&mut self, popup: &str, cx: &mut Context<Self>) {
         let popup = match popup {

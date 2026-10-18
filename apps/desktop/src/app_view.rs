@@ -68,6 +68,8 @@ impl AppView {
         let countdown = cx.new(|cx| CountdownView::new(store.clone(), cx));
         let habits = cx.new(|cx| HabitView::new(store.clone(), cx));
         let focus = cx.new(|cx| FocusView::new(store.clone(), cx));
+        // Mutated only by the debug-build dev state below.
+        #[cfg_attr(not(debug_assertions), allow(unused_mut))]
         let mut this = Self {
             store,
             section: Section::Tasks,
@@ -334,6 +336,9 @@ impl AppView {
         for (i, (action, keys)) in list.into_iter().enumerate() {
             if action.starts_with("task_list::") && i > 0 && list_group_start(i) {
                 body = body.child(heading(strings.shortcut_groups[1]));
+            }
+            if action == "task_list::PinTask" {
+                body = body.child(heading(strings.shortcut_groups[3]));
             }
             if !keys.is_empty() {
                 body = body.child(row(strings.shortcut_labels[i], keys));

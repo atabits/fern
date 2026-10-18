@@ -17,4 +17,22 @@ actions!(
     ]
 );
 
-actions!(task_list, [SelectNext, SelectPrevious, ToggleComplete, DeleteTask]);
+actions!(
+    task_list,
+    [
+        SelectNext,
+        SelectPrevious,
+        ToggleComplete,
+        DeleteTask,
+        PinTask,
+        SetDate,
+        ClearDate,
+        SetToday,
+        SetTomorrow,
+        SetNextWeek,
+        PriorityNone,
+        PriorityLow,
+        PriorityMedium,
+        PriorityHigh,
+    ]
+);

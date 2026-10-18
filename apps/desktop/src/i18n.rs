@@ -223,8 +223,8 @@ pub struct Strings {
     pub copy_link: &'static str,
     pub shortcuts: &'static str,
     /// Labels of `keymap::LISTED_ACTIONS`, in order.
-    pub shortcut_labels: [&'static str; 13],
-    pub shortcut_groups: [&'static str; 3],
+    pub shortcut_labels: [&'static str; 23],
+    pub shortcut_groups: [&'static str; 4],
     /// Quick add syntax: (what, example).
     pub quick_add_help: [(&'static str, &'static str); 4],
     pub undo: &'static str,
@@ -540,9 +540,11 @@ pub static EN: Strings = Strings {
     shortcuts: "Shortcuts",
     shortcut_labels: [
         "Add task", "Search", "Toggle sidebar", "Go to Inbox", "Go to Today", "Go to Tomorrow", "Go to Next 7 Days",
-        "Shortcuts", "Quit", "Next task", "Previous task", "Complete task", "Delete task",
+        "Shortcuts", "Quit", "Next task", "Previous task", "Complete task", "Delete task", "Pin task", "Set date",
+        "Clear date", "Set today", "Set tomorrow", "Set next week", "No priority", "Low priority",
+        "Medium priority", "High priority",
     ],
-    shortcut_groups: ["General", "Task List", "Quick Add"],
+    shortcut_groups: ["General", "Task List", "Quick Add", "Edit Tasks"],
     quick_add_help: [
         ("Date and time", "tomorrow 9am, fri, every day"),
         ("Tag", "#tag"),
@@ -850,8 +852,10 @@ pub static RU: Strings = Strings {
     shortcut_labels: [
         "Новая задача", "Поиск", "Скрыть/показать панель", "Входящие", "Сегодня", "Завтра", "Следующие 7 дней",
         "Горячие клавиши", "Выйти", "Следующая задача", "Предыдущая задача", "Выполнить задачу", "Удалить задачу",
+        "Закрепить задачу", "Выбрать дату", "Убрать дату", "На сегодня", "На завтра", "На следующую неделю",
+        "Без приоритета", "Низкий приоритет", "Средний приоритет", "Высокий приоритет",
     ],
-    shortcut_groups: ["Общие", "Список задач", "Быстрое добавление"],
+    shortcut_groups: ["Общие", "Список задач", "Быстрое добавление", "Правка задач"],
     quick_add_help: [
         ("Дата и время", "завтра 9:00, пт, каждый день"),
         ("Тег", "#тег"),

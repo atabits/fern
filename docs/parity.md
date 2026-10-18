@@ -66,7 +66,7 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 | Details: checklist | ✅ | Enter adds the next item; progress "1/3" in rows |
 | Details: subtasks | ✅ | list with checkboxes, open a subtask, "Add subtask" |
 | Drag and drop | 🟡 | reorder rows; drop on a lists-column entry (list, tag, Today/Tomorrow, Completed, Trash) or on a calendar day; between matrix quadrants. The original's drag behavior was not observed (dragging in TickTick would change data); no nesting by drag |
-| Keyboard shortcuts | ✅ | JSON keymap (Zed format): new task, search, smart lists, list navigation, complete, delete; the original's Shortcuts panel (the sidebar's "?" or Ctrl+/) lists them from the keymap itself, by group, with the quick add syntax |
+| Keyboard shortcuts | ✅ | JSON keymap (Zed format): new task, search, smart lists, list navigation, complete, delete, and the original's task edits on the selected task (Tab+M complete, Tab+P pin, Tab+D date picker, Tab+0 clear date, Tab+1/2/3 today/tomorrow/next week, Alt+0–3 priority); the original's Shortcuts panel (the sidebar's "?" or Ctrl+/) lists them from the keymap itself, by group, with the quick add syntax |
 | Search | 🟡 | popover matched to the original: Task/Tag/List filters, results grouped with highlighted matches, list name, note excerpts, "View more" opens the full list; no "Event" filter (no calendar events) |
 | Calendar | 🟡 | month and week views matched to the original (week: all-day strip, time axis with folded night hours, timed tasks placed by time); view menu with Week/Month; tasks can be dragged between days; no Day, Year, Agenda or multi-day views |
 | Eisenhower Matrix | 🟡 | matched to the original: quadrants by priority (TickTick's default rules), grouped by list, drag a task to another quadrant to change its priority; no custom quadrant rules |
@@ -91,8 +91,7 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 
 ## Next
 
-1. Keyboard shortcuts for task edits (the original's Tab+D date, Tab+P pin, Alt+0–3 priority).
-2. Settings window (theme, language, start of week, default list).
-3. Statistics page in the main sidebar (account menu), not only from Focus.
+1. Settings window (theme, language, start of week, default list).
+2. Statistics page in the main sidebar (account menu), not only from Focus.
 3. Rename and delete habit sections.
 4. Filled sidebar icons (needs own filled glyphs; Lucide has none).

@@ -21,7 +21,18 @@
       "k": "task_list::SelectPrevious",
       "space": "task_list::ToggleComplete",
       "delete": "task_list::DeleteTask",
-      "backspace": "task_list::DeleteTask"
+      "backspace": "task_list::DeleteTask",
+      "tab m": "task_list::ToggleComplete",
+      "tab p": "task_list::PinTask",
+      "tab d": "task_list::SetDate",
+      "tab 0": "task_list::ClearDate",
+      "tab 1": "task_list::SetToday",
+      "tab 2": "task_list::SetTomorrow",
+      "tab 3": "task_list::SetNextWeek",
+      "alt-0": "task_list::PriorityNone",
+      "alt-1": "task_list::PriorityLow",
+      "alt-2": "task_list::PriorityMedium",
+      "alt-3": "task_list::PriorityHigh"
     }
   },
   {

@@ -366,6 +366,7 @@ impl TodoView {
                 Some(("view", "summary")) => self.set_view(View::Summary, cx),
                 Some(("view", "next7")) => self.set_view(View::Next7Days, cx),
                 Some(("view", "completed")) => self.set_view(View::Completed, cx),
+                Some(("view", name)) if name.starts_with('#') => self.set_view(View::Tag(name[1..].to_owned()), cx),
                 Some(("view", "tomorrow")) => self.set_view(View::Tomorrow, cx),
                 // `type=<text>`: text in the quick-add field, as if typed (not added).
                 Some(("type", text)) => {
@@ -995,6 +996,9 @@ impl TodoView {
         let smart = matches!(self.view, View::All | View::Today | View::Tomorrow | View::Next7Days);
         let placeholder: SharedString = if self.preferences.detailed_input {
             strings.input_box_placeholder.into()
+        } else if let View::Tag(tag) = &self.view {
+            // As the original: the tag the new task gets, "#work".
+            format!("#{tag}").into()
         } else if smart {
             let list = self.preferences.default_list.and_then(|id| self.lists.iter().find(|l| l.id == id)).map_or(strings.inbox.to_owned(), |l| l.name.clone());
             strings.add_task_to.replace("{list}", &list).into()
@@ -3484,7 +3488,12 @@ impl TodoView {
     fn sort_settings(&self) -> (SortBy, GroupBy) {
         let key = self.view_key();
         let get = |what: &str| self.store.setting(&format!("{what}:{key}")).ok().flatten().unwrap_or_default();
-        (SortBy::from_key(&get("sort")), GroupBy::from_key(&get("group")))
+        // A tag's view is grouped by list until chosen otherwise, as the original's.
+        let group = match get("group") {
+            key if key.is_empty() && matches!(self.view, View::Tag(_)) => GroupBy::List,
+            key => GroupBy::from_key(&key),
+        };
+        (SortBy::from_key(&get("sort")), group)
     }
 
     fn set_sort(&mut self, sort: Option<SortBy>, group: Option<GroupBy>, cx: &mut Context<Self>) {

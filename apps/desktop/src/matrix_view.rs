@@ -556,7 +556,7 @@ impl MatrixView {
                         .gap_1()
                         .px_1()
                         .child(Icon::new(IconName::ChevronDown).size(IconSize::XSmall))
-                        .child(Label::new(label.clone()).size(LabelSize::Small).weight(FontWeight::SEMIBOLD))
+                        .child(Label::new(label.clone()).weight(FontWeight::SEMIBOLD))
                         .child(Label::new(tasks.len().to_string()).size(LabelSize::XSmall).color(Color::Muted))
                         .into_any_element()
                 });
@@ -587,18 +587,18 @@ impl MatrixView {
                     .gap_1p5()
                     .child(
                         div()
-                            .size(px(14.))
+                            .size(px(16.))
                             .flex()
                             .items_center()
                             .justify_center()
                             .rounded_full()
                             .bg(color)
                             .text_color(theme.colors().background)
-                            .text_size(px(7.))
+                            .text_size(px(8.))
                             .font_weight(FontWeight::BOLD)
                             .child(numeral),
                     )
-                    .child(div().flex_1().child(Label::new(title).size(LabelSize::Small).color(Color::Custom(color))))
+                    .child(div().flex_1().child(Label::new(title).color(Color::Custom(color))))
                     // The original's "…" on a hovered header; its Edit opens "Edit Matrix".
                     .child(
                         div()
@@ -667,7 +667,7 @@ impl Render for MatrixView {
                     .h(px(52.))
                     .flex_none()
                     .px(px(22.))
-                    .child(div().flex_1().child(Label::new(strings.section_matrix).size(LabelSize::Large).weight(FontWeight::BOLD)))
+                    .child(div().flex_1().child(Label::new(strings.section_matrix).size(LabelSize::Large).weight(FontWeight::SEMIBOLD)))
                     .child(IconButton::new("matrix-more", IconName::Ellipsis)),
             )
             .child(

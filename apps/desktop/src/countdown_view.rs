@@ -14,8 +14,8 @@ use crate::calendar;
 use crate::i18n::{self, Strings};
 use crate::text_input::{Cancelled, Mode, Submitted, TextInput};
 
-const CARD_WIDTH: f32 = 281.;
-const CARD_HEIGHT: f32 = 175.;
+const CARD_WIDTH: f32 = 289.;
+const CARD_HEIGHT: f32 = 181.;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Filter {
@@ -79,6 +79,9 @@ enum DraftRow {
 }
 
 /// Emoji offered for countdowns; the original's illustrated icon set is its own artwork.
+/// How far the unit letters sit above the numbers' line box, to share their baseline.
+const UNIT_BASELINE: f32 = 9.;
+
 const COUNTDOWN_EMOJI: [&str; 14] = ["🎂", "🎉", "❤️", "💍", "✈️", "🎄", "🎓", "⭐", "🏆", "🎯", "🚩", "🎮", "👶", "🏠"];
 
 pub struct CountdownView {
@@ -173,10 +176,12 @@ fn face(countdown: &Countdown, today: NaiveDate, days_only: bool, cx: &App) -> F
         theme.colors().accent
     };
     let number = |value: u32, unit: &str| {
+        // As in the original: the numbers in a light serif, the units in the UI font, on the
+        // numbers' baseline.
         h_flex()
-            .items_baseline()
-            .child(div().text_size(px(34.)).text_color(color).child(value.to_string()))
-            .child(div().pl_0p5().pr_1().text_size(px(13.)).text_color(color).child(unit.to_owned()))
+            .items_end()
+            .child(div().text_size(px(46.)).line_height(px(46.)).font_family("IBM Plex Serif").text_color(color).child(value.to_string()))
+            .child(div().pl_1().pr_1().mb(px(UNIT_BASELINE)).text_size(px(18.)).line_height(px(18.)).font_weight(FontWeight::MEDIUM).text_color(color).child(unit.to_owned()))
     };
     let [y, m, d] = strings.unit_letters;
     let numbers = if days_only {
@@ -216,7 +221,7 @@ pub fn render_summary(countdown: &Countdown, date: NaiveDate, cx: &App) -> AnyEl
                 .child(
                     badge(countdown, color, cx),
                 )
-                .child(Label::new(countdown.name.clone()).weight(FontWeight::SEMIBOLD)),
+                .child(div().text_size(px(16.)).font_weight(FontWeight::SEMIBOLD).child(countdown.name.clone())),
         )
         .child(numbers)
         .child(Label::new(subtitle).size(LabelSize::XSmall).color(Color::Muted))
@@ -470,7 +475,6 @@ impl CountdownView {
             .flex_none()
             .items_center()
             .justify_center()
-            .gap_1()
             .rounded(px(8.))
             .bg(theme.colors().surface_background)
             // The card's picture behind its numbers, darkened so they stay readable.
@@ -484,17 +488,20 @@ impl CountdownView {
                     .child(
                         badge(countdown, color, cx),
                     )
-                    .child(Label::new(countdown.name.clone()).weight(FontWeight::SEMIBOLD)),
+                    .child(div().text_size(px(16.)).font_weight(FontWeight::SEMIBOLD).child(countdown.name.clone())),
             )
+            // The original's spacing: 20 px down to the numbers, 16 px on to the dates.
             .child(
                 div()
                     .id("countdown-numbers")
+                    .mt(px(20.))
+                    .mb(px(16.))
                     .cursor_pointer()
                     .tooltip(Tooltip::text(strings.countdown_switch_hint))
                     .on_click(cx.listener(move |this, _, _, cx| this.toggle_format(id, cx)))
                     .child(numbers),
             )
-            .child(div().text_size(px(11.)).when(has_picture, |el| el.text_color(gpui::white().opacity(0.85))).when(!has_picture, |el| el.text_color(theme.colors().text_muted)).child(subtitle))
+            .child(div().text_size(px(12.)).when(has_picture, |el| el.text_color(gpui::white().opacity(0.85))).when(!has_picture, |el| el.text_color(theme.colors().text_muted)).child(subtitle))
             // The original's pin, beside the "…": a pinned card stays first and shows it.
             .child({
                 let pinned = countdown.pinned_at.is_some();
@@ -1288,7 +1295,7 @@ impl Render for CountdownView {
                                     .id("countdown-title")
                                     .gap_1()
                                     .cursor_pointer()
-                                    .child(Label::new(strings.section_countdown).size(LabelSize::Large).weight(FontWeight::BOLD))
+                                    .child(Label::new(strings.section_countdown).size(LabelSize::Large).weight(FontWeight::SEMIBOLD))
                                     .child(Icon::new(IconName::ChevronDown).size(IconSize::XSmall))
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.title_menu = !this.title_menu;

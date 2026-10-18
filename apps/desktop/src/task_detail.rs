@@ -2370,7 +2370,7 @@ impl Render for TaskDetail {
                                     .min_w_0()
                                     .text_size(px(20.))
                                     .line_height(px(28.))
-                                    .font_weight(FontWeight::BOLD)
+                                    .font_weight(FontWeight::SEMIBOLD)
                                     .when(done, |el| el.text_color(theme.colors().text_muted))
                                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                                     .child(self.title.clone()),

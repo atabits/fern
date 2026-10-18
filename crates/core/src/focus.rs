@@ -295,6 +295,16 @@ pub fn format_minutes(minutes: i64) -> String {
     }
 }
 
+/// A duration as the original's Overview shows it: numbers with their unit letters, which it
+/// sets smaller — `[(589, 'h'), (56, 'm')]` for "589h56m", `[(0, 'm')]` for none.
+pub fn duration_parts(minutes: i64) -> Vec<(i64, char)> {
+    match (minutes / 60, minutes % 60) {
+        (0, m) => vec![(m, 'm')],
+        (h, 0) => vec![(h, 'h')],
+        (h, m) => vec![(h, 'h'), (m, 'm')],
+    }
+}
+
 /// The Focus Record as CSV, oldest first: start and end in local time, minutes and title.
 pub fn export_csv(sessions: &[FocusSession]) -> String {
     let mut sorted: Vec<&FocusSession> = sessions.iter().collect();
@@ -320,6 +330,13 @@ pub fn export_csv(sessions: &[FocusSession]) -> String {
 mod tests {
     use super::*;
     use uuid::Uuid;
+
+    #[test]
+    fn duration_parts_as_the_overview_shows_them() {
+        assert_eq!(duration_parts(35_396), [(589, 'h'), (56, 'm')]);
+        assert_eq!(duration_parts(0), [(0, 'm')]);
+        assert_eq!(duration_parts(120), [(2, 'h')]);
+    }
 
     fn session(start: DateTime<Local>, minutes: i64) -> FocusSession {
         let started_at = start.timestamp_millis();

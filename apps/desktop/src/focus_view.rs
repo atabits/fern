@@ -2647,30 +2647,41 @@ impl FocusView {
     fn render_overview(&self, strings: &Strings, cx: &App) -> impl IntoElement {
         let theme = cx.theme();
         let stats = focus_stats(&self.sessions, Local::now().date_naive());
-        let card = |label: &'static str, value: String| {
+        // As the original's: the numbers large, their unit letters ("h", "m") small beside them,
+        // on the same baseline.
+        let card = |label: &'static str, parts: Vec<(i64, Option<char>)>| {
             v_flex()
                 .flex_1()
-                .h(px(70.))
-                .p_2()
-                .gap_1()
+                .h(px(73.))
+                .px_3()
+                .py_2()
+                .gap_0p5()
                 .rounded(px(8.))
                 .bg(theme.colors().surface_background)
-                .child(Label::new(label).size(LabelSize::XSmall).color(Color::Muted))
-                .child(div().text_size(px(22.)).font_weight(FontWeight::SEMIBOLD).child(value))
+                .child(Label::new(label).size(LabelSize::Small).color(Color::Muted))
+                .child(h_flex().items_end().children(parts.into_iter().map(|(number, unit)| {
+                    h_flex()
+                        .items_end()
+                        .child(div().text_size(px(26.)).line_height(px(32.)).font_weight(FontWeight::SEMIBOLD).child(number.to_string()))
+                        .children(unit.map(|u| {
+                            div().text_size(px(14.)).line_height(px(14.)).mb(px(6.)).mx_0p5().font_weight(FontWeight::SEMIBOLD).child(u.to_string())
+                        }))
+                })))
         };
+        let duration = |minutes: i64| fern_core::focus::duration_parts(minutes).into_iter().map(|(n, u)| (n, Some(u))).collect::<Vec<_>>();
         v_flex()
             .gap_2()
             .child(
                 h_flex()
                     .gap_2()
-                    .child(card(strings.focus_today_pomo, stats.today_count.to_string()))
-                    .child(card(strings.focus_today_focus, format_minutes(stats.today_minutes))),
+                    .child(card(strings.focus_today_pomo, vec![(stats.today_count as i64, None)]))
+                    .child(card(strings.focus_today_focus, duration(stats.today_minutes))),
             )
             .child(
                 h_flex()
                     .gap_2()
-                    .child(card(strings.focus_total_pomo, stats.total_count.to_string()))
-                    .child(card(strings.focus_total_duration, format_minutes(stats.total_minutes))),
+                    .child(card(strings.focus_total_pomo, vec![(stats.total_count as i64, None)]))
+                    .child(card(strings.focus_total_duration, duration(stats.total_minutes))),
             )
     }
 

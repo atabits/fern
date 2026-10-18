@@ -84,6 +84,8 @@ pub struct Strings {
     pub habit_current_streak: &'static str,
     /// The unit after a number of days in the habit statistics.
     pub habit_unit_days: &'static str,
+    /// The unit for 0 or 1 days, as the original's "0 Day".
+    pub habit_unit_day: &'static str,
     pub habit_select: &'static str,
     pub habit_monthly_completion: &'static str,
     pub habit_daily_goals: &'static str,
@@ -800,6 +802,7 @@ pub static EN: Strings = Strings {
     habit_monthly_rate: "Monthly check-in rate",
     habit_current_streak: "Current Streak",
     habit_unit_days: "Days",
+    habit_unit_day: "Day",
     habit_select: "Click a habit to see its statistics",
     habit_monthly_completion: "Monthly completion",
     habit_daily_goals: "Daily Goals",
@@ -1463,6 +1466,7 @@ pub static RU: Strings = Strings {
     habit_monthly_rate: "Выполнение за месяц",
     habit_current_streak: "Текущая серия",
     habit_unit_days: "дн.",
+    habit_unit_day: "дн.",
     habit_select: "Выберите привычку, чтобы увидеть статистику",
     habit_monthly_completion: "Выполнено за месяц",
     habit_daily_goals: "Дневные цели",

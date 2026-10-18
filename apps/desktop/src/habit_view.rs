@@ -1137,10 +1137,12 @@ impl HabitView {
             })
     }
 
-    /// TickTick's "Daily Goals" chart: the amount per day over the last days, with the goal line.
+    /// TickTick's "Daily Goals" chart, as the original's: the last 15 days' amounts as a line over
+    /// a grid with its scale on the left, and the goal as a blue line.
     fn render_goal_chart(&self, habit: &Habit, goal: u32, today: NaiveDate, cx: &App) -> AnyElement {
-        const DAYS: i64 = 11;
-        const HEIGHT: f32 = 110.;
+        const DAYS: i64 = 15;
+        const HEIGHT: f32 = 140.;
+        const AXIS: f32 = 18.;
         let strings = i18n::t(cx);
         let colors = cx.theme().colors();
         let days: Vec<(NaiveDate, u32)> = (0..DAYS)
@@ -1148,8 +1150,37 @@ impl HabitView {
             .map(|ago| today - chrono::Duration::days(ago))
             .map(|date| (date, self.amount(habit.id, date)))
             .collect();
-        let top = days.iter().map(|(_, v)| *v).max().unwrap_or(0).max(goal).max(1) as f32;
+        let top = fern_core::habit::chart_top(goal, days.iter().map(|(_, v)| *v).max().unwrap_or(0));
         let unit = habit.goal.as_ref().map(|g| g.unit.clone()).unwrap_or_default();
+        let (accent, grid) = (colors.accent, colors.border_variant);
+        let values: Vec<u32> = days.iter().map(|(_, v)| *v).collect();
+        let plot = gpui::canvas(
+            |_, _, _| {},
+            move |bounds, (), window, _| {
+                let (left, top_y) = (bounds.origin.x, bounds.origin.y);
+                let (width, height) = (bounds.size.width, bounds.size.height);
+                let y = |v: u32| top_y + height * (1. - v as f32 / top as f32);
+                for tick in 0..=top {
+                    window.paint_quad(gpui::fill(gpui::Bounds::new(gpui::point(left, y(tick)), gpui::size(width, px(1.))), grid));
+                }
+                let n = values.len().max(1) as f32;
+                let points: Vec<gpui::Point<Pixels>> =
+                    values.iter().enumerate().map(|(i, v)| gpui::point(left + width * ((i as f32 + 0.5) / n), y(*v))).collect();
+                if let Some(first) = points.first() {
+                    let mut line = gpui::PathBuilder::stroke(px(2.));
+                    line.move_to(*first);
+                    for p in &points[1..] {
+                        line.line_to(*p);
+                    }
+                    if let Ok(path) = line.build() {
+                        window.paint_path(path, accent.opacity(0.6));
+                    }
+                }
+                window.paint_quad(gpui::fill(gpui::Bounds::new(gpui::point(left, y(goal) - px(1.)), gpui::size(width, px(2.))), accent));
+            },
+        )
+        .flex_1()
+        .h(px(HEIGHT));
         v_flex()
             .p_3()
             .gap_2()
@@ -1162,31 +1193,20 @@ impl HabitView {
                     .when(!unit.is_empty(), |el| el.child(Label::new(format!("({unit})")).size(LabelSize::Small).color(Color::Muted))),
             )
             .child(
-                div()
-                    .relative()
-                    .h(px(HEIGHT))
+                h_flex()
+                    .items_start()
                     .child(
-                        h_flex().absolute().inset_0().items_end().gap_1().children(days.iter().map(|(date, value)| {
-                            let done = *value >= goal;
+                        div().relative().w(px(AXIS)).h(px(HEIGHT)).children((0..=top).map(|tick| {
                             div()
-                                .flex_1()
-                                .h(px(HEIGHT * *value as f32 / top))
-                                .rounded_t(px(3.))
-                                .bg(if done { colors.accent } else { colors.accent.opacity(0.4) })
-                                .when(*date == today, |el| el.border_1().border_color(colors.text_muted))
+                                .absolute()
+                                .left_0()
+                                .top(px(HEIGHT * (1. - tick as f32 / top as f32) - 7.))
+                                .child(Label::new(tick.to_string()).size(LabelSize::XSmall).color(Color::Muted))
                         })),
                     )
-                    .child(
-                        div()
-                            .absolute()
-                            .left_0()
-                            .right_0()
-                            .bottom(px(HEIGHT * goal as f32 / top))
-                            .h(px(1.))
-                            .bg(colors.accent),
-                    ),
+                    .child(plot),
             )
-            .child(h_flex().gap_1().children(days.iter().map(|(date, _)| {
+            .child(h_flex().pl(px(AXIS)).children(days.iter().map(|(date, _)| {
                 div().flex_1().flex().justify_center().child(
                     Label::new(date.day().to_string())
                         .size(LabelSize::XSmall)
@@ -1780,14 +1800,14 @@ impl HabitView {
             .child(
                 h_flex()
                     .gap_2()
-                    .child(card(IconName::CircleCheck, status.success, strings.habit_monthly_checkins, month.days.to_string(), strings.habit_unit_days.into()))
-                    .child(card(IconName::Zap, theme.colors().accent, strings.habit_total_checkins, stats.total_days.to_string(), strings.habit_unit_days.into())),
+                    .child(card(IconName::CircleCheck, status.success, strings.habit_monthly_checkins, month.days.to_string(), day_unit(month.days as i64, strings).into()))
+                    .child(card(IconName::Zap, theme.colors().accent, strings.habit_total_checkins, stats.total_days.to_string(), day_unit(stats.total_days as i64, strings).into())),
             )
             .child(
                 h_flex()
                     .gap_2()
                     .child(card(IconName::Percent, status.warning, strings.habit_monthly_rate, month.rate.to_string(), "%".into()))
-                    .child(card(IconName::Flame, status.error, strings.habit_current_streak, stats.streak.to_string(), strings.habit_unit_days.into())),
+                    .child(card(IconName::Flame, status.error, strings.habit_current_streak, stats.streak.to_string(), day_unit(stats.streak as i64, strings).into())),
             )
             .when(habit.goal.is_some(), |el| {
                 el.child(
@@ -2117,4 +2137,9 @@ impl Render for HabitView {
             }))
             .children(modal)
     }
+}
+
+/// "Day" for 0 or 1 days and "Days" for more, as the original's statistics cards say.
+fn day_unit(days: i64, strings: &i18n::Strings) -> &'static str {
+    if days <= 1 { strings.habit_unit_day } else { strings.habit_unit_days }
 }

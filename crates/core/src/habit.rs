@@ -306,6 +306,12 @@ pub fn month_stats_for(frequency: &Frequency, checkins: &HashSet<NaiveDate>, mon
 
 /// Habits and their check-ins as CSV: one line per check-in, habits without any get one line
 /// with empty check-in fields.
+/// The top of the "Daily Goals" chart's scale, as the original's: three steps over the goal (a
+/// goal of 2 gives 0–5), or higher when a day went past that.
+pub fn chart_top(goal: u32, highest: u32) -> u32 {
+    (goal + 3).max(highest).max(1)
+}
+
 pub fn export_csv(habits: &[(Habit, Vec<Checkin>)]) -> String {
     let field = |text: &str| {
         if text.contains([',', '"', '\n']) { format!("\"{}\"", text.replace('"', "\"\"")) } else { text.to_owned() }
@@ -329,6 +335,13 @@ pub fn export_csv(habits: &[(Habit, Vec<Checkin>)]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chart_scale() {
+        assert_eq!(chart_top(2, 0), 5, "the original's 0-5 for a goal of 2");
+        assert_eq!(chart_top(2, 9), 9);
+        assert_eq!(chart_top(1, 1), 4);
+    }
 
     fn d(day: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(2026, 10, day).unwrap()

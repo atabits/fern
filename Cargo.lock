@@ -249,7 +249,7 @@ dependencies = [
 
 [[package]]
 name = "assets"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "gpui",
@@ -1565,7 +1565,7 @@ dependencies = [
 
 [[package]]
 name = "fern_core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1576,7 +1576,7 @@ dependencies = [
 
 [[package]]
 name = "fern_desktop"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "assets",
@@ -1603,7 +1603,7 @@ dependencies = [
 
 [[package]]
 name = "fern_server"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "fern_core",
@@ -2584,7 +2584,7 @@ dependencies = [
 
 [[package]]
 name = "icons"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "strum 0.27.2",
 ]
@@ -5383,7 +5383,7 @@ dependencies = [
 
 [[package]]
 name = "theme"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "gpui",
 ]
@@ -5685,7 +5685,7 @@ dependencies = [
 
 [[package]]
 name = "ui"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "gpui",
  "icons",

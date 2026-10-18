@@ -9,7 +9,7 @@ use ui::prelude::*;
 use ui::{Placement, PopoverAttachment, popover};
 
 use crate::calendar;
-use crate::due_picker::{self, DueDraft, DueMenu};
+use crate::due_picker::{self, CustomReminder, DueDraft, DueMenu, ReminderUnit};
 use crate::i18n::{self, CurrentLocale, Strings};
 use crate::lists_panel;
 use crate::task_rows;
@@ -310,9 +310,16 @@ impl TaskDetail {
                 return;
             }
             // The due-date popover with its time menu or the custom repeat editor open.
-            "due-reminder" => {
+            "due-reminder" | "due-reminder-custom" => {
                 self.open_popup(Popup::Due, cx);
-                self.update_draft(cx, |d| d.menu = Some(DueMenu::Reminder));
+                let custom = popup == "due-reminder-custom";
+                self.update_draft(cx, |d| {
+                    d.menu = Some(if custom {
+                        DueMenu::CustomReminder(CustomReminder::new(d.time.is_some()))
+                    } else {
+                        DueMenu::Reminder
+                    })
+                });
                 return;
             }
             "due-time" | "due-custom" => {
@@ -677,7 +684,8 @@ impl TaskDetail {
                 .child(Icon::new(icon).color(if active { Color::Accent } else { Color::Muted }))
                 .child(div().flex_1().child(Label::new(label).size(LabelSize::Small).color(color)))
                 .child(
-                    Icon::new(if draft.menu == Some(menu) || (menu == DueMenu::Repeat && matches!(draft.menu, Some(DueMenu::Custom(_)))) {
+                    Icon::new(if draft.menu == Some(menu) || (menu == DueMenu::Repeat && matches!(draft.menu, Some(DueMenu::Custom(_))))
+                        || (menu == DueMenu::Reminder && matches!(draft.menu, Some(DueMenu::CustomReminder(_)))) {
                         IconName::ChevronDown
                     } else {
                         IconName::ChevronRight
@@ -748,8 +756,40 @@ impl TaskDetail {
                                 }))
                         },
                     ))
+                    // Custom reminders already chosen, so they can be turned off again.
+                    .children(
+                        draft
+                            .reminders
+                            .iter()
+                            .filter(|m| !due_picker::reminder_options(draft.time.is_some(), strings).iter().any(|(o, _, _)| o == *m))
+                            .map(|&minutes| {
+                                ListItem::new(SharedString::from(format!("reminder-custom-{minutes}")))
+                                    .height(px(28.))
+                                    .child(
+                                        Label::new(due_picker::describe_reminder(minutes, draft.time.is_some(), strings))
+                                            .size(LabelSize::Small),
+                                    )
+                                    .end_slot(check_mark())
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.update_draft(cx, |d| d.toggle_reminder(minutes, Local::now().date_naive()))
+                                    }))
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                    .child(div().py_1().child(Divider::horizontal()))
+                    .child(
+                        ListItem::new("reminder-custom")
+                            .height(px(28.))
+                            .child(Label::new(strings.repeat_custom).size(LabelSize::Small))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.update_draft(cx, |d| {
+                                    d.menu = Some(DueMenu::CustomReminder(CustomReminder::new(d.time.is_some())))
+                                })
+                            })),
+                    )
                     .into_any_element(),
             ),
+            Some(DueMenu::CustomReminder(custom)) => Some(self.render_custom_reminder(custom, &draft, strings, cx)),
             Some(DueMenu::Repeat) => {
                 let base = draft.date.unwrap_or(today);
                 let options = due_picker::repeat_options(base, strings, locale);
@@ -799,7 +839,7 @@ impl TaskDetail {
         };
         let (time_menu, reminder_menu, repeat_menu) = match draft.menu {
             Some(DueMenu::Time) => (menu, None, None),
-            Some(DueMenu::Reminder) => (None, menu, None),
+            Some(DueMenu::Reminder | DueMenu::CustomReminder(_)) => (None, menu, None),
             Some(DueMenu::Repeat | DueMenu::Custom(_)) => (None, None, menu),
             None => (None, None, None),
         };
@@ -895,6 +935,125 @@ impl TaskDetail {
                     .pt_1()
                     .child(button("due-clear", strings.clear, false).on_click(cx.listener(|this, _, _, cx| this.clear_due(cx))))
                     .child(button("due-ok", strings.ok, true).on_click(cx.listener(|this, _, _, cx| this.apply_due(cx)))),
+            )
+            .into_any_element()
+    }
+
+    fn update_custom_reminder(&mut self, cx: &mut Context<Self>, change: impl FnOnce(&mut CustomReminder)) {
+        self.update_draft(cx, |d| {
+            if let Some(DueMenu::CustomReminder(custom)) = d.menu.as_mut() {
+                change(custom);
+            }
+        })
+    }
+
+    /// The custom reminder editor, as in the original: unit, amount in advance, the time of day
+    /// for all-day tasks, and when it will fire.
+    fn render_custom_reminder(
+        &self,
+        custom: CustomReminder,
+        draft: &DueDraft,
+        strings: &'static Strings,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = cx.theme().clone();
+        let has_time = draft.time.is_some();
+        let units: &[ReminderUnit] = if has_time { &ReminderUnit::TIMED } else { &ReminderUnit::ALL_DAY };
+        let offset = custom.offset(has_time);
+        let fires = draft.date.map(|date| {
+            let base = draft.time.unwrap_or_else(|| {
+                chrono::NaiveTime::from_hms_opt(fern_core::reminder::ALL_DAY_REMINDER_HOUR, 0, 0).unwrap_or_default()
+            });
+            date.and_time(base) - chrono::Duration::minutes(offset)
+        });
+        let summary = fires.map(|at| {
+            strings
+                .reminder_summary
+                .replace("{time}", &at.format("%H:%M").to_string())
+                .replace("{date}", &format!("{}, {}", task_rows::short_date(at.date(), strings), at.year()))
+        });
+        let stepper_row = |label: &'static str, value: String, minus: AnyElement, plus: AnyElement| {
+            h_flex()
+                .gap_2()
+                .child(div().flex_1().child(Label::new(label).size(LabelSize::Small)))
+                .child(minus)
+                .child(div().min_w(px(44.)).flex().justify_center().child(Label::new(value).size(LabelSize::Small)))
+                .child(plus)
+        };
+        let small = |id: &'static str, icon: IconName| IconButton::new(id, icon).size(px(22.)).icon_size(IconSize::XSmall);
+        let button = |id: &'static str, label: &'static str, primary: bool| {
+            div()
+                .id(id)
+                .flex_1()
+                .h(px(26.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(6.))
+                .cursor_pointer()
+                .when(primary, |el| el.bg(theme.colors().accent))
+                .when(!primary, |el| el.border_1().border_color(theme.colors().border))
+                .child(Label::new(label).size(LabelSize::Small))
+        };
+        v_flex()
+            .gap_2()
+            .p_2()
+            .rounded(px(6.))
+            .border_1()
+            .border_color(theme.colors().border)
+            .child(h_flex().gap_1().children(units.iter().map(|&unit| {
+                let selected = unit == custom.unit;
+                div()
+                    .id(SharedString::from(format!("reminder-unit-{unit:?}")))
+                    .flex_1()
+                    .h(px(24.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(5.))
+                    .cursor_pointer()
+                    .when(selected, |el| el.bg(theme.colors().element_selected))
+                    .hover(|s| s.bg(theme.colors().element_hover))
+                    .child(Label::new(unit.label(strings)).size(LabelSize::XSmall))
+                    .on_click(cx.listener(move |this, _, _, cx| this.update_custom_reminder(cx, |c| c.unit = unit)))
+            })))
+            .child(stepper_row(
+                strings.reminder_in_advance,
+                custom.amount.to_string(),
+                small("reminder-fewer", IconName::Minus)
+                    .on_click(cx.listener(|this, _, _, cx| this.update_custom_reminder(cx, |c| c.amount = c.amount.saturating_sub(1))))
+                    .into_any_element(),
+                small("reminder-more", IconName::Plus)
+                    .on_click(cx.listener(|this, _, _, cx| this.update_custom_reminder(cx, |c| c.amount = (c.amount + 1).min(999))))
+                    .into_any_element(),
+            ))
+            .when(!has_time, |el| {
+                el.child(stepper_row(
+                    strings.reminder_at,
+                    custom.at.format("%H:%M").to_string(),
+                    small("reminder-earlier", IconName::Minus)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.update_custom_reminder(cx, |c| c.at = c.at - chrono::Duration::minutes(30))
+                        }))
+                        .into_any_element(),
+                    small("reminder-later", IconName::Plus)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.update_custom_reminder(cx, |c| c.at = c.at + chrono::Duration::minutes(30))
+                        }))
+                        .into_any_element(),
+                ))
+            })
+            .child(Label::new(due_picker::describe_reminder(offset, has_time, strings)).size(LabelSize::XSmall).color(Color::Muted))
+            .when_some(summary, |el, summary| el.child(Label::new(summary).size(LabelSize::XSmall).color(Color::Accent)))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(button("reminder-cancel", strings.cancel, false).on_click(cx.listener(|this, _, _, cx| {
+                        this.update_draft(cx, |d| d.menu = Some(DueMenu::Reminder))
+                    })))
+                    .child(button("reminder-ok", strings.ok, true).on_click(cx.listener(move |this, _, _, cx| {
+                        this.update_draft(cx, |d| d.add_reminder(offset, Local::now().date_naive()))
+                    }))),
             )
             .into_any_element()
     }

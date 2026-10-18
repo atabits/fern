@@ -1,7 +1,7 @@
 //! State and labels of the due-date popover, matched to TickTick's: the user edits a draft
 //! (date, time, repeat) and nothing is saved until "OK".
 
-use chrono::{Datelike, Duration, Months, NaiveDate, NaiveTime};
+use chrono::{Datelike, Duration, Months, NaiveDate, NaiveTime, Timelike};
 use fern_core::reminder::{ALL_DAY_OFFSETS, ALL_DAY_REMINDER_HOUR, TIMED_OFFSETS};
 use fern_core::{Frequency, Recurrence, Task};
 
@@ -13,6 +13,8 @@ use crate::i18n::{Locale, Strings};
 pub enum DueMenu {
     Time,
     Reminder,
+    /// The custom reminder editor.
+    CustomReminder(CustomReminder),
     Repeat,
     /// The custom repeat editor with the rule being edited.
     Custom(Recurrence),
@@ -69,6 +71,14 @@ impl DueDraft {
         }
     }
 
+    /// Adds a custom reminder and goes back to the reminder list.
+    pub fn add_reminder(&mut self, offset: i64, today: NaiveDate) {
+        if !self.reminders.contains(&offset) {
+            self.toggle_reminder(offset, today);
+        }
+        self.menu = Some(DueMenu::Reminder);
+    }
+
     pub fn pick_repeat(&mut self, repeat: Option<Recurrence>, today: NaiveDate) {
         self.repeat = repeat;
         if repeat.is_some() && self.date.is_none() {
@@ -114,6 +124,101 @@ pub fn parse_time(text: &str) -> Option<NaiveTime> {
     NaiveTime::from_hms_opt(hour, minute, 0)
 }
 
+/// Units of a custom reminder; all-day tasks use days and weeks, timed ones minutes to days.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ReminderUnit {
+    Minute,
+    Hour,
+    Day,
+    Week,
+}
+
+impl ReminderUnit {
+    pub const TIMED: [Self; 3] = [Self::Minute, Self::Hour, Self::Day];
+    pub const ALL_DAY: [Self; 2] = [Self::Day, Self::Week];
+
+    fn minutes(self) -> i64 {
+        match self {
+            Self::Minute => 1,
+            Self::Hour => 60,
+            Self::Day => 24 * 60,
+            Self::Week => 7 * 24 * 60,
+        }
+    }
+
+    pub fn label(self, strings: &Strings) -> &'static str {
+        strings.reminder_custom_units[self as usize]
+    }
+}
+
+/// The custom reminder being edited: "1 day in advance at 09:00", or "30 minutes in advance".
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct CustomReminder {
+    pub unit: ReminderUnit,
+    pub amount: u32,
+    /// The time of day, for all-day tasks.
+    pub at: NaiveTime,
+}
+
+impl CustomReminder {
+    pub fn new(has_time: bool) -> Self {
+        Self {
+            unit: if has_time { ReminderUnit::Minute } else { ReminderUnit::Day },
+            amount: if has_time { 15 } else { 1 },
+            at: NaiveTime::from_hms_opt(ALL_DAY_REMINDER_HOUR, 0, 0).unwrap_or_default(),
+        }
+    }
+
+    /// Minutes before the due time (09:00 on the due day for all-day tasks), as stored.
+    pub fn offset(&self, has_time: bool) -> i64 {
+        let before = self.amount as i64 * self.unit.minutes();
+        if has_time {
+            before
+        } else {
+            let at = (self.at.num_seconds_from_midnight() / 60) as i64;
+            before + ALL_DAY_REMINDER_HOUR as i64 * 60 - at
+        }
+    }
+}
+
+/// An all-day reminder offset as (days before, time of day): 1440 → (1, 09:00), -540 → (0, 18:00).
+pub fn all_day_parts(offset: i64) -> (u32, NaiveTime) {
+    let from_midnight = ALL_DAY_REMINDER_HOUR as i64 * 60 - offset;
+    let days = if from_midnight >= 0 { 0 } else { (-from_midnight + 24 * 60 - 1) / (24 * 60) };
+    let minutes = from_midnight + days * 24 * 60;
+    let time = NaiveTime::from_hms_opt((minutes / 60) as u32, (minutes % 60) as u32, 0).unwrap_or_default();
+    (days as u32, time)
+}
+
+/// The label of one reminder, with the time for all-day tasks: "1 day early (09:00)".
+pub fn describe_reminder(offset: i64, has_time: bool, strings: &Strings) -> String {
+    let fill = |template: &str, n: i64| template.replace("{n}", &n.to_string());
+    let fill_days = |n: i64| if n == 1 { strings.reminders_all_day[1].to_owned() } else { fill(strings.reminder_days_early, n) };
+    if has_time {
+        if let Some(i) = TIMED_OFFSETS.iter().position(|o| *o == offset) {
+            return strings.reminders_timed[i].to_owned();
+        }
+        return if offset % (24 * 60) == 0 {
+            fill_days(offset / (24 * 60))
+        } else if offset % 60 == 0 {
+            fill(strings.reminder_hours_early, offset / 60)
+        } else {
+            fill(strings.reminder_minutes_early, offset)
+        };
+    }
+    let (days, at) = all_day_parts(offset);
+    let base = if days == 0 {
+        strings.reminders_all_day[0].to_owned()
+    } else if days == 7 {
+        strings.reminders_all_day[4].to_owned()
+    } else if days % 7 == 0 {
+        fill(strings.reminder_weeks_early, days as i64 / 7)
+    } else {
+        fill_days(days as i64)
+    };
+    format!("{base} ({})", at.format("%H:%M"))
+}
+
 /// The reminder options for the draft, with a hint ("09:00" for all-day tasks).
 pub fn reminder_options(has_time: bool, strings: &Strings) -> Vec<(i64, &'static str, String)> {
     if has_time {
@@ -129,11 +234,12 @@ pub fn reminder_label(reminders: &[i64], has_time: bool, strings: &Strings) -> O
     if reminders.is_empty() {
         return None;
     }
-    let options = reminder_options(has_time, strings);
     let labels: Vec<String> = reminders
         .iter()
-        .map(|m| {
-            options.iter().find(|(o, _, _)| o == m).map_or_else(|| format!("-{m}m"), |(_, label, _)| (*label).to_owned())
+        .map(|offset| {
+            let label = describe_reminder(*offset, has_time, strings);
+            // The row stays short: preset all-day reminders drop their usual "(09:00)".
+            label.strip_suffix(" (09:00)").map(str::to_owned).unwrap_or(label)
         })
         .collect();
     Some(labels.join(", "))
@@ -249,6 +355,25 @@ mod tests {
         draft.toggle_reminder(0, today);
         assert_eq!(draft.reminders, [24 * 60]);
         assert_eq!(reminder_options(false, &EN)[0].2, "09:00");
+    }
+
+    #[test]
+    fn custom_reminders() {
+        let t = |h, m| NaiveTime::from_hms_opt(h, m, 0).unwrap();
+        let all_day = |unit, amount, at| CustomReminder { unit, amount, at }.offset(false);
+        assert_eq!(all_day(ReminderUnit::Day, 1, t(9, 0)), 24 * 60);
+        assert_eq!(all_day(ReminderUnit::Day, 0, t(18, 0)), -9 * 60);
+        assert_eq!(all_day(ReminderUnit::Week, 1, t(8, 30)), 7 * 24 * 60 + 30);
+        assert_eq!(all_day_parts(24 * 60), (1, t(9, 0)));
+        assert_eq!(all_day_parts(-9 * 60), (0, t(18, 0)));
+        assert_eq!(all_day_parts(7 * 24 * 60 + 30), (7, t(8, 30)));
+        assert_eq!(CustomReminder { unit: ReminderUnit::Hour, amount: 2, at: t(9, 0) }.offset(true), 120);
+
+        assert_eq!(describe_reminder(120, true, &EN), "2 hours early");
+        assert_eq!(describe_reminder(45, true, &EN), "45 minutes early");
+        assert_eq!(describe_reminder(-9 * 60, false, &EN), "On the day (18:00)");
+        assert_eq!(describe_reminder(7 * 24 * 60 + 30, false, &EN), "1 week early (08:30)");
+        assert_eq!(reminder_label(&[24 * 60, 2 * 24 * 60 - 60], false, &EN).as_deref(), Some("1 day early, 2 days early (10:00)"));
     }
 
     #[test]

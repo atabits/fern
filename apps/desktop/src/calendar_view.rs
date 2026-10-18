@@ -344,7 +344,14 @@ impl CalendarView {
                         .justify_center()
                         .rounded_full()
                         .when(date == today, |el| el.bg(theme.colors().accent))
-                        .child(Label::new(number).weight(FontWeight::SEMIBOLD)),
+                        // As in the original, the days of the months around are muted.
+                        .child(Label::new(number).weight(FontWeight::SEMIBOLD).color(
+                            if self.mode == CalendarMode::Month && date.month() != self.month.month() && date != today {
+                                Color::Muted
+                            } else {
+                                Color::Default
+                            },
+                        )),
                 ),
             )
             .children(tasks.iter().take(TASKS_PER_DAY).map(|task| {
@@ -1033,7 +1040,7 @@ impl Render for CalendarView {
                                 ),
                             })
                                 .size(LabelSize::Large)
-                                .weight(FontWeight::BOLD),
+                                .weight(FontWeight::SEMIBOLD),
                         ),
                     )
                     .when(self.mode == CalendarMode::Week && calendar::week_numbers(), |el| {

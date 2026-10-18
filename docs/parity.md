@@ -93,6 +93,7 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 
 ## Next
 
-1. Interface: re-check the focus, calendar month / week and Settings screens against the original now that bold text renders (Inbox and Habits are checked: the Habit title medium, its week strip's numbers semibold), and fix the weights that differ.
+1. Interface: re-check the Settings window and the Statistics page against the original for font weights (Inbox, Habits, Calendar month — title semibold, the days of the months around muted — and Focus — title and Overview values semibold — are checked).
+2. Calendar: the right-click menu's six date icons as the original calendar's, after hovering them in the original for their tooltips.
 
 Not checkable under the reference rules: whether the original asks for a note when a focus session ends, and its white noise (the desktop original shows no sound choice on the focus page or in Focus Settings; it would only appear with a timer running in the reference account). Fern's record dialog takes a note afterwards.

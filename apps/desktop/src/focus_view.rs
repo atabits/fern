@@ -2608,7 +2608,7 @@ impl FocusView {
                 .rounded(px(8.))
                 .bg(theme.colors().surface_background)
                 .child(Label::new(label).size(LabelSize::XSmall).color(Color::Muted))
-                .child(div().text_size(px(22.)).child(value))
+                .child(div().text_size(px(22.)).font_weight(FontWeight::SEMIBOLD).child(value))
         };
         v_flex()
             .gap_2()
@@ -3271,7 +3271,7 @@ impl Render for FocusView {
                     .flex_none()
                     .px(px(22.))
                     .gap_2()
-                    .child(div().flex_1().child(Label::new(strings.pomodoro).size(LabelSize::Large).weight(FontWeight::BOLD)))
+                    .child(div().flex_1().child(Label::new(strings.pomodoro).size(LabelSize::Large).weight(FontWeight::SEMIBOLD)))
                     // The original's Active and Archived tabs over the timers.
                     .child(h_flex().p_0p5().rounded(px(8.)).bg(theme.colors().element_hover).children(
                         [(false, strings.habit_active), (true, strings.habit_archived)].map(|(archived, label)| {

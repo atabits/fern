@@ -3,6 +3,9 @@
 
 use chrono::{Datelike, Duration, Local, Months, NaiveDate, TimeZone, Weekday};
 
+use std::collections::{HashMap, HashSet};
+
+use crate::habit::Habit;
 use crate::model::{Id, Priority, Task};
 
 /// The original's Date filter.
@@ -135,6 +138,8 @@ pub struct SummaryOptions {
     pub lists: Option<Vec<Option<Id>>>,
     /// "Next Period Tasks": add the open tasks due in the following period.
     pub next_period: bool,
+    /// The Lists filter's "Habit": add the habits' check-ins of the period.
+    pub habits: bool,
 }
 
 impl Default for SummaryOptions {
@@ -146,6 +151,7 @@ impl Default for SummaryOptions {
             fields: vec![Field::CompletionTime],
             lists: None,
             next_period: false,
+            habits: false,
         }
     }
 }
@@ -246,6 +252,28 @@ pub fn summarize(tasks: &[Task], options: &SummaryOptions, today: NaiveDate, wee
     groups
 }
 
+/// The period's check-in days of each active habit, for the report's Habit section.
+pub fn habit_checkins(
+    habits: &[Habit],
+    checkins: &HashMap<Id, HashSet<NaiveDate>>,
+    options: &SummaryOptions,
+    today: NaiveDate,
+    week_start: Weekday,
+) -> Vec<(Habit, usize)> {
+    if !options.habits {
+        return Vec::new();
+    }
+    let (first, last) = options.period.range(today, week_start);
+    habits
+        .iter()
+        .filter(|h| !h.archived)
+        .map(|h| {
+            let days = checkins.get(&h.id).map_or(0, |days| days.iter().filter(|d| **d >= first && **d <= last).count());
+            (h.clone(), days)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -253,6 +281,21 @@ mod tests {
 
     fn d(y: i32, m: u32, day: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(y, m, day).unwrap()
+    }
+
+    #[test]
+    fn habit_check_ins_of_the_period() {
+        let store = Store::open_in_memory().unwrap();
+        let today = Local::now().date_naive();
+        let run = store.add_habit("Run").unwrap();
+        let days: HashSet<NaiveDate> = [today, today - Duration::days(40)].into();
+        let checkins = HashMap::from([(run.id, days)]);
+        let habits = store.habits().unwrap();
+        let off = SummaryOptions { period: Period::Today, ..Default::default() };
+        assert!(habit_checkins(&habits, &checkins, &off, today, Weekday::Mon).is_empty());
+        let on = SummaryOptions { habits: true, ..off };
+        let rows = habit_checkins(&habits, &checkins, &on, today, Weekday::Mon);
+        assert_eq!(rows.iter().map(|(h, n)| (h.name.as_str(), *n)).collect::<Vec<_>>(), [("Run", 1)]);
     }
 
     #[test]

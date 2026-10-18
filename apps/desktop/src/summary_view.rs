@@ -207,6 +207,9 @@ impl SummaryView {
         if menu == "next" {
             self.options.next_period = true;
         }
+        if menu == "habits" {
+            self.options.habits = true;
+        }
         cx.notify();
     }
 
@@ -216,7 +219,19 @@ impl SummaryView {
         let tasks = self.store.tasks().unwrap_or_default();
         let lists = self.store.lists().unwrap_or_default();
         let groups = summarize(&tasks, &self.options, today, calendar::week_start());
-        report(&groups, &self.options, &lists, today, strings)
+        let mut report = report(&groups, &self.options, &lists, today, strings);
+        // The Lists filter's "Habit": each habit's check-ins in the period.
+        let habits = self.store.habits().unwrap_or_default();
+        let checkins = habits.iter().map(|h| (h.id, self.store.checkins(h.id).unwrap_or_default())).collect();
+        let rows = fern_core::summary::habit_checkins(&habits, &checkins, &self.options, today, calendar::week_start());
+        if !rows.is_empty() {
+            let lines = rows
+                .into_iter()
+                .map(|(habit, days)| strings.summary_habit_line.replace("{name}", &habit.name).replace("{n}", &days.to_string()))
+                .collect();
+            report.groups.push((strings.summary_habits.to_owned(), lines));
+        }
+        report
     }
 
     /// A Filter or Display Options row whose value opens a dropdown.
@@ -294,6 +309,7 @@ impl SummaryView {
         ));
         let lists = self.store.lists().unwrap_or_default();
         let list_label = match &options.lists {
+            None if options.habits => format!("{}, {}", strings.summary_all_lists, strings.summary_habits),
             None => strings.summary_all_lists.to_owned(),
             Some(chosen) => chosen
                 .iter()
@@ -309,6 +325,11 @@ impl SummaryView {
             options.lists.is_none(),
             Box::new(|this, _, cx| this.update(cx, |o| o.lists = None)),
         )];
+        list_options.push((
+            strings.summary_habits.to_owned(),
+            options.habits,
+            Box::new(|this, _, cx| this.update(cx, |o| o.habits = !o.habits)),
+        ));
         let choices = std::iter::once((None, strings.inbox.to_owned())).chain(lists.iter().map(|l| (Some(l.id), l.name.clone())));
         list_options.extend(choices.map(|(id, name)| {
             let selected = options.lists.as_ref().is_some_and(|chosen| chosen.contains(&id));

@@ -90,6 +90,9 @@ struct HabitEdit {
     reminder_input: Entity<TextInput>,
     /// The row whose dropdown is open.
     open: Option<EditRow>,
+    /// The time field after the reminders, shown by their "+" as in the original.
+    adding_reminder: bool,
+    constant_reminder: bool,
 }
 
 /// The Edit Habit rows that open a dropdown, as in the original.
@@ -271,6 +274,7 @@ impl HabitView {
                         e.reminders.push(time);
                         e.reminders.sort();
                     }
+                    e.adding_reminder = false;
                 });
                 input.update(cx, |input, cx| input.set_text("", cx));
             }
@@ -303,6 +307,8 @@ impl HabitView {
             new_section: None,
             reminder_input,
             open: None,
+            adding_reminder: false,
+            constant_reminder: habit.constant_reminder,
         });
         self.detail_menu_open = false;
         cx.notify();
@@ -320,6 +326,7 @@ impl HabitView {
             .and_then(|()| self.store.set_habit_look(id, edit.icon.as_deref(), edit.color.as_deref()))
             .and_then(|()| self.store.set_habit_span(id, Some(edit.start_date), edit.goal_days))
             .and_then(|()| self.store.set_habit_section(id, edit.section))
+            .and_then(|()| self.store.set_habit_constant_reminder(id, edit.constant_reminder))
         {
             eprintln!("failed to update the habit: {err:#}");
         }
@@ -529,13 +536,15 @@ impl HabitView {
                     .flex_wrap()
                     .gap_1()
                     .children(edit.reminders.iter().map(|&time| {
+                        // The original's time chips: bordered, 32 px high.
                         h_flex()
                             .id(SharedString::from(format!("habit-reminder-{time}")))
-                            .h(px(24.))
+                            .h(px(32.))
                             .pl_2()
                             .gap_0p5()
-                            .rounded(px(5.))
-                            .bg(theme.colors().element_selected)
+                            .rounded(px(6.))
+                            .border_1()
+                            .border_color(theme.colors().border)
                             .child(Label::new(crate::calendar::format_time(time)).size(LabelSize::Small))
                             .child(
                                 IconButton::new(SharedString::from(format!("habit-reminder-remove-{time}")), IconName::X)
@@ -546,7 +555,40 @@ impl HabitView {
                                     })),
                             )
                     }))
-                    .child(div().flex_1().min_w(px(120.)).child(field(edit.reminder_input.clone().into_any_element())))
+                    .when(edit.adding_reminder || edit.reminders.is_empty(), |el| {
+                        el.child(div().flex_1().min_w(px(120.)).child(field(edit.reminder_input.clone().into_any_element())))
+                    })
+                    .when(!edit.adding_reminder && !edit.reminders.is_empty(), |el| {
+                        el.child(
+                            div()
+                                .id("habit-reminder-add")
+                                .size(px(32.))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(6.))
+                                .border_1()
+                                .border_color(theme.colors().border)
+                                .cursor_pointer()
+                                .child(Icon::new(IconName::Plus).size(IconSize::Small).color(Color::Muted))
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    let input = this.editing.as_ref().map(|e| e.reminder_input.clone());
+                                    this.update_edit(cx, |e| e.adding_reminder = true);
+                                    if let Some(input) = input {
+                                        window.focus(&input.focus_handle(cx), cx);
+                                    }
+                                })),
+                        )
+                    })
+                    .into_any_element(),
+            ))
+            .child(row(
+                strings.habit_constant_reminder,
+                h_flex()
+                    .id("habit-constant-reminder")
+                    .cursor_pointer()
+                    .child(Switch::new().toggle_state(edit.constant_reminder))
+                    .on_click(cx.listener(|this, _, _, cx| this.update_edit(cx, |e| e.constant_reminder = !e.constant_reminder)))
                     .into_any_element(),
             ))
             .child(

@@ -253,7 +253,10 @@ pub fn start(store: Rc<Store>, window: AnyWindowHandle, cx: &mut Context<AppView
                     .collect()
             });
             for (notice, due, buttons) in shown {
-                let reply = show(notice.title.clone(), due, buttons, settings.constant);
+                // Constant everywhere, or for a habit set to "Constant Reminder".
+                let constant = settings.constant
+                    || matches!(notice.target, Target::Habit(id) if store.habits().unwrap_or_default().iter().any(|h| h.id == id && h.constant_reminder));
+                let reply = show(notice.title.clone(), due, buttons, constant);
                 let this = this.clone();
                 cx.spawn(async move |cx| {
                     let Ok(reply) = reply.await else { return };

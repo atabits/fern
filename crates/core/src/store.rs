@@ -631,6 +631,9 @@ const MIGRATIONS: &[&str] = &[
         INSERT INTO sync_log (entity, key, at) VALUES ('matrix_rules', OLD.quadrant, CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER));
     END;
     ",
+    "
+    ALTER TABLE habits ADD COLUMN constant_reminder INTEGER NOT NULL DEFAULT 0;
+    ",
 ];
 
 const TASK_COLUMNS: &str = "id, parent_id, kind, title, notes, priority, due_date, due_time, \
@@ -1640,7 +1643,7 @@ impl Store {
 
     pub fn habits(&self) -> Result<Vec<Habit>> {
         let mut stmt =
-            self.conn.prepare("SELECT id, name, goal_amount, goal_unit, reminders, frequency, icon, color, start_date, goal_days, section, archived_at, icon_checkins FROM habits ORDER BY created_at, rowid")?;
+            self.conn.prepare("SELECT id, name, goal_amount, goal_unit, reminders, frequency, icon, color, start_date, goal_days, section, archived_at, icon_checkins, constant_reminder FROM habits ORDER BY created_at, rowid")?;
         let habits = stmt
             .query_map([], |row| {
                 let goal = row.get::<_, Option<u32>>(2)?.map(|amount| Goal { amount, unit: row.get::<_, Option<String>>(3).ok().flatten().unwrap_or_default() });
@@ -1672,6 +1675,7 @@ impl Store {
                         .unwrap_or_default(),
                     archived: row.get::<_, Option<i64>>(11)?.is_some(),
                     icon_checkins: row.get(12)?,
+                    constant_reminder: row.get(13)?,
                 })
             })?
             .collect::<Result<_, _>>()?;
@@ -1694,6 +1698,7 @@ impl Store {
             section: Default::default(),
             archived: false,
             icon_checkins: false,
+            constant_reminder: false,
         };
         self.conn.execute(
             "INSERT INTO habits (id, name, created_at) VALUES (?1, ?2, ?3)",
@@ -1766,6 +1771,12 @@ impl Store {
         let key = crate::habit::HabitSection::Custom(id).key();
         self.conn.execute("UPDATE habits SET section = NULL WHERE section = ?1", [key])?;
         self.conn.execute("DELETE FROM habit_sections WHERE id = ?1", [id.to_string()])?;
+        Ok(())
+    }
+
+    /// "Constant Reminder": the habit's reminders stay on screen until answered.
+    pub fn set_habit_constant_reminder(&self, id: Id, on: bool) -> Result<()> {
+        self.conn.execute("UPDATE habits SET constant_reminder = ?2 WHERE id = ?1", params![id.to_string(), on])?;
         Ok(())
     }
 
@@ -2910,6 +2921,9 @@ mod tests {
         assert!(!habit.icon_checkins);
         store.set_habit_icon_checkins(water.id, true)?;
         assert!(store.habits()?[0].icon_checkins);
+        assert!(!habit.constant_reminder);
+        store.set_habit_constant_reminder(water.id, true)?;
+        assert!(store.habits()?[0].constant_reminder);
         store.set_habit_archived(water.id, false)?;
         assert!(!store.habits()?[0].archived);
 

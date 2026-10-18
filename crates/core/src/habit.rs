@@ -30,6 +30,8 @@ pub struct Habit {
     pub archived: bool,
     /// "Checked-in Style": checked-in days show the habit's icon instead of a checkmark.
     pub icon_checkins: bool,
+    /// The original's "Constant Reminder": its reminders stay on screen until answered.
+    pub constant_reminder: bool,
 }
 
 /// A habit's section: the original's default ones or one the user added ("Add Section").
@@ -359,6 +361,7 @@ mod tests {
             section: HabitSection::Others,
             archived: false,
             icon_checkins: false,
+            constant_reminder: false,
         };
         let habits = [habit.clone()];
         let mut done = HashMap::new();
@@ -441,6 +444,7 @@ mod tests {
             section: HabitSection::Others,
             archived: false,
             icon_checkins: false,
+            constant_reminder: false,
         };
         let water = Habit { goal: Some(Goal { amount: 8, unit: "glasses".into() }), ..habit("Water, daily") };
         let checkins = vec![Checkin { date: d(18), value: 8, note: Some("said \"done\"".into()) }];

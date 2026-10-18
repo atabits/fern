@@ -56,10 +56,12 @@ impl gpui::EventEmitter<StartFocus> for TodoView {}
 struct FilterEdit {
     draft: fern_core::SmartFilter,
     is_new: bool,
-    /// The "Advanced" tab: conditions combined with "all" or "any".
+    /// The "Advanced" tab: a chain of conditions with AND and OR between them.
     advanced: bool,
     name: Entity<TextInput>,
     keywords: Entity<TextInput>,
+    /// The chain condition whose menu is open (field, NOT, remove).
+    chain_menu: Option<usize>,
 }
 
 /// What the add field's "▾" menu set for the next task.
@@ -474,10 +476,18 @@ impl TodoView {
                     self.add_list_side = true;
                 }
                 Some(("menu", "activity")) => self.open_list_activity(cx),
+                // `filter-new=normal|advanced`, or `filter-new=chain` (an Advanced chain with
+                // a condition's menu open).
                 Some(("filter-new", mode)) => {
                     self.open_filter_edit(None, window, cx);
-                    if let Some(edit) = self.filter_edit.as_mut() {
-                        edit.advanced = mode == "advanced";
+                    if mode != "normal" {
+                        self.set_filter_advanced(true, cx);
+                    }
+                    if mode == "chain" {
+                        if let Some(edit) = self.filter_edit.as_mut() {
+                            edit.draft.chain = fern_core::filter::chain_from_storage("lists and:tags! or:date");
+                            edit.chain_menu = Some(1);
+                        }
                     }
                 }
                 Some(("filter", spec)) => {
@@ -1789,8 +1799,8 @@ impl TodoView {
         let keywords = field(strings.filter_keywords, draft.keywords.clone(), cx);
         window.focus(&name.focus_handle(cx), cx);
         self.header_menu_open = false;
-        let advanced = draft.match_any;
-        self.filter_edit = Some(FilterEdit { draft, is_new, advanced, name, keywords });
+        let advanced = draft.match_any || !draft.chain.is_empty();
+        self.filter_edit = Some(FilterEdit { draft, is_new, advanced, name, keywords, chain_menu: None });
         cx.notify();
     }
 
@@ -1799,6 +1809,152 @@ impl TodoView {
             change(&mut edit.draft);
         }
         cx.notify();
+    }
+
+    /// The dialog's Normal / Advanced tabs. Advanced starts its chain from the set conditions,
+    /// joined as "all" or "any" were; Normal drops the chain.
+    fn set_filter_advanced(&mut self, advanced: bool, cx: &mut Context<Self>) {
+        let Some(edit) = self.filter_edit.as_mut() else { return };
+        edit.advanced = advanced;
+        edit.chain_menu = None;
+        let draft = &mut edit.draft;
+        if !advanced {
+            draft.match_any = false;
+            draft.chain.clear();
+        } else if draft.chain.is_empty() {
+            use fern_core::{Field, Join, Link};
+            let set = [
+                (Field::Lists, !draft.lists.is_empty()),
+                (Field::Tags, !draft.tags.is_empty()),
+                (Field::Date, draft.date != fern_core::DateRule::All),
+                (Field::Priority, !draft.priorities.is_empty()),
+                (Field::Include, !draft.keywords.trim().is_empty()),
+                (Field::Type, draft.kind.is_some()),
+            ];
+            let join = if draft.match_any { Join::Or } else { Join::And };
+            draft.chain = set.into_iter().filter(|(_, on)| *on).map(|(field, _)| Link::new(join, field)).collect();
+            if draft.chain.is_empty() {
+                draft.chain = vec![Link::new(Join::And, Field::Lists)];
+            }
+        }
+        cx.notify();
+    }
+
+    fn update_chain(&mut self, cx: &mut Context<Self>, change: impl FnOnce(&mut Vec<fern_core::Link>, &mut Option<usize>)) {
+        if let Some(edit) = self.filter_edit.as_mut() {
+            change(&mut edit.draft.chain, &mut edit.chain_menu);
+        }
+        cx.notify();
+    }
+
+    /// The Advanced chain, as the original lays it out: condition, Logic, condition … and "+".
+    /// A condition's chip opens its menu: the field, NOT and remove; Logic switches AND and OR.
+    fn render_filter_chain(&self, edit: &FilterEdit, cx: &mut Context<Self>) -> AnyElement {
+        use fern_core::{Field, Join, Link};
+        let strings = i18n::t(cx);
+        let theme = cx.theme().clone();
+        let field_name = |field: Field| match field {
+            Field::Lists => strings.filter_lists,
+            Field::Tags => strings.tags,
+            Field::Date => strings.filter_date,
+            Field::Priority => strings.filter_priority,
+            Field::Include => strings.filter_include,
+            Field::Type => strings.filter_type,
+        };
+        let cell = |id: SharedString, dashed: bool| {
+            div()
+                .id(id)
+                .h(px(28.))
+                .px_3()
+                .flex()
+                .items_center()
+                .rounded(px(6.))
+                .border_1()
+                .border_color(theme.colors().border)
+                .when(dashed, |el| el.border_dashed())
+                .cursor_pointer()
+                .hover(|s| s.bg(theme.colors().element_hover))
+        };
+        let mut row = h_flex().flex_wrap().gap_2();
+        for (i, link) in edit.draft.chain.iter().copied().enumerate() {
+            if i > 0 {
+                row = row.child(
+                    cell(SharedString::from(format!("filter-logic-{i}")), true)
+                        .child(Label::new(strings.filter_logic[(link.join == Join::Or) as usize]).size(LabelSize::Small).color(Color::Accent))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.update_chain(cx, |chain, _| {
+                                chain[i].join = if chain[i].join == Join::And { Join::Or } else { Join::And };
+                            })
+                        })),
+                );
+            }
+            let label = if link.not { format!("{} {}", strings.filter_not, field_name(link.field)) } else { field_name(link.field).to_owned() };
+            let menu = (edit.chain_menu == Some(i)).then(|| {
+                PopoverAttachment::new(
+                    Placement::BelowLeft,
+                    popover(cx)
+                        .w(px(180.))
+                        .on_mouse_down_out(cx.listener(|this, _, _, cx| this.update_chain(cx, |_, menu| *menu = None)))
+                        .children(Field::ALL.into_iter().map(|field| {
+                            let selected = field == link.field;
+                            ListItem::new(SharedString::from(format!("filter-chain-{i}-{}", field.key())))
+                                .child(Label::new(field_name(field)).size(LabelSize::Small).color(if selected { Color::Accent } else { Color::Default }))
+                                .when(selected, |item| item.end_slot(Icon::new(IconName::Check).size(IconSize::XSmall).color(Color::Accent)))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.update_chain(cx, |chain, menu| {
+                                        chain[i].field = field;
+                                        *menu = None;
+                                    })
+                                }))
+                        }))
+                        .child(div().h(px(1.)).my_1().bg(theme.colors().border_variant))
+                        .child(
+                            ListItem::new(SharedString::from(format!("filter-chain-{i}-not")))
+                                .child(Label::new(strings.filter_not).size(LabelSize::Small))
+                                .when(link.not, |item| item.end_slot(Icon::new(IconName::Check).size(IconSize::XSmall).color(Color::Accent)))
+                                .on_click(cx.listener(move |this, _, _, cx| this.update_chain(cx, |chain, _| chain[i].not = !chain[i].not))),
+                        )
+                        .when(edit.draft.chain.len() > 1, |el| {
+                            el.child(
+                                ListItem::new(SharedString::from(format!("filter-chain-{i}-remove")))
+                                    .start_slot(Icon::new(IconName::Trash).size(IconSize::Small).color(Color::Error))
+                                    .child(Label::new(strings.delete).size(LabelSize::Small).color(Color::Error))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.update_chain(cx, |chain, menu| {
+                                            chain.remove(i);
+                                            *menu = None;
+                                        })
+                                    })),
+                            )
+                        })
+                        .into_any_element(),
+                )
+            });
+            row = row.child(
+                div()
+                    .relative()
+                    .child(
+                        cell(SharedString::from(format!("filter-cond-{i}")), false)
+                            .child(Label::new(label).size(LabelSize::Small))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.update_chain(cx, |_, menu| *menu = if *menu == Some(i) { None } else { Some(i) })
+                            })),
+                    )
+                    .children(menu),
+            );
+        }
+        row.child(
+            cell("filter-chain-add".into(), false)
+                .child(Icon::new(IconName::Plus).size(IconSize::Small).color(Color::Muted))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.update_chain(cx, |chain, _| {
+                        // The next condition not in the chain yet, or Lists again.
+                        let field = Field::ALL.into_iter().find(|f| !chain.iter().any(|l| l.field == *f)).unwrap_or(Field::Lists);
+                        chain.push(Link::new(Join::And, field));
+                    })
+                })),
+        )
+        .into_any_element()
     }
 
     fn save_filter(&mut self, cx: &mut Context<Self>) {
@@ -1949,6 +2105,8 @@ impl TodoView {
                 .child(Label::new(label).size(LabelSize::Small))
         };
         let is_new = edit.is_new;
+        let chain = edit.advanced.then(|| self.render_filter_chain(edit, cx));
+        let shows = |field: fern_core::Field| !edit.advanced || edit.draft.chain.iter().any(|l| l.field == field);
         div()
             .absolute()
             .inset_0()
@@ -1970,35 +2128,17 @@ impl TodoView {
                     .child(Label::new(if is_new { strings.add_filter } else { strings.edit_filter }).weight(FontWeight::SEMIBOLD))
                     .child(h_flex().justify_center().gap_1().children([false, true].map(|advanced| {
                         chip(format!("filter-mode-{advanced}"), strings.filter_modes[advanced as usize].into(), edit.advanced == advanced)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                if let Some(edit) = this.filter_edit.as_mut() {
-                                    edit.advanced = advanced;
-                                    if !advanced {
-                                        edit.draft.match_any = false;
-                                    }
-                                }
-                                cx.notify();
-                            }))
+                            .on_click(cx.listener(move |this, _, _, cx| this.set_filter_advanced(advanced, cx)))
                     })))
                     .child(field(edit.name.clone()))
-                    .when(edit.advanced, |el| {
-                        el.child(row(
-                            strings.filter_match,
-                            h_flex()
-                                .gap_1()
-                                .children([false, true].map(|any| {
-                                    chip(format!("filter-match-{any}"), strings.filter_match_options[any as usize].into(), draft.match_any == any)
-                                        .on_click(cx.listener(move |this, _, _, cx| this.update_filter_draft(cx, |d| d.match_any = any)))
-                                }))
-                                .into_any_element(),
-                        ))
-                    })
-                    .child(row(strings.filter_lists, lists.into_any_element()))
-                    .child(row(strings.tags, tags.into_any_element()))
-                    .child(row(strings.filter_date, dates.into_any_element()))
-                    .child(row(strings.filter_priority, priorities.into_any_element()))
-                    .child(row(strings.filter_include, field(edit.keywords.clone()).into_any_element()))
-                    .child(row(strings.filter_type, kinds.into_any_element()))
+                    .children(chain)
+                    // In the Advanced tab only the chain's conditions are set.
+                    .when(shows(fern_core::Field::Lists), |el| el.child(row(strings.filter_lists, lists.into_any_element())))
+                    .when(shows(fern_core::Field::Tags), |el| el.child(row(strings.tags, tags.into_any_element())))
+                    .when(shows(fern_core::Field::Date), |el| el.child(row(strings.filter_date, dates.into_any_element())))
+                    .when(shows(fern_core::Field::Priority), |el| el.child(row(strings.filter_priority, priorities.into_any_element())))
+                    .when(shows(fern_core::Field::Include), |el| el.child(row(strings.filter_include, field(edit.keywords.clone()).into_any_element())))
+                    .when(shows(fern_core::Field::Type), |el| el.child(row(strings.filter_type, kinds.into_any_element())))
                     .child(
                         h_flex()
                             .gap_2()

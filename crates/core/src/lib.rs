@@ -22,7 +22,7 @@ pub mod sync;
 pub mod timeline;
 
 pub use countdown::{Countdown, CountdownKind, Span, span};
-pub use filter::{DateRule, SmartFilter};
+pub use filter::{DateRule, Field, Join, Link, SmartFilter};
 pub use focus::{FocusSession, FocusStats, focus_stats, format_minutes};
 pub use habit::{Checkin, Goal, Habit, HabitStats, MonthStats};
 pub use habit::Frequency as HabitFrequency;

@@ -336,10 +336,12 @@ pub struct Strings {
     pub filter_priority: &'static str,
     pub filter_include: &'static str,
     pub filter_type: &'static str,
-    /// "Normal" and "Advanced": all conditions or any of them.
+    /// "Normal" and "Advanced": the conditions, or a chain of them with AND and OR.
     pub filter_modes: [&'static str; 2],
-    pub filter_match: &'static str,
-    pub filter_match_options: [&'static str; 2],
+    /// The Advanced chain's "Logic" between conditions: AND, OR.
+    pub filter_logic: [&'static str; 2],
+    /// A chain condition that must not match.
+    pub filter_not: &'static str,
     pub filter_all: &'static str,
     /// Overdue, Today, Tomorrow, This Week, No Date (after "All").
     pub filter_dates: [&'static str; 5],
@@ -873,8 +875,8 @@ pub static EN: Strings = Strings {
     filter_include: "Include",
     filter_type: "Type",
     filter_modes: ["Normal", "Advanced"],
-    filter_match: "Match",
-    filter_match_options: ["All conditions", "Any condition"],
+    filter_logic: ["AND", "OR"],
+    filter_not: "NOT",
     filter_all: "All",
     filter_dates: ["Overdue", "Today", "Tomorrow", "This Week", "No Date"],
     filter_kinds: ["Task", "Note"],
@@ -1390,8 +1392,8 @@ pub static RU: Strings = Strings {
     filter_include: "Содержит",
     filter_type: "Тип",
     filter_modes: ["Обычный", "Расширенный"],
-    filter_match: "Условия",
-    filter_match_options: ["Все сразу", "Хотя бы одно"],
+    filter_logic: ["И", "ИЛИ"],
+    filter_not: "НЕ",
     filter_all: "Все",
     filter_dates: ["Просрочено", "Сегодня", "Завтра", "Эта неделя", "Без даты"],
     filter_kinds: ["Задача", "Заметка"],

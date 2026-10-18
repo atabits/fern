@@ -42,6 +42,87 @@ impl DateRule {
     }
 }
 
+/// A condition of the Advanced tab's chain, named as the original's "Filter" menu names them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Field {
+    Lists,
+    Tags,
+    Date,
+    Priority,
+    Include,
+    Type,
+}
+
+impl Field {
+    pub const ALL: [Self; 6] = [Self::Lists, Self::Tags, Self::Date, Self::Priority, Self::Include, Self::Type];
+
+    pub fn key(self) -> &'static str {
+        ["lists", "tags", "date", "priority", "include", "type"][self as usize]
+    }
+
+    fn from_key(key: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|f| f.key() == key)
+    }
+}
+
+/// The original's "Logic" between two conditions.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Join {
+    #[default]
+    And,
+    Or,
+}
+
+/// A condition in the Advanced chain: its field, the original's NOT (it must not match), and the
+/// logic joining it to the condition before (unused for the first).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Link {
+    pub join: Join,
+    pub field: Field,
+    pub not: bool,
+}
+
+impl Link {
+    pub fn new(join: Join, field: Field) -> Self {
+        Self { join, field, not: false }
+    }
+}
+
+/// Writes a chain as text: `lists and:tags! or:date` (`!` is NOT).
+pub fn chain_to_storage(chain: &[Link]) -> String {
+    chain
+        .iter()
+        .enumerate()
+        .map(|(i, link)| {
+            let join = match (i, link.join) {
+                (0, _) => "",
+                (_, Join::And) => "and:",
+                (_, Join::Or) => "or:",
+            };
+            format!("{join}{}{}", link.field.key(), if link.not { "!" } else { "" })
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Reads [`chain_to_storage`]'s text; unknown parts are skipped.
+pub fn chain_from_storage(text: &str) -> Vec<Link> {
+    text.split_whitespace()
+        .filter_map(|part| {
+            let (join, rest) = match part.split_once(':') {
+                Some(("or", rest)) => (Join::Or, rest),
+                Some((_, rest)) => (Join::And, rest),
+                None => (Join::And, part),
+            };
+            let (key, not) = match rest.strip_suffix('!') {
+                Some(key) => (key, true),
+                None => (rest, false),
+            };
+            Field::from_key(key).map(|field| Link { join, field, not })
+        })
+        .collect()
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SmartFilter {
     pub id: Id,
@@ -58,7 +139,11 @@ pub struct SmartFilter {
     /// Only tasks or only notes; `None` is both.
     pub kind: Option<Kind>,
     /// "Advanced" logic: a task needs any one of the set conditions instead of all of them.
+    /// A chain, when there is one, decides instead.
     pub match_any: bool,
+    /// The Advanced tab's chain of conditions with AND and OR between them; AND binds first,
+    /// so `a OR b AND c` is `a OR (b AND c)`. Empty uses the conditions with `match_any`.
+    pub chain: Vec<Link>,
 }
 
 impl SmartFilter {
@@ -74,7 +159,7 @@ impl SmartFilter {
         }
         let text = format!("{}\n{}", task.title, task.notes).to_lowercase();
         // Each set condition and whether the task meets it; unset ones are left out.
-        let conditions = [
+        let conditions: [Option<bool>; 6] = [
             (!self.lists.is_empty()).then(|| self.lists.contains(&task.list_id)),
             (!self.tags.is_empty()).then(|| {
                 self.tags.iter().any(|tag| task.tags.iter().any(|t| t.to_lowercase() == tag.to_lowercase()))
@@ -85,6 +170,20 @@ impl SmartFilter {
                 .then(|| self.keywords.split_whitespace().all(|word| text.contains(&word.to_lowercase()))),
             self.kind.map(|kind| task.kind == kind),
         ];
+        if !self.chain.is_empty() {
+            // OR splits the chain into groups of AND; a condition left unset matches.
+            let mut any = false;
+            let mut group = true;
+            for (i, link) in self.chain.iter().enumerate() {
+                if i > 0 && link.join == Join::Or {
+                    any |= group;
+                    group = true;
+                }
+                let met = conditions[link.field as usize].unwrap_or(true);
+                group &= met != link.not;
+            }
+            return any || group;
+        }
         let mut set = conditions.into_iter().flatten().peekable();
         if set.peek().is_none() {
             return true;
@@ -135,5 +234,31 @@ mod tests {
         assert!(!all.matches(get(report.id), today));
         assert!(DateRule::ThisWeek.matches(Some(NaiveDate::from_ymd_opt(2026, 10, 12).unwrap()), today));
         assert_eq!(DateRule::from_key(DateRule::Overdue.key()), DateRule::Overdue);
+
+        // The Advanced chain: work list AND NOT tagged finance, OR no date.
+        let chain = SmartFilter {
+            lists: vec![Some(work.id)],
+            tags: vec!["finance".into()],
+            date: DateRule::NoDate,
+            chain: vec![Link::new(Join::And, Field::Lists), Link { not: true, ..Link::new(Join::And, Field::Tags) }, Link::new(Join::Or, Field::Date)],
+            ..Default::default()
+        };
+        assert!(!chain.matches(get(report.id), today), "in Work but tagged finance, and dated");
+        assert!(chain.matches(get(errand.id), today), "undated");
+        let without_not = SmartFilter { chain: vec![Link::new(Join::And, Field::Lists), Link::new(Join::And, Field::Tags), Link::new(Join::Or, Field::Date)], ..chain.clone() };
+        assert!(without_not.matches(get(report.id), today));
+        // AND binds before OR: (undated AND high) OR in Work.
+        let precedence = SmartFilter {
+            lists: vec![Some(work.id)],
+            date: DateRule::NoDate,
+            priorities: vec![Priority::High],
+            chain: vec![Link::new(Join::And, Field::Date), Link::new(Join::And, Field::Priority), Link::new(Join::Or, Field::Lists)],
+            ..Default::default()
+        };
+        assert!(precedence.matches(get(report.id), today) && !precedence.matches(get(errand.id), today));
+        let text = chain_to_storage(&chain.chain);
+        assert_eq!(text, "lists and:tags! or:date");
+        assert_eq!(chain_from_storage(&text), chain.chain);
+        assert_eq!(chain_from_storage("bogus or:type"), [Link::new(Join::Or, Field::Type)]);
     }
 }

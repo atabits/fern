@@ -130,6 +130,7 @@ impl TodoView {
                     self.reload(cx);
                 }
                 Some(("list", name)) => self.create_list(name, cx),
+                Some(("view", "trash")) => self.set_view(View::Trash, cx),
                 Some(("view", name)) => {
                     if let Some(id) = self.lists.iter().find(|l| l.name == name).map(|l| l.id) {
                         self.set_view(View::List(id), cx);
@@ -145,6 +146,11 @@ impl TodoView {
                     self.detail.update(cx, |detail, cx| detail.dev_open_popup(&popup, cx));
                 }
                 Some(("menu", "header")) => self.header_menu_open = true,
+                Some(("delete", needle)) => {
+                    if let Some(id) = self.tasks.iter().find(|t| t.title.contains(needle)).map(|t| t.id) {
+                        self.delete(id, cx);
+                    }
+                }
                 Some(("rename", _)) => self.start_rename(window, cx),
                 Some(("new-list", _)) => self.start_new_list(window, cx),
                 _ => {}
@@ -356,10 +362,33 @@ impl TodoView {
         self.reload(cx);
     }
 
+    /// Moves a task to the trash, or deletes it for good when it is already there.
     fn delete(&mut self, id: Id, cx: &mut Context<Self>) {
-        let result = self.store.delete_task(id);
+        let result = if self.view == View::Trash {
+            self.store.purge_task(id)
+        } else {
+            self.store.delete_task(id)
+        };
         self.check(result);
         self.reload(cx);
+    }
+
+    fn restore(&mut self, id: Id, cx: &mut Context<Self>) {
+        let result = self.store.restore_task(id);
+        self.check(result);
+        self.reload(cx);
+    }
+
+    fn empty_trash(&mut self, cx: &mut Context<Self>) {
+        self.header_menu_open = false;
+        let result = self.store.empty_trash();
+        self.check(result);
+        self.reload(cx);
+    }
+
+    /// Views where new tasks cannot be added.
+    fn is_read_only_view(&self) -> bool {
+        matches!(self.view, View::Completed | View::Trash)
     }
 
     fn render_section(
@@ -489,6 +518,24 @@ impl TodoView {
                                 .color(if overdue && !done { Color::Error } else { Color::Accent }),
                         )
                     })
+                    .when(self.view == View::Trash, |el| {
+                        el.child(
+                            div()
+                                .id("restore")
+                                .flex_none()
+                                .opacity(0.)
+                                .group_hover(group.clone(), |s| s.opacity(1.))
+                                .child(
+                                    IconButton::new("restore-button", IconName::RotateCcw)
+                                        .size(px(20.))
+                                        .icon_size(IconSize::Small)
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.restore(id, cx);
+                                        })),
+                                ),
+                        )
+                    })
                     .child(
                         div()
                             .id("delete")
@@ -510,6 +557,7 @@ impl TodoView {
 
     fn render_header_menu(&self, strings: &Strings, cx: &mut Context<Self>) -> AnyElement {
         let in_list = matches!(self.view, View::List(_));
+        let in_trash = self.view == View::Trash;
         popover(cx)
             .w(px(236.))
             .on_mouse_down_out(cx.listener(|this, _, _, cx| {
@@ -549,7 +597,15 @@ impl TodoView {
                         .on_click(cx.listener(|this, _, _, cx| this.delete_current_list(cx))),
                 )
             })
-            .when(!in_list, |el| {
+            .when(in_trash, |el| {
+                el.child(
+                    ListItem::new("empty-trash")
+                        .start_slot(Icon::new(IconName::Trash).color(Color::Error))
+                        .child(Label::new(strings.empty_trash).color(Color::Error))
+                        .on_click(cx.listener(|this, _, _, cx| this.empty_trash(cx))),
+                )
+            })
+            .when(!in_list && !in_trash, |el| {
                 el.child(div().px_2().py_1().child(Label::new(strings.no_actions).color(Color::Muted)))
             })
             .into_any_element()
@@ -659,7 +715,7 @@ impl Render for TodoView {
                             }),
                     ),
             )
-            .child(
+            .when(!self.is_read_only_view(), |el| el.child(
                 h_flex()
                     .mx_2()
                     .mb_2()
@@ -674,7 +730,7 @@ impl Render for TodoView {
                     })
                     .child(Icon::new(IconName::Plus))
                     .child(self.input.clone()),
-            )
+            ))
             .child(
                 div()
                     .id("tasks")
@@ -684,10 +740,10 @@ impl Render for TodoView {
                     .pb_4()
                     .when(self.tasks.is_empty(), |el| {
                         el.child(div().px_3().pt_8().child(
-                            Label::new(if self.view == View::Completed {
-                                strings.no_completed_tasks
-                            } else {
-                                strings.no_tasks
+                            Label::new(match self.view {
+                                View::Completed => strings.no_completed_tasks,
+                                View::Trash => strings.trash_is_empty,
+                                _ => strings.no_tasks,
                             })
                             .color(Color::Muted),
                         ))

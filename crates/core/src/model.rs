@@ -74,6 +74,8 @@ pub struct Task {
     /// Checklist progress as (done, total); `None` when the task has no checklist items.
     pub checklist: Option<(usize, usize)>,
     pub completed_at: Option<i64>,
+    /// When the task was moved to the trash.
+    pub deleted_at: Option<i64>,
     pub created_at: i64,
 }
 
@@ -89,6 +91,10 @@ pub struct ChecklistItem {
 impl Task {
     pub fn is_completed(&self) -> bool {
         self.completed_at.is_some()
+    }
+
+    pub fn is_deleted(&self) -> bool {
+        self.deleted_at.is_some()
     }
 
     pub fn is_overdue(&self, today: NaiveDate) -> bool {
@@ -124,6 +130,7 @@ pub enum View {
     Tomorrow,
     Next7Days,
     Completed,
+    Trash,
     List(Id),
     Tag(String),
 }

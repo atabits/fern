@@ -21,6 +21,7 @@ pub fn title(view: &View, lists: &[List], strings: &Strings) -> SharedString {
         View::Tomorrow => strings.tomorrow.into(),
         View::Next7Days => strings.next_7_days.into(),
         View::Completed => strings.completed.into(),
+        View::Trash => strings.trash.into(),
         View::List(id) => {
             lists.iter().find(|l| l.id == *id).map(|l| l.name.clone()).unwrap_or_default().into()
         }
@@ -163,4 +164,5 @@ pub fn render(
                 .child(separator())
         })
         .child(smart(View::Completed, strings.completed, IconName::SquareCheckBig, None))
+        .child(smart(View::Trash, strings.trash, IconName::Trash, None))
 }

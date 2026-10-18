@@ -67,10 +67,13 @@ const MIGRATIONS: &[&str] = &[
     );
     CREATE INDEX checklist_items_task ON checklist_items(task_id, sort_order);
     ",
+    "
+    ALTER TABLE tasks ADD COLUMN deleted_at INTEGER;
+    ",
 ];
 
 const TASK_COLUMNS: &str = "id, parent_id, kind, title, notes, priority, due_date, due_time, \
-                            completed_at, created_at, list_id";
+                            completed_at, created_at, list_id, deleted_at";
 
 const DATE_FORMAT: &str = "%Y-%m-%d";
 const TIME_FORMAT: &str = "%H:%M";
@@ -175,6 +178,7 @@ impl Store {
             tags: Vec::new(),
             checklist: None,
             completed_at: None,
+            deleted_at: None,
             created_at: now_ms(),
         };
         self.conn.execute(
@@ -262,6 +266,7 @@ impl Store {
              FROM tags t
              LEFT JOIN task_tags tt ON tt.tag = t.name
              LEFT JOIN tasks tk ON tk.id = tt.task_id AND tk.completed_at IS NULL
+                                AND tk.deleted_at IS NULL
              GROUP BY t.name
              ORDER BY t.created_at, t.rowid",
         )?;
@@ -287,6 +292,7 @@ impl Store {
             "SELECT l.id, l.name, l.color, COUNT(t.id)
              FROM lists l
              LEFT JOIN tasks t ON t.list_id = l.id AND t.completed_at IS NULL
+                               AND t.deleted_at IS NULL
              GROUP BY l.id
              ORDER BY l.created_at, l.rowid",
         )?;
@@ -450,9 +456,37 @@ impl Store {
         Ok(())
     }
 
-    /// Deletes the task together with its subtasks.
+    /// Moves the task and its subtasks to the trash.
     pub fn delete_task(&self, id: Id) -> Result<()> {
+        self.set_deleted(id, Some(now_ms()))
+    }
+
+    /// Brings the task and its subtasks back from the trash.
+    pub fn restore_task(&self, id: Id) -> Result<()> {
+        self.set_deleted(id, None)
+    }
+
+    /// Deletes the task and its subtasks permanently.
+    pub fn purge_task(&self, id: Id) -> Result<()> {
         self.conn.execute("DELETE FROM tasks WHERE id = ?1", [id.to_string()])?;
+        Ok(())
+    }
+
+    /// Permanently deletes everything in the trash.
+    pub fn empty_trash(&self) -> Result<()> {
+        self.conn.execute("DELETE FROM tasks WHERE deleted_at IS NOT NULL", [])?;
+        Ok(())
+    }
+
+    fn set_deleted(&self, id: Id, deleted_at: Option<i64>) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        for task in std::iter::once(id).chain(self.descendants(id)?) {
+            tx.execute(
+                "UPDATE tasks SET deleted_at = ?2 WHERE id = ?1",
+                params![task.to_string(), deleted_at],
+            )?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -482,6 +516,9 @@ impl Store {
 }
 
 fn matches_view(task: &Task, view: &View, today: NaiveDate) -> bool {
+    if task.is_deleted() != (*view == View::Trash) {
+        return false;
+    }
     let due_before = |days: i64| task.due_date.is_some_and(|due| due < today + Duration::days(days));
     match view {
         View::Inbox => task.list_id.is_none(),
@@ -493,6 +530,7 @@ fn matches_view(task: &Task, view: &View, today: NaiveDate) -> bool {
         }
         View::Next7Days => !task.is_completed() && due_before(7),
         View::Completed => task.is_completed(),
+        View::Trash => true,
         View::Tag(tag) => task.tags.iter().any(|t| t.to_lowercase() == tag.to_lowercase()),
     }
 }
@@ -521,6 +559,7 @@ fn task_from_row(row: &Row) -> rusqlite::Result<Task> {
         completed_at: row.get(8)?,
         created_at: row.get(9)?,
         list_id: row.get::<_, Option<String>>(10)?.map(|l| parse_uuid(&l, 10)).transpose()?,
+        deleted_at: row.get(11)?,
     })
 }
 
@@ -561,7 +600,7 @@ mod tests {
         assert_eq!(b2.title, "call the dentist");
         assert_eq!(b2.notes, "after 6 pm\nask about weekends");
 
-        store.delete_task(b.id)?;
+        store.purge_task(b.id)?;
         assert_eq!(store.tasks()?.len(), 1);
         Ok(())
     }
@@ -729,8 +768,35 @@ mod tests {
 
         store.delete_checklist_item(a.id)?;
         assert_eq!(titles(&store)?, ["tickets", "phone charger"]);
-        store.delete_task(task.id)?;
+        store.purge_task(task.id)?;
         assert!(store.checklist(task.id)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn trash_hides_restores_and_purges() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let today = d(2026, 10, 18);
+        let parent = store.add_task("old project")?;
+        let child = store.add_task("its step")?;
+        let kept = store.add_task("keep me")?;
+        store.set_parent(child.id, Some(parent.id))?;
+        store.set_tags(parent.id, &["work".into()])?;
+
+        store.delete_task(parent.id)?;
+        assert_eq!(titles(&store.tasks_in(&View::Inbox, today)?), ["keep me"]);
+        assert_eq!(titles(&store.tasks_in(&View::Trash, today)?), ["its step", "old project"]);
+        assert_eq!(store.counts(today)?.inbox, 1);
+        assert_eq!(store.tags()?[0].open_count, 0);
+
+        store.restore_task(parent.id)?;
+        assert_eq!(store.tasks_in(&View::Inbox, today)?.len(), 3);
+        assert!(store.tasks_in(&View::Trash, today)?.is_empty());
+
+        store.delete_task(parent.id)?;
+        store.empty_trash()?;
+        assert_eq!(titles(&store.tasks()?), ["keep me"]);
+        assert!(store.task(kept.id)?.is_some());
         Ok(())
     }
 
@@ -757,7 +823,7 @@ mod tests {
         assert!(store.set_parent(parent.id, Some(grandchild.id)).is_err());
         assert!(store.set_parent(parent.id, Some(parent.id)).is_err());
 
-        store.delete_task(parent.id)?;
+        store.purge_task(parent.id)?;
         assert!(store.tasks()?.is_empty());
         Ok(())
     }

@@ -168,6 +168,7 @@ mod tests {
             tags: Vec::new(),
             checklist: None,
             completed_at: None,
+            deleted_at: None,
             created_at: 0,
         }
     }

@@ -35,7 +35,7 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 | Lists (projects), Inbox | ✅ | create, delete, move tasks with subtasks |
 | Custom sections inside a list (columns) | ⬜ | groups are by kind for now |
 | Manual ordering (`sortOrder`) | ⬜ | |
-| Trash, "Won't Do" | ⬜ | |
+| Trash, "Won't Do" | 🟡 | trash with restore, delete forever and "Empty trash"; no "Won't Do"; deleting a list still deletes its tasks permanently |
 | Reminders | ⬜ | |
 | Settings (UI language) | ✅ | |
 
@@ -48,7 +48,7 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 | Lists column: Inbox / All / Today / Tomorrow / Next 7 Days | ✅ | counters; a new task gets the due date or tag of the current view |
 | Lists column: user lists | ✅ | create inline; rename, color and delete from the "…" menu; no drag and drop |
 | Lists column: tags with color dots and counters | ✅ | |
-| Lists column: Filters, Won't Do, Trash | 🟡 | only Completed |
+| Lists column: Filters, Won't Do, Trash | 🟡 | Completed and Trash |
 | Mini week at the bottom of the lists column | ⬜ | |
 | List header with sidebar toggle | 🟡 | toggle and "…" work; sorting does not |
 | "Add task" field | ✅ | parses date, time, tags, priority and `^list`; no live highlighting yet; `^list` matches one-word list names only |
@@ -79,8 +79,8 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 
 ## Next
 
-1. Trash instead of immediate deletion.
-2. Time and repeat in the due-date picker.
-3. Creating subtasks from the UI.
-4. Manual ordering and drag and drop.
-5. Search.
+1. Time and repeat in the due-date picker.
+2. Creating subtasks from the UI.
+3. Manual ordering and drag and drop.
+4. Search.
+5. "Won't Do" status.

@@ -25,6 +25,36 @@ pub struct Habit {
     pub start_date: Option<NaiveDate>,
     /// "Goal Days": the number of check-in days to reach; `None` is "Forever".
     pub goal_days: Option<u32>,
+    pub section: HabitSection,
+    /// Archived habits are kept with their history but hidden and not reminded.
+    pub archived: bool,
+}
+
+/// The original's default habit sections, in their order.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum HabitSection {
+    Morning,
+    Afternoon,
+    Night,
+    #[default]
+    Others,
+}
+
+impl HabitSection {
+    pub const ALL: [Self; 4] = [Self::Morning, Self::Afternoon, Self::Night, Self::Others];
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Morning => "morning",
+            Self::Afternoon => "afternoon",
+            Self::Night => "night",
+            Self::Others => "others",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Self {
+        Self::ALL.into_iter().find(|s| s.key() == key).unwrap_or_default()
+    }
 }
 
 /// The original's "Goal Days" presets; "Custom" allows any number.
@@ -101,7 +131,7 @@ pub fn reminders_between<'a>(
     until: NaiveDateTime,
 ) -> Vec<(&'a Habit, NaiveDateTime)> {
     let mut fired = Vec::new();
-    for habit in habits {
+    for habit in habits.iter().filter(|h| !h.archived) {
         let mut day = after.date();
         while day <= until.date() {
             let days_done = done.get(&habit.id);
@@ -260,6 +290,8 @@ mod tests {
             color: None,
             start_date: None,
             goal_days: None,
+            section: HabitSection::Others,
+            archived: false,
         };
         let habits = [habit.clone()];
         let mut done = HashMap::new();
@@ -273,6 +305,12 @@ mod tests {
         let later = [Habit { start_date: Some(d(19)), ..habit.clone() }];
         assert!(reminders_between(&later, &HashMap::new(), at(17, 8), at(18, 23)).is_empty());
         assert!(!later[0].is_due(d(18), &HashSet::new()) && later[0].is_due(d(19), &HashSet::new()));
+
+        // Archived habits are not reminded.
+        let archived = [Habit { archived: true, ..habit.clone() }];
+        assert!(reminders_between(&archived, &HashMap::new(), at(17, 8), at(18, 23)).is_empty());
+        assert_eq!(HabitSection::from_key("night"), HabitSection::Night);
+        assert_eq!(HabitSection::from_key("custom"), HabitSection::Others);
     }
 
     #[test]

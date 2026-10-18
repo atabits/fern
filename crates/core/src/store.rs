@@ -141,6 +141,10 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE habits ADD COLUMN start_date TEXT;
     ALTER TABLE habits ADD COLUMN goal_days INTEGER;
     ",
+    "
+    ALTER TABLE habits ADD COLUMN section TEXT;
+    ALTER TABLE habits ADD COLUMN archived_at INTEGER;
+    ",
 ];
 
 const TASK_COLUMNS: &str = "id, parent_id, kind, title, notes, priority, due_date, due_time, \
@@ -716,7 +720,7 @@ impl Store {
 
     pub fn habits(&self) -> Result<Vec<Habit>> {
         let mut stmt =
-            self.conn.prepare("SELECT id, name, goal_amount, goal_unit, reminders, frequency, icon, color, start_date, goal_days FROM habits ORDER BY created_at, rowid")?;
+            self.conn.prepare("SELECT id, name, goal_amount, goal_unit, reminders, frequency, icon, color, start_date, goal_days, section, archived_at FROM habits ORDER BY created_at, rowid")?;
         let habits = stmt
             .query_map([], |row| {
                 let goal = row.get::<_, Option<u32>>(2)?.map(|amount| Goal { amount, unit: row.get::<_, Option<String>>(3).ok().flatten().unwrap_or_default() });
@@ -742,6 +746,11 @@ impl Store {
                         .get::<_, Option<String>>(8)?
                         .and_then(|d| NaiveDate::parse_from_str(&d, DATE_FORMAT).ok()),
                     goal_days: row.get(9)?,
+                    section: row
+                        .get::<_, Option<String>>(10)?
+                        .map(|s| crate::habit::HabitSection::from_key(&s))
+                        .unwrap_or_default(),
+                    archived: row.get::<_, Option<i64>>(11)?.is_some(),
                 })
             })?
             .collect::<Result<_, _>>()?;
@@ -761,6 +770,8 @@ impl Store {
             color: None,
             start_date: None,
             goal_days: None,
+            section: Default::default(),
+            archived: false,
         };
         self.conn.execute(
             "INSERT INTO habits (id, name, created_at) VALUES (?1, ?2, ?3)",
@@ -790,6 +801,19 @@ impl Store {
         self.conn.execute(
             "UPDATE habits SET start_date = ?2, goal_days = ?3 WHERE id = ?1",
             params![id.to_string(), start.map(|d| d.format(DATE_FORMAT).to_string()), goal_days.filter(|n| *n > 0)],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_habit_section(&self, id: Id, section: crate::habit::HabitSection) -> Result<()> {
+        self.conn.execute("UPDATE habits SET section = ?2 WHERE id = ?1", params![id.to_string(), section.key()])?;
+        Ok(())
+    }
+
+    pub fn set_habit_archived(&self, id: Id, archived: bool) -> Result<()> {
+        self.conn.execute(
+            "UPDATE habits SET archived_at = ?2 WHERE id = ?1",
+            params![id.to_string(), archived.then(now_ms)],
         )?;
         Ok(())
     }
@@ -1553,6 +1577,12 @@ mod tests {
         store.set_habit_span(water.id, Some(d(2026, 10, 1)), Some(21))?;
         let habit = store.habits()?.remove(0);
         assert_eq!((habit.start_date, habit.goal_days), (Some(d(2026, 10, 1)), Some(21)));
+        store.set_habit_section(water.id, crate::habit::HabitSection::Morning)?;
+        store.set_habit_archived(water.id, true)?;
+        let habit = store.habits()?.remove(0);
+        assert_eq!((habit.section, habit.archived), (crate::habit::HabitSection::Morning, true));
+        store.set_habit_archived(water.id, false)?;
+        assert!(!store.habits()?[0].archived);
         store.set_habit_span(water.id, None, Some(0))?;
         let habit = store.habits()?.remove(0);
         assert_eq!((habit.start_date, habit.goal_days), (None, None));

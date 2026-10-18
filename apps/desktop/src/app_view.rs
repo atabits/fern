@@ -101,13 +101,14 @@ impl AppView {
                 let days: Vec<i64> = days.split(',').filter_map(|d| d.parse().ok()).collect();
                 this.habits.update(cx, |view, cx| view.dev_add(name, &days, cx));
             }
-            // `habit-select=<name>`: open the habit's details panel.
-            for name in state.split(';').filter_map(|part| part.strip_prefix("habit-select=")) {
-                this.habits.update(cx, |view, cx| view.dev_select(name, cx));
-            }
-            // `habit-do=goal=<amount> <unit>|note=<days ago>><text>|edit` on the selected habit.
-            for command in state.split(';').filter_map(|part| part.strip_prefix("habit-do=")) {
-                this.habits.update(cx, |view, cx| view.dev_apply(command, window, cx));
+            // `habit-select=<name>` opens a habit's details panel; `habit-do=<command>` (see
+            // `HabitView::dev_apply`) acts on the selected habit. They run in order.
+            for part in state.split(';') {
+                if let Some(name) = part.strip_prefix("habit-select=") {
+                    this.habits.update(cx, |view, cx| view.dev_select(name, cx));
+                } else if let Some(command) = part.strip_prefix("habit-do=") {
+                    this.habits.update(cx, |view, cx| view.dev_apply(command, window, cx));
+                }
             }
             // `focus=<title>><minutes ago>><minutes>`, repeatable.
             for spec in state.split(';').filter_map(|part| part.strip_prefix("focus=")) {

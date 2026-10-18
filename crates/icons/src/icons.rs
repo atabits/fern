@@ -8,6 +8,7 @@ use strum::{EnumIter, IntoStaticStr};
 #[strum(serialize_all = "snake_case")]
 pub enum IconName {
     AlarmClock,
+    Archive,
     ArchiveRestore,
     ArrowDownUp,
     Baseline,

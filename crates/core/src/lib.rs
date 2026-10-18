@@ -14,6 +14,7 @@ pub use countdown::{Countdown, CountdownKind, Span, span};
 pub use focus::{FocusSession, FocusStats, focus_stats, format_minutes};
 pub use habit::{Checkin, Goal, Habit, HabitStats, MonthStats};
 pub use habit::Frequency as HabitFrequency;
+pub use habit::HabitSection;
 pub use model::{ChecklistItem, Id, Kind, List, Priority, Tag, Task, View, ViewCounts};
 pub use quick_add::{ParsedTask, parse_quick_add};
 pub use recurrence::{Frequency, Recurrence};

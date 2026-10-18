@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use chrono::{Datelike, Local, NaiveDate};
-use fern_core::{Checkin, Goal, Habit, HabitFrequency, Id, Store, habit};
+use fern_core::{Checkin, Goal, Habit, HabitFrequency, HabitSection, Id, Store, habit};
 use gpui::{Entity, Focusable as _, FontWeight};
 use ui::prelude::*;
 use ui::{Placement, PopoverAttachment, popover};
@@ -53,6 +53,7 @@ struct HabitEdit {
     amount: Option<u32>,
     reminders: Vec<chrono::NaiveTime>,
     frequency: HabitFrequency,
+    section: HabitSection,
     start_date: NaiveDate,
     goal_days: Option<u32>,
     /// The start date's calendar month, while it is open.
@@ -81,6 +82,9 @@ pub struct HabitView {
     /// The month shown in the details panel's calendar.
     month: NaiveDate,
     detail_menu_open: bool,
+    /// The header's Active / Archived switch.
+    show_archived: bool,
+    header_menu_open: bool,
 }
 
 impl HabitView {
@@ -110,6 +114,8 @@ impl HabitView {
             selected: None,
             month: calendar::month_start(Local::now().date_naive()),
             detail_menu_open: false,
+            show_archived: false,
+            header_menu_open: false,
         };
         this.reload(cx);
         this
@@ -186,6 +192,7 @@ impl HabitView {
             amount: habit.goal.as_ref().map(|g| g.amount),
             reminders: habit.reminders.clone(),
             frequency: habit.frequency,
+            section: habit.section,
             reminder_input,
         });
         self.detail_menu_open = false;
@@ -203,6 +210,7 @@ impl HabitView {
             .and_then(|()| self.store.set_habit_frequency(id, edit.frequency))
             .and_then(|()| self.store.set_habit_look(id, edit.icon.as_deref(), edit.color.as_deref()))
             .and_then(|()| self.store.set_habit_span(id, Some(edit.start_date), edit.goal_days))
+            .and_then(|()| self.store.set_habit_section(id, edit.section))
         {
             eprintln!("failed to update the habit: {err:#}");
         }
@@ -280,6 +288,23 @@ impl HabitView {
             .child(Label::new(strings.habit_frequency).size(LabelSize::Small).color(Color::Muted))
             .child(self.render_frequency(edit.frequency, cx))
             .child(self.render_span(edit, cx))
+            .child(Label::new(strings.habit_section).size(LabelSize::Small).color(Color::Muted))
+            .child(h_flex().gap_1().children(HabitSection::ALL.into_iter().enumerate().map(|(i, section)| {
+                let selected = edit.section == section;
+                div()
+                    .id(SharedString::from(format!("habit-section-{i}")))
+                    .flex_1()
+                    .h(px(24.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(12.))
+                    .cursor_pointer()
+                    .when(selected, |el| el.bg(theme.colors().accent.opacity(0.25)))
+                    .when(!selected, |el| el.bg(theme.colors().element_hover))
+                    .child(Label::new(strings.habit_sections[i]).size(LabelSize::XSmall).color(if selected { Color::Accent } else { Color::Default }))
+                    .on_click(cx.listener(move |this, _, _, cx| this.update_edit(cx, |e| e.section = section)))
+            })))
             .child(Label::new(strings.habit_goal).size(LabelSize::Small).color(Color::Muted))
             .child(
                 option("goal-all", strings.habit_goal_all, amount.is_none())
@@ -686,6 +711,12 @@ impl HabitView {
             let (ago, days) = span.split_once(',').unwrap_or((span, "0"));
             let start = Local::now().date_naive() - chrono::Duration::days(ago.parse().unwrap_or(0));
             self.store.set_habit_span(id, Some(start), days.parse().ok()).ok();
+        } else if let Some(section) = command.strip_prefix("section=") {
+            self.store.set_habit_section(id, HabitSection::from_key(section)).ok();
+        } else if command == "archive" {
+            self.store.set_habit_archived(id, true).ok();
+        } else if command == "show-archived" {
+            self.show_archived = true;
         } else if command == "picker" {
             self.update_edit(cx, |e| e.icon_picker = Some(0));
             return;
@@ -841,11 +872,21 @@ impl HabitView {
 
     /// The share of habits checked in on `date`, for the week strip's rings.
     fn day_progress(&self, date: NaiveDate) -> f32 {
-        if self.habits.is_empty() {
+        let active: Vec<&Habit> = self.habits.iter().filter(|h| !h.archived).collect();
+        if active.is_empty() {
             return 0.;
         }
-        let done = self.habits.iter().filter(|h| self.checkins.get(&h.id).is_some_and(|c| c.contains(&date))).count();
-        done as f32 / self.habits.len() as f32
+        let done = active.iter().filter(|h| self.checkins.get(&h.id).is_some_and(|c| c.contains(&date))).count();
+        done as f32 / active.len() as f32
+    }
+
+    fn set_archived(&mut self, habit: Id, archived: bool, cx: &mut Context<Self>) {
+        self.detail_menu_open = false;
+        if let Err(err) = self.store.set_habit_archived(habit, archived) {
+            eprintln!("failed to archive the habit: {err:#}");
+        }
+        self.selected = None;
+        self.reload(cx);
     }
 
     fn render_card(&self, habit: &Habit, week: [NaiveDate; 7], today: NaiveDate, cx: &mut Context<Self>) -> AnyElement {
@@ -1054,6 +1095,13 @@ impl HabitView {
                                                 .child(Label::new(strings.edit))
                                                 .on_click(cx.listener(|this, _, window, cx| this.start_edit(window, cx))),
                                         )
+                                        .child({
+                                            let archived = habit.archived;
+                                            ListItem::new("habit-archive")
+                                                .start_slot(Icon::new(IconName::Archive).color(Color::Muted))
+                                                .child(Label::new(if archived { strings.habit_unarchive } else { strings.habit_archive }))
+                                                .on_click(cx.listener(move |this, _, _, cx| this.set_archived(id, !archived, cx)))
+                                        })
                                         .child(
                                             ListItem::new("habit-delete")
                                                 .start_slot(Icon::new(IconName::Trash).color(Color::Muted))
@@ -1161,7 +1209,34 @@ impl Render for HabitView {
         let today = Local::now().date_naive();
         let week = calendar::week_of(today);
         let habits = self.habits.clone();
-        let cards: Vec<AnyElement> = habits.iter().map(|h| self.render_card(h, week, today, cx)).collect();
+        // Cards of the chosen side (active or archived), grouped by section once sections are used.
+        let visible: Vec<&Habit> = habits.iter().filter(|h| h.archived == self.show_archived).collect();
+        let grouped = visible.iter().any(|h| h.section != HabitSection::Others);
+        let mut cards: Vec<AnyElement> = Vec::new();
+        for (i, section) in HabitSection::ALL.into_iter().enumerate() {
+            let in_section: Vec<&Habit> =
+                visible.iter().copied().filter(|h| !grouped || h.section == section).collect();
+            if in_section.is_empty() || (!grouped && i > 0) {
+                continue;
+            }
+            let section_cards: Vec<AnyElement> = in_section.iter().map(|h| self.render_card(h, week, today, cx)).collect();
+            cards.push(
+                v_flex()
+                    .w_full()
+                    .gap_2()
+                    .when(grouped, |el| {
+                        el.child(
+                            h_flex()
+                                .gap_1()
+                                .pt_2()
+                                .child(Label::new(strings.habit_sections[i]).size(LabelSize::Small).weight(FontWeight::SEMIBOLD))
+                                .child(Label::new(in_section.len().to_string()).size(LabelSize::XSmall).color(Color::Muted)),
+                        )
+                    })
+                    .child(div().flex().flex_wrap().gap(px(12.)).children(section_cards))
+                    .into_any_element(),
+            );
+        }
         let detail = self
             .selected
             .and_then(|id| habits.iter().find(|h| h.id == id))
@@ -1214,8 +1289,46 @@ impl Render for HabitView {
                     .flex_none()
                     .px(px(22.))
                     .gap_1()
-                    .child(Label::new(strings.section_habits).size(LabelSize::Large).weight(FontWeight::BOLD))
-                    .child(Icon::new(IconName::ChevronDown).size(IconSize::XSmall))
+                    .child(
+                        h_flex()
+                            .id("habit-title")
+                            .relative()
+                            .gap_1()
+                            .cursor_pointer()
+                            .child(
+                                Label::new(if self.show_archived { strings.habit_archived } else { strings.section_habits })
+                                    .size(LabelSize::Large)
+                                    .weight(FontWeight::BOLD),
+                            )
+                            .child(Icon::new(IconName::ChevronDown).size(IconSize::XSmall))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.header_menu_open = true;
+                                cx.notify();
+                            }))
+                            .when(self.header_menu_open, |el| {
+                                let archived = self.show_archived;
+                                el.child(PopoverAttachment::new(
+                                    Placement::BelowLeft,
+                                    popover(cx)
+                                        .w(px(180.))
+                                        .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                                            this.header_menu_open = false;
+                                            cx.notify();
+                                        }))
+                                        .children([(false, strings.habit_active), (true, strings.habit_archived)].map(|(value, label)| {
+                                            ListItem::new(if value { "habits-archived" } else { "habits-active" })
+                                                .child(Label::new(label).color(if value == archived { Color::Accent } else { Color::Default }))
+                                                .when(value == archived, |item| item.end_slot(Label::new("✓").color(Color::Accent)))
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.show_archived = value;
+                                                    this.header_menu_open = false;
+                                                    this.selected = None;
+                                                    cx.notify();
+                                                }))
+                                        })),
+                                ))
+                            }),
+                    )
                     .child(div().flex_1())
                     .child(IconButton::new("habit-list", IconName::List))
                     .child(
@@ -1250,9 +1363,11 @@ impl Render for HabitView {
                     .overflow_y_scroll()
                     .px(px(22.))
                     .when(cards.is_empty(), |el| {
-                        el.child(div().pt_8().child(Label::new(strings.habit_empty).color(Color::Muted)))
+                        el.child(div().pt_8().child(
+                            Label::new(if self.show_archived { strings.habit_no_archived } else { strings.habit_empty }).color(Color::Muted),
+                        ))
                     })
-                    .child(div().flex().flex_wrap().gap(px(12.)).children(cards)),
+                    .child(v_flex().gap_2().children(cards)),
             );
 
         h_flex()

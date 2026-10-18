@@ -29,7 +29,13 @@ struct Draft {
     kind: CountdownKind,
     date: NaiveDate,
     month: NaiveDate,
+    /// The icon (an emoji) and its color, as the original's icon picker sets them.
+    icon: Option<String>,
+    color: Option<String>,
 }
+
+/// Emoji offered for countdowns; the original's illustrated icon set is its own artwork.
+const COUNTDOWN_EMOJI: [&str; 14] = ["🎂", "🎉", "❤️", "💍", "✈️", "🎄", "🎓", "⭐", "🏆", "🎯", "🚩", "🎮", "👶", "🏠"];
 
 pub struct CountdownView {
     store: Rc<Store>,
@@ -58,6 +64,31 @@ fn kind_label(kind: CountdownKind, strings: &Strings) -> &'static str {
 
 fn format_date(date: NaiveDate, strings: &Strings) -> String {
     crate::calendar::format_date(date, strings)
+}
+
+/// The color a countdown's dot and icon take: its own, or the accent.
+pub fn countdown_color(color: Option<&str>, cx: &App) -> gpui::Hsla {
+    crate::lists_panel::parse_color(color).unwrap_or(cx.theme().colors().accent)
+}
+
+/// A countdown's round icon: its emoji on its color, or the kind's icon.
+fn badge(countdown: &Countdown, color: gpui::Hsla, cx: &App) -> gpui::Div {
+    let fill = crate::lists_panel::parse_color(countdown.color.as_deref());
+    div()
+        .size(px(18.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_full()
+        .bg(fill.map_or(color.opacity(0.25), |c| c.opacity(0.6)))
+        .map(|el| match &countdown.icon {
+            Some(icon) => el.text_size(px(11.)).child(icon.clone()),
+            None => el.child(
+                Icon::new(kind_icon(countdown.kind))
+                    .size(IconSize::XSmall)
+                    .color(Color::Custom(if fill.is_some() { cx.theme().colors().text } else { color })),
+            ),
+        })
 }
 
 /// The parts of a countdown card: its color, the "1M 1D" numbers and "Days until …".
@@ -110,14 +141,7 @@ pub fn render_summary(countdown: &Countdown, date: NaiveDate, cx: &App) -> AnyEl
             h_flex()
                 .gap_1p5()
                 .child(
-                    div()
-                        .size(px(18.))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded_full()
-                        .bg(color.opacity(0.25))
-                        .child(Icon::new(kind_icon(countdown.kind)).size(IconSize::XSmall).color(Color::Custom(color))),
+                    badge(countdown, color, cx),
                 )
                 .child(Label::new(countdown.name.clone()).weight(FontWeight::SEMIBOLD)),
         )
@@ -153,20 +177,27 @@ impl CountdownView {
             Filter::Kind(kind) => kind,
             Filter::All => CountdownKind::Countdown,
         };
-        self.draft = Some(Draft { name, kind, date: today, month: calendar::month_start(today) });
+        self.draft = Some(Draft { name, kind, date: today, month: calendar::month_start(today), icon: None, color: None });
         cx.notify();
     }
 
     #[cfg(debug_assertions)]
-    pub fn dev_add(&mut self, name: &str, date: NaiveDate, kind: CountdownKind, cx: &mut Context<Self>) {
-        self.store.add_countdown(name, date, kind).ok();
+    pub fn dev_add(&mut self, name: &str, date: NaiveDate, kind: CountdownKind, look: Option<(&str, &str)>, cx: &mut Context<Self>) {
+        if let Ok(countdown) = self.store.add_countdown(name, date, kind)
+            && let Some((icon, color)) = look
+        {
+            self.store.set_countdown_look(countdown.id, Some(icon), (!color.is_empty()).then_some(color)).ok();
+        }
         self.reload(cx);
     }
 
     fn save_draft(&mut self, cx: &mut Context<Self>) {
         let Some(draft) = self.draft.take() else { return };
         let name = draft.name.read(cx).text().to_owned();
-        if let Err(err) = self.store.add_countdown(&name, draft.date, draft.kind) {
+        let added = self.store.add_countdown(&name, draft.date, draft.kind).and_then(|countdown| {
+            self.store.set_countdown_look(countdown.id, draft.icon.as_deref(), draft.color.as_deref())
+        });
+        if let Err(err) = added {
             eprintln!("failed to add the countdown: {err:#}");
         }
         self.reload(cx);
@@ -210,14 +241,7 @@ impl CountdownView {
                 h_flex()
                     .gap_1p5()
                     .child(
-                        div()
-                            .size(px(18.))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded_full()
-                            .bg(color.opacity(0.25))
-                            .child(Icon::new(kind_icon(countdown.kind)).size(IconSize::XSmall).color(Color::Custom(color))),
+                        badge(countdown, color, cx),
                     )
                     .child(Label::new(countdown.name.clone()).weight(FontWeight::SEMIBOLD)),
             )
@@ -316,6 +340,47 @@ impl CountdownView {
                     .bg(theme.colors().background)
                     .child(draft.name.clone()),
             )
+            // The original's icon picker, as for habits: an emoji and its background color.
+            .child(div().flex().flex_wrap().gap_0p5().children(COUNTDOWN_EMOJI.iter().map(|emoji| {
+                let selected = draft.icon.as_deref() == Some(*emoji);
+                div()
+                    .id(SharedString::from(format!("countdown-emoji-{emoji}")))
+                    .size(px(26.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(5.))
+                    .cursor_pointer()
+                    .text_size(px(15.))
+                    .when(selected, |el| el.bg(theme.colors().element_selected))
+                    .hover(|s| s.bg(theme.colors().element_hover))
+                    .child(*emoji)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(draft) = this.draft.as_mut() {
+                            draft.icon = (!selected).then(|| (*emoji).to_owned());
+                        }
+                        cx.notify();
+                    }))
+            })))
+            .child(h_flex().gap_1p5().children(
+                std::iter::once(None).chain(crate::lists_panel::LIST_COLORS.iter().map(|c| Some(*c))).map(|color| {
+                    let selected = draft.color.as_deref() == color;
+                    let fill = crate::lists_panel::parse_color(color).unwrap_or(theme.colors().accent);
+                    div()
+                        .id(SharedString::from(format!("countdown-color-{}", color.unwrap_or("none"))))
+                        .size(px(18.))
+                        .rounded_full()
+                        .cursor_pointer()
+                        .bg(fill.opacity(if color.is_none() { 0.35 } else { 1. }))
+                        .when(selected, |el| el.border_2().border_color(theme.colors().text))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if let Some(draft) = this.draft.as_mut() {
+                                draft.color = color.map(str::to_owned);
+                            }
+                            cx.notify();
+                        }))
+                }),
+            ))
             .child(h_flex().gap_1().children(kinds.map(|option| {
                 let selected = option == kind;
                 div()

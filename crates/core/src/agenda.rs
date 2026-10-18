@@ -17,6 +17,8 @@ pub struct AgendaItem {
     pub repeats: bool,
     /// A countdown rather than a task; `task` is then the countdown's id.
     pub countdown: bool,
+    /// A countdown's own color, a hex color.
+    pub color: Option<String>,
 }
 
 /// The days from `from` through `until` with open tasks due or countdowns, in order; on a day,
@@ -39,6 +41,7 @@ pub fn agenda(
             priority: task.priority,
             repeats: task.repeat.is_some(),
             countdown: false,
+            color: None,
         };
         loop {
             if date > until {
@@ -67,6 +70,7 @@ pub fn agenda(
             priority: Priority::None,
             repeats: false,
             countdown: true,
+            color: countdown.color.clone(),
         };
         let yearly = countdown.kind != CountdownKind::Countdown;
         let years = if yearly { from.year().max(countdown.date.year())..=until.year() } else { countdown.date.year()..=countdown.date.year() };
@@ -126,7 +130,7 @@ mod tests {
 
     #[test]
     fn countdowns_on_their_dates() {
-        let countdown = |name: &str, date, kind| Countdown { id: uuid::Uuid::now_v7(), name: name.into(), date, kind };
+        let countdown = |name: &str, date, kind| Countdown { id: uuid::Uuid::now_v7(), name: name.into(), date, kind, icon: None, color: Some("#ff6b6b".into()) };
         let countdowns = [
             countdown("Release", d(11, 19), CountdownKind::Countdown),
             countdown("New Year", NaiveDate::from_ymd_opt(2024, 1, 1).unwrap(), CountdownKind::Holiday),
@@ -137,5 +141,6 @@ mod tests {
         let listed: Vec<(NaiveDate, &str)> = days.iter().map(|(date, items)| (*date, items[0].title.as_str())).collect();
         assert_eq!(listed, [(d(11, 19), "Release"), (NaiveDate::from_ymd_opt(2027, 1, 1).unwrap(), "New Year")]);
         assert!(days[0].1[0].countdown);
+        assert_eq!(days[0].1[0].color.as_deref(), Some("#ff6b6b"));
     }
 }

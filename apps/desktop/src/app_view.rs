@@ -144,14 +144,16 @@ impl AppView {
             if state.contains("section=matrix") {
                 this.select(Section::Matrix, window, cx);
             }
-            // `countdown=<name>><YYYY-MM-DD>><countdown|anniversary|holiday>`, repeatable.
+            // `countdown=<name>><YYYY-MM-DD>><countdown|anniversary|holiday>[><emoji>|<#color>]`, repeatable.
             for spec in state.split(';').filter_map(|part| part.strip_prefix("countdown=")) {
                 let parts: Vec<&str> = spec.split('>').collect();
-                if let [name, date, kind] = parts[..]
+                if let [name, date, kind, ..] = parts[..]
                     && let Ok(date) = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
                 {
                     let kind = fern_core::CountdownKind::parse(kind);
-                    this.countdown.update(cx, |view, cx| view.dev_add(name, date, kind, cx));
+                    // A fourth part, `<emoji>|<#color>`, sets its icon.
+                    let look = parts.get(3).map(|look| look.split_once('|').unwrap_or((look, "")));
+                    this.countdown.update(cx, |view, cx| view.dev_add(name, date, kind, look, cx));
                     this.calendar.update(cx, |view, cx| view.reload(cx));
                 }
             }
@@ -203,6 +205,9 @@ impl AppView {
             }
             if state.contains("section=countdown") {
                 this.select(Section::Countdown, window, cx);
+            }
+            if state.contains("countdown-draft") {
+                this.countdown.update(cx, |view, cx| view.start_new(window, cx));
             }
             // `notice=<task title or habit name part>><hours ago>`: a fired reminder for the bell; `notices=open`.
             for spec in state.split(';').filter_map(|part| part.strip_prefix("notice=")) {

@@ -292,6 +292,10 @@ const MIGRATIONS: &[&str] = &[
         at       TEXT NOT NULL
     );
     ",
+    "
+    ALTER TABLE countdowns ADD COLUMN icon TEXT;
+    ALTER TABLE countdowns ADD COLUMN color TEXT;
+    ",
 ];
 
 const TASK_COLUMNS: &str = "id, parent_id, kind, title, notes, priority, due_date, due_time, \
@@ -1111,7 +1115,7 @@ impl Store {
     /// Countdowns in creation order.
     pub fn countdowns(&self) -> Result<Vec<Countdown>> {
         let mut stmt =
-            self.conn.prepare("SELECT id, name, date, kind FROM countdowns ORDER BY created_at, rowid")?;
+            self.conn.prepare("SELECT id, name, date, kind, icon, color FROM countdowns ORDER BY created_at, rowid")?;
         let rows = stmt
             .query_map([], |row| {
                 let date: String = row.get(2)?;
@@ -1122,6 +1126,8 @@ impl Store {
                         rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(e))
                     })?,
                     kind: CountdownKind::parse(&row.get::<_, String>(3)?),
+                    icon: row.get(4)?,
+                    color: row.get(5)?,
                 })
             })?
             .collect::<Result<_, _>>()?;
@@ -1131,7 +1137,7 @@ impl Store {
     pub fn add_countdown(&self, name: &str, date: NaiveDate, kind: CountdownKind) -> Result<Countdown> {
         let name = name.trim();
         anyhow::ensure!(!name.is_empty(), "a countdown needs a name");
-        let countdown = Countdown { id: Uuid::now_v7(), name: name.to_owned(), date, kind };
+        let countdown = Countdown { id: Uuid::now_v7(), name: name.to_owned(), date, kind, icon: None, color: None };
         self.conn.execute(
             "INSERT INTO countdowns (id, name, date, kind, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
@@ -1143,6 +1149,16 @@ impl Store {
             ],
         )?;
         Ok(countdown)
+    }
+
+    /// A countdown's icon (an emoji or short text) and its background color; empty clears.
+    pub fn set_countdown_look(&self, id: Id, icon: Option<&str>, color: Option<&str>) -> Result<()> {
+        let icon = icon.map(str::trim).filter(|i| !i.is_empty());
+        self.conn.execute(
+            "UPDATE countdowns SET icon = ?2, color = ?3 WHERE id = ?1",
+            params![id.to_string(), icon, color],
+        )?;
+        Ok(())
     }
 
     pub fn delete_countdown(&self, id: Id) -> Result<()> {
@@ -2463,6 +2479,19 @@ mod tests {
         assert_eq!(store.step_checkin(water.id, day)?, 6);
         store.set_checkin_amount(water.id, day, 0)?;
         assert_eq!(store.step_checkin(water.id, day)?, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn countdown_look() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let release = store.add_countdown("Release", chrono::NaiveDate::from_ymd_opt(2026, 11, 19).unwrap(), CountdownKind::Countdown)?;
+        store.set_countdown_look(release.id, Some("🚀"), Some("#4c8bf5"))?;
+        let saved = store.countdowns()?.remove(0);
+        assert_eq!((saved.icon.as_deref(), saved.color.as_deref()), (Some("🚀"), Some("#4c8bf5")));
+        store.set_countdown_look(release.id, Some("  "), None)?;
+        let saved = store.countdowns()?.remove(0);
+        assert_eq!((saved.icon, saved.color), (None, None));
         Ok(())
     }
 

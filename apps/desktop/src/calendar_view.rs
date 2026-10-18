@@ -588,6 +588,7 @@ impl CalendarView {
                         // Countdowns, as in the original: an orange card and a filled dot instead of
                         // the task's circle; a click shows the countdown's card.
                         let countdown = item.countdown;
+                        let item_color = item.color.clone();
                         let tint = if countdown {
                             theme.status().warning
                         } else {
@@ -602,7 +603,7 @@ impl CalendarView {
                                     .size(px(10.))
                                     .flex_none()
                                     .rounded_full()
-                                    .when(countdown, |el| el.bg(theme.colors().accent))
+                                    .when(countdown, |el| el.bg(crate::countdown_view::countdown_color(item_color.as_deref(), cx)))
                                     .when(!countdown, |el| el.border_1().border_color(theme.colors().text_muted)),
                             )
                             .child(

@@ -38,6 +38,10 @@ pub struct Countdown {
     pub name: String,
     pub date: NaiveDate,
     pub kind: CountdownKind,
+    /// The original's icon, here an emoji or a short text; `None` shows the kind's icon.
+    pub icon: Option<String>,
+    /// The icon's background, a hex color, which the Agenda's dot takes too.
+    pub color: Option<String>,
 }
 
 /// The distance between two dates as calendar years, months and days.

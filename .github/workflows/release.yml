@@ -64,6 +64,8 @@ jobs:
         with:
           name: fern-${{ matrix.target }}
           path: |
+            dist/*.dmg
+            dist/*.AppImage
             dist/*.tar.gz
             dist/*.zip
           if-no-files-found: error
@@ -76,12 +78,19 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
 
+      - name: Release notes
+        run: sed "s/{version}/${GITHUB_REF_NAME#v}/g; s|{repo}|$GITHUB_REPOSITORY|g" .github/release-notes.md > notes.md
+
       - uses: softprops/action-gh-release@v2
         with:
+          name: Fern ${{ github.ref_name }}
+          body_path: notes.md
           files: dist/*
           generate_release_notes: true

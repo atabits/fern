@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# Regenerates the app icons from assets/icon/icon.svg; the results are committed, so regular
+# builds don't need these tools. Requires rsvg-convert (librsvg) and python3.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+src="assets/icon/icon.svg"
+out="assets/icon"
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+
+# The full-bleed square without the macOS safe-area margin, for Linux and Windows.
+sed 's/viewBox="0 0 1024 1024"/viewBox="100 100 824 824"/' "$src" > "$tmp/full.svg"
+rsvg-convert -w 256 -h 256 "$tmp/full.svg" -o "$out/icon-256.png"
+cp "$tmp/full.svg" assets/linux/fern.svg
+
+# Windows .ico with PNG-compressed entries.
+for size in 16 24 32 48 64 128 256; do
+    rsvg-convert -w "$size" -h "$size" "$tmp/full.svg" -o "$tmp/ico-$size.png"
+done
+python3 - "$out/icon.ico" "$tmp"/ico-{16,24,32,48,64,128,256}.png <<'PY'
+import struct, sys
+out, pngs = sys.argv[1], sys.argv[2:]
+images = [open(p, "rb").read() for p in pngs]
+entries, offset = b"", 6 + 16 * len(images)
+for data in images:
+    width, height = struct.unpack(">II", data[16:24])
+    entries += struct.pack("<BBBBHHII", width % 256, height % 256, 0, 0, 1, 32, len(data), offset)
+    offset += len(data)
+with open(out, "wb") as f:
+    f.write(struct.pack("<HHH", 0, 1, len(images)) + entries + b"".join(images))
+PY
+
+# macOS keeps the margin; the .icns is made from this file when packaging on macOS.
+rsvg-convert -w 1024 -h 1024 "$src" -o "$out/icon-macos-1024.png"
+
+echo "Icons generated in $out and assets/linux"

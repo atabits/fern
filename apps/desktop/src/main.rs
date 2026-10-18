@@ -1,3 +1,6 @@
+// A release build on Windows opens no console window next to the app.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 /// The room the original keeps at the top of its window for the title bar's buttons: every
 /// column starts this far down.
 pub const TOP_INSET: f32 = 13.;

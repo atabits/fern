@@ -1,42 +1,78 @@
 #!/usr/bin/env bash
-# Builds Fern and the sync server in release mode for a target and packs them into `dist/`:
-#   Linux    fern-<version>-<target>.tar.gz   (fern, fern-server)
-#   macOS    fern-<version>-<target>.zip      (Fern.app, fern-server)
-#   Windows  fern-<version>-<target>.zip      (fern.exe, fern-server.exe)
+# Builds Fern and its sync server in release mode for a target and packs them into `dist/`:
+#   macOS    fern-<version>-macos-<arch>.dmg               Fern.app, drag into Applications
+#   Linux    fern-<version>-linux-<arch>.AppImage / .tar.gz
+#   Windows  fern-<version>-windows-<arch>.zip             fern.exe
+#   and      fern-server-<version>-<os>-<arch>.tar.gz/.zip the self-hosted sync server
 # usage: script/package <rust target triple> [version]
 set -euo pipefail
+cd "$(dirname "$0")/.."
 
 target=$1
 version=${2:-$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)}
-name="fern-${version}-${target}"
-out="dist/${name}"
+case "$target" in
+    aarch64-*) arch=arm64 ;;
+    x86_64-*) arch=x86_64 ;;
+    *) echo "unsupported target: $target" >&2; exit 1 ;;
+esac
+case "$target" in
+    *-apple-darwin) os=macos ;;
+    *-windows-*) os=windows ;;
+    *-linux-*) os=linux ;;
+esac
 
 cargo build --release --locked --target "$target" -p fern_desktop -p fern_server
 
-bin="target/${target}/release"
-rm -rf "$out"
-mkdir -p "$out"
-cp LICENSE README.md "$out/"
+bin="target/$target/release"
+dist="dist"
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+mkdir -p "$dist"
+exe=""
+[ "$os" = windows ] && exe=".exe"
 
-case "$target" in
-    *-apple-darwin)
-        app="$out/Fern.app/Contents"
-        mkdir -p "$app/MacOS"
+# The sync server, for every platform.
+server="fern-server-$version-$os-$arch"
+mkdir -p "$work/$server"
+cp "$bin/fern-server$exe" LICENSE "$work/$server/"
+if [ "$os" = windows ]; then
+    (cd "$work" && 7z a -tzip "$OLDPWD/$dist/$server.zip" "$server" > /dev/null)
+else
+    tar -C "$work" -czf "$dist/$server.tar.gz" "$server"
+fi
+
+name="fern-$version-$os-$arch"
+case "$os" in
+    macos)
+        app="$work/Fern.app/Contents"
+        mkdir -p "$app/MacOS" "$app/Resources"
         cp "$bin/fern" "$app/MacOS/fern"
+        iconset="$work/AppIcon.iconset"
+        mkdir -p "$iconset"
+        for size in 16 32 128 256 512; do
+            sips -z "$size" "$size" assets/icon/icon-macos-1024.png --out "$iconset/icon_${size}x${size}.png" > /dev/null
+            sips -z $((size * 2)) $((size * 2)) assets/icon/icon-macos-1024.png --out "$iconset/icon_${size}x${size}@2x.png" > /dev/null
+        done
+        iconutil -c icns "$iconset" -o "$app/Resources/AppIcon.icns"
         cat > "$app/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+    <key>CFBundleDevelopmentRegion</key><string>en</string>
     <key>CFBundleName</key><string>Fern</string>
     <key>CFBundleDisplayName</key><string>Fern</string>
     <key>CFBundleIdentifier</key><string>io.github.atabits.fern</string>
     <key>CFBundleExecutable</key><string>fern</string>
+    <key>CFBundleIconFile</key><string>AppIcon</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>${version}</string>
-    <key>CFBundleVersion</key><string>${version}</string>
+    <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+    <key>CFBundleShortVersionString</key><string>$version</string>
+    <key>CFBundleVersion</key><string>$version</string>
     <key>LSMinimumSystemVersion</key><string>11.0</string>
+    <key>LSApplicationCategoryType</key><string>public.app-category.productivity</string>
     <key>NSHighResolutionCapable</key><true/>
+    <key>NSHumanReadableCopyright</key><string>Fern contributors, AGPL-3.0-or-later</string>
     <key>CFBundleURLTypes</key>
     <array>
         <dict>
@@ -47,17 +83,48 @@ case "$target" in
 </dict>
 </plist>
 EOF
-        cp "$bin/fern-server" "$out/"
-        (cd dist && ditto -c -k --keepParent "$name" "$name.zip")
+        # An ad-hoc signature: without one Apple Silicon refuses to run the app at all.
+        codesign --force --deep --sign - "$work/Fern.app"
+        mkdir -p "$work/dmg"
+        mv "$work/Fern.app" "$work/dmg/"
+        ln -s /Applications "$work/dmg/Applications"
+        rm -f "$dist/$name.dmg"
+        hdiutil create -volname Fern -srcfolder "$work/dmg" -ov -format UDZO "$dist/$name.dmg" > /dev/null
         ;;
-    *-windows-*)
-        cp "$bin/fern.exe" "$bin/fern-server.exe" "$out/"
-        (cd dist && 7z a -tzip "$name.zip" "$name" > /dev/null)
+    windows)
+        mkdir -p "$work/$name"
+        cp "$bin/fern.exe" LICENSE README.md "$work/$name/"
+        (cd "$work" && 7z a -tzip "$OLDPWD/$dist/$name.zip" "$name" > /dev/null)
         ;;
-    *)
-        cp "$bin/fern" "$bin/fern-server" "$out/"
-        tar -C dist -czf "dist/$name.tar.gz" "$name"
+    linux)
+        mkdir -p "$work/$name"
+        cp "$bin/fern" assets/linux/fern-tasks.desktop assets/linux/fern.svg LICENSE README.md "$work/$name/"
+        tar -C "$work" -czf "$dist/$name.tar.gz" "$name"
+
+        appdir="$work/AppDir"
+        mkdir -p "$appdir/usr/bin" "$appdir/usr/share/applications" "$appdir/usr/share/icons/hicolor/scalable/apps"
+        cp "$bin/fern" "$appdir/usr/bin/fern"
+        cp assets/linux/fern-tasks.desktop "$appdir/"
+        cp assets/linux/fern-tasks.desktop "$appdir/usr/share/applications/"
+        cp assets/linux/fern.svg "$appdir/"
+        cp assets/linux/fern.svg "$appdir/usr/share/icons/hicolor/scalable/apps/"
+        cat > "$appdir/AppRun" <<'EOF'
+#!/bin/sh
+here="$(dirname "$(readlink -f "$0")")"
+exec "$here/usr/bin/fern" "$@"
+EOF
+        chmod +x "$appdir/AppRun"
+        tool=$(command -v appimagetool || true)
+        if [ -z "$tool" ]; then
+            appimage_arch=$([ "$arch" = arm64 ] && echo aarch64 || echo x86_64)
+            tool="$work/appimagetool"
+            curl -fsSL "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-$appimage_arch.AppImage" -o "$tool"
+            chmod +x "$tool"
+        fi
+        # Without FUSE (CI containers) the tool runs from its extracted image.
+        APPIMAGE_EXTRACT_AND_RUN=1 ARCH=$([ "$arch" = arm64 ] && echo aarch64 || echo x86_64) \
+            "$tool" --no-appstream "$appdir" "$dist/$name.AppImage" > /dev/null
         ;;
 esac
 
-ls -lh dist/"$name".*
+ls -lh "$dist"/*"$version-$os-$arch"*

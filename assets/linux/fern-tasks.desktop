@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Fern
+GenericName=Task Manager
+Comment=Tasks, calendar, habits and focus in one app
+Exec=fern %u
+Icon=fern
+Categories=Office;ProjectManagement;
+Keywords=todo;tasks;calendar;habits;pomodoro;
+MimeType=x-scheme-handler/fern;
+StartupWMClass=fern-tasks
+Terminal=false

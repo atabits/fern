@@ -1,9 +1,10 @@
-//! Общее ядро трекера: модель данных и локальное хранилище.
+//! Shared core of the task tracker: data model, local storage and quick-add parsing.
+//! Used by the desktop app and, later, by the mobile clients.
 
 pub mod model;
 pub mod quick_add;
 pub mod store;
 
-pub use model::{Id, Kind, Priority, Tag, Task, View, ViewCounts};
+pub use model::{Id, Kind, List, Priority, Tag, Task, View, ViewCounts};
 pub use quick_add::{ParsedTask, parse_quick_add};
 pub use store::Store;

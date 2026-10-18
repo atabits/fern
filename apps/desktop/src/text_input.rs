@@ -1,5 +1,6 @@
-//! Поле ввода текста. Основа взята из примера `gpui/examples/input.rs` в репозитории Zed
-//! (готового виджета ввода в GPUI нет) и расширена переносом строк и многострочным режимом.
+//! A text input. GPUI has no ready-made input widget; this one starts from the
+//! `gpui/examples/input.rs` example in the Zed repository and adds soft wrapping and a
+//! multi-line mode.
 
 use std::ops::Range;
 
@@ -36,6 +37,7 @@ actions!(
         Cut,
         Copy,
         Enter,
+        Cancel,
     ]
 );
 
@@ -59,26 +61,31 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("home", Home, context),
         KeyBinding::new("end", End, context),
         KeyBinding::new("enter", Enter, context),
+        KeyBinding::new("escape", Cancel, context),
         KeyBinding::new("ctrl-cmd-space", ShowCharacterPalette, context),
     ]);
 }
 
-/// Пользователь нажал Enter в поле без переносов; внутри — текущий текст.
+/// Enter was pressed in an input that does not take newlines; carries the current text.
 pub struct Submitted(pub String);
 
-/// Текст изменён пользователем (не через [`TextInput::set_text`]).
+/// The user changed the text (not via [`TextInput::set_text`]).
 pub struct Changed;
 
 impl EventEmitter<Submitted> for TextInput {}
+/// Escape was pressed.
+pub struct Cancelled;
+
 impl EventEmitter<Changed> for TextInput {}
+impl EventEmitter<Cancelled> for TextInput {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
-    /// Одна строка без переноса, Enter отправляет [`Submitted`].
+    /// One line without wrapping; Enter emits [`Submitted`].
     SingleLine,
-    /// Длинный текст переносится, но Enter отправляет [`Submitted`], а не вставляет перевод строки.
+    /// Long text wraps, but Enter emits [`Submitted`] instead of inserting a newline.
     Wrapped,
-    /// Многострочный текст: Enter вставляет перевод строки.
+    /// Multi-line text: Enter inserts a newline.
     MultiLine,
 }
 
@@ -100,13 +107,13 @@ pub struct TextInput {
     is_selecting: bool,
 }
 
-/// Результат раскладки с прошлого кадра: нужен для попадания мышью, стрелок вверх/вниз и IME.
+/// The layout from the last frame, used for mouse hit-testing, up/down arrows and IME.
 struct TextLayout {
-    /// Абзацы (по `\n`), каждый со своим смещением в `content` и вертикальной позицией.
+    /// Paragraphs (split at `\n`), each with its offset in `content` and its vertical position.
     paragraphs: Vec<Paragraph>,
     line_height: Pixels,
     bounds: Bounds<Pixels>,
-    /// Раскладка построена по плейсхолдеру, позиции в тексте не соответствуют.
+    /// The layout is of the placeholder, so its positions do not map to the text.
     is_placeholder: bool,
 }
 
@@ -117,7 +124,7 @@ struct Paragraph {
 }
 
 impl TextLayout {
-    /// Позиция курсора для смещения в байтах, относительно левого верхнего угла поля.
+    /// The caret position for a byte offset, relative to the input's top-left corner.
     fn position_for_offset(&self, offset: usize) -> Point<Pixels> {
         if self.is_placeholder {
             return point(px(0.), px(0.));
@@ -136,7 +143,7 @@ impl TextLayout {
         point(position.x, position.y + paragraph.top)
     }
 
-    /// Ближайшее смещение для точки относительно левого верхнего угла поля.
+    /// The closest offset for a point relative to the input's top-left corner.
     fn offset_for_position(&self, position: Point<Pixels>) -> usize {
         if self.is_placeholder {
             return 0;
@@ -181,7 +188,7 @@ impl TextInput {
         &self.content
     }
 
-    /// Заменяет текст без события [`Changed`] — для загрузки данных извне.
+    /// Replaces the text without emitting [`Changed`], for loading data from outside.
     pub fn set_text(&mut self, text: impl Into<SharedString>, cx: &mut Context<Self>) {
         self.content = text.into();
         let end = self.content.len();
@@ -195,6 +202,15 @@ impl TextInput {
     pub fn clear(&mut self, window: &Window, cx: &mut Context<Self>) {
         self.set_text("", cx);
         window.notify_text_input_changed(&self.focus_handle);
+    }
+
+    pub fn set_placeholder(&mut self, placeholder: impl Into<SharedString>, cx: &mut Context<Self>) {
+        self.placeholder = placeholder.into();
+        cx.notify();
+    }
+
+    fn cancel(&mut self, _: &Cancel, _window: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(Cancelled);
     }
 
     fn enter(&mut self, _: &Enter, window: &mut Window, cx: &mut Context<Self>) {
@@ -371,7 +387,7 @@ impl TextInput {
         }
     }
 
-    /// Смещение строкой выше (`direction = -1`) или ниже (`1`) при той же горизонтали.
+    /// The offset one line above (`direction = -1`) or below (`1`) at the same x.
     fn vertical_offset(&self, direction: f32) -> usize {
         let cursor = self.cursor_offset();
         let Some(layout) = self.last_layout.as_ref() else {
@@ -392,7 +408,7 @@ impl TextInput {
         layout.offset_for_position(point(position.x, target_y))
     }
 
-    /// Начало или конец визуальной строки, на которой стоит курсор.
+    /// The start or end of the visual line the caret is on.
     fn visual_line_edge(&self, end: bool) -> usize {
         let cursor = self.cursor_offset();
         let Some(layout) = self.last_layout.as_ref() else {
@@ -668,7 +684,7 @@ impl IntoElement for TextElement {
     }
 }
 
-/// Текст для отображения и прогоны стилей (плейсхолдер, подчёркивание IME).
+/// The text to display and its style runs (placeholder, IME underline).
 fn display_runs(input: &TextInput, window: &Window) -> (SharedString, Vec<TextRun>, bool) {
     let style = window.text_style();
     let is_placeholder = input.content.is_empty();
@@ -749,7 +765,7 @@ impl Element for TextElement {
             return (window.request_layout(style, [], cx), ());
         }
 
-        // Высота зависит от ширины, поэтому считаем её при раскладке.
+        // The height depends on the width, so it is measured during layout.
         let (text, runs, _) = display_runs(input, window);
         let font_size = window.text_style().font_size.to_pixels(window.rem_size());
         let layout_id = window.request_measured_layout(style, move |known, available, window, _| {
@@ -904,6 +920,7 @@ impl Render for TextInput {
             .on_action(cx.listener(Self::cut))
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::enter))
+            .on_action(cx.listener(Self::cancel))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))

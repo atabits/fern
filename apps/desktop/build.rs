@@ -1,4 +1,4 @@
-//! Собирает таблицу иконок из `assets/icons`, чтобы новый SVG не нужно было регистрировать вручную.
+//! Builds the icon table from `assets/icons`, so a new SVG needs no manual registration.
 
 use std::fmt::Write as _;
 use std::path::Path;
@@ -8,7 +8,7 @@ fn main() {
     println!("cargo:rerun-if-changed={}", dir.display());
 
     let mut names: Vec<String> = std::fs::read_dir(&dir)
-        .expect("каталог assets/icons")
+        .expect("assets/icons directory")
         .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
         .filter(|name| name.ends_with(".svg"))
         .collect();

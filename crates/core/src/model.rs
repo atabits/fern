@@ -3,7 +3,7 @@ use uuid::Uuid;
 
 pub type Id = Uuid;
 
-/// Значения совпадают с TickTick (0/1/3/5), чтобы импорт переносился без таблиц соответствия.
+/// Stored as 0/1/3/5, the same values TickTick uses, so imports need no mapping table.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Priority {
     #[default]
@@ -33,7 +33,7 @@ impl Priority {
     }
 }
 
-/// Задача с чекбоксом или заметка (в TickTick — `kind` TEXT / NOTE).
+/// A checkable task or a note (TickTick's `kind` TEXT / NOTE).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum Kind {
     #[default]
@@ -60,13 +60,15 @@ impl Kind {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Task {
     pub id: Id,
+    /// `None` means the task is in the Inbox.
+    pub list_id: Option<Id>,
     pub parent_id: Option<Id>,
     pub kind: Kind,
     pub title: String,
     pub notes: String,
     pub priority: Priority,
     pub due_date: Option<NaiveDate>,
-    /// `None` при заданной дате — задача «на весь день».
+    /// `None` with a date set means an all-day task.
     pub due_time: Option<NaiveTime>,
     pub tags: Vec<String>,
     pub completed_at: Option<i64>,
@@ -83,16 +85,26 @@ impl Task {
     }
 }
 
+/// A user-defined list (a "project" in TickTick).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Tag {
+pub struct List {
+    pub id: Id,
     pub name: String,
-    /// Цвет в виде `#RRGGBB`.
     pub color: Option<String>,
-    /// Количество невыполненных задач с этим тегом.
+    /// Number of open tasks in the list.
     pub open_count: usize,
 }
 
-/// Что показывается в списке задач.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Tag {
+    pub name: String,
+    /// Color as `#RRGGBB`.
+    pub color: Option<String>,
+    /// Number of open tasks with this tag.
+    pub open_count: usize,
+}
+
+/// What the task list shows.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum View {
     Inbox,
@@ -101,10 +113,11 @@ pub enum View {
     Tomorrow,
     Next7Days,
     Completed,
+    List(Id),
     Tag(String),
 }
 
-/// Счётчики невыполненных задач для колонки списков.
+/// Open-task counters for the lists column.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ViewCounts {
     pub inbox: usize,

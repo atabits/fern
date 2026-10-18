@@ -1,6 +1,7 @@
 mod app_view;
 mod assets;
 mod calendar;
+mod i18n;
 mod lists_panel;
 mod sidebar;
 mod task_detail;
@@ -9,6 +10,8 @@ mod text_input;
 mod theme;
 mod todo_view;
 mod widgets;
+
+use std::rc::Rc;
 
 use anyhow::{Context as _, Result};
 use amin_core::Store;
@@ -19,21 +22,27 @@ use gpui::{
 
 use crate::app_view::AppView;
 use crate::assets::Assets;
+use crate::i18n::{CurrentLocale, Locale};
 
 actions!(amin, [Quit]);
 
 fn open_store() -> Result<Store> {
     let dir = dirs::data_dir()
-        .context("не удалось определить каталог данных")?
+        .context("cannot determine the user data directory")?
         .join("amin-task-tracker");
-    std::fs::create_dir_all(&dir).with_context(|| format!("не удалось создать {}", dir.display()))?;
+    std::fs::create_dir_all(&dir).with_context(|| format!("cannot create {}", dir.display()))?;
     Store::open(dir.join("tasks.db"))
 }
 
 fn main() -> Result<()> {
-    let store = open_store()?;
+    let store = Rc::new(open_store()?);
+    let locale = store
+        .setting("locale")?
+        .and_then(|code| Locale::from_code(&code))
+        .unwrap_or_default();
 
     gpui_platform::application().with_assets(Assets).run(move |cx: &mut App| {
+        cx.set_global(CurrentLocale(locale));
         text_input::bind_keys(cx);
         cx.bind_keys([KeyBinding::new("secondary-q", Quit, None)]);
         cx.on_action(|_: &Quit, cx| cx.quit());
@@ -43,14 +52,14 @@ fn main() -> Result<()> {
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 titlebar: Some(TitlebarOptions { title: Some("Amin".into()), ..Default::default() }),
-                // Переопределение нужно для скриншотов при разработке: по нему ставится правило окна.
+                // Overridable so that window-manager rules can target dev builds (used for UI screenshots).
                 app_id: Some(std::env::var("AMIN_APP_ID").unwrap_or_else(|_| "amin-task-tracker".into())),
                 window_min_size: Some(size(px(900.), px(400.))),
                 ..Default::default()
             },
             |window, cx| cx.new(|cx| AppView::new(store, window, cx)),
         )
-        .expect("не удалось открыть окно");
+        .expect("failed to open the main window");
         cx.activate(true);
     });
     Ok(())

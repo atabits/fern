@@ -1,81 +1,86 @@
-# Паритет с TickTick
+# Feature parity with TickTick
 
-Рабочий список: что есть в оригинале, что уже есть у нас, в каком порядке делаем.
-Источник — внешний вид десктопного TickTick 8.0 (скриншоты и замеры по пикселям) и структура данных
-из Open API. Код клиента TickTick не разбираем.
+A working list of what TickTick has, what we already have, and what comes next.
+It is based on how TickTick 8.0 for desktop looks and behaves (screenshots and pixel
+measurements) and on the public shape of its Open API. TickTick's client code is not inspected.
 
-Статусы: ✅ готово · 🟡 частично / только внешний вид · ⬜ нет
+Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 
-## Замеры (логические пиксели, тёмная тема)
+## Measurements (logical pixels, dark theme)
 
-| Элемент | Значение |
+| Element | Value |
 |---|---|
-| Узкая панель разделов | ширина ≈ 50 |
-| Колонка списков (сайдбар) | ширина ≈ 212, пункт ≈ 36 высотой, радиус выделения ≈ 6 |
-| Строка задачи | высота 40, разделитель 1 px снизу, выделение — фон светлее на ~6% |
-| Поле «Add task» | высота ≈ 38, фон светлее основного |
-| Заголовок списка | ≈ 60 высотой, кнопка сворачивания сайдбара слева, сортировка и «…» справа |
-| Чип тега | высота ≈ 18, полностью скруглён, фон — цвет тега ~30%, текст — светлый оттенок цвета |
-| Дата/повтор в строке | синий (акцент), справа |
-| Панель задачи | верхняя строка ≈ 48, нижняя ≈ 44 |
+| Narrow sections sidebar | ≈ 50 wide |
+| Lists column | ≈ 212 wide, items ≈ 36 tall, selection radius ≈ 6 |
+| Task row | 40 tall, 1 px separator at the bottom, selection ~6% lighter than the background |
+| "Add task" field | ≈ 38 tall, lighter background |
+| List header | ≈ 60 tall, sidebar toggle on the left, sort and "…" on the right |
+| Tag chip | ≈ 18 tall, fully rounded, tag color at ~30% as background, lighter tag color as text |
+| Due date / repeat in a row | accent blue, right-aligned |
+| Task details panel | top bar ≈ 48, bottom bar ≈ 44 |
 
-## Модель данных
+## Data model
 
-| Возможность | Статус | Заметки |
+| Feature | Status | Notes |
 |---|---|---|
-| Задача: заголовок, выполнено | ✅ | |
-| Заметка к задаче (`content`) | ✅ | |
-| Срок (`dueDate`, весь день / со временем) | ✅ | ядро; в UI — следующие итерации |
-| Приоритет 0/1/3/5 | ✅ | ядро; в строке — цвет рамки чекбокса |
-| Теги с цветом | ✅ | ядро; регистр не важен, включая кириллицу |
-| Подзадачи (`parentId`) | ✅ | ядро; удаление каскадное, циклы запрещены |
-| Тип элемента: задача / заметка / чек-лист (`kind`) | 🟡 | задача и заметка; чек-лист — позже |
-| Пункты чек-листа (`items`) | ⬜ | |
-| Повтор (`repeatFlag`, RRULE) | ⬜ | |
-| Списки (проекты), «Входящие» | ⬜ | |
-| Колонки-секции в списке («Задачи», «Заметки») | ⬜ | |
-| Ручная сортировка (`sortOrder`) | ⬜ | |
-| Корзина, «Won't Do» | ⬜ | |
-| Напоминания | ⬜ | |
+| Task: title, completion | ✅ | |
+| Task notes (`content`) | ✅ | |
+| Due date (`dueDate`, all-day or with time) | ✅ | |
+| Priority 0/1/3/5 | ✅ | same values as TickTick |
+| Tags with colors | ✅ | case-insensitive, including non-ASCII |
+| Subtasks (`parentId`) | ✅ | cascade delete, no cycles |
+| Item kind: task / note / checklist (`kind`) | 🟡 | task and note; checklist later |
+| Checklist items (`items`) | ⬜ | |
+| Repeat (`repeatFlag`, RRULE) | ⬜ | |
+| Lists (projects), Inbox | ✅ | create, delete, move tasks with subtasks |
+| Custom sections inside a list (columns) | ⬜ | groups are by kind for now |
+| Manual ordering (`sortOrder`) | ⬜ | |
+| Trash, "Won't Do" | ⬜ | |
+| Reminders | ⬜ | |
+| Settings (UI language) | ✅ | |
 
-## Интерфейс
+## Interface
 
-| Возможность | Статус | Заметки |
+| Feature | Status | Notes |
 |---|---|---|
-| Узкая панель разделов | 🟡 | ширина 50 как в оригинале; работает только «Задачи»; иконки контурные, в оригинале залитые; нет бейджа уведомлений |
-| Колонка списков: Inbox / All / Today / Tomorrow / Next 7 Days | ✅ | со счётчиками; новая задача получает срок/тег текущего списка |
-| Колонка списков: теги с цветной точкой и счётчиком | ✅ | |
-| Колонка списков: Lists, Filters, Completed, Won't Do, Trash | 🟡 | есть «Выполненные» |
-| Мини-неделя внизу колонки списков | ⬜ | |
-| Заголовок списка с кнопкой сворачивания сайдбара | 🟡 | сворачивание работает; сортировка и «…» — нет |
-| Поле «Add task» | ✅ | разбор срока, времени, тегов и приоритета из текста (ядро, `quick_add`); подсветки распознанного при вводе пока нет |
-| Строки задач по замерам (40 px, разделители) | ✅ | |
-| Чипы тегов, дата и повтор в строке | 🟡 | теги и срок есть (просроченный — красный); повтора нет |
-| Подзадачи с отступом и сворачиванием | ✅ | создание подзадач из UI — позже |
-| Секции «Задачи» / «Заметки» со счётчиком и сворачиванием | ✅ | плюс свёрнутые «Выполненные»; секции по типу, а не пользовательские колонки |
-| Панель задачи: чекбокс, заголовок, заметка | ✅ | |
-| Панель задачи: выбор срока | 🟡 | быстрые варианты + календарь месяца; нет выбора времени и повтора |
-| Панель задачи: приоритет (флажок) | ✅ | |
-| Панель задачи: теги | ✅ | чипы под заголовком, выбор и создание в окне «+ Тег» |
-| Панель задачи: выбор списка, чек-лист | ⬜ | |
-| Перетаскивание задач | ⬜ | |
-| Календарь, Помодоро, Привычки, Матрица, Обратный отсчёт, Поиск | ⬜ | |
-| Синхронизация между устройствами | ⬜ | |
+| Narrow sections sidebar | 🟡 | only Tasks works; outline icons where TickTick uses filled ones; no notification badge |
+| Account menu with language switch | ✅ | English (default) and Russian |
+| Lists column: Inbox / All / Today / Tomorrow / Next 7 Days | ✅ | counters; a new task gets the due date or tag of the current view |
+| Lists column: user lists | 🟡 | create inline, delete from the "…" menu; no rename, colors or drag and drop |
+| Lists column: tags with color dots and counters | ✅ | |
+| Lists column: Filters, Won't Do, Trash | 🟡 | only Completed |
+| Mini week at the bottom of the lists column | ⬜ | |
+| List header with sidebar toggle | 🟡 | toggle and "…" work; sorting does not |
+| "Add task" field | ✅ | parses date, time, tags, priority and `^list`; no live highlighting yet; `^list` matches one-word list names only |
+| Rows by the measurements (40 px, separators) | ✅ | |
+| Tag chips, due date and repeat in rows | 🟡 | tags and due date (overdue in red); no repeat |
+| Subtasks with indentation and collapsing | ✅ | creating subtasks from the UI comes later |
+| Groups "Tasks" / "Notes" with counters and collapsing | ✅ | plus a collapsed "Completed" group |
+| Details: checkbox, title, notes | ✅ | |
+| Details: due date | 🟡 | quick options and a month calendar; no time or repeat picker |
+| Details: priority (flag) | ✅ | |
+| Details: tags | ✅ | chips under the title, picker with "+ Tag" |
+| Details: list | ✅ | list button in the bottom bar |
+| Details: checklist | ⬜ | |
+| Drag and drop | ⬜ | |
+| Calendar, Pomodoro, Habits, Matrix, Countdown, Search | ⬜ | |
+| Sync between devices | ⬜ | |
 
-## Как проверяем
+## How changes are checked
 
-- `cargo test` — ядро (хранилище, умные списки, теги, подзадачи) и логика строк/календаря десктопа.
-- Скриншот нашего окна рядом с оригиналом и замеры по пикселям. Демо-данные:
-  `cargo run -p amin_core --example seed_demo -- <путь к базе>`.
-- В отладочной сборке `AMIN_DEV_STATE="add=<быстрый ввод>;select=<часть названия>;popup=due|priority|tags"`
-  создаёт задачу и открывает нужное состояние без кликов, `AMIN_APP_ID` меняет app_id окна (для правил оконного менеджера).
+- `cargo test` covers the core (storage, smart views, tags, subtasks, lists, quick add) and the
+  desktop's row, date and calendar logic in both languages.
+- A screenshot of our window next to the original, plus pixel measurements. Demo data:
+  `cargo run -p amin_core --example seed_demo -- <path to database>`.
+- In debug builds `AMIN_DEV_STATE` puts the UI into a given state without clicks, for example
+  `AMIN_DEV_STATE="add=Buy milk tomorrow #home;select=milk;popup=due"`; see
+  `TodoView::apply_dev_state` for all commands. `AMIN_APP_ID` changes the window's app id so
+  window-manager rules can target dev builds.
 
-## Порядок работ
+## Next
 
-1. ~~Строки списка и заголовок по замерам.~~ ✅
-2. ~~Модель: срок, приоритет, теги, подзадачи, тип (задача/заметка) — ядро + миграция + тесты.~~ ✅
-3. ~~Колонка списков: умные списки и теги со счётчиками, фильтрация.~~ ✅
-4. ~~Строки: чипы тегов, дата, подзадачи, секции.~~ ✅
-5. ~~Панель задачи: срок, приоритет, теги.~~ ✅
-6. ~~Разбор быстрого ввода (`завтра`, `#тег`, `!1`).~~ ✅
-7. Чек-листы, корзина, списки-проекты.
+1. Rename lists, list colors.
+2. Checklist items inside a task.
+3. Trash instead of immediate deletion.
+4. Time and repeat in the due-date picker.
+5. Manual ordering and drag and drop.

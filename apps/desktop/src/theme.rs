@@ -73,7 +73,7 @@ pub fn priority_low() -> Rgba {
     rgb(0x4772fa)
 }
 
-/// Цвет флажка и рамки чекбокса для приоритета.
+/// The flag and checkbox border color for a priority.
 pub fn priority(priority: Priority) -> Rgba {
     match priority {
         Priority::High => priority_high(),

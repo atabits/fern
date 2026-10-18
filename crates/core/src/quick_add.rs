@@ -1,13 +1,15 @@
-//! Разбор строки быстрого ввода: «Купить молоко завтра в 18:00 #дом !1».
+//! Parsing of the quick-add line: "Buy milk tomorrow at 6pm #home !1".
 //!
-//! Распознаётся (русский и английский):
-//! - теги `#дом`;
-//! - приоритет `!1`/`!2`/`!3` (высокий/средний/низкий), `!high`, `!высокий` и т.п.;
-//! - даты: «сегодня», «завтра», «послезавтра», дни недели, «через 3 дня», «через неделю»,
-//!   `13.11`, `13.11.2026`, `2026-11-13`, «13 ноября»;
-//! - время: `18:00`, `18ч`.
+//! Recognized tokens (English and Russian keywords work in any UI language):
+//! - tags: `#home`;
+//! - list: `^work` (only existing lists; otherwise the word stays in the title);
+//! - priority: `!1`/`!2`/`!3` (high/medium/low), `!high`, `!medium`, `!low`, `!высокий`, ...;
+//! - dates: today, tomorrow, weekdays, "in 3 days", "in 2 weeks", `13.11`, `13.11.2026`,
+//!   `2026-11-13`, "13 nov", and Russian equivalents ("завтра", "в пятницу", "через неделю");
+//! - time: `18:00`, `6pm`, `6:30am`, `18ч`.
 //!
-//! Распознанные слова (и предлог «в»/«на» перед ними) убираются из названия.
+//! Recognized words, together with a preposition right before them ("at", "on", "в"), are
+//! removed from the title.
 
 use chrono::{Datelike, Duration, Months, NaiveDate, NaiveTime, Weekday};
 
@@ -20,9 +22,12 @@ pub struct ParsedTask {
     pub due_time: Option<NaiveTime>,
     pub priority: Option<Priority>,
     pub tags: Vec<String>,
+    /// The list name as the user spelled it when creating the list.
+    pub list: Option<String>,
 }
 
-pub fn parse_quick_add(input: &str, today: NaiveDate) -> ParsedTask {
+/// `lists` holds the names of existing lists; `^name` is recognized only for those.
+pub fn parse_quick_add(input: &str, today: NaiveDate, lists: &[String]) -> ParsedTask {
     let words: Vec<&str> = input.split_whitespace().collect();
     let lower: Vec<String> = words.iter().map(|w| w.to_lowercase()).collect();
     let mut used = vec![false; words.len()];
@@ -36,6 +41,12 @@ pub fn parse_quick_add(input: &str, today: NaiveDate) -> ParsedTask {
             if !parsed.tags.iter().any(|t: &String| t.to_lowercase() == tag.to_lowercase()) {
                 parsed.tags.push(tag.to_owned());
             }
+            used[i] = true;
+        } else if let Some(list) = word
+            .strip_prefix('^')
+            .and_then(|name| lists.iter().find(|l| l.to_lowercase() == name))
+        {
+            parsed.list = Some(list.clone());
             used[i] = true;
         } else if let Some(priority) = word.strip_prefix('!').and_then(parse_priority) {
             parsed.priority = Some(priority);
@@ -56,7 +67,7 @@ pub fn parse_quick_add(input: &str, today: NaiveDate) -> ParsedTask {
         i += 1;
     }
 
-    // Время без даты — на сегодня, как в TickTick.
+    // A time without a date means today, as in TickTick.
     if parsed.due_time.is_some() && parsed.due_date.is_none() {
         parsed.due_date = Some(today);
     }
@@ -71,12 +82,12 @@ pub fn parse_quick_add(input: &str, today: NaiveDate) -> ParsedTask {
     parsed
 }
 
-/// Отмечает `len` слов с позиции `start` и предлог прямо перед ними.
+/// Marks `len` words starting at `start`, plus a preposition right before them.
 fn mark_with_preposition(used: &mut [bool], lower: &[String], start: usize, len: usize) {
     used[start..start + len].iter_mut().for_each(|u| *u = true);
     if start > 0
         && !used[start - 1]
-        && matches!(lower[start - 1].as_str(), "в" | "во" | "на" | "к" | "до" | "at" | "on" | "by")
+        && matches!(lower[start - 1].as_str(), "в" | "во" | "на" | "к" | "до" | "at" | "on" | "by" | "next")
     {
         used[start - 1] = true;
     }
@@ -92,20 +103,40 @@ fn parse_priority(value: &str) -> Option<Priority> {
 }
 
 fn parse_time(word: &str) -> Option<NaiveTime> {
-    if let Some((h, m)) = word.split_once(':') {
-        if h.is_empty() || h.len() > 2 || m.len() != 2 {
-            return None;
-        }
-        return NaiveTime::from_hms_opt(h.parse().ok()?, m.parse().ok()?, 0);
-    }
-    let hours = word.strip_suffix("ч")?;
+    let (clock, pm) = match word.strip_suffix("pm") {
+        Some(clock) => (clock, Some(true)),
+        None => match word.strip_suffix("am") {
+            Some(clock) => (clock, Some(false)),
+            None => (word.strip_suffix("ч").unwrap_or(word), None),
+        },
+    };
+    let has_suffix = clock.len() != word.len();
+    let (hours, minutes) = match clock.split_once(':') {
+        Some((h, m)) if m.len() == 2 => (h, m.parse::<u32>().ok()?),
+        Some(_) => return None,
+        // A bare number is a time only with a suffix: "6pm", "18ч".
+        None if has_suffix => (clock, 0),
+        None => return None,
+    };
     if hours.is_empty() || hours.len() > 2 {
         return None;
     }
-    NaiveTime::from_hms_opt(hours.parse().ok()?, 0, 0)
+    let mut hours: u32 = hours.parse().ok()?;
+    if let Some(pm) = pm {
+        if !(1..=12).contains(&hours) {
+            return None;
+        }
+        hours = match (hours, pm) {
+            (12, false) => 0,
+            (12, true) => 12,
+            (h, true) => h + 12,
+            (h, false) => h,
+        };
+    }
+    NaiveTime::from_hms_opt(hours, minutes, 0)
 }
 
-/// Дата в начале `words` и сколько слов она заняла.
+/// A date at the start of `words` and how many words it took.
 fn parse_date(words: &[String], today: NaiveDate) -> Option<(NaiveDate, usize)> {
     let first = words[0].as_str();
     match first {
@@ -118,7 +149,7 @@ fn parse_date(words: &[String], today: NaiveDate) -> Option<(NaiveDate, usize)> 
         let ahead = (weekday.num_days_from_monday() as i64
             - today.weekday().num_days_from_monday() as i64)
             .rem_euclid(7);
-        // Тот же день недели означает следующую неделю.
+        // The same weekday as today means next week.
         let ahead = if ahead == 0 { 7 } else { ahead };
         return Some((today + Duration::days(ahead), 1));
     }
@@ -137,7 +168,7 @@ fn parse_date(words: &[String], today: NaiveDate) -> Option<(NaiveDate, usize)> 
         && let (Ok(day), Some(month)) = (first.parse::<u32>(), parse_month(&words[1]))
     {
         let date = NaiveDate::from_ymd_opt(today.year(), month, day)?;
-        // «13 марта» в ноябре — это март следующего года.
+        // "13 March" said in November means March of next year.
         let date = if date < today { NaiveDate::from_ymd_opt(today.year() + 1, month, day)? } else { date };
         return Some((date, 2));
     }
@@ -190,32 +221,32 @@ fn parse_weekday(word: &str) -> Option<Weekday> {
     })
 }
 
+/// Month by full name or common abbreviation (English, Russian nominative and genitive).
+/// Exact forms only, so that "5 marbles" is not read as 5 March.
 fn parse_month(word: &str) -> Option<u32> {
-    const PREFIXES: [&[&str]; 12] = [
-        &["янв", "jan"],
-        &["фев", "feb"],
-        &["мар", "mar"],
-        &["апр", "apr"],
-        &["мая", "май", "may"],
-        &["июн", "jun"],
-        &["июл", "jul"],
-        &["авг", "aug"],
-        &["сен", "sep"],
-        &["окт", "oct"],
-        &["ноя", "nov"],
-        &["дек", "dec"],
+    const FORMS: [&[&str]; 12] = [
+        &["jan", "january", "янв", "январь", "января"],
+        &["feb", "february", "фев", "февр", "февраль", "февраля"],
+        &["mar", "march", "мар", "март", "марта"],
+        &["apr", "april", "апр", "апрель", "апреля"],
+        &["may", "май", "мая"],
+        &["jun", "june", "июн", "июнь", "июня"],
+        &["jul", "july", "июл", "июль", "июля"],
+        &["aug", "august", "авг", "август", "августа"],
+        &["sep", "sept", "september", "сен", "сент", "сентябрь", "сентября"],
+        &["oct", "october", "окт", "октябрь", "октября"],
+        &["nov", "november", "ноя", "нояб", "ноябрь", "ноября"],
+        &["dec", "december", "дек", "декабрь", "декабря"],
     ];
-    PREFIXES
-        .iter()
-        .position(|prefixes| prefixes.iter().any(|p| word.starts_with(p)))
-        .map(|i| i as u32 + 1)
+    let word = word.trim_end_matches('.');
+    FORMS.iter().position(|forms| forms.contains(&word)).map(|i| i as u32 + 1)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // 18 октября 2026 — воскресенье.
+    // 18 October 2026 is a Sunday.
     fn today() -> NaiveDate {
         d(2026, 10, 18)
     }
@@ -228,76 +259,106 @@ mod tests {
         NaiveTime::from_hms_opt(h, m, 0)
     }
 
+    fn date(input: &str) -> Option<NaiveDate> {
+        parse_quick_add(input, today(), &[]).due_date
+    }
+
     #[test]
     fn plain_title_is_untouched() {
-        let p = parse_quick_add("  Купить   молоко ", today());
-        assert_eq!(p, ParsedTask { title: "Купить молоко".into(), ..Default::default() });
+        let p = parse_quick_add("  Buy   milk ", today(), &[]);
+        assert_eq!(p, ParsedTask { title: "Buy milk".into(), ..Default::default() });
     }
 
     #[test]
     fn full_example() {
-        let p = parse_quick_add("Купить молоко завтра в 18:00 #дом !1", today());
-        assert_eq!(p.title, "Купить молоко");
+        let p = parse_quick_add("Buy milk tomorrow at 6pm #home !1", today(), &[]);
+        assert_eq!(p.title, "Buy milk");
         assert_eq!(p.due_date, Some(d(2026, 10, 19)));
         assert_eq!(p.due_time, t(18, 0));
-        assert_eq!(p.tags, ["дом"]);
+        assert_eq!(p.tags, ["home"]);
         assert_eq!(p.priority, Some(Priority::High));
     }
 
     #[test]
     fn relative_dates() {
-        let date = |s: &str| parse_quick_add(s, today()).due_date;
-        assert_eq!(date("x сегодня"), Some(today()));
-        assert_eq!(date("x послезавтра"), Some(d(2026, 10, 20)));
-        assert_eq!(date("x через 3 дня"), Some(d(2026, 10, 21)));
-        assert_eq!(date("x через неделю"), Some(d(2026, 10, 25)));
-        assert_eq!(date("x через 2 месяца"), Some(d(2026, 12, 18)));
+        assert_eq!(date("x today"), Some(today()));
+        assert_eq!(date("x in 3 days"), Some(d(2026, 10, 21)));
         assert_eq!(date("x in 2 weeks"), Some(d(2026, 11, 1)));
+        assert_eq!(date("x in 1 month"), Some(d(2026, 11, 18)));
     }
 
     #[test]
     fn weekdays_point_forward() {
-        let date = |s: &str| parse_quick_add(s, today()).due_date;
-        assert_eq!(date("отчёт в пятницу"), Some(d(2026, 10, 23)));
-        assert_eq!(date("отчёт пн"), Some(d(2026, 10, 19)));
-        // Сегодня воскресенье — «в воскресенье» значит через неделю.
-        assert_eq!(date("отчёт в воскресенье"), Some(d(2026, 10, 25)));
-        assert_eq!(parse_quick_add("отчёт в пятницу", today()).title, "отчёт");
+        assert_eq!(date("report on friday"), Some(d(2026, 10, 23)));
+        assert_eq!(date("report mon"), Some(d(2026, 10, 19)));
+        // Today is Sunday, so "sunday" means next week.
+        assert_eq!(date("report next sunday"), Some(d(2026, 10, 25)));
+        assert_eq!(parse_quick_add("report next sunday", today(), &[]).title, "report");
     }
 
     #[test]
     fn absolute_dates() {
-        let date = |s: &str| parse_quick_add(s, today()).due_date;
         assert_eq!(date("x 13.11"), Some(d(2026, 11, 13)));
         assert_eq!(date("x 01.03"), Some(d(2027, 3, 1)));
         assert_eq!(date("x 13.11.2027"), Some(d(2027, 11, 13)));
         assert_eq!(date("x 2026-12-31"), Some(d(2026, 12, 31)));
-        assert_eq!(date("x 13 ноября"), Some(d(2026, 11, 13)));
-        assert_eq!(date("x до 5 марта"), Some(d(2027, 3, 5)));
-        assert_eq!(parse_quick_add("Оплата до 5 марта", today()).title, "Оплата");
+        assert_eq!(date("x 13 nov"), Some(d(2026, 11, 13)));
+        assert_eq!(date("x by 5 march"), Some(d(2027, 3, 5)));
+        assert_eq!(parse_quick_add("Pay rent by 5 march", today(), &[]).title, "Pay rent");
     }
 
     #[test]
-    fn time_without_date_is_today() {
-        let p = parse_quick_add("созвон 9ч", today());
-        assert_eq!((p.title.as_str(), p.due_date, p.due_time), ("созвон", Some(today()), t(9, 0)));
+    fn times() {
+        let time = |s: &str| parse_quick_add(s, today(), &[]).due_time;
+        assert_eq!(time("x 9:05"), t(9, 5));
+        assert_eq!(time("x 6:30am"), t(6, 30));
+        assert_eq!(time("x 12am"), t(0, 0));
+        assert_eq!(time("x 12pm"), t(12, 0));
+        assert_eq!(time("x 13pm"), None);
+        // A time without a date is for today.
+        let p = parse_quick_add("standup 9am", today(), &[]);
+        assert_eq!((p.title.as_str(), p.due_date, p.due_time), ("standup", Some(today()), t(9, 0)));
+    }
+
+    #[test]
+    fn russian_keywords() {
+        let p = parse_quick_add("Купить молоко завтра в 18:00 #дом !высокий", today(), &[]);
+        assert_eq!(p.title, "Купить молоко");
+        assert_eq!((p.due_date, p.due_time), (Some(d(2026, 10, 19)), t(18, 0)));
+        assert_eq!(p.priority, Some(Priority::High));
+        assert_eq!(date("x послезавтра"), Some(d(2026, 10, 20)));
+        assert_eq!(date("x через 3 дня"), Some(d(2026, 10, 21)));
+        assert_eq!(date("x через неделю"), Some(d(2026, 10, 25)));
+        assert_eq!(date("x в пятницу"), Some(d(2026, 10, 23)));
+        assert_eq!(date("x 13 ноября"), Some(d(2026, 11, 13)));
+        assert_eq!(parse_quick_add("x 9ч", today(), &[]).due_time, t(9, 0));
     }
 
     #[test]
     fn numbers_and_words_that_are_not_dates_stay() {
-        let p = parse_quick_add("Купить 3 яблока в магазине", today());
-        assert_eq!(p.title, "Купить 3 яблока в магазине");
-        assert_eq!(p.due_date, None);
-        let p = parse_quick_add("Прочитать 25:99 и #", today());
-        assert_eq!(p.title, "Прочитать 25:99 и #");
+        let p = parse_quick_add("Buy 3 apples at the store", today(), &[]);
+        assert_eq!((p.title.as_str(), p.due_date), ("Buy 3 apples at the store", None));
+        let p = parse_quick_add("Read 25:99 and #", today(), &[]);
+        assert_eq!(p.title, "Read 25:99 and #");
+        assert_eq!(parse_quick_add("Read page 18", today(), &[]).due_time, None);
+        assert_eq!(date("Buy 5 marbles"), None);
+    }
+
+    #[test]
+    fn known_lists_only() {
+        let lists = ["Work".to_owned()];
+        let p = parse_quick_add("Report ^work", today(), &lists);
+        assert_eq!((p.title.as_str(), p.list.as_deref()), ("Report", Some("Work")));
+        let p = parse_quick_add("Report ^garden", today(), &lists);
+        assert_eq!((p.title.as_str(), p.list), ("Report ^garden", None));
     }
 
     #[test]
     fn priorities_and_duplicate_tags() {
-        let p = parse_quick_add("x !средний #Дом #дом #работа", today());
+        let p = parse_quick_add("x !medium #Home #home #work", today(), &[]);
         assert_eq!(p.priority, Some(Priority::Medium));
-        assert_eq!(p.tags, ["Дом", "работа"]);
-        assert_eq!(parse_quick_add("x !3", today()).priority, Some(Priority::Low));
-        assert_eq!(parse_quick_add("ура!", today()).title, "ура!");
+        assert_eq!(p.tags, ["Home", "work"]);
+        assert_eq!(parse_quick_add("x !3", today(), &[]).priority, Some(Priority::Low));
+        assert_eq!(parse_quick_add("hooray!", today(), &[]).title, "hooray!");
     }
 }

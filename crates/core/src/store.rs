@@ -7,7 +7,7 @@ use chrono::{Duration, NaiveDate, NaiveTime};
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use uuid::Uuid;
 
-use crate::model::{Id, Kind, Priority, Tag, Task, View, ViewCounts};
+use crate::model::{Id, Kind, List, Priority, Tag, Task, View, ViewCounts};
 
 const MIGRATIONS: &[&str] = &[
     "
@@ -40,10 +40,26 @@ const MIGRATIONS: &[&str] = &[
         PRIMARY KEY (task_id, tag)
     );
     ",
+    "
+    CREATE TABLE lists (
+        id         TEXT PRIMARY KEY,
+        name       TEXT NOT NULL,
+        color      TEXT,
+        created_at INTEGER NOT NULL
+    );
+    ALTER TABLE tasks ADD COLUMN list_id TEXT REFERENCES lists(id) ON DELETE CASCADE;
+    CREATE INDEX tasks_list ON tasks(list_id);
+    ",
+    "
+    CREATE TABLE settings (
+        key   TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    );
+    ",
 ];
 
-const TASK_COLUMNS: &str =
-    "id, parent_id, kind, title, notes, priority, due_date, due_time, completed_at, created_at";
+const TASK_COLUMNS: &str = "id, parent_id, kind, title, notes, priority, due_date, due_time, \
+                            completed_at, created_at, list_id";
 
 const DATE_FORMAT: &str = "%Y-%m-%d";
 const TIME_FORMAT: &str = "%H:%M";
@@ -72,7 +88,7 @@ impl Store {
         Ok(Self { conn })
     }
 
-    /// Все задачи: сначала невыполненные (новые сверху), затем выполненные (недавние сверху).
+    /// All tasks: open ones first (newest on top), then completed ones (most recent on top).
     pub fn tasks(&self) -> Result<Vec<Task>> {
         let mut stmt = self.conn.prepare(&format!(
             "SELECT {TASK_COLUMNS} FROM tasks
@@ -96,7 +112,7 @@ impl Store {
         Ok(tasks)
     }
 
-    /// Задачи для представления. `today` передаётся снаружи, чтобы не зависеть от часового пояса в тестах.
+    /// Tasks for a view. `today` is passed in so tests do not depend on the clock or time zone.
     pub fn tasks_in(&self, view: &View, today: NaiveDate) -> Result<Vec<Task>> {
         Ok(self.tasks()?.into_iter().filter(|task| matches_view(task, view, today)).collect())
     }
@@ -134,6 +150,7 @@ impl Store {
     pub fn add_task(&self, title: &str) -> Result<Task> {
         let task = Task {
             id: Uuid::now_v7(),
+            list_id: None,
             parent_id: None,
             kind: Kind::Task,
             title: title.trim().to_owned(),
@@ -172,7 +189,7 @@ impl Store {
         self.update(id, "kind", kind.as_str())
     }
 
-    /// Срок задачи. Время без даты не имеет смысла и игнорируется.
+    /// Sets the due date. A time without a date is meaningless and is dropped.
     pub fn set_due(&self, id: Id, date: Option<NaiveDate>, time: Option<NaiveTime>) -> Result<()> {
         let date_str = date.map(|d| d.format(DATE_FORMAT).to_string());
         let time_str = date.and(time).map(|t| t.format(TIME_FORMAT).to_string());
@@ -183,19 +200,19 @@ impl Store {
         Ok(())
     }
 
-    /// Делает задачу подзадачей `parent` (или поднимает на верхний уровень при `None`).
+    /// Makes the task a subtask of `parent`, or a top-level task for `None`.
     pub fn set_parent(&self, id: Id, parent: Option<Id>) -> Result<()> {
         if let Some(parent) = parent {
             anyhow::ensure!(
                 parent != id && !self.descendants(id)?.contains(&parent),
-                "задачу нельзя вложить в саму себя"
+                "a task cannot be nested inside itself"
             );
         }
         self.update(id, "parent_id", parent.map(|p| p.to_string()))
     }
 
-    /// Заменяет набор тегов задачи; новые теги создаются автоматически.
-    /// Теги сравниваются без учёта регистра (в том числе кириллица — `NOCASE` в SQLite её не понимает).
+    /// Replaces the task's tags; unknown tags are created.
+    /// Tags match case-insensitively in Rust, because SQLite's `NOCASE` only folds ASCII.
     pub fn set_tags(&self, id: Id, tags: &[String]) -> Result<()> {
         let existing: Vec<String> = self
             .conn
@@ -231,7 +248,7 @@ impl Store {
              LEFT JOIN task_tags tt ON tt.tag = t.name
              LEFT JOIN tasks tk ON tk.id = tt.task_id AND tk.completed_at IS NULL
              GROUP BY t.name
-             ORDER BY t.created_at, t.name",
+             ORDER BY t.created_at, t.rowid",
         )?;
         let tags = stmt
             .query_map([], |row| {
@@ -250,7 +267,80 @@ impl Store {
         Ok(())
     }
 
-    /// Удаляет задачу вместе с подзадачами.
+    pub fn lists(&self) -> Result<Vec<List>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT l.id, l.name, l.color, COUNT(t.id)
+             FROM lists l
+             LEFT JOIN tasks t ON t.list_id = l.id AND t.completed_at IS NULL
+             GROUP BY l.id
+             ORDER BY l.created_at, l.rowid",
+        )?;
+        let lists = stmt
+            .query_map([], |row| {
+                Ok(List {
+                    id: parse_uuid(&row.get::<_, String>(0)?, 0)?,
+                    name: row.get(1)?,
+                    color: row.get(2)?,
+                    open_count: row.get::<_, i64>(3)? as usize,
+                })
+            })?
+            .collect::<Result<_, _>>()?;
+        Ok(lists)
+    }
+
+    pub fn create_list(&self, name: &str) -> Result<List> {
+        let name = name.trim();
+        anyhow::ensure!(!name.is_empty(), "a list needs a name");
+        let list = List { id: Uuid::now_v7(), name: name.to_owned(), color: None, open_count: 0 };
+        self.conn.execute(
+            "INSERT INTO lists (id, name, created_at) VALUES (?1, ?2, ?3)",
+            params![list.id.to_string(), list.name, now_ms()],
+        )?;
+        Ok(list)
+    }
+
+    pub fn rename_list(&self, id: Id, name: &str) -> Result<()> {
+        let name = name.trim();
+        anyhow::ensure!(!name.is_empty(), "a list needs a name");
+        self.conn.execute("UPDATE lists SET name = ?2 WHERE id = ?1", params![id.to_string(), name])?;
+        Ok(())
+    }
+
+    /// Deletes the list together with its tasks.
+    pub fn delete_list(&self, id: Id) -> Result<()> {
+        self.conn.execute("DELETE FROM lists WHERE id = ?1", [id.to_string()])?;
+        Ok(())
+    }
+
+    /// Moves the task and its subtasks to a list (`None` means the Inbox).
+    pub fn set_list(&self, id: Id, list: Option<Id>) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        let list = list.map(|l| l.to_string());
+        for task in std::iter::once(id).chain(self.descendants(id)?) {
+            tx.execute("UPDATE tasks SET list_id = ?2 WHERE id = ?1", params![task.to_string(), list])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// A user setting such as the UI language; `None` when never set.
+    pub fn setting(&self, key: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row("SELECT value FROM settings WHERE key = ?1", [key], |row| row.get(0))
+            .optional()?)
+    }
+
+    pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    /// Deletes the task together with its subtasks.
     pub fn delete_task(&self, id: Id) -> Result<()> {
         self.conn.execute("DELETE FROM tasks WHERE id = ?1", [id.to_string()])?;
         Ok(())
@@ -284,8 +374,9 @@ impl Store {
 fn matches_view(task: &Task, view: &View, today: NaiveDate) -> bool {
     let due_before = |days: i64| task.due_date.is_some_and(|due| due < today + Duration::days(days));
     match view {
-        // Пока нет пользовательских списков, во «Входящих» лежит всё.
-        View::Inbox | View::All => true,
+        View::Inbox => task.list_id.is_none(),
+        View::All => true,
+        View::List(id) => task.list_id == Some(*id),
         View::Today => !task.is_completed() && due_before(1),
         View::Tomorrow => {
             !task.is_completed() && task.due_date == Some(today + Duration::days(1))
@@ -318,6 +409,7 @@ fn task_from_row(row: &Row) -> rusqlite::Result<Task> {
         tags: Vec::new(),
         completed_at: row.get(8)?,
         created_at: row.get(9)?,
+        list_id: row.get::<_, Option<String>>(10)?.map(|l| parse_uuid(&l, 10)).transpose()?,
     })
 }
 
@@ -340,9 +432,9 @@ mod tests {
     #[test]
     fn add_complete_delete() -> Result<()> {
         let store = Store::open_in_memory()?;
-        let a = store.add_task("  купить молоко ")?;
-        let b = store.add_task("позвонить маме")?;
-        assert_eq!(a.title, "купить молоко");
+        let a = store.add_task("  buy milk ")?;
+        let b = store.add_task("call the bank")?;
+        assert_eq!(a.title, "buy milk");
 
         store.set_completed(a.id, true)?;
         let tasks = store.tasks()?;
@@ -352,11 +444,11 @@ mod tests {
         store.set_completed(a.id, false)?;
         assert!(!store.task(a.id)?.unwrap().is_completed());
 
-        store.set_title(b.id, "позвонить папе")?;
-        store.set_notes(b.id, "после 18:00\nне забыть про выходные")?;
+        store.set_title(b.id, "call the dentist")?;
+        store.set_notes(b.id, "after 6 pm\nask about weekends")?;
         let b2 = store.task(b.id)?.unwrap();
-        assert_eq!(b2.title, "позвонить папе");
-        assert_eq!(b2.notes, "после 18:00\nне забыть про выходные");
+        assert_eq!(b2.title, "call the dentist");
+        assert_eq!(b2.notes, "after 6 pm\nask about weekends");
 
         store.delete_task(b.id)?;
         assert_eq!(store.tasks()?.len(), 1);
@@ -380,14 +472,14 @@ mod tests {
         conn.execute_batch(MIGRATIONS[0])?;
         conn.pragma_update(None, "user_version", 1)?;
         conn.execute(
-            "INSERT INTO tasks VALUES ('0192f000-0000-7000-8000-000000000001', 'старая', NULL, 1)",
+            "INSERT INTO tasks VALUES ('0192f000-0000-7000-8000-000000000001', 'legacy', NULL, 1)",
             [],
         )?;
         let store = Store::init(conn)?;
         let task = &store.tasks()?[0];
         assert_eq!(
             (task.title.as_str(), task.kind, task.priority),
-            ("старая", Kind::Task, Priority::None)
+            ("legacy", Kind::Task, Priority::None)
         );
         Ok(())
     }
@@ -395,7 +487,7 @@ mod tests {
     #[test]
     fn priority_kind_and_due() -> Result<()> {
         let store = Store::open_in_memory()?;
-        let t = store.add_task("отчёт")?;
+        let t = store.add_task("report")?;
         store.set_priority(t.id, Priority::High)?;
         store.set_kind(t.id, Kind::Note)?;
         store.set_due(t.id, Some(d(2026, 10, 20)), NaiveTime::from_hms_opt(18, 30, 0))?;
@@ -405,7 +497,7 @@ mod tests {
         assert_eq!(t.due_date, Some(d(2026, 10, 20)));
         assert_eq!(t.due_time, NaiveTime::from_hms_opt(18, 30, 0));
 
-        // Время без даты не сохраняется.
+        // A time without a date is not stored.
         store.set_due(t.id, None, NaiveTime::from_hms_opt(9, 0, 0))?;
         let t = store.task(t.id)?.unwrap();
         assert_eq!((t.due_date, t.due_time), (None, None));
@@ -416,13 +508,13 @@ mod tests {
     fn smart_views_and_counts() -> Result<()> {
         let store = Store::open_in_memory()?;
         let today = d(2026, 10, 18);
-        let overdue = store.add_task("просрочено")?;
-        let now = store.add_task("сегодня")?;
-        let tomorrow = store.add_task("завтра")?;
-        let week = store.add_task("через 6 дней")?;
-        let later = store.add_task("через неделю")?;
-        let done = store.add_task("сделано сегодня")?;
-        store.add_task("без срока")?;
+        let overdue = store.add_task("overdue")?;
+        let now = store.add_task("today")?;
+        let tomorrow = store.add_task("tomorrow")?;
+        let week = store.add_task("in 6 days")?;
+        let later = store.add_task("in a week")?;
+        let done = store.add_task("done today")?;
+        store.add_task("no due date")?;
         store.set_due(overdue.id, Some(d(2026, 10, 15)), None)?;
         store.set_due(now.id, Some(today), None)?;
         store.set_due(tomorrow.id, Some(d(2026, 10, 19)), None)?;
@@ -431,13 +523,13 @@ mod tests {
         store.set_due(done.id, Some(today), None)?;
         store.set_completed(done.id, true)?;
 
-        assert_eq!(titles(&store.tasks_in(&View::Today, today)?), ["сегодня", "просрочено"]);
-        assert_eq!(titles(&store.tasks_in(&View::Tomorrow, today)?), ["завтра"]);
+        assert_eq!(titles(&store.tasks_in(&View::Today, today)?), ["today", "overdue"]);
+        assert_eq!(titles(&store.tasks_in(&View::Tomorrow, today)?), ["tomorrow"]);
         assert_eq!(
             titles(&store.tasks_in(&View::Next7Days, today)?),
-            ["через 6 дней", "завтра", "сегодня", "просрочено"]
+            ["in 6 days", "tomorrow", "today", "overdue"]
         );
-        assert_eq!(titles(&store.tasks_in(&View::Completed, today)?), ["сделано сегодня"]);
+        assert_eq!(titles(&store.tasks_in(&View::Completed, today)?), ["done today"]);
         assert_eq!(
             store.counts(today)?,
             ViewCounts { inbox: 6, all: 6, today: 2, tomorrow: 1, next_7_days: 4 }
@@ -450,21 +542,21 @@ mod tests {
         let store = Store::open_in_memory()?;
         let a = store.add_task("a")?;
         let b = store.add_task("b")?;
-        store.set_tags(a.id, &["Дом".into(), "проект".into()])?;
-        store.set_tags(b.id, &["дом".into()])?;
-        store.set_tag_color("Дом", Some("#4AA6EF"))?;
+        store.set_tags(a.id, &["Élan".into(), "focus".into()])?;
+        store.set_tags(b.id, &["élan".into()])?;
+        store.set_tag_color("Élan", Some("#3B82F6"))?;
 
-        assert_eq!(store.task(b.id)?.unwrap().tags, ["Дом"]);
+        assert_eq!(store.task(b.id)?.unwrap().tags, ["Élan"]);
         let tags = store.tags()?;
         assert_eq!(
             tags.iter().map(|t| (t.name.as_str(), t.open_count)).collect::<Vec<_>>(),
-            [("Дом", 2), ("проект", 1)]
+            [("Élan", 2), ("focus", 1)]
         );
-        assert_eq!(tags[0].color.as_deref(), Some("#4AA6EF"));
+        assert_eq!(tags[0].color.as_deref(), Some("#3B82F6"));
 
         store.set_completed(b.id, true)?;
         assert_eq!(store.tags()?[0].open_count, 1);
-        assert_eq!(titles(&store.tasks_in(&View::Tag("дом".into()), d(2026, 1, 1))?), ["a", "b"]);
+        assert_eq!(titles(&store.tasks_in(&View::Tag("ÉLAN".into()), d(2026, 1, 1))?), ["a", "b"]);
 
         store.set_tags(a.id, &[])?;
         assert!(store.task(a.id)?.unwrap().tags.is_empty());
@@ -472,11 +564,51 @@ mod tests {
     }
 
     #[test]
+    fn lists_scope_inbox_and_move_subtasks() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let today = d(2026, 10, 18);
+        let work = store.create_list(" Work ")?;
+        assert_eq!(work.name, "Work");
+        assert!(store.create_list("  ").is_err());
+
+        let inbox_task = store.add_task("in the inbox")?;
+        let parent = store.add_task("report")?;
+        let child = store.add_task("collect numbers")?;
+        store.set_parent(child.id, Some(parent.id))?;
+        store.set_list(parent.id, Some(work.id))?;
+
+        assert_eq!(store.task(child.id)?.unwrap().list_id, Some(work.id));
+        assert_eq!(titles(&store.tasks_in(&View::Inbox, today)?), [inbox_task.title.as_str()]);
+        assert_eq!(titles(&store.tasks_in(&View::List(work.id), today)?), ["collect numbers", "report"]);
+        assert_eq!(store.tasks_in(&View::All, today)?.len(), 3);
+        assert_eq!(store.counts(today)?.inbox, 1);
+        assert_eq!(store.lists()?[0].open_count, 2);
+
+        store.rename_list(work.id, "Office")?;
+        assert_eq!(store.lists()?[0].name, "Office");
+
+        store.delete_list(work.id)?;
+        assert!(store.lists()?.is_empty());
+        assert_eq!(titles(&store.tasks()?), ["in the inbox"]);
+        Ok(())
+    }
+
+    #[test]
+    fn settings_roundtrip() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        assert_eq!(store.setting("locale")?, None);
+        store.set_setting("locale", "ru")?;
+        store.set_setting("locale", "en")?;
+        assert_eq!(store.setting("locale")?.as_deref(), Some("en"));
+        Ok(())
+    }
+
+    #[test]
     fn subtasks_cascade_and_no_cycles() -> Result<()> {
         let store = Store::open_in_memory()?;
-        let parent = store.add_task("распродать технику")?;
-        let child = store.add_task("продать планшет")?;
-        let grandchild = store.add_task("сбросить настройки")?;
+        let parent = store.add_task("plan a trip")?;
+        let child = store.add_task("book flights")?;
+        let grandchild = store.add_task("compare prices")?;
         store.set_parent(child.id, Some(parent.id))?;
         store.set_parent(grandchild.id, Some(child.id))?;
         assert_eq!(store.task(child.id)?.unwrap().parent_id, Some(parent.id));

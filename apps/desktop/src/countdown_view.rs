@@ -1331,7 +1331,7 @@ impl Render for CountdownView {
                     .child(
                         div()
                             .relative()
-                            .child(IconButton::new("countdown-add", IconName::Plus).on_click(cx.listener(|this, _, _, cx| {
+                            .child(IconButton::new("countdown-add", IconName::Plus).icon_size(IconSize::XLarge).icon_color(Color::Default).on_click(cx.listener(|this, _, _, cx| {
                                 this.add_menu = !this.add_menu;
                                 cx.notify();
                             })))
@@ -1363,7 +1363,7 @@ impl Render for CountdownView {
                     .child(
                         div()
                             .relative()
-                            .child(IconButton::new("countdown-more", IconName::Ellipsis).on_click(cx.listener(|this, _, _, cx| {
+                            .child(IconButton::new("countdown-more", IconName::Ellipsis).icon_color(Color::Default).on_click(cx.listener(|this, _, _, cx| {
                                 this.header_menu = !this.header_menu;
                                 cx.notify();
                             })))

@@ -265,6 +265,9 @@ pub struct Strings {
     pub countdown_calc_mode: &'static str,
     pub countdown_calc_options: [(&'static str, &'static str); 2],
     /// Show, the heading of its choices, and the choices in `ShowInList::ALL` order.
+    /// A birthday's Counting Mode and its choices: Countdown, Count Up.
+    pub countdown_counting_mode: &'static str,
+    pub countdown_counting_options: [&'static str; 2],
     pub countdown_show: &'static str,
     pub countdown_show_heading: &'static str,
     pub countdown_show_options: [&'static str; 5],
@@ -828,6 +831,8 @@ pub static EN: Strings = Strings {
     countdown_reminder_days: ["On the day", "1 day early", "2 days early", "3 days early", "1 week early"],
     countdown_calc_mode: "Day Calculation Mode",
     countdown_calc_options: [("Standard", "Day 1 is the day after the date."), ("Standard +1 day", "Day 1 is the date itself.")],
+    countdown_counting_mode: "Counting Mode",
+    countdown_counting_options: ["Countdown", "Count Up"],
     countdown_show: "Show",
     countdown_show_heading: "In the Smart List",
     countdown_show_options: ["On the day", "3 days in advance", "7 days in advance", "Always show", "Do not show"],
@@ -1368,6 +1373,8 @@ pub static RU: Strings = Strings {
     countdown_reminder_days: ["В тот же день", "За 1 день", "За 2 дня", "За 3 дня", "За неделю"],
     countdown_calc_mode: "Подсчёт дней",
     countdown_calc_options: [("Обычный", "Первый день — следующий после даты."), ("Обычный +1 день", "Первый день — сама дата.")],
+    countdown_counting_mode: "Режим отсчёта",
+    countdown_counting_options: ["Обратный отсчёт", "Прямой отсчёт"],
     countdown_show: "Показывать",
     countdown_show_heading: "В умном списке",
     countdown_show_options: ["В тот же день", "За 3 дня", "За 7 дней", "Всегда", "Не показывать"],

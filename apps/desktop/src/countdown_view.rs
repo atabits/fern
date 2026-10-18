@@ -45,6 +45,7 @@ struct Draft {
     constant_reminder: bool,
     show_in_list: fern_core::countdown::ShowInList,
     plus_one_day: bool,
+    count_up: bool,
 }
 
 /// The countdown dialog's fields that open a dropdown, as in the original.
@@ -59,6 +60,7 @@ enum DraftRow {
     Repeat,
     Type,
     CalcMode,
+    CountingMode,
     Show,
 }
 
@@ -136,7 +138,8 @@ fn face(countdown: &Countdown, today: NaiveDate, days_only: bool, cx: &App) -> F
     let strings = i18n::t(cx);
     let theme = cx.theme();
     // A repeating countdown counts to the next time its date comes back.
-    let date = countdown.next_date(today);
+    // A birthday counting up shows the time since the birth.
+    let date = if countdown.count_up { countdown.date } else { countdown.next_date(today) };
     let span = countdown.span(today);
     let color = if span.past { theme.status().warning } else { theme.colors().accent };
     let number = |value: u32, unit: &str| {
@@ -217,7 +220,7 @@ impl CountdownView {
             Filter::Kind(kind) => kind,
             Filter::All => CountdownKind::Countdown,
         };
-        self.draft = Some(Draft { name, kind, date: today, month: calendar::month_start(today), icon: None, color: None, repeat: None, editing: None, show_age: false, open: None, reminders: fern_core::countdown::DEFAULT_REMINDERS.to_vec(), constant_reminder: false, show_in_list: Default::default(), plus_one_day: false });
+        self.draft = Some(Draft { name, kind, date: today, month: calendar::month_start(today), icon: None, color: None, repeat: None, editing: None, show_age: false, open: None, reminders: fern_core::countdown::DEFAULT_REMINDERS.to_vec(), constant_reminder: false, show_in_list: Default::default(), plus_one_day: false, count_up: false });
         cx.notify();
     }
 
@@ -241,6 +244,7 @@ impl CountdownView {
         if let Some(draft) = self.draft.as_mut() {
             draft.open = Some(match row {
                 "calc" => DraftRow::CalcMode,
+                "counting" => DraftRow::CountingMode,
                 "month" => DraftRow::Month,
                 "show" => DraftRow::Show,
                 _ => DraftRow::Reminder,
@@ -274,6 +278,7 @@ impl CountdownView {
             draft.constant_reminder = countdown.constant_reminder;
             draft.show_in_list = countdown.show_in_list;
             draft.plus_one_day = countdown.plus_one_day;
+            draft.count_up = countdown.count_up;
             draft.editing = Some(id);
         }
         cx.notify();
@@ -317,7 +322,7 @@ impl CountdownView {
             self.store.set_countdown_look(id, draft.icon.as_deref(), draft.color.as_deref())?;
             self.store.set_countdown_show_age(id, draft.kind == CountdownKind::Birthday && draft.show_age)?;
             self.store.set_countdown_reminders(id, &draft.reminders, draft.constant_reminder)?;
-            self.store.set_countdown_display(id, draft.show_in_list, draft.plus_one_day)
+            self.store.set_countdown_display(id, draft.show_in_list, draft.plus_one_day, draft.kind == CountdownKind::Birthday && draft.count_up)
         });
         if let Err(err) = added {
             eprintln!("failed to add the countdown: {err:#}");
@@ -678,6 +683,16 @@ impl CountdownView {
                     })))
             }))
             .into_any_element();
+        // A birthday's Counting Mode: Countdown or Count Up.
+        let count_up = draft.count_up;
+        let counting_menu = v_flex()
+            .children(strings.countdown_counting_options.iter().enumerate().map(|(i, label)| {
+                choice(SharedString::from(format!("countdown-counting-{i}")), label, count_up == (i == 1)).on_click(set(Box::new(move |d| {
+                    d.count_up = i == 1;
+                    d.open = None;
+                })))
+            }))
+            .into_any_element();
         // Show: when it shows in the Today list.
         use fern_core::countdown::ShowInList;
         let show = draft.show_in_list;
@@ -790,7 +805,15 @@ impl CountdownView {
         };
         let reminder_row = row(strings.reminder, dropdown(DraftRow::Reminder, reminder_text, reminder_menu, cx));
         let repeat_row = row(strings.repeat, dropdown(DraftRow::Repeat, repeat_text.to_owned(), repeat_menu, cx));
-        let calc_row = row(strings.countdown_calc_mode, dropdown(DraftRow::CalcMode, calc_text, calc_menu, cx));
+        // As in the original, a birthday has Counting Mode where the others have Day Calculation Mode.
+        let calc_row = if kind == CountdownKind::Birthday {
+            row(
+                strings.countdown_counting_mode,
+                dropdown(DraftRow::CountingMode, strings.countdown_counting_options[count_up as usize].to_owned(), counting_menu, cx),
+            )
+        } else {
+            row(strings.countdown_calc_mode, dropdown(DraftRow::CalcMode, calc_text, calc_menu, cx))
+        };
         let show_row = row(strings.countdown_show, dropdown(DraftRow::Show, show_text, show_menu, cx));
         let type_row = row(strings.filter_type, dropdown(DraftRow::Type, kind_label(kind, strings).to_owned(), type_menu, cx));
         let icon_open = open == Some(DraftRow::Icon);

@@ -645,6 +645,9 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE countdowns ADD COLUMN show_in_list TEXT NOT NULL DEFAULT 'day';
     ALTER TABLE countdowns ADD COLUMN plus_one_day INTEGER NOT NULL DEFAULT 0;
     ",
+    "
+    ALTER TABLE countdowns ADD COLUMN count_up INTEGER NOT NULL DEFAULT 0;
+    ",
 ];
 
 const TASK_COLUMNS: &str = "id, parent_id, kind, title, notes, priority, due_date, due_time, \
@@ -1523,7 +1526,7 @@ impl Store {
     /// Countdowns in creation order.
     pub fn countdowns(&self) -> Result<Vec<Countdown>> {
         let mut stmt =
-            self.conn.prepare("SELECT id, name, date, kind, icon, color, repeat, pinned_at, show_age, reminders, constant_reminder, show_in_list, plus_one_day FROM countdowns
+            self.conn.prepare("SELECT id, name, date, kind, icon, color, repeat, pinned_at, show_age, reminders, constant_reminder, show_in_list, plus_one_day, count_up FROM countdowns
              ORDER BY pinned_at IS NULL, pinned_at DESC, created_at, rowid")?;
         let rows = stmt
             .query_map([], |row| {
@@ -1544,6 +1547,7 @@ impl Store {
                     constant_reminder: row.get(10)?,
                     show_in_list: crate::countdown::ShowInList::parse(&row.get::<_, String>(11)?),
                     plus_one_day: row.get(12)?,
+                    count_up: row.get(13)?,
                 })
             })?
             .collect::<Result<_, _>>()?;
@@ -1553,7 +1557,7 @@ impl Store {
     pub fn add_countdown(&self, name: &str, date: NaiveDate, kind: CountdownKind) -> Result<Countdown> {
         let name = name.trim();
         anyhow::ensure!(!name.is_empty(), "a countdown needs a name");
-        let countdown = Countdown { id: Uuid::now_v7(), name: name.to_owned(), date, kind, icon: None, color: None, repeat: None, pinned_at: None, show_age: false, reminders: Vec::new(), constant_reminder: false, show_in_list: Default::default(), plus_one_day: false };
+        let countdown = Countdown { id: Uuid::now_v7(), name: name.to_owned(), date, kind, icon: None, color: None, repeat: None, pinned_at: None, show_age: false, reminders: Vec::new(), constant_reminder: false, show_in_list: Default::default(), plus_one_day: false, count_up: false };
         self.conn.execute(
             "INSERT INTO countdowns (id, name, date, kind, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
@@ -1608,11 +1612,12 @@ impl Store {
         Ok(())
     }
 
-    /// A countdown's Show (in the Today list) and Day Calculation Mode ("Standard +1 day").
-    pub fn set_countdown_display(&self, id: Id, show: crate::countdown::ShowInList, plus_one_day: bool) -> Result<()> {
+    /// A countdown's Show (in the Today list), Day Calculation Mode ("Standard +1 day") and a
+    /// birthday's Counting Mode ("Count Up").
+    pub fn set_countdown_display(&self, id: Id, show: crate::countdown::ShowInList, plus_one_day: bool, count_up: bool) -> Result<()> {
         self.conn.execute(
-            "UPDATE countdowns SET show_in_list = ?2, plus_one_day = ?3 WHERE id = ?1",
-            params![id.to_string(), show.key(), plus_one_day],
+            "UPDATE countdowns SET show_in_list = ?2, plus_one_day = ?3, count_up = ?4 WHERE id = ?1",
+            params![id.to_string(), show.key(), plus_one_day, count_up],
         )?;
         Ok(())
     }
@@ -3167,9 +3172,9 @@ mod tests {
         store.set_countdown_reminders(release.id, &[3, 0, 3], true)?;
         let saved = store.countdowns()?.remove(0);
         assert_eq!((saved.reminders, saved.constant_reminder), (vec![0, 3], true));
-        store.set_countdown_display(release.id, crate::countdown::ShowInList::Always, true)?;
+        store.set_countdown_display(release.id, crate::countdown::ShowInList::Always, true, true)?;
         let saved = store.countdowns()?.remove(0);
-        assert_eq!((saved.show_in_list, saved.plus_one_day), (crate::countdown::ShowInList::Always, true));
+        assert_eq!((saved.show_in_list, saved.plus_one_day, saved.count_up), (crate::countdown::ShowInList::Always, true, true));
         Ok(())
     }
 

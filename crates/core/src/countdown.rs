@@ -96,6 +96,9 @@ pub struct Countdown {
     /// The original's Day Calculation Mode "Standard +1 day": the date itself is day 1 of the
     /// days since it, rather than the day after.
     pub plus_one_day: bool,
+    /// A birthday's Counting Mode "Count Up": the time since the date of birth instead of the
+    /// time to the next birthday.
+    pub count_up: bool,
 }
 
 impl Countdown {
@@ -122,7 +125,8 @@ impl Countdown {
     /// The distance to the date it counts to, with "Standard +1 day" counting the date itself
     /// as day 1 of the days since it.
     pub fn span(&self, today: NaiveDate) -> Span {
-        let mut span = span(today, self.next_date(today));
+        let counted = if self.count_up { self.date } else { self.next_date(today) };
+        let mut span = span(today, counted);
         if self.plus_one_day && span.past {
             span.total_days += 1;
             span.days += 1;
@@ -302,6 +306,7 @@ mod tests {
             constant_reminder: false,
             show_in_list: ShowInList::OnTheDay,
             plus_one_day: false,
+            count_up: false,
         };
         let list = [trip];
         let fired = |from: NaiveDate, to: NaiveDate| -> Vec<chrono::NaiveDateTime> {
@@ -326,6 +331,15 @@ mod tests {
         assert_eq!(wedding.span(d(2026, 10, 18)).total_days, 10);
         wedding.plus_one_day = true;
         assert_eq!(wedding.span(d(2026, 10, 18)).total_days, 11);
+
+        // A birthday counting up: the time since the birth, not to the next birthday.
+        let mut born = list[0].clone();
+        born.kind = CountdownKind::Birthday;
+        born.date = d(2000, 10, 20);
+        assert_eq!(born.span(d(2026, 10, 18)).total_days, 2);
+        born.count_up = true;
+        let since = born.span(d(2026, 10, 18));
+        assert!(since.past && since.years == 25);
     }
 
     #[test]
@@ -344,6 +358,7 @@ mod tests {
             constant_reminder: false,
             show_in_list: ShowInList::OnTheDay,
             plus_one_day: false,
+            count_up: false,
         };
         let today = d(2026, 10, 18);
         let mum = birthday(d(1970, 12, 5));
@@ -374,6 +389,7 @@ mod tests {
             constant_reminder: false,
             show_in_list: ShowInList::OnTheDay,
             plus_one_day: false,
+            count_up: false,
         };
         assert_eq!(once.next_date(d(2026, 10, 18)), d(2026, 9, 13), "without a repeat the date stays");
         let monthly = Countdown { repeat: Some(Recurrence::new(Frequency::Monthly, 1)), ..once.clone() };

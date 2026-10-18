@@ -259,10 +259,15 @@ impl AppView {
             }
             if state.contains("countdown-draft") {
                 this.countdown.update(cx, |view, cx| view.start_new(window, cx));
-                // `countdown-draft=reminder|calc|show`: with that dropdown open.
-                if let Some(row) = state.split(';').find_map(|part| part.strip_prefix("countdown-draft=")) {
-                    this.countdown.update(cx, |view, cx| view.dev_open_row(row, cx));
-                }
+            }
+            // `countdown-add=<kind>`: a new countdown of that kind, as the "+" menu starts it.
+            if let Some(kind) = state.split(';').find_map(|part| part.strip_prefix("countdown-add=")) {
+                let kind = fern_core::CountdownKind::parse(kind);
+                this.countdown.update(cx, |view, cx| view.start_new_kind(kind, window, cx));
+            }
+            // `countdown-draft=reminder|calc|counting|show|month`: the dialog with that dropdown open.
+            if let Some(row) = state.split(';').find_map(|part| part.strip_prefix("countdown-draft=")) {
+                this.countdown.update(cx, |view, cx| view.dev_open_row(row, cx));
             }
             // `attach=<task title part>><file path>`: a file attached to that task.
             for spec in state.split(';').filter_map(|part| part.strip_prefix("attach=")) {

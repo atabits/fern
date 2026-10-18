@@ -265,6 +265,8 @@ pub struct Strings {
     /// advance", "Remind me at", the summary ("{n} days ahead") and a custom reminder's label.
     /// The names of `fern_core::countdown::PRESETS`, in order.
     pub countdown_presets: [&'static str; 8],
+    /// The names of `fern_core::countdown::ANNIVERSARY_PRESETS`, in order.
+    pub countdown_anniversary_presets: [&'static str; 8],
     pub countdown_custom: &'static str,
     pub countdown_custom_units: [&'static str; 2],
     pub countdown_custom_advance: [&'static str; 2],
@@ -840,6 +842,10 @@ pub static EN: Strings = Strings {
     countdown_turns: "Turns {n}",
     countdown_reminder_days: ["On the day", "1 day early", "2 days early", "3 days early", "1 week early"],
     countdown_presets: ["Trip", "Concert", "Payday", "Pay Rent", "Credit Card Bill Due", "Mortgage Payment", "Pay Insurance", "Health Check"],
+    countdown_anniversary_presets: [
+        "Graduation Anniversary", "Work Anniversary", "Dating Anniversary", "Proposal Day", "Marriage License Day",
+        "Wedding Anniversary", "100 Days Together", "Enrollment Anniversary",
+    ],
     countdown_custom: "Custom",
     countdown_custom_units: ["Day", "Week"],
     countdown_custom_advance: ["Days in advance", "Weeks in advance"],
@@ -1389,6 +1395,10 @@ pub static RU: Strings = Strings {
     countdown_turns: "Исполнится {n}",
     countdown_reminder_days: ["В тот же день", "За 1 день", "За 2 дня", "За 3 дня", "За неделю"],
     countdown_presets: ["Поездка", "Концерт", "День зарплаты", "Оплата аренды", "Оплата кредитной карты", "Платёж по ипотеке", "Оплата страховки", "Медосмотр"],
+    countdown_anniversary_presets: [
+        "Годовщина выпуска", "Годовщина на работе", "Годовщина знакомства", "День предложения", "День регистрации брака",
+        "Годовщина свадьбы", "100 дней вместе", "Годовщина поступления",
+    ],
     countdown_custom: "Своё",
     countdown_custom_units: ["День", "Неделя"],
     countdown_custom_advance: ["Дней заранее", "Недель заранее"],

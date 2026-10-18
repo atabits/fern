@@ -241,8 +241,8 @@ impl CountdownView {
         self.start_new(window, cx);
         if let Some(draft) = self.draft.as_mut() {
             draft.kind = kind;
-            // As in the original, a new birthday repeats yearly.
-            if kind == CountdownKind::Birthday {
+            // As in the original, a new birthday or holiday repeats yearly.
+            if matches!(kind, CountdownKind::Birthday | CountdownKind::Holiday) {
                 draft.repeat = Some(fern_core::Recurrence::new(fern_core::Frequency::Yearly, 1));
             }
         }
@@ -923,9 +923,9 @@ impl CountdownView {
                 .child(div().w(px(80.)).flex_none().child(Label::new(label)))
                 .child(div().flex_1().min_w_0().child(content))
         };
-        // A birthday picks its date from a month, as the original's "Select Date"; the others
+        // A birthday or a holiday picks its date from a month, as the original's "Select Date"; the others
         // take month, day and year fields.
-        let date_row = if kind == CountdownKind::Birthday {
+        let date_row = if matches!(kind, CountdownKind::Birthday | CountdownKind::Holiday) {
             row(strings.filter_date, dropdown(DraftRow::Date, format_date(selected, strings), date_menu, cx))
         } else {
             row(
@@ -941,13 +941,14 @@ impl CountdownView {
         let reminder_row = row(strings.reminder, dropdown(DraftRow::Reminder, reminder_text, reminder_menu, cx));
         let repeat_row = row(strings.repeat, dropdown(DraftRow::Repeat, repeat_text.to_owned(), repeat_menu, cx));
         // As in the original, a birthday has Counting Mode where the others have Day Calculation Mode.
-        let calc_row = if kind == CountdownKind::Birthday {
-            row(
+        // A holiday has neither, as in the original.
+        let calc_row = match kind {
+            CountdownKind::Birthday => Some(row(
                 strings.countdown_counting_mode,
                 dropdown(DraftRow::CountingMode, strings.countdown_counting_options[count_up as usize].to_owned(), counting_menu, cx),
-            )
-        } else {
-            row(strings.countdown_calc_mode, dropdown(DraftRow::CalcMode, calc_text, calc_menu, cx))
+            )),
+            CountdownKind::Holiday => None,
+            _ => Some(row(strings.countdown_calc_mode, dropdown(DraftRow::CalcMode, calc_text, calc_menu, cx))),
         };
         let show_row = row(strings.countdown_show, dropdown(DraftRow::Show, show_text, show_menu, cx));
         let type_row = row(strings.filter_type, dropdown(DraftRow::Type, kind_label(kind, strings).to_owned(), type_menu, cx));
@@ -1016,7 +1017,11 @@ impl CountdownView {
                         }
                         cx.notify();
                     }))
-                    .children(fern_core::countdown::PRESETS.iter().zip(strings.countdown_presets).enumerate().map(|(i, (preset, name))| {
+                    .children(fern_core::countdown::presets(kind).iter().zip(if kind == CountdownKind::Anniversary {
+                        strings.countdown_anniversary_presets
+                    } else {
+                        strings.countdown_presets
+                    }).enumerate().map(|(i, (preset, name))| {
                         let preset = *preset;
                         ListItem::new(("countdown-preset", i))
                             .height(px(34.))
@@ -1071,8 +1076,9 @@ impl CountdownView {
                             .border_1()
                             .border_color(theme.colors().border)
                             .child(div().flex_1().child(draft.name.clone()))
-                            // The original's bookmark: ready-made countdowns to start from.
-                            .child(
+                            // The original's bookmark: ready-made entries to start from, for the
+                            // kinds that have them.
+                            .when(!fern_core::countdown::presets(kind).is_empty(), |el| el.child(
                                 div()
                                     .relative()
                                     .child(
@@ -1083,14 +1089,14 @@ impl CountdownView {
                                             }))),
                                     )
                                     .children(presets),
-                            ),
+                            )),
                     ),
             )
             .child(date_row)
             .child(reminder_row)
             .child(repeat_row)
             .child(type_row)
-            .child(calc_row)
+            .children(calc_row)
             .child(show_row)
             .child(div().mt_1().h(px(1.)).bg(theme.colors().border))
             // The original's "Show Age", for a birthday.

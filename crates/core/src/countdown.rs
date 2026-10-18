@@ -166,6 +166,28 @@ pub struct Preset {
     pub color: &'static str,
 }
 
+/// The original's ready-made anniversaries, in its order.
+pub const ANNIVERSARY_PRESETS: [Preset; 8] = [
+    Preset { key: "graduation", icon: "🎓", color: "#3B82F6" },
+    Preset { key: "work", icon: "💼", color: "#EAB308" },
+    Preset { key: "dating", icon: "❤️", color: "#EAB308" },
+    Preset { key: "proposal", icon: "💍", color: "#EC4899" },
+    Preset { key: "license", icon: "📜", color: "#EC4899" },
+    Preset { key: "wedding", icon: "💒", color: "#F97316" },
+    Preset { key: "hundred", icon: "📅", color: "#3B82F6" },
+    Preset { key: "enrollment", icon: "🏫", color: "#F97316" },
+];
+
+/// The ready-made entries a kind's name field offers: the original has them for countdowns and
+/// anniversaries only.
+pub fn presets(kind: CountdownKind) -> &'static [Preset] {
+    match kind {
+        CountdownKind::Countdown => &PRESETS,
+        CountdownKind::Anniversary => &ANNIVERSARY_PRESETS,
+        CountdownKind::Birthday | CountdownKind::Holiday => &[],
+    }
+}
+
 /// The original's ready-made countdowns, in its order.
 pub const PRESETS: [Preset; 8] = [
     Preset { key: "trip", icon: "🧳", color: "#22C55E" },
@@ -334,6 +356,8 @@ mod tests {
     fn presets_are_distinct() {
         let keys: std::collections::HashSet<_> = PRESETS.iter().map(|p| p.key).collect();
         assert_eq!(keys.len(), PRESETS.len());
+        assert_eq!(presets(CountdownKind::Anniversary).len(), 8);
+        assert!(presets(CountdownKind::Holiday).is_empty() && presets(CountdownKind::Birthday).is_empty());
         assert!(PRESETS.iter().all(|p| p.color.starts_with('#') && !p.icon.is_empty()));
     }
 

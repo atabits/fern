@@ -13,7 +13,8 @@ use crate::due_picker::{self, CustomReminder, DueDraft, DueMenu, DueTab, RangeFi
 use crate::i18n::{self, CurrentLocale, Strings};
 use crate::lists_panel;
 use crate::task_rows;
-use crate::text_input::{Changed, Mode, Submitted, TextInput};
+use crate::markdown_toolbar::ToolbarAction;
+use crate::text_input::{Cancelled, Changed, Mode, Submitted, TextInput};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Popup {
@@ -63,6 +64,14 @@ pub struct TaskDetail {
     store: Rc<Store>,
     /// The task's attached files.
     attachments: Vec<fern_core::Attachment>,
+    /// The task's comments, the bottom bar's comment field (while open) and its emoji menu.
+    comments: Vec<fern_core::Comment>,
+    comment_input: Entity<TextInput>,
+    comment_open: bool,
+    comment_emoji: bool,
+    /// The bottom bar's "A": the Markdown toolbar for the description, and its headings menu.
+    format_bar: bool,
+    format_headings: bool,
     /// The month the custom repeat's "By Specific Dates" calendar shows.
     specific_month: Option<NaiveDate>,
     /// The "…" menu's Start Focus side menu, while hovered open.
@@ -137,6 +146,7 @@ impl TaskDetail {
         let subtask_input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.add_subtask, cx));
         let time_input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.time_placeholder, cx));
         let link_search = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.search_placeholder, cx));
+        let comment_input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.write_comment, cx));
 
         let subscriptions = vec![
             cx.subscribe(&title, |this, input, _: &Changed, cx| {
@@ -175,6 +185,23 @@ impl TaskDetail {
                 }
             }),
             cx.subscribe(&link_search, |_, _, _: &Changed, cx| cx.notify()),
+            // Enter posts the comment; Escape closes the field.
+            cx.subscribe_in(&comment_input, window, |this, input, Submitted(text), window, cx| {
+                if let Some(task) = this.task_id()
+                    && !text.trim().is_empty()
+                {
+                    match this.store.add_comment(task, text) {
+                        Ok(_) => input.update(cx, |input, cx| input.clear(window, cx)),
+                        Err(err) => eprintln!("failed to add the comment: {err:#}"),
+                    }
+                    this.sync_comments();
+                    cx.notify();
+                }
+            }),
+            cx.subscribe(&comment_input, |this, _, _: &Cancelled, cx| {
+                this.comment_open = false;
+                cx.notify();
+            }),
             // A time typed by hand in the due-date popover's time menu.
             cx.subscribe_in(&time_input, window, |this, input, Submitted(text), window, cx| {
                 if let Some(time) = due_picker::parse_time(text) {
@@ -197,6 +224,12 @@ impl TaskDetail {
             store,
             focus_submenu: false,
             attachments: Vec::new(),
+            comments: Vec::new(),
+            comment_input,
+            comment_open: false,
+            comment_emoji: false,
+            format_bar: false,
+            format_headings: false,
             specific_month: None,
             estimate_draft: EstimateDraft { minutes: false, amount: 0 },
             task: None,
@@ -244,7 +277,172 @@ impl TaskDetail {
         self.show_checklist = !self.checklist.is_empty();
         self.sync_subtasks();
         self.sync_attachments();
+        self.sync_comments();
         cx.notify();
+    }
+
+    fn sync_comments(&mut self) {
+        self.comments = match self.task_id() {
+            Some(id) => self.store.comments(id).unwrap_or_default(),
+            None => Vec::new(),
+        };
+    }
+
+    /// The description toolbar's buttons: format the notes' selection as Markdown (or type the
+    /// time), open the headings menu, or upload an attachment.
+    fn toolbar_action(&mut self, action: ToolbarAction, window: &mut Window, cx: &mut Context<Self>) {
+        match action {
+            ToolbarAction::ToggleHeadings => self.format_headings = !self.format_headings,
+            ToolbarAction::Attach => return self.upload_attachment(cx),
+            ToolbarAction::Format(format) => {
+                self.format_headings = false;
+                self.notes.update(cx, |input, cx| {
+                    let selection = input.selection();
+                    let (text, selection) = match format {
+                        Some(format) => fern_core::markdown::apply(input.text(), selection, format),
+                        None => fern_core::markdown::insert(input.text(), selection, &crate::calendar::format_time(Local::now().time())),
+                    };
+                    input.edit(text, selection, window, cx);
+                });
+                window.focus(&self.notes.focus_handle(cx), cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// For the dev state: `detail-bar=format|comment|format-headings`, and a comment to show.
+    pub fn dev_bar(&mut self, what: &str, window: &mut Window, cx: &mut Context<Self>) {
+        match what {
+            "format" => self.format_bar = true,
+            "format-headings" => (self.format_bar, self.format_headings) = (true, true),
+            "comment" => {
+                self.comment_open = true;
+                window.focus(&self.comment_input.focus_handle(cx), cx);
+            }
+            "comment-emoji" => (self.comment_open, self.comment_emoji) = (true, true),
+            text if text.starts_with("comment:") => {
+                if let Some(task) = self.task_id() {
+                    let _ = self.store.add_comment(task, &text["comment:".len()..]);
+                    self.sync_comments();
+                }
+            }
+            _ => {}
+        }
+        cx.notify();
+    }
+
+    /// The task's comments, as the original lists them under the task: the text, when it was
+    /// written, and × on hover to delete it.
+    fn render_comments(&self, strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        v_flex()
+            .pt_3()
+            .gap_2()
+            .child(Label::new(format!("{} {}", strings.comments, self.comments.len())).size(LabelSize::Small).color(Color::Muted))
+            .children(self.comments.iter().map(|comment| {
+                let id = comment.id;
+                let when = chrono::DateTime::from_timestamp_millis(comment.created_at)
+                    .map(|t| t.with_timezone(&Local).naive_local())
+                    .map(|t| format!("{} {}", crate::calendar::format_date(t.date(), strings), crate::calendar::format_time(t.time())))
+                    .unwrap_or_default();
+                h_flex()
+                    .id(SharedString::from(format!("comment-{id}")))
+                    .group("comment")
+                    .items_start()
+                    .gap_2()
+                    .p_2()
+                    .rounded(px(6.))
+                    .bg(theme.colors().surface_background)
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap_0p5()
+                            .child(Label::new(comment.text.clone()))
+                            .child(Label::new(when).size(LabelSize::XSmall).color(Color::Muted)),
+                    )
+                    .child(
+                        div().invisible().group_hover("comment", |s| s.visible()).child(
+                            IconButton::new(SharedString::from(format!("comment-delete-{id}")), IconName::X)
+                                .icon_size(IconSize::XSmall)
+                                .icon_color(Color::Muted)
+                                .tooltip(Tooltip::text(strings.delete))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    let _ = this.store.delete_comment(id);
+                                    this.sync_comments();
+                                    cx.notify();
+                                })),
+                        ),
+                    )
+            }))
+            .into_any_element()
+    }
+
+    /// The original's comment field over the bottom bar: "Write a comment" with an emoji button.
+    fn render_comment_box(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let emoji_menu = self.comment_emoji.then(|| {
+            let picks: Vec<_> = crate::emoji::search("").into_iter().take(40).map(|e| {
+                div()
+                    .id(SharedString::from(format!("comment-emoji-{e}")))
+                    .size(px(30.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(6.))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme.colors().element_hover))
+                    .child(div().text_size(px(18.)).child(e))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.comment_emoji = false;
+                        this.comment_input.update(cx, |input, cx| {
+                            let (text, selection) = fern_core::markdown::insert(input.text(), input.selection(), e);
+                            input.edit(text, selection, window, cx);
+                        });
+                        window.focus(&this.comment_input.focus_handle(cx), cx);
+                        cx.notify();
+                    }))
+            }).collect();
+            PopoverAttachment::new(
+                Placement::AboveRight,
+                popover(cx)
+                    .w(px(260.))
+                    .p_2()
+                    .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                        this.comment_emoji = false;
+                        cx.notify();
+                    }))
+                    .child(h_flex().flex_wrap().children(picks)),
+            )
+        });
+        div()
+            .px_5()
+            .pb_2()
+            .child(
+                h_flex()
+                    .h(px(36.))
+                    .pl_3()
+                    .pr_1()
+                    .gap_1()
+                    .rounded(px(6.))
+                    .border_1()
+                    .border_color(theme.colors().accent)
+                    .bg(theme.colors().surface_background)
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(div().flex_1().child(self.comment_input.clone()))
+                    .child(
+                        div().relative().child(
+                            IconButton::new("comment-emoji", IconName::Smile)
+                                .icon_color(Color::Muted)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.comment_emoji = !this.comment_emoji;
+                                    cx.notify();
+                                })),
+                        )
+                        .children(emoji_menu),
+                    ),
+            )
+            .into_any_element()
     }
 
     fn sync_attachments(&mut self) {
@@ -2399,8 +2597,26 @@ impl Render for TaskDetail {
                     // Tags sit under the notes, as in the original.
                     .child(self.render_tags_row(strings, cx))
                     .child(div().pt_2().child(Divider::horizontal()))
-                    .child(self.render_subtasks(strings, cx)),
+                    .child(self.render_subtasks(strings, cx))
+                    .when(!self.comments.is_empty(), |el| el.child(self.render_comments(strings, cx))),
             )
+            // The bottom bar's "A" shows the description's Markdown toolbar over it, as the original.
+            .when(self.format_bar && !task.is_deleted(), |el| {
+                let on_action: crate::markdown_toolbar::OnAction<Self> = Rc::new(|this, action, window, cx| this.toolbar_action(action, window, cx));
+                el.child(
+                    div().px_3().pb_2().child(
+                        crate::markdown_toolbar::render("detail-tool", self.format_headings, true, cx, on_action)
+                            .flex_wrap()
+                            .px_1()
+                            .py_0p5()
+                            .rounded(px(8.))
+                            .border_1()
+                            .border_color(theme.colors().border)
+                            .bg(theme.colors().elevated_surface_background),
+                    ),
+                )
+            })
+            .when(self.comment_open && !task.is_deleted(), |el| el.child(self.render_comment_box(cx)))
             .when_some(self.activity.clone(), |el, activity| el.child(self.render_activity(&activity, strings, cx)))
             // Bottom bar: list ……… formatting, comments, more; for a trashed task, as in the
             // original: Restore ……… delete forever.
@@ -2435,8 +2651,28 @@ impl Render for TaskDetail {
                                     }),
                             )
                             .child(div().flex_1())
-                            .child(IconButton::new("format", IconName::Baseline))
-                            .child(IconButton::new("comments", IconName::MessageSquareText))
+                            .child(
+                                IconButton::new("format", IconName::Baseline)
+                                    .toggle_state(self.format_bar)
+                                    .tooltip(Tooltip::text(strings.text_format))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.format_bar = !this.format_bar;
+                                        this.format_headings = false;
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                IconButton::new("comments", IconName::MessageSquareText)
+                                    .toggle_state(self.comment_open)
+                                    .tooltip(Tooltip::text(strings.comments))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.comment_open = !this.comment_open;
+                                        if this.comment_open {
+                                            window.focus(&this.comment_input.focus_handle(cx), cx);
+                                        }
+                                        cx.notify();
+                                    })),
+                            )
                             .child(
                                 div()
                                     .relative()

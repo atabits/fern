@@ -583,6 +583,8 @@ impl TodoView {
                     }
                 }
                 Some(("new-list", _)) => self.start_new_list(window, cx),
+                // `detail-bar=format|format-headings|comment|comment-emoji|comment:<text>`.
+                Some(("detail-bar", what)) => self.detail.update(cx, |detail, cx| detail.dev_bar(what, window, cx)),
                 // `list-dialog=new|<list name>[>icon|folder|type|smart|new-folder|kanban|timeline]`.
                 Some(("list-dialog", spec)) => {
                     let (which, menu) = spec.split_once('>').unwrap_or((spec, ""));

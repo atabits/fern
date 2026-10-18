@@ -15,6 +15,7 @@ mod i18n;
 mod keymap;
 mod list_dialog;
 mod lists_panel;
+mod markdown_toolbar;
 mod matrix_view;
 mod print;
 mod reminders;

@@ -65,6 +65,7 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 | Details: priority (flag) | ✅ | |
 | Details: tags | ✅ | chips under the notes as in the original; the "+ Tag" picker is our addition (TickTick adds tags with "#" in the text) |
 | Details: list | ✅ | list button in the bottom bar |
+| Details: bottom bar's "A" and comments | ✅ | as the original's: "A" (Text Format) shows the description's Markdown toolbar over the bottom bar, the Summary's buttons — Heading Options, Bold, Highlight, check item, bulleted and numbered lists, Italic, Underline, Strikethrough, a line, the time, link, code, quote — and the paperclip (Upload Attachment) in one row (matched to a screenshot; the original's first button, which opens the description full-size, is not there); the comment button opens the original's "Write a comment" field over the bar — Enter posts, Escape closes, the smiley inserts an emoji — and the task's comments are listed under its subtasks with their time, × on hover deleting one; comments sync like other rows. How the original lists comments was not seen (posting one would change the reference account), nor its comment field's picture button, which Fern leaves out |
 | Details: checklist | ✅ | Enter adds the next item; progress "1/3" in rows |
 | Details: subtasks | ✅ | list with checkboxes, open a subtask, "Add subtask" |
 | Drag and drop | 🟡 | reorder rows; drop on a lists-column entry (list, tag, Today/Tomorrow, Completed, Trash) or on a calendar day; between matrix quadrants. The original's drag behavior was not observed (dragging in TickTick would change data); a task dropped on the right 40% of another task's row becomes its subtask, in its list (that part of the row lights up while dragging; the left part keeps reordering), and a task cannot go inside its own subtasks — where the original's nesting zone is was not seen, and the drop itself is checked only through the store's tests, not by dragging in a screenshot |
@@ -95,9 +96,9 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 
 Each item is a whole feature area, done in one pass (it may take several commits).
 
-1. Task details: the original's comments and the bottom bar's remaining buttons, the "…" menu's items still marked unchecked, and the description editor's formatting, as one pass over the details pane.
-2. Search: the original's search page — its filters, the Event filter's place, recent searches and the results' layout — re-checked against the original as one pass.
-3. Summary: the original's Time button and the other toolbar buttons still marked unchecked, checked without changing the reference account's report (if that cannot be done, say so in the row), and the summary's remaining options.
-4. Header heights: every view's title sits about 10 px higher than the original's (its window keeps room for the title bar's buttons); measure the original's header across views and match it in one pass.
+1. Search: the original's search page — its filters, the Event filter's place, recent searches and the results' layout — re-checked against the original as one pass.
+2. Summary: the original's Time button and the other toolbar buttons still marked unchecked, checked without changing the reference account's report (if that cannot be done, say so in the row), and the summary's remaining options.
+3. Header heights: every view's title sits about 10 px higher than the original's (its window keeps room for the title bar's buttons); measure the original's header across views and match it in one pass.
+4. Habits pass: the habit page's remaining original features (the habit log, Habit Settings, statistics cards) checked against the original's screens without checking in, in one pass.
 
 Not checkable under the reference rules: whether the original asks for a note when a focus session ends, and its white noise (the desktop original shows no sound choice on the focus page or in Focus Settings; it would only appear with a timer running in the reference account). Fern's record dialog takes a note afterwards.

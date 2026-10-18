@@ -229,6 +229,16 @@ pub struct List {
     pub archived: bool,
 }
 
+/// A comment on a task, as the original's comments.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Comment {
+    pub id: Id,
+    pub task: Id,
+    pub text: String,
+    /// Unix milliseconds.
+    pub created_at: i64,
+}
+
 /// A folder of lists in the lists column, as the original's.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ListFolder {

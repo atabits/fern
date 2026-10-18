@@ -307,81 +307,22 @@ impl SummaryView {
         cx.notify();
     }
 
-    /// The original's toolbar over the edited report: headings, inline formats, lists, a line,
-    /// the time, links, code and quotes, with its Markdown in each tooltip.
+    /// The original's toolbar over the edited report (see `markdown_toolbar`).
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let strings = i18n::t(cx);
         let colors = cx.theme().colors().clone();
-        let names = strings.markdown_tools;
-        // (format, icon, the tooltip's sample of the Markdown, the shortcut)
-        let tools: [(Option<Format>, IconName, String, Option<&str>); 13] = [
-            (Some(Format::Bold), IconName::Bold, format!("**{}**", names[0]), Some("secondary-b")),
-            (Some(Format::Highlight), IconName::Highlighter, format!("::{}::", names[1]), Some("secondary-shift-y")),
-            (Some(Format::Checklist), IconName::SquareCheck, format!("- [ ] {}", names[2]), Some("secondary-shift-s")),
-            (Some(Format::Bullets), IconName::List, format!("* {}", names[3]), Some("secondary-shift-8")),
-            (Some(Format::Numbered), IconName::ListOrdered, format!("1. {}", names[4]), Some("secondary-shift-7")),
-            (Some(Format::Italic), IconName::Italic, format!("*{}*", names[5]), Some("secondary-i")),
-            (Some(Format::Underline), IconName::Underline, format!("~{}~", names[6]), Some("secondary-u")),
-            (Some(Format::Strike), IconName::Strikethrough, format!("~~{}~~", names[7]), Some("secondary-shift-x")),
-            (Some(Format::Divider), IconName::SeparatorHorizontal, format!("--- {}", names[8]), None),
-            (None, IconName::History, names[9].to_owned(), None),
-            (Some(Format::Link), IconName::Link, format!("[{}](URL)", names[10]), Some("secondary-k")),
-            (Some(Format::Code), IconName::Code, format!("`{}`", names[11]), Some("secondary-alt-c")),
-            (Some(Format::Quote), IconName::Quote, format!("> {}", names[12]), Some("secondary-shift-u")),
-        ];
-        let separator = || div().w(px(1.)).h(px(16.)).mx_1().bg(colors.border_variant);
-        let heading_menu = self.heading_menu.then(|| {
-            PopoverAttachment::new(
-                Placement::BelowLeft,
-                popover(cx)
-                    .w(px(170.))
-                    .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                        this.heading_menu = false;
-                        cx.notify();
-                    }))
-                    .children((1..=3u8).map(|level| {
-                        ListItem::new(("summary-heading", level as usize))
-                            .start_slot(Label::new(format!("H{level}")).size(LabelSize::Small).color(Color::Muted))
-                            .child(Label::new(format!("{} {level}", strings.heading)))
-                            .on_click(cx.listener(move |this, _, window, cx| this.format(Some(Format::Heading(level)), window, cx)))
-                    })),
-            )
+        let on_action: crate::markdown_toolbar::OnAction<Self> = std::rc::Rc::new(|this, action, window, cx| match action {
+            crate::markdown_toolbar::ToolbarAction::Format(format) => this.format(format, window, cx),
+            crate::markdown_toolbar::ToolbarAction::ToggleHeadings => {
+                this.heading_menu = !this.heading_menu;
+                cx.notify();
+            }
+            crate::markdown_toolbar::ToolbarAction::Attach => {}
         });
-        let mut row = h_flex()
+        crate::markdown_toolbar::render("summary-tool", self.heading_menu, false, cx, on_action)
             .h(px(36.))
             .px_2()
-            .gap_0p5()
             .border_b_1()
             .border_color(colors.border_variant)
-            .child(
-                div().relative().child(
-                    IconButton::new("summary-tool-heading", IconName::Heading)
-                        .icon_color(Color::Muted)
-                        .tooltip(Tooltip::text(strings.heading_options))
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.heading_menu = !this.heading_menu;
-                            cx.notify();
-                        })),
-                )
-                .children(heading_menu),
-            );
-        for (i, (format, icon, sample, keys)) in tools.into_iter().enumerate() {
-            // The original groups its buttons: text, lists, styles and lines, then inserts.
-            if [2, 5, 10].contains(&i) {
-                row = row.child(separator());
-            }
-            let tooltip = match keys {
-                Some(keys) => format!("{sample} ({})", crate::keymap::display_keys(keys)),
-                None => sample,
-            };
-            row = row.child(
-                IconButton::new(("summary-tool", i), icon)
-                    .icon_color(if format == Some(Format::Highlight) { Color::Warning } else { Color::Muted })
-                    .tooltip(Tooltip::text(tooltip))
-                    .on_click(cx.listener(move |this, _, window, cx| this.format(format, window, cx))),
-            );
-        }
-        row
     }
 
     /// Opens a dropdown from the debug-build dev state: `summary=<period|lists|status|grouping|fields>`,

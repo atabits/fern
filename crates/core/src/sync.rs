@@ -32,6 +32,7 @@ pub const SYNCED: &[(&str, &[&str])] = &[
     ("filters", &["id"]),
     ("summary_templates", &["id"]),
     ("task_attachments", &["id"]),
+    ("task_comments", &["id"]),
     ("focus_timers", &["id"]),
     ("matrix_rules", &["quadrant"]),
 ];

@@ -698,6 +698,9 @@ pub struct Strings {
     pub skip_recurrence: &'static str,
     pub custom_date: &'static str,
     pub no_tasks_scheduled: &'static str,
+    pub write_comment: &'static str,
+    pub comments: &'static str,
+    pub text_format: &'static str,
 }
 
 pub static EN: Strings = Strings {
@@ -1289,6 +1292,9 @@ pub static EN: Strings = Strings {
     skip_recurrence: "Skip the Recurrence",
     custom_date: "Custom",
     no_tasks_scheduled: "No tasks scheduled.",
+    write_comment: "Write a comment",
+    comments: "Comments",
+    text_format: "Text Format",
 };
 
 pub static RU: Strings = Strings {
@@ -1881,4 +1887,7 @@ pub static RU: Strings = Strings {
     skip_recurrence: "Пропустить повтор",
     custom_date: "Другая дата",
     no_tasks_scheduled: "Задач нет.",
+    write_comment: "Напишите комментарий",
+    comments: "Комментарии",
+    text_format: "Формат текста",
 };

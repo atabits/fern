@@ -691,6 +691,31 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE tags ADD COLUMN parent TEXT;
     ALTER TABLE tags ADD COLUMN pinned_at INTEGER;
     ",
+    // The original's comments on a task.
+    "
+    CREATE TABLE task_comments (
+        id         TEXT PRIMARY KEY,
+        task_id    TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        text       TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+    );
+    CREATE INDEX task_comments_task ON task_comments(task_id);
+    CREATE TRIGGER sync_task_comments_insert AFTER INSERT ON task_comments
+    WHEN NOT EXISTS (SELECT 1 FROM sync_applying)
+    BEGIN
+        INSERT INTO sync_log (entity, key, at) VALUES ('task_comments', NEW.id, CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER));
+    END;
+    CREATE TRIGGER sync_task_comments_update AFTER UPDATE ON task_comments
+    WHEN NOT EXISTS (SELECT 1 FROM sync_applying)
+    BEGIN
+        INSERT INTO sync_log (entity, key, at) VALUES ('task_comments', NEW.id, CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER));
+    END;
+    CREATE TRIGGER sync_task_comments_delete AFTER DELETE ON task_comments
+    WHEN NOT EXISTS (SELECT 1 FROM sync_applying)
+    BEGIN
+        INSERT INTO sync_log (entity, key, at) VALUES ('task_comments', OLD.id, CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER));
+    END;
+    ",
 ];
 
 const TASK_COLUMNS: &str = "id, parent_id, kind, title, notes, priority, due_date, due_time, \
@@ -1347,6 +1372,33 @@ impl Store {
             "UPDATE tasks SET due_date = ?2, due_time = ?3 WHERE id = ?1",
             params![id.to_string(), date_str, time_str],
         )?;
+        Ok(())
+    }
+
+    /// The task's comments, oldest first.
+    pub fn comments(&self, task: Id) -> Result<Vec<crate::model::Comment>> {
+        let mut stmt = self.conn.prepare("SELECT id, text, created_at FROM task_comments WHERE task_id = ?1 ORDER BY created_at, rowid")?;
+        let comments = stmt
+            .query_map([task.to_string()], |row| {
+                Ok(crate::model::Comment { id: parse_uuid(&row.get::<_, String>(0)?, 0)?, task, text: row.get(1)?, created_at: row.get(2)? })
+            })?
+            .collect::<Result<_, _>>()?;
+        Ok(comments)
+    }
+
+    pub fn add_comment(&self, task: Id, text: &str) -> Result<crate::model::Comment> {
+        let text = text.trim();
+        anyhow::ensure!(!text.is_empty(), "a comment needs text");
+        let comment = crate::model::Comment { id: Uuid::now_v7(), task, text: text.to_owned(), created_at: now_ms() };
+        self.conn.execute(
+            "INSERT INTO task_comments (id, task_id, text, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![comment.id.to_string(), task.to_string(), comment.text, comment.created_at],
+        )?;
+        Ok(comment)
+    }
+
+    pub fn delete_comment(&self, id: Id) -> Result<()> {
+        self.conn.execute("DELETE FROM task_comments WHERE id = ?1", [id.to_string()])?;
         Ok(())
     }
 
@@ -3071,6 +3123,20 @@ mod tests {
 
         store.delete_template(template.id)?;
         assert!(store.templates()?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn comments_on_a_task() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let task = store.add_task("Fix the sink")?;
+        assert!(store.add_comment(task.id, "  ").is_err());
+        let first = store.add_comment(task.id, "Bought a new washer")?;
+        store.add_comment(task.id, "Done, no leak")?;
+        let texts = |store: &Store| store.comments(task.id).unwrap().into_iter().map(|c| c.text).collect::<Vec<_>>();
+        assert_eq!(texts(&store), ["Bought a new washer", "Done, no leak"]);
+        store.delete_comment(first.id)?;
+        assert_eq!(texts(&store), ["Done, no leak"]);
         Ok(())
     }
 

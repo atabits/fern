@@ -58,6 +58,9 @@ pub struct FocusView {
     batch: HashSet<Id>,
     batch_filter: fern_core::focus::RecordFilter,
     batch_menu: Option<u8>,
+    /// A filter's Custom fields, while open: the filter (0 Date, 1 Duration) and its two fields
+    /// (Start and End, or Min and Max).
+    batch_custom: Option<(u8, Entity<TextInput>, Entity<TextInput>)>,
     add_title: Entity<TextInput>,
     add_start: Entity<TextInput>,
     add_minutes: i64,
@@ -229,6 +232,7 @@ impl FocusView {
             batch: HashSet::new(),
             batch_filter: Default::default(),
             batch_menu: None,
+            batch_custom: None,
             add_title,
             add_start,
             add_minutes: 25,
@@ -523,6 +527,97 @@ impl FocusView {
         self.set_record_menu(None, cx);
     }
 
+    /// A filter's Custom choice: Start and End days for Date, Min and Max minutes for Duration.
+    fn open_batch_custom(&mut self, which: u8, window: &mut Window, cx: &mut Context<Self>) {
+        let strings = i18n::t(cx);
+        let (first, second) = if which == 0 { (strings.summary_start, strings.summary_end) } else { (strings.batch_min, strings.batch_max) };
+        let field = |placeholder: &'static str, cx: &mut Context<Self>| {
+            let input = cx.new(|cx| TextInput::new(Mode::SingleLine, placeholder, cx));
+            cx.subscribe(&input, |this, _, _: &crate::text_input::Submitted, cx| this.confirm_batch_custom(cx)).detach();
+            input
+        };
+        let (first, second) = (field(first, cx), field(second, cx));
+        window.focus(&first.focus_handle(cx), cx);
+        self.batch_menu = None;
+        self.batch_custom = Some((which, first, second));
+        cx.notify();
+    }
+
+    /// Confirm (or OK): applies the Custom fields when they read as a range; otherwise they stay
+    /// open.
+    fn confirm_batch_custom(&mut self, cx: &mut Context<Self>) {
+        let Some((which, first, second)) = self.batch_custom.clone() else { return };
+        let (first, second) = (first.read(cx).text().to_owned(), second.read(cx).text().to_owned());
+        if which == 0 {
+            let today = Local::now().date_naive();
+            let strings = i18n::t(cx);
+            let parse = |text: &str| crate::calendar::parse_date(text, today, strings);
+            let (Some(start), Some(end)) = (parse(&first), parse(&second)) else { return };
+            self.batch_filter.date = 7;
+            self.batch_filter.days = Some((start.min(end), start.max(end)));
+        } else {
+            let Some(range) = fern_core::focus::RecordFilter::parse_minutes(&first, &second) else { return };
+            self.batch_filter.minutes = Some(range);
+            self.batch_filter.under = None;
+        }
+        self.batch_custom = None;
+        cx.notify();
+    }
+
+    fn render_batch_custom(&self, which: u8, first: Entity<TextInput>, second: Entity<TextInput>, cx: &mut Context<Self>) -> AnyElement {
+        let strings = i18n::t(cx);
+        let theme = cx.theme().clone();
+        let field = |input: Entity<TextInput>| h_flex().flex_1().h(px(28.)).px_2().rounded(px(6.)).border_1().border_color(theme.colors().border).child(input);
+        let button = |id: &'static str, label: &'static str, primary: bool| {
+            div()
+                .id(id)
+                .flex_1()
+                .h(px(26.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(6.))
+                .cursor_pointer()
+                .when(primary, |el| el.bg(theme.colors().accent))
+                .when(!primary, |el| el.border_1().border_color(theme.colors().border))
+                .child(Label::new(label).size(LabelSize::Small))
+        };
+        let fields = if which == 0 {
+            v_flex().gap_2().child(field(first)).child(field(second))
+        } else {
+            v_flex()
+                .gap_2()
+                .child(Label::new(strings.batch_minutes_hint).size(LabelSize::XSmall).color(Color::Muted))
+                .child(h_flex().gap_1().child(field(first)).child(Label::new("–").color(Color::Muted)).child(field(second)))
+        };
+        PopoverAttachment::new(
+            Placement::BelowLeft,
+            popover(cx)
+                .w(px(if which == 0 { 190. } else { 230. }))
+                .p_2()
+                .gap_2()
+                .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                    this.batch_custom = None;
+                    cx.notify();
+                }))
+                .child(fields)
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(button("batch-custom-cancel", strings.cancel, false).on_click(cx.listener(|this, _, _, cx| {
+                            this.batch_custom = None;
+                            cx.notify();
+                        })))
+                        .child(
+                            button("batch-custom-ok", if which == 0 { strings.confirm } else { strings.ok }, true)
+                                .on_click(cx.listener(|this, _, _, cx| this.confirm_batch_custom(cx))),
+                        ),
+                )
+                .into_any_element(),
+        )
+        .into_any_element()
+    }
+
     /// The original's Batch Management: the records by day, each and each day with a checkbox,
     /// "Select All", and Delete for the ticked ones.
     fn render_batch(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -545,14 +640,23 @@ impl FocusView {
         const LINKED: [Option<bool>; 3] = [None, Some(true), Some(false)];
         let current = [
             filter.date as usize,
-            LENGTHS.iter().position(|l| *l == filter.under).unwrap_or(0),
+            if filter.minutes.is_some() { LENGTHS.len() } else { LENGTHS.iter().position(|l| *l == filter.under).unwrap_or(0) },
             LINKED.iter().position(|l| *l == filter.linked).unwrap_or(0),
         ];
         let choices: [&[&'static str]; 3] = [&strings.batch_dates, &strings.batch_lengths, &strings.batch_linked];
+        let choices_len = move |which: u8| choices[which as usize].len();
         let theme = cx.theme().clone();
         let filters = h_flex().gap_1().children((0..3u8).map(|which| {
             let open = self.batch_menu == Some(which);
-            let label = if current[which as usize] == 0 { strings.batch_filters[which as usize] } else { choices[which as usize][current[which as usize]] };
+            let label: SharedString = match (which, filter.days, filter.minutes) {
+                (0, Some((first, last)), _) if filter.date == 7 => {
+                    format!("{} - {}", crate::task_rows::short_date(first, strings), crate::task_rows::short_date(last, strings)).into()
+                }
+                (1, _, Some((least, most))) => format!("{}–{}", format_minutes(least), format_minutes(most)).into(),
+                _ if current[which as usize] == 0 => strings.batch_filters[which as usize].into(),
+                _ => choices[which as usize][current[which as usize]].into(),
+            };
+            let custom = self.batch_custom.clone().filter(|(w, ..)| *w == which).map(|(_, first, second)| self.render_batch_custom(which, first, second, cx));
             div()
                 .relative()
                 .child(
@@ -586,10 +690,21 @@ impl FocusView {
                                 ListItem::new(SharedString::from(format!("batch-filter-{which}-{i}")))
                                     .child(Label::new(*choice).size(LabelSize::Small).color(if selected { Color::Accent } else { Color::Default }))
                                     .when(selected, |item| item.end_slot(Icon::new(IconName::Check).size(IconSize::XSmall).color(Color::Accent)))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                    .on_click(cx.listener(move |this, _, window, cx| {
                                         match which {
-                                            0 => this.batch_filter.date = i as u8,
-                                            1 => this.batch_filter.under = LENGTHS[i],
+                                            // The last choice of Date and Duration is Custom.
+                                            0 | 1 if i == choices_len(which) - 1 => {
+                                                this.open_batch_custom(which, window, cx);
+                                                return;
+                                            }
+                                            0 => {
+                                                this.batch_filter.date = i as u8;
+                                                this.batch_filter.days = None;
+                                            }
+                                            1 => {
+                                                this.batch_filter.under = LENGTHS[i];
+                                                this.batch_filter.minutes = None;
+                                            }
                                             _ => this.batch_filter.linked = LINKED[i],
                                         }
                                         this.batch_menu = None;
@@ -599,6 +714,7 @@ impl FocusView {
                             .into_any_element(),
                     ))
                 })
+                .children(custom)
         }));
         let chosen = self.batch.len();
         let mut rows: Vec<AnyElement> = Vec::new();
@@ -2171,7 +2287,7 @@ impl FocusView {
     }
 
     #[cfg(debug_assertions)]
-    pub fn dev_menu(&mut self, menu: &str, cx: &mut Context<Self>) {
+    pub fn dev_menu(&mut self, menu: &str, window: &mut Window, cx: &mut Context<Self>) {
         let menu = match menu {
             "add" => RecordMenu::Add,
             "settings" => RecordMenu::Settings,
@@ -2188,6 +2304,12 @@ impl FocusView {
                     p.curves[2] = Bucket::Month;
                     p.curve_menu = Some(1);
                 });
+                return;
+            }
+            // Batch Management with a filter's Custom fields open: `batch-date` or `batch-minutes`.
+            "batch-date" | "batch-minutes" => {
+                self.record_menu = Some(RecordMenu::Batch);
+                self.open_batch_custom(if menu == "batch-date" { 0 } else { 1 }, window, cx);
                 return;
             }
             // Batch Management with the newest record ticked.

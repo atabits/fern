@@ -229,7 +229,7 @@ impl AppView {
                 this.focus.update(cx, |view, cx| view.dev_add_timer(icons, window, cx));
             }
             if let Some(menu) = state.split(';').find_map(|part| part.strip_prefix("focus-menu=")) {
-                this.focus.update(cx, |view, cx| view.dev_menu(menu, cx));
+                this.focus.update(cx, |view, cx| view.dev_menu(menu, window, cx));
             }
             // `focus-task=<title part>`: what "Start Focus" in a task's menu does.
             if let Some(needle) = state.split(';').find_map(|part| part.strip_prefix("focus-task="))

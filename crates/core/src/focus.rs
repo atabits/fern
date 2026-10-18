@@ -48,18 +48,39 @@ impl FocusTimer {
     }
 }
 
-/// Batch Management's filters, as in the original (without its Custom choices).
+/// Batch Management's filters, as in the original.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RecordFilter {
-    /// 0 All, 1 Today, 2 Yesterday, 3 This Week, 4 Last Week, 5 This Month, 6 Last Month.
+    /// 0 All, 1 Today, 2 Yesterday, 3 This Week, 4 Last Week, 5 This Month, 6 Last Month,
+    /// 7 Custom (`days`).
     pub date: u8,
+    /// The Custom date choice: from the first to the last day, both included.
+    pub days: Option<(NaiveDate, NaiveDate)>,
     /// Shorter than this many minutes; `None` is all.
     pub under: Option<i64>,
+    /// The Custom duration choice: from the least to the most minutes, both included. It
+    /// replaces `under`.
+    pub minutes: Option<(i64, i64)>,
     /// `Some(true)` only records linked to a task, `Some(false)` only unlinked ones.
     pub linked: Option<bool>,
 }
 
 impl RecordFilter {
+    /// The original's limits for a Custom duration: "5~720 mins".
+    pub const CUSTOM_MINUTES: (i64, i64) = (5, 720);
+
+    /// Reads the Custom duration's Min and Max fields: whole minutes within the limits, the least
+    /// first; an empty field is that end's limit.
+    pub fn parse_minutes(least: &str, most: &str) -> Option<(i64, i64)> {
+        let (low, high) = Self::CUSTOM_MINUTES;
+        let read = |text: &str, empty: i64| match text.trim() {
+            "" => Some(empty),
+            text => text.parse::<i64>().ok().filter(|m| (low..=high).contains(m)),
+        };
+        let (least, most) = (read(least, low)?, read(most, high)?);
+        (least <= most).then_some((least, most))
+    }
+
     pub fn matches(&self, session: &FocusSession, today: NaiveDate, week_start: chrono::Weekday) -> bool {
         let day = session.start_local().date_naive();
         let week = today - Duration::days(((today.weekday().num_days_from_monday() + 7 - week_start.num_days_from_monday()) % 7) as i64);
@@ -72,10 +93,15 @@ impl RecordFilter {
             4 => day >= week - Duration::weeks(1) && day < week,
             5 => day >= month && day <= today,
             6 => day >= last_month && day < month,
+            7 => self.days.is_none_or(|(first, last)| day >= first && day <= last),
             _ => true,
         };
+        let length_ok = match self.minutes {
+            Some((least, most)) => (least..=most).contains(&session.minutes()),
+            None => self.under.is_none_or(|limit| session.minutes() < limit),
+        };
         date_ok
-            && self.under.is_none_or(|limit| session.minutes() < limit)
+            && length_ok
             && self.linked.is_none_or(|linked| session.task_id.is_some() == linked)
     }
 }
@@ -393,5 +419,18 @@ mod tests {
         assert!(short.matches(&short_today, today, monday) && !short.matches(&long_yesterday, today, monday));
         let linked = RecordFilter { linked: Some(true), ..all };
         assert!(linked.matches(&short_today, today, monday) && !linked.matches(&long_yesterday, today, monday));
+
+        // Custom choices.
+        let september = RecordFilter { date: 7, days: Some((NaiveDate::from_ymd_opt(2026, 9, 1).unwrap(), NaiveDate::from_ymd_opt(2026, 9, 30).unwrap())), ..all };
+        assert!(september.matches(&last_month, today, monday) && !september.matches(&short_today, today, monday));
+        let half_hour = RecordFilter { under: Some(10), minutes: Some((25, 50)), ..all };
+        assert!(half_hour.matches(&last_month, today, monday) && half_hour.matches(&long_yesterday, today, monday));
+        assert!(!half_hour.matches(&short_today, today, monday), "a custom range replaces Less Than");
+        assert_eq!(RecordFilter::parse_minutes("20", "40"), Some((20, 40)));
+        assert_eq!(RecordFilter::parse_minutes("", " 90 "), Some((5, 90)));
+        assert_eq!(RecordFilter::parse_minutes("30", ""), Some((30, 720)));
+        assert_eq!(RecordFilter::parse_minutes("40", "20"), None);
+        assert_eq!(RecordFilter::parse_minutes("1", "20"), None, "below the original's 5 minutes");
+        assert_eq!(RecordFilter::parse_minutes("x", "20"), None);
     }
 }

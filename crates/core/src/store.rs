@@ -686,6 +686,11 @@ const MIGRATIONS: &[&str] = &[
         INSERT INTO sync_log (entity, key, at) VALUES ('list_folders', OLD.id, CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER));
     END;
     ",
+    // The original's sub-tags and pinned tags.
+    "
+    ALTER TABLE tags ADD COLUMN parent TEXT;
+    ALTER TABLE tags ADD COLUMN pinned_at INTEGER;
+    ",
 ];
 
 const TASK_COLUMNS: &str = "id, parent_id, kind, title, notes, priority, due_date, due_time, \
@@ -825,6 +830,14 @@ impl Store {
         if let View::Filter(id) = view {
             let filter = self.filters()?.into_iter().find(|f| f.id == *id).context("filter not found")?;
             return Ok(self.tasks()?.into_iter().filter(|task| filter.matches(task, today)).collect());
+        }
+        if let View::Tag(tag) = view {
+            let family = self.tag_family(tag)?;
+            return Ok(self
+                .tasks()?
+                .into_iter()
+                .filter(|task| family.iter().any(|t| matches_view(task, &View::Tag(t.clone()), today)))
+                .collect());
         }
         let hidden = if is_smart(view) { self.hidden_lists()? } else { HashSet::new() };
         Ok(self
@@ -1387,7 +1400,7 @@ impl Store {
 
     pub fn tags(&self) -> Result<Vec<Tag>> {
         let mut stmt = self.conn.prepare(
-            "SELECT t.name, t.color, COUNT(tk.id)
+            "SELECT t.name, t.color, COUNT(tk.id), t.parent, t.pinned_at
              FROM tags t
              LEFT JOIN task_tags tt ON tt.tag = t.name
              LEFT JOIN tasks tk ON tk.id = tt.task_id AND tk.completed_at IS NULL
@@ -1401,6 +1414,8 @@ impl Store {
                     name: row.get(0)?,
                     color: row.get(1)?,
                     open_count: row.get::<_, i64>(2)? as usize,
+                    parent: row.get(3)?,
+                    pinned: row.get::<_, Option<i64>>(4)?.is_some(),
                 })
             })?
             .collect::<Result<_, _>>()?;
@@ -1410,6 +1425,102 @@ impl Store {
     pub fn set_tag_color(&self, name: &str, color: Option<&str>) -> Result<()> {
         self.conn.execute("UPDATE tags SET color = ?2 WHERE name = ?1", params![name, color])?;
         Ok(())
+    }
+
+    /// Checks a parent for `tag`: one level deep, as in the original — the parent is a top-level
+    /// tag other than the tag itself, and a tag with sub-tags cannot become one.
+    fn check_parent(&self, tag: Option<&str>, parent: Option<&str>) -> Result<()> {
+        let Some(parent) = parent else { return Ok(()) };
+        let tags = self.tags()?;
+        let found = tags.iter().find(|t| t.name == parent).context("no such parent tag")?;
+        anyhow::ensure!(found.parent.is_none(), "a sub-tag cannot have sub-tags");
+        if let Some(tag) = tag {
+            anyhow::ensure!(tag != parent, "a tag cannot be its own parent");
+            anyhow::ensure!(!tags.iter().any(|t| t.parent.as_deref() == Some(tag)), "a tag with sub-tags cannot become a sub-tag");
+        }
+        Ok(())
+    }
+
+    /// The original's Add Tags: a new tag with its color and parent.
+    pub fn add_tag(&self, name: &str, color: Option<&str>, parent: Option<&str>) -> Result<()> {
+        let name = name.trim().trim_start_matches('#').trim();
+        anyhow::ensure!(!name.is_empty(), "a tag needs a name");
+        anyhow::ensure!(!self.tags()?.iter().any(|t| t.name.to_lowercase() == name.to_lowercase()), "the tag already exists");
+        self.check_parent(None, parent)?;
+        self.conn.execute(
+            "INSERT INTO tags (name, color, parent, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![name, color, parent, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    /// The original's Edit Tag: name, color and parent. A new name is a new row (the name is the
+    /// key, also for sync), so the tag's tasks and sub-tags move over to it.
+    pub fn update_tag(&self, name: &str, new_name: &str, color: Option<&str>, parent: Option<&str>) -> Result<()> {
+        let new_name = new_name.trim().trim_start_matches('#').trim();
+        anyhow::ensure!(!new_name.is_empty(), "a tag needs a name");
+        self.check_parent(Some(name), parent)?;
+        if new_name != name {
+            anyhow::ensure!(
+                !self.tags()?.iter().any(|t| t.name != name && t.name.to_lowercase() == new_name.to_lowercase()),
+                "the tag already exists"
+            );
+            let tx = self.conn.unchecked_transaction()?;
+            tx.execute(
+                "INSERT INTO tags (name, color, parent, pinned_at, created_at) SELECT ?2, color, parent, pinned_at, created_at FROM tags WHERE name = ?1",
+                params![name, new_name],
+            )?;
+            tx.execute("INSERT OR IGNORE INTO task_tags (task_id, tag) SELECT task_id, ?2 FROM task_tags WHERE tag = ?1", params![name, new_name])?;
+            tx.execute("DELETE FROM task_tags WHERE tag = ?1", [name])?;
+            tx.execute("UPDATE tags SET parent = ?2 WHERE parent = ?1", params![name, new_name])?;
+            tx.execute("DELETE FROM tags WHERE name = ?1", [name])?;
+            tx.commit()?;
+        }
+        self.conn.execute("UPDATE tags SET color = ?2, parent = ?3 WHERE name = ?1", params![new_name, color, parent])?;
+        Ok(())
+    }
+
+    pub fn set_tag_pinned(&self, name: &str, pinned: bool) -> Result<()> {
+        self.conn.execute("UPDATE tags SET pinned_at = ?2 WHERE name = ?1", params![name, pinned.then(now_ms)])?;
+        Ok(())
+    }
+
+    /// The original's Merge Tags: `from`'s tasks get `into` instead, and `from` is deleted; its
+    /// sub-tags go under `into` (or to the top when `into` is itself a sub-tag).
+    pub fn merge_tag(&self, from: &str, into: &str) -> Result<()> {
+        anyhow::ensure!(from != into, "a tag cannot be merged into itself");
+        let tags = self.tags()?;
+        let target = tags.iter().find(|t| t.name == into).context("no such tag")?;
+        let new_parent = if target.parent.is_none() { Some(into) } else { None };
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("INSERT OR IGNORE INTO task_tags (task_id, tag) SELECT task_id, ?2 FROM task_tags WHERE tag = ?1", params![from, into])?;
+        tx.execute("DELETE FROM task_tags WHERE tag = ?1", [from])?;
+        tx.execute("UPDATE tags SET parent = ?2 WHERE parent = ?1 AND name != ?3", params![from, new_parent, into])?;
+        tx.execute("DELETE FROM tags WHERE name = ?1", [from])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Deletes a tag: its tasks keep everything else, its sub-tags move to the top.
+    pub fn delete_tag(&self, name: &str) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM task_tags WHERE tag = ?1", [name])?;
+        tx.execute("UPDATE tags SET parent = NULL WHERE parent = ?1", [name])?;
+        tx.execute("DELETE FROM tags WHERE name = ?1", [name])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// A tag and its sub-tags, lowercased: a parent tag's view shows its sub-tags' tasks too.
+    fn tag_family(&self, tag: &str) -> Result<HashSet<String>> {
+        let tag = tag.to_lowercase();
+        Ok(self
+            .tags()?
+            .into_iter()
+            .filter(|t| t.name.to_lowercase() == tag || t.parent.as_ref().is_some_and(|p| p.to_lowercase() == tag))
+            .map(|t| t.name.to_lowercase())
+            .chain(std::iter::once(tag.clone()))
+            .collect())
     }
 
     /// The lists in their order, archived ones included (see `List::archived`).
@@ -2946,6 +3057,55 @@ mod tests {
 
         store.delete_template(template.id)?;
         assert!(store.templates()?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn sub_tags_merge_rename_and_delete() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let today = NaiveDate::from_ymd_opt(2026, 10, 18).unwrap();
+        let tagged = |title: &str, tags: &[&str]| -> Result<Task> {
+            let task = store.add_task(title)?;
+            store.set_tags(task.id, &tags.iter().map(|t| t.to_string()).collect::<Vec<_>>())?;
+            Ok(task)
+        };
+        tagged("Run", &["health"])?;
+        tagged("Dentist", &["teeth"])?;
+        tagged("Gym", &["sport"])?;
+        store.add_tag("#home", Some("#3B82F6"), None)?;
+        assert!(store.add_tag("Home", None, None).is_err(), "names are unique whatever the case");
+
+        // A sub-tag's tasks show in its parent's view; one level deep only.
+        store.update_tag("teeth", "teeth", None, Some("health"))?;
+        let titles = |view: View| {
+            let mut titles = store.tasks_in(&view, today).unwrap().into_iter().map(|t| t.title).collect::<Vec<_>>();
+            titles.sort();
+            titles
+        };
+        assert_eq!(titles(View::Tag("Health".into())), ["Dentist", "Run"]);
+        assert_eq!(titles(View::Tag("teeth".into())), ["Dentist"]);
+        assert!(store.update_tag("sport", "sport", None, Some("teeth")).is_err(), "teeth is a sub-tag");
+        assert!(store.update_tag("health", "health", None, Some("sport")).is_err(), "health has sub-tags");
+
+        // Renaming keeps the tasks, the sub-tags and the color.
+        store.update_tag("health", "wellbeing", Some("#22C55E"), None)?;
+        let tags = store.tags()?;
+        assert!(!tags.iter().any(|t| t.name == "health"));
+        assert_eq!(tags.iter().find(|t| t.name == "teeth").unwrap().parent.as_deref(), Some("wellbeing"));
+        assert_eq!(titles(View::Tag("wellbeing".into())), ["Dentist", "Run"]);
+
+        // Merging moves the tasks over and deletes the tag.
+        store.merge_tag("sport", "wellbeing")?;
+        assert!(!store.tags()?.iter().any(|t| t.name == "sport"));
+        assert_eq!(titles(View::Tag("wellbeing".into())), ["Dentist", "Gym", "Run"]);
+
+        store.set_tag_pinned("home", true)?;
+        assert!(store.tags()?.iter().find(|t| t.name == "home").unwrap().pinned);
+
+        // Deleting a parent leaves its sub-tags at the top and its tasks untagged.
+        store.delete_tag("wellbeing")?;
+        assert_eq!(store.tags()?.iter().find(|t| t.name == "teeth").unwrap().parent, None);
+        assert!(store.tasks()?.iter().find(|t| t.title == "Run").unwrap().tags.is_empty());
         Ok(())
     }
 

@@ -62,6 +62,9 @@ pub struct Props<'a> {
     pub collapsed_folders: &'a HashSet<Id>,
     /// Whether "Archived Lists" is unfolded.
     pub archived_open: bool,
+    /// Parent tags folded up, and whether the whole Tags section is.
+    pub collapsed_tags: &'a HashSet<String>,
+    pub tags_collapsed: bool,
     /// Saved filters with their task counts.
     pub filters: &'a [(fern_core::SmartFilter, usize)],
     /// Which smart lists Settings → Smart List shows.
@@ -70,8 +73,15 @@ pub struct Props<'a> {
 }
 
 /// What the lists column asks of the view, besides selecting a view.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub enum PanelEvent {
+    /// The Tags heading: its "+", its "…" menu (at that point) and folding the section.
+    AddTag,
+    TagsMenu(Point<Pixels>),
+    ToggleTags,
+    /// A parent tag folded up or out, and a right click on a tag.
+    ToggleTag(String),
+    TagMenu(String, Point<Pixels>),
     ToggleFolder(Id),
     ToggleArchived,
     /// A right click on a list or a folder, at that point of the window.
@@ -93,7 +103,7 @@ pub fn render(
     on_mini: impl Fn(MiniAction, &mut Window, &mut App) + Clone + 'static,
     cx: &App,
 ) -> impl IntoElement {
-    let Props { active, counts, lists, tags, strings, folders, collapsed_folders, archived_open, filters, preferences, mini } = props;
+    let Props { active, counts, lists, tags, strings, folders, collapsed_folders, archived_open, collapsed_tags, tags_collapsed, filters, preferences, mini } = props;
     let shows = |list: SmartList, count: usize| preferences.visibility(list).shows(count);
     let colors = cx.theme().colors();
 
@@ -250,6 +260,109 @@ pub fn render(
         }
     }
 
+    // Tags as in the original: pinned ones first, sub-tags indented under their parent (which
+    // folds them up), a right click for the tag's menu; the heading shows "…" and "+" on hover.
+    let family_count = |tag: &Tag| tag.open_count + tags.iter().filter(|t| t.parent.as_ref() == Some(&tag.name)).map(|t| t.open_count).sum::<usize>();
+    let tag_entry = |tag: &Tag, indent: bool, fold: Option<bool>| -> AnyElement {
+        let name = tag.name.clone();
+        let on_menu = on_panel.clone();
+        let on_fold = on_panel.clone();
+        let count = if fold == Some(true) { family_count(tag) } else { tag.open_count };
+        let menu_name = name.clone();
+        let fold_name = name.clone();
+        div()
+            .id(SharedString::from(format!("tag-entry-{name}")))
+            .relative()
+            .when(indent, |el| el.pl(px(14.)))
+            .on_mouse_down(MouseButton::Right, move |event, window, cx| {
+                cx.stop_propagation();
+                on_menu(PanelEvent::TagMenu(menu_name.clone(), event.position), window, cx)
+            })
+            .child(item(
+                format!("tag-{name}"),
+                View::Tag(name.clone()),
+                name.clone().into(),
+                Icon::new(IconName::Tag).into_any_element(),
+                Some(count),
+                Some(color(tag.color.as_deref(), cx)),
+            ))
+            .when_some(fold, |el, folded| {
+                // A parent's arrow at the left edge, as the original's folders of tags have.
+                el.child(
+                    div()
+                        .id(SharedString::from(format!("tag-fold-{name}")))
+                        .absolute()
+                        .left(px(-6.))
+                        .top(px(11.))
+                        .cursor_pointer()
+                        .child(Icon::new(if folded { IconName::ChevronRight } else { IconName::ChevronDown }).size(IconSize::XSmall).color(Color::Muted))
+                        .on_click(move |_, window, cx| on_fold(PanelEvent::ToggleTag(fold_name.clone()), window, cx)),
+                )
+            })
+            .into_any_element()
+    };
+    let mut ordered: Vec<&Tag> = tags.iter().filter(|t| t.parent.is_none() || !tags.iter().any(|p| Some(&p.name) == t.parent.as_ref())).collect();
+    ordered.sort_by_key(|t| !t.pinned);
+    let mut tag_entries: Vec<AnyElement> = Vec::new();
+    if !tags_collapsed {
+        for tag in ordered {
+            let children: Vec<&Tag> = tags.iter().filter(|t| t.parent.as_ref() == Some(&tag.name)).collect();
+            if !shows(SmartList::Tags, family_count(tag)) {
+                continue;
+            }
+            let folded = collapsed_tags.contains(&tag.name);
+            tag_entries.push(tag_entry(tag, false, (!children.is_empty()).then_some(folded)));
+            if !folded {
+                tag_entries.extend(children.into_iter().filter(|t| shows(SmartList::Tags, t.open_count)).map(|t| tag_entry(t, true, None)));
+            }
+        }
+    }
+    let any_tags = tags.iter().any(|t| shows(SmartList::Tags, t.open_count));
+    let tags_heading = {
+        let (on_add, on_menu, on_fold) = (on_panel.clone(), on_panel.clone(), on_panel.clone());
+        let hover = |el: Stateful<Div>| el.invisible().group_hover("tags-heading", |s| s.visible());
+        h_flex()
+            .id("tags-heading")
+            .group("tags-heading")
+            .h(px(28.))
+            .px_2()
+            .gap_1()
+            .cursor_pointer()
+            .on_click(move |_, window, cx| on_fold(PanelEvent::ToggleTags, window, cx))
+            .relative()
+            // The fold arrow shows left of the word on hover, as the original's, without moving it.
+            .child(hover(
+                div()
+                    .id("tags-fold")
+                    .absolute()
+                    .left(px(-4.))
+                    .top(px(7.))
+                    .child(Icon::new(if tags_collapsed { IconName::ChevronRight } else { IconName::ChevronDown }).size(IconSize::XSmall).color(Color::Muted)),
+            ))
+            .child(div().flex_1().child(Label::new(strings.tags).size(LabelSize::Small).color(Color::Muted)))
+            .child(hover(
+                div()
+                    .id("tags-menu")
+                    .child(Icon::new(IconName::Ellipsis).size(IconSize::Small).color(Color::Muted))
+                    .on_mouse_down(MouseButton::Left, move |event, window, cx| {
+                        cx.stop_propagation();
+                        on_menu(PanelEvent::TagsMenu(event.position), window, cx)
+                    }),
+            ))
+            .child(
+                hover(div().id("add-tag")).child(
+                    IconButton::new("add-tag-button", IconName::Plus)
+                        .size(px(20.))
+                        .icon_size(IconSize::Small)
+                        .tooltip(Tooltip::text(strings.add_tags))
+                        .on_click(move |_, window, cx| {
+                            cx.stop_propagation();
+                            on_add(PanelEvent::AddTag, window, cx)
+                        }),
+                ),
+            )
+            .into_any_element()
+    };
     let lists_column = v_flex()
         .id("lists-panel")
         .flex_1()
@@ -302,20 +415,7 @@ pub fn render(
         })
         .children(list_entries)
         .child(separator())
-        .when(tags.iter().any(|tag| shows(SmartList::Tags, tag.open_count)), |el| {
-            el.child(heading(strings.tags))
-                .children(tags.iter().filter(|tag| shows(SmartList::Tags, tag.open_count)).map(|tag| {
-                    item(
-                        format!("tag-{}", tag.name),
-                        View::Tag(tag.name.clone()),
-                        tag.name.clone().into(),
-                        Icon::new(IconName::Tag).into_any_element(),
-                        Some(tag.open_count),
-                        Some(color(tag.color.as_deref(), cx)),
-                    )
-                }))
-                .child(separator())
-        })
+        .when(any_tags, |el| el.child(tags_heading).children(tag_entries).child(separator()))
         // Filters, as in the original: a hint until there is one.
         .when(shows(SmartList::Filters, 1), |el| el.child(
             heading(strings.filters).child(

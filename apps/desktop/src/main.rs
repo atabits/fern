@@ -23,6 +23,7 @@ mod settings_window;
 mod sidebar;
 mod summary_view;
 mod sync;
+mod tag_dialog;
 mod task_detail;
 mod task_menu;
 mod task_rows;

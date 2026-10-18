@@ -687,6 +687,14 @@ pub struct Strings {
     pub emoji_reset: &'static str,
     /// The emoji picker's categories, in `emoji::CATEGORIES` order.
     pub emoji_categories: [&'static str; 8],
+    pub tag_color: &'static str,
+    pub parent_tag: &'static str,
+    pub add_tags: &'static str,
+    pub edit_tag: &'static str,
+    pub merge_tags: &'static str,
+    pub merge_tags_hint: &'static str,
+    pub select_tag: &'static str,
+    pub add_subtag: &'static str,
 }
 
 pub static EN: Strings = Strings {
@@ -1267,6 +1275,14 @@ pub static EN: Strings = Strings {
     emoji_random: "Random",
     emoji_reset: "Reset",
     emoji_categories: ["People & Body", "Animals & Nature", "Food & Drink", "Activities", "Travel & Places", "Objects", "Symbols", "Flags"],
+    tag_color: "Color",
+    parent_tag: "Parent Tag",
+    add_tags: "Add Tags",
+    edit_tag: "Edit Tag",
+    merge_tags: "Merge Tags",
+    merge_tags_hint: "You can merge the related tasks of tag \"{tag}\" to another tag. After merging, tag \"{tag}\" will be deleted.",
+    select_tag: "Select a tag",
+    add_subtag: "Add Sub-tag",
 };
 
 pub static RU: Strings = Strings {
@@ -1848,4 +1864,12 @@ pub static RU: Strings = Strings {
     emoji_random: "Случайно",
     emoji_reset: "Сбросить",
     emoji_categories: ["Люди", "Животные и природа", "Еда и напитки", "Занятия", "Путешествия", "Предметы", "Символы", "Флаги"],
+    tag_color: "Цвет",
+    parent_tag: "Родительский тег",
+    add_tags: "Добавить тег",
+    edit_tag: "Изменить тег",
+    merge_tags: "Объединить теги",
+    merge_tags_hint: "Задачи с тегом «{tag}» можно перенести на другой тег. После объединения тег «{tag}» будет удалён.",
+    select_tag: "Выберите тег",
+    add_subtag: "Добавить подтег",
 };

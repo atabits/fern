@@ -15,6 +15,7 @@ use crate::actions::{
 };
 use crate::i18n::{self, CurrentLocale, Strings};
 use crate::list_dialog::{DialogEvent, FolderDialog, ListDialog};
+use crate::tag_dialog::{MergeDialog, TagDialog, TagEvent};
 use crate::lists_panel;
 use crate::task_detail::{OpenTask, StartFocus, TaskDetail, TaskUpdated};
 use crate::task_menu;
@@ -108,8 +109,13 @@ pub struct TodoView {
     folders: Vec<ListFolder>,
     collapsed_folders: HashSet<Id>,
     archived_open: bool,
-    /// A right-clicked list or folder in the lists column, with the point its menu opens at.
+    /// A right-clicked list, folder or tag in the lists column, with the point its menu opens at.
     list_menu: Option<(ListMenuTarget, Point<Pixels>)>,
+    /// The tag dialogs, folded parent tags and whether the Tags section is folded.
+    tag_dialog: Option<Entity<TagDialog>>,
+    merge_dialog: Option<Entity<MergeDialog>>,
+    collapsed_tags: HashSet<String>,
+    tags_collapsed: bool,
     search_input: Entity<TextInput>,
     header_menu_open: bool,
     /// Filters of the Completed and Won't Do views; `None` lists means all lists.
@@ -257,6 +263,10 @@ impl TodoView {
             collapsed_folders: HashSet::new(),
             archived_open: false,
             list_menu: None,
+            tag_dialog: None,
+            merge_dialog: None,
+            collapsed_tags: HashSet::new(),
+            tags_collapsed: false,
             search_input,
             header_menu_open: false,
             closed_range: ClosedRange::All,
@@ -611,6 +621,35 @@ impl TodoView {
                     }
                     self.reload(cx);
                 }
+                // `tag-dialog=new|<tag>[>parent]`, `merge-dialog=<tag>[>open]`, `tag-menu=<tag>`,
+                // `tags-menu`, `sub-tag=<tag>><parent>` (dev data only).
+                Some(("tag-dialog", spec)) => {
+                    let (which, menu) = spec.split_once('>').unwrap_or((spec, ""));
+                    let tag = (which != "new").then(|| which.to_owned());
+                    self.open_tag_dialog(tag, None, window, cx);
+                    if menu == "parent"
+                        && let Some(dialog) = &self.tag_dialog
+                    {
+                        dialog.update(cx, |dialog, cx| dialog.dev_open_parent(cx));
+                    }
+                }
+                Some(("merge-dialog", spec)) => {
+                    let (tag, menu) = spec.split_once('>').unwrap_or((spec, ""));
+                    self.open_merge_dialog(tag.to_owned(), window, cx);
+                    if menu == "open"
+                        && let Some(dialog) = &self.merge_dialog
+                    {
+                        dialog.update(cx, |dialog, cx| dialog.dev_open(cx));
+                    }
+                }
+                Some(("tag-menu", tag)) => self.list_menu = Some((ListMenuTarget::Tag(tag.to_owned()), gpui::point(px(150.), px(420.)))),
+                Some(("tags-menu", _)) => self.list_menu = Some((ListMenuTarget::TagsHeading, gpui::point(px(170.), px(330.)))),
+                Some(("sub-tag", spec)) => {
+                    let (tag, parent) = spec.split_once('>').unwrap_or((spec, ""));
+                    let result = self.store.update_tag(tag, tag, None, Some(parent));
+                    self.check(result);
+                    self.reload(cx);
+                }
                 // `list-menu=<list>` and `folder-menu=<folder>` open their right-click menus.
                 Some(("list-menu", name)) => {
                     if let Some(id) = self.lists.iter().find(|l| l.name == name).map(|l| l.id) {
@@ -697,6 +736,8 @@ impl TodoView {
             .split(',')
             .filter_map(|id| Id::parse_str(id).ok())
             .collect();
+        self.collapsed_tags = self.store.setting("collapsed_tags").ok().flatten().unwrap_or_default().lines().map(str::to_owned).collect();
+        self.tags_collapsed = self.store.setting("tags_collapsed").ok().flatten().is_some_and(|v| v == "1");
         // The current list may have been deleted.
         if let View::List(id) = self.view
             && !self.lists.iter().any(|l| l.id == id)
@@ -3119,7 +3160,46 @@ impl TodoView {
         self.lists.iter().filter(|l| !l.archived).cloned().collect()
     }
 
-    fn panel_event(&mut self, event: lists_panel::PanelEvent, cx: &mut Context<Self>) {
+    /// The original's Add Tags (under `parent` for Add Sub-tag), or Edit Tag for `tag`.
+    fn open_tag_dialog(&mut self, tag: Option<String>, parent: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        self.list_menu = None;
+        let editing = tag.clone();
+        let dialog = cx.new(|cx| TagDialog::new(self.store.clone(), tag, parent, window, cx));
+        cx.subscribe_in(&dialog, window, move |this, _, event: &TagEvent, window, cx| {
+            if let TagEvent::Saved(name) = event
+                && editing.as_ref().is_some_and(|old| this.view == View::Tag(old.clone()))
+            {
+                this.view = View::Tag(name.clone());
+            }
+            this.tag_dialog = None;
+            window.focus(&this.list_focus, cx);
+            this.reload(cx);
+        })
+        .detach();
+        self.tag_dialog = Some(dialog);
+        cx.notify();
+    }
+
+    fn open_merge_dialog(&mut self, tag: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.list_menu = None;
+        let from = tag.clone();
+        let dialog = cx.new(|_| MergeDialog::new(self.store.clone(), tag));
+        cx.subscribe_in(&dialog, window, move |this, _, event: &TagEvent, window, cx| {
+            if let TagEvent::Saved(into) = event
+                && this.view == View::Tag(from.clone())
+            {
+                this.view = View::Tag(into.clone());
+            }
+            this.merge_dialog = None;
+            window.focus(&this.list_focus, cx);
+            this.reload(cx);
+        })
+        .detach();
+        self.merge_dialog = Some(dialog);
+        cx.notify();
+    }
+
+    fn panel_event(&mut self, event: lists_panel::PanelEvent, window: &mut Window, cx: &mut Context<Self>) {
         use lists_panel::PanelEvent;
         match event {
             PanelEvent::ToggleFolder(id) => {
@@ -3131,6 +3211,22 @@ impl TodoView {
                 self.check(result);
             }
             PanelEvent::ToggleArchived => self.archived_open = !self.archived_open,
+            PanelEvent::AddTag => return self.open_tag_dialog(None, None, window, cx),
+            PanelEvent::TagsMenu(at) => self.list_menu = Some((ListMenuTarget::TagsHeading, at)),
+            PanelEvent::ToggleTags => {
+                self.tags_collapsed = !self.tags_collapsed;
+                let result = self.store.set_setting("tags_collapsed", if self.tags_collapsed { "1" } else { "0" });
+                self.check(result);
+            }
+            PanelEvent::ToggleTag(tag) => {
+                if !self.collapsed_tags.remove(&tag) {
+                    self.collapsed_tags.insert(tag);
+                }
+                let value: Vec<&str> = self.collapsed_tags.iter().map(String::as_str).collect();
+                let result = self.store.set_setting("collapsed_tags", &value.join("\n"));
+                self.check(result);
+            }
+            PanelEvent::TagMenu(tag, at) => self.list_menu = Some((ListMenuTarget::Tag(tag), at)),
             PanelEvent::ListMenu(id, at) => self.list_menu = Some((ListMenuTarget::List(id), at)),
             PanelEvent::FolderMenu(id, at) => self.list_menu = Some((ListMenuTarget::Folder(id), at)),
             PanelEvent::DropList { list, after, folder } => {
@@ -3162,6 +3258,26 @@ impl TodoView {
             _ => current,
         };
         match (action, target) {
+            (ListAction::Edit, Some(ListMenuTarget::Tag(tag))) => return self.open_tag_dialog(Some(tag), None, window, cx),
+            (ListAction::AddSubtag, Some(ListMenuTarget::Tag(tag))) => return self.open_tag_dialog(None, Some(tag), window, cx),
+            (ListAction::Merge, Some(ListMenuTarget::Tag(tag))) => return self.open_merge_dialog(tag, window, cx),
+            (ListAction::Pin, Some(ListMenuTarget::Tag(tag))) => {
+                let pinned = self.tags.iter().any(|t| t.name == tag && t.pinned);
+                let result = self.store.set_tag_pinned(&tag, !pinned);
+                self.check(result);
+            }
+            (ListAction::Delete, Some(ListMenuTarget::Tag(tag))) => {
+                let result = self.store.delete_tag(&tag);
+                self.check(result);
+                if self.view == View::Tag(tag) {
+                    self.view = View::Inbox;
+                }
+            }
+            (ListAction::ShowTags(visibility), _) => {
+                self.preferences.set_visibility(fern_core::SmartList::Tags, visibility);
+                let result = self.store.save_preferences(&self.preferences);
+                self.check(result);
+            }
             (ListAction::Edit, Some(ListMenuTarget::Folder(folder))) => return self.open_folder_dialog(Some(folder), window, cx),
             (ListAction::AddList, Some(ListMenuTarget::Folder(folder))) => return self.open_list_dialog(None, Some(folder), window, cx),
             (ListAction::Ungroup, Some(ListMenuTarget::Folder(folder))) => {
@@ -3228,6 +3344,45 @@ impl TodoView {
                     item("list-menu-delete", IconName::Trash, strings.delete, ListAction::Delete, cx),
                 ]
             }
+            ListMenuTarget::Tag(tag) => {
+                // As in the original: words only. "Move to Shared Tags" needs shared lists.
+                let tag = self.tags.iter().find(|t| t.name == tag);
+                let pinned = tag.is_some_and(|t| t.pinned);
+                let top = tag.is_some_and(|t| t.parent.is_none());
+                let text = |id: &'static str, label: &'static str, action: ListAction, cx: &mut Context<Self>| {
+                    ListItem::new(id)
+                        .height(px(34.))
+                        .child(Label::new(label))
+                        .on_click(cx.listener(move |this, _, window, cx| this.list_action(action, window, cx)))
+                        .into_any_element()
+                };
+                let mut items = vec![
+                    text("tag-menu-edit", strings.edit, ListAction::Edit, cx),
+                    text("tag-menu-pin", if pinned { strings.unpin } else { strings.pin }, ListAction::Pin, cx),
+                ];
+                if top {
+                    items.push(text("tag-menu-subtag", strings.add_subtag, ListAction::AddSubtag, cx));
+                }
+                items.push(text("tag-menu-merge", strings.merge_tags, ListAction::Merge, cx));
+                items.push(text("tag-menu-delete", strings.delete, ListAction::Delete, cx));
+                items
+            }
+            ListMenuTarget::TagsHeading => {
+                use fern_core::Visibility;
+                let current = self.preferences.visibility(fern_core::SmartList::Tags);
+                [(Visibility::IfNotEmpty, strings.visibility_names[1]), (Visibility::Show, strings.visibility_names[0]), (Visibility::Hide, strings.visibility_names[2])]
+                    .into_iter()
+                    .map(|(visibility, label)| {
+                        let on = current == visibility;
+                        ListItem::new(SharedString::from(format!("tags-show-{label}")))
+                            .height(px(34.))
+                            .child(Label::new(label).color(if on { Color::Accent } else { Color::Default }))
+                            .when(on, |item| item.end_slot(Icon::new(IconName::Check).size(IconSize::Small).color(Color::Accent)))
+                            .on_click(cx.listener(move |this, _, window, cx| this.list_action(ListAction::ShowTags(visibility), window, cx)))
+                            .into_any_element()
+                    })
+                    .collect()
+            }
             ListMenuTarget::Folder(_) => vec![
                 item("folder-menu-edit", IconName::Pencil, strings.edit, ListAction::Edit, cx),
                 item("folder-menu-add", IconName::Plus, strings.add_list, ListAction::AddList, cx),
@@ -3237,10 +3392,12 @@ impl TodoView {
     }
 
     fn render_list_menu(&self, strings: &'static Strings, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let (target, at) = self.list_menu?;
+        let (target, at) = self.list_menu.clone()?;
+        // The tag menu is the original's 163 px; the others as the task menu.
+        let width = if matches!(target, ListMenuTarget::Tag(_) | ListMenuTarget::TagsHeading) { 163. } else { 196. };
         let items = self.render_list_items(target, strings, cx);
         let menu = popover(cx)
-            .w(px(196.))
+            .w(px(width))
             .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                 this.list_menu = None;
                 cx.notify();
@@ -4659,13 +4816,15 @@ impl Render for TodoView {
                         folders: &self.folders,
                         collapsed_folders: &self.collapsed_folders,
                         archived_open: self.archived_open,
+                        collapsed_tags: &self.collapsed_tags,
+                        tags_collapsed: self.tags_collapsed,
                         mini: lists_panel::MiniCalendar { expanded: self.mini_expanded, month: self.mini_month, busy: &self.busy_days },
                     },
                     on_select,
                     {
                         let this = cx.entity().downgrade();
-                        move |event, _: &mut Window, cx: &mut App| {
-                            this.update(cx, |this, cx| this.panel_event(event, cx)).ok();
+                        move |event, window: &mut Window, cx: &mut App| {
+                            this.update(cx, |this, cx| this.panel_event(event, window, cx)).ok();
                         }
                     },
                     on_add_list,
@@ -4722,14 +4881,19 @@ impl Render for TodoView {
             .children(self.render_list_menu(strings, cx))
             .children(self.list_dialog.clone())
             .children(self.folder_dialog.clone())
+            .children(self.tag_dialog.clone())
+            .children(self.merge_dialog.clone())
     }
 }
 
 /// What a list menu acts on.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum ListMenuTarget {
     List(Id),
     Folder(Id),
+    Tag(String),
+    /// The Tags heading's "…": whether tags show.
+    TagsHeading,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -4740,4 +4904,8 @@ enum ListAction {
     Delete,
     AddList,
     Ungroup,
+    Pin,
+    AddSubtag,
+    Merge,
+    ShowTags(fern_core::Visibility),
 }

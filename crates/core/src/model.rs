@@ -273,6 +273,10 @@ pub struct Tag {
     pub color: Option<String>,
     /// Number of open tasks with this tag.
     pub open_count: usize,
+    /// The original's Parent Tag: a sub-tag sits under it in the lists column, one level deep.
+    pub parent: Option<String>,
+    /// Pinned tags come first among the tags.
+    pub pinned: bool,
 }
 
 /// What the task list shows.

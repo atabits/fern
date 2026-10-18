@@ -504,6 +504,21 @@ mod tests {
     }
 
     #[test]
+    fn renamed_tags_travel() -> Result<()> {
+        let laptop = Store::open_in_memory()?;
+        let phone = Store::open_in_memory()?;
+        let task = laptop.add_task("Run")?;
+        laptop.set_tags(task.id, &["health".to_owned()])?;
+        let sent = relay(&laptop, 0, &phone);
+        laptop.update_tag("health", "fitness", None, None)?;
+        relay(&laptop, sent, &phone);
+        let names: Vec<String> = phone.tags()?.into_iter().map(|t| t.name).collect();
+        assert_eq!(names, ["fitness"], "the old name goes on the phone too");
+        assert_eq!(phone.task(task.id)?.unwrap().tags, ["fitness"]);
+        Ok(())
+    }
+
+    #[test]
     fn list_folders_travel() -> Result<()> {
         let laptop = Store::open_in_memory()?;
         let phone = Store::open_in_memory()?;

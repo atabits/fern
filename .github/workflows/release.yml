@@ -1,7 +1,8 @@
 name: Release
 
-# A tag such as `v0.1.0` builds Fern for every platform and attaches the packages to a GitHub
-# release of that tag; "Run workflow" builds them without a release, as artifacts of the run.
+# A tag such as `v0.1.0` builds Fern for every platform and attaches the packages to a draft
+# GitHub release of that tag, published by hand; the tag must match the version in Cargo.toml.
+# "Run workflow" builds them without a release, as artifacts of the run.
 on:
   push:
     tags: ["v*"]
@@ -55,10 +56,16 @@ jobs:
       - name: Version
         id: version
         run: |
+          crate_version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+            # The app shows Cargo.toml's version in Settings → About and in its file properties.
+            if [ "${GITHUB_REF_NAME#v}" != "$crate_version" ]; then
+              echo "::error::The tag $GITHUB_REF_NAME does not match version $crate_version in Cargo.toml"
+              exit 1
+            fi
+            echo "version=$crate_version" >> "$GITHUB_OUTPUT"
           else
-            echo "version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+            echo "version=$crate_version-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Build
@@ -163,8 +170,14 @@ jobs:
           pattern: fern-*
           merge-multiple: true
 
+      # What is new in this version (.github/changes/<version>.md), then the page for every release.
       - name: Release notes
-        run: sed "s/{version}/${GITHUB_REF_NAME#v}/g; s|{repo}|$GITHUB_REPOSITORY|g" .github/release-notes.md > notes.md
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          if [ -f ".github/changes/$version.md" ]; then
+            { cat ".github/changes/$version.md"; echo; } > notes.md
+          fi
+          sed "s/{version}/$version/g; s|{repo}|$GITHUB_REPOSITORY|g" .github/release-notes.md >> notes.md
 
       - uses: softprops/action-gh-release@v2
         with:
@@ -172,3 +185,5 @@ jobs:
           body_path: notes.md
           files: dist/*
           generate_release_notes: true
+          # Published by hand once the packages are checked.
+          draft: true

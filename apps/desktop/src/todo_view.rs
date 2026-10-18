@@ -3081,6 +3081,7 @@ impl TodoView {
                     store.set_tags(id, &tags)
                 }
                 DropTarget::Tag(None) => store.set_tags(id, &[]),
+                DropTarget::List(list) => store.set_list(id, list),
             }
         })();
         self.check(result);

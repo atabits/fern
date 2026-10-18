@@ -128,6 +128,8 @@ pub enum DropTarget {
     Priority(Priority),
     /// A tag in place of the first one, or no tags.
     Tag(Option<String>),
+    /// A list, `None` being the Inbox.
+    List(Option<fern_core::Id>),
 }
 
 /// The header sort menu's "Sort by".
@@ -291,6 +293,7 @@ pub fn grouped_rows_in(
             },
             GroupBy::Priority => Some(DropTarget::Priority(task.priority)),
             GroupBy::Tag => Some(DropTarget::Tag(task.tags.first().map(|_| label.to_owned()))),
+            GroupBy::List => Some(DropTarget::List(task.list_id)),
             _ => None,
         }
     };
@@ -769,6 +772,8 @@ mod tests {
         let drops = |rows: Vec<Row>| -> Vec<Option<DropTarget>> {
             rows.into_iter().filter_map(|r| match r { Row::Day { drop, .. } => Some(drop), _ => None }).collect()
         };
+        let targets = drops(grouped_rows_in(&in_work, GroupBy::List, today, false, &[(work, "Work".into())], &EN));
+        assert!(targets.contains(&Some(DropTarget::List(Some(work)))) && targets.contains(&Some(DropTarget::List(None))), "a list column takes cards into its list");
         assert_eq!(drops(grouped_rows(&tasks, GroupBy::Date, today, false, &EN)), [
             None,
             Some(DropTarget::Due(Some(today))),

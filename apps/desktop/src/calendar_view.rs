@@ -78,6 +78,8 @@ pub struct CalendarView {
     /// A task's right-click menu: the task and where the click was, and its open side menu.
     context_menu: Option<(Id, gpui::Point<Pixels>)>,
     context_side: Option<u8>,
+    /// The Year view's day card, opened by clicking a day.
+    year_day: Option<NaiveDate>,
 }
 
 /// How far ahead the Agenda reaches.
@@ -111,6 +113,7 @@ impl CalendarView {
             countdowns: Vec::new(),
             open_countdown: None,
             context_menu: None,
+            year_day: None,
             context_side: None,
         };
         this.reload(cx);
@@ -218,11 +221,10 @@ impl CalendarView {
                 let weeks = calendar::weeks_from(self.anchor, n as usize);
                 (weeks[0][0], weeks[weeks.len() - 1][6])
             }
-            // The original's Year shows no tasks.
+            // The original's Year marks no tasks on the days, but a day's card lists them.
             CalendarMode::Year => {
-                self.tasks.clear();
-                cx.notify();
-                return;
+                let year = self.month.year();
+                (NaiveDate::from_ymd_opt(year, 1, 1).unwrap_or(self.month), NaiveDate::from_ymd_opt(year, 12, 31).unwrap_or(self.month))
             }
             CalendarMode::Month => {
                 let weeks = calendar::month_weeks(self.month);
@@ -284,6 +286,11 @@ impl CalendarView {
 
     /// The mode menu with its Multi-Day side menu open, for the debug-build dev state.
     #[cfg(debug_assertions)]
+    pub fn dev_year_day(&mut self, day: NaiveDate, cx: &mut Context<Self>) {
+        self.year_day = Some(day);
+        cx.notify();
+    }
+
     pub fn dev_open_menu(&mut self, cx: &mut Context<Self>) {
         self.mode_menu_open = true;
         self.multi_day_menu = true;
@@ -896,55 +903,63 @@ impl CalendarView {
 
     /// The original's Year: the twelve months in three columns, today marked; a click on a day
     /// opens it in the Day view.
-    fn render_year(&self, today: NaiveDate, cx: &mut Context<Self>) -> AnyElement {
+    /// The Year view, as the original's: the months as small calendars filling the view, four
+    /// columns when it is wide and three otherwise; a click on a day opens its card beside it.
+    fn render_year(&self, today: NaiveDate, width: Pixels, cx: &mut Context<Self>) -> AnyElement {
         let strings = i18n::t(cx);
         let theme = cx.theme().clone();
         let year = self.month.year();
-        let months = (1..=12u32).map(|m| {
-            let month = NaiveDate::from_ymd_opt(year, m, 1).expect("every month has a first day");
-            let days = calendar::month_grid(month);
-            v_flex()
-                .flex_1()
-                .min_w_0()
-                .gap_1()
-                .child(div().pb_3().text_size(px(18.)).font_weight(FontWeight::SEMIBOLD).child(strings.months[month.month0() as usize]))
-                .child(h_flex().children(calendar::weekday_labels(&strings.weekdays_narrow).map(|day| {
-                    div().flex_1().h(px(36.)).flex().items_center().justify_center().child(Label::new(day).size(LabelSize::Small).color(Color::Muted))
-                })))
-                .children(days.chunks(7).map(|week| {
-                    h_flex().children(week.iter().map(|&date| {
-                        let outside = date.month() != month.month();
-                        div()
-                            .id(SharedString::from(format!("year-{month}-{date}")))
-                            .flex_1()
-                            .h(px(41.))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .cursor_pointer()
-                            .child(
-                                div()
-                                    .size(px(28.))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .rounded_full()
-                                    .when(date == today && !outside, |el| el.bg(theme.colors().accent))
-                                    .hover(|s| s.bg(theme.colors().element_hover))
-                                    .child(Label::new(date.day().to_string()).color(if outside { Color::Muted } else { Color::Default })),
-                            )
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.anchor = date;
-                                this.month = calendar::month_start(date);
-                                this.set_mode(CalendarMode::Day, cx);
-                            }))
+        let columns = if width >= px(1400.) { 4 } else { 3 };
+        let open = self.year_day;
+        let months: Vec<AnyElement> = (1..=12u32)
+            .map(|m| {
+                let month = NaiveDate::from_ymd_opt(year, m, 1).expect("every month has a first day");
+                let days = calendar::month_grid(month);
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .child(div().pb_3().text_size(px(18.)).font_weight(FontWeight::MEDIUM).child(strings.months[month.month0() as usize]))
+                    .child(h_flex().h(px(30.)).children(calendar::weekday_labels(&strings.weekdays_narrow).map(|day| {
+                        div().flex_1().flex().justify_center().child(Label::new(day).size(LabelSize::Small).color(Color::Muted))
+                    })))
+                    .children(days.chunks(7).map(|week| {
+                        h_flex().flex_1().min_h(px(22.)).children(week.iter().map(|&date| {
+                            let outside = date.month() != month.month();
+                            let is_open = open == Some(date) && !outside;
+                            div()
+                                .flex_1()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(
+                                    div()
+                                        .id(SharedString::from(format!("year-{month}-{date}")))
+                                        .relative()
+                                        .size(px(26.))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded_full()
+                                        .cursor_pointer()
+                                        .when(date == today && !outside, |el| el.bg(theme.colors().accent))
+                                        .when(is_open && date != today, |el| el.bg(theme.colors().element_selected))
+                                        .hover(|s| s.bg(theme.colors().element_hover))
+                                        .child(Label::new(date.day().to_string()).color(if outside { Color::Muted } else { Color::Default }))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.year_day = if this.year_day == Some(date) { None } else { Some(date) };
+                                            cx.notify();
+                                        }))
+                                        .when(is_open, |el| el.child(PopoverAttachment::new(Placement::RightTop, self.render_year_card(date, cx)))),
+                                )
+                        }))
                     }))
-                }))
-        });
+                    .into_any_element()
+            })
+            .collect();
+        let mut months = months.into_iter().peekable();
         let mut rows = Vec::new();
-        let mut months = months.peekable();
         while months.peek().is_some() {
-            rows.push(h_flex().gap(px(40.)).children(months.by_ref().take(3)));
+            rows.push(h_flex().flex_1().min_h(px(240.)).items_stretch().gap(px(60.)).children(months.by_ref().take(columns)));
         }
         v_flex()
             .id("year")
@@ -953,15 +968,35 @@ impl CalendarView {
             .overflow_y_scroll()
             .px(px(60.))
             .pt_2()
-            .pb_6()
-            .gap(px(28.))
+            .pb_4()
+            .gap(px(24.))
             .children(rows)
+            .into_any_element()
+    }
+
+    /// The original's day card in the Year view: the date, then the day's tasks or "No tasks
+    /// scheduled."; a task opens as from the month.
+    fn render_year_card(&self, date: NaiveDate, cx: &mut Context<Self>) -> AnyElement {
+        let strings = i18n::t(cx);
+        let tasks: Vec<Task> = self.tasks.iter().filter(|t| t.occurs_on(date)).cloned().collect();
+        let bars: Vec<_> = tasks.iter().map(|task| self.task_bar(task, cx).h(px(22.))).collect();
+        popover(cx)
+            .w(px(328.))
+            .p_3()
+            .gap_1p5()
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.year_day = None;
+                cx.notify();
+            }))
+            .child(Label::new(calendar::format_date(date, strings)).weight(FontWeight::SEMIBOLD))
+            .when(bars.is_empty(), |el| el.child(Label::new(strings.no_tasks_scheduled).size(LabelSize::Small).color(Color::Muted)))
+            .children(bars)
             .into_any_element()
     }
 }
 
 impl Render for CalendarView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let strings = i18n::t(cx);
         let theme = cx.theme().clone();
         let today = Local::now().date_naive();
@@ -1143,7 +1178,7 @@ impl Render for CalendarView {
             ))
             .map(|el| match self.mode {
                 CalendarMode::Agenda => el.child(self.render_agenda(today, cx)),
-                CalendarMode::Year => el.child(self.render_year(today, cx)),
+                CalendarMode::Year => el.child(self.render_year(today, window.viewport_size().width, cx)),
                 CalendarMode::Month | CalendarMode::MultiWeek(_) => el.child(
                     v_flex()
                         .flex_1()

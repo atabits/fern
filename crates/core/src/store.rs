@@ -1350,6 +1350,20 @@ impl Store {
         Ok(())
     }
 
+    /// The original's "Skip the Recurrence": a repeating task moves on to its next date without
+    /// being completed; its time stays, and a range keeps its length.
+    pub fn skip_recurrence(&self, id: Id) -> Result<()> {
+        let task = self.task(id)?.context("task not found")?;
+        let (Some(repeat), Some(due)) = (&task.repeat, task.due_date) else { anyhow::bail!("the task does not repeat") };
+        let next = repeat.next_after(due);
+        anyhow::ensure!(next > due, "the task has no later date");
+        self.set_due(id, Some(next), task.due_time)?;
+        if let Some(end) = task.end_date {
+            self.update(id, "end_date", (end + (next - due)).format(DATE_FORMAT).to_string())?;
+        }
+        Ok(())
+    }
+
     /// Makes the task a subtask of `parent`, or a top-level task for `None`.
     /// "Link Parent Task": makes a task a subtask of `parent`, moving it to the parent's list.
     pub fn link_parent(&self, id: Id, parent: Id) -> Result<()> {
@@ -3057,6 +3071,23 @@ mod tests {
 
         store.delete_template(template.id)?;
         assert!(store.templates()?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn skipping_the_recurrence() -> Result<()> {
+        use crate::recurrence::{Frequency, Recurrence};
+        let store = Store::open_in_memory()?;
+        let d = |m, day| NaiveDate::from_ymd_opt(2026, m, day).unwrap();
+        let meter = store.add_task("Read the meter")?;
+        store.set_due(meter.id, Some(d(10, 24)), NaiveTime::from_hms_opt(9, 0, 0))?;
+        store.set_repeat(meter.id, Some(Recurrence::new(Frequency::Weekly, 1)), d(10, 18))?;
+        store.skip_recurrence(meter.id)?;
+        let task = store.task(meter.id)?.unwrap();
+        assert_eq!((task.due_date, task.due_time, task.is_completed()), (Some(d(10, 31)), NaiveTime::from_hms_opt(9, 0, 0), false));
+        let once = store.add_task("Once")?;
+        store.set_due(once.id, Some(d(10, 24)), None)?;
+        assert!(store.skip_recurrence(once.id).is_err(), "only repeating tasks skip");
         Ok(())
     }
 

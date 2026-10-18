@@ -695,6 +695,9 @@ pub struct Strings {
     pub merge_tags_hint: &'static str,
     pub select_tag: &'static str,
     pub add_subtag: &'static str,
+    pub skip_recurrence: &'static str,
+    pub custom_date: &'static str,
+    pub no_tasks_scheduled: &'static str,
 }
 
 pub static EN: Strings = Strings {
@@ -1283,6 +1286,9 @@ pub static EN: Strings = Strings {
     merge_tags_hint: "You can merge the related tasks of tag \"{tag}\" to another tag. After merging, tag \"{tag}\" will be deleted.",
     select_tag: "Select a tag",
     add_subtag: "Add Sub-tag",
+    skip_recurrence: "Skip the Recurrence",
+    custom_date: "Custom",
+    no_tasks_scheduled: "No tasks scheduled.",
 };
 
 pub static RU: Strings = Strings {
@@ -1872,4 +1878,7 @@ pub static RU: Strings = Strings {
     merge_tags_hint: "Задачи с тегом «{tag}» можно перенести на другой тег. После объединения тег «{tag}» будет удалён.",
     select_tag: "Выберите тег",
     add_subtag: "Добавить подтег",
+    skip_recurrence: "Пропустить повтор",
+    custom_date: "Другая дата",
+    no_tasks_scheduled: "Задач нет.",
 };

@@ -155,6 +155,10 @@ impl AppView {
             if state.contains("calendar=year") {
                 this.calendar.update(cx, |c, cx| c.set_mode(crate::calendar_view::CalendarMode::Year, cx));
             }
+            // `year-day=2026-10-24` opens that day's card in the Year view.
+            if let Some(day) = state.split(';').find_map(|part| part.strip_prefix("year-day=")).and_then(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok()) {
+                this.calendar.update(cx, |c, cx| c.dev_year_day(day, cx));
+            }
             if state.contains("calendar=multi-week") {
                 this.calendar.update(cx, |c, cx| c.set_mode(crate::calendar_view::CalendarMode::MultiWeek(5), cx));
             }

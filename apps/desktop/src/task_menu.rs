@@ -17,6 +17,9 @@ use crate::task_rows;
 pub enum MenuAction {
     /// Due in this many days; `None` is "a date of one's own", the date picker.
     Due(Option<i64>),
+    /// The original's "Skip the Recurrence" for a repeating task, and "Clear" for a dated one.
+    SkipRecurrence,
+    ClearDate,
     Priority(Priority),
     AddSubtask,
     LinkParent,
@@ -48,6 +51,8 @@ pub fn apply(store: &Store, task: &Task, action: MenuAction, today: NaiveDate) -
     let id = task.id;
     Some(match action {
         MenuAction::Due(Some(days)) => store.set_due(id, Some(today + Duration::days(days)), None),
+        MenuAction::SkipRecurrence => store.skip_recurrence(id),
+        MenuAction::ClearDate => store.set_due(id, None, None),
         MenuAction::Priority(priority) => store.set_priority(id, priority),
         MenuAction::Pin => store.set_pinned(id, task.pinned_at.is_none()),
         MenuAction::WontDo => store.set_wont_do(id, !task.is_wont_do()),
@@ -84,9 +89,21 @@ pub fn render<V: 'static>(
             .hover(|s| s.bg(theme.colors().element_hover))
             .child(Icon::new(icon).color(color))
     };
-    let dates = [(IconName::Sun, Some(0)), (IconName::Sunrise, Some(1)), (IconName::CalendarPlus, Some(7)), (IconName::CalendarDays, None)];
-    let date_row = h_flex().px_1().justify_between().children(dates.into_iter().enumerate().map(|(i, (icon, days))| {
-        icon_button(SharedString::from(format!("task-menu-date-{i}")), icon, Color::Muted, false).on_click(on_click(&act, MenuAction::Due(days), cx))
+    // As the original's: Today, Tomorrow, Next Week, then Skip the Recurrence for a repeating
+    // task, Custom (the date popover), and Clear for a dated one; each with its tooltip.
+    let dated = task.due_date.is_some();
+    let dates = [
+        Some((IconName::Sun, strings.today, MenuAction::Due(Some(0)))),
+        Some((IconName::Sunrise, strings.tomorrow, MenuAction::Due(Some(1)))),
+        Some((IconName::CalendarPlus, strings.next_week, MenuAction::Due(Some(7)))),
+        (dated && task.repeat.is_some()).then_some((IconName::SquareArrowRight, strings.skip_recurrence, MenuAction::SkipRecurrence)),
+        Some((IconName::CalendarDays, strings.custom_date, MenuAction::Due(None))),
+        dated.then_some((IconName::CalendarX, strings.clear, MenuAction::ClearDate)),
+    ];
+    let date_row = h_flex().px_1().justify_between().children(dates.into_iter().flatten().enumerate().map(|(i, (icon, tip, action))| {
+        icon_button(SharedString::from(format!("task-menu-date-{i}")), icon, Color::Muted, false)
+            .tooltip(ui::Tooltip::text(tip))
+            .on_click(on_click(&act, action, cx))
     }));
     let priority_row = h_flex().px_1().justify_between().children([Priority::High, Priority::Medium, Priority::Low, Priority::None].map(|priority| {
         let color = task_rows::priority_color(priority, &theme).map_or(Color::Muted, Color::Custom);
@@ -209,6 +226,8 @@ mod tests {
         apply(&store, &reload(&store), MenuAction::Duplicate, today).unwrap()?;
         assert_eq!(store.tasks()?.iter().filter(|t| t.title == "Water the plants").count(), 2);
         assert!(apply(&store, &task, MenuAction::Due(None), today).is_none(), "the date picker is the view's");
+        apply(&store, &reload(&store), MenuAction::ClearDate, today).unwrap()?;
+        assert_eq!(reload(&store).due_date, None, "Clear");
         assert!(apply(&store, &task, MenuAction::Delete, today).is_none(), "deleting is the view's, with its Undo");
         Ok(())
     }

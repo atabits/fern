@@ -60,9 +60,16 @@ This policy applies to signed Windows releases.
 
 - Free code signing is provided by [SignPath.io](https://signpath.io), with a certificate by
   [SignPath Foundation](https://signpath.org).
-- Committers and reviewers: [Amin Atabiev](https://github.com/atabits).
-- Approvers: [Amin Atabiev](https://github.com/atabits).
+- Authors (committers): [Amin Atabiev](https://github.com/atabits).
+- Reviewers, who review every outside contribution before it is merged: [Amin Atabiev](https://github.com/atabits).
+- Approvers, who approve every signing request: [Amin Atabiev](https://github.com/atabits).
+- Everyone in these roles uses multi-factor authentication on GitHub and SignPath.
+- Signed programs carry their product name and version in their file properties.
+- Fern can be removed completely: the installer comes with an uninstaller, and the data folder
+  is listed in Settings → Data & Sync.
 
 Only binaries built by this repository's GitHub Actions from its own source are signed.
 
-Fern does not send any data anywhere unless you set up sync with a server of your own choosing.
+**Privacy.** Fern does not send any data anywhere. It collects no telemetry and needs no
+account. Data leaves the computer only if you set up sync, and then it goes only to the
+server you choose.

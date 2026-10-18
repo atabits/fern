@@ -1610,6 +1610,7 @@ dependencies = [
  "rusqlite",
  "serde_json",
  "tiny_http",
+ "winresource",
 ]
 
 [[package]]

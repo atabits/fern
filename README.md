@@ -68,6 +68,9 @@ The builds are not signed yet (see [code signing](docs/code-signing.md)):
   Security and click "Open Anyway" next to Fern. You can also run
   `xattr -d com.apple.quarantine /Applications/Fern.app`.
 - **Windows:** in SmartScreen, choose "More info" → "Run anyway".
+- **Code signing policy:** Windows releases will be signed with free code signing provided by
+  [SignPath.io](https://signpath.io), with a certificate by [SignPath Foundation](https://signpath.org).
+  See the [policy](docs/code-signing.md#code-signing-policy), which also lists the team's roles.
 - **Linux:** the `.deb` installs with a double click or `sudo apt install ./fern-*.deb`. The
   AppImage runs anywhere after `chmod +x`.
 

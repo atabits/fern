@@ -92,5 +92,9 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 
 ## Next
 
+1. Countdown: editing a countdown, and the original's Repeat for its date.
+2. Eisenhower Matrix: the original's custom quadrant rules.
+3. Task list: making a task a subtask by dragging it onto another (the original's nesting by drag).
+4. Lists: the original's Timeline view.
 
 Not checkable under the reference rules: whether the original asks for a note when a focus session ends (finding out means running a focus timer in the reference account). Fern's record dialog takes a note afterwards.

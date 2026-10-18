@@ -98,6 +98,8 @@ pub struct SyncButton {
 /// `account_menu` is rendered next to the avatar while the account menu is open.
 pub fn render(
     active: Section,
+    hovered: Option<Section>,
+    on_hover: impl Fn(Section, bool, &mut App) + Clone + 'static,
     on_select: impl Fn(Section, &mut Window, &mut App) + Clone + 'static,
     on_avatar: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     account_menu: Option<AnyElement>,
@@ -142,13 +144,21 @@ pub fn render(
         // The sections, spaced and sized as in the original (50px apart, 24px glyphs).
         .child(v_flex().gap(px(10.)).children(Section::ALL.into_iter().filter(|s| s.enabled(features)).map(|section| {
             let on_select = on_select.clone();
-            // As in the original, the open section's icon turns bright, with no background.
-            IconButton::new(section.id(), section.icon())
+            let on_hover = on_hover.clone();
+            // As in the original, the open section's icon turns bright, with no background even
+            // when hovered, and the section's name shows beside the icon.
+            div()
+                .id(section.id())
+                .relative()
+                .on_hover(move |hovered: &bool, _, cx| on_hover(section, *hovered, cx))
                 .size(px(40.))
-                .icon_size(IconSize::Custom(px(24.)))
-                .tooltip(Tooltip::text(section.title(strings)))
-                .icon_color(if section == active { Color::Default } else { Color::Muted })
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .child(Icon::new(section.icon()).size(IconSize::Custom(px(24.))).color(if section == active { Color::Default } else { Color::Muted }))
                 .on_click(move |_, window, cx| on_select(section, window, cx))
+                .when(hovered == Some(section), |el| el.child(side_tooltip(section.title(strings), cx)))
         })))
         .child(div().flex_1())
         .child(
@@ -188,4 +198,24 @@ pub fn render(
                 .tooltip(Tooltip::text(strings.shortcuts))
                 .on_click(|_, window, cx| window.dispatch_action(Box::new(crate::actions::ShowShortcuts), cx)),
         )
+}
+
+/// A tooltip at the right of a sidebar icon, level with it, shown while it is hovered, as the
+/// original's sidebar shows them.
+fn side_tooltip(text: &'static str, cx: &App) -> impl IntoElement {
+    let colors = cx.theme().colors();
+    div().absolute().left(px(46.)).top_0().h_full().flex().items_center().child(gpui::deferred(
+        div()
+            .px_2()
+            .py_1()
+            .rounded(px(6.))
+            .bg(colors.elevated_surface_background)
+            .border_1()
+            .border_color(colors.border)
+            .shadow_lg()
+            .text_color(colors.text)
+            .text_size(px(12.))
+            .whitespace_nowrap()
+            .child(text),
+    ))
 }

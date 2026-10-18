@@ -79,6 +79,8 @@ pub enum PanelEvent {
     AddTag,
     TagsMenu(Point<Pixels>),
     ToggleTags,
+    /// A smart list's "…", shown on hover in place of its count, at that point of the window.
+    SmartMenu(SmartList, Point<Pixels>),
     /// A parent tag folded up or out, and a right click on a tag.
     ToggleTag(String),
     TagMenu(String, Point<Pixels>),
@@ -112,8 +114,11 @@ pub fn render(
                 label: SharedString,
                 icon: AnyElement,
                 count: Option<usize>,
-                dot: Option<Hsla>| {
+                dot: Option<Hsla>,
+                menu: Option<SmartList>| {
         let on_select = on_select.clone();
+        let on_panel = on_panel.clone();
+        let group = SharedString::from(format!("row-{id}"));
         let on_drop_task = on_drop_task.clone();
         let drop_view = view.clone();
         let accent = colors.accent;
@@ -129,22 +134,52 @@ pub fn render(
                     .when_some(dot, |el, color| el.child(div().size(px(6.)).rounded_full().bg(color)))
                     .when_some(count.filter(|c| *c > 0), |el, count| {
                         el.child(
-                            div().min_w(px(18.)).flex().justify_end().child(
-                                Label::new(count.to_string()).size(LabelSize::Small).color(Color::Muted),
-                            ),
+                            div()
+                                .min_w(px(18.))
+                                .flex()
+                                .justify_end()
+                                .when(menu.is_some(), |el| el.group_hover(group.clone(), |s| s.invisible()))
+                                .child(Label::new(count.to_string()).size(LabelSize::Small).color(Color::Muted)),
+                        )
+                    })
+                    // As the original's, a hovered smart list shows "…" where its count is.
+                    .when_some(menu, |el, list| {
+                        el.child(
+                            div()
+                                .id("smart-more")
+                                .absolute()
+                                .right(px(10.))
+                                .invisible()
+                                .group_hover(group.clone(), |s| s.visible())
+                                .child(Icon::new(IconName::Ellipsis).size(IconSize::Small).color(Color::Muted))
+                                .on_mouse_down(gpui::MouseButton::Left, move |event: &gpui::MouseDownEvent, window, cx| {
+                                    cx.stop_propagation();
+                                    on_panel(PanelEvent::SmartMenu(list, event.position), window, cx)
+                                }),
                         )
                     }),
             )
             .on_click(move |_, window, cx| on_select(view.clone(), window, cx));
         div()
             .id(SharedString::from(format!("drop-{id}")))
+            .group(group)
+            .relative()
             .rounded(px(6.))
             .drag_over::<DraggedTask>(move |style, _, _, _| style.bg(accent.opacity(0.18)))
             .on_drop(move |dragged: &DraggedTask, window, cx| on_drop_task(drop_view.clone(), dragged.id, window, cx))
             .child(item)
     };
     let smart = |view: View, label: &'static str, icon: IconName, count: Option<usize>| {
-        item(format!("view-{label}"), view, label.into(), Icon::new(icon).into_any_element(), count, None)
+        // Every smart list but the Inbox can be hidden from its "…", as in the original.
+        let menu = match view {
+            View::All => Some(SmartList::All),
+            View::Today => Some(SmartList::Today),
+            View::Tomorrow => Some(SmartList::Tomorrow),
+            View::Next7Days => Some(SmartList::Next7Days),
+            View::Summary => Some(SmartList::Summary),
+            _ => None,
+        };
+        item(format!("view-{label}"), view, label.into(), Icon::new(icon).into_any_element(), count, None, menu)
     };
     // As in the original: a row every 38 px, sections apart with a 12 px gap around their line,
     // and a section's "+" shown on hover.
@@ -176,6 +211,7 @@ pub fn render(
             },
             Some(list.open_count),
             parse_color(list.color.as_deref()),
+            None,
         );
         let on_panel = on_panel.clone();
         let on_drop = on_panel.clone();
@@ -293,6 +329,7 @@ pub fn render(
                 Icon::new(IconName::Tag).into_any_element(),
                 Some(count),
                 Some(color(tag.color.as_deref(), cx)),
+                None,
             ))
             .when_some(fold, |el, folded| {
                 // A parent's arrow at the left edge, as the original's folders of tags have.
@@ -467,6 +504,7 @@ pub fn render(
                 filter.name.clone().into(),
                 Icon::new(IconName::Funnel).into_any_element(),
                 Some(*count),
+                None,
                 None,
             )
         }))

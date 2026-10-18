@@ -41,6 +41,8 @@ pub struct AppView {
     settings: Option<gpui::Entity<SettingsWindow>>,
     /// The Statistics page opened from the account menu, which covers the whole window.
     statistics_open: bool,
+    /// The sidebar icon under the pointer, whose name shows beside it.
+    nav_hovered: Option<Section>,
 }
 
 impl AppView {
@@ -126,6 +128,7 @@ impl AppView {
             shortcuts_open: false,
             settings: None,
             statistics_open: false,
+            nav_hovered: None,
         };
         reminders::start(this.store.clone(), window.window_handle(), cx);
         this.start_sync(cx);
@@ -908,6 +911,18 @@ impl Render for AppView {
         let on_select = move |section, window: &mut Window, cx: &mut App| {
             this.update(cx, |this, cx| this.select(section, window, cx)).ok();
         };
+        let hover_target = cx.entity().downgrade();
+        let on_nav_hover = move |section: Section, hovered: bool, cx: &mut App| {
+            hover_target
+                .update(cx, |this, cx| {
+                    let now = if hovered { Some(section) } else { this.nav_hovered.filter(|s| *s != section) };
+                    if this.nav_hovered != now {
+                        this.nav_hovered = now;
+                        cx.notify();
+                    }
+                })
+                .ok();
+        };
         let on_avatar = cx.listener(|this, _, _, cx| this.set_account_menu(true, cx));
         let account_menu = self.account_menu_open.then(|| {
             PopoverAttachment::new(Placement::RightTop, self.render_account_menu(cx)).into_any_element()
@@ -951,7 +966,7 @@ impl Render for AppView {
             .text_color(theme.colors().text)
             .when(self.statistics_open, |el| el.child(div().size_full().child(self.focus.clone())))
             .when(!self.statistics_open, |el| {
-                el.child(sidebar::render(self.section, on_select, on_avatar, account_menu, bell, sync_button, features, cx)).child(match self.section {
+                el.child(sidebar::render(self.section, self.nav_hovered, on_nav_hover, on_select, on_avatar, account_menu, bell, sync_button, features, cx)).child(match self.section {
                 Section::Tasks | Section::Search => div().flex_1().h_full().child(self.todo.clone()),
                 Section::Calendar => div().flex_1().h_full().pt(px(crate::TOP_INSET)).child(self.calendar.clone()),
                 Section::Matrix => div().flex_1().h_full().pt(px(crate::TOP_INSET)).child(self.matrix.clone()),

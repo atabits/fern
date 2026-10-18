@@ -3774,6 +3774,7 @@ impl TodoView {
             PanelEvent::ToggleArchived => self.archived_open = !self.archived_open,
             PanelEvent::AddTag => return self.open_tag_dialog(None, None, window, cx),
             PanelEvent::TagsMenu(at) => self.list_menu = Some((ListMenuTarget::TagsHeading, at)),
+            PanelEvent::SmartMenu(list, at) => self.list_menu = Some((ListMenuTarget::Smart(list), at)),
             PanelEvent::ToggleTags => {
                 self.tags_collapsed = !self.tags_collapsed;
                 let result = self.store.set_setting("tags_collapsed", if self.tags_collapsed { "1" } else { "0" });
@@ -3944,6 +3945,16 @@ impl TodoView {
                     })
                     .collect()
             }
+            ListMenuTarget::Smart(list) => vec![
+                ListItem::new("smart-hide")
+                    .height(px(34.))
+                    .child(Label::new(strings.visibility_names[2]))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.list_menu = None;
+                        this.save_preferences(|p| p.set_visibility(list, fern_core::Visibility::Hide), cx);
+                    }))
+                    .into_any_element(),
+            ],
             ListMenuTarget::Folder(_) => vec![
                 item("folder-menu-edit", IconName::Pencil, strings.edit, ListAction::Edit, cx),
                 item("folder-menu-add", IconName::Plus, strings.add_list, ListAction::AddList, cx),
@@ -3955,7 +3966,12 @@ impl TodoView {
     fn render_list_menu(&self, strings: &'static Strings, cx: &mut Context<Self>) -> Option<AnyElement> {
         let (target, at) = self.list_menu.clone()?;
         // The tag menu is the original's 163 px; the others as the task menu.
-        let width = if matches!(target, ListMenuTarget::Tag(_) | ListMenuTarget::TagsHeading) { 163. } else { 196. };
+        let width = match target {
+            ListMenuTarget::Tag(_) | ListMenuTarget::TagsHeading => 163.,
+            // The original's smart-list menu, with its one Hide.
+            ListMenuTarget::Smart(_) => 163.,
+            _ => 196.,
+        };
         let items = self.render_list_items(target, strings, cx);
         let menu = popover(cx)
             .w(px(width))
@@ -5368,7 +5384,7 @@ impl Render for TodoView {
                         el.child(
                             div()
                                 .relative()
-                                .child(IconButton::new("sort", IconName::ArrowDownUp).on_click(cx.listener(|this, _, _, cx| {
+                                .child(IconButton::new("sort", IconName::ArrowDownUp).tooltip(Tooltip::text(strings.group_and_sort)).on_click(cx.listener(|this, _, _, cx| {
                                     this.sort_menu = Some(None);
                                     cx.notify();
                                 })))
@@ -5380,7 +5396,7 @@ impl Render for TodoView {
                     .when(self.view != View::Trash && !closed_header, |el| el.child(
                         div()
                             .relative()
-                            .child(IconButton::new("more", IconName::Ellipsis).on_click(cx.listener(
+                            .child(IconButton::new("more", IconName::Ellipsis).tooltip(Tooltip::text(strings.more)).on_click(cx.listener(
                                 |this, _, _, cx| {
                                     this.header_menu_open = true;
                                     cx.notify();
@@ -5692,6 +5708,8 @@ enum ListMenuTarget {
     Tag(String),
     /// The Tags heading's "…": whether tags show.
     TagsHeading,
+    /// A smart list's "…": Hide.
+    Smart(fern_core::SmartList),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

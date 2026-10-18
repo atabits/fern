@@ -24,6 +24,10 @@ const TASKS_PER_DAY: usize = 5;
 const WEEK_NUMBER_WIDTH: f32 = 32.;
 pub struct OpenTask(pub Id);
 
+/// A task's right-click menu asked for one of the details' pickers (`due`, `tags`,
+/// `link-parent`): the task opens in the list with that picker.
+pub struct OpenTaskPicker(pub Id, pub &'static str);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CalendarMode {
     /// One day on the hour axis, as the original's Day view.
@@ -71,12 +75,17 @@ pub struct CalendarView {
     /// The countdowns the Agenda lists, and the one whose card is open (its date and id).
     countdowns: Vec<fern_core::Countdown>,
     open_countdown: Option<(NaiveDate, Id)>,
+    /// A task's right-click menu: the task and where the click was, and its open side menu.
+    context_menu: Option<(Id, gpui::Point<Pixels>)>,
+    context_side: Option<u8>,
 }
 
 /// How far ahead the Agenda reaches.
 const AGENDA_DAYS: i64 = 366;
 
 impl EventEmitter<OpenTask> for CalendarView {}
+impl EventEmitter<OpenTaskPicker> for CalendarView {}
+impl EventEmitter<crate::task_detail::StartFocus> for CalendarView {}
 
 impl gpui::Focusable for CalendarView {
     fn focus_handle(&self, _: &App) -> gpui::FocusHandle {
@@ -101,6 +110,8 @@ impl CalendarView {
             agenda: Vec::new(),
             countdowns: Vec::new(),
             open_countdown: None,
+            context_menu: None,
+            context_side: None,
         };
         this.reload(cx);
         this
@@ -116,6 +127,78 @@ impl CalendarView {
     }
 
     /// Re-reads the tasks of the shown days.
+    fn open_context(&mut self, id: Id, position: gpui::Point<Pixels>, cx: &mut Context<Self>) {
+        self.context_menu = Some((id, position));
+        self.context_side = None;
+        cx.notify();
+    }
+
+    /// A choice in a task's right-click menu (see `task_menu`): edits apply here; the pickers
+    /// open the task in the list.
+    fn context_action(&mut self, action: crate::task_menu::MenuAction, cx: &mut Context<Self>) {
+        use crate::task_menu::MenuAction;
+        let Some((id, _)) = self.context_menu else { return };
+        if let MenuAction::Side(side) = action {
+            self.context_side = Some(side);
+            cx.notify();
+            return;
+        }
+        self.context_menu = None;
+        self.context_side = None;
+        let Some(task) = self.store.task(id).ok().flatten() else {
+            cx.notify();
+            return;
+        };
+        if let Some(result) = crate::task_menu::apply(&self.store, &task, action, Local::now().date_naive()) {
+            if let Err(err) = result {
+                eprintln!("failed to change the task: {err:#}");
+            }
+            self.reload(cx);
+            return;
+        }
+        match action {
+            MenuAction::Due(None) => cx.emit(OpenTaskPicker(id, "due")),
+            MenuAction::LinkParent => cx.emit(OpenTaskPicker(id, "link-parent")),
+            MenuAction::Tags => cx.emit(OpenTaskPicker(id, "tags")),
+            MenuAction::AddSubtask => cx.emit(OpenTaskPicker(id, "subtask")),
+            MenuAction::Focus(stopwatch) => cx.emit(crate::task_detail::StartFocus(id, task.title.clone(), stopwatch)),
+            MenuAction::CopyLink => cx.write_to_clipboard(gpui::ClipboardItem::new_string(fern_core::link::task_link(id))),
+            MenuAction::Delete => {
+                if let Err(err) = self.store.delete_task(id) {
+                    eprintln!("failed to delete the task: {err:#}");
+                }
+                self.reload(cx);
+            }
+            _ => {}
+        }
+        cx.notify();
+    }
+
+    /// The task's right-click menu, as the original's calendar has it (no Add Subtask or Pin).
+    fn render_context_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (id, position) = self.context_menu?;
+        let task = self.store.task(id).ok().flatten()?;
+        let lists = self.store.lists().unwrap_or_default();
+        let menu = crate::task_menu::render(
+            &task,
+            &lists,
+            crate::task_menu::MenuKind::Calendar,
+            self.context_side,
+            i18n::t(cx),
+            cx,
+            Rc::new(|this: &mut Self, action, _, cx| this.context_action(action, cx)),
+        );
+        Some(crate::task_menu::place(position, menu))
+    }
+
+    /// Opens a task's right-click menu from the debug-build dev state (`calendar-context=<title part>`).
+    #[cfg(debug_assertions)]
+    pub fn dev_context(&mut self, needle: &str, cx: &mut Context<Self>) {
+        if let Some(task) = self.tasks.iter().find(|t| t.title.contains(needle)) {
+            self.open_context(task.id, gpui::point(px(600.), px(300.)), cx);
+        }
+    }
+
     pub fn reload(&mut self, cx: &mut Context<Self>) {
         if self.mode == CalendarMode::Agenda {
             let from = self.agenda_start();
@@ -297,6 +380,7 @@ impl CalendarView {
                             .truncate(),
                     )
                     .on_click(cx.listener(move |_, _, _, cx| cx.emit(OpenTask(id))))
+                    .on_mouse_down(gpui::MouseButton::Right, cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| this.open_context(id, event.position, cx)))
             }))
             .when(hidden > 0, |el| {
                 el.child(div().px_1().child(Label::new(format!("+{hidden}")).size(LabelSize::XSmall).color(Color::Muted)))
@@ -338,6 +422,7 @@ impl CalendarView {
                     .truncate(),
             )
             .on_click(cx.listener(move |_, _, _, cx| cx.emit(OpenTask(id))))
+                    .on_mouse_down(gpui::MouseButton::Right, cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| this.open_context(id, event.position, cx)))
     }
 
     fn render_week(&self, today: NaiveDate, cx: &mut Context<Self>) -> AnyElement {
@@ -651,6 +736,12 @@ impl CalendarView {
                                             cx.emit(OpenTask(id))
                                         }
                                     }))
+                                    .when(!countdown, |el| {
+                                        el.on_mouse_down(
+                                            gpui::MouseButton::Right,
+                                            cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| this.open_context(id, event.position, cx)),
+                                        )
+                                    })
                                     .when_some(
                                         self.open_countdown
                                             .filter(|open| *open == (date, id))
@@ -1056,5 +1147,6 @@ impl Render for CalendarView {
                 ),
                 _ => el.child(self.render_week(today, cx)),
             })
+            .children(self.render_context_menu(cx))
     }
 }

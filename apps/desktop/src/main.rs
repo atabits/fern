@@ -22,6 +22,7 @@ mod sidebar;
 mod summary_view;
 mod sync;
 mod task_detail;
+mod task_menu;
 mod task_rows;
 mod text_input;
 mod undo;

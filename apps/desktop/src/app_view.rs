@@ -57,6 +57,22 @@ impl AppView {
             });
         })
         .detach();
+        // A picker asked for in the calendar's right-click menu opens with the task in the list.
+        cx.subscribe_in(&calendar, window, |this, _, calendar_view::OpenTaskPicker(id, what), window, cx| {
+            let (id, what) = (*id, *what);
+            this.select(Section::Tasks, window, cx);
+            this.todo.update(cx, |todo, cx| {
+                todo.set_view(fern_core::View::All, cx);
+                todo.start_detail(id, what, window, cx);
+            });
+        })
+        .detach();
+        cx.subscribe_in(&calendar, window, |this, _, crate::task_detail::StartFocus(id, title, stopwatch), window, cx| {
+            let (target, stopwatch) = ((*id, title.clone()), *stopwatch);
+            this.select(Section::Pomodoro, window, cx);
+            this.focus.update(cx, |focus, cx| focus.start_for(Some(target.0), target.1, stopwatch, cx));
+        })
+        .detach();
         // "Start Focus" in a task's menu starts a Pomodoro for it in the Focus section.
         cx.subscribe_in(&todo, window, |this, _, crate::task_detail::StartFocus(id, title, stopwatch), window, cx| {
             let (target, stopwatch) = ((*id, title.clone()), *stopwatch);
@@ -202,6 +218,9 @@ impl AppView {
                 }
             }
             // `agenda-countdown=<name part>` opens that countdown's card in the Agenda.
+            if let Some(needle) = state.split(';').find_map(|part| part.strip_prefix("calendar-context=")) {
+                this.calendar.update(cx, |view, cx| view.dev_context(needle, cx));
+            }
             if let Some(name) = state.split(';').find_map(|part| part.strip_prefix("agenda-countdown=")) {
                 this.calendar.update(cx, |view, cx| view.dev_open_countdown(name, cx));
             }

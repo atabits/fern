@@ -1,7 +1,9 @@
+mod actions;
 mod app_view;
 
 mod calendar;
 mod i18n;
+mod keymap;
 mod lists_panel;
 mod sidebar;
 mod task_detail;
@@ -13,16 +15,13 @@ use std::rc::Rc;
 
 use anyhow::{Context as _, Result};
 use fern_core::Store;
-use gpui::{
-    App, Bounds, KeyBinding, TitlebarOptions, WindowBounds, WindowOptions, actions, prelude::*,
-    px, size,
-};
+use gpui::{App, Bounds, TitlebarOptions, WindowBounds, WindowOptions, prelude::*, px, size};
 
+use crate::actions::Quit;
 use crate::app_view::AppView;
 use assets::Assets;
 use crate::i18n::{CurrentLocale, Locale};
 
-actions!(fern, [Quit]);
 
 fn open_store() -> Result<Store> {
     let dir = dirs::data_dir()
@@ -42,8 +41,10 @@ fn main() -> Result<()> {
     gpui_platform::application().with_assets(Assets).run(move |cx: &mut App| {
         theme::init(cx);
         cx.set_global(CurrentLocale(locale));
-        text_input::bind_keys(cx);
-        cx.bind_keys([KeyBinding::new("secondary-q", Quit, None)]);
+        match keymap::load_default(&Assets, cx) {
+            Ok(errors) => errors.iter().for_each(|err| eprintln!("keymap: {err}")),
+            Err(err) => eprintln!("failed to load the keymap: {err:#}"),
+        }
         cx.on_action(|_: &Quit, cx| cx.quit());
 
         let bounds = Bounds::centered(None, size(px(1280.), px(760.)), cx);

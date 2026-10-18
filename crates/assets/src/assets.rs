@@ -1,4 +1,4 @@
-//! Bundled assets (icons for now). Release builds embed the files; debug builds read them from
+//! Bundled assets: icons and keymaps. Release builds embed the files; debug builds read them from
 //! the checkout, so edits show up on the next launch without a rebuild.
 
 use std::borrow::Cow;
@@ -10,6 +10,7 @@ use rust_embed::RustEmbed;
 #[derive(RustEmbed)]
 #[folder = "../../assets"]
 #[include = "icons/**/*"]
+#[include = "keymaps/**/*"]
 #[exclude = "*.DS_Store"]
 pub struct Assets;
 

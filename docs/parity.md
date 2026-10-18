@@ -64,6 +64,7 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 | Details: checklist | ✅ | Enter adds the next item; progress "1/3" in rows |
 | Details: subtasks | ✅ | list with checkboxes, open a subtask, "Add subtask" |
 | Drag and drop | ⬜ | |
+| Keyboard shortcuts | ✅ | JSON keymap (Zed format): new task, search, smart lists, list navigation, complete, delete |
 | Search | 🟡 | live search by title, notes and tags from the sidebar; no checklist-item or date filters |
 | Calendar, Pomodoro, Habits, Matrix, Countdown | ⬜ | |
 | Sync between devices | ⬜ | |
@@ -81,8 +82,8 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 
 ## Next
 
-1. Keyboard shortcuts (actions and a keymap, Zed-style).
-2. Manual ordering and drag and drop.
+1. Manual ordering and drag and drop.
+2. Week/month calendar view.
 3. "Won't Do" status.
 4. Custom time and "every N" in the due-date picker.
 5. Eisenhower matrix view.

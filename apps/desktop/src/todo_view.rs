@@ -7,6 +7,7 @@ use gpui::{ElementId, Entity, FocusHandle, Focusable, FontWeight, MouseButton};
 use ui::prelude::*;
 use ui::{Placement, PopoverAttachment, popover};
 
+use crate::actions::{DeleteTask, SelectNext, SelectPrevious, ToggleComplete};
 use crate::i18n::{self, CurrentLocale, Strings};
 use crate::lists_panel::{self, LIST_COLORS};
 use crate::task_detail::{OpenTask, TaskDetail, TaskUpdated};
@@ -30,6 +31,8 @@ pub struct TodoView {
     collapsed_tasks: HashSet<Id>,
     collapsed_sections: HashSet<Section>,
     input: Entity<TextInput>,
+    /// Focus of the task list itself, for keyboard navigation (the `TaskList` key context).
+    list_focus: FocusHandle,
     new_list: Entity<TextInput>,
     creating_list: bool,
     rename_input: Entity<TextInput>,
@@ -57,6 +60,11 @@ impl TodoView {
         })
         .detach();
         window.focus(&input.focus_handle(cx), cx);
+        // Escape in the quick-add field hands the keyboard to the list.
+        cx.subscribe_in(&input, window, |this, _, _: &Cancelled, window, cx| {
+            window.focus(&this.list_focus, cx);
+        })
+        .detach();
 
         let new_list = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.new_list, cx));
         cx.subscribe_in(&new_list, window, |this, input, Submitted(name), window, cx| {
@@ -112,6 +120,7 @@ impl TodoView {
             // As in TickTick, completed tasks sit collapsed at the bottom of the list.
             collapsed_sections: HashSet::from([Section::Completed]),
             input,
+            list_focus: cx.focus_handle(),
             new_list,
             creating_list: false,
             rename_input,
@@ -258,7 +267,69 @@ impl TodoView {
         Ok(task)
     }
 
-    fn set_view(&mut self, view: View, cx: &mut Context<Self>) {
+    /// Focuses the quick-add field.
+    pub fn focus_new_task(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_read_only_view() {
+            self.set_view(View::Inbox, cx);
+        }
+        window.focus(&self.input.focus_handle(cx), cx);
+    }
+
+    /// Task ids in the order they are shown, for keyboard navigation.
+    fn visible_task_ids(&self) -> Vec<Id> {
+        task_rows::build_rows(&self.tasks, &self.collapsed_tasks, &self.collapsed_sections)
+            .into_iter()
+            .filter_map(|row| match row {
+                Row::Task { task, .. } => Some(task.id),
+                Row::Section { .. } => None,
+            })
+            .collect()
+    }
+
+    fn move_selection(&mut self, step: isize, cx: &mut Context<Self>) {
+        let ids = self.visible_task_ids();
+        if ids.is_empty() {
+            return;
+        }
+        let next = match self.selected.and_then(|id| ids.iter().position(|i| *i == id)) {
+            Some(index) => (index as isize + step).clamp(0, ids.len() as isize - 1) as usize,
+            None if step > 0 => 0,
+            None => ids.len() - 1,
+        };
+        self.select(ids[next], cx);
+    }
+
+    fn select_next(&mut self, _: &SelectNext, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_selection(1, cx);
+    }
+
+    fn select_previous(&mut self, _: &SelectPrevious, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_selection(-1, cx);
+    }
+
+    fn toggle_selected(&mut self, _: &ToggleComplete, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(task) = self.selected.and_then(|id| self.tasks.iter().find(|t| t.id == id)) {
+            let (id, done) = (task.id, task.is_completed());
+            self.toggle(id, !done, cx);
+        }
+    }
+
+    fn delete_selected(&mut self, _: &DeleteTask, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.selected else { return };
+        // Keep a selection so repeated presses keep working down the list.
+        let ids = self.visible_task_ids();
+        let neighbor = ids
+            .iter()
+            .position(|i| *i == id)
+            .and_then(|index| ids.get(index + 1).or_else(|| index.checked_sub(1).and_then(|i| ids.get(i))))
+            .copied();
+        self.delete(id, cx);
+        if let Some(neighbor) = neighbor {
+            self.select(neighbor, cx);
+        }
+    }
+
+    pub fn set_view(&mut self, view: View, cx: &mut Context<Self>) {
         self.header_menu_open = false;
         self.renaming_list = false;
         if self.view != view {
@@ -362,7 +433,7 @@ impl TodoView {
         cx.notify();
     }
 
-    fn toggle_lists(&mut self, cx: &mut Context<Self>) {
+    pub fn toggle_lists(&mut self, cx: &mut Context<Self>) {
         self.show_lists = !self.show_lists;
         cx.notify();
     }
@@ -496,7 +567,10 @@ impl TodoView {
             .cursor_pointer()
             .when(selected, |el| el.bg(theme.colors().ghost_element_selected))
             .when(!selected, |el| el.hover(|s| s.bg(theme.colors().ghost_element_hover)))
-            .on_click(cx.listener(move |this, _, _, cx| this.select(id, cx)))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                window.focus(&this.list_focus, cx);
+                this.select(id, cx);
+            }))
             .child(
                 div()
                     .id("toggle-children")
@@ -787,6 +861,12 @@ impl Render for TodoView {
             .child(
                 div()
                     .id("tasks")
+                    .track_focus(&self.list_focus)
+                    .key_context("TaskList")
+                    .on_action(cx.listener(Self::select_next))
+                    .on_action(cx.listener(Self::select_previous))
+                    .on_action(cx.listener(Self::toggle_selected))
+                    .on_action(cx.listener(Self::delete_selected))
                     .flex_1()
                     .overflow_y_scroll()
                     .px_2()

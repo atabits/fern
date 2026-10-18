@@ -15,6 +15,23 @@ with mobile clients and sync planned.
 - English and Russian UI, switchable at runtime
 - Local SQLite storage
 
+## Keyboard shortcuts
+
+`Ctrl` on Linux and Windows, `Cmd` on macOS.
+
+| Keys | Action |
+|---|---|
+| `Ctrl+N` | New task |
+| `Ctrl+F` | Search |
+| `Ctrl+\` | Show or hide the lists column |
+| `Ctrl+1` … `Ctrl+4` | Inbox, Today, Tomorrow, Next 7 Days |
+| `↑`/`↓` or `k`/`j` | Move the selection in the task list |
+| `Space` | Complete or reopen the selected task |
+| `Delete` | Move the selected task to the trash |
+| `Esc` in the quick-add field | Move focus to the task list |
+
+Bindings live in `assets/keymaps/default.json`.
+
 ## Repository layout
 
 ```

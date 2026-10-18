@@ -1,0 +1,50 @@
+[
+  {
+    "bindings": {
+      "secondary-q": "fern::Quit",
+      "secondary-n": "fern::NewTask",
+      "secondary-f": "fern::Search",
+      "secondary-\\": "fern::ToggleSidebar",
+      "secondary-1": "fern::ShowInbox",
+      "secondary-2": "fern::ShowToday",
+      "secondary-3": "fern::ShowTomorrow",
+      "secondary-4": "fern::ShowNext7Days"
+    }
+  },
+  {
+    "context": "TaskList",
+    "bindings": {
+      "down": "task_list::SelectNext",
+      "j": "task_list::SelectNext",
+      "up": "task_list::SelectPrevious",
+      "k": "task_list::SelectPrevious",
+      "space": "task_list::ToggleComplete",
+      "delete": "task_list::DeleteTask",
+      "backspace": "task_list::DeleteTask"
+    }
+  },
+  {
+    "context": "TextInput",
+    "bindings": {
+      "backspace": "text_input::Backspace",
+      "delete": "text_input::Delete",
+      "left": "text_input::Left",
+      "right": "text_input::Right",
+      "up": "text_input::Up",
+      "down": "text_input::Down",
+      "shift-left": "text_input::SelectLeft",
+      "shift-right": "text_input::SelectRight",
+      "shift-up": "text_input::SelectUp",
+      "shift-down": "text_input::SelectDown",
+      "secondary-a": "text_input::SelectAll",
+      "secondary-v": "text_input::Paste",
+      "secondary-c": "text_input::Copy",
+      "secondary-x": "text_input::Cut",
+      "home": "text_input::Home",
+      "end": "text_input::End",
+      "enter": "text_input::Enter",
+      "escape": "text_input::Cancel",
+      "ctrl-cmd-space": "text_input::ShowCharacterPalette"
+    }
+  }
+]

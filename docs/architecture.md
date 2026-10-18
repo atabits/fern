@@ -4,7 +4,7 @@ Fern follows the structure of the [Zed](https://github.com/zed-industries/zed) c
 Cargo workspace of small, focused crates on top of GPUI.
 
 ```
-assets/            icons and other bundled files (one directory for every crate)
+assets/            icons, keymaps and other bundled files (one directory for every crate)
 crates/
   core/            data model, SQLite storage and migrations, quick-add parser (no UI)
   icons/           IconName: one variant per file in assets/icons
@@ -26,6 +26,10 @@ apps/
 - Icons are referenced by `IconName`, never by path. A new icon is a new SVG in `assets/icons`
   (snake_case file name) plus a variant; a test checks that every variant has a file.
 - User-visible strings come from `apps/desktop/src/i18n.rs`.
+- Actions are declared with `actions!` (`apps/desktop/src/actions.rs`) and handled with
+  `on_action` inside a key context (`Workspace`, `TaskList`, `TextInput`). Key bindings are data in
+  `assets/keymaps/default.json`, in Zed's keymap format; a test loads it and fails on unknown
+  actions.
 - The core crate has no UI dependencies, so it can be shared with mobile clients.
 
 Zed's own crates are GPL-3.0; Fern is AGPL-3.0, so adapting code from them is allowed as long as

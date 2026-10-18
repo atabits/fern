@@ -4,6 +4,7 @@ use fern_core::Store;
 use ui::prelude::*;
 use ui::{Placement, PopoverAttachment, popover};
 
+use crate::actions::{NewTask, Search, ShowInbox, ShowNext7Days, ShowToday, ShowTomorrow, ToggleSidebar};
 use crate::i18n::{self, CurrentLocale, Locale};
 use crate::sidebar::{self, Section};
 use crate::todo_view::TodoView;
@@ -29,6 +30,24 @@ impl AppView {
         }
         self.section = section;
         cx.notify();
+    }
+
+    fn new_task(&mut self, _: &NewTask, window: &mut Window, cx: &mut Context<Self>) {
+        self.select(Section::Tasks, window, cx);
+        self.todo.update(cx, |todo, cx| todo.focus_new_task(window, cx));
+    }
+
+    fn search(&mut self, _: &Search, window: &mut Window, cx: &mut Context<Self>) {
+        self.select(Section::Search, window, cx);
+    }
+
+    fn toggle_sidebar(&mut self, _: &ToggleSidebar, _: &mut Window, cx: &mut Context<Self>) {
+        self.todo.update(cx, |todo, cx| todo.toggle_lists(cx));
+    }
+
+    fn show_view(&mut self, view: fern_core::View, window: &mut Window, cx: &mut Context<Self>) {
+        self.select(Section::Tasks, window, cx);
+        self.todo.update(cx, |todo, cx| todo.set_view(view, cx));
     }
 
     fn set_account_menu(&mut self, open: bool, cx: &mut Context<Self>) {
@@ -83,6 +102,18 @@ impl Render for AppView {
         });
 
         h_flex()
+            .key_context("Workspace")
+            .on_action(cx.listener(Self::new_task))
+            .on_action(cx.listener(Self::search))
+            .on_action(cx.listener(Self::toggle_sidebar))
+            .on_action(cx.listener(|this, _: &ShowInbox, window, cx| this.show_view(fern_core::View::Inbox, window, cx)))
+            .on_action(cx.listener(|this, _: &ShowToday, window, cx| this.show_view(fern_core::View::Today, window, cx)))
+            .on_action(cx.listener(|this, _: &ShowTomorrow, window, cx| {
+                this.show_view(fern_core::View::Tomorrow, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ShowNext7Days, window, cx| {
+                this.show_view(fern_core::View::Next7Days, window, cx)
+            }))
             .size_full()
             .items_start()
             .bg(theme.colors().background)

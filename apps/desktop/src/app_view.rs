@@ -147,6 +147,12 @@ impl AppView {
             if state.contains("section=matrix") {
                 this.select(Section::Matrix, window, cx);
             }
+            // `matrix-menu=<1-4>` / `matrix-edit=<1-4>`: a quadrant's "…" menu or "Edit Matrix".
+            for (prefix, edit) in [("matrix-menu=", false), ("matrix-edit=", true)] {
+                if let Some(n) = state.split(';').find_map(|part| part.strip_prefix(prefix)).and_then(|n| n.parse::<usize>().ok()) {
+                    this.matrix.update(cx, |view, cx| view.dev_open(n.clamp(1, 4) - 1, edit, cx));
+                }
+            }
             // `countdown=<name>><YYYY-MM-DD>><countdown|anniversary|holiday>[><emoji>|<#color>]`, repeatable.
             for spec in state.split(';').filter_map(|part| part.strip_prefix("countdown=")) {
                 let parts: Vec<&str> = spec.split('>').collect();

@@ -553,10 +553,7 @@ impl TaskDetail {
     /// The "Task Activities" panel at the bottom of the details, as in the original.
     fn render_activity(&self, activity: &[fern_core::Activity], strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
-        const KINDS: [&str; 11] = [
-            "created", "renamed", "completed", "reopened", "date", "date_cleared", "priority", "moved", "deleted",
-            "restored", "wont_do",
-        ];
+
         v_flex()
             .id("task-activity")
             .max_h(px(240.))
@@ -575,7 +572,7 @@ impl TaskDetail {
                     }))),
             )
             .children(activity.iter().rev().map(|entry| {
-                let text = KINDS.iter().position(|k| *k == entry.kind).map_or(entry.kind.as_str(), |i| strings.activity_kinds[i]);
+                let text = activity_text(&entry.kind, strings);
                 let when = chrono::Local
                     .timestamp_millis_opt(entry.at)
                     .single()
@@ -1577,6 +1574,17 @@ impl TaskDetail {
                     }),
             )
     }
+}
+
+/// The activity log's kinds, in the order of `Strings::activity_kinds`.
+const ACTIVITY_KINDS: [&str; 11] = [
+    "created", "renamed", "completed", "reopened", "date", "date_cleared", "priority", "moved", "deleted", "restored",
+    "wont_do",
+];
+
+/// What the activity log says for a kind: "created the task".
+pub fn activity_text<'a>(kind: &'a str, strings: &'static Strings) -> &'a str {
+    ACTIVITY_KINDS.iter().position(|k| *k == kind).map_or(kind, |i| strings.activity_kinds[i])
 }
 
 fn check_mark() -> impl IntoElement {

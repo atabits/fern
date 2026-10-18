@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use fern_core::{Id, Kind, List, Store, Tag, Task, View, ViewCounts};
-use chrono::{Datelike, Duration, Local, NaiveDate};
+use chrono::{Datelike, Duration, Local, NaiveDate, TimeZone as _};
 use gpui::{ElementId, Entity, FocusHandle, Focusable, FontWeight, MouseButton};
 use ui::prelude::*;
 
@@ -77,6 +77,8 @@ pub struct TodoView {
     sections: Vec<fern_core::ListSection>,
     /// The "Add Section" field, while it is shown.
     new_section: Option<Entity<TextInput>>,
+    /// The "List Activities" panel, shown in place of the details while open.
+    list_activity: Option<Vec<(fern_core::Activity, Id, String)>>,
     /// The "Add task" field's template picker, while it is open.
     templates_open: bool,
     /// The section whose "…" menu is open.
@@ -181,6 +183,7 @@ impl TodoView {
             new_section: None,
             section_menu: None,
             templates_open: false,
+            list_activity: None,
             renaming_section: None,
             detail,
             selected: None,
@@ -308,6 +311,7 @@ impl TodoView {
                     }
                 }
                 Some(("menu", "templates")) => self.templates_open = true,
+                Some(("menu", "activity")) => self.open_list_activity(cx),
                 Some(("flag", name)) => {
                     let default = name == "show_completed";
                     self.toggle_view_flag(name, default, cx);
@@ -776,6 +780,117 @@ impl TodoView {
         cx.notify();
     }
 
+    fn open_list_activity(&mut self, cx: &mut Context<Self>) {
+        let list = match self.view {
+            View::List(id) => Some(id),
+            _ => None,
+        };
+        self.list_activity = Some(self.store.list_activity(list, 300).unwrap_or_default());
+        self.header_menu_open = false;
+        cx.notify();
+    }
+
+    /// The original's List Activities: the list's task events by day, newest first, each with
+    /// its task, which a click opens.
+    fn render_list_activity(&self, entries: &[(fern_core::Activity, Id, String)], cx: &mut Context<Self>) -> AnyElement {
+        let strings = i18n::t(cx);
+        let theme = cx.theme().clone();
+        let today = Self::today();
+        let mut items: Vec<AnyElement> = Vec::new();
+        let mut current_day = None;
+        for (activity, task, title) in entries {
+            let Some(when) = Local.timestamp_millis_opt(activity.at).single() else { continue };
+            let day = when.date_naive();
+            if current_day != Some(day) {
+                current_day = Some(day);
+                items.push(
+                    div()
+                        .pt_3()
+                        .pb_1()
+                        .child(Label::new(task_rows::day_header(day, today, strings)).size(LabelSize::XSmall).color(Color::Muted))
+                        .into_any_element(),
+                );
+            }
+            let (icon, color) = match activity.kind.as_str() {
+                "created" => (IconName::Plus, theme.colors().accent),
+                "completed" => (IconName::Check, theme.status().success),
+                "deleted" => (IconName::Trash, theme.status().error),
+                _ => (IconName::Pencil, theme.colors().text_muted),
+            };
+            let task = *task;
+            items.push(
+                h_flex()
+                    .items_start()
+                    .gap_2()
+                    .py_1()
+                    .child(
+                        div()
+                            .mt(px(2.))
+                            .size(px(18.))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_full()
+                            .bg(color)
+                            .child(Icon::new(icon).size(IconSize::XSmall).color(Color::Custom(theme.colors().background))),
+                    )
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .child(
+                                h_flex()
+                                    .gap_1()
+                                    .child(Label::new(crate::task_detail::activity_text(&activity.kind, strings).to_owned()).size(LabelSize::Small).color(Color::Muted))
+                                    .child(
+                                        div()
+                                            .id(SharedString::from(format!("activity-{task}-{}", activity.at)))
+                                            .min_w_0()
+                                            .cursor_pointer()
+                                            .child(Label::new(title.clone()).size(LabelSize::Small).color(Color::Accent).truncate())
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.list_activity = None;
+                                                this.select(task, cx);
+                                            })),
+                                    ),
+                            )
+                            .child(Label::new(when.format("%m/%d %H:%M").to_string()).size(LabelSize::XSmall).color(Color::Muted)),
+                    )
+                    .into_any_element(),
+            );
+        }
+        v_flex()
+            .size_full()
+            .bg(theme.colors().background)
+            .border_l_1()
+            .border_color(theme.colors().border)
+            .child(
+                h_flex()
+                    .h(px(48.))
+                    .px_5()
+                    .border_b_1()
+                    .border_color(theme.colors().border)
+                    .child(div().flex_1().child(Label::new(strings.list_activities).size(LabelSize::Large)))
+                    .child(IconButton::new("close-list-activity", IconName::X).on_click(cx.listener(|this, _, _, cx| {
+                        this.list_activity = None;
+                        cx.notify();
+                    }))),
+            )
+            .child(
+                v_flex()
+                    .id("list-activity")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .px_5()
+                    .pb_4()
+                    .when(entries.is_empty(), |el| el.child(div().pt_4().child(Label::new(strings.stats_no_data).color(Color::Muted))))
+                    .children(items),
+            )
+            .into_any_element()
+    }
+
     fn start_new_section(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let strings = i18n::t(cx);
         let input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.section_name, cx));
@@ -957,6 +1072,7 @@ impl TodoView {
 
     pub fn set_view(&mut self, view: View, cx: &mut Context<Self>) {
         self.header_menu_open = false;
+        self.list_activity = None;
         self.renaming_list = false;
         if self.view != view {
             self.view = view;
@@ -1866,7 +1982,15 @@ impl TodoView {
                         .hover(|s| s.bg(theme.colors().element_hover))
                         .child(Icon::new(icon).color(if on { Color::Accent } else { Color::Muted }))
                 };
-                el.when(in_list, |el| {
+                el.when(in_list || self.view == View::Inbox, |el| {
+                    el.child(
+                        ListItem::new("list-activities")
+                            .start_slot(Icon::new(IconName::ListTree).color(Color::Muted))
+                            .child(Label::new(strings.list_activities))
+                            .on_click(cx.listener(|this, _, _, cx| this.open_list_activity(cx))),
+                    )
+                })
+                .when(in_list, |el| {
                     el.child(
                         ListItem::new("add-section")
                             .start_slot(Icon::new(IconName::Plus).color(Color::Muted))
@@ -2238,6 +2362,9 @@ impl Render for TodoView {
                 ))
             })
             .child(list)
-            .child(div().flex_none().w(px(DETAIL_WIDTH)).h_full().child(self.detail.clone()))
+            .child(div().flex_none().w(px(DETAIL_WIDTH)).h_full().map(|el| match self.list_activity.clone() {
+                Some(entries) => el.child(self.render_list_activity(&entries, cx)),
+                None => el.child(self.detail.clone()),
+            }))
     }
 }

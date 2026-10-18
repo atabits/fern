@@ -1230,6 +1230,25 @@ impl Store {
         Ok(session)
     }
 
+    /// "List Activities": what happened to the tasks of a list (`None` is the inbox), newest
+    /// first, with each task's id and title.
+    pub fn list_activity(&self, list: Option<Id>, limit: usize) -> Result<Vec<(crate::model::Activity, Id, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT a.at, a.kind, t.id, t.title FROM task_activity a JOIN tasks t ON t.id = a.task_id
+             WHERE t.list_id IS ?1 ORDER BY a.at DESC, a.rowid DESC LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![list.map(|l| l.to_string()), limit as i64], |row| {
+                Ok((
+                    crate::model::Activity { at: row.get(0)?, kind: row.get(1)? },
+                    parse_uuid(&row.get::<_, String>(2)?, 2)?,
+                    row.get(3)?,
+                ))
+            })?
+            .collect::<Result<_, _>>()?;
+        Ok(rows)
+    }
+
     /// A task's activity, oldest first.
     pub fn task_activity(&self, task: Id) -> Result<Vec<crate::model::Activity>> {
         let mut stmt =
@@ -1857,6 +1876,16 @@ mod tests {
         store.restore_task(task.id)?;
         let kinds: Vec<String> = store.task_activity(task.id)?.into_iter().map(|a| a.kind).collect();
         assert_eq!(kinds, ["created", "renamed", "date", "priority", "completed", "reopened", "deleted", "restored"]);
+
+        // The list's log: newest first, only its own tasks.
+        let home = store.create_list("Home")?;
+        let other = store.add_task("other")?;
+        store.set_list(other.id, Some(home.id))?;
+        let inbox = store.list_activity(None, 3)?;
+        assert_eq!(inbox.len(), 3);
+        assert_eq!((inbox[0].0.kind.as_str(), inbox[0].2.as_str()), ("restored", "water all the plants"));
+        let in_home: Vec<String> = store.list_activity(Some(home.id), 10)?.into_iter().map(|(a, _, _)| a.kind).collect();
+        assert_eq!(in_home, ["moved", "created"]);
         Ok(())
     }
 

@@ -50,7 +50,7 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 | Lists column: tags with color dots and counters | ✅ | |
 | Lists column: Filters, Won't Do, Trash | 🟡 | Completed, Won't Do and Trash; no Filters |
 | Mini week at the bottom of the lists column | 🟡 | current week, today highlighted (matched to a screenshot); clicking a day does nothing yet — the original behavior is not verified |
-| List header with sidebar toggle | ✅ | toggle and "…" work (the original's "Show / Hide Completed" and "Show / Hide Details" — the first line of the notes under the title — kept per list; the View switcher has List and the original's Kanban — a column per group (Tasks / Notes / Completed, or the chosen Group by) with cards showing tags, date and subtasks; lists get the original's sections ("Add Section" in the menu, "+ Add Section" on the board): tasks group by section, not sectioned first; a task's section is picked under its list in the details' list picker and is dropped when it moves to another list; a section header's "…" renames or deletes it (its tasks stay in the list); no Timeline view, List Activities or Print). Kanban cards drag between columns and take the column's value: section, Tasks / Notes, Completed (leaving it reopens), Today / Tomorrow / No Date, priority or tag; the original's drag behavior was not observed (dragging in TickTick would change data)); the sort button has the original's "Group by" (Custom, Date, Created Time, Tag, Priority, None) and "Sort by" (Custom, Date, Created Time, Modified Time, Title, Tag, Priority), kept per list; edits (fields, tags, checklist, not reordering) update a task's modified time |
+| List header with sidebar toggle | ✅ | toggle and "…" work (the original's "Show / Hide Completed" and "Show / Hide Details" — the first line of the notes under the title — kept per list; the View switcher has List and the original's Kanban — a column per group (Tasks / Notes / Completed, or the chosen Group by) with cards showing tags, date and subtasks; lists get the original's sections ("Add Section" in the menu, "+ Add Section" on the board): tasks group by section, not sectioned first; a task's section is picked under its list in the details' list picker and is dropped when it moves to another list; a section header's "…" renames or deletes it (its tasks stay in the list); List Activities (the original's panel in place of the details: the list's task events by day with colored icons, each task opens on click; Inbox and user lists); no Timeline view or Print). Kanban cards drag between columns and take the column's value: section, Tasks / Notes, Completed (leaving it reopens), Today / Tomorrow / No Date, priority or tag; the original's drag behavior was not observed (dragging in TickTick would change data)); the sort button has the original's "Group by" (Custom, Date, Created Time, Tag, Priority, None) and "Sort by" (Custom, Date, Created Time, Modified Time, Title, Tag, Priority), kept per list; edits (fields, tags, checklist, not reordering) update a task's modified time |
 | "Add task" field | ✅ | parses date, time, repeat, tags, priority and `^list`; no live highlighting yet; `^list` matches one-word list names only |
 | Rows by the measurements (40 px, separators) | ✅ | |
 | Tag chips, due date and repeat in rows | ✅ | overdue dates in red |
@@ -90,8 +90,8 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 
 ## Next
 
-1. List Activities (the list menu's change log, like Task Activities).
-2. Start Focus from a task (details "…" → Start Focus).
+1. Start Focus from a task (details "…" → Start Focus).
+2. Print a list or a task (the menus' Print).
 3. Statistics page in the main sidebar (account menu), not only from Focus.
 3. Rename and delete habit sections.
 4. Filled sidebar icons (needs own filled glyphs; Lucide has none).

@@ -233,6 +233,7 @@ pub struct Strings {
     pub link_parent: &'static str,
     pub unpin: &'static str,
     pub task_activities: &'static str,
+    pub list_activities: &'static str,
     /// Created, renamed, completed, reopened, date, date cleared, priority, moved, deleted,
     /// restored, won't do: what the activity log says for each kind.
     pub activity_kinds: [&'static str; 11],
@@ -512,6 +513,7 @@ pub static EN: Strings = Strings {
     link_parent: "Link Parent Task",
     unpin: "Unpin",
     task_activities: "Task Activities",
+    list_activities: "List Activities",
     activity_kinds: [
         "created the task", "renamed the task", "completed the task", "reopened the task", "changed the date",
         "removed the date", "changed the priority", "moved the task", "moved the task to the trash",
@@ -782,6 +784,7 @@ pub static RU: Strings = Strings {
     link_parent: "Сделать подзадачей",
     unpin: "Открепить",
     task_activities: "История задачи",
+    list_activities: "История списка",
     activity_kinds: [
         "создана задача", "задача переименована", "задача выполнена", "задача снова открыта", "изменена дата",
         "дата убрана", "изменён приоритет", "задача перемещена", "задача в корзине", "задача восстановлена",

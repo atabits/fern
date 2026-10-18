@@ -68,6 +68,9 @@ pub struct CalendarView {
     tasks: Vec<Task>,
     /// The Agenda's days, from today (or the shown month's first day, when later) a year on.
     agenda: Vec<(NaiveDate, Vec<fern_core::agenda::AgendaItem>)>,
+    /// The countdowns the Agenda lists, and the one whose card is open (its date and id).
+    countdowns: Vec<fern_core::Countdown>,
+    open_countdown: Option<(NaiveDate, Id)>,
 }
 
 /// How far ahead the Agenda reaches.
@@ -96,6 +99,8 @@ impl CalendarView {
             multi_week_hovered: false,
             tasks: Vec::new(),
             agenda: Vec::new(),
+            countdowns: Vec::new(),
+            open_countdown: None,
         };
         this.reload(cx);
         this
@@ -114,11 +119,11 @@ impl CalendarView {
     pub fn reload(&mut self, cx: &mut Context<Self>) {
         if self.mode == CalendarMode::Agenda {
             let from = self.agenda_start();
-            let countdowns = self.store.countdowns().unwrap_or_default();
+            self.countdowns = self.store.countdowns().unwrap_or_default();
             match self.store.tasks() {
                 Ok(tasks) => {
                     self.agenda =
-                        fern_core::agenda::agenda(&tasks, &countdowns, from, from + chrono::Duration::days(AGENDA_DAYS))
+                        fern_core::agenda::agenda(&tasks, &self.countdowns, from, from + chrono::Duration::days(AGENDA_DAYS))
                 }
                 Err(err) => eprintln!("failed to load the agenda: {err:#}"),
             }
@@ -182,6 +187,16 @@ impl CalendarView {
             self.anchor = self.month;
         }
         self.reload(cx);
+    }
+
+    /// Opens a countdown's card in the Agenda, for the debug-build dev state.
+    #[cfg(debug_assertions)]
+    pub fn dev_open_countdown(&mut self, name: &str, cx: &mut Context<Self>) {
+        self.open_countdown = self
+            .agenda
+            .iter()
+            .find_map(|(date, items)| items.iter().find(|i| i.countdown && i.title.contains(name)).map(|i| (*date, i.task)));
+        cx.notify();
     }
 
     /// The mode menu with its Multi-Day side menu open, for the debug-build dev state.
@@ -571,7 +586,7 @@ impl CalendarView {
                     .map(|(i, item)| {
                         let id = item.task;
                         // Countdowns, as in the original: an orange card and a filled dot instead of
-                        // the task's circle; they do not open a task.
+                        // the task's circle; a click shows the countdown's card.
                         let countdown = item.countdown;
                         let tint = if countdown {
                             theme.status().warning
@@ -603,16 +618,38 @@ impl CalendarView {
                                     .border_l_3()
                                     .border_color(tint)
                                     .bg(tint.opacity(0.12))
-                                    .when(!countdown, |el| el.hover(|s| s.bg(tint.opacity(0.2))).cursor_pointer())
+                                    .hover(|s| s.bg(tint.opacity(0.2)))
+                                    .cursor_pointer()
                                     .child(div().flex_1().min_w_0().child(Label::new(item.title).size(LabelSize::Small).truncate()))
                                     .when(item.repeats, |el| {
                                         el.child(Icon::new(IconName::Repeat).size(IconSize::XSmall).color(Color::Muted))
                                     })
-                                    .on_click(cx.listener(move |_, _, _, cx| {
-                                        if !countdown {
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        if countdown {
+                                            this.open_countdown = Some((date, id));
+                                            cx.notify();
+                                        } else {
                                             cx.emit(OpenTask(id))
                                         }
-                                    })),
+                                    }))
+                                    .when_some(
+                                        self.open_countdown
+                                            .filter(|open| *open == (date, id))
+                                            .and_then(|_| self.countdowns.iter().find(|c| c.id == id)),
+                                        |el, shown| {
+                                            el.relative().child(PopoverAttachment::new(
+                                                Placement::BelowRight,
+                                                popover(cx)
+                                                    .w(px(220.))
+                                                    .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                                                        this.open_countdown = None;
+                                                        cx.notify();
+                                                    }))
+                                                    .child(crate::countdown_view::render_summary(shown, date, cx))
+                                                    .into_any_element(),
+                                            ))
+                                        },
+                                    ),
                             )
                             .into_any_element()
                     })

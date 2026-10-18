@@ -155,6 +155,10 @@ impl AppView {
                     this.calendar.update(cx, |view, cx| view.reload(cx));
                 }
             }
+            // `agenda-countdown=<name part>` opens that countdown's card in the Agenda.
+            if let Some(name) = state.split(';').find_map(|part| part.strip_prefix("agenda-countdown=")) {
+                this.calendar.update(cx, |view, cx| view.dev_open_countdown(name, cx));
+            }
             // `habit=<name>><days ago,…>`, repeatable.
             for spec in state.split(';').filter_map(|part| part.strip_prefix("habit=")) {
                 let (name, days) = spec.split_once('>').unwrap_or((spec, ""));

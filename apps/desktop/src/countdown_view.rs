@@ -60,6 +60,72 @@ fn format_date(date: NaiveDate, strings: &Strings) -> String {
     crate::calendar::format_date(date, strings)
 }
 
+/// The parts of a countdown card: its color, the "1M 1D" numbers and "Days until …".
+struct Face {
+    color: gpui::Hsla,
+    numbers: gpui::Div,
+    subtitle: String,
+}
+
+fn face(countdown: &Countdown, today: NaiveDate, days_only: bool, cx: &App) -> Face {
+    let strings = i18n::t(cx);
+    let theme = cx.theme();
+    let span = span(today, countdown.date);
+    let color = if span.past { theme.status().warning } else { theme.colors().accent };
+    let number = |value: u32, unit: &str| {
+        h_flex()
+            .items_baseline()
+            .child(div().text_size(px(34.)).text_color(color).child(value.to_string()))
+            .child(div().pl_0p5().pr_1().text_size(px(13.)).text_color(color).child(unit.to_owned()))
+    };
+    let [y, m, d] = strings.unit_letters;
+    let numbers = if days_only {
+        h_flex().child(number(span.total_days, d))
+    } else {
+        h_flex()
+            .when(span.years > 0, |el| el.child(number(span.years, y)))
+            .when(span.months > 0, |el| el.child(number(span.months, m)))
+            .when(span.days > 0 || (span.years == 0 && span.months == 0), |el| el.child(number(span.days, d)))
+    };
+    let subtitle = format!(
+        "{} {}",
+        if span.past { strings.countdown_days_since } else { strings.countdown_days_until },
+        format_date(countdown.date, strings)
+    );
+    Face { color, numbers, subtitle }
+}
+
+/// A countdown as the original shows it when clicked in the calendar's Agenda: the icon and
+/// name, the time left and "Days until …", counted to `date` (this year's date for yearly ones).
+pub fn render_summary(countdown: &Countdown, date: NaiveDate, cx: &App) -> AnyElement {
+    let today = Local::now().date_naive();
+    let shown = Countdown { date, ..countdown.clone() };
+    let Face { color, numbers, subtitle } = face(&shown, today, false, cx);
+    v_flex()
+        .items_center()
+        .gap_1()
+        .py_3()
+        .px_6()
+        .child(
+            h_flex()
+                .gap_1p5()
+                .child(
+                    div()
+                        .size(px(18.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_full()
+                        .bg(color.opacity(0.25))
+                        .child(Icon::new(kind_icon(countdown.kind)).size(IconSize::XSmall).color(Color::Custom(color))),
+                )
+                .child(Label::new(countdown.name.clone()).weight(FontWeight::SEMIBOLD)),
+        )
+        .child(numbers)
+        .child(Label::new(subtitle).size(LabelSize::XSmall).color(Color::Muted))
+        .into_any_element()
+}
+
 impl CountdownView {
     pub fn new(store: Rc<Store>, cx: &mut Context<Self>) -> Self {
         let mut this = Self { store, countdowns: Vec::new(), filter: Filter::All, days_only: HashSet::new(), draft: None };
@@ -124,31 +190,9 @@ impl CountdownView {
         let strings = i18n::t(cx);
         let theme = cx.theme().clone();
         let today = Local::now().date_naive();
-        let span = span(today, countdown.date);
-        let color = if span.past { theme.status().warning } else { theme.colors().accent };
         let id = countdown.id;
         let group = SharedString::from(format!("countdown-{id}"));
-
-        let number = |value: u32, unit: &str| {
-            h_flex()
-                .items_baseline()
-                .child(div().text_size(px(34.)).text_color(color).child(value.to_string()))
-                .child(div().pl_0p5().pr_1().text_size(px(13.)).text_color(color).child(unit.to_owned()))
-        };
-        let [y, m, d] = strings.unit_letters;
-        let numbers = if self.days_only.contains(&id) {
-            h_flex().child(number(span.total_days, d))
-        } else {
-            h_flex()
-                .when(span.years > 0, |el| el.child(number(span.years, y)))
-                .when(span.months > 0, |el| el.child(number(span.months, m)))
-                .when(span.days > 0 || (span.years == 0 && span.months == 0), |el| el.child(number(span.days, d)))
-        };
-        let subtitle = format!(
-            "{} {}",
-            if span.past { strings.countdown_days_since } else { strings.countdown_days_until },
-            format_date(countdown.date, strings)
-        );
+        let Face { color, numbers, subtitle } = face(countdown, today, self.days_only.contains(&id), cx);
 
         v_flex()
             .id(group.clone())

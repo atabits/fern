@@ -74,6 +74,12 @@ struct StatsPage {
     /// Classified Completion Statistics by tag instead of by list, and whether its menu is open.
     by_tag: bool,
     classify_menu: bool,
+    /// The Focus tab's "Details": split by list (0), tag (1) or task (2), its period and day,
+    /// and which of its two menus is open.
+    details_by: u8,
+    details_period: Bucket,
+    details_day: NaiveDate,
+    details_menu: Option<u8>,
 }
 
 /// Bars for the statistics charts, with a label under each; `highlight` marks one bar.
@@ -494,6 +500,10 @@ impl FocusView {
             task_menu: false,
             by_tag: false,
             classify_menu: false,
+            details_by: 0,
+            details_period: Bucket::Day,
+            details_day: today,
+            details_menu: None,
         });
         cx.notify();
     }
@@ -724,9 +734,170 @@ impl FocusView {
                 1 => el.children(self.render_task_tab(page, today, cx)),
                 _ => el
                     .child(overview)
+                    .child(self.render_focus_details(page, today, cx))
                     .child(h_flex().items_start().gap_4().child(trends).child(most_focused))
                     .child(year_grid),
             }))
+            .into_any_element()
+    }
+
+    /// The Focus tab's "Details": focused time of a day, week or month per list, tag or task, as
+    /// a ring chart with a legend.
+    fn render_focus_details(&self, page: StatsPage, today: NaiveDate, cx: &mut Context<Self>) -> AnyElement {
+        let strings = i18n::t(cx);
+        let theme = cx.theme().clone();
+        let status = theme.status().clone();
+        let tasks = self.store.tasks().unwrap_or_default();
+        let lists = self.store.lists().unwrap_or_default();
+        let all_tags = self.store.tags().unwrap_or_default();
+        let week_start = crate::calendar::week_start();
+        let period = page.details_period;
+        let (first, last) = stats::buckets(period, page.details_day, week_start, 1)[0];
+        let totals = fern_core::focus::focus_by(&self.sessions, &tasks, page.details_by, first, last);
+        let palette = [theme.colors().accent, status.success, status.warning, status.error, theme.colors().text_muted];
+        let slices: Vec<(SharedString, i64, Hsla)> = totals
+            .into_iter()
+            .enumerate()
+            .map(|(i, (key, minutes))| {
+                let fallback = palette[i % palette.len()];
+                let (name, color): (SharedString, Hsla) = match key {
+                    fern_core::focus::FocusKey::List(None) => (strings.inbox.into(), fallback),
+                    fern_core::focus::FocusKey::List(Some(id)) => {
+                        let list = lists.iter().find(|l| l.id == id);
+                        (
+                            list.map_or(SharedString::default(), |l| l.name.clone().into()),
+                            list.and_then(|l| crate::lists_panel::parse_color(l.color.as_deref())).unwrap_or(fallback),
+                        )
+                    }
+                    fern_core::focus::FocusKey::Tag(None) => (strings.group_no_tags.into(), fallback),
+                    fern_core::focus::FocusKey::Tag(Some(tag)) => {
+                        let color = all_tags
+                            .iter()
+                            .find(|t| t.name == tag)
+                            .and_then(|t| crate::lists_panel::parse_color(t.color.as_deref()))
+                            .unwrap_or(fallback);
+                        (format!("#{tag}").into(), color)
+                    }
+                    fern_core::focus::FocusKey::Task(title) => (title.into(), fallback),
+                };
+                (name, minutes, color)
+            })
+            .collect();
+        // A session with several tags counts once in the middle.
+        let total: i64 = stats::focus_in(&self.sessions, &[(first, last)])[0].1;
+        let current = stats::buckets(period, today, week_start, 1)[0] == (first, last);
+        let label = match period {
+            Bucket::Day if current => strings.today.to_owned(),
+            Bucket::Week if current => strings.stats_this_week.to_owned(),
+            Bucket::Month if current => strings.stats_this_month.to_owned(),
+            Bucket::Day => crate::task_rows::short_date(first, strings),
+            Bucket::Week => format!("{} - {}", crate::task_rows::short_date(first, strings), crate::task_rows::short_date(last, strings)),
+            Bucket::Month => format!("{} {}", strings.months_short[first.month0() as usize], first.year()),
+        };
+        let by_names = [strings.stats_by_list_option, strings.stats_by_tag_option, strings.stats_by_task_option];
+        let period_names = [strings.stats_day, strings.stats_week, strings.stats_month];
+        let period_index = Bucket::ALL.iter().position(|b| *b == period).unwrap_or(0);
+        let pill = |id: &'static str, menu: u8, text: &'static str, options: Vec<(&'static str, bool, Box<dyn Fn(&mut StatsPage)>)>, cx: &mut Context<Self>| {
+            let open = page.details_menu == Some(menu);
+            let options = Rc::new(options);
+            let dropdown = open.then(|| {
+                PopoverAttachment::new(
+                    Placement::BelowRight,
+                    popover(cx)
+                        .w(px(140.))
+                        .on_mouse_down_out(cx.listener(|this, _, _, cx| this.update_stats(cx, |p| p.details_menu = None)))
+                        .children((0..options.len()).map(|i| {
+                            let (name, selected, _) = &options[i];
+                            let options = options.clone();
+                            ListItem::new(SharedString::from(format!("{id}-{i}")))
+                                .child(Label::new(*name).color(if *selected { Color::Accent } else { Color::Default }))
+                                .when(*selected, |item| item.end_slot(Icon::new(IconName::Check).size(IconSize::Small).color(Color::Accent)))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.update_stats(cx, |p| {
+                                        (options[i].2)(p);
+                                        p.details_menu = None;
+                                    })
+                                }))
+                        })),
+                )
+            });
+            h_flex()
+                .id(id)
+                .relative()
+                .px_2()
+                .h(px(22.))
+                .gap_0p5()
+                .rounded(px(11.))
+                .border_1()
+                .border_color(if open { theme.colors().accent } else { theme.colors().border })
+                .cursor_pointer()
+                .child(Label::new(text).size(LabelSize::XSmall))
+                .child(Icon::new(IconName::ChevronDown).size(IconSize::XSmall).color(Color::Muted))
+                .on_click(cx.listener(move |this, _, _, cx| this.update_stats(cx, |p| p.details_menu = (!open).then_some(menu))))
+                .children(dropdown)
+        };
+        let by_options = (0..3u8)
+            .map(|by| {
+                let set: Box<dyn Fn(&mut StatsPage)> = Box::new(move |p| p.details_by = by);
+                (by_names[by as usize], by == page.details_by, set)
+            })
+            .collect();
+        let period_options = Bucket::ALL
+            .into_iter()
+            .zip(period_names)
+            .map(|(bucket, name)| {
+                let set: Box<dyn Fn(&mut StatsPage)> = Box::new(move |p| p.details_period = bucket);
+                (name, bucket == period, set)
+            })
+            .collect();
+        let step = move |day: NaiveDate, forward: bool| {
+            let (first, last) = stats::buckets(period, day, week_start, 1)[0];
+            if forward { last + chrono::Duration::days(1) } else { first - chrono::Duration::days(1) }
+        };
+        v_flex()
+            .p_4()
+            .gap_2()
+            .rounded(px(10.))
+            .bg(theme.colors().surface_background)
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(div().flex_1().child(Label::new(strings.stats_details).weight(FontWeight::SEMIBOLD)))
+                    .child(pill("details-by", 0, by_names[page.details_by as usize], by_options, cx))
+                    .child(pill("details-period", 1, period_names[period_index], period_options, cx))
+                    .child(IconButton::new("details-back", IconName::ChevronLeft).size(px(22.)).on_click(cx.listener(
+                        move |this, _, _, cx| this.update_stats(cx, |p| p.details_day = step(p.details_day, false)),
+                    )))
+                    .child(Label::new(label).size(LabelSize::Small))
+                    .child(IconButton::new("details-forward", IconName::ChevronRight).size(px(22.)).on_click(cx.listener(
+                        move |this, _, _, cx| this.update_stats(cx, |p| p.details_day = step(p.details_day, true)),
+                    ))),
+            )
+            .child(
+                h_flex()
+                    .py_2()
+                    .gap_6()
+                    .justify_center()
+                    .child(
+                        Donut::new(slices.iter().map(|(_, m, color)| (*m as f32, *color))).center(
+                            v_flex()
+                                .items_center()
+                                .child(div().text_size(px(20.)).font_weight(FontWeight::SEMIBOLD).child(if total == 0 {
+                                    strings.stats_no_data.to_owned()
+                                } else {
+                                    format_minutes(total)
+                                }))
+                                .when(total > 0, |el| el.child(Label::new(strings.focus).size(LabelSize::XSmall).color(Color::Muted))),
+                        ),
+                    )
+                    .child(v_flex().gap_1().children(slices.into_iter().map(|(name, minutes, color)| {
+                        h_flex()
+                            .gap_2()
+                            .child(div().size(px(8.)).rounded_full().bg(color))
+                            .child(Label::new(format_minutes(minutes)).size(LabelSize::Small))
+                            .child(Label::new(name).size(LabelSize::Small).color(Color::Muted).truncate())
+                    }))),
+            )
             .into_any_element()
     }
 
@@ -1275,6 +1446,14 @@ impl FocusView {
                     p.curves[0] = Bucket::Week;
                     p.curves[2] = Bucket::Month;
                     p.curve_menu = Some(1);
+                });
+                return;
+            }
+            "stats-focus-details" => {
+                self.open_stats(cx);
+                self.update_stats(cx, |p| {
+                    p.details_by = 2;
+                    p.details_menu = Some(0);
                 });
                 return;
             }

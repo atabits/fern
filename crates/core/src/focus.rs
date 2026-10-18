@@ -67,6 +67,52 @@ pub fn minutes_by_day(sessions: &[FocusSession], start: NaiveDate, days: usize) 
     out
 }
 
+/// What the Statistics' "Details" splits focus time by: the original's List, Tag or Task.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FocusKey {
+    /// The session's task's list (`None`: the Inbox, or a session without a task).
+    List(Option<Id>),
+    /// One of the task's tags (`None`: no tags, or no task); a session counts for each tag.
+    Tag(Option<String>),
+    /// The session's title, which is its task's title or what it was named after.
+    Task(String),
+}
+
+/// Focused minutes between `first` and `last` per list, tag or task, most first. `by` picks the
+/// kind: 0 list, 1 tag, 2 task.
+pub fn focus_by(
+    sessions: &[FocusSession],
+    tasks: &[crate::model::Task],
+    by: u8,
+    first: NaiveDate,
+    last: NaiveDate,
+) -> Vec<(FocusKey, i64)> {
+    let mut totals: Vec<(FocusKey, i64)> = Vec::new();
+    for session in sessions {
+        let day = session.start_local().date_naive();
+        if day < first || day > last {
+            continue;
+        }
+        let task = session.task_id.and_then(|id| tasks.iter().find(|t| t.id == id));
+        let keys = match by {
+            0 => vec![FocusKey::List(task.and_then(|t| t.list_id))],
+            1 => match task.filter(|t| !t.tags.is_empty()) {
+                Some(task) => task.tags.iter().map(|t| FocusKey::Tag(Some(t.clone()))).collect(),
+                None => vec![FocusKey::Tag(None)],
+            },
+            _ => vec![FocusKey::Task(task.map_or_else(|| session.title.clone(), |t| t.title.clone()))],
+        };
+        for key in keys {
+            match totals.iter_mut().find(|(k, _)| *k == key) {
+                Some((_, minutes)) => *minutes += session.minutes(),
+                None => totals.push((key, session.minutes())),
+            }
+        }
+    }
+    totals.sort_by_key(|(_, minutes)| std::cmp::Reverse(*minutes));
+    totals
+}
+
 /// "Most Focused Time": minutes per hour of day in the month containing `month`, split across
 /// the hours each session covers.
 pub fn minutes_by_hour(sessions: &[FocusSession], month: NaiveDate) -> [i64; 24] {
@@ -186,5 +232,25 @@ mod tests {
         assert_eq!(format_minutes(45), "45m");
         assert_eq!(format_minutes(120), "2h");
         assert_eq!(format_minutes(0), "0m");
+    }
+
+    #[test]
+    fn focus_split_by_list_tag_or_task() {
+        let store = crate::Store::open_in_memory().unwrap();
+        let work = store.create_list("Work").unwrap();
+        let report = store.add_task("report").unwrap();
+        store.set_list(report.id, Some(work.id)).unwrap();
+        store.set_tags(report.id, &["deep".to_owned(), "office".to_owned()]).unwrap();
+        let now = Local::now().timestamp_millis();
+        store.add_focus_session(Some(report.id), "report", now - 50 * 60_000, now - 25 * 60_000).unwrap();
+        store.add_focus_session(None, "Reading", now - 20 * 60_000, now - 10 * 60_000).unwrap();
+        let (sessions, tasks) = (store.focus_sessions().unwrap(), store.tasks().unwrap());
+        let today = Local::now().date_naive();
+
+        assert_eq!(focus_by(&sessions, &tasks, 0, today, today), [(FocusKey::List(Some(work.id)), 25), (FocusKey::List(None), 10)]);
+        let by_tag = focus_by(&sessions, &tasks, 1, today, today);
+        assert_eq!(by_tag.len(), 3);
+        assert!(by_tag.contains(&(FocusKey::Tag(Some("deep".into())), 25)) && by_tag.contains(&(FocusKey::Tag(None), 10)));
+        assert_eq!(focus_by(&sessions, &tasks, 2, today, today)[1], (FocusKey::Task("Reading".into()), 10));
     }
 }

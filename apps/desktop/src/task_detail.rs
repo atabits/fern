@@ -2,7 +2,7 @@
 
 use std::rc::Rc;
 
-use fern_core::{ChecklistItem, Id, List, Priority, Store, Tag, Task};
+use fern_core::{ChecklistItem, Id, Kind, List, Priority, Store, Tag, Task};
 use chrono::{Datelike, Local, NaiveDate};
 use gpui::{Entity, EventEmitter, Focusable, FontWeight, MouseButton, Subscription};
 use ui::prelude::*;
@@ -21,6 +21,7 @@ enum Popup {
     Priority,
     Tags,
     List,
+    More,
 }
 
 pub struct TaskDetail {
@@ -278,7 +279,7 @@ impl TaskDetail {
                 self.due_draft = self.task.as_ref().map(|task| DueDraft::from_task(task, today));
             }
             Popup::Tags => self.all_tags = self.store.tags().unwrap_or_default(),
-            Popup::Priority | Popup::List => {}
+            Popup::Priority | Popup::List | Popup::More => {}
         }
         self.popup = Some(popup);
         cx.notify();
@@ -291,6 +292,7 @@ impl TaskDetail {
             "priority" => Popup::Priority,
             "tags" => Popup::Tags,
             "list" => Popup::List,
+            "more" => Popup::More,
             "checklist" => {
                 self.start_checklist(cx);
                 return;
@@ -388,10 +390,81 @@ impl TaskDetail {
         self.save(cx, |store, id| store.purge_task(id));
     }
 
+    fn menu_action(&mut self, cx: &mut Context<Self>, write: impl FnOnce(&Store, Id) -> anyhow::Result<()>) {
+        self.close_popup(cx);
+        self.save(cx, write);
+    }
+
+    fn toggle_wont_do(&mut self, cx: &mut Context<Self>) {
+        let wont_do = self.task.as_ref().is_some_and(|t| t.is_wont_do());
+        self.menu_action(cx, |store, id| store.set_wont_do(id, !wont_do));
+    }
+
+    fn toggle_kind(&mut self, cx: &mut Context<Self>) {
+        let kind = match self.task.as_ref().map(|t| t.kind) {
+            Some(Kind::Note) => Kind::Task,
+            _ => Kind::Note,
+        };
+        self.menu_action(cx, |store, id| store.set_kind(id, kind));
+    }
+
+    /// The panel's "…" menu, a subset of the original's: the entries Fern supports so far.
+    fn render_more_popup(&self, strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {
+        let Some(task) = self.task.as_ref() else { return div().into_any_element() };
+        let wont_do = task.is_wont_do();
+        let is_note = task.kind == Kind::Note;
+        let item = |id: &'static str, icon: IconName, label: &'static str| {
+            ListItem::new(id).start_slot(Icon::new(icon).color(Color::Muted)).child(Label::new(label))
+        };
+        popover(cx)
+            .w(px(220.))
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_popup(cx)))
+            .child(item("more-subtask", IconName::CornerDownRight, strings.add_subtask).on_click(cx.listener(
+                |this, _, window, cx| {
+                    this.close_popup(cx);
+                    window.focus(&this.subtask_input.focus_handle(cx), cx);
+                },
+            )))
+            .child(
+                item("more-wont-do", if wont_do { IconName::RotateCcw } else { IconName::SquareX }, if wont_do {
+                    strings.reopen
+                } else {
+                    strings.wont_do
+                })
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_wont_do(cx))),
+            )
+            .child(item("more-tags", IconName::Tag, strings.tags).on_click(cx.listener(|this, _, _, cx| {
+                this.open_popup(Popup::Tags, cx);
+            })))
+            .child(div().py_1().child(Divider::horizontal()))
+            .child(item("more-duplicate", IconName::Copy, strings.duplicate).on_click(cx.listener(
+                |this, _, _, cx| this.menu_action(cx, |store, id| store.duplicate_task(id).map(|_| ())),
+            )))
+            .child(
+                item(
+                    "more-convert",
+                    if is_note { IconName::SquareCheck } else { IconName::FileText },
+                    if is_note { strings.convert_to_task } else { strings.convert_to_note },
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_kind(cx))),
+            )
+            .child(div().py_1().child(Divider::horizontal()))
+            .child(item("more-delete", IconName::Trash, strings.delete).on_click(cx.listener(|this, _, _, cx| {
+                this.menu_action(cx, |store, id| store.delete_task(id))
+            })))
+            .into_any_element()
+    }
+
     fn toggle_completed(&mut self, cx: &mut Context<Self>) {
         let Some(task) = self.task.as_mut() else { return };
         let completed = !task.is_completed();
-        if let Err(err) = self.store.set_completed(task.id, completed) {
+        // Unchecking a "Won't Do" task reopens it.
+        let result = if task.is_wont_do() {
+            self.store.set_wont_do(task.id, false)
+        } else {
+            self.store.set_completed(task.id, completed)
+        };
+        if let Err(err) = result {
             eprintln!("failed to update the task: {err:#}");
             return;
         }
@@ -928,6 +1001,7 @@ impl Render for TaskDetail {
                         Checkbox::new("detail-checkbox")
                             .size(px(18.))
                             .toggle_state(done)
+                            .dismissed(task.is_wont_do())
                             .on_click(cx.listener(|this, _, _, cx| this.toggle_completed(cx))),
                     )
                     .child(Divider::vertical())
@@ -1045,7 +1119,20 @@ impl Render for TaskDetail {
                             .child(div().flex_1())
                             .child(IconButton::new("format", IconName::Baseline))
                             .child(IconButton::new("comments", IconName::MessageSquareText))
-                            .child(IconButton::new("more", IconName::Ellipsis))
+                            .child(
+                                div()
+                                    .relative()
+                                    .child(
+                                        IconButton::new("more", IconName::Ellipsis)
+                                            .on_click(cx.listener(|this, _, _, cx| this.open_popup(Popup::More, cx))),
+                                    )
+                                    .when(self.popup == Some(Popup::More), |el| {
+                                        el.child(PopoverAttachment::new(
+                                            Placement::AboveRight,
+                                            self.render_more_popup(strings, cx),
+                                        ))
+                                    }),
+                            )
                         }
                     }),
             )

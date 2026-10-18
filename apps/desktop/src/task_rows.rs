@@ -40,6 +40,8 @@ impl Section {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Row {
     Section { section: Section, count: usize, collapsed: bool },
+    /// A day header in the Completed and Won't Do views, e.g. "Sunday, September 27".
+    Day { label: String, count: usize },
     Task { task: Task, depth: usize, has_children: bool, collapsed: bool },
 }
 
@@ -156,6 +158,55 @@ pub fn snippet(text: &str, query: &str, context: usize) -> Option<String> {
     Some(out.replace('\n', " "))
 }
 
+/// Rows for closed tasks grouped by the day they were closed (newest first), as in the original's
+/// Completed and Won't Do views. `closed_at` picks the timestamp (completion or "Won't Do").
+pub fn rows_by_day(
+    tasks: &[Task],
+    closed_at: impl Fn(&Task) -> Option<i64>,
+    today: NaiveDate,
+    strings: &Strings,
+) -> Vec<Row> {
+    use chrono::{Local, TimeZone};
+    let mut groups: Vec<(NaiveDate, Vec<&Task>)> = Vec::new();
+    let mut sorted: Vec<&Task> = tasks.iter().collect();
+    sorted.sort_by_key(|t| std::cmp::Reverse(closed_at(t).unwrap_or(0)));
+    for task in sorted {
+        let day = closed_at(task)
+            .and_then(|ms| Local.timestamp_millis_opt(ms).single())
+            .map_or(today, |time| time.date_naive());
+        match groups.last_mut() {
+            Some((last, items)) if *last == day => items.push(task),
+            _ => groups.push((day, vec![task])),
+        }
+    }
+    let mut rows = Vec::new();
+    for (day, items) in groups {
+        rows.push(Row::Day { label: day_header(day, today, strings), count: items.len() });
+        rows.extend(items.into_iter().map(|task| Row::Task {
+            task: task.clone(),
+            depth: 0,
+            has_children: false,
+            collapsed: false,
+        }));
+    }
+    rows
+}
+
+/// "Sunday, September 27", with the year when it is not the current one.
+pub fn day_header(day: NaiveDate, today: NaiveDate, strings: &Strings) -> String {
+    let weekday = strings.weekdays_full[day.weekday().num_days_from_monday() as usize];
+    let month = strings.months_genitive[day.month0() as usize];
+    let mut label = if strings.day_before_month {
+        format!("{weekday}, {} {month}", day.day())
+    } else {
+        format!("{weekday}, {month} {}", day.day())
+    };
+    if day.year() != today.year() {
+        label.push_str(&format!(", {}", day.year()));
+    }
+    label
+}
+
 /// The checkbox and flag tint for a priority; `None` for no priority.
 pub fn priority_color(priority: Priority, theme: &Theme) -> Option<Hsla> {
     match priority {
@@ -219,6 +270,7 @@ mod tests {
             checklist: None,
             completed_at: None,
             deleted_at: None,
+            wont_do_at: None,
             created_at: 0,
         }
     }
@@ -227,6 +279,7 @@ mod tests {
         rows.iter()
             .map(|row| match row {
                 Row::Section { section, count, .. } => format!("# {} {count}", section.title(&EN)),
+                Row::Day { label, count } => format!("## {label} {count}"),
                 Row::Task { task, depth, .. } => format!("{}{}", "  ".repeat(*depth), task.title),
             })
             .collect()
@@ -282,6 +335,14 @@ mod tests {
         assert_eq!(snippet("short", "sho", 10).as_deref(), Some("short"));
         assert_eq!(snippet("line one\nline two", "two", 20).as_deref(), Some("line one line two"));
         assert_eq!(snippet("nothing", "zzz", 5), None);
+    }
+
+    #[test]
+    fn day_headers() {
+        let today = d(2026, 10, 18);
+        assert_eq!(day_header(d(2026, 9, 27), today, &EN), "Sunday, September 27");
+        assert_eq!(day_header(d(2025, 9, 26), today, &EN), "Friday, September 26, 2025");
+        assert_eq!(day_header(d(2026, 9, 27), today, &RU), "воскресенье, 27 сентября");
     }
 
     #[test]

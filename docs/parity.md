@@ -35,7 +35,7 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 | Lists (projects), Inbox | ✅ | create, delete, move tasks with subtasks |
 | Custom sections inside a list (columns) | ⬜ | groups are by kind for now |
 | Manual ordering (`sortOrder`) | ✅ | new tasks on top; renumbered with gaps on move |
-| Trash, "Won't Do" | 🟡 | trash matched to the original: flat list, broom button empties it; a trashed task's panel has "Restore" and "Delete forever" in its bottom bar; no "Won't Do" |
+| Trash, "Won't Do" | ✅ | trash matched to the original: flat list, broom button empties it; a trashed task's panel has "Restore" and "Delete forever" in its bottom bar. "Won't Do" matched to the original: set from the details "…" menu or by dropping on the entry, a muted box with a cross, its own view grouped by day with list and date on the right; unchecking reopens. No "All Dates" / "All Lists" filters yet |
 | Reminders | ⬜ | |
 | Settings (UI language) | ✅ | |
 
@@ -48,14 +48,15 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 | Lists column: Inbox / All / Today / Tomorrow / Next 7 Days | ✅ | counters; a new task gets the due date or tag of the current view |
 | Lists column: user lists | ✅ | create inline; rename, color and delete from the "…" menu; no drag and drop |
 | Lists column: tags with color dots and counters | ✅ | |
-| Lists column: Filters, Won't Do, Trash | 🟡 | Completed and Trash |
+| Lists column: Filters, Won't Do, Trash | 🟡 | Completed, Won't Do and Trash; no Filters |
 | Mini week at the bottom of the lists column | 🟡 | current week, today highlighted (matched to a screenshot); clicking a day does nothing yet — the original behavior is not verified |
 | List header with sidebar toggle | 🟡 | toggle and "…" work; sorting does not |
 | "Add task" field | ✅ | parses date, time, repeat, tags, priority and `^list`; no live highlighting yet; `^list` matches one-word list names only |
 | Rows by the measurements (40 px, separators) | ✅ | |
 | Tag chips, due date and repeat in rows | ✅ | overdue dates in red |
 | Subtasks with indentation and collapsing | ✅ | created from the details panel |
-| Groups "Tasks" / "Notes" with counters and collapsing | ✅ | plus a collapsed "Completed" group |
+| Groups "Tasks" / "Notes" with counters and collapsing | ✅ | plus a collapsed "Completed" group; the Completed and Won't Do views group by the day the task was closed ("Sunday, September 27") |
+| Details "…" menu | 🟡 | Add Subtask, Won't Do / Reopen, Tags, Duplicate, Convert to Note / Task, Delete; no Pin, Link Parent Task, attachments, Start Focus, activities, templates, links or print |
 | Details: checkbox, title, notes | ✅ | |
 | Details: due date | 🟡 | popover matched to the original: quick picks with tooltips, month calendar, Time (30-minute list) and Repeat (with date hints and "Every Weekday"), Clear/OK with a draft; no Duration tab, Reminder or Custom repeat |
 | Details: priority (flag) | ✅ | |
@@ -89,9 +90,7 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 
 ## Next
 
-1. "Won't Do" status.
-2. Habit details panel.
-3. Filled sidebar icons and the notification badge.
-3. "Won't Do" status.
-4. Custom time and "every N" in the due-date picker.
-5. Eisenhower matrix view.
+1. Habit details panel.
+2. Filled sidebar icons and the notification badge.
+3. Custom time and "every N" in the due-date picker.
+4. "All Dates" / "All Lists" filters in the Completed and Won't Do views.

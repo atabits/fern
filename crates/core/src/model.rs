@@ -80,6 +80,8 @@ pub struct Task {
     pub completed_at: Option<i64>,
     /// When the task was moved to the trash.
     pub deleted_at: Option<i64>,
+    /// When the task was marked "Won't Do".
+    pub wont_do_at: Option<i64>,
     pub created_at: i64,
 }
 
@@ -95,6 +97,15 @@ pub struct ChecklistItem {
 impl Task {
     pub fn is_completed(&self) -> bool {
         self.completed_at.is_some()
+    }
+
+    pub fn is_wont_do(&self) -> bool {
+        self.wont_do_at.is_some()
+    }
+
+    /// Completed or marked "Won't Do": no longer something to do.
+    pub fn is_closed(&self) -> bool {
+        self.is_completed() || self.is_wont_do()
     }
 
     pub fn is_deleted(&self) -> bool {
@@ -134,6 +145,7 @@ pub enum View {
     Tomorrow,
     Next7Days,
     Completed,
+    WontDo,
     Trash,
     List(Id),
     Tag(String),

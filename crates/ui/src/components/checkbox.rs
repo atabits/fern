@@ -13,6 +13,7 @@ use crate::{Clickable, Toggleable};
 pub struct Checkbox {
     id: ElementId,
     checked: bool,
+    dismissed: bool,
     tint: Option<Hsla>,
     size: Pixels,
     on_click: Option<ClickHandler>,
@@ -20,11 +21,17 @@ pub struct Checkbox {
 
 impl Checkbox {
     pub fn new(id: impl Into<ElementId>) -> Self {
-        Self { id: id.into(), checked: false, tint: None, size: px(16.), on_click: None }
+        Self { id: id.into(), checked: false, dismissed: false, tint: None, size: px(16.), on_click: None }
     }
 
     pub fn tint(mut self, tint: Option<Hsla>) -> Self {
         self.tint = tint;
+        self
+    }
+
+    /// A muted box with a cross, for tasks closed as "Won't Do".
+    pub fn dismissed(mut self, dismissed: bool) -> Self {
+        self.dismissed = dismissed;
         self
     }
 
@@ -51,6 +58,24 @@ impl Clickable for Checkbox {
 impl RenderOnce for Checkbox {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let colors = cx.theme().colors();
+        if self.dismissed {
+            return div()
+                .id(self.id)
+                .size(self.size)
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(3.))
+                .border_1()
+                .border_color(colors.text_muted.opacity(0.6))
+                .bg(colors.text_muted.opacity(0.25))
+                .cursor_pointer()
+                .text_size(self.size * 0.7)
+                .text_color(colors.text_muted)
+                .child("✕")
+                .when_some(self.on_click, |el, handler| el.on_click(handler));
+        }
         let border = if self.checked { colors.accent } else { self.tint.unwrap_or(colors.checkbox_border) };
         div()
             .id(self.id)

@@ -111,10 +111,13 @@ const MIGRATIONS: &[&str] = &[
         ended_at   INTEGER NOT NULL
     );
     ",
+    "
+    ALTER TABLE tasks ADD COLUMN wont_do_at INTEGER;
+    ",
 ];
 
 const TASK_COLUMNS: &str = "id, parent_id, kind, title, notes, priority, due_date, due_time, \
-                            completed_at, created_at, list_id, deleted_at, repeat";
+                            completed_at, created_at, list_id, deleted_at, repeat, wont_do_at";
 
 const DATE_FORMAT: &str = "%Y-%m-%d";
 const TIME_FORMAT: &str = "%H:%M";
@@ -221,6 +224,7 @@ impl Store {
             checklist: None,
             completed_at: None,
             deleted_at: None,
+            wont_do_at: None,
             created_at: now_ms(),
         };
         // New tasks go to the top, as in TickTick.
@@ -308,7 +312,7 @@ impl Store {
                 &format!(
                     "INSERT INTO tasks ({TASK_COLUMNS})
                      SELECT ?2, parent_id, kind, title, notes, priority, due_date, due_time,
-                            ?3, created_at, list_id, NULL, NULL
+                            ?3, created_at, list_id, NULL, NULL, NULL
                      FROM tasks WHERE id = ?1"
                 ),
                 params![id.to_string(), copy.to_string(), now_ms()],
@@ -341,6 +345,31 @@ impl Store {
             self.set_due(id, Some(today), task.due_time)?;
         }
         self.update(id, "repeat", repeat.map(|r| r.to_string()))
+    }
+
+    /// Marks a task "Won't Do" (it leaves the open views like a completed task), or reopens it.
+    pub fn set_wont_do(&self, id: Id, wont_do: bool) -> Result<()> {
+        self.update(id, "wont_do_at", wont_do.then(now_ms))
+    }
+
+    /// Copies a task with its tags and checklist (not its subtasks) right below the original.
+    pub fn duplicate_task(&self, id: Id) -> Result<Task> {
+        let original = self.task(id)?.context("task not found")?;
+        let copy = self.add_task(&original.title)?;
+        self.conn.execute(
+            "UPDATE tasks SET parent_id = o.parent_id, kind = o.kind, notes = o.notes,
+                 priority = o.priority, due_date = o.due_date, due_time = o.due_time,
+                 list_id = o.list_id, repeat = o.repeat
+             FROM (SELECT * FROM tasks WHERE id = ?2) AS o WHERE tasks.id = ?1",
+            params![copy.id.to_string(), id.to_string()],
+        )?;
+        self.set_tags(copy.id, &original.tags)?;
+        for item in self.checklist(id)? {
+            let new = self.add_checklist_item(copy.id, &item.title, None)?;
+            self.set_checklist_item_completed(new.id, item.completed)?;
+        }
+        self.move_task(copy.id, id, true)?;
+        Ok(self.task(copy.id)?.context("copy not found")?)
     }
 
     pub fn set_title(&self, id: Id, title: &str) -> Result<()> {
@@ -792,6 +821,10 @@ fn matches_view(task: &Task, view: &View, today: NaiveDate) -> bool {
     if task.is_deleted() != (*view == View::Trash) {
         return false;
     }
+    // "Won't Do" tasks only show in their own view (and in search and the trash).
+    if task.is_wont_do() && !matches!(view, View::WontDo | View::Search(_) | View::Trash) {
+        return false;
+    }
     let due_before = |days: i64| task.due_date.is_some_and(|due| due < today + Duration::days(days));
     match view {
         View::Inbox => task.list_id.is_none(),
@@ -803,6 +836,7 @@ fn matches_view(task: &Task, view: &View, today: NaiveDate) -> bool {
         }
         View::Next7Days => !task.is_completed() && due_before(7),
         View::Completed => task.is_completed(),
+        View::WontDo => task.is_wont_do(),
         View::Trash => true,
         View::Tag(tag) => task.tags.iter().any(|t| t.to_lowercase() == tag.to_lowercase()),
         View::Search(query) => {
@@ -841,6 +875,7 @@ fn task_from_row(row: &Row) -> rusqlite::Result<Task> {
         list_id: row.get::<_, Option<String>>(10)?.map(|l| parse_uuid(&l, 10)).transpose()?,
         deleted_at: row.get(11)?,
         repeat: row.get::<_, Option<String>>(12)?.and_then(|r| r.parse().ok()),
+        wont_do_at: row.get(13)?,
     })
 }
 
@@ -1219,6 +1254,46 @@ mod tests {
         // Deleting the task keeps the record.
         store.purge_task(task.id)?;
         assert_eq!(store.focus_sessions()?[1].task_id, None);
+        Ok(())
+    }
+
+    #[test]
+    fn wont_do_leaves_open_views() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let today = d(2026, 10, 18);
+        let task = store.add_task("learn the banjo")?;
+        store.set_due(task.id, Some(today), None)?;
+        store.set_wont_do(task.id, true)?;
+        assert!(store.tasks_in(&View::Inbox, today)?.is_empty());
+        assert!(store.tasks_in(&View::Today, today)?.is_empty());
+        assert!(store.tasks_in(&View::Completed, today)?.is_empty());
+        assert_eq!(store.tasks_in(&View::WontDo, today)?.len(), 1);
+        assert_eq!(store.counts(today)?.today, 0);
+        store.set_wont_do(task.id, false)?;
+        assert_eq!(store.tasks_in(&View::Today, today)?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_copies_fields_tags_and_checklist() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let list = store.create_list("Home")?;
+        let task = store.add_task("pack")?;
+        store.set_list(task.id, Some(list.id))?;
+        store.set_priority(task.id, Priority::High)?;
+        store.set_tags(task.id, &["trip".into()])?;
+        let item = store.add_checklist_item(task.id, "socks", None)?;
+        store.set_checklist_item_completed(item.id, true)?;
+        let other = store.add_task("other")?;
+
+        let copy = store.duplicate_task(task.id)?;
+        assert_ne!(copy.id, task.id);
+        assert_eq!((copy.title.as_str(), copy.priority, copy.list_id), ("pack", Priority::High, Some(list.id)));
+        assert_eq!(copy.tags, ["trip"]);
+        assert_eq!(copy.checklist, Some((1, 1)));
+        // The copy sits right below the original.
+        assert_eq!(titles(&store.tasks()?), ["other", "pack", "pack"]);
+        let _ = other;
         Ok(())
     }
 

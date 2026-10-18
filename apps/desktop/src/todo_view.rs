@@ -154,6 +154,7 @@ impl TodoView {
                 }
                 Some(("list", name)) => self.create_list(name, cx),
                 Some(("view", "trash")) => self.set_view(View::Trash, cx),
+                Some(("view", "wontdo")) => self.set_view(View::WontDo, cx),
                 Some(("drop", spec)) => {
                     // `drop=<title part>><today|tomorrow|inbox|completed|trash|list:Name|tag:Name>`:
                     // the same path as dropping a task on the lists column.
@@ -166,6 +167,7 @@ impl TodoView {
                             "tomorrow" => Some(View::Tomorrow),
                             "inbox" => Some(View::Inbox),
                             "completed" => Some(View::Completed),
+                            "wontdo" => Some(View::WontDo),
                             "trash" => Some(View::Trash),
                             other => other
                                 .strip_prefix("tag:")
@@ -313,18 +315,32 @@ impl TodoView {
     }
 
     /// Task ids in the order they are shown, for keyboard navigation.
-    fn visible_task_ids(&self) -> Vec<Id> {
-        task_rows::build_rows(&self.tasks, &self.collapsed_tasks, &self.collapsed_sections, self.view != View::Trash)
+    fn visible_task_ids(&self, strings: &Strings) -> Vec<Id> {
+        self.rows(strings)
             .into_iter()
             .filter_map(|row| match row {
                 Row::Task { task, .. } => Some(task.id),
-                Row::Section { .. } => None,
+                Row::Section { .. } | Row::Day { .. } => None,
             })
             .collect()
     }
 
+    /// The rows of the current view: closed tasks by day, the trash flat, everything else grouped.
+    fn rows(&self, strings: &Strings) -> Vec<Row> {
+        match self.view {
+            View::Completed => task_rows::rows_by_day(&self.tasks, |t| t.completed_at, Self::today(), strings),
+            View::WontDo => task_rows::rows_by_day(&self.tasks, |t| t.wont_do_at, Self::today(), strings),
+            _ => task_rows::build_rows(
+                &self.tasks,
+                &self.collapsed_tasks,
+                &self.collapsed_sections,
+                self.view != View::Trash,
+            ),
+        }
+    }
+
     fn move_selection(&mut self, step: isize, cx: &mut Context<Self>) {
-        let ids = self.visible_task_ids();
+        let ids = self.visible_task_ids(i18n::t(cx));
         if ids.is_empty() {
             return;
         }
@@ -354,7 +370,7 @@ impl TodoView {
     fn delete_selected(&mut self, _: &DeleteTask, _: &mut Window, cx: &mut Context<Self>) {
         let Some(id) = self.selected else { return };
         // Keep a selection so repeated presses keep working down the list.
-        let ids = self.visible_task_ids();
+        let ids = self.visible_task_ids(i18n::t(cx));
         let neighbor = ids
             .iter()
             .position(|i| *i == id)
@@ -512,7 +528,9 @@ impl TodoView {
     }
 
     fn toggle(&mut self, id: Id, completed: bool, cx: &mut Context<Self>) {
-        let result = self.store.set_completed(id, completed);
+        // Unchecking a "Won't Do" task reopens it, as in the original.
+        let wont_do = self.tasks.iter().any(|t| t.id == id && t.is_wont_do());
+        let result = if wont_do { self.store.set_wont_do(id, false) } else { self.store.set_completed(id, completed) };
         self.check(result);
         self.reload(cx);
     }
@@ -547,6 +565,7 @@ impl TodoView {
             View::Today | View::Next7Days => self.store.set_due(id, Some(today), time),
             View::Tomorrow => self.store.set_due(id, Some(today + Duration::days(1)), time),
             View::Completed => self.store.set_completed(id, true),
+            View::WontDo => self.store.set_wont_do(id, true),
             View::Trash => self.store.delete_task(id),
             View::All | View::Search(_) => Ok(()),
         };
@@ -576,7 +595,7 @@ impl TodoView {
 
     /// Views where new tasks cannot be added.
     fn is_read_only_view(&self) -> bool {
-        matches!(self.view, View::Completed | View::Trash | View::Search(_))
+        matches!(self.view, View::Completed | View::WontDo | View::Trash | View::Search(_))
     }
 
     fn render_section(
@@ -614,6 +633,8 @@ impl TodoView {
         let theme = cx.theme().clone();
         let id = task.id;
         let done = task.is_completed();
+        let wont_do = task.is_wont_do();
+        let closed_view = matches!(self.view, View::Completed | View::WontDo);
         let selected = self.selected == Some(id);
         let group = format!("task-{id}");
 
@@ -622,10 +643,11 @@ impl TodoView {
         } else {
             Checkbox::new("marker")
                 .toggle_state(done)
+                .dismissed(wont_do)
                 .tint(task_rows::priority_color(task.priority, &theme))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     cx.stop_propagation();
-                    this.toggle(id, !done, cx);
+                    this.toggle(id, !done && !wont_do, cx);
                 }))
                 .into_any_element()
         };
@@ -691,7 +713,7 @@ impl TodoView {
                             } else {
                                 task.title.clone().into()
                             })
-                            .color(if done || task.title.is_empty() { Color::Muted } else { Color::Default })
+                            .color(if done || wont_do || task.title.is_empty() { Color::Muted } else { Color::Default })
                             .strikethrough(done)
                             .truncate(),
                         ),
@@ -713,6 +735,14 @@ impl TodoView {
                                 ),
                         )
                     })
+                    // Closed tasks show their list, as in the original's Completed and Won't Do views.
+                    .when(closed_view, |el| {
+                        let list = task
+                            .list_id
+                            .and_then(|id| self.lists.iter().find(|l| l.id == id))
+                            .map_or(SharedString::new_static(strings.inbox), |l| l.name.clone().into());
+                        el.child(Label::new(list).size(LabelSize::Small).color(Color::Muted))
+                    })
                     .when_some(due, |el, (label, overdue)| {
                         el.when(task.repeat.is_some(), |el| {
                             el.child(Icon::new(IconName::Repeat).size(IconSize::XSmall).color(Color::Accent))
@@ -720,7 +750,13 @@ impl TodoView {
                         .child(
                             Label::new(label)
                                 .size(LabelSize::Small)
-                                .color(if overdue && !done { Color::Error } else { Color::Accent }),
+                                .color(if closed_view {
+                                    Color::Muted
+                                } else if overdue && !done {
+                                    Color::Error
+                                } else {
+                                    Color::Accent
+                                }),
                         )
                     })
                     .when(self.view == View::Trash, |el| {
@@ -853,13 +889,20 @@ impl Render for TodoView {
             .iter()
             .map(|t| (t.name.clone(), lists_panel::color(t.color.as_deref(), cx)))
             .collect();
-        let rows = task_rows::build_rows(&self.tasks, &self.collapsed_tasks, &self.collapsed_sections, self.view != View::Trash);
+        let rows = self.rows(strings);
         let rows: Vec<_> = rows
             .iter()
             .map(|row| match row {
                 Row::Section { section, count, collapsed } => {
                     self.render_section(*section, *count, *collapsed, strings, cx)
                 }
+                Row::Day { label, count } => h_flex()
+                    .h(px(36.))
+                    .gap_2()
+                    .pl(px(GUTTER))
+                    .child(Label::new(label.clone()).weight(FontWeight::BOLD))
+                    .child(Label::new(count.to_string()).size(LabelSize::Small).color(Color::Muted))
+                    .into_any_element(),
                 Row::Task { task, depth, has_children, collapsed } => self.render_task(
                     task,
                     *depth,
@@ -968,6 +1011,7 @@ impl Render for TodoView {
                         el.child(div().px_3().pt_8().child(
                             Label::new(match &self.view {
                                 View::Completed => strings.no_completed_tasks,
+                                View::WontDo => strings.no_wont_do,
                                 View::Trash => strings.trash_is_empty,
                                 View::Search(query) if query.trim().is_empty() => strings.search_hint,
                                 View::Search(_) => strings.nothing_found,

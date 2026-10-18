@@ -1190,6 +1190,13 @@ impl Store {
         Ok(section)
     }
 
+    pub fn rename_habit_section(&self, id: Id, name: &str) -> Result<()> {
+        let name = name.trim();
+        anyhow::ensure!(!name.is_empty(), "a section needs a name");
+        self.conn.execute("UPDATE habit_sections SET name = ?2 WHERE id = ?1", params![id.to_string(), name])?;
+        Ok(())
+    }
+
     /// Deletes a section; its habits move to Others.
     pub fn delete_habit_section(&self, id: Id) -> Result<()> {
         let key = crate::habit::HabitSection::Custom(id).key();
@@ -2183,6 +2190,9 @@ mod tests {
         assert_eq!(store.habit_sections()?, [pets.clone()]);
         store.set_habit_section(water.id, crate::habit::HabitSection::Custom(pets.id))?;
         assert_eq!(store.habits()?[0].section, crate::habit::HabitSection::Custom(pets.id));
+        store.rename_habit_section(pets.id, " Animals ")?;
+        assert_eq!(store.habit_sections()?[0].name, "Animals");
+        assert!(store.rename_habit_section(pets.id, "").is_err());
         store.delete_habit_section(pets.id)?;
         assert!(store.habit_sections()?.is_empty());
         assert_eq!(store.habits()?[0].section, crate::habit::HabitSection::Others);

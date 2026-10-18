@@ -94,6 +94,10 @@ pub struct HabitView {
     export_message: Option<String>,
     /// The header's list button: habits as full-width rows instead of cards (kept in settings).
     list_layout: bool,
+    /// The custom section whose header "…" menu is open.
+    section_menu: Option<Id>,
+    /// A custom section being renamed in its header.
+    renaming_section: Option<(Id, Entity<TextInput>)>,
 }
 
 const LAYOUT_SETTING: &str = "habit_layout";
@@ -139,6 +143,8 @@ impl HabitView {
             header_menu_open: false,
             list_layout: false,
             sections: Vec::new(),
+            section_menu: None,
+            renaming_section: None,
             header_more: None,
             export_message: None,
         };
@@ -725,6 +731,17 @@ impl HabitView {
     /// `goal=<amount> <unit>` and `note=<text>` for the selected habit, `edit` opens the editor.
     #[cfg(debug_assertions)]
     pub fn dev_apply(&mut self, command: &str, window: &mut Window, cx: &mut Context<Self>) {
+        // `section-menu=<name>` / `section-rename=<name>`: a custom section's header menu.
+        let custom = |name: &str| self.sections.iter().find(|s| s.name == name).map(|s| s.id);
+        if let Some(id) = command.strip_prefix("section-menu=").and_then(custom) {
+            self.section_menu = Some(id);
+            cx.notify();
+            return;
+        }
+        if let Some(id) = command.strip_prefix("section-rename=").and_then(custom) {
+            self.start_rename_section(id, window, cx);
+            return;
+        }
         let Some(id) = self.selected else { return };
         let name = self.habits.iter().find(|h| h.id == id).map(|h| h.name.clone()).unwrap_or_default();
         if let Some(goal) = command.strip_prefix("goal=") {
@@ -932,6 +949,107 @@ impl HabitView {
         }
         let done = active.iter().filter(|h| self.checkins.get(&h.id).is_some_and(|c| c.contains(&date))).count();
         done as f32 / active.len() as f32
+    }
+
+    /// A section's header in the grouped cards: its name and count, and for custom sections a
+    /// "…" (shown on hover) to rename or delete it.
+    fn render_section_header(&self, section: HabitSection, title: String, count: usize, cx: &mut Context<Self>) -> AnyElement {
+        let strings = i18n::t(cx);
+        let custom = match section {
+            HabitSection::Custom(id) => Some(id),
+            _ => None,
+        };
+        let renaming = custom.and_then(|id| self.renaming_section.as_ref().filter(|(r, _)| *r == id)).map(|(_, input)| input.clone());
+        let group = SharedString::from(format!("habit-section-header-{}", section.key()));
+        h_flex()
+            .id(group.clone())
+            .group(group.clone())
+            .h(px(30.))
+            .gap_1()
+            .pt_2()
+            .map(|el| match renaming {
+                Some(input) => el.child(
+                    h_flex().w(px(240.)).h(px(26.)).px_2().rounded(px(6.)).bg(cx.theme().colors().surface_background).child(input),
+                ),
+                None => el
+                    .child(Label::new(title).size(LabelSize::Small).weight(FontWeight::SEMIBOLD))
+                    .child(Label::new(count.to_string()).size(LabelSize::XSmall).color(Color::Muted)),
+            })
+            .when_some(custom, |el, id| {
+                let open = self.section_menu == Some(id);
+                el.child(
+                    div()
+                        .relative()
+                        .opacity(if open { 1. } else { 0. })
+                        .group_hover(group, |s| s.opacity(1.))
+                        .child(
+                            IconButton::new(SharedString::from(format!("habit-section-more-{id}")), IconName::Ellipsis)
+                                .size(px(22.))
+                                .icon_size(IconSize::Small)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.section_menu = Some(id);
+                                    cx.notify();
+                                })),
+                        )
+                        .when(open, |el| {
+                            el.child(PopoverAttachment::new(
+                                Placement::BelowLeft,
+                                popover(cx)
+                                    .w(px(200.))
+                                    .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                                        this.section_menu = None;
+                                        cx.notify();
+                                    }))
+                                    .child(
+                                        ListItem::new("rename-habit-section")
+                                            .start_slot(Icon::new(IconName::Pencil).color(Color::Muted))
+                                            .child(Label::new(strings.rename_section))
+                                            .on_click(cx.listener(move |this, _, window, cx| this.start_rename_section(id, window, cx))),
+                                    )
+                                    .child(
+                                        ListItem::new("delete-habit-section")
+                                            .start_slot(Icon::new(IconName::Trash).color(Color::Error))
+                                            .child(Label::new(strings.delete_section).color(Color::Error))
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.section_menu = None;
+                                                if let Err(err) = this.store.delete_habit_section(id) {
+                                                    eprintln!("failed to delete the section: {err:#}");
+                                                }
+                                                this.reload(cx);
+                                            })),
+                                    ),
+                            ))
+                        }),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn start_rename_section(&mut self, id: Id, window: &mut Window, cx: &mut Context<Self>) {
+        let strings = i18n::t(cx);
+        let name = self.sections.iter().find(|s| s.id == id).map(|s| s.name.clone()).unwrap_or_default();
+        let input = cx.new(|cx| {
+            let mut input = TextInput::new(Mode::SingleLine, strings.habit_section_name, cx);
+            input.set_text(name, cx);
+            input
+        });
+        cx.subscribe(&input, move |this, _, Submitted(name), cx| {
+            if let Err(err) = this.store.rename_habit_section(id, name) {
+                eprintln!("failed to rename the section: {err:#}");
+            }
+            this.renaming_section = None;
+            this.reload(cx);
+        })
+        .detach();
+        cx.subscribe(&input, |this, _, _: &Cancelled, cx| {
+            this.renaming_section = None;
+            cx.notify();
+        })
+        .detach();
+        window.focus(&input.focus_handle(cx), cx);
+        self.section_menu = None;
+        self.renaming_section = Some((id, input));
+        cx.notify();
     }
 
     /// A section's name: the default ones are translated, custom ones are the user's.
@@ -1432,15 +1550,7 @@ impl Render for HabitView {
                 v_flex()
                     .w_full()
                     .gap_2()
-                    .when(grouped, |el| {
-                        el.child(
-                            h_flex()
-                                .gap_1()
-                                .pt_2()
-                                .child(Label::new(title).size(LabelSize::Small).weight(FontWeight::SEMIBOLD))
-                                .child(Label::new(in_section.len().to_string()).size(LabelSize::XSmall).color(Color::Muted)),
-                        )
-                    })
+                    .when(grouped, |el| el.child(self.render_section_header(section, title, in_section.len(), cx)))
                     .child(div().flex().flex_wrap().gap(px(12.)).children(section_cards))
                     .into_any_element(),
             );

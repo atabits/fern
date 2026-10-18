@@ -13,7 +13,7 @@ use crate::actions::{DeleteTask, SelectNext, SelectPrevious, ToggleComplete};
 use crate::i18n::{self, CurrentLocale, Strings};
 use crate::lists_panel::{self, LIST_COLORS};
 use crate::task_detail::{OpenTask, TaskDetail, TaskUpdated};
-use crate::task_rows::{self, ClosedRange, GroupBy, Row, Section, SortBy};
+use crate::task_rows::{self, ClosedRange, DropTarget, GroupBy, Row, Section, SortBy};
 use crate::text_input::{Cancelled, Changed, Mode, Submitted, TextInput};
 
 const DETAIL_WIDTH: f32 = 400.;
@@ -278,6 +278,18 @@ impl TodoView {
                         self.reload(cx);
                     }
                 }
+                Some(("kdrop", spec)) => {
+                    // `kdrop=<task title part>><column number>`: drop a card on a kanban column.
+                    let strings = i18n::t(cx);
+                    let columns = task_rows::kanban_columns(self.rows_with(strings, &HashSet::new(), &HashSet::new()), strings);
+                    if let Some((needle, column)) = spec.split_once('>')
+                        && let Some(id) = self.tasks.iter().find(|t| t.title.contains(needle)).map(|t| t.id)
+                        && let Some((_, Some(target), _)) = column.parse::<usize>().ok().and_then(|c| columns.get(c))
+                    {
+                        let target = target.clone();
+                        self.drop_on_column(id, target, cx);
+                    }
+                }
                 Some(("flag", name)) => {
                     let default = name == "show_completed";
                     self.toggle_view_flag(name, default, cx);
@@ -531,8 +543,10 @@ impl TodoView {
         };
         let id = task.id;
         let due = task.due_date.map(|date| task_rows::due_label(date, task.due_time, today, strings));
+        let dragged = DraggedTask { id, title: task.title.clone().into() };
         v_flex()
             .id(ElementId::Uuid(id))
+            .on_drag(dragged, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
             .p_2()
             .gap_1p5()
             .rounded(px(8.))
@@ -583,6 +597,33 @@ impl TodoView {
         self.new_section = Some(input);
         self.header_menu_open = false;
         cx.notify();
+    }
+
+    /// A card dropped on a kanban column takes the column's value: its section, kind, date,
+    /// priority or tag, or completion. Leaving the Completed column reopens the task.
+    fn drop_on_column(&mut self, id: Id, target: DropTarget, cx: &mut Context<Self>) {
+        let Ok(Some(task)) = self.store.task(id) else { return };
+        let store = &self.store;
+        let result = (|| -> anyhow::Result<()> {
+            if task.is_completed() && target != DropTarget::Complete {
+                store.set_completed(id, false)?;
+            }
+            match target {
+                DropTarget::Section(section) => store.set_section(id, section),
+                DropTarget::Kind(kind) => store.set_kind(id, kind),
+                DropTarget::Complete => store.set_completed(id, true),
+                DropTarget::Due(date) => store.set_due(id, date, date.and(task.due_time)),
+                DropTarget::Priority(priority) => store.set_priority(id, priority),
+                DropTarget::Tag(Some(tag)) => {
+                    let mut tags: Vec<String> = task.tags.iter().skip(1).filter(|t| **t != tag).cloned().collect();
+                    tags.insert(0, tag);
+                    store.set_tags(id, &tags)
+                }
+                DropTarget::Tag(None) => store.set_tags(id, &[]),
+            }
+        })();
+        self.check(result);
+        self.reload(cx);
     }
 
     /// A per-list switch of the header's "…" menu ("Show Completed", "Show Details").
@@ -1721,10 +1762,18 @@ impl Render for TodoView {
                 .px_4()
                 .pb_4()
                 .overflow_x_scroll()
-                .children(columns.into_iter().enumerate().map(|(i, (title, cards))| {
+                .children(columns.into_iter().enumerate().map(|(i, (title, drop, cards))| {
                     let count = cards.len();
+                    let accent = theme.colors().accent;
                     v_flex()
                         .id(SharedString::from(format!("kanban-column-{i}")))
+                        .rounded(px(8.))
+                        .when_some(drop, |el, drop| {
+                            el.drag_over::<DraggedTask>(move |style, _, _, _| style.bg(accent.opacity(0.08)))
+                                .on_drop(cx.listener(move |this, dragged: &DraggedTask, _, cx| {
+                                    this.drop_on_column(dragged.id, drop.clone(), cx)
+                                }))
+                        })
                         .w(px(270.))
                         .flex_none()
                         .max_h_full()
@@ -1776,7 +1825,7 @@ impl Render for TodoView {
                 Row::Section { section, count, collapsed } => {
                     self.render_section(*section, *count, *collapsed, strings, cx)
                 }
-                Row::Day { label, count } => h_flex()
+                Row::Day { label, count, .. } => h_flex()
                     .h(px(36.))
                     .gap_2()
                     .pl(px(GUTTER))

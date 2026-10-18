@@ -40,8 +40,10 @@ impl Section {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Row {
     Section { section: Section, count: usize, collapsed: bool },
-    /// A day header in the Completed and Won't Do views, e.g. "Sunday, September 27".
-    Day { label: String, count: usize },
+    /// A group header with a label: a day in the Completed and Won't Do views ("Sunday,
+    /// September 27"), a date, tag or priority group, or a list section. `drop` says what moving
+    /// a task into the group does, if anything.
+    Day { label: String, count: usize, drop: Option<DropTarget> },
     Task { task: Task, depth: usize, has_children: bool, collapsed: bool },
 }
 
@@ -112,6 +114,20 @@ pub fn build_rows(
         }
     }
     rows
+}
+
+/// What dropping a task onto a group (a kanban column) changes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DropTarget {
+    /// A list section, or none.
+    Section(Option<Id>),
+    Kind(Kind),
+    Complete,
+    /// A due date, or none.
+    Due(Option<NaiveDate>),
+    Priority(Priority),
+    /// A tag in place of the first one, or no tags.
+    Tag(Option<String>),
 }
 
 /// The header sort menu's "Sort by".
@@ -201,6 +217,7 @@ pub fn sort_tasks(tasks: &mut [Task], sort: SortBy) {
 /// a last group. Groups follow a fixed order: by date, overdue first and undated last.
 pub fn grouped_rows(tasks: &[Task], group: GroupBy, today: NaiveDate, strings: &Strings) -> Vec<Row> {
     let (open, done): (Vec<&Task>, Vec<&Task>) = tasks.iter().partition(|t| !t.is_completed());
+    // Each group's order, label and what dropping a task into it does.
     let key = |task: &Task| -> (i64, String) {
         match group {
             GroupBy::Date => match task.due_date {
@@ -236,6 +253,19 @@ pub fn grouped_rows(tasks: &[Task], group: GroupBy, today: NaiveDate, strings: &
     if group == GroupBy::None {
         return open.into_iter().chain(done).map(task_row).collect();
     }
+    let drop_for = |task: &Task, order: i64, label: &str| -> Option<DropTarget> {
+        match group {
+            GroupBy::Date => match order {
+                1 => Some(DropTarget::Due(Some(today))),
+                2 => Some(DropTarget::Due(Some(today + chrono::Duration::days(1)))),
+                5 => Some(DropTarget::Due(None)),
+                _ => None,
+            },
+            GroupBy::Priority => Some(DropTarget::Priority(task.priority)),
+            GroupBy::Tag => Some(DropTarget::Tag(task.tags.first().map(|_| label.to_owned()))),
+            _ => None,
+        }
+    };
     let mut groups: Vec<((i64, String), Vec<&Task>)> = Vec::new();
     for task in open {
         let k = key(task);
@@ -246,12 +276,14 @@ pub fn grouped_rows(tasks: &[Task], group: GroupBy, today: NaiveDate, strings: &
     }
     // Tag groups are alphabetical, the rest by their fixed order.
     groups.sort_by(|((a, la), _), ((b, lb), _)| a.cmp(b).then_with(|| la.to_lowercase().cmp(&lb.to_lowercase())));
+    let completed_at = groups.len();
     if !done.is_empty() {
         groups.push(((i64::MAX, strings.group_completed.to_owned()), done));
     }
     let mut rows = Vec::new();
-    for ((_, label), items) in groups {
-        rows.push(Row::Day { label, count: items.len() });
+    for (i, ((order, label), items)) in groups.into_iter().enumerate() {
+        let drop = if i == completed_at { Some(DropTarget::Complete) } else { drop_for(items[0], order, &label) };
+        rows.push(Row::Day { label, count: items.len(), drop });
         rows.extend(items.into_iter().map(task_row));
     }
     rows
@@ -262,27 +294,28 @@ pub fn grouped_rows(tasks: &[Task], group: GroupBy, today: NaiveDate, strings: &
 pub fn section_rows(tasks: &[Task], sections: &[ListSection], collapsed_tasks: &HashSet<Id>, strings: &Strings) -> Vec<Row> {
     let (open, done): (Vec<Task>, Vec<Task>) = tasks.iter().cloned().partition(|t| !t.is_completed());
     let mut rows = Vec::new();
-    let group = |label: String, tasks: Vec<Task>, always: bool, rows: &mut Vec<Row>| {
+    let group = |label: String, drop: DropTarget, tasks: Vec<Task>, always: bool, rows: &mut Vec<Row>| {
+        let drop = Some(drop);
         if tasks.is_empty() && !always {
             return;
         }
-        rows.push(Row::Day { label, count: tasks.len() });
+        rows.push(Row::Day { label, count: tasks.len(), drop });
         rows.extend(build_rows(&tasks, collapsed_tasks, &HashSet::new(), false));
     };
     let known: HashSet<Id> = sections.iter().map(|s| s.id).collect();
     let unsectioned: Vec<Task> =
         open.iter().filter(|t| t.section_id.is_none_or(|s| !known.contains(&s))).cloned().collect();
-    group(strings.not_sectioned.to_owned(), unsectioned, false, &mut rows);
+    group(strings.not_sectioned.to_owned(), DropTarget::Section(None), unsectioned, false, &mut rows);
     for section in sections {
         let tasks: Vec<Task> = open.iter().filter(|t| t.section_id == Some(section.id)).cloned().collect();
-        group(section.name.clone(), tasks, true, &mut rows);
+        group(section.name.clone(), DropTarget::Section(Some(section.id)), tasks, true, &mut rows);
     }
-    group(strings.group_completed.to_owned(), done, false, &mut rows);
+    group(strings.group_completed.to_owned(), DropTarget::Complete, done, false, &mut rows);
     rows
 }
 
 /// A kanban column: its title and cards, each a top-level task with its subtasks.
-pub type KanbanColumn = (String, Vec<(Task, Vec<Task>)>);
+pub type KanbanColumn = (String, Option<DropTarget>, Vec<(Task, Vec<Task>)>);
 
 /// Splits list rows into kanban columns, one per group header; rows before any header form an
 /// untitled column. Subtasks go into their top-level task's card.
@@ -290,13 +323,20 @@ pub fn kanban_columns(rows: Vec<Row>, strings: &Strings) -> Vec<KanbanColumn> {
     let mut columns: Vec<KanbanColumn> = Vec::new();
     for row in rows {
         match row {
-            Row::Section { section, .. } => columns.push((section.title(strings).to_owned(), Vec::new())),
-            Row::Day { label, .. } => columns.push((label, Vec::new())),
+            Row::Section { section, .. } => {
+                let drop = match section {
+                    Section::Tasks => DropTarget::Kind(Kind::Task),
+                    Section::Notes => DropTarget::Kind(Kind::Note),
+                    Section::Completed => DropTarget::Complete,
+                };
+                columns.push((section.title(strings).to_owned(), Some(drop), Vec::new()))
+            }
+            Row::Day { label, drop, .. } => columns.push((label, drop, Vec::new())),
             Row::Task { task, depth, .. } => {
                 if columns.is_empty() {
-                    columns.push((String::new(), Vec::new()));
+                    columns.push((String::new(), None, Vec::new()));
                 }
-                let cards = &mut columns.last_mut().expect("a column was just ensured").1;
+                let cards = &mut columns.last_mut().expect("a column was just ensured").2;
                 match cards.last_mut() {
                     Some((_, subtasks)) if depth > 0 => subtasks.push(task),
                     _ => cards.push((task, Vec::new())),
@@ -426,7 +466,7 @@ pub fn rows_by_day(
     }
     let mut rows = Vec::new();
     for (day, items) in groups {
-        rows.push(Row::Day { label: day_header(day, today, strings), count: items.len() });
+        rows.push(Row::Day { label: day_header(day, today, strings), count: items.len(), drop: None });
         rows.extend(items.into_iter().map(|task| Row::Task {
             task: task.clone(),
             depth: 0,
@@ -530,7 +570,7 @@ mod tests {
         rows.iter()
             .map(|row| match row {
                 Row::Section { section, count, .. } => format!("# {} {count}", section.title(&EN)),
-                Row::Day { label, count } => format!("## {label} {count}"),
+                Row::Day { label, count, .. } => format!("## {label} {count}"),
                 Row::Task { task, depth, .. } => format!("{}{}", "  ".repeat(*depth), task.title),
             })
             .collect()
@@ -617,7 +657,7 @@ mod tests {
         let columns = kanban_columns(rows, &EN);
         let shape: Vec<(String, Vec<(String, usize)>)> = columns
             .into_iter()
-            .map(|(title, cards)| (title, cards.into_iter().map(|(t, subs)| (t.title, subs.len())).collect()))
+            .map(|(title, _, cards)| (title, cards.into_iter().map(|(t, subs)| (t.title, subs.len())).collect()))
             .collect();
         assert_eq!(shape, [
             ("Tasks".to_owned(), vec![("parent".to_owned(), 1), ("solo".to_owned(), 0)]),
@@ -673,6 +713,19 @@ mod tests {
             "## home 1", "cherry", "## work 1", "Apple", "## No Tags 1", "banana", "## Completed 1", "done"
         ]);
         assert_eq!(shape(&grouped_rows(&tasks, GroupBy::None, today, &EN)), ["banana", "Apple", "cherry", "done"]);
+        let drops = |rows: Vec<Row>| -> Vec<Option<DropTarget>> {
+            rows.into_iter().filter_map(|r| match r { Row::Day { drop, .. } => Some(drop), _ => None }).collect()
+        };
+        assert_eq!(drops(grouped_rows(&tasks, GroupBy::Date, today, &EN)), [
+            None,
+            Some(DropTarget::Due(Some(today))),
+            Some(DropTarget::Due(None)),
+            Some(DropTarget::Complete),
+        ]);
+        assert_eq!(drops(grouped_rows(&tasks, GroupBy::Tag, today, &EN))[..2], [
+            Some(DropTarget::Tag(Some("home".into()))),
+            Some(DropTarget::Tag(Some("work".into()))),
+        ]);
         assert_eq!(SortBy::from_key(SortBy::Tag.key()), SortBy::Tag);
         assert_eq!(GroupBy::from_key("nonsense"), GroupBy::Custom);
     }

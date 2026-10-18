@@ -4169,6 +4169,8 @@ impl TodoView {
         h_flex()
             .id(SharedString::from(format!("group-{section:?}")))
             .h(px(36.))
+            // As the original's, the arrow sits 7 px in from the rows' edge.
+            .pl(px(7.))
             .gap_1()
             .cursor_pointer()
             .on_click(cx.listener(move |this, _, _, cx| this.toggle_section(section, cx)))

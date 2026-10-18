@@ -38,6 +38,17 @@ struct Draft {
     editing: Option<Id>,
     /// A birthday's "Show Age".
     show_age: bool,
+    /// The row whose dropdown is open, or the icon picker.
+    open: Option<DraftRow>,
+}
+
+/// The countdown dialog's fields that open a dropdown, as in the original.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DraftRow {
+    Icon,
+    Date,
+    Repeat,
+    Type,
 }
 
 /// Emoji offered for countdowns; the original's illustrated icon set is its own artwork.
@@ -195,7 +206,7 @@ impl CountdownView {
             Filter::Kind(kind) => kind,
             Filter::All => CountdownKind::Countdown,
         };
-        self.draft = Some(Draft { name, kind, date: today, month: calendar::month_start(today), icon: None, color: None, repeat: None, editing: None, show_age: false });
+        self.draft = Some(Draft { name, kind, date: today, month: calendar::month_start(today), icon: None, color: None, repeat: None, editing: None, show_age: false, open: None });
         cx.notify();
     }
 
@@ -406,13 +417,25 @@ impl CountdownView {
             .into_any_element()
     }
 
+    /// The original's add / edit dialog: the icon and name on top, then a label on the left and
+    /// the value in a field with a ▾ for Date, Repeat and Type, "Show Age" for a birthday, and
+    /// below a divider Cancel and Save.
     fn render_draft(&self, cx: &mut Context<Self>) -> AnyElement {
         let Some(draft) = self.draft.as_ref() else { return div().into_any_element() };
         let strings = i18n::t(cx);
         let theme = cx.theme().clone();
         let today = Local::now().date_naive();
-        let (selected, month, kind) = (draft.date, draft.month, draft.kind);
+        let (selected, month, kind, open) = (draft.date, draft.month, draft.kind, draft.open);
+        let set = |f: Box<dyn Fn(&mut Draft)>| {
+            cx.listener(move |this: &mut Self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>| {
+                if let Some(draft) = this.draft.as_mut() {
+                    f(draft);
+                }
+                cx.notify();
+            })
+        };
 
+        // The Date dropdown: a month to pick the day in.
         let days: Vec<AnyElement> = calendar::month_grid(month)
             .chunks(7)
             .map(|week| {
@@ -437,188 +460,262 @@ impl CountdownView {
                                         Color::Muted
                                     },
                                 ))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    if let Some(draft) = this.draft.as_mut() {
-                                        draft.date = date;
-                                    }
-                                    cx.notify();
-                                })),
+                                .on_click(set(Box::new(move |d| {
+                                    d.date = date;
+                                    d.open = None;
+                                }))),
                         )
                     }))
                     .into_any_element()
             })
             .collect();
-        let kinds = [CountdownKind::Countdown, CountdownKind::Anniversary, CountdownKind::Birthday, CountdownKind::Holiday];
-        let shift = |delta: i32| {
-            move |this: &mut Self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>| {
-                if let Some(draft) = this.draft.as_mut() {
-                    draft.month = calendar::add_months(draft.month, delta);
-                }
-                cx.notify();
-            }
-        };
-
-        popover(cx)
-            .w(px(260.))
-            .p_2()
-            .gap_2()
-            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                this.draft = None;
-                cx.notify();
-            }))
-            .child(Label::new(if draft.editing.is_some() { strings.countdown_edit } else { strings.countdown_new }).weight(FontWeight::SEMIBOLD))
-            .child(
-                h_flex()
-                    .h(px(30.))
-                    .px_2()
-                    .rounded(px(6.))
-                    .bg(theme.colors().background)
-                    .child(draft.name.clone()),
-            )
-            // The original's icon picker, as for habits: an emoji and its background color.
-            .child(div().flex().flex_wrap().gap_0p5().children(COUNTDOWN_EMOJI.iter().map(|emoji| {
-                let selected = draft.icon.as_deref() == Some(*emoji);
-                div()
-                    .id(SharedString::from(format!("countdown-emoji-{emoji}")))
-                    .size(px(26.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded(px(5.))
-                    .cursor_pointer()
-                    .text_size(px(15.))
-                    .when(selected, |el| el.bg(theme.colors().element_selected))
-                    .hover(|s| s.bg(theme.colors().element_hover))
-                    .child(*emoji)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        if let Some(draft) = this.draft.as_mut() {
-                            draft.icon = (!selected).then(|| (*emoji).to_owned());
-                        }
-                        cx.notify();
-                    }))
-            })))
-            .child(h_flex().gap_1p5().children(
-                std::iter::once(None).chain(crate::lists_panel::LIST_COLORS.iter().map(|c| Some(*c))).map(|color| {
-                    let selected = draft.color.as_deref() == color;
-                    let fill = crate::lists_panel::parse_color(color).unwrap_or(theme.colors().accent);
-                    div()
-                        .id(SharedString::from(format!("countdown-color-{}", color.unwrap_or("none"))))
-                        .size(px(18.))
-                        .rounded_full()
-                        .cursor_pointer()
-                        .bg(fill.opacity(if color.is_none() { 0.35 } else { 1. }))
-                        .when(selected, |el| el.border_2().border_color(theme.colors().text))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            if let Some(draft) = this.draft.as_mut() {
-                                draft.color = color.map(str::to_owned);
-                            }
-                            cx.notify();
-                        }))
-                }),
-            ))
-            // The original's Repeat: None, Daily, Weekly, Monthly, Yearly.
-            .child({
-                use fern_core::Frequency;
-                let options = [
-                    (None, strings.none_option),
-                    (Some(Frequency::Daily), strings.repeat_daily),
-                    (Some(Frequency::Weekly), strings.repeat_weekly),
-                    (Some(Frequency::Monthly), strings.repeat_monthly),
-                    (Some(Frequency::Yearly), strings.repeat_yearly),
-                ];
-                let current = draft.repeat.as_ref().map(|r| r.frequency);
-                h_flex()
-                    .gap_1()
-                    .flex_wrap()
-                    .child(Label::new(strings.repeat).size(LabelSize::Small).color(Color::Muted))
-                    .children(options.into_iter().map(|(frequency, label)| {
-                        let selected = current == frequency;
-                        div()
-                            .id(SharedString::from(format!("countdown-repeat-{label}")))
-                            .px_1p5()
-                            .py_0p5()
-                            .rounded(px(4.))
-                            .cursor_pointer()
-                            .bg(if selected { theme.colors().accent } else { theme.colors().element_hover })
-                            .child(Label::new(label).size(LabelSize::XSmall))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                if let Some(draft) = this.draft.as_mut() {
-                                    draft.repeat = frequency.map(|f| fern_core::Recurrence::new(f, 1));
-                                }
-                                cx.notify();
-                            }))
-                    }))
-            })
-            .child(h_flex().gap_1().children(kinds.map(|option| {
-                let selected = option == kind;
-                div()
-                    .id(SharedString::from(format!("countdown-kind-{}", option.as_str())))
-                    .px_2()
-                    .py_0p5()
-                    .rounded(px(4.))
-                    .cursor_pointer()
-                    .bg(if selected { theme.colors().accent } else { theme.colors().element_hover })
-                    .child(Label::new(kind_label(option, strings)).size(LabelSize::Small))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        if let Some(draft) = this.draft.as_mut() {
-                            draft.kind = option;
-                        }
-                        cx.notify();
-                    }))
-            })))
-            // The original's "Show Age", for a birthday.
-            .when(kind == CountdownKind::Birthday, |el| {
-                let on = self.draft.as_ref().is_some_and(|d| d.show_age);
-                el.child(
-                    h_flex()
-                        .id("countdown-show-age")
-                        .gap_2()
-                        .cursor_pointer()
-                        .child(Switch::new().toggle_state(on))
-                        .child(Label::new(strings.countdown_show_age).size(LabelSize::Small))
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            if let Some(draft) = this.draft.as_mut() {
-                                draft.show_age = !draft.show_age;
-                            }
-                            cx.notify();
-                        })),
-                )
-            })
+        let shift = |delta: i32| set(Box::new(move |d| d.month = calendar::add_months(d.month, delta)));
+        let date_menu = v_flex()
+            .gap_1()
             .child(
                 h_flex()
                     .child(div().flex_1().child(Label::new(calendar::month_title(month, strings)).size(LabelSize::Small)))
-                    .child(
-                        IconButton::new("countdown-prev", IconName::ChevronLeft)
-                            .size(px(22.))
-                            .icon_size(IconSize::Small)
-                            .on_click(cx.listener(shift(-1))),
-                    )
-                    .child(
-                        IconButton::new("countdown-next", IconName::ChevronRight)
-                            .size(px(22.))
-                            .icon_size(IconSize::Small)
-                            .on_click(cx.listener(shift(1))),
-                    ),
+                    .child(IconButton::new("countdown-prev", IconName::ChevronLeft).size(px(22.)).icon_size(IconSize::Small).on_click(shift(-1)))
+                    .child(IconButton::new("countdown-next", IconName::ChevronRight).size(px(22.)).icon_size(IconSize::Small).on_click(shift(1))),
             )
             .child(h_flex().children(crate::calendar::weekday_labels(&strings.weekdays_narrow).iter().map(|day| {
                 div().flex_1().flex().justify_center().child(Label::new(*day).size(LabelSize::XSmall).color(Color::Muted))
             })))
             .child(v_flex().children(days))
-            .child(
+            .into_any_element();
+
+        // The Repeat dropdown: the original's None, Daily, Weekly, Monthly, Yearly.
+        use fern_core::Frequency;
+        let repeats = [
+            (None, strings.none_option),
+            (Some(Frequency::Daily), strings.repeat_daily),
+            (Some(Frequency::Weekly), strings.repeat_weekly),
+            (Some(Frequency::Monthly), strings.repeat_monthly),
+            (Some(Frequency::Yearly), strings.repeat_yearly),
+        ];
+        let current = draft.repeat.as_ref().map(|r| r.frequency);
+        let repeat_text = repeats.iter().find(|(f, _)| *f == current).map_or(strings.none_option, |(_, l)| *l);
+        let choice = |id: SharedString, label: &'static str, on: bool| {
+            ListItem::new(id)
+                .height(px(34.))
+                .child(Label::new(label).color(if on { Color::Accent } else { Color::Default }))
+                .when(on, |item| item.end_slot(Icon::new(IconName::Check).size(IconSize::XSmall).color(Color::Accent)))
+        };
+        let repeat_menu = v_flex()
+            .children(repeats.into_iter().map(|(frequency, label)| {
+                choice(SharedString::from(format!("countdown-repeat-{label}")), label, current == frequency).on_click(set(Box::new(
+                    move |d| {
+                        d.repeat = frequency.map(|f| fern_core::Recurrence::new(f, 1));
+                        d.open = None;
+                    },
+                )))
+            }))
+            .into_any_element();
+        let type_menu = v_flex()
+            .children([CountdownKind::Countdown, CountdownKind::Anniversary, CountdownKind::Birthday, CountdownKind::Holiday].map(|option| {
+                choice(SharedString::from(format!("countdown-kind-{}", option.as_str())), kind_label(option, strings), option == kind)
+                    .start_slot(Icon::new(kind_icon(option)).color(Color::Muted))
+                    .on_click(set(Box::new(move |d| {
+                        d.kind = option;
+                        d.open = None;
+                    })))
+            }))
+            .into_any_element();
+
+        // The icon picker under the icon: an emoji and its background color.
+        let icon_menu = v_flex()
+            .gap_2()
+            .child(div().flex().flex_wrap().gap_0p5().children(COUNTDOWN_EMOJI.iter().map(|emoji| {
+                let on = draft.icon.as_deref() == Some(*emoji);
                 div()
-                    .id("countdown-save")
-                    .h(px(30.))
+                    .id(SharedString::from(format!("countdown-emoji-{emoji}")))
+                    .size(px(30.))
                     .flex()
                     .items_center()
                     .justify_center()
                     .rounded(px(6.))
                     .cursor_pointer()
-                    .bg(theme.colors().accent)
-                    .child(Label::new(strings.save).size(LabelSize::Small))
-                    .on_click(cx.listener(|this, _, _, cx| this.save_draft(cx))),
+                    .text_size(px(17.))
+                    .when(on, |el| el.bg(theme.colors().element_selected))
+                    .hover(|s| s.bg(theme.colors().element_hover))
+                    .child(*emoji)
+                    .on_click(set(Box::new(move |d| d.icon = (!on).then(|| (*emoji).to_owned()))))
+            })))
+            .child(h_flex().gap_1p5().children(std::iter::once(None).chain(crate::lists_panel::LIST_COLORS.iter().map(|c| Some(*c))).map(|color| {
+                let on = draft.color.as_deref() == color;
+                let fill = crate::lists_panel::parse_color(color).unwrap_or(theme.colors().accent);
+                div()
+                    .id(SharedString::from(format!("countdown-color-{}", color.unwrap_or("none"))))
+                    .size(px(20.))
+                    .rounded_full()
+                    .cursor_pointer()
+                    .bg(fill.opacity(if color.is_none() { 0.35 } else { 1. }))
+                    .when(on, |el| el.border_2().border_color(theme.colors().text))
+                    .on_click(set(Box::new(move |d| d.color = color.map(str::to_owned))))
+            })))
+            .into_any_element();
+
+        let dropdown = |which: DraftRow, text: String, menu: AnyElement, cx: &Context<Self>| -> AnyElement {
+            let on = open == Some(which);
+            div()
+                .relative()
+                .child(
+                    h_flex()
+                        .id(SharedString::from(format!("countdown-row-{which:?}")))
+                        .h(px(32.))
+                        .px_3()
+                        .rounded(px(6.))
+                        .border_1()
+                        .border_color(if on { theme.colors().accent } else { theme.colors().border })
+                        .cursor_pointer()
+                        .child(div().flex_1().min_w_0().child(Label::new(text).truncate()))
+                        .child(Icon::new(IconName::ChevronDown).size(IconSize::XSmall).color(Color::Muted))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if let Some(draft) = this.draft.as_mut() {
+                                draft.open = if draft.open == Some(which) { None } else { Some(which) };
+                            }
+                            cx.notify();
+                        })),
+                )
+                .when(on, |el| {
+                    el.child(PopoverAttachment::new(
+                        Placement::BelowLeft,
+                        popover(cx)
+                            .w(px(294.))
+                            .p_2()
+                            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                                if let Some(draft) = this.draft.as_mut() {
+                                    draft.open = None;
+                                }
+                                cx.notify();
+                            }))
+                            .child(menu),
+                    ))
+                })
+                .into_any_element()
+        };
+        let row = |label: &'static str, content: AnyElement| {
+            h_flex()
+                .min_h(px(32.))
+                .gap_2()
+                .child(div().w(px(80.)).flex_none().child(Label::new(label)))
+                .child(div().flex_1().min_w_0().child(content))
+        };
+        let date_row = row(strings.filter_date, dropdown(DraftRow::Date, format_date(selected, strings), date_menu, cx));
+        let repeat_row = row(strings.repeat, dropdown(DraftRow::Repeat, repeat_text.to_owned(), repeat_menu, cx));
+        let type_row = row(strings.filter_type, dropdown(DraftRow::Type, kind_label(kind, strings).to_owned(), type_menu, cx));
+        let icon_open = open == Some(DraftRow::Icon);
+        let icon = div()
+            .relative()
+            .child(
+                div()
+                    .id("countdown-icon")
+                    .size(px(35.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_full()
+                    .cursor_pointer()
+                    .bg(crate::lists_panel::parse_color(draft.color.as_deref()).unwrap_or(theme.colors().accent).opacity(0.35))
+                    .child(match &draft.icon {
+                        Some(icon) => div().text_size(px(18.)).child(icon.clone()).into_any_element(),
+                        None => Icon::new(kind_icon(kind)).color(Color::Default).into_any_element(),
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(draft) = this.draft.as_mut() {
+                            draft.open = if draft.open == Some(DraftRow::Icon) { None } else { Some(DraftRow::Icon) };
+                        }
+                        cx.notify();
+                    })),
+            )
+            .when(icon_open, |el| {
+                el.child(PopoverAttachment::new(
+                    Placement::BelowLeft,
+                    popover(cx)
+                        .w(px(300.))
+                        .p_3()
+                        .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                            if let Some(draft) = this.draft.as_mut() {
+                                draft.open = None;
+                            }
+                            cx.notify();
+                        }))
+                        .child(icon_menu),
+                ))
+            });
+        let button = |id: &'static str, label: &'static str, primary: bool| {
+            div()
+                .id(id)
+                .w(px(100.))
+                .h(px(30.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(6.))
+                .cursor_pointer()
+                .when(primary, |el| el.bg(theme.colors().accent))
+                .when(!primary, |el| el.border_1().border_color(theme.colors().border))
+                .child(Label::new(label).size(LabelSize::Small))
+        };
+        let show_age = draft.show_age;
+
+        popover(cx)
+            .w(px(430.))
+            .p_4()
+            .gap_2()
+            .child(
+                h_flex()
+                    .child(div().flex_1().child(Label::new(if draft.editing.is_some() { strings.countdown_edit } else { strings.countdown_new }).weight(FontWeight::BOLD)))
+                    .child(IconButton::new("countdown-x", IconName::X).icon_color(Color::Muted).on_click(cx.listener(|this, _, _, cx| {
+                        this.draft = None;
+                        cx.notify();
+                    }))),
+            )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(div().w(px(80.)).flex_none().child(icon))
+                    .child(
+                        h_flex()
+                            .flex_1()
+                            .h(px(32.))
+                            .px_3()
+                            .rounded(px(6.))
+                            .border_1()
+                            .border_color(theme.colors().border)
+                            .child(draft.name.clone()),
+                    ),
+            )
+            .child(date_row)
+            .child(repeat_row)
+            .child(type_row)
+            .child(div().mt_1().h(px(1.)).bg(theme.colors().border))
+            // The original's "Show Age", for a birthday.
+            .when(kind == CountdownKind::Birthday, |el| {
+                el.child(
+                    h_flex()
+                        .id("countdown-show-age")
+                        .gap_2()
+                        .cursor_pointer()
+                        .child(Switch::new().toggle_state(show_age))
+                        .child(Label::new(strings.countdown_show_age))
+                        .on_click(set(Box::new(|d| d.show_age = !d.show_age))),
+                )
+            })
+            .child(
+                h_flex()
+                    .pt_2()
+                    .gap(px(10.))
+                    .justify_end()
+                    .child(button("countdown-cancel", strings.cancel, false).on_click(cx.listener(|this, _, _, cx| {
+                        this.draft = None;
+                        cx.notify();
+                    })))
+                    .child(button("countdown-save", strings.save, true).on_click(cx.listener(|this, _, _, cx| this.save_draft(cx)))),
             )
             .into_any_element()
     }
+
 }
 
 impl Render for CountdownView {
@@ -641,8 +738,22 @@ impl Render for CountdownView {
             .cloned()
             .collect();
         let cards: Vec<AnyElement> = shown.iter().map(|c| self.render_card(c, cx)).collect();
+        // The add / edit dialog over a dimmed background, as the original shows it.
+        let modal = self.draft.is_some().then(|| {
+            div()
+                .id("countdown-modal")
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(gpui::black().opacity(0.35))
+                .occlude()
+                .child(self.render_draft(cx))
+        });
 
         v_flex()
+            .relative()
             .size_full()
             .bg(theme.colors().background)
             .text_color(theme.colors().text)
@@ -684,9 +795,6 @@ impl Render for CountdownView {
                                                 }),
                                         ),
                                 ))
-                            })
-                            .when(self.draft.is_some(), |el| {
-                                el.child(PopoverAttachment::new(Placement::BelowRight, self.render_draft(cx)))
                             }),
                     )
                     .child(IconButton::new("countdown-more", IconName::Ellipsis)),
@@ -718,5 +826,6 @@ impl Render for CountdownView {
                     })
                     .child(div().flex().flex_wrap().gap(px(20.)).children(cards)),
             )
+            .children(modal)
     }
 }

@@ -49,6 +49,7 @@ pub enum IconName {
     LayoutGrid,
     LayoutTemplate,
     Link,
+    Mail,
     List,
     ListChecks,
     ListTree,

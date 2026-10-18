@@ -67,6 +67,19 @@ pub fn task_html(task: &Task, checklist: &[ChecklistItem], today: NaiveDate, str
     page(&task.title, &body)
 }
 
+/// The Summary's report: a section per group with its lines, for "Save as → PDF".
+pub fn report_html(heading: &str, groups: &[(String, Vec<String>)]) -> String {
+    let mut body = String::new();
+    for (title, lines) in groups {
+        body.push_str(&format!("<h2>{}</h2><ul>", escape(title)));
+        for line in lines {
+            body.push_str(&format!("<li>{}</li>", escape(line)));
+        }
+        body.push_str("</ul>");
+    }
+    page(heading, &body)
+}
+
 fn page(title: &str, body: &str) -> String {
     let title = escape(title);
     format!(

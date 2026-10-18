@@ -34,6 +34,8 @@ pub struct SummaryView {
     menu: Option<Menu>,
     /// "Copied" shows on the button after a copy.
     copied: bool,
+    /// The "Save as" menu, while open.
+    save_menu: bool,
     /// The "Custom" date fields, while open.
     custom: Option<(Entity<TextInput>, Entity<TextInput>)>,
 }
@@ -45,6 +47,11 @@ pub struct Report {
 }
 
 impl Report {
+    /// A `mailto:` link with the report as the message, for "Save as → Send Email".
+    pub fn mailto(&self, subject: &str) -> String {
+        format!("mailto:?subject={}&body={}", percent_encode(subject), percent_encode(&self.markdown()))
+    }
+
     /// The report as Markdown, as "Copy" puts it on the clipboard.
     pub fn markdown(&self) -> String {
         let mut out = format!("# {}\n", self.heading);
@@ -56,6 +63,16 @@ impl Report {
         }
         out
     }
+}
+
+/// Percent-encodes everything but unreserved characters, for a URL query.
+fn percent_encode(text: &str) -> String {
+    text.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
 }
 
 pub fn period_label(period: Period, today: NaiveDate, strings: &Strings) -> String {
@@ -145,7 +162,7 @@ impl SummaryView {
     pub fn new(store: Rc<Store>) -> Self {
         // The original keeps the Summary's choices; so does Fern, in the settings table.
         let options = store.summary_options().unwrap_or_default();
-        Self { store, options, menu: None, copied: false, custom: None }
+        Self { store, options, menu: None, copied: false, custom: None, save_menu: false }
     }
 
     /// "Custom" in the Date menu: Start and End fields with Cancel and Confirm.
@@ -214,6 +231,9 @@ impl SummaryView {
         }
         if menu == "habits" {
             self.options.habits = true;
+        }
+        if menu == "save" {
+            self.save_menu = true;
         }
         cx.notify();
     }
@@ -479,6 +499,8 @@ impl Render for SummaryView {
         let report = self.current_report(cx);
         let empty = report.groups.is_empty();
         let markdown = report.markdown();
+        let mailto = report.mailto(&format!("{} {}", strings.summary, report.heading));
+        let (report_heading, report_groups) = (format!("{} {}", strings.summary, report.heading), report.groups.clone());
 
         let body = v_flex()
             .id("summary-report")
@@ -521,7 +543,57 @@ impl Render for SummaryView {
                     )
                     .child(body)
                     .child(
-                        h_flex().h(px(44.)).px_4().justify_end().border_t_1().border_color(colors.border_variant).child(
+                        h_flex().h(px(44.)).px_4().gap_5().justify_end().border_t_1().border_color(colors.border_variant).child({
+                            let heading = report_heading.clone();
+                            let groups = report_groups.clone();
+                            let mail = mailto.clone();
+                            let menu = self.save_menu.then(|| {
+                                PopoverAttachment::new(
+                                    Placement::AboveRight,
+                                    popover(cx)
+                                        .w(px(180.))
+                                        .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                                            this.save_menu = false;
+                                            cx.notify();
+                                        }))
+                                        .child(
+                                            ListItem::new("save-pdf")
+                                                .start_slot(Icon::new(IconName::FileText).color(Color::Error))
+                                                .child(Label::new(strings.summary_pdf))
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.save_menu = false;
+                                                    let html = crate::print::report_html(&heading, &groups);
+                                                    if let Err(err) = crate::print::open("summary", &html) {
+                                                        eprintln!("failed to open the summary for printing: {err:#}");
+                                                    }
+                                                    cx.notify();
+                                                })),
+                                        )
+                                        .child(
+                                            ListItem::new("save-email")
+                                                .start_slot(Icon::new(IconName::Mail).color(Color::Accent))
+                                                .child(Label::new(strings.summary_send_email))
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.save_menu = false;
+                                                    cx.open_url(&mail);
+                                                    cx.notify();
+                                                })),
+                                        ),
+                                )
+                            });
+                            h_flex()
+                                .id("summary-save-as")
+                                .relative()
+                                .gap_1()
+                                .cursor_pointer()
+                                .child(Icon::new(IconName::Share).size(IconSize::Small).color(Color::Muted))
+                                .child(Label::new(strings.summary_save_as).size(LabelSize::Small))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.save_menu = !this.save_menu;
+                                    cx.notify();
+                                }))
+                                .children(menu)
+                        }).child(
                             h_flex()
                                 .id("summary-copy")
                                 .gap_1()
@@ -563,5 +635,7 @@ mod tests {
         let day = short_date(today, &EN);
         assert_eq!(report.groups, [("Completed".to_owned(), vec![format!("[x] [{day}] Ship it #work")])]);
         assert_eq!(report.markdown(), format!("# {day}\n\n## Completed\n- [x] [{day}] Ship it #work\n"));
+        assert!(report.mailto("Summary").starts_with("mailto:?subject=Summary&body=%23%20"));
+        assert_eq!(percent_encode("a b&c"), "a%20b%26c");
     }
 }

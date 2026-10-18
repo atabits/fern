@@ -157,6 +157,27 @@ fn next_birthday(born: NaiveDate, today: NaiveDate) -> NaiveDate {
     if this_year >= today { this_year } else { on(today.year() + 1) }
 }
 
+/// A ready-made countdown of the original's name field: its name (translated by the app by
+/// this key), an emoji standing in for the original's artwork, and a color.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Preset {
+    pub key: &'static str,
+    pub icon: &'static str,
+    pub color: &'static str,
+}
+
+/// The original's ready-made countdowns, in its order.
+pub const PRESETS: [Preset; 8] = [
+    Preset { key: "trip", icon: "🧳", color: "#22C55E" },
+    Preset { key: "concert", icon: "🎤", color: "#EF4444" },
+    Preset { key: "payday", icon: "💵", color: "#EAB308" },
+    Preset { key: "rent", icon: "🏠", color: "#3B82F6" },
+    Preset { key: "card", icon: "💳", color: "#22C55E" },
+    Preset { key: "mortgage", icon: "🏡", color: "#3B82F6" },
+    Preset { key: "insurance", icon: "🛡️", color: "#A855F7" },
+    Preset { key: "health", icon: "🩺", color: "#F97316" },
+];
+
 /// The Reminder choices the original offers, in days before the date: on the day, 1, 2 and 3
 /// days early and a week early.
 pub const REMINDER_DAYS: [u32; 5] = [0, 1, 2, 3, 7];
@@ -307,6 +328,13 @@ mod tests {
     fn month_ends_do_not_overshoot() {
         // Jan 31 → Mar 1: one month (to Feb 28) and one day.
         assert_eq!(ymd(span(d(2026, 1, 31), d(2026, 3, 1))), (0, 1, 1, false));
+    }
+
+    #[test]
+    fn presets_are_distinct() {
+        let keys: std::collections::HashSet<_> = PRESETS.iter().map(|p| p.key).collect();
+        assert_eq!(keys.len(), PRESETS.len());
+        assert!(PRESETS.iter().all(|p| p.color.starts_with('#') && !p.icon.is_empty()));
     }
 
     #[test]

@@ -62,6 +62,7 @@ struct CustomReminder {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DraftRow {
     Icon,
+    Presets,
     Date,
     Month,
     Day,
@@ -294,6 +295,7 @@ impl CountdownView {
         if let Some(draft) = self.draft.as_mut() {
             draft.open = Some(match row {
                 "calc" => DraftRow::CalcMode,
+                "presets" => DraftRow::Presets,
                 "counting" => DraftRow::CountingMode,
                 "month" => DraftRow::Month,
                 "show" => DraftRow::Show,
@@ -1003,6 +1005,45 @@ impl CountdownView {
                 .child(Label::new(label).size(LabelSize::Small))
         };
         let show_age = draft.show_age;
+        let presets = (open == Some(DraftRow::Presets)).then(|| {
+            PopoverAttachment::new(
+                Placement::BelowRight,
+                popover(cx)
+                    .w(px(260.))
+                    .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                        if let Some(draft) = this.draft.as_mut() {
+                            draft.open = None;
+                        }
+                        cx.notify();
+                    }))
+                    .children(fern_core::countdown::PRESETS.iter().zip(strings.countdown_presets).enumerate().map(|(i, (preset, name))| {
+                        let preset = *preset;
+                        ListItem::new(("countdown-preset", i))
+                            .height(px(34.))
+                            .start_slot(
+                                div()
+                                    .size(px(24.))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded_full()
+                                    .bg(crate::lists_panel::parse_color(Some(preset.color)).unwrap_or(theme.colors().accent).opacity(0.45))
+                                    .text_size(px(13.))
+                                    .child(preset.icon),
+                            )
+                            .child(Label::new(name))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if let Some(draft) = this.draft.as_mut() {
+                                    draft.icon = Some(preset.icon.to_owned());
+                                    draft.color = Some(preset.color.to_owned());
+                                    draft.open = None;
+                                    draft.name.update(cx, |input, cx| input.set_text(name, cx));
+                                }
+                                cx.notify();
+                            }))
+                    })),
+            )
+        });
 
         popover(cx)
             .w(px(430.))
@@ -1024,11 +1065,25 @@ impl CountdownView {
                         h_flex()
                             .flex_1()
                             .h(px(32.))
-                            .px_3()
+                            .pl_3()
+                            .pr_1()
                             .rounded(px(6.))
                             .border_1()
                             .border_color(theme.colors().border)
-                            .child(draft.name.clone()),
+                            .child(div().flex_1().child(draft.name.clone()))
+                            // The original's bookmark: ready-made countdowns to start from.
+                            .child(
+                                div()
+                                    .relative()
+                                    .child(
+                                        IconButton::new("countdown-presets", IconName::Bookmark)
+                                            .icon_color(Color::Muted)
+                                            .on_click(set(Box::new(|d| {
+                                                d.open = if d.open == Some(DraftRow::Presets) { None } else { Some(DraftRow::Presets) };
+                                            }))),
+                                    )
+                                    .children(presets),
+                            ),
                     ),
             )
             .child(date_row)

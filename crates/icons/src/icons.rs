@@ -14,6 +14,7 @@ pub enum IconName {
     Baseline,
     Bell,
     Bold,
+    Bookmark,
     BrushCleaning,
     Cake,
     CalendarCheck,

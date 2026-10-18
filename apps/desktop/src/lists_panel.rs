@@ -32,6 +32,7 @@ pub fn title(view: &View, lists: &[List], filters: &[fern_core::SmartFilter], st
         View::Tag(name) => name.clone().into(),
         View::Search(_) => strings.section_search.into(),
         View::Filter(id) => filters.iter().find(|f| f.id == *id).map(|f| f.name.clone()).unwrap_or_default().into(),
+        View::Summary => strings.summary.into(),
     }
 }
 
@@ -147,6 +148,7 @@ pub fn render(
                 Some(counts.next_7_days),
             ))
         })
+        .when(shows(SmartList::Summary, 1), |el| el.child(smart(View::Summary, strings.summary, IconName::FileText, None)))
         .child(separator())
         .child(
             heading(strings.lists).child(

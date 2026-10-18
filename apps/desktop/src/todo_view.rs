@@ -98,6 +98,8 @@ pub struct TodoView {
     filters: Vec<(fern_core::SmartFilter, usize)>,
     /// Settings → Smart List, read on reload.
     preferences: fern_core::Preferences,
+    /// The Summary smart list's report.
+    summary: Entity<crate::summary_view::SummaryView>,
     /// The "Add Filter" / "Edit Filter" dialog, while it is open.
     filter_edit: Option<FilterEdit>,
     /// The "List Activities" panel, shown in place of the details while open.
@@ -116,6 +118,7 @@ pub struct TodoView {
 impl TodoView {
     pub fn new(store: Rc<Store>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let strings = i18n::t(cx);
+        let summary = cx.new(|_| crate::summary_view::SummaryView::new(store.clone()));
         let input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.add_task, cx));
         cx.subscribe_in(&input, window, |this, input, Submitted(text), window, cx| {
             if text.trim().is_empty() {
@@ -214,6 +217,7 @@ impl TodoView {
             list_activity: None,
             filters: Vec::new(),
             preferences: Default::default(),
+            summary,
             filter_edit: None,
             undo: None,
             renaming_section: None,
@@ -244,6 +248,9 @@ impl TodoView {
                 Some(("view", "trash")) => self.set_view(View::Trash, cx),
                 Some(("view", "wontdo")) => self.set_view(View::WontDo, cx),
                 Some(("view", "today")) => self.set_view(View::Today, cx),
+                Some(("view", "summary")) => self.set_view(View::Summary, cx),
+                // `summary=<period|status|grouping|fields>` opens a Summary dropdown.
+                Some(("summary", menu)) => self.summary.update(cx, |summary, cx| summary.dev_open(menu, cx)),
                 Some(("drop", spec)) => {
                     // `drop=<title part>><today|tomorrow|inbox|completed|trash|list:Name|tag:Name>`:
                     // the same path as dropping a task on the lists column.
@@ -1657,7 +1664,7 @@ impl TodoView {
             View::Completed => self.store.set_completed(id, true),
             View::WontDo => self.store.set_wont_do(id, true),
             View::Trash => self.store.delete_task(id),
-            View::All | View::Search(_) | View::Filter(_) => Ok(()),
+            View::All | View::Search(_) | View::Filter(_) | View::Summary => Ok(()),
         };
         self.check(result);
         self.reload(cx);
@@ -2801,11 +2808,15 @@ impl Render for TodoView {
                     cx,
                 ))
             })
-            .child(list)
-            .child(div().flex_none().w(px(DETAIL_WIDTH)).h_full().map(|el| match self.list_activity.clone() {
-                Some(entries) => el.child(self.render_list_activity(&entries, cx)),
-                None => el.child(self.detail.clone()),
-            }))
+            .map(|el| {
+                if self.view == View::Summary {
+                    return el.child(div().flex_1().min_w_0().h_full().child(self.summary.clone()));
+                }
+                el.child(list).child(div().flex_none().w(px(DETAIL_WIDTH)).h_full().map(|el| match self.list_activity.clone() {
+                    Some(entries) => el.child(self.render_list_activity(&entries, cx)),
+                    None => el.child(self.detail.clone()),
+                }))
+            })
             .when_some(self.filter_edit.as_ref().map(|edit| self.render_filter_edit(edit, cx)), |el, dialog| el.child(dialog))
             .when_some(self.undo.as_ref().map(|(_, label, _)| label.clone()), |el, label| {
                 el.child(

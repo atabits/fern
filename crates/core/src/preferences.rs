@@ -40,6 +40,7 @@ pub enum SmartList {
     Tomorrow,
     Next7Days,
     Inbox,
+    Summary,
     Tags,
     Filters,
     Completed,
@@ -49,12 +50,13 @@ pub enum SmartList {
 
 impl SmartList {
     /// In the order of the Settings page, grouped as there.
-    pub const ALL: [SmartList; 10] = [
+    pub const ALL: [SmartList; 11] = [
         SmartList::All,
         SmartList::Today,
         SmartList::Tomorrow,
         SmartList::Next7Days,
         SmartList::Inbox,
+        SmartList::Summary,
         SmartList::Tags,
         SmartList::Filters,
         SmartList::Completed,
@@ -69,6 +71,7 @@ impl SmartList {
             SmartList::Tomorrow => "tomorrow",
             SmartList::Next7Days => "next_7_days",
             SmartList::Inbox => "inbox",
+            SmartList::Summary => "summary",
             SmartList::Tags => "tags",
             SmartList::Filters => "filters",
             SmartList::Completed => "completed",
@@ -81,7 +84,7 @@ impl SmartList {
     /// omit tags without open tasks, and the closed-task lists are only shown or hidden.
     pub fn options(self) -> &'static [Visibility] {
         match self {
-            SmartList::Completed | SmartList::WontDo | SmartList::Trash | SmartList::Filters => {
+            SmartList::Completed | SmartList::WontDo | SmartList::Trash | SmartList::Filters | SmartList::Summary => {
                 &[Visibility::Show, Visibility::Hide]
             }
             SmartList::Tags => &[Visibility::Show, Visibility::IfNotEmpty, Visibility::Hide],
@@ -134,7 +137,7 @@ pub struct Preferences {
     /// Where tasks added outside a list go (smart lists, tags, filters); `None` is the Inbox.
     pub default_list: Option<Id>,
     /// Settings → Smart List, in the order of `SmartList::ALL`.
-    pub smart_lists: [Visibility; 10],
+    pub smart_lists: [Visibility; 11],
 }
 
 impl Preferences {
@@ -159,7 +162,7 @@ impl Default for Preferences {
             week_start: Weekday::Mon,
             hour12: false,
             default_list: None,
-            smart_lists: [Visibility::Show; 10],
+            smart_lists: [Visibility::Show; 11],
         }
     }
 }

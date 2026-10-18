@@ -38,6 +38,7 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 | Trash, "Won't Do" | ✅ | trash matched to the original: flat list, broom button empties it; a trashed task's panel has "Restore" and "Delete forever" in its bottom bar. "Won't Do" matched to the original: set from the details "…" menu or by dropping on the entry, a muted box with a cross, its own view grouped by day with list and date on the right; unchecking reopens. Both closed views have the original's "All Dates" (this week, last week, this month, "Other Date" with start and end days) and "All Lists" (several lists, Cancel/OK) filters |
 | Reminders | ⬜ | |
 | Settings window | 🟡 | matched to the original's (the account menu's Settings, or Ctrl+,): Smart List (show, "Show if not empty" or hide each smart list, Tags with "Omit Empty Tags", Filters and the closed-task lists shown or hidden), Date & Time (the original's "Time Format", 24 hour "13:00" or 12 hour "1:00 PM", used for every time shown — task rows, pickers, reminders, the calendar's axis, focus records; "Start Week on" Monday, Sunday or Saturday — every calendar and week follows it), Appearance ("Follow System Dark Mode" and the Default (light) and Dark themes), More (language; "Default List" for tasks added outside a list), Shortcuts (opens the Shortcuts panel) and About; Escape closes it. No Assigned to Me or Summary rows (no such lists), date format, notifications, the original's other color and city themes, or account pages |
+| Summary | 🟡 | the original's Summary smart list: a report of the period's tasks (Today, Tomorrow, Yesterday, this/next/last week, this/last month), filtered by status (all, completed, uncompleted, won't do), grouped by completion status, list, completion date, task date, tag or priority, with the chosen fields (status, completion time, task time, list, tags) on each line, and "Copy" puts it on the clipboard as Markdown; it can be hidden in Settings → Smart List. The report is read-only (the original's is an editable document); no lists filter, custom dates, "More" filters, templates, "Save as" or "Next Period Tasks" |
 
 ## Interface
 
@@ -91,8 +92,8 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 
 ## Next
 
-1. Summary smart list (the original's report of tasks by period).
-2. Settings → Date & Time: date format and "Show Week Numbers".
-3. Habits: "Checked-in Style" and "Start Focus" in a habit's "…" menu.
-4. Statistics: "You are more productive than N%" and the curves' Day/Week/Month switch.
+1. Settings → Date & Time: date format and "Show Week Numbers".
+2. Habits: "Checked-in Style" and "Start Focus" in a habit's "…" menu.
+3. Statistics: "You are more productive than N%" and the curves' Day/Week/Month switch.
+4. Summary: Lists filter, custom dates and "Next Period Tasks".
 5. Filled sidebar icons (needs own filled glyphs; Lucide has none).

@@ -1504,7 +1504,7 @@ fn matches_view(task: &Task, view: &View, today: NaiveDate) -> bool {
         View::Trash => true,
         View::Tag(tag) => task.tags.iter().any(|t| t.to_lowercase() == tag.to_lowercase()),
         // Filters are matched in `Store::tasks_in`, which knows their conditions.
-        View::Filter(_) => false,
+        View::Filter(_) | View::Summary => false,
         View::Search(query) => {
             let query = query.trim().to_lowercase();
             !query.is_empty()

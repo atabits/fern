@@ -197,6 +197,8 @@ pub enum View {
     Search(String),
     /// A saved filter ("Filters" in the lists column).
     Filter(Id),
+    /// The Summary report; it lists no tasks of its own.
+    Summary,
 }
 
 /// Open-task counters for the lists column.

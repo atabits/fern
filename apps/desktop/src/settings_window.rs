@@ -240,9 +240,9 @@ impl SettingsWindow {
                         cx,
                     )
                 };
-                let [all, today, tomorrow, next7, inbox, tags, filters, completed, wont_do, trash] = SmartList::ALL;
+                let [all, today, tomorrow, next7, inbox, summary, tags, filters, completed, wont_do, trash] = SmartList::ALL;
                 body.child(title(strings.settings_pages[0]))
-                    .child(group().children([all, today, tomorrow, next7, inbox].map(|l| row(self, l, cx))))
+                    .child(group().children([all, today, tomorrow, next7, inbox, summary].map(|l| row(self, l, cx))))
                     .child(group().children([tags, filters].map(|l| row(self, l, cx))))
                     .child(group().children([completed, wont_do, trash].map(|l| row(self, l, cx))))
                     .into_any_element()
@@ -494,6 +494,7 @@ fn smart_list_label(list: SmartList, strings: &i18n::Strings) -> (IconName, &'st
         SmartList::Tomorrow => (IconName::Sunrise, strings.tomorrow),
         SmartList::Next7Days => (IconName::CalendarRange, strings.next_7_days_short),
         SmartList::Inbox => (IconName::Inbox, strings.inbox),
+        SmartList::Summary => (IconName::FileText, strings.summary),
         SmartList::Tags => (IconName::Tag, strings.tags),
         SmartList::Filters => (IconName::Funnel, strings.filters),
         SmartList::Completed => (IconName::SquareCheckBig, strings.completed),

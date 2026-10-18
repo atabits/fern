@@ -496,6 +496,19 @@ impl TodoView {
                         let color = tag_colors.get(tag).copied().unwrap_or_else(theme::text_muted);
                         widgets::tag_chip(tag, color)
                     }))
+                    .when_some(task.checklist, |el, (done_items, total)| {
+                        el.child(
+                            div()
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .text_xs()
+                                .text_color(theme::text_muted())
+                                .child(svg().path("icons/list-checks.svg").size(px(12.)).text_color(theme::text_muted()))
+                                .child(format!("{done_items}/{total}")),
+                        )
+                    })
                     .when_some(due, |el, (label, overdue)| {
                         el.child(
                             div()

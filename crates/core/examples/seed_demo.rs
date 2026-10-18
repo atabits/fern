@@ -36,6 +36,10 @@ fn main() -> anyhow::Result<()> {
     store.set_due(plants.id, Some(today + Duration::days(6)), None)?;
 
     let trip = store.add_task("Plan the weekend trip")?;
+    for (title, done) in [("Pick a destination", true), ("Book a place to stay", false), ("Pack", false)] {
+        let item = store.add_checklist_item(trip.id, title, None)?;
+        store.set_checklist_item_completed(item.id, done)?;
+    }
     let tickets = store.add_task("Compare train tickets")?;
     store.set_parent(tickets.id, Some(trip.id))?;
 

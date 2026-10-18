@@ -105,6 +105,7 @@ pub struct Strings {
     pub priority_none: &'static str,
     pub add_tag: &'static str,
     pub new_tag: &'static str,
+    pub add_item: &'static str,
 
     // Dates.
     pub yesterday: &'static str,
@@ -161,6 +162,7 @@ pub static EN: Strings = Strings {
     priority_none: "No priority",
     add_tag: "+ Tag",
     new_tag: "New tag",
+    add_item: "Add item",
 
     yesterday: "Yesterday",
     weekdays_short: ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"],
@@ -219,6 +221,7 @@ pub static RU: Strings = Strings {
     priority_none: "Без приоритета",
     add_tag: "+ Тег",
     new_tag: "Новый тег",
+    add_item: "Добавить пункт",
 
     yesterday: "Вчера",
     weekdays_short: ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"],

@@ -2,7 +2,7 @@
 
 use std::rc::Rc;
 
-use fern_core::{Id, List, Priority, Store, Tag, Task};
+use fern_core::{ChecklistItem, Id, List, Priority, Store, Tag, Task};
 use chrono::{Datelike, Duration, Local, NaiveDate};
 use gpui::{
     AnyElement, Context, Entity, EventEmitter, Focusable, MouseButton, Rgba, SharedString,
@@ -35,10 +35,29 @@ pub struct TaskDetail {
     all_tags: Vec<Tag>,
     /// All lists, for the list picker and the list button label.
     lists: Vec<List>,
+    /// Checklist items with an input each, in display order.
+    checklist: Vec<ChecklistRow>,
+    new_item: Entity<TextInput>,
+    /// The checklist is shown when it has items or the user asked to start one.
+    show_checklist: bool,
+    /// An input to focus on the next render (focusing needs the window).
+    pending_focus: Option<FocusTarget>,
     popup: Option<Popup>,
     /// The month shown in the due-date calendar.
     calendar_month: NaiveDate,
     _subscriptions: Vec<Subscription>,
+}
+
+struct ChecklistRow {
+    item: ChecklistItem,
+    input: Entity<TextInput>,
+    _subscriptions: [Subscription; 2],
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FocusTarget {
+    Item(Id),
+    NewItem,
 }
 
 /// The task was changed in the panel; the list needs to reload.
@@ -52,6 +71,7 @@ impl TaskDetail {
         let title = cx.new(|cx| TextInput::new(Mode::Wrapped, strings.untitled, cx));
         let notes = cx.new(|cx| TextInput::new(Mode::MultiLine, strings.notes_placeholder, cx));
         let tag_input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.new_tag, cx));
+        let new_item = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.add_item, cx));
 
         let subscriptions = vec![
             cx.subscribe(&title, |this, input, _: &Changed, cx| {
@@ -73,11 +93,20 @@ impl TaskDetail {
                 }
                 input.update(cx, |input, cx| input.clear(window, cx));
             }),
+            cx.subscribe_in(&new_item, window, |this, input, Submitted(text), window, cx| {
+                if !text.trim().is_empty() {
+                    let text = text.clone();
+                    this.save(cx, |store, id| store.add_checklist_item(id, &text, None).map(|_| ()));
+                    input.update(cx, |input, cx| input.clear(window, cx));
+                    this.sync_checklist(cx);
+                }
+            }),
             cx.observe_global::<CurrentLocale>(|this, cx| {
                 let strings = i18n::t(cx);
                 this.title.update(cx, |input, cx| input.set_placeholder(strings.untitled, cx));
                 this.notes.update(cx, |input, cx| input.set_placeholder(strings.notes_placeholder, cx));
                 this.tag_input.update(cx, |input, cx| input.set_placeholder(strings.new_tag, cx));
+                this.new_item.update(cx, |input, cx| input.set_placeholder(strings.add_item, cx));
             }),
         ];
 
@@ -89,6 +118,10 @@ impl TaskDetail {
             tag_input,
             all_tags: Vec::new(),
             lists: Vec::new(),
+            checklist: Vec::new(),
+            new_item,
+            show_checklist: false,
+            pending_focus: None,
             popup: None,
             calendar_month: calendar::month_start(Local::now().date_naive()),
             _subscriptions: subscriptions,
@@ -113,7 +146,146 @@ impl TaskDetail {
         self.task = task;
         self.popup = None;
         self.all_tags = self.store.tags().unwrap_or_default();
+        self.checklist.clear();
+        self.sync_checklist(cx);
+        self.show_checklist = !self.checklist.is_empty();
         cx.notify();
+    }
+
+    /// Reloads checklist items, keeping the inputs of items that still exist so that the caret
+    /// does not jump while the user types.
+    fn sync_checklist(&mut self, cx: &mut Context<Self>) {
+        let Some(task) = self.task_id() else {
+            self.checklist.clear();
+            return;
+        };
+        let items = self.store.checklist(task).unwrap_or_default();
+        let mut old: Vec<ChecklistRow> = std::mem::take(&mut self.checklist);
+        for item in items {
+            let row = match old.iter().position(|row| row.item.id == item.id) {
+                Some(index) => {
+                    let mut row = old.swap_remove(index);
+                    row.item = item;
+                    row
+                }
+                None => self.checklist_row(item, cx),
+            };
+            self.checklist.push(row);
+        }
+        cx.notify();
+    }
+
+    fn checklist_row(&mut self, item: ChecklistItem, cx: &mut Context<Self>) -> ChecklistRow {
+        let id = item.id;
+        let title = item.title.clone();
+        let input = cx.new(|cx| {
+            let mut input = TextInput::new(Mode::Wrapped, "", cx);
+            input.set_text(title, cx);
+            input
+        });
+        let subscriptions = [
+            cx.subscribe(&input, move |this, input, _: &Changed, cx| {
+                let text = input.read(cx).text().to_owned();
+                this.save(cx, |store, _| store.set_checklist_item_title(id, &text));
+            }),
+            // Enter adds the next item right below, as in TickTick.
+            cx.subscribe(&input, move |this, _, _: &Submitted, cx| {
+                let created = this
+                    .task_id()
+                    .and_then(|task| this.store.add_checklist_item(task, "", Some(id)).ok());
+                if let Some(created) = created {
+                    this.pending_focus = Some(FocusTarget::Item(created.id));
+                    cx.emit(TaskUpdated);
+                    this.sync_checklist(cx);
+                }
+            }),
+        ];
+        ChecklistRow { item, input, _subscriptions: subscriptions }
+    }
+
+    fn toggle_checklist_item(&mut self, id: Id, completed: bool, cx: &mut Context<Self>) {
+        self.save(cx, |store, _| store.set_checklist_item_completed(id, completed));
+        self.sync_checklist(cx);
+    }
+
+    fn delete_checklist_item(&mut self, id: Id, cx: &mut Context<Self>) {
+        self.save(cx, |store, _| store.delete_checklist_item(id));
+        self.sync_checklist(cx);
+    }
+
+    fn start_checklist(&mut self, cx: &mut Context<Self>) {
+        self.show_checklist = true;
+        self.pending_focus = Some(FocusTarget::NewItem);
+        cx.notify();
+    }
+
+    fn render_checklist(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex()
+            .flex_col()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .children(self.checklist.iter().map(|row| {
+                let id = row.item.id;
+                let done = row.item.completed;
+                div()
+                    .id(SharedString::from(format!("item-{id}")))
+                    .group("checklist-item")
+                    .min_h(px(30.))
+                    .flex()
+                    .items_start()
+                    .gap_2()
+                    .py_1()
+                    .child(
+                        div()
+                            .id("item-checkbox")
+                            .mt(px(3.))
+                            .size(px(14.))
+                            .flex_none()
+                            .rounded(px(3.))
+                            .border_1()
+                            .border_color(if done { theme::accent() } else { theme::checkbox() })
+                            .when(done, |el| el.bg(theme::accent()))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_size(px(10.))
+                            .text_color(theme::background())
+                            .when(done, |el| el.child("✓"))
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.toggle_checklist_item(id, !done, cx)
+                            })),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .when(done, |el| el.text_color(theme::text_muted()))
+                            .child(row.input.clone()),
+                    )
+                    .child(
+                        div()
+                            .id("item-delete")
+                            .flex_none()
+                            .px_1()
+                            .text_color(theme::text_muted())
+                            .opacity(0.)
+                            .group_hover("checklist-item", |s| s.opacity(1.))
+                            .hover(|s| s.text_color(theme::danger()))
+                            .cursor_pointer()
+                            .child("✕")
+                            .on_click(cx.listener(move |this, _, _, cx| this.delete_checklist_item(id, cx))),
+                    )
+            }))
+            .child(
+                div()
+                    .min_h(px(30.))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(svg().path("icons/plus.svg").size(px(14.)).flex_none().text_color(theme::text_muted()))
+                    .child(div().flex_1().child(self.new_item.clone())),
+            )
     }
 
     /// Updates the task data without touching the inputs, so the caret stays where it is.
@@ -121,7 +293,7 @@ impl TaskDetail {
         match task {
             Some(task) if self.task_id() == Some(task.id) => {
                 self.task = Some(task);
-                cx.notify();
+                self.sync_checklist(cx);
             }
             other => self.show(other, cx),
         }
@@ -160,6 +332,10 @@ impl TaskDetail {
             "priority" => Popup::Priority,
             "tags" => Popup::Tags,
             "list" => Popup::List,
+            "checklist" => {
+                self.start_checklist(cx);
+                return;
+            }
             _ => return,
         };
         self.open_popup(popup, cx);
@@ -511,8 +687,19 @@ fn label_button(id: &'static str) -> gpui::Stateful<gpui::Div> {
 }
 
 impl Render for TaskDetail {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let strings = i18n::t(cx);
+        if let Some(target) = self.pending_focus.take() {
+            let input = match target {
+                FocusTarget::NewItem => Some(self.new_item.clone()),
+                FocusTarget::Item(id) => {
+                    self.checklist.iter().find(|row| row.item.id == id).map(|row| row.input.clone())
+                }
+            };
+            if let Some(input) = input {
+                window.focus(&input.focus_handle(cx), cx);
+            }
+        }
         let panel = div()
             .size_full()
             .flex()
@@ -643,9 +830,16 @@ impl Render for TaskDetail {
                                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                                     .child(self.title.clone()),
                             )
-                            .child(div().pt_1().child(icon_button("checklist", "icons/list-checks.svg"))),
+                            .child(
+                                div().pt_1().child(
+                                    icon_button("checklist", "icons/list-checks.svg")
+                                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                        .on_click(cx.listener(|this, _, _, cx| this.start_checklist(cx))),
+                                ),
+                            ),
                     )
                     .child(self.render_tags_row(strings, cx))
+                    .when(self.show_checklist, |el| el.child(self.render_checklist(cx)))
                     .child(
                         div()
                             .text_size(px(15.))

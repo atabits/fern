@@ -30,7 +30,7 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 | Tags with colors | ✅ | case-insensitive, including non-ASCII |
 | Subtasks (`parentId`) | ✅ | cascade delete, no cycles |
 | Item kind: task / note / checklist (`kind`) | 🟡 | task and note; checklist later |
-| Checklist items (`items`) | ⬜ | |
+| Checklist items (`items`) | ✅ | ordered items, insert after, completion, progress |
 | Repeat (`repeatFlag`, RRULE) | ⬜ | |
 | Lists (projects), Inbox | ✅ | create, delete, move tasks with subtasks |
 | Custom sections inside a list (columns) | ⬜ | groups are by kind for now |
@@ -61,7 +61,7 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 | Details: priority (flag) | ✅ | |
 | Details: tags | ✅ | chips under the title, picker with "+ Tag" |
 | Details: list | ✅ | list button in the bottom bar |
-| Details: checklist | ⬜ | |
+| Details: checklist | ✅ | Enter adds the next item; progress "1/3" in rows |
 | Drag and drop | ⬜ | |
 | Calendar, Pomodoro, Habits, Matrix, Countdown, Search | ⬜ | |
 | Sync between devices | ⬜ | |
@@ -79,8 +79,8 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 
 ## Next
 
-1. Checklist items inside a task.
-2. Trash instead of immediate deletion.
-3. Time and repeat in the due-date picker.
+1. Trash instead of immediate deletion.
+2. Time and repeat in the due-date picker.
+3. Creating subtasks from the UI.
 4. Manual ordering and drag and drop.
-5. Creating subtasks from the UI.
+5. Search.

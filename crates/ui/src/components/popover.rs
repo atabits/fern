@@ -30,6 +30,8 @@ pub enum Placement {
     BelowCenter,
     /// Opens upwards, for buttons at the bottom of a panel.
     AboveRight,
+    /// Opens upwards from the parent's left edge, for a button at the bottom left of a panel.
+    AboveLeft,
     RightTop,
     /// To the right, growing upwards: for buttons at the bottom of the sidebar.
     RightBottom,
@@ -64,6 +66,7 @@ impl RenderOnce for PopoverAttachment {
             Placement::BelowRight => (div().absolute().top(px(30.)).right_0(), Anchor::TopRight),
             Placement::BelowCenter => (div().absolute().top(px(30.)).left_1_2(), Anchor::TopCenter),
             Placement::AboveRight => (div().absolute().top(px(-4.)).right_0(), Anchor::BottomRight),
+            Placement::AboveLeft => (div().absolute().top(px(-4.)).left_0(), Anchor::BottomLeft),
             Placement::RightTop => (div().absolute().top_0().left(px(38.)), Anchor::TopLeft),
             Placement::RightBottom => (div().absolute().bottom_0().left(px(38.)), Anchor::BottomLeft),
             // The menu's own padding (6 px) is kept between the two menus.

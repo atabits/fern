@@ -95,6 +95,10 @@ pub struct TaskDetail {
     time_input: Entity<TextInput>,
     /// The "Link Parent Task" search field.
     link_search: Entity<TextInput>,
+    /// The list menu's search field, and the list (`Some(None)` for the Inbox) whose sections
+    /// show in the side menu.
+    list_search: Entity<TextInput>,
+    list_submenu: Option<Option<Id>>,
     /// The checklist is shown when it has items or the user asked to start one.
     show_checklist: bool,
     /// An input to focus on the next render (focusing needs the window).
@@ -148,6 +152,7 @@ impl TaskDetail {
         let subtask_input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.add_subtask, cx));
         let time_input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.time_placeholder, cx));
         let link_search = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.search_placeholder, cx));
+        let list_search = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.section_search, cx));
         let comment_input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.write_comment, cx));
 
         let subscriptions = vec![
@@ -187,6 +192,10 @@ impl TaskDetail {
                 }
             }),
             cx.subscribe(&link_search, |_, _, _: &Changed, cx| cx.notify()),
+            cx.subscribe(&list_search, |this, _, _: &Changed, cx| {
+                this.list_submenu = None;
+                cx.notify();
+            }),
             // Enter posts the comment; Escape closes the field.
             cx.subscribe_in(&comment_input, window, |this, input, Submitted(text), window, cx| {
                 if let Some(task) = this.task_id()
@@ -219,6 +228,7 @@ impl TaskDetail {
                 this.new_item.update(cx, |input, cx| input.set_placeholder(strings.add_item, cx));
                 this.subtask_input.update(cx, |input, cx| input.set_placeholder(strings.add_subtask, cx));
                 this.time_input.update(cx, |input, cx| input.set_placeholder(strings.time_placeholder, cx));
+                this.list_search.update(cx, |input, cx| input.set_placeholder(strings.section_search, cx));
             }),
         ];
 
@@ -246,6 +256,8 @@ impl TaskDetail {
             subtask_input,
             time_input,
             link_search,
+            list_search,
+            list_submenu: None,
             show_checklist: false,
             pending_focus: None,
             popup: None,
@@ -638,7 +650,11 @@ impl TaskDetail {
                 self.due_draft = self.task.as_ref().map(|task| DueDraft::from_task(task, today));
             }
             Popup::Tags => self.all_tags = self.store.tags().unwrap_or_default(),
-            Popup::Priority | Popup::List | Popup::More => {}
+            Popup::List => {
+                self.list_search.update(cx, |input, cx| input.set_text("", cx));
+                self.list_submenu = None;
+            }
+            Popup::Priority | Popup::More => {}
             Popup::LinkParent => self.link_search.update(cx, |input, cx| input.set_text("", cx)),
             Popup::Estimate => self.estimate_draft = EstimateDraft::from(self.task.as_ref().and_then(|t| t.estimate)),
         }
@@ -683,6 +699,12 @@ impl TaskDetail {
             "priority" => Popup::Priority,
             "tags" => Popup::Tags,
             "list" => Popup::List,
+            // The list menu with the task's list's sections open beside it.
+            "list-sections" => {
+                self.open_popup(Popup::List, cx);
+                self.list_submenu = Some(self.task.as_ref().and_then(|t| t.list_id));
+                return;
+            }
             "more" => Popup::More,
             // The "…" menu with its Start Focus side menu open.
             "more-focus" => {
@@ -2297,47 +2319,82 @@ impl TaskDetail {
             .into_any_element()
     }
 
+    /// The bottom bar's list menu, as the original's (200 × 240, opening upwards): a search
+    /// field, then the Inbox and the lists, the task's own in the accent color; a list with
+    /// sections has a chevron, and hovering it shows its sections beside the menu, the task's
+    /// section ticked. A click on a list or a section moves the task there.
     fn render_list_popup(&self, strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {
-        let current = self.task.as_ref().and_then(|t| t.list_id);
+        let theme = cx.theme().clone();
+        let current = self.task.as_ref().map(|t| (t.list_id, t.section_id));
+        let query = self.list_search.read(cx).text().to_owned();
+        let rows: Vec<(Option<Id>, SharedString, IconName)> = std::iter::once((None, SharedString::new_static(strings.inbox), IconName::Inbox))
+            .chain(self.lists.iter().map(|l| (Some(l.id), SharedString::from(l.name.clone()), IconName::List)))
+            .filter(|(_, name, _)| list_matches(name, &query))
+            .collect();
         popover(cx)
             .w(px(200.))
+            .h(px(240.))
+            .p_0()
             .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_popup(cx)))
             .child(
-                ListItem::new("move-to-inbox")
-                    .start_slot(Icon::new(IconName::Inbox))
-                    .child(Label::new(strings.inbox))
-                    .when(current.is_none(), |item| item.end_slot(check_mark()))
-                    .on_click(cx.listener(|this, _, _, cx| this.set_list(None, cx))),
+                h_flex()
+                    .h(px(39.))
+                    .flex_none()
+                    .px_3()
+                    .gap_2()
+                    .border_b_1()
+                    .border_color(theme.colors().border_variant)
+                    .child(Icon::new(IconName::Search).color(Color::Muted))
+                    .child(div().flex_1().child(self.list_search.clone())),
             )
-            .children(self.lists.iter().flat_map(|list| {
-                let id = list.id;
-                let current_section = self.task.as_ref().and_then(|t| t.section_id);
-                // A list's sections are offered under it, as in the original.
-                let sections = self.store.list_sections(Some(id)).unwrap_or_default();
-                std::iter::once(
-                    ListItem::new(SharedString::from(format!("move-to-{id}")))
-                        .start_slot(Icon::new(IconName::List))
-                        .child(Label::new(list.name.clone()).truncate())
-                        .when(current == Some(id) && current_section.is_none(), |item| item.end_slot(check_mark()))
-                        .on_click(cx.listener(move |this, _, _, cx| this.set_list(Some(id), cx)))
-                        .into_any_element(),
-                )
-                .chain(sections.into_iter().map(|section| {
-                    let section_id = section.id;
-                    ListItem::new(SharedString::from(format!("move-to-section-{section_id}")))
-                        .child(div().pl_6().child(Label::new(section.name).size(LabelSize::Small).truncate()))
-                        .when(current_section == Some(section_id), |item| item.end_slot(check_mark()))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.save(cx, |store, task| {
-                                store.set_list(task, Some(id))?;
-                                store.set_section(task, Some(section_id))
-                            });
-                            this.close_popup(cx);
-                        }))
-                        .into_any_element()
-                }))
-                .collect::<Vec<_>>()
-            }))
+            .child(v_flex().id("list-menu-rows").flex_1().p_1().overflow_y_scroll().children(rows.into_iter().map(|(list, name, icon)| {
+                let selected = current.is_some_and(|(l, _)| l == list);
+                let color = if selected { Color::Accent } else { Color::Default };
+                let sections = self.store.list_sections(list).unwrap_or_default();
+                let open = self.list_submenu == Some(list) && !sections.is_empty();
+                let has_sections = !sections.is_empty();
+                div()
+                    .id(SharedString::from(format!("move-to-{}", list.map_or("inbox".to_owned(), |id| id.to_string()))))
+                    .relative()
+                    .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                        if *hovered && this.list_submenu != Some(list) {
+                            this.list_submenu = Some(list);
+                            cx.notify();
+                        }
+                    }))
+                    .child(
+                        ListItem::new("row")
+                            .height(px(33.))
+                            .toggle_state(open)
+                            .start_slot(Icon::new(icon).color(color))
+                            .child(Label::new(name).color(color).truncate())
+                            .when(has_sections, |item| item.end_slot(Icon::new(IconName::ChevronRight).size(IconSize::Small).color(Color::Muted)))
+                            .on_click(cx.listener(move |this, _, _, cx| this.set_list(list, cx))),
+                    )
+                    .when(open, |el| {
+                        let current_section = current.and_then(|(l, s)| if l == list { s } else { None });
+                        el.child(PopoverAttachment::new(
+                            Placement::RightSide,
+                            popover(cx).w(px(162.)).children(sections.into_iter().map(|section| {
+                                let section_id = section.id;
+                                let ticked = current_section == Some(section_id);
+                                let color = if ticked { Color::Accent } else { Color::Default };
+                                ListItem::new(SharedString::from(format!("move-to-section-{section_id}")))
+                                    .height(px(34.))
+                                    .start_slot(Icon::new(IconName::PanelBottom).color(color))
+                                    .child(Label::new(section.name).color(color).truncate())
+                                    .when(ticked, |item| item.end_slot(Icon::new(IconName::Check).size(IconSize::Small).color(Color::Accent)))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.save(cx, |store, task| {
+                                            store.set_list(task, list)?;
+                                            store.set_section(task, Some(section_id))
+                                        });
+                                        this.close_popup(cx);
+                                    }))
+                            })),
+                        ))
+                    })
+            })))
             .into_any_element()
     }
 
@@ -2439,6 +2496,12 @@ const ACTIVITY_KINDS: [&str; 11] = [
 /// What the activity log says for a kind: "created the task".
 pub fn activity_text<'a>(kind: &'a str, strings: &'static Strings) -> &'a str {
     ACTIVITY_KINDS.iter().position(|k| *k == kind).map_or(kind, |i| strings.activity_kinds[i])
+}
+
+/// Whether a list's name matches the list menu's search, ignoring case.
+fn list_matches(name: &str, query: &str) -> bool {
+    let query = query.trim().to_lowercase();
+    query.is_empty() || name.to_lowercase().contains(&query)
 }
 
 fn check_mark() -> impl IntoElement {
@@ -2662,7 +2725,7 @@ impl Render for TaskDetail {
                                     .on_click(cx.listener(|this, _, _, cx| this.open_popup(Popup::List, cx)))
                                     .when(self.popup == Some(Popup::List), |el| {
                                         el.child(PopoverAttachment::new(
-                                            Placement::BelowLeft,
+                                            Placement::AboveLeft,
                                             self.render_list_popup(strings, cx),
                                         ))
                                     }),
@@ -2738,5 +2801,13 @@ mod size_tests {
         assert_eq!(super::format_size(512), "512 B");
         assert_eq!(super::format_size(12 * 1024 + 5), "12 KB");
         assert_eq!(super::format_size(3_565_158), "3.4 MB");
+    }
+
+    #[test]
+    fn list_menu_search() {
+        assert!(super::list_matches("Work", ""));
+        assert!(super::list_matches("Work", " wo"));
+        assert!(super::list_matches("Входящие", "вх"));
+        assert!(!super::list_matches("Work", "home"));
     }
 }

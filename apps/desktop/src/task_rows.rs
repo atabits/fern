@@ -122,6 +122,7 @@ pub enum SortBy {
     Custom,
     Date,
     Created,
+    Modified,
     Title,
     Tag,
     Priority,
@@ -141,10 +142,11 @@ pub enum GroupBy {
 }
 
 impl SortBy {
-    pub const ALL: [Self; 6] = [Self::Custom, Self::Date, Self::Created, Self::Title, Self::Tag, Self::Priority];
+    pub const ALL: [Self; 7] =
+        [Self::Custom, Self::Date, Self::Created, Self::Modified, Self::Title, Self::Tag, Self::Priority];
 
     pub fn key(self) -> &'static str {
-        ["custom", "date", "created", "title", "tag", "priority"][self as usize]
+        ["custom", "date", "created", "modified", "title", "tag", "priority"][self as usize]
     }
 
     pub fn from_key(key: &str) -> Self {
@@ -180,6 +182,8 @@ pub fn sort_tasks(tasks: &mut [Task], sort: SortBy) {
         // Dated tasks first, earliest first; all-day before timed on the same day.
         SortBy::Date => tasks.sort_by_key(|t| (t.due_date.is_none(), t.due_date, t.due_time.is_some(), t.due_time)),
         SortBy::Created => tasks.sort_by_key(|t| std::cmp::Reverse(t.created_at)),
+        // Most recently edited first; a task never edited counts from when it was added.
+        SortBy::Modified => tasks.sort_by_key(|t| std::cmp::Reverse(t.modified_at.unwrap_or(t.created_at))),
         SortBy::Title => tasks.sort_by_key(|t| t.title.to_lowercase()),
         SortBy::Tag => tasks.sort_by_key(|t| (tag(t).is_none(), tag(t))),
         SortBy::Priority => tasks.sort_by_key(|t| std::cmp::Reverse(t.priority as u8)),
@@ -457,6 +461,7 @@ mod tests {
             wont_do_at: None,
             end_date: None,
             end_time: None,
+            modified_at: None,
             reminders: Vec::new(),
             created_at: 0,
         }
@@ -550,6 +555,9 @@ mod tests {
         assert_eq!(titles(&sorted)[..2], ["banana", "Apple"]);
         sort_tasks(&mut sorted, SortBy::Tag);
         assert_eq!(titles(&sorted)[..2], ["cherry", "Apple"]);
+        sorted[3].modified_at = Some(10);
+        sort_tasks(&mut sorted, SortBy::Modified);
+        assert_eq!(sorted[0].modified_at, Some(10));
 
         assert_eq!(shape(&grouped_rows(&tasks, GroupBy::Date, today, &EN)), [
             "## Overdue 1", "banana", "## Today 1", "Apple", "## No Date 1", "cherry", "## Completed 1", "done"

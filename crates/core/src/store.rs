@@ -152,10 +152,37 @@ const MIGRATIONS: &[&str] = &[
         created_at INTEGER NOT NULL
     );
     ",
+    // When a task last changed, kept by triggers so every write path counts: its fields (not
+    // its position in the list), its tags and its checklist.
+    "
+    ALTER TABLE tasks ADD COLUMN modified_at INTEGER;
+    CREATE TRIGGER tasks_modified AFTER UPDATE OF
+        title, notes, priority, kind, parent_id, list_id, due_date, due_time, end_date, end_time,
+        repeat, reminders, completed_at, deleted_at, wont_do_at ON tasks
+    BEGIN
+        UPDATE tasks SET modified_at = CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) WHERE id = NEW.id;
+    END;
+    CREATE TRIGGER task_tags_added AFTER INSERT ON task_tags
+    BEGIN
+        UPDATE tasks SET modified_at = CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) WHERE id = NEW.task_id;
+    END;
+    CREATE TRIGGER task_tags_removed AFTER DELETE ON task_tags
+    BEGIN
+        UPDATE tasks SET modified_at = CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) WHERE id = OLD.task_id;
+    END;
+    CREATE TRIGGER checklist_changed AFTER UPDATE ON checklist_items
+    BEGIN
+        UPDATE tasks SET modified_at = CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) WHERE id = NEW.task_id;
+    END;
+    CREATE TRIGGER checklist_added AFTER INSERT ON checklist_items
+    BEGIN
+        UPDATE tasks SET modified_at = CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) WHERE id = NEW.task_id;
+    END;
+    ",
 ];
 
 const TASK_COLUMNS: &str = "id, parent_id, kind, title, notes, priority, due_date, due_time, \
-                            completed_at, created_at, list_id, deleted_at, repeat, wont_do_at, reminders, end_date, end_time";
+                            completed_at, created_at, list_id, deleted_at, repeat, wont_do_at, reminders, end_date, end_time, modified_at";
 
 const DATE_FORMAT: &str = "%Y-%m-%d";
 const TIME_FORMAT: &str = "%H:%M";
@@ -265,6 +292,7 @@ impl Store {
             wont_do_at: None,
             end_date: None,
             end_time: None,
+            modified_at: None,
             reminders: Vec::new(),
             created_at: now_ms(),
         };
@@ -357,7 +385,7 @@ impl Store {
                 &format!(
                     "INSERT INTO tasks ({TASK_COLUMNS})
                      SELECT ?2, parent_id, kind, title, notes, priority, due_date, due_time,
-                            ?3, created_at, list_id, NULL, NULL, NULL, NULL, end_date, end_time
+                            ?3, created_at, list_id, NULL, NULL, NULL, NULL, end_date, end_time, ?3
                      FROM tasks WHERE id = ?1"
                 ),
                 params![id.to_string(), copy.to_string(), now_ms()],
@@ -1153,6 +1181,7 @@ fn task_from_row(row: &Row) -> rusqlite::Result<Task> {
         reminders: row.get::<_, Option<String>>(14)?.map(|r| crate::reminder::parse(&r)).unwrap_or_default(),
         end_date: row.get::<_, Option<String>>(15)?.and_then(|d| NaiveDate::parse_from_str(&d, DATE_FORMAT).ok()),
         end_time: row.get::<_, Option<String>>(16)?.and_then(|t| NaiveTime::parse_from_str(&t, TIME_FORMAT).ok()),
+        modified_at: row.get(17)?,
     })
 }
 
@@ -1515,6 +1544,23 @@ mod tests {
         assert!(store.checkins(read.id)?.is_empty());
         store.delete_habit(floss.id)?;
         assert_eq!(store.habits()?.iter().map(|h| h.name.as_str()).collect::<Vec<_>>(), ["Read"]);
+        Ok(())
+    }
+
+    #[test]
+    fn edits_update_the_modified_time() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let a = store.add_task("a")?;
+        let b = store.add_task("b")?;
+        assert_eq!(store.task(a.id)?.unwrap().modified_at, None);
+        store.set_title(a.id, "a, renamed")?;
+        let modified = store.task(a.id)?.unwrap().modified_at;
+        assert!(modified.is_some_and(|m| m >= a.created_at - 1000));
+        // Reordering is not an edit.
+        store.move_task(b.id, a.id, false)?;
+        assert_eq!(store.task(b.id)?.unwrap().modified_at, None);
+        store.set_tags(b.id, &["home".to_owned()])?;
+        assert!(store.task(b.id)?.unwrap().modified_at.is_some());
         Ok(())
     }
 

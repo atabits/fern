@@ -741,7 +741,7 @@ impl CalendarView {
                                     .bg(tint.opacity(0.12))
                                     .hover(|s| s.bg(tint.opacity(0.2)))
                                     .cursor_pointer()
-                                    .child(div().flex_1().min_w_0().child(Label::new(item.title).size(LabelSize::Small).truncate()))
+                                    .child(div().flex_1().min_w_0().child(Label::new(item.title).truncate()))
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         if countdown {
                                             this.open_countdown = Some((date, id));
@@ -781,7 +781,7 @@ impl CalendarView {
             };
             rows.push(
                 h_flex()
-                    .py(px(20.))
+                    .py(px(30.))
                     .items_start()
                     .child(div().pt(px(6.)).child(day))
                     .child(v_flex().flex_1().gap_2().children(entries))
@@ -795,7 +795,8 @@ impl CalendarView {
             .overflow_y_scroll()
             .px(px(60.))
             .pb_6()
-            .child(v_flex().pt(px(14.)).max_w(px(760.)).children(rows))
+            // The original's agenda: 1030 px wide, each day 100 px apart.
+            .child(v_flex().pt(px(14.)).max_w(px(1030.)).children(rows))
             .into_any_element()
     }
 

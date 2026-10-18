@@ -4465,7 +4465,7 @@ impl TodoView {
         }
         let theme = cx.theme().clone();
         let today = Self::today();
-        let habits: Vec<(fern_core::Habit, bool)> = self
+        let habits: Vec<(fern_core::Habit, bool, u32)> = self
             .store
             .habits()
             .unwrap_or_default()
@@ -4473,9 +4473,10 @@ impl TodoView {
             .filter(|h| !h.archived)
             .filter_map(|h| {
                 let done = self.store.checkins(h.id).unwrap_or_default();
+                let amount = self.store.checkin_records(h.id).unwrap_or_default().into_iter().find(|c| c.date == today).map_or(0, |c| c.value);
                 h.is_due(today, &done).then(|| {
                     let checked = done.contains(&today);
-                    (h, checked)
+                    (h, checked, amount)
                 })
             })
             .collect();
@@ -4498,36 +4499,39 @@ impl TodoView {
                         }).weight(FontWeight::BOLD))
                         .child(div().pl_1().child(Label::new(count.to_string()).size(LabelSize::Small).color(Color::Muted))),
                 )
-                .children(habits.into_iter().map(|(habit, checked)| {
+                // As the original's rows: the icon and name, then "0 / 2 unit" and "Today" on
+                // the right, no box; a click checks the habit in or adds a step.
+                .children(habits.into_iter().map(|(habit, checked, amount)| {
                     let id = habit.id;
                     let has_goal = habit.goal.is_some();
+                    let (target, unit) = habit.goal.as_ref().map_or((1, String::new()), |g| (g.amount, g.unit.clone()));
                     h_flex()
+                        .id(SharedString::from(format!("habit-row-{id}")))
                         .h(px(ROW_HEIGHT))
                         .pl(px(GUTTER))
                         .pr_3()
                         .gap(px(10.))
-                        .child(
-                            Checkbox::new(SharedString::from(format!("habit-check-{id}")))
-                                .toggle_state(checked)
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    let result = if has_goal {
-                                        this.store.step_checkin(id, today).map(|_| ())
-                                    } else {
-                                        this.store.toggle_checkin(id, today).map(|_| ())
-                                    };
-                                    this.check(result);
-                                    cx.notify();
-                                })),
-                        )
-                        .child(crate::habit_view::avatar(&habit, px(22.), cx))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(theme.colors().ghost_element_hover))
+                        .child(crate::habit_view::avatar(&habit, px(20.), cx))
                         .child(
                             div().flex_1().min_w_0().child(
                                 Label::new(habit.name.clone())
                                     .color(if checked { Color::Muted } else { Color::Default })
-                                    .strikethrough(checked)
                                     .truncate(),
                             ),
                         )
+                        .child(Label::new(format!("{amount} / {target} {unit}").trim().to_owned()).size(LabelSize::Small).color(Color::Muted))
+                        .child(Label::new(strings.today).size(LabelSize::Small).color(Color::Accent))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let result = if has_goal {
+                                this.store.step_checkin(id, today).map(|_| ())
+                            } else {
+                                this.store.toggle_checkin(id, today).map(|_| ())
+                            };
+                            this.check(result);
+                            cx.notify();
+                        }))
                         .border_b_1()
                         .border_color(theme.colors().border_variant)
                 }))

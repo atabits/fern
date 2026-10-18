@@ -85,6 +85,8 @@ pub struct Task {
     /// The end of a duration ("Duration" tab): the task spans from the due date and time to here.
     pub end_date: Option<NaiveDate>,
     pub end_time: Option<NaiveTime>,
+    /// When the task was pinned to the top of its lists.
+    pub pinned_at: Option<i64>,
     /// Unix milliseconds of the last edit; `None` for tasks never edited since they were added.
     pub modified_at: Option<i64>,
     /// Reminders as minutes before the due time (09:00 on the due day for all-day tasks).

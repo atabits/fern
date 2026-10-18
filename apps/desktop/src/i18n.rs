@@ -192,6 +192,8 @@ pub struct Strings {
     pub no_wont_do: &'static str,
     pub reopen: &'static str,
     pub duplicate: &'static str,
+    pub pin: &'static str,
+    pub unpin: &'static str,
     pub task_activities: &'static str,
     /// Created, renamed, completed, reopened, date, date cleared, priority, moved, deleted,
     /// restored, won't do: what the activity log says for each kind.
@@ -435,6 +437,8 @@ pub static EN: Strings = Strings {
     no_wont_do: "Nothing marked as Won't Do",
     reopen: "Reopen",
     duplicate: "Duplicate",
+    pin: "Pin",
+    unpin: "Unpin",
     task_activities: "Task Activities",
     activity_kinds: [
         "created the task", "renamed the task", "completed the task", "reopened the task", "changed the date",
@@ -669,6 +673,8 @@ pub static RU: Strings = Strings {
     no_wont_do: "Нет задач со статусом «Не буду делать»",
     reopen: "Вернуть в работу",
     duplicate: "Дублировать",
+    pin: "Закрепить",
+    unpin: "Открепить",
     task_activities: "История задачи",
     activity_kinds: [
         "создана задача", "задача переименована", "задача выполнена", "задача снова открыта", "изменена дата",

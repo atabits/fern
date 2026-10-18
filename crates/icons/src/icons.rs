@@ -52,6 +52,8 @@ pub enum IconName {
     Pause,
     Pencil,
     Percent,
+    Pin,
+    PinOff,
     Play,
     Plus,
     RefreshCw,

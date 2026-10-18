@@ -252,6 +252,13 @@ impl TodoView {
                         self.set_view(View::List(id), cx);
                     }
                 }
+                Some(("pin", needle)) => {
+                    if let Some(id) = self.tasks.iter().find(|t| t.title.contains(needle)).map(|t| t.id) {
+                        let result = self.store.set_pinned(id, true);
+                        self.check(result);
+                        self.reload(cx);
+                    }
+                }
                 Some(("select", needle)) => {
                     if let Some(id) = self.tasks.iter().find(|t| t.title.contains(needle)).map(|t| t.id) {
                         self.select(id, cx);
@@ -419,6 +426,7 @@ impl TodoView {
                 let (sort, group) = self.sort_settings();
                 let mut tasks = self.tasks.clone();
                 task_rows::sort_tasks(&mut tasks, sort);
+                task_rows::pinned_first(&mut tasks);
                 match group {
                     GroupBy::Custom => {
                         task_rows::build_rows(&tasks, &self.collapsed_tasks, &self.collapsed_sections, true)
@@ -874,6 +882,9 @@ impl TodoView {
                     .border_b_1()
                     .border_color(theme.colors().border_variant)
                     .child(marker)
+                    .when(task.pinned_at.is_some() && !closed_view, |el| {
+                        el.child(Icon::new(IconName::Pin).size(IconSize::XSmall).color(Color::Accent))
+                    })
                     .child(
                         div().flex_1().min_w_0().child(
                             Label::new(if task.title.is_empty() {

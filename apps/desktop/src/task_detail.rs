@@ -480,6 +480,11 @@ impl TaskDetail {
                     window.focus(&this.subtask_input.focus_handle(cx), cx);
                 },
             )))
+            .child({
+                let pinned = task.pinned_at.is_some();
+                item("more-pin", if pinned { IconName::PinOff } else { IconName::Pin }, if pinned { strings.unpin } else { strings.pin })
+                    .on_click(cx.listener(move |this, _, _, cx| this.menu_action(cx, move |store, id| store.set_pinned(id, !pinned))))
+            })
             .child(
                 item("more-wont-do", if wont_do { IconName::RotateCcw } else { IconName::SquareX }, if wont_do {
                     strings.reopen

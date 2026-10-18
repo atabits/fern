@@ -227,10 +227,14 @@ const MIGRATIONS: &[&str] = &[
         INSERT INTO task_activity (task_id, at, kind) VALUES (NEW.id, CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER), CASE WHEN NEW.wont_do_at IS NULL THEN 'reopened' ELSE 'wont_do' END);
     END;
     ",
+    "
+    ALTER TABLE tasks ADD COLUMN pinned_at INTEGER;
+    ",
 ];
 
 const TASK_COLUMNS: &str = "id, parent_id, kind, title, notes, priority, due_date, due_time, \
-                            completed_at, created_at, list_id, deleted_at, repeat, wont_do_at, reminders, end_date, end_time, modified_at";
+                            completed_at, created_at, list_id, deleted_at, repeat, wont_do_at, reminders, end_date, end_time, modified_at, \
+                            pinned_at";
 
 const DATE_FORMAT: &str = "%Y-%m-%d";
 const TIME_FORMAT: &str = "%H:%M";
@@ -341,6 +345,7 @@ impl Store {
             end_date: None,
             end_time: None,
             modified_at: None,
+            pinned_at: None,
             reminders: Vec::new(),
             created_at: now_ms(),
         };
@@ -433,7 +438,7 @@ impl Store {
                 &format!(
                     "INSERT INTO tasks ({TASK_COLUMNS})
                      SELECT ?2, parent_id, kind, title, notes, priority, due_date, due_time,
-                            ?3, created_at, list_id, NULL, NULL, NULL, NULL, end_date, end_time, ?3
+                            ?3, created_at, list_id, NULL, NULL, NULL, NULL, end_date, end_time, ?3, NULL
                      FROM tasks WHERE id = ?1"
                 ),
                 params![id.to_string(), copy.to_string(), now_ms()],
@@ -523,6 +528,11 @@ impl Store {
             params![id.to_string(), date, time],
         )?;
         Ok(())
+    }
+
+    /// Pins a task to the top of its lists, or unpins it.
+    pub fn set_pinned(&self, id: Id, pinned: bool) -> Result<()> {
+        self.update(id, "pinned_at", pinned.then(now_ms))
     }
 
     pub fn set_reminders(&self, id: Id, reminders: &[i64]) -> Result<()> {
@@ -1242,6 +1252,7 @@ fn task_from_row(row: &Row) -> rusqlite::Result<Task> {
         end_date: row.get::<_, Option<String>>(15)?.and_then(|d| NaiveDate::parse_from_str(&d, DATE_FORMAT).ok()),
         end_time: row.get::<_, Option<String>>(16)?.and_then(|t| NaiveTime::parse_from_str(&t, TIME_FORMAT).ok()),
         modified_at: row.get(17)?,
+        pinned_at: row.get(18)?,
     })
 }
 
@@ -1604,6 +1615,17 @@ mod tests {
         assert!(store.checkins(read.id)?.is_empty());
         store.delete_habit(floss.id)?;
         assert_eq!(store.habits()?.iter().map(|h| h.name.as_str()).collect::<Vec<_>>(), ["Read"]);
+        Ok(())
+    }
+
+    #[test]
+    fn pinning() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let task = store.add_task("pay rent")?;
+        store.set_pinned(task.id, true)?;
+        assert!(store.task(task.id)?.unwrap().pinned_at.is_some());
+        store.set_pinned(task.id, false)?;
+        assert_eq!(store.task(task.id)?.unwrap().pinned_at, None);
         Ok(())
     }
 

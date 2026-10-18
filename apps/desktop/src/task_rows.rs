@@ -174,6 +174,13 @@ impl GroupBy {
     }
 }
 
+/// Moves pinned tasks to the top, the most recently pinned first; the rest keep their order.
+pub fn pinned_first(tasks: &mut [Task]) {
+    tasks.sort_by_key(|t| t.pinned_at.map_or(1, |_| 0));
+    let pinned = tasks.iter().take_while(|t| t.pinned_at.is_some()).count();
+    tasks[..pinned].sort_by_key(|t| std::cmp::Reverse(t.pinned_at));
+}
+
 /// Sorts tasks in place; the sort is stable, so ties keep the manual order.
 pub fn sort_tasks(tasks: &mut [Task], sort: SortBy) {
     let tag = |t: &Task| t.tags.first().map(|t| t.to_lowercase());
@@ -462,6 +469,7 @@ mod tests {
             end_date: None,
             end_time: None,
             modified_at: None,
+            pinned_at: None,
             reminders: Vec::new(),
             created_at: 0,
         }
@@ -527,6 +535,16 @@ mod tests {
         assert_eq!(snippet("short", "sho", 10).as_deref(), Some("short"));
         assert_eq!(snippet("line one\nline two", "two", 20).as_deref(), Some("line one line two"));
         assert_eq!(snippet("nothing", "zzz", 5), None);
+    }
+
+    #[test]
+    fn pinned_tasks_go_first() {
+        let mut tasks = vec![task("a"), task("b"), task("c"), task("d")];
+        tasks[2].pinned_at = Some(1);
+        tasks[3].pinned_at = Some(2);
+        pinned_first(&mut tasks);
+        let titles: Vec<&str> = tasks.iter().map(|t| t.title.as_str()).collect();
+        assert_eq!(titles, ["d", "c", "a", "b"]);
     }
 
     #[test]

@@ -92,6 +92,6 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 
 ## Next
 
-1. Interface: re-check the main screens (Inbox, Today, details, habits, focus) against the original now that bold text renders, and fix the weights that differ.
+1. Interface: re-check the focus, calendar month / week and Settings screens against the original now that bold text renders (Inbox and Habits are checked: the Habit title medium, its week strip's numbers semibold), and fix the weights that differ.
 
 Not checkable under the reference rules: whether the original asks for a note when a focus session ends, and its white noise (the desktop original shows no sound choice on the focus page or in Focus Settings; it would only appear with a timer running in the reference account). Fern's record dialog takes a note afterwards.

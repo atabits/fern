@@ -1956,6 +1956,7 @@ impl Render for HabitView {
                 .child(
                     Label::new(date.day().to_string())
                         .size(LabelSize::Small)
+                        .weight(FontWeight::SEMIBOLD)
                         .color(if is_today { Color::Accent } else { Color::Default }),
                 )
                 .child(
@@ -1988,9 +1989,10 @@ impl Render for HabitView {
                             .gap_1()
                             .cursor_pointer()
                             .child(
+                                // The original's title is medium, not bold.
                                 Label::new(if self.show_archived { strings.habit_archived } else { strings.section_habits })
                                     .size(LabelSize::Large)
-                                    .weight(FontWeight::BOLD),
+                                    .weight(FontWeight::MEDIUM),
                             )
                             .child(Icon::new(IconName::ChevronDown).size(IconSize::XSmall))
                             .on_click(cx.listener(|this, _, _, cx| {

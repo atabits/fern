@@ -990,7 +990,16 @@ impl TodoView {
     /// The add field's placeholder: the Detailed box asks "What would you like to do?".
     fn sync_input_placeholder(&mut self, cx: &mut Context<Self>) {
         let strings = i18n::t(cx);
-        let placeholder = if self.preferences.detailed_input { strings.input_box_placeholder } else { strings.add_task };
+        // In the smart lists, as the original: 'Add task to "Inbox"', naming where new tasks go.
+        let smart = matches!(self.view, View::All | View::Today | View::Tomorrow | View::Next7Days);
+        let placeholder: SharedString = if self.preferences.detailed_input {
+            strings.input_box_placeholder.into()
+        } else if smart {
+            let list = self.preferences.default_list.and_then(|id| self.lists.iter().find(|l| l.id == id)).map_or(strings.inbox.to_owned(), |l| l.name.clone());
+            strings.add_task_to.replace("{list}", &list).into()
+        } else {
+            strings.add_task.into()
+        };
         self.input.update(cx, |input, cx| input.set_placeholder(placeholder, cx));
     }
 
@@ -5417,7 +5426,29 @@ impl Render for TodoView {
                                 .child(Label::new(strings.free_day_hint).size(LabelSize::Small).color(Color::Muted)),
                         )
                     })
-                    .when(rows.is_empty() && !matches!(self.view, View::Day(_)), |el| {
+                    // An empty Tomorrow, as the original's: a map in a soft patch and its words.
+                    .when(rows.is_empty() && self.view == View::Tomorrow, |el| {
+                        el.child(
+                            v_flex()
+                                .pt(px(160.))
+                                .items_center()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .size(px(96.))
+                                        .mb_2()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded_full()
+                                        .bg(theme.colors().element_hover)
+                                        .child(Icon::new(IconName::Map).size(IconSize::XLarge).color(Color::Accent)),
+                                )
+                                .child(Label::new(strings.no_tasks_tomorrow))
+                                .child(Label::new(strings.plan_ahead).size(LabelSize::Small).color(Color::Muted)),
+                        )
+                    })
+                    .when(rows.is_empty() && !matches!(self.view, View::Day(_) | View::Tomorrow), |el| {
                         el.child(div().px_3().pt_8().child(
                             Label::new(match &self.view {
                                 View::Completed => strings.no_completed_tasks,

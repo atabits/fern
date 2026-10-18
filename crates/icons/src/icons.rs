@@ -79,6 +79,7 @@ pub enum IconName {
     ListOrdered,
     ListTree,
     Mail,
+    Map,
     MapPin,
     Menu,
     MessageSquareText,

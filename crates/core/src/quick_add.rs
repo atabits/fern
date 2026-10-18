@@ -30,21 +30,45 @@ pub struct ParsedTask {
 }
 
 /// `lists` holds the names of existing lists; `^name` is recognized only for those.
+/// Settings → More → Smart Recognition: what quick add recognizes, and whether the recognized
+/// text is removed from the title.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Recognition {
+    pub dates: bool,
+    pub remove_date_text: bool,
+    pub tags: bool,
+    pub remove_tag_text: bool,
+}
+
+impl Default for Recognition {
+    fn default() -> Self {
+        Self { dates: true, remove_date_text: true, tags: true, remove_tag_text: true }
+    }
+}
+
 pub fn parse_quick_add(input: &str, today: NaiveDate, lists: &[String]) -> ParsedTask {
+    parse_quick_add_with(input, today, lists, Recognition::default())
+}
+
+pub fn parse_quick_add_with(input: &str, today: NaiveDate, lists: &[String], recognition: Recognition) -> ParsedTask {
     let words: Vec<&str> = input.split_whitespace().collect();
     let lower: Vec<String> = words.iter().map(|w| w.to_lowercase()).collect();
     let mut used = vec![false; words.len()];
     let mut parsed = ParsedTask::default();
+    // With "Remove text in tasks" off, recognized date words are marked here and stay in the title.
+    let mut dates_used = vec![false; words.len()];
 
     let mut i = 0;
     while i < words.len() {
         let word = lower[i].as_str();
 
-        if let Some(tag) = words[i].strip_prefix('#').filter(|t| !t.is_empty()) {
+        if recognition.tags
+            && let Some(tag) = words[i].strip_prefix('#').filter(|t| !t.is_empty())
+        {
             if !parsed.tags.iter().any(|t: &String| t.to_lowercase() == tag.to_lowercase()) {
                 parsed.tags.push(tag.to_owned());
             }
-            used[i] = true;
+            used[i] = recognition.remove_tag_text;
         } else if let Some(list) = word
             .strip_prefix('^')
             .and_then(|name| lists.iter().find(|l| l.to_lowercase() == name))
@@ -54,23 +78,28 @@ pub fn parse_quick_add(input: &str, today: NaiveDate, lists: &[String]) -> Parse
         } else if let Some(priority) = word.strip_prefix('!').and_then(parse_priority) {
             parsed.priority = Some(priority);
             used[i] = true;
-        } else if parsed.repeat.is_none()
+        } else if recognition.dates
+            && parsed.repeat.is_none()
             && let Some((repeat, len)) = parse_repeat(&lower[i..])
         {
             parsed.repeat = Some(repeat);
-            used[i..i + len].iter_mut().for_each(|u| *u = true);
+            if recognition.remove_date_text {
+                used[i..i + len].iter_mut().for_each(|u| *u = true);
+            }
             i += len;
             continue;
-        } else if parsed.due_time.is_none()
+        } else if recognition.dates
+            && parsed.due_time.is_none()
             && let Some(time) = parse_time(word)
         {
             parsed.due_time = Some(time);
-            mark_with_preposition(&mut used, &lower, i, 1);
-        } else if parsed.due_date.is_none()
+            mark_with_preposition(if recognition.remove_date_text { &mut used } else { &mut dates_used }, &lower, i, 1);
+        } else if recognition.dates
+            && parsed.due_date.is_none()
             && let Some((date, len)) = parse_date(&lower[i..], today)
         {
             parsed.due_date = Some(date);
-            mark_with_preposition(&mut used, &lower, i, len);
+            mark_with_preposition(if recognition.remove_date_text { &mut used } else { &mut dates_used }, &lower, i, len);
             i += len;
             continue;
         }
@@ -412,6 +441,20 @@ mod tests {
         assert_eq!((p.title.as_str(), p.list.as_deref()), ("Report", Some("Work")));
         let p = parse_quick_add("Report ^garden", today(), &lists);
         assert_eq!((p.title.as_str(), p.list), ("Report ^garden", None));
+    }
+
+    #[test]
+    fn smart_recognition_switches() {
+        let lists: [String; 0] = [];
+        let off = Recognition { dates: false, tags: false, ..Default::default() };
+        let parsed = parse_quick_add_with("Call mom tomorrow #family", today(), &lists, off);
+        assert_eq!((parsed.title.as_str(), parsed.due_date, parsed.tags.len()), ("Call mom tomorrow #family", None, 0));
+
+        let keep = Recognition { remove_date_text: false, remove_tag_text: false, ..Default::default() };
+        let parsed = parse_quick_add_with("Call mom tomorrow #family", today(), &lists, keep);
+        assert_eq!(parsed.title, "Call mom tomorrow #family");
+        assert_eq!(parsed.due_date, Some(today() + chrono::Duration::days(1)));
+        assert_eq!(parsed.tags, ["family"]);
     }
 
     #[test]

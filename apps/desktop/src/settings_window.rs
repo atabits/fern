@@ -451,6 +451,64 @@ impl SettingsWindow {
                     languages,
                     cx,
                 )))
+                .child({
+                    let r = self.preferences.recognition;
+                    // A switch row with a hint, and the checkbox under it while the switch is on.
+                    let section = |id: &'static str,
+                                   label: &'static str,
+                                   hint: &'static str,
+                                   on: bool,
+                                   toggle: fn(&mut fern_core::Recognition),
+                                   check: Option<(&'static str, bool, fn(&mut fern_core::Recognition))>,
+                                   cx: &mut Context<Self>| {
+                        v_flex()
+                            .px_4()
+                            .py_1p5()
+                            .gap_1()
+                            .child(
+                                h_flex()
+                                    .id(id)
+                                    .cursor_pointer()
+                                    .child(div().flex_1().child(Label::new(label)))
+                                    .child(Switch::new().toggle_state(on))
+                                    .on_click(cx.listener(move |this, _, window, cx| this.update(window, cx, |p| toggle(&mut p.recognition)))),
+                            )
+                            .child(div().text_size(px(11.)).text_color(colors.text_muted).child(hint))
+                            .when_some(check.filter(|_| on), |el, (text, checked, flip)| {
+                                el.child(
+                                    h_flex()
+                                        .id(SharedString::from(format!("{id}-remove")))
+                                        .gap_2()
+                                        .pt_0p5()
+                                        .cursor_pointer()
+                                        .child(Checkbox::new(SharedString::from(format!("{id}-check"))).toggle_state(checked))
+                                        .child(Label::new(text).size(LabelSize::Small))
+                                        .on_click(cx.listener(move |this, _, window, cx| this.update(window, cx, |p| flip(&mut p.recognition)))),
+                                )
+                            })
+                    };
+                    v_flex().child(title(strings.smart_recognition)).child(
+                        group()
+                            .child(section(
+                                "recognize-dates",
+                                strings.date_recognition,
+                                strings.date_recognition_hint,
+                                r.dates,
+                                |r| r.dates = !r.dates,
+                                Some((strings.remove_date_text, r.remove_date_text, |r| r.remove_date_text = !r.remove_date_text)),
+                                cx,
+                            ))
+                            .child(section(
+                                "recognize-tags",
+                                strings.tag_recognition,
+                                strings.tag_recognition_hint,
+                                r.tags,
+                                |r| r.tags = !r.tags,
+                                Some((strings.remove_tag_text, r.remove_tag_text, |r| r.remove_tag_text = !r.remove_tag_text)),
+                                cx,
+                            )),
+                    )
+                })
                 .child(
                     v_flex()
                         .child(title(strings.task_default))

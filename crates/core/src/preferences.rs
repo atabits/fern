@@ -5,6 +5,7 @@ use chrono::Weekday;
 use rusqlite::OptionalExtension as _;
 
 use crate::model::Id;
+use crate::quick_add::Recognition;
 use crate::store::Store;
 
 /// The color theme: fixed, or following the system's dark mode.
@@ -165,6 +166,8 @@ pub struct Preferences {
     pub date_format: Option<DateFormat>,
     /// Settings → Show Week Numbers (W) in the calendar.
     pub week_numbers: bool,
+    /// Settings → More → Smart Recognition, for quick add.
+    pub recognition: Recognition,
     /// Where tasks added outside a list go (smart lists, tags, filters); `None` is the Inbox.
     pub default_list: Option<Id>,
     /// Settings → Smart List, in the order of `SmartList::ALL`.
@@ -194,6 +197,7 @@ impl Default for Preferences {
             hour12: false,
             date_format: None,
             week_numbers: false,
+            recognition: Recognition::default(),
             default_list: None,
             smart_lists: [Visibility::Show; 11],
         }
@@ -205,6 +209,9 @@ const WEEK_START: &str = "week_start";
 const TIME_FORMAT: &str = "time_format";
 const DATE_FORMAT: &str = "date_format";
 const WEEK_NUMBERS: &str = "week_numbers";
+/// Smart Recognition switches, in the order of `Recognition`'s fields.
+const RECOGNITION: [&str; 4] =
+    ["recognize_dates", "remove_date_text", "recognize_tags", "remove_tag_text"];
 const DEFAULT_LIST: &str = "default_list";
 
 impl Store {
@@ -228,8 +235,15 @@ impl Store {
         let hour12 = self.setting(TIME_FORMAT)?.as_deref() == Some("12");
         let date_format = self.setting(DATE_FORMAT)?.and_then(|c| DateFormat::from_code(&c));
         let week_numbers = self.setting(WEEK_NUMBERS)?.as_deref() == Some("1");
+        let flag = |key: &str| -> Result<bool> { Ok(self.setting(key)?.as_deref() != Some("0")) };
+        let recognition = Recognition {
+            dates: flag(RECOGNITION[0])?,
+            remove_date_text: flag(RECOGNITION[1])?,
+            tags: flag(RECOGNITION[2])?,
+            remove_tag_text: flag(RECOGNITION[3])?,
+        };
         let mut preferences =
-            Preferences { theme, week_start, hour12, date_format, week_numbers, default_list, ..defaults };
+            Preferences { theme, week_start, hour12, date_format, week_numbers, recognition, default_list, ..defaults };
         for list in SmartList::ALL {
             if let Some(visibility) = self.setting(&smart_list_key(list))?.and_then(|c| Visibility::from_code(&c)) {
                 preferences.set_visibility(list, visibility);
@@ -244,6 +258,10 @@ impl Store {
         self.set_setting(TIME_FORMAT, if preferences.hour12 { "12" } else { "24" })?;
         self.set_setting(DATE_FORMAT, preferences.date_format.map_or("", DateFormat::code))?;
         self.set_setting(WEEK_NUMBERS, if preferences.week_numbers { "1" } else { "0" })?;
+        let r = preferences.recognition;
+        for (key, on) in RECOGNITION.iter().zip([r.dates, r.remove_date_text, r.tags, r.remove_tag_text]) {
+            self.set_setting(key, if on { "1" } else { "0" })?;
+        }
         self.set_setting(DEFAULT_LIST, &preferences.default_list.map(|id| id.to_string()).unwrap_or_default())?;
         for list in SmartList::ALL {
             self.set_setting(&smart_list_key(list), preferences.visibility(list).code())?;
@@ -278,6 +296,7 @@ mod tests {
             hour12: true,
             date_format: Some(DateFormat::YearMonthDay),
             week_numbers: true,
+            recognition: Recognition { remove_date_text: false, tags: false, ..Default::default() },
             default_list: Some(list.id),
             ..Default::default()
         };

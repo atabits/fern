@@ -560,7 +560,7 @@ impl TodoView {
     fn add_task(&self, input: &str) -> anyhow::Result<Task> {
         let today = Self::today();
         let list_names: Vec<String> = self.lists.iter().map(|l| l.name.clone()).collect();
-        let parsed = fern_core::parse_quick_add(input, today, &list_names);
+        let parsed = fern_core::parse_quick_add_with(input, today, &list_names, self.preferences.recognition);
         let title = if parsed.title.is_empty() { input.trim() } else { parsed.title.as_str() };
         let task = self.store.add_task(title)?;
 

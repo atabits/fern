@@ -36,6 +36,8 @@ pub struct AppView {
     /// The "Shortcuts" panel on the right, while open.
     shortcuts_open: bool,
     settings: Option<gpui::Entity<SettingsWindow>>,
+    /// The Statistics page opened from the account menu, which covers the whole window.
+    statistics_open: bool,
 }
 
 impl AppView {
@@ -72,6 +74,11 @@ impl AppView {
         let countdown = cx.new(|cx| CountdownView::new(store.clone(), cx));
         let habits = cx.new(|cx| HabitView::new(store.clone(), cx));
         let focus = cx.new(|cx| FocusView::new(store.clone(), cx));
+        cx.subscribe(&focus, |this, _, crate::focus_view::StatsClosed, cx| {
+            this.statistics_open = false;
+            cx.notify();
+        })
+        .detach();
         // Mutated only by the debug-build dev state below.
         #[cfg_attr(not(debug_assertions), allow(unused_mut))]
         let mut this = Self {
@@ -89,6 +96,7 @@ impl AppView {
             notices_open: false,
             shortcuts_open: false,
             settings: None,
+            statistics_open: false,
         };
         reminders::start(this.store.clone(), cx);
         settings_window::apply(&this.store.preferences().unwrap_or_default(), window, cx);
@@ -184,6 +192,12 @@ impl AppView {
                 if let Some(settings) = &this.settings {
                     settings.update(cx, |settings, cx| settings.dev_open(spec, cx));
                 }
+            }
+            if state.contains("statistics=open") {
+                this.open_statistics(cx);
+            }
+            if state.contains("account-menu=open") {
+                this.account_menu_open = true;
             }
             if state.contains("shortcuts=open") {
                 this.shortcuts_open = true;
@@ -294,7 +308,20 @@ impl AppView {
                     .child(Label::new(strings.settings))
                     .on_click(cx.listener(|this, _, window, cx| this.open_settings(window, cx))),
             )
+            .child(
+                ListItem::new("account-statistics")
+                    .start_slot(Icon::new(IconName::ChartNoAxesColumn))
+                    .child(Label::new(strings.statistics))
+                    .on_click(cx.listener(|this, _, _, cx| this.open_statistics(cx))),
+            )
             .into_any_element()
+    }
+
+    fn open_statistics(&mut self, cx: &mut Context<Self>) {
+        self.account_menu_open = false;
+        self.statistics_open = true;
+        self.focus.update(cx, |focus, cx| focus.open_stats_overview(cx));
+        cx.notify();
     }
 
     fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -503,15 +530,16 @@ impl Render for AppView {
             .items_start()
             .bg(theme.colors().background)
             .text_color(theme.colors().text)
-            .child(sidebar::render(self.section, on_select, on_avatar, account_menu, bell, cx))
-            .child(match self.section {
+            .when(self.statistics_open, |el| el.child(div().size_full().child(self.focus.clone())))
+            .when(!self.statistics_open, |el| {
+                el.child(sidebar::render(self.section, on_select, on_avatar, account_menu, bell, cx)).child(match self.section {
                 Section::Tasks | Section::Search => div().flex_1().h_full().child(self.todo.clone()),
                 Section::Calendar => div().flex_1().h_full().child(self.calendar.clone()),
                 Section::Matrix => div().flex_1().h_full().child(self.matrix.clone()),
                 Section::Countdown => div().flex_1().h_full().child(self.countdown.clone()),
                 Section::Habits => div().flex_1().h_full().child(self.habits.clone()),
-                Section::Pomodoro => div().flex_1().h_full().child(self.focus.clone()),
-
+                    Section::Pomodoro => div().flex_1().h_full().child(self.focus.clone()),
+                })
             })
             .when(self.shortcuts_open, |el| el.child(self.render_shortcuts(cx)))
             .when_some(self.settings.clone(), |el, settings| {

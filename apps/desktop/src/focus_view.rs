@@ -391,6 +391,13 @@ impl FocusView {
         cx.notify();
     }
 
+    /// The Statistics page on its Overview tab, as the account menu opens it.
+    pub fn open_stats_overview(&mut self, cx: &mut Context<Self>) {
+        self.reload(cx);
+        self.open_stats(cx);
+        self.update_stats(cx, |p| p.tab = 0);
+    }
+
     fn update_stats(&mut self, cx: &mut Context<Self>, change: impl FnOnce(&mut StatsPage)) {
         if let Some(stats) = self.stats.as_mut() {
             change(stats);
@@ -553,12 +560,18 @@ impl FocusView {
                 }))
             })));
 
-        v_flex()
+        // As in the original, the page keeps a readable width, centered in wide windows.
+        div()
             .id("focus-stats")
             .size_full()
             .overflow_y_scroll()
+            .flex()
+            .justify_center()
             .bg(theme.colors().background)
             .text_color(theme.colors().text)
+            .child(v_flex()
+            .w_full()
+            .max_w(px(960.))
             .px_8()
             .py_5()
             .gap_4()
@@ -594,6 +607,7 @@ impl FocusView {
                             .child(Label::new(strings.done))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.stats = None;
+                                cx.emit(StatsClosed);
                                 cx.notify();
                             })),
                     ),
@@ -605,7 +619,7 @@ impl FocusView {
                     .child(overview)
                     .child(h_flex().items_start().gap_4().child(trends).child(most_focused))
                     .child(year_grid),
-            })
+            }))
             .into_any_element()
     }
 
@@ -895,6 +909,12 @@ impl FocusView {
         out
     }
 }
+
+/// "Done" on the Statistics page, which the app shows over everything when opened from the
+/// account menu.
+pub struct StatsClosed;
+
+impl gpui::EventEmitter<StatsClosed> for FocusView {}
 
 impl Render for FocusView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {

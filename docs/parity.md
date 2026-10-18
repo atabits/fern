@@ -44,7 +44,7 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 | Feature | Status | Notes |
 |---|---|---|
 | Narrow sections sidebar | 🟡 | order and tooltips match the original; every section works; the bell has the original's red unread badge and lists fired reminders, including ones missed while the app was closed (opening the list marks them read, a click opens the task). The original's notification list was not opened (that would mark the user's notifications read). Outline icons where TickTick uses filled ones |
-| Account menu | 🟡 | Settings; the language moved to Settings → More (English by default, and Russian); no Statistics entry yet |
+| Account menu | ✅ | the original's Settings and Statistics (the Statistics page over the whole window on its Overview tab, closed with Done; the page keeps the original's centered width); the language is in Settings → More. No Premium or Sign Out (no accounts yet) |
 | Lists column: Inbox / All / Today / Tomorrow / Next 7 Days | ✅ | counters; a new task gets the due date or tag of the current view |
 | Lists column: user lists | ✅ | create inline; rename, color and delete from the "…" menu; no drag and drop |
 | Lists column: tags with color dots and counters | ✅ | |
@@ -91,8 +91,8 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 
 ## Next
 
-1. Statistics page in the main sidebar (account menu), not only from Focus.
-2. Settings → Smart List: show or hide each smart list in the lists column.
-3. Settings → Date & Time: 12/24-hour time format.
-4. Rename and delete habit sections.
+1. Settings → Smart List: show or hide each smart list in the lists column.
+2. Settings → Date & Time: 12/24-hour time format.
+3. Rename and delete habit sections.
+4. Statistics → My Achievement Score.
 5. Filled sidebar icons (needs own filled glyphs; Lucide has none).

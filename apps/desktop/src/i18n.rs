@@ -453,8 +453,6 @@ pub struct Strings {
     pub edit_timer: &'static str,
     pub timer_name: &'static str,
     pub timer_mode: &'static str,
-    pub summary_edit: &'static str,
-    pub summary_done: &'static str,
     /// The editor toolbar's buttons after the heading, as the original's tooltips name them:
     /// Bold, Highlight, Check Item, Bulleted List, Numbered List, Italic, Underline, Strike,
     /// Horizontal Line, Time, Link, Code, Quote.
@@ -1079,8 +1077,6 @@ pub static EN: Strings = Strings {
     edit_timer: "Edit Timer",
     timer_name: "Name",
     timer_mode: "Timer Mode",
-    summary_edit: "Edit the report",
-    summary_done: "Done",
     markdown_tools: [
         "Bold", "Highlight", "Check Item", "Bulleted List", "Numbered List", "Italic", "Underline", "Strike",
         "Horizontal Line", "Time", "Link", "Code", "Quote",
@@ -1684,8 +1680,6 @@ pub static RU: Strings = Strings {
     edit_timer: "Изменить таймер",
     timer_name: "Название",
     timer_mode: "Режим таймера",
-    summary_edit: "Изменить отчёт",
-    summary_done: "Готово",
     markdown_tools: [
         "Жирный", "Выделение", "Пункт чек-листа", "Маркированный список", "Нумерованный список", "Курсив",
         "Подчёркнутый", "Зачёркнутый", "Горизонтальная линия", "Время", "Ссылка", "Код", "Цитата",

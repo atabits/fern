@@ -293,6 +293,10 @@ impl SummaryView {
     /// `None` (Time) types the current time.
     fn format(&mut self, format: Option<Format>, window: &mut Window, cx: &mut Context<Self>) {
         self.heading_menu = false;
+        // As in the original, the report is always editable: a button starts editing it.
+        if !self.editing {
+            self.toggle_editing(window, cx);
+        }
         let Some(editor) = self.editor.clone().filter(|_| self.editing) else { return };
         editor.update(cx, |input, cx| {
             let selection = input.selection();
@@ -431,16 +435,16 @@ impl SummaryView {
             )
         });
         h_flex()
-            .h(px(32.))
-            .px_3()
-            .child(div().flex_1().child(Label::new(label).size(LabelSize::Small)))
+            .h(px(40.))
+            .px_4()
+            .child(div().flex_1().child(Label::new(label)))
             .child(
                 h_flex()
                     .id(SharedString::from(format!("summary-{label}")))
                     .relative()
                     .gap_1()
                     .cursor_pointer()
-                    .child(Label::new(value).size(LabelSize::Small).color(Color::Muted))
+                    .child(Label::new(value).color(Color::Muted))
                     .child(Icon::new(IconName::ChevronsUpDown).size(IconSize::XSmall).color(Color::Muted))
                     .on_click(cx.listener(move |this, _, _, cx| this.set_menu((!open).then_some(menu), cx)))
                     .children(dropdown),
@@ -643,9 +647,9 @@ impl SummaryView {
             )
         });
         h_flex()
-            .h(px(32.))
-            .px_3()
-            .child(div().flex_1().child(Label::new(strings.summary_more).size(LabelSize::Small)))
+            .h(px(40.))
+            .px_4()
+            .child(div().flex_1().child(Label::new(strings.summary_more)))
             .child(
                 h_flex()
                     .id("summary-more")
@@ -653,7 +657,7 @@ impl SummaryView {
                     .gap_1()
                     .max_w(px(170.))
                     .cursor_pointer()
-                    .child(Label::new(value).size(LabelSize::Small).color(Color::Muted).truncate())
+                    .child(Label::new(value).color(Color::Muted).truncate())
                     .child(Icon::new(IconName::ChevronsUpDown).size(IconSize::XSmall).color(Color::Muted))
                     .on_click(cx.listener(move |this, _, _, cx| this.set_menu((!open).then_some(Menu::More), cx)))
                     .children(dropdown),
@@ -867,8 +871,10 @@ impl Render for SummaryView {
             .min_h_0()
             .overflow_y_scroll()
             .px_4()
-            .pb_4()
+            .py_3()
             .gap_1()
+            // A click in the report edits it, as the original's always-editable report.
+            .when(editor.is_none(), |el| el.cursor_text().on_click(cx.listener(|this, _, window, cx| this.toggle_editing(window, cx))))
             .when_some(editor.clone(), |el, editor| {
                 el.child(
                     div()
@@ -891,12 +897,12 @@ impl Render for SummaryView {
                         .child(editor),
                 )
             })
-            .when(editor.is_none(), |el| el.child(div().text_size(px(18.)).font_weight(FontWeight::BOLD).pb_1().child(report.heading.clone())))
+            .when(editor.is_none(), |el| el.child(div().text_size(px(20.)).font_weight(FontWeight::SEMIBOLD).pb_1().child(report.heading.clone())))
             .when(editor.is_none() && empty, |el| el.child(Label::new(strings.summary_empty).color(Color::Muted)))
             .children(report.groups.into_iter().filter(|_| editor.is_none()).map(|(title, lines)| {
                 v_flex()
                     .pt_1()
-                    .child(div().pb_1().font_weight(FontWeight::BOLD).child(title))
+                    .child(div().pb_1().text_size(px(17.)).font_weight(FontWeight::SEMIBOLD).child(title))
                     .children(lines.into_iter().map(|line| {
                         h_flex()
                             .gap_2()
@@ -919,22 +925,25 @@ impl Render for SummaryView {
                             .h(px(52.))
                             .px_4()
                             .gap_2()
-                            .child(Icon::new(IconName::FileText).color(Color::Muted))
-                            .child(div().flex_1().text_size(px(20.)).font_weight(FontWeight::BOLD).child(strings.summary))
-                            .child(
-                                IconButton::new("summary-edit", if self.editing { IconName::Check } else { IconName::Pencil })
-                                    .icon_color(if self.editor.is_some() { Color::Accent } else { Color::Muted })
-                                    .tooltip(Tooltip::text(if self.editing { strings.summary_done } else { strings.summary_edit }))
-                                    .on_click(cx.listener(|this, _, window, cx| this.toggle_editing(window, cx))),
-                            ),
+                            .child(div().flex_1().text_size(px(20.)).font_weight(FontWeight::SEMIBOLD).child(strings.summary)),
                     )
-                    .when(self.editing, |el| el.child(self.render_toolbar(cx)))
-                    .child(body)
+                    // The original's report: its toolbar always on top, in a frame with the report.
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_h_0()
+                            .mx_4()
+                            .rounded(px(8.))
+                            .border_1()
+                            .border_color(colors.border_variant)
+                            .child(self.render_toolbar(cx))
+                            .child(body),
+                    )
                     .child(
                         h_flex().h(px(44.)).px_4().gap_5().justify_end()
                         .children(self.saved.clone().map(|message| {
                             div().flex_1().min_w_0().child(Label::new(message).size(LabelSize::XSmall).color(Color::Muted).truncate())
-                        })).border_t_1().border_color(colors.border_variant).child({
+                        })).child({
                             let heading = report_heading.clone();
                             let groups = report_groups.clone();
                             let mail = mailto.clone();
@@ -996,7 +1005,7 @@ impl Render for SummaryView {
                                 .gap_1()
                                 .cursor_pointer()
                                 .child(Icon::new(IconName::Share).size(IconSize::Small).color(Color::Muted))
-                                .child(Label::new(strings.summary_save_as).size(LabelSize::Small))
+                                .child(Label::new(strings.summary_save_as))
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.save_menu = !this.save_menu;
                                     cx.notify();
@@ -1008,7 +1017,7 @@ impl Render for SummaryView {
                                 .gap_1()
                                 .cursor_pointer()
                                 .child(Icon::new(IconName::Copy).size(IconSize::Small).color(Color::Muted))
-                                .child(Label::new(if self.copied { strings.summary_copied } else { strings.summary_copy }).size(LabelSize::Small))
+                                .child(Label::new(if self.copied { strings.summary_copied } else { strings.summary_copy }))
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     cx.write_to_clipboard(ClipboardItem::new_string(markdown.clone()));
                                     this.copied = true;

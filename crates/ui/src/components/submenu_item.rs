@@ -20,6 +20,7 @@ pub struct SubmenuItem {
     placement: Placement,
     on_hover: Option<HoverHandler>,
     items: Vec<AnyElement>,
+    height: Option<gpui::Pixels>,
 }
 
 impl SubmenuItem {
@@ -32,6 +33,7 @@ impl SubmenuItem {
             placement: Placement::LeftSide,
             on_hover: None,
             items: Vec::new(),
+            height: None,
         }
     }
 
@@ -57,6 +59,12 @@ impl SubmenuItem {
     }
 
     /// The side menu's entries, usually `ListItem`s.
+    /// The row's height, as `ListItem::height` sets it.
+    pub fn height(mut self, height: gpui::Pixels) -> Self {
+        self.height = Some(height);
+        self
+    }
+
     pub fn items(mut self, items: impl IntoIterator<Item = impl IntoElement>) -> Self {
         self.items.extend(items.into_iter().map(IntoElement::into_any_element));
         self
@@ -69,7 +77,8 @@ impl RenderOnce for SubmenuItem {
             .toggle_state(self.open)
             .when_some(self.icon, |item, icon| item.start_slot(Icon::new(icon).color(Color::Muted)))
             .child(Label::new(self.label))
-            .end_slot(Icon::new(IconName::ChevronRight).size(IconSize::Small).color(Color::Muted));
+            .end_slot(Icon::new(IconName::ChevronRight).size(IconSize::Small).color(Color::Muted))
+            .when_some(self.height, |item, height| item.height(height));
         let menu = self.open.then(|| PopoverAttachment::new(self.placement, popover(cx).min_w(gpui::px(180.)).children(self.items)));
         div()
             .id(self.id)

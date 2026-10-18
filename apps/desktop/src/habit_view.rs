@@ -1683,8 +1683,9 @@ impl HabitView {
                             .when(self.detail_menu_open, |el| {
                                 el.child(PopoverAttachment::new(
                                     Placement::BelowRight,
+                                    // The original's measures: 178 px wide, a row every 34 px.
                                     popover(cx)
-                                        .w(px(200.))
+                                        .w(px(178.))
                                         .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                                             this.detail_submenu = None;
                                             this.detail_menu_open = false;
@@ -1693,6 +1694,7 @@ impl HabitView {
                                         .child(self.menu_entry(
                                             "habit-edit-entry",
                                             ListItem::new("habit-edit")
+                                                .height(px(34.))
                                                 .start_slot(Icon::new(IconName::Pencil).color(Color::Muted))
                                                 .child(Label::new(strings.edit))
                                                 .on_click(cx.listener(|this, _, window, cx| this.start_edit(window, cx))),
@@ -1701,6 +1703,7 @@ impl HabitView {
                                         .child({
                                             let title = habit.name.clone();
                                             self.side_menu("habit-start-focus", IconName::CircleDot, strings.start_focus, DetailSubmenu::StartFocus, cx)
+                                                .height(px(34.))
                                                 .items([(false, strings.start_pomo), (true, strings.start_stopwatch)].map(|(stopwatch, label)| {
                                                     let title = title.clone();
                                                     ListItem::new(SharedString::from(format!("habit-focus-{stopwatch}")))
@@ -1716,6 +1719,7 @@ impl HabitView {
                                         .child({
                                             let current = habit.icon_checkins;
                                             self.side_menu("habit-checkin-style", IconName::SquareCheck, strings.checked_in_style, DetailSubmenu::CheckinStyle, cx)
+                                                .height(px(34.))
                                                 .items([(false, strings.checkin_style_checkmark), (true, strings.checkin_style_icon)].map(|(icon, label)| {
                                                     ListItem::new(SharedString::from(format!("habit-style-{icon}")))
                                                         .child(Label::new(label).color(if icon == current { Color::Accent } else { Color::Default }))
@@ -1737,6 +1741,7 @@ impl HabitView {
                                             self.menu_entry(
                                                 "habit-archive-entry",
                                                 ListItem::new("habit-archive")
+                                                    .height(px(34.))
                                                     .start_slot(Icon::new(IconName::Archive).color(Color::Muted))
                                                     .child(Label::new(if archived { strings.habit_unarchive } else { strings.habit_archive }))
                                                     .on_click(cx.listener(move |this, _, _, cx| this.set_archived(id, !archived, cx))),
@@ -1746,6 +1751,7 @@ impl HabitView {
                                         .child(self.menu_entry(
                                             "habit-delete-entry",
                                             ListItem::new("habit-delete")
+                                                .height(px(34.))
                                                 .start_slot(Icon::new(IconName::Trash).color(Color::Muted))
                                                 .child(Label::new(strings.delete))
                                                 .on_click(cx.listener(move |this, _, _, cx| this.delete(id, cx))),

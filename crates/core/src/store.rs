@@ -634,6 +634,9 @@ const MIGRATIONS: &[&str] = &[
     "
     ALTER TABLE habits ADD COLUMN constant_reminder INTEGER NOT NULL DEFAULT 0;
     ",
+    "
+    ALTER TABLE countdowns ADD COLUMN show_age INTEGER NOT NULL DEFAULT 0;
+    ",
 ];
 
 const TASK_COLUMNS: &str = "id, parent_id, kind, title, notes, priority, due_date, due_time, \
@@ -1512,7 +1515,7 @@ impl Store {
     /// Countdowns in creation order.
     pub fn countdowns(&self) -> Result<Vec<Countdown>> {
         let mut stmt =
-            self.conn.prepare("SELECT id, name, date, kind, icon, color, repeat, pinned_at FROM countdowns
+            self.conn.prepare("SELECT id, name, date, kind, icon, color, repeat, pinned_at, show_age FROM countdowns
              ORDER BY pinned_at IS NULL, pinned_at DESC, created_at, rowid")?;
         let rows = stmt
             .query_map([], |row| {
@@ -1528,6 +1531,7 @@ impl Store {
                     color: row.get(5)?,
                     repeat: row.get::<_, Option<String>>(6)?.and_then(|rule| rule.parse().ok()),
                     pinned_at: row.get(7)?,
+                    show_age: row.get(8)?,
                 })
             })?
             .collect::<Result<_, _>>()?;
@@ -1537,7 +1541,7 @@ impl Store {
     pub fn add_countdown(&self, name: &str, date: NaiveDate, kind: CountdownKind) -> Result<Countdown> {
         let name = name.trim();
         anyhow::ensure!(!name.is_empty(), "a countdown needs a name");
-        let countdown = Countdown { id: Uuid::now_v7(), name: name.to_owned(), date, kind, icon: None, color: None, repeat: None, pinned_at: None };
+        let countdown = Countdown { id: Uuid::now_v7(), name: name.to_owned(), date, kind, icon: None, color: None, repeat: None, pinned_at: None, show_age: false };
         self.conn.execute(
             "INSERT INTO countdowns (id, name, date, kind, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
@@ -1575,6 +1579,12 @@ impl Store {
             "UPDATE countdowns SET name = ?2, date = ?3, kind = ?4, repeat = ?5 WHERE id = ?1",
             params![id.to_string(), name, date.format(DATE_FORMAT).to_string(), kind.as_str(), repeat.map(|r| r.to_string())],
         )?;
+        Ok(())
+    }
+
+    /// A birthday's "Show Age".
+    pub fn set_countdown_show_age(&self, id: Id, on: bool) -> Result<()> {
+        self.conn.execute("UPDATE countdowns SET show_age = ?2 WHERE id = ?1", params![id.to_string(), on])?;
         Ok(())
     }
 
@@ -3117,6 +3127,8 @@ mod tests {
         store.set_countdown_look(release.id, Some("  "), None)?;
         let saved = store.countdowns()?.remove(0);
         assert_eq!((saved.icon, saved.color), (None, None));
+        store.set_countdown_show_age(release.id, true)?;
+        assert!(store.countdowns()?[0].show_age);
         Ok(())
     }
 

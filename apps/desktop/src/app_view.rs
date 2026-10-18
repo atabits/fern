@@ -170,6 +170,13 @@ impl AppView {
                     this.calendar.update(cx, |view, cx| view.reload(cx));
                 }
             }
+            // `countdown-age=<name part>`: that birthday with "Show Age" on.
+            if let Some(name) = state.split(';').find_map(|part| part.strip_prefix("countdown-age=")) {
+                if let Some(countdown) = this.store.countdowns().unwrap_or_default().into_iter().find(|c| c.name.contains(name)) {
+                    this.store.set_countdown_show_age(countdown.id, true).ok();
+                    this.countdown.update(cx, |view, cx| view.reload(cx));
+                }
+            }
             // `countdown-pin=<name part>`: that countdown pinned.
             if let Some(name) = state.split(';').find_map(|part| part.strip_prefix("countdown-pin=")) {
                 if let Some(countdown) = this.store.countdowns().unwrap_or_default().into_iter().find(|c| c.name.contains(name)) {

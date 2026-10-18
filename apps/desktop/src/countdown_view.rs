@@ -36,6 +36,8 @@ struct Draft {
     repeat: Option<fern_core::Recurrence>,
     /// The countdown being edited; `None` for a new one.
     editing: Option<Id>,
+    /// A birthday's "Show Age".
+    show_age: bool,
 }
 
 /// Emoji offered for countdowns; the original's illustrated icon set is its own artwork.
@@ -130,11 +132,15 @@ fn face(countdown: &Countdown, today: NaiveDate, days_only: bool, cx: &App) -> F
             .when(span.months > 0, |el| el.child(number(span.months, m)))
             .when(span.days > 0 || (span.years == 0 && span.months == 0), |el| el.child(number(span.days, d)))
     };
-    let subtitle = format!(
+    let mut subtitle = format!(
         "{} {}",
         if span.past { strings.countdown_days_since } else { strings.countdown_days_until },
         format_date(date, strings)
     );
+    // A birthday with "Show Age" says the age turned on that day.
+    if let Some(age) = countdown.age(today).filter(|_| countdown.show_age) {
+        subtitle = format!("{} · {subtitle}", strings.countdown_turns.replace("{n}", &age.to_string()));
+    }
     Face { color, numbers, subtitle }
 }
 
@@ -189,7 +195,7 @@ impl CountdownView {
             Filter::Kind(kind) => kind,
             Filter::All => CountdownKind::Countdown,
         };
-        self.draft = Some(Draft { name, kind, date: today, month: calendar::month_start(today), icon: None, color: None, repeat: None, editing: None });
+        self.draft = Some(Draft { name, kind, date: today, month: calendar::month_start(today), icon: None, color: None, repeat: None, editing: None, show_age: false });
         cx.notify();
     }
 
@@ -199,6 +205,10 @@ impl CountdownView {
         self.start_new(window, cx);
         if let Some(draft) = self.draft.as_mut() {
             draft.kind = kind;
+            // As in the original, a new birthday repeats yearly.
+            if kind == CountdownKind::Birthday {
+                draft.repeat = Some(fern_core::Recurrence::new(fern_core::Frequency::Yearly, 1));
+            }
         }
         cx.notify();
     }
@@ -223,6 +233,7 @@ impl CountdownView {
             draft.icon = countdown.icon;
             draft.color = countdown.color;
             draft.repeat = countdown.repeat;
+            draft.show_age = countdown.show_age;
             draft.editing = Some(id);
         }
         cx.notify();
@@ -262,7 +273,10 @@ impl CountdownView {
                 self.store.update_countdown(countdown.id, &name, draft.date, draft.kind, draft.repeat.as_ref()).map(|()| countdown.id)
             }),
         }
-        .and_then(|id| self.store.set_countdown_look(id, draft.icon.as_deref(), draft.color.as_deref()));
+        .and_then(|id| {
+            self.store.set_countdown_look(id, draft.icon.as_deref(), draft.color.as_deref())?;
+            self.store.set_countdown_show_age(id, draft.kind == CountdownKind::Birthday && draft.show_age)
+        });
         if let Err(err) = added {
             eprintln!("failed to add the countdown: {err:#}");
         }
@@ -552,6 +566,24 @@ impl CountdownView {
                         cx.notify();
                     }))
             })))
+            // The original's "Show Age", for a birthday.
+            .when(kind == CountdownKind::Birthday, |el| {
+                let on = self.draft.as_ref().is_some_and(|d| d.show_age);
+                el.child(
+                    h_flex()
+                        .id("countdown-show-age")
+                        .gap_2()
+                        .cursor_pointer()
+                        .child(Switch::new().toggle_state(on))
+                        .child(Label::new(strings.countdown_show_age).size(LabelSize::Small))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if let Some(draft) = this.draft.as_mut() {
+                                draft.show_age = !draft.show_age;
+                            }
+                            cx.notify();
+                        })),
+                )
+            })
             .child(
                 h_flex()
                     .child(div().flex_1().child(Label::new(calendar::month_title(month, strings)).size(LabelSize::Small)))

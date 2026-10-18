@@ -50,6 +50,8 @@ pub struct Countdown {
     pub repeat: Option<crate::recurrence::Recurrence>,
     /// When the countdown was pinned to the front of the grid.
     pub pinned_at: Option<i64>,
+    /// The original's "Show Age" for a birthday: the card says the age turned.
+    pub show_age: bool,
 }
 
 impl Countdown {
@@ -165,6 +167,7 @@ mod tests {
             color: None,
             repeat: None,
             pinned_at: None,
+            show_age: false,
         };
         let today = d(2026, 10, 18);
         let mum = birthday(d(1970, 12, 5));
@@ -175,6 +178,7 @@ mod tests {
         assert_eq!(birthday(d(2000, 2, 29)).next_date(today), d(2027, 2, 28));
         assert_eq!(CountdownKind::parse(CountdownKind::Birthday.as_str()), CountdownKind::Birthday);
         assert_eq!(birthday(d(2030, 1, 1)).age(today), Some(0), "not born yet");
+        assert!(!mum.show_age, "the age shows only when asked, as in the original");
     }
 
     #[test]
@@ -189,6 +193,7 @@ mod tests {
             color: None,
             repeat: None,
             pinned_at: None,
+            show_age: false,
         };
         assert_eq!(once.next_date(d(2026, 10, 18)), d(2026, 9, 13), "without a repeat the date stays");
         let monthly = Countdown { repeat: Some(Recurrence::new(Frequency::Monthly, 1)), ..once.clone() };

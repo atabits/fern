@@ -37,6 +37,10 @@ pub enum Placement {
     LeftSide,
     /// Beside the parent on its right, level with its top.
     RightSide,
+    /// Beside the parent on its left, level with its top, 10 px apart: a card for a small item.
+    LeftOf,
+    /// Beside the parent on its right, level with its top, 10 px apart.
+    RightOf,
 }
 
 /// Renders a popover on top of the rest of the UI, attached to its parent, which must be
@@ -65,6 +69,8 @@ impl RenderOnce for PopoverAttachment {
             // The menu's own padding (6 px) is kept between the two menus.
             Placement::LeftSide => (div().absolute().top(px(-6.)).left(px(-8.)), Anchor::TopRight),
             Placement::RightSide => (div().absolute().top(px(-6.)).right(px(-8.)), Anchor::TopLeft),
+            Placement::LeftOf => (div().absolute().top_0().left(px(-10.)), Anchor::TopRight),
+            Placement::RightOf => (div().absolute().top_0().right(px(-10.)), Anchor::TopLeft),
         };
         // Side menus open from inside another popover, so they paint above it.
         let priority = if matches!(self.placement, Placement::LeftSide | Placement::RightSide) { 2 } else { 1 };

@@ -611,6 +611,17 @@ pub fn due_label(
     (label, days < 0)
 }
 
+/// The date in the calendar's task card, as the original's: the weekday and the date,
+/// "Sat, Oct 24" ("Sat, Oct 24, 2027" in another year), with the time when there is one.
+pub fn card_due_label(date: NaiveDate, time: Option<NaiveTime>, today: NaiveDate, strings: &Strings) -> String {
+    let weekday = strings.weekdays_short[date.weekday().num_days_from_monday() as usize];
+    let mut label = format!("{weekday}, {}", closed_due_label(date, today, strings));
+    if let Some(time) = time {
+        label.push_str(&format!(" {}", crate::calendar::format_time(time)));
+    }
+    label
+}
+
 /// A closed task's date, as the original's Completed and Won't Do show it: the date itself,
 /// "Oct 15" ("Oct 15, 2025" in another year), never "Today" or "Tomorrow".
 pub fn closed_due_label(date: NaiveDate, today: NaiveDate, strings: &Strings) -> String {
@@ -914,6 +925,13 @@ mod tests {
             due_label(today, NaiveTime::from_hms_opt(18, 30, 0), today, &EN),
             ("Today 18:30".into(), false)
         );
+    }
+
+    #[test]
+    fn card_due_labels() {
+        let today = d(2026, 10, 18);
+        assert_eq!(card_due_label(d(2026, 10, 24), None, today, &EN), "Sat, Oct 24");
+        assert_eq!(card_due_label(d(2027, 1, 4), None, today, &EN), "Mon, Jan 4, 2027");
     }
 
     #[test]

@@ -46,7 +46,7 @@ pub struct AppView {
 impl AppView {
     pub fn new(store: Rc<Store>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let todo = cx.new(|cx| TodoView::new(store.clone(), window, cx));
-        let calendar = cx.new(|cx| CalendarView::new(store.clone(), cx));
+        let calendar = cx.new(|cx| CalendarView::new(store.clone(), window, cx));
         // A task clicked in the calendar opens in the task list with its details.
         cx.subscribe_in(&calendar, window, |this, _, calendar_view::OpenTask(id), window, cx| {
             let id = *id;
@@ -228,6 +228,10 @@ impl AppView {
             // `agenda-countdown=<name part>` opens that countdown's card in the Agenda.
             if let Some(needle) = state.split(';').find_map(|part| part.strip_prefix("calendar-context=")) {
                 this.calendar.update(cx, |view, cx| view.dev_context(needle, cx));
+            }
+            // `calendar-card=<title part>` opens that task's card in the calendar.
+            if let Some(needle) = state.split(';').find_map(|part| part.strip_prefix("calendar-card=")) {
+                this.calendar.update(cx, |view, cx| view.dev_card(needle, cx));
             }
             if let Some(name) = state.split(';').find_map(|part| part.strip_prefix("agenda-countdown=")) {
                 this.calendar.update(cx, |view, cx| view.dev_open_countdown(name, cx));

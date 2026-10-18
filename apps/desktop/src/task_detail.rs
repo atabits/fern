@@ -100,6 +100,8 @@ pub struct TaskDetail {
     /// An input to focus on the next render (focusing needs the window).
     pending_focus: Option<FocusTarget>,
     popup: Option<Popup>,
+    /// Shown as the calendar's task card, framed by the card instead of a left border.
+    card: bool,
     /// The due-date popover's draft, while it is open.
     due_draft: Option<DueDraft>,
     /// The "Task Activities" panel, while it is open.
@@ -247,10 +249,21 @@ impl TaskDetail {
             show_checklist: false,
             pending_focus: None,
             popup: None,
+            card: false,
             due_draft: None,
             activity: None,
             _subscriptions: subscriptions,
         }
+    }
+
+    /// Makes this the calendar's task card, which draws its own frame.
+    pub fn set_card(&mut self) {
+        self.card = true;
+    }
+
+    /// Whether one of the details' popovers is open, which a click outside the card closes first.
+    pub fn has_popup(&self) -> bool {
+        self.popup.is_some()
     }
 
     pub fn task_id(&self) -> Option<Id> {
@@ -2467,8 +2480,7 @@ impl Render for TaskDetail {
             .size_full()
             .bg(theme.colors().background)
             .text_color(theme.colors().text)
-            .border_l_1()
-            .border_color(theme.colors().border);
+            .when(!self.card, |el| el.border_l_1().border_color(theme.colors().border));
 
         let Some(task) = self.task.as_ref() else {
             return panel
@@ -2487,6 +2499,8 @@ impl Render for TaskDetail {
                     Some(end) => due_picker::range_label(date, task.due_time, end, task.end_time, strings),
                     None => label,
                 };
+                // The calendar's card writes the date out, as the original's.
+                let label = if self.card && task.end_date.is_none() { task_rows::card_due_label(date, task.due_time, today, strings) } else { label };
                 (label.into(), if overdue && !done { Color::Error } else { Color::Accent })
             }
             None => (strings.due_date.into(), Color::Muted),
@@ -2597,9 +2611,11 @@ impl Render for TaskDetail {
                     .when(self.show_checklist, |el| el.child(self.render_checklist(cx)))
                     .when(!self.attachments.is_empty(), |el| el.child(self.render_attachments(cx)))
                     // Tags sit under the notes, as in the original.
-                    .child(self.render_tags_row(strings, cx))
-                    .child(div().pt_2().child(Divider::horizontal()))
-                    .child(self.render_subtasks(strings, cx))
+                    // The calendar's card leaves out the empty tags and subtasks, as the original's.
+                    .when(!self.card || !task.tags.is_empty(), |el| el.child(self.render_tags_row(strings, cx)))
+                    .when(!self.card || !self.subtasks.is_empty(), |el| {
+                        el.child(div().pt_2().child(Divider::horizontal())).child(self.render_subtasks(strings, cx))
+                    })
                     .when(!self.comments.is_empty(), |el| el.child(self.render_comments(strings, cx))),
             )
             // The bottom bar's "A" shows the description's Markdown toolbar over it, as the original.

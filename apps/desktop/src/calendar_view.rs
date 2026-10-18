@@ -13,6 +13,7 @@ use crate::actions::{AgendaView, DayView, MonthView, NewTask, ToggleSidebar, Wee
 use crate::calendar::{self, week_axis};
 use crate::drag::DraggedTask;
 use crate::i18n;
+use crate::task_detail::{StartFocus, TaskDetail, TaskUpdated};
 use crate::task_rows;
 
 /// How many tasks a day cell shows before collapsing the rest into "+N".
@@ -80,7 +81,15 @@ pub struct CalendarView {
     context_side: Option<u8>,
     /// The Year view's day card, opened by clicking a day.
     year_day: Option<NaiveDate>,
+    /// The task card a click on a task opens beside it, as in the original: the task, the day
+    /// it was clicked on, and the details it shows.
+    card: Option<(Id, NaiveDate)>,
+    detail: gpui::Entity<TaskDetail>,
 }
+
+/// The original's task card: 402 px wide, 301 px tall.
+const CARD_WIDTH: f32 = 402.;
+const CARD_HEIGHT: f32 = 301.;
 
 /// How far ahead the Agenda reaches.
 const AGENDA_DAYS: i64 = 366;
@@ -96,8 +105,22 @@ impl gpui::Focusable for CalendarView {
 }
 
 impl CalendarView {
-    pub fn new(store: Rc<Store>, cx: &mut Context<Self>) -> Self {
+    pub fn new(store: Rc<Store>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let today = Local::now().date_naive();
+        let detail = cx.new(|cx| {
+            let mut detail = TaskDetail::new(store.clone(), window, cx);
+            detail.set_card();
+            detail
+        });
+        cx.subscribe(&detail, |this, _, _: &TaskUpdated, cx| this.card_updated(cx)).detach();
+        cx.subscribe(&detail, |_, _, StartFocus(id, title, stopwatch), cx| cx.emit(StartFocus(*id, title.clone(), *stopwatch))).detach();
+        // A subtask clicked in the card opens in the card.
+        cx.subscribe(&detail, |this, _, crate::task_detail::OpenTask(id), cx| {
+            if let Some((_, day)) = this.card {
+                this.open_card(*id, day, cx);
+            }
+        })
+        .detach();
         let mut this = Self {
             store,
             mode: CalendarMode::Month,
@@ -115,6 +138,8 @@ impl CalendarView {
             context_menu: None,
             year_day: None,
             context_side: None,
+            card: None,
+            detail,
         };
         this.reload(cx);
         this
@@ -127,6 +152,74 @@ impl CalendarView {
             CalendarMode::MultiDay(n) => (0..n as i64).map(|i| self.anchor + chrono::Duration::days(i)).collect(),
             _ => calendar::week_of(self.anchor).to_vec(),
         }
+    }
+
+    /// Opens a task's card beside it, the task as clicked on `day`.
+    fn open_card(&mut self, id: Id, day: NaiveDate, cx: &mut Context<Self>) {
+        let Ok(Some(task)) = self.store.task(id) else { return };
+        let lists = self.store.lists().unwrap_or_default();
+        self.detail.update(cx, |detail, cx| {
+            detail.set_lists(lists);
+            detail.show(Some(task), cx);
+        });
+        self.card = Some((id, day));
+        cx.notify();
+    }
+
+    fn close_card(&mut self, cx: &mut Context<Self>) {
+        if self.card.take().is_some() {
+            self.detail.update(cx, |detail, cx| detail.show(None, cx));
+            cx.notify();
+        }
+    }
+
+    /// The card's task changed: the calendar shows the change, and the card closes when the task
+    /// is gone.
+    fn card_updated(&mut self, cx: &mut Context<Self>) {
+        self.reload(cx);
+        let Some((id, _)) = self.card else { return };
+        match self.store.task(id) {
+            Ok(Some(task)) if !task.is_deleted() => self.detail.update(cx, |detail, cx| detail.refresh(Some(task), cx)),
+            _ => self.close_card(cx),
+        }
+    }
+
+    /// Opens a task's card from the debug-build dev state (`calendar-card=<title part>`).
+    #[cfg(debug_assertions)]
+    pub fn dev_card(&mut self, needle: &str, cx: &mut Context<Self>) {
+        if let Some(task) = self.tasks.iter().find(|t| t.title.contains(needle)) {
+            let day = task.due_date.unwrap_or_else(|| Local::now().date_naive());
+            self.open_card(task.id, day, cx);
+        }
+    }
+
+    /// The card a clicked task opens: its details, framed, closed by a click elsewhere or Escape.
+    fn render_card(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        div()
+            .id("calendar-task-card")
+            .occlude()
+            .w(px(CARD_WIDTH))
+            .h(px(CARD_HEIGHT))
+            .rounded(px(10.))
+            .overflow_hidden()
+            .border_1()
+            .border_color(theme.colors().border)
+            .bg(theme.colors().background)
+            .shadow_lg()
+            // The details' own popovers lie outside the card; a click in them keeps it open.
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                if !this.detail.read(cx).has_popup() {
+                    this.close_card(cx);
+                }
+            }))
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                if event.keystroke.key == "escape" && !this.detail.read(cx).has_popup() {
+                    this.close_card(cx);
+                }
+            }))
+            .child(self.detail.clone())
+            .into_any_element()
     }
 
     /// Re-reads the tasks of the shown days.
@@ -262,6 +355,7 @@ impl CalendarView {
                 self.month = calendar::month_start(self.anchor);
             }
         }
+        self.card = None;
         self.reload(cx);
     }
 
@@ -271,6 +365,7 @@ impl CalendarView {
         if (mode.is_timed() || matches!(mode, CalendarMode::MultiWeek(_))) && calendar::month_start(self.anchor) != self.month {
             self.anchor = self.month;
         }
+        self.card = None;
         self.reload(cx);
     }
 
@@ -361,48 +456,16 @@ impl CalendarView {
                         )),
                 ),
             )
-            .children(tasks.iter().take(TASKS_PER_DAY).map(|task| {
-                let id = task.id;
-                let done = task.is_completed();
-                let tint = task_rows::priority_color(task.priority, &theme).unwrap_or(theme.colors().accent);
-                let dragged = DraggedTask { id, title: task.title.clone().into() };
-                h_flex()
-                    .id(SharedString::from(format!("calendar-task-{id}")))
-                    .on_drag(dragged, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
-                    .h(px(18.))
-                    .flex_none()
-                    .gap_1()
-                    .px_1()
-                    .rounded(px(3.))
-                    .cursor_pointer()
-                    .bg(tint.opacity(if done { 0.12 } else { 0.28 }))
-                    .hover(|s| s.bg(tint.opacity(0.4)))
-                    .child(
-                        div()
-                            .size(px(10.))
-                            .flex_none()
-                            .rounded(px(2.))
-                            .border_1()
-                            .border_color(theme.colors().text_muted)
-                            .when(done, |el| el.bg(theme.colors().text_muted)),
-                    )
-                    .child(
-                        Label::new(task.title.clone())
-                            .size(LabelSize::XSmall)
-                            .color(if done { Color::Muted } else { Color::Default })
-                            .strikethrough(done)
-                            .truncate(),
-                    )
-                    .on_click(cx.listener(move |_, _, _, cx| cx.emit(OpenTask(id))))
-                    .on_mouse_down(gpui::MouseButton::Right, cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| this.open_context(id, event.position, cx)))
-            }))
+            .children(tasks.iter().take(TASKS_PER_DAY).map(|task| self.task_bar(task, Some(date), cx)))
             .when(hidden > 0, |el| {
                 el.child(div().px_1().child(Label::new(format!("+{hidden}")).size(LabelSize::XSmall).color(Color::Muted)))
             })
             .into_any_element()
     }
 
-    fn task_bar(&self, task: &Task, cx: &mut Context<Self>) -> Stateful<Div> {
+    /// A task's bar on `day`; `None` in the Year view's day card, where a click opens the task in
+    /// the list.
+    fn task_bar(&self, task: &Task, day: Option<NaiveDate>, cx: &mut Context<Self>) -> Stateful<Div> {
         let theme = cx.theme().clone();
         let id = task.id;
         let done = task.is_completed();
@@ -435,8 +498,18 @@ impl CalendarView {
                     .strikethrough(done)
                     .truncate(),
             )
-            .on_click(cx.listener(move |_, _, _, cx| cx.emit(OpenTask(id))))
-                    .on_mouse_down(gpui::MouseButton::Right, cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| this.open_context(id, event.position, cx)))
+            .on_click(cx.listener(move |this, _, _, cx| match day {
+                Some(day) => this.open_card(id, day, cx),
+                None => cx.emit(OpenTask(id)),
+            }))
+            .on_mouse_down(gpui::MouseButton::Right, cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| this.open_context(id, event.position, cx)))
+            // As in the original, the card opens on the bar's left, or on its right in the first
+            // days of the week, where there is no room.
+            .when_some(day.filter(|d| self.card == Some((id, *d))), |el, day| {
+                let column = calendar::week_of(day).iter().position(|d| *d == day).unwrap_or(0);
+                let placement = if column < 3 { Placement::RightOf } else { Placement::LeftOf };
+                el.relative().child(PopoverAttachment::new(placement, self.render_card(cx)))
+            })
     }
 
     fn render_week(&self, today: NaiveDate, cx: &mut Context<Self>) -> AnyElement {
@@ -460,7 +533,7 @@ impl CalendarView {
                     .tasks
                     .iter()
                     .filter(|t| t.occurs_on(date) && t.due_time.is_none())
-                    .map(|t| self.task_bar(t, cx).into_any_element())
+                    .map(|t| self.task_bar(t, Some(date), cx).into_any_element())
                     .collect();
                 v_flex()
                     .id(SharedString::from(format!("week-allday-{date}")))
@@ -544,7 +617,7 @@ impl CalendarView {
                         .left(px(2.))
                         .right(px(2.))
                         .h(px(height))
-                        .child(self.task_bar(t, cx).h(px(height)).items_start().pt(px(1.)))
+                        .child(self.task_bar(t, Some(date), cx).h(px(height)).items_start().pt(px(1.)))
                         .into_any_element()
                 })
                 .collect();
@@ -997,7 +1070,7 @@ impl CalendarView {
     fn render_year_card(&self, date: NaiveDate, cx: &mut Context<Self>) -> AnyElement {
         let strings = i18n::t(cx);
         let tasks: Vec<Task> = self.tasks.iter().filter(|t| t.occurs_on(date)).cloned().collect();
-        let bars: Vec<_> = tasks.iter().map(|task| self.task_bar(task, cx).h(px(22.))).collect();
+        let bars: Vec<_> = tasks.iter().map(|task| self.task_bar(task, None, cx).h(px(22.))).collect();
         popover(cx)
             .w(px(328.))
             .p_3()

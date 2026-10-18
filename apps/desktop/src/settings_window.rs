@@ -130,13 +130,31 @@ impl SettingsWindow {
         cx.notify();
     }
 
-    /// "Import Backups": a backup is checked now and restored on the next start.
+    /// "Import Backups": a Fern backup is checked now and restored on the next start; a TickTick
+    /// backup (its CSV file) is added to the tasks here right away.
     fn import_backup(&mut self, cx: &mut Context<Self>) {
         let chosen = cx.prompt_for_paths(gpui::PathPromptOptions { files: true, directories: false, multiple: false, prompt: None });
         cx.spawn(async move |this, cx| {
             let Some(path) = chosen.await.ok().and_then(Result::ok).flatten().and_then(|paths| paths.into_iter().next()) else {
                 return;
             };
+            if path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("csv")) {
+                let text = std::fs::read_to_string(&path);
+                this.update(cx, |this, cx| {
+                    let strings = i18n::t(cx);
+                    let imported = text.map_err(anyhow::Error::from).and_then(|text| this.store.import_ticktick(&text));
+                    this.backup_message = Some(match imported {
+                        Ok(summary) => strings
+                            .imported_from_ticktick
+                            .replace("{tasks}", &summary.tasks.to_string())
+                            .replace("{lists}", &summary.lists.to_string()),
+                        Err(err) => format!("{err:#}"),
+                    });
+                    cx.notify();
+                })
+                .ok();
+                return;
+            }
             let outcome = fern_core::Store::check_backup(&path)
                 .and_then(|()| Ok(std::fs::copy(&path, crate::pending_restore_path()?)?))
                 .map(|_| ());
@@ -166,6 +184,18 @@ impl SettingsWindow {
     #[cfg(debug_assertions)]
     pub fn dev_open(&mut self, spec: &str, cx: &mut Context<Self>) {
         let (page, menu) = spec.split_once('>').unwrap_or((spec, ""));
+        // `about>import:<path>`: imports a TickTick backup as "Import Backups" does.
+        if let Some(path) = menu.strip_prefix("import:") {
+            let text = std::fs::read_to_string(path).unwrap_or_default();
+            let strings = i18n::t(cx);
+            self.backup_message = Some(match self.store.import_ticktick(&text) {
+                Ok(summary) => strings
+                    .imported_from_ticktick
+                    .replace("{tasks}", &summary.tasks.to_string())
+                    .replace("{lists}", &summary.lists.to_string()),
+                Err(err) => format!("{err:#}"),
+            });
+        }
         self.page = match page {
             "smart-list" => Page::SmartList,
             "appearance" => Page::Appearance,

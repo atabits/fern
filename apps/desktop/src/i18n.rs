@@ -535,6 +535,8 @@ pub struct Strings {
     pub generate_backup: &'static str,
     pub import_backups: &'static str,
     pub restore_on_restart: &'static str,
+    /// After importing a TickTick backup; `{tasks}` and `{lists}` are counts.
+    pub imported_from_ticktick: &'static str,
     pub version: &'static str,
     pub license: &'static str,
 }
@@ -981,6 +983,7 @@ pub static EN: Strings = Strings {
     generate_backup: "Generate Backup",
     import_backups: "Import Backups",
     restore_on_restart: "The backup will replace all data the next time Fern starts.",
+    imported_from_ticktick: "Imported from TickTick: tasks: {tasks}, new lists: {lists}.",
     version: "Version",
     license: "License",
 };
@@ -1428,6 +1431,7 @@ pub static RU: Strings = Strings {
     generate_backup: "Создать копию",
     import_backups: "Восстановить из копии",
     restore_on_restart: "Копия заменит все данные при следующем запуске Fern.",
+    imported_from_ticktick: "Импортировано из TickTick: задач — {tasks}, новых списков — {lists}.",
     version: "Версия",
     license: "Лицензия",
 };

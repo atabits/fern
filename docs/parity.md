@@ -98,9 +98,9 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 
 Each item is a whole feature area, done in one pass (it may take several commits).
 
-1. Habit check-in pass: the habit card's check-in states and the details' month calendar against the original's look, from the reference shots already taken, without checking in, in one pass.
-2. Smart lists' grouping: the original groups Today's tasks by list (its kanban shows an "Inbox" column where Fern shows "Tasks"); its Group by default for the smart lists, read from their "⇅" menu without changing it, in one pass.
-3. Light theme pass: the original's light theme against Fern's Default theme on the main screens, switching the original's theme and back, in one pass.
-4. Habit page pass: the habit section's week strip, cards and the list layout against the original's at the current window size, in one pass.
+1. Smart lists' grouping: the original groups Today's tasks by list (its kanban shows an "Inbox" column where Fern shows "Tasks"); its Group by default for the smart lists, read from their "⇅" menu without changing it, in one pass.
+2. Light theme pass: the original's light theme against Fern's Default theme on the main screens, switching the original's theme and back, in one pass.
+3. Habit page pass: the habit section's week strip, cards and the list layout against the original's at the current window size, in one pass.
+4. Filter view pass: a saved filter's view and its "…" menu against the original's (the reference account has no filter, so only the Add Filter dialog's current state), in one pass.
 
 Not checkable under the reference rules: whether the original asks for a note when a focus session ends, and its white noise (the desktop original shows no sound choice on the focus page or in Focus Settings; it would only appear with a timer running in the reference account). Fern's record dialog takes a note afterwards.

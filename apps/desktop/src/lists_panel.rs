@@ -119,7 +119,7 @@ pub fn render(
         let accent = colors.accent;
         // Every entry is also a drop target for dragged tasks.
         let item = ListItem::new(SharedString::from(id.clone()))
-            .height(px(36.))
+            .height(px(38.))
             .toggle_state(&view == active)
             .start_slot(icon)
             .child(Label::new(label).truncate())
@@ -146,12 +146,20 @@ pub fn render(
     let smart = |view: View, label: &'static str, icon: IconName, count: Option<usize>| {
         item(format!("view-{label}"), view, label.into(), Icon::new(icon).into_any_element(), count, None)
     };
-    let separator = || div().my_2().mx_2().child(Divider::horizontal());
+    // As in the original: a row every 38 px, sections apart with a 12 px gap around their line,
+    // and a section's "+" shown on hover.
+    let separator = || div().my_3().mx_2().child(Divider::horizontal());
     let heading = |text: &'static str| {
         h_flex()
-            .h(px(28.))
+            .id(SharedString::from(format!("heading-{text}")))
+            .group(SharedString::from(format!("heading-{text}")))
+            .h(px(36.))
+            .pt_1()
             .px_2()
             .child(div().flex_1().child(Label::new(text).size(LabelSize::Small).color(Color::Muted)))
+    };
+    let on_hover_only = |text: &'static str, button: IconButton| {
+        div().invisible().group_hover(SharedString::from(format!("heading-{text}")), |s| s.visible()).child(button)
     };
 
     // The lists in their order; a folder sits where its first list is (empty ones last), its
@@ -324,7 +332,8 @@ pub fn render(
         h_flex()
             .id("tags-heading")
             .group("tags-heading")
-            .h(px(28.))
+            .h(px(36.))
+            .pt_1()
             .px_2()
             .gap_1()
             .cursor_pointer()
@@ -404,27 +413,41 @@ pub fn render(
                     on_panel(PanelEvent::DropList { list: dragged.id, after: None, folder: None }, window, cx)
                 })
                 .child(
-                    heading(strings.lists).child(
+                    heading(strings.lists).child(on_hover_only(
+                        strings.lists,
                         IconButton::new("add-list", IconName::Plus)
                             .size(px(20.))
                             .icon_size(IconSize::Small)
                             .tooltip(Tooltip::text(strings.add_list))
                             .on_click(on_add_list),
-                    ),
+                    )),
                 )
         })
+        // As in the original, a hint until there is a list; Lists, Tags and Filters follow one
+        // another without lines between them.
+        .when(lists.is_empty(), |el| {
+            el.child(
+                div()
+                    .mx_1()
+                    .mb_1()
+                    .p_2()
+                    .rounded(px(6.))
+                    .bg(colors.surface_background)
+                    .child(Label::new(strings.lists_hint).size(LabelSize::XSmall).color(Color::Muted)),
+            )
+        })
         .children(list_entries)
-        .child(separator())
-        .when(any_tags, |el| el.child(tags_heading).children(tag_entries).child(separator()))
+        .when(any_tags, |el| el.child(tags_heading).children(tag_entries))
         // Filters, as in the original: a hint until there is one.
         .when(shows(SmartList::Filters, 1), |el| el.child(
-            heading(strings.filters).child(
+            heading(strings.filters).child(on_hover_only(
+                strings.filters,
                 IconButton::new("add-filter", IconName::Plus)
                     .size(px(20.))
                     .icon_size(IconSize::Small)
                     .tooltip(Tooltip::text(strings.add_filter))
                     .on_click(on_add_filter),
-            ),
+            )),
         ))
         .when(filters.is_empty() && shows(SmartList::Filters, 1), |el| {
             el.child(

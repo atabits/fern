@@ -95,6 +95,7 @@ pub enum IconName {
     Settings,
     Share,
     Square,
+    SquareArrowOutUpRight,
     SquareCheck,
     SquareCheckBig,
     SquareX,

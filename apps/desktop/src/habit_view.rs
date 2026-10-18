@@ -1015,6 +1015,16 @@ impl HabitView {
         } else if command == "settings" {
             self.header_more = Some(HeaderMore::Settings);
             return;
+        } else if command == "more" {
+            // The header's "…" menu.
+            self.header_more = Some(HeaderMore::Menu);
+            cx.notify();
+            return;
+        } else if command == "header" {
+            // The header's "Habit ▾" menu.
+            self.header_menu_open = true;
+            cx.notify();
+            return;
         } else if command == "list" {
             self.set_list_layout(true, cx);
             return;
@@ -1407,11 +1417,13 @@ impl HabitView {
             cx.notify();
         });
         match more {
+            // The original's measures: 162 px wide, a row every 34 px.
             HeaderMore::Menu => popover(cx)
-                .w(px(180.))
+                .w(px(162.))
                 .on_mouse_down_out(close)
                 .child(
                     ListItem::new("habit-settings")
+                        .height(px(34.))
                         .start_slot(Icon::new(IconName::Settings).color(Color::Muted))
                         .child(Label::new(strings.settings))
                         .on_click(cx.listener(|this, _, _, cx| {
@@ -1421,7 +1433,8 @@ impl HabitView {
                 )
                 .child(
                     ListItem::new("habit-export")
-                        .start_slot(Icon::new(IconName::Share).color(Color::Muted))
+                        .height(px(34.))
+                        .start_slot(Icon::new(IconName::SquareArrowOutUpRight).color(Color::Muted))
                         .child(Label::new(strings.export))
                         .on_click(cx.listener(|this, _, _, cx| this.export(cx))),
                 )
@@ -1988,14 +2001,16 @@ impl Render for HabitView {
                                 let archived = self.show_archived;
                                 el.child(PopoverAttachment::new(
                                     Placement::BelowLeft,
+                                    // The original's measures: 162 px wide, a row every 34 px.
                                     popover(cx)
-                                        .w(px(180.))
+                                        .w(px(162.))
                                         .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                                             this.header_menu_open = false;
                                             cx.notify();
                                         }))
                                         .children([(false, strings.habit_active), (true, strings.habit_archived)].map(|(value, label)| {
                                             ListItem::new(if value { "habits-archived" } else { "habits-active" })
+                                                .height(px(34.))
                                                 .child(Label::new(label).color(if value == archived { Color::Accent } else { Color::Default }))
                                                 .when(value == archived, |item| item.end_slot(Label::new("✓").color(Color::Accent)))
                                                 .on_click(cx.listener(move |this, _, _, cx| {

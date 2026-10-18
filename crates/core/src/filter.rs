@@ -192,6 +192,43 @@ impl SmartFilter {
     }
 }
 
+/// Ready-made Advanced filters for the dialog's "Examples" (the original links to its help page
+/// instead). Their names are the app's to translate; the order is fixed.
+pub fn examples() -> [SmartFilter; 3] {
+    let link = |join, field| Link::new(join, field);
+    [
+        // Due today and important.
+        SmartFilter {
+            date: DateRule::Today,
+            priorities: vec![Priority::High, Priority::Medium],
+            chain: vec![link(Join::And, Field::Date), link(Join::And, Field::Priority)],
+            ..SmartFilter::default()
+        },
+        // Overdue or high priority.
+        SmartFilter {
+            date: DateRule::Overdue,
+            priorities: vec![Priority::High],
+            chain: vec![link(Join::And, Field::Date), link(Join::Or, Field::Priority)],
+            ..SmartFilter::default()
+        },
+        // Undated tasks outside the Inbox.
+        SmartFilter {
+            lists: vec![None],
+            date: DateRule::NoDate,
+            kind: Some(Kind::Task),
+            chain: vec![Link { not: true, ..link(Join::And, Field::Lists) }, link(Join::And, Field::Date), link(Join::And, Field::Type)],
+            ..SmartFilter::default()
+        },
+    ]
+}
+
+impl SmartFilter {
+    /// The tasks the filter shows, in the given order: the dialog's "Preview" before saving.
+    pub fn preview<'a>(&self, tasks: &'a [Task], today: NaiveDate) -> Vec<&'a Task> {
+        tasks.iter().filter(|task| self.matches(task, today)).collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -260,5 +297,31 @@ mod tests {
         assert_eq!(text, "lists and:tags! or:date");
         assert_eq!(chain_from_storage(&text), chain.chain);
         assert_eq!(chain_from_storage("bogus or:type"), [Link::new(Join::Or, Field::Type)]);
+    }
+
+    #[test]
+    fn examples_and_preview() {
+        let store = Store::open_in_memory().unwrap();
+        let today = NaiveDate::from_ymd_opt(2026, 10, 18).unwrap();
+        let work = store.create_list("Work").unwrap();
+        let late = store.add_task("late").unwrap();
+        store.set_due(late.id, Some(today - Duration::days(2)), None).unwrap();
+        let urgent = store.add_task("urgent").unwrap();
+        store.set_priority(urgent.id, Priority::High).unwrap();
+        store.set_due(urgent.id, Some(today), None).unwrap();
+        let someday = store.add_task("someday").unwrap();
+        store.set_list(someday.id, Some(work.id)).unwrap();
+        let inbox_undated = store.add_task("inbox").unwrap();
+        let tasks = store.tasks().unwrap();
+        let titles = |filter: &SmartFilter| {
+            let mut titles: Vec<&str> = filter.preview(&tasks, today).iter().map(|t| t.title.as_str()).collect();
+            titles.sort();
+            titles
+        };
+        let [today_important, overdue_or_high, undated_elsewhere] = examples();
+        assert_eq!(titles(&today_important), ["urgent"]);
+        assert_eq!(titles(&overdue_or_high), ["late", "urgent"]);
+        assert_eq!(titles(&undated_elsewhere), ["someday"]);
+        assert!(!titles(&SmartFilter::default()).is_empty() && titles(&SmartFilter::default()).contains(&inbox_undated.title.as_str()));
     }
 }

@@ -62,6 +62,10 @@ struct FilterEdit {
     keywords: Entity<TextInput>,
     /// The chain condition whose menu is open (field, NOT, remove).
     chain_menu: Option<usize>,
+    /// "Preview": the tasks the filter would show, in place of the conditions.
+    preview: bool,
+    /// The Advanced tab's "Examples" menu, while open.
+    examples_open: bool,
 }
 
 /// What the add field's "▾" menu set for the next task.
@@ -476,12 +480,16 @@ impl TodoView {
                     self.add_list_side = true;
                 }
                 Some(("menu", "activity")) => self.open_list_activity(cx),
-                // `filter-new=normal|advanced`, or `filter-new=chain` (an Advanced chain with
-                // a condition's menu open).
+                // `filter-new=normal|advanced`, `filter-new=chain` (an Advanced chain with a
+                // condition's menu open), `filter-new=preview` or `filter-new=examples`.
                 Some(("filter-new", mode)) => {
                     self.open_filter_edit(None, window, cx);
                     if mode != "normal" {
                         self.set_filter_advanced(true, cx);
+                    }
+                    if let Some(edit) = self.filter_edit.as_mut() {
+                        edit.preview = mode == "preview";
+                        edit.examples_open = mode == "examples";
                     }
                     if mode == "chain" {
                         if let Some(edit) = self.filter_edit.as_mut() {
@@ -1800,7 +1808,7 @@ impl TodoView {
         window.focus(&name.focus_handle(cx), cx);
         self.header_menu_open = false;
         let advanced = draft.match_any || !draft.chain.is_empty();
-        self.filter_edit = Some(FilterEdit { draft, is_new, advanced, name, keywords, chain_menu: None });
+        self.filter_edit = Some(FilterEdit { draft, is_new, advanced, name, keywords, chain_menu: None, preview: false, examples_open: false });
         cx.notify();
     }
 
@@ -1957,6 +1965,163 @@ impl TodoView {
         .into_any_element()
     }
 
+    fn set_filter_preview(&mut self, preview: bool, cx: &mut Context<Self>) {
+        if let Some(edit) = self.filter_edit.as_mut() {
+            edit.preview = preview;
+            edit.examples_open = false;
+            edit.chain_menu = None;
+        }
+        cx.notify();
+    }
+
+    /// "Examples" in the Advanced tab: ready-made chains, applied with a click (the name stays).
+    fn render_filter_examples(&self, open: bool, cx: &mut Context<Self>) -> AnyElement {
+        let strings = i18n::t(cx);
+        let menu = open.then(|| {
+            PopoverAttachment::new(
+                Placement::AboveRight,
+                popover(cx)
+                    .w(px(260.))
+                    .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                        if let Some(edit) = this.filter_edit.as_mut() {
+                            edit.examples_open = false;
+                        }
+                        cx.notify();
+                    }))
+                    .children(fern_core::filter::examples().into_iter().enumerate().map(|(i, example)| {
+                        ListItem::new(("filter-example", i))
+                            .child(Label::new(strings.filter_example_names[i]).size(LabelSize::Small))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if let Some(edit) = this.filter_edit.as_mut() {
+                                    let (id, name) = (edit.draft.id, edit.draft.name.clone());
+                                    edit.draft = fern_core::SmartFilter { id, name, ..example.clone() };
+                                    edit.examples_open = false;
+                                    let keywords = edit.keywords.clone();
+                                    let text = edit.draft.keywords.clone();
+                                    keywords.update(cx, |input, cx| input.set_text(text, cx));
+                                }
+                                cx.notify();
+                            }))
+                    }))
+                    .into_any_element(),
+            )
+        });
+        div()
+            .relative()
+            .child(
+                div()
+                    .id("filter-examples")
+                    .px_2()
+                    .cursor_pointer()
+                    .child(Label::new(strings.filter_examples).size(LabelSize::Small).color(Color::Muted))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(edit) = this.filter_edit.as_mut() {
+                            edit.examples_open = !edit.examples_open;
+                        }
+                        cx.notify();
+                    })),
+            )
+            .children(menu)
+            .into_any_element()
+    }
+
+    /// The original's "Preview": the open tasks the filter would show, by list with a count,
+    /// then Cancel (back to the conditions) or Save.
+    fn render_filter_preview(&self, edit: &FilterEdit, cx: &mut Context<Self>) -> AnyElement {
+        let strings = i18n::t(cx);
+        let theme = cx.theme().clone();
+        let today = Self::today();
+        let mut draft = edit.draft.clone();
+        draft.keywords = edit.keywords.read(cx).text().to_owned();
+        let tasks = self.store.tasks().unwrap_or_default();
+        let shown = draft.preview(&tasks, today);
+        let lists: Vec<(Option<Id>, SharedString)> = std::iter::once((None, SharedString::new_static(strings.inbox)))
+            .chain(self.lists.iter().map(|l| (Some(l.id), l.name.clone().into())))
+            .collect();
+        let mut body = v_flex().id("filter-preview-tasks").max_h(px(420.)).overflow_y_scroll().gap_0p5();
+        if shown.is_empty() {
+            body = body.child(div().py_4().child(Label::new(strings.filter_preview_empty).color(Color::Muted)));
+        }
+        for (list, name) in lists {
+            let in_list: Vec<&&Task> = shown.iter().filter(|t| t.list_id == list).collect();
+            if in_list.is_empty() {
+                continue;
+            }
+            body = body.child(
+                h_flex()
+                    .gap_2()
+                    .pt_1()
+                    .child(Icon::new(IconName::ChevronDown).size(IconSize::XSmall).color(Color::Muted))
+                    .child(Label::new(name).size(LabelSize::Small).weight(FontWeight::SEMIBOLD))
+                    .child(Label::new(in_list.len().to_string()).size(LabelSize::XSmall).color(Color::Muted)),
+            );
+            for task in in_list {
+                let due = task.due_date.map(|date| crate::task_rows::due_label(date, task.due_time, today, strings));
+                body = body.child(
+                    h_flex()
+                        .h(px(34.))
+                        .pl_4()
+                        .gap_2()
+                        .border_b_1()
+                        .border_color(theme.colors().border_variant)
+                        .child(
+                            Icon::new(if task.kind == Kind::Note { IconName::FileText } else { IconName::Square })
+                                .size(IconSize::Small)
+                                .color(Color::Muted),
+                        )
+                        .child(div().flex_1().min_w_0().child(Label::new(task.title.clone()).size(LabelSize::Small).truncate()))
+                        .children(task.tags.iter().map(|tag| Label::new(tag.clone()).size(LabelSize::XSmall).color(Color::Muted)))
+                        .children(due.map(|(label, overdue)| {
+                            Label::new(label).size(LabelSize::XSmall).color(if overdue { Color::Error } else { Color::Accent })
+                        })),
+                );
+            }
+        }
+        let button = |id: &'static str, label: &'static str, primary: bool| {
+            div()
+                .id(id)
+                .px_4()
+                .h(px(30.))
+                .flex()
+                .items_center()
+                .rounded(px(6.))
+                .cursor_pointer()
+                .when(primary, |el| el.bg(theme.colors().accent))
+                .when(!primary, |el| el.border_1().border_color(theme.colors().border))
+                .child(Label::new(label).size(LabelSize::Small))
+        };
+        div()
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(gpui::black().opacity(0.35))
+            .child(
+                v_flex()
+                    .id("filter-preview-dialog")
+                    .w(px(560.))
+                    .p_4()
+                    .gap_2()
+                    .rounded(px(10.))
+                    .border_1()
+                    .border_color(theme.colors().border)
+                    .bg(theme.colors().elevated_surface_background)
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(h_flex().justify_center().child(Label::new(strings.filter_preview).weight(FontWeight::SEMIBOLD)))
+                    .child(body)
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .pt_2()
+                            .justify_end()
+                            .child(button("filter-preview-cancel", strings.cancel, false).on_click(cx.listener(|this, _, _, cx| this.set_filter_preview(false, cx))))
+                            .child(button("filter-preview-save", strings.save, true).on_click(cx.listener(|this, _, _, cx| this.save_filter(cx)))),
+                    ),
+            )
+            .into_any_element()
+    }
+
     fn save_filter(&mut self, cx: &mut Context<Self>) {
         let Some(edit) = self.filter_edit.as_ref() else { return };
         let mut filter = edit.draft.clone();
@@ -2105,7 +2270,11 @@ impl TodoView {
                 .child(Label::new(label).size(LabelSize::Small))
         };
         let is_new = edit.is_new;
+        if edit.preview {
+            return self.render_filter_preview(edit, cx);
+        }
         let chain = edit.advanced.then(|| self.render_filter_chain(edit, cx));
+        let examples = edit.advanced.then(|| self.render_filter_examples(edit.examples_open, cx));
         let shows = |field: fern_core::Field| !edit.advanced || edit.draft.chain.iter().any(|l| l.field == field);
         div()
             .absolute()
@@ -2143,7 +2312,15 @@ impl TodoView {
                         h_flex()
                             .gap_2()
                             .pt_2()
+                            .child(
+                                div()
+                                    .id("filter-preview")
+                                    .cursor_pointer()
+                                    .child(Label::new(strings.filter_preview).size(LabelSize::Small).color(Color::Accent))
+                                    .on_click(cx.listener(|this, _, _, cx| this.set_filter_preview(true, cx))),
+                            )
                             .child(div().flex_1())
+                            .children(examples)
                             .child(button("filter-close", strings.close, false).on_click(cx.listener(|this, _, _, cx| {
                                 this.filter_edit = None;
                                 cx.notify();

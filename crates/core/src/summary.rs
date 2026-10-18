@@ -140,6 +140,21 @@ pub struct SummaryOptions {
     pub next_period: bool,
     /// The Lists filter's "Habit": add the habits' check-ins of the period.
     pub habits: bool,
+    /// "More → Tag": tasks with any of these tags; `None` is "All Tags".
+    pub tags: Option<Vec<String>>,
+    /// "More → Priority": tasks of these priorities; `None` is "All priorities".
+    pub priorities: Option<Vec<Priority>>,
+}
+
+impl SummaryOptions {
+    /// The "More" filters (tag and priority) a task must pass.
+    fn passes_more(&self, task: &Task) -> bool {
+        let tag_ok = self.tags.as_ref().is_none_or(|tags| {
+            task.tags.iter().any(|t| tags.iter().any(|wanted| wanted.eq_ignore_ascii_case(t)))
+        });
+        let priority_ok = self.priorities.as_ref().is_none_or(|p| p.contains(&task.priority));
+        tag_ok && priority_ok
+    }
 }
 
 impl Default for SummaryOptions {
@@ -152,6 +167,8 @@ impl Default for SummaryOptions {
             lists: None,
             next_period: false,
             habits: false,
+            tags: None,
+            priorities: None,
         }
     }
 }
@@ -183,8 +200,13 @@ impl SummaryOptions {
         let lists = self.lists.as_ref().map(|lists| {
             lists.iter().map(|l| l.map_or("inbox".to_owned(), |id| id.to_string())).collect::<Vec<_>>().join(",")
         });
+        let tags = self.tags.as_ref().map_or("all".to_owned(), |tags| tags.join(","));
+        let priorities = self
+            .priorities
+            .as_ref()
+            .map_or("all".to_owned(), |p| p.iter().map(|p| p.to_i64().to_string()).collect::<Vec<_>>().join(","));
         format!(
-            "period={period};status={};grouping={};fields={};lists={};next={};habits={}",
+            "period={period};status={};grouping={};fields={};lists={};next={};habits={};tags={tags};priorities={priorities}",
             code_of(&StatusFilter::ALL, &STATUS_CODES, self.status),
             code_of(&Grouping::ALL, &GROUPING_CODES, self.grouping),
             fields.join(","),
@@ -224,6 +246,10 @@ impl SummaryOptions {
                 }
                 "next" => options.next_period = value == "1",
                 "habits" => options.habits = value == "1",
+                "tags" if value != "all" => options.tags = Some(value.split(',').filter(|t| !t.is_empty()).map(str::to_owned).collect()),
+                "priorities" if value != "all" => {
+                    options.priorities = Some(value.split(',').filter_map(|p| p.parse().ok()).map(Priority::from_i64).collect());
+                }
                 _ => {}
             }
         }
@@ -317,6 +343,7 @@ pub fn summarize(tasks: &[Task], options: &SummaryOptions, today: NaiveDate, wee
         .iter()
         .filter(|t| !t.is_deleted())
         .filter(|t| options.lists.as_ref().is_none_or(|lists| lists.contains(&t.list_id)))
+        .filter(|t| options.passes_more(t))
         .filter(|t| report_date(t).is_some_and(|d| d >= first && d <= last))
         .filter(|t| match options.status {
             StatusFilter::All => true,
@@ -366,6 +393,7 @@ pub fn summarize(tasks: &[Task], options: &SummaryOptions, today: NaiveDate, wee
             .iter()
             .filter(|t| !t.is_deleted() && !t.is_closed())
             .filter(|t| options.lists.as_ref().is_none_or(|lists| lists.contains(&t.list_id)))
+            .filter(|t| options.passes_more(t))
             .filter(|t| t.due_date.is_some_and(|d| d >= first && d <= last))
             .cloned()
             .collect();
@@ -424,6 +452,26 @@ mod tests {
     }
 
     #[test]
+    fn more_filters() {
+        let store = Store::open_in_memory().unwrap();
+        let today = Local::now().date_naive();
+        let urgent = store.add_task("urgent").unwrap();
+        store.set_due(urgent.id, Some(today), None).unwrap();
+        store.set_priority(urgent.id, Priority::High).unwrap();
+        store.set_tags(urgent.id, &["Work".to_owned()]).unwrap();
+        let chore = store.add_task("chore").unwrap();
+        store.set_due(chore.id, Some(today), None).unwrap();
+        let tasks = store.tasks().unwrap();
+        let titles = |options: &SummaryOptions| {
+            summarize(&tasks, options, today, Weekday::Mon).into_iter().flat_map(|g| g.tasks).map(|t| t.title).collect::<Vec<_>>()
+        };
+        let base = SummaryOptions { period: Period::Today, ..Default::default() };
+        assert_eq!(titles(&base).len(), 2);
+        assert_eq!(titles(&SummaryOptions { tags: Some(vec!["work".into()]), ..base.clone() }), ["urgent"]);
+        assert_eq!(titles(&SummaryOptions { priorities: Some(vec![Priority::None]), ..base }), ["chore"]);
+    }
+
+    #[test]
     fn templates() {
         let store = Store::open_in_memory().unwrap();
         assert!(store.save_summary_template(" ", &SummaryOptions::default()).is_err());
@@ -448,6 +496,8 @@ mod tests {
             lists: Some(vec![None, Some(list.id)]),
             next_period: true,
             habits: true,
+            tags: Some(vec!["home".into(), "work".into()]),
+            priorities: Some(vec![Priority::High, Priority::None]),
         };
         store.save_summary_options(&options).unwrap();
         assert_eq!(store.summary_options().unwrap(), options);

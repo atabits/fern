@@ -8,7 +8,7 @@ use fern_core::summary::{Field, GroupKey, Grouping, Period, StatusFilter, Summar
 use fern_core::{List, Priority, Store, Task};
 use gpui::{ClipboardItem, Entity, Focusable as _, FontWeight};
 use ui::prelude::*;
-use ui::{Placement, PopoverAttachment, popover};
+use ui::{Placement, PopoverAttachment, SubmenuItem, popover};
 
 use crate::calendar;
 use crate::i18n::{self, Strings};
@@ -23,6 +23,8 @@ type Pick = Box<dyn Fn(&mut SummaryView, &mut Window, &mut Context<SummaryView>)
 enum Menu {
     Period,
     Lists,
+    /// "More": Tag and Priority, each in a side menu.
+    More,
     Status,
     Grouping,
     Fields,
@@ -38,6 +40,8 @@ pub struct SummaryView {
     save_menu: bool,
     /// The name field of "Save as Template", while open.
     naming: Option<Entity<TextInput>>,
+    /// The "More" menu's open side menu: 0 Tag, 1 Priority.
+    more_side: Option<u8>,
     /// The "Custom" date fields, while open.
     custom: Option<(Entity<TextInput>, Entity<TextInput>)>,
 }
@@ -164,7 +168,7 @@ impl SummaryView {
     pub fn new(store: Rc<Store>) -> Self {
         // The original keeps the Summary's choices; so does Fern, in the settings table.
         let options = store.summary_options().unwrap_or_default();
-        Self { store, options, menu: None, copied: false, custom: None, save_menu: false, naming: None }
+        Self { store, options, menu: None, copied: false, custom: None, save_menu: false, naming: None, more_side: None }
     }
 
     /// "Custom" in the Date menu: Start and End fields with Cancel and Confirm.
@@ -246,6 +250,7 @@ impl SummaryView {
         self.menu = match menu {
             "period" => Some(Menu::Period),
             "lists" => Some(Menu::Lists),
+            "more" => Some(Menu::More),
             "status" => Some(Menu::Status),
             "grouping" => Some(Menu::Grouping),
             "fields" => Some(Menu::Fields),
@@ -256,6 +261,10 @@ impl SummaryView {
         }
         if menu == "habits" {
             self.options.habits = true;
+        }
+        if menu == "more-tag" {
+            self.menu = Some(Menu::More);
+            self.more_side = Some(0);
         }
         if menu == "save" {
             self.save_menu = true;
@@ -443,6 +452,118 @@ impl SummaryView {
             }))
     }
 
+    /// The original's "More" filter: Tag and Priority side menus with checkable entries.
+    fn render_more_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let strings = i18n::t(cx);
+        let options = &self.options;
+        let open = self.menu == Some(Menu::More);
+        let priorities = [
+            (Priority::High, strings.priority_high),
+            (Priority::Medium, strings.priority_medium),
+            (Priority::Low, strings.priority_low),
+            (Priority::None, strings.priority_none),
+        ];
+        let mut parts = Vec::new();
+        if let Some(tags) = &options.tags {
+            parts.push(tags.iter().map(|t| format!("#{t}")).collect::<Vec<_>>().join(", "));
+        }
+        if let Some(chosen) = &options.priorities {
+            parts.push(priorities.iter().filter(|(p, _)| chosen.contains(p)).map(|(_, n)| *n).collect::<Vec<_>>().join(", "));
+        }
+        let value = if parts.is_empty() { strings.none_option.to_owned() } else { parts.join("; ") };
+        let check = |selected: bool, item: ListItem| {
+            item.when(selected, |item| item.end_slot(Icon::new(IconName::Check).size(IconSize::Small).color(Color::Accent)))
+        };
+        let dropdown = open.then(|| {
+            let tags = self.store.tags().unwrap_or_default();
+            let tag_items = std::iter::once(
+                check(options.tags.is_none(), ListItem::new("more-tag-all").child(Label::new(strings.summary_all_tags)))
+                    .on_click(cx.listener(|this, _, _, cx| this.update(cx, |o| o.tags = None)))
+                    .into_any_element(),
+            )
+            .chain(tags.into_iter().map(|tag| {
+                let name = tag.name.clone();
+                let selected = options.tags.as_ref().is_some_and(|t| t.contains(&name));
+                check(selected, ListItem::new(SharedString::from(format!("more-tag-{name}"))).child(Label::new(format!("#{name}"))))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let name = name.clone();
+                        this.update(cx, |o| {
+                            let mut chosen = o.tags.take().unwrap_or_default();
+                            match chosen.iter().position(|t| *t == name) {
+                                Some(i) => {
+                                    chosen.remove(i);
+                                }
+                                None => chosen.push(name),
+                            }
+                            o.tags = (!chosen.is_empty()).then_some(chosen);
+                        })
+                    }))
+                    .into_any_element()
+            }))
+            .collect::<Vec<_>>();
+            let priority_items = std::iter::once(
+                check(options.priorities.is_none(), ListItem::new("more-priority-all").child(Label::new(strings.summary_all_priorities)))
+                    .on_click(cx.listener(|this, _, _, cx| this.update(cx, |o| o.priorities = None)))
+                    .into_any_element(),
+            )
+            .chain(priorities.into_iter().map(|(priority, name)| {
+                let selected = options.priorities.as_ref().is_some_and(|p| p.contains(&priority));
+                check(selected, ListItem::new(SharedString::from(format!("more-priority-{}", priority.to_i64()))).child(Label::new(name)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.update(cx, |o| {
+                            let mut chosen = o.priorities.take().unwrap_or_default();
+                            match chosen.iter().position(|p| *p == priority) {
+                                Some(i) => {
+                                    chosen.remove(i);
+                                }
+                                None => chosen.push(priority),
+                            }
+                            o.priorities = (!chosen.is_empty()).then_some(chosen);
+                        })
+                    }))
+                    .into_any_element()
+            }))
+            .collect::<Vec<_>>();
+            let side = |index: u8, id: &'static str, label: &'static str, items: Vec<AnyElement>, cx: &mut Context<Self>| {
+                SubmenuItem::new(id, label).open(self.more_side == Some(index)).items(items).on_hover(cx.listener(
+                    move |this, hovered: &bool, _, cx| {
+                        if *hovered && this.more_side != Some(index) {
+                            this.more_side = Some(index);
+                            cx.notify();
+                        }
+                    },
+                ))
+            };
+            PopoverAttachment::new(
+                Placement::BelowRight,
+                popover(cx)
+                    .w(px(200.))
+                    .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                        this.more_side = None;
+                        this.set_menu(None, cx);
+                    }))
+                    .child(side(0, "more-tag", strings.summary_tag, tag_items, cx))
+                    .child(side(1, "more-priority", strings.summary_priority, priority_items, cx)),
+            )
+        });
+        h_flex()
+            .h(px(32.))
+            .px_3()
+            .child(div().flex_1().child(Label::new(strings.summary_more).size(LabelSize::Small)))
+            .child(
+                h_flex()
+                    .id("summary-more")
+                    .relative()
+                    .gap_1()
+                    .max_w(px(170.))
+                    .cursor_pointer()
+                    .child(Label::new(value).size(LabelSize::Small).color(Color::Muted).truncate())
+                    .child(Icon::new(IconName::ChevronsUpDown).size(IconSize::XSmall).color(Color::Muted))
+                    .on_click(cx.listener(move |this, _, _, cx| this.set_menu((!open).then_some(Menu::More), cx)))
+                    .children(dropdown),
+            )
+    }
+
     fn render_options(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let strings = i18n::t(cx);
         let colors = cx.theme().colors().clone();
@@ -599,7 +720,8 @@ impl SummaryView {
                             )
                     }))
                     .child(self.row(strings.summary_lists, list_label, Menu::Lists, list_options, true, cx))
-                    .child(self.row(strings.summary_status, strings.summary_statuses[status_index].to_owned(), Menu::Status, statuses, false, cx)),
+                    .child(self.row(strings.summary_status, strings.summary_statuses[status_index].to_owned(), Menu::Status, statuses, false, cx))
+                    .child(self.render_more_row(cx)),
             )
             .child(heading(strings.summary_display_options))
             .child(

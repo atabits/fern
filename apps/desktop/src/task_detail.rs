@@ -76,11 +76,15 @@ pub struct TaskUpdated;
 /// The user asked to open another task (a subtask) in the panel.
 pub struct OpenTask(pub Id);
 
+/// The panel completed or deleted a task; the list offers to undo it.
+pub struct Undoable(pub crate::undo::UndoAction, pub String);
+
 /// The user asked to focus on the task ("Start Focus").
 pub struct StartFocus(pub Id, pub String);
 
 impl EventEmitter<TaskUpdated> for TaskDetail {}
 impl EventEmitter<StartFocus> for TaskDetail {}
+impl EventEmitter<Undoable> for TaskDetail {}
 impl EventEmitter<OpenTask> for TaskDetail {}
 
 impl TaskDetail {
@@ -560,7 +564,12 @@ impl TaskDetail {
                 }
             })))
             .child(item("more-delete", IconName::Trash, strings.delete).on_click(cx.listener(|this, _, _, cx| {
-                this.menu_action(cx, |store, id| store.delete_task(id))
+                let task = this.task.as_ref().map(|t| (t.id, t.title.clone()));
+                this.menu_action(cx, |store, id| store.delete_task(id));
+                if let Some((id, title)) = task {
+                    let label = i18n::t(cx).undo_deleted.replace("{title}", &title);
+                    cx.emit(Undoable(crate::undo::UndoAction::Restore(id), label));
+                }
             })))
             .into_any_element()
     }
@@ -668,15 +677,22 @@ impl TaskDetail {
     fn toggle_completed(&mut self, cx: &mut Context<Self>) {
         let Some(task) = self.task.as_mut() else { return };
         let completed = !task.is_completed();
+        let mut undo = None;
         // Unchecking a "Won't Do" task reopens it.
         let result = if task.is_wont_do() {
             self.store.set_wont_do(task.id, false)
+        } else if completed {
+            crate::undo::complete(&self.store, task).map(|action| undo = Some(action))
         } else {
-            self.store.set_completed(task.id, completed)
+            self.store.set_completed(task.id, false)
         };
         if let Err(err) = result {
             eprintln!("failed to update the task: {err:#}");
             return;
+        }
+        if let Some(action) = undo {
+            let label = i18n::t(cx).undo_completed.replace("{title}", &task.title);
+            cx.emit(Undoable(action, label));
         }
         if let Ok(Some(fresh)) = self.store.task(task.id) {
             *task = fresh;

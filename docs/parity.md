@@ -53,7 +53,7 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 | List header with sidebar toggle | ✅ | toggle and "…" work (the original's "Show / Hide Completed" and "Show / Hide Details" — the first line of the notes under the title — kept per list; the View switcher has List and the original's Kanban — a column per group (Tasks / Notes / Completed, or the chosen Group by) with cards showing tags, date and subtasks; lists get the original's sections ("Add Section" in the menu, "+ Add Section" on the board): tasks group by section, not sectioned first; a task's section is picked under its list in the details' list picker and is dropped when it moves to another list; a section header's "…" renames or deletes it (its tasks stay in the list); List Activities (the original's panel in place of the details: the list's task events by day with colored icons, each task opens on click; Inbox and user lists) and Print (a plain page of the list opened in the browser, which prints it; the menu follows the original's order); no Timeline view). Kanban cards drag between columns and take the column's value: section, Tasks / Notes, Completed (leaving it reopens), Today / Tomorrow / No Date, priority or tag; the original's drag behavior was not observed (dragging in TickTick would change data)); the sort button has the original's "Group by" (Custom, Date, Created Time, Tag, Priority, None) and "Sort by" (Custom, Date, Created Time, Modified Time, Title, Tag, Priority), kept per list; edits (fields, tags, checklist, not reordering) update a task's modified time |
 | "Add task" field | ✅ | parses date, time, repeat, tags, priority and `^list`; no live highlighting yet; `^list` matches one-word list names only |
 | Rows by the measurements (40 px, separators) | ✅ | |
-| Undo | 🟡 | completing a task (not a repeating one) or moving it to the trash from the list shows an "Undo" toast for 5 seconds; the original's toast was not observed (it would need completing a task in TickTick); no undo from the details panel |
+| Undo | 🟡 | completing a task or moving it to the trash, from the list or the details panel, shows an "Undo" toast for 5 seconds; for a repeating task Undo removes the completed copy and puts the task back on its date. The original's toast was not observed (it would need completing a task in TickTick); a repeating task's checklist stays reset after Undo |
 | Tag chips, due date and repeat in rows | ✅ | overdue dates in red |
 | Subtasks with indentation and collapsing | ✅ | created from the details panel |
 | Groups "Tasks" / "Notes" with counters and collapsing | ✅ | plus a collapsed "Completed" group; the Completed and Won't Do views group by the day the task was closed ("Sunday, September 27") |
@@ -91,8 +91,8 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 
 ## Next
 
-1. Undo from the details panel and for repeating tasks.
-2. Keyboard shortcuts for task edits (the original's Tab+D date, Tab+P pin, Alt+0–3 priority).
+1. Keyboard shortcuts for task edits (the original's Tab+D date, Tab+P pin, Alt+0–3 priority).
+2. Settings window (theme, language, start of week, default list).
 3. Statistics page in the main sidebar (account menu), not only from Focus.
 3. Rename and delete habit sections.
 4. Filled sidebar icons (needs own filled glyphs; Lucide has none).

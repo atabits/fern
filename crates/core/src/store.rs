@@ -532,6 +532,12 @@ impl Store {
     }
 
     pub fn set_completed(&self, id: Id, completed: bool) -> Result<()> {
+        self.complete(id, completed).map(|_| ())
+    }
+
+    /// Completes or reopens a task. Completing a repeating task keeps a completed copy and moves
+    /// the task to its next date; the copy is returned so that it can be undone.
+    pub fn complete(&self, id: Id, completed: bool) -> Result<Option<Id>> {
         if completed
             && let Some(task) = self.task(id)?
             && let (Some(repeat), Some(due)) = (task.repeat, task.due_date)
@@ -564,9 +570,26 @@ impl Store {
                 [id.to_string()],
             )?;
             tx.commit()?;
-            return Ok(());
+            return Ok(Some(copy));
         }
-        self.update(id, "completed_at", completed.then(now_ms))
+        self.update(id, "completed_at", completed.then(now_ms)).map(|_| None)
+    }
+
+    /// Undoes completing a repeating task: removes the completed copy and puts the task back on
+    /// its earlier dates.
+    pub fn undo_repeat(&self, id: Id, copy: Id, due: Option<NaiveDate>, end: Option<NaiveDate>) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM tasks WHERE id = ?1", [copy.to_string()])?;
+        tx.execute(
+            "UPDATE tasks SET due_date = ?2, end_date = ?3 WHERE id = ?1",
+            params![
+                id.to_string(),
+                due.map(|d| d.format(DATE_FORMAT).to_string()),
+                end.map(|d| d.format(DATE_FORMAT).to_string())
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// Sets or clears the repeat rule. A repeating task needs a due date; `today` is used when
@@ -1969,6 +1992,21 @@ mod tests {
         store.delete_list_section(kitchen.id)?;
         assert_eq!(store.task(task.id)?.unwrap().section_id, None);
         assert!(store.list_sections(home.id)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn completing_a_repeating_task_can_be_undone() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let task = store.add_task("water the plants")?;
+        store.set_due(task.id, Some(d(2026, 10, 18)), None)?;
+        store.set_repeat(task.id, Some(crate::Recurrence::new(crate::Frequency::Daily, 1)), d(2026, 10, 18))?;
+        let copy = store.complete(task.id, true)?.expect("a repeating task leaves a completed copy");
+        assert_eq!(store.task(task.id)?.unwrap().due_date, Some(d(2026, 10, 19)));
+        store.undo_repeat(task.id, copy, Some(d(2026, 10, 18)), None)?;
+        assert_eq!(store.task(task.id)?.unwrap().due_date, Some(d(2026, 10, 18)));
+        assert!(store.task(copy)?.is_none());
+        assert_eq!(store.complete(store.add_task("once")?.id, true)?, None);
         Ok(())
     }
 

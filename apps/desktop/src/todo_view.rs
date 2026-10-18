@@ -172,6 +172,10 @@ impl TodoView {
         cx.subscribe(&detail, |this, _, _: &TaskUpdated, cx| this.reload(cx)).detach();
         cx.subscribe(&detail, |this, _, OpenTask(id), cx| this.select(*id, cx)).detach();
         cx.subscribe(&detail, |_, _, StartFocus(id, title), cx| cx.emit(StartFocus(*id, title.clone()))).detach();
+        cx.subscribe(&detail, |this, _, crate::task_detail::Undoable(action, label), cx| {
+            this.offer_undo(*action, label.clone(), cx);
+        })
+        .detach();
 
         let mut this = Self {
             store,
@@ -1534,15 +1538,20 @@ impl TodoView {
         // Unchecking a "Won't Do" task reopens it, as in the original.
         let wont_do = self.tasks.iter().any(|t| t.id == id && t.is_wont_do());
         let task = self.tasks.iter().find(|t| t.id == id).cloned();
-        let result = if wont_do { self.store.set_wont_do(id, false) } else { self.store.set_completed(id, completed) };
-        // Completing offers Undo; repeating tasks move on to their next date instead.
-        if self.check(result).is_some()
-            && completed
-            && !wont_do
-            && let Some(task) = task.filter(|t| t.repeat.is_none())
-        {
-            let label = i18n::t(cx).undo_completed.replace("{title}", &task.title);
-            self.offer_undo(crate::undo::UndoAction::Reopen(id), label, cx);
+        match task {
+            // Completing offers Undo, also for a repeating task, which moves to its next date.
+            Some(task) if completed && !wont_do => {
+                let result = crate::undo::complete(&self.store, &task);
+                if let Some(action) = self.check(result) {
+                    let label = i18n::t(cx).undo_completed.replace("{title}", &task.title);
+                    self.offer_undo(action, label, cx);
+                }
+            }
+            _ => {
+                let result =
+                    if wont_do { self.store.set_wont_do(id, false) } else { self.store.set_completed(id, completed) };
+                self.check(result);
+            }
         }
         self.reload(cx);
     }

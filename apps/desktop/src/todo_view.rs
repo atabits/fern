@@ -3557,6 +3557,57 @@ impl TodoView {
         )
     }
 
+    /// The countdowns whose Show puts them in Today (on the day by default, as in the original),
+    /// each with its icon, name and the days left.
+    fn render_countdowns(&self, strings: &Strings, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.view != View::Today {
+            return None;
+        }
+        let theme = cx.theme().clone();
+        let today = Self::today();
+        let countdowns: Vec<fern_core::Countdown> = self
+            .store
+            .countdowns()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|c| c.show_in_list.shows(c.next_date(today), today))
+            .collect();
+        if countdowns.is_empty() {
+            return None;
+        }
+        let count = countdowns.len();
+        Some(
+            v_flex()
+                .child(
+                    h_flex()
+                        .h(px(36.))
+                        .gap_1()
+                        .pl(px(GUTTER))
+                        .child(Label::new(strings.section_countdown).weight(FontWeight::BOLD))
+                        .child(div().pl_1().child(Label::new(count.to_string()).size(LabelSize::Small).color(Color::Muted))),
+                )
+                .children(countdowns.into_iter().map(|countdown| {
+                    let date = countdown.next_date(today);
+                    let days = countdown.span(today).total_days;
+                    let when = if date == today { strings.today.to_owned() } else { format!("{days} {}", strings.habit_days) };
+                    h_flex()
+                        .h(px(ROW_HEIGHT))
+                        .pl(px(GUTTER))
+                        .pr_3()
+                        .gap(px(10.))
+                        .child(match countdown.icon.clone() {
+                            Some(icon) => div().w(px(16.)).child(icon).into_any_element(),
+                            None => Icon::new(crate::countdown_view::kind_icon(countdown.kind)).color(Color::Accent).into_any_element(),
+                        })
+                        .child(div().flex_1().min_w_0().child(Label::new(countdown.name.clone()).truncate()))
+                        .child(Label::new(when).size(LabelSize::Small).color(Color::Accent))
+                        .border_b_1()
+                        .border_color(theme.colors().border_variant)
+                }))
+                .into_any_element(),
+        )
+    }
+
     fn set_closed_menu(&mut self, menu: Option<ClosedMenu>, cx: &mut Context<Self>) {
         self.closed_menu = menu;
         cx.notify();
@@ -4373,7 +4424,8 @@ impl Render for TodoView {
                         )
                     })
                     .children(rows)
-                    .children(self.render_habits(strings, cx)),
+                    .children(self.render_habits(strings, cx))
+                    .children(self.render_countdowns(strings, cx)),
             ))
             .when_some(self.error.clone(), |el, error| {
                 el.child(

@@ -36,6 +36,41 @@ impl CountdownKind {
     }
 }
 
+/// The original's Show: when a countdown shows in the Today smart list.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ShowInList {
+    #[default]
+    OnTheDay,
+    ThreeDaysAhead,
+    SevenDaysAhead,
+    Always,
+    Never,
+}
+
+impl ShowInList {
+    pub const ALL: [Self; 5] = [Self::OnTheDay, Self::ThreeDaysAhead, Self::SevenDaysAhead, Self::Always, Self::Never];
+
+    pub fn key(self) -> &'static str {
+        ["day", "3", "7", "always", "never"][self as usize]
+    }
+
+    pub fn parse(key: &str) -> Self {
+        Self::ALL.into_iter().find(|s| s.key() == key).unwrap_or_default()
+    }
+
+    /// Whether a countdown counting to `date` shows in the Today list on `today`.
+    pub fn shows(self, date: NaiveDate, today: NaiveDate) -> bool {
+        let ahead = (date - today).num_days();
+        match self {
+            Self::OnTheDay => ahead == 0,
+            Self::ThreeDaysAhead => (0..=3).contains(&ahead),
+            Self::SevenDaysAhead => (0..=7).contains(&ahead),
+            Self::Always => true,
+            Self::Never => false,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Countdown {
     pub id: Id,
@@ -56,6 +91,11 @@ pub struct Countdown {
     pub reminders: Vec<u32>,
     /// The reminders stay on screen until answered.
     pub constant_reminder: bool,
+    /// The original's Show: when it shows in the Today list.
+    pub show_in_list: ShowInList,
+    /// The original's Day Calculation Mode "Standard +1 day": the date itself is day 1 of the
+    /// days since it, rather than the day after.
+    pub plus_one_day: bool,
 }
 
 impl Countdown {
@@ -79,6 +119,17 @@ impl Countdown {
 }
 
 impl Countdown {
+    /// The distance to the date it counts to, with "Standard +1 day" counting the date itself
+    /// as day 1 of the days since it.
+    pub fn span(&self, today: NaiveDate) -> Span {
+        let mut span = span(today, self.next_date(today));
+        if self.plus_one_day && span.past {
+            span.total_days += 1;
+            span.days += 1;
+        }
+        span
+    }
+
     /// For a birthday, the age turned on its next date (0 before the day of birth).
     pub fn age(&self, today: NaiveDate) -> Option<u32> {
         (self.kind == CountdownKind::Birthday).then(|| (self.next_date(today).year() - self.date.year()).max(0) as u32)
@@ -214,6 +265,8 @@ mod tests {
             show_age: false,
             reminders: DEFAULT_REMINDERS.to_vec(),
             constant_reminder: false,
+            show_in_list: ShowInList::OnTheDay,
+            plus_one_day: false,
         };
         let list = [trip];
         let fired = |from: NaiveDate, to: NaiveDate| -> Vec<chrono::NaiveDateTime> {
@@ -224,6 +277,20 @@ mod tests {
         assert_eq!(fired(d(2026, 10, 17), d(2026, 10, 22)), [at(d(2026, 10, 18), 9), at(d(2026, 10, 21), 9)]);
         assert!(fired(d(2026, 10, 22), d(2026, 10, 30)).is_empty(), "past dates do not remind");
         assert_eq!(parse_reminders("0, 3,x"), [0, 3]);
+
+        // Show in the Today list.
+        let date = d(2026, 10, 21);
+        assert!(ShowInList::ThreeDaysAhead.shows(date, d(2026, 10, 18)) && !ShowInList::OnTheDay.shows(date, d(2026, 10, 18)));
+        assert!(ShowInList::OnTheDay.shows(date, date) && !ShowInList::SevenDaysAhead.shows(date, d(2026, 10, 22)));
+        assert!(ShowInList::Always.shows(date, d(2020, 1, 1)) && !ShowInList::Never.shows(date, date));
+        assert_eq!(ShowInList::parse(ShowInList::SevenDaysAhead.key()), ShowInList::SevenDaysAhead);
+
+        // "Standard +1 day" counts the date as day 1 of the days since.
+        let mut wedding = list[0].clone();
+        wedding.date = d(2026, 10, 8);
+        assert_eq!(wedding.span(d(2026, 10, 18)).total_days, 10);
+        wedding.plus_one_day = true;
+        assert_eq!(wedding.span(d(2026, 10, 18)).total_days, 11);
     }
 
     #[test]
@@ -240,6 +307,8 @@ mod tests {
             show_age: false,
             reminders: Vec::new(),
             constant_reminder: false,
+            show_in_list: ShowInList::OnTheDay,
+            plus_one_day: false,
         };
         let today = d(2026, 10, 18);
         let mum = birthday(d(1970, 12, 5));
@@ -268,6 +337,8 @@ mod tests {
             show_age: false,
             reminders: Vec::new(),
             constant_reminder: false,
+            show_in_list: ShowInList::OnTheDay,
+            plus_one_day: false,
         };
         assert_eq!(once.next_date(d(2026, 10, 18)), d(2026, 9, 13), "without a repeat the date stays");
         let monthly = Countdown { repeat: Some(Recurrence::new(Frequency::Monthly, 1)), ..once.clone() };

@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use std::rc::Rc;
 
 use chrono::{Datelike, Local, NaiveDate};
-use fern_core::{Countdown, CountdownKind, Id, Store, span};
+use fern_core::{Countdown, CountdownKind, Id, Store};
 use gpui::{Entity, Focusable as _, FontWeight};
 use ui::prelude::*;
 use ui::{Placement, PopoverAttachment, popover};
@@ -43,6 +43,8 @@ struct Draft {
     /// The original's Reminder: days before the date, at 09:00.
     reminders: Vec<u32>,
     constant_reminder: bool,
+    show_in_list: fern_core::countdown::ShowInList,
+    plus_one_day: bool,
 }
 
 /// The countdown dialog's fields that open a dropdown, as in the original.
@@ -53,6 +55,8 @@ enum DraftRow {
     Reminder,
     Repeat,
     Type,
+    CalcMode,
+    Show,
 }
 
 /// Emoji offered for countdowns; the original's illustrated icon set is its own artwork.
@@ -71,7 +75,7 @@ pub struct CountdownView {
     add_menu: bool,
 }
 
-fn kind_icon(kind: CountdownKind) -> IconName {
+pub fn kind_icon(kind: CountdownKind) -> IconName {
     match kind {
         CountdownKind::Countdown => IconName::Hourglass,
         CountdownKind::Anniversary => IconName::Heart,
@@ -130,7 +134,7 @@ fn face(countdown: &Countdown, today: NaiveDate, days_only: bool, cx: &App) -> F
     let theme = cx.theme();
     // A repeating countdown counts to the next time its date comes back.
     let date = countdown.next_date(today);
-    let span = span(today, date);
+    let span = countdown.span(today);
     let color = if span.past { theme.status().warning } else { theme.colors().accent };
     let number = |value: u32, unit: &str| {
         h_flex()
@@ -210,7 +214,7 @@ impl CountdownView {
             Filter::Kind(kind) => kind,
             Filter::All => CountdownKind::Countdown,
         };
-        self.draft = Some(Draft { name, kind, date: today, month: calendar::month_start(today), icon: None, color: None, repeat: None, editing: None, show_age: false, open: None, reminders: fern_core::countdown::DEFAULT_REMINDERS.to_vec(), constant_reminder: false });
+        self.draft = Some(Draft { name, kind, date: today, month: calendar::month_start(today), icon: None, color: None, repeat: None, editing: None, show_age: false, open: None, reminders: fern_core::countdown::DEFAULT_REMINDERS.to_vec(), constant_reminder: false, show_in_list: Default::default(), plus_one_day: false });
         cx.notify();
     }
 
@@ -228,11 +232,15 @@ impl CountdownView {
         cx.notify();
     }
 
-    /// The new countdown's Reminder dropdown, for screenshots.
+    /// The new countdown's `reminder`, `calc` or `show` dropdown, for screenshots.
     #[cfg(debug_assertions)]
-    pub fn dev_open_reminder(&mut self, cx: &mut Context<Self>) {
+    pub fn dev_open_row(&mut self, row: &str, cx: &mut Context<Self>) {
         if let Some(draft) = self.draft.as_mut() {
-            draft.open = Some(DraftRow::Reminder);
+            draft.open = Some(match row {
+                "calc" => DraftRow::CalcMode,
+                "show" => DraftRow::Show,
+                _ => DraftRow::Reminder,
+            });
         }
         cx.notify();
     }
@@ -260,6 +268,8 @@ impl CountdownView {
             draft.show_age = countdown.show_age;
             draft.reminders = countdown.reminders.clone();
             draft.constant_reminder = countdown.constant_reminder;
+            draft.show_in_list = countdown.show_in_list;
+            draft.plus_one_day = countdown.plus_one_day;
             draft.editing = Some(id);
         }
         cx.notify();
@@ -302,7 +312,8 @@ impl CountdownView {
         .and_then(|id| {
             self.store.set_countdown_look(id, draft.icon.as_deref(), draft.color.as_deref())?;
             self.store.set_countdown_show_age(id, draft.kind == CountdownKind::Birthday && draft.show_age)?;
-            self.store.set_countdown_reminders(id, &draft.reminders, draft.constant_reminder)
+            self.store.set_countdown_reminders(id, &draft.reminders, draft.constant_reminder)?;
+            self.store.set_countdown_display(id, draft.show_in_list, draft.plus_one_day)
         });
         if let Err(err) = added {
             eprintln!("failed to add the countdown: {err:#}");
@@ -604,6 +615,47 @@ impl CountdownView {
             )
             .into_any_element();
 
+        // Day Calculation Mode: the original's two choices, each with its explanation.
+        let plus_one = draft.plus_one_day;
+        let calc_text = strings.countdown_calc_options[plus_one as usize].0.to_owned();
+        let calc_menu = v_flex()
+            .children(strings.countdown_calc_options.iter().enumerate().map(|(i, (label, about))| {
+                let on = plus_one == (i == 1);
+                h_flex()
+                    .id(("countdown-calc", i))
+                    .px_2()
+                    .py_1p5()
+                    .rounded(px(4.))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme.colors().element_hover))
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .child(Label::new(*label).color(if on { Color::Accent } else { Color::Default }))
+                            .child(Label::new(*about).size(LabelSize::XSmall).color(Color::Muted)),
+                    )
+                    .when(on, |el| el.child(Icon::new(IconName::Check).size(IconSize::XSmall).color(Color::Accent)))
+                    .on_click(set(Box::new(move |d| {
+                        d.plus_one_day = i == 1;
+                        d.open = None;
+                    })))
+            }))
+            .into_any_element();
+        // Show: when it shows in the Today list.
+        use fern_core::countdown::ShowInList;
+        let show = draft.show_in_list;
+        let show_text = strings.countdown_show_options[show as usize].to_owned();
+        let show_menu = v_flex()
+            .child(div().px_2().py_1().child(Label::new(strings.countdown_show_heading).size(LabelSize::Small).color(Color::Muted)))
+            .children(ShowInList::ALL.into_iter().map(|option| {
+                choice(SharedString::from(format!("countdown-show-{}", option.key())), strings.countdown_show_options[option as usize], option == show)
+                    .on_click(set(Box::new(move |d| {
+                        d.show_in_list = option;
+                        d.open = None;
+                    })))
+            }))
+            .into_any_element();
+
         // The icon picker under the icon: an emoji and its background color.
         let icon_menu = v_flex()
             .gap_2()
@@ -686,6 +738,8 @@ impl CountdownView {
         let date_row = row(strings.filter_date, dropdown(DraftRow::Date, format_date(selected, strings), date_menu, cx));
         let reminder_row = row(strings.reminder, dropdown(DraftRow::Reminder, reminder_text, reminder_menu, cx));
         let repeat_row = row(strings.repeat, dropdown(DraftRow::Repeat, repeat_text.to_owned(), repeat_menu, cx));
+        let calc_row = row(strings.countdown_calc_mode, dropdown(DraftRow::CalcMode, calc_text, calc_menu, cx));
+        let show_row = row(strings.countdown_show, dropdown(DraftRow::Show, show_text, show_menu, cx));
         let type_row = row(strings.filter_type, dropdown(DraftRow::Type, kind_label(kind, strings).to_owned(), type_menu, cx));
         let icon_open = open == Some(DraftRow::Icon);
         let icon = div()
@@ -773,6 +827,8 @@ impl CountdownView {
             .child(reminder_row)
             .child(repeat_row)
             .child(type_row)
+            .child(calc_row)
+            .child(show_row)
             .child(div().mt_1().h(px(1.)).bg(theme.colors().border))
             // The original's "Show Age", for a birthday.
             .when(kind == CountdownKind::Birthday, |el| {

@@ -145,7 +145,7 @@ mod tests {
 
     #[test]
     fn countdowns_on_their_dates() {
-        let countdown = |name: &str, date, kind| Countdown { id: uuid::Uuid::now_v7(), name: name.into(), date, kind, icon: None, color: Some("#ff6b6b".into()), repeat: None, pinned_at: None, show_age: false, reminders: Vec::new(), constant_reminder: false };
+        let countdown = |name: &str, date, kind| Countdown { id: uuid::Uuid::now_v7(), name: name.into(), date, kind, icon: None, color: Some("#ff6b6b".into()), repeat: None, pinned_at: None, show_age: false, reminders: Vec::new(), constant_reminder: false, show_in_list: Default::default(), plus_one_day: false };
         let countdowns = [
             countdown("Release", d(11, 19), CountdownKind::Countdown),
             countdown("New Year", NaiveDate::from_ymd_opt(2024, 1, 1).unwrap(), CountdownKind::Holiday),

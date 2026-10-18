@@ -259,9 +259,9 @@ impl AppView {
             }
             if state.contains("countdown-draft") {
                 this.countdown.update(cx, |view, cx| view.start_new(window, cx));
-                // `countdown-draft=reminder`: with its Reminder dropdown open.
-                if state.contains("countdown-draft=reminder") {
-                    this.countdown.update(cx, |view, cx| view.dev_open_reminder(cx));
+                // `countdown-draft=reminder|calc|show`: with that dropdown open.
+                if let Some(row) = state.split(';').find_map(|part| part.strip_prefix("countdown-draft=")) {
+                    this.countdown.update(cx, |view, cx| view.dev_open_row(row, cx));
                 }
             }
             // `attach=<task title part>><file path>`: a file attached to that task.

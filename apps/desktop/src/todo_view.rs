@@ -167,6 +167,10 @@ pub struct TodoView {
     renaming_section: Option<(Id, Entity<TextInput>)>,
     detail: Entity<TaskDetail>,
     selected: Option<Id>,
+    /// A task row's right-click menu: the task and where the click was (window coordinates).
+    context_menu: Option<(Id, gpui::Point<Pixels>)>,
+    /// Its side menu open: 0 Move to, 1 Start Focus.
+    context_side: Option<u8>,
     error: Option<String>,
 }
 
@@ -305,6 +309,8 @@ impl TodoView {
             renaming_section: None,
             detail,
             selected: None,
+            context_menu: None,
+            context_side: None,
             error: None,
         };
         this.reload(cx);
@@ -480,6 +486,13 @@ impl TodoView {
                     self.add_list_side = true;
                 }
                 Some(("menu", "activity")) => self.open_list_activity(cx),
+                // `context=<title part>`: that task's right-click menu, opened beside its row.
+                Some(("context", needle)) => {
+                    if let Some(task) = self.tasks.iter().find(|t| t.title.contains(needle)).cloned() {
+                        self.select(task.id, cx);
+                        self.context_menu = Some((task.id, gpui::point(px(420.), px(200.))));
+                    }
+                }
                 // `filter-new=normal|advanced`, `filter-new=chain` (an Advanced chain with a
                 // condition's menu open), `filter-new=preview` or `filter-new=examples`.
                 Some(("filter-new", mode)) => {
@@ -3356,6 +3369,14 @@ impl TodoView {
                 window.focus(&this.list_focus, cx);
                 this.select(id, cx);
             }))
+            // The original's right-click menu, at the pointer; the task is selected too.
+            .on_mouse_down(MouseButton::Right, cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                window.focus(&this.list_focus, cx);
+                this.select(id, cx);
+                this.context_menu = Some((id, event.position));
+                this.context_side = None;
+                cx.notify();
+            }))
             .child(
                 div()
                     .id("toggle-children")
@@ -3604,6 +3625,166 @@ impl TodoView {
                         .border_b_1()
                         .border_color(theme.colors().border_variant)
                 }))
+                .into_any_element(),
+        )
+    }
+
+    /// A right-click menu choice: changes the task, closes the menu and shows the result.
+    fn context_edit(&mut self, cx: &mut Context<Self>, change: impl FnOnce(&Store) -> anyhow::Result<()>) {
+        self.context_menu = None;
+        self.context_side = None;
+        let result = change(&self.store);
+        self.check(result);
+        self.reload(cx);
+    }
+
+    /// The task's right-click menu, as the original's: Date (today, tomorrow, next week, a date)
+    /// and Priority rows of icons, then Add Subtask, Link Parent Task, Pin, Won't Do, Move to,
+    /// Tags, Start Focus, Duplicate, Copy Link, Convert to Note and Delete.
+    fn render_context_menu(&self, strings: &'static Strings, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (id, position) = self.context_menu?;
+        let task = self.tasks.iter().find(|t| t.id == id).cloned().or_else(|| self.store.task(id).ok().flatten())?;
+        let theme = cx.theme().clone();
+        let today = Self::today();
+        let heading = |label: &'static str| div().px_2().pt_1().child(Label::new(label).size(LabelSize::XSmall).color(Color::Muted));
+        let icon_button = |id: SharedString, icon: IconName, color: Color, on: bool| {
+            div()
+                .id(id)
+                .size(px(30.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(6.))
+                .cursor_pointer()
+                .when(on, |el| el.bg(theme.colors().element_selected))
+                .hover(|s| s.bg(theme.colors().element_hover))
+                .child(Icon::new(icon).color(color))
+        };
+        let dates = [(IconName::Sun, Some(0)), (IconName::Sunrise, Some(1)), (IconName::CalendarPlus, Some(7)), (IconName::CalendarDays, None)];
+        let date_row = h_flex().px_1().justify_between().children(dates.into_iter().enumerate().map(|(i, (icon, days))| {
+            icon_button(SharedString::from(format!("context-date-{i}")), icon, Color::Muted, false).on_click(cx.listener(
+                move |this, _, window, cx| match days {
+                    Some(days) => {
+                        let date = today + Duration::days(days);
+                        this.context_edit(cx, |store| store.set_due(id, Some(date), None));
+                    }
+                    // A date of one's own: the details' date popover.
+                    None => {
+                        this.context_menu = None;
+                        this.detail.update(cx, |detail, cx| detail.start("due", window, cx));
+                        cx.notify();
+                    }
+                },
+            ))
+        }));
+        let priorities = [Priority::High, Priority::Medium, Priority::Low, Priority::None];
+        let priority_row = h_flex().px_1().justify_between().children(priorities.into_iter().map(|priority| {
+            let color = task_rows::priority_color(priority, &theme).map_or(Color::Muted, Color::Custom);
+            icon_button(SharedString::from(format!("context-priority-{}", priority.to_i64())), IconName::Flag, color, task.priority == priority)
+                .on_click(cx.listener(move |this, _, _, cx| this.context_edit(cx, |store| store.set_priority(id, priority))))
+        }));
+        let item = |key: &'static str, icon: IconName, label: &'static str| {
+            ListItem::new(key).height(px(34.)).start_slot(Icon::new(icon).color(Color::Muted)).child(Label::new(label))
+        };
+        let detail_item = |key: &'static str, icon: IconName, label: &'static str, what: &'static str, cx: &mut Context<Self>| {
+            item(key, icon, label).on_click(cx.listener(move |this, _, window, cx| {
+                this.context_menu = None;
+                this.detail.update(cx, |detail, cx| detail.start(what, window, cx));
+                cx.notify();
+            }))
+        };
+        let pinned = task.pinned_at.is_some();
+        let wont_do = task.is_wont_do();
+        let note = task.kind == Kind::Note;
+        let title = task.title.clone();
+        let lists = self.lists.clone();
+        let menu = popover(cx)
+            .w(px(196.))
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.context_menu = None;
+                this.context_side = None;
+                cx.notify();
+            }))
+            .child(heading(strings.filter_date))
+            .child(date_row)
+            .child(heading(strings.filter_priority))
+            .child(priority_row)
+            .child(div().py_1().child(Divider::horizontal()))
+            .child(detail_item("context-subtask", IconName::CornerDownRight, strings.add_subtask, "subtask", cx))
+            .child(detail_item("context-parent", IconName::ListTree, strings.link_parent, "link-parent", cx))
+            .child(item("context-pin", if pinned { IconName::PinOff } else { IconName::Pin }, if pinned { strings.unpin } else { strings.pin }).on_click(
+                cx.listener(move |this, _, _, cx| this.context_edit(cx, |store| store.set_pinned(id, !pinned))),
+            ))
+            .child(item("context-wont-do", IconName::SquareX, strings.wont_do).on_click(cx.listener(move |this, _, _, cx| {
+                this.context_edit(cx, |store| store.set_wont_do(id, !wont_do))
+            })))
+            .child(
+                SubmenuItem::new("context-move", strings.move_to)
+                    .icon(IconName::Inbox)
+                    .height(px(34.))
+                    .open(self.context_side == Some(0))
+                    .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                        if *hovered && this.context_side != Some(0) {
+                            this.context_side = Some(0);
+                            cx.notify();
+                        }
+                    }))
+                    .items(std::iter::once((None, SharedString::new_static(strings.inbox))).chain(lists.into_iter().map(|l| (Some(l.id), l.name.into()))).map(
+                        |(list, name)| {
+                            ListItem::new(SharedString::from(format!("context-move-{list:?}")))
+                                .child(Label::new(name).color(if task.list_id == list { Color::Accent } else { Color::Default }))
+                                .on_click(cx.listener(move |this, _, _, cx| this.context_edit(cx, |store| store.set_list(id, list))))
+                        },
+                    )),
+            )
+            .child(detail_item("context-tags", IconName::Tag, strings.tags, "tags", cx))
+            .child(div().py_1().child(Divider::horizontal()))
+            .child(
+                SubmenuItem::new("context-focus", strings.start_focus)
+                    .icon(IconName::CircleDot)
+                    .height(px(34.))
+                    .open(self.context_side == Some(1))
+                    .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                        if *hovered && this.context_side != Some(1) {
+                            this.context_side = Some(1);
+                            cx.notify();
+                        }
+                    }))
+                    .items([(false, strings.start_pomo), (true, strings.start_stopwatch)].map(|(stopwatch, label)| {
+                        let title = title.clone();
+                        ListItem::new(SharedString::from(format!("context-focus-{stopwatch}"))).child(Label::new(label)).on_click(cx.listener(
+                            move |this, _, _, cx| {
+                                this.context_menu = None;
+                                this.context_side = None;
+                                cx.emit(StartFocus(id, title.clone(), stopwatch));
+                                cx.notify();
+                            },
+                        ))
+                    })),
+            )
+            .child(div().py_1().child(Divider::horizontal()))
+            .child(item("context-duplicate", IconName::Copy, strings.duplicate).on_click(cx.listener(move |this, _, _, cx| {
+                this.context_edit(cx, |store| store.duplicate_task(id).map(|_| ()))
+            })))
+            .child(item("context-link", IconName::Link, strings.copy_link).on_click(cx.listener(move |this, _, _, cx| {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(fern_core::link::task_link(id)));
+                this.context_menu = None;
+                cx.notify();
+            })))
+            .child(
+                item("context-convert", IconName::FileText, if note { strings.convert_to_task } else { strings.convert_to_note }).on_click(cx.listener(
+                    move |this, _, _, cx| this.context_edit(cx, |store| store.set_kind(id, if note { Kind::Task } else { Kind::Note })),
+                )),
+            )
+            // Deleting goes the list's usual way, with its Undo.
+            .child(item("context-delete", IconName::Trash, strings.delete).on_click(cx.listener(move |this, _, _, cx| {
+                this.context_menu = None;
+                this.context_side = None;
+                this.delete(id, cx);
+            })));
+        Some(
+            gpui::deferred(gpui::anchored().position(position).snap_to_window_with_margin(px(8.)).child(menu))
+                .with_priority(1)
                 .into_any_element(),
         )
     }
@@ -4519,5 +4700,6 @@ impl Render for TodoView {
                     ),
                 )
             })
+            .children(self.render_context_menu(strings, cx))
     }
 }

@@ -441,6 +441,24 @@ impl TaskDetail {
         self.store.preferences().map_or(60, |p| p.task_defaults.duration)
     }
 
+    /// The details' own pickers, for the task list's right-click menu: `subtask` focuses the Add
+    /// Subtask field, `due`, `tags` and `link-parent` open their popovers.
+    pub fn start(&mut self, what: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.task.is_none() {
+            return;
+        }
+        match what {
+            "subtask" => window.focus(&self.subtask_input.focus_handle(cx), cx),
+            "due" => self.open_popup(Popup::Due, cx),
+            "tags" => self.open_popup(Popup::Tags, cx),
+            "link-parent" => {
+                self.open_popup(Popup::LinkParent, cx);
+                window.focus(&self.link_search.focus_handle(cx), cx);
+            }
+            _ => {}
+        }
+    }
+
     pub fn open_due(&mut self, cx: &mut Context<Self>) {
         if self.task.is_some() {
             self.open_popup(Popup::Due, cx);

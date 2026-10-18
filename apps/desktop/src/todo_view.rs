@@ -50,6 +50,8 @@ impl gpui::EventEmitter<StartFocus> for TodoView {}
 struct FilterEdit {
     draft: fern_core::SmartFilter,
     is_new: bool,
+    /// The "Advanced" tab: conditions combined with "all" or "any".
+    advanced: bool,
     name: Entity<TextInput>,
     keywords: Entity<TextInput>,
 }
@@ -329,7 +331,12 @@ impl TodoView {
                 }
                 Some(("menu", "templates")) => self.templates_open = true,
                 Some(("menu", "activity")) => self.open_list_activity(cx),
-                Some(("filter-new", _)) => self.open_filter_edit(None, window, cx),
+                Some(("filter-new", mode)) => {
+                    self.open_filter_edit(None, window, cx);
+                    if let Some(edit) = self.filter_edit.as_mut() {
+                        edit.advanced = mode == "advanced";
+                    }
+                }
                 Some(("filter", spec)) => {
                     // `filter=<name>><tag>`: a saved filter of one tag, opened.
                     let (name, tag) = spec.split_once('>').unwrap_or((spec, ""));
@@ -854,7 +861,8 @@ impl TodoView {
         let keywords = field(strings.filter_keywords, draft.keywords.clone(), cx);
         window.focus(&name.focus_handle(cx), cx);
         self.header_menu_open = false;
-        self.filter_edit = Some(FilterEdit { draft, is_new, name, keywords });
+        let advanced = draft.match_any;
+        self.filter_edit = Some(FilterEdit { draft, is_new, advanced, name, keywords });
         cx.notify();
     }
 
@@ -1032,7 +1040,31 @@ impl TodoView {
                     .bg(theme.colors().elevated_surface_background)
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .child(Label::new(if is_new { strings.add_filter } else { strings.edit_filter }).weight(FontWeight::SEMIBOLD))
+                    .child(h_flex().justify_center().gap_1().children([false, true].map(|advanced| {
+                        chip(format!("filter-mode-{advanced}"), strings.filter_modes[advanced as usize].into(), edit.advanced == advanced)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if let Some(edit) = this.filter_edit.as_mut() {
+                                    edit.advanced = advanced;
+                                    if !advanced {
+                                        edit.draft.match_any = false;
+                                    }
+                                }
+                                cx.notify();
+                            }))
+                    })))
                     .child(field(edit.name.clone()))
+                    .when(edit.advanced, |el| {
+                        el.child(row(
+                            strings.filter_match,
+                            h_flex()
+                                .gap_1()
+                                .children([false, true].map(|any| {
+                                    chip(format!("filter-match-{any}"), strings.filter_match_options[any as usize].into(), draft.match_any == any)
+                                        .on_click(cx.listener(move |this, _, _, cx| this.update_filter_draft(cx, |d| d.match_any = any)))
+                                }))
+                                .into_any_element(),
+                        ))
+                    })
                     .child(row(strings.filter_lists, lists.into_any_element()))
                     .child(row(strings.tags, tags.into_any_element()))
                     .child(row(strings.filter_date, dates.into_any_element()))

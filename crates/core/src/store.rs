@@ -263,6 +263,9 @@ const MIGRATIONS: &[&str] = &[
         created_at INTEGER NOT NULL
     );
     ",
+    "
+    ALTER TABLE filters ADD COLUMN match_any INTEGER NOT NULL DEFAULT 0;
+    ",
 ];
 
 const TASK_COLUMNS: &str = "id, parent_id, kind, title, notes, priority, due_date, due_time, \
@@ -334,7 +337,7 @@ impl Store {
     /// Saved filters, oldest first.
     pub fn filters(&self) -> Result<Vec<crate::filter::SmartFilter>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, lists, tags, date, priorities, keywords, kind FROM filters ORDER BY created_at, rowid",
+            "SELECT id, name, lists, tags, date, priorities, keywords, kind, match_any FROM filters ORDER BY created_at, rowid",
         )?;
         let filters = stmt
             .query_map([], |row| {
@@ -354,6 +357,7 @@ impl Store {
                     priorities: priorities.split(',').filter_map(|p| p.parse().ok()).map(Priority::from_i64).collect(),
                     keywords: row.get(6)?,
                     kind: row.get::<_, Option<String>>(7)?.map(|k| Kind::parse(&k)),
+                    match_any: row.get(8)?,
                 })
             })?
             .collect::<Result<_, _>>()?;
@@ -367,11 +371,11 @@ impl Store {
             filter.lists.iter().map(|l| l.map_or_else(|| "inbox".to_owned(), |id| id.to_string())).collect();
         let priorities: Vec<String> = filter.priorities.iter().map(|p| p.to_i64().to_string()).collect();
         self.conn.execute(
-            "INSERT INTO filters (id, name, lists, tags, date, priorities, keywords, kind, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            "INSERT INTO filters (id, name, lists, tags, date, priorities, keywords, kind, created_at, match_any)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
              ON CONFLICT(id) DO UPDATE SET name = excluded.name, lists = excluded.lists, tags = excluded.tags,
                  date = excluded.date, priorities = excluded.priorities, keywords = excluded.keywords,
-                 kind = excluded.kind",
+                 kind = excluded.kind, match_any = excluded.match_any",
             params![
                 filter.id.to_string(),
                 filter.name.trim(),
@@ -381,7 +385,8 @@ impl Store {
                 priorities.join(","),
                 filter.keywords.trim(),
                 filter.kind.map(|k| k.as_str()),
-                now_ms()
+                now_ms(),
+                filter.match_any
             ],
         )?;
         Ok(())
@@ -1903,6 +1908,10 @@ mod tests {
         filter.name = "Urgent".into();
         store.save_filter(&filter)?;
         assert_eq!(store.filters()?, [filter.clone()]);
+        let any = crate::filter::SmartFilter { id: Uuid::now_v7(), name: "Any".into(), match_any: true, ..filter.clone() };
+        store.save_filter(&any)?;
+        assert!(store.filters()?[1].match_any);
+        store.delete_filter(any.id)?;
         assert_eq!(titles(&store.tasks_in(&View::Filter(filter.id), today)?), ["report"]);
         store.delete_filter(filter.id)?;
         assert!(store.filters()?.is_empty());

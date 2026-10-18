@@ -48,7 +48,7 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 | Lists column: Inbox / All / Today / Tomorrow / Next 7 Days | ✅ | counters; a new task gets the due date or tag of the current view |
 | Lists column: user lists | ✅ | create inline; rename, color and delete from the "…" menu; no drag and drop |
 | Lists column: tags with color dots and counters | ✅ | |
-| Lists column: Filters, Won't Do, Trash | ✅ | Completed, Won't Do and Trash; Filters as in the original: a hint until there is one, "+" opens "Add Filter" (name, lists, tags, date, priority, keywords, type; an empty condition matches all), filters list their open tasks with a count, and their "…" edits or deletes them. No "Advanced" filter rules |
+| Lists column: Filters, Won't Do, Trash | ✅ | Completed, Won't Do and Trash; Filters as in the original: a hint until there is one, "+" opens "Add Filter" (name, lists, tags, date, priority, keywords, type; an empty condition matches all), filters list their open tasks with a count, and their "…" edits or deletes them. The dialog's Normal / Advanced tabs: Advanced matches all conditions or any one of them; the original's free chain of conditions with mixed And / Or is not built |
 | Mini week at the bottom of the lists column | 🟡 | current week, today highlighted (matched to a screenshot); clicking a day does nothing yet — the original behavior is not verified |
 | List header with sidebar toggle | ✅ | toggle and "…" work (the original's "Show / Hide Completed" and "Show / Hide Details" — the first line of the notes under the title — kept per list; the View switcher has List and the original's Kanban — a column per group (Tasks / Notes / Completed, or the chosen Group by) with cards showing tags, date and subtasks; lists get the original's sections ("Add Section" in the menu, "+ Add Section" on the board): tasks group by section, not sectioned first; a task's section is picked under its list in the details' list picker and is dropped when it moves to another list; a section header's "…" renames or deletes it (its tasks stay in the list); List Activities (the original's panel in place of the details: the list's task events by day with colored icons, each task opens on click; Inbox and user lists) and Print (a plain page of the list opened in the browser, which prints it; the menu follows the original's order); no Timeline view). Kanban cards drag between columns and take the column's value: section, Tasks / Notes, Completed (leaving it reopens), Today / Tomorrow / No Date, priority or tag; the original's drag behavior was not observed (dragging in TickTick would change data)); the sort button has the original's "Group by" (Custom, Date, Created Time, Tag, Priority, None) and "Sort by" (Custom, Date, Created Time, Modified Time, Title, Tag, Priority), kept per list; edits (fields, tags, checklist, not reordering) update a task's modified time |
 | "Add task" field | ✅ | parses date, time, repeat, tags, priority and `^list`; no live highlighting yet; `^list` matches one-word list names only |
@@ -90,8 +90,8 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 
 ## Next
 
-1. Advanced filter rules (any/all of conditions).
-2. Undo for completing and deleting tasks (the original's "Undo" toast).
+1. Undo for completing and deleting tasks (the original's "Undo" toast).
+2. Keyboard shortcut help (the original's shortcut list).
 3. Statistics page in the main sidebar (account menu), not only from Focus.
 3. Rename and delete habit sections.
 4. Filled sidebar icons (needs own filled glyphs; Lucide has none).

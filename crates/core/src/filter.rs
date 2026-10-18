@@ -57,6 +57,8 @@ pub struct SmartFilter {
     pub keywords: String,
     /// Only tasks or only notes; `None` is both.
     pub kind: Option<Kind>,
+    /// "Advanced" logic: a task needs any one of the set conditions instead of all of them.
+    pub match_any: bool,
 }
 
 impl SmartFilter {
@@ -67,16 +69,27 @@ impl SmartFilter {
 
     /// Whether an open task belongs in the filter.
     pub fn matches(&self, task: &Task, today: NaiveDate) -> bool {
+        if task.is_deleted() || task.is_closed() {
+            return false;
+        }
         let text = format!("{}\n{}", task.title, task.notes).to_lowercase();
-        !task.is_deleted()
-            && !task.is_closed()
-            && (self.lists.is_empty() || self.lists.contains(&task.list_id))
-            && (self.tags.is_empty()
-                || self.tags.iter().any(|tag| task.tags.iter().any(|t| t.to_lowercase() == tag.to_lowercase())))
-            && self.date.matches(task.due_date, today)
-            && (self.priorities.is_empty() || self.priorities.contains(&task.priority))
-            && self.keywords.split_whitespace().all(|word| text.contains(&word.to_lowercase()))
-            && self.kind.is_none_or(|kind| task.kind == kind)
+        // Each set condition and whether the task meets it; unset ones are left out.
+        let conditions = [
+            (!self.lists.is_empty()).then(|| self.lists.contains(&task.list_id)),
+            (!self.tags.is_empty()).then(|| {
+                self.tags.iter().any(|tag| task.tags.iter().any(|t| t.to_lowercase() == tag.to_lowercase()))
+            }),
+            (self.date != DateRule::All).then(|| self.date.matches(task.due_date, today)),
+            (!self.priorities.is_empty()).then(|| self.priorities.contains(&task.priority)),
+            (!self.keywords.trim().is_empty())
+                .then(|| self.keywords.split_whitespace().all(|word| text.contains(&word.to_lowercase()))),
+            self.kind.map(|kind| task.kind == kind),
+        ];
+        let mut set = conditions.into_iter().flatten().peekable();
+        if set.peek().is_none() {
+            return true;
+        }
+        if self.match_any { set.any(|met| met) } else { set.all(|met| met) }
     }
 }
 
@@ -115,6 +128,11 @@ mod tests {
         assert!(!urgent_work.matches(get(errand.id), today));
         let inbox_undated = SmartFilter { lists: vec![None], date: DateRule::NoDate, ..Default::default() };
         assert!(inbox_undated.matches(get(errand.id), today) && !inbox_undated.matches(get(report.id), today));
+        // "Any": high priority or tagged finance, so the untagged, normal errand is out.
+        let any = SmartFilter { priorities: vec![Priority::High], tags: vec!["errands".into()], match_any: true, ..Default::default() };
+        assert!(any.matches(get(report.id), today) && !any.matches(get(errand.id), today));
+        let all = SmartFilter { match_any: false, ..any.clone() };
+        assert!(!all.matches(get(report.id), today));
         assert!(DateRule::ThisWeek.matches(Some(NaiveDate::from_ymd_opt(2026, 10, 12).unwrap()), today));
         assert_eq!(DateRule::from_key(DateRule::Overdue.key()), DateRule::Overdue);
     }

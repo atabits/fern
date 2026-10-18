@@ -1,10 +1,10 @@
 //! App preferences from the Settings window, stored as key-value pairs in the `settings` table.
 
 use anyhow::Result;
-use chrono::Weekday;
+use chrono::{Datelike, Duration, NaiveDate, Weekday};
 use rusqlite::OptionalExtension as _;
 
-use crate::model::Id;
+use crate::model::{Id, Priority};
 use crate::quick_add::Recognition;
 use crate::store::Store;
 
@@ -153,6 +153,63 @@ impl DateFormat {
     }
 }
 
+/// The original's "Default Date" for new tasks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DefaultDate {
+    Today,
+    Tomorrow,
+    DayAfterTomorrow,
+    NextWeek,
+}
+
+impl DefaultDate {
+    pub const ALL: [DefaultDate; 4] =
+        [DefaultDate::Today, DefaultDate::Tomorrow, DefaultDate::DayAfterTomorrow, DefaultDate::NextWeek];
+
+    /// The day it means; "Next Week" is the next Monday, as the original's date shortcuts.
+    pub fn date(self, today: NaiveDate) -> NaiveDate {
+        match self {
+            DefaultDate::Today => today,
+            DefaultDate::Tomorrow => today + Duration::days(1),
+            DefaultDate::DayAfterTomorrow => today + Duration::days(2),
+            DefaultDate::NextWeek => today + Duration::days(7 - today.weekday().num_days_from_monday() as i64),
+        }
+    }
+
+    fn code(self) -> &'static str {
+        match self {
+            DefaultDate::Today => "today",
+            DefaultDate::Tomorrow => "tomorrow",
+            DefaultDate::DayAfterTomorrow => "day_after_tomorrow",
+            DefaultDate::NextWeek => "next_week",
+        }
+    }
+}
+
+/// The original's durations for "Default Duration", in minutes.
+pub const DURATIONS: [i64; 10] = [10, 15, 30, 45, 60, 90, 120, 150, 180, 24 * 60];
+
+/// Settings → More → Task Default: what a new task starts with.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TaskDefaults {
+    pub date: Option<DefaultDate>,
+    /// The length of a new time range ("Duration"), in minutes.
+    pub duration: i64,
+    /// A reminder for tasks with a time, in minutes before it; `None` is no reminder.
+    pub timed_reminder: Option<i64>,
+    /// A reminder for all-day tasks, in minutes before 09:00 of the day; `None` is no reminder.
+    pub all_day_reminder: Option<i64>,
+    pub priority: Priority,
+    pub tag: Option<String>,
+}
+
+impl Default for TaskDefaults {
+    /// The original's defaults: no date, an hour, reminded on time.
+    fn default() -> Self {
+        Self { date: None, duration: 60, timed_reminder: Some(0), all_day_reminder: None, priority: Priority::None, tag: None }
+    }
+}
+
 /// The days a week can start on, as in the original's "Start Week on".
 pub const WEEK_STARTS: [Weekday; 3] = [Weekday::Mon, Weekday::Sun, Weekday::Sat];
 
@@ -168,6 +225,7 @@ pub struct Preferences {
     pub week_numbers: bool,
     /// Settings → More → Smart Recognition, for quick add.
     pub recognition: Recognition,
+    pub task_defaults: TaskDefaults,
     /// Where tasks added outside a list go (smart lists, tags, filters); `None` is the Inbox.
     pub default_list: Option<Id>,
     /// Settings → Smart List, in the order of `SmartList::ALL`.
@@ -198,6 +256,7 @@ impl Default for Preferences {
             date_format: None,
             week_numbers: false,
             recognition: Recognition::default(),
+            task_defaults: TaskDefaults::default(),
             default_list: None,
             smart_lists: [Visibility::Show; 11],
         }
@@ -209,6 +268,12 @@ const WEEK_START: &str = "week_start";
 const TIME_FORMAT: &str = "time_format";
 const DATE_FORMAT: &str = "date_format";
 const WEEK_NUMBERS: &str = "week_numbers";
+const DEFAULT_DATE: &str = "default_date";
+const DEFAULT_DURATION: &str = "default_duration";
+const DEFAULT_TIMED_REMINDER: &str = "default_timed_reminder";
+const DEFAULT_ALL_DAY_REMINDER: &str = "default_all_day_reminder";
+const DEFAULT_PRIORITY: &str = "default_priority";
+const DEFAULT_TAG: &str = "default_tag";
 /// Smart Recognition switches, in the order of `Recognition`'s fields.
 const RECOGNITION: [&str; 4] =
     ["recognize_dates", "remove_date_text", "recognize_tags", "remove_tag_text"];
@@ -242,8 +307,42 @@ impl Store {
             tags: flag(RECOGNITION[2])?,
             remove_tag_text: flag(RECOGNITION[3])?,
         };
-        let mut preferences =
-            Preferences { theme, week_start, hour12, date_format, week_numbers, recognition, default_list, ..defaults };
+        let defaults_of_tasks = TaskDefaults::default();
+        // A stored offset, "none" for no reminder, or unset for the default.
+        let reminder = |key: &str, default: Option<i64>| -> Result<Option<i64>> {
+            Ok(match self.setting(key)?.as_deref() {
+                None => default,
+                Some("none") => None,
+                Some(v) => v.parse().ok().or(default),
+            })
+        };
+        let task_defaults = TaskDefaults {
+            date: self.setting(DEFAULT_DATE)?.and_then(|c| DefaultDate::ALL.into_iter().find(|d| d.code() == c)),
+            duration: self
+                .setting(DEFAULT_DURATION)?
+                .and_then(|v| v.parse().ok())
+                .filter(|m| *m > 0)
+                .unwrap_or(defaults_of_tasks.duration),
+            timed_reminder: reminder(DEFAULT_TIMED_REMINDER, defaults_of_tasks.timed_reminder)?,
+            all_day_reminder: reminder(DEFAULT_ALL_DAY_REMINDER, defaults_of_tasks.all_day_reminder)?,
+            priority: self
+                .setting(DEFAULT_PRIORITY)?
+                .and_then(|v| v.parse::<i64>().ok())
+                .map(Priority::from_i64)
+                .unwrap_or_default(),
+            tag: self.setting(DEFAULT_TAG)?.filter(|t| !t.is_empty()),
+        };
+        let mut preferences = Preferences {
+            theme,
+            week_start,
+            hour12,
+            date_format,
+            week_numbers,
+            recognition,
+            task_defaults,
+            default_list,
+            ..defaults
+        };
         for list in SmartList::ALL {
             if let Some(visibility) = self.setting(&smart_list_key(list))?.and_then(|c| Visibility::from_code(&c)) {
                 preferences.set_visibility(list, visibility);
@@ -258,6 +357,14 @@ impl Store {
         self.set_setting(TIME_FORMAT, if preferences.hour12 { "12" } else { "24" })?;
         self.set_setting(DATE_FORMAT, preferences.date_format.map_or("", DateFormat::code))?;
         self.set_setting(WEEK_NUMBERS, if preferences.week_numbers { "1" } else { "0" })?;
+        let t = &preferences.task_defaults;
+        let offset = |o: Option<i64>| o.map_or("none".to_owned(), |o| o.to_string());
+        self.set_setting(DEFAULT_DATE, t.date.map_or("", DefaultDate::code))?;
+        self.set_setting(DEFAULT_DURATION, &t.duration.to_string())?;
+        self.set_setting(DEFAULT_TIMED_REMINDER, &offset(t.timed_reminder))?;
+        self.set_setting(DEFAULT_ALL_DAY_REMINDER, &offset(t.all_day_reminder))?;
+        self.set_setting(DEFAULT_PRIORITY, &t.priority.to_i64().to_string())?;
+        self.set_setting(DEFAULT_TAG, t.tag.as_deref().unwrap_or(""))?;
         let r = preferences.recognition;
         for (key, on) in RECOGNITION.iter().zip([r.dates, r.remove_date_text, r.tags, r.remove_tag_text]) {
             self.set_setting(key, if on { "1" } else { "0" })?;
@@ -297,6 +404,14 @@ mod tests {
             date_format: Some(DateFormat::YearMonthDay),
             week_numbers: true,
             recognition: Recognition { remove_date_text: false, tags: false, ..Default::default() },
+            task_defaults: TaskDefaults {
+                date: Some(DefaultDate::Tomorrow),
+                duration: 30,
+                timed_reminder: None,
+                all_day_reminder: Some(24 * 60),
+                priority: Priority::High,
+                tag: Some("work".into()),
+            },
             default_list: Some(list.id),
             ..Default::default()
         };
@@ -336,6 +451,16 @@ mod tests {
         assert!(Visibility::IfNotEmpty.shows(2));
         assert!(!Visibility::Hide.shows(5));
         Ok(())
+    }
+
+    #[test]
+    fn default_dates() {
+        let sunday = NaiveDate::from_ymd_opt(2026, 10, 18).unwrap();
+        assert_eq!(DefaultDate::Tomorrow.date(sunday), NaiveDate::from_ymd_opt(2026, 10, 19).unwrap());
+        assert_eq!(DefaultDate::NextWeek.date(sunday), NaiveDate::from_ymd_opt(2026, 10, 19).unwrap());
+        let monday = NaiveDate::from_ymd_opt(2026, 10, 19).unwrap();
+        assert_eq!(DefaultDate::NextWeek.date(monday), NaiveDate::from_ymd_opt(2026, 10, 26).unwrap());
+        assert_eq!(TaskDefaults::default().timed_reminder, Some(0));
     }
 
     #[test]

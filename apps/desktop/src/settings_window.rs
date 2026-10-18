@@ -4,7 +4,8 @@
 use std::rc::Rc;
 
 use chrono::Datelike as _;
-use fern_core::{DateFormat, Preferences, SmartList, Store, ThemeMode, Visibility, WEEK_STARTS};
+use fern_core::reminder::{ALL_DAY_OFFSETS, TIMED_OFFSETS};
+use fern_core::{DURATIONS, DefaultDate, Priority, format_minutes, DateFormat, Preferences, SmartList, Store, ThemeMode, Visibility, WEEK_STARTS};
 use gpui::{EventEmitter, FocusHandle, Focusable, FontWeight, WindowAppearance};
 use theme::Theme;
 use ui::prelude::*;
@@ -28,6 +29,12 @@ pub enum Page {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Menu {
     Visibility(SmartList),
+    DefaultDate,
+    DefaultDuration,
+    TimedReminder,
+    AllDayReminder,
+    DefaultPriority,
+    DefaultTag,
     TimeFormat,
     DateFormat,
     WeekStart,
@@ -129,9 +136,109 @@ impl SettingsWindow {
             "tags" => Some(Menu::Visibility(SmartList::Tags)),
             "language" => Some(Menu::Language),
             "list" => Some(Menu::DefaultList),
+            "duration" => Some(Menu::DefaultDuration),
+            "reminder" => Some(Menu::TimedReminder),
             _ => None,
         };
         cx.notify();
+    }
+
+    /// Task Default's first group: date, duration and reminders of new tasks.
+    fn render_task_defaults(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let strings = i18n::t(cx);
+        let defaults = self.preferences.task_defaults.clone();
+        let pick = |change: Box<dyn Fn(&mut fern_core::TaskDefaults)>| -> Box<dyn Fn(&mut Self, &mut Window, &mut Context<Self>)> {
+            Box::new(move |this, window, cx| this.update(window, cx, |p| change(&mut p.task_defaults)))
+        };
+        let date_name = |date: Option<DefaultDate>| match date {
+            None => strings.none_option,
+            Some(date) => strings.default_dates[DefaultDate::ALL.iter().position(|d| *d == date).unwrap_or(0)],
+        };
+        let dates = std::iter::once(None)
+            .chain(DefaultDate::ALL.into_iter().map(Some))
+            .map(|date| (SharedString::from(date_name(date)), date == defaults.date, pick(Box::new(move |t| t.date = date))))
+            .collect();
+        let duration_name = |minutes: i64| {
+            DURATIONS.iter().position(|d| *d == minutes).map_or_else(|| format_minutes(minutes), |i| strings.durations[i].to_owned())
+        };
+        let durations = DURATIONS
+            .into_iter()
+            .map(|minutes| (SharedString::from(duration_name(minutes)), minutes == defaults.duration, pick(Box::new(move |t| t.duration = minutes))))
+            .collect();
+        let reminder_options = |offsets: [i64; 5], names: [&'static str; 5], current: Option<i64>, set: fn(&mut fern_core::TaskDefaults, Option<i64>)| {
+            std::iter::once((None, strings.none_option))
+                .chain(offsets.into_iter().zip(names).map(|(o, n)| (Some(o), n)))
+                .map(|(offset, name)| (SharedString::from(name), offset == current, pick(Box::new(move |t| set(t, offset)))))
+                .collect::<Vec<_>>()
+        };
+        let reminder_name = |offsets: [i64; 5], names: [&'static str; 5], current: Option<i64>| {
+            current.and_then(|o| offsets.iter().position(|x| *x == o)).map_or(strings.none_option, |i| names[i])
+        };
+        v_flex()
+            .py_1p5()
+            .rounded(px(8.))
+            .bg(cx.theme().colors().surface_background)
+            .child(self.select_row(None, strings.default_date, date_name(defaults.date).into(), Menu::DefaultDate, dates, cx))
+            .child(self.select_row(None, strings.default_duration, duration_name(defaults.duration).into(), Menu::DefaultDuration, durations, cx))
+            .child(self.select_row(
+                None,
+                strings.default_timed_reminder,
+                reminder_name(TIMED_OFFSETS, strings.reminders_timed, defaults.timed_reminder).into(),
+                Menu::TimedReminder,
+                reminder_options(TIMED_OFFSETS, strings.reminders_timed, defaults.timed_reminder, |t, o| t.timed_reminder = o),
+                cx,
+            ))
+            .child(self.select_row(
+                None,
+                strings.default_all_day_reminder,
+                reminder_name(ALL_DAY_OFFSETS, strings.reminders_all_day, defaults.all_day_reminder).into(),
+                Menu::AllDayReminder,
+                reminder_options(ALL_DAY_OFFSETS, strings.reminders_all_day, defaults.all_day_reminder, |t, o| t.all_day_reminder = o),
+                cx,
+            ))
+    }
+
+    /// Task Default's priority and tag rows, above the default list.
+    fn render_priority_and_tag(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let strings = i18n::t(cx);
+        let defaults = self.preferences.task_defaults.clone();
+        let priorities = [
+            (Priority::None, strings.priority_none),
+            (Priority::Low, strings.priority_low),
+            (Priority::Medium, strings.priority_medium),
+            (Priority::High, strings.priority_high),
+        ];
+        let priority_name = priorities.iter().find(|(p, _)| *p == defaults.priority).map_or(strings.priority_none, |(_, n)| n);
+        let priority_options = priorities
+            .into_iter()
+            .map(|(priority, name)| {
+                let pick: Box<dyn Fn(&mut Self, &mut Window, &mut Context<Self>)> =
+                    Box::new(move |this, window, cx| this.update(window, cx, |p| p.task_defaults.priority = priority));
+                (SharedString::from(name), priority == defaults.priority, pick)
+            })
+            .collect();
+        let tags = self.store.tags().unwrap_or_default();
+        let tag_options = std::iter::once(None)
+            .chain(tags.into_iter().map(|t| Some(t.name)))
+            .map(|tag| {
+                let selected = tag == defaults.tag;
+                let label = SharedString::from(tag.clone().unwrap_or_else(|| strings.none_option.to_owned()));
+                let pick: Box<dyn Fn(&mut Self, &mut Window, &mut Context<Self>)> =
+                    Box::new(move |this, window, cx| this.update(window, cx, |p| p.task_defaults.tag = tag.clone()));
+                (label, selected, pick)
+            })
+            .collect();
+        vec![
+            self.select_row(None, strings.default_priority, (*priority_name).into(), Menu::DefaultPriority, priority_options, cx),
+            self.select_row(
+                None,
+                strings.default_tag,
+                defaults.tag.clone().unwrap_or_else(|| strings.none_option.to_owned()).into(),
+                Menu::DefaultTag,
+                tag_options,
+                cx,
+            ),
+        ]
     }
 
     fn render_nav(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -220,7 +327,7 @@ impl SettingsWindow {
         let colors = cx.theme().colors().clone();
         let group = || v_flex().py_1p5().rounded(px(8.)).bg(colors.surface_background);
         let title = |text: &'static str| div().pb_3().child(Label::new(text).weight(FontWeight::SEMIBOLD));
-        let body = v_flex().flex_1().min_w_0().h_full().bg(colors.background).pt(px(48.)).px_6().pb_6().gap_4();
+        let body = v_flex().id("settings-page").flex_1().min_w_0().h_full().overflow_y_scroll().bg(colors.background).pt(px(48.)).px_6().pb_6().gap_4();
         match self.page {
             Page::SmartList => {
                 let row = |this: &Self, list: SmartList, cx: &mut Context<Self>| {
@@ -512,7 +619,9 @@ impl SettingsWindow {
                 .child(
                     v_flex()
                         .child(title(strings.task_default))
-                        .child(group().child(self.select_row(
+                        .child(self.render_task_defaults(cx))
+                        .child(div().h_3())
+                        .child(group().children(self.render_priority_and_tag(cx)).child(self.select_row(
                             None,
                             strings.default_list,
                             list_name,

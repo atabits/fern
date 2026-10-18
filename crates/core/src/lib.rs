@@ -22,7 +22,7 @@ pub use habit::{Checkin, Goal, Habit, HabitStats, MonthStats};
 pub use habit::Frequency as HabitFrequency;
 pub use habit::{CustomSection, HabitSection};
 pub use model::{Activity, ChecklistItem, ListSection, Template, Id, Kind, List, Priority, Tag, Task, View, ViewCounts};
-pub use preferences::{DateFormat, Preferences, SmartList, ThemeMode, Visibility, WEEK_STARTS};
+pub use preferences::{DURATIONS, DateFormat, DefaultDate, Preferences, TaskDefaults, SmartList, ThemeMode, Visibility, WEEK_STARTS};
 pub use quick_add::{ParsedTask, Recognition, parse_quick_add, parse_quick_add_with};
 pub use recurrence::{Frequency, Recurrence};
 pub use store::Store;

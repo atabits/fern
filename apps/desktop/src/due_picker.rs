@@ -71,8 +71,8 @@ impl DueDraft {
     }
 
     /// Switches to the Duration tab. Like the original, an empty draft starts at the next full
-    /// hour and lasts an hour.
-    pub fn start_duration(&mut self, now: NaiveDateTime) {
+    /// hour and lasts the default duration (Settings → Task Default), an hour unless changed.
+    pub fn start_duration(&mut self, now: NaiveDateTime, minutes: i64) {
         self.tab = DueTab::Duration;
         self.menu = None;
         let date = *self.date.get_or_insert(now.date());
@@ -82,7 +82,7 @@ impl DueDraft {
                 self.time = NaiveTime::from_hms_opt(next_hour, 0, 0);
             }
             self.end_date = Some(date);
-            self.end_time = self.time.map(|t| t + Duration::hours(1));
+            self.end_time = self.time.map(|t| t + Duration::minutes(minutes));
         }
     }
 
@@ -499,7 +499,7 @@ mod tests {
             menu: None,
         };
         assert_eq!(draft.end(), None);
-        draft.start_duration(today.and_hms_opt(5, 30, 0).unwrap());
+        draft.start_duration(today.and_hms_opt(5, 30, 0).unwrap(), 60);
         assert_eq!((draft.date, draft.time, draft.end_date, draft.end_time), (Some(today), t(6), Some(today), t(7)));
         assert_eq!(draft.end(), Some((today, t(7))));
 

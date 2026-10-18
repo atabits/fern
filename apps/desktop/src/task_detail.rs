@@ -318,6 +318,11 @@ impl TaskDetail {
     }
 
     /// Opens the due-date picker (the "Set date" shortcut).
+    /// Settings → Task Default → Default Duration, in minutes.
+    fn default_duration(&self) -> i64 {
+        self.store.preferences().map_or(60, |p| p.task_defaults.duration)
+    }
+
     pub fn open_due(&mut self, cx: &mut Context<Self>) {
         if self.task.is_some() {
             self.open_popup(Popup::Due, cx);
@@ -356,7 +361,8 @@ impl TaskDetail {
             }
             "due-duration" => {
                 self.open_popup(Popup::Due, cx);
-                self.update_draft(cx, |d| d.start_duration(Local::now().naive_local()));
+                let duration = self.default_duration();
+                self.update_draft(cx, |d| d.start_duration(Local::now().naive_local(), duration));
                 return;
             }
             "due-time" | "due-custom" => {
@@ -1204,8 +1210,9 @@ impl TaskDetail {
                             .when(draft.tab == tab, |el| el.bg(theme.colors().element_selected))
                             .child(Label::new(label).size(LabelSize::Small).color(if draft.tab == tab { Color::Default } else { Color::Muted }))
                             .on_click(cx.listener(move |this, _, _, cx| {
+                                let duration = this.default_duration();
                                 this.update_draft(cx, |d| match tab {
-                                    DueTab::Duration => d.start_duration(Local::now().naive_local()),
+                                    DueTab::Duration => d.start_duration(Local::now().naive_local(), duration),
                                     DueTab::Date => d.tab = DueTab::Date,
                                 })
                             }))

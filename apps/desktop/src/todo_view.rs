@@ -569,11 +569,22 @@ impl TodoView {
             View::Tomorrow => Some(today + Duration::days(1)),
             _ => None,
         };
-        if let Some(date) = parsed.due_date.or(view_due) {
+        // Settings → More → Task Default fills in what neither the text nor the view gives.
+        let defaults = &self.preferences.task_defaults;
+        if let Some(date) = parsed.due_date.or(view_due).or(defaults.date.map(|d| d.date(today))) {
             self.store.set_due(task.id, Some(date), parsed.due_time)?;
+            let reminder = if parsed.due_time.is_some() { defaults.timed_reminder } else { defaults.all_day_reminder };
+            if let Some(offset) = reminder {
+                self.store.set_reminders(task.id, &[offset])?;
+            }
         }
 
         let mut tags = parsed.tags;
+        if let Some(tag) = &defaults.tag
+            && !tags.iter().any(|t| t.to_lowercase() == tag.to_lowercase())
+        {
+            tags.push(tag.clone());
+        }
         if let View::Tag(tag) = &self.view
             && !tags.iter().any(|t| t.to_lowercase() == tag.to_lowercase())
         {
@@ -585,7 +596,7 @@ impl TodoView {
         if let Some(repeat) = parsed.repeat {
             self.store.set_repeat(task.id, Some(repeat), today)?;
         }
-        if let Some(priority) = parsed.priority {
+        if let Some(priority) = parsed.priority.or((defaults.priority != fern_core::Priority::None).then_some(defaults.priority)) {
             self.store.set_priority(task.id, priority)?;
         }
 

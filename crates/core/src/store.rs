@@ -586,6 +586,25 @@ const MIGRATIONS: &[&str] = &[
     "
     ALTER TABLE filters ADD COLUMN chain TEXT NOT NULL DEFAULT '';
     ",
+    // Focus timers sync like the other rows.
+    "
+    INSERT INTO sync_log (entity, key, at) SELECT 'focus_timers', id, 0 FROM focus_timers;
+    CREATE TRIGGER sync_focus_timers_insert AFTER INSERT ON focus_timers
+    WHEN NOT EXISTS (SELECT 1 FROM sync_applying)
+    BEGIN
+        INSERT INTO sync_log (entity, key, at) VALUES ('focus_timers', NEW.id, CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER));
+    END;
+    CREATE TRIGGER sync_focus_timers_update AFTER UPDATE ON focus_timers
+    WHEN NOT EXISTS (SELECT 1 FROM sync_applying)
+    BEGIN
+        INSERT INTO sync_log (entity, key, at) VALUES ('focus_timers', NEW.id, CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER));
+    END;
+    CREATE TRIGGER sync_focus_timers_delete AFTER DELETE ON focus_timers
+    WHEN NOT EXISTS (SELECT 1 FROM sync_applying)
+    BEGIN
+        INSERT INTO sync_log (entity, key, at) VALUES ('focus_timers', OLD.id, CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER));
+    END;
+    ",
 ];
 
 const TASK_COLUMNS: &str = "id, parent_id, kind, title, notes, priority, due_date, due_time, \

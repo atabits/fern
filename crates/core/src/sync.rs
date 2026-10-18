@@ -31,6 +31,7 @@ pub const SYNCED: &[(&str, &[&str])] = &[
     ("filters", &["id"]),
     ("summary_templates", &["id"]),
     ("task_attachments", &["id"]),
+    ("focus_timers", &["id"]),
 ];
 
 /// Key parts are joined with this character, as the triggers do.
@@ -454,6 +455,27 @@ mod tests {
         assert_eq!(phone.attachments(task.id)?, [attachment]);
         assert_eq!(phone.files_to_sync(&phone_dir)?, (vec![], vec![file]));
         std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn focus_timers_travel() -> Result<()> {
+        let laptop = Store::open_in_memory()?;
+        let phone = Store::open_in_memory()?;
+        let mut timer = crate::focus::FocusTimer::new("Reading");
+        timer.icon = Some("📚".into());
+        timer.minutes = 45;
+        laptop.save_focus_timer(&timer)?;
+        let sent = relay(&laptop, 0, &phone);
+        assert_eq!(phone.focus_timers(false)?, [timer.clone()]);
+
+        // Archived on the phone, then deleted on the laptop.
+        phone.set_focus_timer_archived(timer.id, true)?;
+        relay(&phone, 0, &laptop);
+        assert!(laptop.focus_timers(false)?.is_empty() && laptop.focus_timers(true)?.len() == 1);
+        laptop.delete_focus_timer(timer.id)?;
+        relay(&laptop, sent, &phone);
+        assert!(phone.focus_timers(true)?.is_empty());
         Ok(())
     }
 

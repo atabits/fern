@@ -39,7 +39,9 @@ Attachments' records sync like other rows; their files go through the server's f
 (`PUT`/`GET /files/<name>`, kept in `<data>.files`): after a sync the app sends the files the
 server lacks and fetches the ones missing here.
 
-Not synced: settings, task activity, habit snoozes.
+Focus timers sync like other rows.
+
+Not synced: settings (so the Matrix rules and saved view choices stay per device), task activity, habit snoozes.
 
 ## Conventions
 

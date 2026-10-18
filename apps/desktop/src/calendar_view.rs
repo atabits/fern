@@ -598,14 +598,30 @@ impl CalendarView {
                         h_flex()
                             .gap_3()
                             .child(div().w(px(72.)).flex_none().child(Label::new(when).size(LabelSize::Small).color(Color::Muted)))
-                            .child(
+                            // As in the original: a countdown's round icon, a repeating task's repeat
+                            // mark, or a task's circle.
+                            .child(div().w(px(16.)).flex_none().flex().justify_center().child(if countdown {
                                 div()
-                                    .size(px(10.))
-                                    .flex_none()
+                                    .size(px(16.))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
                                     .rounded_full()
-                                    .when(countdown, |el| el.bg(crate::countdown_view::countdown_color(item_color.as_deref(), cx)))
-                                    .when(!countdown, |el| el.border_1().border_color(theme.colors().text_muted)),
-                            )
+                                    .bg(crate::countdown_view::countdown_color(item_color.as_deref(), cx).opacity(0.5))
+                                    .text_size(px(9.))
+                                    .child(match item.icon.clone() {
+                                        Some(icon) => icon.into_any_element(),
+                                        None => Icon::new(crate::countdown_view::kind_icon(item.kind.unwrap_or_default()))
+                                            .size(IconSize::XSmall)
+                                            .color(Color::Default)
+                                            .into_any_element(),
+                                    })
+                                    .into_any_element()
+                            } else if item.repeats {
+                                Icon::new(IconName::Repeat).size(IconSize::XSmall).color(Color::Muted).into_any_element()
+                            } else {
+                                div().size(px(10.)).rounded_full().border_1().border_color(theme.colors().text_muted).into_any_element()
+                            }))
                             .child(
                                 h_flex()
                                     .id(SharedString::from(format!("agenda-{date}-{i}")))
@@ -622,9 +638,6 @@ impl CalendarView {
                                     .hover(|s| s.bg(tint.opacity(0.2)))
                                     .cursor_pointer()
                                     .child(div().flex_1().min_w_0().child(Label::new(item.title).size(LabelSize::Small).truncate()))
-                                    .when(item.repeats, |el| {
-                                        el.child(Icon::new(IconName::Repeat).size(IconSize::XSmall).color(Color::Muted))
-                                    })
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         if countdown {
                                             this.open_countdown = Some((date, id));

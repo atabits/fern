@@ -19,6 +19,9 @@ pub struct AgendaItem {
     pub countdown: bool,
     /// A countdown's own color, a hex color.
     pub color: Option<String>,
+    /// A countdown's icon (an emoji) and kind, which the agenda shows in its round badge.
+    pub icon: Option<String>,
+    pub kind: Option<CountdownKind>,
 }
 
 /// The days from `from` through `until` with open tasks due or countdowns, in order; on a day,
@@ -42,6 +45,8 @@ pub fn agenda(
             repeats: task.repeat.is_some(),
             countdown: false,
             color: None,
+            icon: None,
+            kind: None,
         };
         loop {
             if date > until {
@@ -72,6 +77,8 @@ pub fn agenda(
             repeats: false,
             countdown: true,
             color: countdown.color.clone(),
+            icon: countdown.icon.clone(),
+            kind: Some(countdown.kind),
         };
         // A countdown with its own repeat is listed on each of its dates, like a repeating task.
         if let Some(repeat) = &countdown.repeat {
@@ -164,5 +171,6 @@ mod tests {
         let rent = agenda(&[], &[monthly], d(10, 18), d(12, 31));
         assert_eq!(rent.iter().map(|(date, _)| *date).collect::<Vec<_>>(), [d(11, 13), d(12, 13)]);
         assert_eq!(days[0].1[0].color.as_deref(), Some("#ff6b6b"));
+        assert_eq!(days[1].1[0].kind, Some(CountdownKind::Holiday), "the badge knows the kind");
     }
 }

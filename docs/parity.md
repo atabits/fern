@@ -35,7 +35,7 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 | Lists (projects), Inbox | ✅ | create, delete, move tasks with subtasks |
 | Custom sections inside a list (columns) | ⬜ | groups are by kind for now |
 | Manual ordering (`sortOrder`) | ✅ | new tasks on top; renumbered with gaps on move |
-| Trash, "Won't Do" | ✅ | trash matched to the original: flat list, broom button empties it; a trashed task's panel has "Restore" and "Delete forever" in its bottom bar. "Won't Do" matched to the original: set from the details "…" menu or by dropping on the entry, a muted box with a cross, its own view grouped by day with list and date on the right; unchecking reopens. No "All Dates" / "All Lists" filters yet |
+| Trash, "Won't Do" | ✅ | trash matched to the original: flat list, broom button empties it; a trashed task's panel has "Restore" and "Delete forever" in its bottom bar. "Won't Do" matched to the original: set from the details "…" menu or by dropping on the entry, a muted box with a cross, its own view grouped by day with list and date on the right; unchecking reopens. Both closed views have the original's "All Dates" (this week, last week, this month) and "All Lists" (several lists, Cancel/OK) filters; no "Other Date" range yet |
 | Reminders | ⬜ | |
 | Settings (UI language) | ✅ | |
 
@@ -90,7 +90,7 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 
 ## Next
 
-1. "All Dates" / "All Lists" filters in the Completed and Won't Do views.
-2. Habit goals and check-in notes (habit log).
-3. Reminders (the due-date picker's Reminder row) with desktop notifications.
-4. Filled sidebar icons and the notification badge (needs reminders to have something to count).
+1. Habit goals and check-in notes (habit log).
+2. Reminders (the due-date picker's Reminder row) with desktop notifications.
+3. Filled sidebar icons and the notification badge (needs reminders to have something to count).
+4. "Other Date" range in the closed views' date filter.

@@ -158,6 +158,45 @@ pub fn snippet(text: &str, query: &str, context: usize) -> Option<String> {
     Some(out.replace('\n', " "))
 }
 
+/// The "All Dates" filter of the Completed and Won't Do views. Weeks start on Monday.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ClosedRange {
+    #[default]
+    All,
+    ThisWeek,
+    LastWeek,
+    ThisMonth,
+}
+
+impl ClosedRange {
+    pub const ALL: [Self; 4] = [Self::All, Self::ThisWeek, Self::LastWeek, Self::ThisMonth];
+
+    pub fn label(self, strings: &Strings) -> &'static str {
+        match self {
+            Self::All => strings.all_dates,
+            Self::ThisWeek => strings.this_week,
+            Self::LastWeek => strings.last_week,
+            Self::ThisMonth => strings.this_month,
+        }
+    }
+
+    pub fn contains(self, day: NaiveDate, today: NaiveDate) -> bool {
+        let monday = today - chrono::Duration::days(today.weekday().num_days_from_monday() as i64);
+        match self {
+            Self::All => true,
+            Self::ThisWeek => day >= monday && day < monday + chrono::Duration::weeks(1),
+            Self::LastWeek => day >= monday - chrono::Duration::weeks(1) && day < monday,
+            Self::ThisMonth => day.year() == today.year() && day.month() == today.month(),
+        }
+    }
+}
+
+/// The local day of a timestamp in milliseconds.
+pub fn local_day(ms: i64) -> Option<NaiveDate> {
+    use chrono::{Local, TimeZone};
+    Local.timestamp_millis_opt(ms).single().map(|time| time.date_naive())
+}
+
 /// Rows for closed tasks grouped by the day they were closed (newest first), as in the original's
 /// Completed and Won't Do views. `closed_at` picks the timestamp (completion or "Won't Do").
 pub fn rows_by_day(
@@ -166,14 +205,11 @@ pub fn rows_by_day(
     today: NaiveDate,
     strings: &Strings,
 ) -> Vec<Row> {
-    use chrono::{Local, TimeZone};
     let mut groups: Vec<(NaiveDate, Vec<&Task>)> = Vec::new();
     let mut sorted: Vec<&Task> = tasks.iter().collect();
     sorted.sort_by_key(|t| std::cmp::Reverse(closed_at(t).unwrap_or(0)));
     for task in sorted {
-        let day = closed_at(task)
-            .and_then(|ms| Local.timestamp_millis_opt(ms).single())
-            .map_or(today, |time| time.date_naive());
+        let day = closed_at(task).and_then(local_day).unwrap_or(today);
         match groups.last_mut() {
             Some((last, items)) if *last == day => items.push(task),
             _ => groups.push((day, vec![task])),
@@ -335,6 +371,17 @@ mod tests {
         assert_eq!(snippet("short", "sho", 10).as_deref(), Some("short"));
         assert_eq!(snippet("line one\nline two", "two", 20).as_deref(), Some("line one line two"));
         assert_eq!(snippet("nothing", "zzz", 5), None);
+    }
+
+    #[test]
+    fn closed_ranges() {
+        let today = d(2026, 10, 18); // a Sunday
+        let r = |range: ClosedRange, day| range.contains(day, today);
+        assert!(r(ClosedRange::ThisWeek, d(2026, 10, 12)) && !r(ClosedRange::ThisWeek, d(2026, 10, 11)));
+        assert!(r(ClosedRange::LastWeek, d(2026, 10, 5)) && r(ClosedRange::LastWeek, d(2026, 10, 11)));
+        assert!(!r(ClosedRange::LastWeek, d(2026, 10, 12)) && !r(ClosedRange::LastWeek, d(2026, 10, 4)));
+        assert!(r(ClosedRange::ThisMonth, d(2026, 10, 1)) && !r(ClosedRange::ThisMonth, d(2025, 10, 1)));
+        assert!(r(ClosedRange::All, d(2000, 1, 1)));
     }
 
     #[test]

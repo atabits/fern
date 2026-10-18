@@ -13,7 +13,7 @@ use crate::actions::{DeleteTask, SelectNext, SelectPrevious, ToggleComplete};
 use crate::i18n::{self, CurrentLocale, Strings};
 use crate::lists_panel::{self, LIST_COLORS};
 use crate::task_detail::{OpenTask, TaskDetail, TaskUpdated};
-use crate::task_rows::{self, Row, Section};
+use crate::task_rows::{self, ClosedRange, Row, Section};
 use crate::text_input::{Cancelled, Changed, Mode, Submitted, TextInput};
 
 const DETAIL_WIDTH: f32 = 400.;
@@ -21,6 +21,14 @@ const ROW_HEIGHT: f32 = 40.;
 /// Space left of the checkbox for the subtask chevron.
 const GUTTER: f32 = 20.;
 const INDENT: f32 = 24.;
+
+/// An open filter dropdown of the Completed and Won't Do views. The lists filter is edited as a
+/// draft until "OK", as in the original.
+#[derive(Clone, Debug, PartialEq)]
+enum ClosedMenu {
+    Dates,
+    Lists(Option<Vec<Option<Id>>>),
+}
 
 pub struct TodoView {
     store: Rc<Store>,
@@ -41,6 +49,10 @@ pub struct TodoView {
     renaming_list: bool,
     search_input: Entity<TextInput>,
     header_menu_open: bool,
+    /// Filters of the Completed and Won't Do views; `None` lists means all lists.
+    closed_range: ClosedRange,
+    closed_lists: Option<Vec<Option<Id>>>,
+    closed_menu: Option<ClosedMenu>,
     detail: Entity<TaskDetail>,
     selected: Option<Id>,
     error: Option<String>,
@@ -129,6 +141,9 @@ impl TodoView {
             renaming_list: false,
             search_input,
             header_menu_open: false,
+            closed_range: ClosedRange::All,
+            closed_lists: None,
+            closed_menu: None,
             detail,
             selected: None,
             error: None,
@@ -211,6 +226,9 @@ impl TodoView {
                     self.detail.update(cx, |detail, cx| detail.dev_open_popup(&popup, cx));
                 }
                 Some(("menu", "header")) => self.header_menu_open = true,
+                Some(("menu", "dates")) => self.closed_menu = Some(ClosedMenu::Dates),
+                Some(("menu", "lists")) => self.closed_menu = Some(ClosedMenu::Lists(self.closed_lists.clone())),
+                Some(("range", "this-week")) => self.closed_range = ClosedRange::ThisWeek,
                 Some(("delete", needle)) => {
                     if let Some(id) = self.tasks.iter().find(|t| t.title.contains(needle)).map(|t| t.id) {
                         self.delete(id, cx);
@@ -327,9 +345,23 @@ impl TodoView {
 
     /// The rows of the current view: closed tasks by day, the trash flat, everything else grouped.
     fn rows(&self, strings: &Strings) -> Vec<Row> {
+        let closed = |closed_at: fn(&Task) -> Option<i64>| {
+            let today = Self::today();
+            let tasks: Vec<Task> = self
+                .tasks
+                .iter()
+                .filter(|t| {
+                    let day = closed_at(t).and_then(task_rows::local_day).unwrap_or(today);
+                    self.closed_range.contains(day, today)
+                        && self.closed_lists.as_ref().is_none_or(|lists| lists.contains(&t.list_id))
+                })
+                .cloned()
+                .collect();
+            task_rows::rows_by_day(&tasks, closed_at, today, strings)
+        };
         match self.view {
-            View::Completed => task_rows::rows_by_day(&self.tasks, |t| t.completed_at, Self::today(), strings),
-            View::WontDo => task_rows::rows_by_day(&self.tasks, |t| t.wont_do_at, Self::today(), strings),
+            View::Completed => closed(|t| t.completed_at),
+            View::WontDo => closed(|t| t.wont_do_at),
             _ => task_rows::build_rows(
                 &self.tasks,
                 &self.collapsed_tasks,
@@ -796,6 +828,174 @@ impl TodoView {
             .into_any_element()
     }
 
+    fn set_closed_menu(&mut self, menu: Option<ClosedMenu>, cx: &mut Context<Self>) {
+        self.closed_menu = menu;
+        cx.notify();
+    }
+
+    /// Toggles a list in the lists-filter draft; "All Lists" is `None`.
+    fn toggle_closed_list(&mut self, list: Option<Option<Id>>, cx: &mut Context<Self>) {
+        if let Some(ClosedMenu::Lists(draft)) = self.closed_menu.as_mut() {
+            *draft = match (list, draft.take()) {
+                (None, _) => None,
+                (Some(list), None) => Some(vec![list]),
+                (Some(list), Some(mut lists)) => {
+                    if let Some(at) = lists.iter().position(|l| *l == list) {
+                        lists.remove(at);
+                    } else {
+                        lists.push(list);
+                    }
+                    (!lists.is_empty()).then_some(lists)
+                }
+            };
+        }
+        cx.notify();
+    }
+
+    /// The "All Dates" / "All Lists" filter buttons of the Completed and Won't Do views.
+    fn render_closed_filters(&self, strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let list_name = |list: Option<Id>| -> SharedString {
+            list.and_then(|id| self.lists.iter().find(|l| l.id == id))
+                .map_or(SharedString::new_static(strings.inbox), |l| l.name.clone().into())
+        };
+        let lists_label: SharedString = match &self.closed_lists {
+            None => strings.all_lists.into(),
+            Some(lists) if lists.len() == 1 => list_name(lists[0]),
+            Some(lists) => format!("{} ({})", strings.all_lists, lists.len()).into(),
+        };
+        let open = self.closed_menu.clone();
+        let filter_button = |id: &'static str, label: SharedString, active: bool| {
+            h_flex()
+                .id(id)
+                .h(px(24.))
+                .px_2()
+                .gap_1()
+                .rounded(px(5.))
+                .border_1()
+                .border_color(if active { theme.colors().accent } else { theme.colors().border })
+                .cursor_pointer()
+                .child(Label::new(label).size(LabelSize::XSmall))
+                .child(Icon::new(IconName::ChevronDown).size(IconSize::XSmall).color(Color::Muted))
+        };
+        let check = || Label::new("✓").color(Color::Accent);
+
+        let dates_menu = popover(cx)
+            .w(px(180.))
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.set_closed_menu(None, cx)))
+            .children(ClosedRange::ALL.into_iter().map(|range| {
+                let selected = range == self.closed_range;
+                ListItem::new(SharedString::from(format!("closed-range-{range:?}")))
+                    .child(Label::new(range.label(strings)).color(if selected { Color::Accent } else { Color::Default }))
+                    .when(selected, |item| item.end_slot(check()))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.closed_range = range;
+                        this.set_closed_menu(None, cx);
+                    }))
+            }));
+
+        let draft = match &open {
+            Some(ClosedMenu::Lists(draft)) => draft.clone(),
+            _ => None,
+        };
+        let entries: Vec<(Option<Option<Id>>, SharedString, IconName)> = std::iter::once((None, strings.all_lists.into(), IconName::Layers))
+            .chain(std::iter::once((Some(None), strings.inbox.into(), IconName::Inbox)))
+            .chain(self.lists.iter().map(|l| (Some(Some(l.id)), l.name.clone().into(), IconName::List)))
+            .collect();
+        let lists_menu = popover(cx)
+            .w(px(240.))
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.set_closed_menu(None, cx)))
+            .children(entries.into_iter().map(|(list, label, icon)| {
+                let selected = match (&list, &draft) {
+                    (None, None) => true,
+                    (Some(list), Some(lists)) => lists.contains(list),
+                    _ => false,
+                };
+                let id = match list {
+                    None => "closed-list-all".to_owned(),
+                    Some(None) => "closed-list-inbox".to_owned(),
+                    Some(Some(id)) => format!("closed-list-{id}"),
+                };
+                ListItem::new(SharedString::from(id))
+                    .start_slot(Icon::new(icon).color(if selected { Color::Accent } else { Color::Muted }))
+                    .child(Label::new(label).color(if selected { Color::Accent } else { Color::Default }))
+                    .when(selected, |item| item.end_slot(check()))
+                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_closed_list(list, cx)))
+            }))
+            .child(div().py_1().child(Divider::horizontal()))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .p_1()
+                    .child(
+                        div()
+                            .id("closed-lists-cancel")
+                            .flex_1()
+                            .h(px(26.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(6.))
+                            .border_1()
+                            .border_color(theme.colors().border)
+                            .cursor_pointer()
+                            .child(Label::new(strings.cancel).size(LabelSize::Small))
+                            .on_click(cx.listener(|this, _, _, cx| this.set_closed_menu(None, cx))),
+                    )
+                    .child(
+                        div()
+                            .id("closed-lists-ok")
+                            .flex_1()
+                            .h(px(26.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(6.))
+                            .bg(theme.colors().accent)
+                            .cursor_pointer()
+                            .child(Label::new(strings.ok).size(LabelSize::Small))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(ClosedMenu::Lists(draft)) = this.closed_menu.take() {
+                                    this.closed_lists = draft;
+                                }
+                                cx.notify();
+                            })),
+                    ),
+            );
+
+        h_flex()
+            .h(px(30.))
+            .flex_none()
+            .px(px(24.))
+            .gap_2()
+            .child(
+                div()
+                    .relative()
+                    .child(
+                        filter_button("closed-dates", self.closed_range.label(strings).into(), open == Some(ClosedMenu::Dates))
+                            .on_click(cx.listener(|this, _, _, cx| this.set_closed_menu(Some(ClosedMenu::Dates), cx))),
+                    )
+                    .when(open == Some(ClosedMenu::Dates), |el| {
+                        el.child(PopoverAttachment::new(Placement::BelowLeft, dates_menu))
+                    }),
+            )
+            .child(
+                div()
+                    .relative()
+                    .child(
+                        filter_button("closed-lists", lists_label, matches!(open, Some(ClosedMenu::Lists(_))))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                let draft = this.closed_lists.clone();
+                                this.set_closed_menu(Some(ClosedMenu::Lists(draft)), cx)
+                            })),
+                    )
+                    .when(matches!(open, Some(ClosedMenu::Lists(_))), |el| {
+                        el.child(PopoverAttachment::new(Placement::BelowLeft, lists_menu))
+                    }),
+            )
+            .into_any_element()
+    }
+
     fn render_header_menu(&self, strings: &Strings, cx: &mut Context<Self>) -> AnyElement {
         let in_list = matches!(self.view, View::List(_));
         let in_trash = self.view == View::Trash;
@@ -978,6 +1178,9 @@ impl Render for TodoView {
                             }),
                     )),
             )
+            .when(matches!(self.view, View::Completed | View::WontDo), |el| {
+                el.child(self.render_closed_filters(strings, cx))
+            })
             .when(!self.is_read_only_view(), |el| el.child(
                 h_flex()
                     .mx_2()
@@ -1007,7 +1210,7 @@ impl Render for TodoView {
                     .overflow_y_scroll()
                     .px_2()
                     .pb_4()
-                    .when(self.tasks.is_empty(), |el| {
+                    .when(rows.is_empty(), |el| {
                         el.child(div().px_3().pt_8().child(
                             Label::new(match &self.view {
                                 View::Completed => strings.no_completed_tasks,

@@ -190,6 +190,23 @@ impl TextInput {
         cx.notify();
     }
 
+    /// The selected byte range (the cursor when empty).
+    pub fn selection(&self) -> Range<usize> {
+        self.selected_range.clone()
+    }
+
+    /// Replaces the text as an edit — it emits [`Changed`] — and selects `selection`.
+    pub fn edit(&mut self, text: String, selection: Range<usize>, window: &Window, cx: &mut Context<Self>) {
+        let len = text.len();
+        self.content = text.into();
+        self.selected_range = selection.start.min(len)..selection.end.min(len);
+        self.selection_reversed = false;
+        self.marked_range = None;
+        window.notify_text_input_changed(&self.focus_handle);
+        cx.emit(Changed);
+        cx.notify();
+    }
+
     pub fn clear(&mut self, window: &Window, cx: &mut Context<Self>) {
         self.set_text("", cx);
         window.notify_text_input_changed(&self.focus_handle);

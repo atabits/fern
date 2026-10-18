@@ -41,3 +41,8 @@ actions!(
         PriorityHigh,
     ]
 );
+
+actions!(
+    markdown,
+    [Bold, Highlight, CheckItem, BulletedList, NumberedList, Italic, Underline, Strike, Link, Code, Quote]
+);

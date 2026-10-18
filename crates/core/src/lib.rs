@@ -8,6 +8,7 @@ pub mod focus;
 pub mod habit;
 pub mod import;
 pub mod link;
+pub mod markdown;
 pub mod matrix;
 pub mod model;
 pub mod preferences;

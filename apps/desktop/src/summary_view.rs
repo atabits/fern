@@ -4,6 +4,7 @@
 use std::rc::Rc;
 
 use chrono::{Local, NaiveDate};
+use fern_core::markdown::{self, Format};
 use fern_core::summary::{Field, GroupKey, Grouping, Period, StatusFilter, SummaryGroup, SummaryOptions, summarize};
 use fern_core::{List, Priority, Store, Task};
 use gpui::{ClipboardItem, Entity, Focusable as _, FontWeight};
@@ -11,6 +12,7 @@ use ui::prelude::*;
 use ui::Tooltip;
 use ui::{Placement, PopoverAttachment, SubmenuItem, popover};
 
+use crate::actions as md;
 use crate::calendar;
 use crate::i18n::{self, Strings};
 use crate::task_rows::{local_day, short_date};
@@ -46,6 +48,8 @@ pub struct SummaryView {
     editor: Option<Entity<TextInput>>,
     /// Whether the editor shows (it keeps its text while hidden).
     editing: bool,
+    /// The toolbar's "Heading Options" menu, while open.
+    heading_menu: bool,
     /// The name field of "Save as Template", while open.
     naming: Option<Entity<TextInput>>,
     /// The "More" menu's open side menu: 0 Tag, 1 Priority.
@@ -188,6 +192,7 @@ impl SummaryView {
             more_side: None,
             editor: None,
             editing: false,
+            heading_menu: false,
         }
     }
 
@@ -284,12 +289,108 @@ impl SummaryView {
         cx.notify();
     }
 
+    /// A toolbar button or its shortcut: formats the editor's selection as Markdown, or for
+    /// `None` (Time) types the current time.
+    fn format(&mut self, format: Option<Format>, window: &mut Window, cx: &mut Context<Self>) {
+        self.heading_menu = false;
+        let Some(editor) = self.editor.clone().filter(|_| self.editing) else { return };
+        editor.update(cx, |input, cx| {
+            let selection = input.selection();
+            let (text, selection) = match format {
+                Some(format) => markdown::apply(input.text(), selection, format),
+                None => markdown::insert(input.text(), selection, &calendar::format_time(Local::now().time())),
+            };
+            input.edit(text, selection, window, cx);
+        });
+        window.focus(&editor.focus_handle(cx), cx);
+        self.copied = false;
+        cx.notify();
+    }
+
+    /// The original's toolbar over the edited report: headings, inline formats, lists, a line,
+    /// the time, links, code and quotes, with its Markdown in each tooltip.
+    fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let strings = i18n::t(cx);
+        let colors = cx.theme().colors().clone();
+        let names = strings.markdown_tools;
+        // (format, icon, the tooltip's sample of the Markdown, the shortcut)
+        let tools: [(Option<Format>, IconName, String, Option<&str>); 13] = [
+            (Some(Format::Bold), IconName::Bold, format!("**{}**", names[0]), Some("secondary-b")),
+            (Some(Format::Highlight), IconName::Highlighter, format!("::{}::", names[1]), Some("secondary-shift-y")),
+            (Some(Format::Checklist), IconName::SquareCheck, format!("- [ ] {}", names[2]), Some("secondary-shift-s")),
+            (Some(Format::Bullets), IconName::List, format!("* {}", names[3]), Some("secondary-shift-8")),
+            (Some(Format::Numbered), IconName::ListOrdered, format!("1. {}", names[4]), Some("secondary-shift-7")),
+            (Some(Format::Italic), IconName::Italic, format!("*{}*", names[5]), Some("secondary-i")),
+            (Some(Format::Underline), IconName::Underline, format!("~{}~", names[6]), Some("secondary-u")),
+            (Some(Format::Strike), IconName::Strikethrough, format!("~~{}~~", names[7]), Some("secondary-shift-x")),
+            (Some(Format::Divider), IconName::SeparatorHorizontal, format!("--- {}", names[8]), None),
+            (None, IconName::History, names[9].to_owned(), None),
+            (Some(Format::Link), IconName::Link, format!("[{}](URL)", names[10]), Some("secondary-k")),
+            (Some(Format::Code), IconName::Code, format!("`{}`", names[11]), Some("secondary-alt-c")),
+            (Some(Format::Quote), IconName::Quote, format!("> {}", names[12]), Some("secondary-shift-u")),
+        ];
+        let separator = || div().w(px(1.)).h(px(16.)).mx_1().bg(colors.border_variant);
+        let heading_menu = self.heading_menu.then(|| {
+            PopoverAttachment::new(
+                Placement::BelowLeft,
+                popover(cx)
+                    .w(px(170.))
+                    .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                        this.heading_menu = false;
+                        cx.notify();
+                    }))
+                    .children((1..=3u8).map(|level| {
+                        ListItem::new(("summary-heading", level as usize))
+                            .start_slot(Label::new(format!("H{level}")).size(LabelSize::Small).color(Color::Muted))
+                            .child(Label::new(format!("{} {level}", strings.heading)))
+                            .on_click(cx.listener(move |this, _, window, cx| this.format(Some(Format::Heading(level)), window, cx)))
+                    })),
+            )
+        });
+        let mut row = h_flex()
+            .h(px(36.))
+            .px_2()
+            .gap_0p5()
+            .border_b_1()
+            .border_color(colors.border_variant)
+            .child(
+                div().relative().child(
+                    IconButton::new("summary-tool-heading", IconName::Heading)
+                        .icon_color(Color::Muted)
+                        .tooltip(Tooltip::text(strings.heading_options))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.heading_menu = !this.heading_menu;
+                            cx.notify();
+                        })),
+                )
+                .children(heading_menu),
+            );
+        for (i, (format, icon, sample, keys)) in tools.into_iter().enumerate() {
+            // The original groups its buttons: text, lists, styles and lines, then inserts.
+            if [2, 5, 10].contains(&i) {
+                row = row.child(separator());
+            }
+            let tooltip = match keys {
+                Some(keys) => format!("{sample} ({})", crate::keymap::display_keys(keys)),
+                None => sample,
+            };
+            row = row.child(
+                IconButton::new(("summary-tool", i), icon)
+                    .icon_color(if format == Some(Format::Highlight) { Color::Warning } else { Color::Muted })
+                    .tooltip(Tooltip::text(tooltip))
+                    .on_click(cx.listener(move |this, _, window, cx| this.format(format, window, cx))),
+            );
+        }
+        row
+    }
+
     /// Opens a dropdown from the debug-build dev state: `summary=<period|lists|status|grouping|fields>`,
     /// `summary=custom` (the Custom date fields) or `summary=next` (Next Period Tasks on).
     #[cfg(debug_assertions)]
     pub fn dev_open(&mut self, menu: &str, window: &mut Window, cx: &mut Context<Self>) {
-        if menu == "edit" {
+        if menu == "edit" || menu == "edit-heading" {
             self.toggle_editing(window, cx);
+            self.heading_menu = menu == "edit-heading";
             return;
         }
         if menu == "custom" {
@@ -828,7 +929,26 @@ impl Render for SummaryView {
             .pb_4()
             .gap_1()
             .when_some(editor.clone(), |el, editor| {
-                el.child(div().p_2().rounded(px(6.)).bg(colors.surface_background).text_size(px(14.)).child(editor))
+                el.child(
+                    div()
+                        .key_context("SummaryEditor")
+                        .p_2()
+                        .rounded(px(6.))
+                        .bg(colors.surface_background)
+                        .text_size(px(14.))
+                        .on_action(cx.listener(|this, _: &md::Bold, window, cx| this.format(Some(Format::Bold), window, cx)))
+                        .on_action(cx.listener(|this, _: &md::Highlight, window, cx| this.format(Some(Format::Highlight), window, cx)))
+                        .on_action(cx.listener(|this, _: &md::CheckItem, window, cx| this.format(Some(Format::Checklist), window, cx)))
+                        .on_action(cx.listener(|this, _: &md::BulletedList, window, cx| this.format(Some(Format::Bullets), window, cx)))
+                        .on_action(cx.listener(|this, _: &md::NumberedList, window, cx| this.format(Some(Format::Numbered), window, cx)))
+                        .on_action(cx.listener(|this, _: &md::Italic, window, cx| this.format(Some(Format::Italic), window, cx)))
+                        .on_action(cx.listener(|this, _: &md::Underline, window, cx| this.format(Some(Format::Underline), window, cx)))
+                        .on_action(cx.listener(|this, _: &md::Strike, window, cx| this.format(Some(Format::Strike), window, cx)))
+                        .on_action(cx.listener(|this, _: &md::Link, window, cx| this.format(Some(Format::Link), window, cx)))
+                        .on_action(cx.listener(|this, _: &md::Code, window, cx| this.format(Some(Format::Code), window, cx)))
+                        .on_action(cx.listener(|this, _: &md::Quote, window, cx| this.format(Some(Format::Quote), window, cx)))
+                        .child(editor),
+                )
             })
             .when(editor.is_none(), |el| el.child(div().text_size(px(18.)).font_weight(FontWeight::BOLD).pb_1().child(report.heading.clone())))
             .when(editor.is_none() && empty, |el| el.child(Label::new(strings.summary_empty).color(Color::Muted)))
@@ -867,6 +987,7 @@ impl Render for SummaryView {
                                     .on_click(cx.listener(|this, _, window, cx| this.toggle_editing(window, cx))),
                             ),
                     )
+                    .when(self.editing, |el| el.child(self.render_toolbar(cx)))
                     .child(body)
                     .child(
                         h_flex().h(px(44.)).px_4().gap_5().justify_end()

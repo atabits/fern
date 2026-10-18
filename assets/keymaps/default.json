@@ -52,6 +52,22 @@
     }
   },
   {
+    "context": "SummaryEditor",
+    "bindings": {
+      "secondary-b": "markdown::Bold",
+      "secondary-shift-y": "markdown::Highlight",
+      "secondary-shift-s": "markdown::CheckItem",
+      "secondary-shift-8": "markdown::BulletedList",
+      "secondary-shift-7": "markdown::NumberedList",
+      "secondary-i": "markdown::Italic",
+      "secondary-u": "markdown::Underline",
+      "secondary-shift-x": "markdown::Strike",
+      "secondary-k": "markdown::Link",
+      "secondary-alt-c": "markdown::Code",
+      "secondary-shift-u": "markdown::Quote"
+    }
+  },
+  {
     "context": "Settings",
     "bindings": {
       "escape": "settings::DismissSettings"

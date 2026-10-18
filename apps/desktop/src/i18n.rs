@@ -397,6 +397,13 @@ pub struct Strings {
     pub timer_mode: &'static str,
     pub summary_edit: &'static str,
     pub summary_done: &'static str,
+    /// The editor toolbar's buttons after the heading, as the original's tooltips name them:
+    /// Bold, Highlight, Check Item, Bulleted List, Numbered List, Italic, Underline, Strike,
+    /// Horizontal Line, Time, Link, Code, Quote.
+    pub markdown_tools: [&'static str; 13],
+    pub heading_options: &'static str,
+    /// "Heading" before its level: "Heading 1".
+    pub heading: &'static str,
     pub batch_management: &'static str,
     /// `{n}` records chosen in Batch Management.
     pub n_selected: &'static str,
@@ -923,6 +930,12 @@ pub static EN: Strings = Strings {
     timer_mode: "Timer Mode",
     summary_edit: "Edit the report",
     summary_done: "Done",
+    markdown_tools: [
+        "Bold", "Highlight", "Check Item", "Bulleted List", "Numbered List", "Italic", "Underline", "Strike",
+        "Horizontal Line", "Time", "Link", "Code", "Quote",
+    ],
+    heading_options: "Heading Options",
+    heading: "Heading",
     batch_management: "Batch Management",
     n_selected: "{n} Selected",
     select_all: "Select All",
@@ -1431,6 +1444,12 @@ pub static RU: Strings = Strings {
     timer_mode: "Режим таймера",
     summary_edit: "Изменить отчёт",
     summary_done: "Готово",
+    markdown_tools: [
+        "Жирный", "Выделение", "Пункт чек-листа", "Маркированный список", "Нумерованный список", "Курсив",
+        "Подчёркнутый", "Зачёркнутый", "Горизонтальная линия", "Время", "Ссылка", "Код", "Цитата",
+    ],
+    heading_options: "Заголовки",
+    heading: "Заголовок",
     batch_management: "Пакетное управление",
     n_selected: "Выбрано: {n}",
     select_all: "Выбрать все",

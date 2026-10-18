@@ -7,7 +7,7 @@ use gpui::{ElementId, Entity, FocusHandle, Focusable, FontWeight, MouseButton};
 use ui::prelude::*;
 
 use crate::drag::DraggedTask;
-use ui::{Placement, PopoverAttachment, popover};
+use ui::{Placement, PopoverAttachment, SubmenuItem, popover};
 
 use crate::actions::{
     ClearDate, DeleteTask, PinTask, PriorityHigh, PriorityLow, PriorityMedium, PriorityNone, SelectNext, SelectPrevious,
@@ -57,6 +57,15 @@ struct FilterEdit {
     advanced: bool,
     name: Entity<TextInput>,
     keywords: Entity<TextInput>,
+}
+
+/// What the add field's "▾" menu set for the next task.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct AddDraft {
+    priority: Option<Priority>,
+    /// `Some(None)` is the Inbox.
+    list: Option<Option<Id>>,
+    note: bool,
 }
 
 pub struct TodoView {
@@ -112,6 +121,10 @@ pub struct TodoView {
     list_activity: Option<Vec<(fern_core::Activity, Id, String)>>,
     /// The "Add task" field's template picker, while it is open.
     templates_open: bool,
+    /// The add field's "▾" menu, its list side menu, and what it set for the next task.
+    add_menu_open: bool,
+    add_list_side: bool,
+    add_draft: AddDraft,
     /// The section whose "…" menu is open.
     section_menu: Option<Id>,
     /// A section being renamed, with its field.
@@ -135,6 +148,7 @@ impl TodoView {
             if this.check(result).is_some() {
                 input.update(cx, |input, cx| input.clear(window, cx));
                 this.quick_add_due = None;
+                this.add_draft = AddDraft::default();
                 this.reload(cx);
             }
         })
@@ -225,6 +239,9 @@ impl TodoView {
             new_section: None,
             section_menu: None,
             templates_open: false,
+            add_menu_open: false,
+            add_list_side: false,
+            add_draft: AddDraft::default(),
             list_activity: None,
             filters: Vec::new(),
             preferences: Default::default(),
@@ -377,6 +394,10 @@ impl TodoView {
                     }
                 }
                 Some(("menu", "templates")) => self.templates_open = true,
+                Some(("menu", "add")) => {
+                    self.add_menu_open = true;
+                    self.add_list_side = true;
+                }
                 Some(("menu", "activity")) => self.open_list_activity(cx),
                 Some(("filter-new", mode)) => {
                     self.open_filter_edit(None, window, cx);
@@ -658,7 +679,12 @@ impl TodoView {
         if let Some(repeat) = parsed.repeat {
             self.store.set_repeat(task.id, Some(repeat), today)?;
         }
-        if let Some(priority) = parsed.priority.or((defaults.priority != fern_core::Priority::None).then_some(defaults.priority)) {
+        let draft_priority = self.add_draft.priority.filter(|p| *p != fern_core::Priority::None);
+        if let Some(priority) = parsed
+            .priority
+            .or(draft_priority)
+            .or((defaults.priority != fern_core::Priority::None).then_some(defaults.priority))
+        {
             self.store.set_priority(task.id, priority)?;
         }
 
@@ -673,8 +699,13 @@ impl TodoView {
             View::Inbox | View::List(_) => None,
             _ => self.store.preferences().ok().and_then(|p| p.default_list),
         };
-        if let Some(list) = parsed_list.or(view_list).or(default_list) {
+        // The "▾" menu's list goes before the view's and the default one.
+        let draft_list = self.add_draft.list;
+        if let Some(Some(list)) = parsed_list.map(Some).or(draft_list).or(view_list.map(Some)).or(default_list.map(Some)) {
             self.store.set_list(task.id, Some(list))?;
+        }
+        if self.add_draft.note {
+            self.store.set_kind(task.id, fern_core::Kind::Note)?;
         }
         Ok(task)
     }
@@ -688,6 +719,91 @@ impl TodoView {
         self.input.update(cx, |input, cx| input.set_highlights(spans, cx));
         self.quick_add_due = parsed.due_date.map(|date| (date, parsed.due_time));
         cx.notify();
+    }
+
+    /// The add field's "▾" menu, as in the original.
+    fn render_add_menu(&self, strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let draft = self.add_draft;
+        let flags = [Priority::High, Priority::Medium, Priority::Low, Priority::None].map(|priority| {
+            let selected = draft.priority == Some(priority);
+            let color = task_rows::priority_color(priority, &theme).unwrap_or(theme.colors().text_muted);
+            div()
+                .id(SharedString::from(format!("add-priority-{}", priority.to_i64())))
+                .size(px(30.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(6.))
+                .cursor_pointer()
+                .when(selected, |el| el.bg(theme.colors().element_selected))
+                .hover(|s| s.bg(theme.colors().element_hover))
+                .child(Icon::new(IconName::Flag).color(Color::Custom(color)))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.add_draft.priority = if selected { None } else { Some(priority) };
+                    cx.notify();
+                }))
+        });
+        let list_name = match draft.list {
+            Some(Some(id)) => self.lists.iter().find(|l| l.id == id).map_or(strings.inbox.to_owned(), |l| l.name.clone()),
+            _ => strings.inbox.to_owned(),
+        };
+        let list_items = std::iter::once((None, strings.inbox.to_owned()))
+            .chain(self.lists.iter().map(|l| (Some(l.id), l.name.clone())))
+            .map(|(id, name)| {
+                let selected = draft.list.unwrap_or(None) == id && (draft.list.is_some() || id.is_none());
+                ListItem::new(SharedString::from(format!("add-list-{}", id.map_or("inbox".to_owned(), |i| i.to_string()))))
+                    .child(Label::new(name).color(if selected { Color::Accent } else { Color::Default }))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.add_draft.list = Some(id);
+                        this.add_menu_open = false;
+                        cx.notify();
+                    }))
+            })
+            .collect::<Vec<_>>();
+        popover(cx)
+            .w(px(240.))
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.add_menu_open = false;
+                cx.notify();
+            }))
+            .child(div().px_2().pt_1().child(Label::new(strings.filter_priority).size(LabelSize::XSmall).color(Color::Muted)))
+            .child(h_flex().px_1().py_1().justify_between().children(flags))
+            .child(div().py_1().child(Divider::horizontal()))
+            .child(
+                SubmenuItem::new("add-list", list_name)
+                    .icon(IconName::Inbox)
+                    .open(self.add_list_side)
+                    .placement(Placement::LeftSide)
+                    .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                        if *hovered && !this.add_list_side {
+                            this.add_list_side = true;
+                            cx.notify();
+                        }
+                    }))
+                    .items(list_items),
+            )
+            .child(
+                ListItem::new("add-from-template")
+                    .start_slot(Icon::new(IconName::LayoutTemplate).color(Color::Muted))
+                    .child(Label::new(strings.add_from_template))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.add_menu_open = false;
+                        this.templates_open = true;
+                        cx.notify();
+                    })),
+            )
+            .child(
+                ListItem::new("add-as-note")
+                    .start_slot(Icon::new(IconName::FileText).color(Color::Muted))
+                    .child(Label::new(if draft.note { strings.convert_to_task } else { strings.convert_to_note }))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.add_draft.note = !this.add_draft.note;
+                        this.add_menu_open = false;
+                        cx.notify();
+                    })),
+            )
+            .into_any_element()
     }
 
     /// Focuses the quick-add field.
@@ -2789,15 +2905,20 @@ impl Render for TodoView {
                             .relative()
                             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                             .child(
-                                IconButton::new("templates", IconName::LayoutTemplate)
+                                // The original's "▾": priority, list, template and note for the
+                                // next task; its flag takes the chosen priority's color.
+                                IconButton::new("add-options", IconName::ChevronDown)
                                     .size(px(24.))
                                     .icon_size(IconSize::Small)
-                                    .tooltip(Tooltip::text(strings.templates))
                                     .on_click(cx.listener(|this, _, _, cx| {
-                                        this.templates_open = true;
+                                        this.add_menu_open = !this.add_menu_open;
+                                        this.add_list_side = false;
                                         cx.notify();
                                     })),
                             )
+                            .when(self.add_menu_open, |el| {
+                                el.child(PopoverAttachment::new(Placement::BelowRight, self.render_add_menu(strings, cx)))
+                            })
                             .when(self.templates_open, |el| {
                                 el.child(PopoverAttachment::new(Placement::BelowRight, self.render_templates(strings, cx)))
                             }),

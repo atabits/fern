@@ -361,6 +361,7 @@ pub struct Strings {
     /// restored, won't do: what the activity log says for each kind.
     pub activity_kinds: [&'static str; 11],
     pub convert_to_note: &'static str,
+    pub add_from_template: &'static str,
     pub convert_to_task: &'static str,
     pub delete: &'static str,
     /// Full month names in the genitive ("September" / "сентября") for day headers.
@@ -818,6 +819,7 @@ pub static EN: Strings = Strings {
         "restored the task", "marked the task as Won't Do",
     ],
     convert_to_note: "Convert to Note",
+    add_from_template: "Add from Template",
     convert_to_task: "Convert to Task",
     delete: "Delete",
     months_genitive: [
@@ -1255,6 +1257,7 @@ pub static RU: Strings = Strings {
         "отмечено «Не буду делать»",
     ],
     convert_to_note: "Превратить в заметку",
+    add_from_template: "Добавить из шаблона",
     convert_to_task: "Превратить в задачу",
     delete: "Удалить",
     months_genitive: [

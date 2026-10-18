@@ -390,6 +390,7 @@ pub struct Strings {
     pub checklist: &'static str,
     pub sync: &'static str,
     pub features: &'static str,
+    pub arrange_tasks: &'static str,
     pub notifications_page: &'static str,
     /// Settings → Notifications: each switch's name and what it does.
     pub notification_items: [(&'static str, &'static str); 3],
@@ -900,6 +901,7 @@ pub static EN: Strings = Strings {
     checklist: "Checklist",
     sync: "Sync",
     features: "Features",
+    arrange_tasks: "Arrange Tasks",
     notifications_page: "Notifications",
     notification_items: [
         ("Daily Notifications", "Fern reminds you of today's tasks at a set time every day."),
@@ -1394,6 +1396,7 @@ pub static RU: Strings = Strings {
     checklist: "Чек-лист",
     sync: "Синхронизация",
     features: "Функции",
+    arrange_tasks: "Расставить задачи",
     notifications_page: "Уведомления",
     notification_items: [
         ("Ежедневное уведомление", "Fern каждый день в заданное время напоминает о задачах на сегодня."),

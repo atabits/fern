@@ -116,6 +116,8 @@ pub struct TodoView {
     /// The Timeline's scale: 0 Day, 1 Week, 2 Month; and whether its menu is open.
     timeline_scale: usize,
     scale_menu_open: bool,
+    /// The Timeline's "Arrange Tasks" panel: the undated tasks, to drag onto days.
+    arrange_open: bool,
     /// The current list's sections.
     sections: Vec<fern_core::ListSection>,
     /// The "Add Section" field, while it is shown.
@@ -271,6 +273,7 @@ impl TodoView {
             timeline_from: Self::today(),
             timeline_scale: 0,
             scale_menu_open: false,
+            arrange_open: false,
             sections: Vec::new(),
             new_section: None,
             section_menu: None,
@@ -437,6 +440,10 @@ impl TodoView {
                 Some(("menu", "templates")) => self.templates_open = true,
                 Some(("menu", "input-box")) => self.input_box_open = true,
                 Some(("menu", "timeline")) => self.set_layout(false, true, cx),
+                Some(("menu", "arrange")) => {
+                    self.set_layout(false, true, cx);
+                    self.arrange_open = true;
+                }
                 Some(("menu", "timeline-week")) => {
                     self.set_layout(false, true, cx);
                     self.timeline_scale = 1;
@@ -2417,7 +2424,101 @@ impl TodoView {
                         })),
                 )
         });
-        v_flex().id("timeline").flex_1().min_h_0().overflow_y_scroll().child(header).children(rows).into_any_element()
+        let timeline = v_flex().id("timeline").flex_1().min_w_0().min_h_0().overflow_y_scroll().child(header).children(rows);
+        h_flex()
+            .flex_1()
+            .min_h_0()
+            .items_start()
+            .child(timeline)
+            .when(self.arrange_open, |el| el.child(self.render_arrange(strings, cx)))
+            .into_any_element()
+    }
+
+    /// The original's "Arrange Tasks": the list's undated open tasks by group, as bars in their
+    /// first tag's color, to drag onto a day of the Timeline.
+    fn render_arrange(&self, strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let groups = task_rows::kanban_columns(self.rows_with(strings, &HashSet::new(), &HashSet::new()), strings);
+        let tag_color = |task: &Task| {
+            task.tags
+                .first()
+                .and_then(|name| self.tags.iter().find(|t| t.name.to_lowercase() == name.to_lowercase()))
+                .and_then(|t| lists_panel::parse_color(t.color.as_deref()))
+                .unwrap_or(theme.colors().accent)
+        };
+        let bar = |task: Task, depth: usize, cx: &mut Context<Self>| {
+            let id = task.id;
+            let color = tag_color(&task);
+            let dragged = DraggedTask { id, title: task.title.clone().into() };
+            div()
+                .id(SharedString::from(format!("arrange-{id}")))
+                .ml(px(depth as f32 * 14.))
+                .h(px(22.))
+                .px_1p5()
+                .flex()
+                .items_center()
+                .rounded(px(3.))
+                .bg(color.opacity(0.7))
+                .cursor_grab()
+                .on_drag(dragged, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
+                .gap_1()
+                .when(task.kind == Kind::Note, |el| el.child(Icon::new(IconName::FileText).size(IconSize::XSmall)))
+                .child(Label::new(task.title).size(LabelSize::XSmall).truncate())
+                .on_click(cx.listener(move |this, _, _, cx| this.select(id, cx)))
+                .into_any_element()
+        };
+        let mut items: Vec<AnyElement> = Vec::new();
+        for (label, _, cards) in groups {
+            let undated: Vec<(Task, Vec<Task>)> = cards
+                .into_iter()
+                .filter(|(task, _)| !task.is_closed())
+                .map(|(task, subtasks)| (task, subtasks.into_iter().filter(|t| t.due_date.is_none() && !t.is_closed()).collect::<Vec<_>>()))
+                .filter(|(task, subtasks)| task.due_date.is_none() || !subtasks.is_empty())
+                .collect();
+            let count: usize = undated.iter().map(|(t, s)| usize::from(t.due_date.is_none()) + s.len()).sum();
+            if count == 0 {
+                continue;
+            }
+            items.push(
+                h_flex()
+                    .pt_2()
+                    .pb_1()
+                    .gap_1()
+                    .child(Icon::new(IconName::ChevronDown).size(IconSize::XSmall).color(Color::Muted))
+                    .child(Label::new(label).size(LabelSize::Small).weight(FontWeight::SEMIBOLD))
+                    .child(Label::new(count.to_string()).size(LabelSize::XSmall).color(Color::Muted))
+                    .into_any_element(),
+            );
+            for (task, subtasks) in undated {
+                if task.due_date.is_none() {
+                    items.push(bar(task, 0, cx));
+                }
+                for subtask in subtasks {
+                    items.push(bar(subtask, 1, cx));
+                }
+            }
+        }
+        v_flex()
+            .id("arrange-tasks")
+            .w(px(220.))
+            .flex_none()
+            .h_full()
+            .px_2()
+            .pt_2()
+            .gap_1()
+            .border_l_1()
+            .border_color(theme.colors().border_variant)
+            .overflow_y_scroll()
+            .child(
+                h_flex()
+                    .child(div().flex_1().child(Label::new(strings.arrange_tasks).weight(FontWeight::SEMIBOLD)))
+                    .child(IconButton::new("arrange-close", IconName::X).size(px(22.)).icon_size(IconSize::Small).on_click(cx.listener(|this, _, _, cx| {
+                        this.arrange_open = false;
+                        cx.notify();
+                    }))),
+            )
+            .children(items)
+            .into_any_element()
     }
 
     fn sort_settings(&self) -> (SortBy, GroupBy) {
@@ -3581,6 +3682,18 @@ impl TodoView {
                             .child(layout("layout-timeline", IconName::ChartGantt, timeline).on_click(cx.listener(|this, _, _, cx| this.set_layout(false, true, cx)))),
                     )
                     .child(div().my_1().child(Divider::horizontal()))
+                    .when(timeline, |el| {
+                        el.child(
+                            ListItem::new("arrange-tasks")
+                                .start_slot(Icon::new(IconName::CalendarPlus).color(Color::Muted))
+                                .child(Label::new(strings.arrange_tasks))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.arrange_open = true;
+                                    this.header_menu_open = false;
+                                    cx.notify();
+                                })),
+                        )
+                    })
                     .child(
                         ListItem::new("toggle-completed")
                             .start_slot(Icon::new(IconName::SquareCheck).color(Color::Muted))

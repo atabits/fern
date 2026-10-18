@@ -8,6 +8,7 @@ use fern_core::summary::{Field, GroupKey, Grouping, Period, StatusFilter, Summar
 use fern_core::{List, Priority, Store, Task};
 use gpui::{ClipboardItem, Entity, Focusable as _, FontWeight};
 use ui::prelude::*;
+use ui::Tooltip;
 use ui::{Placement, PopoverAttachment, SubmenuItem, popover};
 
 use crate::calendar;
@@ -40,6 +41,11 @@ pub struct SummaryView {
     saved: Option<String>,
     /// The "Save as" menu, while open.
     save_menu: bool,
+    /// The report as an editable document, the original's way: Markdown text that Copy and
+    /// Send Email then use. New options make the report again.
+    editor: Option<Entity<TextInput>>,
+    /// Whether the editor shows (it keeps its text while hidden).
+    editing: bool,
     /// The name field of "Save as Template", while open.
     naming: Option<Entity<TextInput>>,
     /// The "More" menu's open side menu: 0 Tag, 1 Priority.
@@ -170,7 +176,19 @@ impl SummaryView {
     pub fn new(store: Rc<Store>) -> Self {
         // The original keeps the Summary's choices; so does Fern, in the settings table.
         let options = store.summary_options().unwrap_or_default();
-        Self { store, options, menu: None, copied: false, saved: None, custom: None, save_menu: false, naming: None, more_side: None }
+        Self {
+            store,
+            options,
+            menu: None,
+            copied: false,
+            saved: None,
+            custom: None,
+            save_menu: false,
+            naming: None,
+            more_side: None,
+            editor: None,
+            editing: false,
+        }
     }
 
     /// "Custom" in the Date menu: Start and End fields with Cancel and Confirm.
@@ -238,6 +256,31 @@ impl SummaryView {
             eprintln!("failed to save the summary options: {err:#}");
         }
         self.copied = false;
+        // A report made with other options replaces the edited one.
+        self.editor = None;
+        self.editing = false;
+        cx.notify();
+    }
+
+    /// The pencil in the report's header: edit the report as text, or show it again.
+    fn toggle_editing(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.editing {
+            self.editing = false;
+        } else {
+            if self.editor.is_none() {
+                let markdown = self.current_report(cx).markdown();
+                self.editor = Some(cx.new(|cx| {
+                    let mut input = TextInput::new(Mode::MultiLine, "", cx);
+                    input.set_text(markdown, cx);
+                    input
+                }));
+            }
+            if let Some(editor) = &self.editor {
+                window.focus(&editor.focus_handle(cx), cx);
+            }
+            self.editing = true;
+        }
+        self.copied = false;
         cx.notify();
     }
 
@@ -245,6 +288,10 @@ impl SummaryView {
     /// `summary=custom` (the Custom date fields) or `summary=next` (Next Period Tasks on).
     #[cfg(debug_assertions)]
     pub fn dev_open(&mut self, menu: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if menu == "edit" {
+            self.toggle_editing(window, cx);
+            return;
+        }
         if menu == "custom" {
             self.open_custom(window, cx);
             return;
@@ -761,10 +808,17 @@ impl Render for SummaryView {
         let colors = cx.theme().colors().clone();
         let report = self.current_report(cx);
         let empty = report.groups.is_empty();
-        let markdown = report.markdown();
-        let mailto = report.mailto(&format!("{} {}", strings.summary, report.heading));
+        // An edited report is what Copy and Send Email take.
+        let edited = self.editor.as_ref().map(|editor| editor.read(cx).text().to_owned());
+        let markdown = edited.clone().unwrap_or_else(|| report.markdown());
+        let subject = format!("{} {}", strings.summary, report.heading);
+        let mailto = match &edited {
+            Some(text) => format!("mailto:?subject={}&body={}", percent_encode(&subject), percent_encode(text)),
+            None => report.mailto(&subject),
+        };
         let (report_heading, report_groups) = (format!("{} {}", strings.summary, report.heading), report.groups.clone());
 
+        let editor = self.editor.clone().filter(|_| self.editing);
         let body = v_flex()
             .id("summary-report")
             .flex_1()
@@ -773,9 +827,12 @@ impl Render for SummaryView {
             .px_4()
             .pb_4()
             .gap_1()
-            .child(div().text_size(px(18.)).font_weight(FontWeight::BOLD).pb_1().child(report.heading))
-            .when(empty, |el| el.child(Label::new(strings.summary_empty).color(Color::Muted)))
-            .children(report.groups.into_iter().map(|(title, lines)| {
+            .when_some(editor.clone(), |el, editor| {
+                el.child(div().p_2().rounded(px(6.)).bg(colors.surface_background).text_size(px(14.)).child(editor))
+            })
+            .when(editor.is_none(), |el| el.child(div().text_size(px(18.)).font_weight(FontWeight::BOLD).pb_1().child(report.heading.clone())))
+            .when(editor.is_none() && empty, |el| el.child(Label::new(strings.summary_empty).color(Color::Muted)))
+            .children(report.groups.into_iter().filter(|_| editor.is_none()).map(|(title, lines)| {
                 v_flex()
                     .pt_1()
                     .child(div().pb_1().font_weight(FontWeight::BOLD).child(title))
@@ -802,7 +859,13 @@ impl Render for SummaryView {
                             .px_4()
                             .gap_2()
                             .child(Icon::new(IconName::FileText).color(Color::Muted))
-                            .child(div().text_size(px(20.)).font_weight(FontWeight::BOLD).child(strings.summary)),
+                            .child(div().flex_1().text_size(px(20.)).font_weight(FontWeight::BOLD).child(strings.summary))
+                            .child(
+                                IconButton::new("summary-edit", if self.editing { IconName::Check } else { IconName::Pencil })
+                                    .icon_color(if self.editor.is_some() { Color::Accent } else { Color::Muted })
+                                    .tooltip(Tooltip::text(if self.editing { strings.summary_done } else { strings.summary_edit }))
+                                    .on_click(cx.listener(|this, _, window, cx| this.toggle_editing(window, cx))),
+                            ),
                     )
                     .child(body)
                     .child(

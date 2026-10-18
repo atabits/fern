@@ -367,6 +367,8 @@ pub struct Strings {
     /// The focus page's picker tabs: Task, Timer, Habit.
     pub focus_picker_tabs: [&'static str; 3],
     pub focus_picker_search: &'static str,
+    /// After a timer's Pomo minutes field: "mins".
+    pub timer_mins: &'static str,
     pub templates: &'static str,
     pub no_templates: &'static str,
     pub show_completed: &'static str,
@@ -911,6 +913,7 @@ pub static EN: Strings = Strings {
     focus_collapse: "Collapse",
     focus_picker_tabs: ["Task", "Timer", "Habit"],
     focus_picker_search: "Search",
+    timer_mins: "mins",
     templates: "Templates",
     no_templates: "No templates yet: save one from a task's menu",
     show_completed: "Show Completed",
@@ -1439,6 +1442,7 @@ pub static RU: Strings = Strings {
     focus_collapse: "Свернуть",
     focus_picker_tabs: ["Задача", "Таймер", "Привычка"],
     focus_picker_search: "Поиск",
+    timer_mins: "мин",
     templates: "Шаблоны",
     no_templates: "Шаблонов пока нет: сохраните из меню задачи",
     show_completed: "Показывать выполненные",

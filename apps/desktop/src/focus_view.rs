@@ -234,6 +234,8 @@ impl NextFocus {
 struct TimerDraft {
     timer: fern_core::focus::FocusTimer,
     name: Entity<TextInput>,
+    /// The Pomo minutes, typed as in the original.
+    minutes: Entity<TextInput>,
     new: bool,
     /// The icon picker under the name, while open: 0 Emoji, 1 Text (the name's initial).
     icon_tab: Option<usize>,
@@ -909,16 +911,30 @@ impl FocusView {
             input.set_text(timer.name.clone(), cx);
             input
         });
-        cx.subscribe(&name, |this, _, _: &crate::text_input::Submitted, cx| this.save_timer(cx)).detach();
+        let minutes = cx.new(|cx| {
+            let mut input = TextInput::new(Mode::SingleLine, "", cx);
+            input.set_text(timer.minutes.to_string(), cx);
+            input
+        });
+        for input in [&name, &minutes] {
+            cx.subscribe(input, |this, _, _: &crate::text_input::Submitted, cx| this.save_timer(cx)).detach();
+        }
         window.focus(&name.focus_handle(cx), cx);
         self.timer_menu = None;
-        self.timer_draft = Some(TimerDraft { timer, name, new, icon_tab: None });
+        self.timer_draft = Some(TimerDraft { timer, name, minutes, new, icon_tab: None });
         cx.notify();
     }
 
     fn save_timer(&mut self, cx: &mut Context<Self>) {
         let Some(draft) = self.timer_draft.take() else { return };
+        // A Pomo needs minutes that read; the dialog stays open until they do.
+        let minutes = fern_core::focus::FocusTimer::parse_minutes(draft.minutes.read(cx).text());
+        if minutes.is_none() && !draft.timer.stopwatch {
+            self.timer_draft = Some(draft);
+            return;
+        }
         let mut timer = draft.timer;
+        timer.minutes = minutes.unwrap_or(timer.minutes);
         timer.name = draft.name.read(cx).text().trim().to_owned();
         if let Err(err) = self.store.save_focus_timer(&timer) {
             eprintln!("failed to save the timer: {err:#}");
@@ -929,12 +945,15 @@ impl FocusView {
         self.reload(cx);
     }
 
+    /// The original's "Add Timer" dialog, by its measures: the title and ×, a 35 px icon beside
+    /// the name, the bold "Timer Mode", Pomo with its minutes in a field and Stopwatch, then Close
+    /// and Save on the right.
     fn render_timer_draft(&self, draft: &TimerDraft, cx: &mut Context<Self>) -> AnyElement {
         let strings = i18n::t(cx);
         let theme = cx.theme().clone();
         let timer = &draft.timer;
         let icons = draft.icon_tab.map(|tab| self.render_timer_icons(timer, tab, cx));
-        let avatar = icon_avatar(timer.icon.as_deref(), timer.color.as_deref(), draft.name.read(cx).text(), px(30.), cx);
+        let avatar = icon_avatar(timer.icon.as_deref(), timer.color.as_deref(), draft.name.read(cx).text(), px(35.), cx);
         let change = |f: fn(&mut fern_core::focus::FocusTimer)| {
             cx.listener(move |this: &mut Self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>| {
                 if let Some(draft) = this.timer_draft.as_mut() {
@@ -945,17 +964,20 @@ impl FocusView {
         };
         let radio = |on: bool| {
             div()
-                .size(px(14.))
+                .size(px(16.))
+                .flex()
+                .items_center()
+                .justify_center()
                 .rounded_full()
                 .border_1()
                 .border_color(if on { theme.colors().accent } else { theme.colors().text_muted })
-                .when(on, |el| el.bg(theme.colors().accent))
+                .when(on, |el| el.child(div().size(px(8.)).rounded_full().bg(theme.colors().accent)))
         };
         let button = |id: &'static str, label: &'static str, primary: bool| {
             div()
                 .id(id)
-                .flex_1()
-                .h(px(28.))
+                .w(px(100.))
+                .h(px(30.))
                 .flex()
                 .items_center()
                 .justify_center()
@@ -965,15 +987,24 @@ impl FocusView {
                 .when(!primary, |el| el.border_1().border_color(theme.colors().border))
                 .child(Label::new(label).size(LabelSize::Small))
         };
-        // A dialog in the middle of the window, closed with Close, as in the original.
+        let close = cx.listener(|this, _, _, cx| {
+            this.timer_draft = None;
+            cx.notify();
+        });
         popover(cx)
-            .w(px(440.))
-            .p_4()
-            .gap_3()
-            .child(Label::new(if draft.new { strings.add_timer } else { strings.edit_timer }).weight(FontWeight::SEMIBOLD))
+            .w(px(442.))
+            .px(px(20.))
+            .pt(px(16.))
+            .pb(px(16.))
+            .gap(px(14.))
             .child(
                 h_flex()
-                    .gap_2()
+                    .child(div().flex_1().child(Label::new(if draft.new { strings.add_timer } else { strings.edit_timer }).weight(FontWeight::BOLD)))
+                    .child(IconButton::new("timer-x", IconName::X).icon_color(Color::Muted).on_click(close)),
+            )
+            .child(
+                h_flex()
+                    .gap_3()
                     .child(
                         div()
                             .id("timer-icon-button")
@@ -986,39 +1017,59 @@ impl FocusView {
                                 cx.notify();
                             })),
                     )
-                    .child(h_flex().flex_1().h(px(30.)).px_2().rounded(px(6.)).bg(theme.colors().background).child(draft.name.clone())),
+                    .child(
+                        h_flex()
+                            .flex_1()
+                            .h(px(30.))
+                            .px_3()
+                            .rounded(px(6.))
+                            .border_1()
+                            .border_color(theme.colors().border)
+                            .child(draft.name.clone()),
+                    ),
             )
             .children(icons)
-            .child(Label::new(strings.timer_mode).size(LabelSize::Small).color(Color::Muted))
+            .child(div().pt_1().child(Label::new(strings.timer_mode).weight(FontWeight::SEMIBOLD)))
             .child(
                 h_flex()
-                    .gap_2()
+                    .h(px(33.))
+                    .gap_3()
                     .child(
                         h_flex()
                             .id("timer-pomo")
                             .gap_2()
                             .cursor_pointer()
                             .child(radio(!timer.stopwatch))
-                            .child(Label::new(strings.focus_modes[0]).size(LabelSize::Small))
+                            .child(Label::new(strings.focus_modes[0]))
                             .on_click(change(|t| t.stopwatch = false)),
                     )
-                    .child(IconButton::new("timer-less", IconName::Minus).size(px(22.)).icon_size(IconSize::XSmall).on_click(change(|t| t.minutes = (t.minutes - 5).max(5))))
-                    .child(Label::new(timer.minutes.to_string()).size(LabelSize::Small))
-                    .child(IconButton::new("timer-more", IconName::Plus).size(px(22.)).icon_size(IconSize::XSmall).on_click(change(|t| t.minutes = (t.minutes + 5).min(180))))
-                    .child(Label::new(strings.minutes).size(LabelSize::XSmall).color(Color::Muted)),
+                    .child(
+                        h_flex()
+                            .w(px(79.))
+                            .h(px(33.))
+                            .px_2()
+                            .justify_center()
+                            .rounded(px(6.))
+                            .bg(theme.colors().element_hover)
+                            .child(draft.minutes.clone()),
+                    )
+                    .child(Label::new(strings.timer_mins)),
             )
             .child(
                 h_flex()
                     .id("timer-stopwatch")
+                    .h(px(33.))
                     .gap_2()
                     .cursor_pointer()
                     .child(radio(timer.stopwatch))
-                    .child(Label::new(strings.focus_modes[1]).size(LabelSize::Small))
+                    .child(Label::new(strings.focus_modes[1]))
                     .on_click(change(|t| t.stopwatch = true)),
             )
             .child(
                 h_flex()
-                    .gap_2()
+                    .pt_3()
+                    .gap(px(8.))
+                    .justify_end()
                     .child(button("timer-close", strings.close, false).on_click(cx.listener(|this, _, _, cx| {
                         this.timer_draft = None;
                         cx.notify();

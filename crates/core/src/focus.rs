@@ -41,6 +41,14 @@ impl FocusTimer {
         Self { id: uuid::Uuid::now_v7(), name: name.to_owned(), icon: None, minutes: 25, stopwatch: false, archived: false, color: None }
     }
 
+    /// The longest Pomo a timer takes, in minutes.
+    pub const MAX_MINUTES: i64 = 180;
+
+    /// Reads the dialog's minutes field: a whole number of minutes from 1 to [`Self::MAX_MINUTES`].
+    pub fn parse_minutes(text: &str) -> Option<i64> {
+        text.trim().parse::<i64>().ok().filter(|m| (1..=Self::MAX_MINUTES).contains(m))
+    }
+
     /// How long a session of this timer runs: its own Pomo length, or `None` for a stopwatch,
     /// which counts up until stopped.
     pub fn length_ms(&self) -> Option<i64> {
@@ -424,6 +432,10 @@ mod tests {
         assert_eq!(timer.length_ms(), Some(45 * 60_000), "a timer runs its own Pomo length");
         timer.stopwatch = true;
         assert_eq!(timer.length_ms(), None);
+        assert_eq!(FocusTimer::parse_minutes(" 20 "), Some(20));
+        for bad in ["", "0", "-5", "181", "20m"] {
+            assert_eq!(FocusTimer::parse_minutes(bad), None, "{bad:?}");
+        }
     }
 
     #[test]

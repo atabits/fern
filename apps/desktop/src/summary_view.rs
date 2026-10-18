@@ -842,12 +842,13 @@ impl Render for SummaryView {
                                                 .child(Label::new(strings.summary_image))
                                                 .on_click(cx.listener(move |this, _, _, cx| {
                                                     this.save_menu = false;
-                                                    let dir = dirs::download_dir().or_else(dirs::home_dir).unwrap_or_else(|| ".".into());
-                                                    let path = dir.join(format!("fern-summary-{}.svg", Local::now().format("%Y-%m-%d")));
-                                                    let svg = crate::print::report_svg(&heading, &groups);
-                                                    this.saved = Some(match std::fs::write(&path, svg) {
-                                                        Ok(()) => i18n::t(cx).exported_to.replace("{path}", &path.display().to_string()),
-                                                        Err(err) => err.to_string(),
+                                                    let name = format!("fern-summary-{}.svg", Local::now().format("%Y-%m-%d"));
+                                                    let svg = crate::print::report_svg(&heading, &groups).into_bytes();
+                                                    crate::export::save_as(name, svg, cx, |this, result, cx| {
+                                                        if let Some(message) = crate::export::outcome(result, i18n::t(cx)) {
+                                                            this.saved = Some(message);
+                                                        }
+                                                        cx.notify();
                                                     });
                                                     cx.notify();
                                                 }))

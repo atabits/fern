@@ -1178,17 +1178,17 @@ impl HabitView {
     /// Writes habits and check-ins as CSV to the downloads folder.
     fn export(&mut self, cx: &mut Context<Self>) {
         self.header_more = None;
-        let strings = i18n::t(cx);
         let data: Vec<(Habit, Vec<Checkin>)> = self
             .habits
             .iter()
             .map(|h| (h.clone(), self.records.get(&h.id).cloned().unwrap_or_default()))
             .collect();
-        let dir = dirs::download_dir().or_else(dirs::home_dir).unwrap_or_else(|| ".".into());
-        let path = dir.join(format!("fern-habits-{}.csv", Local::now().format("%Y-%m-%d")));
-        self.export_message = Some(match std::fs::write(&path, habit::export_csv(&data)) {
-            Ok(()) => strings.exported_to.replace("{path}", &path.display().to_string()),
-            Err(err) => format!("{err}"),
+        let name = format!("fern-habits-{}.csv", Local::now().format("%Y-%m-%d"));
+        crate::export::save_as(name, habit::export_csv(&data).into_bytes(), cx, |this, result, cx| {
+            if let Some(message) = crate::export::outcome(result, i18n::t(cx)) {
+                this.export_message = Some(message);
+            }
+            cx.notify();
         });
         cx.notify();
     }

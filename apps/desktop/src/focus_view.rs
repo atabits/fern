@@ -366,12 +366,13 @@ impl FocusView {
     }
 
     fn export(&mut self, cx: &mut Context<Self>) {
-        let strings = i18n::t(cx);
-        let dir = dirs::download_dir().or_else(dirs::home_dir).unwrap_or_else(|| ".".into());
-        let path = dir.join(format!("fern-focus-{}.csv", Local::now().format("%Y-%m-%d")));
-        self.message = Some(match std::fs::write(&path, fern_core::focus::export_csv(&self.sessions)) {
-            Ok(()) => strings.exported_to.replace("{path}", &path.display().to_string()),
-            Err(err) => err.to_string(),
+        let name = format!("fern-focus-{}.csv", Local::now().format("%Y-%m-%d"));
+        let csv = fern_core::focus::export_csv(&self.sessions).into_bytes();
+        crate::export::save_as(name, csv, cx, |this, result, cx| {
+            if let Some(message) = crate::export::outcome(result, i18n::t(cx)) {
+                this.message = Some(message);
+            }
+            cx.notify();
         });
         self.set_record_menu(None, cx);
     }

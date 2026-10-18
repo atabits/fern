@@ -5,6 +5,7 @@ mod calendar;
 mod calendar_view;
 mod countdown_view;
 mod drag;
+mod export;
 mod due_picker;
 mod focus_timer;
 mod focus_view;

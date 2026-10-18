@@ -3338,6 +3338,11 @@ mod tests {
         assert_eq!(names(home.id), ["Doing"]);
         let moved = store.task(task.id)?.unwrap();
         assert_eq!((moved.list_id, moved.section_id), (Some(home.id), Some(doing.id)));
+        // On to the Inbox, tasks and all.
+        store.move_list_section(doing.id, None)?;
+        assert_eq!(store.list_sections(None)?.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["Doing"]);
+        let moved = store.task(task.id)?.unwrap();
+        assert_eq!((moved.list_id, moved.section_id), (None, Some(doing.id)));
         Ok(())
     }
 

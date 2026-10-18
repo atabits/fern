@@ -3004,18 +3004,18 @@ impl TodoView {
         // The section's place among the list's sections, for Add Section to Left / Right.
         let index = self.sections.iter().position(|s| s.id == section).unwrap_or(column);
         let side = self.column_menu.is_some_and(|(_, side)| side);
-        let lists: Vec<ListItem> = self
-            .active_lists()
-            .into_iter()
-            .filter(|l| Some(l.id) != match self.view { View::List(id) => Some(id), _ => None })
-            .map(|list| {
-                let to = list.id;
-                ListItem::new(SharedString::from(format!("section-move-{to}")))
-                    .start_slot(Icon::new(IconName::List).color(Color::Muted))
-                    .child(Label::new(list.name.clone()))
+        // Move to: the Inbox and the lists, but not where the section already is.
+        let owner = self.section_owner();
+        let lists: Vec<ListItem> = std::iter::once((None, SharedString::new_static(strings.inbox), IconName::Inbox))
+            .chain(self.active_lists().into_iter().map(|l| (Some(l.id), SharedString::from(l.name), IconName::List)))
+            .filter(|(to, _, _)| owner != Some(*to))
+            .map(|(to, name, icon)| {
+                ListItem::new(SharedString::from(format!("section-move-{to:?}")))
+                    .start_slot(Icon::new(icon).color(Color::Muted))
+                    .child(Label::new(name))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.column_menu = None;
-                        let result = this.store.move_list_section(section, Some(to));
+                        let result = this.store.move_list_section(section, to);
                         this.check(result);
                         this.reload(cx);
                     }))

@@ -7,6 +7,7 @@ use ui::{Placement, PopoverAttachment, popover};
 
 use crate::actions::{NewTask, Search, ShowInbox, ShowNext7Days, ShowToday, ShowTomorrow, ToggleSidebar};
 use crate::calendar_view::{self, CalendarView};
+use crate::countdown_view::CountdownView;
 use crate::i18n::{self, CurrentLocale, Locale};
 use crate::matrix_view::{self, MatrixView};
 use crate::search_modal::{SearchEvent, SearchModal};
@@ -19,6 +20,7 @@ pub struct AppView {
     todo: gpui::Entity<TodoView>,
     calendar: gpui::Entity<CalendarView>,
     matrix: gpui::Entity<MatrixView>,
+    countdown: gpui::Entity<CountdownView>,
     search: Option<gpui::Entity<SearchModal>>,
     account_menu_open: bool,
 }
@@ -47,8 +49,17 @@ impl AppView {
             });
         })
         .detach();
-        let mut this =
-            Self { store, section: Section::Tasks, todo, calendar, matrix, search: None, account_menu_open: false };
+        let countdown = cx.new(|cx| CountdownView::new(store.clone(), cx));
+        let mut this = Self {
+            store,
+            section: Section::Tasks,
+            todo,
+            calendar,
+            matrix,
+            countdown,
+            search: None,
+            account_menu_open: false,
+        };
         #[cfg(debug_assertions)]
         if let Ok(state) = std::env::var("FERN_DEV_STATE") {
             if state.contains("section=calendar") {
@@ -59,6 +70,19 @@ impl AppView {
             }
             if state.contains("section=matrix") {
                 this.select(Section::Matrix, window, cx);
+            }
+            // `countdown=<name>><YYYY-MM-DD>><countdown|anniversary|holiday>`, repeatable.
+            for spec in state.split(';').filter_map(|part| part.strip_prefix("countdown=")) {
+                let parts: Vec<&str> = spec.split('>').collect();
+                if let [name, date, kind] = parts[..]
+                    && let Ok(date) = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
+                {
+                    let kind = fern_core::CountdownKind::parse(kind);
+                    this.countdown.update(cx, |view, cx| view.dev_add(name, date, kind, cx));
+                }
+            }
+            if state.contains("section=countdown") {
+                this.select(Section::Countdown, window, cx);
             }
             if let Some(query) = state.split(';').find_map(|part| part.strip_prefix("search-popover=")) {
                 this.open_search(window, cx);
@@ -82,6 +106,9 @@ impl AppView {
         }
         if section == Section::Matrix {
             self.matrix.update(cx, |matrix, cx| matrix.reload(cx));
+        }
+        if section == Section::Countdown {
+            self.countdown.update(cx, |countdown, cx| countdown.reload(cx));
         }
         self.section = section;
         cx.notify();
@@ -212,6 +239,7 @@ impl Render for AppView {
                 Section::Tasks | Section::Search => div().flex_1().h_full().child(self.todo.clone()),
                 Section::Calendar => div().flex_1().h_full().child(self.calendar.clone()),
                 Section::Matrix => div().flex_1().h_full().child(self.matrix.clone()),
+                Section::Countdown => div().flex_1().h_full().child(self.countdown.clone()),
                 other => v_flex()
                     .flex_1()
                     .h_full()

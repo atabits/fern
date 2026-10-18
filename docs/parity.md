@@ -43,7 +43,7 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 
 | Feature | Status | Notes |
 |---|---|---|
-| Narrow sections sidebar | 🟡 | Tasks, Calendar, Search and Matrix work; outline icons where TickTick uses filled ones; no notification badge |
+| Narrow sections sidebar | 🟡 | Tasks, Calendar, Search, Matrix and Countdown work; outline icons where TickTick uses filled ones; no notification badge |
 | Account menu with language switch | ✅ | English (default) and Russian |
 | Lists column: Inbox / All / Today / Tomorrow / Next 7 Days | ✅ | counters; a new task gets the due date or tag of the current view |
 | Lists column: user lists | ✅ | create inline; rename, color and delete from the "…" menu; no drag and drop |
@@ -68,7 +68,8 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 | Search | 🟡 | popover matched to the original: Task/Tag/List filters, results grouped with highlighted matches, list name, note excerpts, "View more" opens the full list; no "Event" filter (no calendar events) |
 | Calendar | 🟡 | month and week views matched to the original (week: all-day strip, time axis with folded night hours, timed tasks placed by time); view menu with Week/Month; tasks can be dragged between days; no Day, Year, Agenda or multi-day views |
 | Eisenhower Matrix | 🟡 | matched to the original: quadrants by priority (TickTick's default rules), grouped by list, drag a task to another quadrant to change its priority; no custom quadrant rules |
-| Pomodoro, Habits, Countdown | ⬜ | |
+| Countdown | 🟡 | matched to the original: filter tabs, card grid with Y/M/D or days-only (click the numbers), until/since colors, add with name, type and date, delete on hover; no background images, editing or repeating dates |
+| Pomodoro, Habits | ⬜ | |
 | Sync between devices | ⬜ | |
 
 ## How changes are checked
@@ -87,9 +88,9 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 
 ## Next
 
-1. Countdown section.
-2. Habits section.
-3. Pomodoro section.
+1. Habits section.
+2. Pomodoro section.
+3. "Won't Do" status.
 3. "Won't Do" status.
 4. Custom time and "every N" in the due-date picker.
 5. Eisenhower matrix view.

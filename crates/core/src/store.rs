@@ -7,6 +7,7 @@ use chrono::{Duration, NaiveDate, NaiveTime};
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use uuid::Uuid;
 
+use crate::countdown::{Countdown, CountdownKind};
 use crate::model::{ChecklistItem, Id, Kind, List, Priority, Tag, Task, View, ViewCounts};
 use crate::recurrence::Recurrence;
 
@@ -77,6 +78,15 @@ const MIGRATIONS: &[&str] = &[
     "
     ALTER TABLE tasks ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0;
     UPDATE tasks SET sort_order = -created_at;
+    ",
+    "
+    CREATE TABLE countdowns (
+        id         TEXT PRIMARY KEY,
+        name       TEXT NOT NULL,
+        date       TEXT NOT NULL,
+        kind       TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+    );
     ",
 ];
 
@@ -557,6 +567,48 @@ impl Store {
         Ok(progress)
     }
 
+    /// Countdowns in creation order.
+    pub fn countdowns(&self) -> Result<Vec<Countdown>> {
+        let mut stmt =
+            self.conn.prepare("SELECT id, name, date, kind FROM countdowns ORDER BY created_at, rowid")?;
+        let rows = stmt
+            .query_map([], |row| {
+                let date: String = row.get(2)?;
+                Ok(Countdown {
+                    id: parse_uuid(&row.get::<_, String>(0)?, 0)?,
+                    name: row.get(1)?,
+                    date: NaiveDate::parse_from_str(&date, DATE_FORMAT).map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(e))
+                    })?,
+                    kind: CountdownKind::parse(&row.get::<_, String>(3)?),
+                })
+            })?
+            .collect::<Result<_, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn add_countdown(&self, name: &str, date: NaiveDate, kind: CountdownKind) -> Result<Countdown> {
+        let name = name.trim();
+        anyhow::ensure!(!name.is_empty(), "a countdown needs a name");
+        let countdown = Countdown { id: Uuid::now_v7(), name: name.to_owned(), date, kind };
+        self.conn.execute(
+            "INSERT INTO countdowns (id, name, date, kind, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                countdown.id.to_string(),
+                countdown.name,
+                date.format(DATE_FORMAT).to_string(),
+                kind.as_str(),
+                now_ms()
+            ],
+        )?;
+        Ok(countdown)
+    }
+
+    pub fn delete_countdown(&self, id: Id) -> Result<()> {
+        self.conn.execute("DELETE FROM countdowns WHERE id = ?1", [id.to_string()])?;
+        Ok(())
+    }
+
     /// A user setting such as the UI language; `None` when never set.
     pub fn setting(&self, key: &str) -> Result<Option<String>> {
         Ok(self
@@ -1018,6 +1070,20 @@ mod tests {
 
         let tasks = store.tasks_due_between(d(2026, 10, 1), d(2026, 10, 31))?;
         assert_eq!(titles(&tasks), ["all day", "morning", "evening"]);
+        Ok(())
+    }
+
+    #[test]
+    fn countdowns_crud() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let trip = store.add_countdown(" Trip ", d(2027, 1, 1), CountdownKind::Countdown)?;
+        store.add_countdown("Moved in", d(2025, 3, 1), CountdownKind::Anniversary)?;
+        assert!(store.add_countdown(" ", d(2027, 1, 1), CountdownKind::Holiday).is_err());
+        let all = store.countdowns()?;
+        assert_eq!(all.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["Trip", "Moved in"]);
+        assert_eq!(all[1].kind, CountdownKind::Anniversary);
+        store.delete_countdown(trip.id)?;
+        assert_eq!(store.countdowns()?.len(), 1);
         Ok(())
     }
 

@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use chrono::{Datelike, Local, NaiveDate};
-use fern_core::{Habit, Id, Store, habit};
+use fern_core::{Checkin, Goal, Habit, Id, Store, habit};
 use gpui::{Entity, Focusable as _, FontWeight};
 use ui::prelude::*;
 use ui::{Placement, PopoverAttachment, popover};
@@ -18,10 +18,23 @@ use crate::text_input::{Cancelled, Mode, Submitted, TextInput};
 const CARD_WIDTH: f32 = 365.;
 const CARD_HEIGHT: f32 = 107.;
 
+/// The "Edit Habit" popover: name and daily goal.
+struct HabitEdit {
+    name: Entity<TextInput>,
+    unit: Entity<TextInput>,
+    /// `None`: "Achieve it all".
+    amount: Option<u32>,
+}
+
 pub struct HabitView {
     store: Rc<Store>,
     habits: Vec<Habit>,
     checkins: HashMap<Id, HashSet<NaiveDate>>,
+    /// Check-ins with amounts and notes, for the details panel.
+    records: HashMap<Id, Vec<Checkin>>,
+    /// The note field under the habit log, for today's check-in.
+    note_input: Entity<TextInput>,
+    editing: Option<HabitEdit>,
     new_habit: Option<Entity<TextInput>>,
     /// The habit shown in the details panel.
     selected: Option<Id>,
@@ -32,10 +45,27 @@ pub struct HabitView {
 
 impl HabitView {
     pub fn new(store: Rc<Store>, cx: &mut Context<Self>) -> Self {
+        let strings = i18n::t(cx);
+        let note_input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.habit_note_placeholder, cx));
+        cx.subscribe(&note_input, |this, input, _: &Submitted, cx| {
+            let note = input.read(cx).text().to_owned();
+            if let Some(habit) = this.selected {
+                let today = Local::now().date_naive();
+                if let Err(err) = this.store.set_checkin_note(habit, today, &note) {
+                    eprintln!("failed to save the note: {err:#}");
+                }
+                input.update(cx, |input, cx| input.set_text("", cx));
+                this.reload(cx);
+            }
+        })
+        .detach();
         let mut this = Self {
             store,
             habits: Vec::new(),
             checkins: HashMap::new(),
+            records: HashMap::new(),
+            note_input,
+            editing: None,
             new_habit: None,
             selected: None,
             month: calendar::month_start(Local::now().date_naive()),
@@ -47,11 +77,10 @@ impl HabitView {
 
     pub fn reload(&mut self, cx: &mut Context<Self>) {
         self.habits = self.store.habits().unwrap_or_default();
-        self.checkins = self
-            .habits
-            .iter()
-            .map(|h| (h.id, self.store.checkins(h.id).unwrap_or_default()))
-            .collect();
+        self.records =
+            self.habits.iter().map(|h| (h.id, self.store.checkin_records(h.id).unwrap_or_default())).collect();
+        self.checkins =
+            self.records.iter().map(|(id, records)| (*id, records.iter().map(|c| c.date).collect())).collect();
         if self.selected.is_some_and(|id| !self.habits.iter().any(|h| h.id == id)) {
             self.selected = None;
         }
@@ -67,9 +96,149 @@ impl HabitView {
         cx.notify();
     }
 
+    fn start_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(habit) = self.selected.and_then(|id| self.habits.iter().find(|h| h.id == id)).cloned() else {
+            return;
+        };
+        let strings = i18n::t(cx);
+        let name = cx.new(|cx| {
+            let mut input = TextInput::new(Mode::SingleLine, strings.habit_name, cx);
+            input.set_text(habit.name.clone(), cx);
+            input
+        });
+        let unit = cx.new(|cx| {
+            let mut input = TextInput::new(Mode::SingleLine, strings.habit_unit_placeholder, cx);
+            input.set_text(habit.goal.as_ref().map(|g| g.unit.clone()).unwrap_or_default(), cx);
+            input
+        });
+        window.focus(&name.focus_handle(cx), cx);
+        self.editing = Some(HabitEdit { name, unit, amount: habit.goal.as_ref().map(|g| g.amount) });
+        self.detail_menu_open = false;
+        cx.notify();
+    }
+
+    fn save_edit(&mut self, cx: &mut Context<Self>) {
+        let (Some(edit), Some(id)) = (self.editing.take(), self.selected) else { return };
+        let name = edit.name.read(cx).text().to_owned();
+        let goal = edit.amount.map(|amount| Goal { amount, unit: edit.unit.read(cx).text().to_owned() });
+        if let Err(err) = self.store.update_habit(id, &name, goal.as_ref()) {
+            eprintln!("failed to update the habit: {err:#}");
+        }
+        self.reload(cx);
+    }
+
+    fn update_edit(&mut self, cx: &mut Context<Self>, change: impl FnOnce(&mut HabitEdit)) {
+        if let Some(edit) = self.editing.as_mut() {
+            change(edit);
+        }
+        cx.notify();
+    }
+
+    fn render_edit(&self, edit: &HabitEdit, cx: &mut Context<Self>) -> AnyElement {
+        let strings = i18n::t(cx);
+        let theme = cx.theme().clone();
+        let option = |id: &'static str, label: &'static str, on: bool| {
+            h_flex()
+                .id(id)
+                .h(px(26.))
+                .gap_2()
+                .cursor_pointer()
+                .child(Checkbox::new(SharedString::from(format!("{id}-box"))).toggle_state(on))
+                .child(Label::new(label).size(LabelSize::Small))
+        };
+        let field = |child: AnyElement| {
+            h_flex().h(px(30.)).px_2().rounded(px(6.)).bg(theme.colors().background).child(child)
+        };
+        let amount = edit.amount;
+        let button = |id: &'static str, label: &'static str, primary: bool| {
+            div()
+                .id(id)
+                .flex_1()
+                .h(px(28.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(6.))
+                .cursor_pointer()
+                .when(primary, |el| el.bg(theme.colors().accent))
+                .when(!primary, |el| el.border_1().border_color(theme.colors().border))
+                .child(Label::new(label).size(LabelSize::Small))
+        };
+        popover(cx)
+            .w(px(300.))
+            .p_3()
+            .gap_2()
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.editing = None;
+                cx.notify();
+            }))
+            .child(Label::new(strings.edit_habit).weight(FontWeight::SEMIBOLD))
+            .child(field(edit.name.clone().into_any_element()))
+            .child(Label::new(strings.habit_goal).size(LabelSize::Small).color(Color::Muted))
+            .child(
+                option("goal-all", strings.habit_goal_all, amount.is_none())
+                    .on_click(cx.listener(|this, _, _, cx| this.update_edit(cx, |e| e.amount = None))),
+            )
+            .child(
+                option("goal-amount", strings.habit_goal_amount, amount.is_some())
+                    .on_click(cx.listener(|this, _, _, cx| this.update_edit(cx, |e| e.amount = e.amount.or(Some(1))))),
+            )
+            .when_some(amount, |el, amount| {
+                el.child(
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            IconButton::new("goal-fewer", IconName::Minus).on_click(cx.listener(|this, _, _, cx| {
+                                this.update_edit(cx, |e| e.amount = e.amount.map(|a| a.saturating_sub(1).max(1)))
+                            })),
+                        )
+                        .child(div().min_w(px(24.)).flex().justify_center().child(Label::new(amount.to_string())))
+                        .child(
+                            IconButton::new("goal-more", IconName::Plus).on_click(cx.listener(|this, _, _, cx| {
+                                this.update_edit(cx, |e| e.amount = e.amount.map(|a| (a + 1).min(999)))
+                            })),
+                        )
+                        .child(div().flex_1().child(field(edit.unit.clone().into_any_element())))
+                        .child(Label::new(strings.habit_per_day).size(LabelSize::Small).color(Color::Muted)),
+                )
+            })
+            .child(
+                h_flex()
+                    .gap_2()
+                    .pt_1()
+                    .child(button("edit-cancel", strings.cancel, false).on_click(cx.listener(|this, _, _, cx| {
+                        this.editing = None;
+                        cx.notify();
+                    })))
+                    .child(button("edit-save", strings.save, true).on_click(cx.listener(|this, _, _, cx| this.save_edit(cx)))),
+            )
+            .into_any_element()
+    }
+
     fn shift_month(&mut self, delta: i32, cx: &mut Context<Self>) {
         self.month = calendar::add_months(self.month, delta);
         cx.notify();
+    }
+
+    /// `goal=<amount> <unit>` and `note=<text>` for the selected habit, `edit` opens the editor.
+    #[cfg(debug_assertions)]
+    pub fn dev_apply(&mut self, command: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.selected else { return };
+        let name = self.habits.iter().find(|h| h.id == id).map(|h| h.name.clone()).unwrap_or_default();
+        if let Some(goal) = command.strip_prefix("goal=") {
+            let (amount, unit) = goal.split_once(' ').unwrap_or((goal, ""));
+            let goal = amount.parse().ok().map(|amount| Goal { amount, unit: unit.to_owned() });
+            self.store.update_habit(id, &name, goal.as_ref()).ok();
+        } else if let Some(note) = command.strip_prefix("note=") {
+            let (days_ago, note) = note.split_once('>').unwrap_or(("0", note));
+            let date = Local::now().date_naive() - chrono::Duration::days(days_ago.parse().unwrap_or(0));
+            self.store.set_checkin_note(id, date, note).ok();
+        } else if command == "edit" {
+            self.reload(cx);
+            self.start_edit(window, cx);
+            return;
+        }
+        self.reload(cx);
     }
 
     #[cfg(debug_assertions)]
@@ -231,8 +400,20 @@ impl HabitView {
         let stats = habit::stats(checked, today);
         let month = habit::month_stats(checked, self.month, today);
         let status = theme.status().clone();
+        let no_records = Vec::new();
+        let records = self.records.get(&id).unwrap_or(&no_records);
+        let (monthly_done, total_done) = habit::completion(records, self.month);
+        let in_month = |date: NaiveDate| date.year() == self.month.year() && date.month() == self.month.month();
+        let notes: Vec<(NaiveDate, String)> = records
+            .iter()
+            .rev()
+            .filter(|c| in_month(c.date))
+            .filter_map(|c| c.note.clone().map(|note| (c.date, note)))
+            .collect();
+        let checked_today = checked.contains(&today);
+        let goal_unit: SharedString = habit.goal.as_ref().map_or(SharedString::default(), |g| g.unit.clone().into());
 
-        let card = |icon: IconName, color: Hsla, label: &'static str, value: String, unit: &'static str| {
+        let card = |icon: IconName, color: Hsla, label: &'static str, value: String, unit: SharedString| {
             v_flex()
                 .flex_1()
                 .p_3()
@@ -294,8 +475,11 @@ impl HabitView {
 
         let initial: String = habit.name.chars().next().map(|c| c.to_uppercase().collect()).unwrap_or_default();
         v_flex()
+            .id("habit-detail")
             .size_full()
+            .overflow_y_scroll()
             .px_4()
+            .pb_4()
             .gap_2()
             .child(
                 h_flex()
@@ -338,27 +522,44 @@ impl HabitView {
                                             cx.notify();
                                         }))
                                         .child(
+                                            ListItem::new("habit-edit")
+                                                .start_slot(Icon::new(IconName::Pencil).color(Color::Muted))
+                                                .child(Label::new(strings.edit))
+                                                .on_click(cx.listener(|this, _, window, cx| this.start_edit(window, cx))),
+                                        )
+                                        .child(
                                             ListItem::new("habit-delete")
                                                 .start_slot(Icon::new(IconName::Trash).color(Color::Muted))
                                                 .child(Label::new(strings.delete))
                                                 .on_click(cx.listener(move |this, _, _, cx| this.delete(id, cx))),
                                         ),
                                 ))
+                            })
+                            .when_some(self.editing.as_ref(), |el, edit| {
+                                el.child(PopoverAttachment::new(Placement::BelowRight, self.render_edit(edit, cx)))
                             }),
                     ),
             )
             .child(
                 h_flex()
                     .gap_2()
-                    .child(card(IconName::CircleCheck, status.success, strings.habit_monthly_checkins, month.days.to_string(), strings.habit_unit_days))
-                    .child(card(IconName::Zap, theme.colors().accent, strings.habit_total_checkins, stats.total_days.to_string(), strings.habit_unit_days)),
+                    .child(card(IconName::CircleCheck, status.success, strings.habit_monthly_checkins, month.days.to_string(), strings.habit_unit_days.into()))
+                    .child(card(IconName::Zap, theme.colors().accent, strings.habit_total_checkins, stats.total_days.to_string(), strings.habit_unit_days.into())),
             )
             .child(
                 h_flex()
                     .gap_2()
-                    .child(card(IconName::Percent, status.warning, strings.habit_monthly_rate, month.rate.to_string(), "%"))
-                    .child(card(IconName::Flame, status.error, strings.habit_current_streak, stats.streak.to_string(), strings.habit_unit_days)),
+                    .child(card(IconName::Percent, status.warning, strings.habit_monthly_rate, month.rate.to_string(), "%".into()))
+                    .child(card(IconName::Flame, status.error, strings.habit_current_streak, stats.streak.to_string(), strings.habit_unit_days.into())),
             )
+            .when(habit.goal.is_some(), |el| {
+                el.child(
+                    h_flex()
+                        .gap_2()
+                        .child(card(IconName::ChartNoAxesColumn, theme.colors().accent, strings.habit_monthly_completion, monthly_done.to_string(), goal_unit.clone()))
+                        .child(card(IconName::ChartNoAxesColumn, theme.colors().accent, strings.habit_total_completion, total_done.to_string(), goal_unit.clone())),
+                )
+            })
             .child(
                 v_flex()
                     .p_3()
@@ -386,6 +587,40 @@ impl HabitView {
                     )
                     .child(weekdays)
                     .children(grid),
+            )
+            .child(
+                v_flex()
+                    .p_3()
+                    .gap_2()
+                    .rounded(px(8.))
+                    .bg(theme.colors().surface_background)
+                    .child(
+                        Label::new(format!("{}{}", strings.habit_log_on, strings.months[self.month.month0() as usize]))
+                            .weight(FontWeight::SEMIBOLD),
+                    )
+                    .when(notes.is_empty(), |el| {
+                        el.child(Label::new(strings.habit_log_empty).size(LabelSize::Small).color(Color::Muted))
+                    })
+                    .children(notes.into_iter().map(|(date, note)| {
+                        v_flex()
+                            .child(
+                                Label::new(crate::task_rows::day_header(date, today, strings))
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                            )
+                            .child(Label::new(note).size(LabelSize::Small))
+                    }))
+                    .when(checked_today && in_month(today), |el| {
+                        el.child(
+                            h_flex()
+                                .h(px(30.))
+                                .px_2()
+                                .rounded(px(6.))
+                                .bg(theme.colors().background)
+                                .text_size(px(13.))
+                                .child(self.note_input.clone()),
+                        )
+                    }),
             )
             .into_any_element()
     }

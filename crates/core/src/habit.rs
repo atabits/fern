@@ -10,6 +10,31 @@ use crate::model::Id;
 pub struct Habit {
     pub id: Id,
     pub name: String,
+    /// "Reach a certain amount" per day; `None` is the original's "Achieve it all".
+    pub goal: Option<Goal>,
+}
+
+/// A daily amount to reach, e.g. 8 glasses.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Goal {
+    pub amount: u32,
+    pub unit: String,
+}
+
+/// One day's check-in: the amount done and an optional note ("check-in thoughts").
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Checkin {
+    pub date: NaiveDate,
+    pub value: u32,
+    pub note: Option<String>,
+}
+
+/// The amount done in the month containing `month`, and in total, for habits with a goal.
+pub fn completion(checkins: &[Checkin], month: NaiveDate) -> (u32, u32) {
+    let in_month = |date: &NaiveDate| date.year() == month.year() && date.month() == month.month();
+    let monthly = checkins.iter().filter(|c| in_month(&c.date)).map(|c| c.value).sum();
+    let total = checkins.iter().map(|c| c.value).sum();
+    (monthly, total)
 }
 
 /// Check-in statistics shown on a habit card.
@@ -80,6 +105,13 @@ mod tests {
         assert_eq!(stats(&checked, today), HabitStats { total_days: 3, streak: 1 });
         let checked: HashSet<_> = [d(10), d(15)].into();
         assert_eq!(stats(&checked, today).streak, 0);
+    }
+
+    #[test]
+    fn completion_sums_amounts() {
+        let c = |date, value| Checkin { date, value, note: None };
+        let checkins = [c(d(1), 2), c(d(9), 3), c(NaiveDate::from_ymd_opt(2026, 9, 30).unwrap(), 2)];
+        assert_eq!(completion(&checkins, d(18)), (5, 7));
     }
 
     #[test]

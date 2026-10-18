@@ -17,6 +17,7 @@ pub enum IconName {
     CalendarHeart,
     CalendarPlus,
     CalendarRange,
+    ChartNoAxesColumn,
     ChevronDown,
     ChevronLeft,
     ChevronRight,

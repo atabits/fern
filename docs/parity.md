@@ -70,7 +70,7 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 | Calendar | 🟡 | month and week views matched to the original (week: all-day strip, time axis with folded night hours, timed tasks placed by time); view menu with Week/Month; tasks can be dragged between days; no Day, Year, Agenda or multi-day views |
 | Eisenhower Matrix | 🟡 | matched to the original: quadrants by priority (TickTick's default rules), grouped by list, drag a task to another quadrant to change its priority; no custom quadrant rules |
 | Countdown | 🟡 | matched to the original: filter tabs, card grid with Y/M/D or days-only (click the numbers), until/since colors, add with name, type and date, delete on hover; no background images, editing or repeating dates |
-| Habits | 🟡 | matched to the original: week strip with daily progress rings, cards with total days, streak and this week's check-ins (click a dot to check in), add; clicking a card opens the details panel: monthly check-ins, total check-ins, monthly rate and current streak cards, a month calendar to check in on past days, delete from its "…" menu. No icons, goals (completion cards, daily goals chart), check-in notes (habit log) or reminders |
+| Habits | 🟡 | matched to the original: week strip with daily progress rings, cards with total days, streak and this week's check-ins (click a dot to check in), add; clicking a card opens the details panel: monthly check-ins, total check-ins, monthly rate and current streak cards, a month calendar to check in on past days, "Edit" and delete from its "…" menu. "Edit Habit" (a popover) sets the name and the goal: "Achieve it all" or "Reach a certain amount" per day with a unit; with a goal the panel adds monthly and total completion cards. The habit log lists the month's check-in notes, with a field for today's note once checked in. No icons, frequency other than daily, partial amounts per check-in, daily goals chart, sections, archive or reminders |
 | Focus (Pomodoro) | 🟡 | matched to the original: today's tasks to focus on, a 25-minute timer bar with pause and stop, Overview (today/total pomos and focus time), Focus Record grouped by day; no Active/Archived focus items, white noise, custom lengths or manual records |
 | Sync between devices | ⬜ | |
 
@@ -90,7 +90,7 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 
 ## Next
 
-1. Habit goals and check-in notes (habit log).
-2. Reminders (the due-date picker's Reminder row) with desktop notifications.
-3. Filled sidebar icons and the notification badge (needs reminders to have something to count).
-4. "Other Date" range in the closed views' date filter.
+1. Reminders (the due-date picker's Reminder row) with desktop notifications.
+2. Filled sidebar icons and the notification badge (needs reminders to have something to count).
+3. "Other Date" range in the closed views' date filter.
+4. Habit check-ins with partial amounts and the daily goals chart.

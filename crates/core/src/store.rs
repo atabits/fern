@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use crate::countdown::{Countdown, CountdownKind};
 use crate::focus::FocusSession;
-use crate::habit::Habit;
+use crate::habit::{Checkin, Goal, Habit};
 use crate::model::{ChecklistItem, Id, Kind, List, Priority, Tag, Task, View, ViewCounts};
 use crate::recurrence::Recurrence;
 
@@ -113,6 +113,12 @@ const MIGRATIONS: &[&str] = &[
     ",
     "
     ALTER TABLE tasks ADD COLUMN wont_do_at INTEGER;
+    ",
+    "
+    ALTER TABLE habits ADD COLUMN goal_amount INTEGER;
+    ALTER TABLE habits ADD COLUMN goal_unit TEXT;
+    ALTER TABLE habit_checkins ADD COLUMN value INTEGER NOT NULL DEFAULT 1;
+    ALTER TABLE habit_checkins ADD COLUMN note TEXT;
     ",
 ];
 
@@ -662,9 +668,13 @@ impl Store {
     }
 
     pub fn habits(&self) -> Result<Vec<Habit>> {
-        let mut stmt = self.conn.prepare("SELECT id, name FROM habits ORDER BY created_at, rowid")?;
+        let mut stmt =
+            self.conn.prepare("SELECT id, name, goal_amount, goal_unit FROM habits ORDER BY created_at, rowid")?;
         let habits = stmt
-            .query_map([], |row| Ok(Habit { id: parse_uuid(&row.get::<_, String>(0)?, 0)?, name: row.get(1)? }))?
+            .query_map([], |row| {
+                let goal = row.get::<_, Option<u32>>(2)?.map(|amount| Goal { amount, unit: row.get::<_, Option<String>>(3).ok().flatten().unwrap_or_default() });
+                Ok(Habit { id: parse_uuid(&row.get::<_, String>(0)?, 0)?, name: row.get(1)?, goal })
+            })?
             .collect::<Result<_, _>>()?;
         Ok(habits)
     }
@@ -672,7 +682,7 @@ impl Store {
     pub fn add_habit(&self, name: &str) -> Result<Habit> {
         let name = name.trim();
         anyhow::ensure!(!name.is_empty(), "a habit needs a name");
-        let habit = Habit { id: Uuid::now_v7(), name: name.to_owned() };
+        let habit = Habit { id: Uuid::now_v7(), name: name.to_owned(), goal: None };
         self.conn.execute(
             "INSERT INTO habits (id, name, created_at) VALUES (?1, ?2, ?3)",
             params![habit.id.to_string(), habit.name, now_ms()],
@@ -685,7 +695,22 @@ impl Store {
         Ok(())
     }
 
-    /// Checks a habit in for `date`, or removes the check-in when it is already there.
+    /// Renames a habit and sets its daily goal (`None`: "Achieve it all").
+    pub fn update_habit(&self, id: Id, name: &str, goal: Option<&Goal>) -> Result<()> {
+        let name = name.trim();
+        anyhow::ensure!(!name.is_empty(), "a habit needs a name");
+        if let Some(goal) = goal {
+            anyhow::ensure!(goal.amount > 0, "a goal needs an amount");
+        }
+        self.conn.execute(
+            "UPDATE habits SET name = ?2, goal_amount = ?3, goal_unit = ?4 WHERE id = ?1",
+            params![id.to_string(), name, goal.map(|g| g.amount), goal.map(|g| g.unit.trim())],
+        )?;
+        Ok(())
+    }
+
+    /// Checks a habit in for `date` (reaching its goal at once), or removes the check-in when it
+    /// is already there.
     pub fn toggle_checkin(&self, habit: Id, date: NaiveDate) -> Result<bool> {
         let date = date.format(DATE_FORMAT).to_string();
         let removed = self.conn.execute(
@@ -694,21 +719,44 @@ impl Store {
         )?;
         if removed == 0 {
             self.conn.execute(
-                "INSERT INTO habit_checkins (habit_id, date) VALUES (?1, ?2)",
+                "INSERT INTO habit_checkins (habit_id, date, value)
+                 VALUES (?1, ?2, (SELECT COALESCE(goal_amount, 1) FROM habits WHERE id = ?1))",
                 params![habit.to_string(), date],
             )?;
         }
         Ok(removed == 0)
     }
 
+    /// Writes the note of an existing check-in; an empty note removes it.
+    pub fn set_checkin_note(&self, habit: Id, date: NaiveDate, note: &str) -> Result<()> {
+        let note = note.trim();
+        let updated = self.conn.execute(
+            "UPDATE habit_checkins SET note = ?3 WHERE habit_id = ?1 AND date = ?2",
+            params![habit.to_string(), date.format(DATE_FORMAT).to_string(), (!note.is_empty()).then_some(note)],
+        )?;
+        anyhow::ensure!(updated == 1, "a note needs a check-in on that day");
+        Ok(())
+    }
+
     /// All check-in dates of a habit.
     pub fn checkins(&self, habit: Id) -> Result<std::collections::HashSet<NaiveDate>> {
-        let mut stmt = self.conn.prepare("SELECT date FROM habit_checkins WHERE habit_id = ?1")?;
-        let dates = stmt
-            .query_map([habit.to_string()], |row| row.get::<_, String>(0))?
-            .filter_map(|r| r.ok().and_then(|d| NaiveDate::parse_from_str(&d, DATE_FORMAT).ok()))
+        Ok(self.checkin_records(habit)?.into_iter().map(|c| c.date).collect())
+    }
+
+    /// A habit's check-ins with their amounts and notes, oldest first.
+    pub fn checkin_records(&self, habit: Id) -> Result<Vec<Checkin>> {
+        let mut stmt =
+            self.conn.prepare("SELECT date, value, note FROM habit_checkins WHERE habit_id = ?1 ORDER BY date")?;
+        let records = stmt
+            .query_map([habit.to_string()], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?, row.get::<_, Option<String>>(2)?))
+            })?
+            .filter_map(|r| {
+                let (date, value, note) = r.ok()?;
+                Some(Checkin { date: NaiveDate::parse_from_str(&date, DATE_FORMAT).ok()?, value, note })
+            })
             .collect();
-        Ok(dates)
+        Ok(records)
     }
 
     /// Records a finished focus session.
@@ -1238,6 +1286,27 @@ mod tests {
         assert!(store.checkins(read.id)?.is_empty());
         store.delete_habit(floss.id)?;
         assert_eq!(store.habits()?.iter().map(|h| h.name.as_str()).collect::<Vec<_>>(), ["Read"]);
+        Ok(())
+    }
+
+    #[test]
+    fn habit_goals_and_notes() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let water = store.add_habit("Water")?;
+        let goal = Goal { amount: 8, unit: "glasses".into() };
+        store.update_habit(water.id, "Drink water", Some(&goal))?;
+        assert!(store.update_habit(water.id, "Drink water", Some(&Goal { amount: 0, unit: String::new() })).is_err());
+        let habit = store.habits()?.remove(0);
+        assert_eq!((habit.name.as_str(), habit.goal), ("Drink water", Some(goal)));
+
+        store.toggle_checkin(water.id, d(2026, 10, 18))?;
+        assert!(store.set_checkin_note(water.id, d(2026, 10, 17), "no check-in").is_err());
+        store.set_checkin_note(water.id, d(2026, 10, 18), " Felt great ")?;
+        let records = store.checkin_records(water.id)?;
+        assert_eq!(records, [Checkin { date: d(2026, 10, 18), value: 8, note: Some("Felt great".into()) }]);
+
+        store.update_habit(water.id, "Drink water", None)?;
+        assert_eq!(store.habits()?[0].goal, None);
         Ok(())
     }
 

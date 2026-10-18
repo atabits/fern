@@ -99,6 +99,10 @@ impl AppView {
             for name in state.split(';').filter_map(|part| part.strip_prefix("habit-select=")) {
                 this.habits.update(cx, |view, cx| view.dev_select(name, cx));
             }
+            // `habit-do=goal=<amount> <unit>|note=<days ago>><text>|edit` on the selected habit.
+            for command in state.split(';').filter_map(|part| part.strip_prefix("habit-do=")) {
+                this.habits.update(cx, |view, cx| view.dev_apply(command, window, cx));
+            }
             // `focus=<title>><minutes ago>><minutes>`, repeatable.
             for spec in state.split(';').filter_map(|part| part.strip_prefix("focus=")) {
                 let parts: Vec<&str> = spec.split('>').collect();

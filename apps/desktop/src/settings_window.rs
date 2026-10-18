@@ -728,7 +728,7 @@ impl SettingsWindow {
                                         .gap_2()
                                         .pt_0p5()
                                         .cursor_pointer()
-                                        .child(Checkbox::new(SharedString::from(format!("{id}-check"))).toggle_state(checked))
+                                        .child(Checkbox::new(SharedString::from(format!("{id}-check"))).accent().toggle_state(checked))
                                         .child(Label::new(text).size(LabelSize::Small))
                                         .on_click(cx.listener(move |this, _, window, cx| this.update(window, cx, |p| flip(&mut p.recognition)))),
                                 )

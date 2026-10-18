@@ -18,11 +18,12 @@ pub struct Checkbox {
     tint: Option<Hsla>,
     size: Pixels,
     on_click: Option<ClickHandler>,
+    accent: bool,
 }
 
 impl Checkbox {
     pub fn new(id: impl Into<ElementId>) -> Self {
-        Self { id: id.into(), checked: false, dismissed: false, lines: false, tint: None, size: px(16.), on_click: None }
+        Self { id: id.into(), checked: false, dismissed: false, lines: false, tint: None, size: px(16.), on_click: None, accent: false }
     }
 
     pub fn tint(mut self, tint: Option<Hsla>) -> Self {
@@ -39,6 +40,12 @@ impl Checkbox {
     /// Lines inside the open box, as the original marks a task kept as a checklist.
     pub fn lines(mut self, lines: bool) -> Self {
         self.lines = lines;
+        self
+    }
+
+    /// Checked in the accent color, as the original's settings boxes are (tasks are grey).
+    pub fn accent(mut self) -> Self {
+        self.accent = true;
         self
     }
 
@@ -83,8 +90,9 @@ impl RenderOnce for Checkbox {
                 .child("✕")
                 .when_some(self.on_click, |el, handler| el.on_click(handler));
         }
-        // A checked box is grey, as the original's.
-        let border = if self.checked { colors.text_muted.opacity(0.6) } else { self.tint.unwrap_or(colors.checkbox_border) };
+        // A checked task's box is grey, as the original's; a setting's is in the accent color.
+        let fill = if self.accent { colors.accent } else { colors.text_muted.opacity(0.6) };
+        let border = if self.checked { fill } else { self.tint.unwrap_or(colors.checkbox_border) };
         div()
             .id(self.id)
             .size(self.size)
@@ -96,7 +104,7 @@ impl RenderOnce for Checkbox {
             .border_1()
             .border_color(border)
             .cursor_pointer()
-            .when(self.checked, |el| el.bg(colors.text_muted.opacity(0.6)).child("✓"))
+            .when(self.checked, |el| el.bg(fill).child("✓"))
             .when(self.lines && !self.checked, |el| {
                 el.child(
                     div()

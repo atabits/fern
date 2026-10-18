@@ -9,7 +9,7 @@ use gpui::{EventEmitter, FontWeight};
 use ui::prelude::*;
 use ui::{Placement, PopoverAttachment, SubmenuItem, popover};
 
-use crate::actions::{DayView, MonthView, NewTask, ToggleSidebar, WeekView};
+use crate::actions::{AgendaView, DayView, MonthView, NewTask, ToggleSidebar, WeekView};
 use crate::calendar::{self, week_axis};
 use crate::drag::DraggedTask;
 use crate::i18n;
@@ -32,12 +32,14 @@ pub enum CalendarMode {
     Month,
     /// The original's Multi-Day: this many days from the anchor on the hour axis.
     MultiDay(u8),
+    /// The original's Agenda: the coming days with something due, as a list.
+    Agenda,
 }
 
 impl CalendarMode {
-    /// Whether the days are drawn on the hour axis (all but Month).
+    /// Whether the days are drawn on the hour axis (all but Month and Agenda).
     pub fn is_timed(self) -> bool {
-        self != CalendarMode::Month
+        !matches!(self, CalendarMode::Month | CalendarMode::Agenda)
     }
 }
 
@@ -53,7 +55,12 @@ pub struct CalendarView {
     /// The mode menu's Multi-Day side menu, while hovered open.
     multi_day_menu: bool,
     tasks: Vec<Task>,
+    /// The Agenda's days, from today (or the shown month's first day, when later) a year on.
+    agenda: Vec<(NaiveDate, Vec<fern_core::agenda::AgendaItem>)>,
 }
+
+/// How far ahead the Agenda reaches.
+const AGENDA_DAYS: i64 = 366;
 
 impl EventEmitter<OpenTask> for CalendarView {}
 
@@ -75,6 +82,7 @@ impl CalendarView {
             focus_handle: cx.focus_handle(),
             multi_day_menu: false,
             tasks: Vec::new(),
+            agenda: Vec::new(),
         };
         this.reload(cx);
         this
@@ -91,6 +99,17 @@ impl CalendarView {
 
     /// Re-reads the tasks of the shown days.
     pub fn reload(&mut self, cx: &mut Context<Self>) {
+        if self.mode == CalendarMode::Agenda {
+            let from = self.agenda_start();
+            match self.store.tasks() {
+                Ok(tasks) => {
+                    self.agenda = fern_core::agenda::agenda(&tasks, from, from + chrono::Duration::days(AGENDA_DAYS))
+                }
+                Err(err) => eprintln!("failed to load the agenda: {err:#}"),
+            }
+            cx.notify();
+            return;
+        }
         let (start, end) = match self.mode {
             CalendarMode::Month => {
                 let weeks = calendar::month_weeks(self.month);
@@ -108,9 +127,14 @@ impl CalendarView {
         cx.notify();
     }
 
+    /// The Agenda starts today in the current month, and on the first day of a later one.
+    fn agenda_start(&self) -> NaiveDate {
+        Local::now().date_naive().max(self.month)
+    }
+
     fn shift(&mut self, delta: i32, cx: &mut Context<Self>) {
         match self.mode {
-            CalendarMode::Month => self.month = calendar::add_months(self.month, delta),
+            CalendarMode::Month | CalendarMode::Agenda => self.month = calendar::add_months(self.month, delta),
             mode => {
                 let step = match mode {
                     CalendarMode::Day => 1,
@@ -451,12 +475,139 @@ impl CalendarView {
             .into_any_element()
     }
 
+    /// The original's Agenda: a row per day — the day, "All Day" or the time, a circle and a
+    /// card per task — with a heading where a new month starts, and today always shown.
+    fn render_agenda(&self, today: NaiveDate, cx: &mut Context<Self>) -> AnyElement {
+        let strings = i18n::t(cx);
+        let theme = cx.theme().clone();
+        let start = self.agenda_start();
+        let mut days = self.agenda.clone();
+        if start == today && days.first().is_none_or(|(date, _)| *date != today) {
+            days.insert(0, (today, Vec::new()));
+        }
+        let mut month = calendar::month_start(start);
+        let mut rows: Vec<AnyElement> = Vec::new();
+        for (date, items) in days {
+            if calendar::month_start(date) != month {
+                month = calendar::month_start(date);
+                rows.push(
+                    div()
+                        .pt(px(28.))
+                        .pb(px(10.))
+                        .text_size(px(18.))
+                        .font_weight(FontWeight::BOLD)
+                        .child(calendar::month_title(month, strings))
+                        .into_any_element(),
+                );
+            }
+            let is_today = date == today;
+            let day = h_flex()
+                .w(px(120.))
+                .flex_none()
+                .gap_2()
+                .items_baseline()
+                .child(
+                    div()
+                        .text_size(px(22.))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(if is_today { theme.colors().accent } else { theme.colors().text })
+                        .child(date.day().to_string()),
+                )
+                .child(
+                    Label::new(strings.weekdays_short[date.weekday().num_days_from_monday() as usize])
+                        .size(LabelSize::XSmall)
+                        .color(if is_today { Color::Accent } else { Color::Muted }),
+                );
+            let entries: Vec<AnyElement> = if items.is_empty() {
+                vec![
+                    h_flex()
+                        .gap_3()
+                        .child(div().w(px(72.)).flex_none().child(Label::new(strings.range_all_day).size(LabelSize::Small).color(Color::Muted)))
+                        .child(div().size(px(10.)).flex_none().rounded_full().bg(theme.colors().element_hover))
+                        .child(
+                            div()
+                                .flex_1()
+                                .h(px(52.))
+                                .px_4()
+                                .flex()
+                                .items_center()
+                                .rounded(px(6.))
+                                .bg(theme.colors().accent.opacity(0.18))
+                                .child(Label::new(strings.no_tasks_today).size(LabelSize::Small)),
+                        )
+                        .into_any_element(),
+                ]
+            } else {
+                items
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, item)| {
+                        let id = item.task;
+                        let tint = task_rows::priority_color(item.priority, &theme).unwrap_or(theme.colors().accent);
+                        let when = item.time.map_or(strings.range_all_day.to_owned(), calendar::format_time);
+                        h_flex()
+                            .gap_3()
+                            .child(div().w(px(72.)).flex_none().child(Label::new(when).size(LabelSize::Small).color(Color::Muted)))
+                            .child(
+                                div()
+                                    .size(px(10.))
+                                    .flex_none()
+                                    .rounded_full()
+                                    .border_1()
+                                    .border_color(theme.colors().text_muted),
+                            )
+                            .child(
+                                h_flex()
+                                    .id(SharedString::from(format!("agenda-{date}-{i}")))
+                                    .flex_1()
+                                    .min_w_0()
+                                    .h(px(40.))
+                                    .pl_3()
+                                    .pr_3()
+                                    .gap_2()
+                                    .rounded(px(6.))
+                                    .border_l_3()
+                                    .border_color(tint)
+                                    .bg(tint.opacity(0.12))
+                                    .hover(|s| s.bg(tint.opacity(0.2)))
+                                    .cursor_pointer()
+                                    .child(div().flex_1().min_w_0().child(Label::new(item.title).size(LabelSize::Small).truncate()))
+                                    .when(item.repeats, |el| {
+                                        el.child(Icon::new(IconName::Repeat).size(IconSize::XSmall).color(Color::Muted))
+                                    })
+                                    .on_click(cx.listener(move |_, _, _, cx| cx.emit(OpenTask(id)))),
+                            )
+                            .into_any_element()
+                    })
+                    .collect()
+            };
+            rows.push(
+                h_flex()
+                    .py(px(20.))
+                    .items_start()
+                    .child(div().pt(px(6.)).child(day))
+                    .child(v_flex().flex_1().gap_2().children(entries))
+                    .into_any_element(),
+            );
+        }
+        v_flex()
+            .id("agenda")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .px(px(60.))
+            .pb_6()
+            .child(v_flex().pt(px(14.)).max_w(px(760.)).children(rows))
+            .into_any_element()
+    }
+
     fn render_mode_menu(&self, cx: &mut Context<Self>) -> AnyElement {
         let strings = i18n::t(cx);
         let items = [
             (CalendarMode::Day, strings.day, "D/1"),
             (CalendarMode::Week, strings.week, "W/2"),
             (CalendarMode::Month, strings.month, "M/3"),
+            (CalendarMode::Agenda, strings.agenda, "A/5"),
         ];
 
         popover(cx)
@@ -545,6 +696,7 @@ impl Render for CalendarView {
             .on_action(cx.listener(|this, _: &DayView, _, cx| this.set_mode(CalendarMode::Day, cx)))
             .on_action(cx.listener(|this, _: &WeekView, _, cx| this.set_mode(CalendarMode::Week, cx)))
             .on_action(cx.listener(|this, _: &MonthView, _, cx| this.set_mode(CalendarMode::Month, cx)))
+            .on_action(cx.listener(|this, _: &AgendaView, _, cx| this.set_mode(CalendarMode::Agenda, cx)))
             .size_full()
             .bg(theme.colors().background)
             .text_color(theme.colors().text)
@@ -563,7 +715,7 @@ impl Render for CalendarView {
                         div().flex_1().child(
                             Label::new(calendar::month_title(
                                 match self.mode {
-                                    CalendarMode::Month => self.month,
+                                    CalendarMode::Month | CalendarMode::Agenda => self.month,
                                     CalendarMode::Week => calendar::week_of(self.anchor)[0],
                                     _ => self.anchor,
                                 },
@@ -602,6 +754,7 @@ impl Render for CalendarView {
                                             CalendarMode::Day => strings.day,
                                             CalendarMode::MultiDay(_) => strings.multi_day,
                                             CalendarMode::Month => strings.month,
+                                            CalendarMode::Agenda => strings.agenda,
                                         })
                                         .size(LabelSize::Small),
                                     )
@@ -640,7 +793,7 @@ impl Render for CalendarView {
                     )
                     .child(IconButton::new("calendar-more", IconName::Ellipsis)),
             )
-            .child(
+            .when(self.mode != CalendarMode::Agenda, |el| el.child(
                 h_flex()
                     .flex_none()
                     .h(px(22.))
@@ -667,8 +820,9 @@ impl Render for CalendarView {
                             .justify_center()
                             .child(Label::new(day).size(LabelSize::Small).color(Color::Muted))
                     })),
-            )
+            ))
             .map(|el| match self.mode {
+                CalendarMode::Agenda => el.child(self.render_agenda(today, cx)),
                 CalendarMode::Month => el.child(
                     v_flex()
                         .flex_1()

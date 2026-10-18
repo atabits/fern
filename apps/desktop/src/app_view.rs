@@ -129,6 +129,9 @@ impl AppView {
             if state.contains("calendar=multi") {
                 this.calendar.update(cx, |c, cx| c.set_mode(crate::calendar_view::CalendarMode::MultiDay(3), cx));
             }
+            if state.contains("calendar=agenda") {
+                this.calendar.update(cx, |c, cx| c.set_mode(crate::calendar_view::CalendarMode::Agenda, cx));
+            }
             if state.contains("calendar-menu=open") {
                 this.calendar.update(cx, |c, cx| c.dev_open_menu(cx));
             }

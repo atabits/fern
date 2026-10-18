@@ -1,6 +1,7 @@
 //! Shared core of the task tracker: data model, local storage and quick-add parsing.
 //! Used by the desktop app and, later, by the mobile clients.
 
+pub mod agenda;
 pub mod countdown;
 pub mod filter;
 pub mod focus;

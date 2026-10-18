@@ -5,7 +5,7 @@ use gpui::Focusable as _;
 use ui::prelude::*;
 use ui::{Placement, PopoverAttachment, popover};
 
-use crate::actions::{NewTask, Search, ShowInbox, ShowNext7Days, ShowToday, ShowTomorrow, ToggleSidebar};
+use crate::actions::{NewTask, Search, ShowInbox, ShowNext7Days, ShowShortcuts, ShowToday, ShowTomorrow, ToggleSidebar};
 use crate::calendar_view::{self, CalendarView};
 use crate::countdown_view::CountdownView;
 use crate::focus_view::FocusView;
@@ -30,6 +30,8 @@ pub struct AppView {
     account_menu_open: bool,
     notices: Notices,
     notices_open: bool,
+    /// The "Shortcuts" panel on the right, while open.
+    shortcuts_open: bool,
 }
 
 impl AppView {
@@ -79,6 +81,7 @@ impl AppView {
             account_menu_open: false,
             notices: Notices::default(),
             notices_open: false,
+            shortcuts_open: false,
         };
         reminders::start(this.store.clone(), cx);
         #[cfg(debug_assertions)]
@@ -152,6 +155,9 @@ impl AppView {
                     let at = chrono::Local::now().naive_local() - chrono::Duration::hours(ago.parse().unwrap_or(0));
                     this.add_notices(vec![Notice { target: Target::Task(task.id), title: task.title, at }], cx);
                 }
+            }
+            if state.contains("shortcuts=open") {
+                this.shortcuts_open = true;
             }
             if state.contains("notices=open") {
                 this.set_notices_open(true, cx);
@@ -291,6 +297,73 @@ impl AppView {
         });
     }
 
+    fn toggle_shortcuts(&mut self, cx: &mut Context<Self>) {
+        self.shortcuts_open = !self.shortcuts_open;
+        cx.notify();
+    }
+
+    /// The original's Shortcuts panel: the keymap's bindings by group, and quick add syntax.
+    fn render_shortcuts(&self, cx: &mut Context<Self>) -> AnyElement {
+        let strings = i18n::t(cx);
+        let theme = cx.theme().clone();
+        let list = std::str::from_utf8(
+            &gpui::AssetSource::load(&assets::Assets, crate::keymap::DEFAULT_KEYMAP_PATH).ok().flatten().unwrap_or_default(),
+        )
+        .ok()
+        .and_then(|source| crate::keymap::shortcut_list(source).ok())
+        .unwrap_or_default();
+        let chip = |text: String| {
+            div()
+                .px_2()
+                .h(px(22.))
+                .flex()
+                .items_center()
+                .rounded(px(4.))
+                .border_1()
+                .border_color(theme.colors().border)
+                .child(Label::new(text).size(LabelSize::XSmall).color(Color::Muted))
+        };
+        let row = |label: &'static str, keys: Vec<String>| {
+            h_flex()
+                .h(px(32.))
+                .child(div().flex_1().child(Label::new(label).size(LabelSize::Small)))
+                .child(h_flex().gap_1().children(keys.into_iter().map(chip)))
+        };
+        let heading = |text: &'static str| div().pt_3().pb_1().child(Label::new(text).weight(gpui::FontWeight::SEMIBOLD));
+        let mut body = v_flex().child(heading(strings.shortcut_groups[0]));
+        for (i, (action, keys)) in list.into_iter().enumerate() {
+            if action.starts_with("task_list::") && i > 0 && list_group_start(i) {
+                body = body.child(heading(strings.shortcut_groups[1]));
+            }
+            if !keys.is_empty() {
+                body = body.child(row(strings.shortcut_labels[i], keys));
+            }
+        }
+        body = body.child(heading(strings.shortcut_groups[2]));
+        for (what, example) in strings.quick_add_help {
+            body = body.child(row(what, vec![example.to_owned()]));
+        }
+        v_flex()
+            .absolute()
+            .top_0()
+            .right_0()
+            .bottom_0()
+            .w(px(380.))
+            .bg(theme.colors().elevated_surface_background)
+            .border_l_1()
+            .border_color(theme.colors().border)
+            .shadow_lg()
+            .child(
+                h_flex()
+                    .h(px(48.))
+                    .px_4()
+                    .child(div().flex_1().child(Label::new(strings.shortcuts).size(LabelSize::Large)))
+                    .child(IconButton::new("close-shortcuts", IconName::X).on_click(cx.listener(|this, _, _, cx| this.toggle_shortcuts(cx)))),
+            )
+            .child(v_flex().id("shortcut-list").flex_1().min_h_0().overflow_y_scroll().px_4().pb_4().child(body))
+            .into_any_element()
+    }
+
     pub fn add_notices(&mut self, notices: Vec<Notice>, cx: &mut Context<Self>) {
         if !notices.is_empty() {
             self.notices.push(notices);
@@ -383,6 +456,7 @@ impl Render for AppView {
             .on_action(cx.listener(Self::new_task))
             .on_action(cx.listener(Self::search))
             .on_action(cx.listener(Self::toggle_sidebar))
+            .on_action(cx.listener(|this, _: &ShowShortcuts, _, cx| this.toggle_shortcuts(cx)))
             .on_action(cx.listener(|this, _: &ShowInbox, window, cx| this.show_view(fern_core::View::Inbox, window, cx)))
             .on_action(cx.listener(|this, _: &ShowToday, window, cx| this.show_view(fern_core::View::Today, window, cx)))
             .on_action(cx.listener(|this, _: &ShowTomorrow, window, cx| {
@@ -405,8 +479,14 @@ impl Render for AppView {
                 Section::Pomodoro => div().flex_1().h_full().child(self.focus.clone()),
 
             })
+            .when(self.shortcuts_open, |el| el.child(self.render_shortcuts(cx)))
             .when_some(self.search.clone(), |el, search| {
                 el.child(div().absolute().top(px(160.)).left_0().right_0().flex().justify_center().child(search))
             })
     }
+}
+
+/// Where the task list's shortcuts start in `keymap::LISTED_ACTIONS`.
+fn list_group_start(index: usize) -> bool {
+    crate::keymap::LISTED_ACTIONS.iter().position(|a| a.starts_with("task_list::")) == Some(index)
 }

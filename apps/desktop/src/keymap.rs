@@ -11,6 +11,64 @@ use serde::Deserialize;
 
 pub const DEFAULT_KEYMAP_PATH: &str = "keymaps/default.json";
 
+/// Actions shown in the shortcut list, in order; text editing keys are left out.
+pub const LISTED_ACTIONS: [&str; 13] = [
+    "fern::NewTask",
+    "fern::Search",
+    "fern::ToggleSidebar",
+    "fern::ShowInbox",
+    "fern::ShowToday",
+    "fern::ShowTomorrow",
+    "fern::ShowNext7Days",
+    "fern::ShowShortcuts",
+    "fern::Quit",
+    "task_list::SelectNext",
+    "task_list::SelectPrevious",
+    "task_list::ToggleComplete",
+    "task_list::DeleteTask",
+];
+
+/// The keys bound to each listed action, as they read on screen ("Ctrl+N", "↓"), in the order
+/// of `LISTED_ACTIONS`.
+pub fn shortcut_list(source: &str) -> Result<Vec<(&'static str, Vec<String>)>> {
+    let sections: Vec<KeymapSection> = serde_json::from_str(source).context("invalid keymap JSON")?;
+    Ok(LISTED_ACTIONS
+        .iter()
+        .map(|action| {
+            let keys = sections
+                .iter()
+                .flat_map(|s| s.bindings.iter())
+                .filter(|(_, a)| a.as_str() == *action)
+                .map(|(keys, _)| display_keys(keys))
+                .collect();
+            (*action, keys)
+        })
+        .collect())
+}
+
+/// "secondary-n" → "Ctrl+N" (⌘N on macOS), "down" → "↓", "space" → "Space".
+pub fn display_keys(keystroke: &str) -> String {
+    keystroke
+        .split('-')
+        .map(|part| match part {
+            "secondary" => if cfg!(target_os = "macos") { "⌘".to_owned() } else { "Ctrl".to_owned() },
+            "ctrl" => "Ctrl".to_owned(),
+            "shift" => "Shift".to_owned(),
+            "alt" => "Alt".to_owned(),
+            "down" => "↓".to_owned(),
+            "up" => "↑".to_owned(),
+            "left" => "←".to_owned(),
+            "right" => "→".to_owned(),
+            "delete" => "Del".to_owned(),
+            other => {
+                let mut chars = other.chars();
+                chars.next().map_or_else(String::new, |c| c.to_uppercase().chain(chars).collect())
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(if cfg!(target_os = "macos") { "" } else { "+" })
+}
+
 #[derive(Deserialize)]
 struct KeymapSection {
     #[serde(default)]
@@ -67,6 +125,20 @@ pub fn load(source: &str, cx: &mut App) -> Result<Vec<String>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn shortcut_list_reads_the_keymap() {
+        let list = super::shortcut_list(include_str!("../../../assets/keymaps/default.json")).unwrap();
+        assert_eq!(list.len(), super::LISTED_ACTIONS.len());
+        let keys = |action: &str| list.iter().find(|(a, _)| *a == action).unwrap().1.clone();
+        assert!(!keys("fern::NewTask").is_empty());
+        let mut next = keys("task_list::SelectNext");
+        next.sort();
+        assert_eq!(next, ["J", "↓"]);
+        if !cfg!(target_os = "macos") {
+            assert_eq!(super::display_keys("secondary-shift-p"), "Ctrl+Shift+P");
+        }
+    }
+
     use super::*;
     use gpui::TestAppContext;
 

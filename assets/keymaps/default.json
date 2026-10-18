@@ -8,7 +8,8 @@
       "secondary-1": "fern::ShowInbox",
       "secondary-2": "fern::ShowToday",
       "secondary-3": "fern::ShowTomorrow",
-      "secondary-4": "fern::ShowNext7Days"
+      "secondary-4": "fern::ShowNext7Days",
+      "secondary-/": "fern::ShowShortcuts"
     }
   },
   {

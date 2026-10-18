@@ -151,5 +151,9 @@ pub fn render(
                 })
                 .children(bell.menu),
         )
-        .child(button("help", IconName::CircleQuestionMark))
+        .child(
+            button("help", IconName::CircleQuestionMark)
+                .tooltip(Tooltip::text(strings.shortcuts))
+                .on_click(|_, window, cx| window.dispatch_action(Box::new(crate::actions::ShowShortcuts), cx)),
+        )
 }

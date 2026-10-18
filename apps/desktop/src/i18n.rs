@@ -221,6 +221,12 @@ pub struct Strings {
     pub start_focus: &'static str,
     pub print: &'static str,
     pub copy_link: &'static str,
+    pub shortcuts: &'static str,
+    /// Labels of `keymap::LISTED_ACTIONS`, in order.
+    pub shortcut_labels: [&'static str; 13],
+    pub shortcut_groups: [&'static str; 3],
+    /// Quick add syntax: (what, example).
+    pub quick_add_help: [(&'static str, &'static str); 4],
     pub undo: &'static str,
     /// "{title}" is replaced: "Completed “{title}”".
     pub undo_completed: &'static str,
@@ -531,6 +537,18 @@ pub static EN: Strings = Strings {
     start_focus: "Start Focus",
     print: "Print",
     copy_link: "Copy Link",
+    shortcuts: "Shortcuts",
+    shortcut_labels: [
+        "Add task", "Search", "Toggle sidebar", "Go to Inbox", "Go to Today", "Go to Tomorrow", "Go to Next 7 Days",
+        "Shortcuts", "Quit", "Next task", "Previous task", "Complete task", "Delete task",
+    ],
+    shortcut_groups: ["General", "Task List", "Quick Add"],
+    quick_add_help: [
+        ("Date and time", "tomorrow 9am, fri, every day"),
+        ("Tag", "#tag"),
+        ("Priority", "!1 !2 !3, !high"),
+        ("List", "^list"),
+    ],
     undo: "Undo",
     undo_completed: "Completed “{title}”",
     undo_deleted: "Deleted “{title}”",
@@ -828,6 +846,18 @@ pub static RU: Strings = Strings {
     start_focus: "Начать фокус",
     print: "Печать",
     copy_link: "Скопировать ссылку",
+    shortcuts: "Горячие клавиши",
+    shortcut_labels: [
+        "Новая задача", "Поиск", "Скрыть/показать панель", "Входящие", "Сегодня", "Завтра", "Следующие 7 дней",
+        "Горячие клавиши", "Выйти", "Следующая задача", "Предыдущая задача", "Выполнить задачу", "Удалить задачу",
+    ],
+    shortcut_groups: ["Общие", "Список задач", "Быстрое добавление"],
+    quick_add_help: [
+        ("Дата и время", "завтра 9:00, пт, каждый день"),
+        ("Тег", "#тег"),
+        ("Приоритет", "!1 !2 !3, !высокий"),
+        ("Список", "^список"),
+    ],
     undo: "Отменить",
     undo_completed: "Выполнено: «{title}»",
     undo_deleted: "Удалено: «{title}»",

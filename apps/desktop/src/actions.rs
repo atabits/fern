@@ -13,6 +13,7 @@ actions!(
         ShowToday,
         ShowTomorrow,
         ShowNext7Days,
+        ShowShortcuts,
     ]
 );
 

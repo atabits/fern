@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 
-use chrono::{Duration, NaiveDate};
+use chrono::{Datelike, Duration, NaiveDate};
 
 use crate::model::Id;
 
@@ -31,6 +31,38 @@ pub fn stats(checkins: &HashSet<NaiveDate>, today: NaiveDate) -> HabitStats {
     HabitStats { total_days: checkins.len(), streak }
 }
 
+/// Check-in statistics for one month, shown in the habit details panel.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MonthStats {
+    /// Days of the month the habit was checked in.
+    pub days: usize,
+    /// Checked days as a share of the month's days so far (all of them for a past month), in
+    /// whole percent.
+    pub rate: u32,
+}
+
+/// Statistics for the month containing `month`.
+pub fn month_stats(checkins: &HashSet<NaiveDate>, month: NaiveDate, today: NaiveDate) -> MonthStats {
+    let in_month = |date: &NaiveDate| date.year() == month.year() && date.month() == month.month();
+    let days = checkins.iter().filter(|date| in_month(date)).count();
+    let first = month.with_day(1).unwrap_or(month);
+    let next = if first.month() == 12 {
+        NaiveDate::from_ymd_opt(first.year() + 1, 1, 1)
+    } else {
+        NaiveDate::from_ymd_opt(first.year(), first.month() + 1, 1)
+    }
+    .unwrap_or(first);
+    let elapsed = if today < first {
+        0
+    } else if today >= next {
+        (next - first).num_days()
+    } else {
+        (today - first).num_days() + 1
+    };
+    let rate = if elapsed == 0 { 0 } else { (days as i64 * 100 / elapsed) as u32 };
+    MonthStats { days, rate }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -48,5 +80,16 @@ mod tests {
         assert_eq!(stats(&checked, today), HabitStats { total_days: 3, streak: 1 });
         let checked: HashSet<_> = [d(10), d(15)].into();
         assert_eq!(stats(&checked, today).streak, 0);
+    }
+
+    #[test]
+    fn month_stats_count_the_days_so_far() {
+        let today = d(10);
+        let checked: HashSet<_> = [d(1), d(2), d(9), NaiveDate::from_ymd_opt(2026, 9, 30).unwrap()].into();
+        assert_eq!(month_stats(&checked, d(1), today), MonthStats { days: 3, rate: 30 });
+        let september = NaiveDate::from_ymd_opt(2026, 9, 5).unwrap();
+        assert_eq!(month_stats(&checked, september, today), MonthStats { days: 1, rate: 3 });
+        let november = NaiveDate::from_ymd_opt(2026, 11, 1).unwrap();
+        assert_eq!(month_stats(&checked, november, today), MonthStats::default());
     }
 }

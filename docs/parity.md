@@ -70,7 +70,7 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 | Calendar | 🟡 | month and week views matched to the original (week: all-day strip, time axis with folded night hours, timed tasks placed by time); view menu with Week/Month; tasks can be dragged between days; no Day, Year, Agenda or multi-day views |
 | Eisenhower Matrix | 🟡 | matched to the original: quadrants by priority (TickTick's default rules), grouped by list, drag a task to another quadrant to change its priority; no custom quadrant rules |
 | Countdown | 🟡 | matched to the original: filter tabs, card grid with Y/M/D or days-only (click the numbers), until/since colors, add with name, type and date, delete on hover; no background images, editing or repeating dates |
-| Habits | 🟡 | matched to the original: week strip with daily progress rings, cards with total days, streak and this week's check-ins (click a dot to check in), add and delete; no habit details panel, icons, goals or reminders |
+| Habits | 🟡 | matched to the original: week strip with daily progress rings, cards with total days, streak and this week's check-ins (click a dot to check in), add; clicking a card opens the details panel: monthly check-ins, total check-ins, monthly rate and current streak cards, a month calendar to check in on past days, delete from its "…" menu. No icons, goals (completion cards, daily goals chart), check-in notes (habit log) or reminders |
 | Focus (Pomodoro) | 🟡 | matched to the original: today's tasks to focus on, a 25-minute timer bar with pause and stop, Overview (today/total pomos and focus time), Focus Record grouped by day; no Active/Archived focus items, white noise, custom lengths or manual records |
 | Sync between devices | ⬜ | |
 
@@ -90,7 +90,7 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 
 ## Next
 
-1. Habit details panel.
-2. Filled sidebar icons and the notification badge.
-3. Custom time and "every N" in the due-date picker.
-4. "All Dates" / "All Lists" filters in the Completed and Won't Do views.
+1. Filled sidebar icons and the notification badge.
+2. Custom time and "every N" in the due-date picker.
+3. "All Dates" / "All Lists" filters in the Completed and Won't Do views.
+4. Habit goals and check-in notes (habit log).

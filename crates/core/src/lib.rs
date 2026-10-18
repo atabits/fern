@@ -11,7 +11,7 @@ pub mod store;
 
 pub use countdown::{Countdown, CountdownKind, Span, span};
 pub use focus::{FocusSession, FocusStats, focus_stats, format_minutes};
-pub use habit::{Habit, HabitStats};
+pub use habit::{Habit, HabitStats, MonthStats};
 pub use model::{ChecklistItem, Id, Kind, List, Priority, Tag, Task, View, ViewCounts};
 pub use quick_add::{ParsedTask, parse_quick_add};
 pub use recurrence::{Frequency, Recurrence};

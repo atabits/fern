@@ -1,5 +1,6 @@
 //! The Habit section, matched to TickTick's: a week strip with daily progress rings and habit
-//! cards with totals, streaks and this week's check-ins.
+//! cards with totals, streaks and this week's check-ins; the selected habit's statistics and
+//! month calendar on the right.
 
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -22,11 +23,24 @@ pub struct HabitView {
     habits: Vec<Habit>,
     checkins: HashMap<Id, HashSet<NaiveDate>>,
     new_habit: Option<Entity<TextInput>>,
+    /// The habit shown in the details panel.
+    selected: Option<Id>,
+    /// The month shown in the details panel's calendar.
+    month: NaiveDate,
+    detail_menu_open: bool,
 }
 
 impl HabitView {
     pub fn new(store: Rc<Store>, cx: &mut Context<Self>) -> Self {
-        let mut this = Self { store, habits: Vec::new(), checkins: HashMap::new(), new_habit: None };
+        let mut this = Self {
+            store,
+            habits: Vec::new(),
+            checkins: HashMap::new(),
+            new_habit: None,
+            selected: None,
+            month: calendar::month_start(Local::now().date_naive()),
+            detail_menu_open: false,
+        };
         this.reload(cx);
         this
     }
@@ -38,7 +52,31 @@ impl HabitView {
             .iter()
             .map(|h| (h.id, self.store.checkins(h.id).unwrap_or_default()))
             .collect();
+        if self.selected.is_some_and(|id| !self.habits.iter().any(|h| h.id == id)) {
+            self.selected = None;
+        }
         cx.notify();
+    }
+
+    fn select(&mut self, habit: Id, cx: &mut Context<Self>) {
+        if self.selected != Some(habit) {
+            self.selected = Some(habit);
+            self.month = calendar::month_start(Local::now().date_naive());
+            self.detail_menu_open = false;
+        }
+        cx.notify();
+    }
+
+    fn shift_month(&mut self, delta: i32, cx: &mut Context<Self>) {
+        self.month = calendar::add_months(self.month, delta);
+        cx.notify();
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn dev_select(&mut self, name: &str, cx: &mut Context<Self>) {
+        if let Some(id) = self.habits.iter().find(|h| h.name == name).map(|h| h.id) {
+            self.select(id, cx);
+        }
     }
 
     fn toggle(&mut self, habit: Id, date: NaiveDate, cx: &mut Context<Self>) {
@@ -49,6 +87,7 @@ impl HabitView {
     }
 
     fn delete(&mut self, habit: Id, cx: &mut Context<Self>) {
+        self.detail_menu_open = false;
         if let Err(err) = self.store.delete_habit(habit) {
             eprintln!("failed to delete the habit: {err:#}");
         }
@@ -108,8 +147,7 @@ impl HabitView {
         let group = SharedString::from(format!("habit-{id}"));
 
         v_flex()
-            .id(group.clone())
-            .group(group.clone())
+            .id(group)
             .relative()
             .w(px(CARD_WIDTH))
             .h(px(CARD_HEIGHT))
@@ -117,7 +155,11 @@ impl HabitView {
             .p_3()
             .gap_2()
             .rounded(px(8.))
+            .border_1()
+            .border_color(if self.selected == Some(id) { theme.colors().accent } else { gpui::transparent_black() })
             .bg(theme.colors().surface_background)
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, _, cx| this.select(id, cx)))
             .child(
                 h_flex()
                     .gap_2()
@@ -171,15 +213,179 @@ impl HabitView {
                     .cursor_pointer()
                     .bg(if done { theme.colors().accent } else { theme.colors().element_hover })
                     .when(date > today, |el| el.opacity(0.4))
-                    .on_click(cx.listener(move |this, _, _, cx| this.toggle(id, date, cx)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.toggle(id, date, cx);
+                    }))
             })))
+            .into_any_element()
+    }
+
+    /// The details panel: name, statistics cards and a month calendar of check-ins.
+    fn render_detail(&self, habit: &Habit, today: NaiveDate, cx: &mut Context<Self>) -> AnyElement {
+        let strings = i18n::t(cx);
+        let theme = cx.theme().clone();
+        let id = habit.id;
+        let empty = HashSet::new();
+        let checked = self.checkins.get(&id).unwrap_or(&empty);
+        let stats = habit::stats(checked, today);
+        let month = habit::month_stats(checked, self.month, today);
+        let status = theme.status().clone();
+
+        let card = |icon: IconName, color: Hsla, label: &'static str, value: String, unit: &'static str| {
+            v_flex()
+                .flex_1()
+                .p_3()
+                .gap_1()
+                .rounded(px(8.))
+                .bg(theme.colors().surface_background)
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .child(Icon::new(icon).size(IconSize::Small).color(Color::Custom(color)))
+                        .child(Label::new(label).size(LabelSize::Small)),
+                )
+                .child(
+                    h_flex()
+                        .items_baseline()
+                        .gap_1()
+                        .child(div().text_size(px(20.)).font_weight(FontWeight::SEMIBOLD).child(value))
+                        .child(Label::new(unit).size(LabelSize::XSmall)),
+                )
+        };
+
+        let weekdays = h_flex().children(strings.weekdays_short.iter().map(|day| {
+            div().flex_1().flex().justify_center().child(Label::new(*day).size(LabelSize::Small).color(Color::Muted))
+        }));
+        let grid: Vec<AnyElement> = calendar::month_grid(self.month)
+            .chunks(7)
+            .map(|week| {
+                h_flex()
+                    .children(week.iter().map(|&date| {
+                        let in_month = date.month() == self.month.month();
+                        let done = checked.contains(&date);
+                        let future = date > today;
+                        v_flex()
+                            .flex_1()
+                            .items_center()
+                            .gap_1()
+                            .py_1()
+                            .when(!in_month || future, |el| el.opacity(0.45))
+                            .child(
+                                Label::new(date.day().to_string())
+                                    .size(LabelSize::Small)
+                                    .color(if date == today { Color::Accent } else { Color::Default }),
+                            )
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!("detail-checkin-{date}")))
+                                    .size(px(26.))
+                                    .rounded_full()
+                                    .bg(if done { theme.colors().accent } else { theme.colors().element_hover })
+                                    .when(!future, |el| {
+                                        el.cursor_pointer()
+                                            .on_click(cx.listener(move |this, _, _, cx| this.toggle(id, date, cx)))
+                                    }),
+                            )
+                    }))
+                    .into_any_element()
+            })
+            .collect();
+
+        let initial: String = habit.name.chars().next().map(|c| c.to_uppercase().collect()).unwrap_or_default();
+        v_flex()
+            .size_full()
+            .px_4()
+            .gap_2()
             .child(
-                div().absolute().top(px(6.)).right(px(6.)).opacity(0.).group_hover(group, |s| s.opacity(1.)).child(
-                    IconButton::new("delete-habit", IconName::X)
-                        .size(px(22.))
-                        .icon_size(IconSize::Small)
-                        .on_click(cx.listener(move |this, _, _, cx| this.delete(id, cx))),
-                ),
+                h_flex()
+                    .h(px(52.))
+                    .flex_none()
+                    .gap_2()
+                    .child(
+                        div()
+                            .size(px(30.))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_full()
+                            .bg(theme.colors().accent.opacity(0.35))
+                            .child(Label::new(initial).weight(FontWeight::BOLD)),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(Label::new(habit.name.clone()).size(LabelSize::Large).weight(FontWeight::SEMIBOLD).truncate()),
+                    )
+                    .child(
+                        div()
+                            .relative()
+                            .child(IconButton::new("habit-detail-more", IconName::Ellipsis).on_click(cx.listener(
+                                |this, _, _, cx| {
+                                    this.detail_menu_open = true;
+                                    cx.notify();
+                                },
+                            )))
+                            .when(self.detail_menu_open, |el| {
+                                el.child(PopoverAttachment::new(
+                                    Placement::BelowRight,
+                                    popover(cx)
+                                        .w(px(180.))
+                                        .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                                            this.detail_menu_open = false;
+                                            cx.notify();
+                                        }))
+                                        .child(
+                                            ListItem::new("habit-delete")
+                                                .start_slot(Icon::new(IconName::Trash).color(Color::Muted))
+                                                .child(Label::new(strings.delete))
+                                                .on_click(cx.listener(move |this, _, _, cx| this.delete(id, cx))),
+                                        ),
+                                ))
+                            }),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(card(IconName::CircleCheck, status.success, strings.habit_monthly_checkins, month.days.to_string(), strings.habit_unit_days))
+                    .child(card(IconName::Zap, theme.colors().accent, strings.habit_total_checkins, stats.total_days.to_string(), strings.habit_unit_days)),
+            )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(card(IconName::Percent, status.warning, strings.habit_monthly_rate, month.rate.to_string(), "%"))
+                    .child(card(IconName::Flame, status.error, strings.habit_current_streak, stats.streak.to_string(), strings.habit_unit_days)),
+            )
+            .child(
+                v_flex()
+                    .p_3()
+                    .gap_1()
+                    .rounded(px(8.))
+                    .bg(theme.colors().surface_background)
+                    .child(
+                        h_flex()
+                            .h(px(32.))
+                            .child(
+                                IconButton::new("habit-prev-month", IconName::ChevronLeft)
+                                    .on_click(cx.listener(|this, _, _, cx| this.shift_month(-1, cx))),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .flex()
+                                    .justify_center()
+                                    .child(Label::new(calendar::month_title(self.month, strings)).weight(FontWeight::SEMIBOLD)),
+                            )
+                            .child(
+                                IconButton::new("habit-next-month", IconName::ChevronRight)
+                                    .on_click(cx.listener(|this, _, _, cx| this.shift_month(1, cx))),
+                            ),
+                    )
+                    .child(weekdays)
+                    .children(grid),
             )
             .into_any_element()
     }
@@ -193,6 +399,10 @@ impl Render for HabitView {
         let week = calendar::week_of(today);
         let habits = self.habits.clone();
         let cards: Vec<AnyElement> = habits.iter().map(|h| self.render_card(h, week, today, cx)).collect();
+        let detail = self
+            .selected
+            .and_then(|id| habits.iter().find(|h| h.id == id))
+            .map(|habit| self.render_detail(habit, today, cx));
 
         let strip = h_flex().px(px(22.)).pb_3().children(week.map(|date| {
             let progress = self.day_progress(date);
@@ -288,6 +498,13 @@ impl Render for HabitView {
             .bg(theme.colors().background)
             .text_color(theme.colors().text)
             .child(column)
-            .child(div().flex_1().h_full())
+            .child(div().flex_1().min_w_0().h_full().map(|el| match detail {
+                Some(detail) => el.child(detail),
+                None => el
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(Label::new(strings.habit_select).color(Color::Muted)),
+            }))
     }
 }

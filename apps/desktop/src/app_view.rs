@@ -95,6 +95,10 @@ impl AppView {
                 let days: Vec<i64> = days.split(',').filter_map(|d| d.parse().ok()).collect();
                 this.habits.update(cx, |view, cx| view.dev_add(name, &days, cx));
             }
+            // `habit-select=<name>`: open the habit's details panel.
+            for name in state.split(';').filter_map(|part| part.strip_prefix("habit-select=")) {
+                this.habits.update(cx, |view, cx| view.dev_select(name, cx));
+            }
             // `focus=<title>><minutes ago>><minutes>`, repeatable.
             for spec in state.split(';').filter_map(|part| part.strip_prefix("focus=")) {
                 let parts: Vec<&str> = spec.split('>').collect();

@@ -21,6 +21,7 @@ pub enum IconName {
     ChevronLeft,
     ChevronRight,
     Circle,
+    CircleCheck,
     CircleDot,
     CircleQuestionMark,
     Clock,
@@ -45,6 +46,7 @@ pub enum IconName {
     PanelLeft,
     Pause,
     Pencil,
+    Percent,
     Play,
     Plus,
     RefreshCw,
@@ -61,6 +63,7 @@ pub enum IconName {
     Trash,
     User,
     X,
+    Zap,
 }
 
 impl IconName {

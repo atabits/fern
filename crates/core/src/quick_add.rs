@@ -6,7 +6,8 @@
 //! - priority: `!1`/`!2`/`!3` (high/medium/low), `!high`, `!medium`, `!low`, `!высокий`, ...;
 //! - dates: today, tomorrow, weekdays, "in 3 days", "in 2 weeks", `13.11`, `13.11.2026`,
 //!   `2026-11-13`, "13 nov", and Russian equivalents ("завтра", "в пятницу", "через неделю");
-//! - time: `18:00`, `6pm`, `6:30am`, `18ч`.
+//! - time: `18:00`, `6pm`, `6:30am`, `18ч`;
+//! - repeat: "every day", "every 2 weeks", "daily", "weekly", "каждый день", "ежемесячно".
 //!
 //! Recognized words, together with a preposition right before them ("at", "on", "в"), are
 //! removed from the title.
@@ -14,6 +15,7 @@
 use chrono::{Datelike, Duration, Months, NaiveDate, NaiveTime, Weekday};
 
 use crate::model::Priority;
+use crate::recurrence::{Frequency, Recurrence};
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ParsedTask {
@@ -22,6 +24,7 @@ pub struct ParsedTask {
     pub due_time: Option<NaiveTime>,
     pub priority: Option<Priority>,
     pub tags: Vec<String>,
+    pub repeat: Option<Recurrence>,
     /// The list name as the user spelled it when creating the list.
     pub list: Option<String>,
 }
@@ -51,6 +54,13 @@ pub fn parse_quick_add(input: &str, today: NaiveDate, lists: &[String]) -> Parse
         } else if let Some(priority) = word.strip_prefix('!').and_then(parse_priority) {
             parsed.priority = Some(priority);
             used[i] = true;
+        } else if parsed.repeat.is_none()
+            && let Some((repeat, len)) = parse_repeat(&lower[i..])
+        {
+            parsed.repeat = Some(repeat);
+            used[i..i + len].iter_mut().for_each(|u| *u = true);
+            i += len;
+            continue;
         } else if parsed.due_time.is_none()
             && let Some(time) = parse_time(word)
         {
@@ -91,6 +101,42 @@ fn mark_with_preposition(used: &mut [bool], lower: &[String], start: usize, len:
     {
         used[start - 1] = true;
     }
+}
+
+/// A repeat rule at the start of `words` and how many words it took.
+fn parse_repeat(words: &[String]) -> Option<(Recurrence, usize)> {
+    let single = |word: &str| {
+        Some(match word {
+            "daily" | "ежедневно" => Frequency::Daily,
+            "weekly" | "еженедельно" => Frequency::Weekly,
+            "monthly" | "ежемесячно" => Frequency::Monthly,
+            "yearly" | "annually" | "ежегодно" => Frequency::Yearly,
+            _ => return None,
+        })
+    };
+    if let Some(frequency) = single(&words[0]) {
+        return Some((Recurrence::new(frequency, 1), 1));
+    }
+    if !matches!(words[0].as_str(), "every" | "каждый" | "каждую" | "каждое" | "каждые") || words.len() < 2 {
+        return None;
+    }
+    let (interval, unit, len) = match words[1].parse::<u32>() {
+        Ok(n) if words.len() >= 3 => (n, words[2].as_str(), 3),
+        Ok(_) => return None,
+        Err(_) => (1, words[1].as_str(), 2),
+    };
+    let frequency = if unit.starts_with("day") || unit.starts_with("дн") || unit.starts_with("ден") {
+        Frequency::Daily
+    } else if unit.starts_with("week") || unit.starts_with("недел") {
+        Frequency::Weekly
+    } else if unit.starts_with("month") || unit.starts_with("месяц") {
+        Frequency::Monthly
+    } else if unit.starts_with("year") || unit.starts_with("год") || unit.starts_with("лет") {
+        Frequency::Yearly
+    } else {
+        return None;
+    };
+    Some((Recurrence::new(frequency, interval), len))
 }
 
 fn parse_priority(value: &str) -> Option<Priority> {
@@ -342,6 +388,21 @@ mod tests {
         assert_eq!(p.title, "Read 25:99 and #");
         assert_eq!(parse_quick_add("Read page 18", today(), &[]).due_time, None);
         assert_eq!(date("Buy 5 marbles"), None);
+    }
+
+    #[test]
+    fn repeats() {
+        let repeat = |s: &str| parse_quick_add(s, today(), &[]).repeat;
+        assert_eq!(repeat("x every day"), Some(Recurrence::new(Frequency::Daily, 1)));
+        assert_eq!(repeat("x every 2 weeks"), Some(Recurrence::new(Frequency::Weekly, 2)));
+        assert_eq!(repeat("x monthly"), Some(Recurrence::new(Frequency::Monthly, 1)));
+        assert_eq!(repeat("x каждую неделю"), Some(Recurrence::new(Frequency::Weekly, 1)));
+        assert_eq!(repeat("x ежегодно"), Some(Recurrence::new(Frequency::Yearly, 1)));
+        assert_eq!(repeat("x every time"), None);
+        let p = parse_quick_add("Water the plants every 3 days at 9am", today(), &[]);
+        assert_eq!(p.title, "Water the plants");
+        assert_eq!(p.repeat, Some(Recurrence::new(Frequency::Daily, 3)));
+        assert_eq!(p.due_time, t(9, 0));
     }
 
     #[test]

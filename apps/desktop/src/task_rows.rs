@@ -165,6 +165,7 @@ mod tests {
             priority: Priority::None,
             due_date: None,
             due_time: None,
+            repeat: None,
             tags: Vec::new(),
             checklist: None,
             completed_at: None,

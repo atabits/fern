@@ -31,7 +31,7 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 | Subtasks (`parentId`) | ✅ | cascade delete, no cycles |
 | Item kind: task / note / checklist (`kind`) | 🟡 | task and note; checklist later |
 | Checklist items (`items`) | ✅ | ordered items, insert after, completion, progress |
-| Repeat (`repeatFlag`, RRULE) | ⬜ | |
+| Repeat (`repeatFlag`, RRULE) | 🟡 | FREQ + INTERVAL; completing moves the task to the next date and keeps a completed copy; no BYDAY/BYMONTHDAY yet |
 | Lists (projects), Inbox | ✅ | create, delete, move tasks with subtasks |
 | Custom sections inside a list (columns) | ⬜ | groups are by kind for now |
 | Manual ordering (`sortOrder`) | ⬜ | |
@@ -51,13 +51,13 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 | Lists column: Filters, Won't Do, Trash | 🟡 | Completed and Trash |
 | Mini week at the bottom of the lists column | ⬜ | |
 | List header with sidebar toggle | 🟡 | toggle and "…" work; sorting does not |
-| "Add task" field | ✅ | parses date, time, tags, priority and `^list`; no live highlighting yet; `^list` matches one-word list names only |
+| "Add task" field | ✅ | parses date, time, repeat, tags, priority and `^list`; no live highlighting yet; `^list` matches one-word list names only |
 | Rows by the measurements (40 px, separators) | ✅ | |
-| Tag chips, due date and repeat in rows | 🟡 | tags and due date (overdue in red); no repeat |
+| Tag chips, due date and repeat in rows | ✅ | overdue dates in red |
 | Subtasks with indentation and collapsing | ✅ | creating subtasks from the UI comes later |
 | Groups "Tasks" / "Notes" with counters and collapsing | ✅ | plus a collapsed "Completed" group |
 | Details: checkbox, title, notes | ✅ | |
-| Details: due date | 🟡 | quick options and a month calendar; no time or repeat picker |
+| Details: due date | 🟡 | quick options, month calendar, preset times, daily/weekly/monthly/yearly repeat; no custom time or "every N" in the picker |
 | Details: priority (flag) | ✅ | |
 | Details: tags | ✅ | chips under the title, picker with "+ Tag" |
 | Details: list | ✅ | list button in the bottom bar |
@@ -79,8 +79,8 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 
 ## Next
 
-1. Time and repeat in the due-date picker.
-2. Creating subtasks from the UI.
+1. Creating subtasks from the UI.
+2. Search.
 3. Manual ordering and drag and drop.
-4. Search.
-5. "Won't Do" status.
+4. "Won't Do" status.
+5. Custom time and "every N" in the due-date picker.

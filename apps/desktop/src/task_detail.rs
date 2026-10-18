@@ -2,8 +2,8 @@
 
 use std::rc::Rc;
 
-use fern_core::{ChecklistItem, Id, List, Priority, Store, Tag, Task};
-use chrono::{Datelike, Duration, Local, NaiveDate};
+use fern_core::{ChecklistItem, Frequency, Id, List, Priority, Recurrence, Store, Tag, Task};
+use chrono::{Datelike, Duration, Local, NaiveDate, NaiveTime};
 use gpui::{Entity, EventEmitter, Focusable, FontWeight, MouseButton, Subscription};
 use ui::prelude::*;
 use ui::{Placement, PopoverAttachment, popover};
@@ -280,6 +280,17 @@ impl TaskDetail {
         self.close_popup(cx);
     }
 
+    /// Sets the time of day; picking a time for a task without a date schedules it for today.
+    fn set_time(&mut self, time: Option<NaiveTime>, cx: &mut Context<Self>) {
+        let date = self.task.as_ref().and_then(|t| t.due_date).or_else(|| time.map(|_| Local::now().date_naive()));
+        self.save(cx, |store, id| store.set_due(id, date, time));
+    }
+
+    fn set_repeat(&mut self, repeat: Option<Recurrence>, cx: &mut Context<Self>) {
+        let today = Local::now().date_naive();
+        self.save(cx, |store, id| store.set_repeat(id, repeat, today));
+    }
+
     fn set_priority(&mut self, priority: Priority, cx: &mut Context<Self>) {
         self.save(cx, |store, id| store.set_priority(id, priority));
         self.close_popup(cx);
@@ -488,6 +499,9 @@ impl TaskDetail {
                     .child(Label::new(*day).size(LabelSize::Small).color(Color::Muted))
             })))
             .child(div().flex().flex_wrap().w(px(224.)).children(days))
+            .child(Divider::horizontal())
+            .child(self.render_time_row(strings, cx))
+            .child(self.render_repeat_row(strings, cx))
             .when(selected.is_some(), |el| {
                 el.child(
                     div()
@@ -503,6 +517,48 @@ impl TaskDetail {
                 )
             })
             .into_any_element()
+    }
+
+    fn render_time_row(&self, strings: &'static Strings, cx: &mut Context<Self>) -> impl IntoElement {
+        let current = self.task.as_ref().and_then(|t| t.due_time);
+        let options: Vec<(SharedString, Option<NaiveTime>)> = std::iter::once((strings.no_time.into(), None))
+            .chain([9, 12, 15, 18, 21].into_iter().map(|hour| {
+                (format!("{hour:02}:00").into(), NaiveTime::from_hms_opt(hour, 0, 0))
+            }))
+            .collect();
+        option_row(
+            strings.time,
+            options
+                .into_iter()
+                .map(|(label, time)| {
+                    option_chip(SharedString::from(format!("time-{label}")), label, current == time, cx)
+                        .on_click(cx.listener(move |this, _, _, cx| this.set_time(time, cx)))
+                })
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    fn render_repeat_row(&self, strings: &'static Strings, cx: &mut Context<Self>) -> impl IntoElement {
+        let current = self.task.as_ref().and_then(|t| t.repeat).map(|r| r.frequency);
+        let options = [
+            (strings.repeat_none, None),
+            (strings.repeat_daily, Some(Frequency::Daily)),
+            (strings.repeat_weekly, Some(Frequency::Weekly)),
+            (strings.repeat_monthly, Some(Frequency::Monthly)),
+            (strings.repeat_yearly, Some(Frequency::Yearly)),
+        ];
+        option_row(
+            strings.repeat,
+            options
+                .into_iter()
+                .map(|(label, frequency)| {
+                    let id = SharedString::from(format!("repeat-{frequency:?}"));
+                    option_chip(id, label.into(), current == frequency, cx).on_click(cx.listener(
+                        move |this, _, _, cx| this.set_repeat(frequency.map(|f| Recurrence::new(f, 1)), cx),
+                    ))
+                })
+                .collect::<Vec<_>>(),
+        )
     }
 
     fn render_priority_popup(&self, strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {
@@ -622,6 +678,27 @@ impl TaskDetail {
     }
 }
 
+/// A labeled row of option chips in the due-date popover.
+fn option_row(label: &'static str, chips: impl IntoIterator<Item = Stateful<Div>>) -> impl IntoElement {
+    v_flex()
+        .gap_1()
+        .child(Label::new(label).size(LabelSize::Small).color(Color::Muted))
+        .child(h_flex().flex_wrap().gap_1().children(chips))
+}
+
+fn option_chip(id: SharedString, label: SharedString, selected: bool, cx: &App) -> Stateful<Div> {
+    let colors = cx.theme().colors();
+    div()
+        .id(id)
+        .px_1p5()
+        .py_0p5()
+        .rounded(px(4.))
+        .cursor_pointer()
+        .bg(if selected { colors.accent } else { colors.element_hover })
+        .hover(move |s| if selected { s } else { s.bg(colors.element_selected) })
+        .child(Label::new(label).size(LabelSize::Small))
+}
+
 fn check_mark() -> impl IntoElement {
     Label::new("✓").color(Color::Accent)
 }
@@ -673,6 +750,7 @@ impl Render for TaskDetail {
         let done = task.is_completed();
         let notes_focus = self.notes.focus_handle(cx);
         let today = Local::now().date_naive();
+        let repeats = task.repeat.is_some();
         let (due_text, due_color): (SharedString, Color) = match task.due_date {
             Some(date) => {
                 let (label, overdue) = task_rows::due_label(date, task.due_time, today, strings);
@@ -706,6 +784,7 @@ impl Render for TaskDetail {
                     .child(Divider::vertical())
                     .child(
                         label_button("due-date", IconName::CalendarDays, due_text, due_color, cx)
+                            .when(repeats, |el| el.child(Icon::new(IconName::Repeat).size(IconSize::Small).color(due_color)))
                             .on_click(cx.listener(|this, _, _, cx| this.open_popup(Popup::Due, cx)))
                             .when(self.popup == Some(Popup::Due), |el| {
                                 el.child(PopoverAttachment::new(

@@ -34,6 +34,7 @@ pub enum IconName {
     Pencil,
     Plus,
     RefreshCw,
+    Repeat,
     RotateCcw,
     Search,
     SquareCheck,

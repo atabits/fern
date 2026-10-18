@@ -3,8 +3,10 @@
 
 pub mod model;
 pub mod quick_add;
+pub mod recurrence;
 pub mod store;
 
 pub use model::{ChecklistItem, Id, Kind, List, Priority, Tag, Task, View, ViewCounts};
 pub use quick_add::{ParsedTask, parse_quick_add};
+pub use recurrence::{Frequency, Recurrence};
 pub use store::Store;

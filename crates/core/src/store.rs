@@ -8,6 +8,7 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 use uuid::Uuid;
 
 use crate::model::{ChecklistItem, Id, Kind, List, Priority, Tag, Task, View, ViewCounts};
+use crate::recurrence::Recurrence;
 
 const MIGRATIONS: &[&str] = &[
     "
@@ -70,10 +71,13 @@ const MIGRATIONS: &[&str] = &[
     "
     ALTER TABLE tasks ADD COLUMN deleted_at INTEGER;
     ",
+    "
+    ALTER TABLE tasks ADD COLUMN repeat TEXT;
+    ",
 ];
 
 const TASK_COLUMNS: &str = "id, parent_id, kind, title, notes, priority, due_date, due_time, \
-                            completed_at, created_at, list_id, deleted_at";
+                            completed_at, created_at, list_id, deleted_at, repeat";
 
 const DATE_FORMAT: &str = "%Y-%m-%d";
 const TIME_FORMAT: &str = "%H:%M";
@@ -175,6 +179,7 @@ impl Store {
             priority: Priority::None,
             due_date: None,
             due_time: None,
+            repeat: None,
             tags: Vec::new(),
             checklist: None,
             completed_at: None,
@@ -188,8 +193,53 @@ impl Store {
         Ok(task)
     }
 
+    /// Completes or reopens a task. Completing a repeating task with a due date does not close
+    /// it: a completed copy is kept for history, and the task moves to its next occurrence with
+    /// its checklist reset — the way TickTick handles repeats.
     pub fn set_completed(&self, id: Id, completed: bool) -> Result<()> {
+        if completed
+            && let Some(task) = self.task(id)?
+            && let (Some(repeat), Some(due)) = (task.repeat, task.due_date)
+        {
+            let tx = self.conn.unchecked_transaction()?;
+            let copy = Uuid::now_v7();
+            tx.execute(
+                &format!(
+                    "INSERT INTO tasks ({TASK_COLUMNS})
+                     SELECT ?2, parent_id, kind, title, notes, priority, due_date, due_time,
+                            ?3, created_at, list_id, NULL, NULL
+                     FROM tasks WHERE id = ?1"
+                ),
+                params![id.to_string(), copy.to_string(), now_ms()],
+            )?;
+            tx.execute(
+                "INSERT INTO task_tags (task_id, tag) SELECT ?2, tag FROM task_tags WHERE task_id = ?1",
+                params![id.to_string(), copy.to_string()],
+            )?;
+            tx.execute(
+                "UPDATE tasks SET due_date = ?2 WHERE id = ?1",
+                params![id.to_string(), repeat.next_after(due).format(DATE_FORMAT).to_string()],
+            )?;
+            tx.execute(
+                "UPDATE checklist_items SET completed_at = NULL WHERE task_id = ?1",
+                [id.to_string()],
+            )?;
+            tx.commit()?;
+            return Ok(());
+        }
         self.update(id, "completed_at", completed.then(now_ms))
+    }
+
+    /// Sets or clears the repeat rule. A repeating task needs a due date; `today` is used when
+    /// the task has none.
+    pub fn set_repeat(&self, id: Id, repeat: Option<Recurrence>, today: NaiveDate) -> Result<()> {
+        if repeat.is_some()
+            && let Some(task) = self.task(id)?
+            && task.due_date.is_none()
+        {
+            self.set_due(id, Some(today), task.due_time)?;
+        }
+        self.update(id, "repeat", repeat.map(|r| r.to_string()))
     }
 
     pub fn set_title(&self, id: Id, title: &str) -> Result<()> {
@@ -560,6 +610,7 @@ fn task_from_row(row: &Row) -> rusqlite::Result<Task> {
         created_at: row.get(9)?,
         list_id: row.get::<_, Option<String>>(10)?.map(|l| parse_uuid(&l, 10)).transpose()?,
         deleted_at: row.get(11)?,
+        repeat: row.get::<_, Option<String>>(12)?.and_then(|r| r.parse().ok()),
     })
 }
 
@@ -797,6 +848,37 @@ mod tests {
         store.empty_trash()?;
         assert_eq!(titles(&store.tasks()?), ["keep me"]);
         assert!(store.task(kept.id)?.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn completing_a_repeating_task_moves_it_forward() -> Result<()> {
+        use crate::recurrence::Frequency;
+
+        let store = Store::open_in_memory()?;
+        let today = d(2026, 10, 18);
+        let task = store.add_task("water the plants")?;
+        store.set_tags(task.id, &["home".into()])?;
+        store.set_repeat(task.id, Some(Recurrence::new(Frequency::Weekly, 1)), today)?;
+        assert_eq!(store.task(task.id)?.unwrap().due_date, Some(today));
+        let item = store.add_checklist_item(task.id, "balcony", None)?;
+        store.set_checklist_item_completed(item.id, true)?;
+
+        store.set_completed(task.id, true)?;
+        let task_now = store.task(task.id)?.unwrap();
+        assert!(!task_now.is_completed());
+        assert_eq!(task_now.due_date, Some(d(2026, 10, 25)));
+        assert_eq!(task_now.checklist, Some((0, 1)));
+
+        let history = store.tasks_in(&View::Completed, today)?;
+        assert_eq!(titles(&history), ["water the plants"]);
+        assert_eq!(history[0].due_date, Some(today));
+        assert_eq!(history[0].repeat, None);
+        assert_eq!(history[0].tags, ["home"]);
+
+        store.set_repeat(task.id, None, today)?;
+        store.set_completed(task.id, true)?;
+        assert!(store.task(task.id)?.unwrap().is_completed());
         Ok(())
     }
 

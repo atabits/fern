@@ -222,6 +222,9 @@ impl TodoView {
         if !tags.is_empty() {
             self.store.set_tags(task.id, &tags)?;
         }
+        if let Some(repeat) = parsed.repeat {
+            self.store.set_repeat(task.id, Some(repeat), today)?;
+        }
         if let Some(priority) = parsed.priority {
             self.store.set_priority(task.id, priority)?;
         }
@@ -512,7 +515,10 @@ impl TodoView {
                         )
                     })
                     .when_some(due, |el, (label, overdue)| {
-                        el.child(
+                        el.when(task.repeat.is_some(), |el| {
+                            el.child(Icon::new(IconName::Repeat).size(IconSize::XSmall).color(Color::Accent))
+                        })
+                        .child(
                             Label::new(label)
                                 .size(LabelSize::Small)
                                 .color(if overdue && !done { Color::Error } else { Color::Accent }),

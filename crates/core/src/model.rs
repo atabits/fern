@@ -1,6 +1,8 @@
 use chrono::{NaiveDate, NaiveTime};
 use uuid::Uuid;
 
+use crate::recurrence::Recurrence;
+
 pub type Id = Uuid;
 
 /// Stored as 0/1/3/5, the same values TickTick uses, so imports need no mapping table.
@@ -70,6 +72,8 @@ pub struct Task {
     pub due_date: Option<NaiveDate>,
     /// `None` with a date set means an all-day task.
     pub due_time: Option<NaiveTime>,
+    /// Repeat rule; completing the task moves its due date to the next occurrence.
+    pub repeat: Option<Recurrence>,
     pub tags: Vec<String>,
     /// Checklist progress as (done, total); `None` when the task has no checklist items.
     pub checklist: Option<(usize, usize)>,

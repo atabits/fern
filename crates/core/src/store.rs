@@ -179,6 +179,54 @@ const MIGRATIONS: &[&str] = &[
         UPDATE tasks SET modified_at = CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) WHERE id = NEW.task_id;
     END;
     ",
+    // "Task Activities": what happened to a task and when, recorded by triggers.
+    "
+    CREATE TABLE task_activity (
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        at      INTEGER NOT NULL,
+        kind    TEXT NOT NULL
+    );
+    CREATE INDEX task_activity_task ON task_activity (task_id, at);
+    CREATE TRIGGER activity_created AFTER INSERT ON tasks
+    BEGIN
+        INSERT INTO task_activity (task_id, at, kind) VALUES (NEW.id, CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER), 'created');
+    END;
+    CREATE TRIGGER activity_renamed AFTER UPDATE OF title ON tasks
+    WHEN OLD.title IS NOT NEW.title AND OLD.title <> ''
+    BEGIN
+        INSERT INTO task_activity (task_id, at, kind) VALUES (NEW.id, CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER), 'renamed');
+    END;
+    CREATE TRIGGER activity_completed AFTER UPDATE OF completed_at ON tasks
+    WHEN OLD.completed_at IS NOT NEW.completed_at
+    BEGIN
+        INSERT INTO task_activity (task_id, at, kind) VALUES (NEW.id, CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER), CASE WHEN NEW.completed_at IS NULL THEN 'reopened' ELSE 'completed' END);
+    END;
+    CREATE TRIGGER activity_date AFTER UPDATE OF due_date, due_time ON tasks
+    WHEN OLD.due_date IS NOT NEW.due_date OR OLD.due_time IS NOT NEW.due_time
+    BEGIN
+        INSERT INTO task_activity (task_id, at, kind) VALUES (NEW.id, CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER), CASE WHEN NEW.due_date IS NULL THEN 'date_cleared' ELSE 'date' END);
+    END;
+    CREATE TRIGGER activity_priority AFTER UPDATE OF priority ON tasks
+    WHEN OLD.priority IS NOT NEW.priority
+    BEGIN
+        INSERT INTO task_activity (task_id, at, kind) VALUES (NEW.id, CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER), 'priority');
+    END;
+    CREATE TRIGGER activity_moved AFTER UPDATE OF list_id ON tasks
+    WHEN OLD.list_id IS NOT NEW.list_id
+    BEGIN
+        INSERT INTO task_activity (task_id, at, kind) VALUES (NEW.id, CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER), 'moved');
+    END;
+    CREATE TRIGGER activity_deleted AFTER UPDATE OF deleted_at ON tasks
+    WHEN OLD.deleted_at IS NOT NEW.deleted_at
+    BEGIN
+        INSERT INTO task_activity (task_id, at, kind) VALUES (NEW.id, CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER), CASE WHEN NEW.deleted_at IS NULL THEN 'restored' ELSE 'deleted' END);
+    END;
+    CREATE TRIGGER activity_wont_do AFTER UPDATE OF wont_do_at ON tasks
+    WHEN OLD.wont_do_at IS NOT NEW.wont_do_at
+    BEGIN
+        INSERT INTO task_activity (task_id, at, kind) VALUES (NEW.id, CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER), CASE WHEN NEW.wont_do_at IS NULL THEN 'reopened' ELSE 'wont_do' END);
+    END;
+    ",
 ];
 
 const TASK_COLUMNS: &str = "id, parent_id, kind, title, notes, priority, due_date, due_time, \
@@ -1013,6 +1061,18 @@ impl Store {
         Ok(session)
     }
 
+    /// A task's activity, oldest first.
+    pub fn task_activity(&self, task: Id) -> Result<Vec<crate::model::Activity>> {
+        let mut stmt =
+            self.conn.prepare("SELECT at, kind FROM task_activity WHERE task_id = ?1 ORDER BY at, rowid")?;
+        let activity = stmt
+            .query_map([task.to_string()], |row| {
+                Ok(crate::model::Activity { at: row.get(0)?, kind: row.get(1)? })
+            })?
+            .collect::<Result<_, _>>()?;
+        Ok(activity)
+    }
+
     pub fn delete_focus_session(&self, id: Id) -> Result<()> {
         self.conn.execute("DELETE FROM focus_sessions WHERE id = ?1", [id.to_string()])?;
         Ok(())
@@ -1544,6 +1604,22 @@ mod tests {
         assert!(store.checkins(read.id)?.is_empty());
         store.delete_habit(floss.id)?;
         assert_eq!(store.habits()?.iter().map(|h| h.name.as_str()).collect::<Vec<_>>(), ["Read"]);
+        Ok(())
+    }
+
+    #[test]
+    fn task_activity_is_recorded() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let task = store.add_task("water the plants")?;
+        store.set_title(task.id, "water all the plants")?;
+        store.set_due(task.id, Some(d(2026, 10, 20)), None)?;
+        store.set_priority(task.id, crate::Priority::High)?;
+        store.set_completed(task.id, true)?;
+        store.set_completed(task.id, false)?;
+        store.delete_task(task.id)?;
+        store.restore_task(task.id)?;
+        let kinds: Vec<String> = store.task_activity(task.id)?.into_iter().map(|a| a.kind).collect();
+        assert_eq!(kinds, ["created", "renamed", "date", "priority", "completed", "reopened", "deleted", "restored"]);
         Ok(())
     }
 

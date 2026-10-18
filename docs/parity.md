@@ -56,7 +56,7 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 | Tag chips, due date and repeat in rows | ✅ | overdue dates in red |
 | Subtasks with indentation and collapsing | ✅ | created from the details panel |
 | Groups "Tasks" / "Notes" with counters and collapsing | ✅ | plus a collapsed "Completed" group; the Completed and Won't Do views group by the day the task was closed ("Sunday, September 27") |
-| Details "…" menu | 🟡 | Add Subtask, Won't Do / Reopen, Tags, Duplicate, Convert to Note / Task, Delete; no Pin, Link Parent Task, attachments, Start Focus, activities, templates, links or print |
+| Details "…" menu | 🟡 | Add Subtask, Won't Do / Reopen, Tags, Task Activities (the original's panel at the bottom of the details: created, renamed, completed, date, priority, list, trash and Won't Do changes with their times, recorded by database triggers), Duplicate, Convert to Note / Task, Delete; no Pin, Link Parent Task, attachments, Start Focus, templates, links or print |
 | Details: checkbox, title, notes | ✅ | |
 | Details: due date | 🟡 | popover matched to the original: quick picks with tooltips, month calendar, Time (a field for typing any time — "7:45", "745", "7pm" — plus a 30-minute list), Repeat (with date hints, "Every Weekday" and Custom: every N days/weeks/months/years, weekdays for weekly rules, e.g. "Every 2 weeks on Mo, We"), Reminder (matched to the original's options: on the day / 1, 2, 3 days / 1 week early at 09:00 for all-day tasks; on time / 5, 30 minutes / 1 hour / 1 day early for timed ones; several at once; Custom: N minutes/hours/days in advance for timed tasks, N days/weeks in advance at a chosen time for all-day ones, with "Remind at … on …"), Clear/OK with a draft; reminders fire as desktop notifications while the app runs and show an alarm icon in rows. Duration tab matched to the original: start and end day and time (an hour from the next full hour by default), "All Day"; the panel shows "Oct 18, 06:00 - 07:00" and repeats move the whole span. Spans show in the calendar: on every day they cover in the month view, as start-to-end blocks in the week view. No time zone picker, default "On time" reminder, "Constant Reminder" or "By Due Dates / By Completion" repeat mode |
 | Details: priority (flag) | ✅ | |
@@ -90,7 +90,7 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 
 ## Next
 
-1. "Task Activities" in the details "…" menu (a change log per task).
+1. Pin tasks to the top of a list (details "…" → Pin).
 2. Focus Statistics (the Pomodoro header's "Statistics").
 3. Rename and delete habit sections.
 4. Filled sidebar icons (needs own filled glyphs; Lucide has none).

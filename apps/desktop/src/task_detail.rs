@@ -3,7 +3,7 @@
 use std::rc::Rc;
 
 use fern_core::{ChecklistItem, Frequency, Id, Kind, List, Priority, Recurrence, Store, Tag, Task};
-use chrono::{Datelike, Local, NaiveDate};
+use chrono::{Datelike, Local, NaiveDate, TimeZone as _};
 use gpui::{Entity, EventEmitter, Focusable, FontWeight, MouseButton, Subscription};
 use ui::prelude::*;
 use ui::{Placement, PopoverAttachment, popover};
@@ -49,6 +49,8 @@ pub struct TaskDetail {
     popup: Option<Popup>,
     /// The due-date popover's draft, while it is open.
     due_draft: Option<DueDraft>,
+    /// The "Task Activities" panel, while it is open.
+    activity: Option<Vec<fern_core::Activity>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -154,6 +156,7 @@ impl TaskDetail {
             pending_focus: None,
             popup: None,
             due_draft: None,
+            activity: None,
             _subscriptions: subscriptions,
         }
     }
@@ -175,6 +178,7 @@ impl TaskDetail {
         self.notes.update(cx, |input, cx| input.set_text(notes, cx));
         self.task = task;
         self.popup = None;
+        self.activity = None;
         self.all_tags = self.store.tags().unwrap_or_default();
         self.checklist.clear();
         self.sync_checklist(cx);
@@ -320,6 +324,10 @@ impl TaskDetail {
                         DueMenu::Reminder
                     })
                 });
+                return;
+            }
+            "activity" => {
+                self.open_activity(cx);
                 return;
             }
             "due-duration" => {
@@ -484,6 +492,12 @@ impl TaskDetail {
                 this.open_popup(Popup::Tags, cx);
             })))
             .child(div().py_1().child(Divider::horizontal()))
+            .child(item("more-activities", IconName::ListTree, strings.task_activities).on_click(cx.listener(
+                |this, _, _, cx| {
+                    this.close_popup(cx);
+                    this.open_activity(cx);
+                },
+            )))
             .child(item("more-duplicate", IconName::Copy, strings.duplicate).on_click(cx.listener(
                 |this, _, _, cx| this.menu_action(cx, |store, id| store.duplicate_task(id).map(|_| ())),
             )))
@@ -499,6 +513,61 @@ impl TaskDetail {
             .child(item("more-delete", IconName::Trash, strings.delete).on_click(cx.listener(|this, _, _, cx| {
                 this.menu_action(cx, |store, id| store.delete_task(id))
             })))
+            .into_any_element()
+    }
+
+    fn open_activity(&mut self, cx: &mut Context<Self>) {
+        let Some(task) = self.task.as_ref() else { return };
+        let mut activity = self.store.task_activity(task.id).unwrap_or_default();
+        // Tasks from before activity was recorded still show when they were created.
+        if activity.first().is_none_or(|a| a.kind != "created") {
+            activity.insert(0, fern_core::Activity { at: task.created_at, kind: "created".into() });
+        }
+        self.activity = Some(activity);
+        cx.notify();
+    }
+
+    /// The "Task Activities" panel at the bottom of the details, as in the original.
+    fn render_activity(&self, activity: &[fern_core::Activity], strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        const KINDS: [&str; 11] = [
+            "created", "renamed", "completed", "reopened", "date", "date_cleared", "priority", "moved", "deleted",
+            "restored", "wont_do",
+        ];
+        v_flex()
+            .id("task-activity")
+            .max_h(px(240.))
+            .overflow_y_scroll()
+            .px_5()
+            .py_3()
+            .gap_2()
+            .border_t_1()
+            .border_color(theme.colors().border)
+            .child(
+                h_flex()
+                    .child(div().flex_1().child(Label::new(strings.task_activities).weight(FontWeight::SEMIBOLD)))
+                    .child(IconButton::new("close-activity", IconName::X).on_click(cx.listener(|this, _, _, cx| {
+                        this.activity = None;
+                        cx.notify();
+                    }))),
+            )
+            .children(activity.iter().rev().map(|entry| {
+                let text = KINDS.iter().position(|k| *k == entry.kind).map_or(entry.kind.as_str(), |i| strings.activity_kinds[i]);
+                let when = chrono::Local
+                    .timestamp_millis_opt(entry.at)
+                    .single()
+                    .map(|t| t.format("%m/%d %H:%M").to_string())
+                    .unwrap_or_default();
+                h_flex()
+                    .items_start()
+                    .gap_2()
+                    .child(div().mt(px(5.)).size(px(8.)).flex_none().rounded_full().bg(theme.colors().accent))
+                    .child(
+                        v_flex()
+                            .child(Label::new(text).size(LabelSize::Small))
+                            .child(Label::new(when).size(LabelSize::XSmall).color(Color::Muted)),
+                    )
+            }))
             .into_any_element()
     }
 
@@ -1585,6 +1654,7 @@ impl Render for TaskDetail {
                     .child(div().pt_2().child(Divider::horizontal()))
                     .child(self.render_subtasks(strings, cx)),
             )
+            .when_some(self.activity.clone(), |el, activity| el.child(self.render_activity(&activity, strings, cx)))
             // Bottom bar: list ……… formatting, comments, more; for a trashed task, as in the
             // original: Restore ……… delete forever.
             .child(

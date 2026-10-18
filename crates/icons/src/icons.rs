@@ -43,6 +43,7 @@ pub enum IconName {
     LayoutGrid,
     List,
     ListChecks,
+    ListTree,
     MapPin,
     MessageSquareText,
     Minus,

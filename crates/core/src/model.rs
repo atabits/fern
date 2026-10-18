@@ -92,6 +92,15 @@ pub struct Task {
     pub created_at: i64,
 }
 
+/// One entry of a task's activity: when and what ("created", "renamed", "completed", "reopened",
+/// "date", "date_cleared", "priority", "moved", "deleted", "restored", "wont_do").
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Activity {
+    /// Unix milliseconds.
+    pub at: i64,
+    pub kind: String,
+}
+
 /// One item of a task's checklist (TickTick's `items`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChecklistItem {

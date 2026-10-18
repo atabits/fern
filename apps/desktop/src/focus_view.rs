@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use chrono::{Datelike, Local, NaiveDate};
 use fern_core::stats::{self, Bucket};
 use fern_core::{FocusSession, Id, Store, Task, View, focus_stats, format_minutes};
-use gpui::{Entity, FontWeight, Task as GpuiTask};
+use gpui::{Entity, Focusable as _, FontWeight, Task as GpuiTask};
 use ui::{Donut, Placement, PopoverAttachment, popover};
 use ui::prelude::*;
 
@@ -53,6 +53,9 @@ pub struct FocusView {
     message: Option<String>,
     /// The Statistics page, while it is open.
     stats: Option<StatsPage>,
+    /// The focus record whose dialog is open, and its note field.
+    open_record: Option<Id>,
+    record_note: Entity<TextInput>,
 }
 
 /// What the Statistics page shows: the Trends week, the Most Focused Time month and the year.
@@ -201,6 +204,8 @@ impl FocusView {
             add_minutes: 25,
             message: None,
             stats: None,
+            open_record: None,
+            record_note: cx.new(|cx| TextInput::new(Mode::MultiLine, strings.focus_note_placeholder, cx)),
         };
         this.reload(cx);
         this
@@ -343,6 +348,104 @@ impl FocusView {
         self.add_start.update(cx, |input, cx| input.set_text("", cx));
         self.record_menu = None;
         self.reload(cx);
+    }
+
+    /// Opens a focus record's dialog, its note in the field.
+    fn open_record(&mut self, id: Id, window: &mut Window, cx: &mut Context<Self>) {
+        let note = self.sessions.iter().find(|s| s.id == id).map(|s| s.note.clone()).unwrap_or_default();
+        self.record_note.update(cx, |input, cx| input.set_text(note, cx));
+        window.focus(&self.record_note.focus_handle(cx), cx);
+        self.open_record = Some(id);
+        cx.notify();
+    }
+
+    /// Closes the dialog, keeping what was written in the note.
+    fn close_record(&mut self, cx: &mut Context<Self>) {
+        if let Some(id) = self.open_record.take() {
+            let note = self.record_note.read(cx).text().to_owned();
+            if let Err(err) = self.store.set_focus_note(id, &note) {
+                eprintln!("failed to save the focus note: {err:#}");
+            }
+            self.reload(cx);
+        }
+        cx.notify();
+    }
+
+    /// The original's Focus Record dialog: the record, its time and length, and a note.
+    fn render_record_dialog(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let id = self.open_record?;
+        let session = self.sessions.iter().find(|s| s.id == id)?;
+        let strings = i18n::t(cx);
+        let theme = cx.theme().clone();
+        let start = session.start_local();
+        let when = format!(
+            "{}, {} - {}",
+            crate::task_rows::short_date(start.date_naive(), strings),
+            crate::calendar::format_time(start),
+            crate::calendar::format_time(session.end_local())
+        );
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    v_flex()
+                        .w(px(420.))
+                        .p_4()
+                        .gap_2()
+                        .rounded(px(10.))
+                        .bg(theme.colors().elevated_surface_background)
+                        .border_1()
+                        .border_color(theme.colors().border)
+                        .shadow_lg()
+                        .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_record(cx)))
+                        .child(
+                            h_flex()
+                                .child(div().flex_1().child(Label::new(strings.focus_record).weight(FontWeight::SEMIBOLD)))
+                                .child(IconButton::new("close-record", IconName::X).on_click(cx.listener(|this, _, _, cx| this.close_record(cx)))),
+                        )
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .child(
+                                    Icon::new(if session.stopwatch { IconName::Timer } else { IconName::CircleDot }).color(Color::Accent),
+                                )
+                                .child(Label::new(session.title.clone()).truncate()),
+                        )
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .child(Icon::new(IconName::CalendarDays).size(IconSize::Small).color(Color::Muted))
+                                .child(Label::new(when).size(LabelSize::Small).color(Color::Muted)),
+                        )
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .child(Icon::new(IconName::Clock).size(IconSize::Small).color(Color::Muted))
+                                .child(Label::new(format_minutes(session.minutes())).size(LabelSize::Small).color(Color::Muted)),
+                        )
+                        .child(
+                            div()
+                                .min_h(px(110.))
+                                .p_2()
+                                .rounded(px(6.))
+                                .bg(theme.colors().surface_background)
+                                .child(self.record_note.clone()),
+                        )
+                        .child(
+                            h_flex().justify_end().child(
+                                IconButton::new("delete-open-record", IconName::Trash).on_click(cx.listener(move |this, _, _, cx| {
+                                    this.open_record = None;
+                                    this.delete_record(id, cx);
+                                })),
+                            ),
+                        ),
+                )
+                .into_any_element(),
+        )
     }
 
     fn delete_record(&mut self, id: fern_core::Id, cx: &mut Context<Self>) {
@@ -1534,6 +1637,17 @@ impl FocusView {
                 });
                 return;
             }
+            // The newest record's dialog, with a note.
+            "record" => {
+                if let Some(session) = self.sessions.first() {
+                    let id = session.id;
+                    self.store.set_focus_note(id, "Outlined the first two sections").ok();
+                    self.reload(cx);
+                    self.record_note.update(cx, |input, cx| input.set_text("Outlined the first two sections", cx));
+                    self.open_record = Some(id);
+                }
+                return;
+            }
             "stats-focus" => {
                 self.open_stats(cx);
                 return;
@@ -1669,6 +1783,8 @@ impl FocusView {
                     .items_start()
                     .gap_2()
                     .py_1()
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, window, cx| this.open_record(session_id, window, cx)))
                     // As in the original: the session's kind (Pomodoro or stopwatch) in a circle,
                     // and a line down to a small ring beside the title.
                     .child(
@@ -1707,7 +1823,10 @@ impl FocusView {
                                 .size(LabelSize::XSmall)
                                 .color(Color::Muted),
                             )
-                            .child(Label::new(session.title.clone()).truncate()),
+                            .child(Label::new(session.title.clone()).truncate())
+                            .when(!session.note.is_empty(), |el| {
+                                el.child(Label::new(session.note.clone()).size(LabelSize::Small).color(Color::Muted).truncate())
+                            }),
                     )
                     .child(Label::new(format_minutes(session.minutes())).size(LabelSize::XSmall).color(Color::Muted))
                     .child(
@@ -1931,12 +2050,14 @@ impl Render for FocusView {
             );
 
         h_flex()
+            .relative()
             .size_full()
             .items_start()
             .bg(theme.colors().background)
             .text_color(theme.colors().text)
             .child(left)
             .child(right)
+            .children(self.render_record_dialog(cx))
             .into_any_element()
     }
 }

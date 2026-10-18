@@ -15,6 +15,8 @@ pub struct FocusSession {
     pub ended_at: i64,
     /// Timed with the stopwatch rather than as a Pomodoro.
     pub stopwatch: bool,
+    /// The record's note, shown under its title.
+    pub note: String,
 }
 
 impl FocusSession {
@@ -212,6 +214,7 @@ mod tests {
             started_at,
             ended_at: started_at + minutes * 60_000,
             stopwatch: false,
+            note: String::new(),
         }
     }
 
@@ -283,7 +286,7 @@ mod tests {
         let at = |d: u32, h: u32, m: u32| {
             Local.from_local_datetime(&NaiveDate::from_ymd_opt(2026, 10, d).unwrap().and_hms_opt(h, m, 0).unwrap()).unwrap().timestamp_millis()
         };
-        let session = |start: i64, end: i64| FocusSession { id: uuid::Uuid::now_v7(), task_id: None, title: "x".into(), started_at: start, ended_at: end, stopwatch: false };
+        let session = |start: i64, end: i64| FocusSession { id: uuid::Uuid::now_v7(), task_id: None, title: "x".into(), started_at: start, ended_at: end, stopwatch: false, note: String::new() };
         let monday = NaiveDate::from_ymd_opt(2026, 10, 12).unwrap();
         let sessions = [session(at(15, 13, 30), at(15, 16, 0)), session(at(13, 23, 0), at(14, 1, 0)), session(at(20, 9, 0), at(20, 10, 0))];
         assert_eq!(timeline(&sessions, monday), [(3, 810, 960), (1, 1380, 1440), (2, 0, 60)]);

@@ -131,7 +131,7 @@ impl FocusView {
         cx.notify();
     }
 
-    fn start(&mut self, task: Option<(Id, String)>, cx: &mut Context<Self>) {
+    pub fn start(&mut self, task: Option<(Id, String)>, cx: &mut Context<Self>) {
         self.finish(cx);
         let length = self.minutes(POMO_SETTING) * 60_000;
         self.start_timer(task, None, length, cx);

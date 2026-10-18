@@ -46,6 +46,13 @@ impl AppView {
             });
         })
         .detach();
+        // "Start Focus" in a task's menu starts a Pomodoro for it in the Focus section.
+        cx.subscribe_in(&todo, window, |this, _, crate::task_detail::StartFocus(id, title), window, cx| {
+            let target = Some((*id, title.clone()));
+            this.select(Section::Pomodoro, window, cx);
+            this.focus.update(cx, |focus, cx| focus.start(target, cx));
+        })
+        .detach();
         let matrix = cx.new(|cx| MatrixView::new(store.clone(), cx));
         cx.subscribe_in(&matrix, window, |this, _, matrix_view::OpenTask(id), window, cx| {
             let id = *id;
@@ -121,6 +128,13 @@ impl AppView {
             }
             if let Some(menu) = state.split(';').find_map(|part| part.strip_prefix("focus-menu=")) {
                 this.focus.update(cx, |view, cx| view.dev_menu(menu, cx));
+            }
+            // `focus-task=<title part>`: what "Start Focus" in a task's menu does.
+            if let Some(needle) = state.split(';').find_map(|part| part.strip_prefix("focus-task="))
+                && let Some(task) = this.store.tasks().unwrap_or_default().into_iter().find(|t| t.title.contains(needle))
+            {
+                this.select(Section::Pomodoro, window, cx);
+                this.focus.update(cx, |focus, cx| focus.start(Some((task.id, task.title)), cx));
             }
             if state.contains("section=focus") {
                 this.select(Section::Pomodoro, window, cx);

@@ -76,7 +76,11 @@ pub struct TaskUpdated;
 /// The user asked to open another task (a subtask) in the panel.
 pub struct OpenTask(pub Id);
 
+/// The user asked to focus on the task ("Start Focus").
+pub struct StartFocus(pub Id, pub String);
+
 impl EventEmitter<TaskUpdated> for TaskDetail {}
+impl EventEmitter<StartFocus> for TaskDetail {}
 impl EventEmitter<OpenTask> for TaskDetail {}
 
 impl TaskDetail {
@@ -518,6 +522,12 @@ impl TaskDetail {
                     this.open_activity(cx);
                 },
             )))
+            .child(item("more-focus", IconName::CircleDot, strings.start_focus).on_click(cx.listener(|this, _, _, cx| {
+                this.close_popup(cx);
+                if let Some(task) = this.task.as_ref() {
+                    cx.emit(StartFocus(task.id, task.title.clone()));
+                }
+            })))
             .child(item("more-template", IconName::LayoutTemplate, strings.save_as_template).on_click(cx.listener(
                 |this, _, _, cx| this.menu_action(cx, |store, id| store.save_template(id).map(|_| ())),
             )))

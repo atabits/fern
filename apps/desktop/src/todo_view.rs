@@ -12,7 +12,7 @@ use ui::{Placement, PopoverAttachment, popover};
 use crate::actions::{DeleteTask, SelectNext, SelectPrevious, ToggleComplete};
 use crate::i18n::{self, CurrentLocale, Strings};
 use crate::lists_panel::{self, LIST_COLORS};
-use crate::task_detail::{OpenTask, TaskDetail, TaskUpdated};
+use crate::task_detail::{OpenTask, StartFocus, TaskDetail, TaskUpdated};
 use crate::task_rows::{self, ClosedRange, DropTarget, GroupBy, Row, Section, SortBy};
 use crate::text_input::{Cancelled, Changed, Mode, Submitted, TextInput};
 
@@ -43,6 +43,8 @@ enum RangeEnd {
     Start,
     End,
 }
+
+impl gpui::EventEmitter<StartFocus> for TodoView {}
 
 pub struct TodoView {
     store: Rc<Store>,
@@ -153,6 +155,7 @@ impl TodoView {
         let detail = cx.new(|cx| TaskDetail::new(store.clone(), window, cx));
         cx.subscribe(&detail, |this, _, _: &TaskUpdated, cx| this.reload(cx)).detach();
         cx.subscribe(&detail, |this, _, OpenTask(id), cx| this.select(*id, cx)).detach();
+        cx.subscribe(&detail, |_, _, StartFocus(id, title), cx| cx.emit(StartFocus(*id, title.clone()))).detach();
 
         let mut this = Self {
             store,

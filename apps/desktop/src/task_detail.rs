@@ -340,6 +340,7 @@ impl TaskDetail {
     }
 
     /// For the dev state: `detail-bar=format|comment|format-headings`, and a comment to show.
+    #[cfg(debug_assertions)]
     pub fn dev_bar(&mut self, what: &str, window: &mut Window, cx: &mut Context<Self>) {
         match what {
             "format" => self.format_bar = true,

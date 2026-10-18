@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# Builds Fern and the sync server in release mode for a target and packs them into `dist/`:
+#   Linux    fern-<version>-<target>.tar.gz   (fern, fern-server)
+#   macOS    fern-<version>-<target>.zip      (Fern.app, fern-server)
+#   Windows  fern-<version>-<target>.zip      (fern.exe, fern-server.exe)
+# usage: script/package <rust target triple> [version]
+set -euo pipefail
+
+target=$1
+version=${2:-$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)}
+name="fern-${version}-${target}"
+out="dist/${name}"
+
+cargo build --release --locked --target "$target" -p fern_desktop -p fern_server
+
+bin="target/${target}/release"
+rm -rf "$out"
+mkdir -p "$out"
+cp LICENSE README.md "$out/"
+
+case "$target" in
+    *-apple-darwin)
+        app="$out/Fern.app/Contents"
+        mkdir -p "$app/MacOS"
+        cp "$bin/fern" "$app/MacOS/fern"
+        cat > "$app/Info.plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key><string>Fern</string>
+    <key>CFBundleDisplayName</key><string>Fern</string>
+    <key>CFBundleIdentifier</key><string>io.github.atabits.fern</string>
+    <key>CFBundleExecutable</key><string>fern</string>
+    <key>CFBundlePackageType</key><string>APPL</string>
+    <key>CFBundleShortVersionString</key><string>${version}</string>
+    <key>CFBundleVersion</key><string>${version}</string>
+    <key>LSMinimumSystemVersion</key><string>11.0</string>
+    <key>NSHighResolutionCapable</key><true/>
+    <key>CFBundleURLTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleURLName</key><string>Fern task link</string>
+            <key>CFBundleURLSchemes</key><array><string>fern</string></array>
+        </dict>
+    </array>
+</dict>
+</plist>
+EOF
+        cp "$bin/fern-server" "$out/"
+        (cd dist && ditto -c -k --keepParent "$name" "$name.zip")
+        ;;
+    *-windows-*)
+        cp "$bin/fern.exe" "$bin/fern-server.exe" "$out/"
+        (cd dist && 7z a -tzip "$name.zip" "$name" > /dev/null)
+        ;;
+    *)
+        cp "$bin/fern" "$bin/fern-server" "$out/"
+        tar -C dist -czf "dist/$name.tar.gz" "$name"
+        ;;
+esac
+
+ls -lh dist/"$name".*

@@ -686,6 +686,7 @@ impl CalendarView {
         cx.notify();
     }
 
+    #[cfg(debug_assertions)]
     pub fn dev_open_menu(&mut self, cx: &mut Context<Self>) {
         self.mode_menu_open = true;
         self.multi_day_menu = true;

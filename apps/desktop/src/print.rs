@@ -125,10 +125,17 @@ pub fn open(name: &str, html: &str) -> std::io::Result<()> {
     let path = std::env::temp_dir().join(format!("fern-print-{name}.html"));
     std::fs::write(&path, html)?;
     #[cfg(target_os = "macos")]
-    let opener = "open";
-    #[cfg(not(target_os = "macos"))]
-    let opener = "xdg-open";
-    std::process::Command::new(opener).arg(&path).spawn().map(|_| ())
+    let mut command = std::process::Command::new("open");
+    // `start` is a shell built-in on Windows; its first quoted argument is the window title.
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut command = std::process::Command::new("cmd");
+        command.args(["/C", "start", ""]);
+        command
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let mut command = std::process::Command::new("xdg-open");
+    command.arg(&path).spawn().map(|_| ())
 }
 
 #[cfg(test)]

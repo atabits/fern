@@ -46,21 +46,37 @@ docs/            architecture notes and feature parity with TickTick
 The core is meant to be shared by every client: the desktop app uses it directly, and the
 Android app will use it through UniFFI.
 
+## Download
+
+Builds for Linux (x86_64, ARM64), macOS (Apple Silicon, Intel) and Windows (x86_64) are
+attached to each [release](https://github.com/atabits/fern/releases). They are not signed:
+on macOS, open `Fern.app` with right click → Open the first time; on Windows, choose
+"More info → Run anyway" in SmartScreen.
+
 ## Building
 
-Requirements: Rust stable (see `mise.toml`) and, on Linux, the libraries GPUI needs
-(Wayland or X11, xkbcommon, Vulkan, fontconfig).
+Requirements: Rust stable (see `mise.toml`) and the platform's build tools:
+
+- **Linux**: the libraries GPUI needs (Wayland or X11, xkbcommon, Vulkan, fontconfig);
+  on Debian and Ubuntu `script/linux-deps` installs them.
+- **macOS**: Xcode (GPUI compiles its Metal shaders with it), macOS 11 or later.
+- **Windows**: Visual Studio Build Tools with the "Desktop development with C++" workload.
 
 ```sh
 cargo run -p fern_desktop        # run the desktop app
 cargo test --workspace           # run the tests
+script/package <target>          # release build packed into dist/, e.g. x86_64-unknown-linux-gnu
 ```
 
 GPUI is taken straight from the [Zed repository](https://github.com/zed-industries/zed); the
 first build compiles it and takes a while.
 
-Data is stored in `$XDG_DATA_HOME/fern-tasks/tasks.db` (usually
-`~/.local/share/fern-tasks/tasks.db`).
+CI builds and tests every push on Linux, macOS and Windows; pushing a `v*` tag builds the
+packages for all five targets and publishes them as a GitHub release.
+
+Data is stored in the platform's data directory, in `fern-tasks/tasks.db`: on Linux
+`~/.local/share/fern-tasks/tasks.db`, on macOS `~/Library/Application Support/fern-tasks/`,
+on Windows `%APPDATA%\fern-tasks\`.
 
 ## Contributing
 

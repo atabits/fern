@@ -171,6 +171,7 @@ impl ListDialog {
     }
 
     /// For the dev state: opens one of the dropdowns.
+    #[cfg(debug_assertions)]
     pub fn dev_open(&mut self, what: &str, window: &mut Window, cx: &mut Context<Self>) {
         match what {
             "icon" => self.toggle(Menu::Icon, window, cx),

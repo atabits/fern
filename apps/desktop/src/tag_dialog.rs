@@ -176,6 +176,7 @@ impl TagDialog {
         }
     }
 
+    #[cfg(debug_assertions)]
     pub fn dev_open_parent(&mut self, cx: &mut Context<Self>) {
         self.parent_open = true;
         cx.notify();
@@ -329,6 +330,7 @@ impl MergeDialog {
         }
     }
 
+    #[cfg(debug_assertions)]
     pub fn dev_open(&mut self, cx: &mut Context<Self>) {
         self.open = true;
         cx.notify();

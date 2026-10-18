@@ -19,16 +19,99 @@ use crate::drag::DraggedTask;
 
 use crate::i18n::{self, Strings};
 use crate::lists_panel;
-use crate::task_rows;
+use crate::task_rows::{self, GroupBy, SortBy};
 
 /// The user clicked a task in the matrix.
 pub struct OpenTask(pub Id);
+
+/// A quadrant's Group by (`None` is by list, the original's default), Sort by and Order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QuadrantView {
+    pub group: Option<GroupBy>,
+    pub sort: SortBy,
+    pub newest_first: bool,
+}
+
+impl Default for QuadrantView {
+    /// The original's: by list, by time, oldest first.
+    fn default() -> Self {
+        Self { group: None, sort: SortBy::Date, newest_first: false }
+    }
+}
+
+impl QuadrantView {
+    fn to_storage(self) -> String {
+        format!("{},{},{}", self.group.map_or("list", GroupBy::key), self.sort.key(), if self.newest_first { "newest" } else { "oldest" })
+    }
+
+    fn from_storage(text: &str) -> Self {
+        let mut parts = text.split(',');
+        let group = parts.next().unwrap_or("list");
+        let sort = parts.next().map(SortBy::from_key).unwrap_or(SortBy::Date);
+        let newest_first = parts.next() == Some("newest");
+        // Anything but a list grouping the list menu offers falls back to grouping by list.
+        let group = match GroupBy::from_key(group) {
+            GroupBy::Custom => None,
+            other => Some(other),
+        };
+        Self { group, sort, newest_first }
+    }
+}
+
+/// A quadrant's tasks as groups (a label, empty for no header, and its tasks), grouped and
+/// sorted the quadrant's way. "Oldest first" is the earliest date or creation first.
+pub fn arrange(mut tasks: Vec<Task>, view: QuadrantView, lists: &[List], today: chrono::NaiveDate, strings: &Strings) -> Vec<(String, Vec<Task>)> {
+    task_rows::sort_tasks(&mut tasks, view.sort);
+    // Created and Modified sort newest first, the others in their natural order.
+    let natural_newest = matches!(view.sort, SortBy::Created | SortBy::Modified);
+    if natural_newest != view.newest_first {
+        tasks.reverse();
+    }
+    match view.group {
+        None => {
+            // By list, keeping the order in which lists first appear.
+            let mut groups: Vec<(Option<Id>, Vec<Task>)> = Vec::new();
+            let mut index: HashMap<Option<Id>, usize> = HashMap::new();
+            for task in tasks {
+                let at = *index.entry(task.list_id).or_insert_with(|| {
+                    groups.push((task.list_id, Vec::new()));
+                    groups.len() - 1
+                });
+                groups[at].1.push(task);
+            }
+            groups
+                .into_iter()
+                .map(|(list, tasks)| {
+                    let name = list.and_then(|id| lists.iter().find(|l| l.id == id)).map_or(strings.inbox.to_owned(), |l| l.name.clone());
+                    (name, tasks)
+                })
+                .collect()
+        }
+        Some(group) => {
+            let mut groups: Vec<(String, Vec<Task>)> = Vec::new();
+            for row in task_rows::grouped_rows(&tasks, group, today, false, strings) {
+                match row {
+                    task_rows::Row::Day { label, .. } => groups.push((label, Vec::new())),
+                    task_rows::Row::Task { task, .. } => match groups.last_mut() {
+                        Some((_, tasks)) => tasks.push(task),
+                        None => groups.push((String::new(), vec![task])),
+                    },
+                    task_rows::Row::Section { .. } => {}
+                }
+            }
+            groups
+        }
+    }
+}
 
 pub struct MatrixView {
     store: Rc<Store>,
     tasks: Vec<Task>,
     lists: Vec<List>,
     rules: [QuadrantRule; 4],
+    /// Each quadrant's Group by, Sort by and Order, and the menu row whose choices are open.
+    views: [QuadrantView; 4],
+    menu_row: Option<u8>,
     /// The quadrant whose header "…" menu is open.
     menu: Option<usize>,
     /// "Edit Matrix": the quadrant and its rule being edited, with the name field.
@@ -47,6 +130,8 @@ impl MatrixView {
             tasks: Vec::new(),
             lists: Vec::new(),
             rules: QuadrantRule::defaults(),
+            views: [QuadrantView::default(); 4],
+            menu_row: None,
             menu: None,
             editing: None,
             name_input,
@@ -67,6 +152,9 @@ impl MatrixView {
             .collect();
         self.lists = self.store.lists().unwrap_or_default();
         self.rules = self.store.matrix_rules().unwrap_or_else(|_| QuadrantRule::defaults());
+        for (i, view) in self.views.iter_mut().enumerate() {
+            *view = self.store.setting(&format!("matrix_view_{i}")).ok().flatten().map(|s| QuadrantView::from_storage(&s)).unwrap_or_default();
+        }
         self.tags = self.store.tags().unwrap_or_default().into_iter().map(|t| t.name).collect();
         cx.notify();
     }
@@ -147,8 +235,82 @@ impl MatrixView {
         self.reload(cx);
     }
 
-    /// The original's "Edit Matrix": the quadrant's name, and its Lists, Tags, Date and
-    /// Priority; then Restore, Close or Save.
+    /// The "…" menu's Group by, Sort by and Order, as in the original: each row shows its choice
+    /// and a click lists the choices under it.
+    fn render_view_rows(&self, quadrant: usize, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let strings = i18n::t(cx);
+        let view = self.views[quadrant];
+        let group_label = |group: Option<GroupBy>| group.map_or(strings.filter_lists, |g| g.label(strings));
+        let rows: [(u8, IconName, &'static str, &'static str, Vec<(&'static str, QuadrantView)>); 3] = [
+            (
+                0,
+                IconName::LayoutGrid,
+                strings.group_by,
+                group_label(view.group),
+                std::iter::once(None)
+                    .chain([GroupBy::Date, GroupBy::Created, GroupBy::Tag, GroupBy::Priority, GroupBy::None].map(Some))
+                    .map(|group| (group_label(group), QuadrantView { group, ..view }))
+                    .collect(),
+            ),
+            (
+                1,
+                IconName::ArrowDownUp,
+                strings.sort_by,
+                view.sort.label(strings),
+                [SortBy::Date, SortBy::Created, SortBy::Modified, SortBy::Title, SortBy::Tag, SortBy::Priority]
+                    .map(|sort| (sort.label(strings), QuadrantView { sort, ..view }))
+                    .to_vec(),
+            ),
+            (
+                2,
+                IconName::ArrowDownUp,
+                strings.order,
+                strings.order_options[view.newest_first as usize],
+                [false, true].map(|newest_first| (strings.order_options[newest_first as usize], QuadrantView { newest_first, ..view })).to_vec(),
+            ),
+        ];
+        let mut items = Vec::new();
+        for (row, icon, label, value, choices) in rows {
+            let open = self.menu_row == Some(row);
+            items.push(
+                ListItem::new(SharedString::from(format!("quadrant-view-{row}")))
+                    .start_slot(Icon::new(icon).color(Color::Muted))
+                    .child(Label::new(label))
+                    .end_slot(
+                        h_flex()
+                            .gap_1()
+                            .child(Label::new(value).size(LabelSize::Small).color(Color::Muted))
+                            .child(Icon::new(if open { IconName::ChevronDown } else { IconName::ChevronRight }).size(IconSize::XSmall).color(Color::Muted)),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.menu_row = if this.menu_row == Some(row) { None } else { Some(row) };
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+            );
+            if open {
+                for (i, (choice, next)) in choices.into_iter().enumerate() {
+                    let selected = next == view;
+                    items.push(
+                        ListItem::new(SharedString::from(format!("quadrant-view-{row}-{i}")))
+                            .child(div().pl_6().child(Label::new(choice).size(LabelSize::Small).color(if selected { Color::Accent } else { Color::Default })))
+                            .when(selected, |item| item.end_slot(Icon::new(IconName::Check).size(IconSize::XSmall).color(Color::Accent)))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.views[quadrant] = next;
+                                if let Err(err) = this.store.set_setting(&format!("matrix_view_{quadrant}"), &next.to_storage()) {
+                                    eprintln!("failed to save the quadrant's view: {err:#}");
+                                }
+                                this.menu_row = None;
+                                cx.notify();
+                            }))
+                            .into_any_element(),
+                    );
+                }
+            }
+        }
+        items
+    }
+
     /// Opens a quadrant's "…" menu (`menu`) or its "Edit Matrix" (`edit`), for the debug-build
     /// dev state.
     #[cfg(debug_assertions)]
@@ -157,10 +319,13 @@ impl MatrixView {
             self.start_edit(quadrant, cx);
         } else {
             self.menu = Some(quadrant);
+            self.menu_row = Some(0);
             cx.notify();
         }
     }
 
+    /// The original's "Edit Matrix": the quadrant's name, and its Lists, Tags, Date and
+    /// Priority; then Restore, Close or Save.
     fn render_edit(&self, quadrant: usize, rule: &QuadrantRule, cx: &mut Context<Self>) -> AnyElement {
         let strings = i18n::t(cx);
         let theme = cx.theme().clone();
@@ -376,34 +541,28 @@ impl MatrixView {
             })
             .collect();
 
-        // Group by list, keeping the order in which lists first appear.
-        let mut groups: Vec<(Option<Id>, Vec<&Task>)> = Vec::new();
-        let mut index: HashMap<Option<Id>, usize> = HashMap::new();
-        for task in tasks {
-            let at = *index.entry(task.list_id).or_insert_with(|| {
-                groups.push((task.list_id, Vec::new()));
-                groups.len() - 1
-            });
-            groups[at].1.push(task);
-        }
         let list_name = |list: Option<Id>| -> SharedString {
             list.and_then(|id| self.lists.iter().find(|l| l.id == id))
                 .map_or(SharedString::new_static(strings.inbox), |l| l.name.clone().into())
         };
+        let tasks: Vec<Task> = tasks.into_iter().cloned().collect();
+        let groups = arrange(tasks, self.views[quadrant], &self.lists, today, strings);
         let content: Vec<AnyElement> = groups
             .iter()
-            .flat_map(|(list, tasks)| {
-                let name = list_name(*list);
-                let header = h_flex()
-                    .h(px(28.))
-                    .gap_1()
-                    .px_1()
-                    .child(Icon::new(IconName::ChevronDown).size(IconSize::XSmall))
-                    .child(Label::new(name.clone()).size(LabelSize::Small).weight(FontWeight::SEMIBOLD))
-                    .child(Label::new(tasks.len().to_string()).size(LabelSize::XSmall).color(Color::Muted))
-                    .into_any_element();
-                std::iter::once(header)
-                    .chain(tasks.iter().map(|task| self.render_task(task, &name, cx)))
+            .flat_map(|(label, tasks)| {
+                let header = (!label.is_empty()).then(|| {
+                    h_flex()
+                        .h(px(28.))
+                        .gap_1()
+                        .px_1()
+                        .child(Icon::new(IconName::ChevronDown).size(IconSize::XSmall))
+                        .child(Label::new(label.clone()).size(LabelSize::Small).weight(FontWeight::SEMIBOLD))
+                        .child(Label::new(tasks.len().to_string()).size(LabelSize::XSmall).color(Color::Muted))
+                        .into_any_element()
+                });
+                header
+                    .into_iter()
+                    .chain(tasks.iter().map(|task| self.render_task(task, &list_name(task.list_id), cx)))
                     .collect::<Vec<_>>()
             })
             .collect();
@@ -456,9 +615,10 @@ impl MatrixView {
                                 el.child(PopoverAttachment::new(
                                     Placement::BelowRight,
                                     popover(cx)
-                                        .w(px(150.))
+                                        .w(px(230.))
                                         .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                                             this.menu = None;
+                                            this.menu_row = None;
                                             cx.notify();
                                         }))
                                         .child(
@@ -467,6 +627,7 @@ impl MatrixView {
                                                 .child(Label::new(strings.edit))
                                                 .on_click(cx.listener(move |this, _, _, cx| this.start_edit(quadrant, cx))),
                                         )
+                                        .children(self.render_view_rows(quadrant, cx))
                                         .into_any_element(),
                                 ))
                             })
@@ -519,5 +680,38 @@ impl Render for MatrixView {
                     .child(h_flex().flex_1().min_h_0().items_stretch().gap(px(12.)).child(q1).child(q2))
                     .child(h_flex().flex_1().min_h_0().items_stretch().gap(px(12.)).child(q3).child(q4)),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use fern_core::Store;
+
+    use super::*;
+
+    #[test]
+    fn quadrant_views() {
+        let store = Store::open_in_memory().unwrap();
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 10, 18).unwrap();
+        for (title, days) in [("later", 5), ("soon", 1), ("now", 0)] {
+            let task = store.add_task(title).unwrap();
+            store.set_due(task.id, Some(today + chrono::Duration::days(days)), None).unwrap();
+        }
+        let tasks = store.tasks().unwrap();
+        let strings = &crate::i18n::EN;
+        let titles = |groups: &[(String, Vec<Task>)]| -> Vec<String> {
+            groups.iter().flat_map(|(_, tasks)| tasks.iter().map(|t| t.title.clone())).collect()
+        };
+        let by_list = arrange(tasks.clone(), QuadrantView::default(), &[], today, strings);
+        assert_eq!(by_list.len(), 1);
+        assert_eq!(by_list[0].0, "Inbox");
+        assert_eq!(titles(&by_list), ["now", "soon", "later"], "by time, oldest first");
+        let newest = arrange(tasks.clone(), QuadrantView { newest_first: true, ..QuadrantView::default() }, &[], today, strings);
+        assert_eq!(titles(&newest), ["later", "soon", "now"]);
+        let by_date = arrange(tasks.clone(), QuadrantView { group: Some(GroupBy::Date), ..QuadrantView::default() }, &[], today, strings);
+        assert_eq!(by_date.iter().map(|(label, _)| label.as_str()).collect::<Vec<_>>(), ["Today", "Tomorrow", "Next 7 Days"]);
+        let view = QuadrantView { group: Some(GroupBy::Tag), sort: SortBy::Title, newest_first: true };
+        assert_eq!(QuadrantView::from_storage(&view.to_storage()), view);
+        assert_eq!(QuadrantView::from_storage(""), QuadrantView::default());
     }
 }

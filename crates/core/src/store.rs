@@ -1544,6 +1544,7 @@ impl Store {
                     pinned_at: row.get(7)?,
                     show_age: row.get(8)?,
                     reminders: crate::countdown::parse_reminders(&row.get::<_, String>(9)?),
+                    custom_reminders: crate::countdown::parse_custom_reminders(&row.get::<_, String>(9)?),
                     constant_reminder: row.get(10)?,
                     show_in_list: crate::countdown::ShowInList::parse(&row.get::<_, String>(11)?),
                     plus_one_day: row.get(12)?,
@@ -1557,7 +1558,7 @@ impl Store {
     pub fn add_countdown(&self, name: &str, date: NaiveDate, kind: CountdownKind) -> Result<Countdown> {
         let name = name.trim();
         anyhow::ensure!(!name.is_empty(), "a countdown needs a name");
-        let countdown = Countdown { id: Uuid::now_v7(), name: name.to_owned(), date, kind, icon: None, color: None, repeat: None, pinned_at: None, show_age: false, reminders: Vec::new(), constant_reminder: false, show_in_list: Default::default(), plus_one_day: false, count_up: false };
+        let countdown = Countdown { id: Uuid::now_v7(), name: name.to_owned(), date, kind, icon: None, color: None, repeat: None, pinned_at: None, show_age: false, reminders: Vec::new(), custom_reminders: Vec::new(), constant_reminder: false, show_in_list: Default::default(), plus_one_day: false, count_up: false };
         self.conn.execute(
             "INSERT INTO countdowns (id, name, date, kind, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
@@ -1600,11 +1601,8 @@ impl Store {
 
     /// A countdown's Reminder: the days before its date to be reminded, and whether they stay
     /// on screen until answered.
-    pub fn set_countdown_reminders(&self, id: Id, days: &[u32], constant: bool) -> Result<()> {
-        let mut days = days.to_vec();
-        days.sort();
-        days.dedup();
-        let text = days.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
+    pub fn set_countdown_reminders(&self, id: Id, days: &[u32], custom: &[(u32, chrono::NaiveTime)], constant: bool) -> Result<()> {
+        let text = crate::countdown::reminders_to_storage(days, custom);
         self.conn.execute(
             "UPDATE countdowns SET reminders = ?2, constant_reminder = ?3 WHERE id = ?1",
             params![id.to_string(), text, constant],
@@ -3169,7 +3167,7 @@ mod tests {
         assert_eq!((saved.icon, saved.color), (None, None));
         store.set_countdown_show_age(release.id, true)?;
         assert!(store.countdowns()?[0].show_age);
-        store.set_countdown_reminders(release.id, &[3, 0, 3], true)?;
+        store.set_countdown_reminders(release.id, &[3, 0, 3], &[], true)?;
         let saved = store.countdowns()?.remove(0);
         assert_eq!((saved.reminders, saved.constant_reminder), (vec![0, 3], true));
         store.set_countdown_display(release.id, crate::countdown::ShowInList::Always, true, true)?;

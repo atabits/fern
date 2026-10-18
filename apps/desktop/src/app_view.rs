@@ -268,6 +268,10 @@ impl AppView {
             // `countdown-draft=reminder|calc|counting|show|month`: the dialog with that dropdown open.
             if let Some(row) = state.split(';').find_map(|part| part.strip_prefix("countdown-draft=")) {
                 this.countdown.update(cx, |view, cx| view.dev_open_row(row, cx));
+                // `countdown-draft=custom`: the Reminder's Custom form.
+                if row == "custom" {
+                    this.countdown.update(cx, |view, cx| view.open_custom_reminder(window, cx));
+                }
             }
             // `attach=<task title part>><file path>`: a file attached to that task.
             for spec in state.split(';').filter_map(|part| part.strip_prefix("attach=")) {

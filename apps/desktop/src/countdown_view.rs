@@ -42,10 +42,20 @@ struct Draft {
     open: Option<DraftRow>,
     /// The original's Reminder: days before the date, at 09:00.
     reminders: Vec<u32>,
+    /// Its Custom reminders (days before, time), and the Custom form while open.
+    custom_reminders: Vec<(u32, chrono::NaiveTime)>,
+    custom: Option<CustomReminder>,
     constant_reminder: bool,
     show_in_list: fern_core::countdown::ShowInList,
     plus_one_day: bool,
     count_up: bool,
+}
+
+/// The Reminder's Custom form: a Day or Week unit, how many in advance, and the time.
+struct CustomReminder {
+    weeks: bool,
+    count: Entity<TextInput>,
+    time: Entity<TextInput>,
 }
 
 /// The countdown dialog's fields that open a dropdown, as in the original.
@@ -220,7 +230,7 @@ impl CountdownView {
             Filter::Kind(kind) => kind,
             Filter::All => CountdownKind::Countdown,
         };
-        self.draft = Some(Draft { name, kind, date: today, month: calendar::month_start(today), icon: None, color: None, repeat: None, editing: None, show_age: false, open: None, reminders: fern_core::countdown::DEFAULT_REMINDERS.to_vec(), constant_reminder: false, show_in_list: Default::default(), plus_one_day: false, count_up: false });
+        self.draft = Some(Draft { name, kind, date: today, month: calendar::month_start(today), icon: None, color: None, repeat: None, editing: None, show_age: false, open: None, reminders: fern_core::countdown::DEFAULT_REMINDERS.to_vec(), custom_reminders: Vec::new(), custom: None, constant_reminder: false, show_in_list: Default::default(), plus_one_day: false, count_up: false });
         cx.notify();
     }
 
@@ -234,6 +244,46 @@ impl CountdownView {
             if kind == CountdownKind::Birthday {
                 draft.repeat = Some(fern_core::Recurrence::new(fern_core::Frequency::Yearly, 1));
             }
+        }
+        cx.notify();
+    }
+
+    /// The Reminder's Custom: its form, starting as the original's at 1 day and 09:00.
+    pub fn open_custom_reminder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let field = |text: &str, cx: &mut Context<Self>| {
+            let text = text.to_owned();
+            cx.new(|cx| {
+                let mut input = TextInput::new(Mode::SingleLine, "", cx);
+                input.set_text(text, cx);
+                input
+            })
+        };
+        let count = field("1", cx);
+        let time = field(&calendar::format_time(fern_core::countdown::reminder_time()), cx);
+        for input in [&count, &time] {
+            cx.subscribe(input, |_, _, _: &crate::text_input::Changed, cx| cx.notify()).detach();
+            cx.subscribe(input, |this, _, _: &Submitted, cx| this.confirm_custom_reminder(cx)).detach();
+        }
+        window.focus(&count.focus_handle(cx), cx);
+        if let Some(draft) = self.draft.as_mut() {
+            draft.custom = Some(CustomReminder { weeks: false, count, time });
+        }
+        cx.notify();
+    }
+
+    /// The Custom form's OK: adds the reminder when the count and time read.
+    fn confirm_custom_reminder(&mut self, cx: &mut Context<Self>) {
+        let Some(draft) = self.draft.as_mut() else { return };
+        let Some(custom) = draft.custom.as_ref() else { return };
+        let count: Option<u32> = custom.count.read(cx).text().trim().parse().ok();
+        let time = crate::due_picker::parse_time(custom.time.read(cx).text());
+        if let (Some(count), Some(time)) = (count, time) {
+            let days = if custom.weeks { count * 7 } else { count };
+            if !draft.custom_reminders.contains(&(days, time)) {
+                draft.custom_reminders.push((days, time));
+                draft.custom_reminders.sort();
+            }
+            draft.custom = None;
         }
         cx.notify();
     }
@@ -275,6 +325,7 @@ impl CountdownView {
             draft.repeat = countdown.repeat;
             draft.show_age = countdown.show_age;
             draft.reminders = countdown.reminders.clone();
+            draft.custom_reminders = countdown.custom_reminders.clone();
             draft.constant_reminder = countdown.constant_reminder;
             draft.show_in_list = countdown.show_in_list;
             draft.plus_one_day = countdown.plus_one_day;
@@ -321,7 +372,7 @@ impl CountdownView {
         .and_then(|id| {
             self.store.set_countdown_look(id, draft.icon.as_deref(), draft.color.as_deref())?;
             self.store.set_countdown_show_age(id, draft.kind == CountdownKind::Birthday && draft.show_age)?;
-            self.store.set_countdown_reminders(id, &draft.reminders, draft.constant_reminder)?;
+            self.store.set_countdown_reminders(id, &draft.reminders, &draft.custom_reminders, draft.constant_reminder)?;
             self.store.set_countdown_display(id, draft.show_in_list, draft.plus_one_day, draft.kind == CountdownKind::Birthday && draft.count_up)
         });
         if let Err(err) = added {
@@ -560,21 +611,87 @@ impl CountdownView {
 
         // The Reminder dropdown: the original's None, the days before at 09:00 (several may be
         // ticked), and Constant Reminder.
-        let reminder_text = if draft.reminders.is_empty() {
+        let custom_label = |days: u32, time: chrono::NaiveTime| {
+            format!("{} ({})", strings.countdown_custom_label.replace("{n}", &days.to_string()), crate::calendar::format_time(time))
+        };
+        let reminder_text = if draft.reminders.is_empty() && draft.custom_reminders.is_empty() {
             strings.none_option.to_owned()
         } else {
             fern_core::countdown::REMINDER_DAYS
                 .iter()
                 .zip(strings.countdown_reminder_days)
                 .filter(|(days, _)| draft.reminders.contains(days))
-                .map(|(_, label)| label)
+                .map(|(_, label)| label.to_owned())
+                .chain(draft.custom_reminders.iter().map(|&(days, time)| custom_label(days, time)))
                 .collect::<Vec<_>>()
                 .join(", ")
         };
         let time = crate::calendar::format_time(fern_core::countdown::reminder_time());
         let constant = draft.constant_reminder;
+        let custom_form = draft.custom.as_ref().map(|custom| {
+            let weeks = custom.weeks;
+            let count: u32 = custom.count.read(cx).text().trim().parse().unwrap_or(0);
+            let days = if weeks { count * 7 } else { count };
+            let field = |input: Entity<TextInput>| {
+                h_flex().w(px(100.)).h(px(30.)).px_2().rounded(px(6.)).bg(theme.colors().element_hover).child(input)
+            };
+            let small_button = |id: &'static str, label: &'static str, primary: bool| {
+                div()
+                    .id(id)
+                    .flex_1()
+                    .h(px(28.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(6.))
+                    .cursor_pointer()
+                    .when(primary, |el| el.bg(theme.colors().accent))
+                    .when(!primary, |el| el.border_1().border_color(theme.colors().border))
+                    .child(Label::new(label).size(LabelSize::Small))
+            };
+            v_flex()
+                .gap_2()
+                .p_1()
+                .child(h_flex().gap_1().children(strings.countdown_custom_units.iter().enumerate().map(|(i, label)| {
+                    let on = weeks == (i == 1);
+                    div()
+                        .id(("countdown-custom-unit", i))
+                        .flex_1()
+                        .h(px(28.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(6.))
+                        .cursor_pointer()
+                        .when(on, |el| el.bg(theme.colors().element_selected))
+                        .when(!on, |el| el.border_1().border_color(theme.colors().border))
+                        .child(Label::new(*label).size(LabelSize::Small))
+                        .on_click(set(Box::new(move |d| {
+                            if let Some(custom) = d.custom.as_mut() {
+                                custom.weeks = i == 1;
+                            }
+                        })))
+                })))
+                .child(h_flex().child(div().flex_1().child(Label::new(strings.countdown_custom_advance[weeks as usize]))).child(field(custom.count.clone())))
+                .child(h_flex().child(div().flex_1().child(Label::new(strings.countdown_custom_at))).child(field(custom.time.clone())))
+                .child(Label::new(strings.countdown_custom_ahead.replace("{n}", &days.to_string())).size(LabelSize::Small).color(Color::Muted))
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(small_button("countdown-custom-cancel", strings.cancel, false).on_click(set(Box::new(|d| d.custom = None))))
+                        .child(small_button("countdown-custom-ok", strings.ok, true).on_click(cx.listener(|this, _, _, cx| this.confirm_custom_reminder(cx)))),
+                )
+                .into_any_element()
+        });
         let reminder_menu = v_flex()
-            .child(choice("countdown-reminder-none".into(), strings.none_option, draft.reminders.is_empty()).on_click(set(Box::new(|d| d.reminders.clear()))))
+            .child(
+                choice("countdown-reminder-none".into(), strings.none_option, draft.reminders.is_empty() && draft.custom_reminders.is_empty()).on_click(
+                    set(Box::new(|d| {
+                        d.reminders.clear();
+                        d.custom_reminders.clear();
+                    })),
+                ),
+            )
             .children(fern_core::countdown::REMINDER_DAYS.into_iter().zip(strings.countdown_reminder_days).map(|(days, label)| {
                 let on = draft.reminders.contains(&days);
                 ListItem::new(SharedString::from(format!("countdown-reminder-{days}")))
@@ -595,6 +712,20 @@ impl CountdownView {
                         }
                     })))
             }))
+            // Custom reminders, each unticked with a click, then the original's Custom.
+            .children(draft.custom_reminders.iter().map(|&(days, time)| {
+                ListItem::new(SharedString::from(format!("countdown-custom-{days}-{time}")))
+                    .height(px(34.))
+                    .child(Label::new(custom_label(days, time)).color(Color::Accent))
+                    .end_slot(Icon::new(IconName::Check).size(IconSize::XSmall).color(Color::Accent))
+                    .on_click(set(Box::new(move |d| d.custom_reminders.retain(|r| *r != (days, time)))))
+            }))
+            .child(
+                ListItem::new("countdown-custom")
+                    .height(px(34.))
+                    .child(Label::new(strings.countdown_custom))
+                    .on_click(cx.listener(|this, _, window, cx| this.open_custom_reminder(window, cx))),
+            )
             .child(div().my_1().h(px(1.)).bg(theme.colors().border_variant))
             .child(
                 h_flex()
@@ -623,6 +754,8 @@ impl CountdownView {
                 ),
             )
             .into_any_element();
+        // The original's Custom shows its form in place of the list.
+        let reminder_menu = custom_form.unwrap_or(reminder_menu);
 
         // The original's countdown date: month, day and year fields, each a list.
         use fern_core::countdown::{DatePart, days_in_month, with_date_part};

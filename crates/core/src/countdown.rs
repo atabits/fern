@@ -89,6 +89,8 @@ pub struct Countdown {
     pub show_age: bool,
     /// The original's Reminder: days before the date to be reminded, at 09:00 (0 is the day).
     pub reminders: Vec<u32>,
+    /// The original's Custom reminders: days before the date and a time of one's own.
+    pub custom_reminders: Vec<(u32, chrono::NaiveTime)>,
     /// The reminders stay on screen until answered.
     pub constant_reminder: bool,
     /// The original's Show: when it shows in the Today list.
@@ -177,8 +179,9 @@ pub fn reminders_between(countdowns: &[Countdown], after: chrono::NaiveDateTime,
         let mut targets = vec![countdown.next_date(after.date()), countdown.next_date(after.date() + chrono::Duration::days(8))];
         targets.dedup();
         for target in targets {
-            for &days in &countdown.reminders {
-                let at = (target - chrono::Duration::days(days as i64)).and_time(reminder_time());
+            let all = countdown.reminders.iter().map(|&days| (days, reminder_time())).chain(countdown.custom_reminders.iter().copied());
+            for (days, time) in all {
+                let at = (target - chrono::Duration::days(days as i64)).and_time(time);
                 if after < at && at <= until && !fired.iter().any(|(c, t): &(&Countdown, _)| c.id == countdown.id && *t == at) {
                     fired.push((countdown, at));
                 }
@@ -215,9 +218,35 @@ pub fn days_in_month(year: i32, month: u32) -> u32 {
     (add_months(first, 1) - first).num_days() as u32
 }
 
-/// Reads stored reminder days ("0,3").
+/// Reads stored reminder days ("0,3"); custom entries ("5@18:30") are left to
+/// [`parse_custom_reminders`].
 pub fn parse_reminders(text: &str) -> Vec<u32> {
     text.split(',').filter_map(|d| d.trim().parse().ok()).collect()
+}
+
+/// Reads the stored Custom reminders: "5@18:30" is 5 days early at 18:30.
+pub fn parse_custom_reminders(text: &str) -> Vec<(u32, chrono::NaiveTime)> {
+    text.split(',')
+        .filter_map(|entry| {
+            let (days, time) = entry.trim().split_once('@')?;
+            Some((days.parse().ok()?, chrono::NaiveTime::parse_from_str(time, "%H:%M").ok()?))
+        })
+        .collect()
+}
+
+/// Writes the reminders as stored: the preset days, then the Custom ones.
+pub fn reminders_to_storage(days: &[u32], custom: &[(u32, chrono::NaiveTime)]) -> String {
+    let mut days = days.to_vec();
+    days.sort();
+    days.dedup();
+    let mut custom = custom.to_vec();
+    custom.sort();
+    custom.dedup();
+    days.iter()
+        .map(u32::to_string)
+        .chain(custom.iter().map(|(d, t)| format!("{d}@{}", t.format("%H:%M"))))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// The distance between two dates as calendar years, months and days.
@@ -303,6 +332,7 @@ mod tests {
             pinned_at: None,
             show_age: false,
             reminders: DEFAULT_REMINDERS.to_vec(),
+            custom_reminders: Vec::new(),
             constant_reminder: false,
             show_in_list: ShowInList::OnTheDay,
             plus_one_day: false,
@@ -317,6 +347,17 @@ mod tests {
         assert_eq!(fired(d(2026, 10, 17), d(2026, 10, 22)), [at(d(2026, 10, 18), 9), at(d(2026, 10, 21), 9)]);
         assert!(fired(d(2026, 10, 22), d(2026, 10, 30)).is_empty(), "past dates do not remind");
         assert_eq!(parse_reminders("0, 3,x"), [0, 3]);
+
+        // A Custom reminder: 5 days early at 18:30.
+        let mut custom = list[0].clone();
+        custom.reminders.clear();
+        custom.custom_reminders = vec![(5, chrono::NaiveTime::from_hms_opt(18, 30, 0).unwrap())];
+        let custom_list = [custom];
+        let fired: Vec<_> = reminders_between(&custom_list, at(d(2026, 10, 15), 0), at(d(2026, 10, 17), 0)).into_iter().map(|(_, t)| t).collect();
+        assert_eq!(fired, [d(2026, 10, 16).and_hms_opt(18, 30, 0).unwrap()]);
+        let text = reminders_to_storage(&[3, 0], &custom_list[0].custom_reminders);
+        assert_eq!(text, "0,3,5@18:30");
+        assert_eq!((parse_reminders(&text), parse_custom_reminders(&text)), (vec![0, 3], custom_list[0].custom_reminders.clone()));
 
         // Show in the Today list.
         let date = d(2026, 10, 21);
@@ -355,6 +396,7 @@ mod tests {
             pinned_at: None,
             show_age: false,
             reminders: Vec::new(),
+            custom_reminders: Vec::new(),
             constant_reminder: false,
             show_in_list: ShowInList::OnTheDay,
             plus_one_day: false,
@@ -386,6 +428,7 @@ mod tests {
             pinned_at: None,
             show_age: false,
             reminders: Vec::new(),
+            custom_reminders: Vec::new(),
             constant_reminder: false,
             show_in_list: ShowInList::OnTheDay,
             plus_one_day: false,

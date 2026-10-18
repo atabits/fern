@@ -271,9 +271,25 @@ pub fn achievement_level(score: i64) -> u32 {
     level
 }
 
+/// A chart's scale as the original's axes show it: five even steps from `low`, each a whole
+/// number, covering `high` — `(step, top)`, e.g. 0–5 gives steps of 1 and 0–7 steps of 2 to 10.
+pub fn chart_scale(low: i64, high: i64) -> (i64, i64) {
+    let span = (high - low).max(1);
+    let step = (span + 4) / 5;
+    (step, low + step * 5)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chart_scales() {
+        assert_eq!(chart_scale(0, 5), (1, 5));
+        assert_eq!(chart_scale(0, 7), (2, 10));
+        assert_eq!(chart_scale(0, 0), (1, 5));
+        assert_eq!(chart_scale(15_644, 15_697), (11, 15_699));
+    }
     use crate::Store;
 
     #[test]

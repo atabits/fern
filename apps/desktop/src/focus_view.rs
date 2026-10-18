@@ -122,12 +122,17 @@ fn bar_chart(values: &[i64], labels: Vec<String>, highlight: Option<usize>, heig
     let top = values.iter().copied().max().unwrap_or(0).max(1) as f32;
     v_flex()
         .gap_1()
-        .child(h_flex().h(px(height)).items_end().gap_1().children(values.iter().enumerate().map(|(i, v)| {
-            div()
-                .flex_1()
-                .h(px((height * *v as f32 / top).max(if *v > 0 { 2. } else { 0. })))
-                .rounded_t(px(3.))
-                .bg(if highlight == Some(i) { colors.accent } else { colors.accent.opacity(0.6) })
+        // As the original's: a thin bar over a grey track the chart's full height.
+        .child(h_flex().h(px(height)).gap_1().children(values.iter().enumerate().map(|(i, v)| {
+            div().flex_1().h_full().flex().justify_center().child(
+                div().w(px(6.)).h_full().flex().flex_col().justify_end().rounded(px(3.)).bg(colors.element_hover).child(
+                    div()
+                        .w_full()
+                        .h(px((height * *v as f32 / top).max(if *v > 0 { 2. } else { 0. })))
+                        .rounded(px(3.))
+                        .bg(if highlight == Some(i) || highlight.is_none() { colors.accent } else { colors.accent.opacity(0.6) }),
+                ),
+            )
         })))
         .child(h_flex().gap_1().children(labels.into_iter().map(|l| {
             div().flex_1().flex().justify_center().child(Label::new(l).size(LabelSize::XSmall).color(Color::Muted))
@@ -159,7 +164,8 @@ fn line_chart(values: &[i64], labels: Vec<String>, height: f32, from_zero: bool,
     let colors = cx.theme().colors();
     let (accent, dot) = (colors.accent, colors.text);
     let low = if from_zero { 0 } else { values.iter().copied().min().unwrap_or(0) };
-    let high = values.iter().copied().max().unwrap_or(0).max(low + 1);
+    // The original's axis: five whole steps from the lowest value over the highest.
+    let (step, high) = fern_core::stats::chart_scale(low, values.iter().copied().max().unwrap_or(0));
     let values = values.to_vec();
     let axis = |v: i64| Label::new(v.to_string()).size(LabelSize::XSmall).color(Color::Muted);
     let plot = gpui::canvas(
@@ -216,7 +222,7 @@ fn line_chart(values: &[i64], labels: Vec<String>, height: f32, from_zero: bool,
             h_flex()
                 .items_start()
                 .gap_2()
-                .child(v_flex().h(px(height)).justify_between().child(axis(high)).child(axis(low)))
+                .child(v_flex().h(px(height)).justify_between().children((0..=5).rev().map(|i| axis(low + step * i))))
                 .child(div().flex_1().child(plot)),
         )
         .child(h_flex().pl(px(36.)).children(labels.into_iter().map(|l| {
@@ -1996,15 +2002,23 @@ impl FocusView {
         let day_labels: Vec<String> =
             (0..7).map(|i| (start + chrono::Duration::days(i)).day().to_string()).collect();
         // The original's Overview: 30 px values over muted words, lines between the columns.
-        let value = |v: String, label: &'static str| {
+        // A value as the original's: the numbers large, a duration's "h" and "m" small beside them.
+        let value = |parts: Vec<(i64, Option<char>)>, label: &'static str| {
             v_flex()
                 .flex_1()
                 .min_w_0()
                 .items_center()
                 .gap_1()
-                .child(div().text_size(px(30.)).font_weight(FontWeight::SEMIBOLD).text_color(theme.colors().accent).child(v))
+                .child(h_flex().items_end().text_color(theme.colors().accent).font_weight(FontWeight::SEMIBOLD).children(parts.into_iter().map(|(n, unit)| {
+                    h_flex()
+                        .items_end()
+                        .child(div().text_size(px(30.)).line_height(px(36.)).child(n.to_string()))
+                        .children(unit.map(|u| div().text_size(px(16.)).line_height(px(16.)).mb(px(7.)).mx_0p5().child(u.to_string())))
+                })))
                 .child(Label::new(label).color(Color::Muted).truncate())
         };
+        let count = |n: i64| vec![(n, None)];
+        let duration = |m: i64| fern_core::focus::duration_parts_full(m).into_iter().map(|(n, u)| (n, Some(u))).collect::<Vec<_>>();
         let rule = || div().w(px(1.)).h(px(38.)).flex_none().bg(theme.colors().border);
         // The counts are semibold, their words regular, as in the original.
         let counts = [
@@ -2121,7 +2135,7 @@ impl FocusView {
                 .gap_1()
                 .child(
                     div()
-                        .size(px(28.))
+                        .size(px(36.))
                         .rounded_full()
                         .border_2()
                         .border_color(if share >= 1. { theme.colors().accent } else { theme.colors().element_hover })
@@ -2167,19 +2181,19 @@ impl FocusView {
                                 .gap_8()
                                 .child(
                                     h_flex()
-                                        .child(value(completed[6].to_string(), strings.stats_today_completed))
+                                        .child(value(count(completed[6] as i64), strings.stats_today_completed))
                                         .child(rule())
-                                        .child(value(focus.today_count.to_string(), strings.focus_today_pomo))
+                                        .child(value(count(focus.today_count as i64), strings.focus_today_pomo))
                                         .child(rule())
-                                        .child(value(format_minutes(focus.today_minutes), strings.focus_today_focus)),
+                                        .child(value(duration(focus.today_minutes), strings.focus_today_focus)),
                                 )
                                 .child(
                                     h_flex()
-                                        .child(value(completed_total.to_string(), strings.stats_total_completed))
+                                        .child(value(count(completed_total as i64), strings.stats_total_completed))
                                         .child(rule())
-                                        .child(value(focus.total_count.to_string(), strings.focus_total_pomo))
+                                        .child(value(count(focus.total_count as i64), strings.focus_total_pomo))
                                         .child(rule())
-                                        .child(value(format_minutes(focus.total_minutes), strings.focus_total_duration)),
+                                        .child(value(duration(focus.total_minutes), strings.focus_total_duration)),
                                 ),
                         ),
                 )
@@ -2222,7 +2236,13 @@ impl FocusView {
                 .child(chart(2, strings.stats_pomo_curve, pomos, true, cx))
                 .child(chart(3, strings.stats_focus_curve, minutes, false, cx))
                 .into_any_element(),
-            card().child(div().text_size(px(16.)).font_weight(FontWeight::SEMIBOLD).child(strings.stats_weekly_habits)).child(habit_week).into_any_element(),
+            // As the original's, the week's habits take the left column's width.
+            h_flex()
+                .items_start()
+                .gap_4()
+                .child(card().flex_1().child(div().text_size(px(16.)).font_weight(FontWeight::SEMIBOLD).child(strings.stats_weekly_habits)).child(habit_week))
+                .child(div().flex_1())
+                .into_any_element(),
         ]
     }
 

@@ -305,6 +305,12 @@ pub fn duration_parts(minutes: i64) -> Vec<(i64, char)> {
     }
 }
 
+/// A duration as the original's Statistics overview shows it: hours and minutes both, even when
+/// zero — `[(0, 'h'), (0, 'm')]` for "0h0m".
+pub fn duration_parts_full(minutes: i64) -> Vec<(i64, char)> {
+    vec![(minutes / 60, 'h'), (minutes % 60, 'm')]
+}
+
 /// The Focus Record as CSV, oldest first: start and end in local time, minutes and title.
 pub fn export_csv(sessions: &[FocusSession]) -> String {
     let mut sorted: Vec<&FocusSession> = sessions.iter().collect();
@@ -336,6 +342,8 @@ mod tests {
         assert_eq!(duration_parts(35_396), [(589, 'h'), (56, 'm')]);
         assert_eq!(duration_parts(0), [(0, 'm')]);
         assert_eq!(duration_parts(120), [(2, 'h')]);
+        assert_eq!(duration_parts_full(0), [(0, 'h'), (0, 'm')]);
+        assert_eq!(duration_parts_full(25), [(0, 'h'), (25, 'm')]);
     }
 
     fn session(start: DateTime<Local>, minutes: i64) -> FocusSession {

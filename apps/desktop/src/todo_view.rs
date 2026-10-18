@@ -2200,15 +2200,24 @@ impl TodoView {
                 cx.notify();
             })
         };
-        // The day columns behind each row, so that weekends stay shaded all the way down.
-        let backdrop = |height: Pixels| {
-            h_flex().absolute().top_0().left_0().w_full().h(height).children(days.iter().map(|date| {
+        // The day columns behind each row, so that weekends stay shaded all the way down; a bar
+        // dropped on one moves its task there, keeping its duration.
+        let accent = theme.colors().accent;
+        let backdrop = |row: usize, height: Pixels, cx: &mut Context<Self>| {
+            h_flex().absolute().top_0().left_0().w_full().h(height).children(days.iter().map(|&date| {
                 div()
+                    .id(SharedString::from(format!("timeline-day-{row}-{date}")))
                     .flex_1()
                     .h_full()
                     .border_l_1()
                     .border_color(theme.colors().border_variant)
-                    .when(weekend(date), |el| el.bg(theme.colors().element_hover.opacity(0.5)))
+                    .when(weekend(&date), |el| el.bg(theme.colors().element_hover.opacity(0.5)))
+                    .drag_over::<DraggedTask>(move |style, _, _, _| style.bg(accent.opacity(0.15)))
+                    .on_drop(cx.listener(move |this, dragged: &DraggedTask, _, cx| {
+                        let result = this.store.move_dates(dragged.id, date);
+                        this.check(result);
+                        this.reload(cx);
+                    }))
             }))
         };
         let header = v_flex()
@@ -2287,12 +2296,14 @@ impl TodoView {
                         .h_full()
                         .mr(px(20.))
                         .relative()
-                        .child(backdrop(height))
+                        .child(backdrop(i, height, cx))
                         .children(bars.into_iter().enumerate().map(|(n, (task, first, span))| {
                             let id = task.id;
                             let tint = task_rows::priority_color(task.priority, &theme).unwrap_or(theme.colors().accent);
+                            let dragged = DraggedTask { id, title: task.title.clone().into() };
                             div()
                                 .id(SharedString::from(format!("timeline-{i}-{id}")))
+                                .on_drag(dragged, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
                                 .absolute()
                                 .top(px(8. + 32. * n as f32))
                                 .left(gpui::relative(first as f32 / DAYS as f32))

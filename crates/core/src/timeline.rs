@@ -44,4 +44,23 @@ mod tests {
         assert_eq!(bar(&store.task(task.id)?.unwrap(), d(24), 5), None);
         Ok(())
     }
+
+    #[test]
+    fn moving_keeps_the_duration() -> anyhow::Result<()> {
+        let store = Store::open_in_memory()?;
+        let task = store.add_task("Trip")?;
+        let time = chrono::NaiveTime::from_hms_opt(9, 0, 0);
+        store.set_due(task.id, Some(d(20)), time)?;
+        store.set_due_end(task.id, Some((d(23), None)))?;
+        store.move_dates(task.id, d(25))?;
+        let moved = store.task(task.id)?.unwrap();
+        assert_eq!((moved.due_date, moved.due_time, moved.end_date), (Some(d(25)), time, Some(d(28))));
+
+        // An undated task just gets the date.
+        let plain = store.add_task("Call")?;
+        store.move_dates(plain.id, d(19))?;
+        let plain = store.task(plain.id)?.unwrap();
+        assert_eq!((plain.due_date, plain.end_date), (Some(d(19)), None));
+        Ok(())
+    }
 }

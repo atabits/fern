@@ -1045,6 +1045,22 @@ impl Store {
         Ok(())
     }
 
+    /// Moves a task to start on `date`, keeping its time and the length of its duration: a bar
+    /// dragged in the Timeline.
+    pub fn move_dates(&self, id: Id, date: NaiveDate) -> Result<()> {
+        let task = self.task(id)?.context("task not found")?;
+        let shift = task.due_date.map(|due| date - due);
+        let end = match (task.end_date, shift) {
+            (Some(end), Some(shift)) => Some((end + shift, task.end_time)),
+            _ => None,
+        };
+        self.set_due(id, Some(date), task.due_time)?;
+        if task.end_date.is_some() {
+            self.set_due_end(id, end)?;
+        }
+        Ok(())
+    }
+
     /// "Save as Template": keeps a task's title, notes, priority, tags and checklist.
     pub fn save_template(&self, task: Id) -> Result<crate::model::Template> {
         let task = self.task(task)?.context("task not found")?;

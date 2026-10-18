@@ -1544,40 +1544,50 @@ impl FocusView {
                 ))
         };
         let signed = |n: i64, text: String| if n > 0 { format!("+{text}") } else { text };
-        let overview_item = |value: String, label: &'static str, change: Option<String>| {
+        // As the original's: numbers large with a duration's "h" and "m" small beside them.
+        let overview_item = |parts: Vec<(i64, Option<char>)>, label: &'static str, change: Option<String>| {
             v_flex()
                 .flex_1()
                 .items_center()
                 .gap_0p5()
-                .child(div().text_size(px(26.)).font_weight(FontWeight::SEMIBOLD).text_color(theme.colors().accent).child(value))
+                .child(h_flex().items_end().text_color(theme.colors().accent).font_weight(FontWeight::SEMIBOLD).children(parts.into_iter().map(|(n, unit)| {
+                    h_flex()
+                        .items_end()
+                        .child(div().text_size(px(26.)).line_height(px(32.)).child(n.to_string()))
+                        .children(unit.map(|u| div().text_size(px(15.)).line_height(px(15.)).mb(px(5.)).mx_0p5().child(u.to_string())))
+                })))
                 .child(Label::new(label).size(LabelSize::Small).color(Color::Muted))
                 .children(change.map(|c| Label::new(c).size(LabelSize::XSmall).color(Color::Muted)))
         };
+        let rule = || div().w(px(1.)).h(px(38.)).flex_none().bg(theme.colors().border);
+        let full = |m: i64| fern_core::focus::duration_parts_full(m).into_iter().map(|(n, u)| (n, Some(u))).collect::<Vec<_>>();
         let overview = card()
             .child(div().text_size(px(16.)).font_weight(FontWeight::SEMIBOLD).child(strings.focus_overview))
             .child(
                 h_flex()
                     .child(overview_item(
-                        stats.today_count.to_string(),
+                        vec![(stats.today_count as i64, None)],
                         strings.focus_today_pomo,
                         Some(strings.stats_from_yesterday.replace("{n}", &signed(count_change, count_change.to_string()))),
                     ))
-                    .child(overview_item(stats.total_count.to_string(), strings.focus_total_pomo, None))
+                    .child(rule())
+                    .child(overview_item(vec![(stats.total_count as i64, None)], strings.focus_total_pomo, None))
+                    .child(rule())
                     .child(overview_item(
-                        format_minutes(stats.today_minutes),
+                        full(stats.today_minutes),
                         strings.focus_today_focus,
                         Some(strings.stats_from_yesterday.replace(
                             "{n}",
                             &signed(minutes_change, if minutes_change < 0 { format!("-{}", format_minutes(-minutes_change)) } else { format_minutes(minutes_change) }),
                         )),
                     ))
-                    .child(overview_item(format_minutes(stats.total_minutes), strings.focus_total_duration, None)),
+                    .child(rule())
+                    .child(overview_item(full(stats.total_minutes), strings.focus_total_duration, None)),
             );
 
         // Trends: minutes per day of the chosen week.
         const CHART: f32 = 140.;
         let week = fern_core::focus::minutes_by_day(&self.sessions, page.week, 7);
-        let week_top = week.iter().copied().max().unwrap_or(0).max(1) as f32;
         let average = week.iter().sum::<i64>() / 7;
         let week_label = format!(
             "{} - {}",
@@ -1598,8 +1608,8 @@ impl FocusView {
                     div().flex_1().flex().justify_center().child(Label::new(l).size(LabelSize::XSmall).color(Color::Muted))
                 })))
         };
-        let today_index = (today - page.week).num_days();
         let trends = card()
+            .min_h(px(CARD_HEIGHT))
             .flex_1()
             .min_w_0()
             .child(
@@ -1618,11 +1628,13 @@ impl FocusView {
                     .size(LabelSize::Small)
                     .color(Color::Muted),
             )
-            .child(bars(
-                week,
-                week_top,
+            // As the original's, the week as a curve.
+            .child(line_chart(
+                &week,
                 crate::calendar::weekday_labels(&strings.weekdays_short).iter().map(|d| (*d).to_owned()).collect(),
-                (0..7).contains(&today_index).then_some(today_index as usize),
+                CHART,
+                true,
+                cx,
             ));
 
         // Timeline: the week's sessions as blocks on a day's hours, as in the original.
@@ -1640,6 +1652,7 @@ impl FocusView {
         let accent = theme.colors().accent;
         let grid_line = theme.colors().border_variant;
         let timeline = card()
+            .min_h(px(CARD_HEIGHT))
             .flex_1()
             .min_w_0()
             .child(
@@ -1686,6 +1699,7 @@ impl FocusView {
         let hours_top = hours.iter().copied().max().unwrap_or(0).max(1) as f32;
         let most = hours.iter().enumerate().max_by_key(|(_, m)| **m).filter(|(_, m)| **m > 0).map(|(h, _)| h);
         let most_focused = card()
+            .min_h(px(CARD_HEIGHT))
             .flex_1()
             .min_w_0()
             .child(
@@ -1706,10 +1720,8 @@ impl FocusView {
                 most,
             ));
 
-        // Year Grids: one cell per day, columns are weeks.
+        // Year Grids: one cell per day of the year.
         let first = NaiveDate::from_ymd_opt(page.year, 1, 1).unwrap_or(today);
-        let grid_start = crate::calendar::week_of(first)[0];
-        let days = fern_core::focus::minutes_by_day(&self.sessions, grid_start, 54 * 7);
         let shade = |minutes: i64| match minutes {
             0 => theme.colors().element_hover,
             1..60 => theme.colors().accent.opacity(0.3),
@@ -1717,23 +1729,51 @@ impl FocusView {
             180..300 => theme.colors().accent.opacity(0.8),
             _ => theme.colors().accent,
         };
+        // As the original's: the year's days in columns of 15, top to bottom, with the quarters'
+        // months over them and the legend at the side.
+        let year_days = fern_core::focus::minutes_by_day(&self.sessions, first, 366);
+        let in_year = (0..366).take_while(|i| (first + chrono::Duration::days(*i as i64)).year() == page.year).count();
+        const PER_COLUMN: usize = 15;
+        const CELL: f32 = 13.;
+        let columns = in_year.div_ceil(PER_COLUMN);
+        let month_column = |month: u32| {
+            NaiveDate::from_ymd_opt(page.year, month, 1).map_or(0, |d| (d - first).num_days() as usize / PER_COLUMN)
+        };
+        let legend = [(0, "0m"), (1, "0-1h"), (60, "1h-3h"), (180, "3h-5h"), (300, ">5h")];
         let year_grid = card()
+            .min_h(px(CARD_HEIGHT))
+            .flex_1()
+            .min_w_0()
             .child(
                 h_flex()
                     .child(div().flex_1().child(Label::new(strings.stats_year_grids).weight(FontWeight::SEMIBOLD)))
                     .child(nav("year", page.year.to_string(), |p| p.year -= 1, |p| p.year += 1, cx)),
             )
-            .child(h_flex().gap(px(3.)).children((0..54).map(|week| {
-                v_flex().gap(px(3.)).children((0..7).map(|weekday| {
-                    let index = week * 7 + weekday;
-                    let date = grid_start + chrono::Duration::days(index as i64);
+            .child(
+                div().relative().h(px(14.)).children([1u32, 4, 7, 10].map(|month| {
                     div()
-                        .size(px(11.))
-                        .rounded(px(2.))
-                        .bg(shade(days[index]))
-                        .when(date.year() != page.year, |el| el.opacity(0.))
-                }))
-            })));
+                        .absolute()
+                        .left(px(month_column(month) as f32 * (CELL + 3.)))
+                        .child(Label::new(strings.months_short[month as usize - 1]).size(LabelSize::XSmall).color(Color::Muted))
+                })),
+            )
+            .child(
+                h_flex()
+                    .items_end()
+                    .gap_3()
+                    .child(h_flex().gap(px(3.)).children((0..columns).map(|column| {
+                        v_flex().gap(px(3.)).children((0..PER_COLUMN).map(|row| {
+                            let index = column * PER_COLUMN + row;
+                            div().size(px(CELL)).rounded(px(2.)).when(index < in_year, |el| el.bg(shade(year_days[index])))
+                        }))
+                    })))
+                    .child(v_flex().gap_0p5().children(legend.map(|(minutes, label)| {
+                        h_flex()
+                            .gap_1()
+                            .child(div().size(px(8.)).rounded(px(1.)).bg(shade(minutes)))
+                            .child(Label::new(label).size(LabelSize::XSmall).color(Color::Muted))
+                    }))),
+            );
 
         // As in the original, the page keeps a readable width, centered in wide windows.
         div()
@@ -1810,7 +1850,8 @@ impl FocusView {
                                     .gap_2()
                                     .rounded(px(10.))
                                     .bg(theme.colors().surface_background)
-                                    .child(self.render_record_header(false, cx))
+                                    .min_h(px(CARD_HEIGHT))
+                    .child(self.render_record_header(false, cx))
                                     .child(
                                         v_flex()
                                             .id("stats-focus-record")
@@ -1821,8 +1862,8 @@ impl FocusView {
                             ),
                     )
                     .child(h_flex().items_start().gap_4().child(trends).child(timeline))
-                    .child(h_flex().items_start().gap_4().child(most_focused).child(div().flex_1()))
-                    .child(year_grid),
+                    // Most Focused Time and Year Grids side by side, as in the original.
+                    .child(h_flex().items_start().gap_4().child(most_focused).child(year_grid)),
             }))
             .into_any_element()
     }
@@ -1941,6 +1982,7 @@ impl FocusView {
             if forward { last + chrono::Duration::days(1) } else { first - chrono::Duration::days(1) }
         };
         v_flex()
+            .min_h(px(CARD_HEIGHT))
             .p_4()
             .gap_2()
             .rounded(px(10.))
@@ -1965,7 +2007,7 @@ impl FocusView {
                     .gap_6()
                     .justify_center()
                     .child(
-                        Donut::new(slices.iter().map(|(_, m, color)| (*m as f32, *color))).center(
+                        Donut::new(slices.iter().map(|(_, m, color)| (*m as f32, *color))).size(px(216.)).thickness(px(14.)).center(
                             v_flex()
                                 .items_center()
                                 .child(div().text_size(px(20.)).font_weight(FontWeight::SEMIBOLD).child(if total == 0 {

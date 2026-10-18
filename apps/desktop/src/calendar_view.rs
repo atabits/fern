@@ -956,7 +956,7 @@ impl CalendarView {
                 .children(hour_lines)
                 .children(timed)
                 // The original's red line at the current time, with a dot where it starts.
-                .when(date == today, |el| {
+                .when(date == today && week_axis::unfolded(Local::now().time()), |el| {
                     let top = week_axis::offset(Local::now().time());
                     el.child(div().absolute().top(px(top - 1.)).left_0().right_0().h(px(2.)).bg(now_color)).child(
                         div().absolute().top(px(top - 4.)).left(px(-4.)).size(px(8.)).rounded_full().bg(now_color),
@@ -981,7 +981,7 @@ impl CalendarView {
                             .items_start()
                             .child(
                                 // The current time in red on the axis, as in the original.
-                                div().relative().child(axis).when(week.contains(&today), |el| {
+                                div().relative().child(axis).when(week.contains(&today) && week_axis::unfolded(Local::now().time()), |el| {
                                     let now = Local::now().time();
                                     el.child(
                                         div()

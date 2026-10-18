@@ -197,6 +197,12 @@ pub mod week_axis {
         2. * FOLDED_HEIGHT + (LAST_HOUR - FIRST_HOUR) as f32 * HOUR_HEIGHT
     }
 
+    /// Whether `time` falls in the hour rows rather than a folded night block, where the original
+    /// shows no current-time line.
+    pub fn unfolded(time: NaiveTime) -> bool {
+        (FIRST_HOUR..LAST_HOUR).contains(&time.hour())
+    }
+
     /// The vertical offset of `time` from the top of the axis.
     pub fn offset(time: NaiveTime) -> f32 {
         let minutes = (time.hour() * 60 + time.minute()) as f32;
@@ -299,6 +305,9 @@ mod tests {
         assert_eq!(offset(t(9, 30)), FOLDED_HEIGHT + 1.5 * HOUR_HEIGHT);
         assert_eq!(offset(t(21, 0)), FOLDED_HEIGHT + 13. * HOUR_HEIGHT);
         assert!(offset(t(23, 59)) < total_height());
+        // As the original's, no current-time line in the folded night blocks.
+        assert!(unfolded(t(8, 0)) && unfolded(t(20, 59)));
+        assert!(!unfolded(t(21, 9)) && !unfolded(t(7, 59)));
     }
 
     #[test]

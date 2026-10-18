@@ -516,7 +516,7 @@ pub struct Strings {
     /// Custom, Date, Created Time, Modified Time, Title, Tag, Priority.
     pub sort_options: [&'static str; 7],
     /// Custom, Date, Created Time, Tag, Priority, None.
-    pub group_options: [&'static str; 6],
+    pub group_options: [&'static str; 7],
     pub group_overdue: &'static str,
     pub group_later: &'static str,
     pub group_no_date: &'static str,
@@ -1154,7 +1154,7 @@ pub static EN: Strings = Strings {
     group_by: "Group by",
     sort_by: "Sort by",
     sort_options: ["Custom", "Date", "Created Time", "Modified Time", "Title", "Tag", "Priority"],
-    group_options: ["Custom", "Date", "Created Time", "Tag", "Priority", "None"],
+    group_options: ["Custom", "Date", "Created Time", "Tag", "Priority", "None", "List"],
     group_overdue: "Overdue",
     group_later: "Later",
     group_no_date: "No Date",
@@ -1772,7 +1772,7 @@ pub static RU: Strings = Strings {
     group_by: "Группировать",
     sort_by: "Сортировать",
     sort_options: ["Вручную", "По дате", "По созданию", "По изменению", "По названию", "По тегу", "По приоритету"],
-    group_options: ["Вручную", "По дате", "По созданию", "По тегу", "По приоритету", "Без групп"],
+    group_options: ["Вручную", "По дате", "По созданию", "По тегу", "По приоритету", "Без групп", "По списку"],
     group_overdue: "Просрочено",
     group_later: "Позже",
     group_no_date: "Без даты",

@@ -155,6 +155,8 @@ pub enum GroupBy {
     Tag,
     Priority,
     None,
+    /// By list, the Inbox first, as the original groups its smart lists.
+    List,
 }
 
 impl SortBy {
@@ -175,10 +177,10 @@ impl SortBy {
 }
 
 impl GroupBy {
-    pub const ALL: [Self; 6] = [Self::Custom, Self::Date, Self::Created, Self::Tag, Self::Priority, Self::None];
+    pub const ALL: [Self; 7] = [Self::Custom, Self::List, Self::Date, Self::Created, Self::Tag, Self::Priority, Self::None];
 
     pub fn key(self) -> &'static str {
-        ["custom", "date", "created", "tag", "priority", "none"][self as usize]
+        ["custom", "date", "created", "tag", "priority", "none", "list"][self as usize]
     }
 
     pub fn from_key(key: &str) -> Self {
@@ -226,6 +228,18 @@ pub fn order_tasks(tasks: &mut [Task], sort: SortBy, descending: bool) {
 /// a last group. Groups follow a fixed order: by date, overdue first (or, with `overdue_last` —
 /// Settings → "Overdue Section shows at" — after the undated ones) and undated last.
 pub fn grouped_rows(tasks: &[Task], group: GroupBy, today: NaiveDate, overdue_last: bool, strings: &Strings) -> Vec<Row> {
+    grouped_rows_in(tasks, group, today, overdue_last, &[], strings)
+}
+
+/// `grouped_rows` knowing the lists, for Group by List: their names, in their order.
+pub fn grouped_rows_in(
+    tasks: &[Task],
+    group: GroupBy,
+    today: NaiveDate,
+    overdue_last: bool,
+    lists: &[(fern_core::Id, String)],
+    strings: &Strings,
+) -> Vec<Row> {
     let (open, done): (Vec<&Task>, Vec<&Task>) = tasks.iter().partition(|t| !t.is_completed());
     // Each group's order, label and what dropping a task into it does.
     let key = |task: &Task| -> (i64, String) {
@@ -256,6 +270,10 @@ pub fn grouped_rows(tasks: &[Task], group: GroupBy, today: NaiveDate, overdue_la
                 };
                 (order, label.to_owned())
             }
+            GroupBy::List => match task.list_id.and_then(|id| lists.iter().position(|(l, _)| *l == id)) {
+                Some(i) => (i as i64 + 1, lists[i].1.clone()),
+                None => (0, strings.inbox.to_owned()),
+            },
             GroupBy::Custom | GroupBy::None => (0, String::new()),
         }
     };
@@ -738,6 +756,12 @@ mod tests {
             "## home 1", "cherry", "## work 1", "Apple", "## No Tags 1", "banana", "## Completed 1", "done"
         ]);
         assert_eq!(shape(&grouped_rows(&tasks, GroupBy::None, today, false, &EN)), ["banana", "Apple", "cherry", "done"]);
+        let work = fern_core::Id::now_v7();
+        let mut in_work = tasks.clone();
+        in_work[0].list_id = Some(work);
+        let by_list = shape(&grouped_rows_in(&in_work, GroupBy::List, today, false, &[(work, "Work".into())], &EN));
+        assert!(by_list[0].starts_with("## Inbox"), "the Inbox first, then the lists in their order");
+        assert!(by_list.iter().any(|l| l == "## Work 1"));
         // "Overdue Section shows at: Bottom of List".
         assert_eq!(shape(&grouped_rows(&tasks, GroupBy::Date, today, true, &EN)), [
             "## Today 1", "Apple", "## No Date 1", "cherry", "## Overdue 1", "banana", "## Completed 1", "done"

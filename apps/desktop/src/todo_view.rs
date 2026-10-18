@@ -1722,7 +1722,10 @@ impl TodoView {
                     GroupBy::Custom => {
                         task_rows::build_rows(&tasks, collapsed_tasks, collapsed_sections, true)
                     }
-                    group => task_rows::grouped_rows(&tasks, group, Self::today(), self.preferences.task_defaults.overdue_last, strings),
+                    group => {
+                        let lists: Vec<(Id, String)> = self.lists.iter().map(|l| (l.id, l.name.clone())).collect();
+                        task_rows::grouped_rows_in(&tasks, group, Self::today(), self.preferences.task_defaults.overdue_last, &lists, strings)
+                    }
                 }
             }
         }

@@ -1,7 +1,7 @@
 //! State and labels of the due-date popover, matched to TickTick's: the user edits a draft
 //! (date, time, repeat) and nothing is saved until "OK".
 
-use chrono::{Datelike, Duration, Months, NaiveDate, NaiveTime, Timelike};
+use chrono::{Datelike, Duration, Months, NaiveDate, NaiveDateTime, NaiveTime, Timelike};
 use fern_core::reminder::{ALL_DAY_OFFSETS, ALL_DAY_REMINDER_HOUR, TIMED_OFFSETS};
 use fern_core::{Frequency, Recurrence, Task};
 
@@ -30,6 +30,28 @@ pub struct DueDraft {
     /// The month shown in the calendar.
     pub month: NaiveDate,
     pub menu: Option<DueMenu>,
+    pub tab: DueTab,
+    /// The end of a duration, on the Duration tab.
+    pub end_date: Option<NaiveDate>,
+    pub end_time: Option<NaiveTime>,
+    /// The Duration tab's field being picked with the calendar or the time list.
+    pub range_field: Option<RangeField>,
+}
+
+/// The tabs of the due-date popover.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DueTab {
+    #[default]
+    Date,
+    Duration,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RangeField {
+    StartDate,
+    StartTime,
+    EndDate,
+    EndTime,
 }
 
 impl DueDraft {
@@ -39,9 +61,71 @@ impl DueDraft {
             time: task.due_time,
             repeat: task.repeat,
             reminders: task.reminders.clone(),
+            tab: if task.end_date.is_some() { DueTab::Duration } else { DueTab::Date },
+            end_date: task.end_date,
+            end_time: task.end_time,
+            range_field: None,
             month: calendar::month_start(task.due_date.unwrap_or(today)),
             menu: None,
         }
+    }
+
+    /// Switches to the Duration tab. Like the original, an empty draft starts at the next full
+    /// hour and lasts an hour.
+    pub fn start_duration(&mut self, now: NaiveDateTime) {
+        self.tab = DueTab::Duration;
+        self.menu = None;
+        let date = *self.date.get_or_insert(now.date());
+        if self.end_date.is_none() {
+            if self.time.is_none() {
+                let next_hour = (now.hour() + 1) % 24;
+                self.time = NaiveTime::from_hms_opt(next_hour, 0, 0);
+            }
+            self.end_date = Some(date);
+            self.end_time = self.time.map(|t| t + Duration::hours(1));
+        }
+    }
+
+    pub fn is_all_day(&self) -> bool {
+        self.time.is_none()
+    }
+
+    /// "All Day" drops the times; turning it off restores an hour from 09:00.
+    pub fn set_all_day(&mut self, all_day: bool) {
+        if all_day {
+            self.time = None;
+            self.end_time = None;
+        } else {
+            self.time = NaiveTime::from_hms_opt(9, 0, 0);
+            self.end_time = NaiveTime::from_hms_opt(10, 0, 0);
+        }
+    }
+
+    /// Picks a day for the start or the end; the end never goes before the start.
+    pub fn pick_range_date(&mut self, date: NaiveDate) {
+        match self.range_field {
+            Some(RangeField::EndDate) => self.end_date = Some(date.max(self.date.unwrap_or(date))),
+            _ => {
+                self.date = Some(date);
+                if self.end_date.is_none_or(|end| end < date) {
+                    self.end_date = Some(date);
+                }
+            }
+        }
+        self.range_field = None;
+    }
+
+    pub fn pick_range_time(&mut self, time: NaiveTime) {
+        match self.range_field {
+            Some(RangeField::EndTime) => self.end_time = Some(time),
+            _ => self.time = Some(time),
+        }
+        self.range_field = None;
+    }
+
+    /// The end to save: only on the Duration tab and with a start date.
+    pub fn end(&self) -> Option<(NaiveDate, Option<NaiveTime>)> {
+        (self.tab == DueTab::Duration && self.date.is_some()).then_some(()).and(self.end_date).map(|d| (d, self.end_time))
     }
 
     pub fn pick_date(&mut self, date: NaiveDate) {
@@ -245,6 +329,24 @@ pub fn reminder_label(reminders: &[i64], has_time: bool, strings: &Strings) -> O
     Some(labels.join(", "))
 }
 
+/// A duration's label: "Oct 18, 06:00 - 07:00", "Oct 18 - Oct 20" or with times on both days.
+pub fn range_label(
+    start: NaiveDate,
+    start_time: Option<NaiveTime>,
+    end: NaiveDate,
+    end_time: Option<NaiveTime>,
+    strings: &Strings,
+) -> String {
+    let day = |date| crate::task_rows::short_date(date, strings);
+    let time = |t: Option<NaiveTime>| t.map(|t| t.format("%H:%M").to_string());
+    match (time(start_time), time(end_time)) {
+        (Some(a), Some(b)) if start == end => format!("{}, {a} - {b}", day(start)),
+        (Some(a), Some(b)) => format!("{}, {a} - {}, {b}", day(start), day(end)),
+        _ if start == end => day(start),
+        _ => format!("{} - {}", day(start), day(end)),
+    }
+}
+
 /// The quick picks above the calendar: today, tomorrow, next week, next month.
 pub fn quick_dates(today: NaiveDate) -> [NaiveDate; 4] {
     [
@@ -345,6 +447,10 @@ mod tests {
             repeat: None,
             reminders: Vec::new(),
             month: today,
+            tab: DueTab::Date,
+            end_date: None,
+            end_time: None,
+            range_field: None,
             menu: Some(DueMenu::Reminder),
         };
         draft.toggle_reminder(24 * 60, today);
@@ -374,6 +480,42 @@ mod tests {
         assert_eq!(describe_reminder(-9 * 60, false, &EN), "On the day (18:00)");
         assert_eq!(describe_reminder(7 * 24 * 60 + 30, false, &EN), "1 week early (08:30)");
         assert_eq!(reminder_label(&[24 * 60, 2 * 24 * 60 - 60], false, &EN).as_deref(), Some("1 day early, 2 days early (10:00)"));
+    }
+
+    #[test]
+    fn durations() {
+        let today = d(2026, 10, 18);
+        let t = |h| NaiveTime::from_hms_opt(h, 0, 0);
+        let mut draft = DueDraft {
+            date: None,
+            time: None,
+            repeat: None,
+            reminders: Vec::new(),
+            month: today,
+            tab: DueTab::Date,
+            end_date: None,
+            end_time: None,
+            range_field: None,
+            menu: None,
+        };
+        assert_eq!(draft.end(), None);
+        draft.start_duration(today.and_hms_opt(5, 30, 0).unwrap());
+        assert_eq!((draft.date, draft.time, draft.end_date, draft.end_time), (Some(today), t(6), Some(today), t(7)));
+        assert_eq!(draft.end(), Some((today, t(7))));
+
+        draft.range_field = Some(RangeField::EndDate);
+        draft.pick_range_date(d(2026, 10, 15));
+        assert_eq!(draft.end_date, Some(today), "the end cannot go before the start");
+        draft.range_field = Some(RangeField::StartDate);
+        draft.pick_range_date(d(2026, 10, 20));
+        assert_eq!((draft.date, draft.end_date), (Some(d(2026, 10, 20)), Some(d(2026, 10, 20))));
+        draft.set_all_day(true);
+        assert_eq!((draft.time, draft.end_time), (None, None));
+        draft.tab = DueTab::Date;
+        assert_eq!(draft.end(), None, "the Date tab saves no duration");
+
+        assert_eq!(range_label(today, t(6), today, t(7), &EN), "Oct 18, 06:00 - 07:00");
+        assert_eq!(range_label(today, None, d(2026, 10, 20), None, &EN), "Oct 18 - Oct 20");
     }
 
     #[test]
@@ -420,13 +562,21 @@ mod tests {
             repeat: None,
             reminders: Vec::new(),
             month: today,
+            tab: DueTab::Date,
+            end_date: None,
+            end_time: None,
+            range_field: None,
             menu: Some(DueMenu::Time),
         };
         draft.pick_time(NaiveTime::from_hms_opt(9, 30, 0), today);
         assert_eq!((draft.date, draft.menu), (Some(today), None));
 
         let mut draft =
-            DueDraft { date: None, time: None, repeat: None, reminders: Vec::new(), month: today, menu: None };
+            DueDraft { date: None, time: None, repeat: None, reminders: Vec::new(), month: today,
+            tab: DueTab::Date,
+            end_date: None,
+            end_time: None,
+            range_field: None, menu: None };
         draft.pick_repeat(Some(Recurrence::weekdays()), today);
         assert_eq!(draft.date, Some(today));
         assert_eq!(time_options().len(), 48);

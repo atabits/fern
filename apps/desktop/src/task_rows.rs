@@ -323,6 +323,8 @@ mod tests {
             completed_at: None,
             deleted_at: None,
             wont_do_at: None,
+            end_date: None,
+            end_time: None,
             reminders: Vec::new(),
             created_at: 0,
         }

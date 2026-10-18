@@ -126,10 +126,14 @@ const MIGRATIONS: &[&str] = &[
     "
     ALTER TABLE habits ADD COLUMN reminders TEXT;
     ",
+    "
+    ALTER TABLE tasks ADD COLUMN end_date TEXT;
+    ALTER TABLE tasks ADD COLUMN end_time TEXT;
+    ",
 ];
 
 const TASK_COLUMNS: &str = "id, parent_id, kind, title, notes, priority, due_date, due_time, \
-                            completed_at, created_at, list_id, deleted_at, repeat, wont_do_at, reminders";
+                            completed_at, created_at, list_id, deleted_at, repeat, wont_do_at, reminders, end_date, end_time";
 
 const DATE_FORMAT: &str = "%Y-%m-%d";
 const TIME_FORMAT: &str = "%H:%M";
@@ -237,6 +241,8 @@ impl Store {
             completed_at: None,
             deleted_at: None,
             wont_do_at: None,
+            end_date: None,
+            end_time: None,
             reminders: Vec::new(),
             created_at: now_ms(),
         };
@@ -325,7 +331,7 @@ impl Store {
                 &format!(
                     "INSERT INTO tasks ({TASK_COLUMNS})
                      SELECT ?2, parent_id, kind, title, notes, priority, due_date, due_time,
-                            ?3, created_at, list_id, NULL, NULL, NULL, NULL
+                            ?3, created_at, list_id, NULL, NULL, NULL, NULL, end_date, end_time
                      FROM tasks WHERE id = ?1"
                 ),
                 params![id.to_string(), copy.to_string(), now_ms()],
@@ -334,9 +340,12 @@ impl Store {
                 "INSERT INTO task_tags (task_id, tag) SELECT ?2, tag FROM task_tags WHERE task_id = ?1",
                 params![id.to_string(), copy.to_string()],
             )?;
+            let next = repeat.next_after(due);
+            // A duration moves with its start.
+            let end = task.end_date.map(|end| (end + (next - due)).format(DATE_FORMAT).to_string());
             tx.execute(
-                "UPDATE tasks SET due_date = ?2 WHERE id = ?1",
-                params![id.to_string(), repeat.next_after(due).format(DATE_FORMAT).to_string()],
+                "UPDATE tasks SET due_date = ?2, end_date = ?3 WHERE id = ?1",
+                params![id.to_string(), next.format(DATE_FORMAT).to_string(), end],
             )?;
             tx.execute(
                 "UPDATE checklist_items SET completed_at = NULL WHERE task_id = ?1",
@@ -372,7 +381,8 @@ impl Store {
         self.conn.execute(
             "UPDATE tasks SET parent_id = o.parent_id, kind = o.kind, notes = o.notes,
                  priority = o.priority, due_date = o.due_date, due_time = o.due_time,
-                 list_id = o.list_id, repeat = o.repeat, reminders = o.reminders
+                 list_id = o.list_id, repeat = o.repeat, reminders = o.reminders,
+                 end_date = o.end_date, end_time = o.end_time
              FROM (SELECT * FROM tasks WHERE id = ?2) AS o WHERE tasks.id = ?1",
             params![copy.id.to_string(), id.to_string()],
         )?;
@@ -402,6 +412,17 @@ impl Store {
     }
 
     /// Sets the due date. A time without a date is meaningless and is dropped.
+    /// Sets the end of a task's duration; `None` makes it a plain due date again.
+    pub fn set_due_end(&self, id: Id, end: Option<(NaiveDate, Option<NaiveTime>)>) -> Result<()> {
+        let date = end.map(|(d, _)| d.format(DATE_FORMAT).to_string());
+        let time = end.and_then(|(_, t)| t).map(|t| t.format(TIME_FORMAT).to_string());
+        self.conn.execute(
+            "UPDATE tasks SET end_date = ?2, end_time = ?3 WHERE id = ?1",
+            params![id.to_string(), date, time],
+        )?;
+        Ok(())
+    }
+
     pub fn set_reminders(&self, id: Id, reminders: &[i64]) -> Result<()> {
         self.update(id, "reminders", crate::reminder::format(reminders))
     }
@@ -990,6 +1011,8 @@ fn task_from_row(row: &Row) -> rusqlite::Result<Task> {
         repeat: row.get::<_, Option<String>>(12)?.and_then(|r| r.parse().ok()),
         wont_do_at: row.get(13)?,
         reminders: row.get::<_, Option<String>>(14)?.map(|r| crate::reminder::parse(&r)).unwrap_or_default(),
+        end_date: row.get::<_, Option<String>>(15)?.and_then(|d| NaiveDate::parse_from_str(&d, DATE_FORMAT).ok()),
+        end_time: row.get::<_, Option<String>>(16)?.and_then(|t| NaiveTime::parse_from_str(&t, TIME_FORMAT).ok()),
     })
 }
 
@@ -1352,6 +1375,25 @@ mod tests {
         assert!(store.checkins(read.id)?.is_empty());
         store.delete_habit(floss.id)?;
         assert_eq!(store.habits()?.iter().map(|h| h.name.as_str()).collect::<Vec<_>>(), ["Read"]);
+        Ok(())
+    }
+
+    #[test]
+    fn durations_move_with_repeats() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let task = store.add_task("conference")?;
+        let t = |h| NaiveTime::from_hms_opt(h, 0, 0).unwrap();
+        store.set_due(task.id, Some(d(2026, 10, 20)), Some(t(9)))?;
+        store.set_due_end(task.id, Some((d(2026, 10, 22), Some(t(17)))))?;
+        let stored = store.task(task.id)?.unwrap();
+        assert_eq!((stored.end_date, stored.end_time), (Some(d(2026, 10, 22)), Some(t(17))));
+        assert_eq!(store.duplicate_task(task.id)?.end_date, Some(d(2026, 10, 22)));
+        store.set_repeat(task.id, Some(crate::Recurrence::new(crate::Frequency::Weekly, 1)), d(2026, 10, 18))?;
+        store.set_completed(task.id, true)?;
+        let next = store.task(task.id)?.unwrap();
+        assert_eq!((next.due_date, next.end_date), (Some(d(2026, 10, 27)), Some(d(2026, 10, 29))));
+        store.set_due_end(task.id, None)?;
+        assert_eq!(store.task(task.id)?.unwrap().end_date, None);
         Ok(())
     }
 

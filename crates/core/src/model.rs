@@ -82,6 +82,9 @@ pub struct Task {
     pub deleted_at: Option<i64>,
     /// When the task was marked "Won't Do".
     pub wont_do_at: Option<i64>,
+    /// The end of a duration ("Duration" tab): the task spans from the due date and time to here.
+    pub end_date: Option<NaiveDate>,
+    pub end_time: Option<NaiveTime>,
     /// Reminders as minutes before the due time (09:00 on the due day for all-day tasks).
     pub reminders: Vec<i64>,
     pub created_at: i64,

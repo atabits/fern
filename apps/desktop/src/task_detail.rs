@@ -9,7 +9,7 @@ use ui::prelude::*;
 use ui::{Placement, PopoverAttachment, popover};
 
 use crate::calendar;
-use crate::due_picker::{self, CustomReminder, DueDraft, DueMenu, ReminderUnit};
+use crate::due_picker::{self, CustomReminder, DueDraft, DueMenu, DueTab, RangeField, ReminderUnit};
 use crate::i18n::{self, CurrentLocale, Strings};
 use crate::lists_panel;
 use crate::task_rows;
@@ -322,6 +322,11 @@ impl TaskDetail {
                 });
                 return;
             }
+            "due-duration" => {
+                self.open_popup(Popup::Due, cx);
+                self.update_draft(cx, |d| d.start_duration(Local::now().naive_local()));
+                return;
+            }
             "due-time" | "due-custom" => {
                 self.open_popup(Popup::Due, cx);
                 let today = Local::now().date_naive();
@@ -358,6 +363,7 @@ impl TaskDetail {
             let today = Local::now().date_naive();
             self.save(cx, |store, id| {
                 store.set_due(id, draft.date, draft.time)?;
+                store.set_due_end(id, draft.end())?;
                 store.set_reminders(id, if draft.date.is_some() { &draft.reminders } else { &[] })?;
                 store.set_repeat(id, draft.repeat, today)
             });
@@ -371,6 +377,7 @@ impl TaskDetail {
         let today = Local::now().date_naive();
         self.save(cx, |store, id| {
             store.set_due(id, None, None)?;
+            store.set_due_end(id, None)?;
             store.set_reminders(id, &[])?;
             store.set_repeat(id, None, today)
         });
@@ -609,6 +616,104 @@ impl TaskDetail {
             )
     }
 
+    /// The Duration tab: start and end with day and time, "All Day", and a calendar or time list
+    /// for the field being picked.
+    fn render_duration(
+        &self,
+        draft: &DueDraft,
+        calendar_block: AnyElement,
+        strings: &'static Strings,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = cx.theme().clone();
+        let all_day = draft.is_all_day();
+        let chip = |id: &'static str, label: SharedString, field: RangeField, cx: &mut Context<Self>| {
+            let active = draft.range_field == Some(field);
+            div()
+                .id(id)
+                .flex_1()
+                .h(px(28.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(6.))
+                .border_1()
+                .border_color(if active { theme.colors().accent } else { theme.colors().border })
+                .cursor_pointer()
+                .child(Label::new(label).size(LabelSize::Small))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.update_draft(cx, |d| {
+                        d.range_field = if d.range_field == Some(field) { None } else { Some(field) };
+                        let shown = if field == RangeField::EndDate { d.end_date } else { d.date };
+                        if let Some(date) = shown {
+                            d.month = calendar::month_start(date);
+                        }
+                    })
+                }))
+        };
+        let day = |date: Option<NaiveDate>| -> SharedString {
+            date.map_or(SharedString::default(), |d| task_rows::short_date(d, strings).into())
+        };
+        let time = |t: Option<chrono::NaiveTime>| -> SharedString { t.map_or(SharedString::default(), |t| t.format("%H:%M").to_string().into()) };
+        let line = |label: &'static str, date_chip: AnyElement, time_chip: Option<AnyElement>| {
+            h_flex()
+                .gap_2()
+                .child(div().w(px(40.)).child(Label::new(label).size(LabelSize::Small)))
+                .child(date_chip)
+                .children(time_chip)
+        };
+        let start_date = chip("range-start-date", day(draft.date), RangeField::StartDate, cx).into_any_element();
+        let start_time = (!all_day).then(|| chip("range-start-time", time(draft.time), RangeField::StartTime, cx).into_any_element());
+        let end_date = chip("range-end-date", day(draft.end_date), RangeField::EndDate, cx).into_any_element();
+        let end_time = (!all_day).then(|| chip("range-end-time", time(draft.end_time), RangeField::EndTime, cx).into_any_element());
+        let picker: Option<AnyElement> = match draft.range_field {
+            Some(RangeField::StartDate | RangeField::EndDate) => Some(calendar_block),
+            Some(field @ (RangeField::StartTime | RangeField::EndTime)) => {
+                let current = if field == RangeField::EndTime { draft.end_time } else { draft.time };
+                Some(
+                    v_flex()
+                        .id("range-times")
+                        .max_h(px(180.))
+                        .overflow_y_scroll()
+                        .children(due_picker::time_options().into_iter().map(|t| {
+                            ListItem::new(SharedString::from(format!("range-time-{t}")))
+                                .height(px(28.))
+                                .child(Label::new(t.format("%H:%M").to_string()).size(LabelSize::Small))
+                                .when(current == Some(t), |item| item.end_slot(check_mark()))
+                                .on_click(cx.listener(move |this, _, _, cx| this.update_draft(cx, |d| d.pick_range_time(t))))
+                        }))
+                        .into_any_element(),
+                )
+            }
+            None => None,
+        };
+        v_flex()
+            .gap_2()
+            .child(line(strings.range_start, start_date, start_time))
+            .child(line(strings.range_end, end_date, end_time))
+            .children(picker)
+            .child(
+                h_flex()
+                    .id("range-all-day")
+                    .cursor_pointer()
+                    .child(div().flex_1().child(Label::new(strings.range_all_day).size(LabelSize::Small)))
+                    .child(
+                        div()
+                            .w(px(30.))
+                            .h(px(18.))
+                            .p(px(2.))
+                            .rounded_full()
+                            .flex()
+                            .when(all_day, |el| el.justify_end().bg(theme.colors().accent))
+                            .when(!all_day, |el| el.bg(theme.colors().element_hover))
+                            .child(div().size(px(14.)).rounded_full().bg(gpui::white())),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| this.update_draft(cx, |d| d.set_all_day(!all_day)))),
+            )
+            .child(Divider::horizontal())
+            .into_any_element()
+    }
+
     fn render_due_popup(&self, strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {
         let Some(draft) = self.due_draft.clone() else { return div().into_any_element() };
         let theme = cx.theme().clone();
@@ -639,7 +744,9 @@ impl TaskDetail {
                 h_flex()
                     .children(week.iter().map(|&date| {
                         let in_month = date.month() == month.month();
-                        let is_selected = draft.date == Some(date);
+                        let picked = if draft.range_field == Some(RangeField::EndDate) { draft.end_date } else { draft.date };
+                        let is_selected = picked == Some(date);
+                        let duration = draft.tab == DueTab::Duration;
                         let is_today = date == today;
                         div().flex_1().flex().justify_center().child(
                             div()
@@ -664,7 +771,9 @@ impl TaskDetail {
                                         Color::Muted
                                     },
                                 ))
-                                .on_click(cx.listener(move |this, _, _, cx| this.update_draft(cx, |d| d.pick_date(date)))),
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.update_draft(cx, |d| if duration { d.pick_range_date(date) } else { d.pick_date(date) })
+                                })),
                         )
                     }))
                     .into_any_element()
@@ -861,30 +970,13 @@ impl TaskDetail {
                 .child(Label::new(label).size(LabelSize::Small))
         };
 
-        popover(cx)
-            .w(px(260.))
-            .p_2()
-            .gap_2()
-            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_popup(cx)))
-            .child(
-                div().p_0p5().rounded(px(6.)).bg(theme.colors().background).child(
-                    div()
-                        .h(px(26.))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded(px(5.))
-                        .bg(theme.colors().element_selected)
-                        .child(Label::new(strings.date_tab).size(LabelSize::Small)),
-                ),
-            )
-            .child(
-                h_flex()
+        let quick_row = h_flex()
                     .child(quick("due-today", IconName::Sun, strings.today, d_today, cx))
                     .child(quick("due-tomorrow", IconName::Sunrise, strings.tomorrow, d_tomorrow, cx))
                     .child(quick("due-week", IconName::CalendarPlus, strings.next_week, d_week, cx))
-                    .child(quick("due-month", IconName::Moon, strings.next_month, d_month, cx)),
-            )
+                    .child(quick("due-month", IconName::Moon, strings.next_month, d_month, cx));
+        let calendar_block = v_flex()
+            .gap_2()
             .child(
                 h_flex()
                     .px_1()
@@ -915,9 +1007,44 @@ impl TaskDetail {
                 div().flex_1().flex().justify_center().child(Label::new(*day).size(LabelSize::XSmall).color(Color::Muted))
             })))
             .child(v_flex().gap_0p5().children(weeks))
-            .child(Divider::horizontal())
-            .child(row("due-time-row", IconName::Clock, time_label, draft.time.is_some(), DueMenu::Time, cx))
-            .children(time_menu)
+            .into_any_element();
+        popover(cx)
+            .w(px(260.))
+            .p_2()
+            .gap_2()
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_popup(cx)))
+            .child(h_flex().p_0p5().rounded(px(6.)).bg(theme.colors().background).children(
+                [(DueTab::Date, "due-tab-date", strings.date_tab), (DueTab::Duration, "due-tab-duration", strings.duration_tab)].map(
+                    |(tab, id, label)| {
+                        div()
+                            .id(id)
+                            .flex_1()
+                            .h(px(26.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(5.))
+                            .cursor_pointer()
+                            .when(draft.tab == tab, |el| el.bg(theme.colors().element_selected))
+                            .child(Label::new(label).size(LabelSize::Small).color(if draft.tab == tab { Color::Default } else { Color::Muted }))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.update_draft(cx, |d| match tab {
+                                    DueTab::Duration => d.start_duration(Local::now().naive_local()),
+                                    DueTab::Date => d.tab = DueTab::Date,
+                                })
+                            }))
+                    },
+                ),
+            ))
+            .map(|el| match draft.tab {
+                DueTab::Date => el
+                    .child(quick_row)
+                    .child(calendar_block)
+                    .child(Divider::horizontal())
+                    .child(row("due-time-row", IconName::Clock, time_label, draft.time.is_some(), DueMenu::Time, cx))
+                    .children(time_menu),
+                DueTab::Duration => el.child(self.render_duration(&draft, calendar_block, strings, cx)),
+            })
             .child(row(
                 "due-reminder-row",
                 IconName::AlarmClock,
@@ -1346,6 +1473,10 @@ impl Render for TaskDetail {
         let (due_text, due_color): (SharedString, Color) = match task.due_date {
             Some(date) => {
                 let (label, overdue) = task_rows::due_label(date, task.due_time, today, strings);
+                let label = match task.end_date {
+                    Some(end) => due_picker::range_label(date, task.due_time, end, task.end_time, strings),
+                    None => label,
+                };
                 (label.into(), if overdue && !done { Color::Error } else { Color::Accent })
             }
             None => (strings.due_date.into(), Color::Muted),

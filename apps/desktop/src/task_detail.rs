@@ -310,6 +310,11 @@ impl TaskDetail {
                 return;
             }
             // The due-date popover with its time menu or the custom repeat editor open.
+            "due-reminder" => {
+                self.open_popup(Popup::Due, cx);
+                self.update_draft(cx, |d| d.menu = Some(DueMenu::Reminder));
+                return;
+            }
             "due-time" | "due-custom" => {
                 self.open_popup(Popup::Due, cx);
                 let today = Local::now().date_naive();
@@ -346,6 +351,7 @@ impl TaskDetail {
             let today = Local::now().date_naive();
             self.save(cx, |store, id| {
                 store.set_due(id, draft.date, draft.time)?;
+                store.set_reminders(id, if draft.date.is_some() { &draft.reminders } else { &[] })?;
                 store.set_repeat(id, draft.repeat, today)
             });
         }
@@ -358,6 +364,7 @@ impl TaskDetail {
         let today = Local::now().date_naive();
         self.save(cx, |store, id| {
             store.set_due(id, None, None)?;
+            store.set_reminders(id, &[])?;
             store.set_repeat(id, None, today)
         });
         self.close_popup(cx);
@@ -721,6 +728,28 @@ impl TaskDetail {
                     .into_any_element(),
             ),
             Some(DueMenu::Custom(rule)) => Some(self.render_custom_repeat(rule, strings, cx)),
+            Some(DueMenu::Reminder) => Some(
+                v_flex()
+                    .children(due_picker::reminder_options(draft.time.is_some(), strings).into_iter().map(
+                        |(minutes, label, hint)| {
+                            ListItem::new(SharedString::from(format!("reminder-{minutes}")))
+                                .height(px(28.))
+                                .child(
+                                    h_flex()
+                                        .gap_1()
+                                        .child(Label::new(label).size(LabelSize::Small))
+                                        .when(!hint.is_empty(), |el| {
+                                            el.child(Label::new(format!("({hint})")).size(LabelSize::Small).color(Color::Muted))
+                                        }),
+                                )
+                                .when(draft.reminders.contains(&minutes), |item| item.end_slot(check_mark()))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.update_draft(cx, |d| d.toggle_reminder(minutes, Local::now().date_naive()))
+                                }))
+                        },
+                    ))
+                    .into_any_element(),
+            ),
             Some(DueMenu::Repeat) => {
                 let base = draft.date.unwrap_or(today);
                 let options = due_picker::repeat_options(base, strings, locale);
@@ -768,11 +797,14 @@ impl TaskDetail {
             }
             None => None,
         };
-        let (time_menu, repeat_menu) = match draft.menu {
-            Some(DueMenu::Time) => (menu, None),
-            Some(DueMenu::Repeat | DueMenu::Custom(_)) => (None, menu),
-            None => (None, None),
+        let (time_menu, reminder_menu, repeat_menu) = match draft.menu {
+            Some(DueMenu::Time) => (menu, None, None),
+            Some(DueMenu::Reminder) => (None, menu, None),
+            Some(DueMenu::Repeat | DueMenu::Custom(_)) => (None, None, menu),
+            None => (None, None, None),
         };
+        let reminder_label: SharedString = due_picker::reminder_label(&draft.reminders, draft.time.is_some(), strings)
+            .map_or(strings.reminder.into(), Into::into);
 
         let button = |id: &'static str, label: &'static str, primary: bool| {
             div()
@@ -846,6 +878,15 @@ impl TaskDetail {
             .child(Divider::horizontal())
             .child(row("due-time-row", IconName::Clock, time_label, draft.time.is_some(), DueMenu::Time, cx))
             .children(time_menu)
+            .child(row(
+                "due-reminder-row",
+                IconName::AlarmClock,
+                reminder_label,
+                !draft.reminders.is_empty(),
+                DueMenu::Reminder,
+                cx,
+            ))
+            .children(reminder_menu)
             .child(row("due-repeat-row", IconName::Repeat, repeat_label, draft.repeat.is_some(), DueMenu::Repeat, cx))
             .children(repeat_menu)
             .child(

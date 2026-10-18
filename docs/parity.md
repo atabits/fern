@@ -58,7 +58,7 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 | Groups "Tasks" / "Notes" with counters and collapsing | ✅ | plus a collapsed "Completed" group; the Completed and Won't Do views group by the day the task was closed ("Sunday, September 27") |
 | Details "…" menu | 🟡 | Add Subtask, Won't Do / Reopen, Tags, Duplicate, Convert to Note / Task, Delete; no Pin, Link Parent Task, attachments, Start Focus, activities, templates, links or print |
 | Details: checkbox, title, notes | ✅ | |
-| Details: due date | 🟡 | popover matched to the original: quick picks with tooltips, month calendar, Time (a field for typing any time — "7:45", "745", "7pm" — plus a 30-minute list), Repeat (with date hints, "Every Weekday" and Custom: every N days/weeks/months/years, weekdays for weekly rules, e.g. "Every 2 weeks on Mo, We"), Clear/OK with a draft; no Duration tab, Reminder or "By Due Dates / By Completion" repeat mode |
+| Details: due date | 🟡 | popover matched to the original: quick picks with tooltips, month calendar, Time (a field for typing any time — "7:45", "745", "7pm" — plus a 30-minute list), Repeat (with date hints, "Every Weekday" and Custom: every N days/weeks/months/years, weekdays for weekly rules, e.g. "Every 2 weeks on Mo, We"), Reminder (matched to the original's options: on the day / 1, 2, 3 days / 1 week early at 09:00 for all-day tasks; on time / 5, 30 minutes / 1 hour / 1 day early for timed ones; several at once), Clear/OK with a draft; reminders fire as desktop notifications while the app runs and show an alarm icon in rows. No Duration tab, custom reminders, "Constant Reminder" or "By Due Dates / By Completion" repeat mode |
 | Details: priority (flag) | ✅ | |
 | Details: tags | ✅ | chips under the notes as in the original; the "+ Tag" picker is our addition (TickTick adds tags with "#" in the text) |
 | Details: list | ✅ | list button in the bottom bar |
@@ -90,7 +90,7 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 
 ## Next
 
-1. Reminders (the due-date picker's Reminder row) with desktop notifications.
-2. Filled sidebar icons and the notification badge (needs reminders to have something to count).
-3. "Other Date" range in the closed views' date filter.
-4. Habit check-ins with partial amounts and the daily goals chart.
+1. Filled sidebar icons and the notification badge (missed reminders).
+2. "Other Date" range in the closed views' date filter.
+3. Habit check-ins with partial amounts and the daily goals chart.
+4. Custom reminders and reminders for habits.

@@ -182,6 +182,11 @@ pub struct Strings {
     pub time: &'static str,
     pub no_time: &'static str,
     pub time_placeholder: &'static str,
+    pub reminder: &'static str,
+    /// Reminder offsets for tasks with a time, matching `fern_core::reminder::TIMED_OFFSETS`.
+    pub reminders_timed: [&'static str; 5],
+    /// Reminder offsets for all-day tasks, matching `fern_core::reminder::ALL_DAY_OFFSETS`.
+    pub reminders_all_day: [&'static str; 5],
     pub repeat_custom: &'static str,
     pub repeat_every: &'static str,
     /// Units for the custom repeat: day, week, month, year.
@@ -348,6 +353,9 @@ pub static EN: Strings = Strings {
     time: "Time",
     no_time: "None",
     time_placeholder: "Type a time, e.g. 7:45",
+    reminder: "Reminder",
+    reminders_timed: ["On time", "5 minutes early", "30 minutes early", "1 hour early", "1 day early"],
+    reminders_all_day: ["On the day", "1 day early", "2 days early", "3 days early", "1 week early"],
     repeat_custom: "Custom",
     repeat_every: "Every",
     repeat_units: ["Day", "Week", "Month", "Year"],
@@ -510,6 +518,9 @@ pub static RU: Strings = Strings {
     time: "Время",
     no_time: "Нет",
     time_placeholder: "Время, например 7:45",
+    reminder: "Напоминание",
+    reminders_timed: ["Вовремя", "За 5 минут", "За 30 минут", "За 1 час", "За 1 день"],
+    reminders_all_day: ["В тот же день", "За 1 день", "За 2 дня", "За 3 дня", "За 1 неделю"],
     repeat_custom: "Настроить",
     repeat_every: "Каждые",
     repeat_units: ["День", "Неделя", "Месяц", "Год"],

@@ -776,7 +776,10 @@ impl TodoView {
                         el.child(Label::new(list).size(LabelSize::Small).color(Color::Muted))
                     })
                     .when_some(due, |el, (label, overdue)| {
-                        el.when(task.repeat.is_some(), |el| {
+                        el.when(!task.reminders.is_empty() && !closed_view, |el| {
+                            el.child(Icon::new(IconName::AlarmClock).size(IconSize::XSmall).color(Color::Muted))
+                        })
+                        .when(task.repeat.is_some(), |el| {
                             el.child(Icon::new(IconName::Repeat).size(IconSize::XSmall).color(Color::Accent))
                         })
                         .child(

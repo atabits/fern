@@ -21,6 +21,7 @@ chrono.workspace = true
 dirs.workspace = true
 gpui.workspace = true
 gpui_platform.workspace = true
+notify-rust.workspace = true
 unicode-segmentation.workspace = true
 
 [dev-dependencies]

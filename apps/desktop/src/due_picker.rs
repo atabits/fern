@@ -2,6 +2,7 @@
 //! (date, time, repeat) and nothing is saved until "OK".
 
 use chrono::{Datelike, Duration, Months, NaiveDate, NaiveTime};
+use fern_core::reminder::{ALL_DAY_OFFSETS, ALL_DAY_REMINDER_HOUR, TIMED_OFFSETS};
 use fern_core::{Frequency, Recurrence, Task};
 
 use crate::calendar;
@@ -11,6 +12,7 @@ use crate::i18n::{Locale, Strings};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DueMenu {
     Time,
+    Reminder,
     Repeat,
     /// The custom repeat editor with the rule being edited.
     Custom(Recurrence),
@@ -21,6 +23,8 @@ pub struct DueDraft {
     pub date: Option<NaiveDate>,
     pub time: Option<NaiveTime>,
     pub repeat: Option<Recurrence>,
+    /// Minutes before the due time, see `fern_core::reminder`.
+    pub reminders: Vec<i64>,
     /// The month shown in the calendar.
     pub month: NaiveDate,
     pub menu: Option<DueMenu>,
@@ -32,6 +36,7 @@ impl DueDraft {
             date: task.due_date,
             time: task.due_time,
             repeat: task.repeat,
+            reminders: task.reminders.clone(),
             month: calendar::month_start(task.due_date.unwrap_or(today)),
             menu: None,
         }
@@ -49,6 +54,19 @@ impl DueDraft {
             self.date = Some(today);
         }
         self.menu = None;
+    }
+
+    /// Turns a reminder on or off; like a time, a reminder without a date schedules today.
+    pub fn toggle_reminder(&mut self, minutes: i64, today: NaiveDate) {
+        if let Some(at) = self.reminders.iter().position(|m| *m == minutes) {
+            self.reminders.remove(at);
+        } else {
+            self.reminders.push(minutes);
+            self.reminders.sort();
+        }
+        if self.date.is_none() {
+            self.date = Some(today);
+        }
     }
 
     pub fn pick_repeat(&mut self, repeat: Option<Recurrence>, today: NaiveDate) {
@@ -94,6 +112,31 @@ pub fn parse_time(text: &str) -> Option<NaiveTime> {
         None => hour,
     };
     NaiveTime::from_hms_opt(hour, minute, 0)
+}
+
+/// The reminder options for the draft, with a hint ("09:00" for all-day tasks).
+pub fn reminder_options(has_time: bool, strings: &Strings) -> Vec<(i64, &'static str, String)> {
+    if has_time {
+        TIMED_OFFSETS.into_iter().zip(strings.reminders_timed).map(|(m, label)| (m, label, String::new())).collect()
+    } else {
+        let hint = format!("{ALL_DAY_REMINDER_HOUR:02}:00");
+        ALL_DAY_OFFSETS.into_iter().zip(strings.reminders_all_day).map(|(m, label)| (m, label, hint.clone())).collect()
+    }
+}
+
+/// The Reminder row's label: the chosen reminders, or `None` for the plain "Reminder".
+pub fn reminder_label(reminders: &[i64], has_time: bool, strings: &Strings) -> Option<String> {
+    if reminders.is_empty() {
+        return None;
+    }
+    let options = reminder_options(has_time, strings);
+    let labels: Vec<String> = reminders
+        .iter()
+        .map(|m| {
+            options.iter().find(|(o, _, _)| o == m).map_or_else(|| format!("-{m}m"), |(_, label, _)| (*label).to_owned())
+        })
+        .collect();
+    Some(labels.join(", "))
 }
 
 /// The quick picks above the calendar: today, tomorrow, next week, next month.
@@ -188,6 +231,27 @@ mod tests {
     }
 
     #[test]
+    fn reminders() {
+        let today = d(2026, 10, 18);
+        let mut draft = DueDraft {
+            date: None,
+            time: None,
+            repeat: None,
+            reminders: Vec::new(),
+            month: today,
+            menu: Some(DueMenu::Reminder),
+        };
+        draft.toggle_reminder(24 * 60, today);
+        draft.toggle_reminder(0, today);
+        assert_eq!((draft.date, draft.reminders.as_slice()), (Some(today), [0, 24 * 60].as_slice()));
+        assert_eq!(reminder_label(&draft.reminders, false, &EN).as_deref(), Some("On the day, 1 day early"));
+        assert_eq!(reminder_label(&[30], true, &EN).as_deref(), Some("30 minutes early"));
+        draft.toggle_reminder(0, today);
+        assert_eq!(draft.reminders, [24 * 60]);
+        assert_eq!(reminder_options(false, &EN)[0].2, "09:00");
+    }
+
+    #[test]
     fn typed_times() {
         let t = |h, m| NaiveTime::from_hms_opt(h, m, 0);
         assert_eq!(parse_time("7"), t(7, 0));
@@ -225,11 +289,19 @@ mod tests {
     #[test]
     fn time_or_repeat_without_a_date_means_today() {
         let today = d(2026, 10, 18);
-        let mut draft = DueDraft { date: None, time: None, repeat: None, month: today, menu: Some(DueMenu::Time) };
+        let mut draft = DueDraft {
+            date: None,
+            time: None,
+            repeat: None,
+            reminders: Vec::new(),
+            month: today,
+            menu: Some(DueMenu::Time),
+        };
         draft.pick_time(NaiveTime::from_hms_opt(9, 30, 0), today);
         assert_eq!((draft.date, draft.menu), (Some(today), None));
 
-        let mut draft = DueDraft { date: None, time: None, repeat: None, month: today, menu: None };
+        let mut draft =
+            DueDraft { date: None, time: None, repeat: None, reminders: Vec::new(), month: today, menu: None };
         draft.pick_repeat(Some(Recurrence::weekdays()), today);
         assert_eq!(draft.date, Some(today));
         assert_eq!(time_options().len(), 48);

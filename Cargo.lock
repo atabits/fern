@@ -1567,6 +1567,7 @@ dependencies = [
  "gpui",
  "gpui_platform",
  "icons",
+ "notify-rust",
  "serde",
  "serde_json",
  "theme",

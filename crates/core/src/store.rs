@@ -120,10 +120,13 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE habit_checkins ADD COLUMN value INTEGER NOT NULL DEFAULT 1;
     ALTER TABLE habit_checkins ADD COLUMN note TEXT;
     ",
+    "
+    ALTER TABLE tasks ADD COLUMN reminders TEXT;
+    ",
 ];
 
 const TASK_COLUMNS: &str = "id, parent_id, kind, title, notes, priority, due_date, due_time, \
-                            completed_at, created_at, list_id, deleted_at, repeat, wont_do_at";
+                            completed_at, created_at, list_id, deleted_at, repeat, wont_do_at, reminders";
 
 const DATE_FORMAT: &str = "%Y-%m-%d";
 const TIME_FORMAT: &str = "%H:%M";
@@ -231,6 +234,7 @@ impl Store {
             completed_at: None,
             deleted_at: None,
             wont_do_at: None,
+            reminders: Vec::new(),
             created_at: now_ms(),
         };
         // New tasks go to the top, as in TickTick.
@@ -318,7 +322,7 @@ impl Store {
                 &format!(
                     "INSERT INTO tasks ({TASK_COLUMNS})
                      SELECT ?2, parent_id, kind, title, notes, priority, due_date, due_time,
-                            ?3, created_at, list_id, NULL, NULL, NULL
+                            ?3, created_at, list_id, NULL, NULL, NULL, NULL
                      FROM tasks WHERE id = ?1"
                 ),
                 params![id.to_string(), copy.to_string(), now_ms()],
@@ -365,7 +369,7 @@ impl Store {
         self.conn.execute(
             "UPDATE tasks SET parent_id = o.parent_id, kind = o.kind, notes = o.notes,
                  priority = o.priority, due_date = o.due_date, due_time = o.due_time,
-                 list_id = o.list_id, repeat = o.repeat
+                 list_id = o.list_id, repeat = o.repeat, reminders = o.reminders
              FROM (SELECT * FROM tasks WHERE id = ?2) AS o WHERE tasks.id = ?1",
             params![copy.id.to_string(), id.to_string()],
         )?;
@@ -395,6 +399,10 @@ impl Store {
     }
 
     /// Sets the due date. A time without a date is meaningless and is dropped.
+    pub fn set_reminders(&self, id: Id, reminders: &[i64]) -> Result<()> {
+        self.update(id, "reminders", crate::reminder::format(reminders))
+    }
+
     pub fn set_due(&self, id: Id, date: Option<NaiveDate>, time: Option<NaiveTime>) -> Result<()> {
         let date_str = date.map(|d| d.format(DATE_FORMAT).to_string());
         let time_str = date.and(time).map(|t| t.format(TIME_FORMAT).to_string());
@@ -924,6 +932,7 @@ fn task_from_row(row: &Row) -> rusqlite::Result<Task> {
         deleted_at: row.get(11)?,
         repeat: row.get::<_, Option<String>>(12)?.and_then(|r| r.parse().ok()),
         wont_do_at: row.get(13)?,
+        reminders: row.get::<_, Option<String>>(14)?.map(|r| crate::reminder::parse(&r)).unwrap_or_default(),
     })
 }
 
@@ -1286,6 +1295,26 @@ mod tests {
         assert!(store.checkins(read.id)?.is_empty());
         store.delete_habit(floss.id)?;
         assert_eq!(store.habits()?.iter().map(|h| h.name.as_str()).collect::<Vec<_>>(), ["Read"]);
+        Ok(())
+    }
+
+    #[test]
+    fn reminders_are_stored_and_kept_by_repeats() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let task = store.add_task("water the plants")?;
+        store.set_due(task.id, Some(d(2026, 10, 20)), None)?;
+        store.set_repeat(task.id, Some(crate::Recurrence::new(crate::Frequency::Daily, 1)), d(2026, 10, 18))?;
+        store.set_reminders(task.id, &[0, 24 * 60])?;
+        assert_eq!(store.task(task.id)?.unwrap().reminders, [0, 24 * 60]);
+        assert_eq!(store.duplicate_task(task.id)?.reminders, [0, 24 * 60]);
+        // Completing a repeating task keeps the reminders on the next occurrence only.
+        store.set_completed(task.id, true)?;
+        let tasks = store.tasks()?;
+        let done = tasks.iter().find(|t| t.is_completed()).unwrap();
+        assert!(done.reminders.is_empty());
+        assert_eq!(store.task(task.id)?.unwrap().reminders, [0, 24 * 60]);
+        store.set_reminders(task.id, &[])?;
+        assert!(store.task(task.id)?.unwrap().reminders.is_empty());
         Ok(())
     }
 

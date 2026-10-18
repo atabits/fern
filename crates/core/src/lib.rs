@@ -7,6 +7,7 @@ pub mod habit;
 pub mod model;
 pub mod quick_add;
 pub mod recurrence;
+pub mod reminder;
 pub mod store;
 
 pub use countdown::{Countdown, CountdownKind, Span, span};

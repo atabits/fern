@@ -82,6 +82,8 @@ pub struct Task {
     pub deleted_at: Option<i64>,
     /// When the task was marked "Won't Do".
     pub wont_do_at: Option<i64>,
+    /// Reminders as minutes before the due time (09:00 on the due day for all-day tasks).
+    pub reminders: Vec<i64>,
     pub created_at: i64,
 }
 

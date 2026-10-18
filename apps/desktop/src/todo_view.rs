@@ -67,8 +67,13 @@ struct AddDraft {
     list: Option<Option<Id>>,
     note: bool,
     tags: Vec<String>,
-    /// The date picked with the field's calendar button; a typed date wins.
+    /// The date picked with the field's calendar button, with its time, reminders and repeat;
+    /// a typed date wins.
     date: Option<NaiveDate>,
+    time: Option<chrono::NaiveTime>,
+    /// `None` keeps the default reminder from the settings.
+    reminders: Option<Vec<i64>>,
+    repeat: Option<fern_core::Recurrence>,
     /// Files picked with the menu's Attachment, attached once the task is added.
     files: Vec<std::path::PathBuf>,
 }
@@ -135,8 +140,10 @@ pub struct TodoView {
     add_tag_input: Entity<TextInput>,
     /// The "▾" menu's "Input Box Setting" chooser, while open.
     input_box_open: bool,
-    /// The field's date picker, while open, with the month it shows.
+    /// The field's date picker, while open, with the month it shows, and its expanded row
+    /// (0 Time, 1 Reminder, 2 Repeat).
     add_date_month: Option<NaiveDate>,
+    add_date_row: Option<u8>,
     /// The section whose "…" menu is open.
     section_menu: Option<Id>,
     /// A section being renamed, with its field.
@@ -262,6 +269,7 @@ impl TodoView {
             add_tag_input,
             input_box_open: false,
             add_date_month: None,
+            add_date_row: None,
             list_activity: None,
             filters: Vec::new(),
             preferences: Default::default(),
@@ -415,6 +423,14 @@ impl TodoView {
                 }
                 Some(("menu", "templates")) => self.templates_open = true,
                 Some(("menu", "input-box")) => self.input_box_open = true,
+                // `menu=add-date-repeat`: the picker with a time and a weekly repeat, Repeat open.
+                Some(("menu", "add-date-repeat")) => {
+                    self.add_draft.date = Some(Self::today() + chrono::Duration::days(1));
+                    self.add_draft.time = chrono::NaiveTime::from_hms_opt(9, 0, 0);
+                    self.add_draft.repeat = Some(fern_core::Recurrence::new(fern_core::Frequency::Weekly, 1));
+                    self.add_date_month = Some(crate::calendar::month_start(Self::today()));
+                    self.add_date_row = Some(2);
+                }
                 // `menu=add-date`: the field's date picker open, with tomorrow picked.
                 Some(("menu", "add-date")) => {
                     self.add_draft.date = Some(Self::today() + chrono::Duration::days(1));
@@ -689,11 +705,19 @@ impl TodoView {
         };
         // Settings → More → Task Default fills in what neither the text nor the view gives.
         let defaults = &self.preferences.task_defaults;
+        // The date picker's time and reminders go with its date, not with a typed one.
+        let from_picker = parsed.due_date.is_none() && self.add_draft.date.is_some();
+        let due_time = if from_picker { self.add_draft.time } else { parsed.due_time };
         if let Some(date) = parsed.due_date.or(self.add_draft.date).or(view_due).or(defaults.date.map(|d| d.date(today))) {
-            self.store.set_due(task.id, Some(date), parsed.due_time)?;
-            let reminder = if parsed.due_time.is_some() { defaults.timed_reminder } else { defaults.all_day_reminder };
-            if let Some(offset) = reminder {
-                self.store.set_reminders(task.id, &[offset])?;
+            self.store.set_due(task.id, Some(date), due_time)?;
+            match self.add_draft.reminders.as_ref().filter(|_| from_picker) {
+                Some(reminders) => self.store.set_reminders(task.id, reminders)?,
+                None => {
+                    let reminder = if due_time.is_some() { defaults.timed_reminder } else { defaults.all_day_reminder };
+                    if let Some(offset) = reminder {
+                        self.store.set_reminders(task.id, &[offset])?;
+                    }
+                }
             }
         }
 
@@ -716,7 +740,7 @@ impl TodoView {
         if !tags.is_empty() {
             self.store.set_tags(task.id, &tags)?;
         }
-        if let Some(repeat) = parsed.repeat {
+        if let Some(repeat) = parsed.repeat.or_else(|| self.add_draft.repeat.clone().filter(|_| self.add_draft.date.is_some())) {
             self.store.set_repeat(task.id, Some(repeat), today)?;
         }
         let draft_priority = self.add_draft.priority.filter(|p| *p != fern_core::Priority::None);
@@ -807,7 +831,7 @@ impl TodoView {
 
     /// The date the field shows: the typed one, or the one picked with its calendar button.
     fn shown_add_due(&self) -> Option<(NaiveDate, Option<chrono::NaiveTime>)> {
-        self.quick_add_due.or(self.add_draft.date.map(|date| (date, None)))
+        self.quick_add_due.or(self.add_draft.date.map(|date| (date, self.add_draft.time)))
     }
 
     /// The field's calendar button, as in the original: it opens a date picker for the next task,
@@ -830,16 +854,125 @@ impl TodoView {
         })
     }
 
+    /// The date picker's Time, Reminder and Repeat rows, as in the task's date popover: a click
+    /// opens the row's choices under it.
+    fn render_add_date_rows(&self, strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let draft = &self.add_draft;
+        let date = draft.date.unwrap_or_else(Self::today);
+        let has_time = draft.time.is_some();
+        let open = self.add_date_row;
+        let row = |i: u8, icon: IconName, label: String, set: bool| {
+            h_flex()
+                .id(SharedString::from(format!("add-date-row-{i}")))
+                .h(px(30.))
+                .px_1()
+                .gap_2()
+                .rounded(px(5.))
+                .cursor_pointer()
+                .hover(|s| s.bg(theme.colors().element_hover))
+                .child(Icon::new(icon).size(IconSize::Small).color(if set { Color::Accent } else { Color::Muted }))
+                .child(div().flex_1().min_w_0().child(Label::new(label).size(LabelSize::Small).color(if set { Color::Accent } else { Color::Default }).truncate()))
+                .child(Icon::new(if open == Some(i) { IconName::ChevronDown } else { IconName::ChevronRight }).size(IconSize::XSmall).color(Color::Muted))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.add_date_row = if this.add_date_row == Some(i) { None } else { Some(i) };
+                    cx.notify();
+                }))
+        };
+        let choice = |id: SharedString, label: String, selected: bool| {
+            h_flex()
+                .id(id)
+                .h(px(26.))
+                .px_2()
+                .gap_2()
+                .rounded(px(5.))
+                .cursor_pointer()
+                .hover(|s| s.bg(theme.colors().element_hover))
+                .child(div().flex_1().child(Label::new(label).size(LabelSize::Small).color(if selected { Color::Accent } else { Color::Default })))
+                .when(selected, |el| el.child(Icon::new(IconName::Check).size(IconSize::XSmall).color(Color::Accent)))
+        };
+        let time_label = draft.time.map_or(strings.time.to_owned(), crate::calendar::format_time);
+        let reminder_label = draft
+            .reminders
+            .as_ref()
+            .and_then(|r| crate::due_picker::reminder_label(r, has_time, strings))
+            .unwrap_or_else(|| strings.reminder.to_owned());
+        let repeat_label =
+            draft.repeat.as_ref().map_or(strings.repeat.to_owned(), |r| crate::due_picker::repeat_label(r, strings));
+        let mut rows = v_flex().gap_0p5();
+        rows = rows.child(row(0, IconName::Clock, time_label, has_time));
+        if open == Some(0) {
+            let times = std::iter::once(None).chain(crate::due_picker::time_options().into_iter().map(Some));
+            rows = rows.child(v_flex().id("add-date-times").max_h(px(150.)).overflow_y_scroll().children(times.map(|time| {
+                let label = time.map_or(strings.no_time.to_owned(), crate::calendar::format_time);
+                choice(SharedString::from(format!("add-time-{label}")), label, draft.time == time).on_click(cx.listener(move |this, _, _, cx| {
+                    this.add_draft.time = time;
+                    this.add_draft.date.get_or_insert_with(Self::today);
+                    this.add_draft.reminders = None;
+                    this.add_date_row = None;
+                    cx.notify();
+                }))
+            })));
+        }
+        rows = rows.child(row(1, IconName::AlarmClock, reminder_label, draft.reminders.as_ref().is_some_and(|r| !r.is_empty())));
+        if open == Some(1) {
+            let chosen = draft.reminders.clone().unwrap_or_default();
+            rows = rows.child(v_flex().children(crate::due_picker::reminder_options(has_time, strings).into_iter().map(|(offset, label, hint)| {
+                let selected = chosen.contains(&offset);
+                let label = if hint.is_empty() { label.to_owned() } else { format!("{label} ({hint})") };
+                choice(SharedString::from(format!("add-reminder-{offset}")), label, selected).on_click(cx.listener(move |this, _, _, cx| {
+                    let reminders = this.add_draft.reminders.get_or_insert_with(Vec::new);
+                    if let Some(i) = reminders.iter().position(|r| *r == offset) {
+                        reminders.remove(i);
+                    } else {
+                        reminders.push(offset);
+                    }
+                    this.add_draft.date.get_or_insert_with(Self::today);
+                    cx.notify();
+                }))
+            })));
+        }
+        rows = rows.child(row(2, IconName::Repeat, repeat_label, draft.repeat.is_some()));
+        if open == Some(2) {
+            let options = crate::due_picker::repeat_options(date, strings, i18n::locale(cx));
+            rows = rows.child(
+                v_flex()
+                    .child(choice("add-repeat-none".into(), strings.none_option.to_owned(), draft.repeat.is_none()).on_click(cx.listener(|this, _, _, cx| {
+                        this.add_draft.repeat = None;
+                        this.add_date_row = None;
+                        cx.notify();
+                    })))
+                    .children(options.into_iter().enumerate().map(|(i, (rule, label, hint))| {
+                        let selected = draft.repeat.as_ref() == Some(&rule);
+                        let label = if hint.is_empty() { label } else { format!("{label} ({hint})") };
+                        choice(SharedString::from(format!("add-repeat-{i}")), label, selected).on_click(cx.listener(move |this, _, _, cx| {
+                            this.add_draft.repeat = Some(rule.clone());
+                            this.add_draft.date.get_or_insert_with(Self::today);
+                            this.add_date_row = None;
+                            cx.notify();
+                        }))
+                    })),
+            );
+        }
+        rows.into_any_element()
+    }
+
     /// The add field's date picker: the original's quick picks (today, tomorrow, next week, next
     /// month) and the month; a pick applies to the next task added. Clear drops it.
     fn render_add_date(&self, month: NaiveDate, strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
         let today = Self::today();
         let picked = self.add_draft.date;
+        // A pick stays in the picker, as in the original; OK closes it and Clear drops it all.
         let pick = |date: Option<NaiveDate>| {
             move |this: &mut Self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>| {
                 this.add_draft.date = date;
-                this.add_date_month = None;
+                if date.is_none() {
+                    this.add_draft.time = None;
+                    this.add_draft.reminders = None;
+                    this.add_draft.repeat = None;
+                    this.add_date_month = None;
+                }
                 cx.notify();
             }
         };
@@ -934,6 +1067,8 @@ impl TodoView {
                 div().flex_1().flex().justify_center().child(Label::new(day).size(LabelSize::XSmall).color(Color::Muted))
             })))
             .children(weeks)
+            .child(div().py_1().child(Divider::horizontal()))
+            .child(self.render_add_date_rows(strings, cx))
             .child(
                 h_flex()
                     .pt_1()

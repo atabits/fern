@@ -550,6 +550,13 @@ impl Store {
     }
 
     /// Makes the task a subtask of `parent`, or a top-level task for `None`.
+    /// "Link Parent Task": makes a task a subtask of `parent`, moving it to the parent's list.
+    pub fn link_parent(&self, id: Id, parent: Id) -> Result<()> {
+        let list = self.task(parent)?.context("parent task not found")?.list_id;
+        self.set_parent(id, Some(parent))?;
+        self.set_list(id, list)
+    }
+
     pub fn set_parent(&self, id: Id, parent: Option<Id>) -> Result<()> {
         if let Some(parent) = parent {
             anyhow::ensure!(
@@ -1172,7 +1179,8 @@ impl Store {
         Ok(())
     }
 
-    fn descendants(&self, id: Id) -> Result<Vec<Id>> {
+    /// Subtasks of a task, at any depth.
+    pub fn descendants(&self, id: Id) -> Result<Vec<Id>> {
         let mut stmt = self.conn.prepare(
             "WITH RECURSIVE sub(id) AS (
                  SELECT id FROM tasks WHERE parent_id = ?1
@@ -1890,6 +1898,15 @@ mod tests {
 
         assert!(store.set_parent(parent.id, Some(grandchild.id)).is_err());
         assert!(store.set_parent(parent.id, Some(parent.id)).is_err());
+
+        // Linking a parent moves the task into the parent's list.
+        let list = store.create_list("Home")?;
+        let other = store.add_task("other")?;
+        store.set_list(parent.id, Some(list.id))?;
+        store.link_parent(other.id, parent.id)?;
+        let other = store.task(other.id)?.unwrap();
+        assert_eq!((other.parent_id, other.list_id), (Some(parent.id), Some(list.id)));
+        assert!(store.link_parent(parent.id, grandchild.id).is_err());
 
         store.purge_task(parent.id)?;
         assert!(store.tasks()?.is_empty());

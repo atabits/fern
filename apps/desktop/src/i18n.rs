@@ -202,6 +202,7 @@ pub struct Strings {
     pub reopen: &'static str,
     pub duplicate: &'static str,
     pub pin: &'static str,
+    pub link_parent: &'static str,
     pub unpin: &'static str,
     pub task_activities: &'static str,
     /// Created, renamed, completed, reopened, date, date cleared, priority, moved, deleted,
@@ -454,6 +455,7 @@ pub static EN: Strings = Strings {
     reopen: "Reopen",
     duplicate: "Duplicate",
     pin: "Pin",
+    link_parent: "Link Parent Task",
     unpin: "Unpin",
     task_activities: "Task Activities",
     activity_kinds: [
@@ -697,6 +699,7 @@ pub static RU: Strings = Strings {
     reopen: "Вернуть в работу",
     duplicate: "Дублировать",
     pin: "Закрепить",
+    link_parent: "Сделать подзадачей",
     unpin: "Открепить",
     task_activities: "История задачи",
     activity_kinds: [

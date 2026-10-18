@@ -22,6 +22,8 @@ enum Popup {
     Tags,
     List,
     More,
+    /// "Link Parent Task": a searchable list of tasks to nest this one under.
+    LinkParent,
 }
 
 pub struct TaskDetail {
@@ -42,6 +44,8 @@ pub struct TaskDetail {
     subtask_input: Entity<TextInput>,
     /// The due-date popover's field for typing a time.
     time_input: Entity<TextInput>,
+    /// The "Link Parent Task" search field.
+    link_search: Entity<TextInput>,
     /// The checklist is shown when it has items or the user asked to start one.
     show_checklist: bool,
     /// An input to focus on the next render (focusing needs the window).
@@ -84,6 +88,7 @@ impl TaskDetail {
         let new_item = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.add_item, cx));
         let subtask_input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.add_subtask, cx));
         let time_input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.time_placeholder, cx));
+        let link_search = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.search_placeholder, cx));
 
         let subscriptions = vec![
             cx.subscribe(&title, |this, input, _: &Changed, cx| {
@@ -121,6 +126,7 @@ impl TaskDetail {
                     this.sync_subtasks();
                 }
             }),
+            cx.subscribe(&link_search, |_, _, _: &Changed, cx| cx.notify()),
             // A time typed by hand in the due-date popover's time menu.
             cx.subscribe_in(&time_input, window, |this, input, Submitted(text), window, cx| {
                 if let Some(time) = due_picker::parse_time(text) {
@@ -152,6 +158,7 @@ impl TaskDetail {
             subtasks: Vec::new(),
             subtask_input,
             time_input,
+            link_search,
             show_checklist: false,
             pending_focus: None,
             popup: None,
@@ -296,6 +303,7 @@ impl TaskDetail {
             }
             Popup::Tags => self.all_tags = self.store.tags().unwrap_or_default(),
             Popup::Priority | Popup::List | Popup::More => {}
+            Popup::LinkParent => self.link_search.update(cx, |input, cx| input.set_text("", cx)),
         }
         self.popup = Some(popup);
         cx.notify();
@@ -309,6 +317,7 @@ impl TaskDetail {
             "tags" => Popup::Tags,
             "list" => Popup::List,
             "more" => Popup::More,
+            "link-parent" => Popup::LinkParent,
             "checklist" => {
                 self.start_checklist(cx);
                 return;
@@ -480,6 +489,12 @@ impl TaskDetail {
                     window.focus(&this.subtask_input.focus_handle(cx), cx);
                 },
             )))
+            .child(item("more-link-parent", IconName::CornerDownRight, strings.link_parent).on_click(cx.listener(
+                |this, _, window, cx| {
+                    this.open_popup(Popup::LinkParent, cx);
+                    window.focus(&this.link_search.focus_handle(cx), cx);
+                },
+            )))
             .child({
                 let pinned = task.pinned_at.is_some();
                 item("more-pin", if pinned { IconName::PinOff } else { IconName::Pin }, if pinned { strings.unpin } else { strings.pin })
@@ -573,6 +588,54 @@ impl TaskDetail {
                             .child(Label::new(when).size(LabelSize::XSmall).color(Color::Muted)),
                     )
             }))
+            .into_any_element()
+    }
+
+    /// The "Link Parent Task" picker: open tasks other than this one and its subtasks, filtered by
+    /// the search field, each with its list.
+    fn render_link_parent(&self, strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let Some(task) = self.task.as_ref() else { return div().into_any_element() };
+        let query = self.link_search.read(cx).text().trim().to_lowercase();
+        let excluded: std::collections::HashSet<Id> =
+            self.store.descendants(task.id).unwrap_or_default().into_iter().chain([task.id]).collect();
+        let candidates: Vec<Task> = self
+            .store
+            .tasks()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|t| !t.is_closed() && !t.is_deleted() && !excluded.contains(&t.id) && task.parent_id != Some(t.id))
+            .filter(|t| query.is_empty() || t.title.to_lowercase().contains(&query))
+            .take(30)
+            .collect();
+        popover(cx)
+            .w(px(340.))
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_popup(cx)))
+            .child(
+                h_flex()
+                    .h(px(34.))
+                    .px_2()
+                    .gap_2()
+                    .border_b_1()
+                    .border_color(theme.colors().border)
+                    .child(Icon::new(IconName::Search).color(Color::Muted))
+                    .child(div().flex_1().child(self.link_search.clone())),
+            )
+            .child(v_flex().id("link-parent-list").max_h(px(320.)).overflow_y_scroll().children(candidates.into_iter().map(|candidate| {
+                let parent = candidate.id;
+                let list: SharedString = candidate
+                    .list_id
+                    .and_then(|id| self.lists.iter().find(|l| l.id == id))
+                    .map_or(strings.inbox.into(), |l| l.name.clone().into());
+                ListItem::new(SharedString::from(format!("link-{parent}")))
+                    .start_slot(Icon::new(IconName::Circle).size(IconSize::Small).color(Color::Muted))
+                    .child(Label::new(candidate.title.clone()).truncate())
+                    .end_slot(Label::new(list).size(LabelSize::XSmall).color(Color::Muted))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.close_popup(cx);
+                        this.save(cx, |store, id| store.link_parent(id, parent));
+                    }))
+            })))
             .into_any_element()
     }
 
@@ -1706,6 +1769,12 @@ impl Render for TaskDetail {
                                         el.child(PopoverAttachment::new(
                                             Placement::AboveRight,
                                             self.render_more_popup(strings, cx),
+                                        ))
+                                    })
+                                    .when(self.popup == Some(Popup::LinkParent), |el| {
+                                        el.child(PopoverAttachment::new(
+                                            Placement::AboveRight,
+                                            self.render_link_parent(strings, cx),
                                         ))
                                     }),
                             )

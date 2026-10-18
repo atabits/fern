@@ -42,6 +42,25 @@ pub struct Countdown {
     pub icon: Option<String>,
     /// The icon's background, a hex color, which the Agenda's dot takes too.
     pub color: Option<String>,
+    /// The original's Repeat: the date comes back by this rule.
+    pub repeat: Option<crate::recurrence::Recurrence>,
+}
+
+impl Countdown {
+    /// The date the countdown counts to: its date, or for a repeating one the first time it
+    /// comes back on or after `today`.
+    pub fn next_date(&self, today: NaiveDate) -> NaiveDate {
+        let Some(repeat) = &self.repeat else { return self.date };
+        let mut date = self.date;
+        while date < today {
+            let next = repeat.next_after(date);
+            if next <= date {
+                break;
+            }
+            date = next;
+        }
+        date
+    }
 }
 
 /// The distance between two dates as calendar years, months and days.
@@ -102,5 +121,24 @@ mod tests {
     fn month_ends_do_not_overshoot() {
         // Jan 31 → Mar 1: one month (to Feb 28) and one day.
         assert_eq!(ymd(span(d(2026, 1, 31), d(2026, 3, 1))), (0, 1, 1, false));
+    }
+
+    #[test]
+    fn repeating_countdowns_come_back() {
+        use crate::recurrence::{Frequency, Recurrence};
+        let once = Countdown {
+            id: uuid::Uuid::now_v7(),
+            name: "Rent".into(),
+            date: d(2026, 9, 13),
+            kind: CountdownKind::Countdown,
+            icon: None,
+            color: None,
+            repeat: None,
+        };
+        assert_eq!(once.next_date(d(2026, 10, 18)), d(2026, 9, 13), "without a repeat the date stays");
+        let monthly = Countdown { repeat: Some(Recurrence::new(Frequency::Monthly, 1)), ..once.clone() };
+        assert_eq!(monthly.next_date(d(2026, 10, 18)), d(2026, 11, 13));
+        assert_eq!(monthly.next_date(d(2026, 10, 13)), d(2026, 10, 13), "today counts");
+        assert_eq!(monthly.next_date(d(2026, 8, 1)), d(2026, 9, 13), "before the first date, the first date");
     }
 }

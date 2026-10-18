@@ -160,6 +160,13 @@ impl AppView {
                     this.calendar.update(cx, |view, cx| view.reload(cx));
                 }
             }
+            // `countdown-menu=<name part>` / `countdown-edit=<name part>`: a card's "…" menu or its
+            // edit popover.
+            for (prefix, edit) in [("countdown-menu=", false), ("countdown-edit=", true)] {
+                if let Some(name) = state.split(';').find_map(|part| part.strip_prefix(prefix)) {
+                    this.countdown.update(cx, |view, cx| view.dev_open(name, edit, window, cx));
+                }
+            }
             // `agenda-countdown=<name part>` opens that countdown's card in the Agenda.
             if let Some(name) = state.split(';').find_map(|part| part.strip_prefix("agenda-countdown=")) {
                 this.calendar.update(cx, |view, cx| view.dev_open_countdown(name, cx));

@@ -32,6 +32,10 @@ struct Draft {
     /// The icon (an emoji) and its color, as the original's icon picker sets them.
     icon: Option<String>,
     color: Option<String>,
+    /// The original's Repeat for the date.
+    repeat: Option<fern_core::Recurrence>,
+    /// The countdown being edited; `None` for a new one.
+    editing: Option<Id>,
 }
 
 /// Emoji offered for countdowns; the original's illustrated icon set is its own artwork.
@@ -44,6 +48,8 @@ pub struct CountdownView {
     /// Cards switched to the "days only" format.
     days_only: HashSet<Id>,
     draft: Option<Draft>,
+    /// The card whose "…" menu is open.
+    card_menu: Option<Id>,
 }
 
 fn kind_icon(kind: CountdownKind) -> IconName {
@@ -101,7 +107,9 @@ struct Face {
 fn face(countdown: &Countdown, today: NaiveDate, days_only: bool, cx: &App) -> Face {
     let strings = i18n::t(cx);
     let theme = cx.theme();
-    let span = span(today, countdown.date);
+    // A repeating countdown counts to the next time its date comes back.
+    let date = countdown.next_date(today);
+    let span = span(today, date);
     let color = if span.past { theme.status().warning } else { theme.colors().accent };
     let number = |value: u32, unit: &str| {
         h_flex()
@@ -121,7 +129,7 @@ fn face(countdown: &Countdown, today: NaiveDate, days_only: bool, cx: &App) -> F
     let subtitle = format!(
         "{} {}",
         if span.past { strings.countdown_days_since } else { strings.countdown_days_until },
-        format_date(countdown.date, strings)
+        format_date(date, strings)
     );
     Face { color, numbers, subtitle }
 }
@@ -130,7 +138,7 @@ fn face(countdown: &Countdown, today: NaiveDate, days_only: bool, cx: &App) -> F
 /// name, the time left and "Days until …", counted to `date` (this year's date for yearly ones).
 pub fn render_summary(countdown: &Countdown, date: NaiveDate, cx: &App) -> AnyElement {
     let today = Local::now().date_naive();
-    let shown = Countdown { date, ..countdown.clone() };
+    let shown = Countdown { date, repeat: None, ..countdown.clone() };
     let Face { color, numbers, subtitle } = face(&shown, today, false, cx);
     v_flex()
         .items_center()
@@ -152,7 +160,7 @@ pub fn render_summary(countdown: &Countdown, date: NaiveDate, cx: &App) -> AnyEl
 
 impl CountdownView {
     pub fn new(store: Rc<Store>, cx: &mut Context<Self>) -> Self {
-        let mut this = Self { store, countdowns: Vec::new(), filter: Filter::All, days_only: HashSet::new(), draft: None };
+        let mut this = Self { store, countdowns: Vec::new(), filter: Filter::All, days_only: HashSet::new(), draft: None, card_menu: None };
         this.reload(cx);
         this
     }
@@ -177,7 +185,40 @@ impl CountdownView {
             Filter::Kind(kind) => kind,
             Filter::All => CountdownKind::Countdown,
         };
-        self.draft = Some(Draft { name, kind, date: today, month: calendar::month_start(today), icon: None, color: None });
+        self.draft = Some(Draft { name, kind, date: today, month: calendar::month_start(today), icon: None, color: None, repeat: None, editing: None });
+        cx.notify();
+    }
+
+    /// "Edit" in a card's "…" menu: the countdown's popover, filled in.
+    pub fn start_edit(&mut self, id: Id, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(countdown) = self.countdowns.iter().find(|c| c.id == id).cloned() else { return };
+        self.card_menu = None;
+        self.start_new(window, cx);
+        if let Some(draft) = self.draft.as_mut() {
+            draft.name.update(cx, |input, cx| input.set_text(countdown.name.clone(), cx));
+            draft.kind = countdown.kind;
+            draft.date = countdown.date;
+            draft.month = calendar::month_start(countdown.date);
+            draft.icon = countdown.icon;
+            draft.color = countdown.color;
+            draft.repeat = countdown.repeat;
+            draft.editing = Some(id);
+        }
+        cx.notify();
+    }
+
+    /// `menu` opens the card's "…" menu, `edit` its edit popover, with a monthly repeat.
+    #[cfg(debug_assertions)]
+    pub fn dev_open(&mut self, name: &str, edit: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.countdowns.iter().find(|c| c.name.contains(name)).map(|c| c.id) else { return };
+        if edit {
+            self.start_edit(id, window, cx);
+            if let Some(draft) = self.draft.as_mut() {
+                draft.repeat = Some(fern_core::Recurrence::new(fern_core::Frequency::Monthly, 1));
+            }
+        } else {
+            self.card_menu = Some(id);
+        }
         cx.notify();
     }
 
@@ -194,9 +235,13 @@ impl CountdownView {
     fn save_draft(&mut self, cx: &mut Context<Self>) {
         let Some(draft) = self.draft.take() else { return };
         let name = draft.name.read(cx).text().to_owned();
-        let added = self.store.add_countdown(&name, draft.date, draft.kind).and_then(|countdown| {
-            self.store.set_countdown_look(countdown.id, draft.icon.as_deref(), draft.color.as_deref())
-        });
+        let added = match draft.editing {
+            Some(id) => self.store.update_countdown(id, &name, draft.date, draft.kind, draft.repeat.as_ref()).map(|()| id),
+            None => self.store.add_countdown(&name, draft.date, draft.kind).and_then(|countdown| {
+                self.store.update_countdown(countdown.id, &name, draft.date, draft.kind, draft.repeat.as_ref()).map(|()| countdown.id)
+            }),
+        }
+        .and_then(|id| self.store.set_countdown_look(id, draft.icon.as_deref(), draft.color.as_deref()));
         if let Err(err) = added {
             eprintln!("failed to add the countdown: {err:#}");
         }
@@ -261,12 +306,44 @@ impl CountdownView {
                     .right(px(6.))
                     .opacity(0.)
                     .group_hover(group, |s| s.opacity(1.))
+                    .when(self.card_menu == Some(id), |el| el.opacity(1.))
                     .child(
-                        IconButton::new("delete-countdown", IconName::X)
+                        // The original's "…" on a hovered card: Edit and Delete.
+                        IconButton::new("countdown-more", IconName::Ellipsis)
                             .size(px(22.))
                             .icon_size(IconSize::Small)
-                            .on_click(cx.listener(move |this, _, _, cx| this.delete(id, cx))),
-                    ),
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.card_menu = if this.card_menu == Some(id) { None } else { Some(id) };
+                                cx.notify();
+                            })),
+                    )
+                    .when(self.card_menu == Some(id), |el| {
+                        el.child(PopoverAttachment::new(
+                            Placement::BelowRight,
+                            popover(cx)
+                                .w(px(150.))
+                                .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                                    this.card_menu = None;
+                                    cx.notify();
+                                }))
+                                .child(
+                                    ListItem::new("countdown-edit")
+                                        .start_slot(Icon::new(IconName::Pencil).color(Color::Muted))
+                                        .child(Label::new(strings.edit))
+                                        .on_click(cx.listener(move |this, _, window, cx| this.start_edit(id, window, cx))),
+                                )
+                                .child(
+                                    ListItem::new("countdown-delete")
+                                        .start_slot(Icon::new(IconName::Trash).color(Color::Muted))
+                                        .child(Label::new(strings.delete))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.card_menu = None;
+                                            this.delete(id, cx)
+                                        })),
+                                )
+                                .into_any_element(),
+                        ))
+                    }),
             )
             .into_any_element()
     }
@@ -331,7 +408,7 @@ impl CountdownView {
                 this.draft = None;
                 cx.notify();
             }))
-            .child(Label::new(strings.countdown_new).weight(FontWeight::SEMIBOLD))
+            .child(Label::new(if draft.editing.is_some() { strings.countdown_edit } else { strings.countdown_new }).weight(FontWeight::SEMIBOLD))
             .child(
                 h_flex()
                     .h(px(30.))
@@ -381,6 +458,39 @@ impl CountdownView {
                         }))
                 }),
             ))
+            // The original's Repeat: None, Daily, Weekly, Monthly, Yearly.
+            .child({
+                use fern_core::Frequency;
+                let options = [
+                    (None, strings.none_option),
+                    (Some(Frequency::Daily), strings.repeat_daily),
+                    (Some(Frequency::Weekly), strings.repeat_weekly),
+                    (Some(Frequency::Monthly), strings.repeat_monthly),
+                    (Some(Frequency::Yearly), strings.repeat_yearly),
+                ];
+                let current = draft.repeat.as_ref().map(|r| r.frequency);
+                h_flex()
+                    .gap_1()
+                    .flex_wrap()
+                    .child(Label::new(strings.repeat).size(LabelSize::Small).color(Color::Muted))
+                    .children(options.into_iter().map(|(frequency, label)| {
+                        let selected = current == frequency;
+                        div()
+                            .id(SharedString::from(format!("countdown-repeat-{label}")))
+                            .px_1p5()
+                            .py_0p5()
+                            .rounded(px(4.))
+                            .cursor_pointer()
+                            .bg(if selected { theme.colors().accent } else { theme.colors().element_hover })
+                            .child(Label::new(label).size(LabelSize::XSmall))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if let Some(draft) = this.draft.as_mut() {
+                                    draft.repeat = frequency.map(|f| fern_core::Recurrence::new(f, 1));
+                                }
+                                cx.notify();
+                            }))
+                    }))
+            })
             .child(h_flex().gap_1().children(kinds.map(|option| {
                 let selected = option == kind;
                 div()

@@ -72,6 +72,21 @@ pub fn agenda(
             countdown: true,
             color: countdown.color.clone(),
         };
+        // A countdown with its own repeat is listed on each of its dates, like a repeating task.
+        if let Some(repeat) = &countdown.repeat {
+            let mut date = countdown.date;
+            while date <= until {
+                if date >= from {
+                    entries.push((date, item.clone()));
+                }
+                let next = repeat.next_after(date);
+                if next <= date {
+                    break;
+                }
+                date = next;
+            }
+            continue;
+        }
         let yearly = countdown.kind != CountdownKind::Countdown;
         let years = if yearly { from.year().max(countdown.date.year())..=until.year() } else { countdown.date.year()..=countdown.date.year() };
         for year in years {
@@ -130,7 +145,7 @@ mod tests {
 
     #[test]
     fn countdowns_on_their_dates() {
-        let countdown = |name: &str, date, kind| Countdown { id: uuid::Uuid::now_v7(), name: name.into(), date, kind, icon: None, color: Some("#ff6b6b".into()) };
+        let countdown = |name: &str, date, kind| Countdown { id: uuid::Uuid::now_v7(), name: name.into(), date, kind, icon: None, color: Some("#ff6b6b".into()), repeat: None };
         let countdowns = [
             countdown("Release", d(11, 19), CountdownKind::Countdown),
             countdown("New Year", NaiveDate::from_ymd_opt(2024, 1, 1).unwrap(), CountdownKind::Holiday),
@@ -141,6 +156,12 @@ mod tests {
         let listed: Vec<(NaiveDate, &str)> = days.iter().map(|(date, items)| (*date, items[0].title.as_str())).collect();
         assert_eq!(listed, [(d(11, 19), "Release"), (NaiveDate::from_ymd_opt(2027, 1, 1).unwrap(), "New Year")]);
         assert!(days[0].1[0].countdown);
+        let monthly = Countdown {
+            repeat: Some(crate::recurrence::Recurrence::new(crate::recurrence::Frequency::Monthly, 1)),
+            ..countdown("Rent", d(10, 13), CountdownKind::Countdown)
+        };
+        let rent = agenda(&[], &[monthly], d(10, 18), d(12, 31));
+        assert_eq!(rent.iter().map(|(date, _)| *date).collect::<Vec<_>>(), [d(11, 13), d(12, 13)]);
         assert_eq!(days[0].1[0].color.as_deref(), Some("#ff6b6b"));
     }
 }

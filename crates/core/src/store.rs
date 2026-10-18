@@ -563,6 +563,9 @@ const MIGRATIONS: &[&str] = &[
     END;
     CREATE TABLE sync_uploaded (name TEXT PRIMARY KEY);
     ",
+    "
+    ALTER TABLE countdowns ADD COLUMN repeat TEXT;
+    ",
 ];
 
 const TASK_COLUMNS: &str = "id, parent_id, kind, title, notes, priority, due_date, due_time, \
@@ -1423,7 +1426,7 @@ impl Store {
     /// Countdowns in creation order.
     pub fn countdowns(&self) -> Result<Vec<Countdown>> {
         let mut stmt =
-            self.conn.prepare("SELECT id, name, date, kind, icon, color FROM countdowns ORDER BY created_at, rowid")?;
+            self.conn.prepare("SELECT id, name, date, kind, icon, color, repeat FROM countdowns ORDER BY created_at, rowid")?;
         let rows = stmt
             .query_map([], |row| {
                 let date: String = row.get(2)?;
@@ -1436,6 +1439,7 @@ impl Store {
                     kind: CountdownKind::parse(&row.get::<_, String>(3)?),
                     icon: row.get(4)?,
                     color: row.get(5)?,
+                    repeat: row.get::<_, Option<String>>(6)?.and_then(|rule| rule.parse().ok()),
                 })
             })?
             .collect::<Result<_, _>>()?;
@@ -1445,7 +1449,7 @@ impl Store {
     pub fn add_countdown(&self, name: &str, date: NaiveDate, kind: CountdownKind) -> Result<Countdown> {
         let name = name.trim();
         anyhow::ensure!(!name.is_empty(), "a countdown needs a name");
-        let countdown = Countdown { id: Uuid::now_v7(), name: name.to_owned(), date, kind, icon: None, color: None };
+        let countdown = Countdown { id: Uuid::now_v7(), name: name.to_owned(), date, kind, icon: None, color: None, repeat: None };
         self.conn.execute(
             "INSERT INTO countdowns (id, name, date, kind, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
@@ -1457,6 +1461,24 @@ impl Store {
             ],
         )?;
         Ok(countdown)
+    }
+
+    /// Edits a countdown: its name, date, kind and repeat.
+    pub fn update_countdown(
+        &self,
+        id: Id,
+        name: &str,
+        date: NaiveDate,
+        kind: CountdownKind,
+        repeat: Option<&crate::recurrence::Recurrence>,
+    ) -> Result<()> {
+        let name = name.trim();
+        anyhow::ensure!(!name.is_empty(), "a countdown needs a name");
+        self.conn.execute(
+            "UPDATE countdowns SET name = ?2, date = ?3, kind = ?4, repeat = ?5 WHERE id = ?1",
+            params![id.to_string(), name, date.format(DATE_FORMAT).to_string(), kind.as_str(), repeat.map(|r| r.to_string())],
+        )?;
+        Ok(())
     }
 
     /// A countdown's icon (an emoji or short text) and its background color; empty clears.
@@ -2865,6 +2887,11 @@ mod tests {
         store.set_countdown_look(release.id, Some("🚀"), Some("#4c8bf5"))?;
         let saved = store.countdowns()?.remove(0);
         assert_eq!((saved.icon.as_deref(), saved.color.as_deref()), (Some("🚀"), Some("#4c8bf5")));
+        let monthly = crate::recurrence::Recurrence::new(crate::recurrence::Frequency::Monthly, 1);
+        store.update_countdown(release.id, "Release day", saved.date, CountdownKind::Countdown, Some(&monthly))?;
+        let edited = store.countdowns()?.remove(0);
+        assert_eq!((edited.name.as_str(), edited.repeat), ("Release day", Some(monthly)));
+        assert!(store.update_countdown(release.id, " ", saved.date, CountdownKind::Countdown, None).is_err());
         store.set_countdown_look(release.id, Some("  "), None)?;
         let saved = store.countdowns()?.remove(0);
         assert_eq!((saved.icon, saved.color), (None, None));

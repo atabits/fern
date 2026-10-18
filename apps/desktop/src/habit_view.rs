@@ -340,16 +340,19 @@ impl HabitView {
                 .child(Label::new(label).size(LabelSize::Small))
         };
         let picker = edit.icon_picker.map(|tab| self.render_icon_picker(edit, tab, cx));
-        // The original's width, so the icon picker under the icon stays inside the dialog.
+        // The original's dialog: in the middle of the view, its width, closed with × or Cancel.
         popover(cx)
             .w(px(425.))
-            .p_3()
+            .p_4()
             .gap_2()
-            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                this.editing = None;
-                cx.notify();
-            }))
-            .child(Label::new(strings.edit_habit).weight(FontWeight::SEMIBOLD))
+            .child(
+                h_flex()
+                    .child(div().flex_1().child(Label::new(strings.edit_habit).weight(FontWeight::BOLD)))
+                    .child(IconButton::new("habit-edit-x", IconName::X).icon_color(Color::Muted).on_click(cx.listener(|this, _, _, cx| {
+                        this.editing = None;
+                        cx.notify();
+                    }))),
+            )
             .child(
                 h_flex()
                     .gap_2()
@@ -1617,9 +1620,6 @@ impl HabitView {
                                             cx,
                                         )),
                                 ))
-                            })
-                            .when_some(self.editing.as_ref(), |el, edit| {
-                                el.child(PopoverAttachment::new(Placement::BelowRight, self.render_edit(edit, cx)))
                             }),
                     ),
             )
@@ -1927,7 +1927,21 @@ impl Render for HabitView {
                     .child(v_flex().gap_2().children(cards)),
             );
 
+        // Edit Habit over a dimmed background, as the original shows it.
+        let modal = self.editing.as_ref().map(|edit| self.render_edit(edit, cx)).map(|dialog| {
+            div()
+                .id("habit-modal")
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(gpui::black().opacity(0.35))
+                .occlude()
+                .child(dialog)
+        });
         h_flex()
+            .relative()
             .size_full()
             .items_start()
             .bg(theme.colors().background)
@@ -1941,5 +1955,6 @@ impl Render for HabitView {
                     .justify_center()
                     .child(Label::new(strings.habit_select).color(Color::Muted)),
             }))
+            .children(modal)
     }
 }

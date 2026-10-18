@@ -152,6 +152,7 @@ impl AppView {
                 {
                     let kind = fern_core::CountdownKind::parse(kind);
                     this.countdown.update(cx, |view, cx| view.dev_add(name, date, kind, cx));
+                    this.calendar.update(cx, |view, cx| view.reload(cx));
                 }
             }
             // `habit=<name>><days ago,…>`, repeatable.

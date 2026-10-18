@@ -114,9 +114,11 @@ impl CalendarView {
     pub fn reload(&mut self, cx: &mut Context<Self>) {
         if self.mode == CalendarMode::Agenda {
             let from = self.agenda_start();
+            let countdowns = self.store.countdowns().unwrap_or_default();
             match self.store.tasks() {
                 Ok(tasks) => {
-                    self.agenda = fern_core::agenda::agenda(&tasks, from, from + chrono::Duration::days(AGENDA_DAYS))
+                    self.agenda =
+                        fern_core::agenda::agenda(&tasks, &countdowns, from, from + chrono::Duration::days(AGENDA_DAYS))
                 }
                 Err(err) => eprintln!("failed to load the agenda: {err:#}"),
             }
@@ -568,7 +570,14 @@ impl CalendarView {
                     .enumerate()
                     .map(|(i, item)| {
                         let id = item.task;
-                        let tint = task_rows::priority_color(item.priority, &theme).unwrap_or(theme.colors().accent);
+                        // Countdowns, as in the original: an orange card and a filled dot instead of
+                        // the task's circle; they do not open a task.
+                        let countdown = item.countdown;
+                        let tint = if countdown {
+                            theme.status().warning
+                        } else {
+                            task_rows::priority_color(item.priority, &theme).unwrap_or(theme.colors().accent)
+                        };
                         let when = item.time.map_or(strings.range_all_day.to_owned(), calendar::format_time);
                         h_flex()
                             .gap_3()
@@ -578,8 +587,8 @@ impl CalendarView {
                                     .size(px(10.))
                                     .flex_none()
                                     .rounded_full()
-                                    .border_1()
-                                    .border_color(theme.colors().text_muted),
+                                    .when(countdown, |el| el.bg(theme.colors().accent))
+                                    .when(!countdown, |el| el.border_1().border_color(theme.colors().text_muted)),
                             )
                             .child(
                                 h_flex()
@@ -594,13 +603,16 @@ impl CalendarView {
                                     .border_l_3()
                                     .border_color(tint)
                                     .bg(tint.opacity(0.12))
-                                    .hover(|s| s.bg(tint.opacity(0.2)))
-                                    .cursor_pointer()
+                                    .when(!countdown, |el| el.hover(|s| s.bg(tint.opacity(0.2))).cursor_pointer())
                                     .child(div().flex_1().min_w_0().child(Label::new(item.title).size(LabelSize::Small).truncate()))
                                     .when(item.repeats, |el| {
                                         el.child(Icon::new(IconName::Repeat).size(IconSize::XSmall).color(Color::Muted))
                                     })
-                                    .on_click(cx.listener(move |_, _, _, cx| cx.emit(OpenTask(id)))),
+                                    .on_click(cx.listener(move |_, _, _, cx| {
+                                        if !countdown {
+                                            cx.emit(OpenTask(id))
+                                        }
+                                    })),
                             )
                             .into_any_element()
                     })

@@ -4358,22 +4358,39 @@ impl TodoView {
                                 ),
                         )
                     })
+                    // As the original: "…" on a hovered row opens the task's menu there.
                     .child(
                         div()
-                            .id("delete")
+                            .id("row-more")
                             .flex_none()
-                            .px_1()
-                            .text_color(theme.colors().text_muted)
                             .opacity(0.)
-                            .group_hover(group, |s| s.opacity(1.))
-                            .hover(|s| s.text_color(theme.status().error))
-                            .child("✕")
-                            .on_click(cx.listener(move |this, _, _, cx| {
+                            .group_hover(group.clone(), |s| s.opacity(1.))
+                            .child(Icon::new(IconName::Ellipsis).size(IconSize::Small).color(Color::Muted))
+                            .on_mouse_down(MouseButton::Left, cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
                                 cx.stop_propagation();
-                                this.delete(id, cx);
+                                window.focus(&this.list_focus, cx);
+                                this.select(id, cx);
+                                this.context_menu = Some((id, event.position));
+                                this.context_side = None;
+                                cx.notify();
                             })),
                     ),
             )
+            // And the drag handle left of a hovered row, as the original's.
+            .when(draggable, |el| {
+                el.child(
+                    div()
+                        .absolute()
+                        .left(px(-13.))
+                        .top_0()
+                        .h_full()
+                        .flex()
+                        .items_center()
+                        .opacity(0.)
+                        .group_hover(group, |s| s.opacity(1.))
+                        .child(Icon::new(IconName::Menu).size(IconSize::XSmall).color(Color::Muted)),
+                )
+            })
             .into_any_element()
     }
 

@@ -250,6 +250,19 @@ const MIGRATIONS: &[&str] = &[
         created_at INTEGER NOT NULL
     );
     ",
+    "
+    CREATE TABLE filters (
+        id         TEXT PRIMARY KEY,
+        name       TEXT NOT NULL,
+        lists      TEXT NOT NULL,
+        tags       TEXT NOT NULL,
+        date       TEXT NOT NULL,
+        priorities TEXT NOT NULL,
+        keywords   TEXT NOT NULL,
+        kind       TEXT,
+        created_at INTEGER NOT NULL
+    );
+    ",
 ];
 
 const TASK_COLUMNS: &str = "id, parent_id, kind, title, notes, priority, due_date, due_time, \
@@ -311,7 +324,72 @@ impl Store {
 
     /// Tasks for a view. `today` is passed in so tests do not depend on the clock or time zone.
     pub fn tasks_in(&self, view: &View, today: NaiveDate) -> Result<Vec<Task>> {
+        if let View::Filter(id) = view {
+            let filter = self.filters()?.into_iter().find(|f| f.id == *id).context("filter not found")?;
+            return Ok(self.tasks()?.into_iter().filter(|task| filter.matches(task, today)).collect());
+        }
         Ok(self.tasks()?.into_iter().filter(|task| matches_view(task, view, today)).collect())
+    }
+
+    /// Saved filters, oldest first.
+    pub fn filters(&self) -> Result<Vec<crate::filter::SmartFilter>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, lists, tags, date, priorities, keywords, kind FROM filters ORDER BY created_at, rowid",
+        )?;
+        let filters = stmt
+            .query_map([], |row| {
+                let lists: String = row.get(2)?;
+                let tags: String = row.get(3)?;
+                let priorities: String = row.get(5)?;
+                Ok(crate::filter::SmartFilter {
+                    id: parse_uuid(&row.get::<_, String>(0)?, 0)?,
+                    name: row.get(1)?,
+                    lists: lists
+                        .split(',')
+                        .filter(|l| !l.is_empty())
+                        .map(|l| if l == "inbox" { None } else { Uuid::parse_str(l).ok() })
+                        .collect(),
+                    tags: tags.lines().filter(|t| !t.is_empty()).map(str::to_owned).collect(),
+                    date: crate::filter::DateRule::from_key(&row.get::<_, String>(4)?),
+                    priorities: priorities.split(',').filter_map(|p| p.parse().ok()).map(Priority::from_i64).collect(),
+                    keywords: row.get(6)?,
+                    kind: row.get::<_, Option<String>>(7)?.map(|k| Kind::parse(&k)),
+                })
+            })?
+            .collect::<Result<_, _>>()?;
+        Ok(filters)
+    }
+
+    /// Adds a filter, or replaces the one with the same id.
+    pub fn save_filter(&self, filter: &crate::filter::SmartFilter) -> Result<()> {
+        anyhow::ensure!(!filter.name.trim().is_empty(), "a filter needs a name");
+        let lists: Vec<String> =
+            filter.lists.iter().map(|l| l.map_or_else(|| "inbox".to_owned(), |id| id.to_string())).collect();
+        let priorities: Vec<String> = filter.priorities.iter().map(|p| p.to_i64().to_string()).collect();
+        self.conn.execute(
+            "INSERT INTO filters (id, name, lists, tags, date, priorities, keywords, kind, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(id) DO UPDATE SET name = excluded.name, lists = excluded.lists, tags = excluded.tags,
+                 date = excluded.date, priorities = excluded.priorities, keywords = excluded.keywords,
+                 kind = excluded.kind",
+            params![
+                filter.id.to_string(),
+                filter.name.trim(),
+                lists.join(","),
+                filter.tags.join("\n"),
+                filter.date.key(),
+                priorities.join(","),
+                filter.keywords.trim(),
+                filter.kind.map(|k| k.as_str()),
+                now_ms()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_filter(&self, id: Id) -> Result<()> {
+        self.conn.execute("DELETE FROM filters WHERE id = ?1", [id.to_string()])?;
+        Ok(())
     }
 
     pub fn counts(&self, today: NaiveDate) -> Result<ViewCounts> {
@@ -1390,6 +1468,8 @@ fn matches_view(task: &Task, view: &View, today: NaiveDate) -> bool {
         View::WontDo => task.is_wont_do(),
         View::Trash => true,
         View::Tag(tag) => task.tags.iter().any(|t| t.to_lowercase() == tag.to_lowercase()),
+        // Filters are matched in `Store::tasks_in`, which knows their conditions.
+        View::Filter(_) => false,
         View::Search(query) => {
             let query = query.trim().to_lowercase();
             !query.is_empty()
@@ -1795,6 +1875,37 @@ mod tests {
         assert!(store.checkins(read.id)?.is_empty());
         store.delete_habit(floss.id)?;
         assert_eq!(store.habits()?.iter().map(|h| h.name.as_str()).collect::<Vec<_>>(), ["Read"]);
+        Ok(())
+    }
+
+    #[test]
+    fn filters_are_stored_and_listed() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let today = d(2026, 10, 18);
+        let work = store.create_list("Work")?;
+        let report = store.add_task("report")?;
+        store.set_list(report.id, Some(work.id))?;
+        store.set_priority(report.id, Priority::High)?;
+        store.add_task("milk")?;
+        let mut filter = crate::filter::SmartFilter {
+            id: Uuid::now_v7(),
+            name: "Urgent work".into(),
+            lists: vec![Some(work.id), None],
+            priorities: vec![Priority::High],
+            tags: vec!["a".into(), "b c".into()],
+            kind: Some(Kind::Task),
+            ..Default::default()
+        };
+        assert!(store.save_filter(&crate::filter::SmartFilter { name: " ".into(), ..filter.clone() }).is_err());
+        store.save_filter(&filter)?;
+        assert_eq!(store.filters()?, [filter.clone()]);
+        filter.tags.clear();
+        filter.name = "Urgent".into();
+        store.save_filter(&filter)?;
+        assert_eq!(store.filters()?, [filter.clone()]);
+        assert_eq!(titles(&store.tasks_in(&View::Filter(filter.id), today)?), ["report"]);
+        store.delete_filter(filter.id)?;
+        assert!(store.filters()?.is_empty());
         Ok(())
     }
 

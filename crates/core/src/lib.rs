@@ -2,6 +2,7 @@
 //! Used by the desktop app and, later, by the mobile clients.
 
 pub mod countdown;
+pub mod filter;
 pub mod focus;
 pub mod habit;
 pub mod model;
@@ -12,6 +13,7 @@ pub mod stats;
 pub mod store;
 
 pub use countdown::{Countdown, CountdownKind, Span, span};
+pub use filter::{DateRule, SmartFilter};
 pub use focus::{FocusSession, FocusStats, focus_stats, format_minutes};
 pub use habit::{Checkin, Goal, Habit, HabitStats, MonthStats};
 pub use habit::Frequency as HabitFrequency;

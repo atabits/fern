@@ -35,6 +35,7 @@ pub enum IconName {
     FileText,
     Flag,
     Flame,
+    Funnel,
     Gift,
     Heart,
     Hourglass,

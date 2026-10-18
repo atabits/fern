@@ -16,7 +16,7 @@ pub const LIST_COLORS: [&str; 8] =
     ["#EF4444", "#F97316", "#EAB308", "#22C55E", "#06B6D4", "#3B82F6", "#A855F7", "#EC4899"];
 
 /// The title of a view for the list header.
-pub fn title(view: &View, lists: &[List], strings: &Strings) -> SharedString {
+pub fn title(view: &View, lists: &[List], filters: &[fern_core::SmartFilter], strings: &Strings) -> SharedString {
     match view {
         View::Inbox => strings.inbox.into(),
         View::All => strings.all.into(),
@@ -31,6 +31,7 @@ pub fn title(view: &View, lists: &[List], strings: &Strings) -> SharedString {
         }
         View::Tag(name) => name.clone().into(),
         View::Search(_) => strings.section_search.into(),
+        View::Filter(id) => filters.iter().find(|f| f.id == *id).map(|f| f.name.clone()).unwrap_or_default().into(),
     }
 }
 
@@ -54,6 +55,8 @@ pub struct Props<'a> {
     pub strings: &'static Strings,
     /// The inline "new list" input while the user is creating a list.
     pub new_list_input: Option<AnyElement>,
+    /// Saved filters with their task counts.
+    pub filters: &'a [(fern_core::SmartFilter, usize)],
 }
 
 pub fn render(
@@ -61,9 +64,10 @@ pub fn render(
     on_select: impl Fn(View, &mut Window, &mut App) + Clone + 'static,
     on_add_list: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     on_drop_task: impl Fn(View, fern_core::Id, &mut Window, &mut App) + Clone + 'static,
+    on_add_filter: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     cx: &App,
 ) -> impl IntoElement {
-    let Props { active, counts, lists, tags, strings, new_list_input } = props;
+    let Props { active, counts, lists, tags, strings, new_list_input, filters } = props;
     let colors = cx.theme().colors();
 
     let item = |id: String,
@@ -175,6 +179,38 @@ pub fn render(
                 }))
                 .child(separator())
         })
+        // Filters, as in the original: a hint until there is one.
+        .child(
+            heading(strings.filters).child(
+                IconButton::new("add-filter", IconName::Plus)
+                    .size(px(20.))
+                    .icon_size(IconSize::Small)
+                    .tooltip(Tooltip::text(strings.add_filter))
+                    .on_click(on_add_filter),
+            ),
+        )
+        .when(filters.is_empty(), |el| {
+            el.child(
+                div()
+                    .mx_1()
+                    .mb_1()
+                    .p_2()
+                    .rounded(px(6.))
+                    .bg(colors.surface_background)
+                    .child(Label::new(strings.filters_hint).size(LabelSize::XSmall).color(Color::Muted)),
+            )
+        })
+        .children(filters.iter().map(|(filter, count)| {
+            item(
+                format!("filter-{}", filter.id),
+                View::Filter(filter.id),
+                filter.name.clone().into(),
+                IconName::Funnel,
+                Some(*count),
+                None,
+            )
+        }))
+        .child(separator())
         .child(smart(View::Completed, strings.completed, IconName::SquareCheckBig, None))
         .child(smart(View::WontDo, strings.wont_do, IconName::SquareX, None))
         .child(smart(View::Trash, strings.trash, IconName::Trash, None));

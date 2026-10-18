@@ -195,6 +195,8 @@ pub enum View {
     Tag(String),
     /// Tasks whose title, notes or tags contain the text, ignoring case.
     Search(String),
+    /// A saved filter ("Filters" in the lists column).
+    Filter(Id),
 }
 
 /// Open-task counters for the lists column.

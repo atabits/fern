@@ -13,6 +13,20 @@ impl FocusTimer {
         Self { length_ms, started_at: now, paused_at: None, paused_total: 0 }
     }
 
+    /// A stopwatch: counts up with no end, until it is stopped.
+    pub fn stopwatch(now: i64) -> Self {
+        Self::start(now, STOPWATCH_LENGTH)
+    }
+
+    pub fn is_stopwatch(&self) -> bool {
+        self.length_ms == STOPWATCH_LENGTH
+    }
+
+    /// What the clock shows: time left on a Pomodoro, time so far on a stopwatch.
+    pub fn display(&self, now: i64) -> i64 {
+        if self.is_stopwatch() { self.elapsed(now) } else { self.remaining(now) }
+    }
+
     pub fn is_paused(&self) -> bool {
         self.paused_at.is_some()
     }
@@ -44,6 +58,9 @@ impl FocusTimer {
     }
 }
 
+/// A stopwatch's length: far beyond any session, so it never finishes.
+const STOPWATCH_LENGTH: i64 = i64::MAX / 4;
+
 /// The break after a finished Pomodoro.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BreakKind {
@@ -70,6 +87,19 @@ mod tests {
     use super::*;
 
     const MIN: i64 = 60_000;
+
+    #[test]
+    fn stopwatch_counts_up_and_never_finishes() {
+        let mut watch = FocusTimer::stopwatch(0);
+        assert!(watch.is_stopwatch());
+        assert_eq!(watch.display(90 * MIN), 90 * MIN);
+        assert!(!watch.finished(24 * 60 * MIN));
+        watch.pause(10 * MIN);
+        watch.resume(15 * MIN);
+        assert_eq!(watch.display(20 * MIN), 15 * MIN);
+        let pomo = FocusTimer::start(0, 25 * MIN);
+        assert_eq!(pomo.display(5 * MIN), 20 * MIN);
+    }
 
     #[test]
     fn every_fourth_pomo_gets_a_long_break() {

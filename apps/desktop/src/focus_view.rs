@@ -19,6 +19,8 @@ use crate::text_input::{Mode, TextInput};
 const POMO_SETTING: (&str, i64, i64, i64) = ("focus_pomo_minutes", 25, 5, 180);
 const SHORT_BREAK_SETTING: (&str, i64, i64, i64) = ("focus_short_break_minutes", 5, 1, 60);
 const LONG_BREAK_SETTING: (&str, i64, i64, i64) = ("focus_long_break_minutes", 15, 1, 90);
+/// "pomo" or "stopwatch".
+const MODE_SETTING: &str = "focus_mode";
 /// Shorter sessions are not recorded.
 const MIN_RECORDED_MS: i64 = 60_000;
 
@@ -131,13 +133,29 @@ impl FocusView {
         cx.notify();
     }
 
+    /// Starts a Pomodoro, or a stopwatch in the stopwatch mode.
     pub fn start(&mut self, task: Option<(Id, String)>, cx: &mut Context<Self>) {
         self.finish(cx);
-        let length = self.minutes(POMO_SETTING) * 60_000;
-        self.start_timer(task, None, length, cx);
+        let timer = if self.stopwatch_mode() {
+            FocusTimer::stopwatch(now_ms())
+        } else {
+            FocusTimer::start(now_ms(), self.minutes(POMO_SETTING) * 60_000)
+        };
+        self.start_timer(task, None, timer, cx);
     }
 
-    fn start_timer(&mut self, task: Option<(Id, String)>, on_break: Option<BreakKind>, length_ms: i64, cx: &mut Context<Self>) {
+    fn stopwatch_mode(&self) -> bool {
+        self.store.setting(MODE_SETTING).ok().flatten().as_deref() == Some("stopwatch")
+    }
+
+    fn set_stopwatch_mode(&mut self, stopwatch: bool, cx: &mut Context<Self>) {
+        if let Err(err) = self.store.set_setting(MODE_SETTING, if stopwatch { "stopwatch" } else { "pomo" }) {
+            eprintln!("failed to save the focus mode: {err:#}");
+        }
+        cx.notify();
+    }
+
+    fn start_timer(&mut self, task: Option<(Id, String)>, on_break: Option<BreakKind>, timer: FocusTimer, cx: &mut Context<Self>) {
         let ticker = cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(Duration::from_secs(1)).await;
@@ -146,7 +164,7 @@ impl FocusView {
                 }
             }
         });
-        self.running = Some(Running { timer: FocusTimer::start(now_ms(), length_ms), task, on_break, _ticker: ticker });
+        self.running = Some(Running { timer, task, on_break, _ticker: ticker });
         cx.notify();
     }
 
@@ -162,7 +180,7 @@ impl FocusView {
                 let kind = break_after(pomos);
                 let setting = if kind == BreakKind::Long { LONG_BREAK_SETTING } else { SHORT_BREAK_SETTING };
                 let length = self.minutes(setting) * 60_000;
-                self.start_timer(None, Some(kind), length, cx);
+                self.start_timer(None, Some(kind), FocusTimer::start(now_ms(), length), cx);
             }
         }
         cx.notify();
@@ -763,6 +781,10 @@ impl FocusView {
         let menu = match menu {
             "add" => RecordMenu::Add,
             "settings" => RecordMenu::Settings,
+            "stopwatch" => {
+                self.set_stopwatch_mode(true, cx);
+                return;
+            }
             "stats" | "stats-overview" | "stats-task" => {
                 self.open_stats(cx);
                 let tab = match menu {
@@ -917,7 +939,7 @@ impl Render for FocusView {
 
         let (clock, label, running, paused) = match &self.running {
             Some(r) => (
-                format_clock(r.timer.remaining(now)),
+                format_clock(r.timer.display(now)),
                 match r.on_break {
                     Some(BreakKind::Short) => SharedString::new_static(strings.focus_short_break),
                     Some(BreakKind::Long) => SharedString::new_static(strings.focus_long_break),
@@ -926,7 +948,12 @@ impl Render for FocusView {
                 true,
                 r.timer.is_paused(),
             ),
-            None => (format_clock(self.minutes(POMO_SETTING) * 60_000), SharedString::new_static(strings.focus), false, false),
+            None => (
+                format_clock(if self.stopwatch_mode() { 0 } else { self.minutes(POMO_SETTING) * 60_000 }),
+                SharedString::new_static(strings.focus),
+                false,
+                false,
+            ),
         };
 
         let left = v_flex()
@@ -993,6 +1020,26 @@ impl Render for FocusView {
                             .child(Label::new(label).size(LabelSize::XSmall).color(Color::Muted).truncate())
                             .child(div().text_size(px(20.)).child(clock)),
                     )
+                    // Pomo or Stopwatch, chosen while no timer runs.
+                    .when(!running, |el| {
+                        let stopwatch = self.stopwatch_mode();
+                        el.child(h_flex().p_0p5().rounded(px(12.)).bg(theme.colors().surface_background).children(
+                            strings.focus_modes.iter().enumerate().map(|(i, label)| {
+                                let selected = (i == 1) == stopwatch;
+                                div()
+                                    .id(SharedString::from(format!("focus-mode-{i}")))
+                                    .px_3()
+                                    .h(px(24.))
+                                    .flex()
+                                    .items_center()
+                                    .rounded(px(10.))
+                                    .cursor_pointer()
+                                    .when(selected, |el| el.bg(theme.colors().element_selected))
+                                    .child(Label::new(*label).size(LabelSize::XSmall).color(if selected { Color::Default } else { Color::Muted }))
+                                    .on_click(cx.listener(move |this, _, _, cx| this.set_stopwatch_mode(i == 1, cx)))
+                            }),
+                        ))
+                    })
                     .when(running, |el| {
                         el.child(
                             IconButton::new("focus-stop", IconName::Square)

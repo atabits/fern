@@ -45,6 +45,7 @@ pub enum IconName {
     Layers,
     LayoutGrid,
     LayoutTemplate,
+    Link,
     List,
     ListChecks,
     ListTree,

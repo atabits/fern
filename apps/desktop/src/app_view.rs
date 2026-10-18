@@ -282,6 +282,15 @@ impl AppView {
 }
 
 impl AppView {
+    /// Opens a task from a `fern://task/…` link, in All with its details.
+    pub fn open_task(&mut self, task: fern_core::Id, window: &mut Window, cx: &mut Context<Self>) {
+        self.select(Section::Tasks, window, cx);
+        self.todo.update(cx, |todo, cx| {
+            todo.set_view(fern_core::View::All, cx);
+            todo.select(task, cx);
+        });
+    }
+
     pub fn add_notices(&mut self, notices: Vec<Notice>, cx: &mut Context<Self>) {
         if !notices.is_empty() {
             self.notices.push(notices);

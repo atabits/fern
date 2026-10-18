@@ -5,6 +5,7 @@ pub mod countdown;
 pub mod filter;
 pub mod focus;
 pub mod habit;
+pub mod link;
 pub mod model;
 pub mod quick_add;
 pub mod recurrence;

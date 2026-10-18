@@ -68,7 +68,17 @@ fn main() -> Result<()> {
                 window_min_size: Some(size(px(900.), px(400.))),
                 ..Default::default()
             },
-            |window, cx| cx.new(|cx| AppView::new(store, window, cx)),
+            |window, cx| {
+                // `fern fern://task/<id>` opens that task ("Copy Link").
+                let link = std::env::args().skip(1).find_map(|arg| fern_core::link::parse_task_link(&arg));
+                cx.new(|cx| {
+                    let mut view = AppView::new(store, window, cx);
+                    if let Some(task) = link {
+                        view.open_task(task, window, cx);
+                    }
+                    view
+                })
+            },
         )
         .expect("failed to open the main window");
         cx.activate(true);

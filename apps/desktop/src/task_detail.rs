@@ -106,6 +106,8 @@ pub struct TaskDetail {
     popup: Option<Popup>,
     /// Shown as the calendar's task card, framed by the card instead of a left border.
     card: bool,
+    /// The Add Subtask field shown while the task has no subtasks, from the "…" menu.
+    subtask_open: bool,
     /// The due-date popover's draft, while it is open.
     due_draft: Option<DueDraft>,
     /// The "Task Activities" panel, while it is open.
@@ -262,6 +264,7 @@ impl TaskDetail {
             pending_focus: None,
             popup: None,
             card: false,
+            subtask_open: false,
             due_draft: None,
             activity: None,
             _subscriptions: subscriptions,
@@ -295,6 +298,7 @@ impl TaskDetail {
         self.notes.update(cx, |input, cx| input.set_text(notes, cx));
         self.task = task;
         self.popup = None;
+        self.subtask_open = false;
         self.activity = None;
         self.all_tags = self.store.tags().unwrap_or_default();
         self.checklist.clear();
@@ -675,7 +679,10 @@ impl TaskDetail {
             return;
         }
         match what {
-            "subtask" => window.focus(&self.subtask_input.focus_handle(cx), cx),
+            "subtask" => {
+                self.subtask_open = true;
+                window.focus(&self.subtask_input.focus_handle(cx), cx);
+            }
             "due" => self.open_popup(Popup::Due, cx),
             "tags" => self.open_popup(Popup::Tags, cx),
             "link-parent" => {
@@ -922,6 +929,7 @@ impl TaskDetail {
             .child(self.close_side_menu_on_hover(item("more-subtask", IconName::CornerDownRight, strings.add_subtask_item).on_click(cx.listener(
                 |this, _, window, cx| {
                     this.close_popup(cx);
+                    this.subtask_open = true;
                     window.focus(&this.subtask_input.focus_handle(cx), cx);
                 },
             )), cx))
@@ -2456,30 +2464,33 @@ impl TaskDetail {
                     .child(Label::new(text).size(LabelSize::XSmall).color(Color::Accent))
                     .on_click(cx.listener(|this, _, _, cx| this.open_popup(Popup::Estimate, cx)))
             }))
+            // As the original's, a tag is a plain chip; a click opens the tag picker, where it is
+            // unticked.
             .children(self.task_tags().into_iter().map(|tag| {
-                let name = tag.clone();
-                Chip::new(tag.clone(), self.tag_color(&tag, cx)).end_slot(
-                    div()
-                        .id(SharedString::from(format!("remove-tag-{tag}")))
-                        .cursor_pointer()
-                        .opacity(0.6)
-                        .hover(|s| s.opacity(1.))
-                        .child("×")
-                        .on_click(cx.listener(move |this, _, _, cx| this.remove_tag(&name, cx))),
-                )
+                div()
+                    .id(SharedString::from(format!("tag-chip-{tag}")))
+                    .cursor_pointer()
+                    .child(Chip::new(tag.clone(), self.tag_color(&tag, cx)))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.open_popup(Popup::Tags, cx);
+                        window.focus(&this.tag_input.focus_handle(cx), cx);
+                    }))
             }))
             .child(
+                // The original's "+" after the tags: an accent-outlined circle.
                 div()
                     .id("add-tag")
                     .relative()
-                    .h(px(18.))
-                    .px(px(6.))
+                    .size(px(18.))
                     .flex()
                     .items_center()
+                    .justify_center()
                     .rounded_full()
+                    .border_1()
+                    .border_color(theme.colors().accent)
                     .cursor_pointer()
                     .hover(|s| s.bg(theme.colors().element_hover))
-                    .child(Label::new(strings.add_tag).size(LabelSize::XSmall).color(Color::Muted))
+                    .child(Icon::new(IconName::Plus).size(IconSize::Custom(px(11.))).color(Color::Accent))
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.open_popup(Popup::Tags, cx);
                         window.focus(&this.tag_input.focus_handle(cx), cx);
@@ -2567,7 +2578,11 @@ impl Render for TaskDetail {
                     None => label,
                 };
                 // The calendar's card writes the date out, as the original's.
-                let label = if self.card && task.end_date.is_none() { task_rows::card_due_label(date, task.due_time, today, strings) } else { label };
+                let label = if self.card && task.end_date.is_none() {
+                    task_rows::card_due_label(date, task.due_time, today, strings)
+                } else {
+                    task_rows::detail_due_label(label, date, today, strings)
+                };
                 (label.into(), if overdue && !done { Color::Error } else { Color::Accent })
             }
             None => (strings.due_date.into(), Color::Muted),
@@ -2680,8 +2695,10 @@ impl Render for TaskDetail {
                     .when(!self.attachments.is_empty(), |el| el.child(self.render_attachments(cx)))
                     // Tags sit under the notes, as in the original.
                     // The calendar's card leaves out the empty tags and subtasks, as the original's.
-                    .when(!self.card || !task.tags.is_empty(), |el| el.child(self.render_tags_row(strings, cx)))
-                    .when(!self.card || !self.subtasks.is_empty(), |el| {
+                    // As the original's, the tags row only once there are tags (the "…" menu's Tags
+                    // adds the first), and the subtasks only once there are some or one is begun.
+                    .when(!task.tags.is_empty() || task.estimate.is_some(), |el| el.child(div().pt(px(18.)).child(self.render_tags_row(strings, cx))))
+                    .when(!self.subtasks.is_empty() || self.subtask_open, |el| {
                         el.child(div().pt_2().child(Divider::horizontal())).child(self.render_subtasks(strings, cx))
                     })
                     .when(!self.comments.is_empty(), |el| el.child(self.render_comments(strings, cx))),

@@ -25,7 +25,7 @@ use crate::text_input::{Cancelled, Changed, Mode, Submitted, TextInput};
 /// The share of a task row, from the left, where a dropped task goes before it; the rest of the
 /// row nests it.
 const NEST_ZONE: f32 = 0.6;
-const DETAIL_WIDTH: f32 = 400.;
+const DETAIL_WIDTH: f32 = 419.;
 const ROW_HEIGHT: f32 = 40.;
 /// Below this width the window is narrow, for View Options' Task Detail Layout.
 const NARROW_WINDOW: f32 = 1200.;

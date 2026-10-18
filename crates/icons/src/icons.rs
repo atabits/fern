@@ -72,6 +72,7 @@ pub enum IconName {
     Layers,
     LayoutGrid,
     LayoutTemplate,
+    Lightbulb,
     Link,
     List,
     ListChecks,

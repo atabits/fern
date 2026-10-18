@@ -152,6 +152,9 @@ pub struct TodoView {
     column_menu: Option<(Id, bool)>,
     /// The Timeline's groups folded up, by name.
     timeline_folded: HashSet<String>,
+    /// Today's "Suggested Tasks" panel (the header's light bulb), and whether its Long Unfinished
+    /// list is shown in full.
+    suggestions_open: Option<bool>,
     /// The header menu's View Options dialog and its Show Date by dropdown, while open.
     view_options: Option<bool>,
     section_rename: Option<(Id, Entity<TextInput>)>,
@@ -302,6 +305,7 @@ impl TodoView {
             column_menu: None,
             timeline_folded: HashSet::new(),
             view_options: None,
+            suggestions_open: None,
             section_rename: None,
             section_menu: None,
             templates_open: false,
@@ -480,6 +484,7 @@ impl TodoView {
                 Some(("menu", "timeline")) => self.set_layout(false, true, cx),
                 Some(("menu", "kanban")) => self.set_layout(true, false, cx),
                 Some(("menu", "view-options")) => self.view_options = Some(false),
+                Some(("menu", "suggestions")) => self.suggestions_open = Some(false),
                 Some(("menu", "view-options-date")) => self.view_options = Some(true),
                 Some(("show-date", "countdown")) => self.save_preferences(|p| p.countdown_dates = true, cx),
                 Some(("menu", "arrange")) => {
@@ -2608,6 +2613,114 @@ impl TodoView {
         self.new_section = Some(input);
         self.header_menu_open = false;
         cx.notify();
+    }
+
+    /// The original's Suggested Tasks: Recently Added and Long Unfinished, each with "+" to plan
+    /// the task for today; four of the long unfinished ones until "More".
+    fn render_suggestions(&self, all: bool, strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let today = Self::today();
+        let found = fern_core::suggest::suggestions(&self.store.tasks().unwrap_or_default(), today);
+        let row = |task: &Task, note: String, cx: &mut Context<Self>| {
+            let id = task.id;
+            h_flex()
+                .id(SharedString::from(format!("suggestion-{id}")))
+                .py_1p5()
+                .gap_2()
+                .items_start()
+                .border_b_1()
+                .border_color(theme.colors().border_variant)
+                .child(div().pt(px(3.)).child(Checkbox::new(SharedString::from(format!("suggestion-box-{id}"))).size(px(14.))))
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .child(Label::new(task.title.clone()).truncate())
+                        .child(Label::new(note).size(LabelSize::XSmall).color(Color::Muted)),
+                )
+                .child(
+                    IconButton::new(SharedString::from(format!("suggestion-add-{id}")), IconName::Plus)
+                        .icon_color(Color::Accent)
+                        .tooltip(Tooltip::text(strings.add_to_today))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let result = this.store.set_due(id, Some(Self::today()), None);
+                            this.check(result);
+                            this.reload(cx);
+                        })),
+                )
+                .into_any_element()
+        };
+        let recent: Vec<AnyElement> = found
+            .recent
+            .iter()
+            .map(|task| {
+                let when = fern_core::suggest::created_day(task)
+                    .zip(chrono::DateTime::from_timestamp_millis(task.created_at))
+                    .map(|(day, at)| task_rows::due_label(day, Some(at.with_timezone(&Local).time()), today, strings).0)
+                    .unwrap_or_default();
+                row(task, strings.added_on.replace("{when}", &when), cx)
+            })
+            .collect();
+        let shown = if all { found.long_unfinished.len() } else { found.long_unfinished.len().min(4) };
+        let long: Vec<AnyElement> = found.long_unfinished[..shown]
+            .iter()
+            .map(|task| {
+                let days = fern_core::suggest::created_day(task).map_or(0, |d| (today - d).num_days());
+                row(task, strings.created_days_ago.replace("{n}", &days.to_string()), cx)
+            })
+            .collect();
+        let more = !all && found.long_unfinished.len() > 4;
+        let heading = |text: &'static str| Label::new(text).size(LabelSize::Small).weight(FontWeight::SEMIBOLD);
+        div()
+            .absolute()
+            .right(px(12.))
+            .bottom(px(12.))
+            .child(
+                v_flex()
+                    .id("suggested-tasks")
+                    .w(px(370.))
+                    .max_h(px(560.))
+                    .overflow_y_scroll()
+                    .p_4()
+                    .gap_2()
+                    .rounded(px(10.))
+                    .bg(theme.colors().elevated_surface_background)
+                    .border_1()
+                    .border_color(theme.colors().border)
+                    .shadow_lg()
+                    .child(
+                        h_flex()
+                            .child(div().flex_1().text_size(px(16.)).font_weight(FontWeight::SEMIBOLD).child(strings.suggested_tasks))
+                            .child(IconButton::new("suggestions-x", IconName::X).icon_color(Color::Muted).on_click(cx.listener(|this, _, _, cx| {
+                                this.suggestions_open = None;
+                                cx.notify();
+                            }))),
+                    )
+                    .when(recent.is_empty() && long.is_empty(), |el| el.child(Label::new(strings.no_suggestions).color(Color::Muted)))
+                    .when(!recent.is_empty(), |el| el.child(heading(strings.recently_added)).children(recent))
+                    .when(!long.is_empty(), |el| {
+                        el.child(
+                            h_flex()
+                                .pt_2()
+                                .child(div().flex_1().child(heading(strings.long_unfinished)))
+                                .when(more, |el| {
+                                    el.child(
+                                        h_flex()
+                                            .id("suggestions-more")
+                                            .cursor_pointer()
+                                            .child(Label::new(strings.more).size(LabelSize::Small).color(Color::Muted))
+                                            .child(Icon::new(IconName::ChevronRight).size(IconSize::XSmall).color(Color::Muted))
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.suggestions_open = Some(true);
+                                                cx.notify();
+                                            })),
+                                    )
+                                }),
+                        )
+                        .children(long)
+                    }),
+            )
+            .into_any_element()
     }
 
     fn save_preferences(&mut self, change: impl FnOnce(&mut fern_core::Preferences), cx: &mut Context<Self>) {
@@ -5163,6 +5276,18 @@ impl Render for TodoView {
                                 .on_click(cx.listener(|this, _, _, cx| this.empty_trash(cx))),
                         )
                     })
+                    // The original's light bulb in Today: Suggested Tasks.
+                    .when(self.view == View::Today, |el| {
+                        el.child(
+                            IconButton::new("suggestions", IconName::Lightbulb)
+                                .toggle_state(self.suggestions_open.is_some())
+                                .tooltip(Tooltip::text(strings.suggested_tasks))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.suggestions_open = if this.suggestions_open.is_some() { None } else { Some(false) };
+                                    cx.notify();
+                                })),
+                        )
+                    })
                     .when(self.view != View::Trash, |el| {
                         el.child(
                             div()
@@ -5451,6 +5576,7 @@ impl Render for TodoView {
             .children(self.render_context_menu(strings, cx))
             .children(self.render_list_menu(strings, cx))
             .children(self.view_options.map(|menu| self.render_view_options(menu, strings, cx)))
+            .children(self.suggestions_open.filter(|_| self.view == View::Today).map(|all| self.render_suggestions(all, strings, cx)))
             .children(self.list_dialog.clone())
             .children(self.folder_dialog.clone())
             .children(self.tag_dialog.clone())

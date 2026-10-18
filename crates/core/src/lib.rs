@@ -18,6 +18,7 @@ pub mod reminder;
 pub mod search;
 pub mod stats;
 pub mod store;
+pub mod suggest;
 pub mod summary;
 pub mod sync;
 pub mod timeline;

@@ -73,6 +73,10 @@ pub fn priority_low() -> Rgba {
     rgb(0x4772fa)
 }
 
+/// Colors offered for lists, as stored in the database.
+pub const LIST_COLORS: [&str; 8] =
+    ["#EF4444", "#F97316", "#EAB308", "#22C55E", "#06B6D4", "#3B82F6", "#A855F7", "#EC4899"];
+
 /// The flag and checkbox border color for a priority.
 pub fn priority(priority: Priority) -> Rgba {
     match priority {

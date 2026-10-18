@@ -79,6 +79,8 @@ pub struct Strings {
     pub lists: &'static str,
     pub new_list: &'static str,
     pub delete_list: &'static str,
+    pub rename_list: &'static str,
+    pub color: &'static str,
     /// Shown in the "…" menu when the current view has no actions.
     pub no_actions: &'static str,
 
@@ -136,6 +138,8 @@ pub static EN: Strings = Strings {
     lists: "Lists",
     new_list: "New list",
     delete_list: "Delete list",
+    rename_list: "Rename",
+    color: "Color",
     no_actions: "No actions",
 
     add_task: "Add task",
@@ -192,6 +196,8 @@ pub static RU: Strings = Strings {
     lists: "Списки",
     new_list: "Новый список",
     delete_list: "Удалить список",
+    rename_list: "Переименовать",
+    color: "Цвет",
     no_actions: "Нет действий",
 
     add_task: "Добавить задачу",

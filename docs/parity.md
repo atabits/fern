@@ -46,7 +46,7 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 | Narrow sections sidebar | 🟡 | only Tasks works; outline icons where TickTick uses filled ones; no notification badge |
 | Account menu with language switch | ✅ | English (default) and Russian |
 | Lists column: Inbox / All / Today / Tomorrow / Next 7 Days | ✅ | counters; a new task gets the due date or tag of the current view |
-| Lists column: user lists | 🟡 | create inline, delete from the "…" menu; no rename, colors or drag and drop |
+| Lists column: user lists | ✅ | create inline; rename, color and delete from the "…" menu; no drag and drop |
 | Lists column: tags with color dots and counters | ✅ | |
 | Lists column: Filters, Won't Do, Trash | 🟡 | only Completed |
 | Mini week at the bottom of the lists column | ⬜ | |
@@ -79,8 +79,8 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 
 ## Next
 
-1. Rename lists, list colors.
-2. Checklist items inside a task.
-3. Trash instead of immediate deletion.
-4. Time and repeat in the due-date picker.
-5. Manual ordering and drag and drop.
+1. Checklist items inside a task.
+2. Trash instead of immediate deletion.
+3. Time and repeat in the due-date picker.
+4. Manual ordering and drag and drop.
+5. Creating subtasks from the UI.

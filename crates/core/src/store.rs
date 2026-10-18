@@ -306,6 +306,12 @@ impl Store {
         Ok(())
     }
 
+    /// Sets the list color as `#RRGGBB`, or clears it with `None`.
+    pub fn set_list_color(&self, id: Id, color: Option<&str>) -> Result<()> {
+        self.conn.execute("UPDATE lists SET color = ?2 WHERE id = ?1", params![id.to_string(), color])?;
+        Ok(())
+    }
+
     /// Deletes the list together with its tasks.
     pub fn delete_list(&self, id: Id) -> Result<()> {
         self.conn.execute("DELETE FROM lists WHERE id = ?1", [id.to_string()])?;
@@ -586,6 +592,11 @@ mod tests {
 
         store.rename_list(work.id, "Office")?;
         assert_eq!(store.lists()?[0].name, "Office");
+        assert!(store.rename_list(work.id, " ").is_err());
+        store.set_list_color(work.id, Some("#22C55E"))?;
+        assert_eq!(store.lists()?[0].color.as_deref(), Some("#22C55E"));
+        store.set_list_color(work.id, None)?;
+        assert_eq!(store.lists()?[0].color, None);
 
         store.delete_list(work.id)?;
         assert!(store.lists()?.is_empty());

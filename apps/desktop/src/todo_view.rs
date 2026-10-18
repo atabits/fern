@@ -35,6 +35,8 @@ pub struct TodoView {
     input: Entity<TextInput>,
     new_list: Entity<TextInput>,
     creating_list: bool,
+    rename_input: Entity<TextInput>,
+    renaming_list: bool,
     header_menu_open: bool,
     detail: Entity<TaskDetail>,
     selected: Option<Id>,
@@ -70,6 +72,15 @@ impl TodoView {
         })
         .detach();
 
+        let rename_input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.new_list, cx));
+        cx.subscribe(&rename_input, |this, _, Submitted(name), cx| this.rename_current_list(name, cx))
+            .detach();
+        cx.subscribe(&rename_input, |this, _, _: &Cancelled, cx| {
+            this.renaming_list = false;
+            cx.notify();
+        })
+        .detach();
+
         // Placeholders live inside the inputs, so they are updated when the language changes.
         cx.observe_global::<CurrentLocale>(|this, cx| {
             let strings = i18n::t(cx);
@@ -95,6 +106,8 @@ impl TodoView {
             input,
             new_list,
             creating_list: false,
+            rename_input,
+            renaming_list: false,
             header_menu_open: false,
             detail,
             selected: None,
@@ -135,6 +148,7 @@ impl TodoView {
                     self.detail.update(cx, |detail, cx| detail.dev_open_popup(&popup, cx));
                 }
                 Some(("menu", "header")) => self.header_menu_open = true,
+                Some(("rename", _)) => self.start_rename(window, cx),
                 Some(("new-list", _)) => self.start_new_list(window, cx),
                 _ => {}
             }
@@ -223,6 +237,7 @@ impl TodoView {
 
     fn set_view(&mut self, view: View, cx: &mut Context<Self>) {
         self.header_menu_open = false;
+        self.renaming_list = false;
         if self.view != view {
             self.view = view;
             self.reload(cx);
@@ -246,6 +261,42 @@ impl TodoView {
         if let Some(list) = self.check(result) {
             self.view = View::List(list.id);
         }
+        self.reload(cx);
+    }
+
+    fn current_list(&self) -> Option<&List> {
+        match self.view {
+            View::List(id) => self.lists.iter().find(|l| l.id == id),
+            _ => None,
+        }
+    }
+
+    fn start_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(name) = self.current_list().map(|l| l.name.clone()) else { return };
+        self.header_menu_open = false;
+        self.renaming_list = true;
+        self.rename_input.update(cx, |input, cx| input.set_text(name, cx));
+        window.focus(&self.rename_input.focus_handle(cx), cx);
+        cx.notify();
+    }
+
+    fn rename_current_list(&mut self, name: &str, cx: &mut Context<Self>) {
+        self.renaming_list = false;
+        if let View::List(id) = self.view
+            && !name.trim().is_empty()
+        {
+            let result = self.store.rename_list(id, name);
+            self.check(result);
+        }
+        self.reload(cx);
+    }
+
+    fn set_current_list_color(&mut self, color: Option<&str>, cx: &mut Context<Self>) {
+        if let View::List(id) = self.view {
+            let result = self.store.set_list_color(id, color);
+            self.check(result);
+        }
+        self.header_menu_open = false;
         self.reload(cx);
     }
 
@@ -476,13 +527,39 @@ impl TodoView {
     fn render_header_menu(&self, strings: &Strings, cx: &mut Context<Self>) -> AnyElement {
         let in_list = matches!(self.view, View::List(_));
         widgets::popover_frame()
-            .w(px(180.))
+            .w(px(236.))
             .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                 this.header_menu_open = false;
                 cx.notify();
             }))
             .when(in_list, |el| {
+                let current = self.current_list().and_then(|l| l.color.clone());
                 el.child(
+                    widgets::menu_item("rename-list")
+                        .child(svg().path("icons/pencil.svg").size(px(16.)).text_color(theme::text_muted()))
+                        .child(strings.rename_list)
+                        .on_click(cx.listener(|this, _, window, cx| this.start_rename(window, cx))),
+                )
+                .child(div().px_2().pt_1().text_xs().text_color(theme::text_muted()).child(strings.color))
+                .child(
+                    div()
+                        .px_2()
+                        .py_1()
+                        .flex()
+                        .flex_wrap()
+                        .gap_1p5()
+                        .child(
+                            color_swatch("color-none", None, current.is_none())
+                                .on_click(cx.listener(|this, _, _, cx| this.set_current_list_color(None, cx))),
+                        )
+                        .children(theme::LIST_COLORS.into_iter().map(|color| {
+                            color_swatch(color, Some(color), current.as_deref() == Some(color)).on_click(
+                                cx.listener(move |this, _, _, cx| this.set_current_list_color(Some(color), cx)),
+                            )
+                        })),
+                )
+                .child(div().my_1().h(px(1.)).bg(theme::border()))
+                .child(
                     widgets::menu_item("delete-list")
                         .text_color(theme::danger())
                         .child(svg().path("icons/trash-2.svg").size(px(16.)).text_color(theme::danger()))
@@ -495,6 +572,21 @@ impl TodoView {
             })
             .into_any_element()
     }
+}
+
+/// A round color option; `None` is "no color", drawn as an outlined circle.
+fn color_swatch(id: &'static str, color: Option<&str>, selected: bool) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .size(px(18.))
+        .rounded_full()
+        .cursor_pointer()
+        .border_2()
+        .border_color(if selected { theme::text() } else { gpui::transparent_black().into() })
+        .map(|el| match color {
+            Some(color) => el.bg(lists_panel::color(Some(color))),
+            None => el.border_1().border_color(if selected { theme::text() } else { theme::text_muted() }),
+        })
 }
 
 fn chevron(collapsed: bool) -> impl IntoElement {
@@ -574,7 +666,13 @@ impl Render for TodoView {
                             .truncate()
                             .text_size(px(20.))
                             .font_weight(gpui::FontWeight::BOLD)
-                            .child(lists_panel::title(&self.view, &self.lists, strings)),
+                            .map(|el| {
+                                if self.renaming_list {
+                                    el.child(self.rename_input.clone())
+                                } else {
+                                    el.child(lists_panel::title(&self.view, &self.lists, strings))
+                                }
+                            }),
                     )
                     .child(header_icon("sort", "icons/arrow-down-up.svg"))
                     .child(

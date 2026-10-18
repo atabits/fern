@@ -483,7 +483,7 @@ impl TodoView {
         }
     }
 
-    fn select(&mut self, id: Id, cx: &mut Context<Self>) {
+    pub fn select(&mut self, id: Id, cx: &mut Context<Self>) {
         if self.selected == Some(id) {
             return;
         }

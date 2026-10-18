@@ -43,7 +43,7 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 
 | Feature | Status | Notes |
 |---|---|---|
-| Narrow sections sidebar | 🟡 | Tasks and Search work; outline icons where TickTick uses filled ones; no notification badge |
+| Narrow sections sidebar | 🟡 | Tasks, Calendar and Search work; outline icons where TickTick uses filled ones; no notification badge |
 | Account menu with language switch | ✅ | English (default) and Russian |
 | Lists column: Inbox / All / Today / Tomorrow / Next 7 Days | ✅ | counters; a new task gets the due date or tag of the current view |
 | Lists column: user lists | ✅ | create inline; rename, color and delete from the "…" menu; no drag and drop |
@@ -66,7 +66,8 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 | Drag and drop | 🟡 | reorder rows by dragging (drop before the target); no dragging into lists or onto tasks to nest |
 | Keyboard shortcuts | ✅ | JSON keymap (Zed format): new task, search, smart lists, list navigation, complete, delete |
 | Search | 🟡 | live search by title, notes and tags from the sidebar; no checklist-item or date filters |
-| Calendar, Pomodoro, Habits, Matrix, Countdown | ⬜ | |
+| Calendar | 🟡 | month grid with tasks by due date, priority tint, "+N" overflow, open a task from a cell; no week/day views or dragging tasks between days |
+| Pomodoro, Habits, Matrix, Countdown | ⬜ | |
 | Sync between devices | ⬜ | |
 
 ## How changes are checked
@@ -82,8 +83,9 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 
 ## Next
 
-1. Week/month calendar view.
-2. Drag tasks onto lists in the lists column.
+1. Drag tasks onto calendar days and onto lists in the lists column.
+2. Eisenhower matrix view.
+3. Week view in the calendar.
 3. "Won't Do" status.
 4. Custom time and "every N" in the due-date picker.
 5. Eisenhower matrix view.

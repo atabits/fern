@@ -5,6 +5,7 @@ use ui::prelude::*;
 use ui::{Placement, PopoverAttachment, popover};
 
 use crate::actions::{NewTask, Search, ShowInbox, ShowNext7Days, ShowToday, ShowTomorrow, ToggleSidebar};
+use crate::calendar_view::{self, CalendarView};
 use crate::i18n::{self, CurrentLocale, Locale};
 use crate::sidebar::{self, Section};
 use crate::todo_view::TodoView;
@@ -13,13 +14,30 @@ pub struct AppView {
     store: Rc<Store>,
     section: Section,
     todo: gpui::Entity<TodoView>,
+    calendar: gpui::Entity<CalendarView>,
     account_menu_open: bool,
 }
 
 impl AppView {
     pub fn new(store: Rc<Store>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let todo = cx.new(|cx| TodoView::new(store.clone(), window, cx));
-        Self { store, section: Section::Tasks, todo, account_menu_open: false }
+        let calendar = cx.new(|cx| CalendarView::new(store.clone(), cx));
+        // A task clicked in the calendar opens in the task list with its details.
+        cx.subscribe_in(&calendar, window, |this, _, calendar_view::OpenTask(id), window, cx| {
+            let id = *id;
+            this.select(Section::Tasks, window, cx);
+            this.todo.update(cx, |todo, cx| {
+                todo.set_view(fern_core::View::All, cx);
+                todo.select(id, cx);
+            });
+        })
+        .detach();
+        let mut this = Self { store, section: Section::Tasks, todo, calendar, account_menu_open: false };
+        #[cfg(debug_assertions)]
+        if std::env::var("FERN_DEV_STATE").is_ok_and(|s| s.contains("section=calendar")) {
+            this.select(Section::Calendar, window, cx);
+        }
+        this
     }
 
     fn select(&mut self, section: Section, window: &mut Window, cx: &mut Context<Self>) {
@@ -27,6 +45,9 @@ impl AppView {
         match section {
             Section::Search => self.todo.update(cx, |todo, cx| todo.start_search(window, cx)),
             _ => self.todo.update(cx, |todo, cx| todo.stop_search(cx)),
+        }
+        if section == Section::Calendar {
+            self.calendar.update(cx, |calendar, cx| calendar.reload(cx));
         }
         self.section = section;
         cx.notify();
@@ -121,6 +142,7 @@ impl Render for AppView {
             .child(sidebar::render(self.section, on_select, on_avatar, account_menu, cx))
             .child(match self.section {
                 Section::Tasks | Section::Search => div().flex_1().h_full().child(self.todo.clone()),
+                Section::Calendar => div().flex_1().h_full().child(self.calendar.clone()),
                 other => v_flex()
                     .flex_1()
                     .h_full()

@@ -227,6 +227,19 @@ impl Store {
         Ok(())
     }
 
+    /// Tasks (open and completed, not in the trash) due between `start` and `end`, inclusive,
+    /// ordered by due date and time.
+    pub fn tasks_due_between(&self, start: NaiveDate, end: NaiveDate) -> Result<Vec<Task>> {
+        let mut tasks: Vec<Task> = self
+            .tasks()?
+            .into_iter()
+            .filter(|t| !t.is_deleted() && t.due_date.is_some_and(|d| d >= start && d <= end))
+            .collect();
+        // Stable sort keeps the manual order within a day; all-day tasks come first.
+        tasks.sort_by_key(|t| (t.due_date, t.due_time.is_some(), t.due_time));
+        Ok(tasks)
+    }
+
     /// Direct subtasks of `parent` that are not in the trash, oldest first.
     pub fn subtasks(&self, parent: Id) -> Result<Vec<Task>> {
         let mut subtasks: Vec<Task> = self
@@ -984,6 +997,27 @@ mod tests {
         store.add_task("d")?;
         assert_eq!(titles(&store.tasks()?), ["d", "a", "b", "c"]);
         assert!(store.move_task(a.id, Uuid::now_v7(), false).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn tasks_due_in_a_range() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let evening = store.add_task("evening")?;
+        let morning = store.add_task("morning")?;
+        let all_day = store.add_task("all day")?;
+        let outside = store.add_task("outside")?;
+        let trashed = store.add_task("trashed")?;
+        store.set_due(evening.id, Some(d(2026, 10, 20)), NaiveTime::from_hms_opt(19, 0, 0))?;
+        store.set_due(morning.id, Some(d(2026, 10, 20)), NaiveTime::from_hms_opt(8, 0, 0))?;
+        store.set_due(all_day.id, Some(d(2026, 10, 20)), None)?;
+        store.set_due(outside.id, Some(d(2026, 11, 2)), None)?;
+        store.set_due(trashed.id, Some(d(2026, 10, 21)), None)?;
+        store.delete_task(trashed.id)?;
+        store.set_completed(morning.id, true)?;
+
+        let tasks = store.tasks_due_between(d(2026, 10, 1), d(2026, 10, 31))?;
+        assert_eq!(titles(&tasks), ["all day", "morning", "evening"]);
         Ok(())
     }
 

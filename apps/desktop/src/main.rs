@@ -2,6 +2,7 @@ mod actions;
 mod app_view;
 
 mod calendar;
+mod calendar_view;
 mod i18n;
 mod keymap;
 mod lists_panel;

@@ -40,5 +40,3 @@ unknown publisher, choose **More info → Run anyway**.
 **Linux** — on Debian and Ubuntu, open the `.deb` or run `sudo apt install ./fern-{version}-linux-*.deb`.
 Elsewhere, `chmod +x fern-{version}-linux-*.AppImage` and run it. You can also unpack the
 tar.gz and run `fern`.
-
-Code signing policy: https://github.com/{repo}/blob/main/docs/code-signing.md#code-signing-policy

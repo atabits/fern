@@ -569,6 +569,13 @@ impl Store {
         Ok(section)
     }
 
+    pub fn rename_list_section(&self, id: Id, name: &str) -> Result<()> {
+        let name = name.trim();
+        anyhow::ensure!(!name.is_empty(), "a section needs a name");
+        self.conn.execute("UPDATE list_sections SET name = ?2 WHERE id = ?1", params![id.to_string(), name])?;
+        Ok(())
+    }
+
     /// Deletes a section; its tasks stay in the list without a section.
     pub fn delete_list_section(&self, id: Id) -> Result<()> {
         self.conn.execute("UPDATE tasks SET section_id = NULL WHERE section_id = ?1", [id.to_string()])?;
@@ -1713,6 +1720,9 @@ mod tests {
         store.set_list(task.id, Some(work.id))?;
         assert_eq!(store.task(task.id)?.unwrap().section_id, None);
 
+        store.rename_list_section(kitchen.id, " Kitchen & pantry ")?;
+        assert!(store.rename_list_section(kitchen.id, "").is_err());
+        assert_eq!(store.list_sections(home.id)?[0].name, "Kitchen & pantry");
         store.set_list(task.id, Some(home.id))?;
         store.set_section(task.id, Some(kitchen.id))?;
         store.delete_list_section(kitchen.id)?;

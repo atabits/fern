@@ -77,6 +77,10 @@ pub struct TodoView {
     sections: Vec<fern_core::ListSection>,
     /// The "Add Section" field, while it is shown.
     new_section: Option<Entity<TextInput>>,
+    /// The section whose "…" menu is open.
+    section_menu: Option<Id>,
+    /// A section being renamed, with its field.
+    renaming_section: Option<(Id, Entity<TextInput>)>,
     detail: Entity<TaskDetail>,
     selected: Option<Id>,
     error: Option<String>,
@@ -173,6 +177,8 @@ impl TodoView {
             kanban: false,
             sections: Vec::new(),
             new_section: None,
+            section_menu: None,
+            renaming_section: None,
             detail,
             selected: None,
             error: None,
@@ -289,6 +295,9 @@ impl TodoView {
                         let target = target.clone();
                         self.drop_on_column(id, target, cx);
                     }
+                }
+                Some(("section-menu", name)) => {
+                    self.section_menu = self.sections.iter().find(|s| s.name == name).map(|s| s.id);
                 }
                 Some(("flag", name)) => {
                     let default = name == "show_completed";
@@ -574,6 +583,110 @@ impl TodoView {
                 div().pl(px(16.)).child(line(sub, SharedString::from(format!("card-check-{}", sub.id)), cx))
             }))
             .into_any_element()
+    }
+
+    /// A group header: its label and count; a list section also gets a "…" menu with Rename and
+    /// Delete, and is replaced by a field while it is renamed.
+    fn render_group_header(
+        &self,
+        label: String,
+        count: usize,
+        drop: Option<&DropTarget>,
+        height: f32,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let strings = i18n::t(cx);
+        let section = match drop {
+            Some(DropTarget::Section(Some(id))) => Some(*id),
+            _ => None,
+        };
+        let renaming = section.and_then(|id| self.renaming_section.as_ref().filter(|(s, _)| *s == id)).map(|(_, input)| input.clone());
+        let group = SharedString::from(format!("group-header-{label}"));
+        h_flex()
+            .id(group.clone())
+            .group(group.clone())
+            .h(px(height))
+            .gap_2()
+            .map(|el| match renaming {
+                Some(input) => el.child(
+                    h_flex().flex_1().h(px(28.)).px_2().rounded(px(6.)).bg(cx.theme().colors().surface_background).child(input),
+                ),
+                None => el
+                    .child(Label::new(label).weight(FontWeight::BOLD))
+                    .child(Label::new(count.to_string()).size(LabelSize::Small).color(Color::Muted)),
+            })
+            .when_some(section, |el, id| {
+                el.child(div().flex_1()).child(
+                    div()
+                        .relative()
+                        .opacity(if self.section_menu == Some(id) { 1. } else { 0. })
+                        .group_hover(group, |s| s.opacity(1.))
+                        .child(
+                            IconButton::new(SharedString::from(format!("section-more-{id}")), IconName::Ellipsis)
+                                .size(px(22.))
+                                .icon_size(IconSize::Small)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.section_menu = Some(id);
+                                    cx.notify();
+                                })),
+                        )
+                        .when(self.section_menu == Some(id), |el| {
+                            el.child(PopoverAttachment::new(
+                                Placement::BelowRight,
+                                popover(cx)
+                                    .w(px(200.))
+                                    .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                                        this.section_menu = None;
+                                        cx.notify();
+                                    }))
+                                    .child(
+                                        ListItem::new("rename-section")
+                                            .start_slot(Icon::new(IconName::Pencil).color(Color::Muted))
+                                            .child(Label::new(strings.rename_section))
+                                            .on_click(cx.listener(move |this, _, window, cx| this.start_rename_section(id, window, cx))),
+                                    )
+                                    .child(
+                                        ListItem::new("delete-section")
+                                            .start_slot(Icon::new(IconName::Trash).color(Color::Error))
+                                            .child(Label::new(strings.delete_section).color(Color::Error))
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.section_menu = None;
+                                                let result = this.store.delete_list_section(id);
+                                                this.check(result);
+                                                this.reload(cx);
+                                            })),
+                                    ),
+                            ))
+                        }),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn start_rename_section(&mut self, id: Id, window: &mut Window, cx: &mut Context<Self>) {
+        let strings = i18n::t(cx);
+        let name = self.sections.iter().find(|s| s.id == id).map(|s| s.name.clone()).unwrap_or_default();
+        let input = cx.new(|cx| {
+            let mut input = TextInput::new(Mode::SingleLine, strings.section_name, cx);
+            input.set_text(name, cx);
+            input
+        });
+        cx.subscribe(&input, move |this, _, Submitted(name), cx| {
+            let result = this.store.rename_list_section(id, name);
+            this.check(result);
+            this.renaming_section = None;
+            this.reload(cx);
+        })
+        .detach();
+        cx.subscribe(&input, |this, _, _: &Cancelled, cx| {
+            this.renaming_section = None;
+            cx.notify();
+        })
+        .detach();
+        window.focus(&input.focus_handle(cx), cx);
+        self.section_menu = None;
+        self.renaming_section = Some((id, input));
+        cx.notify();
     }
 
     fn start_new_section(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1763,6 +1876,7 @@ impl Render for TodoView {
                 .pb_4()
                 .overflow_x_scroll()
                 .children(columns.into_iter().enumerate().map(|(i, (title, drop, cards))| {
+                    let drop_for_header = drop.clone();
                     let count = cards.len();
                     let accent = theme.colors().accent;
                     v_flex()
@@ -1778,13 +1892,13 @@ impl Render for TodoView {
                         .flex_none()
                         .max_h_full()
                         .gap_2()
-                        .child(
-                            h_flex()
-                                .h(px(30.))
-                                .gap_2()
-                                .child(Label::new(if title.is_empty() { strings.group_tasks.to_owned() } else { title }).weight(FontWeight::BOLD))
-                                .child(Label::new(count.to_string()).size(LabelSize::Small).color(Color::Muted)),
-                        )
+                        .child(self.render_group_header(
+                            if title.is_empty() { strings.group_tasks.to_owned() } else { title },
+                            count,
+                            drop_for_header.as_ref(),
+                            30.,
+                            cx,
+                        ))
                         .child(
                             v_flex()
                                 .id(SharedString::from(format!("kanban-cards-{i}")))
@@ -1825,13 +1939,9 @@ impl Render for TodoView {
                 Row::Section { section, count, collapsed } => {
                     self.render_section(*section, *count, *collapsed, strings, cx)
                 }
-                Row::Day { label, count, .. } => h_flex()
-                    .h(px(36.))
-                    .gap_2()
-                    .pl(px(GUTTER))
-                    .child(Label::new(label.clone()).weight(FontWeight::BOLD))
-                    .child(Label::new(count.to_string()).size(LabelSize::Small).color(Color::Muted))
-                    .into_any_element(),
+                Row::Day { label, count, drop } => {
+                    div().pl(px(GUTTER)).child(self.render_group_header(label.clone(), *count, drop.as_ref(), 36., cx)).into_any_element()
+                }
                 Row::Task { task, depth, has_children, collapsed } => self.render_task(
                     task,
                     *depth,

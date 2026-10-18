@@ -662,6 +662,31 @@ impl FocusView {
 
     /// The original's Batch Management: the records by day, each and each day with a checkbox,
     /// "Select All", and Delete for the ticked ones.
+    /// Batch Management or Add Timer, as the original shows them: in the middle of the view
+    /// over a dimmed background.
+    fn render_modal(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let dialog = if let Some(draft) = self.timer_draft.as_ref() {
+            self.render_timer_draft(draft, cx)
+        } else if self.record_menu == Some(RecordMenu::Batch) {
+            self.render_batch(cx)
+        } else {
+            return None;
+        };
+        Some(
+            div()
+                .id("focus-modal")
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(gpui::black().opacity(0.35))
+                .occlude()
+                .child(dialog)
+                .into_any_element(),
+        )
+    }
+
     fn render_batch(&self, cx: &mut Context<Self>) -> AnyElement {
         let strings = i18n::t(cx);
         let today = chrono::Local::now().date_naive();
@@ -817,12 +842,12 @@ impl FocusView {
                 );
             }
         }
+        // A dialog in the middle of the window, closed with its ×, as in the original.
         popover(cx)
-            .w(px(360.))
-            .max_h(px(520.))
-            .p_3()
+            .w(px(440.))
+            .max_h(px(560.))
+            .p_4()
             .gap_2()
-            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.set_record_menu(None, cx)))
             .child(
                 h_flex()
                     .child(
@@ -940,14 +965,11 @@ impl FocusView {
                 .when(!primary, |el| el.border_1().border_color(theme.colors().border))
                 .child(Label::new(label).size(LabelSize::Small))
         };
+        // A dialog in the middle of the window, closed with Close, as in the original.
         popover(cx)
-            .w(px(300.))
-            .p_3()
+            .w(px(440.))
+            .p_4()
             .gap_3()
-            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                this.timer_draft = None;
-                cx.notify();
-            }))
             .child(Label::new(if draft.new { strings.add_timer } else { strings.edit_timer }).weight(FontWeight::SEMIBOLD))
             .child(
                 h_flex()
@@ -2497,7 +2519,7 @@ impl FocusView {
                             .child(IconButton::new("record-more", IconName::Ellipsis).on_click(cx.listener(|this, _, _, cx| {
                                 this.set_record_menu(Some(RecordMenu::More), cx)
                             })))
-                            .when_some(self.record_menu.filter(|m| matches!(m, RecordMenu::More | RecordMenu::Batch)), |el, menu| {
+                            .when_some(self.record_menu.filter(|m| *m == RecordMenu::More), |el, menu| {
                                 el.child(PopoverAttachment::new(Placement::BelowRight, self.render_record_menu(menu, cx)))
                             }),
                     )
@@ -3136,14 +3158,7 @@ impl Render for FocusView {
                                 }))
                         }),
                     ))
-                    .child(
-                        div()
-                            .relative()
-                            .child(IconButton::new("timer-add", IconName::Plus).on_click(cx.listener(|this, _, window, cx| this.open_timer(None, window, cx))))
-                            .when_some(self.timer_draft.as_ref(), |el, draft| {
-                                el.child(PopoverAttachment::new(Placement::BelowRight, self.render_timer_draft(draft, cx)))
-                            }),
-                    )
+                    .child(IconButton::new("timer-add", IconName::Plus).on_click(cx.listener(|this, _, window, cx| this.open_timer(None, window, cx))))
                     .child(
                         div()
                             .relative()
@@ -3251,6 +3266,7 @@ impl Render for FocusView {
             .child(left)
             .child(right)
             .children(self.render_record_dialog(cx))
+            .children(self.render_modal(cx))
             .into_any_element()
     }
 }

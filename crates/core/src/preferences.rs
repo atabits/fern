@@ -232,6 +232,8 @@ pub struct Preferences {
     /// The add field's "Input Box Setting": "Detailed" (a taller box with a toolbar and an Add
     /// button) rather than "Simple".
     pub detailed_input: bool,
+    /// Settings → Features: which of the original's optional sections show in the sidebar.
+    pub features: Features,
     /// Settings → More → Smart Recognition, for quick add.
     pub recognition: Recognition,
     pub task_defaults: TaskDefaults,
@@ -266,6 +268,7 @@ impl Default for Preferences {
             week_numbers: false,
             mini_calendar: true,
             detailed_input: false,
+            features: Features::default(),
             recognition: Recognition::default(),
             task_defaults: TaskDefaults::default(),
             default_list: None,
@@ -281,6 +284,52 @@ const DATE_FORMAT: &str = "date_format";
 const WEEK_NUMBERS: &str = "week_numbers";
 const MINI_CALENDAR: &str = "mini_calendar";
 const INPUT_BOX: &str = "input_box";
+const FEATURES: &str = "features";
+
+/// The original's Features: sections that can be turned off.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Features {
+    pub calendar: bool,
+    pub matrix: bool,
+    pub habits: bool,
+    pub focus: bool,
+    pub countdown: bool,
+}
+
+impl Default for Features {
+    fn default() -> Self {
+        Self { calendar: true, matrix: true, habits: true, focus: true, countdown: true }
+    }
+}
+
+impl Features {
+    /// Stored as the names of the sections turned off, e.g. "matrix,countdown".
+    fn to_storage(self) -> String {
+        let off: Vec<&str> = [
+            ("calendar", self.calendar),
+            ("matrix", self.matrix),
+            ("habits", self.habits),
+            ("focus", self.focus),
+            ("countdown", self.countdown),
+        ]
+        .into_iter()
+        .filter(|(_, on)| !on)
+        .map(|(name, _)| name)
+        .collect();
+        off.join(",")
+    }
+
+    fn from_storage(text: &str) -> Self {
+        let off: Vec<&str> = text.split(',').collect();
+        Self {
+            calendar: !off.contains(&"calendar"),
+            matrix: !off.contains(&"matrix"),
+            habits: !off.contains(&"habits"),
+            focus: !off.contains(&"focus"),
+            countdown: !off.contains(&"countdown"),
+        }
+    }
+}
 const DEFAULT_DATE: &str = "default_date";
 const DEFAULT_DURATION: &str = "default_duration";
 const DEFAULT_TIMED_REMINDER: &str = "default_timed_reminder";
@@ -317,6 +366,7 @@ impl Store {
         let week_numbers = self.setting(WEEK_NUMBERS)?.as_deref() == Some("1");
         let mini_calendar = self.setting(MINI_CALENDAR)?.as_deref() != Some("0");
         let detailed_input = self.setting(INPUT_BOX)?.as_deref() == Some("detailed");
+        let features = self.setting(FEATURES)?.map(|t| Features::from_storage(&t)).unwrap_or_default();
         let flag = |key: &str| -> Result<bool> { Ok(self.setting(key)?.as_deref() != Some("0")) };
         let recognition = Recognition {
             dates: flag(RECOGNITION[0])?,
@@ -359,6 +409,7 @@ impl Store {
             week_numbers,
             mini_calendar,
             detailed_input,
+            features,
             recognition,
             task_defaults,
             default_list,
@@ -379,6 +430,7 @@ impl Store {
         self.set_setting(DATE_FORMAT, preferences.date_format.map_or("", DateFormat::code))?;
         self.set_setting(WEEK_NUMBERS, if preferences.week_numbers { "1" } else { "0" })?;
         self.set_setting(MINI_CALENDAR, if preferences.mini_calendar { "1" } else { "0" })?;
+        self.set_setting(FEATURES, &preferences.features.to_storage())?;
         self.set_setting(INPUT_BOX, if preferences.detailed_input { "detailed" } else { "simple" })?;
         let t = &preferences.task_defaults;
         let offset = |o: Option<i64>| o.map_or("none".to_owned(), |o| o.to_string());
@@ -430,6 +482,7 @@ mod tests {
             week_numbers: true,
             mini_calendar: false,
             detailed_input: true,
+            features: Features { matrix: false, countdown: false, ..Features::default() },
             recognition: Recognition { remove_date_text: false, tags: false, ..Default::default() },
             task_defaults: TaskDefaults {
                 date: Some(DefaultDate::Tomorrow),

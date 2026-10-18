@@ -17,6 +17,18 @@ pub enum Section {
 }
 
 impl Section {
+    /// Whether Settings → Features leaves the section on; Tasks and Search always are.
+    pub fn enabled(self, features: fern_core::Features) -> bool {
+        match self {
+            Section::Tasks | Section::Search => true,
+            Section::Calendar => features.calendar,
+            Section::Matrix => features.matrix,
+            Section::Habits => features.habits,
+            Section::Pomodoro => features.focus,
+            Section::Countdown => features.countdown,
+        }
+    }
+
     pub const ALL: [Section; 7] = [
         Section::Tasks,
         Section::Calendar,
@@ -91,6 +103,7 @@ pub fn render(
     account_menu: Option<AnyElement>,
     bell: Bell,
     sync: SyncButton,
+    features: fern_core::Features,
     cx: &App,
 ) -> impl IntoElement {
     let colors = cx.theme().colors();
@@ -126,7 +139,7 @@ pub fn render(
                 .children(account_menu),
         )
         // The sections, spaced and sized as in the original (50px apart, 24px glyphs).
-        .child(v_flex().gap(px(10.)).children(Section::ALL.into_iter().map(|section| {
+        .child(v_flex().gap(px(10.)).children(Section::ALL.into_iter().filter(|s| s.enabled(features)).map(|section| {
             let on_select = on_select.clone();
             // As in the original, the open section's icon turns bright, with no background.
             IconButton::new(section.id(), section.icon())

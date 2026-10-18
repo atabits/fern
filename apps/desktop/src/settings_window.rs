@@ -17,6 +17,8 @@ use crate::i18n::{self, CurrentLocale, Locale};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Page {
+    /// The original's Features: the optional sections on or off.
+    Features,
     SmartList,
     #[default]
     DateTime,
@@ -242,6 +244,7 @@ impl SettingsWindow {
             "more" => Page::More,
             "about" => Page::About,
             "sync" => Page::Sync,
+            "features" => Page::Features,
             _ => Page::DateTime,
         };
         self.menu = match menu {
@@ -378,6 +381,10 @@ impl SettingsWindow {
             .border_r_1()
             .border_color(cx.theme().colors().border)
             .child(div().px_2().pt_2().pb_3().child(Label::new(strings.settings).size(LabelSize::Large).weight(FontWeight::SEMIBOLD)))
+            .child(
+                item("settings-features", IconName::LayoutGrid, strings.features, self.page == Page::Features)
+                    .on_click(cx.listener(|this, _, _, cx| this.set_page(Page::Features, cx))),
+            )
             .child(page("settings-smart-list", IconName::Funnel, 0, Page::SmartList))
             .child(page("settings-date-time", IconName::Clock, 1, Page::DateTime))
             .child(page("settings-appearance", IconName::PaintRoller, 2, Page::Appearance))
@@ -817,6 +824,35 @@ impl SettingsWindow {
                         ),
                     )
                 })
+                .into_any_element()
+            }
+            Page::Features => {
+                let features = self.preferences.features;
+                let values = [features.calendar, features.matrix, features.habits, features.focus, features.countdown];
+                let toggles: [fn(&mut fern_core::Features); 5] = [
+                    |f| f.calendar = !f.calendar,
+                    |f| f.matrix = !f.matrix,
+                    |f| f.habits = !f.habits,
+                    |f| f.focus = !f.focus,
+                    |f| f.countdown = !f.countdown,
+                ];
+                body.child(title(strings.features)).child(group().children(
+                    strings.feature_items.into_iter().zip(values).zip(toggles).enumerate().map(|(i, (((name, hint), on), toggle))| {
+                        v_flex()
+                            .px_4()
+                            .py_1p5()
+                            .gap_0p5()
+                            .child(
+                                h_flex()
+                                    .id(SharedString::from(format!("feature-{i}")))
+                                    .cursor_pointer()
+                                    .child(div().flex_1().child(Label::new(name)))
+                                    .child(Switch::new().toggle_state(on))
+                                    .on_click(cx.listener(move |this, _, window, cx| this.update(window, cx, |p| toggle(&mut p.features)))),
+                            )
+                            .child(div().text_size(px(11.)).text_color(colors.text_muted).child(hint))
+                    }),
+                ))
                 .into_any_element()
             }
             Page::Sync => {

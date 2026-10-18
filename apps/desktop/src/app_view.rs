@@ -34,6 +34,8 @@ pub struct AppView {
     notices: Notices,
     notices_open: bool,
     sync: crate::sync::SyncStatus,
+    /// Settings → Features: the sections shown in the sidebar.
+    features: fern_core::Features,
     /// The "Shortcuts" panel on the right, while open.
     shortcuts_open: bool,
     settings: Option<gpui::Entity<SettingsWindow>>,
@@ -87,6 +89,7 @@ impl AppView {
             cx.notify();
         })
         .detach();
+        let store_features = store.preferences().map(|p| p.features).unwrap_or_default();
         // Mutated only by the debug-build dev state below.
         #[cfg_attr(not(debug_assertions), allow(unused_mut))]
         let mut this = Self {
@@ -103,6 +106,7 @@ impl AppView {
             notices: Notices::default(),
             notices_open: false,
             sync: crate::sync::SyncStatus::Off,
+            features: store_features,
             shortcuts_open: false,
             settings: None,
             statistics_open: false,
@@ -286,6 +290,22 @@ impl AppView {
                 settings_window::apply(&preferences, window, cx);
                 this.todo.update(cx, |todo, cx| todo.reload(cx));
             }
+            // `features-off=matrix,countdown`: those sections turned off in Settings → Features.
+            if let Some(off) = state.split(';').find_map(|part| part.strip_prefix("features-off=")) {
+                let mut preferences = this.store.preferences().unwrap_or_default();
+                for name in off.split(',') {
+                    match name {
+                        "calendar" => preferences.features.calendar = false,
+                        "matrix" => preferences.features.matrix = false,
+                        "habits" => preferences.features.habits = false,
+                        "focus" => preferences.features.focus = false,
+                        "countdown" => preferences.features.countdown = false,
+                        _ => {}
+                    }
+                }
+                this.store.save_preferences(&preferences).ok();
+                this.features = preferences.features;
+            }
             // `sync-config=<server>|<token>`: Settings → Sync filled in.
             if let Some(spec) = state.split(';').find_map(|part| part.strip_prefix("sync-config=")) {
                 let (server, token) = spec.split_once('|').unwrap_or((spec, ""));
@@ -441,6 +461,11 @@ impl AppView {
             }
             // The default list and the week start show up in the views.
             this.todo.update(cx, |todo, cx| todo.reload(cx));
+            // A section turned off in Features closes.
+            this.features = this.store.preferences().map(|p| p.features).unwrap_or_default();
+            if !this.section.enabled(this.features) {
+                this.select(Section::Tasks, window, cx);
+            }
             window.focus(&this.todo.focus_handle(cx), cx);
             cx.notify();
         })
@@ -797,6 +822,7 @@ impl Render for AppView {
         let account_menu = self.account_menu_open.then(|| {
             PopoverAttachment::new(Placement::RightTop, self.render_account_menu(cx)).into_any_element()
         });
+        let features = self.features;
         let sync_button = sidebar::SyncButton {
             tooltip: self.sync_tooltip(i18n::t(cx)),
             failed: matches!(self.sync, crate::sync::SyncStatus::Failed(_)),
@@ -835,7 +861,7 @@ impl Render for AppView {
             .text_color(theme.colors().text)
             .when(self.statistics_open, |el| el.child(div().size_full().child(self.focus.clone())))
             .when(!self.statistics_open, |el| {
-                el.child(sidebar::render(self.section, on_select, on_avatar, account_menu, bell, sync_button, cx)).child(match self.section {
+                el.child(sidebar::render(self.section, on_select, on_avatar, account_menu, bell, sync_button, features, cx)).child(match self.section {
                 Section::Tasks | Section::Search => div().flex_1().h_full().child(self.todo.clone()),
                 Section::Calendar => div().flex_1().h_full().child(self.calendar.clone()),
                 Section::Matrix => div().flex_1().h_full().child(self.matrix.clone()),

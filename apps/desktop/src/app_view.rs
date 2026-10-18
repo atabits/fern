@@ -1,12 +1,14 @@
 use std::rc::Rc;
 
 use fern_core::Store;
+use gpui::Focusable as _;
 use ui::prelude::*;
 use ui::{Placement, PopoverAttachment, popover};
 
 use crate::actions::{NewTask, Search, ShowInbox, ShowNext7Days, ShowToday, ShowTomorrow, ToggleSidebar};
 use crate::calendar_view::{self, CalendarView};
 use crate::i18n::{self, CurrentLocale, Locale};
+use crate::search_modal::{SearchEvent, SearchModal};
 use crate::sidebar::{self, Section};
 use crate::todo_view::TodoView;
 
@@ -15,6 +17,7 @@ pub struct AppView {
     section: Section,
     todo: gpui::Entity<TodoView>,
     calendar: gpui::Entity<CalendarView>,
+    search: Option<gpui::Entity<SearchModal>>,
     account_menu_open: bool,
 }
 
@@ -32,24 +35,66 @@ impl AppView {
             });
         })
         .detach();
-        let mut this = Self { store, section: Section::Tasks, todo, calendar, account_menu_open: false };
+        let mut this = Self { store, section: Section::Tasks, todo, calendar, search: None, account_menu_open: false };
         #[cfg(debug_assertions)]
-        if std::env::var("FERN_DEV_STATE").is_ok_and(|s| s.contains("section=calendar")) {
-            this.select(Section::Calendar, window, cx);
+        if let Ok(state) = std::env::var("FERN_DEV_STATE") {
+            if state.contains("section=calendar") {
+                this.select(Section::Calendar, window, cx);
+            }
+            if let Some(query) = state.split(';').find_map(|part| part.strip_prefix("search-popover=")) {
+                this.open_search(window, cx);
+                if let Some(search) = &this.search {
+                    search.update(cx, |search, cx| search.set_query(query, cx));
+                }
+            }
         }
         this
     }
 
     fn select(&mut self, section: Section, window: &mut Window, cx: &mut Context<Self>) {
-        // Search shows its results in the task list, so it reuses the tasks view.
-        match section {
-            Section::Search => self.todo.update(cx, |todo, cx| todo.start_search(window, cx)),
-            _ => self.todo.update(cx, |todo, cx| todo.stop_search(cx)),
+        // Search is a popover over the current screen, as in the original.
+        if section == Section::Search {
+            self.open_search(window, cx);
+            return;
         }
+        self.todo.update(cx, |todo, cx| todo.stop_search(cx));
         if section == Section::Calendar {
             self.calendar.update(cx, |calendar, cx| calendar.reload(cx));
         }
         self.section = section;
+        cx.notify();
+    }
+
+    fn open_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let search = cx.new(|cx| SearchModal::new(self.store.clone(), cx));
+        cx.subscribe_in(&search, window, |this, _, event, window, cx| {
+            this.search = None;
+            match event {
+                SearchEvent::OpenTask(id) => {
+                    let id = *id;
+                    this.select(Section::Tasks, window, cx);
+                    this.todo.update(cx, |todo, cx| {
+                        todo.set_view(fern_core::View::All, cx);
+                        todo.select(id, cx);
+                    });
+                }
+                SearchEvent::OpenView(fern_core::View::Search(query)) => {
+                    let query = query.clone();
+                    this.select(Section::Tasks, window, cx);
+                    this.todo.update(cx, |todo, cx| todo.show_search_results(query, cx));
+                }
+                SearchEvent::OpenView(view) => {
+                    let view = view.clone();
+                    this.select(Section::Tasks, window, cx);
+                    this.todo.update(cx, |todo, cx| todo.set_view(view, cx));
+                }
+                SearchEvent::Dismissed => {}
+            }
+            cx.notify();
+        })
+        .detach();
+        window.focus(&search.focus_handle(cx), cx);
+        self.search = Some(search);
         cx.notify();
     }
 
@@ -123,6 +168,7 @@ impl Render for AppView {
         });
 
         h_flex()
+            .relative()
             .key_context("Workspace")
             .on_action(cx.listener(Self::new_task))
             .on_action(cx.listener(Self::search))
@@ -151,6 +197,9 @@ impl Render for AppView {
                     .gap_2()
                     .child(Label::new(other.title(strings)).size(LabelSize::Large))
                     .child(Label::new(strings.coming_soon).color(Color::Muted)),
+            })
+            .when_some(self.search.clone(), |el, search| {
+                el.child(div().absolute().top(px(160.)).left_0().right_0().flex().justify_center().child(search))
             })
     }
 }

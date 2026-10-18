@@ -44,6 +44,7 @@ pub enum IconName {
     Tag,
     Trash,
     User,
+    X,
 }
 
 impl IconName {

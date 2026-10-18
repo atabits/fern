@@ -67,6 +67,10 @@ pub struct Strings {
     pub search_placeholder: &'static str,
     pub search_hint: &'static str,
     pub nothing_found: &'static str,
+    pub search_filter_task: &'static str,
+    pub search_filter_tag: &'static str,
+    pub search_filter_list: &'static str,
+    pub view_more: &'static str,
     pub language: &'static str,
 
     // Smart lists and the lists column.
@@ -145,8 +149,12 @@ pub static EN: Strings = Strings {
     section_countdown: "Countdown",
     coming_soon: "Coming soon",
     search_placeholder: "Search tasks",
-    search_hint: "Search by title, notes or tags",
+    search_hint: "Enter keywords to search",
     nothing_found: "Nothing found",
+    search_filter_task: "Task",
+    search_filter_tag: "Tag",
+    search_filter_list: "List",
+    view_more: "View more",
     language: "Language",
 
     inbox: "Inbox",
@@ -221,8 +229,12 @@ pub static RU: Strings = Strings {
     section_countdown: "Обратный отсчёт",
     coming_soon: "Скоро",
     search_placeholder: "Поиск задач",
-    search_hint: "Ищет по названию, заметке и тегам",
+    search_hint: "Введите слова для поиска",
     nothing_found: "Ничего не найдено",
+    search_filter_task: "Задачи",
+    search_filter_tag: "Теги",
+    search_filter_list: "Списки",
+    view_more: "Показать все",
     language: "Язык",
 
     inbox: "Входящие",

@@ -377,6 +377,12 @@ impl TodoView {
         cx.notify();
     }
 
+    /// Shows the full results for `query` in the list (the popover's "View more").
+    pub fn show_search_results(&mut self, query: String, cx: &mut Context<Self>) {
+        self.search_input.update(cx, |input, cx| input.set_text(query.clone(), cx));
+        self.set_view(View::Search(query), cx);
+    }
+
     /// Leaves search results for the Inbox.
     pub fn stop_search(&mut self, cx: &mut Context<Self>) {
         if matches!(self.view, View::Search(_)) {

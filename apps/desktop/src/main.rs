@@ -6,6 +6,7 @@ mod calendar_view;
 mod i18n;
 mod keymap;
 mod lists_panel;
+mod search_modal;
 mod sidebar;
 mod task_detail;
 mod task_rows;

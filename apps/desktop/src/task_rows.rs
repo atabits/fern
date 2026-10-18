@@ -112,6 +112,50 @@ pub fn build_rows(
     rows
 }
 
+/// Byte ranges of case-insensitive occurrences of `query` in `text`, for highlighting.
+/// Compares character by character, so non-ASCII text (Cyrillic, accents) works.
+pub fn match_ranges(text: &str, query: &str) -> Vec<std::ops::Range<usize>> {
+    let query: Vec<char> = query.trim().chars().flat_map(char::to_lowercase).collect();
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    let lower: Vec<char> = chars.iter().map(|(_, c)| c.to_lowercase().next().unwrap_or(*c)).collect();
+    let mut ranges = Vec::new();
+    let mut i = 0;
+    while i + query.len() <= lower.len() {
+        if lower[i..i + query.len()] == query[..] {
+            let start = chars[i].0;
+            let end = chars.get(i + query.len()).map_or(text.len(), |(index, _)| *index);
+            ranges.push(start..end);
+            i += query.len();
+        } else {
+            i += 1;
+        }
+    }
+    ranges
+}
+
+/// A short excerpt of `text` around the first match of `query`, with "…" where it was cut.
+pub fn snippet(text: &str, query: &str, context: usize) -> Option<String> {
+    let range = match_ranges(text, query).into_iter().next()?;
+    let before: Vec<char> = text[..range.start].chars().collect();
+    let after: Vec<char> = text[range.end..].chars().collect();
+    let start = before.len().saturating_sub(context);
+    let end = after.len().min(context);
+    let mut out = String::new();
+    if start > 0 {
+        out.push('…');
+    }
+    out.extend(&before[start..]);
+    out.push_str(&text[range]);
+    out.extend(&after[..end]);
+    if end < after.len() {
+        out.push('…');
+    }
+    Some(out.replace('\n', " "))
+}
+
 /// The checkbox and flag tint for a priority; `None` for no priority.
 pub fn priority_color(priority: Priority, theme: &Theme) -> Option<Hsla> {
     match priority {
@@ -221,6 +265,23 @@ mod tests {
         done.completed_at = Some(1);
         let rows = build_rows(&[a, note, done], &HashSet::new(), &HashSet::from([Section::Completed]), true);
         assert_eq!(shape(&rows), ["# Tasks 1", "a task", "# Notes 1", "a note", "# Completed 1"]);
+    }
+
+    #[test]
+    fn match_ranges_ignore_case_and_handle_unicode() {
+        assert_eq!(match_ranges("Buy Milk and milk", "MILK"), [4..8, 13..17]);
+        let text = "Купить хлеб";
+        let ranges = match_ranges(text, "ХЛЕБ");
+        assert_eq!(&text[ranges[0].clone()], "хлеб");
+        assert!(match_ranges("abc", "  ").is_empty());
+    }
+
+    #[test]
+    fn snippets_cut_around_the_match() {
+        assert_eq!(snippet("one two three four", "three", 4).as_deref(), Some("…two three fou…"));
+        assert_eq!(snippet("short", "sho", 10).as_deref(), Some("short"));
+        assert_eq!(snippet("line one\nline two", "two", 20).as_deref(), Some("line one line two"));
+        assert_eq!(snippet("nothing", "zzz", 5), None);
     }
 
     #[test]

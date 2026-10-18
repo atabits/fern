@@ -7,6 +7,7 @@ mod label;
 mod list_item;
 mod popover;
 mod stack;
+mod submenu_item;
 mod switch;
 mod tooltip;
 
@@ -19,5 +20,6 @@ pub use label::*;
 pub use list_item::*;
 pub use popover::*;
 pub use stack::*;
+pub use submenu_item::*;
 pub use switch::*;
 pub use tooltip::*;

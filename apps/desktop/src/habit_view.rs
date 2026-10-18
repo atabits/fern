@@ -9,7 +9,7 @@ use chrono::{Datelike, Local, NaiveDate};
 use fern_core::{Checkin, CustomSection, Goal, Habit, HabitFrequency, HabitSection, Id, Store, habit};
 use gpui::{Entity, Focusable as _, FontWeight};
 use ui::prelude::*;
-use ui::{Placement, PopoverAttachment, popover};
+use ui::{Placement, PopoverAttachment, SubmenuItem, popover};
 
 use crate::calendar;
 use crate::i18n;
@@ -876,16 +876,28 @@ impl HabitView {
         }
     }
 
-    fn submenu_item(&self, id: &'static str, icon: IconName, label: &'static str, submenu: DetailSubmenu, cx: &mut Context<Self>) -> ListItem {
-        let open = self.detail_submenu == Some(submenu);
-        ListItem::new(id)
-            .start_slot(Icon::new(icon).color(Color::Muted))
-            .child(Label::new(label))
-            .end_slot(Icon::new(if open { IconName::ChevronDown } else { IconName::ChevronRight }).size(IconSize::Small).color(Color::Muted))
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.detail_submenu = (!open).then_some(submenu);
-                cx.notify();
-            }))
+    /// An item of the details' "…" menu with a side menu that opens on hover.
+    fn side_menu(&self, id: &'static str, icon: IconName, label: &'static str, submenu: DetailSubmenu, cx: &mut Context<Self>) -> SubmenuItem {
+        SubmenuItem::new(id, label).icon(icon).open(self.detail_submenu == Some(submenu)).on_hover(cx.listener(
+            move |this, hovered: &bool, _, cx| {
+                if *hovered && this.detail_submenu != Some(submenu) {
+                    this.detail_submenu = Some(submenu);
+                    cx.notify();
+                }
+            },
+        ))
+    }
+
+    /// A plain item of the details' "…" menu: hovering it closes an open side menu.
+    fn menu_entry(&self, id: &'static str, item: ListItem, cx: &mut Context<Self>) -> impl IntoElement {
+        div().id(id).child(item).on_hover(cx.listener(
+            |this, hovered: &bool, _, cx| {
+                if *hovered && this.detail_submenu.is_some() {
+                    this.detail_submenu = None;
+                    cx.notify();
+                }
+            },
+        ))
     }
 
     /// A day's check-in circle: a checkmark on a filled circle when done, or the habit's own icon
@@ -1472,61 +1484,67 @@ impl HabitView {
                                             this.detail_menu_open = false;
                                             cx.notify();
                                         }))
-                                        .child(
+                                        .child(self.menu_entry(
+                                            "habit-edit-entry",
                                             ListItem::new("habit-edit")
                                                 .start_slot(Icon::new(IconName::Pencil).color(Color::Muted))
                                                 .child(Label::new(strings.edit))
                                                 .on_click(cx.listener(|this, _, window, cx| this.start_edit(window, cx))),
-                                        )
-                                        .child(self.submenu_item("habit-start-focus", IconName::CircleDot, strings.start_focus, DetailSubmenu::StartFocus, cx))
-                                        .when(self.detail_submenu == Some(DetailSubmenu::StartFocus), |el| {
+                                            cx,
+                                        ))
+                                        .child({
                                             let title = habit.name.clone();
-                                            el.children([(false, strings.start_pomo), (true, strings.start_stopwatch)].map(|(stopwatch, label)| {
-                                                let title = title.clone();
-                                                ListItem::new(SharedString::from(format!("habit-focus-{stopwatch}")))
-                                                    .start_slot(div().w(px(16.)))
-                                                    .child(Label::new(label))
-                                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                                        this.detail_menu_open = false;
-                                                        this.detail_submenu = None;
-                                                        cx.emit(StartFocus { title: title.clone(), stopwatch });
-                                                        cx.notify();
-                                                    }))
-                                            }))
+                                            self.side_menu("habit-start-focus", IconName::CircleDot, strings.start_focus, DetailSubmenu::StartFocus, cx)
+                                                .items([(false, strings.start_pomo), (true, strings.start_stopwatch)].map(|(stopwatch, label)| {
+                                                    let title = title.clone();
+                                                    ListItem::new(SharedString::from(format!("habit-focus-{stopwatch}")))
+                                                        .child(Label::new(label))
+                                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                                            this.detail_menu_open = false;
+                                                            this.detail_submenu = None;
+                                                            cx.emit(StartFocus { title: title.clone(), stopwatch });
+                                                            cx.notify();
+                                                        }))
+                                                }))
                                         })
-                                        .child(self.submenu_item("habit-checkin-style", IconName::SquareCheck, strings.checked_in_style, DetailSubmenu::CheckinStyle, cx))
-                                        .when(self.detail_submenu == Some(DetailSubmenu::CheckinStyle), |el| {
+                                        .child({
                                             let current = habit.icon_checkins;
-                                            el.children([(false, strings.checkin_style_checkmark), (true, strings.checkin_style_icon)].map(|(icon, label)| {
-                                                ListItem::new(SharedString::from(format!("habit-style-{icon}")))
-                                                    .start_slot(div().w(px(16.)))
-                                                    .child(Label::new(label).color(if icon == current { Color::Accent } else { Color::Default }))
-                                                    .when(icon == current, |item| {
-                                                        item.end_slot(Icon::new(IconName::Check).size(IconSize::Small).color(Color::Accent))
-                                                    })
-                                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                                        if let Err(err) = this.store.set_habit_icon_checkins(id, icon) {
-                                                            eprintln!("failed to save the checked-in style: {err:#}");
-                                                        }
-                                                        this.detail_menu_open = false;
-                                                        this.detail_submenu = None;
-                                                        this.reload(cx);
-                                                    }))
-                                            }))
+                                            self.side_menu("habit-checkin-style", IconName::SquareCheck, strings.checked_in_style, DetailSubmenu::CheckinStyle, cx)
+                                                .items([(false, strings.checkin_style_checkmark), (true, strings.checkin_style_icon)].map(|(icon, label)| {
+                                                    ListItem::new(SharedString::from(format!("habit-style-{icon}")))
+                                                        .child(Label::new(label).color(if icon == current { Color::Accent } else { Color::Default }))
+                                                        .when(icon == current, |item| {
+                                                            item.end_slot(Icon::new(IconName::Check).size(IconSize::Small).color(Color::Accent))
+                                                        })
+                                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                                            if let Err(err) = this.store.set_habit_icon_checkins(id, icon) {
+                                                                eprintln!("failed to save the checked-in style: {err:#}");
+                                                            }
+                                                            this.detail_menu_open = false;
+                                                            this.detail_submenu = None;
+                                                            this.reload(cx);
+                                                        }))
+                                                }))
                                         })
                                         .child({
                                             let archived = habit.archived;
-                                            ListItem::new("habit-archive")
-                                                .start_slot(Icon::new(IconName::Archive).color(Color::Muted))
-                                                .child(Label::new(if archived { strings.habit_unarchive } else { strings.habit_archive }))
-                                                .on_click(cx.listener(move |this, _, _, cx| this.set_archived(id, !archived, cx)))
+                                            self.menu_entry(
+                                                "habit-archive-entry",
+                                                ListItem::new("habit-archive")
+                                                    .start_slot(Icon::new(IconName::Archive).color(Color::Muted))
+                                                    .child(Label::new(if archived { strings.habit_unarchive } else { strings.habit_archive }))
+                                                    .on_click(cx.listener(move |this, _, _, cx| this.set_archived(id, !archived, cx))),
+                                                cx,
+                                            )
                                         })
-                                        .child(
+                                        .child(self.menu_entry(
+                                            "habit-delete-entry",
                                             ListItem::new("habit-delete")
                                                 .start_slot(Icon::new(IconName::Trash).color(Color::Muted))
                                                 .child(Label::new(strings.delete))
                                                 .on_click(cx.listener(move |this, _, _, cx| this.delete(id, cx))),
-                                        ),
+                                            cx,
+                                        )),
                                 ))
                             })
                             .when_some(self.editing.as_ref(), |el, edit| {

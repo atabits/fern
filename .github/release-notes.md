@@ -2,6 +2,18 @@ Fern is a free, open-source task manager: tasks, a calendar, habits, focus and c
 native app. Download it and start working: no account, no server, your data stays on your
 computer. Sync between your devices through your own `fern-server` is optional.
 
+> [!WARNING]
+> **Early preview.** Please read before installing:
+> - **Unsigned builds.** Windows SmartScreen and macOS Gatekeeper warn on first launch. See
+>   Installation below.
+> - **Little testing on macOS and Windows.** Fern is developed on Linux. The macOS and Windows
+>   builds pass CI, but few people have run them yet.
+>   [Report issues](https://github.com/{repo}/issues).
+> - **Back up what matters.** Fern keeps a daily copy of your data. Settings → About → Generate
+>   Backup makes one on demand.
+> - **Desktop only.** No mobile app yet, and sync needs your own `fern-server`.
+> - **No automatic updates.** Watch the repository's releases to hear about new versions.
+
 ## Downloads
 
 | Platform | Download |

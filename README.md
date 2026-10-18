@@ -17,6 +17,13 @@ Download it and start working: no account, no server, your data stays on your ma
 
 ![Fern: Next 7 Days with a task's details](docs/screenshots/tasks.png)
 
+> [!WARNING]
+> **Fern is an early preview (0.1).** It already works for everyday tasks, but please read
+> [the known limitations](#known-limitations) before you install it. In short:
+> - Builds are not code-signed yet, so Windows and macOS warn about them.
+> - There is no mobile app yet.
+> - Sync needs a server you run yourself.
+
 ---
 
 ## ✨ Why You'll Love It
@@ -145,10 +152,31 @@ a trademark of its owner and is used here only to describe what Fern is inspired
 
 ---
 
+<a id="known-limitations"></a>
+
 ## ⚠️ Important Notes
 
-- **Early days.** Fern is young. Back up `tasks.db` before you trust it with anything important.
-- **Mobile apps are planned.** The core in `crates/core` is meant to be shared with an Android app through UniFFI.
+Fern 0.1 is an early preview. Here is what to expect:
+
+- **Unsigned builds.** On first launch, Windows SmartScreen shows "Windows protected your PC"
+  and macOS refuses to open the app. [Download](#download) explains how to open it anyway.
+  Signing is being set up (see [code signing](docs/code-signing.md)).
+- **Little testing on macOS and Windows.** Fern is developed and used daily on Linux. The
+  macOS and Windows builds are built and tested in CI, but few people have run them yet.
+  Please [report](https://github.com/atabits/fern/issues) anything that looks wrong.
+- **Young software.** Bugs are likely. Fern keeps a daily copy of your data for the last week.
+  Still, for anything important, use Settings → About → Generate Backup now and then. Newer
+  versions upgrade the data automatically, but you can't open it in an older version again.
+- **Desktop only.** There is no mobile app yet. An Android app is planned on the same core
+  (`crates/core`, through UniFFI).
+- **No hosted sync.** Fern works fully offline on one computer. To sync several devices, you
+  run `fern-server` yourself.
+- **No automatic updates.** To hear about new versions, choose Watch → Custom → Releases on
+  GitHub.
+- **Two languages.** The interface is in English and Russian. More languages are welcome.
+- **Not everything from TickTick yet.** [docs/parity.md](docs/parity.md) tracks what matches the
+  original and what is still missing. Team features such as shared lists and assignees are
+  not planned.
 
 ---
 

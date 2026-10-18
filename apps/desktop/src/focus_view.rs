@@ -1355,18 +1355,21 @@ impl FocusView {
         let theme = cx.theme().clone();
         let close = cx.listener(|this, _, _, cx| this.set_record_menu(None, cx));
         match menu {
+            // As the original's: 163 px wide, a row every 34 px.
             RecordMenu::HeaderMore => popover(cx)
-                .w(px(200.))
+                .w(px(163.))
                 .on_mouse_down_out(close)
                 .child(
                     ListItem::new("focus-statistics")
-                        .start_slot(Icon::new(IconName::ChartNoAxesColumn).color(Color::Muted))
+                        .height(px(34.))
+                        .start_slot(Icon::new(IconName::ChartPie).color(Color::Muted))
                         .child(Label::new(strings.statistics))
                         .on_click(cx.listener(|this, _, _, cx| this.open_stats(cx))),
                 )
                 .child(
                     ListItem::new("focus-settings")
-                        .start_slot(Icon::new(IconName::Settings).color(Color::Muted))
+                        .height(px(34.))
+                        .start_slot(Icon::new(IconName::Settings2).color(Color::Muted))
                         .child(Label::new(strings.focus_settings))
                         .on_click(cx.listener(|this, _, _, cx| this.set_record_menu(Some(RecordMenu::Settings), cx))),
                 )
@@ -1400,11 +1403,13 @@ impl FocusView {
                     .into_any_element()
             }
             RecordMenu::Batch => self.render_batch(cx),
+            // As the original's: 178 px wide, a row every 34 px, Delete All in red only once armed.
             RecordMenu::More => popover(cx)
-                .w(px(240.))
+                .w(px(178.))
                 .on_mouse_down_out(close)
                 .child(
                     ListItem::new("focus-batch")
+                        .height(px(34.))
                         .start_slot(Icon::new(IconName::ListChecks).color(Color::Muted))
                         .child(Label::new(strings.batch_management))
                         .on_click(cx.listener(|this, _, _, cx| {
@@ -1415,16 +1420,18 @@ impl FocusView {
                 )
                 .child(
                     ListItem::new("focus-export")
-                        .start_slot(Icon::new(IconName::Share).color(Color::Muted))
+                        .height(px(34.))
+                        .start_slot(Icon::new(IconName::SquareArrowOutUpRight).color(Color::Muted))
                         .child(Label::new(strings.export))
                         .on_click(cx.listener(|this, _, _, cx| this.export(cx))),
                 )
                 .child(
                     ListItem::new("focus-delete-all")
-                        .start_slot(Icon::new(IconName::Trash).color(Color::Error))
+                        .height(px(34.))
+                        .start_slot(Icon::new(IconName::Trash).color(if self.delete_all_armed { Color::Error } else { Color::Muted }))
                         .child(
                             Label::new(if self.delete_all_armed { strings.delete_all_confirm } else { strings.delete_all })
-                                .color(Color::Error),
+                                .color(if self.delete_all_armed { Color::Error } else { Color::Default }),
                         )
                         .on_click(cx.listener(|this, _, _, cx| this.delete_all(cx))),
                 )
@@ -2537,6 +2544,8 @@ impl FocusView {
         let menu = match menu {
             "add" => RecordMenu::Add,
             "settings" => RecordMenu::Settings,
+            "more" => RecordMenu::More,
+            "header-more" => RecordMenu::HeaderMore,
             "stopwatch" => {
                 self.set_stopwatch_mode(true, cx);
                 return;

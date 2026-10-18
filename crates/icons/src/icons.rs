@@ -28,6 +28,7 @@ pub enum IconName {
     CalendarX,
     ChartGantt,
     ChartNoAxesColumn,
+    ChartPie,
     Check,
     ChevronDown,
     ChevronLeft,

@@ -364,6 +364,8 @@ impl TodoView {
                 Some(("view", "wontdo")) => self.set_view(View::WontDo, cx),
                 Some(("view", "today")) => self.set_view(View::Today, cx),
                 Some(("view", "summary")) => self.set_view(View::Summary, cx),
+                Some(("view", "next7")) => self.set_view(View::Next7Days, cx),
+                Some(("view", "tomorrow")) => self.set_view(View::Tomorrow, cx),
                 // `type=<text>`: text in the quick-add field, as if typed (not added).
                 Some(("type", text)) => {
                     self.input.update(cx, |input, cx| input.set_text(text.to_owned(), cx));
@@ -1721,6 +1723,10 @@ impl TodoView {
                 task_rows::order_tasks(&mut tasks, sort, self.view_flag("descending", false));
                 task_rows::pinned_first(&mut tasks);
                 match group {
+                    // As the original's Next 7 Days: a group for each day.
+                    GroupBy::Custom if self.view == View::Next7Days => {
+                        task_rows::next_days_rows(&tasks, Self::today(), crate::calendar::week_start(), strings)
+                    }
                     GroupBy::Custom if !self.sections.is_empty() => {
                         task_rows::section_rows(&tasks, &self.sections, collapsed_tasks, strings)
                     }
@@ -4465,7 +4471,12 @@ impl TodoView {
                         .h(px(36.))
                         .gap_1()
                         .pl(px(GUTTER))
-                        .child(Label::new(strings.section_habits).weight(FontWeight::BOLD))
+                        // Next 7 Days names today's habits by the day, as the original: "Sunday, Today's Habit".
+                        .child(Label::new(if self.view == View::Next7Days {
+                            format!("{}, {}", strings.weekdays_full[today.weekday().num_days_from_monday() as usize], strings.todays_habit)
+                        } else {
+                            strings.section_habits.to_owned()
+                        }).weight(FontWeight::BOLD))
                         .child(div().pl_1().child(Label::new(count.to_string()).size(LabelSize::Small).color(Color::Muted))),
                 )
                 .children(habits.into_iter().map(|(habit, checked)| {
@@ -5430,8 +5441,10 @@ impl Render for TodoView {
                                 .child(input),
                         )
                     })
+                    // In Next 7 Days today's habits come first, as the original's.
+                    .when(self.view == View::Next7Days, |el| el.children(self.render_habits(strings, cx)))
                     .children(rows)
-                    .children(self.render_habits(strings, cx))
+                    .when(self.view != View::Next7Days, |el| el.children(self.render_habits(strings, cx)))
                     .children(self.render_countdowns(strings, cx)),
             ))
             .when_some(self.error.clone(), |el, error| {

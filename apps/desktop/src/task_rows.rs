@@ -523,6 +523,46 @@ pub fn day_header(day: NaiveDate, today: NaiveDate, strings: &Strings) -> String
     label
 }
 
+/// A day's header in Next 7 Days, as the original's: "Sunday, Today", "Monday, Tomorrow",
+/// "Wednesday, October 21", and "Next Saturday, October 24" for a day in the next week.
+pub fn next_days_header(day: NaiveDate, today: NaiveDate, week_start: chrono::Weekday, strings: &Strings) -> String {
+    let weekday = strings.weekdays_full[day.weekday().num_days_from_monday() as usize];
+    let offset = (day - today).num_days();
+    if offset == 0 || offset == 1 {
+        return format!("{weekday}, {}", if offset == 0 { strings.today } else { strings.tomorrow });
+    }
+    let week = |d: NaiveDate| (d - chrono::Duration::days(((7 + d.weekday().num_days_from_monday() - week_start.num_days_from_monday()) % 7) as i64)).num_days_from_ce();
+    let label = day_header(day, today, strings);
+    if week(day) != week(today) { strings.next_weekday.replace("{day}", &label) } else { label }
+}
+
+/// Next 7 Days' rows, as the original groups them: the overdue tasks, then a group for each day
+/// with tasks, its header from `next_days_header`; completed tasks last.
+pub fn next_days_rows(tasks: &[Task], today: NaiveDate, week_start: chrono::Weekday, strings: &Strings) -> Vec<Row> {
+    let (open, done): (Vec<&Task>, Vec<&Task>) = tasks.iter().partition(|t| !t.is_completed());
+    let task_row = |task: &Task| Row::Task { task: task.clone(), depth: 0, has_children: false, collapsed: false };
+    let mut rows = Vec::new();
+    let overdue: Vec<&&Task> = open.iter().filter(|t| t.due_date.is_some_and(|d| d < today)).collect();
+    if !overdue.is_empty() {
+        rows.push(Row::Day { label: strings.group_overdue.to_owned(), count: overdue.len(), drop: None });
+        rows.extend(overdue.into_iter().map(|t| task_row(t)));
+    }
+    for offset in 0..7 {
+        let day = today + chrono::Duration::days(offset);
+        let on_day: Vec<&&Task> = open.iter().filter(|t| t.due_date == Some(day)).collect();
+        if on_day.is_empty() {
+            continue;
+        }
+        rows.push(Row::Day { label: next_days_header(day, today, week_start, strings), count: on_day.len(), drop: Some(DropTarget::Due(Some(day))) });
+        rows.extend(on_day.into_iter().map(|t| task_row(t)));
+    }
+    if !done.is_empty() {
+        rows.push(Row::Section { section: Section::Completed, count: done.len(), collapsed: false });
+        rows.extend(done.into_iter().map(task_row));
+    }
+    rows
+}
+
 /// The checkbox and flag tint for a priority; `None` for no priority.
 pub fn priority_color(priority: Priority, theme: &Theme) -> Option<Hsla> {
     match priority {
@@ -809,6 +849,20 @@ mod tests {
         assert_eq!(day_header(d(2026, 9, 27), today, &EN), "Sunday, September 27");
         assert_eq!(day_header(d(2025, 9, 26), today, &EN), "Friday, September 26, 2025");
         assert_eq!(day_header(d(2026, 9, 27), today, &RU), "воскресенье, 27 сентября");
+    }
+
+    #[test]
+    fn next_days_groups() {
+        let today = d(2026, 10, 18);
+        let mon = chrono::Weekday::Mon;
+        assert_eq!(next_days_header(today, today, mon, &EN), "Sunday, Today");
+        assert_eq!(next_days_header(d(2026, 10, 19), today, mon, &EN), "Monday, Tomorrow");
+        assert_eq!(next_days_header(d(2026, 10, 24), today, mon, &EN), "Next Saturday, October 24");
+        let mut late = task("late");
+        late.due_date = Some(d(2026, 10, 17));
+        let mut sat = task("sat");
+        sat.due_date = Some(d(2026, 10, 24));
+        assert_eq!(shape(&next_days_rows(&[sat, late], today, mon, &EN)), ["## Overdue 1", "late", "## Next Saturday, October 24 1", "sat"]);
     }
 
     #[test]

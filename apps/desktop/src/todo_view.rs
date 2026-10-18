@@ -4187,7 +4187,13 @@ impl TodoView {
                 .into_any_element()
         };
 
-        let due = task.due_date.map(|date| task_rows::row_due_label(date, task.due_time, today, strings, self.preferences.countdown_dates));
+        let due = task.due_date.map(|date| {
+            if matches!(self.view, View::Completed | View::WontDo) {
+                (task_rows::closed_due_label(date, today, strings), false)
+            } else {
+                task_rows::row_due_label(date, task.due_time, today, strings, self.preferences.countdown_dates)
+            }
+        });
 
         let draggable = self.view != View::Trash;
         let dragged = DraggedTask { id, title: task.title.clone().into() };

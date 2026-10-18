@@ -611,6 +611,14 @@ pub fn due_label(
     (label, days < 0)
 }
 
+/// A closed task's date, as the original's Completed and Won't Do show it: the date itself,
+/// "Oct 15" ("Oct 15, 2025" in another year), never "Today" or "Tomorrow".
+pub fn closed_due_label(date: NaiveDate, today: NaiveDate, strings: &Strings) -> String {
+    let month = strings.months_short[date.month0() as usize];
+    let day = if strings.day_before_month { format!("{} {month}", date.day()) } else { format!("{month} {}", date.day()) };
+    if date.year() == today.year() { day } else { format!("{day}, {}", date.year()) }
+}
+
 /// A task row's date with the View Options' "Show Date by": Task Time is `due_label`; Countdown
 /// says how far away the date is ("in 3 days", "2 days ago"), today, tomorrow and yesterday
 /// keeping their names.
@@ -722,8 +730,8 @@ mod tests {
     #[test]
     fn rows_by_list_section() {
         let list = Uuid::now_v7();
-        let kitchen = ListSection { id: Uuid::now_v7(), list_id: list, name: "Kitchen".into() };
-        let garden = ListSection { id: Uuid::now_v7(), list_id: list, name: "Garden".into() };
+        let kitchen = ListSection { id: Uuid::now_v7(), list_id: Some(list), name: "Kitchen".into() };
+        let garden = ListSection { id: Uuid::now_v7(), list_id: Some(list), name: "Garden".into() };
         let mut tap = task("fix the tap");
         tap.section_id = Some(kitchen.id);
         let mut done = task("done");
@@ -914,6 +922,8 @@ mod tests {
         assert_eq!(row_due_label(today + chrono::Duration::days(3), None, today, &EN, true).0, "in 3 days");
         assert_eq!(row_due_label(today - chrono::Duration::days(2), None, today, &EN, true), ("2 days ago".to_owned(), true));
         assert_eq!(row_due_label(today, None, today, &EN, true).0, "Today");
+        assert_eq!(closed_due_label(today, today, &EN), "Oct 18", "a closed task shows the date itself");
+        assert_eq!(closed_due_label(d(2025, 9, 26), today, &EN), "Sep 26, 2025");
         let label = |date| due_label(date, None, today, &RU).0;
         assert_eq!(label(today), "Сегодня");
         assert_eq!(label(d(2026, 10, 24)), "Сб");

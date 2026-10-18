@@ -39,7 +39,7 @@ impl Recurrence {
         self.frequency == Frequency::Weekly && self.interval == 1 && self.weekdays == 0b0001_1111
     }
 
-    fn falls_on(&self, day: Weekday) -> bool {
+    pub fn falls_on(&self, day: Weekday) -> bool {
         self.weekdays & (1 << day.num_days_from_monday()) != 0
     }
 
@@ -48,11 +48,21 @@ impl Recurrence {
         let n = self.interval.max(1);
         match self.frequency {
             Frequency::Daily => from + Duration::days(n as i64),
-            // With BYDAY: the next listed weekday (the interval is assumed to be 1 week).
-            Frequency::Weekly if self.weekdays != 0 => (1..=7)
-                .map(|offset| from + Duration::days(offset))
-                .find(|day| self.falls_on(day.weekday()))
-                .unwrap_or(from),
+            // With BYDAY: the next listed weekday later in the same week, otherwise the first
+            // listed weekday `interval` weeks on (weeks start on Monday).
+            Frequency::Weekly if self.weekdays != 0 => {
+                let monday = from - Duration::days(from.weekday().num_days_from_monday() as i64);
+                let later_this_week = (from.weekday().num_days_from_monday() as i64 + 1..7)
+                    .map(|offset| monday + Duration::days(offset))
+                    .find(|day| self.falls_on(day.weekday()));
+                later_this_week.unwrap_or_else(|| {
+                    let next = monday + Duration::weeks(n as i64);
+                    (0..7)
+                        .map(|offset| next + Duration::days(offset))
+                        .find(|day| self.falls_on(day.weekday()))
+                        .unwrap_or(next)
+                })
+            }
             Frequency::Weekly => from + Duration::weeks(n as i64),
             Frequency::Monthly => from.checked_add_months(Months::new(n)).unwrap_or(from),
             Frequency::Yearly => from.checked_add_months(Months::new(12 * n)).unwrap_or(from),
@@ -169,5 +179,15 @@ mod tests {
         assert_eq!(Recurrence::new(Frequency::Weekly, 1).next_after(d(2026, 10, 18)), d(2026, 10, 25));
         assert_eq!(Recurrence::new(Frequency::Monthly, 1).next_after(d(2026, 1, 31)), d(2026, 2, 28));
         assert_eq!(Recurrence::new(Frequency::Yearly, 1).next_after(d(2028, 2, 29)), d(2029, 2, 28));
+    }
+
+    #[test]
+    fn every_other_week_on_some_days() {
+        // Mondays and Wednesdays every 2 weeks; 2026-10-19 is a Monday.
+        let rule = Recurrence { frequency: Frequency::Weekly, interval: 2, weekdays: 0b101 };
+        assert_eq!(rule.to_string(), "FREQ=WEEKLY;INTERVAL=2;BYDAY=MO,WE");
+        assert_eq!(rule.next_after(d(2026, 10, 19)), d(2026, 10, 21));
+        assert_eq!(rule.next_after(d(2026, 10, 21)), d(2026, 11, 2));
+        assert_eq!(rule.next_after(d(2026, 10, 25)), d(2026, 11, 2));
     }
 }

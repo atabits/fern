@@ -12,6 +12,8 @@ use crate::i18n::{Locale, Strings};
 pub enum DueMenu {
     Time,
     Repeat,
+    /// The custom repeat editor with the rule being edited.
+    Custom(Recurrence),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -58,6 +60,42 @@ impl DueDraft {
     }
 }
 
+/// The rule the custom repeat editor starts from: the current one, or weekly on the date's day.
+pub fn custom_start(repeat: Option<Recurrence>, date: NaiveDate) -> Recurrence {
+    repeat.unwrap_or_else(|| {
+        let mut rule = Recurrence::new(Frequency::Weekly, 1);
+        rule.weekdays = 1 << date.weekday().num_days_from_monday();
+        rule
+    })
+}
+
+/// A time typed by hand: "7", "7:45", "745", "19.30", "7pm", "7:45 am".
+pub fn parse_time(text: &str) -> Option<NaiveTime> {
+    let text = text.trim().to_lowercase();
+    let (text, meridiem) = match text.strip_suffix("am").or_else(|| text.strip_suffix("a")) {
+        Some(rest) => (rest.trim().to_owned(), Some(false)),
+        None => match text.strip_suffix("pm").or_else(|| text.strip_suffix("p")) {
+            Some(rest) => (rest.trim().to_owned(), Some(true)),
+            None => (text.clone(), None),
+        },
+    };
+    let (hour, minute) = match text.split_once([':', '.', ' ']) {
+        Some((h, m)) => (h.trim().parse::<u32>().ok()?, m.trim().parse::<u32>().ok()?),
+        None if text.len() >= 3 && text.chars().all(|c| c.is_ascii_digit()) => {
+            let (h, m) = text.split_at(text.len() - 2);
+            (h.parse().ok()?, m.parse().ok()?)
+        }
+        None => (text.parse().ok()?, 0),
+    };
+    let hour = match meridiem {
+        Some(_) if !(1..=12).contains(&hour) => return None,
+        Some(false) => hour % 12,
+        Some(true) => hour % 12 + 12,
+        None => hour,
+    };
+    NaiveTime::from_hms_opt(hour, minute, 0)
+}
+
 /// The quick picks above the calendar: today, tomorrow, next week, next month.
 pub fn quick_dates(today: NaiveDate) -> [NaiveDate; 4] {
     [
@@ -93,13 +131,25 @@ pub fn repeat_label(repeat: &Recurrence, strings: &Strings) -> String {
     if repeat.is_weekdays() {
         return strings.repeat_weekdays.to_owned();
     }
-    let base = match repeat.frequency {
-        Frequency::Daily => strings.repeat_daily,
-        Frequency::Weekly => strings.repeat_weekly,
-        Frequency::Monthly => strings.repeat_monthly,
-        Frequency::Yearly => strings.repeat_yearly,
+    let unit = unit_index(repeat.frequency);
+    let mut label = if repeat.interval > 1 {
+        format!("{} {} {}", strings.repeat_every, repeat.interval, strings.repeat_units_plural[unit])
+    } else {
+        [strings.repeat_daily, strings.repeat_weekly, strings.repeat_monthly, strings.repeat_yearly][unit].to_owned()
     };
-    if repeat.interval > 1 { format!("{base} ×{}", repeat.interval) } else { base.to_owned() }
+    if repeat.frequency == Frequency::Weekly && repeat.weekdays != 0 {
+        let days: Vec<&str> =
+            (0..7).filter(|i| repeat.weekdays & (1 << i) != 0).map(|i| strings.weekdays_min[i]).collect();
+        label.push_str(strings.repeat_on);
+        label.push_str(&days.join(", "));
+    }
+    label
+}
+
+pub const UNITS: [Frequency; 4] = [Frequency::Daily, Frequency::Weekly, Frequency::Monthly, Frequency::Yearly];
+
+pub fn unit_index(frequency: Frequency) -> usize {
+    UNITS.iter().position(|f| *f == frequency).unwrap_or(0)
 }
 
 /// "18th" in English, "18-го" in Russian.
@@ -135,6 +185,34 @@ mod tests {
             "1st", "2nd", "3rd", "4th", "11th", "12th", "13th", "21st", "22nd", "31st"
         ]);
         assert_eq!(ordinal(18, Locale::Ru), "18-го");
+    }
+
+    #[test]
+    fn typed_times() {
+        let t = |h, m| NaiveTime::from_hms_opt(h, m, 0);
+        assert_eq!(parse_time("7"), t(7, 0));
+        assert_eq!(parse_time("7:45"), t(7, 45));
+        assert_eq!(parse_time("745"), t(7, 45));
+        assert_eq!(parse_time("19.30"), t(19, 30));
+        assert_eq!(parse_time("7pm"), t(19, 0));
+        assert_eq!(parse_time("12 am"), t(0, 0));
+        assert_eq!(parse_time("7:45 PM"), t(19, 45));
+        assert_eq!(parse_time("25"), None);
+        assert_eq!(parse_time("13pm"), None);
+        assert_eq!(parse_time("soon"), None);
+    }
+
+    #[test]
+    fn repeat_labels() {
+        use crate::i18n::RU;
+        let weekly = |interval, weekdays| Recurrence { frequency: Frequency::Weekly, interval, weekdays };
+        assert_eq!(repeat_label(&Recurrence::new(Frequency::Daily, 1), &EN), "Daily");
+        assert_eq!(repeat_label(&Recurrence::new(Frequency::Daily, 3), &EN), "Every 3 days");
+        assert_eq!(repeat_label(&weekly(1, 0b100_0000), &EN), "Weekly on Su");
+        assert_eq!(repeat_label(&weekly(2, 0b101), &EN), "Every 2 weeks on Mo, We");
+        assert_eq!(repeat_label(&weekly(2, 0b101), &RU), "Каждые 2 нед.: пн, ср");
+        assert_eq!(repeat_label(&Recurrence::weekdays(), &EN), "Every Weekday");
+        assert_eq!(custom_start(None, d(2026, 10, 18)), weekly(1, 0b100_0000));
     }
 
     #[test]

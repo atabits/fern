@@ -42,6 +42,7 @@ pub enum IconName {
     ListChecks,
     MapPin,
     MessageSquareText,
+    Minus,
     Moon,
     PanelLeft,
     Pause,

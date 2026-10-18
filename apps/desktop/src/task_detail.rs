@@ -2,7 +2,7 @@
 
 use std::rc::Rc;
 
-use fern_core::{ChecklistItem, Id, Kind, List, Priority, Store, Tag, Task};
+use fern_core::{ChecklistItem, Frequency, Id, Kind, List, Priority, Recurrence, Store, Tag, Task};
 use chrono::{Datelike, Local, NaiveDate};
 use gpui::{Entity, EventEmitter, Focusable, FontWeight, MouseButton, Subscription};
 use ui::prelude::*;
@@ -40,6 +40,8 @@ pub struct TaskDetail {
     /// Direct subtasks of the shown task.
     subtasks: Vec<Task>,
     subtask_input: Entity<TextInput>,
+    /// The due-date popover's field for typing a time.
+    time_input: Entity<TextInput>,
     /// The checklist is shown when it has items or the user asked to start one.
     show_checklist: bool,
     /// An input to focus on the next render (focusing needs the window).
@@ -79,6 +81,7 @@ impl TaskDetail {
         let tag_input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.new_tag, cx));
         let new_item = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.add_item, cx));
         let subtask_input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.add_subtask, cx));
+        let time_input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.time_placeholder, cx));
 
         let subscriptions = vec![
             cx.subscribe(&title, |this, input, _: &Changed, cx| {
@@ -116,6 +119,13 @@ impl TaskDetail {
                     this.sync_subtasks();
                 }
             }),
+            // A time typed by hand in the due-date popover's time menu.
+            cx.subscribe_in(&time_input, window, |this, input, Submitted(text), window, cx| {
+                if let Some(time) = due_picker::parse_time(text) {
+                    this.update_draft(cx, |d| d.pick_time(Some(time), Local::now().date_naive()));
+                    input.update(cx, |input, cx| input.clear(window, cx));
+                }
+            }),
             cx.observe_global::<CurrentLocale>(|this, cx| {
                 let strings = i18n::t(cx);
                 this.title.update(cx, |input, cx| input.set_placeholder(strings.untitled, cx));
@@ -123,6 +133,7 @@ impl TaskDetail {
                 this.tag_input.update(cx, |input, cx| input.set_placeholder(strings.new_tag, cx));
                 this.new_item.update(cx, |input, cx| input.set_placeholder(strings.add_item, cx));
                 this.subtask_input.update(cx, |input, cx| input.set_placeholder(strings.add_subtask, cx));
+                this.time_input.update(cx, |input, cx| input.set_placeholder(strings.time_placeholder, cx));
             }),
         ];
 
@@ -138,6 +149,7 @@ impl TaskDetail {
             new_item,
             subtasks: Vec::new(),
             subtask_input,
+            time_input,
             show_checklist: false,
             pending_focus: None,
             popup: None,
@@ -295,6 +307,20 @@ impl TaskDetail {
             "more" => Popup::More,
             "checklist" => {
                 self.start_checklist(cx);
+                return;
+            }
+            // The due-date popover with its time menu or the custom repeat editor open.
+            "due-time" | "due-custom" => {
+                self.open_popup(Popup::Due, cx);
+                let today = Local::now().date_naive();
+                let custom = popup == "due-custom";
+                self.update_draft(cx, |d| {
+                    d.menu = Some(if custom {
+                        DueMenu::Custom(due_picker::custom_start(d.repeat, d.date.unwrap_or(today)))
+                    } else {
+                        DueMenu::Time
+                    })
+                });
                 return;
             }
             _ => return,
@@ -644,7 +670,11 @@ impl TaskDetail {
                 .child(Icon::new(icon).color(if active { Color::Accent } else { Color::Muted }))
                 .child(div().flex_1().child(Label::new(label).size(LabelSize::Small).color(color)))
                 .child(
-                    Icon::new(if draft.menu == Some(menu) { IconName::ChevronDown } else { IconName::ChevronRight })
+                    Icon::new(if draft.menu == Some(menu) || (menu == DueMenu::Repeat && matches!(draft.menu, Some(DueMenu::Custom(_)))) {
+                        IconName::ChevronDown
+                    } else {
+                        IconName::ChevronRight
+                    })
                         .size(IconSize::XSmall),
                 )
                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -659,6 +689,17 @@ impl TaskDetail {
         let menu: Option<AnyElement> = match draft.menu {
             Some(DueMenu::Time) => Some(
                 v_flex()
+                    .gap_1()
+                    .child(
+                        h_flex()
+                            .h(px(28.))
+                            .px_2()
+                            .rounded(px(6.))
+                            .bg(theme.colors().background)
+                            .text_size(px(12.))
+                            .child(self.time_input.clone()),
+                    )
+                    .child(v_flex()
                     .id("time-options")
                     .max_h(px(180.))
                     .overflow_y_scroll()
@@ -676,9 +717,10 @@ impl TaskDetail {
                                     }))
                             })
                             .collect::<Vec<_>>(),
-                    )
+                    ))
                     .into_any_element(),
             ),
+            Some(DueMenu::Custom(rule)) => Some(self.render_custom_repeat(rule, strings, cx)),
             Some(DueMenu::Repeat) => {
                 let base = draft.date.unwrap_or(today);
                 let options = due_picker::repeat_options(base, strings, locale);
@@ -709,6 +751,18 @@ impl TaskDetail {
                                     this.update_draft(cx, |d| d.pick_repeat(Some(rule), Local::now().date_naive()))
                                 }))
                         }))
+                        .child(div().py_1().child(Divider::horizontal()))
+                        .child(
+                            ListItem::new("repeat-custom")
+                                .height(px(28.))
+                                .child(Label::new(strings.repeat_custom).size(LabelSize::Small))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    let today = Local::now().date_naive();
+                                    this.update_draft(cx, |d| {
+                                        d.menu = Some(DueMenu::Custom(due_picker::custom_start(d.repeat, d.date.unwrap_or(today))))
+                                    })
+                                })),
+                        )
                         .into_any_element(),
                 )
             }
@@ -716,7 +770,7 @@ impl TaskDetail {
         };
         let (time_menu, repeat_menu) = match draft.menu {
             Some(DueMenu::Time) => (menu, None),
-            Some(DueMenu::Repeat) => (None, menu),
+            Some(DueMenu::Repeat | DueMenu::Custom(_)) => (None, menu),
             None => (None, None),
         };
 
@@ -800,6 +854,122 @@ impl TaskDetail {
                     .pt_1()
                     .child(button("due-clear", strings.clear, false).on_click(cx.listener(|this, _, _, cx| this.clear_due(cx))))
                     .child(button("due-ok", strings.ok, true).on_click(cx.listener(|this, _, _, cx| this.apply_due(cx)))),
+            )
+            .into_any_element()
+    }
+
+    /// "Custom" repeat: every N days, weeks, months or years, and the weekdays for weekly rules.
+    fn render_custom_repeat(&self, rule: Recurrence, strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let unit = due_picker::unit_index(rule.frequency);
+        let units = h_flex().gap_1().children(due_picker::UNITS.into_iter().enumerate().map(|(i, frequency)| {
+            let selected = i == unit;
+            div()
+                .id(SharedString::from(format!("repeat-unit-{i}")))
+                .flex_1()
+                .h(px(24.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(5.))
+                .cursor_pointer()
+                .when(selected, |el| el.bg(theme.colors().element_selected))
+                .hover(|s| s.bg(theme.colors().element_hover))
+                .child(Label::new(strings.repeat_units[i]).size(LabelSize::XSmall))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.update_draft(cx, |d| {
+                        if let Some(DueMenu::Custom(rule)) = d.menu.as_mut() {
+                            rule.frequency = frequency;
+                            if frequency != Frequency::Weekly {
+                                rule.weekdays = 0;
+                            }
+                        }
+                    })
+                }))
+        }));
+        let weekdays = h_flex().justify_between().children((0..7u8).map(|i| {
+            let on = rule.weekdays & (1 << i) != 0;
+            div()
+                .id(SharedString::from(format!("repeat-day-{i}")))
+                .size(px(24.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_full()
+                .cursor_pointer()
+                .when(on, |el| el.bg(theme.colors().accent))
+                .when(!on, |el| el.hover(|s| s.bg(theme.colors().element_hover)))
+                .child(Label::new(strings.weekdays_narrow[i as usize]).size(LabelSize::XSmall))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.update_draft(cx, |d| {
+                        if let Some(DueMenu::Custom(rule)) = d.menu.as_mut() {
+                            rule.weekdays ^= 1 << i;
+                        }
+                    })
+                }))
+        }));
+        let button = |id: &'static str, label: &'static str, primary: bool| {
+            div()
+                .id(id)
+                .flex_1()
+                .h(px(26.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(6.))
+                .cursor_pointer()
+                .when(primary, |el| el.bg(theme.colors().accent))
+                .when(!primary, |el| el.border_1().border_color(theme.colors().border))
+                .child(Label::new(label).size(LabelSize::Small))
+        };
+        v_flex()
+            .gap_2()
+            .p_2()
+            .rounded(px(6.))
+            .border_1()
+            .border_color(theme.colors().border)
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(Label::new(strings.repeat_every).size(LabelSize::Small))
+                    .child(div().flex_1())
+                    .child(
+                        IconButton::new("repeat-fewer", IconName::Minus)
+                            .size(px(22.))
+                            .icon_size(IconSize::XSmall)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.update_draft(cx, |d| {
+                                    if let Some(DueMenu::Custom(rule)) = d.menu.as_mut() {
+                                        rule.interval = rule.interval.saturating_sub(1).max(1);
+                                    }
+                                })
+                            })),
+                    )
+                    .child(div().min_w(px(20.)).flex().justify_center().child(Label::new(rule.interval.to_string())))
+                    .child(
+                        IconButton::new("repeat-more", IconName::Plus)
+                            .size(px(22.))
+                            .icon_size(IconSize::XSmall)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.update_draft(cx, |d| {
+                                    if let Some(DueMenu::Custom(rule)) = d.menu.as_mut() {
+                                        rule.interval = (rule.interval + 1).min(99);
+                                    }
+                                })
+                            })),
+                    ),
+            )
+            .child(units)
+            .when(rule.frequency == Frequency::Weekly, |el| el.child(weekdays))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(button("repeat-cancel", strings.cancel, false).on_click(cx.listener(|this, _, _, cx| {
+                        this.update_draft(cx, |d| d.menu = Some(DueMenu::Repeat))
+                    })))
+                    .child(button("repeat-ok", strings.ok, true).on_click(cx.listener(move |this, _, _, cx| {
+                        this.update_draft(cx, |d| d.pick_repeat(Some(rule), Local::now().date_naive()))
+                    }))),
             )
             .into_any_element()
     }

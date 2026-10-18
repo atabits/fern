@@ -58,7 +58,7 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 | Groups "Tasks" / "Notes" with counters and collapsing | ✅ | plus a collapsed "Completed" group; the Completed and Won't Do views group by the day the task was closed ("Sunday, September 27") |
 | Details "…" menu | 🟡 | Add Subtask, Won't Do / Reopen, Tags, Duplicate, Convert to Note / Task, Delete; no Pin, Link Parent Task, attachments, Start Focus, activities, templates, links or print |
 | Details: checkbox, title, notes | ✅ | |
-| Details: due date | 🟡 | popover matched to the original: quick picks with tooltips, month calendar, Time (30-minute list) and Repeat (with date hints and "Every Weekday"), Clear/OK with a draft; no Duration tab, Reminder or Custom repeat |
+| Details: due date | 🟡 | popover matched to the original: quick picks with tooltips, month calendar, Time (a field for typing any time — "7:45", "745", "7pm" — plus a 30-minute list), Repeat (with date hints, "Every Weekday" and Custom: every N days/weeks/months/years, weekdays for weekly rules, e.g. "Every 2 weeks on Mo, We"), Clear/OK with a draft; no Duration tab, Reminder or "By Due Dates / By Completion" repeat mode |
 | Details: priority (flag) | ✅ | |
 | Details: tags | ✅ | chips under the notes as in the original; the "+ Tag" picker is our addition (TickTick adds tags with "#" in the text) |
 | Details: list | ✅ | list button in the bottom bar |
@@ -90,7 +90,7 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 
 ## Next
 
-1. Filled sidebar icons and the notification badge.
-2. Custom time and "every N" in the due-date picker.
-3. "All Dates" / "All Lists" filters in the Completed and Won't Do views.
-4. Habit goals and check-in notes (habit log).
+1. "All Dates" / "All Lists" filters in the Completed and Won't Do views.
+2. Habit goals and check-in notes (habit log).
+3. Reminders (the due-date picker's Reminder row) with desktop notifications.
+4. Filled sidebar icons and the notification badge (needs reminders to have something to count).

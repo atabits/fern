@@ -1788,8 +1788,7 @@ impl FocusView {
             // 960 px of cards, as the original's, between 32 px margins.
             .max_w(px(1024.))
             .px_8()
-            // The original's header sits lower, with the window's top room above it.
-            .pt(px(19. + crate::TOP_INSET))
+            .pt(px(19.))
             .pb_5()
             .gap_4()
             .child(

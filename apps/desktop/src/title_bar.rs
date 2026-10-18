@@ -1,227 +1,215 @@
-//! The window's title bar, drawn by the app on every platform as Zed's: the system one is
-//! hidden, the top `HEIGHT` of every column moves the window and maximizes it on a double click,
-//! and the window's buttons sit in that strip: macOS keeps its own traffic lights on the left,
-//! Windows gets its caption buttons in the top-right corner, and Linux gets the desktop's
-//! buttons on the side it puts them, with the app's own window edges for resizing.
-
-use std::cell::Cell;
-use std::sync::OnceLock;
+//! Fern's own title bar and window frame, drawn in the app's theme on every platform instead of
+//! the system's: the window is opened without the system title bar (`window_options`), and this
+//! module draws the bar, the window buttons and, on Linux, the frame's border, shadow and resize
+//! edges. After Zed's `platform_title_bar` and `client_side_decorations`.
+//!
+//! - macOS keeps its traffic lights, which sit over the bar's left end.
+//! - Windows draws nothing itself: the bar's areas are tagged with [`WindowControlArea`], so the
+//!   system handles dragging, double clicks, snap layouts and the buttons' clicks.
+//! - Linux asks the compositor for client-side decorations. When it draws its own (server-side),
+//!   the bar stays but without window buttons.
 
 use gpui::{
-    CursorStyle, Decorations, HitboxBehavior, Hsla, MouseButton, Point, ResizeEdge, Rgba, Size, Stateful, Tiling,
-    TitlebarOptions, WindowButton, WindowButtonLayout, WindowControlArea, canvas, point, svg,
+    Bounds, CursorStyle, Decorations, Global, HitboxBehavior, MouseButton, Point, ResizeEdge, Size,
+    TitlebarOptions, Tiling, WindowButton, WindowButtonLayout, WindowControlArea, WindowDecorations,
+    canvas, point, rgb, transparent_black,
 };
-use icons::IconName;
 use ui::prelude::*;
 
-/// How tall the title bar is: every column starts this far down (`crate::TOP_INSET`).
-pub const HEIGHT: f32 = 32.;
-
-/// The room around a Linux window that draws its own frame: its shadow, and where the pointer
-/// resizes it.
+/// The radius of the window's corners with client-side decorations.
+const ROUNDING: Pixels = px(10.);
+/// The room around the window for its shadow, which is also where it is grabbed to resize.
 const SHADOW: Pixels = px(10.);
+/// macOS traffic lights: their position, and the room the bar leaves for them.
+const TRAFFIC_LIGHTS: Point<Pixels> = point(px(12.), px(11.));
+const TRAFFIC_LIGHT_PADDING: Pixels = px(80.);
 
-pub fn titlebar_options() -> TitlebarOptions {
-    TitlebarOptions {
+/// The bar's height: Windows' caption height there, a bit more elsewhere.
+pub fn height() -> Pixels {
+    if cfg!(target_os = "windows") { px(32.) } else { px(36.) }
+}
+
+/// The window options that hide the system title bar.
+pub fn window_options() -> (TitlebarOptions, WindowDecorations) {
+    let titlebar = TitlebarOptions {
         title: Some("Fern".into()),
         appears_transparent: true,
-        // The traffic lights in the middle of the title bar, at its left.
-        traffic_light_position: Some(point(px(12.), px(9.))),
+        traffic_light_position: Some(TRAFFIC_LIGHTS),
+    };
+    (titlebar, WindowDecorations::Client)
+}
+
+pub struct TitleBar {
+    /// Linux and macOS: a press on the bar turns into a window move once the mouse moves.
+    should_move: bool,
+}
+
+impl TitleBar {
+    pub fn new() -> Self {
+        Self { should_move: false }
     }
 }
 
-thread_local! {
-    /// Set by a press on the title bar: the next move of the pointer moves the window, so a
-    /// double click still reaches the title bar.
-    static SHOULD_MOVE: Cell<bool> = const { Cell::new(false) };
-}
-
-/// The strip along the top that moves the window, and the window's buttons in it. It lies over
-/// the columns, which keep their clickable parts below `HEIGHT`, and under the dialogs.
-pub fn render(window: &mut Window, cx: &App) -> impl IntoElement {
-    let drag_area = div()
-        .id("title-bar")
-        .absolute()
-        .top_0()
-        .left_0()
-        .right_0()
-        .h(px(HEIGHT))
-        // Windows moves the window itself: it asks the app what is under the pointer.
-        .window_control_area(WindowControlArea::Drag)
-        .when(!cfg!(target_os = "windows"), |el| {
-            el.on_mouse_down(MouseButton::Left, |event, window, _| {
-                if event.click_count == 2 {
-                    double_click(window);
-                } else {
-                    SHOULD_MOVE.set(true);
-                }
-            })
-            .on_mouse_up(MouseButton::Left, |_, _, _| SHOULD_MOVE.set(false))
-            .on_mouse_down_out(|_, _, _| SHOULD_MOVE.set(false))
-            .on_mouse_move(|_, window, _| {
-                if SHOULD_MOVE.replace(false) {
-                    window.start_window_move();
-                }
-            })
-            .when(cfg!(any(target_os = "linux", target_os = "freebsd")), |el| {
-                el.on_mouse_down(MouseButton::Right, |event, window, _| window.show_window_menu(event.position))
-            })
-        });
-
-    div()
-        .absolute()
-        .inset_0()
-        .child(drag_area)
-        .when(cfg!(target_os = "windows"), |el| el.child(caption_buttons(window, cx)))
-        .when(
-            cfg!(any(target_os = "linux", target_os = "freebsd"))
-                && matches!(window.window_decorations(), Decorations::Client { .. }),
-            |el| {
-                let layout = cx.button_layout().unwrap_or(WindowButtonLayout {
-                    left: [None; 3],
-                    right: [Some(WindowButton::Minimize), Some(WindowButton::Maximize), Some(WindowButton::Close)],
-                });
-                el.child(linux_buttons("title-bar-left", &layout.left, window, cx).left_0())
-                    .child(linux_buttons("title-bar-right", &layout.right, window, cx).right_0())
-            },
-        )
-}
-
-fn double_click(window: &mut Window) {
-    if cfg!(target_os = "macos") {
-        // Zooms or minimizes, as the system settings say.
-        window.titlebar_double_click();
-    } else if window.is_resizable() && window.window_controls().maximize {
-        window.zoom_window();
-    }
-}
-
-/// Minimize, maximize (or restore) and close in the desktop's order.
-fn linux_buttons(id: &'static str, buttons: &[Option<WindowButton>], window: &Window, cx: &App) -> Stateful<Div> {
-    let controls = window.window_controls();
-    let colors = cx.theme().colors();
-    let maximized = window.is_maximized();
-    h_flex()
-        .id(id)
-        .absolute()
-        .top_0()
-        .h(px(HEIGHT))
-        .px_3()
-        .gap_3()
-        .children(
-            buttons
-                .iter()
-                .flatten()
-                .filter(|button| match button {
-                    WindowButton::Minimize => controls.minimize,
-                    WindowButton::Maximize => controls.maximize,
-                    WindowButton::Close => true,
-                })
-                .map(|button| {
-                    let (id, icon) = match button {
-                        WindowButton::Minimize => ("caption-minimize", IconName::WindowMinimize),
-                        WindowButton::Maximize if maximized => ("caption-restore", IconName::WindowRestore),
-                        WindowButton::Maximize => ("caption-maximize", IconName::WindowMaximize),
-                        WindowButton::Close => ("caption-close", IconName::WindowClose),
-                    };
-                    let button = *button;
-                    h_flex()
-                        .id(id)
-                        .justify_center()
-                        .size(px(20.))
-                        .rounded_full()
-                        .bg(colors.element_hover)
-                        .hover(|style| style.bg(colors.element_selected))
-                        .cursor_pointer()
-                        .child(svg().path(icon.path()).size(px(16.)).flex_none().text_color(colors.icon))
-                        .on_click(move |_, window, _| match button {
-                            WindowButton::Minimize => window.minimize_window(),
-                            WindowButton::Maximize => window.zoom_window(),
-                            WindowButton::Close => window.remove_window(),
-                        })
-                }),
-        )
-        // Keeps the clicks from the title bar under the buttons.
-        .occlude()
-}
-
-/// The caption buttons' size, as Windows' own.
-const CAPTION_WIDTH: f32 = 46.;
-
-/// Minimize, maximize (or restore) and close; Windows itself handles the clicks.
-fn caption_buttons(window: &mut Window, cx: &App) -> impl IntoElement {
-    let maximize = if window.is_maximized() { CaptionButton::Restore } else { CaptionButton::Maximize };
-    h_flex()
-        .id("caption-buttons")
-        .absolute()
-        .top_0()
-        .right_0()
-        .h(px(HEIGHT))
-        .font_family(caption_font(window))
-        .child(CaptionButton::Minimize.render(window, cx))
-        .child(maximize.render(window, cx))
-        .child(CaptionButton::Close.render(window, cx))
-}
-
-/// Windows 11 draws the caption glyphs with Segoe Fluent Icons; Windows 10 has the same glyphs
-/// in Segoe MDL2 Assets.
-fn caption_font(window: &Window) -> &'static str {
-    static FONT: OnceLock<&'static str> = OnceLock::new();
-    FONT.get_or_init(|| {
-        if window.text_system().all_font_names().iter().any(|name| name == "Segoe Fluent Icons") {
-            "Segoe Fluent Icons"
-        } else {
-            "Segoe MDL2 Assets"
-        }
-    })
-}
-
-#[derive(Clone, Copy)]
-enum CaptionButton {
-    Minimize,
-    Maximize,
-    Restore,
-    Close,
-}
-
-impl CaptionButton {
-    fn render(self, window: &Window, cx: &App) -> impl IntoElement {
-        let (id, glyph, area, enabled) = match self {
-            Self::Minimize => ("caption-minimize", "\u{e921}", WindowControlArea::Min, window.is_minimizable()),
-            Self::Maximize => ("caption-maximize", "\u{e922}", WindowControlArea::Max, window.is_resizable()),
-            Self::Restore => ("caption-restore", "\u{e923}", WindowControlArea::Max, window.is_resizable()),
-            Self::Close => ("caption-close", "\u{e8bb}", WindowControlArea::Close, true),
-        };
+impl Render for TitleBar {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors();
-        let (hover_bg, hover_fg, active_bg, active_fg) = match self {
-            Self::Close => {
-                let red: Hsla = Rgba { r: 232. / 255., g: 17. / 255., b: 32. / 255., a: 1. }.into();
-                (red, gpui::white(), red.opacity(0.8), gpui::white().opacity(0.8))
-            }
-            _ => (colors.element_hover, colors.text, colors.element_selected, colors.text),
+        let decorations = window.window_decorations();
+        let client_side = matches!(decorations, Decorations::Client { .. });
+        let fullscreen = window.is_fullscreen();
+        let linux = cfg!(any(target_os = "linux", target_os = "freebsd"));
+        let mac = cfg!(target_os = "macos");
+        let windows = cfg!(target_os = "windows");
+        let buttons = if windows {
+            Some(WindowButtonLayout { left: [None; 3], right: [Some(WindowButton::Minimize), Some(WindowButton::Maximize), Some(WindowButton::Close)] })
+        } else if linux && client_side {
+            Some(button_layout(cx))
+        } else {
+            None
         };
+        let side = |buttons: [Option<WindowButton>; 3], id: &'static str| {
+            buttons.iter().any(Option::is_some).then(|| WindowButtons { id, buttons }.into_any_element())
+        };
+        let left_buttons = buttons.and_then(|b| side(b.left, "left-window-buttons")).filter(|_| !fullscreen);
+        let right_buttons = buttons.and_then(|b| side(b.right, "right-window-buttons")).filter(|_| !fullscreen);
+        let background = if linux && !window.is_window_active() { colors.panel_background } else { colors.sidebar_background };
+
         h_flex()
-            .id(id)
-            .justify_center()
-            // Keeps the title bar under the button out of Windows' hit test.
-            .occlude()
-            .w(px(CAPTION_WIDTH))
-            .h_full()
-            .text_size(px(10.))
-            .text_color(if enabled { colors.text_muted } else { colors.text_placeholder })
-            .when(enabled, |el| {
-                el.hover(|style| style.bg(hover_bg).text_color(hover_fg))
-                    .active(|style| style.bg(active_bg).text_color(active_fg))
+            .id("title-bar")
+            .window_control_area(WindowControlArea::Drag)
+            .flex_none()
+            .w_full()
+            .h(height())
+            .bg(background)
+            .border_b_1()
+            .border_color(colors.border)
+            .map(|bar| match decorations {
+                Decorations::Client { tiling } if !windows => bar
+                    .when(!(tiling.top || tiling.left), |bar| bar.rounded_tl(ROUNDING))
+                    .when(!(tiling.top || tiling.right), |bar| bar.rounded_tr(ROUNDING)),
+                _ => bar,
             })
-            .window_control_area(area)
-            .child(glyph)
+            .when(!windows, |bar| {
+                bar.on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, _| this.should_move = true))
+                    .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, _| this.should_move = false))
+                    .on_mouse_down_out(cx.listener(|this, _, _, _| this.should_move = false))
+                    .on_mouse_move(cx.listener(|this, _, window, _| {
+                        if this.should_move {
+                            this.should_move = false;
+                            window.start_window_move();
+                        }
+                    }))
+                    .on_click(move |event, window, _| {
+                        if event.click_count() != 2 {
+                            return;
+                        }
+                        if mac {
+                            window.titlebar_double_click();
+                        } else if window.window_controls().maximize && window.is_resizable() {
+                            window.zoom_window();
+                        }
+                    })
+            })
+            .when(linux && client_side && window.window_controls().window_menu, |bar| {
+                bar.on_mouse_down(MouseButton::Right, |event, window, _| window.show_window_menu(event.position))
+            })
+            .children(left_buttons)
+            .child(
+                h_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .gap_2()
+                    .map(|title| if mac && !fullscreen { title.pl(TRAFFIC_LIGHT_PADDING) } else { title.pl_3() })
+                    .child(gpui::img("icon/icon.svg").size(px(16.)).flex_none())
+                    .child(Label::new("Fern").size(LabelSize::Small).color(Color::Muted)),
+            )
+            .children(right_buttons)
     }
 }
 
-/// The window's frame when the app draws it (Linux, unless the desktop draws it): a border and
-/// a shadow around `content`, and edges that resize the window. Elsewhere `content` as it is.
-pub fn client_side_decorations(content: impl IntoElement, window: &mut Window, cx: &App) -> Stateful<Div> {
-    let decorations = window.window_decorations();
+/// Linux: the desktop's order of the window buttons (GNOME's `button-layout`), or Minimize,
+/// Maximize, Close on the right.
+fn button_layout(cx: &App) -> WindowButtonLayout {
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    {
+        cx.button_layout().unwrap_or_else(WindowButtonLayout::linux_default)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+    {
+        let _ = cx;
+        WindowButtonLayout { left: [None; 3], right: [Some(WindowButton::Minimize), Some(WindowButton::Maximize), Some(WindowButton::Close)] }
+    }
+}
+
+/// The minimize, maximize and close buttons on one side of the bar.
+#[derive(IntoElement)]
+struct WindowButtons {
+    id: &'static str,
+    buttons: [Option<WindowButton>; 3],
+}
+
+impl RenderOnce for WindowButtons {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let controls = window.window_controls();
+        let maximized = window.is_maximized();
+        h_flex()
+            .id(self.id)
+            .h_full()
+            .flex_none()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .children(self.buttons.into_iter().flatten().filter(|button| match button {
+                WindowButton::Minimize => controls.minimize && window.is_minimizable(),
+                WindowButton::Maximize => controls.maximize && window.is_resizable(),
+                WindowButton::Close => true,
+            }).map(|button| window_button(button, maximized, cx)))
+    }
+}
+
+fn window_button(button: WindowButton, maximized: bool, cx: &App) -> impl IntoElement {
+    let colors = cx.theme().colors();
+    let (icon, area) = match button {
+        WindowButton::Minimize => (IconName::WindowMinimize, WindowControlArea::Min),
+        WindowButton::Maximize if maximized => (IconName::WindowRestore, WindowControlArea::Max),
+        WindowButton::Maximize => (IconName::WindowMaximize, WindowControlArea::Max),
+        WindowButton::Close => (IconName::WindowClose, WindowControlArea::Close),
+    };
+    let close = button == WindowButton::Close;
+    let close_red: Hsla = rgb(0xe81123).into();
+    h_flex()
+        .id(button.id())
+        .group(button.id())
+        .h_full()
+        .w(px(44.))
+        .justify_center()
+        .occlude()
+        .window_control_area(area)
+        .hover(|el| el.bg(if close { close_red } else { colors.ghost_element_hover }))
+        .active(|el| el.bg(if close { close_red.opacity(0.8) } else { colors.element_hover }))
+        .child(
+            gpui::svg()
+                .path(icon.path())
+                .size(px(14.))
+                .text_color(colors.icon_muted)
+                .group_hover(button.id(), |el| el.text_color(if close { gpui::white() } else { colors.icon })),
+        )
+        // On Windows the system handles the click through the control area.
+        .when(!cfg!(target_os = "windows"), |el| {
+            el.on_mouse_move(|_, _, cx| cx.stop_propagation()).on_click(move |_, window, cx| {
+                cx.stop_propagation();
+                match button {
+                    WindowButton::Minimize => window.minimize_window(),
+                    WindowButton::Maximize => window.zoom_window(),
+                    WindowButton::Close => window.remove_window(),
+                }
+            })
+        })
+}
+
+/// Wraps the window's content in the frame Fern draws with client-side decorations on Linux:
+/// rounded corners, a border, a shadow, and edges that resize the window. With server-side
+/// decorations, and on macOS and Windows, the content is returned as is.
+pub fn window_frame(content: impl IntoElement, window: &mut Window, cx: &mut App) -> Stateful<Div> {
+    let decorations = if cfg!(any(target_os = "linux", target_os = "freebsd")) { window.window_decorations() } else { Decorations::Server };
     let resizable = window.is_resizable();
     let tiling = match decorations {
         Decorations::Server => Tiling::default(),
@@ -231,62 +219,71 @@ pub fn client_side_decorations(content: impl IntoElement, window: &mut Window, c
         Decorations::Client { .. } => SHADOW,
         Decorations::Server => px(0.),
     });
-    let client = matches!(decorations, Decorations::Client { .. });
 
+    /// The edge under the mouse, to repaint the cursor when it changes.
+    struct HoveredEdge(ResizeEdge);
+    impl Global for HoveredEdge {}
+
+    let client = matches!(decorations, Decorations::Client { .. });
     div()
-        .id("window-backdrop")
+        .id("window-frame")
         .size_full()
-        .when(client, |el| {
-            el.when(!tiling.top, |el| el.pt(SHADOW))
-                .when(!tiling.bottom, |el| el.pb(SHADOW))
-                .when(!tiling.left, |el| el.pl(SHADOW))
-                .when(!tiling.right, |el| el.pr(SHADOW))
-                .when(resizable, |el| {
-                    el.on_mouse_move(move |event, window, _| {
-                        let edge = resize_edge(event.position, window.window_bounds().get_bounds().size, tiling);
-                        if RESIZE_EDGE.replace(edge) != edge {
-                            window.refresh();
-                        }
-                    })
-                    .on_mouse_down(MouseButton::Left, move |event, window, _| {
-                        if let Some(edge) = resize_edge(event.position, window.window_bounds().get_bounds().size, tiling) {
-                            window.start_window_resize(edge);
-                        }
-                    })
+        .bg(transparent_black())
+        .when(client, |frame| {
+            frame
+                .when(!tiling.top, |frame| frame.pt(SHADOW))
+                .when(!tiling.bottom, |frame| frame.pb(SHADOW))
+                .when(!tiling.left, |frame| frame.pl(SHADOW))
+                .when(!tiling.right, |frame| frame.pr(SHADOW))
+                .when(resizable, |frame| {
+                    frame
+                        .on_mouse_move(move |event, window, cx| {
+                            let edge = resize_edge(event.position, window.window_bounds().get_bounds().size, tiling);
+                            if edge != cx.try_global::<HoveredEdge>().map(|edge| edge.0) {
+                                window.refresh();
+                            }
+                        })
+                        .on_mouse_down(MouseButton::Left, move |event, window, _| {
+                            if let Some(edge) = resize_edge(event.position, window.window_bounds().get_bounds().size, tiling) {
+                                window.start_window_resize(edge);
+                            }
+                        })
                 })
         })
         .child(
             div()
                 .size_full()
                 .cursor(CursorStyle::Arrow)
-                .when(client, |el| {
-                    el.border_color(cx.theme().colors().border)
+                .when(client, |content| {
+                    content
+                        .overflow_hidden()
+                        .border_color(cx.theme().colors().border)
+                        .when(!(tiling.top || tiling.left), |el| el.rounded_tl(ROUNDING))
+                        .when(!(tiling.top || tiling.right), |el| el.rounded_tr(ROUNDING))
+                        .when(!(tiling.bottom || tiling.left), |el| el.rounded_bl(ROUNDING))
+                        .when(!(tiling.bottom || tiling.right), |el| el.rounded_br(ROUNDING))
                         .when(!tiling.top, |el| el.border_t_1())
                         .when(!tiling.bottom, |el| el.border_b_1())
                         .when(!tiling.left, |el| el.border_l_1())
                         .when(!tiling.right, |el| el.border_r_1())
                         .when(!tiling.is_tiled(), |el| {
-                            el.shadow(vec![
-                                gpui::BoxShadow::new(px(0.), px(0.), gpui::black().opacity(0.4)).blur_radius(SHADOW / 2.),
-                            ])
+                            el.shadow(vec![gpui::BoxShadow::new(px(0.), px(0.), gpui::black().opacity(0.4)).blur_radius(SHADOW / 2.)])
                         })
                 })
                 .on_mouse_move(|_, _, cx| cx.stop_propagation())
                 .child(content),
         )
-        .when(client && resizable, |el| {
-            // The resize cursor over the edges.
-            el.child(
+        .when(client && resizable, |frame| {
+            frame.child(
                 canvas(
                     |_, window, _| {
-                        let size = window.window_bounds().get_bounds().size;
-                        window.insert_hitbox(gpui::Bounds::new(point(px(0.), px(0.)), size), HitboxBehavior::Normal)
+                        window.insert_hitbox(Bounds::new(point(px(0.), px(0.)), window.window_bounds().get_bounds().size), HitboxBehavior::Normal)
                     },
-                    move |_, hitbox, window, _| {
-                        let Some(edge) = resize_edge(window.mouse_position(), window.window_bounds().get_bounds().size, tiling)
-                        else {
+                    move |_, hitbox, window, cx| {
+                        let Some(edge) = resize_edge(window.mouse_position(), window.window_bounds().get_bounds().size, tiling) else {
                             return;
                         };
+                        cx.set_global(HoveredEdge(edge));
                         let cursor = match edge {
                             ResizeEdge::Top | ResizeEdge::Bottom => CursorStyle::ResizeUpDown,
                             ResizeEdge::Left | ResizeEdge::Right => CursorStyle::ResizeLeftRight,
@@ -302,38 +299,44 @@ pub fn client_side_decorations(content: impl IntoElement, window: &mut Window, c
         })
 }
 
-thread_local! {
-    /// The edge under the pointer, so the frame is drawn again with its cursor when it changes.
-    static RESIZE_EDGE: Cell<Option<ResizeEdge>> = const { Cell::new(None) };
-}
-
-/// The edge or corner of the window at `pos`, as Zed's: the shadow's width along the sides, a
-/// bit more at the corners.
-fn resize_edge(pos: Point<Pixels>, window_size: Size<Pixels>, tiling: Tiling) -> Option<ResizeEdge> {
-    let bounds = gpui::Bounds::new(Point::default(), window_size).inset(SHADOW * 1.5);
-    if bounds.contains(&pos) {
+/// The window edge or corner at `pos`, if it is in the shadow around the window.
+fn resize_edge(pos: Point<Pixels>, window: Size<Pixels>, tiling: Tiling) -> Option<ResizeEdge> {
+    if Bounds::new(Point::default(), window).inset(SHADOW * 1.5).contains(&pos) {
         return None;
     }
-    let corner = gpui::size(SHADOW * 1.5, SHADOW * 1.5);
-    let at = |x, y| gpui::Bounds::new(point(x, y), corner).contains(&pos);
-    let (right, bottom) = (window_size.width - corner.width, window_size.height - corner.height);
-    if !tiling.top && at(px(0.), px(0.)) {
-        Some(ResizeEdge::TopLeft)
-    } else if !tiling.top && at(right, px(0.)) {
-        Some(ResizeEdge::TopRight)
-    } else if !tiling.bottom && at(px(0.), bottom) {
-        Some(ResizeEdge::BottomLeft)
-    } else if !tiling.bottom && at(right, bottom) {
-        Some(ResizeEdge::BottomRight)
-    } else if !tiling.top && pos.y < SHADOW {
-        Some(ResizeEdge::Top)
-    } else if !tiling.bottom && pos.y > window_size.height - SHADOW {
-        Some(ResizeEdge::Bottom)
-    } else if !tiling.left && pos.x < SHADOW {
-        Some(ResizeEdge::Left)
-    } else if !tiling.right && pos.x > window_size.width - SHADOW {
-        Some(ResizeEdge::Right)
-    } else {
-        None
+    let corner = SHADOW * 1.5;
+    let left = pos.x < corner;
+    let right = pos.x > window.width - corner;
+    let top = pos.y < corner;
+    let bottom = pos.y > window.height - corner;
+    match () {
+        _ if !tiling.top && top && left => Some(ResizeEdge::TopLeft),
+        _ if !tiling.top && top && right => Some(ResizeEdge::TopRight),
+        _ if !tiling.bottom && bottom && left => Some(ResizeEdge::BottomLeft),
+        _ if !tiling.bottom && bottom && right => Some(ResizeEdge::BottomRight),
+        _ if !tiling.top && pos.y < SHADOW => Some(ResizeEdge::Top),
+        _ if !tiling.bottom && pos.y > window.height - SHADOW => Some(ResizeEdge::Bottom),
+        _ if !tiling.left && pos.x < SHADOW => Some(ResizeEdge::Left),
+        _ if !tiling.right && pos.x > window.width - SHADOW => Some(ResizeEdge::Right),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::size;
+
+    #[test]
+    fn resize_edges() {
+        let window = size(px(800.), px(600.));
+        let free = Tiling::default();
+        assert_eq!(resize_edge(point(px(400.), px(300.)), window, free), None);
+        assert_eq!(resize_edge(point(px(2.), px(2.)), window, free), Some(ResizeEdge::TopLeft));
+        assert_eq!(resize_edge(point(px(400.), px(598.)), window, free), Some(ResizeEdge::Bottom));
+        assert_eq!(resize_edge(point(px(795.), px(300.)), window, free), Some(ResizeEdge::Right));
+        // A tiled edge can't be dragged.
+        let tiled = Tiling { right: true, ..Tiling::default() };
+        assert_eq!(resize_edge(point(px(795.), px(300.)), window, tiled), None);
     }
 }

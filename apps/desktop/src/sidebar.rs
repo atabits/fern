@@ -120,7 +120,7 @@ pub fn render(
         .w(px(WIDTH))
         .h_full()
         .items_center()
-        .pt(px(12. + crate::TOP_INSET))
+        .pt_3()
         .pb_3()
         .gap_1()
         .bg(colors.sidebar_background)

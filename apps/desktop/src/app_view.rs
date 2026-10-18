@@ -18,6 +18,7 @@ use crate::reminders::{self, Notice, NoticeAction, Notices, Reply, Target};
 use crate::search_modal::{SearchEvent, SearchModal};
 use crate::settings_window::{self, SettingsEvent, SettingsWindow};
 use crate::sidebar::{self, Section};
+use crate::title_bar::{self, TitleBar};
 use crate::todo_view::TodoView;
 
 pub struct AppView {
@@ -29,6 +30,7 @@ pub struct AppView {
     countdown: gpui::Entity<CountdownView>,
     habits: gpui::Entity<HabitView>,
     focus: gpui::Entity<FocusView>,
+    title_bar: gpui::Entity<TitleBar>,
     search: Option<gpui::Entity<SearchModal>>,
     account_menu_open: bool,
     notices: Notices,
@@ -111,6 +113,7 @@ impl AppView {
         // Mutated only by the debug-build dev state below.
         #[cfg_attr(not(debug_assertions), allow(unused_mut))]
         let mut this = Self {
+            title_bar: cx.new(|_| TitleBar::new()),
             store,
             section: Section::Tasks,
             todo,
@@ -953,8 +956,11 @@ impl Render for AppView {
                 .then(|| PopoverAttachment::new(Placement::RightBottom, self.render_notices(cx)).into_any_element()),
         };
 
-        let root = h_flex()
+        let content = h_flex()
             .relative()
+            .flex_1()
+            .min_h_0()
+            .w_full()
             .key_context("Workspace")
             .on_action(cx.listener(Self::new_task))
             .on_action(cx.listener(Self::search))
@@ -969,7 +975,6 @@ impl Render for AppView {
             .on_action(cx.listener(|this, _: &ShowNext7Days, window, cx| {
                 this.show_view(fern_core::View::Next7Days, window, cx)
             }))
-            .size_full()
             .items_start()
             .bg(theme.colors().background)
             .text_color(theme.colors().text)
@@ -977,15 +982,13 @@ impl Render for AppView {
             .when(!self.statistics_open, |el| {
                 el.child(sidebar::render(self.section, self.nav_hovered, on_nav_hover, on_select, on_avatar, account_menu, bell, sync_button, features, cx)).child(match self.section {
                 Section::Tasks | Section::Search => div().flex_1().h_full().child(self.todo.clone()),
-                Section::Calendar => div().flex_1().h_full().pt(px(crate::TOP_INSET)).child(self.calendar.clone()),
-                Section::Matrix => div().flex_1().h_full().pt(px(crate::TOP_INSET)).child(self.matrix.clone()),
-                Section::Countdown => div().flex_1().h_full().pt(px(crate::TOP_INSET)).child(self.countdown.clone()),
-                Section::Habits => div().flex_1().h_full().pt(px(crate::TOP_INSET)).child(self.habits.clone()),
-                    Section::Pomodoro => div().flex_1().h_full().pt(px(crate::TOP_INSET)).child(self.focus.clone()),
+                Section::Calendar => div().flex_1().h_full().child(self.calendar.clone()),
+                Section::Matrix => div().flex_1().h_full().child(self.matrix.clone()),
+                Section::Countdown => div().flex_1().h_full().child(self.countdown.clone()),
+                Section::Habits => div().flex_1().h_full().child(self.habits.clone()),
+                    Section::Pomodoro => div().flex_1().h_full().child(self.focus.clone()),
                 })
             })
-            // Over the columns but under the dialogs, which keep their own clicks.
-            .child(crate::title_bar::render(window, cx))
             .when(self.shortcuts_open, |el| el.child(self.render_shortcuts(cx)))
             .when_some(self.settings.clone(), |el, settings| {
                 el.child(
@@ -1004,7 +1007,13 @@ impl Render for AppView {
             .when_some(self.search.clone(), |el, search| {
                 el.child(div().absolute().top(px(160.)).left_0().right_0().flex().justify_center().child(search))
             });
-        crate::title_bar::client_side_decorations(root, window, cx)
+        let root = v_flex()
+            .size_full()
+            .bg(theme.colors().background)
+            .text_color(theme.colors().text)
+            .child(self.title_bar.clone())
+            .child(content);
+        title_bar::window_frame(root, window, cx)
     }
 }
 

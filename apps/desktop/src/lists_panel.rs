@@ -526,7 +526,7 @@ pub fn render(
     v_flex()
         .flex_none()
         .w(px(WIDTH))
-        .pt(px(crate::TOP_INSET))
+        
         .h_full()
         .bg(colors.panel_background)
         .border_r_1()

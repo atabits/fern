@@ -215,6 +215,7 @@ server), you must publish its source under the same license.
 Third-party components:
 
 - [GPUI](https://github.com/zed-industries/zed): Apache-2.0. `apps/desktop/src/text_input.rs` started from GPUI's `examples/input.rs`.
+- [Zed](https://github.com/zed-industries/zed): GPL-3.0-or-later. `apps/desktop/src/title_bar.rs` follows its `platform_title_bar` and `client_side_decorations`.
 - Icons from [Lucide](https://lucide.dev): ISC. See `assets/icons/LICENSE`.
 - [IBM Plex Sans](https://github.com/IBM/plex) for the UI and IBM Plex Serif for the countdown numbers: SIL Open Font License 1.1. See `assets/fonts/OFL.txt`.
 

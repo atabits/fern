@@ -1,10 +1,6 @@
 // A release build on Windows opens no console window next to the app.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
-/// Every column starts this far down: the app's own title bar, which moves the window and holds
-/// its buttons (see `title_bar`).
-pub const TOP_INSET: f32 = title_bar::HEIGHT;
-
 mod actions;
 mod app_view;
 
@@ -45,7 +41,7 @@ use std::rc::Rc;
 
 use anyhow::{Context as _, Result};
 use fern_core::Store;
-use gpui::{App, Bounds, WindowBounds, WindowDecorations, WindowOptions, prelude::*, px, size};
+use gpui::{App, Bounds, WindowBounds, WindowOptions, prelude::*, px, size};
 
 use crate::actions::Quit;
 use crate::app_view::AppView;
@@ -138,12 +134,13 @@ fn main() -> Result<()> {
         cx.on_action(|_: &Quit, cx| cx.quit());
 
         let bounds = Bounds::centered(None, size(px(1280.), px(760.)), cx);
+        let (titlebar, decorations) = title_bar::window_options();
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
-                // The app draws its own title bar on every platform (`title_bar`).
-                titlebar: Some(title_bar::titlebar_options()),
-                window_decorations: Some(WindowDecorations::Client),
+                titlebar: Some(titlebar),
+                window_decorations: Some(decorations),
+                // macOS: the app moves the window from its own title bar.
                 app_owns_titlebar_drag: true,
                 // Overridable so that window-manager rules can target dev builds (used for UI screenshots).
                 app_id: Some(std::env::var("FERN_APP_ID").unwrap_or_else(|_| "fern-tasks".into())),

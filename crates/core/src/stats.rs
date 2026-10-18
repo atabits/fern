@@ -1,6 +1,6 @@
 //! Task statistics for the Statistics page's Overview and Task tabs.
 
-use chrono::{Duration, Local, NaiveDate, TimeZone};
+use chrono::{Datelike, Duration, Local, Months, NaiveDate, TimeZone, Weekday};
 
 use crate::focus::FocusSession;
 use crate::model::{Id, Task};
@@ -63,6 +63,96 @@ pub fn days_using(tasks: &[Task], today: NaiveDate) -> i64 {
 /// The previous day, for "from yesterday".
 pub fn yesterday(day: NaiveDate) -> NaiveDate {
     day - Duration::days(1)
+}
+
+/// The period of each point on the Overview's curves: the original's Day / Week / Month switch.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Bucket {
+    #[default]
+    Day,
+    Week,
+    Month,
+}
+
+impl Bucket {
+    pub const ALL: [Bucket; 3] = [Bucket::Day, Bucket::Week, Bucket::Month];
+}
+
+/// The last `count` periods up to the one containing `today`, oldest first, as (first, last) days.
+pub fn buckets(bucket: Bucket, today: NaiveDate, week_start: Weekday, count: usize) -> Vec<(NaiveDate, NaiveDate)> {
+    (0..count as i64)
+        .rev()
+        .map(|back| match bucket {
+            Bucket::Day => {
+                let day = today - Duration::days(back);
+                (day, day)
+            }
+            Bucket::Week => {
+                let offset = (today.weekday().num_days_from_monday() + 7 - week_start.num_days_from_monday()) % 7;
+                let first = today - Duration::days(offset as i64) - Duration::weeks(back);
+                (first, first + Duration::days(6))
+            }
+            Bucket::Month => {
+                let first = today.with_day(1).expect("every month has a first day") - Months::new(back as u32);
+                (first, first + Months::new(1) - Duration::days(1))
+            }
+        })
+        .collect()
+}
+
+/// Tasks completed in each period.
+pub fn completed_in(tasks: &[Task], periods: &[(NaiveDate, NaiveDate)]) -> Vec<usize> {
+    let days: Vec<NaiveDate> = tasks.iter().filter(|t| !t.is_deleted()).filter_map(completed_on).collect();
+    periods.iter().map(|(first, last)| days.iter().filter(|d| *d >= first && *d <= last).count()).collect()
+}
+
+/// The completion rate of each period, in whole percent: completed of the period's tasks.
+pub fn completion_rate_in(tasks: &[Task], periods: &[(NaiveDate, NaiveDate)]) -> Vec<u32> {
+    periods
+        .iter()
+        .map(|(first, last)| {
+            let (done, total) = tasks
+                .iter()
+                .filter(|t| !t.is_deleted() && !t.is_wont_do())
+                .filter(|t| {
+                    let day = completed_on(t).or(if t.is_completed() { None } else { t.due_date });
+                    day.is_some_and(|d| d >= *first && d <= *last)
+                })
+                .fold((0, 0), |(done, total), t| (done + t.is_completed() as u32, total + 1));
+            if total == 0 { 0 } else { done * 100 / total }
+        })
+        .collect()
+}
+
+/// Focus sessions and focused minutes in each period.
+pub fn focus_in(sessions: &[FocusSession], periods: &[(NaiveDate, NaiveDate)]) -> Vec<(usize, i64)> {
+    periods
+        .iter()
+        .map(|(first, last)| {
+            sessions
+                .iter()
+                .filter(|s| {
+                    let day = s.start_local().date_naive();
+                    day >= *first && day <= *last
+                })
+                .fold((0, 0), |(count, minutes), s| (count + 1, minutes + (s.ended_at - s.started_at) / 60_000))
+        })
+        .collect()
+}
+
+/// "You are more productive than N%": the share of earlier days, since the first task, on which
+/// fewer tasks were completed than today. The original compares with other people; Fern, being
+/// self-hosted, compares with your own history.
+pub fn more_productive_than(tasks: &[Task], today: NaiveDate) -> u32 {
+    let days = days_using(tasks, today) - 1;
+    if days <= 0 {
+        return 0;
+    }
+    let first = today - Duration::days(days);
+    let counts = completed_by_day(tasks, first, days as usize + 1);
+    let today_count = counts[days as usize];
+    let fewer = counts[..days as usize].iter().filter(|c| **c < today_count).count();
+    (fewer * 100 / days as usize) as u32
 }
 
 /// Points for "My Achievement Score". The original does not publish its rules, so Fern uses its
@@ -167,5 +257,28 @@ mod tests {
         assert_eq!(achievement_level(150), 3);
         assert_eq!(achievement_level(299), 3);
         assert_eq!(achievement_level(300), 4);
+    }
+
+    #[test]
+    fn periods_and_productivity() {
+        let sunday = NaiveDate::from_ymd_opt(2026, 10, 18).unwrap();
+        let d = |m, day| NaiveDate::from_ymd_opt(2026, m, day).unwrap();
+        assert_eq!(buckets(Bucket::Day, sunday, Weekday::Mon, 2), [(d(10, 17), d(10, 17)), (sunday, sunday)]);
+        assert_eq!(buckets(Bucket::Week, sunday, Weekday::Mon, 2), [(d(10, 5), d(10, 11)), (d(10, 12), d(10, 18))]);
+        assert_eq!(buckets(Bucket::Month, sunday, Weekday::Mon, 2), [(d(9, 1), d(9, 30)), (d(10, 1), d(10, 31))]);
+
+        let store = Store::open_in_memory().unwrap();
+        let today = Local::now().date_naive();
+        let done = store.add_task("done").unwrap();
+        store.set_due(done.id, Some(today), None).unwrap();
+        store.set_completed(done.id, true).unwrap();
+        let open = store.add_task("open").unwrap();
+        store.set_due(open.id, Some(today), None).unwrap();
+        let tasks = store.tasks().unwrap();
+        let this_week = buckets(Bucket::Week, today, Weekday::Mon, 1);
+        assert_eq!(completed_in(&tasks, &this_week), [1]);
+        assert_eq!(completion_rate_in(&tasks, &this_week), [50]);
+        // Only today so far: nothing to compare with.
+        assert_eq!(more_productive_than(&tasks, today), 0);
     }
 }

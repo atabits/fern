@@ -6,6 +6,7 @@ use std::rc::Rc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chrono::{Datelike, Local, NaiveDate};
+use fern_core::stats::{self, Bucket};
 use fern_core::{FocusSession, Id, Store, Task, View, focus_stats, format_minutes};
 use gpui::{Entity, FontWeight, Task as GpuiTask};
 use ui::{Placement, PopoverAttachment, popover};
@@ -63,6 +64,10 @@ struct StatsPage {
     year: i32,
     /// The Task tab's day.
     day: NaiveDate,
+    /// The Overview's curves (completion, rate, pomos, focus): Day, Week or Month points.
+    curves: [Bucket; 4],
+    /// The curve whose period menu is open.
+    curve_menu: Option<usize>,
 }
 
 /// Bars for the statistics charts, with a label under each; `highlight` marks one bar.
@@ -85,10 +90,11 @@ fn bar_chart(values: &[i64], labels: Vec<String>, highlight: Option<usize>, heig
 
 /// A smooth line with a shaded area under it, scaled between the values' minimum and maximum,
 /// as in the original's "My Achievement Score".
-fn line_chart(values: &[i64], labels: Vec<String>, height: f32, cx: &App) -> Div {
+/// `from_zero` starts the scale at zero (counts); otherwise at the lowest value (the score).
+fn line_chart(values: &[i64], labels: Vec<String>, height: f32, from_zero: bool, cx: &App) -> Div {
     let colors = cx.theme().colors();
     let (accent, dot) = (colors.accent, colors.text);
-    let low = values.iter().copied().min().unwrap_or(0);
+    let low = if from_zero { 0 } else { values.iter().copied().min().unwrap_or(0) };
     let high = values.iter().copied().max().unwrap_or(0).max(low + 1);
     let values = values.to_vec();
     let axis = |v: i64| Label::new(v.to_string()).size(LabelSize::XSmall).color(Color::Muted);
@@ -471,6 +477,8 @@ impl FocusView {
             week: crate::calendar::week_of(today)[0],
             month: crate::calendar::month_start(today),
             year: today.year(),
+            curves: [Bucket::Day; 4],
+            curve_menu: None,
         });
         cx.notify();
     }
@@ -697,7 +705,7 @@ impl FocusView {
                     ),
             )
             .map(|el| match page.tab {
-                0 => el.children(self.render_overview_tab(today, cx)),
+                0 => el.children(self.render_overview_tab(page, today, cx)),
                 1 => el.children(self.render_task_tab(page.day, today, cx)),
                 _ => el
                     .child(overview)
@@ -708,7 +716,7 @@ impl FocusView {
     }
 
     /// The Statistics page's Overview tab: totals, recent curves and the week's habits.
-    fn render_overview_tab(&self, today: NaiveDate, cx: &mut Context<Self>) -> Vec<AnyElement> {
+    fn render_overview_tab(&self, page: StatsPage, today: NaiveDate, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let strings = i18n::t(cx);
         let theme = cx.theme().clone();
         let tasks = self.store.tasks().unwrap_or_default();
@@ -734,16 +742,29 @@ impl FocusView {
             .replace("{completed}", &completed_total.to_string())
             .replace("{lists}", &lists.len().to_string())
             .replace("{days}", &fern_core::stats::days_using(&tasks, today).to_string());
-        let rates: Vec<i64> = (0..7)
-            .map(|i| fern_core::stats::completion_rate(&tasks, start + chrono::Duration::days(i)).unwrap_or(0) as i64)
-            .collect();
-        let pomos: Vec<i64> = (0..7)
-            .map(|i| {
-                let day = start + chrono::Duration::days(i);
-                self.sessions.iter().filter(|s| s.start_local().date_naive() == day).count() as i64
-            })
-            .collect();
-        let minutes = fern_core::focus::minutes_by_day(&self.sessions, start, 7);
+        // Each curve has its own Day / Week / Month switch, as in the original.
+        let periods = |curve: usize| stats::buckets(page.curves[curve], today, crate::calendar::week_start(), 7);
+        let labels = |curve: usize| -> Vec<String> {
+            let bucket = page.curves[curve];
+            let periods = periods(curve);
+            let last = periods.len() - 1;
+            periods
+                .iter()
+                .enumerate()
+                .map(|(i, (first, _))| match bucket {
+                    Bucket::Day if i == last => strings.today.to_owned(),
+                    Bucket::Week if i == last => strings.stats_this_week.to_owned(),
+                    Bucket::Month if i == last => strings.stats_this_month.to_owned(),
+                    Bucket::Month => strings.months_short[first.month0() as usize].to_owned(),
+                    _ => first.day().to_string(),
+                })
+                .collect()
+        };
+        let completed_curve: Vec<i64> = stats::completed_in(&tasks, &periods(0)).into_iter().map(|n| n as i64).collect();
+        let rates: Vec<i64> = stats::completion_rate_in(&tasks, &periods(1)).into_iter().map(i64::from).collect();
+        let pomos: Vec<i64> = stats::focus_in(&self.sessions, &periods(2)).into_iter().map(|(n, _)| n as i64).collect();
+        let minutes: Vec<i64> = stats::focus_in(&self.sessions, &periods(3)).into_iter().map(|(_, m)| m).collect();
+        let productive = stats::more_productive_than(&tasks, today);
         let checkins: Vec<NaiveDate> = self
             .store
             .habits()
@@ -753,11 +774,64 @@ impl FocusView {
             .collect();
         let scores = fern_core::stats::achievement_scores(&tasks, &self.sessions, &checkins, start, 7);
         let score = scores.last().copied().unwrap_or(0);
-        let chart = |title: &'static str, values: Vec<i64>| {
+        let chart = |curve: usize, title: &'static str, values: Vec<i64>, line: bool, cx: &mut Context<Self>| {
+            let bucket = page.curves[curve];
+            let open = page.curve_menu == Some(curve);
+            let names = [strings.stats_day, strings.stats_week, strings.stats_month];
+            let index = Bucket::ALL.iter().position(|b| *b == bucket).unwrap_or(0);
+            let menu = open.then(|| {
+                PopoverAttachment::new(
+                    Placement::BelowRight,
+                    popover(cx)
+                        .w(px(140.))
+                        .on_mouse_down_out(cx.listener(|this, _, _, cx| this.update_stats(cx, |p| p.curve_menu = None)))
+                        .children(Bucket::ALL.into_iter().zip(names).enumerate().map(|(i, (choice, name))| {
+                            ListItem::new(SharedString::from(format!("curve-{curve}-{i}")))
+                                .child(Label::new(name).color(if choice == bucket { Color::Accent } else { Color::Default }))
+                                .when(choice == bucket, |item| {
+                                    item.end_slot(Icon::new(IconName::Check).size(IconSize::Small).color(Color::Accent))
+                                })
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.update_stats(cx, |p| {
+                                        p.curves[curve] = choice;
+                                        p.curve_menu = None;
+                                    })
+                                }))
+                        })),
+                )
+            });
+            let labels = labels(curve);
             card()
                 .flex_1()
-                .child(Label::new(title).weight(FontWeight::SEMIBOLD))
-                .child(bar_chart(&values, day_labels.clone(), Some(6), 120., cx))
+                .child(
+                    h_flex()
+                        .child(div().flex_1().child(Label::new(title).weight(FontWeight::SEMIBOLD)))
+                        .child(
+                            h_flex()
+                                .id(SharedString::from(format!("curve-period-{curve}")))
+                                .relative()
+                                .px_2()
+                                .h(px(22.))
+                                .gap_0p5()
+                                .rounded(px(11.))
+                                .border_1()
+                                .border_color(if open { theme.colors().accent } else { theme.colors().border })
+                                .cursor_pointer()
+                                .child(Label::new(names[index]).size(LabelSize::XSmall))
+                                .child(Icon::new(IconName::ChevronDown).size(IconSize::XSmall).color(Color::Muted))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.update_stats(cx, |p| p.curve_menu = (!open).then_some(curve))
+                                }))
+                                .children(menu),
+                        ),
+                )
+                .map(|el| {
+                    if line {
+                        el.child(line_chart(&values, labels, 120., true, cx))
+                    } else {
+                        el.child(bar_chart(&values, labels, Some(6), 120., cx))
+                    }
+                })
         };
 
         // The week's habits: the share of active habits done each day.
@@ -788,7 +862,18 @@ impl FocusView {
                 .py_2()
                 .rounded(px(10.))
                 .bg(theme.colors().surface_background)
-                .child(Label::new(summary).size(LabelSize::Small))
+                .flex()
+                .child(div().flex_1().child(Label::new(summary).size(LabelSize::Small)))
+                .child(
+                    h_flex().gap_1().children({
+                        let (before, after) = strings.stats_more_productive.split_once("{n}").unwrap_or((strings.stats_more_productive, ""));
+                        [
+                            Label::new(before.trim_end()).size(LabelSize::Small).color(Color::Muted),
+                            Label::new(format!("{productive}%")).size(LabelSize::Small).color(Color::Warning),
+                            Label::new(after.trim_start()).size(LabelSize::Small).color(Color::Muted),
+                        ]
+                    }),
+                )
                 .into_any_element(),
             h_flex()
                 .items_stretch()
@@ -834,20 +919,20 @@ impl FocusView {
                                         ),
                                 ),
                         )
-                        .child(line_chart(&scores, day_labels.clone(), 110., cx)),
+                        .child(line_chart(&scores, day_labels.clone(), 110., false, cx)),
                 )
                 .into_any_element(),
             h_flex()
                 .items_start()
                 .gap_4()
-                .child(chart(strings.stats_completion_curve, completed.iter().map(|n| *n as i64).collect()))
-                .child(chart(strings.stats_rate_curve, rates))
+                .child(chart(0, strings.stats_completion_curve, completed_curve, true, cx))
+                .child(chart(1, strings.stats_rate_curve, rates, false, cx))
                 .into_any_element(),
             h_flex()
                 .items_start()
                 .gap_4()
-                .child(chart(strings.stats_pomo_curve, pomos))
-                .child(chart(strings.stats_focus_curve, minutes))
+                .child(chart(2, strings.stats_pomo_curve, pomos, true, cx))
+                .child(chart(3, strings.stats_focus_curve, minutes, false, cx))
                 .into_any_element(),
             card().child(Label::new(strings.stats_weekly_habits).weight(FontWeight::SEMIBOLD)).child(habit_week).into_any_element(),
         ]
@@ -922,6 +1007,17 @@ impl FocusView {
             "settings" => RecordMenu::Settings,
             "stopwatch" => {
                 self.set_stopwatch_mode(true, cx);
+                return;
+            }
+            // The Overview with the completion curve by week and its period menu open.
+            "stats-curves" => {
+                self.open_stats(cx);
+                self.update_stats(cx, |p| {
+                    p.tab = 0;
+                    p.curves[0] = Bucket::Week;
+                    p.curves[2] = Bucket::Month;
+                    p.curve_menu = Some(1);
+                });
                 return;
             }
             "stats" | "stats-overview" | "stats-task" => {

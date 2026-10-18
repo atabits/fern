@@ -381,6 +381,17 @@ impl TodoView {
                         self.reload(cx);
                     }
                 }
+                // `estimate=<title part>>p3|m90`: an Estimation, as Start Focus → Estimation sets it.
+                Some(("estimate", spec)) => {
+                    let all = self.store.tasks().unwrap_or_default();
+                    if let Some((needle, value)) = spec.split_once('>')
+                        && let Some(task) = all.iter().find(|t| t.title.contains(needle))
+                    {
+                        let estimate = fern_core::Estimate::from_storage(&value.replacen(['p', 'm'], &format!("{}:", &value[..1]), 1));
+                        self.store.set_estimate(task.id, estimate).ok();
+                        self.reload(cx);
+                    }
+                }
                 Some(("select", needle)) => {
                     if let Some(id) = self.tasks.iter().find(|t| t.title.contains(needle)).map(|t| t.id) {
                         self.select(id, cx);

@@ -1754,6 +1754,24 @@ impl TaskDetail {
             .flex_wrap()
             .gap_1()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            // The Estimation (Start Focus → Estimation), which opens it again.
+            .children(self.task.as_ref().and_then(|t| t.estimate).map(|estimate| {
+                let text = match estimate {
+                    fern_core::Estimate::Pomos(n) => format!("{n} {}", strings.pomo_unit),
+                    fern_core::Estimate::Minutes(n) => fern_core::format_minutes(n as i64),
+                };
+                h_flex()
+                    .id("estimate-chip")
+                    .h(px(18.))
+                    .px(px(6.))
+                    .gap_1()
+                    .rounded_full()
+                    .cursor_pointer()
+                    .bg(theme.colors().accent.opacity(0.2))
+                    .child(Icon::new(IconName::CircleDot).size(IconSize::XSmall).color(Color::Accent))
+                    .child(Label::new(text).size(LabelSize::XSmall).color(Color::Accent))
+                    .on_click(cx.listener(|this, _, _, cx| this.open_popup(Popup::Estimate, cx)))
+            }))
             .children(self.task_tags().into_iter().map(|tag| {
                 let name = tag.clone();
                 Chip::new(tag.clone(), self.tag_color(&tag, cx)).end_slot(

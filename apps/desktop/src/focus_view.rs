@@ -54,9 +54,30 @@ pub struct FocusView {
 /// What the Statistics page shows: the Trends week, the Most Focused Time month and the year.
 #[derive(Clone, Copy)]
 struct StatsPage {
+    tab: usize,
     week: NaiveDate,
     month: NaiveDate,
     year: i32,
+    /// The Task tab's day.
+    day: NaiveDate,
+}
+
+/// Bars for the statistics charts, with a label under each; `highlight` marks one bar.
+fn bar_chart(values: &[i64], labels: Vec<String>, highlight: Option<usize>, height: f32, cx: &App) -> Div {
+    let colors = cx.theme().colors();
+    let top = values.iter().copied().max().unwrap_or(0).max(1) as f32;
+    v_flex()
+        .gap_1()
+        .child(h_flex().h(px(height)).items_end().gap_1().children(values.iter().enumerate().map(|(i, v)| {
+            div()
+                .flex_1()
+                .h(px((height * *v as f32 / top).max(if *v > 0 { 2. } else { 0. })))
+                .rounded_t(px(3.))
+                .bg(if highlight == Some(i) { colors.accent } else { colors.accent.opacity(0.6) })
+        })))
+        .child(h_flex().gap_1().children(labels.into_iter().map(|l| {
+            div().flex_1().flex().justify_center().child(Label::new(l).size(LabelSize::XSmall).color(Color::Muted))
+        })))
 }
 
 /// The Focus Record's "+" form and "…" menu, as in the original.
@@ -343,6 +364,8 @@ impl FocusView {
         let today = Local::now().date_naive();
         self.record_menu = None;
         self.stats = Some(StatsPage {
+            tab: 2,
+            day: today,
             week: crate::calendar::week_of(today)[0],
             month: crate::calendar::month_start(today),
             year: today.year(),
@@ -524,6 +547,22 @@ impl FocusView {
             .child(
                 h_flex()
                     .child(div().flex_1().child(div().text_size(px(24.)).font_weight(FontWeight::BOLD).child(strings.statistics)))
+                    .child(h_flex().p_0p5().rounded(px(16.)).bg(theme.colors().surface_background).children(
+                        strings.stats_tabs.iter().enumerate().map(|(i, label)| {
+                            div()
+                                .id(SharedString::from(format!("stats-tab-{i}")))
+                                .px_4()
+                                .h(px(28.))
+                                .flex()
+                                .items_center()
+                                .rounded(px(14.))
+                                .cursor_pointer()
+                                .when(i == page.tab, |el| el.bg(theme.colors().element_selected))
+                                .child(Label::new(*label).size(LabelSize::Small))
+                                .on_click(cx.listener(move |this, _, _, cx| this.update_stats(cx, |p| p.tab = i)))
+                        }),
+                    ))
+                    .child(div().flex_1())
                     .child(
                         div()
                             .id("stats-done")
@@ -541,10 +580,182 @@ impl FocusView {
                             })),
                     ),
             )
-            .child(overview)
-            .child(h_flex().items_start().gap_4().child(trends).child(most_focused))
-            .child(year_grid)
+            .map(|el| match page.tab {
+                0 => el.children(self.render_overview_tab(today, cx)),
+                1 => el.children(self.render_task_tab(page.day, today, cx)),
+                _ => el
+                    .child(overview)
+                    .child(h_flex().items_start().gap_4().child(trends).child(most_focused))
+                    .child(year_grid),
+            })
             .into_any_element()
+    }
+
+    /// The Statistics page's Overview tab: totals, recent curves and the week's habits.
+    fn render_overview_tab(&self, today: NaiveDate, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let strings = i18n::t(cx);
+        let theme = cx.theme().clone();
+        let tasks = self.store.tasks().unwrap_or_default();
+        let lists = self.store.lists().unwrap_or_default();
+        let focus = focus_stats(&self.sessions, today);
+        let completed_total = tasks.iter().filter(|t| t.is_completed() && !t.is_deleted()).count();
+        let open_total = tasks.iter().filter(|t| !t.is_closed() && !t.is_deleted()).count();
+        let start = today - chrono::Duration::days(6);
+        let completed = fern_core::stats::completed_by_day(&tasks, start, 7);
+        let card = || v_flex().min_w_0().p_4().gap_2().rounded(px(10.)).bg(theme.colors().surface_background);
+        let day_labels: Vec<String> =
+            (0..7).map(|i| (start + chrono::Duration::days(i)).day().to_string()).collect();
+        let value = |v: String, label: &'static str| {
+            v_flex()
+                .flex_1()
+                .items_center()
+                .child(div().text_size(px(22.)).text_color(theme.colors().accent).child(v))
+                .child(Label::new(label).size(LabelSize::XSmall).color(Color::Muted))
+        };
+        let summary = strings
+            .stats_summary
+            .replace("{tasks}", &open_total.to_string())
+            .replace("{completed}", &completed_total.to_string())
+            .replace("{lists}", &lists.len().to_string())
+            .replace("{days}", &fern_core::stats::days_using(&tasks, today).to_string());
+        let rates: Vec<i64> = (0..7)
+            .map(|i| fern_core::stats::completion_rate(&tasks, start + chrono::Duration::days(i)).unwrap_or(0) as i64)
+            .collect();
+        let pomos: Vec<i64> = (0..7)
+            .map(|i| {
+                let day = start + chrono::Duration::days(i);
+                self.sessions.iter().filter(|s| s.start_local().date_naive() == day).count() as i64
+            })
+            .collect();
+        let minutes = fern_core::focus::minutes_by_day(&self.sessions, start, 7);
+        let chart = |title: &'static str, values: Vec<i64>| {
+            card()
+                .flex_1()
+                .child(Label::new(title).weight(FontWeight::SEMIBOLD))
+                .child(bar_chart(&values, day_labels.clone(), Some(6), 120., cx))
+        };
+
+        // The week's habits: the share of active habits done each day.
+        let habits: Vec<fern_core::Habit> = self.store.habits().unwrap_or_default().into_iter().filter(|h| !h.archived).collect();
+        let done: Vec<std::collections::HashSet<NaiveDate>> =
+            habits.iter().map(|h| self.store.checkins(h.id).unwrap_or_default()).collect();
+        let week = crate::calendar::week_of(today);
+        let habit_week = h_flex().justify_between().children(week.iter().enumerate().map(|(i, date)| {
+            let share = if habits.is_empty() { 0. } else { done.iter().filter(|d| d.contains(date)).count() as f32 / habits.len() as f32 };
+            v_flex()
+                .items_center()
+                .gap_1()
+                .child(
+                    div()
+                        .size(px(28.))
+                        .rounded_full()
+                        .border_2()
+                        .border_color(if share >= 1. { theme.colors().accent } else { theme.colors().element_hover })
+                        .when(share > 0. && share < 1., |el| el.bg(theme.colors().accent.opacity(0.3)))
+                        .when(share >= 1., |el| el.bg(theme.colors().accent.opacity(0.6))),
+                )
+                .child(Label::new(strings.weekdays_short[i]).size(LabelSize::XSmall).color(Color::Muted))
+        }));
+
+        vec![
+            div()
+                .px_4()
+                .py_2()
+                .rounded(px(10.))
+                .bg(theme.colors().surface_background)
+                .child(Label::new(summary).size(LabelSize::Small))
+                .into_any_element(),
+            card()
+                .child(Label::new(strings.focus_overview).weight(FontWeight::SEMIBOLD))
+                .child(
+                    h_flex()
+                        .child(value(completed[6].to_string(), strings.stats_today_completed))
+                        .child(value(focus.today_count.to_string(), strings.focus_today_pomo))
+                        .child(value(format_minutes(focus.today_minutes), strings.focus_today_focus)),
+                )
+                .child(
+                    h_flex()
+                        .child(value(completed_total.to_string(), strings.stats_total_completed))
+                        .child(value(focus.total_count.to_string(), strings.focus_total_pomo))
+                        .child(value(format_minutes(focus.total_minutes), strings.focus_total_duration)),
+                )
+                .into_any_element(),
+            h_flex()
+                .items_start()
+                .gap_4()
+                .child(chart(strings.stats_completion_curve, completed.iter().map(|n| *n as i64).collect()))
+                .child(chart(strings.stats_rate_curve, rates))
+                .into_any_element(),
+            h_flex()
+                .items_start()
+                .gap_4()
+                .child(chart(strings.stats_pomo_curve, pomos))
+                .child(chart(strings.stats_focus_curve, minutes))
+                .into_any_element(),
+            card().child(Label::new(strings.stats_weekly_habits).weight(FontWeight::SEMIBOLD)).child(habit_week).into_any_element(),
+        ]
+    }
+
+    /// The Statistics page's Task tab: a day's completed tasks and rate, and completion per list.
+    fn render_task_tab(&self, day: NaiveDate, today: NaiveDate, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let strings = i18n::t(cx);
+        let theme = cx.theme().clone();
+        let tasks = self.store.tasks().unwrap_or_default();
+        let lists = self.store.lists().unwrap_or_default();
+        let yesterday = fern_core::stats::yesterday(day);
+        let count = |d: NaiveDate| fern_core::stats::completed_by_day(&tasks, d, 1)[0] as i64;
+        let rate = |d: NaiveDate| fern_core::stats::completion_rate(&tasks, d).unwrap_or(0) as i64;
+        let signed = |n: i64, unit: &str| if n > 0 { format!("+{n}{unit}") } else { format!("{n}{unit}") };
+        let card = || v_flex().min_w_0().p_4().gap_2().rounded(px(10.)).bg(theme.colors().surface_background);
+        let value = |v: String, label: &'static str, change: String| {
+            v_flex()
+                .flex_1()
+                .items_center()
+                .child(div().text_size(px(26.)).text_color(theme.colors().accent).child(v))
+                .child(Label::new(label).size(LabelSize::XSmall).color(Color::Muted))
+                .child(Label::new(strings.stats_from_yesterday.replace("{n}", &change)).size(LabelSize::XSmall).color(Color::Muted))
+        };
+        let day_label = if day == today { strings.today.to_owned() } else { crate::task_rows::short_date(day, strings) };
+        let by_list = fern_core::stats::completed_by_list(&tasks, day);
+        let most = by_list.first().map_or(1, |(_, n)| *n).max(1) as f32;
+        vec![
+            h_flex()
+                .gap_1()
+                .child(IconButton::new("task-day-back", IconName::ChevronLeft).on_click(cx.listener(|this, _, _, cx| {
+                    this.update_stats(cx, |p| p.day -= chrono::Duration::days(1))
+                })))
+                .child(Label::new(day_label).size(LabelSize::Small))
+                .child(IconButton::new("task-day-forward", IconName::ChevronRight).on_click(cx.listener(|this, _, _, cx| {
+                    this.update_stats(cx, |p| p.day += chrono::Duration::days(1))
+                })))
+                .into_any_element(),
+            card()
+                .child(Label::new(strings.focus_overview).weight(FontWeight::SEMIBOLD))
+                .child(
+                    h_flex()
+                        .child(value(count(day).to_string(), strings.stats_completed_tasks, signed(count(day) - count(yesterday), "")))
+                        .child(value(format!("{}%", rate(day)), strings.stats_completion_rate, signed(rate(day) - rate(yesterday), "%"))),
+                )
+                .into_any_element(),
+            card()
+                .child(Label::new(strings.stats_by_list).weight(FontWeight::SEMIBOLD))
+                .when(by_list.is_empty(), |el| el.child(Label::new(strings.stats_no_data).color(Color::Muted)))
+                .children(by_list.into_iter().map(|(list, n)| {
+                    let name: SharedString = list
+                        .and_then(|id| lists.iter().find(|l| l.id == id))
+                        .map_or(strings.inbox.into(), |l| l.name.clone().into());
+                    h_flex()
+                        .gap_2()
+                        .child(div().w(px(140.)).child(Label::new(name).size(LabelSize::Small).truncate()))
+                        .child(
+                            div().flex_1().h(px(10.)).rounded(px(5.)).bg(theme.colors().element_hover).child(
+                                div().h_full().w(gpui::relative(n as f32 / most)).rounded(px(5.)).bg(theme.colors().accent),
+                            ),
+                        )
+                        .child(Label::new(n.to_string()).size(LabelSize::Small))
+                }))
+                .into_any_element(),
+        ]
     }
 
     #[cfg(debug_assertions)]
@@ -552,8 +763,14 @@ impl FocusView {
         let menu = match menu {
             "add" => RecordMenu::Add,
             "settings" => RecordMenu::Settings,
-            "stats" => {
+            "stats" | "stats-overview" | "stats-task" => {
                 self.open_stats(cx);
+                let tab = match menu {
+                    "stats-overview" => 0,
+                    "stats-task" => 1,
+                    _ => 2,
+                };
+                self.update_stats(cx, |p| p.tab = tab);
                 return;
             }
             _ => RecordMenu::More,

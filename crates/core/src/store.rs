@@ -272,6 +272,14 @@ const MIGRATIONS: &[&str] = &[
     "
     ALTER TABLE tasks ADD COLUMN estimate TEXT;
     ",
+    "
+    CREATE TABLE summary_templates (
+        id         TEXT PRIMARY KEY,
+        name       TEXT NOT NULL,
+        options    TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+    );
+    ",
 ];
 
 const TASK_COLUMNS: &str = "id, parent_id, kind, title, notes, priority, due_date, due_time, \

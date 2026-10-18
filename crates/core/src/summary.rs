@@ -242,6 +242,45 @@ impl crate::store::Store {
     }
 }
 
+/// A saved set of Summary options: the original's "Save as Template".
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SummaryTemplate {
+    pub id: Id,
+    pub name: String,
+    pub options: SummaryOptions,
+}
+
+impl crate::store::Store {
+    pub fn summary_templates(&self) -> anyhow::Result<Vec<SummaryTemplate>> {
+        let mut stmt = self.conn.prepare("SELECT id, name, options FROM summary_templates ORDER BY created_at, rowid")?;
+        let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)))?;
+        let mut templates = Vec::new();
+        for row in rows {
+            let (id, name, options) = row?;
+            if let Ok(id) = id.parse() {
+                templates.push(SummaryTemplate { id, name, options: SummaryOptions::from_storage(&options) });
+            }
+        }
+        Ok(templates)
+    }
+
+    pub fn save_summary_template(&self, name: &str, options: &SummaryOptions) -> anyhow::Result<SummaryTemplate> {
+        let name = name.trim();
+        anyhow::ensure!(!name.is_empty(), "a template needs a name");
+        let template = SummaryTemplate { id: uuid::Uuid::now_v7(), name: name.to_owned(), options: options.clone() };
+        self.conn.execute(
+            "INSERT INTO summary_templates (id, name, options, created_at) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![template.id.to_string(), template.name, options.to_storage(), Local::now().timestamp_millis()],
+        )?;
+        Ok(template)
+    }
+
+    pub fn delete_summary_template(&self, id: Id) -> anyhow::Result<()> {
+        self.conn.execute("DELETE FROM summary_templates WHERE id = ?1", [id.to_string()])?;
+        Ok(())
+    }
+}
+
 /// What a group is about; the desktop turns it into a translated heading.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum GroupKey {
@@ -382,6 +421,18 @@ mod tests {
         let on = SummaryOptions { habits: true, ..off };
         let rows = habit_checkins(&habits, &checkins, &on, today, Weekday::Mon);
         assert_eq!(rows.iter().map(|(h, n)| (h.name.as_str(), *n)).collect::<Vec<_>>(), [("Run", 1)]);
+    }
+
+    #[test]
+    fn templates() {
+        let store = Store::open_in_memory().unwrap();
+        assert!(store.save_summary_template(" ", &SummaryOptions::default()).is_err());
+        let weekly = SummaryOptions { period: Period::LastWeek, grouping: Grouping::List, ..Default::default() };
+        let template = store.save_summary_template(" Weekly review ", &weekly).unwrap();
+        let saved = store.summary_templates().unwrap();
+        assert_eq!(saved, [SummaryTemplate { id: template.id, name: "Weekly review".into(), options: weekly }]);
+        store.delete_summary_template(template.id).unwrap();
+        assert!(store.summary_templates().unwrap().is_empty());
     }
 
     #[test]

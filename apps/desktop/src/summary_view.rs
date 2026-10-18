@@ -13,7 +13,7 @@ use ui::{Placement, PopoverAttachment, popover};
 use crate::calendar;
 use crate::i18n::{self, Strings};
 use crate::task_rows::{local_day, short_date};
-use crate::text_input::{Mode, TextInput};
+use crate::text_input::{Cancelled, Mode, Submitted, TextInput};
 
 /// What picking a dropdown option does.
 type Pick = Box<dyn Fn(&mut SummaryView, &mut Window, &mut Context<SummaryView>)>;
@@ -36,6 +36,8 @@ pub struct SummaryView {
     copied: bool,
     /// The "Save as" menu, while open.
     save_menu: bool,
+    /// The name field of "Save as Template", while open.
+    naming: Option<Entity<TextInput>>,
     /// The "Custom" date fields, while open.
     custom: Option<(Entity<TextInput>, Entity<TextInput>)>,
 }
@@ -162,7 +164,7 @@ impl SummaryView {
     pub fn new(store: Rc<Store>) -> Self {
         // The original keeps the Summary's choices; so does Fern, in the settings table.
         let options = store.summary_options().unwrap_or_default();
-        Self { store, options, menu: None, copied: false, custom: None, save_menu: false }
+        Self { store, options, menu: None, copied: false, custom: None, save_menu: false, naming: None }
     }
 
     /// "Custom" in the Date menu: Start and End fields with Cancel and Confirm.
@@ -182,6 +184,29 @@ impl SummaryView {
         window.focus(&start.focus_handle(cx), cx);
         self.menu = None;
         self.custom = Some((start, end));
+        cx.notify();
+    }
+
+    /// Template "+": a name for the current options.
+    fn start_template(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let strings = i18n::t(cx);
+        let input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.summary_template_name, cx));
+        cx.subscribe(&input, |this, _, Submitted(name), cx| this.save_template(name.clone(), cx)).detach();
+        cx.subscribe(&input, |this, _, _: &Cancelled, cx| {
+            this.naming = None;
+            cx.notify();
+        })
+        .detach();
+        window.focus(&input.focus_handle(cx), cx);
+        self.naming = Some(input);
+        cx.notify();
+    }
+
+    fn save_template(&mut self, name: String, cx: &mut Context<Self>) {
+        match self.store.save_summary_template(&name, &self.options) {
+            Ok(_) => self.naming = None,
+            Err(err) => eprintln!("failed to save the summary template: {err:#}"),
+        }
         cx.notify();
     }
 
@@ -234,6 +259,12 @@ impl SummaryView {
         }
         if menu == "save" {
             self.save_menu = true;
+        }
+        if let Some(name) = menu.strip_prefix("template:") {
+            self.store.save_summary_template(name, &self.options).ok();
+        }
+        if menu == "template-new" {
+            self.start_template(window, cx);
         }
         cx.notify();
     }
@@ -309,6 +340,107 @@ impl SummaryView {
                     .on_click(cx.listener(move |this, _, _, cx| this.set_menu((!open).then_some(menu), cx)))
                     .children(dropdown),
             )
+    }
+
+    /// The original's Template row: saved option sets to apply with a click, and "+" to save the
+    /// current ones under a name.
+    fn render_templates(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let strings = i18n::t(cx);
+        let colors = cx.theme().colors().clone();
+        let templates = self.store.summary_templates().unwrap_or_default();
+        v_flex()
+            .gap_2()
+            .child(
+                h_flex()
+                    .flex_wrap()
+                    .gap_1p5()
+                    .children(templates.into_iter().map(|template| {
+                        let selected = template.options == self.options;
+                        let (id, options) = (template.id, template.options.clone());
+                        let group = SharedString::from(format!("template-{id}"));
+                        h_flex()
+                            .id(group.clone())
+                            .group(group.clone())
+                            .h(px(26.))
+                            .pl_2()
+                            .pr_1()
+                            .gap_1()
+                            .rounded(px(13.))
+                            .border_1()
+                            .border_color(if selected { colors.accent } else { colors.border })
+                            .cursor_pointer()
+                            .child(Label::new(template.name).size(LabelSize::Small).color(if selected { Color::Accent } else { Color::Default }))
+                            .child(
+                                div().invisible().group_hover(group, |s| s.visible()).child(
+                                    IconButton::new(SharedString::from(format!("delete-template-{id}")), IconName::X)
+                                        .size(px(16.))
+                                        .icon_size(IconSize::XSmall)
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            if let Err(err) = this.store.delete_summary_template(id) {
+                                                eprintln!("failed to delete the summary template: {err:#}");
+                                            }
+                                            cx.notify();
+                                        })),
+                                ),
+                            )
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                let options = options.clone();
+                                this.update(cx, |o| *o = options);
+                            }))
+                    }))
+                    .child(
+                        IconButton::new("add-summary-template", IconName::Plus)
+                            .size(px(26.))
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text(strings.summary_save_template))
+                            .on_click(cx.listener(|this, _, window, cx| this.start_template(window, cx))),
+                    ),
+            )
+            .children(self.naming.clone().map(|input| {
+                v_flex()
+                    .gap_1p5()
+                    .child(Label::new(strings.summary_template_hint).size(LabelSize::XSmall).color(Color::Muted))
+                    .child(h_flex().h(px(28.)).px_2().rounded(px(6.)).bg(colors.surface_background).child(input.clone()))
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .justify_end()
+                            .child(
+                                div()
+                                    .id("template-close")
+                                    .px_3()
+                                    .h(px(26.))
+                                    .flex()
+                                    .items_center()
+                                    .rounded(px(6.))
+                                    .border_1()
+                                    .border_color(colors.border)
+                                    .cursor_pointer()
+                                    .child(Label::new(strings.close).size(LabelSize::Small))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.naming = None;
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .id("template-save")
+                                    .px_3()
+                                    .h(px(26.))
+                                    .flex()
+                                    .items_center()
+                                    .rounded(px(6.))
+                                    .bg(colors.accent)
+                                    .cursor_pointer()
+                                    .child(Label::new(strings.save).size(LabelSize::Small).color(Color::Custom(gpui::white())))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        let name = input.read(cx).text().to_owned();
+                                        this.save_template(name, cx);
+                                    })),
+                            ),
+                    )
+            }))
     }
 
     fn render_options(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -414,6 +546,8 @@ impl SummaryView {
             .pt_2()
             .border_l_1()
             .border_color(colors.border_variant)
+            .child(heading(strings.summary_template))
+            .child(self.render_templates(cx))
             .child(heading(strings.summary_filter))
             .child(
                 group()

@@ -99,6 +99,9 @@ pub struct Strings {
     pub focus_add_record: &'static str,
     pub focus_settings: &'static str,
     pub statistics: &'static str,
+    pub stats_achievement_score: &'static str,
+    /// The score's badge; "{level}" is replaced.
+    pub stats_level: &'static str,
     /// Overview, Task, Focus.
     pub stats_tabs: [&'static str; 3],
     /// "{tasks}", "{completed}", "{lists}" and "{days}" are replaced.
@@ -446,6 +449,8 @@ pub static EN: Strings = Strings {
     focus_add_record: "Add Focus Record",
     focus_settings: "Focus Settings",
     statistics: "Statistics",
+    stats_achievement_score: "My Achievement Score",
+    stats_level: "Lv.{level}",
     stats_tabs: ["Overview", "Task", "Focus"],
     stats_summary: "{tasks} Tasks   {completed} Completed   {lists} Lists   {days} Days",
     stats_today_completed: "Today's Completed",
@@ -772,6 +777,8 @@ pub static RU: Strings = Strings {
     focus_add_record: "Добавить запись",
     focus_settings: "Настройки фокуса",
     statistics: "Статистика",
+    stats_achievement_score: "Мои очки достижений",
+    stats_level: "Ур. {level}",
     stats_tabs: ["Обзор", "Задачи", "Фокус"],
     stats_summary: "Задач: {tasks}   Выполнено: {completed}   Списков: {lists}   Дней: {days}",
     stats_today_completed: "Выполнено сегодня",

@@ -2,6 +2,7 @@
 
 use chrono::{Duration, Local, NaiveDate, TimeZone};
 
+use crate::focus::FocusSession;
 use crate::model::{Id, Task};
 
 fn completed_on(task: &Task) -> Option<NaiveDate> {
@@ -64,6 +65,57 @@ pub fn yesterday(day: NaiveDate) -> NaiveDate {
     day - Duration::days(1)
 }
 
+/// Points for "My Achievement Score". The original does not publish its rules, so Fern uses its
+/// own: a completed task is worth 2 points and 1 more when finished by its due date, a focus
+/// session 2 points and a habit check-in 1.
+pub const TASK_POINTS: i64 = 2;
+pub const ON_TIME_BONUS: i64 = 1;
+pub const FOCUS_POINTS: i64 = 2;
+pub const CHECKIN_POINTS: i64 = 1;
+
+/// Points earned on each day, keyed by the day they were earned.
+fn points(tasks: &[Task], sessions: &[FocusSession], checkins: &[NaiveDate]) -> Vec<(NaiveDate, i64)> {
+    let tasks = tasks.iter().filter(|t| !t.is_deleted()).filter_map(|t| {
+        let day = completed_on(t)?;
+        let on_time = t.due_date.is_some_and(|due| day <= due);
+        Some((day, TASK_POINTS + if on_time { ON_TIME_BONUS } else { 0 }))
+    });
+    let focus = sessions.iter().map(|s| (s.start_local().date_naive(), FOCUS_POINTS));
+    let habits = checkins.iter().map(|day| (*day, CHECKIN_POINTS));
+    tasks.chain(focus).chain(habits).collect()
+}
+
+/// The score at the end of each of `days` days from `start`: everything earned up to that day.
+pub fn achievement_scores(
+    tasks: &[Task],
+    sessions: &[FocusSession],
+    checkins: &[NaiveDate],
+    start: NaiveDate,
+    days: usize,
+) -> Vec<i64> {
+    let points = points(tasks, sessions, checkins);
+    (0..days as i64)
+        .map(|i| {
+            let day = start + Duration::days(i);
+            points.iter().filter(|(d, _)| *d <= day).map(|(_, p)| p).sum()
+        })
+        .collect()
+}
+
+/// The level shown on the score's badge: each level needs more points than the last
+/// (level 2 at 50, 3 at 150, 4 at 300, …).
+pub fn achievement_level(score: i64) -> u32 {
+    let mut level = 1;
+    let mut needed = 50;
+    let mut total = 0;
+    while score >= total + needed {
+        total += needed;
+        needed += 50;
+        level += 1;
+    }
+    level
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -91,5 +143,29 @@ mod tests {
         assert_eq!(by_list.len(), 2);
         assert!(by_list.contains(&(Some(list.id), 1)) && by_list.contains(&(None, 1)));
         assert_eq!(days_using(&tasks, today), 1);
+    }
+
+    #[test]
+    fn achievement_score() {
+        let store = Store::open_in_memory().unwrap();
+        let today = Local::now().date_naive();
+        let on_time = store.add_task("on time").unwrap();
+        store.set_due(on_time.id, Some(today), None).unwrap();
+        store.set_completed(on_time.id, true).unwrap();
+        let late = store.add_task("late").unwrap();
+        store.set_due(late.id, Some(yesterday(today)), None).unwrap();
+        store.set_completed(late.id, true).unwrap();
+        store.add_task("open").unwrap();
+        let tasks = store.tasks().unwrap();
+        let checkins = [yesterday(today), today];
+
+        // Yesterday: one check-in. Today: 3 + 2 for the tasks and one more check-in.
+        assert_eq!(achievement_scores(&tasks, &[], &checkins, yesterday(today), 2), [1, 1 + 3 + 2 + 1]);
+        assert_eq!(achievement_level(0), 1);
+        assert_eq!(achievement_level(49), 1);
+        assert_eq!(achievement_level(50), 2);
+        assert_eq!(achievement_level(150), 3);
+        assert_eq!(achievement_level(299), 3);
+        assert_eq!(achievement_level(300), 4);
     }
 }

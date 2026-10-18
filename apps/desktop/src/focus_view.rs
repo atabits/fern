@@ -82,6 +82,77 @@ fn bar_chart(values: &[i64], labels: Vec<String>, highlight: Option<usize>, heig
         })))
 }
 
+/// A smooth line with a shaded area under it, scaled between the values' minimum and maximum,
+/// as in the original's "My Achievement Score".
+fn line_chart(values: &[i64], labels: Vec<String>, height: f32, cx: &App) -> Div {
+    let colors = cx.theme().colors();
+    let (accent, dot) = (colors.accent, colors.text);
+    let low = values.iter().copied().min().unwrap_or(0);
+    let high = values.iter().copied().max().unwrap_or(0).max(low + 1);
+    let values = values.to_vec();
+    let axis = |v: i64| Label::new(v.to_string()).size(LabelSize::XSmall).color(Color::Muted);
+    let plot = gpui::canvas(
+        |_, _, _| {},
+        move |bounds, (), window, _| {
+            let n = values.len().max(1) as f32;
+            let (left, top) = (bounds.origin.x, bounds.origin.y);
+            let (width, chart) = (bounds.size.width, bounds.size.height - px(8.));
+            let points: Vec<gpui::Point<Pixels>> = values
+                .iter()
+                .enumerate()
+                .map(|(i, v)| {
+                    let share = (*v - low) as f32 / (high - low) as f32;
+                    gpui::point(left + width * ((i as f32 + 0.5) / n), top + px(4.) + chart * (1. - share))
+                })
+                .collect();
+            let Some((first, last)) = points.first().zip(points.last()) else { return };
+            let curve = |builder: &mut gpui::PathBuilder| {
+                for pair in points.windows(2) {
+                    let middle = (pair[0].x + pair[1].x) / 2.;
+                    builder.cubic_bezier_to(pair[1], gpui::point(middle, pair[0].y), gpui::point(middle, pair[1].y));
+                }
+            };
+            let bottom = top + bounds.size.height;
+            let mut area = gpui::PathBuilder::fill();
+            area.move_to(gpui::point(first.x, bottom));
+            area.line_to(*first);
+            curve(&mut area);
+            area.line_to(gpui::point(last.x, bottom));
+            area.close();
+            if let Ok(path) = area.build() {
+                window.paint_path(path, accent.opacity(0.3));
+            }
+            let mut line = gpui::PathBuilder::stroke(px(2.));
+            line.move_to(*first);
+            curve(&mut line);
+            if let Ok(path) = line.build() {
+                window.paint_path(path, accent);
+            }
+            for p in &points {
+                let size = px(6.);
+                window.paint_quad(
+                    gpui::fill(gpui::Bounds::new(gpui::point(p.x - size / 2., p.y - size / 2.), gpui::size(size, size)), dot)
+                        .corner_radii(size / 2.),
+                );
+            }
+        },
+    )
+    .w_full()
+    .h(px(height));
+    v_flex()
+        .gap_1()
+        .child(
+            h_flex()
+                .items_start()
+                .gap_2()
+                .child(v_flex().h(px(height)).justify_between().child(axis(high)).child(axis(low)))
+                .child(div().flex_1().child(plot)),
+        )
+        .child(h_flex().pl(px(36.)).children(labels.into_iter().map(|l| {
+            div().flex_1().flex().justify_center().child(Label::new(l).size(LabelSize::XSmall).color(Color::Muted))
+        })))
+}
+
 /// The Focus Record's "+" form and "…" menu, as in the original.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RecordMenu {
@@ -660,6 +731,15 @@ impl FocusView {
             })
             .collect();
         let minutes = fern_core::focus::minutes_by_day(&self.sessions, start, 7);
+        let checkins: Vec<NaiveDate> = self
+            .store
+            .habits()
+            .unwrap_or_default()
+            .iter()
+            .flat_map(|h| self.store.checkins(h.id).unwrap_or_default())
+            .collect();
+        let scores = fern_core::stats::achievement_scores(&tasks, &self.sessions, &checkins, start, 7);
+        let score = scores.last().copied().unwrap_or(0);
         let chart = |title: &'static str, values: Vec<i64>| {
             card()
                 .flex_1()
@@ -697,19 +777,51 @@ impl FocusView {
                 .bg(theme.colors().surface_background)
                 .child(Label::new(summary).size(LabelSize::Small))
                 .into_any_element(),
-            card()
-                .child(Label::new(strings.focus_overview).weight(FontWeight::SEMIBOLD))
+            h_flex()
+                .items_stretch()
+                .gap_4()
                 .child(
-                    h_flex()
-                        .child(value(completed[6].to_string(), strings.stats_today_completed))
-                        .child(value(focus.today_count.to_string(), strings.focus_today_pomo))
-                        .child(value(format_minutes(focus.today_minutes), strings.focus_today_focus)),
+                    card()
+                        .flex_1()
+                        .gap_4()
+                        .child(Label::new(strings.focus_overview).weight(FontWeight::SEMIBOLD))
+                        .child(
+                            h_flex()
+                                .child(value(completed[6].to_string(), strings.stats_today_completed))
+                                .child(value(focus.today_count.to_string(), strings.focus_today_pomo))
+                                .child(value(format_minutes(focus.today_minutes), strings.focus_today_focus)),
+                        )
+                        .child(
+                            h_flex()
+                                .child(value(completed_total.to_string(), strings.stats_total_completed))
+                                .child(value(focus.total_count.to_string(), strings.focus_total_pomo))
+                                .child(value(format_minutes(focus.total_minutes), strings.focus_total_duration)),
+                        ),
                 )
                 .child(
-                    h_flex()
-                        .child(value(completed_total.to_string(), strings.stats_total_completed))
-                        .child(value(focus.total_count.to_string(), strings.focus_total_pomo))
-                        .child(value(format_minutes(focus.total_minutes), strings.focus_total_duration)),
+                    card()
+                        .flex_1()
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .child(div().flex_1().child(Label::new(strings.stats_achievement_score).weight(FontWeight::SEMIBOLD)))
+                                .child(div().text_size(px(18.)).text_color(theme.status().success).child(score.to_string()))
+                                .child(
+                                    div()
+                                        .px_1p5()
+                                        .h(px(20.))
+                                        .flex()
+                                        .items_center()
+                                        .rounded(px(6.))
+                                        .bg(theme.colors().accent.opacity(0.25))
+                                        .child(
+                                            Label::new(strings.stats_level.replace("{level}", &fern_core::stats::achievement_level(score).to_string()))
+                                                .size(LabelSize::XSmall)
+                                                .color(Color::Accent),
+                                        ),
+                                ),
+                        )
+                        .child(line_chart(&scores, day_labels.clone(), 110., cx)),
                 )
                 .into_any_element(),
             h_flex()

@@ -14,6 +14,28 @@ use crate::task_detail::{OpenTask, TaskDetail, TaskUpdated};
 use crate::task_rows::{self, Row, Section};
 use crate::text_input::{Cancelled, Changed, Mode, Submitted, TextInput};
 
+/// A task being dragged to a new place in the list; also renders the drag preview.
+#[derive(Clone)]
+struct DraggedTask {
+    id: Id,
+    title: SharedString,
+}
+
+impl Render for DraggedTask {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = cx.theme().colors();
+        div()
+            .px_3()
+            .py_1p5()
+            .rounded(px(6.))
+            .bg(colors.elevated_surface_background)
+            .border_1()
+            .border_color(colors.border)
+            .shadow_lg()
+            .child(Label::new(self.title.clone()))
+    }
+}
+
 const DETAIL_WIDTH: f32 = 400.;
 const ROW_HEIGHT: f32 = 40.;
 /// Space left of the checkbox for the subtask chevron.
@@ -152,6 +174,15 @@ impl TodoView {
                 }
                 Some(("list", name)) => self.create_list(name, cx),
                 Some(("view", "trash")) => self.set_view(View::Trash, cx),
+                Some(("move", spec)) => {
+                    // `move=<dragged title part>><target title part>`: same path as a mouse drop.
+                    let find = |needle: &str| self.tasks.iter().find(|t| t.title.contains(needle)).map(|t| t.id);
+                    if let Some((dragged, target)) = spec.split_once('>')
+                        && let (Some(dragged), Some(target)) = (find(dragged), find(target))
+                    {
+                        self.drop_task(dragged, target, cx);
+                    }
+                }
                 Some(("search", query)) => {
                     let query = query.to_owned();
                     self.search_input.update(cx, |input, cx| input.set_text(query, cx));
@@ -485,6 +516,13 @@ impl TodoView {
         self.reload(cx);
     }
 
+    /// Drops a dragged task right before `target`.
+    fn drop_task(&mut self, dragged: Id, target: Id, cx: &mut Context<Self>) {
+        let result = self.store.move_task(dragged, target, false);
+        self.check(result);
+        self.reload(cx);
+    }
+
     fn restore(&mut self, id: Id, cx: &mut Context<Self>) {
         let result = self.store.restore_task(id);
         self.check(result);
@@ -556,10 +594,21 @@ impl TodoView {
 
         let due = task.due_date.map(|date| task_rows::due_label(date, task.due_time, today, strings));
 
+        let draggable = self.view != View::Trash;
+        let dragged = DraggedTask { id, title: task.title.clone().into() };
+        let accent = theme.colors().accent;
+
         // The separator starts at the checkbox; the gutter to its left holds the chevron.
         div()
             .id(ElementId::Uuid(id))
             .group(group.clone())
+            .when(draggable, |el| {
+                el.on_drag(dragged, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
+                    .drag_over::<DraggedTask>(move |style, _, _, _| style.border_t_2().border_color(accent))
+                    .on_drop(cx.listener(move |this, dragged: &DraggedTask, _, cx| {
+                        this.drop_task(dragged.id, id, cx)
+                    }))
+            })
             .h(px(ROW_HEIGHT))
             .flex()
             .pl(px(depth as f32 * INDENT))

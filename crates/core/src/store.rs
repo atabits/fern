@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use chrono::{Duration, NaiveDate, NaiveTime};
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use uuid::Uuid;
@@ -74,6 +74,10 @@ const MIGRATIONS: &[&str] = &[
     "
     ALTER TABLE tasks ADD COLUMN repeat TEXT;
     ",
+    "
+    ALTER TABLE tasks ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0;
+    UPDATE tasks SET sort_order = -created_at;
+    ",
 ];
 
 const TASK_COLUMNS: &str = "id, parent_id, kind, title, notes, priority, due_date, due_time, \
@@ -110,7 +114,7 @@ impl Store {
     pub fn tasks(&self) -> Result<Vec<Task>> {
         let mut stmt = self.conn.prepare(&format!(
             "SELECT {TASK_COLUMNS} FROM tasks
-             ORDER BY completed_at IS NOT NULL, completed_at DESC, created_at DESC, rowid DESC"
+             ORDER BY completed_at IS NOT NULL, completed_at DESC, sort_order, rowid DESC"
         ))?;
         let mut tasks: Vec<Task> = stmt.query_map([], task_from_row)?.collect::<Result<_, _>>()?;
 
@@ -186,8 +190,10 @@ impl Store {
             deleted_at: None,
             created_at: now_ms(),
         };
+        // New tasks go to the top, as in TickTick.
         self.conn.execute(
-            "INSERT INTO tasks (id, title, created_at) VALUES (?1, ?2, ?3)",
+            "INSERT INTO tasks (id, title, created_at, sort_order)
+             VALUES (?1, ?2, ?3, (SELECT COALESCE(MIN(sort_order), 0) - 1024 FROM tasks))",
             params![task.id.to_string(), task.title, task.created_at],
         )?;
         Ok(task)
@@ -196,6 +202,31 @@ impl Store {
     /// Completes or reopens a task. Completing a repeating task with a due date does not close
     /// it: a completed copy is kept for history, and the task moves to its next occurrence with
     /// its checklist reset — the way TickTick handles repeats.
+    /// Moves a task right before (or after) `target` in the manual order, then renumbers the
+    /// order with gaps. Renumbering everything keeps the code simple; personal task lists are
+    /// small enough for that.
+    pub fn move_task(&self, id: Id, target: Id, after: bool) -> Result<()> {
+        if id == target {
+            return Ok(());
+        }
+        let mut stmt = self.conn.prepare("SELECT id FROM tasks ORDER BY sort_order, rowid DESC")?;
+        let mut order: Vec<String> = stmt.query_map([], |row| row.get(0))?.collect::<Result<_, _>>()?;
+        let (id, target) = (id.to_string(), target.to_string());
+        order.retain(|other| *other != id);
+        let index = order.iter().position(|other| *other == target).context("target task not found")?;
+        order.insert(if after { index + 1 } else { index }, id);
+
+        let tx = self.conn.unchecked_transaction()?;
+        for (position, task) in order.iter().enumerate() {
+            tx.execute(
+                "UPDATE tasks SET sort_order = ?2 WHERE id = ?1",
+                params![task, position as i64 * 1024],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Direct subtasks of `parent` that are not in the trash, oldest first.
     pub fn subtasks(&self, parent: Id) -> Result<Vec<Task>> {
         let mut subtasks: Vec<Task> = self
@@ -933,6 +964,26 @@ mod tests {
         assert_eq!(search("ХЛЕБ")?, ["Купить хлеб"]);
         assert_eq!(search("grocer")?, ["Купить хлеб"]);
         assert!(search("   ")?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn manual_order() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let a = store.add_task("a")?;
+        let b = store.add_task("b")?;
+        let c = store.add_task("c")?;
+        assert_eq!(titles(&store.tasks()?), ["c", "b", "a"]);
+
+        store.move_task(c.id, a.id, true)?;
+        assert_eq!(titles(&store.tasks()?), ["b", "a", "c"]);
+        store.move_task(a.id, b.id, false)?;
+        assert_eq!(titles(&store.tasks()?), ["a", "b", "c"]);
+
+        // New tasks still land on top after renumbering.
+        store.add_task("d")?;
+        assert_eq!(titles(&store.tasks()?), ["d", "a", "b", "c"]);
+        assert!(store.move_task(a.id, Uuid::now_v7(), false).is_err());
         Ok(())
     }
 

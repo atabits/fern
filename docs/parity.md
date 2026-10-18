@@ -34,7 +34,7 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 | Repeat (`repeatFlag`, RRULE) | 🟡 | FREQ + INTERVAL; completing moves the task to the next date and keeps a completed copy; no BYDAY/BYMONTHDAY yet |
 | Lists (projects), Inbox | ✅ | create, delete, move tasks with subtasks |
 | Custom sections inside a list (columns) | ⬜ | groups are by kind for now |
-| Manual ordering (`sortOrder`) | ⬜ | |
+| Manual ordering (`sortOrder`) | ✅ | new tasks on top; renumbered with gaps on move |
 | Trash, "Won't Do" | 🟡 | trash with restore, delete forever and "Empty trash"; no "Won't Do"; deleting a list still deletes its tasks permanently |
 | Reminders | ⬜ | |
 | Settings (UI language) | ✅ | |
@@ -63,7 +63,7 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 | Details: list | ✅ | list button in the bottom bar |
 | Details: checklist | ✅ | Enter adds the next item; progress "1/3" in rows |
 | Details: subtasks | ✅ | list with checkboxes, open a subtask, "Add subtask" |
-| Drag and drop | ⬜ | |
+| Drag and drop | 🟡 | reorder rows by dragging (drop before the target); no dragging into lists or onto tasks to nest |
 | Keyboard shortcuts | ✅ | JSON keymap (Zed format): new task, search, smart lists, list navigation, complete, delete |
 | Search | 🟡 | live search by title, notes and tags from the sidebar; no checklist-item or date filters |
 | Calendar, Pomodoro, Habits, Matrix, Countdown | ⬜ | |
@@ -82,8 +82,8 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 
 ## Next
 
-1. Manual ordering and drag and drop.
-2. Week/month calendar view.
+1. Week/month calendar view.
+2. Drag tasks onto lists in the lists column.
 3. "Won't Do" status.
 4. Custom time and "every N" in the due-date picker.
 5. Eisenhower matrix view.

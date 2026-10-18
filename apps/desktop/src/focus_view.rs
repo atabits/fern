@@ -113,6 +113,10 @@ struct StatsPage {
 }
 
 /// Bars for the statistics charts, with a label under each; `highlight` marks one bar.
+/// The Statistics page's cards and charts, as tall as the original's.
+const CARD_HEIGHT: f32 = 323.;
+const CHART_HEIGHT: f32 = 240.;
+
 fn bar_chart(values: &[i64], labels: Vec<String>, highlight: Option<usize>, height: f32, cx: &App) -> Div {
     let colors = cx.theme().colors();
     let top = values.iter().copied().max().unwrap_or(0).max(1) as f32;
@@ -1537,7 +1541,7 @@ impl FocusView {
                 .children(change.map(|c| Label::new(c).size(LabelSize::XSmall).color(Color::Muted)))
         };
         let overview = card()
-            .child(Label::new(strings.focus_overview).weight(FontWeight::SEMIBOLD))
+            .child(div().text_size(px(16.)).font_weight(FontWeight::SEMIBOLD).child(strings.focus_overview))
             .child(
                 h_flex()
                     .child(overview_item(
@@ -1729,25 +1733,28 @@ impl FocusView {
             .text_color(theme.colors().text)
             .child(v_flex()
             .w_full()
-            .max_w(px(960.))
+            // 960 px of cards, as the original's, between 32 px margins.
+            .max_w(px(1024.))
             .px_8()
-            .py_5()
+            // The original's header sits lower, with the window's top room above it.
+            .pt(px(32.))
+            .pb_5()
             .gap_4()
             .child(
                 h_flex()
-                    .child(div().flex_1().child(div().text_size(px(24.)).font_weight(FontWeight::MEDIUM).child(strings.statistics)))
-                    .child(h_flex().p_0p5().rounded(px(16.)).bg(theme.colors().surface_background).children(
+                    .child(div().flex_1().child(div().text_size(px(28.)).font_weight(FontWeight::MEDIUM).child(strings.statistics)))
+                    .child(h_flex().p(px(2.)).rounded(px(18.)).bg(theme.colors().surface_background).children(
                         strings.stats_tabs.iter().enumerate().map(|(i, label)| {
                             div()
                                 .id(SharedString::from(format!("stats-tab-{i}")))
-                                .px_4()
-                                .h(px(28.))
+                                .px_5()
+                                .h(px(32.))
                                 .flex()
                                 .items_center()
-                                .rounded(px(14.))
+                                .rounded(px(16.))
                                 .cursor_pointer()
                                 .when(i == page.tab, |el| el.bg(theme.colors().element_selected))
-                                .child(Label::new(*label).size(LabelSize::Small))
+                                .child(Label::new(*label))
                                 .on_click(cx.listener(move |this, _, _, cx| this.update_stats(cx, |p| p.tab = i)))
                         }),
                     ))
@@ -1755,8 +1762,9 @@ impl FocusView {
                     .child(
                         div()
                             .id("stats-done")
-                            .px_5()
-                            .h(px(32.))
+                            .w(px(100.))
+                            .h(px(40.))
+                            .justify_center()
                             .flex()
                             .items_center()
                             .rounded(px(8.))
@@ -1980,13 +1988,17 @@ impl FocusView {
         let card = || v_flex().min_w_0().p_4().gap_2().rounded(px(10.)).bg(theme.colors().surface_background);
         let day_labels: Vec<String> =
             (0..7).map(|i| (start + chrono::Duration::days(i)).day().to_string()).collect();
+        // The original's Overview: 30 px values over muted words, lines between the columns.
         let value = |v: String, label: &'static str| {
             v_flex()
                 .flex_1()
+                .min_w_0()
                 .items_center()
-                .child(div().text_size(px(22.)).font_weight(FontWeight::SEMIBOLD).text_color(theme.colors().accent).child(v))
-                .child(Label::new(label).size(LabelSize::XSmall).color(Color::Muted))
+                .gap_1()
+                .child(div().text_size(px(30.)).font_weight(FontWeight::SEMIBOLD).text_color(theme.colors().accent).child(v))
+                .child(Label::new(label).color(Color::Muted).truncate())
         };
+        let rule = || div().w(px(1.)).h(px(38.)).flex_none().bg(theme.colors().border);
         // The counts are semibold, their words regular, as in the original.
         let counts = [
             ("{tasks}", open_total.to_string()),
@@ -1995,7 +2007,7 @@ impl FocusView {
             ("{days}", fern_core::stats::days_using(&tasks, today).to_string()),
         ];
         let summary = h_flex().children(summary_parts(strings.stats_summary, &counts).into_iter().map(|(text, count)| {
-            Label::new(text).size(LabelSize::Small).when(count, |l| l.weight(FontWeight::SEMIBOLD))
+            Label::new(text).when(count, |l| l.weight(FontWeight::SEMIBOLD))
         }));
         // Each curve has its own Day / Week / Month switch, as in the original.
         let periods = |curve: usize| stats::buckets(page.curves[curve], today, crate::calendar::week_start(), 7);
@@ -2058,9 +2070,10 @@ impl FocusView {
             let labels = labels(curve);
             card()
                 .flex_1()
+                .h(px(CARD_HEIGHT))
                 .child(
                     h_flex()
-                        .child(div().flex_1().child(Label::new(title).weight(FontWeight::SEMIBOLD)))
+                        .child(div().flex_1().child(div().text_size(px(16.)).font_weight(FontWeight::SEMIBOLD).child(title)))
                         .child(
                             h_flex()
                                 .id(SharedString::from(format!("curve-period-{curve}")))
@@ -2082,9 +2095,9 @@ impl FocusView {
                 )
                 .map(|el| {
                     if line {
-                        el.child(line_chart(&values, labels, 120., true, cx))
+                        el.child(line_chart(&values, labels, CHART_HEIGHT, true, cx))
                     } else {
-                        el.child(bar_chart(&values, labels, Some(6), 120., cx))
+                        el.child(bar_chart(&values, labels, Some(6), CHART_HEIGHT, cx))
                     }
                 })
         };
@@ -2113,8 +2126,10 @@ impl FocusView {
 
         vec![
             div()
+                .h(px(60.))
+                .flex_none()
                 .px_4()
-                .py_2()
+                .items_center()
                 .rounded(px(10.))
                 .bg(theme.colors().surface_background)
                 .flex()
@@ -2123,9 +2138,9 @@ impl FocusView {
                     h_flex().gap_1().children({
                         let (before, after) = strings.stats_more_productive.split_once("{n}").unwrap_or((strings.stats_more_productive, ""));
                         [
-                            Label::new(before.trim_end()).size(LabelSize::Small).color(Color::Muted),
-                            Label::new(format!("{productive}%")).size(LabelSize::Small).color(Color::Warning),
-                            Label::new(after.trim_start()).size(LabelSize::Small).color(Color::Muted),
+                            Label::new(before.trim_end()),
+                            Label::new(format!("{productive}%")).weight(FontWeight::SEMIBOLD).color(Color::Warning),
+                            Label::new(after.trim_start()),
                         ]
                     }),
                 )
@@ -2136,28 +2151,39 @@ impl FocusView {
                 .child(
                     card()
                         .flex_1()
-                        .gap_4()
-                        .child(Label::new(strings.focus_overview).weight(FontWeight::SEMIBOLD))
+                        .h(px(CARD_HEIGHT))
+                        .child(div().text_size(px(16.)).font_weight(FontWeight::SEMIBOLD).child(strings.focus_overview))
                         .child(
-                            h_flex()
-                                .child(value(completed[6].to_string(), strings.stats_today_completed))
-                                .child(value(focus.today_count.to_string(), strings.focus_today_pomo))
-                                .child(value(format_minutes(focus.today_minutes), strings.focus_today_focus)),
-                        )
-                        .child(
-                            h_flex()
-                                .child(value(completed_total.to_string(), strings.stats_total_completed))
-                                .child(value(focus.total_count.to_string(), strings.focus_total_pomo))
-                                .child(value(format_minutes(focus.total_minutes), strings.focus_total_duration)),
+                            v_flex()
+                                .flex_1()
+                                .justify_center()
+                                .gap_8()
+                                .child(
+                                    h_flex()
+                                        .child(value(completed[6].to_string(), strings.stats_today_completed))
+                                        .child(rule())
+                                        .child(value(focus.today_count.to_string(), strings.focus_today_pomo))
+                                        .child(rule())
+                                        .child(value(format_minutes(focus.today_minutes), strings.focus_today_focus)),
+                                )
+                                .child(
+                                    h_flex()
+                                        .child(value(completed_total.to_string(), strings.stats_total_completed))
+                                        .child(rule())
+                                        .child(value(focus.total_count.to_string(), strings.focus_total_pomo))
+                                        .child(rule())
+                                        .child(value(format_minutes(focus.total_minutes), strings.focus_total_duration)),
+                                ),
                         ),
                 )
                 .child(
                     card()
                         .flex_1()
+                        .h(px(CARD_HEIGHT))
                         .child(
                             h_flex()
                                 .gap_2()
-                                .child(div().flex_1().child(Label::new(strings.stats_achievement_score).weight(FontWeight::SEMIBOLD)))
+                                .child(div().flex_1().child(div().text_size(px(16.)).font_weight(FontWeight::SEMIBOLD).child(strings.stats_achievement_score)))
                                 .child(div().text_size(px(18.)).font_weight(FontWeight::SEMIBOLD).text_color(theme.status().success).child(score.to_string()))
                                 .child(
                                     div()
@@ -2174,7 +2200,7 @@ impl FocusView {
                                         ),
                                 ),
                         )
-                        .child(line_chart(&scores, day_labels.clone(), 110., false, cx)),
+                        .child(line_chart(&scores, day_labels.clone(), CHART_HEIGHT, false, cx)),
                 )
                 .into_any_element(),
             h_flex()
@@ -2189,7 +2215,7 @@ impl FocusView {
                 .child(chart(2, strings.stats_pomo_curve, pomos, true, cx))
                 .child(chart(3, strings.stats_focus_curve, minutes, false, cx))
                 .into_any_element(),
-            card().child(Label::new(strings.stats_weekly_habits).weight(FontWeight::SEMIBOLD)).child(habit_week).into_any_element(),
+            card().child(div().text_size(px(16.)).font_weight(FontWeight::SEMIBOLD).child(strings.stats_weekly_habits)).child(habit_week).into_any_element(),
         ]
     }
 
@@ -2368,7 +2394,7 @@ impl FocusView {
                 .child(
                     card()
                         .flex_1()
-                        .child(Label::new(strings.focus_overview).weight(FontWeight::SEMIBOLD))
+                        .child(div().text_size(px(16.)).font_weight(FontWeight::SEMIBOLD).child(strings.focus_overview))
                         .child(
                             h_flex()
                                 .py_4()

@@ -47,6 +47,7 @@ enum ClosedMenu {
 enum SortMenu {
     Group,
     Sort,
+    Order,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -586,6 +587,7 @@ impl TodoView {
                 }
                 Some(("menu", "header")) => self.header_menu_open = true,
                 Some(("menu", "sort")) => self.sort_menu = Some(Some(SortMenu::Sort)),
+                Some(("menu", "sort-root")) => self.sort_menu = Some(None),
                 Some(("menu", "group")) => self.sort_menu = Some(Some(SortMenu::Group)),
                 Some(("group", key)) => self.set_sort(None, Some(GroupBy::from_key(key)), cx),
                 Some(("sort", key)) => self.set_sort(Some(SortBy::from_key(key)), None, cx),
@@ -1711,7 +1713,7 @@ impl TodoView {
                 if !self.view_flag("show_completed", true) {
                     tasks.retain(|t| !t.is_completed());
                 }
-                task_rows::sort_tasks(&mut tasks, sort);
+                task_rows::order_tasks(&mut tasks, sort, self.view_flag("descending", false));
                 task_rows::pinned_first(&mut tasks);
                 match group {
                     GroupBy::Custom if !self.sections.is_empty() => {
@@ -3358,6 +3360,7 @@ impl TodoView {
     /// The original's sort menu: "Group by" and "Sort by", each opening its options in place.
     fn render_sort_menu(&self, expanded: Option<SortMenu>, strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {
         let (sort, group) = self.sort_settings();
+        let descending = self.view_flag("descending", false);
         let row = |id: &'static str, icon: IconName, label: &'static str, value: &'static str, which: SortMenu| {
             ListItem::new(id)
                 .start_slot(Icon::new(icon).color(Color::Muted))
@@ -3401,6 +3404,20 @@ impl TodoView {
                 el.children(SortBy::ALL.into_iter().map(|s| {
                     option(format!("sort-{}", s.key()), s.label(strings), s == sort)
                         .on_click(cx.listener(move |this, _, _, cx| this.set_sort(Some(s), None, cx)))
+                }))
+            })
+            // The original's Order: Ascending or Descending, kept per list; with the manual
+            // (Custom) sort, as there, no Order.
+            .when(sort != SortBy::Custom, |el| el.child(row("order-by", IconName::ArrowDownUp, strings.order, strings.order_directions[descending as usize], SortMenu::Order)))
+            .when(sort != SortBy::Custom && expanded == Some(SortMenu::Order), |el| {
+                el.children([false, true].map(|value| {
+                    option(format!("order-{value}"), strings.order_directions[value as usize], value == descending).on_click(cx.listener(move |this, _, _, cx| {
+                        if this.view_flag("descending", false) != value {
+                            this.toggle_view_flag("descending", false, cx);
+                        }
+                        this.sort_menu = None;
+                        cx.notify();
+                    }))
                 }))
             })
             .into_any_element()

@@ -398,6 +398,7 @@ pub struct Strings {
     pub matrix_dates: [&'static str; 5],
     pub order: &'static str,
     pub order_options: [&'static str; 2],
+    pub order_directions: [&'static str; 2],
     pub focus_modes: [&'static str; 2],
     /// The full focus page's buttons: Start, Pause, Continue, End, and its collapse arrow.
     pub focus_start: &'static str,
@@ -1035,6 +1036,7 @@ pub static EN: Strings = Strings {
     matrix_dates: ["Overdue", "Today", "Tomorrow", "Later", "No Date"],
     order: "Order",
     order_options: ["Oldest First", "Newest First"],
+    order_directions: ["Ascending", "Descending"],
     focus_modes: ["Pomo", "Stopwatch"],
     focus_start: "Start",
     focus_pause: "Pause",
@@ -1652,6 +1654,7 @@ pub static RU: Strings = Strings {
     matrix_dates: ["Просрочено", "Сегодня", "Завтра", "Позже", "Без даты"],
     order: "Порядок",
     order_options: ["Сначала старые", "Сначала новые"],
+    order_directions: ["По возрастанию", "По убыванию"],
     focus_modes: ["Помидор", "Секундомер"],
     focus_start: "Старт",
     focus_pause: "Пауза",

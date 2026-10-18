@@ -213,6 +213,15 @@ pub fn sort_tasks(tasks: &mut [Task], sort: SortBy) {
     }
 }
 
+/// Sorts tasks with the list's Order, as the original's sort menu: Descending turns the chosen
+/// sort around (Custom keeps the manual order).
+pub fn order_tasks(tasks: &mut [Task], sort: SortBy, descending: bool) {
+    sort_tasks(tasks, sort);
+    if descending && sort != SortBy::Custom {
+        tasks.reverse();
+    }
+}
+
 /// Rows grouped by date, creation day, tag or priority (or not at all), with completed tasks in
 /// a last group. Groups follow a fixed order: by date, overdue first (or, with `overdue_last` —
 /// Settings → "Overdue Section shows at" — after the undated ones) and undated last.
@@ -708,6 +717,8 @@ mod tests {
 
         let titles = |tasks: &[Task]| tasks.iter().map(|t| t.title.clone()).collect::<Vec<_>>();
         let mut sorted = tasks.clone();
+        order_tasks(&mut sorted, SortBy::Title, true);
+        assert!(sorted.windows(2).all(|w| w[0].title.to_lowercase() >= w[1].title.to_lowercase()), "Descending turns the sort around");
         sort_tasks(&mut sorted, SortBy::Title);
         assert_eq!(titles(&sorted), ["Apple", "banana", "cherry", "done"]);
         sort_tasks(&mut sorted, SortBy::Priority);

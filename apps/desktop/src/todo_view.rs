@@ -69,6 +69,8 @@ struct AddDraft {
     tags: Vec<String>,
     /// The date picked with the field's calendar button; a typed date wins.
     date: Option<NaiveDate>,
+    /// Files picked with the menu's Attachment, attached once the task is added.
+    files: Vec<std::path::PathBuf>,
 }
 
 pub struct TodoView {
@@ -745,6 +747,12 @@ impl TodoView {
         if self.add_draft.note {
             self.store.set_kind(task.id, fern_core::Kind::Note)?;
         }
+        if !self.add_draft.files.is_empty() {
+            let dir = crate::attachments_dir()?;
+            for file in &self.add_draft.files {
+                self.store.add_attachment(task.id, file, &dir)?;
+            }
+        }
         Ok(task)
     }
 
@@ -1185,6 +1193,33 @@ impl TodoView {
                         this.add_tag_input.update(cx, |input, cx| input.set_text("", cx));
                         let focus = this.add_tag_input.read(cx).focus_handle(cx);
                         window.focus(&focus, cx);
+                        cx.notify();
+                    })),
+            )
+            .child(
+                ListItem::new("add-attachment")
+                    .start_slot(Icon::new(IconName::Paperclip).color(Color::Muted))
+                    .child(Label::new(strings.attachment))
+                    .when(!draft.files.is_empty(), |item| {
+                        item.end_slot(Label::new(draft.files.len().to_string()).size(LabelSize::XSmall).color(Color::Accent))
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.add_menu_open = false;
+                        let chosen = cx.prompt_for_paths(gpui::PathPromptOptions {
+                            files: true,
+                            directories: false,
+                            multiple: true,
+                            prompt: None,
+                        });
+                        cx.spawn(async move |this, cx| {
+                            let Some(paths) = chosen.await.ok().and_then(Result::ok).flatten() else { return };
+                            this.update(cx, |this, cx| {
+                                this.add_draft.files.extend(paths);
+                                cx.notify();
+                            })
+                            .ok();
+                        })
+                        .detach();
                         cx.notify();
                     })),
             )

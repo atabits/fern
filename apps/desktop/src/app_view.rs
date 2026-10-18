@@ -209,6 +209,16 @@ impl AppView {
             if state.contains("countdown-draft") {
                 this.countdown.update(cx, |view, cx| view.start_new(window, cx));
             }
+            // `attach=<task title part>><file path>`: a file attached to that task.
+            for spec in state.split(';').filter_map(|part| part.strip_prefix("attach=")) {
+                if let Some((needle, file)) = spec.split_once('>')
+                    && let Some(task) = this.store.tasks().unwrap_or_default().into_iter().find(|t| t.title.contains(needle))
+                    && let Ok(dir) = crate::attachments_dir()
+                {
+                    this.store.add_attachment(task.id, std::path::Path::new(file), &dir).ok();
+                    this.todo.update(cx, |todo, cx| todo.reload(cx));
+                }
+            }
             // `notice=<task title or habit name part>><hours ago>`: a fired reminder for the bell; `notices=open`.
             for spec in state.split(';').filter_map(|part| part.strip_prefix("notice=")) {
                 let (needle, ago) = spec.split_once('>').unwrap_or((spec, "0"));

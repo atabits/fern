@@ -134,6 +134,24 @@ pub struct Activity {
     pub kind: String,
 }
 
+/// A file attached to a task, kept as a copy in the app's attachment folder.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Attachment {
+    pub id: Id,
+    pub task_id: Id,
+    pub name: String,
+    /// Bytes.
+    pub size: u64,
+    pub created_at: i64,
+}
+
+impl Attachment {
+    /// Where the copy lives in the attachment folder `dir`.
+    pub fn path(&self, dir: &std::path::Path) -> std::path::PathBuf {
+        dir.join(format!("{}-{}", self.id, self.name))
+    }
+}
+
 /// One item of a task's checklist (TickTick's `items`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChecklistItem {

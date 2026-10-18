@@ -10,7 +10,7 @@ use uuid::Uuid;
 use crate::countdown::{Countdown, CountdownKind};
 use crate::focus::FocusSession;
 use crate::habit::{Checkin, Goal, Habit};
-use crate::model::{ChecklistItem, Id, Kind, List, Priority, Tag, Task, View, ViewCounts};
+use crate::model::{Attachment, ChecklistItem, Id, Kind, List, Priority, Tag, Task, View, ViewCounts};
 use crate::recurrence::Recurrence;
 
 const MIGRATIONS: &[&str] = &[
@@ -295,6 +295,15 @@ const MIGRATIONS: &[&str] = &[
     "
     ALTER TABLE countdowns ADD COLUMN icon TEXT;
     ALTER TABLE countdowns ADD COLUMN color TEXT;
+    ",
+    "
+    CREATE TABLE task_attachments (
+        id         TEXT PRIMARY KEY,
+        task_id    TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        name       TEXT NOT NULL,
+        size       INTEGER NOT NULL,
+        created_at INTEGER NOT NULL
+    );
     ",
 ];
 
@@ -1158,6 +1167,54 @@ impl Store {
             "UPDATE countdowns SET icon = ?2, color = ?3 WHERE id = ?1",
             params![id.to_string(), icon, color],
         )?;
+        Ok(())
+    }
+
+    /// "Upload Attachment": copies a file into `dir` (the app's attachment folder) as
+    /// `<id>-<name>` and lists it on the task.
+    pub fn add_attachment(&self, task: Id, file: &std::path::Path, dir: &std::path::Path) -> Result<Attachment> {
+        let name = file
+            .file_name()
+            .and_then(|n| n.to_str())
+            .context("the file has no name")?
+            .to_owned();
+        let id = Uuid::now_v7();
+        std::fs::create_dir_all(dir)?;
+        let size = std::fs::copy(file, dir.join(format!("{id}-{name}")))?;
+        let attachment = Attachment { id, task_id: task, name, size, created_at: now_ms() };
+        self.conn.execute(
+            "INSERT INTO task_attachments (id, task_id, name, size, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![id.to_string(), task.to_string(), attachment.name, size as i64, attachment.created_at],
+        )?;
+        Ok(attachment)
+    }
+
+    /// A task's attachments, oldest first.
+    pub fn attachments(&self, task: Id) -> Result<Vec<Attachment>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, task_id, name, size, created_at FROM task_attachments WHERE task_id = ?1 ORDER BY created_at, rowid",
+        )?;
+        let rows = stmt
+            .query_map([task.to_string()], |row| {
+                Ok(Attachment {
+                    id: parse_uuid(&row.get::<_, String>(0)?, 0)?,
+                    task_id: parse_uuid(&row.get::<_, String>(1)?, 1)?,
+                    name: row.get(2)?,
+                    size: row.get::<_, i64>(3)? as u64,
+                    created_at: row.get(4)?,
+                })
+            })?
+            .collect::<Result<_, _>>()?;
+        Ok(rows)
+    }
+
+    /// Removes an attachment and its copy in `dir`.
+    pub fn delete_attachment(&self, attachment: &Attachment, dir: &std::path::Path) -> Result<()> {
+        self.conn.execute("DELETE FROM task_attachments WHERE id = ?1", [attachment.id.to_string()])?;
+        let file = attachment.path(dir);
+        if file.exists() {
+            std::fs::remove_file(file)?;
+        }
         Ok(())
     }
 
@@ -2479,6 +2536,26 @@ mod tests {
         assert_eq!(store.step_checkin(water.id, day)?, 6);
         store.set_checkin_amount(water.id, day, 0)?;
         assert_eq!(store.step_checkin(water.id, day)?, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn attachments_are_copied_and_removed() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("fern-attach-test-{}", Uuid::now_v7()));
+        std::fs::create_dir_all(&dir)?;
+        let source = dir.join("receipt.txt");
+        std::fs::write(&source, "paid")?;
+        let store = Store::open_in_memory()?;
+        let task = store.add_task("Pay rent")?;
+        let folder = dir.join("attachments");
+        let attachment = store.add_attachment(task.id, &source, &folder)?;
+        assert_eq!((attachment.name.as_str(), attachment.size), ("receipt.txt", 4));
+        assert_eq!(std::fs::read_to_string(attachment.path(&folder))?, "paid");
+        assert_eq!(store.attachments(task.id)?, [attachment.clone()]);
+        store.delete_attachment(&attachment, &folder)?;
+        assert!(store.attachments(task.id)?.is_empty());
+        assert!(!attachment.path(&folder).exists());
+        std::fs::remove_dir_all(&dir)?;
         Ok(())
     }
 

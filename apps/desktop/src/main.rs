@@ -43,6 +43,11 @@ pub fn data_dir() -> Result<std::path::PathBuf> {
     Ok(dirs::data_dir().context("cannot determine the user data directory")?.join("fern-tasks"))
 }
 
+/// Where attached files are kept, as copies.
+pub fn attachments_dir() -> Result<std::path::PathBuf> {
+    Ok(data_dir()?.join("attachments"))
+}
+
 /// A backup chosen with "Import Backups", restored on the next start before anything opens.
 pub fn pending_restore_path() -> Result<std::path::PathBuf> {
     Ok(data_dir()?.join("restore.db"))

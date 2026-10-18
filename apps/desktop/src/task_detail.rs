@@ -61,6 +61,8 @@ impl EstimateDraft {
 
 pub struct TaskDetail {
     store: Rc<Store>,
+    /// The task's attached files.
+    attachments: Vec<fern_core::Attachment>,
     /// The month the custom repeat's "By Specific Dates" calendar shows.
     specific_month: Option<NaiveDate>,
     /// The "…" menu's Start Focus side menu, while hovered open.
@@ -194,6 +196,7 @@ impl TaskDetail {
         Self {
             store,
             focus_submenu: false,
+            attachments: Vec::new(),
             specific_month: None,
             estimate_draft: EstimateDraft { minutes: false, amount: 0 },
             task: None,
@@ -240,7 +243,78 @@ impl TaskDetail {
         self.sync_checklist(cx);
         self.show_checklist = !self.checklist.is_empty();
         self.sync_subtasks();
+        self.sync_attachments();
         cx.notify();
+    }
+
+    fn sync_attachments(&mut self) {
+        self.attachments = match self.task_id() {
+            Some(id) => self.store.attachments(id).unwrap_or_default(),
+            None => Vec::new(),
+        };
+    }
+
+    /// "Upload Attachment": files picked in the system's dialog are copied to the app's folder.
+    fn upload_attachment(&mut self, cx: &mut Context<Self>) {
+        self.popup = None;
+        let Some(task) = self.task_id() else { return };
+        let chosen = cx.prompt_for_paths(gpui::PathPromptOptions { files: true, directories: false, multiple: true, prompt: None });
+        cx.spawn(async move |this, cx| {
+            let Some(paths) = chosen.await.ok().and_then(Result::ok).flatten() else { return };
+            this.update(cx, |this, cx| {
+                let added = crate::attachments_dir()
+                    .and_then(|dir| paths.iter().try_for_each(|path| this.store.add_attachment(task, path, &dir).map(|_| ())));
+                if let Err(err) = added {
+                    eprintln!("failed to attach the file: {err:#}");
+                }
+                this.sync_attachments();
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// The attached files under the notes: a click opens one with the system's app.
+    fn render_attachments(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        let dir = crate::attachments_dir().ok();
+        v_flex().gap_1().children(self.attachments.iter().map(|attachment| {
+            let path = dir.as_ref().map(|dir| attachment.path(dir));
+            let removed = attachment.clone();
+            h_flex()
+                .id(SharedString::from(format!("attachment-{}", attachment.id)))
+                .group("attachment")
+                .h(px(36.))
+                .px_2()
+                .gap_2()
+                .rounded(px(6.))
+                .border_1()
+                .border_color(theme.colors().border_variant)
+                .cursor_pointer()
+                .hover(|s| s.bg(theme.colors().element_hover))
+                .child(Icon::new(IconName::Paperclip).size(IconSize::Small).color(Color::Muted))
+                .child(div().flex_1().min_w_0().child(Label::new(attachment.name.clone()).size(LabelSize::Small).truncate()))
+                .child(Label::new(format_size(attachment.size)).size(LabelSize::XSmall).color(Color::Muted))
+                .child(
+                    IconButton::new("attachment-delete", IconName::X).size(px(20.)).icon_size(IconSize::XSmall).on_click(
+                        cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            let result = crate::attachments_dir().and_then(|dir| this.store.delete_attachment(&removed, &dir));
+                            if let Err(err) = result {
+                                eprintln!("failed to remove the attachment: {err:#}");
+                            }
+                            this.sync_attachments();
+                            cx.notify();
+                        }),
+                    ),
+                )
+                .on_click(move |_, _, cx| {
+                    if let Some(path) = &path {
+                        cx.open_with_system(path);
+                    }
+                })
+        }))
     }
 
     fn sync_subtasks(&mut self) {
@@ -330,6 +404,7 @@ impl TaskDetail {
                 self.task = Some(task);
                 self.sync_checklist(cx);
                 self.sync_subtasks();
+                self.sync_attachments();
             }
             other => self.show(other, cx),
         }
@@ -621,6 +696,11 @@ impl TaskDetail {
             .child(self.close_side_menu_on_hover(item("more-tags", IconName::Tag, strings.tags).on_click(cx.listener(|this, _, _, cx| {
                 this.open_popup(Popup::Tags, cx);
             })), cx))
+            .child(self.close_side_menu_on_hover(
+                item("more-attachment", IconName::Paperclip, strings.upload_attachment)
+                    .on_click(cx.listener(|this, _, _, cx| this.upload_attachment(cx))),
+                cx,
+            ))
             .child(
                 SubmenuItem::new("more-focus", strings.start_focus)
                     .icon(IconName::CircleDot)
@@ -2297,6 +2377,7 @@ impl Render for TaskDetail {
                             .child(self.notes.clone()),
                     )
                     .when(self.show_checklist, |el| el.child(self.render_checklist(cx)))
+                    .when(!self.attachments.is_empty(), |el| el.child(self.render_attachments(cx)))
                     // Tags sit under the notes, as in the original.
                     .child(self.render_tags_row(strings, cx))
                     .child(div().pt_2().child(Divider::horizontal()))
@@ -2367,5 +2448,24 @@ impl Render for TaskDetail {
                         }
                     }),
             )
+    }
+}
+
+/// A file size the way people read it: "512 B", "12 KB", "3.4 MB".
+fn format_size(bytes: u64) -> String {
+    match bytes {
+        0..1024 => format!("{bytes} B"),
+        1024..1_048_576 => format!("{} KB", bytes / 1024),
+        _ => format!("{:.1} MB", bytes as f64 / 1_048_576.),
+    }
+}
+
+#[cfg(test)]
+mod size_tests {
+    #[test]
+    fn sizes() {
+        assert_eq!(super::format_size(512), "512 B");
+        assert_eq!(super::format_size(12 * 1024 + 5), "12 KB");
+        assert_eq!(super::format_size(3_565_158), "3.4 MB");
     }
 }

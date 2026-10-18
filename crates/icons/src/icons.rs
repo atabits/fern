@@ -67,6 +67,7 @@ pub enum IconName {
     Moon,
     PaintRoller,
     PanelLeft,
+    Paperclip,
     Pause,
     Pencil,
     Percent,

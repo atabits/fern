@@ -257,6 +257,32 @@ pub fn grouped_rows(tasks: &[Task], group: GroupBy, today: NaiveDate, strings: &
     rows
 }
 
+/// A kanban column: its title and cards, each a top-level task with its subtasks.
+pub type KanbanColumn = (String, Vec<(Task, Vec<Task>)>);
+
+/// Splits list rows into kanban columns, one per group header; rows before any header form an
+/// untitled column. Subtasks go into their top-level task's card.
+pub fn kanban_columns(rows: Vec<Row>, strings: &Strings) -> Vec<KanbanColumn> {
+    let mut columns: Vec<KanbanColumn> = Vec::new();
+    for row in rows {
+        match row {
+            Row::Section { section, .. } => columns.push((section.title(strings).to_owned(), Vec::new())),
+            Row::Day { label, .. } => columns.push((label, Vec::new())),
+            Row::Task { task, depth, .. } => {
+                if columns.is_empty() {
+                    columns.push((String::new(), Vec::new()));
+                }
+                let cards = &mut columns.last_mut().expect("a column was just ensured").1;
+                match cards.last_mut() {
+                    Some((_, subtasks)) if depth > 0 => subtasks.push(task),
+                    _ => cards.push((task, Vec::new())),
+                }
+            }
+        }
+    }
+    columns
+}
+
 /// Byte ranges of case-insensitive occurrences of `query` in `text`, for highlighting.
 /// Compares character by character, so non-ASCII text (Cyrillic, accents) works.
 pub fn match_ranges(text: &str, query: &str) -> Vec<std::ops::Range<usize>> {
@@ -535,6 +561,29 @@ mod tests {
         assert_eq!(snippet("short", "sho", 10).as_deref(), Some("short"));
         assert_eq!(snippet("line one\nline two", "two", 20).as_deref(), Some("line one line two"));
         assert_eq!(snippet("nothing", "zzz", 5), None);
+    }
+
+    #[test]
+    fn kanban_columns_follow_the_groups() {
+        let mut child = task("child");
+        child.parent_id = Some(Uuid::now_v7());
+        let rows = vec![
+            Row::Section { section: Section::Tasks, count: 2, collapsed: false },
+            Row::Task { task: task("parent"), depth: 0, has_children: true, collapsed: false },
+            Row::Task { task: child, depth: 1, has_children: false, collapsed: false },
+            Row::Task { task: task("solo"), depth: 0, has_children: false, collapsed: false },
+            Row::Section { section: Section::Notes, count: 0, collapsed: true },
+        ];
+        let columns = kanban_columns(rows, &EN);
+        let shape: Vec<(String, Vec<(String, usize)>)> = columns
+            .into_iter()
+            .map(|(title, cards)| (title, cards.into_iter().map(|(t, subs)| (t.title, subs.len())).collect()))
+            .collect();
+        assert_eq!(shape, [
+            ("Tasks".to_owned(), vec![("parent".to_owned(), 1), ("solo".to_owned(), 0)]),
+            ("Notes".to_owned(), vec![]),
+        ]);
+        assert_eq!(kanban_columns(vec![Row::Task { task: task("a"), depth: 0, has_children: false, collapsed: false }], &EN)[0].0, "");
     }
 
     #[test]

@@ -71,6 +71,8 @@ pub struct TodoView {
     sort_menu: Option<Option<SortMenu>>,
     /// The current list's "Show Details", read when the list loads.
     show_details: bool,
+    /// The current list's layout: cards in columns instead of rows (the menu's View).
+    kanban: bool,
     detail: Entity<TaskDetail>,
     selected: Option<Id>,
     error: Option<String>,
@@ -164,6 +166,7 @@ impl TodoView {
             closed_menu: None,
             sort_menu: None,
             show_details: false,
+            kanban: false,
             detail,
             selected: None,
             error: None,
@@ -308,6 +311,7 @@ impl TodoView {
 
     fn reload(&mut self, cx: &mut Context<Self>) {
         self.show_details = self.view_flag("show_details", false);
+        self.kanban = self.view_flag("kanban", false);
         let today = Self::today();
         if let Some(lists) = self.check(self.store.lists()) {
             self.lists = lists;
@@ -407,6 +411,11 @@ impl TodoView {
 
     /// The rows of the current view: closed tasks by day, the trash flat, everything else grouped.
     fn rows(&self, strings: &Strings) -> Vec<Row> {
+        self.rows_with(strings, &self.collapsed_tasks, &self.collapsed_sections)
+    }
+
+    /// Rows with the given collapsed tasks and groups; the kanban board shows everything.
+    fn rows_with(&self, strings: &Strings, collapsed_tasks: &HashSet<Id>, collapsed_sections: &HashSet<Section>) -> Vec<Row> {
         let closed = |closed_at: fn(&Task) -> Option<i64>| {
             let today = Self::today();
             let tasks: Vec<Task> = self
@@ -426,8 +435,8 @@ impl TodoView {
             View::WontDo => closed(|t| t.wont_do_at),
             View::Trash | View::Search(_) => task_rows::build_rows(
                 &self.tasks,
-                &self.collapsed_tasks,
-                &self.collapsed_sections,
+                collapsed_tasks,
+                collapsed_sections,
                 self.view != View::Trash,
             ),
             _ => {
@@ -440,7 +449,7 @@ impl TodoView {
                 task_rows::pinned_first(&mut tasks);
                 match group {
                     GroupBy::Custom => {
-                        task_rows::build_rows(&tasks, &self.collapsed_tasks, &self.collapsed_sections, true)
+                        task_rows::build_rows(&tasks, collapsed_tasks, collapsed_sections, true)
                     }
                     group => task_rows::grouped_rows(&tasks, group, Self::today(), strings),
                 }
@@ -457,6 +466,75 @@ impl TodoView {
         }
     }
 
+    /// A kanban card: the task with its tags and date, and its subtasks under it.
+    fn render_card(
+        &self,
+        task: &Task,
+        subtasks: &[Task],
+        tag_colors: &HashMap<String, Hsla>,
+        today: NaiveDate,
+        strings: &Strings,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = cx.theme().clone();
+        let selected = self.selected == Some(task.id);
+        let line = |task: &Task, id: SharedString, cx: &mut Context<Self>| {
+            let task_id = task.id;
+            let done = task.is_completed();
+            h_flex()
+                .items_start()
+                .gap_2()
+                .child(
+                    Checkbox::new(id)
+                        .toggle_state(done)
+                        .tint(task_rows::priority_color(task.priority, &theme))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.toggle(task_id, !done, cx);
+                        })),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_size(px(13.))
+                        .text_color(if done { theme.colors().text_muted } else { theme.colors().text })
+                        .child(if task.title.is_empty() { strings.untitled.to_owned() } else { task.title.clone() }),
+                )
+        };
+        let id = task.id;
+        let due = task.due_date.map(|date| task_rows::due_label(date, task.due_time, today, strings));
+        v_flex()
+            .id(ElementId::Uuid(id))
+            .p_2()
+            .gap_1p5()
+            .rounded(px(8.))
+            .border_1()
+            .border_color(if selected { theme.colors().accent } else { theme.colors().border_variant })
+            .bg(theme.colors().surface_background)
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, _, cx| this.select(id, cx)))
+            .child(line(task, SharedString::from(format!("card-check-{id}")), cx))
+            .when(!task.tags.is_empty() || due.is_some(), |el| {
+                el.child(
+                    h_flex()
+                        .pl(px(24.))
+                        .gap_1()
+                        .flex_wrap()
+                        .children(task.tags.iter().map(|tag| {
+                            Chip::new(tag.clone(), tag_colors.get(tag).copied().unwrap_or(theme.colors().text_muted))
+                        }))
+                        .when_some(due, |el, (label, overdue)| {
+                            el.child(Label::new(label).size(LabelSize::XSmall).color(if overdue { Color::Error } else { Color::Accent }))
+                        }),
+                )
+            })
+            .children(subtasks.iter().map(|sub| {
+                div().pl(px(16.)).child(line(sub, SharedString::from(format!("card-check-{}", sub.id)), cx))
+            }))
+            .into_any_element()
+    }
+
     /// A per-list switch of the header's "…" menu ("Show Completed", "Show Details").
     fn view_flag(&self, name: &str, default: bool) -> bool {
         let key = format!("{name}:{}", self.view_key());
@@ -469,6 +547,7 @@ impl TodoView {
         let result = self.store.set_setting(&key, if value { "1" } else { "0" });
         self.check(result);
         self.show_details = self.view_flag("show_details", false);
+        self.kanban = self.view_flag("kanban", false);
         self.header_menu_open = false;
         cx.notify();
     }
@@ -1480,7 +1559,41 @@ impl TodoView {
             .when(!in_trash && !matches!(self.view, View::Completed | View::WontDo | View::Search(_)), |el| {
                 let completed = self.view_flag("show_completed", true);
                 let details = self.view_flag("show_details", false);
+                let kanban = self.kanban;
+                let theme = cx.theme().clone();
+                let layout = |id: &'static str, icon: IconName, on: bool| {
+                    div()
+                        .id(id)
+                        .flex_1()
+                        .h(px(30.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(6.))
+                        .cursor_pointer()
+                        .when(on, |el| el.bg(theme.colors().element_selected))
+                        .hover(|s| s.bg(theme.colors().element_hover))
+                        .child(Icon::new(icon).color(if on { Color::Accent } else { Color::Muted }))
+                };
                 el.when(in_list, |el| el.child(div().my_1().child(Divider::horizontal())))
+                    .child(div().px_2().pt_1().child(Label::new(strings.view_label).size(LabelSize::Small).color(Color::Muted)))
+                    .child(
+                        h_flex()
+                            .px_2()
+                            .py_1()
+                            .gap_1()
+                            .child(layout("layout-list", IconName::List, !kanban).on_click(cx.listener(move |this, _, _, cx| {
+                                if kanban {
+                                    this.toggle_view_flag("kanban", false, cx)
+                                }
+                            })))
+                            .child(layout("layout-kanban", IconName::Kanban, kanban).on_click(cx.listener(move |this, _, _, cx| {
+                                if !kanban {
+                                    this.toggle_view_flag("kanban", false, cx)
+                                }
+                            }))),
+                    )
+                    .child(div().my_1().child(Divider::horizontal()))
                     .child(
                         ListItem::new("toggle-completed")
                             .start_slot(Icon::new(IconName::SquareCheck).color(Color::Muted))
@@ -1537,7 +1650,50 @@ impl Render for TodoView {
             .iter()
             .map(|t| (t.name.clone(), lists_panel::color(t.color.as_deref(), cx)))
             .collect();
-        let rows = self.rows(strings);
+        let kanban_view = self.kanban
+            && !matches!(self.view, View::Trash | View::Completed | View::WontDo | View::Search(_));
+        let board: Option<AnyElement> = kanban_view.then(|| {
+            let columns = task_rows::kanban_columns(self.rows_with(strings, &HashSet::new(), &HashSet::new()), strings);
+            let theme = cx.theme().clone();
+            h_flex()
+                .id("kanban")
+                .flex_1()
+                .items_start()
+                .gap_3()
+                .px_4()
+                .pb_4()
+                .overflow_x_scroll()
+                .children(columns.into_iter().enumerate().map(|(i, (title, cards))| {
+                    let count = cards.len();
+                    v_flex()
+                        .id(SharedString::from(format!("kanban-column-{i}")))
+                        .w(px(270.))
+                        .flex_none()
+                        .max_h_full()
+                        .gap_2()
+                        .child(
+                            h_flex()
+                                .h(px(30.))
+                                .gap_2()
+                                .child(Label::new(if title.is_empty() { strings.group_tasks.to_owned() } else { title }).weight(FontWeight::BOLD))
+                                .child(Label::new(count.to_string()).size(LabelSize::Small).color(Color::Muted)),
+                        )
+                        .child(
+                            v_flex()
+                                .id(SharedString::from(format!("kanban-cards-{i}")))
+                                .gap_2()
+                                .overflow_y_scroll()
+                                .children(cards.iter().map(|(task, subtasks)| {
+                                    self.render_card(task, subtasks, &tag_colors, today, strings, cx)
+                                })),
+                        )
+                        .when(count == 0, |el| {
+                            el.child(div().h(px(40.)).rounded(px(8.)).border_1().border_color(theme.colors().border_variant))
+                        })
+                }))
+                .into_any_element()
+        });
+        let rows = if kanban_view { Vec::new() } else { self.rows(strings) };
         let rows: Vec<_> = rows
             .iter()
             .map(|row| match row {
@@ -1657,7 +1813,8 @@ impl Render for TodoView {
                     .child(Icon::new(IconName::Plus))
                     .child(self.input.clone()),
             ))
-            .child(
+            .children(board)
+            .when(!kanban_view, |el| el.child(
                 div()
                     .id("tasks")
                     .track_focus(&self.list_focus)
@@ -1685,7 +1842,7 @@ impl Render for TodoView {
                     })
                     .children(rows)
                     .children(self.render_habits(strings, cx)),
-            )
+            ))
             .when_some(self.error.clone(), |el, error| {
                 el.child(
                     div()

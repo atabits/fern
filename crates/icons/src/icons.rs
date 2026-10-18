@@ -38,6 +38,7 @@ pub enum IconName {
     Heart,
     Hourglass,
     Inbox,
+    Kanban,
     Languages,
     Layers,
     LayoutGrid,

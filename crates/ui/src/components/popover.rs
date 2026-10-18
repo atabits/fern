@@ -29,6 +29,8 @@ pub enum Placement {
     /// Opens upwards, for buttons at the bottom of a panel.
     AboveRight,
     RightTop,
+    /// To the right, growing upwards: for buttons at the bottom of the sidebar.
+    RightBottom,
 }
 
 /// Renders a popover on top of the rest of the UI, attached to its parent, which must be
@@ -52,6 +54,7 @@ impl RenderOnce for PopoverAttachment {
             Placement::BelowRight => (div().absolute().top(px(30.)).right_0(), Anchor::TopRight),
             Placement::AboveRight => (div().absolute().top(px(-4.)).right_0(), Anchor::BottomRight),
             Placement::RightTop => (div().absolute().top_0().left(px(38.)), Anchor::TopLeft),
+            Placement::RightBottom => (div().absolute().bottom_0().left(px(38.)), Anchor::BottomLeft),
         };
         attach.child(
             deferred(anchored().anchor(anchor).snap_to_window_with_margin(px(8.)).child(self.content))

@@ -12,6 +12,7 @@ use crate::focus_view::FocusView;
 use crate::habit_view::HabitView;
 use crate::i18n::{self, CurrentLocale, Locale};
 use crate::matrix_view::{self, MatrixView};
+use crate::reminders::{self, Notice, Notices};
 use crate::search_modal::{SearchEvent, SearchModal};
 use crate::sidebar::{self, Section};
 use crate::todo_view::TodoView;
@@ -27,6 +28,8 @@ pub struct AppView {
     focus: gpui::Entity<FocusView>,
     search: Option<gpui::Entity<SearchModal>>,
     account_menu_open: bool,
+    notices: Notices,
+    notices_open: bool,
 }
 
 impl AppView {
@@ -67,7 +70,10 @@ impl AppView {
             focus,
             search: None,
             account_menu_open: false,
+            notices: Notices::default(),
+            notices_open: false,
         };
+        reminders::start(this.store.clone(), cx);
         #[cfg(debug_assertions)]
         if let Ok(state) = std::env::var("FERN_DEV_STATE") {
             if state.contains("section=calendar") {
@@ -120,6 +126,17 @@ impl AppView {
             }
             if state.contains("section=countdown") {
                 this.select(Section::Countdown, window, cx);
+            }
+            // `notice=<task title part>><hours ago>`: a fired reminder for the bell; `notices=open`.
+            for spec in state.split(';').filter_map(|part| part.strip_prefix("notice=")) {
+                let (needle, ago) = spec.split_once('>').unwrap_or((spec, "0"));
+                if let Some(task) = this.store.tasks().unwrap_or_default().into_iter().find(|t| t.title.contains(needle)) {
+                    let at = chrono::Local::now().naive_local() - chrono::Duration::hours(ago.parse().unwrap_or(0));
+                    this.add_notices(vec![Notice { task: task.id, title: task.title, at }], cx);
+                }
+            }
+            if state.contains("notices=open") {
+                this.set_notices_open(true, cx);
             }
             if let Some(query) = state.split(';').find_map(|part| part.strip_prefix("search-popover=")) {
                 this.open_search(window, cx);
@@ -246,6 +263,63 @@ impl AppView {
     }
 }
 
+impl AppView {
+    pub fn add_notices(&mut self, notices: Vec<Notice>, cx: &mut Context<Self>) {
+        if !notices.is_empty() {
+            self.notices.push(notices);
+            cx.notify();
+        }
+    }
+
+    /// Opening the list marks the notifications read, which clears the badge.
+    fn set_notices_open(&mut self, open: bool, cx: &mut Context<Self>) {
+        self.notices_open = open;
+        if open {
+            self.notices.mark_read();
+        }
+        cx.notify();
+    }
+
+    fn open_notice(&mut self, task: fern_core::Id, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_notices_open(false, cx);
+        self.select(Section::Tasks, window, cx);
+        self.todo.update(cx, |todo, cx| {
+            todo.set_view(fern_core::View::All, cx);
+            todo.select(task, cx);
+        });
+    }
+
+    fn render_notices(&self, cx: &mut Context<Self>) -> AnyElement {
+        let strings = i18n::t(cx);
+        let today = chrono::Local::now().date_naive();
+        popover(cx)
+            .w(px(300.))
+            .max_h(px(420.))
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.set_notices_open(false, cx)))
+            .child(div().px_2().py_1().child(Label::new(strings.notifications).weight(gpui::FontWeight::SEMIBOLD)))
+            .when(self.notices.items.is_empty(), |el| {
+                el.child(div().px_2().py_3().child(Label::new(strings.no_notifications).color(Color::Muted)))
+            })
+            .child(
+                v_flex().id("notices").overflow_y_scroll().children(self.notices.items.iter().enumerate().map(|(i, notice)| {
+                    let task = notice.task;
+                    let (when, _) = crate::task_rows::due_label(notice.at.date(), Some(notice.at.time()), today, strings);
+                    ListItem::new(SharedString::from(format!("notice-{i}")))
+                        .height(px(44.))
+                        .start_slot(Icon::new(IconName::AlarmClock).color(Color::Accent))
+                        .child(
+                            v_flex()
+                                .min_w_0()
+                                .child(Label::new(notice.title.clone()).truncate())
+                                .child(Label::new(when).size(LabelSize::XSmall).color(Color::Muted)),
+                        )
+                        .on_click(cx.listener(move |this, _, window, cx| this.open_notice(task, window, cx)))
+                })),
+            )
+            .into_any_element()
+    }
+}
+
 impl Render for AppView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
@@ -257,6 +331,16 @@ impl Render for AppView {
         let account_menu = self.account_menu_open.then(|| {
             PopoverAttachment::new(Placement::RightTop, self.render_account_menu(cx)).into_any_element()
         });
+        let bell = sidebar::Bell {
+            unread: self.notices.unread,
+            on_click: Box::new(cx.listener(|this, _, _, cx| {
+                let open = !this.notices_open;
+                this.set_notices_open(open, cx)
+            })),
+            menu: self
+                .notices_open
+                .then(|| PopoverAttachment::new(Placement::RightBottom, self.render_notices(cx)).into_any_element()),
+        };
 
         h_flex()
             .relative()
@@ -276,7 +360,7 @@ impl Render for AppView {
             .items_start()
             .bg(theme.colors().background)
             .text_color(theme.colors().text)
-            .child(sidebar::render(self.section, on_select, on_avatar, account_menu, cx))
+            .child(sidebar::render(self.section, on_select, on_avatar, account_menu, bell, cx))
             .child(match self.section {
                 Section::Tasks | Section::Search => div().flex_1().h_full().child(self.todo.clone()),
                 Section::Calendar => div().flex_1().h_full().child(self.calendar.clone()),

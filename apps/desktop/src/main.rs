@@ -56,7 +56,6 @@ fn main() -> Result<()> {
             Err(err) => eprintln!("failed to load the keymap: {err:#}"),
         }
         cx.on_action(|_: &Quit, cx| cx.quit());
-        reminders::start(store.clone(), cx);
 
         let bounds = Bounds::centered(None, size(px(1280.), px(760.)), cx);
         cx.open_window(

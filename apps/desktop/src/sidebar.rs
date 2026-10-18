@@ -67,12 +67,21 @@ impl Section {
 
 pub const WIDTH: f32 = 50.;
 
+/// The notification bell: a red badge with the unread count, as in the original.
+pub struct Bell {
+    pub unread: usize,
+    pub on_click: Box<dyn Fn(&ClickEvent, &mut Window, &mut App)>,
+    /// The notification list, while it is open.
+    pub menu: Option<AnyElement>,
+}
+
 /// `account_menu` is rendered next to the avatar while the account menu is open.
 pub fn render(
     active: Section,
     on_select: impl Fn(Section, &mut Window, &mut App) + Clone + 'static,
     on_avatar: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     account_menu: Option<AnyElement>,
+    bell: Bell,
     cx: &App,
 ) -> impl IntoElement {
     let colors = cx.theme().colors();
@@ -116,6 +125,31 @@ pub fn render(
         }))
         .child(div().flex_1())
         .child(button("sync", IconName::RefreshCw))
-        .child(button("notifications", IconName::Bell))
+        .child(
+            div()
+                .relative()
+                .child(button("notifications", IconName::Bell).tooltip(Tooltip::text(strings.notifications)).on_click(bell.on_click))
+                .when(bell.unread > 0, |el| {
+                    el.child(
+                        div()
+                            .absolute()
+                            .top(px(2.))
+                            .right(px(2.))
+                            .min_w(px(14.))
+                            .h(px(14.))
+                            .px(px(3.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_full()
+                            .bg(cx.theme().status().error)
+                            .text_color(gpui::white())
+                            .text_size(px(9.))
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .child(if bell.unread > 99 { "99+".to_owned() } else { bell.unread.to_string() }),
+                    )
+                })
+                .children(bell.menu),
+        )
         .child(button("help", IconName::CircleQuestionMark))
 }

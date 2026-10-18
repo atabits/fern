@@ -43,7 +43,7 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 
 | Feature | Status | Notes |
 |---|---|---|
-| Narrow sections sidebar | 🟡 | order and tooltips match the original; every section works; outline icons where TickTick uses filled ones; no notification badge |
+| Narrow sections sidebar | 🟡 | order and tooltips match the original; every section works; the bell has the original's red unread badge and lists fired reminders, including ones missed while the app was closed (opening the list marks them read, a click opens the task). The original's notification list was not opened (that would mark the user's notifications read). Outline icons where TickTick uses filled ones |
 | Account menu with language switch | ✅ | English (default) and Russian |
 | Lists column: Inbox / All / Today / Tomorrow / Next 7 Days | ✅ | counters; a new task gets the due date or tag of the current view |
 | Lists column: user lists | ✅ | create inline; rename, color and delete from the "…" menu; no drag and drop |
@@ -90,7 +90,7 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 
 ## Next
 
-1. Filled sidebar icons and the notification badge (missed reminders).
+1. Filled sidebar icons (needs own filled glyphs; Lucide has none).
 2. "Other Date" range in the closed views' date filter.
 3. Habit check-ins with partial amounts and the daily goals chart.
 4. Custom reminders and reminders for habits.

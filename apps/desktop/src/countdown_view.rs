@@ -135,18 +135,19 @@ pub fn countdown_color(color: Option<&str>, cx: &App) -> gpui::Hsla {
 /// A countdown's round icon: its emoji on its color, or the kind's icon.
 fn badge(countdown: &Countdown, color: gpui::Hsla, cx: &App) -> gpui::Div {
     let fill = crate::lists_panel::parse_color(countdown.color.as_deref());
+    // The original's 24 px round icon beside the name.
     div()
-        .size(px(18.))
+        .size(px(24.))
         .flex()
         .items_center()
         .justify_center()
         .rounded_full()
         .bg(fill.map_or(color.opacity(0.25), |c| c.opacity(0.6)))
         .map(|el| match &countdown.icon {
-            Some(icon) => el.text_size(px(11.)).child(icon.clone()),
+            Some(icon) => el.text_size(px(14.)).child(icon.clone()),
             None => el.child(
                 Icon::new(kind_icon(countdown.kind))
-                    .size(IconSize::XSmall)
+                    .size(IconSize::Small)
                     .color(Color::Custom(if fill.is_some() { cx.theme().colors().text } else { color })),
             ),
         })
@@ -1392,16 +1393,19 @@ impl Render for CountdownView {
                             }),
                     ),
             )
-            .when(!hide_group, |el| el.child(h_flex().flex_none().px(px(20.)).gap_1().pb_3().children(filters.map(|(filter, label)| {
+            .when(!hide_group, |el| el.child(h_flex().flex_none().px(px(20.)).pt_2().gap_1().pb(px(18.)).children(filters.map(|(filter, label)| {
+                // The original's filter pills: 32 px, at the body size.
                 let selected = self.filter == filter;
                 div()
                     .id(label)
-                    .px_2()
-                    .py_0p5()
-                    .rounded(px(6.))
+                    .h(px(32.))
+                    .px_3()
+                    .flex()
+                    .items_center()
+                    .rounded(px(16.))
                     .cursor_pointer()
                     .when(selected, |el| el.bg(theme.colors().accent.opacity(0.2)))
-                    .child(Label::new(label).size(LabelSize::Small).color(if selected { Color::Accent } else { Color::Muted }))
+                    .child(Label::new(label).color(if selected { Color::Accent } else { Color::Muted }))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.filter = filter;
                         cx.notify();

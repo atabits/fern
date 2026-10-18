@@ -670,16 +670,31 @@ impl CalendarView {
                         .gap_3()
                         .child(div().w(px(72.)).flex_none().child(Label::new(strings.range_all_day).size(LabelSize::Small).color(Color::Muted)))
                         .child(div().size(px(10.)).flex_none().rounded_full().bg(theme.colors().element_hover))
+                        // The original's banner: a light sky with a sun, drawn for Fern rather than
+                        // copied, the words dark on it.
                         .child(
-                            div()
+                            h_flex()
                                 .flex_1()
-                                .h(px(52.))
-                                .px_4()
-                                .flex()
-                                .items_center()
-                                .rounded(px(6.))
-                                .bg(theme.colors().accent.opacity(0.18))
-                                .child(Label::new(strings.no_tasks_today).size(LabelSize::Small)),
+                                .h(px(64.))
+                                .px_5()
+                                .rounded(px(8.))
+                                .bg(gpui::linear_gradient(
+                                    90.,
+                                    gpui::linear_color_stop(gpui::rgb(0xdbe9f7), 0.),
+                                    gpui::linear_color_stop(gpui::rgb(0x9fc7ee), 1.),
+                                ))
+                                .child(div().flex_1().text_color(gpui::rgb(0x334155)).child(Label::new(strings.no_tasks_today).color(Color::Custom(gpui::rgb(0x334155).into()))))
+                                .child(
+                                    div()
+                                        .size(px(44.))
+                                        .mr(px(80.))
+                                        .rounded_full()
+                                        .bg(gpui::linear_gradient(
+                                            180.,
+                                            gpui::linear_color_stop(gpui::rgb(0xfde68a), 0.),
+                                            gpui::linear_color_stop(gpui::rgb(0xf59e0b), 1.),
+                                        )),
+                                ),
                         )
                         .into_any_element(),
                 ]
@@ -793,9 +808,11 @@ impl CalendarView {
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
-            .px(px(60.))
+            .pl(px(185.))
+            .pr(px(60.))
             .pb_6()
-            // The original's agenda: 1030 px wide, each day 100 px apart.
+            // The original's agenda: 185 px in from the left, up to 1030 px wide, each day 100 px
+            // apart.
             .child(v_flex().pt(px(14.)).max_w(px(1030.)).children(rows))
             .into_any_element()
     }

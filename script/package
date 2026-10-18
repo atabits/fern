@@ -118,7 +118,7 @@ EOF
         # The installer, with Inno Setup (`choco install innosetup` puts it in Program Files).
         iscc=$(command -v iscc || echo "/c/Program Files (x86)/Inno Setup 6/ISCC.exe")
         # Git Bash would turn the /switches into paths.
-        MSYS2_ARG_CONV_EXCL='*' "$iscc" /Q "/DVersion=$version" "/DSourceDir=$(cygpath -w "$PWD/$bin")" \
+        MSYS2_ARG_CONV_EXCL='*' "$iscc" /Q "/DVersion=$version" "/DFileVersion=${version%%-*}" "/DSourceDir=$(cygpath -w "$PWD/$bin")" \
             "/DOutputDir=$(cygpath -w "$PWD/$dist")" "/DOutputName=$name-setup" assets/windows/fern.iss
         ;;
     linux)

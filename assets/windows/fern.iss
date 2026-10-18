@@ -1,5 +1,5 @@
 ; The Windows installer, built by script/package with Inno Setup:
-;   iscc /DVersion=<version> /DSourceDir=<folder with fern.exe> /DOutputDir=<dir> /DOutputName=<name> fern.iss
+;   iscc /DVersion=<version> /DFileVersion=<x.y.z> /DSourceDir=<folder with fern.exe> /DOutputDir=<dir> /DOutputName=<name> fern.iss
 ; It installs for the current user without asking for administrator rights; the first page
 ; offers installing for everyone instead.
 
@@ -12,6 +12,10 @@ AppId={{99571A45-E987-4A60-A898-1843F3429CD4}
 AppName={#AppName}
 AppVersion={#Version}
 AppVerName={#AppName} {#Version}
+; The installer's own file properties; FileVersion is the version without a build suffix.
+VersionInfoVersion={#FileVersion}
+VersionInfoProductName={#AppName}
+VersionInfoDescription={#AppName} Setup
 AppPublisher=Amin Atabiev
 AppPublisherURL=https://github.com/atabits/fern
 AppSupportURL=https://github.com/atabits/fern/issues

@@ -148,7 +148,7 @@ Description: Tasks, calendar, habits and focus in one native app
  A free, open-source task manager inspired by TickTick. It works offline,
  needs no account and keeps the data on this computer.
 EOF
-            dpkg-deb --root-owner-group --build "$deb" "$dist/$name.deb" > /dev/null
+            dpkg-deb -Zxz --root-owner-group --build "$deb" "$dist/$name.deb" > /dev/null
         fi
 
         appdir="$work/AppDir"

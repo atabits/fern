@@ -9,7 +9,7 @@ use chrono::{Datelike, Local, NaiveDate};
 use fern_core::stats::{self, Bucket};
 use fern_core::{FocusSession, Id, Store, Task, View, focus_stats, format_minutes};
 use gpui::{Entity, FontWeight, Task as GpuiTask};
-use ui::{Placement, PopoverAttachment, popover};
+use ui::{Donut, Placement, PopoverAttachment, popover};
 use ui::prelude::*;
 
 use crate::focus_timer::{BreakKind, FocusTimer, break_after, format_clock};
@@ -1016,7 +1016,6 @@ impl FocusView {
         };
 
         let by_list = stats::completed_by_list_in(&tasks, first, last);
-        let most = by_list.first().map_or(1, |(_, n)| *n).max(1) as f32;
         let kinds = stats::completion_kinds(&tasks, first, last);
         let status = theme.status().clone();
         let kind_rows = [
@@ -1025,25 +1024,38 @@ impl FocusView {
             (status.warning, kinds.undated, strings.stats_undated),
             (theme.colors().text_muted, kinds.uncompleted, strings.stats_uncompleted),
         ];
-        let total = kinds.total().max(1) as f32;
         let rate_card = card()
             .flex_1()
             .child(Label::new(strings.stats_rate_distribution).weight(FontWeight::SEMIBOLD))
-            .when(kinds.total() == 0, |el| el.child(Label::new(strings.stats_no_data).color(Color::Muted)))
-            .when(kinds.total() > 0, |el| {
-                el.child(
-                    h_flex().h(px(12.)).w_full().rounded(px(6.)).overflow_hidden().children(
-                        kind_rows.iter().filter(|(_, n, _)| *n > 0).map(|(color, n, _)| div().h_full().w(gpui::relative(*n as f32 / total)).bg(*color)),
-                    ),
-                )
-                .children(kind_rows.iter().map(|(color, n, label)| {
-                    h_flex()
-                        .gap_2()
-                        .child(div().size(px(8.)).rounded_full().bg(*color))
-                        .child(Label::new(n.to_string()).size(LabelSize::Small))
-                        .child(Label::new(*label).size(LabelSize::Small).color(Color::Muted))
-                }))
-            });
+            .child(
+                h_flex()
+                    .py_2()
+                    .gap_6()
+                    .justify_center()
+                    .child(
+                        Donut::new(kind_rows.iter().map(|(color, n, _)| (*n as f32, *color))).center(
+                            v_flex()
+                                .items_center()
+                                .child(div().text_size(px(20.)).font_weight(FontWeight::SEMIBOLD).child(if kinds.total() == 0 {
+                                    strings.stats_no_data.to_owned()
+                                } else {
+                                    format!("{}%", rate(first, last))
+                                }))
+                                .when(kinds.total() > 0, |el| {
+                                    el.child(Label::new(strings.stats_completion_rate).size(LabelSize::XSmall).color(Color::Muted))
+                                }),
+                        ),
+                    )
+                    .when(kinds.total() > 0, |el| {
+                        el.child(v_flex().gap_1().children(kind_rows.iter().map(|(color, n, label)| {
+                            h_flex()
+                                .gap_2()
+                                .child(div().size(px(8.)).rounded_full().bg(*color))
+                                .child(Label::new(n.to_string()).size(LabelSize::Small))
+                                .child(Label::new(*label).size(LabelSize::Small).color(Color::Muted))
+                        })))
+                    }),
+            );
         // Weekly and Monthly add the completion per day, as in the original.
         let distribution = (period != Bucket::Day).then(|| {
             let days = (last - first).num_days() as usize + 1;
@@ -1133,22 +1145,51 @@ impl FocusView {
                     card()
                         .flex_1()
                         .child(Label::new(strings.stats_by_list).weight(FontWeight::SEMIBOLD))
-                        .when(by_list.is_empty(), |el| el.child(Label::new(strings.stats_no_data).color(Color::Muted)))
-                        .children(by_list.into_iter().map(|(list, n)| {
-                            let name: SharedString = list
-                                .and_then(|id| lists.iter().find(|l| l.id == id))
-                                .map_or(strings.inbox.into(), |l| l.name.clone().into());
+                        .child({
+                            // Each list in its own color, or one from a palette.
+                            let palette = [theme.colors().accent, status.success, status.warning, status.error, theme.colors().text_muted];
+                            let slices: Vec<(SharedString, usize, Hsla)> = by_list
+                                .iter()
+                                .enumerate()
+                                .map(|(i, (list, n))| {
+                                    let list = list.and_then(|id| lists.iter().find(|l| l.id == id));
+                                    let name: SharedString = list.map_or(strings.inbox.into(), |l| l.name.clone().into());
+                                    let color = list
+                                        .and_then(|l| crate::lists_panel::parse_color(l.color.as_deref()))
+                                        .unwrap_or(palette[i % palette.len()]);
+                                    (name, *n, color)
+                                })
+                                .collect();
+                            let completed: usize = slices.iter().map(|(_, n, _)| n).sum();
                             h_flex()
-                                .gap_2()
-                                .child(div().w(px(140.)).child(Label::new(name).size(LabelSize::Small).truncate()))
+                                .py_2()
+                                .gap_6()
+                                .justify_center()
                                 .child(
-                                    div().flex_1().h(px(10.)).rounded(px(5.)).bg(theme.colors().element_hover).child(
-                                        div().h_full().w(gpui::relative(n as f32 / most)).rounded(px(5.)).bg(theme.colors().accent),
+                                    Donut::new(slices.iter().map(|(_, n, color)| (*n as f32, *color))).center(
+                                        v_flex()
+                                            .items_center()
+                                            .child(div().text_size(px(20.)).font_weight(FontWeight::SEMIBOLD).child(if completed == 0 {
+                                                strings.stats_no_data.to_owned()
+                                            } else {
+                                                completed.to_string()
+                                            }))
+                                            .when(completed > 0, |el| {
+                                                el.child(Label::new(strings.stats_completed_tasks).size(LabelSize::XSmall).color(Color::Muted))
+                                            }),
                                     ),
                                 )
-                                .child(Label::new(n.to_string()).size(LabelSize::Small))
-                        })),
+                                .child(v_flex().gap_1().children(slices.into_iter().map(|(name, n, color)| {
+                                    h_flex()
+                                        .gap_2()
+                                        .child(div().size(px(8.)).rounded_full().bg(color))
+                                        .child(Label::new(n.to_string()).size(LabelSize::Small))
+                                        .child(Label::new(name).size(LabelSize::Small).color(Color::Muted).truncate())
+                                })))
+                        }),
                 )
+                // Daily keeps the list card at half width, as in the original.
+                .when(period == Bucket::Day, |el| el.child(div().flex_1()))
                 .into_any_element(),
         ]
     }

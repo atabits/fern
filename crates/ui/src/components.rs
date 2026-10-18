@@ -1,6 +1,7 @@
 mod checkbox;
 mod chip;
 mod divider;
+mod donut;
 mod icon;
 mod icon_button;
 mod label;
@@ -14,6 +15,7 @@ mod tooltip;
 pub use checkbox::*;
 pub use chip::*;
 pub use divider::*;
+pub use donut::*;
 pub use icon::*;
 pub use icon_button::*;
 pub use label::*;

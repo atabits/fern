@@ -432,6 +432,11 @@ impl Store {
     }
 
     pub fn add_task(&self, title: &str) -> Result<Task> {
+        self.add_task_at(title, true)
+    }
+
+    /// Adds a task at the top of the lists, or at the bottom ("Default Add to" in the settings).
+    pub fn add_task_at(&self, title: &str, top: bool) -> Result<Task> {
         let task = Task {
             id: Uuid::now_v7(),
             list_id: None,
@@ -456,10 +461,13 @@ impl Store {
             reminders: Vec::new(),
             created_at: now_ms(),
         };
-        // New tasks go to the top, as in TickTick.
+        let order = if top {
+            "(SELECT COALESCE(MIN(sort_order), 0) - 1024 FROM tasks)"
+        } else {
+            "(SELECT COALESCE(MAX(sort_order), 0) + 1024 FROM tasks)"
+        };
         self.conn.execute(
-            "INSERT INTO tasks (id, title, created_at, sort_order)
-             VALUES (?1, ?2, ?3, (SELECT COALESCE(MIN(sort_order), 0) - 1024 FROM tasks))",
+            &format!("INSERT INTO tasks (id, title, created_at, sort_order) VALUES (?1, ?2, ?3, {order})"),
             params![task.id.to_string(), task.title, task.created_at],
         )?;
         Ok(task)
@@ -2274,6 +2282,17 @@ mod tests {
         // The copy sits right below the original.
         assert_eq!(titles(&store.tasks()?), ["other", "pack", "pack"]);
         let _ = other;
+        Ok(())
+    }
+
+    #[test]
+    fn new_tasks_at_the_top_or_bottom() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        store.add_task("first")?;
+        store.add_task_at("top", true)?;
+        store.add_task_at("bottom", false)?;
+        let titles: Vec<String> = store.tasks_in(&View::Inbox, chrono::Local::now().date_naive())?.into_iter().map(|t| t.title).collect();
+        assert_eq!(titles, ["top", "first", "bottom"]);
         Ok(())
     }
 

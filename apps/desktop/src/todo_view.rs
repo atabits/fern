@@ -562,7 +562,7 @@ impl TodoView {
         let list_names: Vec<String> = self.lists.iter().map(|l| l.name.clone()).collect();
         let parsed = fern_core::parse_quick_add_with(input, today, &list_names, self.preferences.recognition);
         let title = if parsed.title.is_empty() { input.trim() } else { parsed.title.as_str() };
-        let task = self.store.add_task(title)?;
+        let task = self.store.add_task_at(title, !self.preferences.task_defaults.add_to_bottom)?;
 
         let view_due = match &self.view {
             View::Today | View::Next7Days => Some(today),

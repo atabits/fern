@@ -35,6 +35,7 @@ enum Menu {
     AllDayReminder,
     DefaultPriority,
     DefaultTag,
+    AddTo,
     TimeFormat,
     DateFormat,
     WeekStart,
@@ -137,6 +138,7 @@ impl SettingsWindow {
             "language" => Some(Menu::Language),
             "list" => Some(Menu::DefaultList),
             "duration" => Some(Menu::DefaultDuration),
+            "add-to" => Some(Menu::AddTo),
             "reminder" => Some(Menu::TimedReminder),
             _ => None,
         };
@@ -637,7 +639,28 @@ impl SettingsWindow {
                                 .text_size(px(11.))
                                 .text_color(colors.text_muted)
                                 .child(strings.default_list_hint),
-                        ),
+                        )
+                        .child(div().h_3())
+                        .child(group().child({
+                            let bottom = self.preferences.task_defaults.add_to_bottom;
+                            let options = [(false, strings.add_to_top), (true, strings.add_to_bottom)]
+                                .into_iter()
+                                .map(|(choice, name)| {
+                                    let pick: Box<dyn Fn(&mut Self, &mut Window, &mut Context<Self>)> = Box::new(move |this, window, cx| {
+                                        this.update(window, cx, |p| p.task_defaults.add_to_bottom = choice)
+                                    });
+                                    (SharedString::from(name), choice == bottom, pick)
+                                })
+                                .collect();
+                            self.select_row(
+                                None,
+                                strings.default_add_to,
+                                (if bottom { strings.add_to_bottom } else { strings.add_to_top }).into(),
+                                Menu::AddTo,
+                                options,
+                                cx,
+                            )
+                        })),
                 )
                 .into_any_element()
             }

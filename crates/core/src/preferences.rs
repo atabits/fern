@@ -201,12 +201,14 @@ pub struct TaskDefaults {
     pub all_day_reminder: Option<i64>,
     pub priority: Priority,
     pub tag: Option<String>,
+    /// "Default Add to": new tasks at the bottom of the list instead of the top.
+    pub add_to_bottom: bool,
 }
 
 impl Default for TaskDefaults {
     /// The original's defaults: no date, an hour, reminded on time.
     fn default() -> Self {
-        Self { date: None, duration: 60, timed_reminder: Some(0), all_day_reminder: None, priority: Priority::None, tag: None }
+        Self { date: None, duration: 60, timed_reminder: Some(0), all_day_reminder: None, priority: Priority::None, tag: None, add_to_bottom: false }
     }
 }
 
@@ -274,6 +276,7 @@ const DEFAULT_TIMED_REMINDER: &str = "default_timed_reminder";
 const DEFAULT_ALL_DAY_REMINDER: &str = "default_all_day_reminder";
 const DEFAULT_PRIORITY: &str = "default_priority";
 const DEFAULT_TAG: &str = "default_tag";
+const DEFAULT_ADD_TO: &str = "default_add_to";
 /// Smart Recognition switches, in the order of `Recognition`'s fields.
 const RECOGNITION: [&str; 4] =
     ["recognize_dates", "remove_date_text", "recognize_tags", "remove_tag_text"];
@@ -331,6 +334,7 @@ impl Store {
                 .map(Priority::from_i64)
                 .unwrap_or_default(),
             tag: self.setting(DEFAULT_TAG)?.filter(|t| !t.is_empty()),
+            add_to_bottom: self.setting(DEFAULT_ADD_TO)?.as_deref() == Some("bottom"),
         };
         let mut preferences = Preferences {
             theme,
@@ -365,6 +369,7 @@ impl Store {
         self.set_setting(DEFAULT_ALL_DAY_REMINDER, &offset(t.all_day_reminder))?;
         self.set_setting(DEFAULT_PRIORITY, &t.priority.to_i64().to_string())?;
         self.set_setting(DEFAULT_TAG, t.tag.as_deref().unwrap_or(""))?;
+        self.set_setting(DEFAULT_ADD_TO, if t.add_to_bottom { "bottom" } else { "top" })?;
         let r = preferences.recognition;
         for (key, on) in RECOGNITION.iter().zip([r.dates, r.remove_date_text, r.tags, r.remove_tag_text]) {
             self.set_setting(key, if on { "1" } else { "0" })?;
@@ -411,6 +416,7 @@ mod tests {
                 all_day_reminder: Some(24 * 60),
                 priority: Priority::High,
                 tag: Some("work".into()),
+                add_to_bottom: true,
             },
             default_list: Some(list.id),
             ..Default::default()

@@ -179,6 +179,20 @@ pub fn timeline(sessions: &[FocusSession], first: NaiveDate) -> Vec<(usize, u32,
     blocks
 }
 
+/// A day's sessions as minute spans `(from, to)` of that day, for the focus page's hours; a
+/// session over midnight shows its part of the day.
+pub fn day_blocks(sessions: &[FocusSession], day: NaiveDate) -> Vec<(u32, u32, &FocusSession)> {
+    sessions
+        .iter()
+        .flat_map(|session| {
+            timeline(std::slice::from_ref(session), day)
+                .into_iter()
+                .filter(|(index, ..)| *index == 0)
+                .map(move |(_, from, to)| (from, to, session))
+        })
+        .collect()
+}
+
 /// What the Statistics' "Details" splits focus time by: the original's List, Tag or Task.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FocusKey {
@@ -377,6 +391,16 @@ mod tests {
         let monday = NaiveDate::from_ymd_opt(2026, 10, 12).unwrap();
         let sessions = [session(at(15, 13, 30), at(15, 16, 0)), session(at(13, 23, 0), at(14, 1, 0)), session(at(20, 9, 0), at(20, 10, 0))];
         assert_eq!(timeline(&sessions, monday), [(3, 810, 960), (1, 1380, 1440), (2, 0, 60)]);
+    }
+
+    #[test]
+    fn day_blocks_of_a_day() {
+        let at = |d: u32, h: u32, m: u32| Local.with_ymd_and_hms(2026, 10, d, h, m, 0).unwrap().timestamp_millis();
+        let session = |start: i64, end: i64| FocusSession { id: uuid::Uuid::now_v7(), task_id: None, title: "x".into(), started_at: start, ended_at: end, stopwatch: false, note: String::new() };
+        let sessions = [session(at(17, 23, 0), at(18, 1, 0)), session(at(18, 13, 30), at(18, 14, 0)), session(at(16, 9, 0), at(16, 10, 0))];
+        let today = NaiveDate::from_ymd_opt(2026, 10, 18).unwrap();
+        let blocks: Vec<(u32, u32)> = day_blocks(&sessions, today).into_iter().map(|(from, to, _)| (from, to)).collect();
+        assert_eq!(blocks, [(0, 60), (810, 840)]);
     }
 
     #[test]

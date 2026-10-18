@@ -61,6 +61,8 @@ pub struct FocusView {
     /// A filter's Custom fields, while open: the filter (0 Date, 1 Duration) and its two fields
     /// (Start and End, or Min and Max).
     batch_custom: Option<(u8, Entity<TextInput>, Entity<TextInput>)>,
+    /// The original's full focus page, opened from the timer bar.
+    expanded: bool,
     add_title: Entity<TextInput>,
     add_start: Entity<TextInput>,
     add_minutes: i64,
@@ -233,6 +235,7 @@ impl FocusView {
             batch_filter: Default::default(),
             batch_menu: None,
             batch_custom: None,
+            expanded: false,
             add_title,
             add_start,
             add_minutes: 25,
@@ -2306,6 +2309,11 @@ impl FocusView {
                 });
                 return;
             }
+            // The full focus page.
+            "page" => {
+                self.set_expanded(true, cx);
+                return;
+            }
             // Batch Management with a filter's Custom fields open: `batch-date` or `batch-minutes`.
             "batch-date" | "batch-minutes" => {
                 self.record_menu = Some(RecordMenu::Batch);
@@ -2533,6 +2541,199 @@ pub struct StatsClosed;
 
 impl gpui::EventEmitter<StatsClosed> for FocusView {}
 
+impl FocusView {
+    fn set_expanded(&mut self, expanded: bool, cx: &mut Context<Self>) {
+        self.expanded = expanded;
+        self.record_menu = None;
+        cx.notify();
+    }
+
+    /// Pomo or Stopwatch, chosen while no timer runs.
+    fn render_mode_switch(&self, size: LabelSize, cx: &mut Context<Self>) -> AnyElement {
+        let strings = i18n::t(cx);
+        let theme = cx.theme().clone();
+        let stopwatch = self.stopwatch_mode();
+        let height = if size == LabelSize::XSmall { 24. } else { 30. };
+        h_flex()
+            .p_0p5()
+            .rounded(px(height / 2. + 2.))
+            .bg(theme.colors().surface_background)
+            .children(strings.focus_modes.iter().enumerate().map(|(i, label)| {
+                let selected = (i == 1) == stopwatch;
+                div()
+                    .id(SharedString::from(format!("focus-mode-{i}")))
+                    .px_3()
+                    .h(px(height))
+                    .flex()
+                    .items_center()
+                    .rounded(px(height / 2.))
+                    .cursor_pointer()
+                    .when(selected, |el| el.bg(theme.colors().element_selected))
+                    .child(Label::new(*label).size(size).color(if selected { Color::Default } else { Color::Muted }))
+                    .on_click(cx.listener(move |this, _, _, cx| this.set_stopwatch_mode(i == 1, cx)))
+            }))
+            .into_any_element()
+    }
+
+    /// The original's full focus page: the arrow back, Pomo / Stopwatch and "…" on top, "Focus >"
+    /// over a big ring with the time and Start (or Pause / Continue and End), and on the right
+    /// the day's hours with its sessions and a red line at the time now.
+    fn render_page(&self, clock: String, label: SharedString, running: bool, paused: bool, cx: &mut Context<Self>) -> AnyElement {
+        // The original's measures: an hour is 213 px, the ring 350 px, the panel 490 px wide.
+        const HOUR: f32 = 213.;
+        let strings = i18n::t(cx);
+        let theme = cx.theme().clone();
+        let now = Local::now();
+        let (hour, minute) = (chrono::Timelike::hour(&now), chrono::Timelike::minute(&now));
+        let pill = |id: &'static str, text: &'static str, primary: bool| {
+            div()
+                .id(id)
+                .w(px(167.))
+                .h(px(47.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_full()
+                .cursor_pointer()
+                .when(primary, |el| el.bg(theme.colors().accent))
+                .when(!primary, |el| el.border_1().border_color(theme.colors().border))
+                .child(Label::new(text))
+        };
+        let buttons = if running {
+            h_flex()
+                .gap_3()
+                .child(pill("focus-page-pause", if paused { strings.focus_continue } else { strings.focus_pause }, true).on_click(cx.listener(|this, _, _, cx| this.toggle_pause(cx))))
+                .child(pill("focus-page-end", strings.focus_end, false).on_click(cx.listener(|this, _, _, cx| this.finish(cx))))
+        } else {
+            h_flex().child(pill("focus-page-start", strings.focus_start, true).on_click(cx.listener(|this, _, _, cx| this.start(None, cx))))
+        };
+        let left = v_flex()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .border_r_1()
+            .border_color(theme.colors().border)
+            .child(
+                h_flex()
+                    .h(px(52.))
+                    .flex_none()
+                    .px_4()
+                    .child(
+                        div().flex_1().child(
+                            IconButton::new("focus-page-collapse", IconName::ChevronDown)
+                                .icon_color(Color::Muted)
+                                .tooltip(ui::Tooltip::text(strings.focus_collapse))
+                                .on_click(cx.listener(|this, _, _, cx| this.set_expanded(false, cx))),
+                        ),
+                    )
+                    .when(!running, |el| el.child(self.render_mode_switch(LabelSize::Small, cx)))
+                    .child(
+                        h_flex().flex_1().justify_end().child(
+                            div()
+                                .relative()
+                                .child(IconButton::new("focus-page-more", IconName::Ellipsis).on_click(cx.listener(|this, _, _, cx| {
+                                    this.set_record_menu(Some(RecordMenu::HeaderMore), cx)
+                                })))
+                                .when_some(
+                                    self.record_menu.filter(|m| matches!(m, RecordMenu::HeaderMore | RecordMenu::Settings)),
+                                    |el, menu| el.child(PopoverAttachment::new(Placement::BelowRight, self.render_record_menu(menu, cx))),
+                                ),
+                        ),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .flex_1()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        h_flex()
+                            .mb(px(110.))
+                            .gap_0p5()
+                            .child(Label::new(label).size(LabelSize::Small).color(Color::Muted))
+                            .child(Icon::new(IconName::ChevronRight).size(IconSize::XSmall).color(Color::Muted)),
+                    )
+                    .child(
+                        div()
+                            .size(px(350.))
+                            .mb(px(120.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_full()
+                            .border(px(5.))
+                            .border_color(if running { theme.colors().accent } else { theme.colors().border })
+                            .child(div().text_size(px(56.)).child(clock)),
+                    )
+                    .child(buttons),
+            );
+
+        // The hours from the one before now to midnight, as the original opens on now.
+        let first = hour.saturating_sub(1);
+        let today = now.date_naive();
+        let top = |minute: u32| px((minute as f32 / 60. - first as f32) * HOUR);
+        let hours = div()
+            .relative()
+            .h(px((24 - first) as f32 * HOUR))
+            .children((first..24).map(|hour| {
+                h_flex()
+                    .absolute()
+                    .top(top(hour * 60))
+                    .left_0()
+                    .right_0()
+                    .gap_2()
+                    .child(div().w(px(24.)).child(Label::new(hour.to_string()).size(LabelSize::XSmall).color(Color::Muted)))
+                    .child(div().flex_1().h(px(1.)).bg(theme.colors().border_variant))
+            }))
+            .children(fern_core::focus::day_blocks(&self.sessions, today).into_iter().filter(|(_, to, _)| *to > first * 60).map(|(from, to, session)| {
+                div()
+                    .absolute()
+                    .top(top(from.max(first * 60)))
+                    .left(px(32.))
+                    .right_0()
+                    .h(px(((to - from.max(first * 60)) as f32 / 60. * HOUR).max(4.)))
+                    .px_2()
+                    .rounded(px(4.))
+                    .bg(theme.colors().accent.opacity(0.25))
+                    .border_l_2()
+                    .border_color(theme.colors().accent)
+                    .overflow_hidden()
+                    .child(Label::new(session.title.clone()).size(LabelSize::XSmall))
+            }))
+            .child(
+                h_flex()
+                    .absolute()
+                    .top(top(hour * 60 + minute) - px(3.))
+                    .left(px(28.))
+                    .right_0()
+                    .child(div().size(px(6.)).rounded_full().bg(theme.status().error))
+                    .child(div().flex_1().h(px(1.)).bg(theme.status().error)),
+            );
+        let stopwatch = self.stopwatch_mode();
+        let right = v_flex()
+            .w(px(490.))
+            .flex_none()
+            .h_full()
+            .px_4()
+            .child(
+                h_flex()
+                    .h(px(52.))
+                    .gap_2()
+                    .child(Icon::new(if stopwatch { IconName::Timer } else { IconName::FernFocus }).color(Color::Accent))
+                    .child(Label::new(strings.focus_modes[stopwatch as usize]).size(LabelSize::Large).color(Color::Muted)),
+            )
+            .child(v_flex().id("focus-page-hours").flex_1().min_h_0().overflow_y_scroll().pt_2().child(hours));
+        h_flex()
+            .relative()
+            .size_full()
+            .bg(theme.colors().background)
+            .text_color(theme.colors().text)
+            .child(left)
+            .child(right)
+            .into_any_element()
+    }
+}
+
 impl Render for FocusView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if let Some(page) = self.stats {
@@ -2625,6 +2826,9 @@ impl Render for FocusView {
             ),
         };
 
+        if self.expanded {
+            return self.render_page(clock, label, running, paused, cx);
+        }
         let left = v_flex()
             .flex_1()
             .min_w_0()
@@ -2712,33 +2916,19 @@ impl Render for FocusView {
                     .border_t_1()
                     .border_color(theme.colors().border)
                     .child(Icon::new(IconName::CircleDot).size(IconSize::XLarge).color(Color::Accent))
+                    // As in the original, the bar opens the full focus page.
                     .child(
                         v_flex()
+                            .id("focus-bar-open")
                             .flex_1()
                             .min_w_0()
+                            .cursor_pointer()
                             .child(Label::new(label).size(LabelSize::XSmall).color(Color::Muted).truncate())
-                            .child(div().text_size(px(20.)).child(clock)),
+                            .child(div().text_size(px(20.)).child(clock))
+                            .on_click(cx.listener(|this, _, _, cx| this.set_expanded(true, cx))),
                     )
                     // Pomo or Stopwatch, chosen while no timer runs.
-                    .when(!running, |el| {
-                        let stopwatch = self.stopwatch_mode();
-                        el.child(h_flex().p_0p5().rounded(px(12.)).bg(theme.colors().surface_background).children(
-                            strings.focus_modes.iter().enumerate().map(|(i, label)| {
-                                let selected = (i == 1) == stopwatch;
-                                div()
-                                    .id(SharedString::from(format!("focus-mode-{i}")))
-                                    .px_3()
-                                    .h(px(24.))
-                                    .flex()
-                                    .items_center()
-                                    .rounded(px(10.))
-                                    .cursor_pointer()
-                                    .when(selected, |el| el.bg(theme.colors().element_selected))
-                                    .child(Label::new(*label).size(LabelSize::XSmall).color(if selected { Color::Default } else { Color::Muted }))
-                                    .on_click(cx.listener(move |this, _, _, cx| this.set_stopwatch_mode(i == 1, cx)))
-                            }),
-                        ))
-                    })
+                    .when(!running, |el| el.child(self.render_mode_switch(LabelSize::XSmall, cx)))
                     .when(running, |el| {
                         el.child(
                             IconButton::new("focus-stop", IconName::Square)

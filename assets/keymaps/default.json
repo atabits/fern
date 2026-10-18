@@ -45,6 +45,8 @@
       "2": "calendar::WeekView",
       "m": "calendar::MonthView",
       "3": "calendar::MonthView",
+      "y": "calendar::YearView",
+      "4": "calendar::YearView",
       "a": "calendar::AgendaView",
       "5": "calendar::AgendaView"
     }

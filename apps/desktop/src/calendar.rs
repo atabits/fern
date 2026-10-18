@@ -159,6 +159,12 @@ pub fn month_weeks(month: NaiveDate) -> Vec<[NaiveDate; 7]> {
     weeks
 }
 
+/// `count` weeks from the one that contains `date`: the original's Multi-Week.
+pub fn weeks_from(date: NaiveDate, count: usize) -> Vec<[NaiveDate; 7]> {
+    let first = week_of(date)[0];
+    (0..count).map(|i| week_of(first + Duration::weeks(i as i64))).collect()
+}
+
 /// 42 days (six weeks) covering `month`.
 pub fn month_grid(month: NaiveDate) -> Vec<NaiveDate> {
     let start = week_of(month_start(month))[0];
@@ -361,5 +367,14 @@ mod tests {
         assert_eq!(add_months(d(2026, 1, 15), -1), d(2025, 12, 1));
         assert_eq!(month_title(d(2026, 10, 18), &EN), "October 2026");
         assert_eq!(month_title(d(2026, 10, 18), &RU), "Октябрь 2026");
+    }
+
+    #[test]
+    fn multi_week_weeks() {
+        let day = NaiveDate::from_ymd_opt(2026, 10, 18).unwrap();
+        let weeks = weeks_from(day, 5);
+        assert_eq!(weeks.len(), 5);
+        assert_eq!(weeks[0], week_of(day));
+        assert_eq!(weeks[4][0], weeks[0][0] + Duration::weeks(4));
     }
 }

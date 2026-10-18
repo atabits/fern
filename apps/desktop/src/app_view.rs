@@ -129,6 +129,12 @@ impl AppView {
             if state.contains("calendar=multi") {
                 this.calendar.update(cx, |c, cx| c.set_mode(crate::calendar_view::CalendarMode::MultiDay(3), cx));
             }
+            if state.contains("calendar=year") {
+                this.calendar.update(cx, |c, cx| c.set_mode(crate::calendar_view::CalendarMode::Year, cx));
+            }
+            if state.contains("calendar=multi-week") {
+                this.calendar.update(cx, |c, cx| c.set_mode(crate::calendar_view::CalendarMode::MultiWeek(5), cx));
+            }
             if state.contains("calendar=agenda") {
                 this.calendar.update(cx, |c, cx| c.set_mode(crate::calendar_view::CalendarMode::Agenda, cx));
             }

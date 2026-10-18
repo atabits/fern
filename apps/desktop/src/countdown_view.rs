@@ -50,12 +50,15 @@ pub struct CountdownView {
     draft: Option<Draft>,
     /// The card whose "…" menu is open.
     card_menu: Option<Id>,
+    /// The "+" menu of kinds, as in the original.
+    add_menu: bool,
 }
 
 fn kind_icon(kind: CountdownKind) -> IconName {
     match kind {
         CountdownKind::Countdown => IconName::Hourglass,
         CountdownKind::Anniversary => IconName::Heart,
+        CountdownKind::Birthday => IconName::Cake,
         CountdownKind::Holiday => IconName::Gift,
     }
 }
@@ -64,6 +67,7 @@ fn kind_label(kind: CountdownKind, strings: &Strings) -> &'static str {
     match kind {
         CountdownKind::Countdown => strings.countdown_kind_countdown,
         CountdownKind::Anniversary => strings.countdown_kind_anniversary,
+        CountdownKind::Birthday => strings.countdown_kind_birthday,
         CountdownKind::Holiday => strings.countdown_kind_holiday,
     }
 }
@@ -160,7 +164,7 @@ pub fn render_summary(countdown: &Countdown, date: NaiveDate, cx: &App) -> AnyEl
 
 impl CountdownView {
     pub fn new(store: Rc<Store>, cx: &mut Context<Self>) -> Self {
-        let mut this = Self { store, countdowns: Vec::new(), filter: Filter::All, days_only: HashSet::new(), draft: None, card_menu: None };
+        let mut this = Self { store, countdowns: Vec::new(), filter: Filter::All, days_only: HashSet::new(), draft: None, card_menu: None, add_menu: false };
         this.reload(cx);
         this
     }
@@ -186,6 +190,23 @@ impl CountdownView {
             Filter::All => CountdownKind::Countdown,
         };
         self.draft = Some(Draft { name, kind, date: today, month: calendar::month_start(today), icon: None, color: None, repeat: None, editing: None });
+        cx.notify();
+    }
+
+    /// A kind from the "+" menu: a new countdown of that kind.
+    pub fn start_new_kind(&mut self, kind: CountdownKind, window: &mut Window, cx: &mut Context<Self>) {
+        self.add_menu = false;
+        self.start_new(window, cx);
+        if let Some(draft) = self.draft.as_mut() {
+            draft.kind = kind;
+        }
+        cx.notify();
+    }
+
+    /// Opens the "+" menu from the debug-build dev state (`countdown-add-menu`).
+    #[cfg(debug_assertions)]
+    pub fn dev_add_menu(&mut self, cx: &mut Context<Self>) {
+        self.add_menu = true;
         cx.notify();
     }
 
@@ -413,7 +434,7 @@ impl CountdownView {
                     .into_any_element()
             })
             .collect();
-        let kinds = [CountdownKind::Countdown, CountdownKind::Anniversary, CountdownKind::Holiday];
+        let kinds = [CountdownKind::Countdown, CountdownKind::Anniversary, CountdownKind::Birthday, CountdownKind::Holiday];
         let shift = |delta: i32| {
             move |this: &mut Self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>| {
                 if let Some(draft) = this.draft.as_mut() {
@@ -605,10 +626,33 @@ impl Render for CountdownView {
                     .child(
                         div()
                             .relative()
-                            .child(
-                                IconButton::new("countdown-add", IconName::Plus)
-                                    .on_click(cx.listener(|this, _, window, cx| this.start_new(window, cx))),
-                            )
+                            .child(IconButton::new("countdown-add", IconName::Plus).on_click(cx.listener(|this, _, _, cx| {
+                                this.add_menu = !this.add_menu;
+                                cx.notify();
+                            })))
+                            // The original's "+" asks for the kind first: 162 px wide, a row every 34 px.
+                            .when(self.add_menu, |el| {
+                                el.child(PopoverAttachment::new(
+                                    Placement::BelowRight,
+                                    popover(cx)
+                                        .w(px(162.))
+                                        .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                                            this.add_menu = false;
+                                            cx.notify();
+                                        }))
+                                        .children(
+                                            [CountdownKind::Countdown, CountdownKind::Anniversary, CountdownKind::Birthday, CountdownKind::Holiday]
+                                                .into_iter()
+                                                .map(|kind| {
+                                                    ListItem::new(SharedString::from(format!("countdown-add-{}", kind.as_str())))
+                                                        .height(px(34.))
+                                                        .start_slot(Icon::new(kind_icon(kind)).color(Color::Muted))
+                                                        .child(Label::new(kind_label(kind, strings)))
+                                                        .on_click(cx.listener(move |this, _, window, cx| this.start_new_kind(kind, window, cx)))
+                                                }),
+                                        ),
+                                ))
+                            })
                             .when(self.draft.is_some(), |el| {
                                 el.child(PopoverAttachment::new(Placement::BelowRight, self.render_draft(cx)))
                             }),

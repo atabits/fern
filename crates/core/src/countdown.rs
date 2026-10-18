@@ -11,6 +11,8 @@ pub enum CountdownKind {
     Countdown,
     /// Counts the time since a date, such as a wedding.
     Anniversary,
+    /// A birthday: the date of birth, counted down to every year.
+    Birthday,
     Holiday,
 }
 
@@ -19,6 +21,7 @@ impl CountdownKind {
         match self {
             CountdownKind::Countdown => "countdown",
             CountdownKind::Anniversary => "anniversary",
+            CountdownKind::Birthday => "birthday",
             CountdownKind::Holiday => "holiday",
         }
     }
@@ -26,6 +29,7 @@ impl CountdownKind {
     pub fn parse(value: &str) -> Self {
         match value {
             "anniversary" => CountdownKind::Anniversary,
+            "birthday" => CountdownKind::Birthday,
             "holiday" => CountdownKind::Holiday,
             _ => CountdownKind::Countdown,
         }
@@ -52,6 +56,9 @@ impl Countdown {
     /// The date the countdown counts to: its date, or for a repeating one the first time it
     /// comes back on or after `today`.
     pub fn next_date(&self, today: NaiveDate) -> NaiveDate {
+        if self.kind == CountdownKind::Birthday && self.repeat.is_none() {
+            return next_birthday(self.date, today);
+        }
         let Some(repeat) = &self.repeat else { return self.date };
         let mut date = self.date;
         while date < today {
@@ -63,6 +70,28 @@ impl Countdown {
         }
         date
     }
+}
+
+impl Countdown {
+    /// For a birthday, the age turned on its next date (0 before the day of birth).
+    pub fn age(&self, today: NaiveDate) -> Option<u32> {
+        (self.kind == CountdownKind::Birthday).then(|| (self.next_date(today).year() - self.date.year()).max(0) as u32)
+    }
+}
+
+/// The first birthday on or after `today` of someone born on `born`; a 29 February birthday
+/// falls on 28 February in other years.
+fn next_birthday(born: NaiveDate, today: NaiveDate) -> NaiveDate {
+    if born >= today {
+        return born;
+    }
+    let on = |year: i32| {
+        NaiveDate::from_ymd_opt(year, born.month(), born.day())
+            .or_else(|| NaiveDate::from_ymd_opt(year, born.month(), born.day() - 1))
+            .expect("a day before the 29th always exists")
+    };
+    let this_year = on(today.year());
+    if this_year >= today { this_year } else { on(today.year() + 1) }
 }
 
 /// The distance between two dates as calendar years, months and days.
@@ -123,6 +152,29 @@ mod tests {
     fn month_ends_do_not_overshoot() {
         // Jan 31 → Mar 1: one month (to Feb 28) and one day.
         assert_eq!(ymd(span(d(2026, 1, 31), d(2026, 3, 1))), (0, 1, 1, false));
+    }
+
+    #[test]
+    fn birthdays_come_every_year() {
+        let birthday = |born: NaiveDate| Countdown {
+            id: uuid::Uuid::now_v7(),
+            name: "Mum".into(),
+            date: born,
+            kind: CountdownKind::Birthday,
+            icon: None,
+            color: None,
+            repeat: None,
+            pinned_at: None,
+        };
+        let today = d(2026, 10, 18);
+        let mum = birthday(d(1970, 12, 5));
+        assert_eq!((mum.next_date(today), mum.age(today)), (d(2026, 12, 5), Some(56)));
+        let past = birthday(d(1990, 3, 1));
+        assert_eq!((past.next_date(today), past.age(today)), (d(2027, 3, 1), Some(37)));
+        assert_eq!(birthday(d(1990, 10, 18)).next_date(today), today, "today is the birthday");
+        assert_eq!(birthday(d(2000, 2, 29)).next_date(today), d(2027, 2, 28));
+        assert_eq!(CountdownKind::parse(CountdownKind::Birthday.as_str()), CountdownKind::Birthday);
+        assert_eq!(birthday(d(2030, 1, 1)).age(today), Some(0), "not born yet");
     }
 
     #[test]

@@ -15,6 +15,7 @@ pub enum IconName {
     Bell,
     Bold,
     BrushCleaning,
+    Cake,
     CalendarCheck,
     CalendarDays,
     CalendarHeart,

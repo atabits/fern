@@ -247,6 +247,9 @@ impl AppView {
             if state.contains("section=countdown") {
                 this.select(Section::Countdown, window, cx);
             }
+            if state.contains("countdown-add-menu") {
+                this.countdown.update(cx, |view, cx| view.dev_add_menu(cx));
+            }
             if state.contains("countdown-draft") {
                 this.countdown.update(cx, |view, cx| view.start_new(window, cx));
             }

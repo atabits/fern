@@ -412,6 +412,16 @@ impl TaskDetail {
                 self.update_draft(cx, |d| d.start_duration(Local::now().naive_local(), duration));
                 return;
             }
+            // The custom repeat's monthly "Each" with the 1st, 15th and last day picked.
+            "due-custom-monthly" => {
+                self.open_popup(Popup::Due, cx);
+                self.update_draft(cx, |d| {
+                    let mut rule = Recurrence::new(Frequency::Monthly, 1);
+                    rule.month_days = 1 | 1 << 14 | fern_core::recurrence::LAST_DAY;
+                    d.menu = Some(DueMenu::Custom(rule));
+                });
+                return;
+            }
             "due-time" | "due-custom" => {
                 self.open_popup(Popup::Due, cx);
                 let today = Local::now().date_naive();
@@ -1560,6 +1570,10 @@ impl TaskDetail {
                             if frequency != Frequency::Weekly {
                                 rule.weekdays = 0;
                             }
+                            if frequency != Frequency::Monthly {
+                                rule.month_days = 0;
+                                rule.nth_weekday = None;
+                            }
                         }
                     })
                 }))
@@ -1638,6 +1652,7 @@ impl TaskDetail {
             )
             .child(units)
             .when(rule.frequency == Frequency::Weekly, |el| el.child(weekdays))
+            .when(rule.frequency == Frequency::Monthly, |el| el.child(self.render_monthly_rule(rule, strings, cx)))
             .child(
                 h_flex()
                     .gap_2()
@@ -1649,6 +1664,117 @@ impl TaskDetail {
                     }))),
             )
             .into_any_element()
+    }
+
+    /// Monthly rules, as in the original: "Each" picks days of the month (and the last day),
+    /// "On the" picks the nth weekday.
+    fn render_monthly_rule(&self, rule: Recurrence, strings: &'static Strings, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        let on_the = rule.nth_weekday.is_some();
+        let update = move |this: &mut Self, cx: &mut Context<Self>, change: &dyn Fn(&mut Recurrence)| {
+            this.update_draft(cx, |d| {
+                if let Some(DueMenu::Custom(rule)) = d.menu.as_mut() {
+                    change(rule);
+                }
+            })
+        };
+        let tab = |id: &'static str, label: &'static str, selected: bool, to_on_the: bool| {
+            div()
+                .id(id)
+                .flex_1()
+                .h(px(24.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(5.))
+                .cursor_pointer()
+                .when(selected, |el| el.bg(theme.colors().element_selected))
+                .child(Label::new(label).size(LabelSize::XSmall))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    update(this, cx, &|rule| {
+                        if to_on_the {
+                            rule.month_days = 0;
+                            rule.nth_weekday.get_or_insert((1, chrono::Weekday::Mon));
+                        } else {
+                            rule.nth_weekday = None;
+                        }
+                    })
+                }))
+        };
+        let chip = |id: SharedString, label: String, on: bool, bit: u32| {
+            div()
+                .id(id)
+                .h(px(22.))
+                .min_w(px(22.))
+                .px_1()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_full()
+                .cursor_pointer()
+                .when(on, |el| el.bg(theme.colors().accent))
+                .when(!on, |el| el.hover(|s| s.bg(theme.colors().element_hover)))
+                .child(Label::new(label).size(LabelSize::XSmall))
+                .on_click(cx.listener(move |this, _, _, cx| update(this, cx, &|rule| rule.month_days ^= bit)))
+        };
+        let cycler = |id: &'static str, label: String, next: fn(&mut Recurrence)| {
+            div()
+                .id(id)
+                .flex_1()
+                .h(px(24.))
+                .px_2()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(5.))
+                .border_1()
+                .border_color(theme.colors().border)
+                .cursor_pointer()
+                .child(Label::new(label).size(LabelSize::XSmall))
+                .on_click(cx.listener(move |this, _, _, cx| update(this, cx, &|rule| next(rule))))
+        };
+        v_flex()
+            .gap_2()
+            .child(
+                h_flex()
+                    .gap_1()
+                    .child(tab("monthly-each", strings.repeat_each, !on_the, false))
+                    .child(tab("monthly-on-the", strings.repeat_on_the, on_the, true)),
+            )
+            .map(|el| match rule.nth_weekday {
+                Some((nth, weekday)) => {
+                    let nth_label = if nth < 0 { strings.repeat_nth[4] } else { strings.repeat_nth[(nth as usize).clamp(1, 4) - 1] };
+                    el.child(
+                        h_flex()
+                            .gap_2()
+                            .child(cycler("monthly-nth", nth_label.to_owned(), |rule| {
+                                if let Some((nth, _)) = rule.nth_weekday.as_mut() {
+                                    *nth = match *nth { 1 => 2, 2 => 3, 3 => 4, 4 => -1, _ => 1 };
+                                }
+                            }))
+                            .child(cycler(
+                                "monthly-weekday",
+                                strings.weekdays_full[weekday.num_days_from_monday() as usize].to_owned(),
+                                |rule| {
+                                    if let Some((_, day)) = rule.nth_weekday.as_mut() {
+                                        *day = day.succ();
+                                    }
+                                },
+                            )),
+                    )
+                }
+                None => el.child(
+                    div().flex().flex_wrap().gap_1().children((0..31u32).map(|i| {
+                        chip(SharedString::from(format!("month-day-{i}")), (i + 1).to_string(), rule.month_days & (1 << i) != 0, 1 << i)
+                    }))
+                    .child(chip(
+                        "month-day-last".into(),
+                        strings.repeat_last_day_title.to_owned(),
+                        rule.month_days & fern_core::recurrence::LAST_DAY != 0,
+                        fern_core::recurrence::LAST_DAY,
+                    )),
+                ),
+            })
     }
 
     fn render_priority_popup(&self, strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {

@@ -31,7 +31,7 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 | Subtasks (`parentId`) | ✅ | cascade delete, no cycles |
 | Item kind: task / note / checklist (`kind`) | 🟡 | task and note; checklist later |
 | Checklist items (`items`) | ✅ | ordered items, insert after, completion, progress |
-| Repeat (`repeatFlag`, RRULE) | 🟡 | FREQ, INTERVAL and weekly BYDAY (every weekday); completing moves the task to the next date and keeps a completed copy; no BYMONTHDAY or custom rules yet |
+| Repeat (`repeatFlag`, RRULE) | 🟡 | FREQ, INTERVAL and weekly BYDAY (every weekday); completing moves the task to the next date and keeps a completed copy; monthly rules also have the original's "Each" (days of the month and the last day, `BYMONTHDAY`) and "On the" (the first to fourth or last weekday, `BYDAY=1SU`), next dates following them; no "Workday" or "Skip Weekends" yet |
 | Lists (projects), Inbox | ✅ | create, delete, move tasks with subtasks |
 | Custom sections inside a list (columns) | ⬜ | groups are by kind for now |
 | Manual ordering (`sortOrder`) | ✅ | new tasks on top; renumbered with gaps on move |
@@ -92,10 +92,10 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 
 ## Next
 
-1. Repeat: custom rules (a day of the month, the last weekday).
-2. Focus record: notes (the original's grey line under a record's title).
-3. Settings → Account: Backup & Restore (export and import the whole database).
-4. Calendar: the view menu's keys (D/1, W/2, M/3) and the red now-line on the hour axis.
-5. Quick add: the field's ▾ (the original's expanded add form with date, priority, list and tags).
-6. Habits: reminders with the original's Snooze / Record / +1 actions in the notification.
+1. Focus record: notes (the original's grey line under a record's title).
+2. Settings → Account: Backup & Restore (export and import the whole database).
+3. Calendar: the view menu's keys (D/1, W/2, M/3) and the red now-line on the hour axis.
+4. Quick add: the field's ▾ (the original's expanded add form with date, priority, list and tags).
+5. Habits: reminders with the original's Snooze / Record / +1 actions in the notification.
+6. Repeat: monthly "Workday" and "Skip Weekends", and "By Completion" (repeat from the completion date).
 7. Filled sidebar icons (needs own filled glyphs; Lucide has none).

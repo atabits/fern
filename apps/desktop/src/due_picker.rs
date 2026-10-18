@@ -394,6 +394,22 @@ pub fn repeat_label(repeat: &Recurrence, strings: &Strings) -> String {
         label.push_str(strings.repeat_on);
         label.push_str(&days.join(", "));
     }
+    // Monthly "Each": the days, and "the last day".
+    if repeat.frequency == Frequency::Monthly && repeat.month_days != 0 {
+        let days: Vec<String> = (0..31)
+            .filter(|i| repeat.month_days & (1 << i) != 0)
+            .map(|i| (i + 1).to_string())
+            .chain((repeat.month_days & fern_core::recurrence::LAST_DAY != 0).then(|| strings.repeat_last_day.to_owned()))
+            .collect();
+        label.push_str(strings.repeat_on);
+        label.push_str(&days.join(", "));
+    }
+    // Monthly "On the": "the first Sunday", "the last Friday".
+    if let Some((nth, weekday)) = repeat.nth_weekday.filter(|_| repeat.frequency == Frequency::Monthly) {
+        let nth = if nth < 0 { strings.repeat_nth[4] } else { strings.repeat_nth[(nth as usize).clamp(1, 4) - 1] };
+        label.push_str(strings.repeat_on);
+        label.push_str(&format!("{nth} {}", strings.weekdays_full[weekday.num_days_from_monday() as usize]));
+    }
     label
 }
 
@@ -536,7 +552,7 @@ mod tests {
     #[test]
     fn repeat_labels() {
         use crate::i18n::RU;
-        let weekly = |interval, weekdays| Recurrence { frequency: Frequency::Weekly, interval, weekdays };
+        let weekly = |interval, weekdays| Recurrence { weekdays, ..Recurrence::new(Frequency::Weekly, interval) };
         assert_eq!(repeat_label(&Recurrence::new(Frequency::Daily, 1), &EN), "Daily");
         assert_eq!(repeat_label(&Recurrence::new(Frequency::Daily, 3), &EN), "Every 3 days");
         assert_eq!(repeat_label(&weekly(1, 0b100_0000), &EN), "Weekly on Su");
@@ -581,5 +597,14 @@ mod tests {
         assert_eq!(draft.date, Some(today));
         assert_eq!(time_options().len(), 48);
         assert_eq!(quick_dates(d(2026, 1, 31))[3], d(2026, 2, 28));
+    }
+
+    #[test]
+    fn monthly_rule_labels() {
+        let mut rule = Recurrence::new(Frequency::Monthly, 1);
+        rule.month_days = 1 | fern_core::recurrence::LAST_DAY;
+        assert_eq!(repeat_label(&rule, &EN), "Monthly on 1, last day");
+        let rule = Recurrence { nth_weekday: Some((1, chrono::Weekday::Sun)), ..Recurrence::new(Frequency::Monthly, 1) };
+        assert_eq!(repeat_label(&rule, &EN), "Monthly on first Sunday");
     }
 }

@@ -3570,7 +3570,7 @@ impl TodoView {
             .countdowns()
             .unwrap_or_default()
             .into_iter()
-            .filter(|c| c.show_in_list.shows(c.next_date(today), today))
+            .filter(|c| !c.archived && c.show_in_list.shows(c.next_date(today), today))
             .collect();
         if countdowns.is_empty() {
             return None;

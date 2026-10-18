@@ -89,7 +89,15 @@ pub struct CountdownView {
     card_menu: Option<Id>,
     /// The "+" menu of kinds, as in the original.
     add_menu: bool,
+    /// The title's "Countdown ▾" menu (Active / Archived) and the header's "…" menu, while open.
+    title_menu: bool,
+    header_menu: bool,
+    /// Listing the archived countdowns.
+    show_archived: bool,
 }
+
+/// Hides the kind tabs (the header "…" menu's Hide Group).
+const HIDE_GROUP_SETTING: &str = "countdown_hide_group";
 
 pub fn kind_icon(kind: CountdownKind) -> IconName {
     match kind {
@@ -206,7 +214,7 @@ pub fn render_summary(countdown: &Countdown, date: NaiveDate, cx: &App) -> AnyEl
 
 impl CountdownView {
     pub fn new(store: Rc<Store>, cx: &mut Context<Self>) -> Self {
-        let mut this = Self { store, countdowns: Vec::new(), filter: Filter::All, days_only: HashSet::new(), draft: None, card_menu: None, add_menu: false };
+        let mut this = Self { store, countdowns: Vec::new(), filter: Filter::All, days_only: HashSet::new(), draft: None, card_menu: None, add_menu: false, title_menu: false, header_menu: false, show_archived: false };
         this.reload(cx);
         this
     }
@@ -302,6 +310,14 @@ impl CountdownView {
                 _ => DraftRow::Reminder,
             });
         }
+        cx.notify();
+    }
+
+    /// The header's "Countdown ▾" (or with `more`, its "…") menu, for screenshots.
+    #[cfg(debug_assertions)]
+    pub fn dev_header_menu(&mut self, more: bool, cx: &mut Context<Self>) {
+        self.title_menu = !more;
+        self.header_menu = more;
         cx.notify();
     }
 
@@ -490,6 +506,19 @@ impl CountdownView {
                                         .child(Label::new(strings.edit))
                                         .on_click(cx.listener(move |this, _, window, cx| this.start_edit(id, window, cx))),
                                 )
+                                .child({
+                                    let archived = countdown.archived;
+                                    ListItem::new("countdown-archive")
+                                        .start_slot(Icon::new(if archived { IconName::ArchiveRestore } else { IconName::Archive }).color(Color::Muted))
+                                        .child(Label::new(if archived { strings.habit_unarchive } else { strings.habit_archive }))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.card_menu = None;
+                                            if let Err(err) = this.store.set_countdown_archived(id, !archived) {
+                                                eprintln!("failed to archive the countdown: {err:#}");
+                                            }
+                                            this.reload(cx);
+                                        }))
+                                })
                                 .child(
                                     ListItem::new("countdown-delete")
                                         .start_slot(Icon::new(IconName::Trash).color(Color::Muted))
@@ -1131,6 +1160,7 @@ impl Render for CountdownView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let strings = i18n::t(cx);
         let theme = cx.theme().clone();
+        let hide_group = self.store.setting(HIDE_GROUP_SETTING).ok().flatten().as_deref() == Some("1");
         let filters = [
             (Filter::All, strings.countdown_all),
             (Filter::Kind(CountdownKind::Countdown), strings.countdown_kind_countdown),
@@ -1140,6 +1170,7 @@ impl Render for CountdownView {
         let shown: Vec<Countdown> = self
             .countdowns
             .iter()
+            .filter(|c| c.archived == self.show_archived)
             .filter(|c| match self.filter {
                 Filter::All => true,
                 Filter::Kind(kind) => c.kind == kind,
@@ -1172,8 +1203,46 @@ impl Render for CountdownView {
                     .flex_none()
                     .px(px(22.))
                     .gap_1()
-                    .child(Label::new(strings.section_countdown).size(LabelSize::Large).weight(FontWeight::BOLD))
-                    .child(Icon::new(IconName::ChevronDown).size(IconSize::XSmall))
+                    // The original's "Countdown ▾": Active or Archived countdowns.
+                    .child(
+                        div()
+                            .relative()
+                            .child(
+                                h_flex()
+                                    .id("countdown-title")
+                                    .gap_1()
+                                    .cursor_pointer()
+                                    .child(Label::new(strings.section_countdown).size(LabelSize::Large).weight(FontWeight::BOLD))
+                                    .child(Icon::new(IconName::ChevronDown).size(IconSize::XSmall))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.title_menu = !this.title_menu;
+                                        cx.notify();
+                                    })),
+                            )
+                            .when(self.title_menu, |el| {
+                                let archived = self.show_archived;
+                                el.child(PopoverAttachment::new(
+                                    Placement::BelowLeft,
+                                    popover(cx)
+                                        .w(px(162.))
+                                        .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                                            this.title_menu = false;
+                                            cx.notify();
+                                        }))
+                                        .children([(false, strings.habit_active), (true, strings.habit_archived)].map(|(value, label)| {
+                                            ListItem::new(if value { "countdowns-archived" } else { "countdowns-active" })
+                                                .height(px(34.))
+                                                .child(Label::new(label).color(if value == archived { Color::Accent } else { Color::Default }))
+                                                .when(value == archived, |item| item.end_slot(Icon::new(IconName::Check).size(IconSize::XSmall).color(Color::Accent)))
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.show_archived = value;
+                                                    this.title_menu = false;
+                                                    cx.notify();
+                                                }))
+                                        })),
+                                ))
+                            }),
+                    )
                     .child(div().flex_1())
                     .child(
                         div()
@@ -1206,9 +1275,41 @@ impl Render for CountdownView {
                                 ))
                             }),
                     )
-                    .child(IconButton::new("countdown-more", IconName::Ellipsis)),
+                    // The original's "…": Hide Group (the kind tabs) or Show Group.
+                    .child(
+                        div()
+                            .relative()
+                            .child(IconButton::new("countdown-more", IconName::Ellipsis).on_click(cx.listener(|this, _, _, cx| {
+                                this.header_menu = !this.header_menu;
+                                cx.notify();
+                            })))
+                            .when(self.header_menu, |el| {
+                                el.child(PopoverAttachment::new(
+                                    Placement::BelowRight,
+                                    popover(cx)
+                                        .w(px(162.))
+                                        .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                                            this.header_menu = false;
+                                            cx.notify();
+                                        }))
+                                        .child(
+                                            ListItem::new("countdown-hide-group")
+                                                .height(px(34.))
+                                                .start_slot(Icon::new(IconName::Layers).color(Color::Muted))
+                                                .child(Label::new(if hide_group { strings.countdown_show_group } else { strings.countdown_hide_group }))
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.header_menu = false;
+                                                    if let Err(err) = this.store.set_setting(HIDE_GROUP_SETTING, if hide_group { "0" } else { "1" }) {
+                                                        eprintln!("failed to save the countdown setting: {err:#}");
+                                                    }
+                                                    cx.notify();
+                                                })),
+                                        ),
+                                ))
+                            }),
+                    ),
             )
-            .child(h_flex().flex_none().px(px(20.)).gap_1().pb_3().children(filters.map(|(filter, label)| {
+            .when(!hide_group, |el| el.child(h_flex().flex_none().px(px(20.)).gap_1().pb_3().children(filters.map(|(filter, label)| {
                 let selected = self.filter == filter;
                 div()
                     .id(label)
@@ -1222,7 +1323,7 @@ impl Render for CountdownView {
                         this.filter = filter;
                         cx.notify();
                     }))
-            })))
+            }))))
             .child(
                 div()
                     .id("countdown-grid")

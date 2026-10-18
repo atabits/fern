@@ -254,6 +254,10 @@ impl AppView {
             if state.contains("section=countdown") {
                 this.select(Section::Countdown, window, cx);
             }
+            // `countdown-header=title|more`: the header's "Countdown ▾" or "…" menu.
+            if let Some(menu) = state.split(';').find_map(|part| part.strip_prefix("countdown-header=")) {
+                this.countdown.update(cx, |view, cx| view.dev_header_menu(menu == "more", cx));
+            }
             if state.contains("countdown-add-menu") {
                 this.countdown.update(cx, |view, cx| view.dev_add_menu(cx));
             }

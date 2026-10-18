@@ -101,6 +101,8 @@ pub struct Countdown {
     /// A birthday's Counting Mode "Count Up": the time since the date of birth instead of the
     /// time to the next birthday.
     pub count_up: bool,
+    /// Archived countdowns are kept but listed apart (the original's "Countdown ▾ → Archived").
+    pub archived: bool,
 }
 
 impl Countdown {
@@ -216,7 +218,8 @@ pub fn reminder_time() -> chrono::NaiveTime {
 /// countdown counts to (the next time a repeating one comes back), at 09:00.
 pub fn reminders_between(countdowns: &[Countdown], after: chrono::NaiveDateTime, until: chrono::NaiveDateTime) -> Vec<(&Countdown, chrono::NaiveDateTime)> {
     let mut fired = Vec::new();
-    for countdown in countdowns {
+    // Archived countdowns do not remind.
+    for countdown in countdowns.iter().filter(|c| !c.archived) {
         // The dates it counts to around the window: from its start, and a week later, which
         // covers "1 week early" for the next time it comes back.
         let mut targets = vec![countdown.next_date(after.date()), countdown.next_date(after.date() + chrono::Duration::days(8))];
@@ -389,6 +392,7 @@ mod tests {
             show_in_list: ShowInList::OnTheDay,
             plus_one_day: false,
             count_up: false,
+            archived: false,
         };
         let list = [trip];
         let fired = |from: NaiveDate, to: NaiveDate| -> Vec<chrono::NaiveDateTime> {
@@ -453,6 +457,7 @@ mod tests {
             show_in_list: ShowInList::OnTheDay,
             plus_one_day: false,
             count_up: false,
+            archived: false,
         };
         let today = d(2026, 10, 18);
         let mum = birthday(d(1970, 12, 5));
@@ -485,6 +490,7 @@ mod tests {
             show_in_list: ShowInList::OnTheDay,
             plus_one_day: false,
             count_up: false,
+            archived: false,
         };
         assert_eq!(once.next_date(d(2026, 10, 18)), d(2026, 9, 13), "without a repeat the date stays");
         let monthly = Countdown { repeat: Some(Recurrence::new(Frequency::Monthly, 1)), ..once.clone() };

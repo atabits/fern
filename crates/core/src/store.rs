@@ -648,6 +648,9 @@ const MIGRATIONS: &[&str] = &[
     "
     ALTER TABLE countdowns ADD COLUMN count_up INTEGER NOT NULL DEFAULT 0;
     ",
+    "
+    ALTER TABLE countdowns ADD COLUMN archived_at INTEGER;
+    ",
 ];
 
 const TASK_COLUMNS: &str = "id, parent_id, kind, title, notes, priority, due_date, due_time, \
@@ -1526,7 +1529,7 @@ impl Store {
     /// Countdowns in creation order.
     pub fn countdowns(&self) -> Result<Vec<Countdown>> {
         let mut stmt =
-            self.conn.prepare("SELECT id, name, date, kind, icon, color, repeat, pinned_at, show_age, reminders, constant_reminder, show_in_list, plus_one_day, count_up FROM countdowns
+            self.conn.prepare("SELECT id, name, date, kind, icon, color, repeat, pinned_at, show_age, reminders, constant_reminder, show_in_list, plus_one_day, count_up, archived_at FROM countdowns
              ORDER BY pinned_at IS NULL, pinned_at DESC, created_at, rowid")?;
         let rows = stmt
             .query_map([], |row| {
@@ -1549,6 +1552,7 @@ impl Store {
                     show_in_list: crate::countdown::ShowInList::parse(&row.get::<_, String>(11)?),
                     plus_one_day: row.get(12)?,
                     count_up: row.get(13)?,
+                    archived: row.get::<_, Option<i64>>(14)?.is_some(),
                 })
             })?
             .collect::<Result<_, _>>()?;
@@ -1558,7 +1562,7 @@ impl Store {
     pub fn add_countdown(&self, name: &str, date: NaiveDate, kind: CountdownKind) -> Result<Countdown> {
         let name = name.trim();
         anyhow::ensure!(!name.is_empty(), "a countdown needs a name");
-        let countdown = Countdown { id: Uuid::now_v7(), name: name.to_owned(), date, kind, icon: None, color: None, repeat: None, pinned_at: None, show_age: false, reminders: Vec::new(), custom_reminders: Vec::new(), constant_reminder: false, show_in_list: Default::default(), plus_one_day: false, count_up: false };
+        let countdown = Countdown { id: Uuid::now_v7(), name: name.to_owned(), date, kind, icon: None, color: None, repeat: None, pinned_at: None, show_age: false, reminders: Vec::new(), custom_reminders: Vec::new(), constant_reminder: false, show_in_list: Default::default(), plus_one_day: false, count_up: false, archived: false };
         self.conn.execute(
             "INSERT INTO countdowns (id, name, date, kind, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
@@ -1616,6 +1620,15 @@ impl Store {
         self.conn.execute(
             "UPDATE countdowns SET show_in_list = ?2, plus_one_day = ?3, count_up = ?4 WHERE id = ?1",
             params![id.to_string(), show.key(), plus_one_day, count_up],
+        )?;
+        Ok(())
+    }
+
+    /// Archives a countdown (kept, listed under Archived) or restores it.
+    pub fn set_countdown_archived(&self, id: Id, archived: bool) -> Result<()> {
+        self.conn.execute(
+            "UPDATE countdowns SET archived_at = ?2 WHERE id = ?1",
+            params![id.to_string(), archived.then(now_ms)],
         )?;
         Ok(())
     }
@@ -3173,6 +3186,10 @@ mod tests {
         store.set_countdown_display(release.id, crate::countdown::ShowInList::Always, true, true)?;
         let saved = store.countdowns()?.remove(0);
         assert_eq!((saved.show_in_list, saved.plus_one_day, saved.count_up), (crate::countdown::ShowInList::Always, true, true));
+        store.set_countdown_archived(release.id, true)?;
+        assert!(store.countdowns()?.iter().find(|c| c.id == release.id).unwrap().archived);
+        store.set_countdown_archived(release.id, false)?;
+        assert!(!store.countdowns()?.iter().find(|c| c.id == release.id).unwrap().archived);
         Ok(())
     }
 

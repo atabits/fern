@@ -19,6 +19,9 @@ use crate::task_detail::{OpenTask, StartFocus, TaskDetail, TaskUpdated};
 use crate::task_rows::{self, ClosedRange, DropTarget, GroupBy, Row, Section, SortBy};
 use crate::text_input::{Cancelled, Changed, Mode, Submitted, TextInput};
 
+/// The share of a task row, from the left, where a dropped task goes before it; the rest of the
+/// row nests it.
+const NEST_ZONE: f32 = 0.6;
 const DETAIL_WIDTH: f32 = 400.;
 const ROW_HEIGHT: f32 = 40.;
 /// Space left of the checkbox for the subtask chevron.
@@ -2534,6 +2537,17 @@ impl TodoView {
         self.reload(cx);
     }
 
+    /// Drops a dragged task onto the right part of `parent`'s row: it becomes a subtask there,
+    /// in the parent's list. A task cannot go inside itself or its own subtasks.
+    fn nest_task(&mut self, dragged: Id, parent: Id, cx: &mut Context<Self>) {
+        if dragged == parent {
+            return;
+        }
+        let result = self.store.link_parent(dragged, parent);
+        self.check(result);
+        self.reload(cx);
+    }
+
     /// Drops a dragged task right before `target`.
     fn drop_task(&mut self, dragged: Id, target: Id, cx: &mut Context<Self>) {
         let result = self.store.move_task(dragged, target, false);
@@ -2626,11 +2640,33 @@ impl TodoView {
             .id(ElementId::Uuid(id))
             .group(group.clone())
             .when(draggable, |el| {
+                // Two drop zones, as in the original: on the left a dragged task goes before this
+                // one; on the right it becomes this task's subtask.
                 el.on_drag(dragged, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
-                    .drag_over::<DraggedTask>(move |style, _, _, _| style.border_t_2().border_color(accent))
-                    .on_drop(cx.listener(move |this, dragged: &DraggedTask, _, cx| {
-                        this.drop_task(dragged.id, id, cx)
-                    }))
+                    .relative()
+                    .child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .h_full()
+                            .w(gpui::relative(NEST_ZONE))
+                            .drag_over::<DraggedTask>(move |style, _, _, _| style.border_t_2().border_color(accent))
+                            .on_drop(cx.listener(move |this, dragged: &DraggedTask, _, cx| this.drop_task(dragged.id, id, cx))),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .right_0()
+                            .h_full()
+                            .w(gpui::relative(1. - NEST_ZONE))
+                            .rounded(px(6.))
+                            .drag_over::<DraggedTask>(move |style, _, _, _| {
+                                style.border_1().border_color(accent).bg(accent.opacity(0.08))
+                            })
+                            .on_drop(cx.listener(move |this, dragged: &DraggedTask, _, cx| this.nest_task(dragged.id, id, cx))),
+                    )
             })
             .h(px(if details { ROW_HEIGHT + 14. } else { ROW_HEIGHT }))
             .flex()

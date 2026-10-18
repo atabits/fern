@@ -141,7 +141,7 @@ pub fn render<V: 'static>(
         .child(heading(strings.filter_priority))
         .child(priority_row)
         .child(div().py_1().child(Divider::horizontal()))
-        .when(kind == MenuKind::List, |el| el.child(item("task-menu-subtask", IconName::CornerDownRight, strings.add_subtask, MenuAction::AddSubtask, cx)))
+        .when(kind == MenuKind::List, |el| el.child(item("task-menu-subtask", IconName::CornerDownRight, strings.add_subtask_item, MenuAction::AddSubtask, cx)))
         .child(item("task-menu-parent", IconName::ListTree, strings.link_parent, MenuAction::LinkParent, cx))
         .when(kind == MenuKind::List, |el| {
             el.child(item(

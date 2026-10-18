@@ -913,12 +913,13 @@ impl TaskDetail {
         let wont_do = task.is_wont_do();
         let is_note = task.kind == Kind::Note;
         let item = |id: &'static str, icon: IconName, label: &'static str| {
-            ListItem::new(id).start_slot(Icon::new(icon).color(Color::Muted)).child(Label::new(label))
+            ListItem::new(id).height(px(34.)).start_slot(Icon::new(icon).color(Color::Muted)).child(Label::new(label))
         };
+        // The original's menu: 178 px wide, a row every 34 px.
         popover(cx)
-            .w(px(220.))
+            .w(px(178.))
             .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_popup(cx)))
-            .child(self.close_side_menu_on_hover(item("more-subtask", IconName::CornerDownRight, strings.add_subtask).on_click(cx.listener(
+            .child(self.close_side_menu_on_hover(item("more-subtask", IconName::CornerDownRight, strings.add_subtask_item).on_click(cx.listener(
                 |this, _, window, cx| {
                     this.close_popup(cx);
                     window.focus(&this.subtask_input.focus_handle(cx), cx);
@@ -955,6 +956,7 @@ impl TaskDetail {
             .child(
                 SubmenuItem::new("more-focus", strings.start_focus)
                     .icon(IconName::CircleDot)
+                    .height(px(34.))
                     .open(self.focus_submenu)
                     .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
                         if *hovered && !this.focus_submenu {
@@ -964,6 +966,7 @@ impl TaskDetail {
                     }))
                     .items([(false, strings.start_pomo), (true, strings.start_stopwatch)].map(|(stopwatch, label)| {
                         ListItem::new(SharedString::from(format!("more-focus-{stopwatch}")))
+                            .height(px(34.))
                             .child(Label::new(label))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.close_popup(cx);
@@ -973,6 +976,7 @@ impl TaskDetail {
                             }))
                     }))
                     .items([ListItem::new("more-focus-estimate")
+                        .height(px(34.))
                         .child(Label::new(strings.estimation))
                         .on_click(cx.listener(|this, _, _, cx| this.open_popup(Popup::Estimate, cx)))]),
             )
@@ -986,15 +990,15 @@ impl TaskDetail {
             .child(self.close_side_menu_on_hover(item("more-template", IconName::LayoutTemplate, strings.save_as_template).on_click(cx.listener(
                 |this, _, _, cx| this.menu_action(cx, |store, id| store.save_template(id).map(|_| ())),
             )), cx))
+            .child(self.close_side_menu_on_hover(item("more-duplicate", IconName::Copy, strings.duplicate).on_click(cx.listener(
+                |this, _, _, cx| this.menu_action(cx, |store, id| store.duplicate_task(id).map(|_| ())),
+            )), cx))
             .child(self.close_side_menu_on_hover(item("more-copy-link", IconName::Link, strings.copy_link).on_click(cx.listener(|this, _, _, cx| {
                 this.close_popup(cx);
                 if let Some(task) = this.task.as_ref() {
                     cx.write_to_clipboard(gpui::ClipboardItem::new_string(fern_core::link::task_link(task.id)));
                 }
             })), cx))
-            .child(self.close_side_menu_on_hover(item("more-duplicate", IconName::Copy, strings.duplicate).on_click(cx.listener(
-                |this, _, _, cx| this.menu_action(cx, |store, id| store.duplicate_task(id).map(|_| ())),
-            )), cx))
             .child(self.close_side_menu_on_hover(
                 item(
                     "more-convert",

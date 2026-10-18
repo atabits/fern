@@ -88,6 +88,32 @@ struct HabitEdit {
     icon_text: Entity<TextInput>,
     /// A field for adding a reminder time.
     reminder_input: Entity<TextInput>,
+    /// The row whose dropdown is open.
+    open: Option<EditRow>,
+}
+
+/// The Edit Habit rows that open a dropdown, as in the original.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EditRow {
+    Frequency,
+    Goal,
+    StartDate,
+    GoalDays,
+    Section,
+}
+
+/// The Frequency field's text: "Daily", the chosen weekdays, "3 days per week" or "Every 2 days".
+fn frequency_label(frequency: HabitFrequency, strings: &i18n::Strings) -> String {
+    match frequency {
+        HabitFrequency::Daily { weekdays } if weekdays == HabitFrequency::EVERY_DAY => strings.habit_frequency_kinds[0].to_owned(),
+        HabitFrequency::Daily { weekdays } => (0..7)
+            .filter(|i| weekdays & (1 << i) != 0)
+            .map(|i| strings.weekdays_short[i])
+            .collect::<Vec<_>>()
+            .join(", "),
+        HabitFrequency::Weekly { days } => strings.habit_days_per_week.replace("{n}", &days.to_string()),
+        HabitFrequency::Interval { days } => strings.habit_every_n_days.replace("{n}", &days.to_string()),
+    }
 }
 
 pub struct HabitView {
@@ -276,6 +302,7 @@ impl HabitView {
             section: habit.section,
             new_section: None,
             reminder_input,
+            open: None,
         });
         self.detail_menu_open = false;
         cx.notify();
@@ -340,6 +367,120 @@ impl HabitView {
                 .child(Label::new(label).size(LabelSize::Small))
         };
         let picker = edit.icon_picker.map(|tab| self.render_icon_picker(edit, tab, cx));
+        let frequency_menu = self.render_frequency(edit.frequency, cx);
+        let (start_text, start_menu, goal_days_text, goal_days_menu) = self.render_span(edit, cx);
+        let section_menu = v_flex()
+            .gap_2()
+            .child(h_flex().flex_wrap().gap_1().children(HabitSection::ordered(&self.sections).into_iter().enumerate().map(|(i, section)| {
+                let selected = edit.section == section;
+                div()
+                    .id(SharedString::from(format!("habit-section-{i}")))
+                    .px_2()
+                    .h(px(24.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(12.))
+                    .cursor_pointer()
+                    .when(selected, |el| el.bg(theme.colors().accent.opacity(0.25)))
+                    .when(!selected, |el| el.bg(theme.colors().element_hover))
+                    .child(Label::new(self.section_label(section, cx)).size(LabelSize::XSmall).color(if selected { Color::Accent } else { Color::Default }))
+                    .on_click(cx.listener(move |this, _, _, cx| this.update_edit(cx, |e| e.section = section)))
+            })).child(
+                div()
+                    .id("habit-section-add")
+                    .px_2()
+                    .h(px(24.))
+                    .flex()
+                    .items_center()
+                    .rounded(px(12.))
+                    .cursor_pointer()
+                    .border_1()
+                    .border_color(theme.colors().border)
+                    .child(Label::new(format!("+ {}", strings.habit_add_section)).size(LabelSize::XSmall))
+                    .on_click(cx.listener(|this, _, window, cx| this.start_new_section(window, cx))),
+            ))
+            .when_some(edit.new_section.clone(), |el, input| {
+                el.child(h_flex().h(px(30.)).px_2().rounded(px(6.)).bg(theme.colors().background).child(input))
+            })
+            .into_any_element();
+        let goal_menu = v_flex()
+            .child(
+                option("goal-all", strings.habit_goal_all, amount.is_none())
+                    .on_click(cx.listener(|this, _, _, cx| this.update_edit(cx, |e| e.amount = None))),
+            )
+            .child(
+                option("goal-amount", strings.habit_goal_amount, amount.is_some())
+                    .on_click(cx.listener(|this, _, _, cx| this.update_edit(cx, |e| e.amount = e.amount.or(Some(1))))),
+            )
+            .when_some(amount, |el, amount| {
+                el.child(
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            IconButton::new("goal-fewer", IconName::Minus).on_click(cx.listener(|this, _, _, cx| {
+                                this.update_edit(cx, |e| e.amount = e.amount.map(|a| a.saturating_sub(1).max(1)))
+                            })),
+                        )
+                        .child(div().min_w(px(24.)).flex().justify_center().child(Label::new(amount.to_string())))
+                        .child(
+                            IconButton::new("goal-more", IconName::Plus).on_click(cx.listener(|this, _, _, cx| {
+                                this.update_edit(cx, |e| e.amount = e.amount.map(|a| (a + 1).min(999)))
+                            })),
+                        )
+                        .child(div().flex_1().child(field(edit.unit.clone().into_any_element())))
+                        .child(Label::new(strings.habit_per_day).size(LabelSize::Small).color(Color::Muted)),
+                )
+            })
+            .into_any_element();
+        let goal_text = match amount {
+            None => strings.habit_goal_all.to_owned(),
+            Some(n) => format!("{n} {}{}", edit.unit.read(cx).text(), strings.habit_per_day),
+        };
+        let section_text = self.section_label(edit.section, cx).to_string();
+        // The original's rows: a label on the left and the value in a field that opens its choices.
+        let row = |label: &'static str, content: AnyElement| {
+            // With the dialog's 8 px gap, a row every 40 px as in the original.
+            h_flex()
+                .min_h(px(32.))
+                .gap_2()
+                .child(div().w(px(101.)).flex_none().child(Label::new(label)))
+                .child(div().flex_1().min_w_0().child(content))
+        };
+        let open = edit.open;
+        let dropdown = |which: EditRow, text: String, menu: AnyElement| -> AnyElement {
+            let on = open == Some(which);
+            div()
+                .relative()
+                .child(
+                    h_flex()
+                        .id(SharedString::from(format!("habit-row-{which:?}")))
+                        .h(px(32.))
+                        .px_3()
+                        .rounded(px(6.))
+                        .border_1()
+                        .border_color(if on { theme.colors().accent } else { theme.colors().border })
+                        .cursor_pointer()
+                        .child(div().flex_1().min_w_0().child(Label::new(text).truncate()))
+                        .child(Icon::new(IconName::ChevronDown).size(IconSize::XSmall).color(Color::Muted))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.update_edit(cx, |e| e.open = if e.open == Some(which) { None } else { Some(which) })
+                        })),
+                )
+                .when(on, |el| {
+                    el.child(PopoverAttachment::new(
+                        Placement::BelowLeft,
+                        popover(cx)
+                            .w(px(294.))
+                            .p_3()
+                            .gap_2()
+                            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.update_edit(cx, |e| e.open = None)))
+                            .child(menu),
+                    ))
+                })
+                .into_any_element()
+        };
+
         // The original's dialog: in the middle of the view, its width, closed with × or Cancel.
         popover(cx)
             .w(px(425.))
@@ -377,72 +518,13 @@ impl HabitView {
                     )
                     .child(div().flex_1().child(field(edit.name.clone().into_any_element()))),
             )
-            .child(Label::new(strings.habit_frequency).size(LabelSize::Small).color(Color::Muted))
-            .child(self.render_frequency(edit.frequency, cx))
-            .child(self.render_span(edit, cx))
-            .child(Label::new(strings.habit_section).size(LabelSize::Small).color(Color::Muted))
-            .child(h_flex().flex_wrap().gap_1().children(HabitSection::ordered(&self.sections).into_iter().enumerate().map(|(i, section)| {
-                let selected = edit.section == section;
-                div()
-                    .id(SharedString::from(format!("habit-section-{i}")))
-                    .px_2()
-                    .h(px(24.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded(px(12.))
-                    .cursor_pointer()
-                    .when(selected, |el| el.bg(theme.colors().accent.opacity(0.25)))
-                    .when(!selected, |el| el.bg(theme.colors().element_hover))
-                    .child(Label::new(self.section_label(section, cx)).size(LabelSize::XSmall).color(if selected { Color::Accent } else { Color::Default }))
-                    .on_click(cx.listener(move |this, _, _, cx| this.update_edit(cx, |e| e.section = section)))
-            })).child(
-                div()
-                    .id("habit-section-add")
-                    .px_2()
-                    .h(px(24.))
-                    .flex()
-                    .items_center()
-                    .rounded(px(12.))
-                    .cursor_pointer()
-                    .border_1()
-                    .border_color(theme.colors().border)
-                    .child(Label::new(format!("+ {}", strings.habit_add_section)).size(LabelSize::XSmall))
-                    .on_click(cx.listener(|this, _, window, cx| this.start_new_section(window, cx))),
-            ))
-            .when_some(edit.new_section.clone(), |el, input| {
-                el.child(h_flex().h(px(30.)).px_2().rounded(px(6.)).bg(theme.colors().background).child(input))
-            })
-            .child(Label::new(strings.habit_goal).size(LabelSize::Small).color(Color::Muted))
-            .child(
-                option("goal-all", strings.habit_goal_all, amount.is_none())
-                    .on_click(cx.listener(|this, _, _, cx| this.update_edit(cx, |e| e.amount = None))),
-            )
-            .child(
-                option("goal-amount", strings.habit_goal_amount, amount.is_some())
-                    .on_click(cx.listener(|this, _, _, cx| this.update_edit(cx, |e| e.amount = e.amount.or(Some(1))))),
-            )
-            .when_some(amount, |el, amount| {
-                el.child(
-                    h_flex()
-                        .gap_2()
-                        .child(
-                            IconButton::new("goal-fewer", IconName::Minus).on_click(cx.listener(|this, _, _, cx| {
-                                this.update_edit(cx, |e| e.amount = e.amount.map(|a| a.saturating_sub(1).max(1)))
-                            })),
-                        )
-                        .child(div().min_w(px(24.)).flex().justify_center().child(Label::new(amount.to_string())))
-                        .child(
-                            IconButton::new("goal-more", IconName::Plus).on_click(cx.listener(|this, _, _, cx| {
-                                this.update_edit(cx, |e| e.amount = e.amount.map(|a| (a + 1).min(999)))
-                            })),
-                        )
-                        .child(div().flex_1().child(field(edit.unit.clone().into_any_element())))
-                        .child(Label::new(strings.habit_per_day).size(LabelSize::Small).color(Color::Muted)),
-                )
-            })
-            .child(Label::new(strings.reminder).size(LabelSize::Small).color(Color::Muted))
-            .child(
+            .child(row(strings.habit_frequency, dropdown(EditRow::Frequency, frequency_label(edit.frequency, strings), frequency_menu)))
+            .child(row(strings.habit_goal, dropdown(EditRow::Goal, goal_text, goal_menu)))
+            .child(row(strings.habit_start_date, dropdown(EditRow::StartDate, start_text, start_menu)))
+            .child(row(strings.habit_goal_days, dropdown(EditRow::GoalDays, goal_days_text, goal_days_menu)))
+            .child(row(strings.habit_section, dropdown(EditRow::Section, section_text, section_menu)))
+            .child(row(
+                strings.reminder,
                 h_flex()
                     .flex_wrap()
                     .gap_1()
@@ -464,8 +546,9 @@ impl HabitView {
                                     })),
                             )
                     }))
-                    .child(div().flex_1().min_w(px(120.)).child(field(edit.reminder_input.clone().into_any_element()))),
-            )
+                    .child(div().flex_1().min_w(px(120.)).child(field(edit.reminder_input.clone().into_any_element())))
+                    .into_any_element(),
+            ))
             .child(
                 h_flex()
                     .gap_2()
@@ -480,12 +563,14 @@ impl HabitView {
     }
 
     /// "Start Date" with a calendar, and "Goal Days": Forever, the presets or a custom number.
-    fn render_span(&self, edit: &HabitEdit, cx: &mut Context<Self>) -> AnyElement {
+    /// The Start Date and Goal Days rows' texts and dropdowns: a month to pick the start in, and
+    /// the original's Goal Days choices.
+    fn render_span(&self, edit: &HabitEdit, cx: &mut Context<Self>) -> (String, AnyElement, String, AnyElement) {
         let strings = i18n::t(cx);
         let theme = cx.theme().clone();
         let today = Local::now().date_naive();
         let start = edit.start_date;
-        let calendar_view = edit.start_calendar.map(|month| {
+        let calendar_view = Some(edit.start_calendar.unwrap_or(calendar::month_start(start))).map(|month| {
             v_flex()
                 .gap_1()
                 .child(
@@ -519,6 +604,7 @@ impl HabitView {
                                 this.update_edit(cx, |e| {
                                     e.start_date = date;
                                     e.start_calendar = None;
+                                    e.open = None;
                                 })
                             }))
                     }))
@@ -543,33 +629,8 @@ impl HabitView {
         } else {
             format!("{}, {}", crate::task_rows::short_date(start, strings), start.year())
         };
-        v_flex()
+        let goal_menu = v_flex()
             .gap_2()
-            .child(
-                h_flex()
-                    .gap_2()
-                    .child(div().flex_1().child(Label::new(strings.habit_start_date).size(LabelSize::Small).color(Color::Muted)))
-                    .child(
-                        div()
-                            .id("habit-start")
-                            .h(px(26.))
-                            .px_2()
-                            .flex()
-                            .items_center()
-                            .rounded(px(6.))
-                            .border_1()
-                            .border_color(if edit.start_calendar.is_some() { theme.colors().accent } else { theme.colors().border })
-                            .cursor_pointer()
-                            .child(Label::new(start_label).size(LabelSize::Small))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.update_edit(cx, |e| {
-                                    e.start_calendar = if e.start_calendar.is_some() { None } else { Some(calendar::month_start(start)) }
-                                })
-                            })),
-                    ),
-            )
-            .children(calendar_view)
-            .child(Label::new(strings.habit_goal_days).size(LabelSize::Small).color(Color::Muted))
             .child(
                 h_flex()
                     .flex_wrap()
@@ -598,7 +659,12 @@ impl HabitView {
                         }))),
                 )
             })
-            .into_any_element()
+            .into_any_element();
+        let goal_days_text = match edit.goal_days {
+            None => strings.habit_forever.to_owned(),
+            Some(n) => format!("{n} {}", strings.habit_days),
+        };
+        (start_label, v_flex().children(calendar_view).into_any_element(), goal_days_text, goal_menu)
     }
 
     /// The icon picker, as the original's: Icon, Emoji and Text tabs on top; Icon is a grid of
@@ -897,6 +963,15 @@ impl HabitView {
             return;
         } else if command == "show-archived" {
             self.show_archived = true;
+        } else if let Some(which) = command.strip_prefix("row=") {
+            // `row=frequency|goal|section`: Edit Habit with that row's dropdown open.
+            let which = match which {
+                "goal" => EditRow::Goal,
+                "section" => EditRow::Section,
+                _ => EditRow::Frequency,
+            };
+            self.update_edit(cx, |e| e.open = Some(which));
+            return;
         } else if command == "picker" {
             self.update_edit(cx, |e| e.icon_picker = Some(0));
             return;

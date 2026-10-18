@@ -1192,7 +1192,7 @@ impl TodoView {
                                             })),
                                     ),
                             )
-                            .child(Label::new(format!("{} {}", when.format("%m/%d"), crate::calendar::format_time(when))).size(LabelSize::XSmall).color(Color::Muted)),
+                            .child(Label::new(format!("{} {}", crate::calendar::format_day_month(when.date_naive(), strings), crate::calendar::format_time(when))).size(LabelSize::XSmall).color(Color::Muted)),
                     )
                     .into_any_element(),
             );

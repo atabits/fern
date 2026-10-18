@@ -125,6 +125,33 @@ impl Visibility {
     }
 }
 
+/// The original's Date Format for numeric dates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DateFormat {
+    /// 12/31/2026
+    MonthDayYear,
+    /// 31/12/2026
+    DayMonthYear,
+    /// 2026/12/31
+    YearMonthDay,
+}
+
+impl DateFormat {
+    pub const ALL: [DateFormat; 3] = [DateFormat::MonthDayYear, DateFormat::DayMonthYear, DateFormat::YearMonthDay];
+
+    pub fn code(self) -> &'static str {
+        match self {
+            DateFormat::MonthDayYear => "mdy",
+            DateFormat::DayMonthYear => "dmy",
+            DateFormat::YearMonthDay => "ymd",
+        }
+    }
+
+    pub fn from_code(code: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|f| f.code() == code)
+    }
+}
+
 /// The days a week can start on, as in the original's "Start Week on".
 pub const WEEK_STARTS: [Weekday; 3] = [Weekday::Mon, Weekday::Sun, Weekday::Sat];
 
@@ -134,6 +161,10 @@ pub struct Preferences {
     pub week_start: Weekday,
     /// Settings → Time Format: 12-hour ("1:00 PM") instead of 24-hour ("13:00").
     pub hour12: bool,
+    /// Settings → Date Format; `None` follows the UI language.
+    pub date_format: Option<DateFormat>,
+    /// Settings → Show Week Numbers (W) in the calendar.
+    pub week_numbers: bool,
     /// Where tasks added outside a list go (smart lists, tags, filters); `None` is the Inbox.
     pub default_list: Option<Id>,
     /// Settings → Smart List, in the order of `SmartList::ALL`.
@@ -161,6 +192,8 @@ impl Default for Preferences {
             theme: ThemeMode::default(),
             week_start: Weekday::Mon,
             hour12: false,
+            date_format: None,
+            week_numbers: false,
             default_list: None,
             smart_lists: [Visibility::Show; 11],
         }
@@ -170,6 +203,8 @@ impl Default for Preferences {
 const THEME: &str = "theme";
 const WEEK_START: &str = "week_start";
 const TIME_FORMAT: &str = "time_format";
+const DATE_FORMAT: &str = "date_format";
+const WEEK_NUMBERS: &str = "week_numbers";
 const DEFAULT_LIST: &str = "default_list";
 
 impl Store {
@@ -191,7 +226,10 @@ impl Store {
             None => None,
         };
         let hour12 = self.setting(TIME_FORMAT)?.as_deref() == Some("12");
-        let mut preferences = Preferences { theme, week_start, hour12, default_list, ..defaults };
+        let date_format = self.setting(DATE_FORMAT)?.and_then(|c| DateFormat::from_code(&c));
+        let week_numbers = self.setting(WEEK_NUMBERS)?.as_deref() == Some("1");
+        let mut preferences =
+            Preferences { theme, week_start, hour12, date_format, week_numbers, default_list, ..defaults };
         for list in SmartList::ALL {
             if let Some(visibility) = self.setting(&smart_list_key(list))?.and_then(|c| Visibility::from_code(&c)) {
                 preferences.set_visibility(list, visibility);
@@ -204,6 +242,8 @@ impl Store {
         self.set_setting(THEME, preferences.theme.code())?;
         self.set_setting(WEEK_START, &preferences.week_start.to_string())?;
         self.set_setting(TIME_FORMAT, if preferences.hour12 { "12" } else { "24" })?;
+        self.set_setting(DATE_FORMAT, preferences.date_format.map_or("", DateFormat::code))?;
+        self.set_setting(WEEK_NUMBERS, if preferences.week_numbers { "1" } else { "0" })?;
         self.set_setting(DEFAULT_LIST, &preferences.default_list.map(|id| id.to_string()).unwrap_or_default())?;
         for list in SmartList::ALL {
             self.set_setting(&smart_list_key(list), preferences.visibility(list).code())?;
@@ -236,6 +276,8 @@ mod tests {
             theme: ThemeMode::Light,
             week_start: Weekday::Sun,
             hour12: true,
+            date_format: Some(DateFormat::YearMonthDay),
+            week_numbers: true,
             default_list: Some(list.id),
             ..Default::default()
         };

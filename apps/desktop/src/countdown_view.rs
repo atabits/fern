@@ -57,7 +57,7 @@ fn kind_label(kind: CountdownKind, strings: &Strings) -> &'static str {
 }
 
 fn format_date(date: NaiveDate, strings: &Strings) -> String {
-    if strings.dotted_dates { date.format("%d.%m.%Y").to_string() } else { date.format("%m/%d/%Y").to_string() }
+    crate::calendar::format_date(date, strings)
 }
 
 impl CountdownView {

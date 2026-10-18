@@ -19,6 +19,9 @@ use crate::task_rows;
 const TASKS_PER_DAY: usize = 5;
 
 /// The user clicked a task in the calendar.
+
+/// The week-number column of the month grid.
+const WEEK_NUMBER_WIDTH: f32 = 32.;
 pub struct OpenTask(pub Id);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -406,6 +409,18 @@ impl Render for CalendarView {
                     .flex_1()
                     .items_stretch()
                     .min_h_0()
+                    // Settings → Show Week Numbers: "W42" before each week, as in the original.
+                    .when(calendar::week_numbers(), |el| {
+                        el.child(
+                            div()
+                                .w(px(WEEK_NUMBER_WIDTH))
+                                .flex_none()
+                                .pt_1()
+                                .flex()
+                                .justify_center()
+                                .child(Label::new(format!("W{}", calendar::week_number(&week))).size(LabelSize::XSmall).color(Color::Muted)),
+                        )
+                    })
                     .children(week.map(|date| self.render_day(date, today, cx)))
                     .into_any_element()
             })
@@ -448,6 +463,13 @@ impl Render for CalendarView {
                                 .weight(FontWeight::BOLD),
                         ),
                     )
+                    .when(self.mode == CalendarMode::Week && calendar::week_numbers(), |el| {
+                        el.child(
+                            Label::new(format!("W{}", calendar::week_number(&calendar::week_of(self.anchor))))
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        )
+                    })
                     .child(
                         bordered("calendar-add-frame").child(
                             IconButton::new("calendar-add", IconName::Plus)
@@ -511,6 +533,9 @@ impl Render for CalendarView {
                     .flex_none()
                     .h(px(22.))
                     .when(self.mode == CalendarMode::Week, |el| el.child(div().w(px(56.)).flex_none()))
+                    .when(self.mode == CalendarMode::Month && calendar::week_numbers(), |el| {
+                        el.child(div().w(px(WEEK_NUMBER_WIDTH)).flex_none())
+                    })
                     .children(crate::calendar::weekday_labels(&strings.weekdays_short).iter().map(|day| {
                         div()
                             .flex_1()

@@ -411,6 +411,8 @@ pub struct Strings {
     pub visibility_names: [&'static str; 4],
     pub start_week_on: &'static str,
     pub time_format: &'static str,
+    pub date_format: &'static str,
+    pub show_week_numbers: &'static str,
     /// 24-hour, 12-hour.
     pub time_formats: [&'static str; 2],
     /// Monday, Sunday, Saturday, as in `fern_core::WEEK_STARTS`.
@@ -757,6 +759,8 @@ pub static EN: Strings = Strings {
     visibility_names: ["Show", "Show if not empty", "Hide", "Show (Omit Empty Tags)"],
     start_week_on: "Start Week on",
     time_format: "Time Format",
+    date_format: "Date Format",
+    show_week_numbers: "Show Week Numbers (W)",
     time_formats: ["24 Hour (13:00)", "12 Hour (1:00 PM)"],
     week_start_names: ["Monday", "Sunday", "Saturday"],
     color_series: "Color Series",
@@ -1101,6 +1105,8 @@ pub static RU: Strings = Strings {
     visibility_names: ["Показывать", "Показывать, если не пусто", "Скрыть", "Показывать (без пустых меток)"],
     start_week_on: "Начало недели",
     time_format: "Формат времени",
+    date_format: "Формат даты",
+    show_week_numbers: "Показывать номера недель (W)",
     time_formats: ["24 часа (13:00)", "12 часов (1:00 PM)"],
     week_start_names: ["Понедельник", "Воскресенье", "Суббота"],
     color_series: "Цветовые темы",

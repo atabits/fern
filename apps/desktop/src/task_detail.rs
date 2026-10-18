@@ -618,7 +618,7 @@ impl TaskDetail {
                 let when = chrono::Local
                     .timestamp_millis_opt(entry.at)
                     .single()
-                    .map(|t| format!("{} {}", t.format("%m/%d"), crate::calendar::format_time(t)))
+                    .map(|t| format!("{} {}", calendar::format_day_month(t.date_naive(), strings), calendar::format_time(t)))
                     .unwrap_or_default();
                 h_flex()
                     .items_start()

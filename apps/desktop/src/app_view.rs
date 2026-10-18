@@ -199,9 +199,15 @@ impl AppView {
                     this.todo.update(cx, |todo, cx| todo.reload(cx));
                 }
             }
-            // `hour12`: Settings → Time Format set to 12 hours.
-            if state.split(';').any(|part| part == "hour12") {
-                let preferences = fern_core::Preferences { hour12: true, ..this.store.preferences().unwrap_or_default() };
+            // `hour12` and `week-numbers`: Settings → Time Format set to 12 hours, and week numbers on.
+            let flag = |name: &str| state.split(';').any(|part| part == name);
+            if flag("hour12") || flag("week-numbers") {
+                let defaults = this.store.preferences().unwrap_or_default();
+                let preferences = fern_core::Preferences {
+                    hour12: flag("hour12") || defaults.hour12,
+                    week_numbers: flag("week-numbers") || defaults.week_numbers,
+                    ..defaults
+                };
                 this.store.save_preferences(&preferences).ok();
                 settings_window::apply(&preferences, window, cx);
             }

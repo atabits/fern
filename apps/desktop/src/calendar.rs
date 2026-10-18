@@ -31,6 +31,58 @@ thread_local! {
     static HOUR12: Cell<bool> = const { Cell::new(false) };
 }
 
+thread_local! {
+    /// Settings → Date Format; `None` follows the UI language.
+    static DATE_FORMAT: Cell<Option<fern_core::DateFormat>> = const { Cell::new(None) };
+    /// Settings → Show Week Numbers.
+    static WEEK_NUMBERS: Cell<bool> = const { Cell::new(false) };
+}
+
+pub fn set_date_format(format: Option<fern_core::DateFormat>) {
+    DATE_FORMAT.with(|f| f.set(format));
+}
+
+pub fn set_week_numbers(on: bool) {
+    WEEK_NUMBERS.with(|w| w.set(on));
+}
+
+pub fn week_numbers() -> bool {
+    WEEK_NUMBERS.with(Cell::get)
+}
+
+/// The ISO week number shown for a calendar row: the week of its Thursday-most day, which is
+/// the ISO rule for weeks starting on Monday.
+pub fn week_number(week: &[NaiveDate; 7]) -> u32 {
+    week.iter().find(|d| d.weekday() == Weekday::Thu).unwrap_or(&week[3]).iso_week().week()
+}
+
+/// A numeric date in the chosen format: "12/31/2026", "31/12/2026" or "2026/12/31"; without a
+/// choice, the language's own ("31.12.2026" in Russian).
+pub fn format_date(date: NaiveDate, strings: &Strings) -> String {
+    format_date_as(date, DATE_FORMAT.with(Cell::get), strings.dotted_dates, true)
+}
+
+/// A numeric day and month: "12/31", "31/12" or "31.12".
+pub fn format_day_month(date: NaiveDate, strings: &Strings) -> String {
+    format_date_as(date, DATE_FORMAT.with(Cell::get), strings.dotted_dates, false)
+}
+
+pub fn format_date_as(date: NaiveDate, format: Option<fern_core::DateFormat>, dotted: bool, year: bool) -> String {
+    use fern_core::DateFormat::*;
+    let pattern = match (format, year) {
+        (Some(MonthDayYear), true) => "%m/%d/%Y",
+        (Some(DayMonthYear), true) => "%d/%m/%Y",
+        (Some(YearMonthDay), true) => "%Y/%m/%d",
+        (Some(DayMonthYear), false) => "%d/%m",
+        (Some(_), false) => "%m/%d",
+        (None, true) if dotted => "%d.%m.%Y",
+        (None, true) => "%m/%d/%Y",
+        (None, false) if dotted => "%d.%m",
+        (None, false) => "%m/%d",
+    };
+    date.format(pattern).to_string()
+}
+
 pub fn set_hour12(on: bool) {
     HOUR12.with(|hour12| hour12.set(on));
 }
@@ -228,6 +280,21 @@ mod tests {
         assert_eq!(week[0], d(2026, 10, 12));
         assert_eq!(week[6], d(2026, 10, 18));
         assert_eq!(week_of(d(2026, 10, 12))[0], d(2026, 10, 12));
+    }
+
+    #[test]
+    fn date_formats_and_week_numbers() {
+        use fern_core::DateFormat::*;
+        let date = d(2026, 12, 31);
+        assert_eq!(format_date_as(date, Some(MonthDayYear), true, true), "12/31/2026");
+        assert_eq!(format_date_as(date, Some(DayMonthYear), false, true), "31/12/2026");
+        assert_eq!(format_date_as(date, Some(YearMonthDay), false, true), "2026/12/31");
+        assert_eq!(format_date_as(date, None, true, true), "31.12.2026");
+        assert_eq!(format_date_as(date, None, false, false), "12/31");
+        assert_eq!(format_date_as(date, Some(DayMonthYear), false, false), "31/12");
+        // October 12–18, 2026 is ISO week 42, whichever day the row starts on.
+        assert_eq!(week_number(&week_from(d(2026, 10, 18), Weekday::Mon)), 42);
+        assert_eq!(week_number(&week_from(d(2026, 10, 14), Weekday::Sun)), 42);
     }
 
     #[test]

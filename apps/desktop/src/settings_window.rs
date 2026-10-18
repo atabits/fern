@@ -3,7 +3,8 @@
 
 use std::rc::Rc;
 
-use fern_core::{Preferences, SmartList, Store, ThemeMode, Visibility, WEEK_STARTS};
+use chrono::Datelike as _;
+use fern_core::{DateFormat, Preferences, SmartList, Store, ThemeMode, Visibility, WEEK_STARTS};
 use gpui::{EventEmitter, FocusHandle, Focusable, FontWeight, WindowAppearance};
 use theme::Theme;
 use ui::prelude::*;
@@ -28,6 +29,7 @@ pub enum Page {
 enum Menu {
     Visibility(SmartList),
     TimeFormat,
+    DateFormat,
     WeekStart,
     Language,
     DefaultList,
@@ -68,6 +70,8 @@ pub fn apply(preferences: &Preferences, window: &Window, cx: &mut App) {
     }
     calendar::set_week_start(preferences.week_start);
     calendar::set_hour12(preferences.hour12);
+    calendar::set_date_format(preferences.date_format);
+    calendar::set_week_numbers(preferences.week_numbers);
     cx.refresh_windows();
 }
 
@@ -120,6 +124,7 @@ impl SettingsWindow {
         self.menu = match menu {
             "week" => Some(Menu::WeekStart),
             "time" => Some(Menu::TimeFormat),
+            "date" => Some(Menu::DateFormat),
             "today" => Some(Menu::Visibility(SmartList::Today)),
             "tags" => Some(Menu::Visibility(SmartList::Tags)),
             "language" => Some(Menu::Language),
@@ -260,6 +265,21 @@ impl SettingsWindow {
                     .collect();
                 let current = WEEK_STARTS.iter().position(|d| *d == week_start).unwrap_or(0);
                 let hour12 = self.preferences.hour12;
+                let week_numbers = self.preferences.week_numbers;
+                // The original shows each format on the year's last day.
+                let sample = chrono::NaiveDate::from_ymd_opt(chrono::Local::now().year(), 12, 31).expect("December 31 exists");
+                let current_format = self.preferences.date_format;
+                let date_formats = DateFormat::ALL
+                    .into_iter()
+                    .map(|format| {
+                        let pick: Box<dyn Fn(&mut Self, &mut Window, &mut Context<Self>)> =
+                            Box::new(move |this, window, cx| this.update(window, cx, |p| p.date_format = Some(format)));
+                        let label = calendar::format_date_as(sample, Some(format), false, true);
+                        let selected = current_format == Some(format)
+                            || (current_format.is_none() && label == calendar::format_date(sample, strings));
+                        (SharedString::from(label), selected, pick)
+                    })
+                    .collect();
                 let formats = [false, true]
                     .into_iter()
                     .map(|twelve| {
@@ -278,7 +298,16 @@ impl SettingsWindow {
                             Menu::TimeFormat,
                             formats,
                             cx,
-                        )).child(self.select_row(
+                        ))
+                        .child(self.select_row(
+                            None,
+                            strings.date_format,
+                            calendar::format_date(sample, strings).into(),
+                            Menu::DateFormat,
+                            date_formats,
+                            cx,
+                        ))
+                        .child(self.select_row(
                             None,
                             strings.start_week_on,
                             strings.week_start_names[current].into(),
@@ -286,6 +315,20 @@ impl SettingsWindow {
                             options,
                             cx,
                         ))),
+                )
+                .child(
+                    group().child(
+                        h_flex()
+                            .id("week-numbers")
+                            .h(px(36.))
+                            .px_4()
+                            .cursor_pointer()
+                            .child(div().flex_1().child(Label::new(strings.show_week_numbers)))
+                            .child(Switch::new().toggle_state(week_numbers))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.update(window, cx, |p| p.week_numbers = !week_numbers)
+                            })),
+                    ),
                 )
                 .into_any_element()
             }

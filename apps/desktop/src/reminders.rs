@@ -142,11 +142,15 @@ pub fn actions(store: &Store, target: Target) -> &'static [NoticeAction] {
 
 /// Shows a desktop notification with its actions as buttons, and waits on a thread of its own for
 /// the one clicked, if any.
-fn show(title: String, body: String, actions: Vec<(&'static str, &'static str)>) -> futures::channel::oneshot::Receiver<Reply> {
+fn show(title: String, body: String, actions: Vec<(&'static str, &'static str)>, constant: bool) -> futures::channel::oneshot::Receiver<Reply> {
     let (tx, rx) = futures::channel::oneshot::channel();
     std::thread::spawn(move || {
         let mut notification = notify_rust::Notification::new();
         notification.appname("Fern").summary(&title).body(&body).icon("alarm-clock");
+        // Settings → Notifications → "Constant Reminder": the notification stays until dismissed.
+        if constant {
+            notification.timeout(notify_rust::Timeout::Never);
+        }
         for (key, label) in &actions {
             notification.action(key, label);
         }
@@ -165,6 +169,37 @@ fn show(title: String, body: String, actions: Vec<(&'static str, &'static str)>)
         }
     });
     rx
+}
+
+/// The day the daily notification was last shown.
+const DAILY_SHOWN: &str = "daily_notification_shown";
+
+/// The original's "Daily Notifications": once a day at its time, today's open tasks in one
+/// notification.
+fn show_daily(store: &Store, settings: fern_core::Notifications, now: NaiveDateTime, cx: &mut gpui::AsyncApp) {
+    let last = store.setting(DAILY_SHOWN).ok().flatten().and_then(|d| chrono::NaiveDate::parse_from_str(&d, "%Y-%m-%d").ok());
+    if !settings.daily_due(now, last) {
+        return;
+    }
+    store.set_setting(DAILY_SHOWN, &now.date().format("%Y-%m-%d").to_string()).ok();
+    let tasks = store.tasks_in(&fern_core::View::Today, now.date()).unwrap_or_default();
+    let open: Vec<String> = tasks.into_iter().filter(|t| !t.is_closed()).map(|t| t.title).collect();
+    let (title, body) = cx.update(|cx| daily_text(&open, i18n::t(cx)));
+    // Nothing to answer: a click on it only opens the app where the system does that.
+    drop(show(title, body, Vec::new(), settings.constant));
+}
+
+/// The daily notification's title and body: how many tasks today, and the first few.
+fn daily_text(titles: &[String], strings: &i18n::Strings) -> (String, String) {
+    let title = strings.daily_title.replace("{n}", &titles.len().to_string());
+    let mut body: Vec<String> = titles.iter().take(5).map(|t| format!("• {t}")).collect();
+    if titles.len() > 5 {
+        body.push("…".to_owned());
+    }
+    if titles.is_empty() {
+        body.push(strings.daily_empty.to_owned());
+    }
+    (title, body.join("\n"))
 }
 
 /// Starts checking for reminders: collects the ones missed since the last run, then shows new
@@ -192,9 +227,18 @@ pub fn start(store: Rc<Store>, window: AnyWindowHandle, cx: &mut Context<AppView
             store.set_setting(CHECKED_AT, &last.format(STAMP_FORMAT).to_string()).ok();
             cx.background_executor().timer(CHECK_EVERY).await;
             let now = Local::now().naive_local();
+            let settings = store.preferences().unwrap_or_default().notifications;
+            show_daily(&store, settings, now, cx);
             let notices = fired(&store, last, now);
             last = now;
             if notices.is_empty() {
+                continue;
+            }
+            // With desktop reminders off, reminders only go to the bell.
+            if !settings.desktop {
+                if this.update(cx, |this, cx| this.add_notices(notices, cx)).is_err() {
+                    break;
+                }
                 continue;
             }
             let shown: Vec<_> = cx.update(|cx| {
@@ -209,7 +253,7 @@ pub fn start(store: Rc<Store>, window: AnyWindowHandle, cx: &mut Context<AppView
                     .collect()
             });
             for (notice, due, buttons) in shown {
-                let reply = show(notice.title.clone(), due, buttons);
+                let reply = show(notice.title.clone(), due, buttons, settings.constant);
                 let this = this.clone();
                 cx.spawn(async move |cx| {
                     let Ok(reply) = reply.await else { return };
@@ -240,6 +284,16 @@ mod tests {
     fn notice(title: &str, hour: u32) -> Notice {
         let at = NaiveDate::from_ymd_opt(2026, 10, 18).unwrap().and_hms_opt(hour, 0, 0).unwrap();
         Notice { target: Target::Task(uuid::Uuid::now_v7()), title: title.into(), at }
+    }
+
+    #[test]
+    fn daily_notification_text() {
+        let titles: Vec<String> = (1..=7).map(|i| format!("Task {i}")).collect();
+        let (title, body) = daily_text(&titles, &i18n::EN);
+        assert_eq!(title, "Today: 7 tasks");
+        assert_eq!(body.lines().count(), 6, "five tasks and an ellipsis");
+        let (_, empty) = daily_text(&[], &i18n::EN);
+        assert_eq!(empty, i18n::EN.daily_empty);
     }
 
     #[test]

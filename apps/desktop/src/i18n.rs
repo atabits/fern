@@ -390,6 +390,13 @@ pub struct Strings {
     pub checklist: &'static str,
     pub sync: &'static str,
     pub features: &'static str,
+    pub notifications_page: &'static str,
+    /// Settings → Notifications: each switch's name and what it does.
+    pub notification_items: [(&'static str, &'static str); 3],
+    pub daily_time: &'static str,
+    /// The daily notification's title; `{n}` is how many tasks.
+    pub daily_title: &'static str,
+    pub daily_empty: &'static str,
     /// Settings → Features: each section's name and what it is for.
     pub feature_items: [(&'static str, &'static str); 5],
     pub sync_server: &'static str,
@@ -893,6 +900,15 @@ pub static EN: Strings = Strings {
     checklist: "Checklist",
     sync: "Sync",
     features: "Features",
+    notifications_page: "Notifications",
+    notification_items: [
+        ("Daily Notifications", "Fern reminds you of today's tasks at a set time every day."),
+        ("Desktop Reminder", "Reminders pop up as desktop notifications; off, they only go to the bell."),
+        ("Constant Reminder", "Reminders stay on screen until you dismiss them."),
+    ],
+    daily_time: "Time",
+    daily_title: "Today: {n} tasks",
+    daily_empty: "Nothing due today.",
     feature_items: [
         ("Calendar", "Manage your tasks with the calendar's views."),
         ("Eisenhower Matrix", "Focus on what's important and urgent."),
@@ -1378,6 +1394,15 @@ pub static RU: Strings = Strings {
     checklist: "Чек-лист",
     sync: "Синхронизация",
     features: "Функции",
+    notifications_page: "Уведомления",
+    notification_items: [
+        ("Ежедневное уведомление", "Fern каждый день в заданное время напоминает о задачах на сегодня."),
+        ("Уведомления на рабочем столе", "Напоминания появляются как уведомления системы; если выключить, они только попадают в колокольчик."),
+        ("Постоянное напоминание", "Напоминания остаются на экране, пока вы их не закроете."),
+    ],
+    daily_time: "Время",
+    daily_title: "Сегодня: задач — {n}",
+    daily_empty: "На сегодня ничего нет.",
     feature_items: [
         ("Календарь", "Задачи в видах календаря."),
         ("Матрица Эйзенхауэра", "Сосредоточьтесь на важном и срочном."),

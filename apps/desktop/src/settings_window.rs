@@ -19,6 +19,8 @@ use crate::i18n::{self, CurrentLocale, Locale};
 pub enum Page {
     /// The original's Features: the optional sections on or off.
     Features,
+    /// Daily notification, desktop reminders and constant reminders.
+    Notifications,
     SmartList,
     #[default]
     DateTime,
@@ -46,6 +48,7 @@ enum Menu {
     WeekStart,
     Language,
     DefaultList,
+    DailyTime,
 }
 
 pub enum SettingsEvent {
@@ -245,6 +248,7 @@ impl SettingsWindow {
             "about" => Page::About,
             "sync" => Page::Sync,
             "features" => Page::Features,
+            "notifications" => Page::Notifications,
             _ => Page::DateTime,
         };
         self.menu = match menu {
@@ -386,6 +390,10 @@ impl SettingsWindow {
                     .on_click(cx.listener(|this, _, _, cx| this.set_page(Page::Features, cx))),
             )
             .child(page("settings-smart-list", IconName::Funnel, 0, Page::SmartList))
+            .child(
+                item("settings-notifications", IconName::Bell, strings.notifications_page, self.page == Page::Notifications)
+                    .on_click(cx.listener(|this, _, _, cx| this.set_page(Page::Notifications, cx))),
+            )
             .child(page("settings-date-time", IconName::Clock, 1, Page::DateTime))
             .child(page("settings-appearance", IconName::PaintRoller, 2, Page::Appearance))
             .child(page("settings-more", IconName::ToggleRight, 3, Page::More))
@@ -824,6 +832,56 @@ impl SettingsWindow {
                         ),
                     )
                 })
+                .into_any_element()
+            }
+            Page::Notifications => {
+                let n = self.preferences.notifications;
+                let values = [n.daily.is_some(), n.desktop, n.constant];
+                let toggles: [fn(&mut fern_core::Notifications); 3] = [
+                    |n| n.daily = if n.daily.is_some() { None } else { chrono::NaiveTime::from_hms_opt(9, 0, 0) },
+                    |n| n.desktop = !n.desktop,
+                    |n| n.constant = !n.constant,
+                ];
+                let times: Vec<(SharedString, bool, Box<dyn Fn(&mut Self, &mut Window, &mut Context<Self>)>)> = (5..=23u32)
+                    .filter_map(|h| chrono::NaiveTime::from_hms_opt(h, 0, 0))
+                    .map(|time| {
+                        let option: (SharedString, bool, Box<dyn Fn(&mut Self, &mut Window, &mut Context<Self>)>) = (
+                            calendar::format_time(time).into(),
+                            n.daily == Some(time),
+                            Box::new(move |this: &mut Self, window: &mut Window, cx: &mut Context<Self>| {
+                                this.update(window, cx, |p| p.notifications.daily = Some(time))
+                            }),
+                        );
+                        option
+                    })
+                    .collect();
+                let mut daily_time = n.daily.map(|t| self.select_row(None, strings.daily_time, calendar::format_time(t).into(), Menu::DailyTime, times, cx));
+                body.child(title(strings.notifications_page)).child(group().children(
+                    strings.notification_items.into_iter().zip(values).zip(toggles).enumerate().map(|(i, (((name, hint), on), toggle))| {
+                        v_flex()
+                            .px_4()
+                            .py_1p5()
+                            .gap_0p5()
+                            .child(
+                                h_flex()
+                                    .id(SharedString::from(format!("notification-{i}")))
+                                    .cursor_pointer()
+                                    .child(div().flex_1().child(Label::new(name)))
+                                    .child(Switch::new().toggle_state(on))
+                                    .on_click(cx.listener(move |this, _, window, cx| this.update(window, cx, |p| toggle(&mut p.notifications)))),
+                            )
+                            .child(div().text_size(px(11.)).text_color(colors.text_muted).child(hint))
+                            .into_any_element()
+                    })
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .enumerate()
+                    .flat_map(|(i, row)| {
+                        let extra = if i == 0 { daily_time.take() } else { None };
+                        std::iter::once(row).chain(extra)
+                    })
+                    .collect::<Vec<_>>(),
+                ))
                 .into_any_element()
             }
             Page::Features => {

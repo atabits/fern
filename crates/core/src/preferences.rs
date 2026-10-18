@@ -234,6 +234,8 @@ pub struct Preferences {
     pub detailed_input: bool,
     /// Settings → Features: which of the original's optional sections show in the sidebar.
     pub features: Features,
+    /// Settings → Notifications.
+    pub notifications: Notifications,
     /// Settings → More → Smart Recognition, for quick add.
     pub recognition: Recognition,
     pub task_defaults: TaskDefaults,
@@ -269,6 +271,7 @@ impl Default for Preferences {
             mini_calendar: true,
             detailed_input: false,
             features: Features::default(),
+            notifications: Notifications::default(),
             recognition: Recognition::default(),
             task_defaults: TaskDefaults::default(),
             default_list: None,
@@ -285,6 +288,34 @@ const WEEK_NUMBERS: &str = "week_numbers";
 const MINI_CALENDAR: &str = "mini_calendar";
 const INPUT_BOX: &str = "input_box";
 const FEATURES: &str = "features";
+const DAILY_NOTIFICATION: &str = "daily_notification";
+const DESKTOP_REMINDERS: &str = "desktop_reminders";
+const CONSTANT_REMINDERS: &str = "constant_reminders";
+
+/// Settings → Notifications, as far as the original's apply to a desktop app.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Notifications {
+    /// The original's "Daily Notifications": today's tasks in one notification at this time.
+    pub daily: Option<chrono::NaiveTime>,
+    /// The original's "Web Reminder", here the desktop's: reminders pop up as notifications.
+    pub desktop: bool,
+    /// The original's "Global Constant Reminder": notifications stay until dismissed.
+    pub constant: bool,
+}
+
+impl Default for Notifications {
+    fn default() -> Self {
+        Self { daily: None, desktop: true, constant: false }
+    }
+}
+
+impl Notifications {
+    /// Whether the daily notification is due at `now`, given the day it was last shown: once a
+    /// day, from its time on.
+    pub fn daily_due(&self, now: chrono::NaiveDateTime, last_shown: Option<chrono::NaiveDate>) -> bool {
+        self.daily.is_some_and(|at| now.time() >= at && last_shown != Some(now.date()))
+    }
+}
 
 /// The original's Features: sections that can be turned off.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -367,6 +398,11 @@ impl Store {
         let mini_calendar = self.setting(MINI_CALENDAR)?.as_deref() != Some("0");
         let detailed_input = self.setting(INPUT_BOX)?.as_deref() == Some("detailed");
         let features = self.setting(FEATURES)?.map(|t| Features::from_storage(&t)).unwrap_or_default();
+        let notifications = Notifications {
+            daily: self.setting(DAILY_NOTIFICATION)?.and_then(|t| chrono::NaiveTime::parse_from_str(&t, "%H:%M").ok()),
+            desktop: self.setting(DESKTOP_REMINDERS)?.as_deref() != Some("0"),
+            constant: self.setting(CONSTANT_REMINDERS)?.as_deref() == Some("1"),
+        };
         let flag = |key: &str| -> Result<bool> { Ok(self.setting(key)?.as_deref() != Some("0")) };
         let recognition = Recognition {
             dates: flag(RECOGNITION[0])?,
@@ -410,6 +446,7 @@ impl Store {
             mini_calendar,
             detailed_input,
             features,
+            notifications,
             recognition,
             task_defaults,
             default_list,
@@ -431,6 +468,10 @@ impl Store {
         self.set_setting(WEEK_NUMBERS, if preferences.week_numbers { "1" } else { "0" })?;
         self.set_setting(MINI_CALENDAR, if preferences.mini_calendar { "1" } else { "0" })?;
         self.set_setting(FEATURES, &preferences.features.to_storage())?;
+        let n = &preferences.notifications;
+        self.set_setting(DAILY_NOTIFICATION, &n.daily.map_or(String::new(), |t| t.format("%H:%M").to_string()))?;
+        self.set_setting(DESKTOP_REMINDERS, if n.desktop { "1" } else { "0" })?;
+        self.set_setting(CONSTANT_REMINDERS, if n.constant { "1" } else { "0" })?;
         self.set_setting(INPUT_BOX, if preferences.detailed_input { "detailed" } else { "simple" })?;
         let t = &preferences.task_defaults;
         let offset = |o: Option<i64>| o.map_or("none".to_owned(), |o| o.to_string());
@@ -483,6 +524,7 @@ mod tests {
             mini_calendar: false,
             detailed_input: true,
             features: Features { matrix: false, countdown: false, ..Features::default() },
+            notifications: Notifications { daily: chrono::NaiveTime::from_hms_opt(8, 0, 0), desktop: false, constant: true },
             recognition: Recognition { remove_date_text: false, tags: false, ..Default::default() },
             task_defaults: TaskDefaults {
                 date: Some(DefaultDate::Tomorrow),
@@ -552,5 +594,18 @@ mod tests {
         store.set_setting(WEEK_START, "Wed")?;
         assert_eq!(store.preferences()?, Preferences::default());
         Ok(())
+    }
+
+    #[test]
+    fn daily_notification_once_a_day() {
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 10, 18).unwrap();
+        let at = |h| day.and_hms_opt(h, 0, 0).unwrap();
+        let off = Notifications::default();
+        assert!(!off.daily_due(at(9), None));
+        let on = Notifications { daily: chrono::NaiveTime::from_hms_opt(8, 0, 0), ..off };
+        assert!(!on.daily_due(at(7), None), "not before its time");
+        assert!(on.daily_due(at(9), None));
+        assert!(on.daily_due(at(9), day.pred_opt()));
+        assert!(!on.daily_due(at(9), Some(day)), "once a day");
     }
 }

@@ -13,7 +13,7 @@ use crate::actions::{DeleteTask, SelectNext, SelectPrevious, ToggleComplete};
 use crate::i18n::{self, CurrentLocale, Strings};
 use crate::lists_panel::{self, LIST_COLORS};
 use crate::task_detail::{OpenTask, TaskDetail, TaskUpdated};
-use crate::task_rows::{self, ClosedRange, Row, Section};
+use crate::task_rows::{self, ClosedRange, GroupBy, Row, Section, SortBy};
 use crate::text_input::{Cancelled, Changed, Mode, Submitted, TextInput};
 
 const DETAIL_WIDTH: f32 = 400.;
@@ -30,6 +30,12 @@ enum ClosedMenu {
     /// "Other Date": the range being picked and the calendar shown for one of its ends.
     OtherDate { start: Option<NaiveDate>, end: Option<NaiveDate>, picking: Option<RangeEnd>, month: NaiveDate },
     Lists(Option<Vec<Option<Id>>>),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SortMenu {
+    Group,
+    Sort,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -61,6 +67,8 @@ pub struct TodoView {
     closed_range: ClosedRange,
     closed_lists: Option<Vec<Option<Id>>>,
     closed_menu: Option<ClosedMenu>,
+    /// The header's sort menu: `Some(None)` when open, with the expanded submenu otherwise.
+    sort_menu: Option<Option<SortMenu>>,
     detail: Entity<TaskDetail>,
     selected: Option<Id>,
     error: Option<String>,
@@ -152,6 +160,7 @@ impl TodoView {
             closed_range: ClosedRange::All,
             closed_lists: None,
             closed_menu: None,
+            sort_menu: None,
             detail,
             selected: None,
             error: None,
@@ -253,6 +262,10 @@ impl TodoView {
                     self.detail.update(cx, |detail, cx| detail.dev_open_popup(&popup, cx));
                 }
                 Some(("menu", "header")) => self.header_menu_open = true,
+                Some(("menu", "sort")) => self.sort_menu = Some(Some(SortMenu::Sort)),
+                Some(("menu", "group")) => self.sort_menu = Some(Some(SortMenu::Group)),
+                Some(("group", key)) => self.set_sort(None, Some(GroupBy::from_key(key)), cx),
+                Some(("sort", key)) => self.set_sort(Some(SortBy::from_key(key)), None, cx),
                 Some(("menu", "dates")) => self.closed_menu = Some(ClosedMenu::Dates),
                 Some(("menu", "other-date")) => {
                     self.open_other_date(cx);
@@ -396,13 +409,102 @@ impl TodoView {
         match self.view {
             View::Completed => closed(|t| t.completed_at),
             View::WontDo => closed(|t| t.wont_do_at),
-            _ => task_rows::build_rows(
+            View::Trash | View::Search(_) => task_rows::build_rows(
                 &self.tasks,
                 &self.collapsed_tasks,
                 &self.collapsed_sections,
                 self.view != View::Trash,
             ),
+            _ => {
+                let (sort, group) = self.sort_settings();
+                let mut tasks = self.tasks.clone();
+                task_rows::sort_tasks(&mut tasks, sort);
+                match group {
+                    GroupBy::Custom => {
+                        task_rows::build_rows(&tasks, &self.collapsed_tasks, &self.collapsed_sections, true)
+                    }
+                    group => task_rows::grouped_rows(&tasks, group, Self::today(), strings),
+                }
+            }
         }
+    }
+
+    /// The settings key of the current view's sort and grouping: each list keeps its own.
+    fn view_key(&self) -> String {
+        match &self.view {
+            View::List(id) => format!("list:{id}"),
+            View::Tag(tag) => format!("tag:{tag}"),
+            other => format!("{other:?}").to_lowercase(),
+        }
+    }
+
+    fn sort_settings(&self) -> (SortBy, GroupBy) {
+        let key = self.view_key();
+        let get = |what: &str| self.store.setting(&format!("{what}:{key}")).ok().flatten().unwrap_or_default();
+        (SortBy::from_key(&get("sort")), GroupBy::from_key(&get("group")))
+    }
+
+    fn set_sort(&mut self, sort: Option<SortBy>, group: Option<GroupBy>, cx: &mut Context<Self>) {
+        let key = self.view_key();
+        let result = sort
+            .map(|s| self.store.set_setting(&format!("sort:{key}"), s.key()))
+            .into_iter()
+            .chain(group.map(|g| self.store.set_setting(&format!("group:{key}"), g.key())))
+            .collect::<anyhow::Result<Vec<()>>>();
+        self.check(result);
+        self.sort_menu = None;
+        cx.notify();
+    }
+
+    /// The original's sort menu: "Group by" and "Sort by", each opening its options in place.
+    fn render_sort_menu(&self, expanded: Option<SortMenu>, strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {
+        let (sort, group) = self.sort_settings();
+        let row = |id: &'static str, icon: IconName, label: &'static str, value: &'static str, which: SortMenu| {
+            ListItem::new(id)
+                .start_slot(Icon::new(icon).color(Color::Muted))
+                .child(
+                    h_flex()
+                        .w_full()
+                        .gap_2()
+                        .child(div().flex_1().child(Label::new(label)))
+                        .child(Label::new(value).color(Color::Muted))
+                        .child(
+                            Icon::new(if expanded == Some(which) { IconName::ChevronDown } else { IconName::ChevronRight })
+                                .size(IconSize::XSmall)
+                                .color(Color::Muted),
+                        ),
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.sort_menu = Some(if expanded == Some(which) { None } else { Some(which) });
+                    cx.notify();
+                }))
+        };
+        let option = |id: String, label: &'static str, selected: bool| {
+            ListItem::new(SharedString::from(id))
+                .child(div().pl_6().child(Label::new(label).color(if selected { Color::Accent } else { Color::Default })))
+                .when(selected, |item| item.end_slot(Label::new("✓").color(Color::Accent)))
+        };
+        popover(cx)
+            .w(px(250.))
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.sort_menu = None;
+                cx.notify();
+            }))
+            .child(row("group-by", IconName::Rows3, strings.group_by, group.label(strings), SortMenu::Group))
+            .when(expanded == Some(SortMenu::Group), |el| {
+                el.children(GroupBy::ALL.into_iter().map(|g| {
+                    option(format!("group-{}", g.key()), g.label(strings), g == group)
+                        .on_click(cx.listener(move |this, _, _, cx| this.set_sort(None, Some(g), cx)))
+                }))
+            })
+            .child(row("sort-by", IconName::ArrowDownUp, strings.sort_by, sort.label(strings), SortMenu::Sort))
+            .when(expanded == Some(SortMenu::Sort), |el| {
+                el.children(SortBy::ALL.into_iter().map(|s| {
+                    option(format!("sort-{}", s.key()), s.label(strings), s == sort)
+                        .on_click(cx.listener(move |this, _, _, cx| this.set_sort(Some(s), None, cx)))
+                }))
+            })
+            .into_any_element()
     }
 
     fn move_selection(&mut self, step: isize, cx: &mut Context<Self>) {
@@ -1446,7 +1548,19 @@ impl Render for TodoView {
                                 .on_click(cx.listener(|this, _, _, cx| this.empty_trash(cx))),
                         )
                     })
-                    .when(self.view != View::Trash, |el| el.child(IconButton::new("sort", IconName::ArrowDownUp)))
+                    .when(self.view != View::Trash, |el| {
+                        el.child(
+                            div()
+                                .relative()
+                                .child(IconButton::new("sort", IconName::ArrowDownUp).on_click(cx.listener(|this, _, _, cx| {
+                                    this.sort_menu = Some(None);
+                                    cx.notify();
+                                })))
+                                .when_some(self.sort_menu, |el, expanded| {
+                                    el.child(PopoverAttachment::new(Placement::BelowRight, self.render_sort_menu(expanded, strings, cx)))
+                                }),
+                        )
+                    })
                     .when(self.view != View::Trash, |el| el.child(
                         div()
                             .relative()

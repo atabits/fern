@@ -114,6 +114,138 @@ pub fn build_rows(
     rows
 }
 
+/// The header sort menu's "Sort by".
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SortBy {
+    /// The manual order.
+    #[default]
+    Custom,
+    Date,
+    Created,
+    Title,
+    Tag,
+    Priority,
+}
+
+/// The header sort menu's "Group by".
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GroupBy {
+    /// Tasks / Notes / Completed.
+    #[default]
+    Custom,
+    Date,
+    Created,
+    Tag,
+    Priority,
+    None,
+}
+
+impl SortBy {
+    pub const ALL: [Self; 6] = [Self::Custom, Self::Date, Self::Created, Self::Title, Self::Tag, Self::Priority];
+
+    pub fn key(self) -> &'static str {
+        ["custom", "date", "created", "title", "tag", "priority"][self as usize]
+    }
+
+    pub fn from_key(key: &str) -> Self {
+        Self::ALL.into_iter().find(|s| s.key() == key).unwrap_or_default()
+    }
+
+    pub fn label(self, strings: &Strings) -> &'static str {
+        strings.sort_options[self as usize]
+    }
+}
+
+impl GroupBy {
+    pub const ALL: [Self; 6] = [Self::Custom, Self::Date, Self::Created, Self::Tag, Self::Priority, Self::None];
+
+    pub fn key(self) -> &'static str {
+        ["custom", "date", "created", "tag", "priority", "none"][self as usize]
+    }
+
+    pub fn from_key(key: &str) -> Self {
+        Self::ALL.into_iter().find(|s| s.key() == key).unwrap_or_default()
+    }
+
+    pub fn label(self, strings: &Strings) -> &'static str {
+        strings.group_options[self as usize]
+    }
+}
+
+/// Sorts tasks in place; the sort is stable, so ties keep the manual order.
+pub fn sort_tasks(tasks: &mut [Task], sort: SortBy) {
+    let tag = |t: &Task| t.tags.first().map(|t| t.to_lowercase());
+    match sort {
+        SortBy::Custom => {}
+        // Dated tasks first, earliest first; all-day before timed on the same day.
+        SortBy::Date => tasks.sort_by_key(|t| (t.due_date.is_none(), t.due_date, t.due_time.is_some(), t.due_time)),
+        SortBy::Created => tasks.sort_by_key(|t| std::cmp::Reverse(t.created_at)),
+        SortBy::Title => tasks.sort_by_key(|t| t.title.to_lowercase()),
+        SortBy::Tag => tasks.sort_by_key(|t| (tag(t).is_none(), tag(t))),
+        SortBy::Priority => tasks.sort_by_key(|t| std::cmp::Reverse(t.priority as u8)),
+    }
+}
+
+/// Rows grouped by date, creation day, tag or priority (or not at all), with completed tasks in
+/// a last group. Groups follow a fixed order: by date, overdue first and undated last.
+pub fn grouped_rows(tasks: &[Task], group: GroupBy, today: NaiveDate, strings: &Strings) -> Vec<Row> {
+    let (open, done): (Vec<&Task>, Vec<&Task>) = tasks.iter().partition(|t| !t.is_completed());
+    let key = |task: &Task| -> (i64, String) {
+        match group {
+            GroupBy::Date => match task.due_date {
+                Some(d) if d < today => (0, strings.group_overdue.to_owned()),
+                Some(d) if d == today => (1, strings.today.to_owned()),
+                Some(d) if d == today + chrono::Duration::days(1) => (2, strings.tomorrow.to_owned()),
+                Some(d) if d <= today + chrono::Duration::days(7) => (3, strings.next_7_days.to_owned()),
+                Some(_) => (4, strings.group_later.to_owned()),
+                None => (5, strings.group_no_date.to_owned()),
+            },
+            GroupBy::Created => {
+                let day = local_day(task.created_at).unwrap_or(today);
+                (-(day - NaiveDate::MIN).num_days(), day_header(day, today, strings))
+            }
+            GroupBy::Tag => match task.tags.first() {
+                Some(tag) => (0, tag.clone()),
+                None => (1, strings.group_no_tags.to_owned()),
+            },
+            GroupBy::Priority => {
+                let order = 5 - task.priority as i64;
+                let label = match task.priority {
+                    Priority::High => strings.priority_high,
+                    Priority::Medium => strings.priority_medium,
+                    Priority::Low => strings.priority_low,
+                    Priority::None => strings.priority_none,
+                };
+                (order, label.to_owned())
+            }
+            GroupBy::Custom | GroupBy::None => (0, String::new()),
+        }
+    };
+    let task_row = |task: &Task| Row::Task { task: task.clone(), depth: 0, has_children: false, collapsed: false };
+    if group == GroupBy::None {
+        return open.into_iter().chain(done).map(task_row).collect();
+    }
+    let mut groups: Vec<((i64, String), Vec<&Task>)> = Vec::new();
+    for task in open {
+        let k = key(task);
+        match groups.iter_mut().find(|(g, _)| *g == k) {
+            Some((_, items)) => items.push(task),
+            None => groups.push((k, vec![task])),
+        }
+    }
+    // Tag groups are alphabetical, the rest by their fixed order.
+    groups.sort_by(|((a, la), _), ((b, lb), _)| a.cmp(b).then_with(|| la.to_lowercase().cmp(&lb.to_lowercase())));
+    if !done.is_empty() {
+        groups.push(((i64::MAX, strings.group_completed.to_owned()), done));
+    }
+    let mut rows = Vec::new();
+    for ((_, label), items) in groups {
+        rows.push(Row::Day { label, count: items.len() });
+        rows.extend(items.into_iter().map(task_row));
+    }
+    rows
+}
+
 /// Byte ranges of case-insensitive occurrences of `query` in `text`, for highlighting.
 /// Compares character by character, so non-ASCII text (Cyrillic, accents) works.
 pub fn match_ranges(text: &str, query: &str) -> Vec<std::ops::Range<usize>> {
@@ -390,6 +522,44 @@ mod tests {
         assert_eq!(snippet("short", "sho", 10).as_deref(), Some("short"));
         assert_eq!(snippet("line one\nline two", "two", 20).as_deref(), Some("line one line two"));
         assert_eq!(snippet("nothing", "zzz", 5), None);
+    }
+
+    #[test]
+    fn sorting_and_grouping() {
+        let today = d(2026, 10, 18);
+        let mut a = task("banana");
+        a.due_date = Some(d(2026, 10, 17));
+        a.priority = Priority::Low;
+        let mut b = task("Apple");
+        b.due_date = Some(today);
+        b.priority = Priority::High;
+        b.tags = vec!["work".into()];
+        let mut c = task("cherry");
+        c.tags = vec!["home".into()];
+        let mut done = task("done");
+        done.completed_at = Some(1);
+        let tasks = vec![a, b, c, done];
+
+        let titles = |tasks: &[Task]| tasks.iter().map(|t| t.title.clone()).collect::<Vec<_>>();
+        let mut sorted = tasks.clone();
+        sort_tasks(&mut sorted, SortBy::Title);
+        assert_eq!(titles(&sorted), ["Apple", "banana", "cherry", "done"]);
+        sort_tasks(&mut sorted, SortBy::Priority);
+        assert_eq!(titles(&sorted)[..2], ["Apple", "banana"]);
+        sort_tasks(&mut sorted, SortBy::Date);
+        assert_eq!(titles(&sorted)[..2], ["banana", "Apple"]);
+        sort_tasks(&mut sorted, SortBy::Tag);
+        assert_eq!(titles(&sorted)[..2], ["cherry", "Apple"]);
+
+        assert_eq!(shape(&grouped_rows(&tasks, GroupBy::Date, today, &EN)), [
+            "## Overdue 1", "banana", "## Today 1", "Apple", "## No Date 1", "cherry", "## Completed 1", "done"
+        ]);
+        assert_eq!(shape(&grouped_rows(&tasks, GroupBy::Tag, today, &EN)), [
+            "## home 1", "cherry", "## work 1", "Apple", "## No Tags 1", "banana", "## Completed 1", "done"
+        ]);
+        assert_eq!(shape(&grouped_rows(&tasks, GroupBy::None, today, &EN)), ["banana", "Apple", "cherry", "done"]);
+        assert_eq!(SortBy::from_key(SortBy::Tag.key()), SortBy::Tag);
+        assert_eq!(GroupBy::from_key("nonsense"), GroupBy::Custom);
     }
 
     #[test]

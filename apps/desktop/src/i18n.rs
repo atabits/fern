@@ -207,6 +207,16 @@ pub struct Strings {
     pub group_tasks: &'static str,
     pub group_notes: &'static str,
     pub group_completed: &'static str,
+    pub group_by: &'static str,
+    pub sort_by: &'static str,
+    /// Custom, Date, Created Time, Title, Tag, Priority.
+    pub sort_options: [&'static str; 6],
+    /// Custom, Date, Created Time, Tag, Priority, None.
+    pub group_options: [&'static str; 6],
+    pub group_overdue: &'static str,
+    pub group_later: &'static str,
+    pub group_no_date: &'static str,
+    pub group_no_tags: &'static str,
 
     // Task details.
     pub select_task: &'static str,
@@ -424,6 +434,14 @@ pub static EN: Strings = Strings {
     group_tasks: "Tasks",
     group_notes: "Notes",
     group_completed: "Completed",
+    group_by: "Group by",
+    sort_by: "Sort by",
+    sort_options: ["Custom", "Date", "Created Time", "Title", "Tag", "Priority"],
+    group_options: ["Custom", "Date", "Created Time", "Tag", "Priority", "None"],
+    group_overdue: "Overdue",
+    group_later: "Later",
+    group_no_date: "No Date",
+    group_no_tags: "No Tags",
 
     select_task: "Select a task to see its details",
     notes_placeholder: "Write something",
@@ -632,6 +650,14 @@ pub static RU: Strings = Strings {
     group_tasks: "Задачи",
     group_notes: "Заметки",
     group_completed: "Выполненные",
+    group_by: "Группировать",
+    sort_by: "Сортировать",
+    sort_options: ["Вручную", "По дате", "По созданию", "По названию", "По тегу", "По приоритету"],
+    group_options: ["Вручную", "По дате", "По созданию", "По тегу", "По приоритету", "Без групп"],
+    group_overdue: "Просрочено",
+    group_later: "Позже",
+    group_no_date: "Без даты",
+    group_no_tags: "Без тегов",
 
     select_task: "Выбери задачу, чтобы увидеть подробности",
     notes_placeholder: "Напиши что-нибудь",

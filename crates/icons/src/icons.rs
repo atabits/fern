@@ -56,6 +56,7 @@ pub enum IconName {
     RefreshCw,
     Repeat,
     RotateCcw,
+    Rows3,
     Search,
     Settings,
     Share,

@@ -50,7 +50,7 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 | Lists column: tags with color dots and counters | ✅ | |
 | Lists column: Filters, Won't Do, Trash | 🟡 | Completed, Won't Do and Trash; no Filters |
 | Mini week at the bottom of the lists column | 🟡 | current week, today highlighted (matched to a screenshot); clicking a day does nothing yet — the original behavior is not verified |
-| List header with sidebar toggle | ✅ | toggle and "…" work; the sort button has the original's "Group by" (Custom, Date, Created Time, Tag, Priority, None) and "Sort by" (Custom, Date, Created Time, Modified Time, Title, Tag, Priority), kept per list; edits (fields, tags, checklist, not reordering) update a task's modified time |
+| List header with sidebar toggle | ✅ | toggle and "…" work (the original's "Show / Hide Completed" and "Show / Hide Details" — the first line of the notes under the title — kept per list; no Kanban / Timeline views, Add Section, List Activities or Print); the sort button has the original's "Group by" (Custom, Date, Created Time, Tag, Priority, None) and "Sort by" (Custom, Date, Created Time, Modified Time, Title, Tag, Priority), kept per list; edits (fields, tags, checklist, not reordering) update a task's modified time |
 | "Add task" field | ✅ | parses date, time, repeat, tags, priority and `^list`; no live highlighting yet; `^list` matches one-word list names only |
 | Rows by the measurements (40 px, separators) | ✅ | |
 | Tag chips, due date and repeat in rows | ✅ | overdue dates in red |
@@ -90,7 +90,8 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 
 ## Next
 
-1. Save as Template / templates for new tasks.
-2. Statistics page in the main sidebar (account menu), not only from Focus.
+1. Kanban view for lists (the list menu's View switcher), with list sections ("Add Section").
+2. Save as Template / templates for new tasks.
+3. Statistics page in the main sidebar (account menu), not only from Focus.
 3. Rename and delete habit sections.
 4. Filled sidebar icons (needs own filled glyphs; Lucide has none).

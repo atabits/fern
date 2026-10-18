@@ -69,6 +69,8 @@ pub struct TodoView {
     closed_menu: Option<ClosedMenu>,
     /// The header's sort menu: `Some(None)` when open, with the expanded submenu otherwise.
     sort_menu: Option<Option<SortMenu>>,
+    /// The current list's "Show Details", read when the list loads.
+    show_details: bool,
     detail: Entity<TaskDetail>,
     selected: Option<Id>,
     error: Option<String>,
@@ -161,6 +163,7 @@ impl TodoView {
             closed_lists: None,
             closed_menu: None,
             sort_menu: None,
+            show_details: false,
             detail,
             selected: None,
             error: None,
@@ -252,6 +255,10 @@ impl TodoView {
                         self.set_view(View::List(id), cx);
                     }
                 }
+                Some(("flag", name)) => {
+                    let default = name == "show_completed";
+                    self.toggle_view_flag(name, default, cx);
+                }
                 Some(("pin", needle)) => {
                     if let Some(id) = self.tasks.iter().find(|t| t.title.contains(needle)).map(|t| t.id) {
                         let result = self.store.set_pinned(id, true);
@@ -300,6 +307,7 @@ impl TodoView {
     }
 
     fn reload(&mut self, cx: &mut Context<Self>) {
+        self.show_details = self.view_flag("show_details", false);
         let today = Self::today();
         if let Some(lists) = self.check(self.store.lists()) {
             self.lists = lists;
@@ -425,6 +433,9 @@ impl TodoView {
             _ => {
                 let (sort, group) = self.sort_settings();
                 let mut tasks = self.tasks.clone();
+                if !self.view_flag("show_completed", true) {
+                    tasks.retain(|t| !t.is_completed());
+                }
                 task_rows::sort_tasks(&mut tasks, sort);
                 task_rows::pinned_first(&mut tasks);
                 match group {
@@ -444,6 +455,22 @@ impl TodoView {
             View::Tag(tag) => format!("tag:{tag}"),
             other => format!("{other:?}").to_lowercase(),
         }
+    }
+
+    /// A per-list switch of the header's "…" menu ("Show Completed", "Show Details").
+    fn view_flag(&self, name: &str, default: bool) -> bool {
+        let key = format!("{name}:{}", self.view_key());
+        self.store.setting(&key).ok().flatten().map_or(default, |v| v == "1")
+    }
+
+    fn toggle_view_flag(&mut self, name: &str, default: bool, cx: &mut Context<Self>) {
+        let key = format!("{name}:{}", self.view_key());
+        let value = !self.view_flag(name, default);
+        let result = self.store.set_setting(&key, if value { "1" } else { "0" });
+        self.check(result);
+        self.show_details = self.view_flag("show_details", false);
+        self.header_menu_open = false;
+        cx.notify();
     }
 
     fn sort_settings(&self) -> (SortBy, GroupBy) {
@@ -809,6 +836,7 @@ impl TodoView {
         let theme = cx.theme().clone();
         let id = task.id;
         let done = task.is_completed();
+        let details = self.show_details && !task.notes.trim().is_empty();
         let wont_do = task.is_wont_do();
         let closed_view = matches!(self.view, View::Completed | View::WontDo);
         let selected = self.selected == Some(id);
@@ -845,7 +873,7 @@ impl TodoView {
                         this.drop_task(dragged.id, id, cx)
                     }))
             })
-            .h(px(ROW_HEIGHT))
+            .h(px(if details { ROW_HEIGHT + 14. } else { ROW_HEIGHT }))
             .flex()
             .pl(px(depth as f32 * INDENT))
             .rounded(px(6.))
@@ -886,7 +914,7 @@ impl TodoView {
                         el.child(Icon::new(IconName::Pin).size(IconSize::XSmall).color(Color::Accent))
                     })
                     .child(
-                        div().flex_1().min_w_0().child(
+                        v_flex().flex_1().min_w_0().child(
                             Label::new(if task.title.is_empty() {
                                 SharedString::new_static(strings.untitled)
                             } else {
@@ -895,7 +923,11 @@ impl TodoView {
                             .color(if done || wont_do || task.title.is_empty() { Color::Muted } else { Color::Default })
                             .strikethrough(done)
                             .truncate(),
-                        ),
+                        )
+                        // "Show Details": the first line of the notes under the title.
+                        .when_some(details.then(|| task.notes.lines().find(|l| !l.trim().is_empty())).flatten(), |el, line| {
+                            el.child(Label::new(line.trim().to_owned()).size(LabelSize::XSmall).color(Color::Muted).truncate())
+                        }),
                     )
                     .children(task.tags.iter().map(|tag| {
                         let color = tag_colors.get(tag).copied().unwrap_or(theme.colors().text_muted);
@@ -1445,7 +1477,24 @@ impl TodoView {
                         .on_click(cx.listener(|this, _, _, cx| this.empty_trash(cx))),
                 )
             })
-            .when(!in_list && !in_trash, |el| {
+            .when(!in_trash && !matches!(self.view, View::Completed | View::WontDo | View::Search(_)), |el| {
+                let completed = self.view_flag("show_completed", true);
+                let details = self.view_flag("show_details", false);
+                el.when(in_list, |el| el.child(div().my_1().child(Divider::horizontal())))
+                    .child(
+                        ListItem::new("toggle-completed")
+                            .start_slot(Icon::new(IconName::SquareCheck).color(Color::Muted))
+                            .child(Label::new(if completed { strings.hide_completed } else { strings.show_completed }))
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_view_flag("show_completed", true, cx))),
+                    )
+                    .child(
+                        ListItem::new("toggle-details")
+                            .start_slot(Icon::new(IconName::FileText).color(Color::Muted))
+                            .child(Label::new(if details { strings.hide_details } else { strings.show_details }))
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_view_flag("show_details", false, cx))),
+                    )
+            })
+            .when(!in_list && !in_trash && matches!(self.view, View::Completed | View::WontDo | View::Search(_)), |el| {
                 el.child(div().px_2().py_1().child(Label::new(strings.no_actions).color(Color::Muted)))
             })
             .into_any_element()

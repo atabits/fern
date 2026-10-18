@@ -18,7 +18,7 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 | List header | ≈ 60 tall, sidebar toggle on the left, sort and "…" on the right |
 | Tag chip | ≈ 18 tall, fully rounded, tag color at ~30% as background, lighter tag color as text |
 | Due date / repeat in a row | accent blue, right-aligned |
-| Task details panel | top bar ≈ 48, bottom bar ≈ 44 |
+| Task details panel | top bar ≈ 48 with a 15 px box, bottom bar ≈ 44 with no line over it (matched to a screenshot) |
 
 ## Data model
 
@@ -98,9 +98,9 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 
 Each item is a whole feature area, done in one pass (it may take several commits).
 
-1. Task details pane pass: the pane's top bar, title, description and bottom bar sizes against the original's at the current window size, in one pass.
-2. Notifications pass: the bell's list of fired reminders against the original's look (from its documentation of the panel, without opening the reference account's list, which would mark them read).
-3. Habit check-in pass: the habit card's check-in states and the details' month calendar against the original's look, from the reference shots already taken, without checking in, in one pass.
-4. Kanban and Timeline in smart lists: whether the original offers them in Today, Tomorrow and Next 7 Days and how they group there, checked by switching the view and back, in one pass.
+1. Notifications pass: the bell's list of fired reminders against the original's look (from its documentation of the panel, without opening the reference account's list, which would mark them read).
+2. Habit check-in pass: the habit card's check-in states and the details' month calendar against the original's look, from the reference shots already taken, without checking in, in one pass.
+3. Kanban and Timeline in smart lists: whether the original offers them in Today, Tomorrow and Next 7 Days and how they group there, checked by switching the view and back, in one pass.
+4. Light theme pass: the original's light theme against Fern's Default theme on the main screens, switching the original's theme and back, in one pass.
 
 Not checkable under the reference rules: whether the original asks for a note when a focus session ends, and its white noise (the desktop original shows no sound choice on the focus page or in Focus Settings; it would only appear with a timer running in the reference account). Fern's record dialog takes a note afterwards.

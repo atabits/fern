@@ -2509,8 +2509,9 @@ impl Render for TaskDetail {
                     .border_b_1()
                     .border_color(theme.colors().border)
                     .child(
+                        // The original's 15 px box in the details' top bar.
                         Checkbox::new("detail-checkbox")
-                            .size(px(18.))
+                            .size(px(15.))
                             .toggle_state(done)
                             .dismissed(task.is_wont_do())
                             .lines(!self.checklist.is_empty())
@@ -2623,10 +2624,9 @@ impl Render for TaskDetail {
             .child(
                 h_flex()
                     .gap_2()
+                    // As the original's: no line over the bottom bar.
                     .h(px(44.))
                     .px_5()
-                    .border_t_1()
-                    .border_color(theme.colors().border)
                     .map(|bar| {
                         if task.is_deleted() {
                             bar.child(

@@ -32,6 +32,7 @@ pub const SYNCED: &[(&str, &[&str])] = &[
     ("summary_templates", &["id"]),
     ("task_attachments", &["id"]),
     ("focus_timers", &["id"]),
+    ("matrix_rules", &["quadrant"]),
 ];
 
 /// Key parts are joined with this character, as the triggers do.
@@ -476,6 +477,22 @@ mod tests {
         laptop.delete_focus_timer(timer.id)?;
         relay(&laptop, sent, &phone);
         assert!(phone.focus_timers(true)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn matrix_rules_travel() -> Result<()> {
+        use crate::matrix::QuadrantRule;
+        let laptop = Store::open_in_memory()?;
+        let phone = Store::open_in_memory()?;
+        let rule = QuadrantRule { name: "Do now".into(), ..QuadrantRule::defaults()[0].clone() };
+        laptop.save_matrix_rule(0, Some(&rule))?;
+        let sent = relay(&laptop, 0, &phone);
+        assert_eq!(phone.matrix_rules()?[0], rule);
+        // "Restore" on the laptop brings the default back on the phone too.
+        laptop.save_matrix_rule(0, None)?;
+        relay(&laptop, sent, &phone);
+        assert_eq!(phone.matrix_rules()?[0], QuadrantRule::defaults()[0]);
         Ok(())
     }
 

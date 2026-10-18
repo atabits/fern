@@ -1,5 +1,6 @@
 //! The Eisenhower Matrix's quadrants and their rules, as the original's "Edit Matrix" sets them:
 //! lists, tags, dates and priorities. A task goes into the first quadrant whose rule it meets.
+//! The rules are kept in `matrix_rules`, which syncs between devices.
 
 use chrono::{Duration, NaiveDate};
 
@@ -114,9 +115,14 @@ pub fn quadrant_of(rules: &[QuadrantRule; 4], task: &Task, today: NaiveDate) -> 
 impl Store {
     /// The four quadrants' rules: the saved ones, the original's defaults otherwise.
     pub fn matrix_rules(&self) -> anyhow::Result<[QuadrantRule; 4]> {
+        use rusqlite::OptionalExtension as _;
         let mut rules = QuadrantRule::defaults();
         for (i, rule) in rules.iter_mut().enumerate() {
-            if let Some(saved) = self.setting(&format!("matrix_rule_{i}"))?.and_then(|t| QuadrantRule::from_storage(&t)) {
+            let saved: Option<String> = self
+                .conn
+                .query_row("SELECT rule FROM matrix_rules WHERE quadrant = ?1", [i.to_string()], |r| r.get(0))
+                .optional()?;
+            if let Some(saved) = saved.and_then(|t| QuadrantRule::from_storage(&t)) {
                 *rule = saved;
             }
         }
@@ -126,11 +132,16 @@ impl Store {
     /// Saves a quadrant's rule; `None` restores the original's default ("Restore").
     pub fn save_matrix_rule(&self, quadrant: usize, rule: Option<&QuadrantRule>) -> anyhow::Result<()> {
         anyhow::ensure!(quadrant < 4, "there are four quadrants");
-        let key = format!("matrix_rule_{quadrant}");
+        let key = quadrant.to_string();
         match rule {
-            Some(rule) => self.set_setting(&key, &rule.to_storage()),
-            None => self.delete_setting(&key),
-        }
+            Some(rule) => self.conn.execute(
+                "INSERT INTO matrix_rules (quadrant, rule) VALUES (?1, ?2)
+                 ON CONFLICT(quadrant) DO UPDATE SET rule = excluded.rule",
+                rusqlite::params![key, rule.to_storage()],
+            )?,
+            None => self.conn.execute("DELETE FROM matrix_rules WHERE quadrant = ?1", [key])?,
+        };
+        Ok(())
     }
 }
 

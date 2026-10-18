@@ -605,6 +605,32 @@ const MIGRATIONS: &[&str] = &[
         INSERT INTO sync_log (entity, key, at) VALUES ('focus_timers', OLD.id, CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER));
     END;
     ",
+    // The Eisenhower Matrix's quadrant rules move out of the settings into a synced table.
+    "
+    CREATE TABLE matrix_rules (
+        quadrant TEXT PRIMARY KEY,
+        rule     TEXT NOT NULL
+    );
+    INSERT INTO matrix_rules (quadrant, rule)
+        SELECT substr(key, 13), value FROM settings WHERE key GLOB 'matrix_rule_[0-3]';
+    DELETE FROM settings WHERE key GLOB 'matrix_rule_[0-3]';
+    INSERT INTO sync_log (entity, key, at) SELECT 'matrix_rules', quadrant, 0 FROM matrix_rules;
+    CREATE TRIGGER sync_matrix_rules_insert AFTER INSERT ON matrix_rules
+    WHEN NOT EXISTS (SELECT 1 FROM sync_applying)
+    BEGIN
+        INSERT INTO sync_log (entity, key, at) VALUES ('matrix_rules', NEW.quadrant, CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER));
+    END;
+    CREATE TRIGGER sync_matrix_rules_update AFTER UPDATE ON matrix_rules
+    WHEN NOT EXISTS (SELECT 1 FROM sync_applying)
+    BEGIN
+        INSERT INTO sync_log (entity, key, at) VALUES ('matrix_rules', NEW.quadrant, CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER));
+    END;
+    CREATE TRIGGER sync_matrix_rules_delete AFTER DELETE ON matrix_rules
+    WHEN NOT EXISTS (SELECT 1 FROM sync_applying)
+    BEGIN
+        INSERT INTO sync_log (entity, key, at) VALUES ('matrix_rules', OLD.quadrant, CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER));
+    END;
+    ",
 ];
 
 const TASK_COLUMNS: &str = "id, parent_id, kind, title, notes, priority, due_date, due_time, \

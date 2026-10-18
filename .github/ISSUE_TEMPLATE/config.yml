@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Known limitations of the preview
+    url: https://github.com/atabits/fern#known-limitations
+    about: Unsigned builds, no mobile app yet, self-hosted sync. Check here first.

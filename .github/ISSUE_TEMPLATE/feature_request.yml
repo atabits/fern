@@ -1,0 +1,15 @@
+name: Feature request
+description: An idea for Fern, or something from TickTick you miss
+labels: [enhancement]
+body:
+  - type: textarea
+    id: idea
+    attributes:
+      label: What would you like
+      description: What you want to do and why. If TickTick has it, say where it is there.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: How you do it now

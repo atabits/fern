@@ -5389,7 +5389,7 @@ impl Render for TodoView {
                         el.child(
                             div()
                                 .relative()
-                                .child(IconButton::new("sort", IconName::ArrowDownUp).tooltip(Tooltip::text(strings.group_and_sort)).on_click(cx.listener(|this, _, _, cx| {
+                                .child(IconButton::new("sort", IconName::ArrowDownUp).tip(strings.group_and_sort, ui::TipSide::Below).on_click(cx.listener(|this, _, _, cx| {
                                     this.sort_menu = Some(None);
                                     cx.notify();
                                 })))
@@ -5401,7 +5401,7 @@ impl Render for TodoView {
                     .when(self.view != View::Trash && !closed_header, |el| el.child(
                         div()
                             .relative()
-                            .child(IconButton::new("more", IconName::Ellipsis).tooltip(Tooltip::text(strings.more)).on_click(cx.listener(
+                            .child(IconButton::new("more", IconName::Ellipsis).tip(strings.more, ui::TipSide::Below).on_click(cx.listener(
                                 |this, _, _, cx| {
                                     this.header_menu_open = true;
                                     cx.notify();

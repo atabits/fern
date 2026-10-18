@@ -6,7 +6,7 @@ use fern_core::{ChecklistItem, Frequency, Id, Kind, List, Priority, Recurrence, 
 use chrono::{Datelike, Local, NaiveDate, TimeZone as _};
 use gpui::{Entity, EventEmitter, Focusable, FontWeight, MouseButton, Subscription};
 use ui::prelude::*;
-use ui::{Placement, PopoverAttachment, SubmenuItem, popover};
+use ui::{Placement, PopoverAttachment, SubmenuItem, TipSide, popover, with_tip};
 
 use crate::calendar;
 use crate::due_picker::{self, CustomReminder, DueDraft, DueMenu, DueTab, RangeField, ReminderUnit};
@@ -2618,6 +2618,7 @@ impl Render for TaskDetail {
                             .child(
                                 IconButton::new("priority", IconName::Flag)
                                     .icon_color(priority_color)
+                                    .tip(strings.summary_priority, TipSide::Below)
                                     .on_click(cx.listener(|this, _, _, cx| this.open_popup(Popup::Priority, cx))),
                             )
                             .when(self.popup == Some(Popup::Priority), |el| {
@@ -2725,7 +2726,14 @@ impl Render for TaskDetail {
                             )
                         } else {
                             bar.child(
-                                label_button("list", list_icon, list_name, Color::Muted, cx)
+                                with_tip(
+                                    label_button("list", list_icon, list_name, Color::Muted, cx),
+                                    "list-tip",
+                                    strings.move_to,
+                                    TipSide::Above,
+                                    window,
+                                    cx,
+                                )
                                     .on_click(cx.listener(|this, _, _, cx| this.open_popup(Popup::List, cx)))
                                     .when(self.popup == Some(Popup::List), |el| {
                                         el.child(PopoverAttachment::new(
@@ -2738,7 +2746,7 @@ impl Render for TaskDetail {
                             .child(
                                 IconButton::new("format", IconName::Baseline)
                                     .toggle_state(self.format_bar)
-                                    .tooltip(Tooltip::text(strings.text_format))
+                                    .tip(strings.text_format, TipSide::Above)
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.format_bar = !this.format_bar;
                                         this.format_headings = false;
@@ -2748,7 +2756,7 @@ impl Render for TaskDetail {
                             .child(
                                 IconButton::new("comments", IconName::MessageSquareText)
                                     .toggle_state(self.comment_open)
-                                    .tooltip(Tooltip::text(strings.comments))
+                                    .tip(strings.comment_tip, TipSide::Above)
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.comment_open = !this.comment_open;
                                         if this.comment_open {
@@ -2762,6 +2770,7 @@ impl Render for TaskDetail {
                                     .relative()
                                     .child(
                                         IconButton::new("more", IconName::Ellipsis)
+                                            .when(self.popup != Some(Popup::More), |b| b.tip(strings.more, TipSide::Above))
                                             .on_click(cx.listener(|this, _, _, cx| this.open_popup(Popup::More, cx))),
                                     )
                                     .when(self.popup == Some(Popup::More), |el| {

@@ -1558,7 +1558,7 @@ impl Render for CalendarView {
                     .child(
                         div()
                             .relative()
-                            .child(IconButton::new("calendar-more", IconName::Ellipsis).on_click(cx.listener(|this, _, _, cx| {
+                            .child(IconButton::new("calendar-more", IconName::Ellipsis).when(!self.more_menu, |b| b.tip(i18n::t(cx).more, ui::TipSide::Below)).on_click(cx.listener(|this, _, _, cx| {
                                 this.more_menu = !this.more_menu;
                                 cx.notify();
                             })))

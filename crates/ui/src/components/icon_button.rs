@@ -20,6 +20,7 @@ pub struct IconButton {
     selected: bool,
     on_click: Option<ClickHandler>,
     tooltip: Option<Box<dyn Fn(&mut Window, &mut App) -> AnyView + 'static>>,
+    tip: Option<(gpui::SharedString, crate::TipSide)>,
 }
 
 impl IconButton {
@@ -33,6 +34,7 @@ impl IconButton {
             selected: false,
             on_click: None,
             tooltip: None,
+            tip: None,
         }
     }
 
@@ -49,6 +51,12 @@ impl IconButton {
     /// Shows a tooltip on hover, e.g. `Tooltip::text("…")`.
     pub fn tooltip(mut self, tooltip: impl Fn(&mut Window, &mut App) -> AnyView + 'static) -> Self {
         self.tooltip = Some(Box::new(tooltip));
+        self
+    }
+
+    /// A tooltip centered over or under the button, as the original's (see `with_tip`).
+    pub fn tip(mut self, text: impl Into<gpui::SharedString>, side: crate::TipSide) -> Self {
+        self.tip = Some((text.into(), side));
         self
     }
 
@@ -74,10 +82,12 @@ impl Toggleable for IconButton {
 }
 
 impl RenderOnce for IconButton {
-    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let colors = cx.theme().colors();
         let icon_color = if self.selected { Color::Default } else { self.icon_color };
-        div()
+        let tip = self.tip;
+        let tip_key = gpui::ElementId::NamedChild(std::sync::Arc::new(self.id.clone()), "tip".into());
+        let button = div()
             .id(self.id)
             .flex_none()
             .size(self.size)
@@ -90,6 +100,10 @@ impl RenderOnce for IconButton {
             .hover(|style| style.bg(colors.element_hover))
             .when_some(self.on_click, |el, handler| el.on_click(handler))
             .when_some(self.tooltip, |el, tooltip| el.tooltip(tooltip))
-            .child(Icon::new(self.icon).size(self.icon_size).color(icon_color))
+            .child(Icon::new(self.icon).size(self.icon_size).color(icon_color));
+        match tip {
+            Some((text, side)) => crate::with_tip(button, tip_key, text, side, window, cx),
+            None => button,
+        }
     }
 }

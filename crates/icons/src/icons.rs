@@ -53,6 +53,7 @@ pub enum IconName {
     FernTasks,
     FileText,
     Flag,
+    FlagFilled,
     Flame,
     Folder,
     FolderOpen,

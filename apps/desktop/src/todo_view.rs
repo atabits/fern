@@ -1026,7 +1026,8 @@ impl TodoView {
     /// and the templates.
     fn add_field_popovers(&self, el: Div, strings: &'static Strings, cx: &mut Context<Self>) -> Div {
         el.when(self.add_menu_open, |el| {
-            el.child(PopoverAttachment::new(Placement::BelowRight, self.render_add_menu(strings, cx)))
+            // As the original's, the menu hangs from the field's calendar button, opening rightwards.
+            el.child(PopoverAttachment::new(Placement::BelowLeft, self.render_add_menu(strings, cx)))
         })
         .when_some(self.add_tags.clone(), |el, picked| {
             el.child(PopoverAttachment::new(Placement::BelowRight, self.render_add_tags(&picked, strings, cx)))
@@ -1075,7 +1076,7 @@ impl TodoView {
         let row = |i: u8, icon: IconName, label: String, set: bool| {
             h_flex()
                 .id(SharedString::from(format!("add-date-row-{i}")))
-                .h(px(30.))
+                .h(px(36.))
                 .px_1()
                 .gap_2()
                 .rounded(px(5.))
@@ -1277,7 +1278,8 @@ impl TodoView {
                 div().flex_1().flex().justify_center().child(Label::new(day).size(LabelSize::XSmall).color(Color::Muted))
             })))
             .children(weeks)
-            .child(div().py_1().child(Divider::horizontal()))
+            // As the original's, no line between the month and the Time, Reminder and Repeat rows.
+            .child(div().h(px(8.)))
             .child(self.render_add_date_rows(strings, cx))
             .child(
                 h_flex()
@@ -1480,7 +1482,7 @@ impl TodoView {
                 .cursor_pointer()
                 .when(selected, |el| el.bg(theme.colors().element_selected))
                 .hover(|s| s.bg(theme.colors().element_hover))
-                .child(Icon::new(IconName::Flag).color(Color::Custom(color)))
+                .child(Icon::new(if priority == Priority::None { IconName::Flag } else { IconName::FlagFilled }).color(Color::Custom(color)))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.add_draft.priority = if selected { None } else { Some(priority) };
                     cx.notify();
@@ -1503,20 +1505,21 @@ impl TodoView {
                     }))
             })
             .collect::<Vec<_>>();
+        // As the original's: 181 px wide, a row every 34 px, no line under the flags.
         popover(cx)
-            .w(px(240.))
+            .w(px(181.))
             .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                 this.add_menu_open = false;
                 cx.notify();
             }))
             .child(div().px_2().pt_1().child(Label::new(strings.filter_priority).size(LabelSize::XSmall).color(Color::Muted)))
             .child(h_flex().px_1().py_1().justify_between().children(flags))
-            .child(div().py_1().child(Divider::horizontal()))
             .child(
                 SubmenuItem::new("add-list", list_name)
                     .icon(IconName::Inbox)
+                    .height(px(34.))
                     .open(self.add_list_side)
-                    .placement(Placement::LeftSide)
+                    .placement(Placement::RightSide)
                     .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
                         if *hovered && !this.add_list_side {
                             this.add_list_side = true;
@@ -1526,7 +1529,7 @@ impl TodoView {
                     .items(list_items),
             )
             .child(
-                ListItem::new("add-tags")
+                ListItem::new("add-tags").height(px(34.))
                     .start_slot(Icon::new(IconName::Tag).color(Color::Muted))
                     .child(Label::new(strings.tags))
                     .when(!draft.tags.is_empty(), |item| {
@@ -1542,7 +1545,7 @@ impl TodoView {
                     })),
             )
             .child(
-                ListItem::new("add-attachment")
+                ListItem::new("add-attachment").height(px(34.))
                     .start_slot(Icon::new(IconName::Paperclip).color(Color::Muted))
                     .child(Label::new(strings.attachment))
                     .when(!draft.files.is_empty(), |item| {
@@ -1569,7 +1572,7 @@ impl TodoView {
                     })),
             )
             .child(
-                ListItem::new("add-from-template")
+                ListItem::new("add-from-template").height(px(34.))
                     .start_slot(Icon::new(IconName::LayoutTemplate).color(Color::Muted))
                     .child(Label::new(strings.add_from_template))
                     .on_click(cx.listener(|this, _, _, cx| {
@@ -1579,7 +1582,7 @@ impl TodoView {
                     })),
             )
             .child(
-                ListItem::new("add-as-note")
+                ListItem::new("add-as-note").height(px(34.))
                     .start_slot(Icon::new(IconName::FileText).color(Color::Muted))
                     .child(Label::new(if draft.note { strings.convert_to_task } else { strings.convert_to_note }))
                     .on_click(cx.listener(|this, _, _, cx| {
@@ -1590,7 +1593,7 @@ impl TodoView {
             )
             .child(div().py_1().child(Divider::horizontal()))
             .child(
-                ListItem::new("add-input-box")
+                ListItem::new("add-input-box").height(px(34.))
                     .start_slot(Icon::new(IconName::Settings).color(Color::Muted))
                     .child(Label::new(strings.input_box_setting))
                     .on_click(cx.listener(|this, _, _, cx| {
@@ -5453,7 +5456,7 @@ impl Render for TodoView {
                             .relative()
                             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                             .child(
-                                h_flex().child(self.add_date_button(Placement::BelowRight, strings, cx)).child(
+                                h_flex().child(self.add_date_button(Placement::BelowCenter, strings, cx)).child(
                                 // The original's "▾": priority, list, template and note for the
                                 // next task; its flag takes the chosen priority's color.
                                 IconButton::new("add-options", IconName::ChevronDown)

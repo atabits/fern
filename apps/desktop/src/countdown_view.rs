@@ -40,6 +40,9 @@ struct Draft {
     show_age: bool,
     /// The row whose dropdown is open, or the icon picker.
     open: Option<DraftRow>,
+    /// The original's Reminder: days before the date, at 09:00.
+    reminders: Vec<u32>,
+    constant_reminder: bool,
 }
 
 /// The countdown dialog's fields that open a dropdown, as in the original.
@@ -47,6 +50,7 @@ struct Draft {
 enum DraftRow {
     Icon,
     Date,
+    Reminder,
     Repeat,
     Type,
 }
@@ -206,7 +210,7 @@ impl CountdownView {
             Filter::Kind(kind) => kind,
             Filter::All => CountdownKind::Countdown,
         };
-        self.draft = Some(Draft { name, kind, date: today, month: calendar::month_start(today), icon: None, color: None, repeat: None, editing: None, show_age: false, open: None });
+        self.draft = Some(Draft { name, kind, date: today, month: calendar::month_start(today), icon: None, color: None, repeat: None, editing: None, show_age: false, open: None, reminders: fern_core::countdown::DEFAULT_REMINDERS.to_vec(), constant_reminder: false });
         cx.notify();
     }
 
@@ -220,6 +224,15 @@ impl CountdownView {
             if kind == CountdownKind::Birthday {
                 draft.repeat = Some(fern_core::Recurrence::new(fern_core::Frequency::Yearly, 1));
             }
+        }
+        cx.notify();
+    }
+
+    /// The new countdown's Reminder dropdown, for screenshots.
+    #[cfg(debug_assertions)]
+    pub fn dev_open_reminder(&mut self, cx: &mut Context<Self>) {
+        if let Some(draft) = self.draft.as_mut() {
+            draft.open = Some(DraftRow::Reminder);
         }
         cx.notify();
     }
@@ -245,6 +258,8 @@ impl CountdownView {
             draft.color = countdown.color;
             draft.repeat = countdown.repeat;
             draft.show_age = countdown.show_age;
+            draft.reminders = countdown.reminders.clone();
+            draft.constant_reminder = countdown.constant_reminder;
             draft.editing = Some(id);
         }
         cx.notify();
@@ -286,7 +301,8 @@ impl CountdownView {
         }
         .and_then(|id| {
             self.store.set_countdown_look(id, draft.icon.as_deref(), draft.color.as_deref())?;
-            self.store.set_countdown_show_age(id, draft.kind == CountdownKind::Birthday && draft.show_age)
+            self.store.set_countdown_show_age(id, draft.kind == CountdownKind::Birthday && draft.show_age)?;
+            self.store.set_countdown_reminders(id, &draft.reminders, draft.constant_reminder)
         });
         if let Err(err) = added {
             eprintln!("failed to add the countdown: {err:#}");
@@ -522,6 +538,72 @@ impl CountdownView {
             }))
             .into_any_element();
 
+        // The Reminder dropdown: the original's None, the days before at 09:00 (several may be
+        // ticked), and Constant Reminder.
+        let reminder_text = if draft.reminders.is_empty() {
+            strings.none_option.to_owned()
+        } else {
+            fern_core::countdown::REMINDER_DAYS
+                .iter()
+                .zip(strings.countdown_reminder_days)
+                .filter(|(days, _)| draft.reminders.contains(days))
+                .map(|(_, label)| label)
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let time = crate::calendar::format_time(fern_core::countdown::reminder_time());
+        let constant = draft.constant_reminder;
+        let reminder_menu = v_flex()
+            .child(choice("countdown-reminder-none".into(), strings.none_option, draft.reminders.is_empty()).on_click(set(Box::new(|d| d.reminders.clear()))))
+            .children(fern_core::countdown::REMINDER_DAYS.into_iter().zip(strings.countdown_reminder_days).map(|(days, label)| {
+                let on = draft.reminders.contains(&days);
+                ListItem::new(SharedString::from(format!("countdown-reminder-{days}")))
+                    .height(px(34.))
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .child(Label::new(label).color(if on { Color::Accent } else { Color::Default }))
+                            .child(Label::new(format!("({time})")).color(if on { Color::Accent } else { Color::Muted })),
+                    )
+                    .when(on, |item| item.end_slot(Icon::new(IconName::Check).size(IconSize::XSmall).color(Color::Accent)))
+                    .on_click(set(Box::new(move |d| {
+                        if let Some(at) = d.reminders.iter().position(|r| *r == days) {
+                            d.reminders.remove(at);
+                        } else {
+                            d.reminders.push(days);
+                            d.reminders.sort();
+                        }
+                    })))
+            }))
+            .child(div().my_1().h(px(1.)).bg(theme.colors().border_variant))
+            .child(
+                h_flex()
+                    .id("countdown-constant")
+                    .h(px(34.))
+                    .px_2()
+                    .cursor_pointer()
+                    .child(div().flex_1().child(Label::new(strings.habit_constant_reminder)))
+                    .child(Switch::new().toggle_state(constant))
+                    .on_click(set(Box::new(|d| d.constant_reminder = !d.constant_reminder))),
+            )
+            .child(
+                h_flex().pt_1().justify_end().child(
+                    div()
+                        .id("countdown-reminder-ok")
+                        .w(px(100.))
+                        .h(px(28.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(6.))
+                        .cursor_pointer()
+                        .bg(theme.colors().accent)
+                        .child(Label::new(strings.ok).size(LabelSize::Small))
+                        .on_click(set(Box::new(|d| d.open = None))),
+                ),
+            )
+            .into_any_element();
+
         // The icon picker under the icon: an emoji and its background color.
         let icon_menu = v_flex()
             .gap_2()
@@ -602,6 +684,7 @@ impl CountdownView {
                 .child(div().flex_1().min_w_0().child(content))
         };
         let date_row = row(strings.filter_date, dropdown(DraftRow::Date, format_date(selected, strings), date_menu, cx));
+        let reminder_row = row(strings.reminder, dropdown(DraftRow::Reminder, reminder_text, reminder_menu, cx));
         let repeat_row = row(strings.repeat, dropdown(DraftRow::Repeat, repeat_text.to_owned(), repeat_menu, cx));
         let type_row = row(strings.filter_type, dropdown(DraftRow::Type, kind_label(kind, strings).to_owned(), type_menu, cx));
         let icon_open = open == Some(DraftRow::Icon);
@@ -687,6 +770,7 @@ impl CountdownView {
                     ),
             )
             .child(date_row)
+            .child(reminder_row)
             .child(repeat_row)
             .child(type_row)
             .child(div().mt_1().h(px(1.)).bg(theme.colors().border))

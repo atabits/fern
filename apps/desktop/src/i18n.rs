@@ -259,6 +259,8 @@ pub struct Strings {
     /// A birthday's "Show Age" switch, and the card's line with the age: "Turns {n}".
     pub countdown_show_age: &'static str,
     pub countdown_turns: &'static str,
+    /// The Reminder choices, in `fern_core::countdown::REMINDER_DAYS` order.
+    pub countdown_reminder_days: [&'static str; 5],
     pub countdown_new: &'static str,
     pub countdown_edit: &'static str,
     pub countdown_name: &'static str,
@@ -816,6 +818,7 @@ pub static EN: Strings = Strings {
     countdown_kind_birthday: "Birthday",
     countdown_show_age: "Show Age",
     countdown_turns: "Turns {n}",
+    countdown_reminder_days: ["On the day", "1 day early", "2 days early", "3 days early", "1 week early"],
     countdown_new: "New countdown",
     countdown_edit: "Edit countdown",
     countdown_name: "Name",
@@ -1350,6 +1353,7 @@ pub static RU: Strings = Strings {
     countdown_kind_birthday: "День рождения",
     countdown_show_age: "Показывать возраст",
     countdown_turns: "Исполнится {n}",
+    countdown_reminder_days: ["В тот же день", "За 1 день", "За 2 дня", "За 3 дня", "За неделю"],
     countdown_new: "Новый отсчёт",
     countdown_edit: "Изменить отсчёт",
     countdown_name: "Название",

@@ -23,6 +23,7 @@ const STAMP_FORMAT: &str = "%Y-%m-%dT%H:%M:%S";
 pub enum Target {
     Task(Id),
     Habit(Id),
+    Countdown(Id),
 }
 
 /// What a habit's reminder offers besides opening it, as in the original: "Snooze", and "Check
@@ -106,7 +107,8 @@ impl Notices {
     }
 }
 
-/// Reminders of open tasks and of habits not yet done that day, firing in `(after, until]`.
+/// Reminders of open tasks, of habits not yet done that day and of countdowns, firing in
+/// `(after, until]`.
 pub fn fired(store: &Store, after: NaiveDateTime, until: NaiveDateTime) -> Vec<Notice> {
     let tasks = store.tasks().unwrap_or_default();
     let mut notices: Vec<Notice> = reminder::due_between(&tasks, after, until)
@@ -120,6 +122,12 @@ pub fn fired(store: &Store, after: NaiveDateTime, until: NaiveDateTime) -> Vec<N
             .into_iter()
             .map(|(habit, at)| Notice { target: Target::Habit(habit.id), title: habit.name.clone(), at }),
     );
+    let countdowns = store.countdowns().unwrap_or_default();
+    notices.extend(
+        fern_core::countdown::reminders_between(&countdowns, after, until)
+            .into_iter()
+            .map(|(countdown, at)| Notice { target: Target::Countdown(countdown.id), title: countdown.name.clone(), at }),
+    );
     let snoozes = store.habit_snoozes().unwrap_or_default();
     notices.extend(
         fern_core::habit::snoozed_between(&habits, &done, &snoozes, after, until)
@@ -132,7 +140,7 @@ pub fn fired(store: &Store, after: NaiveDateTime, until: NaiveDateTime) -> Vec<N
 /// The actions a notice offers: none for tasks.
 pub fn actions(store: &Store, target: Target) -> &'static [NoticeAction] {
     match target {
-        Target::Task(_) => &[],
+        Target::Task(_) | Target::Countdown(_) => &[],
         Target::Habit(id) => {
             let has_goal = store.habits().unwrap_or_default().iter().any(|h| h.id == id && h.goal.is_some());
             NoticeAction::for_habit(has_goal)
@@ -255,7 +263,11 @@ pub fn start(store: Rc<Store>, window: AnyWindowHandle, cx: &mut Context<AppView
             for (notice, due, buttons) in shown {
                 // Constant everywhere, or for a habit set to "Constant Reminder".
                 let constant = settings.constant
-                    || matches!(notice.target, Target::Habit(id) if store.habits().unwrap_or_default().iter().any(|h| h.id == id && h.constant_reminder));
+                    || match notice.target {
+                        Target::Habit(id) => store.habits().unwrap_or_default().iter().any(|h| h.id == id && h.constant_reminder),
+                        Target::Countdown(id) => store.countdowns().unwrap_or_default().iter().any(|c| c.id == id && c.constant_reminder),
+                        Target::Task(_) => false,
+                    };
                 let reply = show(notice.title.clone(), due, buttons, constant);
                 let this = this.clone();
                 cx.spawn(async move |cx| {

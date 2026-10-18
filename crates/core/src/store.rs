@@ -637,6 +637,10 @@ const MIGRATIONS: &[&str] = &[
     "
     ALTER TABLE countdowns ADD COLUMN show_age INTEGER NOT NULL DEFAULT 0;
     ",
+    "
+    ALTER TABLE countdowns ADD COLUMN reminders TEXT NOT NULL DEFAULT '';
+    ALTER TABLE countdowns ADD COLUMN constant_reminder INTEGER NOT NULL DEFAULT 0;
+    ",
 ];
 
 const TASK_COLUMNS: &str = "id, parent_id, kind, title, notes, priority, due_date, due_time, \
@@ -1515,7 +1519,7 @@ impl Store {
     /// Countdowns in creation order.
     pub fn countdowns(&self) -> Result<Vec<Countdown>> {
         let mut stmt =
-            self.conn.prepare("SELECT id, name, date, kind, icon, color, repeat, pinned_at, show_age FROM countdowns
+            self.conn.prepare("SELECT id, name, date, kind, icon, color, repeat, pinned_at, show_age, reminders, constant_reminder FROM countdowns
              ORDER BY pinned_at IS NULL, pinned_at DESC, created_at, rowid")?;
         let rows = stmt
             .query_map([], |row| {
@@ -1532,6 +1536,8 @@ impl Store {
                     repeat: row.get::<_, Option<String>>(6)?.and_then(|rule| rule.parse().ok()),
                     pinned_at: row.get(7)?,
                     show_age: row.get(8)?,
+                    reminders: crate::countdown::parse_reminders(&row.get::<_, String>(9)?),
+                    constant_reminder: row.get(10)?,
                 })
             })?
             .collect::<Result<_, _>>()?;
@@ -1541,7 +1547,7 @@ impl Store {
     pub fn add_countdown(&self, name: &str, date: NaiveDate, kind: CountdownKind) -> Result<Countdown> {
         let name = name.trim();
         anyhow::ensure!(!name.is_empty(), "a countdown needs a name");
-        let countdown = Countdown { id: Uuid::now_v7(), name: name.to_owned(), date, kind, icon: None, color: None, repeat: None, pinned_at: None, show_age: false };
+        let countdown = Countdown { id: Uuid::now_v7(), name: name.to_owned(), date, kind, icon: None, color: None, repeat: None, pinned_at: None, show_age: false, reminders: Vec::new(), constant_reminder: false };
         self.conn.execute(
             "INSERT INTO countdowns (id, name, date, kind, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
@@ -1578,6 +1584,20 @@ impl Store {
         self.conn.execute(
             "UPDATE countdowns SET name = ?2, date = ?3, kind = ?4, repeat = ?5 WHERE id = ?1",
             params![id.to_string(), name, date.format(DATE_FORMAT).to_string(), kind.as_str(), repeat.map(|r| r.to_string())],
+        )?;
+        Ok(())
+    }
+
+    /// A countdown's Reminder: the days before its date to be reminded, and whether they stay
+    /// on screen until answered.
+    pub fn set_countdown_reminders(&self, id: Id, days: &[u32], constant: bool) -> Result<()> {
+        let mut days = days.to_vec();
+        days.sort();
+        days.dedup();
+        let text = days.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
+        self.conn.execute(
+            "UPDATE countdowns SET reminders = ?2, constant_reminder = ?3 WHERE id = ?1",
+            params![id.to_string(), text, constant],
         )?;
         Ok(())
     }
@@ -3129,6 +3149,9 @@ mod tests {
         assert_eq!((saved.icon, saved.color), (None, None));
         store.set_countdown_show_age(release.id, true)?;
         assert!(store.countdowns()?[0].show_age);
+        store.set_countdown_reminders(release.id, &[3, 0, 3], true)?;
+        let saved = store.countdowns()?.remove(0);
+        assert_eq!((saved.reminders, saved.constant_reminder), (vec![0, 3], true));
         Ok(())
     }
 

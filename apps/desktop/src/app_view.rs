@@ -259,6 +259,10 @@ impl AppView {
             }
             if state.contains("countdown-draft") {
                 this.countdown.update(cx, |view, cx| view.start_new(window, cx));
+                // `countdown-draft=reminder`: with its Reminder dropdown open.
+                if state.contains("countdown-draft=reminder") {
+                    this.countdown.update(cx, |view, cx| view.dev_open_reminder(cx));
+                }
             }
             // `attach=<task title part>><file path>`: a file attached to that task.
             for spec in state.split(';').filter_map(|part| part.strip_prefix("attach=")) {
@@ -744,6 +748,7 @@ impl AppView {
                 self.select(Section::Habits, window, cx);
                 self.habits.update(cx, |habits, cx| habits.select(habit, cx));
             }
+            Target::Countdown(_) => self.select(Section::Countdown, window, cx),
         }
     }
 

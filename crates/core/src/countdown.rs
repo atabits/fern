@@ -52,6 +52,10 @@ pub struct Countdown {
     pub pinned_at: Option<i64>,
     /// The original's "Show Age" for a birthday: the card says the age turned.
     pub show_age: bool,
+    /// The original's Reminder: days before the date to be reminded, at 09:00 (0 is the day).
+    pub reminders: Vec<u32>,
+    /// The reminders stay on screen until answered.
+    pub constant_reminder: bool,
 }
 
 impl Countdown {
@@ -94,6 +98,45 @@ fn next_birthday(born: NaiveDate, today: NaiveDate) -> NaiveDate {
     };
     let this_year = on(today.year());
     if this_year >= today { this_year } else { on(today.year() + 1) }
+}
+
+/// The Reminder choices the original offers, in days before the date: on the day, 1, 2 and 3
+/// days early and a week early.
+pub const REMINDER_DAYS: [u32; 5] = [0, 1, 2, 3, 7];
+
+/// The original's default for a new countdown: on the day and 3 days early.
+pub const DEFAULT_REMINDERS: [u32; 2] = [0, 3];
+
+/// The time of day countdown reminders fire, as the original's "(09:00)".
+pub fn reminder_time() -> chrono::NaiveTime {
+    chrono::NaiveTime::from_hms_opt(9, 0, 0).expect("09:00 is a time")
+}
+
+/// Countdown reminders firing in `(after, until]`: each reminder day before the date the
+/// countdown counts to (the next time a repeating one comes back), at 09:00.
+pub fn reminders_between(countdowns: &[Countdown], after: chrono::NaiveDateTime, until: chrono::NaiveDateTime) -> Vec<(&Countdown, chrono::NaiveDateTime)> {
+    let mut fired = Vec::new();
+    for countdown in countdowns {
+        // The dates it counts to around the window: from its start, and a week later, which
+        // covers "1 week early" for the next time it comes back.
+        let mut targets = vec![countdown.next_date(after.date()), countdown.next_date(after.date() + chrono::Duration::days(8))];
+        targets.dedup();
+        for target in targets {
+            for &days in &countdown.reminders {
+                let at = (target - chrono::Duration::days(days as i64)).and_time(reminder_time());
+                if after < at && at <= until && !fired.iter().any(|(c, t): &(&Countdown, _)| c.id == countdown.id && *t == at) {
+                    fired.push((countdown, at));
+                }
+            }
+        }
+    }
+    fired.sort_by_key(|(_, at)| *at);
+    fired
+}
+
+/// Reads stored reminder days ("0,3").
+pub fn parse_reminders(text: &str) -> Vec<u32> {
+    text.split(',').filter_map(|d| d.trim().parse().ok()).collect()
 }
 
 /// The distance between two dates as calendar years, months and days.
@@ -157,6 +200,33 @@ mod tests {
     }
 
     #[test]
+    fn countdown_reminders() {
+        let at = |date: NaiveDate, h: u32| date.and_hms_opt(h, 0, 0).unwrap();
+        let trip = Countdown {
+            id: uuid::Uuid::now_v7(),
+            name: "Trip".into(),
+            date: d(2026, 10, 21),
+            kind: CountdownKind::Countdown,
+            icon: None,
+            color: None,
+            repeat: None,
+            pinned_at: None,
+            show_age: false,
+            reminders: DEFAULT_REMINDERS.to_vec(),
+            constant_reminder: false,
+        };
+        let list = [trip];
+        let fired = |from: NaiveDate, to: NaiveDate| -> Vec<chrono::NaiveDateTime> {
+            reminders_between(&list, at(from, 0), at(to, 23)).into_iter().map(|(_, t)| t).collect()
+        };
+        // 3 days early is the 18th at 09:00, the day itself the 21st.
+        assert_eq!(fired(d(2026, 10, 18), d(2026, 10, 18)), [at(d(2026, 10, 18), 9)]);
+        assert_eq!(fired(d(2026, 10, 17), d(2026, 10, 22)), [at(d(2026, 10, 18), 9), at(d(2026, 10, 21), 9)]);
+        assert!(fired(d(2026, 10, 22), d(2026, 10, 30)).is_empty(), "past dates do not remind");
+        assert_eq!(parse_reminders("0, 3,x"), [0, 3]);
+    }
+
+    #[test]
     fn birthdays_come_every_year() {
         let birthday = |born: NaiveDate| Countdown {
             id: uuid::Uuid::now_v7(),
@@ -168,6 +238,8 @@ mod tests {
             repeat: None,
             pinned_at: None,
             show_age: false,
+            reminders: Vec::new(),
+            constant_reminder: false,
         };
         let today = d(2026, 10, 18);
         let mum = birthday(d(1970, 12, 5));
@@ -194,6 +266,8 @@ mod tests {
             repeat: None,
             pinned_at: None,
             show_age: false,
+            reminders: Vec::new(),
+            constant_reminder: false,
         };
         assert_eq!(once.next_date(d(2026, 10, 18)), d(2026, 9, 13), "without a repeat the date stays");
         let monthly = Countdown { repeat: Some(Recurrence::new(Frequency::Monthly, 1)), ..once.clone() };

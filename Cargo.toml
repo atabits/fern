@@ -7,6 +7,7 @@ members = [
     "crates/theme",
     "crates/ui",
     "apps/desktop",
+    "apps/server",
 ]
 
 [workspace.package]
@@ -32,6 +33,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 smallvec = "1"
 strum = { version = "0.27", features = ["derive"] }
+tiny_http = "0.12"
 unicode-segmentation = "1"
 uuid = { version = "1", features = ["v7"] }
 

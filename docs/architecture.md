@@ -14,6 +14,7 @@ crates/
                    Divider, popovers; import ui::prelude::* in views
 apps/
   desktop/         the desktop app: views (entities), i18n, the text input, main()
+  server/          fern-server, the self-hosted sync server
 ```
 
 ## Sync
@@ -27,8 +28,10 @@ Devices sync through a self-hosted server, row by row (`crates/core/src/sync.rs`
   may arrive in any order (foreign keys are checked at commit), and applied changes are not
   logged again, so they do not bounce back. Only the synced tables and plain column names are
   accepted from outside.
-- The server keeps the latest change of every row with its own sequence number and hands a
-  device the changes after the number it last saw. It is still to be written (`apps/server`).
+- The server (`apps/server`, the `fern-server` binary) keeps the latest change of every row with
+  its own sequence number in SQLite. One `POST /sync` with a bearer token (`FERN_TOKEN`) takes a
+  device's changes and returns the other devices' changes after the number the device last saw.
+  It speaks plain HTTP; a reverse proxy adds TLS.
 
 Not synced: settings, task activity, habit snoozes, attachments' files.
 

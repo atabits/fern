@@ -14,6 +14,7 @@ use ui::{Donut, Placement, PopoverAttachment, popover};
 use ui::prelude::*;
 
 use crate::focus_timer::{BreakKind, FocusTimer, break_after, format_clock};
+use crate::habit_view::{HABIT_EMOJI, icon_avatar};
 use crate::i18n::{self, Strings};
 use crate::text_input::{Mode, TextInput};
 
@@ -194,6 +195,8 @@ struct TimerDraft {
     timer: fern_core::focus::FocusTimer,
     name: Entity<TextInput>,
     new: bool,
+    /// The icon picker under the name, while open: 0 Emoji, 1 Text (the name's initial).
+    icon_tab: Option<usize>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -284,6 +287,18 @@ impl FocusView {
             FocusTimer::start(now_ms(), self.minutes(POMO_SETTING) * 60_000)
         };
         self.start_timer(Some((task, title)), None, timer, cx);
+    }
+
+    /// A timer's play button: a session named after it, with its own Pomo length or as a
+    /// stopwatch.
+    fn start_from_timer(&mut self, timer: &fern_core::focus::FocusTimer, cx: &mut Context<Self>) {
+        self.finish(cx);
+        self.set_stopwatch_mode(timer.stopwatch, cx);
+        let clock = match timer.length_ms() {
+            Some(length) => FocusTimer::start(now_ms(), length),
+            None => FocusTimer::stopwatch(now_ms()),
+        };
+        self.start_timer(Some((None, timer.name.clone())), None, clock, cx);
     }
 
     fn stopwatch_mode(&self) -> bool {
@@ -714,7 +729,7 @@ impl FocusView {
         cx.subscribe(&name, |this, _, _: &crate::text_input::Submitted, cx| this.save_timer(cx)).detach();
         window.focus(&name.focus_handle(cx), cx);
         self.timer_menu = None;
-        self.timer_draft = Some(TimerDraft { timer, name, new });
+        self.timer_draft = Some(TimerDraft { timer, name, new, icon_tab: None });
         cx.notify();
     }
 
@@ -735,6 +750,8 @@ impl FocusView {
         let strings = i18n::t(cx);
         let theme = cx.theme().clone();
         let timer = &draft.timer;
+        let icons = draft.icon_tab.map(|tab| self.render_timer_icons(timer, tab, cx));
+        let avatar = icon_avatar(timer.icon.as_deref(), timer.color.as_deref(), draft.name.read(cx).text(), px(30.), cx);
         let change = |f: fn(&mut fern_core::focus::FocusTimer)| {
             cx.listener(move |this: &mut Self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>| {
                 if let Some(draft) = this.timer_draft.as_mut() {
@@ -774,7 +791,24 @@ impl FocusView {
                 cx.notify();
             }))
             .child(Label::new(if draft.new { strings.add_timer } else { strings.edit_timer }).weight(FontWeight::SEMIBOLD))
-            .child(h_flex().h(px(30.)).px_2().rounded(px(6.)).bg(theme.colors().background).child(draft.name.clone()))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        div()
+                            .id("timer-icon-button")
+                            .cursor_pointer()
+                            .child(avatar)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(draft) = this.timer_draft.as_mut() {
+                                    draft.icon_tab = if draft.icon_tab.is_some() { None } else { Some(0) };
+                                }
+                                cx.notify();
+                            })),
+                    )
+                    .child(h_flex().flex_1().h(px(30.)).px_2().rounded(px(6.)).bg(theme.colors().background).child(draft.name.clone())),
+            )
+            .children(icons)
             .child(Label::new(strings.timer_mode).size(LabelSize::Small).color(Color::Muted))
             .child(
                 h_flex()
@@ -814,14 +848,93 @@ impl FocusView {
             .into_any_element()
     }
 
+    /// The timer's icon picker, like a habit's: an emoji or the name's initial ("Text"), on a
+    /// color.
+    fn render_timer_icons(&self, timer: &fern_core::focus::FocusTimer, tab: usize, cx: &mut Context<Self>) -> AnyElement {
+        let strings = i18n::t(cx);
+        let theme = cx.theme().clone();
+        let edit = |f: Box<dyn Fn(&mut TimerDraft)>| {
+            cx.listener(move |this: &mut Self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>| {
+                if let Some(draft) = this.timer_draft.as_mut() {
+                    f(draft);
+                }
+                cx.notify();
+            })
+        };
+        let tabs = h_flex().p_0p5().rounded(px(6.)).bg(theme.colors().background).children(
+            strings.habit_icon_tabs.iter().enumerate().map(|(i, label)| {
+                div()
+                    .id(("timer-icon-tab", i))
+                    .flex_1()
+                    .h(px(24.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(5.))
+                    .cursor_pointer()
+                    .when(i == tab, |el| el.bg(theme.colors().element_selected))
+                    .child(Label::new(*label).size(LabelSize::Small))
+                    .on_click(edit(Box::new(move |d| {
+                        d.icon_tab = Some(i);
+                        // "Text" shows the name's initial.
+                        if i == 1 {
+                            d.timer.icon = None;
+                        }
+                    })))
+            }),
+        );
+        let emoji = div().flex().flex_wrap().gap_0p5().children(HABIT_EMOJI.iter().map(|emoji| {
+            let selected = timer.icon.as_deref() == Some(*emoji);
+            div()
+                .id(SharedString::from(format!("timer-emoji-{emoji}")))
+                .size(px(30.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(6.))
+                .cursor_pointer()
+                .text_size(px(17.))
+                .when(selected, |el| el.bg(theme.colors().element_selected))
+                .hover(|s| s.bg(theme.colors().element_hover))
+                .child(*emoji)
+                .on_click(edit(Box::new(move |d| {
+                    d.timer.icon = Some((*emoji).to_owned());
+                    d.icon_tab = None;
+                })))
+        }));
+        let colors = h_flex().gap_1p5().children(
+            std::iter::once(None).chain(crate::lists_panel::LIST_COLORS.iter().map(|c| Some(*c))).map(|color| {
+                let selected = timer.color.as_deref() == color;
+                let fill = crate::lists_panel::parse_color(color).unwrap_or(theme.colors().accent);
+                div()
+                    .id(SharedString::from(format!("timer-color-{}", color.unwrap_or("none"))))
+                    .size(px(20.))
+                    .rounded_full()
+                    .cursor_pointer()
+                    .bg(fill.opacity(if color.is_none() { 0.35 } else { 1. }))
+                    .when(selected, |el| el.border_2().border_color(theme.colors().text))
+                    .on_click(edit(Box::new(move |d| d.timer.color = color.map(str::to_owned))))
+            }),
+        );
+        v_flex()
+            .gap_2()
+            .p_2()
+            .rounded(px(6.))
+            .border_1()
+            .border_color(theme.colors().border)
+            .child(tabs)
+            .when(tab == 0, |el| el.child(emoji))
+            .child(colors)
+            .into_any_element()
+    }
+
     /// A timer of the Pomodoro list: its icon, name, today's minutes and play; its "…" has Edit,
     /// Archive (or Restore) and Delete.
     fn render_timer(&self, timer: &fern_core::focus::FocusTimer, today_minutes: i64, cx: &mut Context<Self>) -> AnyElement {
         let strings = i18n::t(cx);
         let theme = cx.theme().clone();
         let id = timer.id;
-        let (name, stopwatch) = (timer.name.clone(), timer.stopwatch);
-        let initial = timer.icon.clone().unwrap_or_else(|| timer.name.chars().next().map(|c| c.to_uppercase().collect()).unwrap_or_default());
+        let played = timer.clone();
         let group = SharedString::from(format!("timer-{id}"));
         let menu_open = self.timer_menu == Some(id);
         let archived = timer.archived;
@@ -834,17 +947,7 @@ impl FocusView {
             .gap_2()
             .rounded(px(6.))
             .hover(|s| s.bg(theme.colors().ghost_element_hover))
-            .child(
-                div()
-                    .size(px(22.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded_full()
-                    .bg(theme.colors().accent.opacity(0.3))
-                    .text_size(px(11.))
-                    .child(initial),
-            )
+            .child(icon_avatar(timer.icon.as_deref(), timer.color.as_deref(), &timer.name, px(26.), cx))
             .child(div().flex_1().min_w_0().child(Label::new(timer.name.clone()).truncate()))
             .child(Label::new(format_minutes(today_minutes)).size(LabelSize::Small).color(Color::Muted))
             .child(
@@ -905,7 +1008,7 @@ impl FocusView {
                         .size(px(22.))
                         .icon_size(IconSize::Small)
                         .icon_color(Color::Accent)
-                        .on_click(cx.listener(move |this, _, _, cx| this.start_named(name.clone(), stopwatch, cx))),
+                        .on_click(cx.listener(move |this, _, _, cx| this.start_from_timer(&played, cx))),
                 )
             })
             .into_any_element()
@@ -2060,8 +2163,11 @@ impl FocusView {
     }
 
     #[cfg(debug_assertions)]
-    pub fn dev_add_timer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn dev_add_timer(&mut self, icons: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.open_timer(None, window, cx);
+        if let Some(draft) = self.timer_draft.as_mut() {
+            draft.icon_tab = icons.then_some(0);
+        }
     }
 
     #[cfg(debug_assertions)]

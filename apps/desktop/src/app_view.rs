@@ -214,14 +214,19 @@ impl AppView {
                     this.focus.update(cx, |view, cx| view.dev_record(title, ago, minutes, stopwatch, cx));
                 }
             }
-            // `focus-timer=<name>`, repeatable: a timer in the Pomodoro list; `focus-timer-add`
-            // opens "Add Timer".
-            for name in state.split(';').filter_map(|part| part.strip_prefix("focus-timer=")) {
-                this.store.save_focus_timer(&fern_core::focus::FocusTimer::new(name)).ok();
+            // `focus-timer=<name>[><emoji>[>#color]]`, repeatable: a timer in the Pomodoro list;
+            // `focus-timer-add` opens "Add Timer", `focus-timer-add=icons` with its icon picker.
+            for spec in state.split(';').filter_map(|part| part.strip_prefix("focus-timer=")) {
+                let mut parts = spec.split('>');
+                let mut timer = fern_core::focus::FocusTimer::new(parts.next().unwrap_or_default());
+                timer.icon = parts.next().map(str::to_owned);
+                timer.color = parts.next().map(str::to_owned);
+                this.store.save_focus_timer(&timer).ok();
                 this.focus.update(cx, |view, cx| view.reload(cx));
             }
             if state.contains("focus-timer-add") {
-                this.focus.update(cx, |view, cx| view.dev_add_timer(window, cx));
+                let icons = state.contains("focus-timer-add=icons");
+                this.focus.update(cx, |view, cx| view.dev_add_timer(icons, window, cx));
             }
             if let Some(menu) = state.split(';').find_map(|part| part.strip_prefix("focus-menu=")) {
                 this.focus.update(cx, |view, cx| view.dev_menu(menu, cx));

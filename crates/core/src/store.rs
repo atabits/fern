@@ -580,6 +580,9 @@ const MIGRATIONS: &[&str] = &[
         created_at  INTEGER NOT NULL
     );
     ",
+    "
+    ALTER TABLE focus_timers ADD COLUMN color TEXT;
+    ",
 ];
 
 const TASK_COLUMNS: &str = "id, parent_id, kind, title, notes, priority, due_date, due_time, \
@@ -1978,7 +1981,7 @@ impl Store {
     /// The Pomodoro list's timers ("Add Timer"), oldest first; active ones or archived ones.
     pub fn focus_timers(&self, archived: bool) -> Result<Vec<crate::focus::FocusTimer>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, icon, minutes, stopwatch, archived_at FROM focus_timers
+            "SELECT id, name, icon, minutes, stopwatch, archived_at, color FROM focus_timers
              WHERE (archived_at IS NOT NULL) = ?1 ORDER BY created_at, rowid",
         )?;
         let rows = stmt
@@ -1990,21 +1993,22 @@ impl Store {
                     minutes: row.get(3)?,
                     stopwatch: row.get(4)?,
                     archived: row.get::<_, Option<i64>>(5)?.is_some(),
+                    color: row.get(6)?,
                 })
             })?
             .collect::<Result<_, _>>()?;
         Ok(rows)
     }
 
-    /// Adds or edits a timer: its name, icon, Pomo length in minutes or stopwatch.
+    /// Adds or edits a timer: its name, icon and color, Pomo length in minutes or stopwatch.
     pub fn save_focus_timer(&self, timer: &crate::focus::FocusTimer) -> Result<()> {
         let name = timer.name.trim();
         anyhow::ensure!(!name.is_empty(), "a timer needs a name");
         self.conn.execute(
-            "INSERT INTO focus_timers (id, name, icon, minutes, stopwatch, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT(id) DO UPDATE SET name = excluded.name, icon = excluded.icon,
+            "INSERT INTO focus_timers (id, name, icon, minutes, stopwatch, created_at, color) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(id) DO UPDATE SET name = excluded.name, icon = excluded.icon, color = excluded.color,
                  minutes = excluded.minutes, stopwatch = excluded.stopwatch",
-            params![timer.id.to_string(), name, timer.icon, timer.minutes.max(1), timer.stopwatch, now_ms()],
+            params![timer.id.to_string(), name, timer.icon, timer.minutes.max(1), timer.stopwatch, now_ms(), timer.color],
         )?;
         Ok(())
     }
@@ -2992,6 +2996,8 @@ mod tests {
         store.save_focus_timer(&timer)?;
         timer.name = "Weekly planning".into();
         timer.minutes = 45;
+        timer.icon = Some("📚".into());
+        timer.color = Some("#4772fa".into());
         store.save_focus_timer(&timer)?;
         assert_eq!(store.focus_timers(false)?, [timer.clone()]);
         store.set_focus_timer_archived(timer.id, true)?;

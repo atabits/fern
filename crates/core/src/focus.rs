@@ -31,12 +31,20 @@ pub struct FocusTimer {
     /// Timed with the stopwatch instead of a Pomo.
     pub stopwatch: bool,
     pub archived: bool,
+    /// The icon's background color (`#rrggbb`); `None` is the accent color.
+    pub color: Option<String>,
 }
 
 impl FocusTimer {
     /// A new timer as the original's dialog starts it: a 25-minute Pomo.
     pub fn new(name: &str) -> Self {
-        Self { id: uuid::Uuid::now_v7(), name: name.to_owned(), icon: None, minutes: 25, stopwatch: false, archived: false }
+        Self { id: uuid::Uuid::now_v7(), name: name.to_owned(), icon: None, minutes: 25, stopwatch: false, archived: false, color: None }
+    }
+
+    /// How long a session of this timer runs: its own Pomo length, or `None` for a stopwatch,
+    /// which counts up until stopped.
+    pub fn length_ms(&self) -> Option<i64> {
+        (!self.stopwatch).then(|| self.minutes.max(1) * 60_000)
     }
 }
 
@@ -343,6 +351,15 @@ mod tests {
         let monday = NaiveDate::from_ymd_opt(2026, 10, 12).unwrap();
         let sessions = [session(at(15, 13, 30), at(15, 16, 0)), session(at(13, 23, 0), at(14, 1, 0)), session(at(20, 9, 0), at(20, 10, 0))];
         assert_eq!(timeline(&sessions, monday), [(3, 810, 960), (1, 1380, 1440), (2, 0, 60)]);
+    }
+
+    #[test]
+    fn timer_length() {
+        let mut timer = FocusTimer::new("Reading");
+        timer.minutes = 45;
+        assert_eq!(timer.length_ms(), Some(45 * 60_000), "a timer runs its own Pomo length");
+        timer.stopwatch = true;
+        assert_eq!(timer.length_ms(), None);
     }
 
     #[test]

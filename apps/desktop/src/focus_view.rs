@@ -67,6 +67,10 @@ pub struct FocusView {
     picker: Option<Picker>,
     /// What the page's Start focuses on, picked there.
     next: Option<NextFocus>,
+    /// The picker's tab, kept between openings as the original keeps it.
+    picker_tab: usize,
+    /// The view the picker's Task tab lists ("Today" until another is chosen).
+    picker_view: View,
     add_title: Entity<TextInput>,
     add_start: Entity<TextInput>,
     add_minutes: i64,
@@ -201,10 +205,11 @@ fn line_chart(values: &[i64], labels: Vec<String>, height: f32, from_zero: bool,
 /// The focus page's picker, opened from "Focus >" or the eye over the hours: the original's
 /// Task, Timer and Habit tabs over a search field.
 struct Picker {
-    tab: usize,
     search: Entity<TextInput>,
     /// Opened from the eye over the hours rather than from "Focus >".
     at_eye: bool,
+    /// The Task tab's "Today >" list of views, while open.
+    views_open: bool,
 }
 
 /// What the focus page's Start focuses on.
@@ -268,6 +273,8 @@ impl FocusView {
             expanded: false,
             picker: None,
             next: None,
+            picker_tab: 0,
+            picker_view: View::Today,
             add_title,
             add_start,
             add_minutes: 25,
@@ -2346,13 +2353,21 @@ impl FocusView {
                 self.set_expanded(true, cx);
                 return;
             }
-            // The page with its picker open: `page-pick` (Task) or `page-pick-timer`.
+            // The page with its picker open: `page-pick` (Task), `page-pick-timer`, or
+            // `page-pick-views` (the Task tab's list of views).
+            "page-pick-views" => {
+                self.set_expanded(true, cx);
+                self.open_picker(false, window, cx);
+                self.picker_tab = 0;
+                if let Some(picker) = self.picker.as_mut() {
+                    picker.views_open = true;
+                }
+                return;
+            }
             "page-pick" | "page-pick-timer" => {
                 self.set_expanded(true, cx);
                 self.open_picker(false, window, cx);
-                if let Some(picker) = self.picker.as_mut() {
-                    picker.tab = (menu == "page-pick-timer") as usize;
-                }
+                self.picker_tab = (menu == "page-pick-timer") as usize;
                 return;
             }
             // Batch Management with a filter's Custom fields open: `batch-date` or `batch-minutes`.
@@ -2605,7 +2620,7 @@ impl FocusView {
         })
         .detach();
         window.focus(&search.focus_handle(cx), cx);
-        self.picker = Some(Picker { tab: 0, search, at_eye });
+        self.picker = Some(Picker { search, at_eye, views_open: false });
         cx.notify();
     }
 
@@ -2637,32 +2652,84 @@ impl FocusView {
         let query = picker.search.read(cx).text().to_owned();
         let today = Local::now().date_naive();
         let habits: Vec<fern_core::Habit> = self.store.habits().unwrap_or_default().into_iter().filter(|h| !h.archived && matches_search(&h.name, &query)).collect();
+        // As in the original, the picked one has a filled circle and stays lit.
+        let picked = self.next.as_ref().map(|n| n.title().to_owned());
         let item = |id: SharedString, title: String, next: NextFocus, cx: &mut Context<Self>| {
+            let on = picked.as_deref() == Some(next.title());
             ListItem::new(id)
-                .start_slot(Icon::new(IconName::Circle).size(IconSize::Small).color(Color::Muted))
+                .toggle_state(on)
+                .start_slot(
+                    Icon::new(if on { IconName::CircleDot } else { IconName::Circle })
+                        .size(IconSize::Small)
+                        .color(if on { Color::Accent } else { Color::Muted }),
+                )
                 .child(Label::new(title).size(LabelSize::Small).truncate())
                 .on_click(cx.listener(move |this, _, _, cx| this.pick(next.clone(), cx)))
                 .into_any_element()
         };
         let mut items: Vec<AnyElement> = Vec::new();
-        match picker.tab {
+        // The views the Task tab can list: the smart lists, the Inbox and the lists.
+        let views: Vec<(View, SharedString)> = [
+            (View::Today, SharedString::new_static(strings.today)),
+            (View::Tomorrow, SharedString::new_static(strings.tomorrow)),
+            (View::Next7Days, SharedString::new_static(strings.next_7_days)),
+            (View::Inbox, SharedString::new_static(strings.inbox)),
+        ]
+        .into_iter()
+        .chain(self.store.lists().unwrap_or_default().into_iter().map(|l| (View::List(l.id), l.name.into())))
+        .collect();
+        let view_name = views.iter().find(|(v, _)| *v == self.picker_view).map_or(SharedString::new_static(strings.today), |(_, n)| n.clone());
+        match self.picker_tab {
+            0 if picker.views_open => {
+                for (i, (view, name)) in views.into_iter().enumerate() {
+                    let on = view == self.picker_view;
+                    items.push(
+                        ListItem::new(("focus-picker-view", i))
+                            .toggle_state(on)
+                            .child(Label::new(name).size(LabelSize::Small).color(if on { Color::Accent } else { Color::Default }))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.picker_view = view.clone();
+                                if let Some(picker) = this.picker.as_mut() {
+                                    picker.views_open = false;
+                                }
+                                cx.notify();
+                            }))
+                            .into_any_element(),
+                    );
+                }
+            }
             0 => {
                 items.push(
                     h_flex()
+                        .id("focus-picker-views")
                         .gap_1()
                         .px_2()
                         .py_1()
+                        .cursor_pointer()
                         .child(Icon::new(IconName::CalendarDays).size(IconSize::Small).color(Color::Muted))
-                        .child(Label::new(strings.today).size(LabelSize::Small).weight(FontWeight::SEMIBOLD))
+                        .child(Label::new(view_name).size(LabelSize::Small).weight(FontWeight::SEMIBOLD))
                         .child(Icon::new(IconName::ChevronRight).size(IconSize::XSmall).color(Color::Muted))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if let Some(picker) = this.picker.as_mut() {
+                                picker.views_open = true;
+                            }
+                            cx.notify();
+                        }))
                         .into_any_element(),
                 );
-                for task in self.tasks.iter().filter(|t| matches_search(&t.title, &query)) {
+                let listed = if self.picker_view == View::Today {
+                    self.tasks.clone()
+                } else {
+                    self.store.tasks_in(&self.picker_view, today).unwrap_or_default()
+                };
+                for task in listed.iter().filter(|t| matches_search(&t.title, &query)) {
                     items.push(item(format!("pick-task-{}", task.id).into(), task.title.clone(), NextFocus::Task(task.id, task.title.clone()), cx));
                 }
-                // As in the original, the habits due today follow the tasks.
-                let due: Vec<&fern_core::Habit> =
-                    habits.iter().filter(|h| h.is_due(today, &self.store.checkins(h.id).unwrap_or_default())).collect();
+                // As in the original, the habits due today follow Today's tasks.
+                let due: Vec<&fern_core::Habit> = habits
+                    .iter()
+                    .filter(|h| self.picker_view == View::Today && h.is_due(today, &self.store.checkins(h.id).unwrap_or_default()))
+                    .collect();
                 if !due.is_empty() {
                     items.push(div().px_2().pt_1().child(Label::new(strings.focus_picker_tabs[2]).size(LabelSize::XSmall).color(Color::Muted)).into_any_element());
                 }
@@ -2683,7 +2750,7 @@ impl FocusView {
             }
         }
         let tabs = h_flex().justify_center().gap_1().children(strings.focus_picker_tabs.iter().enumerate().map(|(i, label)| {
-            let on = picker.tab == i;
+            let on = self.picker_tab == i;
             div()
                 .id(("focus-picker-tab", i))
                 .px_3()
@@ -2695,8 +2762,9 @@ impl FocusView {
                 .when(on, |el| el.bg(theme.colors().accent.opacity(0.2)))
                 .child(Label::new(*label).size(LabelSize::Small).color(if on { Color::Accent } else { Color::Muted }))
                 .on_click(cx.listener(move |this, _, _, cx| {
+                    this.picker_tab = i;
                     if let Some(picker) = this.picker.as_mut() {
-                        picker.tab = i;
+                        picker.views_open = false;
                     }
                     cx.notify();
                 }))

@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use chrono::{Datelike, Local, NaiveDate};
-use fern_core::{Checkin, Goal, Habit, Id, Store, habit};
+use fern_core::{Checkin, Goal, Habit, HabitFrequency, Id, Store, habit};
 use gpui::{Entity, Focusable as _, FontWeight};
 use ui::prelude::*;
 use ui::{Placement, PopoverAttachment, popover};
@@ -25,6 +25,7 @@ struct HabitEdit {
     /// `None`: "Achieve it all".
     amount: Option<u32>,
     reminders: Vec<chrono::NaiveTime>,
+    frequency: HabitFrequency,
     /// A field for adding a reminder time.
     reminder_input: Entity<TextInput>,
 }
@@ -132,6 +133,7 @@ impl HabitView {
             unit,
             amount: habit.goal.as_ref().map(|g| g.amount),
             reminders: habit.reminders.clone(),
+            frequency: habit.frequency,
             reminder_input,
         });
         self.detail_menu_open = false;
@@ -146,6 +148,7 @@ impl HabitView {
             .store
             .update_habit(id, &name, goal.as_ref())
             .and_then(|()| self.store.set_habit_reminders(id, &edit.reminders))
+            .and_then(|()| self.store.set_habit_frequency(id, edit.frequency))
         {
             eprintln!("failed to update the habit: {err:#}");
         }
@@ -199,6 +202,8 @@ impl HabitView {
             }))
             .child(Label::new(strings.edit_habit).weight(FontWeight::SEMIBOLD))
             .child(field(edit.name.clone().into_any_element()))
+            .child(Label::new(strings.habit_frequency).size(LabelSize::Small).color(Color::Muted))
+            .child(self.render_frequency(edit.frequency, cx))
             .child(Label::new(strings.habit_goal).size(LabelSize::Small).color(Color::Muted))
             .child(
                 option("goal-all", strings.habit_goal_all, amount.is_none())
@@ -265,6 +270,104 @@ impl HabitView {
             .into_any_element()
     }
 
+    /// The original's Frequency menu: daily on chosen weekdays, N days a week, or every N days.
+    fn render_frequency(&self, frequency: HabitFrequency, cx: &mut Context<Self>) -> AnyElement {
+        let strings = i18n::t(cx);
+        let theme = cx.theme().clone();
+        let kind = match frequency {
+            HabitFrequency::Daily { .. } => 0,
+            HabitFrequency::Weekly { .. } => 1,
+            HabitFrequency::Interval { .. } => 2,
+        };
+        let circle = |id: SharedString, label: SharedString, on: bool| {
+            div()
+                .id(id)
+                .size(px(26.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_full()
+                .cursor_pointer()
+                .when(on, |el| el.bg(theme.colors().accent))
+                .when(!on, |el| el.bg(theme.colors().element_hover))
+                .child(Label::new(label).size(LabelSize::XSmall))
+        };
+        let tabs = h_flex().gap_1().children(strings.habit_frequency_kinds.iter().enumerate().map(|(i, label)| {
+            div()
+                .id(SharedString::from(format!("frequency-kind-{i}")))
+                .flex_1()
+                .h(px(24.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(12.))
+                .cursor_pointer()
+                .when(i == kind, |el| el.bg(theme.colors().accent.opacity(0.25)))
+                .when(i != kind, |el| el.bg(theme.colors().element_hover))
+                .child(Label::new(*label).size(LabelSize::XSmall).color(if i == kind { Color::Accent } else { Color::Default }))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.update_edit(cx, |e| {
+                        e.frequency = match i {
+                            0 => HabitFrequency::default(),
+                            1 => HabitFrequency::Weekly { days: 3 },
+                            _ => HabitFrequency::Interval { days: 2 },
+                        }
+                    })
+                }))
+        }));
+        let detail: AnyElement = match frequency {
+            HabitFrequency::Daily { weekdays } => h_flex()
+                .justify_between()
+                .children((0..7u8).map(|i| {
+                    circle(
+                        SharedString::from(format!("frequency-day-{i}")),
+                        strings.weekdays_min[i as usize].into(),
+                        weekdays & (1 << i) != 0,
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.update_edit(cx, |e| {
+                            if let HabitFrequency::Daily { weekdays } = &mut e.frequency {
+                                // At least one day stays selected.
+                                let toggled = *weekdays ^ (1 << i);
+                                if toggled != 0 {
+                                    *weekdays = toggled;
+                                }
+                            }
+                        })
+                    }))
+                }))
+                .into_any_element(),
+            HabitFrequency::Weekly { days } => v_flex()
+                .gap_1()
+                .child(Label::new(strings.habit_days_per_week.replace("{n}", &days.to_string())).size(LabelSize::XSmall).color(Color::Muted))
+                .child(h_flex().justify_between().children((1..=7u8).map(|n| {
+                    circle(SharedString::from(format!("frequency-week-{n}")), n.to_string().into(), n == days).on_click(
+                        cx.listener(move |this, _, _, cx| this.update_edit(cx, |e| e.frequency = HabitFrequency::Weekly { days: n })),
+                    )
+                })))
+                .into_any_element(),
+            HabitFrequency::Interval { days } => h_flex()
+                .gap_2()
+                .child(div().flex_1().child(Label::new(strings.habit_every_n_days.replace("{n}", &days.to_string())).size(LabelSize::Small)))
+                .child(IconButton::new("interval-fewer", IconName::Minus).on_click(cx.listener(|this, _, _, cx| {
+                    this.update_edit(cx, |e| {
+                        if let HabitFrequency::Interval { days } = &mut e.frequency {
+                            *days = days.saturating_sub(1).max(2);
+                        }
+                    })
+                })))
+                .child(IconButton::new("interval-more", IconName::Plus).on_click(cx.listener(|this, _, _, cx| {
+                    this.update_edit(cx, |e| {
+                        if let HabitFrequency::Interval { days } = &mut e.frequency {
+                            *days = (*days + 1).min(365);
+                        }
+                    })
+                })))
+                .into_any_element(),
+        };
+        v_flex().gap_2().child(tabs).child(detail).into_any_element()
+    }
+
     fn shift_month(&mut self, delta: i32, cx: &mut Context<Self>) {
         self.month = calendar::add_months(self.month, delta);
         cx.notify();
@@ -293,6 +396,8 @@ impl HabitView {
         } else if let Some(times) = command.strip_prefix("remind=") {
             let times: Vec<chrono::NaiveTime> = times.split(',').filter_map(crate::due_picker::parse_time).collect();
             self.store.set_habit_reminders(id, &times).ok();
+        } else if let Some(frequency) = command.strip_prefix("freq=") {
+            self.store.set_habit_frequency(id, HabitFrequency::from_storage(frequency)).ok();
         } else if command == "edit" {
             self.reload(cx);
             self.start_edit(window, cx);
@@ -328,10 +433,16 @@ impl HabitView {
     /// A check-in dot: filled when the day is done, lighter for a partial amount.
     fn dot_color(&self, habit: Id, date: NaiveDate, cx: &App) -> Hsla {
         let colors = cx.theme().colors();
-        if self.checkins.get(&habit).is_some_and(|c| c.contains(&date)) {
+        let empty = HashSet::new();
+        let done = self.checkins.get(&habit).unwrap_or(&empty);
+        let frequency = self.habits.iter().find(|h| h.id == habit).map(|h| h.frequency).unwrap_or_default();
+        if done.contains(&date) {
             colors.accent
         } else if self.amount(habit, date) > 0 {
             colors.accent.opacity(0.4)
+        } else if !frequency.is_due(date, done) {
+            // Not scheduled that day.
+            colors.element_hover.opacity(0.35)
         } else {
             colors.element_hover
         }
@@ -452,7 +563,7 @@ impl HabitView {
         let id = habit.id;
         let empty = HashSet::new();
         let checked = self.checkins.get(&id).unwrap_or(&empty);
-        let stats = habit::stats(checked, today);
+        let stats = habit::stats_for(&habit.frequency, checked, today);
         let initial: String = habit.name.chars().next().map(|c| c.to_uppercase().collect()).unwrap_or_default();
         let group = SharedString::from(format!("habit-{id}"));
 
@@ -537,8 +648,8 @@ impl HabitView {
         let id = habit.id;
         let empty = HashSet::new();
         let checked = self.checkins.get(&id).unwrap_or(&empty);
-        let stats = habit::stats(checked, today);
-        let month = habit::month_stats(checked, self.month, today);
+        let stats = habit::stats_for(&habit.frequency, checked, today);
+        let month = habit::month_stats_for(&habit.frequency, checked, self.month, today);
         let status = theme.status().clone();
         let no_records = Vec::new();
         let records = self.records.get(&id).unwrap_or(&no_records);

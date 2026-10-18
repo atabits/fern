@@ -16,6 +16,62 @@ pub struct Habit {
     pub goal: Option<Goal>,
     /// Times of day to be reminded, earliest first.
     pub reminders: Vec<NaiveTime>,
+    pub frequency: Frequency,
+}
+
+/// How often a habit is meant to be done, as in the original's Frequency menu.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Frequency {
+    /// On the given weekdays (bit 0 = Monday); all seven is "every day".
+    Daily { weekdays: u8 },
+    /// Any N days a week.
+    Weekly { days: u8 },
+    /// Every N days.
+    Interval { days: u32 },
+}
+
+impl Default for Frequency {
+    fn default() -> Self {
+        Self::Daily { weekdays: Self::EVERY_DAY }
+    }
+}
+
+impl Frequency {
+    pub const EVERY_DAY: u8 = 0b111_1111;
+
+    /// Whether the habit should be done on `date`, given the days it was done.
+    pub fn is_due(&self, date: NaiveDate, done: &HashSet<NaiveDate>) -> bool {
+        match *self {
+            Self::Daily { weekdays } => weekdays & (1 << date.weekday().num_days_from_monday()) != 0,
+            Self::Weekly { days } => {
+                let monday = date - Duration::days(date.weekday().num_days_from_monday() as i64);
+                let this_week = (0..7).map(|i| monday + Duration::days(i)).filter(|d| *d != date && done.contains(d)).count();
+                this_week < days as usize
+            }
+            Self::Interval { days } => {
+                (1..days.max(1) as i64).all(|ago| !done.contains(&(date - Duration::days(ago))))
+            }
+        }
+    }
+
+    /// Stored as "daily:127", "weekly:2" or "interval:3".
+    pub fn to_storage(&self) -> String {
+        match *self {
+            Self::Daily { weekdays } => format!("daily:{weekdays}"),
+            Self::Weekly { days } => format!("weekly:{days}"),
+            Self::Interval { days } => format!("interval:{days}"),
+        }
+    }
+
+    pub fn from_storage(text: &str) -> Self {
+        let (kind, n) = text.split_once(':').unwrap_or((text, ""));
+        match (kind, n.parse::<u32>()) {
+            ("daily", Ok(mask)) if mask & Self::EVERY_DAY as u32 != 0 => Self::Daily { weekdays: mask as u8 & Self::EVERY_DAY },
+            ("weekly", Ok(days)) if (1..=7).contains(&days) => Self::Weekly { days: days as u8 },
+            ("interval", Ok(days)) if days >= 1 => Self::Interval { days },
+            _ => Self::default(),
+        }
+    }
 }
 
 /// Habit reminders firing in `(after, until]`: every reminder time of every day, unless the habit
@@ -30,7 +86,9 @@ pub fn reminders_between<'a>(
     for habit in habits {
         let mut day = after.date();
         while day <= until.date() {
-            let done_today = done.get(&habit.id).is_some_and(|days| days.contains(&day));
+            let days_done = done.get(&habit.id);
+            let done_today = days_done.is_some_and(|days| days.contains(&day))
+                || !habit.frequency.is_due(day, days_done.unwrap_or(&HashSet::new()));
             for time in &habit.reminders {
                 let at = day.and_time(*time);
                 if at > after && at <= until && !done_today {
@@ -77,10 +135,32 @@ pub struct HabitStats {
 }
 
 pub fn stats(checkins: &HashSet<NaiveDate>, today: NaiveDate) -> HabitStats {
-    let mut day = if checkins.contains(&today) { today } else { today - Duration::days(1) };
+    stats_for(&Frequency::default(), checkins, today)
+}
+
+/// Statistics where the streak only counts the days the habit is scheduled on: a Monday,
+/// Wednesday, Friday habit keeps its streak over the days in between. Weekly and interval habits
+/// count consecutive check-ins.
+pub fn stats_for(frequency: &Frequency, checkins: &HashSet<NaiveDate>, today: NaiveDate) -> HabitStats {
+    let scheduled = |day: NaiveDate| match frequency {
+        Frequency::Daily { weekdays } => weekdays & (1 << day.weekday().num_days_from_monday()) != 0,
+        _ => checkins.contains(&day),
+    };
+    let mut day = today;
     let mut streak = 0;
-    while checkins.contains(&day) {
-        streak += 1;
+    // Today does not break the streak until it is over.
+    if !checkins.contains(&today) {
+        day -= Duration::days(1);
+    }
+    let oldest = checkins.iter().min().copied().unwrap_or(today);
+    while day >= oldest {
+        if checkins.contains(&day) {
+            streak += 1;
+        } else if scheduled(day) {
+            break;
+        } else if !matches!(frequency, Frequency::Daily { .. }) {
+            break;
+        }
         day -= Duration::days(1);
     }
     HabitStats { total_days: checkins.len(), streak }
@@ -98,6 +178,11 @@ pub struct MonthStats {
 
 /// Statistics for the month containing `month`.
 pub fn month_stats(checkins: &HashSet<NaiveDate>, month: NaiveDate, today: NaiveDate) -> MonthStats {
+    month_stats_for(&Frequency::default(), checkins, month, today)
+}
+
+/// Like [`month_stats`], with the rate counted over the scheduled days of a daily habit.
+pub fn month_stats_for(frequency: &Frequency, checkins: &HashSet<NaiveDate>, month: NaiveDate, today: NaiveDate) -> MonthStats {
     let in_month = |date: &NaiveDate| date.year() == month.year() && date.month() == month.month();
     let days = checkins.iter().filter(|date| in_month(date)).count();
     let first = month.with_day(1).unwrap_or(month);
@@ -107,12 +192,19 @@ pub fn month_stats(checkins: &HashSet<NaiveDate>, month: NaiveDate, today: Naive
         NaiveDate::from_ymd_opt(first.year(), first.month() + 1, 1)
     }
     .unwrap_or(first);
+    let last = if today >= next { next - Duration::days(1) } else { today };
     let elapsed = if today < first {
         0
-    } else if today >= next {
-        (next - first).num_days()
     } else {
-        (today - first).num_days() + 1
+        let mut count = 0;
+        let mut day = first;
+        while day <= last {
+            if !matches!(frequency, Frequency::Daily { weekdays } if weekdays & (1 << day.weekday().num_days_from_monday()) == 0) {
+                count += 1;
+            }
+            day += Duration::days(1);
+        }
+        count
     };
     let rate = if elapsed == 0 { 0 } else { (days as i64 * 100 / elapsed) as u32 };
     MonthStats { days, rate }
@@ -145,6 +237,7 @@ mod tests {
             name: "Read".into(),
             goal: None,
             reminders: vec![NaiveTime::from_hms_opt(9, 0, 0).unwrap(), NaiveTime::from_hms_opt(21, 0, 0).unwrap()],
+            frequency: Frequency::default(),
         };
         let habits = [habit.clone()];
         let mut done = HashMap::new();
@@ -153,6 +246,39 @@ mod tests {
         assert_eq!(times, [at(17, 9), at(17, 21), at(18, 9)]);
         done.insert(habit.id, HashSet::from([d(17)]));
         assert_eq!(reminders_between(&habits, &done, at(17, 8), at(18, 10)).len(), 1);
+    }
+
+    #[test]
+    fn frequencies() {
+        // 2026-10-19 is a Monday.
+        let mon_wed_fri = Frequency::Daily { weekdays: 0b10101 };
+        let none = HashSet::new();
+        assert!(mon_wed_fri.is_due(d(19), &none) && !mon_wed_fri.is_due(d(20), &none));
+
+        let twice_a_week = Frequency::Weekly { days: 2 };
+        let done: HashSet<_> = [d(19), d(20)].into();
+        assert!(!twice_a_week.is_due(d(21), &done), "done twice this week already");
+        assert!(twice_a_week.is_due(d(20), &done), "the day itself does not count against it");
+        assert!(twice_a_week.is_due(d(26), &done), "a new week");
+
+        let every_third_day = Frequency::Interval { days: 3 };
+        let done: HashSet<_> = [d(19)].into();
+        assert!(!every_third_day.is_due(d(20), &done) && !every_third_day.is_due(d(21), &done));
+        assert!(every_third_day.is_due(d(22), &done));
+
+        for f in [mon_wed_fri, twice_a_week, every_third_day, Frequency::default()] {
+            assert_eq!(Frequency::from_storage(&f.to_storage()), f);
+        }
+        assert_eq!(Frequency::from_storage("daily:0"), Frequency::default());
+
+        // The streak skips unscheduled days: Mon, Wed, Fri checked, today is Saturday.
+        let checked: HashSet<_> = [d(19), d(21), d(23)].into();
+        assert_eq!(stats_for(&mon_wed_fri, &checked, d(24)).streak, 3);
+        assert_eq!(stats_for(&Frequency::default(), &checked, d(24)).streak, 1);
+        // Rate over scheduled days: Mon 19 to Sat 24 has 3 scheduled days, all done.
+        let rate = month_stats_for(&mon_wed_fri, &checked, d(1), d(24)).rate;
+        let all_days = month_stats_for(&Frequency::default(), &checked, d(1), d(24)).rate;
+        assert!(rate > all_days);
     }
 
     #[test]

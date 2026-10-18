@@ -4309,6 +4309,14 @@ impl TodoView {
                         let color = tag_colors.get(tag).copied().unwrap_or(theme.colors().text_muted);
                         Chip::new(tag.clone(), color)
                     }))
+                    // As the original's, a view across lists names each task's list after its tags.
+                    .when(self.view.shows_list_names(), |el| {
+                        let list = task
+                            .list_id
+                            .and_then(|id| self.lists.iter().find(|l| l.id == id))
+                            .map_or(SharedString::new_static(strings.inbox), |l| l.name.clone().into());
+                        el.child(div().flex_none().child(Label::new(list).size(LabelSize::Small).color(Color::Muted)))
+                    })
                     .when_some(task.checklist, |el, (done_items, total)| {
                         el.child(
                             h_flex()
@@ -4321,14 +4329,6 @@ impl TodoView {
                                         .color(Color::Muted),
                                 ),
                         )
-                    })
-                    // Closed tasks show their list, as in the original's Completed and Won't Do views.
-                    .when(closed_view, |el| {
-                        let list = task
-                            .list_id
-                            .and_then(|id| self.lists.iter().find(|l| l.id == id))
-                            .map_or(SharedString::new_static(strings.inbox), |l| l.name.clone().into());
-                        el.child(Label::new(list).size(LabelSize::Small).color(Color::Muted))
                     })
                     .when_some(due, |el, (label, overdue)| {
                         el.when(!task.reminders.is_empty() && !closed_view, |el| {

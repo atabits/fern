@@ -13,7 +13,7 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 | Narrow sections sidebar | ≈ 50 wide |
 | Window top | every column starts 13 below the window's top edge, the room the original keeps for its title bar's buttons (sidebar, lists column, task list, details and every section; matched to screenshots) |
 | Lists column | ≈ 212 wide, items 38 apart, selection radius ≈ 6; Lists, Tags and Filters follow one another without lines, their "+" shown on hover, an empty Lists section with the original's hint (matched to a screenshot; the reference account, which has no lists, shows Tags above Lists — whether the original keeps that order once there are lists was not seen, so Fern keeps Lists first) |
-| Task row | 40 tall, 1 px separator at the bottom, selection ~6% lighter than the background; a hovered row shows the original's "≡" drag handle left of it and "…" (the task's menu) right of it, outside the row's highlight, as the original's; the hovered row lightens by about as much as the original's (matched to screenshots taken with the pointer over a row in both apps) |
+| Task row | 40 tall, 1 px separator at the bottom, selection ~6% lighter than the background; a hovered row shows the original's "≡" drag handle left of it and "…" (the task's menu) right of it, outside the row's highlight, as the original's; the hovered row lightens by about as much as the original's (matched to screenshots taken with the pointer over a row in both apps); in a view across lists — the smart lists, a tag, Completed, Won't Do, Trash, a filter or a search — a row names its task's list in muted small text after its tags, before its icons and date, as the original's (matched to screenshots of Next 7 Days and a tag); a list's own view and the Inbox leave it out |
 | "Add task" field | ≈ 38 tall, lighter background, 20 in from the column's edge like the rows, an accent outline while focused (matched to a screenshot) |
 | List header | ≈ 60 tall, sidebar toggle on the left, sort and "…" on the right |
 | Tag chip | ≈ 18 tall, fully rounded, tag color at ~30% as background, lighter tag color as text |
@@ -99,9 +99,9 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 
 Each item is a whole feature area, done in one pass (it may take several commits).
 
-1. Row list names: the original shows a task's list ("Inbox") after its tags in a tag's view and the smart lists; match it, in one pass.
-2. Task detail's list button: the list menu in the details' bottom bar against the original's, opened and closed without moving the task, in one pass.
-3. Calendar header "…" menu: the original's calendar "…" menu and what it opens against Fern's, opened and closed without changing a setting, in one pass.
-4. Hover states across the app: the lists column's rows, the sidebar's icons, the header buttons and the kanban cards hovered in the original against Fern's, in one pass.
+1. Task detail's list button: the list menu in the details' bottom bar against the original's, opened and closed without moving the task, in one pass.
+2. Calendar header "…" menu: the original's calendar "…" menu and what it opens against Fern's, opened and closed without changing a setting, in one pass.
+3. Hover states across the app: the lists column's rows, the sidebar's icons, the header buttons and the kanban cards hovered in the original against Fern's, in one pass.
+4. Today's kanban: the original's Today shows as columns (tasks and a Habit column); its column headers, cards and the habit cards against Fern's, in one pass.
 
 Not checkable under the reference rules: the search's full results page (typing a query needs TickTick focused, and the search closes when the focus goes back); countdowns in Today (the reference account has none due today); the empty states of Today, Next 7 Days, All, the Inbox and the tags (none of them is empty in the reference account); the original's light theme (the reference account uses a theme with its own photo, which switching might not restore); a saved filter's view (the reference account has none); whether the original asks for a note when a focus session ends, and its white noise (the desktop original shows no sound choice on the focus page or in Focus Settings; it would only appear with a timer running in the reference account). Fern's record dialog takes a note afterwards.

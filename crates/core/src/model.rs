@@ -313,6 +313,28 @@ pub enum View {
     Day(NaiveDate),
 }
 
+impl View {
+    /// Whether the view gathers tasks from several lists, so that its rows name each task's list
+    /// after the tags, as the original's smart lists, tags and searches do.
+    pub fn shows_list_names(&self) -> bool {
+        !matches!(self, Self::Inbox | Self::List(_) | Self::Summary)
+    }
+}
+
+#[cfg(test)]
+mod view_tests {
+    use super::*;
+
+    #[test]
+    fn list_names_in_views_across_lists() {
+        assert!(View::Next7Days.shows_list_names());
+        assert!(View::Tag("work".into()).shows_list_names());
+        assert!(View::Completed.shows_list_names());
+        assert!(!View::Inbox.shows_list_names());
+        assert!(!View::List(uuid::Uuid::now_v7()).shows_list_names());
+    }
+}
+
 /// Open-task counters for the lists column.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ViewCounts {

@@ -214,6 +214,15 @@ impl AppView {
                     this.focus.update(cx, |view, cx| view.dev_record(title, ago, minutes, stopwatch, cx));
                 }
             }
+            // `focus-timer=<name>`, repeatable: a timer in the Pomodoro list; `focus-timer-add`
+            // opens "Add Timer".
+            for name in state.split(';').filter_map(|part| part.strip_prefix("focus-timer=")) {
+                this.store.save_focus_timer(&fern_core::focus::FocusTimer::new(name)).ok();
+                this.focus.update(cx, |view, cx| view.reload(cx));
+            }
+            if state.contains("focus-timer-add") {
+                this.focus.update(cx, |view, cx| view.dev_add_timer(window, cx));
+            }
             if let Some(menu) = state.split(';').find_map(|part| part.strip_prefix("focus-menu=")) {
                 this.focus.update(cx, |view, cx| view.dev_menu(menu, cx));
             }

@@ -569,6 +569,17 @@ const MIGRATIONS: &[&str] = &[
     "
     ALTER TABLE countdowns ADD COLUMN pinned_at INTEGER;
     ",
+    "
+    CREATE TABLE focus_timers (
+        id          TEXT PRIMARY KEY,
+        name        TEXT NOT NULL,
+        icon        TEXT,
+        minutes     INTEGER NOT NULL,
+        stopwatch   INTEGER NOT NULL DEFAULT 0,
+        archived_at INTEGER,
+        created_at  INTEGER NOT NULL
+    );
+    ",
 ];
 
 const TASK_COLUMNS: &str = "id, parent_id, kind, title, notes, priority, due_date, due_time, \
@@ -1964,6 +1975,53 @@ impl Store {
         Ok(())
     }
 
+    /// The Pomodoro list's timers ("Add Timer"), oldest first; active ones or archived ones.
+    pub fn focus_timers(&self, archived: bool) -> Result<Vec<crate::focus::FocusTimer>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, icon, minutes, stopwatch, archived_at FROM focus_timers
+             WHERE (archived_at IS NOT NULL) = ?1 ORDER BY created_at, rowid",
+        )?;
+        let rows = stmt
+            .query_map([archived], |row| {
+                Ok(crate::focus::FocusTimer {
+                    id: parse_uuid(&row.get::<_, String>(0)?, 0)?,
+                    name: row.get(1)?,
+                    icon: row.get(2)?,
+                    minutes: row.get(3)?,
+                    stopwatch: row.get(4)?,
+                    archived: row.get::<_, Option<i64>>(5)?.is_some(),
+                })
+            })?
+            .collect::<Result<_, _>>()?;
+        Ok(rows)
+    }
+
+    /// Adds or edits a timer: its name, icon, Pomo length in minutes or stopwatch.
+    pub fn save_focus_timer(&self, timer: &crate::focus::FocusTimer) -> Result<()> {
+        let name = timer.name.trim();
+        anyhow::ensure!(!name.is_empty(), "a timer needs a name");
+        self.conn.execute(
+            "INSERT INTO focus_timers (id, name, icon, minutes, stopwatch, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(id) DO UPDATE SET name = excluded.name, icon = excluded.icon,
+                 minutes = excluded.minutes, stopwatch = excluded.stopwatch",
+            params![timer.id.to_string(), name, timer.icon, timer.minutes.max(1), timer.stopwatch, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_focus_timer_archived(&self, id: Id, archived: bool) -> Result<()> {
+        self.conn.execute(
+            "UPDATE focus_timers SET archived_at = ?2 WHERE id = ?1",
+            params![id.to_string(), archived.then(now_ms)],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_focus_timer(&self, id: Id) -> Result<()> {
+        self.conn.execute("DELETE FROM focus_timers WHERE id = ?1", [id.to_string()])?;
+        Ok(())
+    }
+
     /// The Focus Record's "Batch Management" Delete: these records go.
     pub fn delete_focus_sessions(&self, ids: &[Id]) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
@@ -2922,6 +2980,26 @@ mod tests {
         assert!(store.attachments(task.id)?.is_empty());
         assert!(!attachment.path(&folder).exists());
         std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn focus_timers() -> Result<()> {
+        use crate::focus::FocusTimer;
+        let store = Store::open_in_memory()?;
+        let mut timer = FocusTimer::new("Planning");
+        assert_eq!((timer.minutes, timer.stopwatch), (25, false));
+        store.save_focus_timer(&timer)?;
+        timer.name = "Weekly planning".into();
+        timer.minutes = 45;
+        store.save_focus_timer(&timer)?;
+        assert_eq!(store.focus_timers(false)?, [timer.clone()]);
+        store.set_focus_timer_archived(timer.id, true)?;
+        assert!(store.focus_timers(false)?.is_empty());
+        assert_eq!(store.focus_timers(true)?[0].id, timer.id);
+        store.delete_focus_timer(timer.id)?;
+        assert!(store.focus_timers(true)?.is_empty());
+        assert!(store.save_focus_timer(&FocusTimer::new(" ")).is_err());
         Ok(())
     }
 

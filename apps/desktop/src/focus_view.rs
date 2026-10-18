@@ -45,6 +45,12 @@ pub struct FocusView {
     sessions: Vec<FocusSession>,
     running: Option<Running>,
     record_menu: Option<RecordMenu>,
+    /// The Pomodoro list's timers (the original's "Add Timer"), the tab showing (archived or
+    /// active), the "Add Timer"/edit popover and the timer whose "…" menu is open.
+    timers: Vec<fern_core::focus::FocusTimer>,
+    archived_tab: bool,
+    timer_draft: Option<TimerDraft>,
+    timer_menu: Option<Id>,
     /// "Delete All" asks for a second click.
     delete_all_armed: bool,
     /// The records ticked in Batch Management.
@@ -181,6 +187,13 @@ fn line_chart(values: &[i64], labels: Vec<String>, height: f32, from_zero: bool,
 }
 
 /// The Focus Record's "+" form and "…" menu, as in the original.
+/// The "Add Timer" popover: the timer it edits (or a new one), its name, Pomo length and mode.
+struct TimerDraft {
+    timer: fern_core::focus::FocusTimer,
+    name: Entity<TextInput>,
+    new: bool,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RecordMenu {
     Add,
@@ -203,6 +216,10 @@ impl FocusView {
             sessions: Vec::new(),
             running: None,
             record_menu: None,
+            timers: Vec::new(),
+            archived_tab: false,
+            timer_draft: None,
+            timer_menu: None,
             delete_all_armed: false,
             batch: HashSet::new(),
             add_title,
@@ -221,6 +238,7 @@ impl FocusView {
         let today = Local::now().date_naive();
         self.tasks = self.store.tasks_in(&View::Today, today).unwrap_or_default();
         self.sessions = self.store.focus_sessions().unwrap_or_default();
+        self.timers = self.store.focus_timers(self.archived_tab).unwrap_or_default();
         cx.notify();
     }
 
@@ -611,6 +629,216 @@ impl FocusView {
                         )
                     }),
             )
+            .into_any_element()
+    }
+
+    /// "+" in the Pomodoro header, or Edit in a timer's menu: the original's "Add Timer".
+    fn open_timer(&mut self, timer: Option<fern_core::focus::FocusTimer>, window: &mut Window, cx: &mut Context<Self>) {
+        let strings = i18n::t(cx);
+        let new = timer.is_none();
+        let timer = timer.unwrap_or_else(|| fern_core::focus::FocusTimer::new(""));
+        let name = cx.new(|cx| {
+            let mut input = TextInput::new(Mode::SingleLine, strings.timer_name, cx);
+            input.set_text(timer.name.clone(), cx);
+            input
+        });
+        cx.subscribe(&name, |this, _, _: &crate::text_input::Submitted, cx| this.save_timer(cx)).detach();
+        window.focus(&name.focus_handle(cx), cx);
+        self.timer_menu = None;
+        self.timer_draft = Some(TimerDraft { timer, name, new });
+        cx.notify();
+    }
+
+    fn save_timer(&mut self, cx: &mut Context<Self>) {
+        let Some(draft) = self.timer_draft.take() else { return };
+        let mut timer = draft.timer;
+        timer.name = draft.name.read(cx).text().trim().to_owned();
+        if let Err(err) = self.store.save_focus_timer(&timer) {
+            eprintln!("failed to save the timer: {err:#}");
+            if !timer.name.is_empty() {
+                return;
+            }
+        }
+        self.reload(cx);
+    }
+
+    fn render_timer_draft(&self, draft: &TimerDraft, cx: &mut Context<Self>) -> AnyElement {
+        let strings = i18n::t(cx);
+        let theme = cx.theme().clone();
+        let timer = &draft.timer;
+        let change = |f: fn(&mut fern_core::focus::FocusTimer)| {
+            cx.listener(move |this: &mut Self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>| {
+                if let Some(draft) = this.timer_draft.as_mut() {
+                    f(&mut draft.timer);
+                }
+                cx.notify();
+            })
+        };
+        let radio = |on: bool| {
+            div()
+                .size(px(14.))
+                .rounded_full()
+                .border_1()
+                .border_color(if on { theme.colors().accent } else { theme.colors().text_muted })
+                .when(on, |el| el.bg(theme.colors().accent))
+        };
+        let button = |id: &'static str, label: &'static str, primary: bool| {
+            div()
+                .id(id)
+                .flex_1()
+                .h(px(28.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(6.))
+                .cursor_pointer()
+                .when(primary, |el| el.bg(theme.colors().accent))
+                .when(!primary, |el| el.border_1().border_color(theme.colors().border))
+                .child(Label::new(label).size(LabelSize::Small))
+        };
+        popover(cx)
+            .w(px(300.))
+            .p_3()
+            .gap_3()
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.timer_draft = None;
+                cx.notify();
+            }))
+            .child(Label::new(if draft.new { strings.add_timer } else { strings.edit_timer }).weight(FontWeight::SEMIBOLD))
+            .child(h_flex().h(px(30.)).px_2().rounded(px(6.)).bg(theme.colors().background).child(draft.name.clone()))
+            .child(Label::new(strings.timer_mode).size(LabelSize::Small).color(Color::Muted))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        h_flex()
+                            .id("timer-pomo")
+                            .gap_2()
+                            .cursor_pointer()
+                            .child(radio(!timer.stopwatch))
+                            .child(Label::new(strings.focus_modes[0]).size(LabelSize::Small))
+                            .on_click(change(|t| t.stopwatch = false)),
+                    )
+                    .child(IconButton::new("timer-less", IconName::Minus).size(px(22.)).icon_size(IconSize::XSmall).on_click(change(|t| t.minutes = (t.minutes - 5).max(5))))
+                    .child(Label::new(timer.minutes.to_string()).size(LabelSize::Small))
+                    .child(IconButton::new("timer-more", IconName::Plus).size(px(22.)).icon_size(IconSize::XSmall).on_click(change(|t| t.minutes = (t.minutes + 5).min(180))))
+                    .child(Label::new(strings.minutes).size(LabelSize::XSmall).color(Color::Muted)),
+            )
+            .child(
+                h_flex()
+                    .id("timer-stopwatch")
+                    .gap_2()
+                    .cursor_pointer()
+                    .child(radio(timer.stopwatch))
+                    .child(Label::new(strings.focus_modes[1]).size(LabelSize::Small))
+                    .on_click(change(|t| t.stopwatch = true)),
+            )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(button("timer-close", strings.close, false).on_click(cx.listener(|this, _, _, cx| {
+                        this.timer_draft = None;
+                        cx.notify();
+                    })))
+                    .child(button("timer-save", strings.save, true).on_click(cx.listener(|this, _, _, cx| this.save_timer(cx)))),
+            )
+            .into_any_element()
+    }
+
+    /// A timer of the Pomodoro list: its icon, name, today's minutes and play; its "…" has Edit,
+    /// Archive (or Restore) and Delete.
+    fn render_timer(&self, timer: &fern_core::focus::FocusTimer, today_minutes: i64, cx: &mut Context<Self>) -> AnyElement {
+        let strings = i18n::t(cx);
+        let theme = cx.theme().clone();
+        let id = timer.id;
+        let (name, stopwatch) = (timer.name.clone(), timer.stopwatch);
+        let initial = timer.icon.clone().unwrap_or_else(|| timer.name.chars().next().map(|c| c.to_uppercase().collect()).unwrap_or_default());
+        let group = SharedString::from(format!("timer-{id}"));
+        let menu_open = self.timer_menu == Some(id);
+        let archived = timer.archived;
+        let edited = timer.clone();
+        h_flex()
+            .id(group.clone())
+            .group(group.clone())
+            .h(px(40.))
+            .px_2()
+            .gap_2()
+            .rounded(px(6.))
+            .hover(|s| s.bg(theme.colors().ghost_element_hover))
+            .child(
+                div()
+                    .size(px(22.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_full()
+                    .bg(theme.colors().accent.opacity(0.3))
+                    .text_size(px(11.))
+                    .child(initial),
+            )
+            .child(div().flex_1().min_w_0().child(Label::new(timer.name.clone()).truncate()))
+            .child(Label::new(format_minutes(today_minutes)).size(LabelSize::Small).color(Color::Muted))
+            .child(
+                div()
+                    .relative()
+                    .opacity(if menu_open { 1. } else { 0. })
+                    .group_hover(group, |s| s.opacity(1.))
+                    .child(IconButton::new("timer-more", IconName::Ellipsis).size(px(22.)).icon_size(IconSize::Small).on_click(cx.listener(move |this, _, _, cx| {
+                        this.timer_menu = if this.timer_menu == Some(id) { None } else { Some(id) };
+                        cx.notify();
+                    })))
+                    .when(menu_open, |el| {
+                        el.child(PopoverAttachment::new(
+                            Placement::BelowRight,
+                            popover(cx)
+                                .w(px(160.))
+                                .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                                    this.timer_menu = None;
+                                    cx.notify();
+                                }))
+                                .child(
+                                    ListItem::new("timer-edit")
+                                        .start_slot(Icon::new(IconName::Pencil).color(Color::Muted))
+                                        .child(Label::new(strings.edit))
+                                        .on_click(cx.listener(move |this, _, window, cx| this.open_timer(Some(edited.clone()), window, cx))),
+                                )
+                                .child(
+                                    ListItem::new("timer-archive")
+                                        .start_slot(Icon::new(if archived { IconName::ArchiveRestore } else { IconName::Archive }).color(Color::Muted))
+                                        .child(Label::new(if archived { strings.habit_unarchive } else { strings.habit_archive }))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            if let Err(err) = this.store.set_focus_timer_archived(id, !archived) {
+                                                eprintln!("failed to archive the timer: {err:#}");
+                                            }
+                                            this.timer_menu = None;
+                                            this.reload(cx);
+                                        })),
+                                )
+                                .child(
+                                    ListItem::new("timer-delete")
+                                        .start_slot(Icon::new(IconName::Trash).color(Color::Error))
+                                        .child(Label::new(strings.delete).color(Color::Error))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            if let Err(err) = this.store.delete_focus_timer(id) {
+                                                eprintln!("failed to delete the timer: {err:#}");
+                                            }
+                                            this.timer_menu = None;
+                                            this.reload(cx);
+                                        })),
+                                )
+                                .into_any_element(),
+                        ))
+                    }),
+            )
+            .when(!archived, |el| {
+                el.child(
+                    IconButton::new("timer-play", IconName::Play)
+                        .size(px(22.))
+                        .icon_size(IconSize::Small)
+                        .icon_color(Color::Accent)
+                        .on_click(cx.listener(move |this, _, _, cx| this.start_named(name.clone(), stopwatch, cx))),
+                )
+            })
             .into_any_element()
     }
 
@@ -1762,6 +1990,11 @@ impl FocusView {
     }
 
     #[cfg(debug_assertions)]
+    pub fn dev_add_timer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_timer(None, window, cx);
+    }
+
+    #[cfg(debug_assertions)]
     pub fn dev_menu(&mut self, menu: &str, cx: &mut Context<Self>) {
         let menu = match menu {
             "add" => RecordMenu::Add,
@@ -2058,6 +2291,22 @@ impl Render for FocusView {
             })
             .collect();
 
+        // A timer's minutes today: the sessions named after it.
+        let timer_rows: Vec<AnyElement> = self
+            .timers
+            .clone()
+            .iter()
+            .map(|timer| {
+                let minutes: i64 = self
+                    .sessions
+                    .iter()
+                    .filter(|s| s.start_local().date_naive() == today && s.title == timer.name)
+                    .map(|s| s.minutes())
+                    .sum();
+                self.render_timer(timer, minutes, cx)
+            })
+            .collect();
+
         let (clock, label, running, paused) = match &self.running {
             Some(r) => (
                 format_clock(r.timer.display(now)),
@@ -2090,6 +2339,34 @@ impl Render for FocusView {
                     .px(px(22.))
                     .gap_2()
                     .child(div().flex_1().child(Label::new(strings.pomodoro).size(LabelSize::Large).weight(FontWeight::BOLD)))
+                    // The original's Active and Archived tabs over the timers.
+                    .child(h_flex().p_0p5().rounded(px(8.)).bg(theme.colors().element_hover).children(
+                        [(false, strings.habit_active), (true, strings.habit_archived)].map(|(archived, label)| {
+                            let on = self.archived_tab == archived;
+                            div()
+                                .id(SharedString::from(format!("timers-tab-{archived}")))
+                                .px_3()
+                                .h(px(24.))
+                                .flex()
+                                .items_center()
+                                .rounded(px(6.))
+                                .cursor_pointer()
+                                .when(on, |el| el.bg(theme.colors().element_selected))
+                                .child(Label::new(label).size(LabelSize::Small).color(if on { Color::Default } else { Color::Muted }))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.archived_tab = archived;
+                                    this.reload(cx);
+                                }))
+                        }),
+                    ))
+                    .child(
+                        div()
+                            .relative()
+                            .child(IconButton::new("timer-add", IconName::Plus).on_click(cx.listener(|this, _, window, cx| this.open_timer(None, window, cx))))
+                            .when_some(self.timer_draft.as_ref(), |el, draft| {
+                                el.child(PopoverAttachment::new(Placement::BelowRight, self.render_timer_draft(draft, cx)))
+                            }),
+                    )
                     .child(
                         div()
                             .relative()
@@ -2109,10 +2386,12 @@ impl Render for FocusView {
                     .min_h_0()
                     .overflow_y_scroll()
                     .px_3()
-                    .when(rows.is_empty(), |el| {
+                    .children(timer_rows)
+                    .when(!self.archived_tab && rows.is_empty() && self.timers.is_empty(), |el| {
                         el.child(div().px_2().pt_4().child(Label::new(strings.focus_no_tasks).color(Color::Muted)))
                     })
-                    .children(rows),
+                    .when(!self.archived_tab && !self.timers.is_empty() && !rows.is_empty(), |el| el.child(div().my_1().child(Divider::horizontal())))
+                    .when(!self.archived_tab, |el| el.children(rows)),
             )
             .when(running, |el| {
                 el.child(

@@ -19,6 +19,27 @@ pub struct FocusSession {
     pub note: String,
 }
 
+/// A timer of the Pomodoro list (the original's "Add Timer"): a name and icon, and how it times.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FocusTimer {
+    pub id: Id,
+    pub name: String,
+    /// An emoji or short text; `None` shows the name's initial.
+    pub icon: Option<String>,
+    /// The Pomo length.
+    pub minutes: i64,
+    /// Timed with the stopwatch instead of a Pomo.
+    pub stopwatch: bool,
+    pub archived: bool,
+}
+
+impl FocusTimer {
+    /// A new timer as the original's dialog starts it: a 25-minute Pomo.
+    pub fn new(name: &str) -> Self {
+        Self { id: uuid::Uuid::now_v7(), name: name.to_owned(), icon: None, minutes: 25, stopwatch: false, archived: false }
+    }
+}
+
 impl FocusSession {
     pub fn minutes(&self) -> i64 {
         ((self.ended_at - self.started_at).max(0) + 30_000) / 60_000

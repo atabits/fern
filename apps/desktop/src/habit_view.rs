@@ -1538,7 +1538,8 @@ impl HabitView {
             .flex()
             .map(|el| {
                 if list {
-                    el.flex_row().items_center().w_full().h(px(72.)).gap_4()
+                    // The original's list rows: 60 px tall, the week's check-ins at the end.
+                    el.flex_row().items_center().w_full().h(px(60.)).gap_4()
                 } else {
                     el.flex_col().w(px(CARD_WIDTH)).h(px(CARD_HEIGHT)).gap_2()
                 }
@@ -1591,8 +1592,8 @@ impl HabitView {
                             ),
                     ),
             )
-            .child(h_flex().justify_between().px_1().when(list, |el| el.w(px(260.)).flex_none()).children(week.map(|date| {
-                self.checkin_mark(id, date, px(16.), cx)
+            .child(h_flex().justify_between().px_1().when(list, |el| el.w(px(200.)).flex_none()).children(week.map(|date| {
+                self.checkin_mark(id, date, px(if list { 22. } else { 16. }), cx)
                     .id(SharedString::from(format!("checkin-{id}-{date}")))
                     .cursor_pointer()
                     .when(date > today, |el| el.opacity(0.4))
@@ -1948,7 +1949,7 @@ impl Render for HabitView {
                     .w_full()
                     .gap_2()
                     .when(grouped, |el| el.child(self.render_section_header(section, title, in_section.len(), cx)))
-                    .child(div().flex().flex_wrap().gap(px(12.)).children(section_cards))
+                    .child(div().flex().flex_wrap().gap(px(if self.list_layout { 10. } else { 12. })).children(section_cards))
                     .into_any_element(),
             );
         }
@@ -1957,7 +1958,8 @@ impl Render for HabitView {
             .and_then(|id| habits.iter().find(|h| h.id == id))
             .map(|habit| self.render_detail(habit, today, cx));
 
-        let strip = h_flex().px(px(22.)).pb_3().children(week.map(|date| {
+        // As the original's, the habits start 35 px under the week's rings.
+        let strip = h_flex().px(px(22.)).pt(px(18.)).pb(px(34.)).children(week.map(|date| {
             let progress = self.day_progress(date);
             let is_today = date == today;
             let ring = if progress >= 1. {

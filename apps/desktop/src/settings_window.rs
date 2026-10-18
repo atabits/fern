@@ -384,7 +384,7 @@ impl SettingsWindow {
             .bg(cx.theme().colors().panel_background)
             .border_r_1()
             .border_color(cx.theme().colors().border)
-            .child(div().px_2().pt_2().pb_3().child(Label::new(strings.settings).size(LabelSize::Large).weight(FontWeight::SEMIBOLD)))
+            .child(div().px_2().pt_2().pb_3().child(div().text_size(px(18.)).font_weight(FontWeight::SEMIBOLD).child(strings.settings)))
             .child(
                 item("settings-features", IconName::LayoutGrid, strings.features, self.page == Page::Features)
                     .on_click(cx.listener(|this, _, _, cx| this.set_page(Page::Features, cx))),
@@ -463,7 +463,7 @@ impl SettingsWindow {
         let strings = i18n::t(cx);
         let colors = cx.theme().colors().clone();
         let group = || v_flex().py_1p5().rounded(px(8.)).bg(colors.surface_background);
-        let title = |text: &'static str| div().pb_3().child(Label::new(text).weight(FontWeight::SEMIBOLD));
+        let title = |text: &'static str| div().pb_3().child(Label::new(text).weight(FontWeight::MEDIUM));
         let body = v_flex().id("settings-page").flex_1().min_w_0().h_full().overflow_y_scroll().bg(colors.background).pt(px(48.)).px_6().pb_6().gap_4();
         match self.page {
             Page::SmartList => {

@@ -130,6 +130,24 @@ fn bar_chart(values: &[i64], labels: Vec<String>, highlight: Option<usize>, heig
         })))
 }
 
+/// Splits a template such as "{tasks} Tasks   {completed} Completed" into its pieces, each
+/// marked whether it is one of the filled-in counts.
+fn summary_parts(template: &str, counts: &[(&str, String)]) -> Vec<(String, bool)> {
+    let mut parts = Vec::new();
+    let mut rest = template;
+    while let Some((at, (key, value))) = counts.iter().filter_map(|c| rest.find(c.0).map(|at| (at, c))).min_by_key(|(at, _)| *at) {
+        if at > 0 {
+            parts.push((rest[..at].to_owned(), false));
+        }
+        parts.push((value.clone(), true));
+        rest = &rest[at + key.len()..];
+    }
+    if !rest.is_empty() {
+        parts.push((rest.to_owned(), false));
+    }
+    parts
+}
+
 /// A smooth line with a shaded area under it, scaled between the values' minimum and maximum,
 /// as in the original's "My Achievement Score".
 /// `from_zero` starts the scale at zero (counts); otherwise at the lowest value (the score).
@@ -1514,7 +1532,7 @@ impl FocusView {
                 .flex_1()
                 .items_center()
                 .gap_0p5()
-                .child(div().text_size(px(26.)).text_color(theme.colors().accent).child(value))
+                .child(div().text_size(px(26.)).font_weight(FontWeight::SEMIBOLD).text_color(theme.colors().accent).child(value))
                 .child(Label::new(label).size(LabelSize::Small).color(Color::Muted))
                 .children(change.map(|c| Label::new(c).size(LabelSize::XSmall).color(Color::Muted)))
         };
@@ -1717,7 +1735,7 @@ impl FocusView {
             .gap_4()
             .child(
                 h_flex()
-                    .child(div().flex_1().child(div().text_size(px(24.)).font_weight(FontWeight::BOLD).child(strings.statistics)))
+                    .child(div().flex_1().child(div().text_size(px(24.)).font_weight(FontWeight::MEDIUM).child(strings.statistics)))
                     .child(h_flex().p_0p5().rounded(px(16.)).bg(theme.colors().surface_background).children(
                         strings.stats_tabs.iter().enumerate().map(|(i, label)| {
                             div()
@@ -1966,15 +1984,19 @@ impl FocusView {
             v_flex()
                 .flex_1()
                 .items_center()
-                .child(div().text_size(px(22.)).text_color(theme.colors().accent).child(v))
+                .child(div().text_size(px(22.)).font_weight(FontWeight::SEMIBOLD).text_color(theme.colors().accent).child(v))
                 .child(Label::new(label).size(LabelSize::XSmall).color(Color::Muted))
         };
-        let summary = strings
-            .stats_summary
-            .replace("{tasks}", &open_total.to_string())
-            .replace("{completed}", &completed_total.to_string())
-            .replace("{lists}", &lists.len().to_string())
-            .replace("{days}", &fern_core::stats::days_using(&tasks, today).to_string());
+        // The counts are semibold, their words regular, as in the original.
+        let counts = [
+            ("{tasks}", open_total.to_string()),
+            ("{completed}", completed_total.to_string()),
+            ("{lists}", lists.len().to_string()),
+            ("{days}", fern_core::stats::days_using(&tasks, today).to_string()),
+        ];
+        let summary = h_flex().children(summary_parts(strings.stats_summary, &counts).into_iter().map(|(text, count)| {
+            Label::new(text).size(LabelSize::Small).when(count, |l| l.weight(FontWeight::SEMIBOLD))
+        }));
         // Each curve has its own Day / Week / Month switch, as in the original.
         let periods = |curve: usize| stats::buckets(page.curves[curve], today, crate::calendar::week_start(), 7);
         let labels = |curve: usize| -> Vec<String> {
@@ -2096,7 +2118,7 @@ impl FocusView {
                 .rounded(px(10.))
                 .bg(theme.colors().surface_background)
                 .flex()
-                .child(div().flex_1().child(Label::new(summary).size(LabelSize::Small)))
+                .child(div().flex_1().child(summary))
                 .child(
                     h_flex().gap_1().children({
                         let (before, after) = strings.stats_more_productive.split_once("{n}").unwrap_or((strings.stats_more_productive, ""));
@@ -2136,7 +2158,7 @@ impl FocusView {
                             h_flex()
                                 .gap_2()
                                 .child(div().flex_1().child(Label::new(strings.stats_achievement_score).weight(FontWeight::SEMIBOLD)))
-                                .child(div().text_size(px(18.)).text_color(theme.status().success).child(score.to_string()))
+                                .child(div().text_size(px(18.)).font_weight(FontWeight::SEMIBOLD).text_color(theme.status().success).child(score.to_string()))
                                 .child(
                                     div()
                                         .px_1p5()
@@ -2199,7 +2221,7 @@ impl FocusView {
             v_flex()
                 .flex_1()
                 .items_center()
-                .child(div().text_size(px(26.)).text_color(theme.colors().accent).child(v))
+                .child(div().text_size(px(26.)).font_weight(FontWeight::SEMIBOLD).text_color(theme.colors().accent).child(v))
                 .child(Label::new(label).size(LabelSize::XSmall).color(Color::Muted))
                 .child(Label::new(from.replace("{n}", &change)).size(LabelSize::XSmall).color(Color::Muted))
         };
@@ -3402,5 +3424,19 @@ impl Render for FocusView {
             .children(self.render_record_dialog(cx))
             .children(self.render_modal(cx))
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn summary_counts_stand_apart() {
+        let counts = [("{tasks}", "14".to_owned()), ("{days}", "3".to_owned())];
+        let parts = summary_parts("{tasks} Tasks   {days} Days", &counts);
+        assert_eq!(parts, [("14".into(), true), (" Tasks   ".into(), false), ("3".into(), true), (" Days".into(), false)]);
+        let ru = summary_parts("Задач: {tasks}", &counts);
+        assert_eq!(ru, [("Задач: ".into(), false), ("14".into(), true)]);
     }
 }

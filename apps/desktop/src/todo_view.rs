@@ -178,6 +178,7 @@ impl TodoView {
                 Some(("list", name)) => self.create_list(name, cx),
                 Some(("view", "trash")) => self.set_view(View::Trash, cx),
                 Some(("view", "wontdo")) => self.set_view(View::WontDo, cx),
+                Some(("view", "today")) => self.set_view(View::Today, cx),
                 Some(("drop", spec)) => {
                     // `drop=<title part>><today|tomorrow|inbox|completed|trash|list:Name|tag:Name>`:
                     // the same path as dropping a task on the lists column.
@@ -864,6 +865,81 @@ impl TodoView {
             .into_any_element()
     }
 
+    /// As in the original, Today and Next 7 Days list the habits due today, unless turned off in
+    /// the habit settings. Checking one checks the habit in (one unit for amount goals).
+    fn render_habits(&self, strings: &Strings, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !matches!(self.view, View::Today | View::Next7Days)
+            || self.store.setting(crate::habit_view::IN_TODAY_SETTING).ok().flatten().as_deref() == Some("0")
+        {
+            return None;
+        }
+        let theme = cx.theme().clone();
+        let today = Self::today();
+        let habits: Vec<(fern_core::Habit, bool)> = self
+            .store
+            .habits()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|h| !h.archived)
+            .filter_map(|h| {
+                let done = self.store.checkins(h.id).unwrap_or_default();
+                h.is_due(today, &done).then(|| {
+                    let checked = done.contains(&today);
+                    (h, checked)
+                })
+            })
+            .collect();
+        if habits.is_empty() {
+            return None;
+        }
+        let count = habits.len();
+        Some(
+            v_flex()
+                .child(
+                    h_flex()
+                        .h(px(36.))
+                        .gap_1()
+                        .pl(px(GUTTER))
+                        .child(Label::new(strings.section_habits).weight(FontWeight::BOLD))
+                        .child(div().pl_1().child(Label::new(count.to_string()).size(LabelSize::Small).color(Color::Muted))),
+                )
+                .children(habits.into_iter().map(|(habit, checked)| {
+                    let id = habit.id;
+                    let has_goal = habit.goal.is_some();
+                    h_flex()
+                        .h(px(ROW_HEIGHT))
+                        .pl(px(GUTTER))
+                        .pr_3()
+                        .gap(px(10.))
+                        .child(
+                            Checkbox::new(SharedString::from(format!("habit-check-{id}")))
+                                .toggle_state(checked)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    let result = if has_goal {
+                                        this.store.step_checkin(id, today).map(|_| ())
+                                    } else {
+                                        this.store.toggle_checkin(id, today).map(|_| ())
+                                    };
+                                    this.check(result);
+                                    cx.notify();
+                                })),
+                        )
+                        .child(crate::habit_view::avatar(&habit, px(22.), cx))
+                        .child(
+                            div().flex_1().min_w_0().child(
+                                Label::new(habit.name.clone())
+                                    .color(if checked { Color::Muted } else { Color::Default })
+                                    .strikethrough(checked)
+                                    .truncate(),
+                            ),
+                        )
+                        .border_b_1()
+                        .border_color(theme.colors().border_variant)
+                }))
+                .into_any_element(),
+        )
+    }
+
     fn set_closed_menu(&mut self, menu: Option<ClosedMenu>, cx: &mut Context<Self>) {
         self.closed_menu = menu;
         cx.notify();
@@ -1433,7 +1509,8 @@ impl Render for TodoView {
                             .color(Color::Muted),
                         ))
                     })
-                    .children(rows),
+                    .children(rows)
+                    .children(self.render_habits(strings, cx)),
             )
             .when_some(self.error.clone(), |el, error| {
                 el.child(

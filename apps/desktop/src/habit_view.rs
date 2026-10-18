@@ -24,7 +24,7 @@ const HABIT_EMOJI: [&str; 35] = [
 ];
 
 /// A habit's round avatar: its emoji or text on its color, or the name's initial.
-fn avatar(habit: &Habit, size: Pixels, cx: &App) -> Div {
+pub fn avatar(habit: &Habit, size: Pixels, cx: &App) -> Div {
     let theme = cx.theme();
     let label = habit
         .icon
@@ -89,11 +89,24 @@ pub struct HabitView {
     header_menu_open: bool,
     /// Sections the user added.
     sections: Vec<CustomSection>,
+    header_more: Option<HeaderMore>,
+    /// The last export's result, shown under the header.
+    export_message: Option<String>,
     /// The header's list button: habits as full-width rows instead of cards (kept in settings).
     list_layout: bool,
 }
 
 const LAYOUT_SETTING: &str = "habit_layout";
+/// Whether habits show in the Today and Next 7 Days lists ("1" by default).
+pub const IN_TODAY_SETTING: &str = "habits_in_today";
+const SORT_SETTING: &str = "habits_sort_by_status";
+
+/// The header's "…" menu and its Settings popover.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HeaderMore {
+    Menu,
+    Settings,
+}
 
 impl HabitView {
     pub fn new(store: Rc<Store>, cx: &mut Context<Self>) -> Self {
@@ -126,6 +139,8 @@ impl HabitView {
             header_menu_open: false,
             list_layout: false,
             sections: Vec::new(),
+            header_more: None,
+            export_message: None,
         };
         this.list_layout = this.store.setting(LAYOUT_SETTING).ok().flatten().as_deref() == Some("list");
         this.reload(cx);
@@ -748,6 +763,9 @@ impl HabitView {
             self.store.set_habit_section(id, section).ok();
         } else if command == "archive" {
             self.store.set_habit_archived(id, true).ok();
+        } else if command == "settings" {
+            self.header_more = Some(HeaderMore::Settings);
+            return;
         } else if command == "list" {
             self.set_list_layout(true, cx);
             return;
@@ -946,6 +964,120 @@ impl HabitView {
         .detach();
         window.focus(&input.focus_handle(cx), cx);
         self.update_edit(cx, |e| e.new_section = Some(input));
+    }
+
+    fn flag(&self, key: &str, default: bool) -> bool {
+        self.store.setting(key).ok().flatten().map_or(default, |v| v == "1")
+    }
+
+    fn set_flag(&mut self, key: &str, value: bool, cx: &mut Context<Self>) {
+        if let Err(err) = self.store.set_setting(key, if value { "1" } else { "0" }) {
+            eprintln!("failed to save the setting: {err:#}");
+        }
+        cx.notify();
+    }
+
+    /// Writes habits and check-ins as CSV to the downloads folder.
+    fn export(&mut self, cx: &mut Context<Self>) {
+        self.header_more = None;
+        let strings = i18n::t(cx);
+        let data: Vec<(Habit, Vec<Checkin>)> = self
+            .habits
+            .iter()
+            .map(|h| (h.clone(), self.records.get(&h.id).cloned().unwrap_or_default()))
+            .collect();
+        let dir = dirs::download_dir().or_else(dirs::home_dir).unwrap_or_else(|| ".".into());
+        let path = dir.join(format!("fern-habits-{}.csv", Local::now().format("%Y-%m-%d")));
+        self.export_message = Some(match std::fs::write(&path, habit::export_csv(&data)) {
+            Ok(()) => strings.exported_to.replace("{path}", &path.display().to_string()),
+            Err(err) => format!("{err}"),
+        });
+        cx.notify();
+    }
+
+    fn render_header_more(&self, more: HeaderMore, cx: &mut Context<Self>) -> AnyElement {
+        let strings = i18n::t(cx);
+        let theme = cx.theme().clone();
+        let close = cx.listener(|this, _, _, cx| {
+            this.header_more = None;
+            cx.notify();
+        });
+        match more {
+            HeaderMore::Menu => popover(cx)
+                .w(px(180.))
+                .on_mouse_down_out(close)
+                .child(
+                    ListItem::new("habit-settings")
+                        .start_slot(Icon::new(IconName::Settings).color(Color::Muted))
+                        .child(Label::new(strings.settings))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.header_more = Some(HeaderMore::Settings);
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    ListItem::new("habit-export")
+                        .start_slot(Icon::new(IconName::Share).color(Color::Muted))
+                        .child(Label::new(strings.export))
+                        .on_click(cx.listener(|this, _, _, cx| this.export(cx))),
+                )
+                .into_any_element(),
+            HeaderMore::Settings => {
+                let toggle = |on: bool| {
+                    div()
+                        .w(px(30.))
+                        .h(px(18.))
+                        .p(px(2.))
+                        .flex_none()
+                        .rounded_full()
+                        .flex()
+                        .when(on, |el| el.justify_end().bg(theme.colors().accent))
+                        .when(!on, |el| el.bg(theme.colors().element_hover))
+                        .child(div().size(px(14.)).rounded_full().bg(gpui::white()))
+                };
+                let in_today = self.flag(IN_TODAY_SETTING, true);
+                let by_status = self.flag(SORT_SETTING, false);
+                popover(cx)
+                    .w(px(300.))
+                    .p_3()
+                    .gap_3()
+                    .on_mouse_down_out(close)
+                    .child(Label::new(strings.habit_settings).weight(FontWeight::SEMIBOLD))
+                    .child(
+                        h_flex()
+                            .id("setting-in-today")
+                            .gap_2()
+                            .cursor_pointer()
+                            .child(div().flex_1().child(Label::new(strings.habits_in_today).size(LabelSize::Small)))
+                            .child(toggle(in_today))
+                            .on_click(cx.listener(move |this, _, _, cx| this.set_flag(IN_TODAY_SETTING, !in_today, cx))),
+                    )
+                    .child(
+                        h_flex()
+                            .id("setting-sort")
+                            .gap_2()
+                            .items_start()
+                            .cursor_pointer()
+                            .child(
+                                v_flex()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .gap_1()
+                                    .child(Label::new(strings.habits_sort_by_status).size(LabelSize::Small))
+                                    .child(
+                                        div()
+                                            .w_full()
+                                            .text_size(px(11.))
+                                            .text_color(theme.colors().text_muted)
+                                            .child(strings.habits_sort_hint),
+                                    ),
+                            )
+                            .child(toggle(by_status))
+                            .on_click(cx.listener(move |this, _, _, cx| this.set_flag(SORT_SETTING, !by_status, cx))),
+                    )
+                    .into_any_element()
+            }
+        }
     }
 
     fn set_list_layout(&mut self, list: bool, cx: &mut Context<Self>) {
@@ -1297,8 +1429,12 @@ impl Render for HabitView {
         let grouped = visible.iter().any(|h| h.section != HabitSection::Others);
         let mut cards: Vec<AnyElement> = Vec::new();
         for (i, section) in HabitSection::ordered(&self.sections).into_iter().enumerate() {
-            let in_section: Vec<&Habit> =
+            let mut in_section: Vec<&Habit> =
                 visible.iter().copied().filter(|h| !grouped || h.section == section).collect();
+            if self.flag(SORT_SETTING, false) {
+                // Unchecked habits first, keeping their order otherwise.
+                in_section.sort_by_key(|h| self.checkins.get(&h.id).is_some_and(|c| c.contains(&today)));
+            }
             if in_section.is_empty() || (!grouped && i > 0) {
                 continue;
             }
@@ -1439,8 +1575,21 @@ impl Render for HabitView {
                                 ))
                             }),
                     )
-                    .child(IconButton::new("habit-more", IconName::Ellipsis)),
+                    .child(
+                        div()
+                            .relative()
+                            .child(IconButton::new("habit-more", IconName::Ellipsis).on_click(cx.listener(|this, _, _, cx| {
+                                this.header_more = Some(HeaderMore::Menu);
+                                cx.notify();
+                            })))
+                            .when_some(self.header_more, |el, more| {
+                                el.child(PopoverAttachment::new(Placement::BelowRight, self.render_header_more(more, cx)))
+                            }),
+                    ),
             )
+            .when_some(self.export_message.clone(), |el, message| {
+                el.child(div().px(px(22.)).pb_2().child(Label::new(message).size(LabelSize::XSmall).color(Color::Muted)))
+            })
             .child(strip)
             .child(
                 div()

@@ -280,6 +280,28 @@ pub fn month_stats_for(frequency: &Frequency, checkins: &HashSet<NaiveDate>, mon
     MonthStats { days, rate }
 }
 
+/// Habits and their check-ins as CSV: one line per check-in, habits without any get one line
+/// with empty check-in fields.
+pub fn export_csv(habits: &[(Habit, Vec<Checkin>)]) -> String {
+    let field = |text: &str| {
+        if text.contains([',', '"', '\n']) { format!("\"{}\"", text.replace('"', "\"\"")) } else { text.to_owned() }
+    };
+    let mut out = String::from("habit,archived,goal,unit,date,amount,note\n");
+    for (habit, checkins) in habits {
+        let goal = habit.goal.as_ref().map(|g| g.amount.to_string()).unwrap_or_default();
+        let unit = habit.goal.as_ref().map(|g| field(&g.unit)).unwrap_or_default();
+        let prefix = format!("{},{},{goal},{unit}", field(&habit.name), habit.archived);
+        if checkins.is_empty() {
+            out.push_str(&format!("{prefix},,,\n"));
+        }
+        for checkin in checkins {
+            let note = checkin.note.as_deref().map(field).unwrap_or_default();
+            out.push_str(&format!("{prefix},{},{},{note}\n", checkin.date, checkin.value));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -370,6 +392,32 @@ mod tests {
         let rate = month_stats_for(&mon_wed_fri, &checked, d(1), d(24)).rate;
         let all_days = month_stats_for(&Frequency::default(), &checked, d(1), d(24)).rate;
         assert!(rate > all_days);
+    }
+
+    #[test]
+    fn csv_export() {
+        let habit = |name: &str| Habit {
+            id: uuid::Uuid::now_v7(),
+            name: name.into(),
+            goal: None,
+            reminders: Vec::new(),
+            frequency: Frequency::default(),
+            icon: None,
+            color: None,
+            start_date: None,
+            goal_days: None,
+            section: HabitSection::Others,
+            archived: false,
+        };
+        let water = Habit { goal: Some(Goal { amount: 8, unit: "glasses".into() }), ..habit("Water, daily") };
+        let checkins = vec![Checkin { date: d(18), value: 8, note: Some("said \"done\"".into()) }];
+        let csv = export_csv(&[(water, checkins), (habit("Read"), Vec::new())]);
+        assert_eq!(
+            csv,
+            "habit,archived,goal,unit,date,amount,note\n\
+             \"Water, daily\",false,8,glasses,2026-10-18,8,\"said \"\"done\"\"\"\n\
+             Read,false,,,,,\n"
+        );
     }
 
     #[test]

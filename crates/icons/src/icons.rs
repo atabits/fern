@@ -57,6 +57,8 @@ pub enum IconName {
     Repeat,
     RotateCcw,
     Search,
+    Settings,
+    Share,
     Square,
     SquareCheck,
     SquareCheckBig,

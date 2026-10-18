@@ -36,6 +36,8 @@ pub struct SummaryView {
     menu: Option<Menu>,
     /// "Copied" shows on the button after a copy.
     copied: bool,
+    /// Where "Save as → Image" wrote the picture, or why it could not.
+    saved: Option<String>,
     /// The "Save as" menu, while open.
     save_menu: bool,
     /// The name field of "Save as Template", while open.
@@ -168,7 +170,7 @@ impl SummaryView {
     pub fn new(store: Rc<Store>) -> Self {
         // The original keeps the Summary's choices; so does Fern, in the settings table.
         let options = store.summary_options().unwrap_or_default();
-        Self { store, options, menu: None, copied: false, custom: None, save_menu: false, naming: None, more_side: None }
+        Self { store, options, menu: None, copied: false, saved: None, custom: None, save_menu: false, naming: None, more_side: None }
     }
 
     /// "Custom" in the Date menu: Start and End fields with Cancel and Confirm.
@@ -268,6 +270,11 @@ impl SummaryView {
         }
         if menu == "save" {
             self.save_menu = true;
+        }
+        // `summary=image:<path>`: what "Save as → Image" writes, to a given file.
+        if let Some(path) = menu.strip_prefix("image:") {
+            let report = self.current_report(cx);
+            std::fs::write(path, crate::print::report_svg(&report.heading, &report.groups)).ok();
         }
         if let Some(name) = menu.strip_prefix("template:") {
             self.store.save_summary_template(name, &self.options).ok();
@@ -799,7 +806,10 @@ impl Render for SummaryView {
                     )
                     .child(body)
                     .child(
-                        h_flex().h(px(44.)).px_4().gap_5().justify_end().border_t_1().border_color(colors.border_variant).child({
+                        h_flex().h(px(44.)).px_4().gap_5().justify_end()
+                        .children(self.saved.clone().map(|message| {
+                            div().flex_1().min_w_0().child(Label::new(message).size(LabelSize::XSmall).color(Color::Muted).truncate())
+                        })).border_t_1().border_color(colors.border_variant).child({
                             let heading = report_heading.clone();
                             let groups = report_groups.clone();
                             let mail = mailto.clone();
@@ -825,6 +835,23 @@ impl Render for SummaryView {
                                                     cx.notify();
                                                 })),
                                         )
+                                        .child({
+                                            let (heading, groups) = (report_heading.clone(), report_groups.clone());
+                                            ListItem::new("save-image")
+                                                .start_slot(Icon::new(IconName::Image).color(Color::Warning))
+                                                .child(Label::new(strings.summary_image))
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.save_menu = false;
+                                                    let dir = dirs::download_dir().or_else(dirs::home_dir).unwrap_or_else(|| ".".into());
+                                                    let path = dir.join(format!("fern-summary-{}.svg", Local::now().format("%Y-%m-%d")));
+                                                    let svg = crate::print::report_svg(&heading, &groups);
+                                                    this.saved = Some(match std::fs::write(&path, svg) {
+                                                        Ok(()) => i18n::t(cx).exported_to.replace("{path}", &path.display().to_string()),
+                                                        Err(err) => err.to_string(),
+                                                    });
+                                                    cx.notify();
+                                                }))
+                                        })
                                         .child(
                                             ListItem::new("save-email")
                                                 .start_slot(Icon::new(IconName::Mail).color(Color::Accent))

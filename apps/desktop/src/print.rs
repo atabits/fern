@@ -80,6 +80,38 @@ pub fn report_html(heading: &str, groups: &[(String, Vec<String>)]) -> String {
     page(heading, &body)
 }
 
+/// The Summary's report as an SVG picture, for "Save as → Image": the heading, then each group's
+/// title and lines, dark text on white.
+pub fn report_svg(heading: &str, groups: &[(String, Vec<String>)]) -> String {
+    const WIDTH: usize = 720;
+    const LINE: usize = 26;
+    let mut lines: Vec<(usize, &str, &str)> = vec![(40, "22", heading)];
+    for (title, items) in groups {
+        lines.push((LINE + 10, "16", title));
+        lines.extend(items.iter().map(|item| (LINE, "14", item.as_str())));
+    }
+    let mut y = 0;
+    let mut body = String::new();
+    for (gap, size, text) in &lines {
+        y += gap;
+        let weight = if *size == "14" { "normal" } else { "bold" };
+        let x = if *size == "14" { 44 } else { 32 };
+        if *size == "14" {
+            body.push_str(&format!("<circle cx=\"34\" cy=\"{}\" r=\"2.5\" fill=\"#4772fa\"/>", y - 5));
+        }
+        body.push_str(&format!(
+            "<text x=\"{x}\" y=\"{y}\" font-size=\"{size}\" font-weight=\"{weight}\">{}</text>",
+            escape(text)
+        ));
+    }
+    let height = y + 32;
+    format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{WIDTH}\" height=\"{height}\" viewBox=\"0 0 {WIDTH} {height}\">\
+         <rect width=\"100%\" height=\"100%\" fill=\"#ffffff\"/>\
+         <g font-family=\"system-ui, sans-serif\" fill=\"#222222\">{body}</g></svg>"
+    )
+}
+
 fn page(title: &str, body: &str) -> String {
     let title = escape(title);
     format!(
@@ -122,5 +154,12 @@ mod tests {
         let parent = store.task(parent.id).unwrap().unwrap();
         let page = task_html(&parent, &store.checklist(parent.id).unwrap(), today, &EN);
         assert!(page.contains("Kitchen &amp; bath") && page.contains("☐</span><span>turn off water"));
+    }
+
+    #[test]
+    fn report_picture() {
+        let svg = report_svg("Oct 12 - Oct 18", &[("Completed".into(), vec!["Fix <the> tap".into()])]);
+        assert!(svg.starts_with("<svg") && svg.ends_with("</svg>"));
+        assert!(svg.contains("Fix &lt;the&gt; tap") && svg.contains(">Completed<"));
     }
 }

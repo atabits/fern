@@ -40,6 +40,7 @@ pub enum IconName {
     Gift,
     Heart,
     Hourglass,
+    Image,
     Info,
     Inbox,
     Kanban,

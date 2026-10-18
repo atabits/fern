@@ -4214,6 +4214,90 @@ impl TodoView {
 
     /// As in the original, Today and Next 7 Days list the habits due today, unless turned off in
     /// the habit settings. Checking one checks the habit in (one unit for amount goals).
+    /// The kanban's Habit column in Today and Next 7 Days, as the original's: a card per habit
+    /// due today with its icon and name and "Today 0 / 2 unit" (or "0 / 1" without a goal); a
+    /// click checks it in or adds a step.
+    fn render_habit_column(&self, strings: &'static Strings, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !matches!(self.view, View::Today | View::Next7Days)
+            || self.store.setting(crate::habit_view::IN_TODAY_SETTING).ok().flatten().as_deref() == Some("0")
+        {
+            return None;
+        }
+        let theme = cx.theme().clone();
+        let today = Self::today();
+        let habits: Vec<(fern_core::Habit, u32)> = self
+            .store
+            .habits()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|h| !h.archived)
+            .filter_map(|h| {
+                let done = self.store.checkins(h.id).unwrap_or_default();
+                let amount = self.store.checkin_records(h.id).unwrap_or_default().into_iter().find(|c| c.date == today).map_or(0, |c| c.value);
+                h.is_due(today, &done).then_some((h, amount))
+            })
+            .collect();
+        if habits.is_empty() {
+            return None;
+        }
+        let count = habits.len();
+        let cards: Vec<AnyElement> = habits
+            .into_iter()
+            .map(|(habit, amount)| {
+                let id = habit.id;
+                let has_goal = habit.goal.is_some();
+                let (target, unit) = habit.goal.as_ref().map_or((1, String::new()), |g| (g.amount, g.unit.clone()));
+                v_flex()
+                    .id(SharedString::from(format!("habit-card-{id}")))
+                    .p_2()
+                    .gap_1()
+                    .rounded(px(8.))
+                    .border_1()
+                    .border_color(theme.colors().border_variant)
+                    .bg(theme.colors().surface_background)
+                    .cursor_pointer()
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(crate::habit_view::avatar(&habit, px(20.), cx))
+                            .child(div().flex_1().min_w_0().child(Label::new(habit.name.clone()).truncate())),
+                    )
+                    .child(
+                        h_flex()
+                            .pl(px(28.))
+                            .gap_1()
+                            .child(Label::new(strings.today).size(LabelSize::Small).color(Color::Accent))
+                            .child(Label::new(format!("{amount} / {target} {unit}").trim().to_owned()).size(LabelSize::Small).color(Color::Muted)),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let result = if has_goal {
+                            this.store.step_checkin(id, today).map(|_| ())
+                        } else {
+                            this.store.toggle_checkin(id, today).map(|_| ())
+                        };
+                        this.check(result);
+                        cx.notify();
+                    }))
+                    .into_any_element()
+            })
+            .collect();
+        Some(
+            v_flex()
+                .w(px(258.))
+                .flex_none()
+                .gap_2()
+                .child(
+                    h_flex()
+                        .h(px(30.))
+                        .gap_1()
+                        .child(Label::new(strings.section_habits).weight(FontWeight::SEMIBOLD))
+                        .child(Label::new(count.to_string()).size(LabelSize::Small).color(Color::Muted)),
+                )
+                .children(cards)
+                .into_any_element(),
+        )
+    }
+
     fn render_habits(&self, strings: &Strings, cx: &mut Context<Self>) -> Option<AnyElement> {
         if !matches!(self.view, View::Today | View::Next7Days)
             || self.store.setting(crate::habit_view::IN_TODAY_SETTING).ok().flatten().as_deref() == Some("0")
@@ -4970,6 +5054,7 @@ impl Render for TodoView {
                             el.child(div().h(px(40.)).rounded(px(8.)).border_1().border_color(theme.colors().border_variant))
                         })
                 }))
+                .children(self.render_habit_column(strings, cx))
                 .when(matches!(self.view, View::List(_)), |el| {
                     el.child(
                         v_flex().w(px(220.)).flex_none().pt(px(6.)).map(|el| match self.new_section.clone() {

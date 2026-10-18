@@ -29,7 +29,7 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 | Priority 0/1/3/5 | ✅ | same values as TickTick |
 | Tags with colors | ✅ | case-insensitive, including non-ASCII |
 | Subtasks (`parentId`) | ✅ | cascade delete, no cycles |
-| Item kind: task / note / checklist (`kind`) | 🟡 | task and note; checklist later |
+| Item kind: task / note / checklist (`kind`) | ✅ | task and note; the original's checklist kind is a task with checklist items: its box shows lines in the row and in the details, as there; the details' title button (tooltip "Checklist", as in the original) starts one, and the description comes first with the items under it. Converting a description into items and back, which the original's button may do, was not tried — it would change the reference account's task |
 | Checklist items (`items`) | ✅ | ordered items, insert after, completion, progress |
 | Repeat (`repeatFlag`, RRULE) | ✅ | FREQ, INTERVAL and weekly BYDAY (every weekday); completing moves the task to the next date and keeps a completed copy; monthly rules have the original's "Each" (days of the month and the last day, `BYMONTHDAY`), "On the" (the first to fourth or last weekday, `BYDAY=1SU`) and "Workday" (the first or last, `BYSETPOS`); daily rules "Skip Weekends"; the modes "By Due Dates", "By Completion Date" and "By Specific Dates" (see Details: due date) |
 | Lists (projects), Inbox | ✅ | create, delete, move tasks with subtasks |
@@ -92,7 +92,6 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 
 ## Next
 
-1. Item kind: the original's checklist kind (a task shown as its checklist).
-2. Countdowns in the Agenda: the original's dot colors and what a click does.
+1. Countdowns in the Agenda: the original's dot colors and what a click does.
 
 Not checkable under the reference rules: whether the original asks for a note when a focus session ends (finding out means running a focus timer in the reference account). Fern's record dialog takes a note afterwards.

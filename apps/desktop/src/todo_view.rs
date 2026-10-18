@@ -2065,6 +2065,7 @@ impl TodoView {
             Checkbox::new("marker")
                 .toggle_state(done)
                 .dismissed(wont_do)
+                .lines(task.checklist.is_some())
                 .tint(task_rows::priority_color(task.priority, &theme))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     cx.stop_propagation();

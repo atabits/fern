@@ -2217,6 +2217,7 @@ impl Render for TaskDetail {
                             .size(px(18.))
                             .toggle_state(done)
                             .dismissed(task.is_wont_do())
+                            .lines(!self.checklist.is_empty())
                             .on_click(cx.listener(|this, _, _, cx| this.toggle_completed(cx))),
                     )
                     .child(Divider::vertical())
@@ -2282,11 +2283,12 @@ impl Render for TaskDetail {
                                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                                     .child(
                                         IconButton::new("checklist", IconName::ListChecks)
+                                            .tooltip(Tooltip::text(i18n::t(cx).checklist))
                                             .on_click(cx.listener(|this, _, _, cx| this.start_checklist(cx))),
                                     ),
                             ),
                     )
-                    .when(self.show_checklist, |el| el.child(self.render_checklist(cx)))
+                    // As in the original, the description comes first and the checklist under it.
                     .child(
                         div()
                             .text_size(px(15.))
@@ -2294,6 +2296,7 @@ impl Render for TaskDetail {
                             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                             .child(self.notes.clone()),
                     )
+                    .when(self.show_checklist, |el| el.child(self.render_checklist(cx)))
                     // Tags sit under the notes, as in the original.
                     .child(self.render_tags_row(strings, cx))
                     .child(div().pt_2().child(Divider::horizontal()))

@@ -14,6 +14,7 @@ pub struct Checkbox {
     id: ElementId,
     checked: bool,
     dismissed: bool,
+    lines: bool,
     tint: Option<Hsla>,
     size: Pixels,
     on_click: Option<ClickHandler>,
@@ -21,7 +22,7 @@ pub struct Checkbox {
 
 impl Checkbox {
     pub fn new(id: impl Into<ElementId>) -> Self {
-        Self { id: id.into(), checked: false, dismissed: false, tint: None, size: px(16.), on_click: None }
+        Self { id: id.into(), checked: false, dismissed: false, lines: false, tint: None, size: px(16.), on_click: None }
     }
 
     pub fn tint(mut self, tint: Option<Hsla>) -> Self {
@@ -32,6 +33,12 @@ impl Checkbox {
     /// A muted box with a cross, for tasks closed as "Won't Do".
     pub fn dismissed(mut self, dismissed: bool) -> Self {
         self.dismissed = dismissed;
+        self
+    }
+
+    /// Lines inside the open box, as the original marks a task kept as a checklist.
+    pub fn lines(mut self, lines: bool) -> Self {
+        self.lines = lines;
         self
     }
 
@@ -89,6 +96,15 @@ impl RenderOnce for Checkbox {
             .border_color(border)
             .cursor_pointer()
             .when(self.checked, |el| el.bg(colors.accent).child("✓"))
+            .when(self.lines && !self.checked, |el| {
+                el.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.))
+                        .children((0..3).map(|_| div().w(self.size * 0.45).h(px(1.)).bg(border))),
+                )
+            })
             .when_some(self.tint.filter(|_| !self.checked), |el, tint| el.bg(tint.opacity(0.15)))
             .text_size(self.size * 0.7)
             .text_color(colors.background)

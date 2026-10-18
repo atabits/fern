@@ -7,11 +7,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chrono::{Datelike, Local, NaiveDate};
 use fern_core::{FocusSession, Id, Store, Task, View, focus_stats, format_minutes};
-use gpui::{FontWeight, Task as GpuiTask};
+use gpui::{Entity, FontWeight, Task as GpuiTask};
+use ui::{Placement, PopoverAttachment, popover};
 use ui::prelude::*;
 
 use crate::focus_timer::{FocusTimer, format_clock};
 use crate::i18n::{self, Strings};
+use crate::text_input::{Mode, TextInput};
 
 /// The default Pomodoro length.
 const POMO_MS: i64 = 25 * 60_000;
@@ -33,11 +35,40 @@ pub struct FocusView {
     tasks: Vec<Task>,
     sessions: Vec<FocusSession>,
     running: Option<Running>,
+    record_menu: Option<RecordMenu>,
+    /// "Delete All" asks for a second click.
+    delete_all_armed: bool,
+    add_title: Entity<TextInput>,
+    add_start: Entity<TextInput>,
+    add_minutes: i64,
+    /// The last export's result.
+    message: Option<String>,
+}
+
+/// The Focus Record's "+" form and "…" menu, as in the original.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RecordMenu {
+    Add,
+    More,
 }
 
 impl FocusView {
     pub fn new(store: Rc<Store>, cx: &mut Context<Self>) -> Self {
-        let mut this = Self { store, tasks: Vec::new(), sessions: Vec::new(), running: None };
+        let strings = i18n::t(cx);
+        let add_title = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.focus_record_title, cx));
+        let add_start = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.focus_record_start, cx));
+        let mut this = Self {
+            store,
+            tasks: Vec::new(),
+            sessions: Vec::new(),
+            running: None,
+            record_menu: None,
+            delete_all_armed: false,
+            add_title,
+            add_start,
+            add_minutes: 25,
+            message: None,
+        };
         this.reload(cx);
         this
     }
@@ -94,6 +125,139 @@ impl FocusView {
         self.reload(cx);
     }
 
+    fn set_record_menu(&mut self, menu: Option<RecordMenu>, cx: &mut Context<Self>) {
+        self.record_menu = menu;
+        self.delete_all_armed = false;
+        cx.notify();
+    }
+
+    /// Saves the "+" form: a session today from the typed start time for the chosen minutes.
+    fn add_record(&mut self, cx: &mut Context<Self>) {
+        let title = self.add_title.read(cx).text().trim().to_owned();
+        let start = crate::due_picker::parse_time(self.add_start.read(cx).text());
+        let (Some(start), false) = (start, title.is_empty()) else { return };
+        let today = Local::now().date_naive();
+        let started = today.and_time(start).and_local_timezone(Local).single().map(|t| t.timestamp_millis());
+        if let Some(started) = started {
+            let ended = started + self.add_minutes * 60_000;
+            if let Err(err) = self.store.add_focus_session(None, &title, started, ended) {
+                eprintln!("failed to add the focus record: {err:#}");
+            }
+        }
+        self.add_title.update(cx, |input, cx| input.set_text("", cx));
+        self.add_start.update(cx, |input, cx| input.set_text("", cx));
+        self.record_menu = None;
+        self.reload(cx);
+    }
+
+    fn delete_record(&mut self, id: fern_core::Id, cx: &mut Context<Self>) {
+        if let Err(err) = self.store.delete_focus_session(id) {
+            eprintln!("failed to delete the focus record: {err:#}");
+        }
+        self.reload(cx);
+    }
+
+    fn delete_all(&mut self, cx: &mut Context<Self>) {
+        if !self.delete_all_armed {
+            self.delete_all_armed = true;
+            cx.notify();
+            return;
+        }
+        if let Err(err) = self.store.delete_all_focus_sessions() {
+            eprintln!("failed to delete the focus records: {err:#}");
+        }
+        self.set_record_menu(None, cx);
+        self.reload(cx);
+    }
+
+    fn export(&mut self, cx: &mut Context<Self>) {
+        let strings = i18n::t(cx);
+        let dir = dirs::download_dir().or_else(dirs::home_dir).unwrap_or_else(|| ".".into());
+        let path = dir.join(format!("fern-focus-{}.csv", Local::now().format("%Y-%m-%d")));
+        self.message = Some(match std::fs::write(&path, fern_core::focus::export_csv(&self.sessions)) {
+            Ok(()) => strings.exported_to.replace("{path}", &path.display().to_string()),
+            Err(err) => err.to_string(),
+        });
+        self.set_record_menu(None, cx);
+    }
+
+    fn render_record_menu(&self, menu: RecordMenu, cx: &mut Context<Self>) -> AnyElement {
+        let strings = i18n::t(cx);
+        let theme = cx.theme().clone();
+        let close = cx.listener(|this, _, _, cx| this.set_record_menu(None, cx));
+        match menu {
+            RecordMenu::More => popover(cx)
+                .w(px(240.))
+                .on_mouse_down_out(close)
+                .child(
+                    ListItem::new("focus-export")
+                        .start_slot(Icon::new(IconName::Share).color(Color::Muted))
+                        .child(Label::new(strings.export))
+                        .on_click(cx.listener(|this, _, _, cx| this.export(cx))),
+                )
+                .child(
+                    ListItem::new("focus-delete-all")
+                        .start_slot(Icon::new(IconName::Trash).color(Color::Error))
+                        .child(
+                            Label::new(if self.delete_all_armed { strings.delete_all_confirm } else { strings.delete_all })
+                                .color(Color::Error),
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| this.delete_all(cx))),
+                )
+                .into_any_element(),
+            RecordMenu::Add => {
+                let field = |input: Entity<TextInput>| {
+                    h_flex().h(px(30.)).px_2().rounded(px(6.)).bg(theme.colors().background).child(input)
+                };
+                popover(cx)
+                    .w(px(280.))
+                    .p_3()
+                    .gap_2()
+                    .on_mouse_down_out(close)
+                    .child(Label::new(strings.focus_add_record).weight(FontWeight::SEMIBOLD))
+                    .child(field(self.add_title.clone()))
+                    .child(field(self.add_start.clone()))
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(div().flex_1().child(Label::new(strings.focus_record_minutes).size(LabelSize::Small)))
+                            .child(IconButton::new("record-shorter", IconName::Minus).on_click(cx.listener(|this, _, _, cx| {
+                                this.add_minutes = (this.add_minutes - 5).max(5);
+                                cx.notify();
+                            })))
+                            .child(Label::new(format_minutes(self.add_minutes)).size(LabelSize::Small))
+                            .child(IconButton::new("record-longer", IconName::Plus).on_click(cx.listener(|this, _, _, cx| {
+                                this.add_minutes = (this.add_minutes + 5).min(12 * 60);
+                                cx.notify();
+                            }))),
+                    )
+                    .child(
+                        div()
+                            .id("record-save")
+                            .h(px(28.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(6.))
+                            .bg(theme.colors().accent)
+                            .cursor_pointer()
+                            .child(Label::new(strings.save).size(LabelSize::Small))
+                            .on_click(cx.listener(|this, _, _, cx| this.add_record(cx))),
+                    )
+                    .into_any_element()
+            }
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn dev_menu(&mut self, menu: &str, cx: &mut Context<Self>) {
+        let menu = match menu {
+            "add" => RecordMenu::Add,
+            _ => RecordMenu::More,
+        };
+        self.set_record_menu(Some(menu), cx);
+    }
+
     #[cfg(debug_assertions)]
     pub fn dev_record(&mut self, title: &str, minutes_ago: i64, minutes: i64, cx: &mut Context<Self>) {
         let start = now_ms() - minutes_ago * 60_000;
@@ -131,12 +295,14 @@ impl FocusView {
             )
     }
 
-    fn render_record(&self, strings: &Strings, cx: &App) -> Vec<AnyElement> {
+    fn render_record(&self, strings: &Strings, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let theme = cx.theme();
         let today = Local::now().date_naive();
         let mut out = Vec::new();
         let mut current: Option<NaiveDate> = None;
         for session in &self.sessions {
+            let session_id = session.id;
+            let group = SharedString::from(format!("focus-record-{session_id}"));
             let start = session.start_local();
             let date = start.date_naive();
             if current != Some(date) {
@@ -151,6 +317,8 @@ impl FocusView {
             }
             out.push(
                 h_flex()
+                    .id(group.clone())
+                    .group(group.clone())
                     .items_start()
                     .gap_2()
                     .py_1()
@@ -171,6 +339,14 @@ impl FocusView {
                             .child(Label::new(session.title.clone()).truncate()),
                     )
                     .child(Label::new(format_minutes(session.minutes())).size(LabelSize::XSmall).color(Color::Muted))
+                    .child(
+                        div().opacity(0.).group_hover(group, |s| s.opacity(1.)).child(
+                            IconButton::new(SharedString::from(format!("delete-record-{session_id}")), IconName::X)
+                                .size(px(20.))
+                                .icon_size(IconSize::XSmall)
+                                .on_click(cx.listener(move |this, _, _, cx| this.delete_record(session_id, cx))),
+                        ),
+                    )
                     .into_any_element(),
             );
         }
@@ -302,7 +478,34 @@ impl Render for FocusView {
             .px_4()
             .child(h_flex().h(px(52.)).child(Label::new(strings.focus_overview).size(LabelSize::Large).weight(FontWeight::SEMIBOLD)))
             .child(self.render_overview(strings, cx))
-            .child(h_flex().pt_5().child(Label::new(strings.focus_record).size(LabelSize::Large).weight(FontWeight::SEMIBOLD)))
+            .child(
+                h_flex()
+                    .pt_5()
+                    .child(div().flex_1().child(Label::new(strings.focus_record).size(LabelSize::Large).weight(FontWeight::SEMIBOLD)))
+                    .child(
+                        div()
+                            .relative()
+                            .child(IconButton::new("record-add", IconName::Plus).on_click(cx.listener(|this, _, _, cx| {
+                                this.set_record_menu(Some(RecordMenu::Add), cx)
+                            })))
+                            .when(self.record_menu == Some(RecordMenu::Add), |el| {
+                                el.child(PopoverAttachment::new(Placement::BelowRight, self.render_record_menu(RecordMenu::Add, cx)))
+                            }),
+                    )
+                    .child(
+                        div()
+                            .relative()
+                            .child(IconButton::new("record-more", IconName::Ellipsis).on_click(cx.listener(|this, _, _, cx| {
+                                this.set_record_menu(Some(RecordMenu::More), cx)
+                            })))
+                            .when(self.record_menu == Some(RecordMenu::More), |el| {
+                                el.child(PopoverAttachment::new(Placement::BelowRight, self.render_record_menu(RecordMenu::More, cx)))
+                            }),
+                    ),
+            )
+            .when_some(self.message.clone(), |el, message| {
+                el.child(Label::new(message).size(LabelSize::XSmall).color(Color::Muted))
+            })
             .child(
                 v_flex()
                     .id("focus-record")

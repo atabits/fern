@@ -119,6 +119,9 @@ impl AppView {
                     this.focus.update(cx, |view, cx| view.dev_record(title, ago, minutes, cx));
                 }
             }
+            if let Some(menu) = state.split(';').find_map(|part| part.strip_prefix("focus-menu=")) {
+                this.focus.update(cx, |view, cx| view.dev_menu(menu, cx));
+            }
             if state.contains("section=focus") {
                 this.select(Section::Pomodoro, window, cx);
             }

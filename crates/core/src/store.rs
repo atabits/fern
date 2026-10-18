@@ -985,6 +985,17 @@ impl Store {
         Ok(session)
     }
 
+    pub fn delete_focus_session(&self, id: Id) -> Result<()> {
+        self.conn.execute("DELETE FROM focus_sessions WHERE id = ?1", [id.to_string()])?;
+        Ok(())
+    }
+
+    /// The Focus Record's "Delete All".
+    pub fn delete_all_focus_sessions(&self) -> Result<()> {
+        self.conn.execute("DELETE FROM focus_sessions", [])?;
+        Ok(())
+    }
+
     /// Focus sessions, newest first.
     pub fn focus_sessions(&self) -> Result<Vec<FocusSession>> {
         let mut stmt = self.conn.prepare(
@@ -1648,6 +1659,11 @@ mod tests {
         // Deleting the task keeps the record.
         store.purge_task(task.id)?;
         assert_eq!(store.focus_sessions()?[1].task_id, None);
+        let all = store.focus_sessions()?;
+        store.delete_focus_session(all[0].id)?;
+        assert_eq!(store.focus_sessions()?.len(), all.len() - 1);
+        store.delete_all_focus_sessions()?;
+        assert!(store.focus_sessions()?.is_empty());
         Ok(())
     }
 

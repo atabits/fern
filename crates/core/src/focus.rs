@@ -64,6 +64,27 @@ pub fn format_minutes(minutes: i64) -> String {
     }
 }
 
+/// The Focus Record as CSV, oldest first: start and end in local time, minutes and title.
+pub fn export_csv(sessions: &[FocusSession]) -> String {
+    let mut sorted: Vec<&FocusSession> = sessions.iter().collect();
+    sorted.sort_by_key(|s| s.started_at);
+    let mut out = String::from("start,end,minutes,title\n");
+    for s in sorted {
+        let title = if s.title.contains([',', '"', '\n']) {
+            format!("\"{}\"", s.title.replace('"', "\"\""))
+        } else {
+            s.title.clone()
+        };
+        out.push_str(&format!(
+            "{},{},{},{title}\n",
+            s.start_local().format("%Y-%m-%d %H:%M"),
+            s.end_local().format("%Y-%m-%d %H:%M"),
+            s.minutes()
+        ));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -88,6 +109,19 @@ mod tests {
         assert_eq!(
             focus_stats(&sessions, today),
             FocusStats { today_count: 2, today_minutes: 75, total_count: 3, total_minutes: 100 }
+        );
+    }
+
+    #[test]
+    fn csv_export_is_oldest_first() {
+        let at = |h: u32| Local.with_ymd_and_hms(2026, 10, 18, h, 0, 0).unwrap();
+        let mut late = session(at(14), 50);
+        late.title = "Write, then edit".into();
+        let csv = export_csv(&[late, session(at(9), 25)]);
+        assert_eq!(
+            csv,
+            "start,end,minutes,title\n2026-10-18 09:00,2026-10-18 09:25,25,x\n\
+             2026-10-18 14:00,2026-10-18 14:50,50,\"Write, then edit\"\n"
         );
     }
 

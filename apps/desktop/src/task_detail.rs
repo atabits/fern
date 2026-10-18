@@ -2300,7 +2300,7 @@ impl TaskDetail {
                 let id = list.id;
                 let current_section = self.task.as_ref().and_then(|t| t.section_id);
                 // A list's sections are offered under it, as in the original.
-                let sections = self.store.list_sections(id).unwrap_or_default();
+                let sections = self.store.list_sections(Some(id)).unwrap_or_default();
                 std::iter::once(
                     ListItem::new(SharedString::from(format!("move-to-{id}")))
                         .start_slot(Icon::new(IconName::List))

@@ -205,7 +205,8 @@ pub struct Template {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ListSection {
     pub id: Id,
-    pub list_id: Id,
+    /// The list, or `None` for the Inbox.
+    pub list_id: Option<Id>,
     pub name: String,
 }
 

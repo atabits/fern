@@ -448,7 +448,7 @@ impl TodoView {
                 Some(("section", spec)) => {
                     // `section=<name>` adds a section to the current list; `section=<name>><task>` also files a task.
                     let (name, task) = spec.split_once('>').map_or((spec, None), |(n, t)| (n, Some(t)));
-                    if let View::List(list) = self.view {
+                    if let Some(list) = self.section_owner() {
                         let existing = self.store.list_sections(list).unwrap_or_default().into_iter().find(|s| s.name == name);
                         let section = existing.or_else(|| self.store.add_list_section(list, name).ok());
                         if let (Some(section), Some(task)) = (section, task)
@@ -757,9 +757,9 @@ impl TodoView {
                 (f, count)
             })
             .collect();
-        self.sections = match self.view {
-            View::List(list) => self.store.list_sections(list).unwrap_or_default(),
-            _ => Vec::new(),
+        self.sections = match self.section_owner() {
+            Some(list) => self.store.list_sections(list).unwrap_or_default(),
+            None => Vec::new(),
         };
         let today = Self::today();
         if let Some(lists) = self.check(self.store.lists()) {
@@ -2608,11 +2608,20 @@ impl TodoView {
             .into_any_element()
     }
 
+    /// Whose sections the view shows: a list's, the Inbox's (`Some(None)`), or none.
+    fn section_owner(&self) -> Option<Option<Id>> {
+        match self.view {
+            View::List(id) => Some(Some(id)),
+            View::Inbox => Some(None),
+            _ => None,
+        }
+    }
+
     fn start_new_section(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let strings = i18n::t(cx);
         let input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.section_name, cx));
         cx.subscribe(&input, |this, _, Submitted(name), cx| {
-            if let View::List(list) = this.view {
+            if let Some(list) = this.section_owner() {
                 let result = this.store.insert_list_section(list, name, this.new_section_index.take());
                 this.check(result);
             }
@@ -3006,7 +3015,7 @@ impl TodoView {
                     .child(Label::new(list.name.clone()))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.column_menu = None;
-                        let result = this.store.move_list_section(section, to);
+                        let result = this.store.move_list_section(section, Some(to));
                         this.check(result);
                         this.reload(cx);
                     }))
@@ -5081,7 +5090,7 @@ impl TodoView {
                             })),
                     )
                     .child(div().my_1().child(Divider::horizontal()))
-                    .when(in_list, |el| {
+                    .when(self.section_owner().is_some(), |el| {
                         el.child(
                             ListItem::new("add-section")
                                 .start_slot(Icon::new(IconName::Plus).color(Color::Muted))
@@ -5211,7 +5220,7 @@ impl Render for TodoView {
                         })
                 }))
                 .children(self.render_habit_column(strings, cx))
-                .when(matches!(self.view, View::List(_)), |el| {
+                .when(self.section_owner().is_some(), |el| {
                     el.child(
                         v_flex().w(px(220.)).flex_none().pt(px(6.)).map(|el| match self.new_section.clone() {
                             Some(input) => el.child(

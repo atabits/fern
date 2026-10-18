@@ -721,6 +721,38 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE list_sections ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0;
     UPDATE list_sections SET sort_order = (SELECT COUNT(*) FROM list_sections s WHERE s.list_id = list_sections.list_id AND (s.created_at < list_sections.created_at OR (s.created_at = list_sections.created_at AND s.rowid < list_sections.rowid)));
     ",
+    // The original's Inbox has sections too: a section's list may be none, the Inbox. The table
+    // is rebuilt with the foreign keys off, so that the tasks keep their sections.
+    "
+    PRAGMA foreign_keys = OFF;
+    CREATE TABLE list_sections_new (
+        id         TEXT PRIMARY KEY,
+        list_id    TEXT REFERENCES lists(id) ON DELETE CASCADE,
+        name       TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        sort_order INTEGER NOT NULL DEFAULT 0
+    );
+    INSERT INTO list_sections_new (id, list_id, name, created_at, sort_order)
+        SELECT id, list_id, name, created_at, sort_order FROM list_sections;
+    DROP TABLE list_sections;
+    ALTER TABLE list_sections_new RENAME TO list_sections;
+    CREATE TRIGGER sync_list_sections_insert AFTER INSERT ON list_sections
+    WHEN NOT EXISTS (SELECT 1 FROM sync_applying)
+    BEGIN
+        INSERT INTO sync_log (entity, key, at) VALUES ('list_sections', NEW.id, CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER));
+    END;
+    CREATE TRIGGER sync_list_sections_update AFTER UPDATE ON list_sections
+    WHEN NOT EXISTS (SELECT 1 FROM sync_applying)
+    BEGIN
+        INSERT INTO sync_log (entity, key, at) VALUES ('list_sections', NEW.id, CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER));
+    END;
+    CREATE TRIGGER sync_list_sections_delete AFTER DELETE ON list_sections
+    WHEN NOT EXISTS (SELECT 1 FROM sync_applying)
+    BEGIN
+        INSERT INTO sync_log (entity, key, at) VALUES ('list_sections', OLD.id, CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER));
+    END;
+    PRAGMA foreign_keys = ON;
+    ",
 ];
 
 const TASK_COLUMNS: &str = "id, parent_id, kind, title, notes, priority, due_date, due_time, \
@@ -1298,15 +1330,16 @@ impl Store {
     }
 
     /// Sections of a list ("Add Section"), oldest first.
-    pub fn list_sections(&self, list: Id) -> Result<Vec<crate::model::ListSection>> {
+    /// A list's sections, or the Inbox's for `None`.
+    pub fn list_sections(&self, list: Option<Id>) -> Result<Vec<crate::model::ListSection>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, list_id, name FROM list_sections WHERE list_id = ?1 ORDER BY sort_order, created_at, rowid",
+            "SELECT id, list_id, name FROM list_sections WHERE list_id IS ?1 ORDER BY sort_order, created_at, rowid",
         )?;
         let sections = stmt
-            .query_map([list.to_string()], |row| {
+            .query_map([list.map(|l| l.to_string())], |row| {
                 Ok(crate::model::ListSection {
                     id: parse_uuid(&row.get::<_, String>(0)?, 0)?,
-                    list_id: parse_uuid(&row.get::<_, String>(1)?, 1)?,
+                    list_id: row.get::<_, Option<String>>(1)?.and_then(|l| Uuid::parse_str(&l).ok()),
                     name: row.get(2)?,
                 })
             })?
@@ -1314,13 +1347,13 @@ impl Store {
         Ok(sections)
     }
 
-    pub fn add_list_section(&self, list: Id, name: &str) -> Result<crate::model::ListSection> {
+    pub fn add_list_section(&self, list: Option<Id>, name: &str) -> Result<crate::model::ListSection> {
         self.insert_list_section(list, name, None)
     }
 
     /// Adds a section at `index` among the list's sections (last for `None`), as the kanban's
     /// "Add Section to Left / Right".
-    pub fn insert_list_section(&self, list: Id, name: &str, index: Option<usize>) -> Result<crate::model::ListSection> {
+    pub fn insert_list_section(&self, list: Option<Id>, name: &str, index: Option<usize>) -> Result<crate::model::ListSection> {
         let name = name.trim();
         anyhow::ensure!(!name.is_empty(), "a section needs a name");
         let section = crate::model::ListSection { id: Uuid::now_v7(), list_id: list, name: name.to_owned() };
@@ -1330,7 +1363,7 @@ impl Store {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
             "INSERT INTO list_sections (id, list_id, name, created_at) VALUES (?1, ?2, ?3, ?4)",
-            params![section.id.to_string(), list.to_string(), section.name, now_ms()],
+            params![section.id.to_string(), list.map(|l| l.to_string()), section.name, now_ms()],
         )?;
         for (i, id) in order.iter().enumerate() {
             tx.execute("UPDATE list_sections SET sort_order = ?2 WHERE id = ?1 AND sort_order != ?2", params![id.to_string(), i as i64])?;
@@ -1341,12 +1374,12 @@ impl Store {
 
     /// The kanban column menu's "Move to": the section and its tasks go to another list, after
     /// its sections.
-    pub fn move_list_section(&self, id: Id, to: Id) -> Result<()> {
+    pub fn move_list_section(&self, id: Id, to: Option<Id>) -> Result<()> {
         let tasks: Vec<Id> = self.tasks()?.into_iter().filter(|t| t.section_id == Some(id) && t.parent_id.is_none()).map(|t| t.id).collect();
         let order = self.list_sections(to)?.len() as i64;
-        self.conn.execute("UPDATE list_sections SET list_id = ?2, sort_order = ?3 WHERE id = ?1", params![id.to_string(), to.to_string(), order])?;
+        self.conn.execute("UPDATE list_sections SET list_id = ?2, sort_order = ?3 WHERE id = ?1", params![id.to_string(), to.map(|l| l.to_string()), order])?;
         for task in tasks {
-            self.set_list(task, Some(to))?;
+            self.set_list(task, to)?;
             self.set_section(task, Some(id))?;
         }
         Ok(())
@@ -1369,12 +1402,12 @@ impl Store {
     /// Puts a task (and its subtasks) into a section of its list, or out of any.
     pub fn set_section(&self, id: Id, section: Option<Id>) -> Result<()> {
         if let Some(section) = section {
-            let list: Option<String> = self
+            let list: Option<Option<String>> = self
                 .conn
                 .query_row("SELECT list_id FROM list_sections WHERE id = ?1", [section.to_string()], |row| row.get(0))
                 .optional()?;
             let task_list = self.task(id)?.context("task not found")?.list_id.map(|l| l.to_string());
-            anyhow::ensure!(list.is_some() && list == task_list, "the section belongs to another list");
+            anyhow::ensure!(list == Some(task_list), "the section belongs to another list");
         }
         let section = section.map(|s| s.to_string());
         for task in std::iter::once(id).chain(self.descendants(id)?) {
@@ -1701,8 +1734,8 @@ impl Store {
         let draft = ListDraft { name: format!("{}{suffix}", list.name), ..ListDraft::of(&list) };
         let copy = self.add_list(&draft)?;
         self.place_list(copy.id, Some(id), list.folder)?;
-        for (name, _) in self.list_sections(id)?.into_iter().map(|s| (s.name, s.id)) {
-            self.add_list_section(copy.id, &name)?;
+        for (name, _) in self.list_sections(Some(id))?.into_iter().map(|s| (s.name, s.id)) {
+            self.add_list_section(Some(copy.id), &name)?;
         }
         let tasks = self.tasks()?;
         let roots = tasks.iter().filter(|t| t.list_id == Some(id) && t.parent_id.is_none() && !t.is_completed() && !t.is_deleted());
@@ -3292,15 +3325,15 @@ mod tests {
         let store = Store::open_in_memory()?;
         let work = store.create_list("Work")?;
         let home = store.create_list("Home")?;
-        let doing = store.add_list_section(work.id, "Doing")?;
-        store.insert_list_section(work.id, "To do", Some(0))?;
-        store.insert_list_section(work.id, "Done", None)?;
-        let names = |list| store.list_sections(list).unwrap().into_iter().map(|s| s.name).collect::<Vec<_>>();
+        let doing = store.add_list_section(Some(work.id), "Doing")?;
+        store.insert_list_section(Some(work.id), "To do", Some(0))?;
+        store.insert_list_section(Some(work.id), "Done", None)?;
+        let names = |list| store.list_sections(Some(list)).unwrap().into_iter().map(|s| s.name).collect::<Vec<_>>();
         assert_eq!(names(work.id), ["To do", "Doing", "Done"]);
         let task = store.add_task("Paint")?;
         store.set_list(task.id, Some(work.id))?;
         store.set_section(task.id, Some(doing.id))?;
-        store.move_list_section(doing.id, home.id)?;
+        store.move_list_section(doing.id, Some(home.id))?;
         assert_eq!(names(work.id), ["To do", "Done"]);
         assert_eq!(names(home.id), ["Doing"]);
         let moved = store.task(task.id)?.unwrap();
@@ -3309,14 +3342,52 @@ mod tests {
     }
 
     #[test]
+    fn inbox_sections_migration_keeps_tasks_in_their_sections() -> Result<()> {
+        // A database one migration behind, with a task in a list's section.
+        let conn = Connection::open_in_memory()?;
+        conn.pragma_update(None, "foreign_keys", true)?;
+        for sql in &MIGRATIONS[..MIGRATIONS.len() - 1] {
+            conn.execute_batch(sql)?;
+        }
+        conn.pragma_update(None, "user_version", MIGRATIONS.len() - 1)?;
+        conn.execute_batch(
+            "INSERT INTO lists (id, name, created_at) VALUES ('l', 'Home', 0);
+             INSERT INTO list_sections (id, list_id, name, created_at) VALUES ('s', 'l', 'Kitchen', 0);",
+        )?;
+        let store = Store { conn };
+        let task = store.add_task("Dishes")?;
+        store.conn.execute("UPDATE tasks SET list_id = 'l', section_id = 's' WHERE id = ?1", [task.id.to_string()])?;
+        Store::migrate(&store.conn)?;
+        let section: Option<String> = store.conn.query_row("SELECT section_id FROM tasks WHERE id = ?1", [task.id.to_string()], |r| r.get(0))?;
+        assert_eq!(section.as_deref(), Some("s"), "the task keeps its section");
+        let fk: bool = store.conn.pragma_query_value(None, "foreign_keys", |r| r.get(0))?;
+        assert!(fk, "the foreign keys are on again");
+        Ok(())
+    }
+
+    #[test]
+    fn inbox_sections() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let tasks = store.add_list_section(None, "Tasks")?;
+        let notes = store.add_list_section(None, "Notes")?;
+        let milk = store.add_task("Milk")?;
+        store.set_section(milk.id, Some(tasks.id))?;
+        assert_eq!(store.list_sections(None)?, [tasks.clone(), notes]);
+        assert_eq!(store.task(milk.id)?.unwrap().section_id, Some(tasks.id));
+        let work = store.create_list("Work")?;
+        assert!(store.list_sections(Some(work.id))?.is_empty(), "the Inbox's sections are its own");
+        Ok(())
+    }
+
+    #[test]
     fn list_sections() -> Result<()> {
         let store = Store::open_in_memory()?;
         let home = store.create_list("Home")?;
         let work = store.create_list("Work")?;
-        let kitchen = store.add_list_section(home.id, " Kitchen ")?;
-        assert!(store.add_list_section(home.id, " ").is_err());
-        assert_eq!(store.list_sections(home.id)?, [kitchen.clone()]);
-        assert!(store.list_sections(work.id)?.is_empty());
+        let kitchen = store.add_list_section(Some(home.id), " Kitchen ")?;
+        assert!(store.add_list_section(Some(home.id), " ").is_err());
+        assert_eq!(store.list_sections(Some(home.id))?, [kitchen.clone()]);
+        assert!(store.list_sections(Some(work.id))?.is_empty());
 
         let task = store.add_task("fix the tap")?;
         assert!(store.set_section(task.id, Some(kitchen.id)).is_err(), "the task is not in that list");
@@ -3329,12 +3400,12 @@ mod tests {
 
         store.rename_list_section(kitchen.id, " Kitchen & pantry ")?;
         assert!(store.rename_list_section(kitchen.id, "").is_err());
-        assert_eq!(store.list_sections(home.id)?[0].name, "Kitchen & pantry");
+        assert_eq!(store.list_sections(Some(home.id))?[0].name, "Kitchen & pantry");
         store.set_list(task.id, Some(home.id))?;
         store.set_section(task.id, Some(kitchen.id))?;
         store.delete_list_section(kitchen.id)?;
         assert_eq!(store.task(task.id)?.unwrap().section_id, None);
-        assert!(store.list_sections(home.id)?.is_empty());
+        assert!(store.list_sections(Some(home.id))?.is_empty());
         Ok(())
     }
 

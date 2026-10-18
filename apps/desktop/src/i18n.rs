@@ -391,6 +391,10 @@ pub struct Strings {
     pub sync: &'static str,
     pub features: &'static str,
     pub arrange_tasks: &'static str,
+    pub batch_management: &'static str,
+    /// `{n}` records chosen in Batch Management.
+    pub n_selected: &'static str,
+    pub select_all: &'static str,
     pub notifications_page: &'static str,
     /// Settings → Notifications: each switch's name and what it does.
     pub notification_items: [(&'static str, &'static str); 3],
@@ -902,6 +906,9 @@ pub static EN: Strings = Strings {
     sync: "Sync",
     features: "Features",
     arrange_tasks: "Arrange Tasks",
+    batch_management: "Batch Management",
+    n_selected: "{n} Selected",
+    select_all: "Select All",
     notifications_page: "Notifications",
     notification_items: [
         ("Daily Notifications", "Fern reminds you of today's tasks at a set time every day."),
@@ -1397,6 +1404,9 @@ pub static RU: Strings = Strings {
     sync: "Синхронизация",
     features: "Функции",
     arrange_tasks: "Расставить задачи",
+    batch_management: "Пакетное управление",
+    n_selected: "Выбрано: {n}",
+    select_all: "Выбрать все",
     notifications_page: "Уведомления",
     notification_items: [
         ("Ежедневное уведомление", "Fern каждый день в заданное время напоминает о задачах на сегодня."),

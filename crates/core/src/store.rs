@@ -1964,6 +1964,16 @@ impl Store {
         Ok(())
     }
 
+    /// The Focus Record's "Batch Management" Delete: these records go.
+    pub fn delete_focus_sessions(&self, ids: &[Id]) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        for id in ids {
+            tx.execute("DELETE FROM focus_sessions WHERE id = ?1", [id.to_string()])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// The Focus Record's "Delete All".
     pub fn delete_all_focus_sessions(&self) -> Result<()> {
         self.conn.execute("DELETE FROM focus_sessions", [])?;
@@ -2912,6 +2922,18 @@ mod tests {
         assert!(store.attachments(task.id)?.is_empty());
         assert!(!attachment.path(&folder).exists());
         std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn deleting_chosen_focus_records() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let a = store.add_focus_session(None, "a", 0, 60_000)?;
+        let b = store.add_focus_session(None, "b", 120_000, 180_000)?;
+        let c = store.add_focus_session(None, "c", 240_000, 300_000)?;
+        store.delete_focus_sessions(&[a.id, c.id])?;
+        let left: Vec<Id> = store.focus_sessions()?.into_iter().map(|s| s.id).collect();
+        assert_eq!(left, [b.id]);
         Ok(())
     }
 

@@ -2,6 +2,7 @@
 //! bar at the bottom, an overview and the focus record on the right.
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::rc::Rc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -46,6 +47,8 @@ pub struct FocusView {
     record_menu: Option<RecordMenu>,
     /// "Delete All" asks for a second click.
     delete_all_armed: bool,
+    /// The records ticked in Batch Management.
+    batch: HashSet<Id>,
     add_title: Entity<TextInput>,
     add_start: Entity<TextInput>,
     add_minutes: i64,
@@ -182,6 +185,8 @@ fn line_chart(values: &[i64], labels: Vec<String>, height: f32, from_zero: bool,
 enum RecordMenu {
     Add,
     More,
+    /// The Focus Record's "Batch Management": records to tick and delete together.
+    Batch,
     /// The Pomodoro header's "…" and its Focus Settings.
     HeaderMore,
     Settings,
@@ -199,6 +204,7 @@ impl FocusView {
             running: None,
             record_menu: None,
             delete_all_armed: false,
+            batch: HashSet::new(),
             add_title,
             add_start,
             add_minutes: 25,
@@ -480,6 +486,134 @@ impl FocusView {
         self.set_record_menu(None, cx);
     }
 
+    /// The original's Batch Management: the records by day, each and each day with a checkbox,
+    /// "Select All", and Delete for the ticked ones.
+    fn render_batch(&self, cx: &mut Context<Self>) -> AnyElement {
+        let strings = i18n::t(cx);
+        let mut days: Vec<(chrono::NaiveDate, Vec<&FocusSession>)> = Vec::new();
+        for session in &self.sessions {
+            let day = session.start_local().date_naive();
+            match days.last_mut() {
+                Some((d, list)) if *d == day => list.push(session),
+                _ => days.push((day, vec![session])),
+            }
+        }
+        let all: Vec<Id> = self.sessions.iter().map(|s| s.id).collect();
+        let chosen = self.batch.len();
+        let mut rows: Vec<AnyElement> = Vec::new();
+        for (day, sessions) in days {
+            let ids: Vec<Id> = sessions.iter().map(|s| s.id).collect();
+            let whole = ids.iter().all(|id| self.batch.contains(id));
+            rows.push(
+                h_flex()
+                    .id(SharedString::from(format!("batch-day-{day}")))
+                    .gap_2()
+                    .py_1()
+                    .cursor_pointer()
+                    .child(Checkbox::new(SharedString::from(format!("batch-day-box-{day}"))).size(px(14.)).toggle_state(whole))
+                    .child(Label::new(crate::task_rows::short_date(day, strings)).size(LabelSize::Small).weight(FontWeight::SEMIBOLD))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        for id in &ids {
+                            if whole {
+                                this.batch.remove(id);
+                            } else {
+                                this.batch.insert(*id);
+                            }
+                        }
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+            );
+            for session in sessions {
+                let id = session.id;
+                let on = self.batch.contains(&id);
+                let span = format!(
+                    "{} - {}",
+                    crate::calendar::format_time(session.start_local().time()),
+                    crate::calendar::format_time(session.end_local().time())
+                );
+                rows.push(
+                    h_flex()
+                        .id(SharedString::from(format!("batch-{id}")))
+                        .gap_2()
+                        .py_1()
+                        .items_start()
+                        .cursor_pointer()
+                        .child(Checkbox::new(SharedString::from(format!("batch-box-{id}"))).size(px(14.)).toggle_state(on))
+                        .child(
+                            v_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .child(Label::new(span).size(LabelSize::XSmall).color(Color::Muted))
+                                .child(Label::new(session.title.clone()).size(LabelSize::Small).truncate()),
+                        )
+                        .child(Label::new(fern_core::format_minutes(session.minutes())).size(LabelSize::XSmall).color(Color::Muted))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if !this.batch.remove(&id) {
+                                this.batch.insert(id);
+                            }
+                            cx.notify();
+                        }))
+                        .into_any_element(),
+                );
+            }
+        }
+        popover(cx)
+            .w(px(360.))
+            .max_h(px(520.))
+            .p_3()
+            .gap_2()
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.set_record_menu(None, cx)))
+            .child(
+                h_flex()
+                    .child(
+                        div().flex_1().child(
+                            Label::new(if chosen == 0 {
+                                strings.batch_management.to_owned()
+                            } else {
+                                strings.n_selected.replace("{n}", &chosen.to_string())
+                            })
+                            .weight(FontWeight::SEMIBOLD),
+                        ),
+                    )
+                    .child(IconButton::new("batch-close", IconName::X).size(px(22.)).icon_size(IconSize::Small).on_click(
+                        cx.listener(|this, _, _, cx| this.set_record_menu(None, cx)),
+                    )),
+            )
+            .child(v_flex().id("batch-list").flex_1().min_h_0().overflow_y_scroll().children(rows))
+            .child(
+                h_flex()
+                    .child(
+                        div()
+                            .id("batch-select-all")
+                            .cursor_pointer()
+                            .child(Label::new(strings.select_all).size(LabelSize::Small).color(Color::Accent))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.batch = all.iter().copied().collect();
+                                cx.notify();
+                            })),
+                    )
+                    .child(div().flex_1())
+                    .when(chosen > 0, |el| {
+                        el.child(
+                            div()
+                                .id("batch-delete")
+                                .cursor_pointer()
+                                .child(Label::new(strings.delete).size(LabelSize::Small).color(Color::Error))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    let ids: Vec<Id> = this.batch.drain().collect();
+                                    if let Err(err) = this.store.delete_focus_sessions(&ids) {
+                                        eprintln!("failed to delete the records: {err:#}");
+                                    }
+                                    this.set_record_menu(None, cx);
+                                    this.reload(cx);
+                                })),
+                        )
+                    }),
+            )
+            .into_any_element()
+    }
+
     fn render_record_menu(&self, menu: RecordMenu, cx: &mut Context<Self>) -> AnyElement {
         let strings = i18n::t(cx);
         let theme = cx.theme().clone();
@@ -529,9 +663,19 @@ impl FocusView {
                     .child(row("long-break", strings.focus_long_break, LONG_BREAK_SETTING, cx))
                     .into_any_element()
             }
+            RecordMenu::Batch => self.render_batch(cx),
             RecordMenu::More => popover(cx)
                 .w(px(240.))
                 .on_mouse_down_out(close)
+                .child(
+                    ListItem::new("focus-batch")
+                        .start_slot(Icon::new(IconName::ListChecks).color(Color::Muted))
+                        .child(Label::new(strings.batch_management))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.batch.clear();
+                            this.set_record_menu(Some(RecordMenu::Batch), cx)
+                        })),
+                )
                 .child(
                     ListItem::new("focus-export")
                         .start_slot(Icon::new(IconName::Share).color(Color::Muted))
@@ -1637,6 +1781,13 @@ impl FocusView {
                 });
                 return;
             }
+            // Batch Management with the newest record ticked.
+            "batch" => {
+                self.batch = self.sessions.first().map(|s| s.id).into_iter().collect();
+                self.record_menu = Some(RecordMenu::Batch);
+                cx.notify();
+                return;
+            }
             // The newest record's dialog, with a note.
             "record" => {
                 if let Some(session) = self.sessions.first() {
@@ -1750,8 +1901,8 @@ impl FocusView {
                             .child(IconButton::new("record-more", IconName::Ellipsis).on_click(cx.listener(|this, _, _, cx| {
                                 this.set_record_menu(Some(RecordMenu::More), cx)
                             })))
-                            .when(self.record_menu == Some(RecordMenu::More), |el| {
-                                el.child(PopoverAttachment::new(Placement::BelowRight, self.render_record_menu(RecordMenu::More, cx)))
+                            .when_some(self.record_menu.filter(|m| matches!(m, RecordMenu::More | RecordMenu::Batch)), |el, menu| {
+                                el.child(PopoverAttachment::new(Placement::BelowRight, self.render_record_menu(menu, cx)))
                             }),
                     )
     }

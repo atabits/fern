@@ -92,6 +92,8 @@ pub struct HabitView {
     records: HashMap<Id, Vec<Checkin>>,
     /// The note field under the habit log, for today's check-in.
     note_input: Entity<TextInput>,
+    /// Today's amount of a goal habit, typed in the details panel.
+    amount_input: Entity<TextInput>,
     editing: Option<HabitEdit>,
     new_habit: Option<Entity<TextInput>>,
     /// The habit shown in the details panel.
@@ -145,8 +147,11 @@ impl HabitView {
             }
         })
         .detach();
+        let amount_input = cx.new(|cx| TextInput::new(Mode::SingleLine, "0", cx));
+        cx.subscribe(&amount_input, |this, _, _: &Submitted, cx| this.record_amount(cx)).detach();
         let mut this = Self {
             store,
+            amount_input,
             habits: Vec::new(),
             checkins: HashMap::new(),
             records: HashMap::new(),
@@ -181,6 +186,18 @@ impl HabitView {
             self.selected = None;
         }
         cx.notify();
+    }
+
+    /// Saves the typed amount for today: the original's check-in with a number.
+    fn record_amount(&mut self, cx: &mut Context<Self>) {
+        let Some(habit) = self.selected else { return };
+        let text = self.amount_input.read(cx).text().trim().to_owned();
+        let Ok(amount) = text.parse::<u32>() else { return };
+        if let Err(err) = self.store.set_checkin_amount(habit, Local::now().date_naive(), amount) {
+            eprintln!("failed to record the amount: {err:#}");
+        }
+        self.amount_input.update(cx, |input, cx| input.set_text("", cx));
+        self.reload(cx);
     }
 
     pub fn select(&mut self, habit: Id, cx: &mut Context<Self>) {
@@ -1600,6 +1617,42 @@ impl HabitView {
                     .child(weekdays)
                     .children(grid),
             )
+            // A goal habit's amount for today, typed rather than clicked one unit at a time.
+            .when_some(habit.goal.clone(), |el, goal| {
+                let done = self.amount(id, today);
+                el.child(
+                    h_flex()
+                        .p_3()
+                        .gap_2()
+                        .rounded(px(8.))
+                        .bg(theme.colors().surface_background)
+                        .child(div().flex_1().child(Label::new(strings.habit_today_amount).size(LabelSize::Small)))
+                        .child(Label::new(strings.habit_done_so_far.replace("{n}", &done.to_string())).size(LabelSize::Small).color(Color::Muted))
+                        .child(
+                            h_flex()
+                                .w(px(64.))
+                                .h(px(26.))
+                                .px_2()
+                                .rounded(px(6.))
+                                .bg(theme.colors().background)
+                                .child(self.amount_input.clone()),
+                        )
+                        .child(Label::new(format!("/ {} {}", goal.amount, goal.unit)).size(LabelSize::Small).color(Color::Muted))
+                        .child(
+                            div()
+                                .id("habit-record-amount")
+                                .px_3()
+                                .h(px(26.))
+                                .flex()
+                                .items_center()
+                                .rounded(px(6.))
+                                .bg(theme.colors().accent)
+                                .cursor_pointer()
+                                .child(Label::new(strings.habit_record).size(LabelSize::Small).color(Color::Custom(gpui::white())))
+                                .on_click(cx.listener(|this, _, _, cx| this.record_amount(cx))),
+                        ),
+                )
+            })
             .when_some(habit.goal.as_ref().map(|g| g.amount), |el, goal| el.child(self.render_goal_chart(habit, goal, today, cx)))
             .child(
                 v_flex()

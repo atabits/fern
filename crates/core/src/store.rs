@@ -1339,6 +1339,24 @@ impl Store {
     }
 
     /// Writes the note of an existing check-in; an empty note removes it.
+    /// Records an amount for a goal habit's day, typed rather than stepped; 0 clears the day.
+    pub fn set_checkin_amount(&self, habit: Id, date: NaiveDate, amount: u32) -> Result<()> {
+        let date = date.format(DATE_FORMAT).to_string();
+        if amount == 0 {
+            self.conn.execute(
+                "DELETE FROM habit_checkins WHERE habit_id = ?1 AND date = ?2",
+                params![habit.to_string(), date],
+            )?;
+        } else {
+            self.conn.execute(
+                "INSERT INTO habit_checkins (habit_id, date, value) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(habit_id, date) DO UPDATE SET value = excluded.value",
+                params![habit.to_string(), date, amount],
+            )?;
+        }
+        Ok(())
+    }
+
     pub fn set_checkin_note(&self, habit: Id, date: NaiveDate, note: &str) -> Result<()> {
         let note = note.trim();
         let updated = self.conn.execute(
@@ -2337,6 +2355,19 @@ mod tests {
         let titles: Vec<String> = store.tasks_in(&View::Day(day), today)?.into_iter().map(|t| t.title).collect();
         assert_eq!(titles.len(), 2);
         assert!(titles.contains(&"due that day".to_owned()) && titles.contains(&"done that day".to_owned()));
+        Ok(())
+    }
+
+    #[test]
+    fn typed_check_in_amounts() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let water = store.add_habit("Water")?;
+        store.update_habit(water.id, "Water", Some(&crate::habit::Goal { amount: 8, unit: "glasses".into() }))?;
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 10, 18).unwrap();
+        store.set_checkin_amount(water.id, day, 5)?;
+        assert_eq!(store.step_checkin(water.id, day)?, 6);
+        store.set_checkin_amount(water.id, day, 0)?;
+        assert_eq!(store.step_checkin(water.id, day)?, 1);
         Ok(())
     }
 

@@ -270,6 +270,7 @@ impl AppView {
         self.todo.update(cx, |todo, cx| todo.stop_search(cx));
         if section == Section::Calendar {
             self.calendar.update(cx, |calendar, cx| calendar.reload(cx));
+            window.focus(&self.calendar.focus_handle(cx), cx);
         }
         if section == Section::Matrix {
             self.matrix.update(cx, |matrix, cx| matrix.reload(cx));

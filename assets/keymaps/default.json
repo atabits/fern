@@ -37,6 +37,17 @@
     }
   },
   {
+    "context": "Calendar",
+    "bindings": {
+      "d": "calendar::DayView",
+      "1": "calendar::DayView",
+      "w": "calendar::WeekView",
+      "2": "calendar::WeekView",
+      "m": "calendar::MonthView",
+      "3": "calendar::MonthView"
+    }
+  },
+  {
     "context": "Settings",
     "bindings": {
       "escape": "settings::DismissSettings"

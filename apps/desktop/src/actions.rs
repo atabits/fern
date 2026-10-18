@@ -20,6 +20,8 @@ actions!(
 
 actions!(settings, [DismissSettings]);
 
+actions!(calendar, [DayView, WeekView, MonthView]);
+
 actions!(
     task_list,
     [

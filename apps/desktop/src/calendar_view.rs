@@ -9,7 +9,7 @@ use gpui::{EventEmitter, FontWeight};
 use ui::prelude::*;
 use ui::{Placement, PopoverAttachment, SubmenuItem, popover};
 
-use crate::actions::{NewTask, ToggleSidebar};
+use crate::actions::{DayView, MonthView, NewTask, ToggleSidebar, WeekView};
 use crate::calendar::{self, week_axis};
 use crate::drag::DraggedTask;
 use crate::i18n;
@@ -49,12 +49,19 @@ pub struct CalendarView {
     /// A day of the shown week in week mode.
     anchor: NaiveDate,
     mode_menu_open: bool,
+    focus_handle: gpui::FocusHandle,
     /// The mode menu's Multi-Day side menu, while hovered open.
     multi_day_menu: bool,
     tasks: Vec<Task>,
 }
 
 impl EventEmitter<OpenTask> for CalendarView {}
+
+impl gpui::Focusable for CalendarView {
+    fn focus_handle(&self, _: &App) -> gpui::FocusHandle {
+        self.focus_handle.clone()
+    }
+}
 
 impl CalendarView {
     pub fn new(store: Rc<Store>, cx: &mut Context<Self>) -> Self {
@@ -65,6 +72,7 @@ impl CalendarView {
             month: calendar::month_start(today),
             anchor: today,
             mode_menu_open: false,
+            focus_handle: cx.focus_handle(),
             multi_day_menu: false,
             tasks: Vec::new(),
         };
@@ -322,6 +330,7 @@ impl CalendarView {
         let hour_label = |hour: u32| -> SharedString {
             if hour == 12 { strings.noon.into() } else { calendar::format_hour(hour).into() }
         };
+        let now_color = theme.status().error;
         let mut axis = v_flex().w(gutter).flex_none().child(
             div()
                 .h(px(week_axis::FOLDED_HEIGHT))
@@ -393,6 +402,13 @@ impl CalendarView {
                 .on_drop(cx.listener(move |this, dragged: &DraggedTask, _, cx| this.drop_on_day(dragged.id, date, cx)))
                 .children(hour_lines)
                 .children(timed)
+                // The original's red line at the current time, with a dot where it starts.
+                .when(date == today, |el| {
+                    let top = week_axis::offset(Local::now().time());
+                    el.child(div().absolute().top(px(top - 1.)).left_0().right_0().h(px(2.)).bg(now_color)).child(
+                        div().absolute().top(px(top - 4.)).left(px(-4.)).size(px(8.)).rounded_full().bg(now_color),
+                    )
+                })
         });
 
         v_flex()
@@ -407,7 +423,30 @@ impl CalendarView {
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
-                    .child(h_flex().items_start().child(axis).children(columns)),
+                    .child(
+                        h_flex()
+                            .items_start()
+                            .child(
+                                // The current time in red on the axis, as in the original.
+                                div().relative().child(axis).when(week.contains(&today), |el| {
+                                    let now = Local::now().time();
+                                    el.child(
+                                        div()
+                                            .absolute()
+                                            .top(px(week_axis::offset(now) - 7.))
+                                            .right(px(4.))
+                                            .px_0p5()
+                                            .bg(theme.colors().background)
+                                            .child(
+                                                Label::new(calendar::format_time(now))
+                                                    .size(LabelSize::XSmall)
+                                                    .color(Color::Custom(now_color)),
+                                            ),
+                                    )
+                                }),
+                            )
+                            .children(columns),
+                    ),
             )
             .into_any_element()
     }
@@ -500,6 +539,12 @@ impl Render for CalendarView {
         };
 
         v_flex()
+            .track_focus(&self.focus_handle)
+            .key_context("Calendar")
+            // The view menu's keys, as in the original: D/1, W/2, M/3.
+            .on_action(cx.listener(|this, _: &DayView, _, cx| this.set_mode(CalendarMode::Day, cx)))
+            .on_action(cx.listener(|this, _: &WeekView, _, cx| this.set_mode(CalendarMode::Week, cx)))
+            .on_action(cx.listener(|this, _: &MonthView, _, cx| this.set_mode(CalendarMode::Month, cx)))
             .size_full()
             .bg(theme.colors().background)
             .text_color(theme.colors().text)

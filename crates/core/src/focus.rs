@@ -67,6 +67,27 @@ pub fn minutes_by_day(sessions: &[FocusSession], start: NaiveDate, days: usize) 
     out
 }
 
+/// The Statistics' "Timeline": each session of the week starting on `first` as (day index 0–6,
+/// start minute, end minute) within its day; a session over midnight is split in two.
+pub fn timeline(sessions: &[FocusSession], first: NaiveDate) -> Vec<(usize, u32, u32)> {
+    let minute = |t: DateTime<Local>| t.hour() * 60 + t.minute();
+    let mut blocks = Vec::new();
+    for session in sessions {
+        let (start, end) = (session.start_local(), session.end_local());
+        let mut day = start.date_naive();
+        while day <= end.date_naive() {
+            let from = if day == start.date_naive() { minute(start) } else { 0 };
+            let to = if day == end.date_naive() { minute(end) } else { 24 * 60 };
+            let index = (day - first).num_days();
+            if (0..7).contains(&index) && to > from {
+                blocks.push((index as usize, from, to));
+            }
+            day += Duration::days(1);
+        }
+    }
+    blocks
+}
+
 /// What the Statistics' "Details" splits focus time by: the original's List, Tag or Task.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FocusKey {
@@ -252,5 +273,16 @@ mod tests {
         assert_eq!(by_tag.len(), 3);
         assert!(by_tag.contains(&(FocusKey::Tag(Some("deep".into())), 25)) && by_tag.contains(&(FocusKey::Tag(None), 10)));
         assert_eq!(focus_by(&sessions, &tasks, 2, today, today)[1], (FocusKey::Task("Reading".into()), 10));
+    }
+
+    #[test]
+    fn timeline_blocks() {
+        let at = |d: u32, h: u32, m: u32| {
+            Local.from_local_datetime(&NaiveDate::from_ymd_opt(2026, 10, d).unwrap().and_hms_opt(h, m, 0).unwrap()).unwrap().timestamp_millis()
+        };
+        let session = |start: i64, end: i64| FocusSession { id: uuid::Uuid::now_v7(), task_id: None, title: "x".into(), started_at: start, ended_at: end };
+        let monday = NaiveDate::from_ymd_opt(2026, 10, 12).unwrap();
+        let sessions = [session(at(15, 13, 30), at(15, 16, 0)), session(at(13, 23, 0), at(14, 1, 0)), session(at(20, 9, 0), at(20, 10, 0))];
+        assert_eq!(timeline(&sessions, monday), [(3, 810, 960), (1, 1380, 1440), (2, 0, 60)]);
     }
 }

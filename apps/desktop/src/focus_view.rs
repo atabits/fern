@@ -80,6 +80,8 @@ struct StatsPage {
     details_period: Bucket,
     details_day: NaiveDate,
     details_menu: Option<u8>,
+    /// The first day of the Timeline's week.
+    timeline_week: NaiveDate,
 }
 
 /// Bars for the statistics charts, with a label under each; `highlight` marks one bar.
@@ -504,6 +506,7 @@ impl FocusView {
             details_period: Bucket::Day,
             details_day: today,
             details_menu: None,
+            timeline_week: crate::calendar::week_of(today)[0],
         });
         cx.notify();
     }
@@ -623,6 +626,62 @@ impl FocusView {
                 (0..7).contains(&today_index).then_some(today_index as usize),
             ));
 
+        // Timeline: the week's sessions as blocks on a day's hours, as in the original.
+        const TIMELINE: f32 = 200.;
+        let blocks = fern_core::focus::timeline(&self.sessions, page.timeline_week);
+        let timeline_label = if page.timeline_week == crate::calendar::week_of(today)[0] {
+            strings.stats_this_week.to_owned()
+        } else {
+            format!(
+                "{} - {}",
+                crate::task_rows::short_date(page.timeline_week, strings),
+                crate::task_rows::short_date(page.timeline_week + chrono::Duration::days(6), strings)
+            )
+        };
+        let accent = theme.colors().accent;
+        let grid_line = theme.colors().border_variant;
+        let timeline = card()
+            .flex_1()
+            .min_w_0()
+            .child(
+                h_flex()
+                    .child(div().flex_1().child(Label::new(strings.stats_timeline).weight(FontWeight::SEMIBOLD)))
+                    .child(nav(
+                        "timeline",
+                        timeline_label,
+                        |p| p.timeline_week -= chrono::Duration::days(7),
+                        |p| p.timeline_week += chrono::Duration::days(7),
+                        cx,
+                    )),
+            )
+            .child(
+                h_flex()
+                    .items_start()
+                    .gap_2()
+                    .child(v_flex().w(px(40.)).h(px(TIMELINE)).justify_between().children((0..=6).map(|i| {
+                        Label::new(crate::calendar::format_hour((i * 4) % 24)).size(LabelSize::XSmall).color(Color::Muted)
+                    })))
+                    .child(
+                        div()
+                            .flex_1()
+                            .h(px(TIMELINE))
+                            .relative()
+                            .children((0..=6).map(|i| {
+                                div().absolute().left_0().right_0().top(px(TIMELINE * i as f32 / 6.)).h(px(1.)).bg(grid_line)
+                            }))
+                            .child(h_flex().size_full().children((0..7).map(|day| {
+                                div().flex_1().h_full().relative().children(blocks.iter().filter(|(d, _, _)| *d == day).map(|(_, from, to)| {
+                                    let top = TIMELINE * *from as f32 / 1440.;
+                                    let height = (TIMELINE * (to - from) as f32 / 1440.).max(2.);
+                                    div().absolute().left(px(4.)).right(px(4.)).top(px(top)).h(px(height)).rounded(px(2.)).bg(accent)
+                                }))
+                            }))),
+                    ),
+            )
+            .child(h_flex().pl(px(48.)).children(crate::calendar::weekday_labels(&strings.weekdays_short).iter().map(|d| {
+                div().flex_1().flex().justify_center().child(Label::new(*d).size(LabelSize::XSmall).color(Color::Muted))
+            })));
+
         // Most Focused Time: minutes per hour of the chosen month.
         let hours = fern_core::focus::minutes_by_hour(&self.sessions, page.month);
         let hours_top = hours.iter().copied().max().unwrap_or(0).max(1) as f32;
@@ -735,7 +794,8 @@ impl FocusView {
                 _ => el
                     .child(overview)
                     .child(self.render_focus_details(page, today, cx))
-                    .child(h_flex().items_start().gap_4().child(trends).child(most_focused))
+                    .child(h_flex().items_start().gap_4().child(trends).child(timeline))
+                    .child(h_flex().items_start().gap_4().child(most_focused).child(div().flex_1()))
                     .child(year_grid),
             }))
             .into_any_element()
@@ -1447,6 +1507,10 @@ impl FocusView {
                     p.curves[2] = Bucket::Month;
                     p.curve_menu = Some(1);
                 });
+                return;
+            }
+            "stats-focus" => {
+                self.open_stats(cx);
                 return;
             }
             "stats-focus-details" => {

@@ -66,6 +66,10 @@ fn open_store() -> Result<Store> {
         }
         std::fs::remove_file(&pending).ok();
     }
+    // The sync log keeps one entry per row; without a server it would grow with every edit.
+    if let Err(err) = store.compact_sync_log() {
+        eprintln!("failed to compact the sync log: {err:#}");
+    }
     Ok(store)
 }
 

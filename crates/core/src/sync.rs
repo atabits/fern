@@ -176,11 +176,25 @@ impl Store {
         let applied = self.apply_changes(&received)?;
         self.set_setting(SYNC_SENT, &request.sent.to_string())?;
         self.set_setting(SYNC_SEEN, &position.to_string())?;
+        self.compact_sync_log()?;
         Ok(applied)
     }
 }
 
 impl Store {
+    /// Keeps one log entry per row, its latest: sending and conflicts only look at that one, so
+    /// older entries are dropped whether or not they were sent. Returns how many went.
+    pub fn compact_sync_log(&self) -> Result<usize> {
+        Ok(self.conn.execute(
+            "DELETE FROM sync_log WHERE EXISTS (
+                 SELECT 1 FROM sync_log later
+                 WHERE later.entity = sync_log.entity AND later.key = sync_log.key
+                   AND later.seq > sync_log.seq AND later.at >= sync_log.at
+             )",
+            [],
+        )?)
+    }
+
     /// The last entry of the change log: what a device has sent up to.
     pub fn sync_position(&self) -> Result<i64> {
         Ok(self.conn.query_row("SELECT COALESCE(MAX(seq), 0) FROM sync_log", [], |row| row.get(0))?)
@@ -366,6 +380,25 @@ mod tests {
         // Another server starts over.
         store.set_sync_config(&SyncConfig { server: "https://other.example.org".into(), token: "x".into() })?;
         assert!(store.has_unsent_changes()?);
+        Ok(())
+    }
+
+    #[test]
+    fn the_log_keeps_one_entry_per_row() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let task = store.add_task("Draft")?;
+        for i in 0..20 {
+            store.set_title(task.id, &format!("Draft {i}"))?;
+        }
+        let entries = |store: &Store| -> i64 { store.conn.query_row("SELECT COUNT(*) FROM sync_log", [], |r| r.get(0)).unwrap() };
+        assert!(entries(&store) > 20);
+        let (before, _) = store.changes_since(0)?;
+        store.compact_sync_log()?;
+        assert_eq!(entries(&store), 1);
+        // What a sync sends is the same.
+        let (after, position) = store.changes_since(0)?;
+        assert_eq!(after, before);
+        assert_eq!(position, store.sync_position()?);
         Ok(())
     }
 

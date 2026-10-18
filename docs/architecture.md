@@ -23,6 +23,8 @@ Devices sync through a self-hosted server, row by row (`crates/core/src/sync.rs`
 
 - Triggers log every write to synced data in `sync_log` (table, row key, time), so every write
   path counts. Rows that existed before the log was added count as changed at time 0.
+  The log keeps only the latest entry of each row (`compact_sync_log`, after every sync and on
+  start).
 - A device sends `changes_since(position)`: each changed row once, as it is now, or as deleted.
 - A device applies what it receives with `apply_changes`: the later change of a row wins, rows
   may arrive in any order (foreign keys are checked at commit), and applied changes are not

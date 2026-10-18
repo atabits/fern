@@ -4372,6 +4372,10 @@ impl TodoView {
                                 }),
                         )
                     })
+                    // As the original's, a note with text shows a small page at the row's end.
+                    .when(task.kind == fern_core::Kind::Note && !task.notes.trim().is_empty(), |el| {
+                        el.child(Icon::new(IconName::FileText).size(IconSize::XSmall).color(Color::Muted))
+                    })
                     .when(self.view == View::Trash, |el| {
                         el.child(
                             div()

@@ -2585,7 +2585,8 @@ impl Render for TaskDetail {
                 };
                 (label.into(), if overdue && !done { Color::Error } else { Color::Accent })
             }
-            None => (strings.due_date.into(), Color::Muted),
+            // A note, as the original's, offers a reminder rather than a due date.
+            None => ((if task.kind == Kind::Note { strings.set_reminder } else { strings.due_date }).into(), Color::Muted),
         };
         let priority_color = task_rows::priority_color(task.priority, &theme).map_or(Color::Muted, Color::Custom);
         let list_name: SharedString = task
@@ -2604,17 +2605,18 @@ impl Render for TaskDetail {
                     .px_5()
                     .border_b_1()
                     .border_color(theme.colors().border)
-                    .child(
-                        // The original's 15 px box in the details' top bar.
-                        Checkbox::new("detail-checkbox")
-                            .size(px(15.))
-                            .toggle_state(done)
-                            .dismissed(task.is_wont_do())
-                            .lines(!self.checklist.is_empty())
-                            .on_click(cx.listener(|this, _, _, cx| this.toggle_completed(cx))),
-                    )
-                    // The original's short line between the box and the date.
-                    .child(div().w(px(1.)).h(px(14.)).bg(theme.colors().border))
+                    // The original's 15 px box and the short line after it; a note has neither.
+                    .when(task.kind != Kind::Note, |el| {
+                        el.child(
+                            Checkbox::new("detail-checkbox")
+                                .size(px(15.))
+                                .toggle_state(done)
+                                .dismissed(task.is_wont_do())
+                                .lines(!self.checklist.is_empty())
+                                .on_click(cx.listener(|this, _, _, cx| this.toggle_completed(cx))),
+                        )
+                        .child(div().w(px(1.)).h(px(14.)).bg(theme.colors().border))
+                    })
                     .child(
                         label_button("due-date", IconName::CalendarDays, due_text, due_color, cx)
                             .when(repeats, |el| el.child(Icon::new(IconName::Repeat).size(IconSize::Small).color(due_color)))
@@ -2631,7 +2633,8 @@ impl Render for TaskDetail {
                         div()
                             .relative()
                             .child(
-                                IconButton::new("priority", IconName::Flag)
+                                // A note's priority shows as the original's "!" in a circle.
+                                IconButton::new("priority", if task.kind == Kind::Note { IconName::CircleAlert } else { IconName::Flag })
                                     .icon_color(priority_color)
                                     .tip(strings.summary_priority, TipSide::Below)
                                     .on_click(cx.listener(|this, _, _, cx| this.open_popup(Popup::Priority, cx))),

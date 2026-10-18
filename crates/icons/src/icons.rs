@@ -36,6 +36,7 @@ pub enum IconName {
     ChevronUp,
     ChevronsUpDown,
     Circle,
+    CircleAlert,
     CircleCheck,
     CircleDot,
     CircleQuestionMark,

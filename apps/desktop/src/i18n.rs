@@ -739,6 +739,7 @@ pub struct Strings {
     pub range_until: &'static str,
     pub comments: &'static str,
     pub text_format: &'static str,
+    pub set_reminder: &'static str,
     /// The board's "+ New section" after its last column.
     pub new_section: &'static str,
     pub days_left: &'static str,
@@ -1405,6 +1406,7 @@ pub static EN: Strings = Strings {
     range_until: "End",
     comments: "Comments",
     text_format: "Text Format",
+    set_reminder: "Set Reminder",
     new_section: "New section",
     days_left: "{n}d left",
     comment_tip: "Comment",
@@ -2071,6 +2073,7 @@ pub static RU: Strings = Strings {
     range_until: "Конец",
     comments: "Комментарии",
     text_format: "Формат текста",
+    set_reminder: "Напоминание",
     new_section: "Новый раздел",
     days_left: "ещё {n} дн.",
     comment_tip: "Комментарий",

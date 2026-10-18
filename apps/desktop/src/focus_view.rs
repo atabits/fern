@@ -47,6 +47,16 @@ pub struct FocusView {
     add_minutes: i64,
     /// The last export's result.
     message: Option<String>,
+    /// The Statistics page, while it is open.
+    stats: Option<StatsPage>,
+}
+
+/// What the Statistics page shows: the Trends week, the Most Focused Time month and the year.
+#[derive(Clone, Copy)]
+struct StatsPage {
+    week: NaiveDate,
+    month: NaiveDate,
+    year: i32,
 }
 
 /// The Focus Record's "+" form and "…" menu, as in the original.
@@ -75,6 +85,7 @@ impl FocusView {
             add_start,
             add_minutes: 25,
             message: None,
+            stats: None,
         };
         this.reload(cx);
         this
@@ -225,6 +236,12 @@ impl FocusView {
                 .w(px(200.))
                 .on_mouse_down_out(close)
                 .child(
+                    ListItem::new("focus-statistics")
+                        .start_slot(Icon::new(IconName::ChartNoAxesColumn).color(Color::Muted))
+                        .child(Label::new(strings.statistics))
+                        .on_click(cx.listener(|this, _, _, cx| this.open_stats(cx))),
+                )
+                .child(
                     ListItem::new("focus-settings")
                         .start_slot(Icon::new(IconName::Settings).color(Color::Muted))
                         .child(Label::new(strings.focus_settings))
@@ -322,11 +339,223 @@ impl FocusView {
         }
     }
 
+    fn open_stats(&mut self, cx: &mut Context<Self>) {
+        let today = Local::now().date_naive();
+        self.record_menu = None;
+        self.stats = Some(StatsPage {
+            week: crate::calendar::week_of(today)[0],
+            month: crate::calendar::month_start(today),
+            year: today.year(),
+        });
+        cx.notify();
+    }
+
+    fn update_stats(&mut self, cx: &mut Context<Self>, change: impl FnOnce(&mut StatsPage)) {
+        if let Some(stats) = self.stats.as_mut() {
+            change(stats);
+        }
+        cx.notify();
+    }
+
+    /// The original's Statistics page for focus: overview, Trends, Most Focused Time and the year grid.
+    fn render_stats(&self, page: StatsPage, cx: &mut Context<Self>) -> AnyElement {
+        let strings = i18n::t(cx);
+        let theme = cx.theme().clone();
+        let today = Local::now().date_naive();
+        let stats = focus_stats(&self.sessions, today);
+        let (count_change, minutes_change) = fern_core::focus::change_from_yesterday(&self.sessions, today);
+        let card = || v_flex().p_4().gap_2().rounded(px(10.)).bg(theme.colors().surface_background);
+        let nav = |id: &'static str, label: String, back: fn(&mut StatsPage), forward: fn(&mut StatsPage), cx: &mut Context<Self>| {
+            h_flex()
+                .gap_1()
+                .child(IconButton::new(SharedString::from(format!("{id}-back")), IconName::ChevronLeft).on_click(
+                    cx.listener(move |this, _, _, cx| this.update_stats(cx, back)),
+                ))
+                .child(Label::new(label).size(LabelSize::Small))
+                .child(IconButton::new(SharedString::from(format!("{id}-forward")), IconName::ChevronRight).on_click(
+                    cx.listener(move |this, _, _, cx| this.update_stats(cx, forward)),
+                ))
+        };
+        let signed = |n: i64, text: String| if n > 0 { format!("+{text}") } else { text };
+        let overview_item = |value: String, label: &'static str, change: Option<String>| {
+            v_flex()
+                .flex_1()
+                .items_center()
+                .gap_0p5()
+                .child(div().text_size(px(26.)).text_color(theme.colors().accent).child(value))
+                .child(Label::new(label).size(LabelSize::Small).color(Color::Muted))
+                .children(change.map(|c| Label::new(c).size(LabelSize::XSmall).color(Color::Muted)))
+        };
+        let overview = card()
+            .child(Label::new(strings.focus_overview).weight(FontWeight::SEMIBOLD))
+            .child(
+                h_flex()
+                    .child(overview_item(
+                        stats.today_count.to_string(),
+                        strings.focus_today_pomo,
+                        Some(strings.stats_from_yesterday.replace("{n}", &signed(count_change, count_change.to_string()))),
+                    ))
+                    .child(overview_item(stats.total_count.to_string(), strings.focus_total_pomo, None))
+                    .child(overview_item(
+                        format_minutes(stats.today_minutes),
+                        strings.focus_today_focus,
+                        Some(strings.stats_from_yesterday.replace(
+                            "{n}",
+                            &signed(minutes_change, if minutes_change < 0 { format!("-{}", format_minutes(-minutes_change)) } else { format_minutes(minutes_change) }),
+                        )),
+                    ))
+                    .child(overview_item(format_minutes(stats.total_minutes), strings.focus_total_duration, None)),
+            );
+
+        // Trends: minutes per day of the chosen week.
+        const CHART: f32 = 140.;
+        let week = fern_core::focus::minutes_by_day(&self.sessions, page.week, 7);
+        let week_top = week.iter().copied().max().unwrap_or(0).max(1) as f32;
+        let average = week.iter().sum::<i64>() / 7;
+        let week_label = format!(
+            "{} - {}",
+            crate::task_rows::short_date(page.week, strings),
+            crate::task_rows::short_date(page.week + chrono::Duration::days(6), strings)
+        );
+        let bars = |values: Vec<i64>, top: f32, labels: Vec<String>, highlight: Option<usize>| {
+            v_flex()
+                .gap_1()
+                .child(h_flex().h(px(CHART)).items_end().gap_1().children(values.iter().enumerate().map(|(i, v)| {
+                    div()
+                        .flex_1()
+                        .h(px((CHART * *v as f32 / top).max(if *v > 0 { 2. } else { 0. })))
+                        .rounded_t(px(3.))
+                        .bg(if highlight == Some(i) { theme.colors().accent } else { theme.colors().accent.opacity(0.6) })
+                })))
+                .child(h_flex().gap_1().children(labels.into_iter().map(|l| {
+                    div().flex_1().flex().justify_center().child(Label::new(l).size(LabelSize::XSmall).color(Color::Muted))
+                })))
+        };
+        let today_index = (today - page.week).num_days();
+        let trends = card()
+            .flex_1()
+            .min_w_0()
+            .child(
+                h_flex()
+                    .child(div().flex_1().child(Label::new(strings.stats_trends).weight(FontWeight::SEMIBOLD)))
+                    .child(nav(
+                        "trends",
+                        week_label,
+                        |p| p.week -= chrono::Duration::days(7),
+                        |p| p.week += chrono::Duration::days(7),
+                        cx,
+                    )),
+            )
+            .child(
+                Label::new(strings.stats_daily_average.replace("{t}", &format_minutes(average)))
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
+            .child(bars(
+                week,
+                week_top,
+                strings.weekdays_short.iter().map(|d| (*d).to_owned()).collect(),
+                (0..7).contains(&today_index).then_some(today_index as usize),
+            ));
+
+        // Most Focused Time: minutes per hour of the chosen month.
+        let hours = fern_core::focus::minutes_by_hour(&self.sessions, page.month);
+        let hours_top = hours.iter().copied().max().unwrap_or(0).max(1) as f32;
+        let most = hours.iter().enumerate().max_by_key(|(_, m)| **m).filter(|(_, m)| **m > 0).map(|(h, _)| h);
+        let most_focused = card()
+            .flex_1()
+            .min_w_0()
+            .child(
+                h_flex()
+                    .child(div().flex_1().child(Label::new(strings.stats_most_focused).weight(FontWeight::SEMIBOLD)))
+                    .child(nav(
+                        "most",
+                        crate::calendar::month_title(page.month, strings),
+                        |p| p.month = crate::calendar::add_months(p.month, -1),
+                        |p| p.month = crate::calendar::add_months(p.month, 1),
+                        cx,
+                    )),
+            )
+            .child(bars(
+                hours.to_vec(),
+                hours_top,
+                (0..24).map(|h| if h % 3 == 0 { format!("{h:02}") } else { String::new() }).collect(),
+                most,
+            ));
+
+        // Year Grids: one cell per day, columns are weeks.
+        let first = NaiveDate::from_ymd_opt(page.year, 1, 1).unwrap_or(today);
+        let grid_start = crate::calendar::week_of(first)[0];
+        let days = fern_core::focus::minutes_by_day(&self.sessions, grid_start, 54 * 7);
+        let shade = |minutes: i64| match minutes {
+            0 => theme.colors().element_hover,
+            1..60 => theme.colors().accent.opacity(0.3),
+            60..180 => theme.colors().accent.opacity(0.55),
+            180..300 => theme.colors().accent.opacity(0.8),
+            _ => theme.colors().accent,
+        };
+        let year_grid = card()
+            .child(
+                h_flex()
+                    .child(div().flex_1().child(Label::new(strings.stats_year_grids).weight(FontWeight::SEMIBOLD)))
+                    .child(nav("year", page.year.to_string(), |p| p.year -= 1, |p| p.year += 1, cx)),
+            )
+            .child(h_flex().gap(px(3.)).children((0..54).map(|week| {
+                v_flex().gap(px(3.)).children((0..7).map(|weekday| {
+                    let index = week * 7 + weekday;
+                    let date = grid_start + chrono::Duration::days(index as i64);
+                    div()
+                        .size(px(11.))
+                        .rounded(px(2.))
+                        .bg(shade(days[index]))
+                        .when(date.year() != page.year, |el| el.opacity(0.))
+                }))
+            })));
+
+        v_flex()
+            .id("focus-stats")
+            .size_full()
+            .overflow_y_scroll()
+            .bg(theme.colors().background)
+            .text_color(theme.colors().text)
+            .px_8()
+            .py_5()
+            .gap_4()
+            .child(
+                h_flex()
+                    .child(div().flex_1().child(div().text_size(px(24.)).font_weight(FontWeight::BOLD).child(strings.statistics)))
+                    .child(
+                        div()
+                            .id("stats-done")
+                            .px_5()
+                            .h(px(32.))
+                            .flex()
+                            .items_center()
+                            .rounded(px(8.))
+                            .bg(theme.colors().accent)
+                            .cursor_pointer()
+                            .child(Label::new(strings.done))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.stats = None;
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(overview)
+            .child(h_flex().items_start().gap_4().child(trends).child(most_focused))
+            .child(year_grid)
+            .into_any_element()
+    }
+
     #[cfg(debug_assertions)]
     pub fn dev_menu(&mut self, menu: &str, cx: &mut Context<Self>) {
         let menu = match menu {
             "add" => RecordMenu::Add,
             "settings" => RecordMenu::Settings,
+            "stats" => {
+                self.open_stats(cx);
+                return;
+            }
             _ => RecordMenu::More,
         };
         self.set_record_menu(Some(menu), cx);
@@ -430,6 +659,9 @@ impl FocusView {
 
 impl Render for FocusView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(page) = self.stats {
+            return self.render_stats(page, cx);
+        }
         let strings = i18n::t(cx);
         let theme = cx.theme().clone();
         let now = now_ms();
@@ -614,5 +846,6 @@ impl Render for FocusView {
             .text_color(theme.colors().text)
             .child(left)
             .child(right)
+            .into_any_element()
     }
 }

@@ -1,6 +1,6 @@
 //! Focus (Pomodoro) sessions and their statistics.
 
-use chrono::{DateTime, Local, NaiveDate, TimeZone};
+use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, TimeZone, Timelike};
 
 use crate::model::Id;
 
@@ -53,6 +53,50 @@ pub fn focus_stats(sessions: &[FocusSession], today: NaiveDate) -> FocusStats {
         }
     }
     stats
+}
+
+/// Focus minutes per day for `days` days from `start`, for the Trends chart and the Year Grid.
+pub fn minutes_by_day(sessions: &[FocusSession], start: NaiveDate, days: usize) -> Vec<i64> {
+    let mut out = vec![0; days];
+    for session in sessions {
+        let offset = (session.start_local().date_naive() - start).num_days();
+        if (0..days as i64).contains(&offset) {
+            out[offset as usize] += session.minutes();
+        }
+    }
+    out
+}
+
+/// "Most Focused Time": minutes per hour of day in the month containing `month`, split across
+/// the hours each session covers.
+pub fn minutes_by_hour(sessions: &[FocusSession], month: NaiveDate) -> [i64; 24] {
+    let mut out = [0; 24];
+    for session in sessions {
+        let start = session.start_local();
+        if start.year() != month.year() || start.month() != month.month() {
+            continue;
+        }
+        let mut at = start;
+        let end = session.end_local();
+        while at < end {
+            let next_hour = (at + Duration::hours(1)).with_minute(0).and_then(|t| t.with_second(0)).unwrap_or(end);
+            let until = next_hour.min(end);
+            out[at.hour() as usize] += (until - at).num_minutes();
+            at = until;
+        }
+    }
+    out
+}
+
+/// Today's Pomodoros and minutes minus yesterday's, for "N from yesterday".
+pub fn change_from_yesterday(sessions: &[FocusSession], today: NaiveDate) -> (i64, i64) {
+    let day = |date: NaiveDate| {
+        let stats = focus_stats(sessions, date);
+        (stats.today_count as i64, stats.today_minutes)
+    };
+    let (count, minutes) = day(today);
+    let (before_count, before_minutes) = day(today - Duration::days(1));
+    (count - before_count, minutes - before_minutes)
 }
 
 /// "2h30m", "45m", "0m".
@@ -123,6 +167,17 @@ mod tests {
             "start,end,minutes,title\n2026-10-18 09:00,2026-10-18 09:25,25,x\n\
              2026-10-18 14:00,2026-10-18 14:50,50,\"Write, then edit\"\n"
         );
+    }
+
+    #[test]
+    fn charts() {
+        let at = |d: u32, h: u32, m: u32| Local.with_ymd_and_hms(2026, 10, d, h, m, 0).unwrap();
+        let sessions = [session(at(18, 9, 30), 60), session(at(17, 14, 0), 25), session(at(12, 9, 0), 25)];
+        let day = |d| NaiveDate::from_ymd_opt(2026, 10, d).unwrap();
+        assert_eq!(minutes_by_day(&sessions, day(12), 7), [25, 0, 0, 0, 0, 25, 60]);
+        let hours = minutes_by_hour(&sessions, day(1));
+        assert_eq!((hours[9], hours[10], hours[14]), (25 + 30, 30, 25));
+        assert_eq!(change_from_yesterday(&sessions, day(18)), (0, 35));
     }
 
     #[test]

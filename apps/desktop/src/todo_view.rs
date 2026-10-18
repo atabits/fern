@@ -67,6 +67,8 @@ struct AddDraft {
     list: Option<Option<Id>>,
     note: bool,
     tags: Vec<String>,
+    /// The date picked with the field's calendar button; a typed date wins.
+    date: Option<NaiveDate>,
 }
 
 pub struct TodoView {
@@ -131,6 +133,8 @@ pub struct TodoView {
     add_tag_input: Entity<TextInput>,
     /// The "▾" menu's "Input Box Setting" chooser, while open.
     input_box_open: bool,
+    /// The field's date picker, while open, with the month it shows.
+    add_date_month: Option<NaiveDate>,
     /// The section whose "…" menu is open.
     section_menu: Option<Id>,
     /// A section being renamed, with its field.
@@ -255,6 +259,7 @@ impl TodoView {
             add_tags: None,
             add_tag_input,
             input_box_open: false,
+            add_date_month: None,
             list_activity: None,
             filters: Vec::new(),
             preferences: Default::default(),
@@ -408,6 +413,11 @@ impl TodoView {
                 }
                 Some(("menu", "templates")) => self.templates_open = true,
                 Some(("menu", "input-box")) => self.input_box_open = true,
+                // `menu=add-date`: the field's date picker open, with tomorrow picked.
+                Some(("menu", "add-date")) => {
+                    self.add_draft.date = Some(Self::today() + chrono::Duration::days(1));
+                    self.add_date_month = Some(crate::calendar::month_start(Self::today()));
+                }
                 Some(("menu", "detailed-input")) => {
                     self.preferences.detailed_input = true;
                     self.store.save_preferences(&self.preferences).ok();
@@ -677,7 +687,7 @@ impl TodoView {
         };
         // Settings → More → Task Default fills in what neither the text nor the view gives.
         let defaults = &self.preferences.task_defaults;
-        if let Some(date) = parsed.due_date.or(view_due).or(defaults.date.map(|d| d.date(today))) {
+        if let Some(date) = parsed.due_date.or(self.add_draft.date).or(view_due).or(defaults.date.map(|d| d.date(today))) {
             self.store.set_due(task.id, Some(date), parsed.due_time)?;
             let reminder = if parsed.due_time.is_some() { defaults.timed_reminder } else { defaults.all_day_reminder };
             if let Some(offset) = reminder {
@@ -787,6 +797,148 @@ impl TodoView {
         })
     }
 
+    /// The date the field shows: the typed one, or the one picked with its calendar button.
+    fn shown_add_due(&self) -> Option<(NaiveDate, Option<chrono::NaiveTime>)> {
+        self.quick_add_due.or(self.add_draft.date.map(|date| (date, None)))
+    }
+
+    /// The field's calendar button, as in the original: it opens a date picker for the next task,
+    /// placed under the button.
+    fn add_date_button(&self, placement: Placement, strings: &'static Strings, cx: &mut Context<Self>) -> Div {
+        let picked = self.add_draft.date.is_some();
+        let button = IconButton::new("add-date", IconName::CalendarDays)
+            .size(px(24.))
+            .icon_size(IconSize::Small)
+            .icon_color(if picked { Color::Accent } else { Color::Muted })
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.add_date_month = match this.add_date_month {
+                    Some(_) => None,
+                    None => Some(crate::calendar::month_start(this.add_draft.date.unwrap_or_else(Self::today))),
+                };
+                cx.notify();
+            }));
+        div().relative().child(button).when_some(self.add_date_month, |el, month| {
+            el.child(PopoverAttachment::new(placement, self.render_add_date(month, strings, cx)))
+        })
+    }
+
+    /// The add field's date picker: the original's quick picks (today, tomorrow, next week, next
+    /// month) and the month; a pick applies to the next task added. Clear drops it.
+    fn render_add_date(&self, month: NaiveDate, strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let today = Self::today();
+        let picked = self.add_draft.date;
+        let pick = |date: Option<NaiveDate>| {
+            move |this: &mut Self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>| {
+                this.add_draft.date = date;
+                this.add_date_month = None;
+                cx.notify();
+            }
+        };
+        let [d_today, d_tomorrow, d_week, d_month] = crate::due_picker::quick_dates(today);
+        let quick = |id: &'static str, icon: IconName, tip: &'static str, date: NaiveDate| {
+            div()
+                .id(id)
+                .flex_1()
+                .h(px(30.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(6.))
+                .cursor_pointer()
+                .hover(|s| s.bg(theme.colors().element_hover))
+                .tooltip(Tooltip::text(tip))
+                .child(Icon::new(icon).size(IconSize::Large))
+                .on_click(cx.listener(pick(Some(date))))
+        };
+        let shift = |delta: i32| {
+            cx.listener(move |this: &mut Self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>| {
+                if let Some(month) = this.add_date_month.as_mut() {
+                    *month = crate::calendar::add_months(*month, delta);
+                }
+                cx.notify();
+            })
+        };
+        let days = crate::calendar::month_grid(month);
+        let weeks: Vec<_> = days
+            .chunks(7)
+            .map(|week| {
+                h_flex().children(week.iter().map(|&date| {
+                    let selected = picked == Some(date);
+                    let in_month = date.month() == month.month();
+                    div().flex_1().flex().justify_center().child(
+                        div()
+                            .id(SharedString::from(format!("add-day-{date}")))
+                            .size(px(26.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_full()
+                            .cursor_pointer()
+                            .when(selected, |el| el.bg(theme.colors().accent))
+                            .when(!selected && date == today, |el| el.bg(theme.colors().accent.opacity(0.18)))
+                            .when(!selected, |el| el.hover(|s| s.bg(theme.colors().element_hover)))
+                            .child(Label::new(date.day().to_string()).size(LabelSize::Small).color(
+                                if selected || in_month { Color::Default } else { Color::Muted },
+                            ))
+                            .on_click(cx.listener(pick(Some(date)))),
+                    )
+                }))
+            })
+            .collect();
+        let button = |id: &'static str, label: &'static str, primary: bool| {
+            div()
+                .id(id)
+                .flex_1()
+                .h(px(28.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(6.))
+                .cursor_pointer()
+                .when(primary, |el| el.bg(theme.colors().accent))
+                .when(!primary, |el| el.border_1().border_color(theme.colors().border))
+                .child(Label::new(label).size(LabelSize::Small))
+        };
+        popover(cx)
+            .w(px(260.))
+            .p_2()
+            .gap_1()
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.add_date_month = None;
+                cx.notify();
+            }))
+            .child(
+                h_flex()
+                    .child(quick("add-date-today", IconName::Sun, strings.today, d_today))
+                    .child(quick("add-date-tomorrow", IconName::Sunrise, strings.tomorrow, d_tomorrow))
+                    .child(quick("add-date-week", IconName::CalendarPlus, strings.next_week, d_week))
+                    .child(quick("add-date-month", IconName::Moon, strings.next_month, d_month)),
+            )
+            .child(
+                h_flex()
+                    .px_1()
+                    .child(div().flex_1().child(Label::new(crate::calendar::month_title(month, strings)).size(LabelSize::Small)))
+                    .child(IconButton::new("add-date-prev", IconName::ChevronLeft).size(px(22.)).icon_size(IconSize::XSmall).on_click(shift(-1)))
+                    .child(IconButton::new("add-date-next", IconName::ChevronRight).size(px(22.)).icon_size(IconSize::XSmall).on_click(shift(1))),
+            )
+            .child(h_flex().children(crate::calendar::weekday_labels(&strings.weekdays_narrow).map(|day| {
+                div().flex_1().flex().justify_center().child(Label::new(day).size(LabelSize::XSmall).color(Color::Muted))
+            })))
+            .children(weeks)
+            .child(
+                h_flex()
+                    .pt_1()
+                    .gap_2()
+                    .child(button("add-date-clear", strings.clear, false).on_click(cx.listener(pick(None))))
+                    .child(button("add-date-ok", strings.ok, true).on_click(cx.listener(|this, _, _, cx| {
+                        this.add_date_month = None;
+                        cx.notify();
+                    }))),
+            )
+            .into_any_element()
+    }
+
     /// The original's "Input Box Setting": a preview of the Simple and the Detailed add field;
     /// a click picks one.
     fn render_input_box_setting(&self, strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {
@@ -894,6 +1046,7 @@ impl TodoView {
     fn render_detailed_add(&self, strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
         let input_focus = self.input.read(cx).focus_handle(cx);
+        let date_button = self.add_date_button(Placement::BelowLeft, strings, cx);
         let open_menu = |side: bool| {
             cx.listener(move |this: &mut Self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>| {
                 this.add_menu_open = !this.add_menu_open;
@@ -919,7 +1072,7 @@ impl TodoView {
             .bg(theme.colors().surface_background)
             .on_mouse_down(MouseButton::Left, move |_, window, cx| window.focus(&input_focus, cx))
             .child(h_flex().gap_2().child(div().flex_1().min_w_0().child(self.input.clone())).children(
-                self.quick_add_due.map(|(date, time)| {
+                self.shown_add_due().map(|(date, time)| {
                     let (label, _) = task_rows::due_label(date, time, Self::today(), strings);
                     Label::new(label).size(LabelSize::Small).color(Color::Accent)
                 }),
@@ -928,6 +1081,7 @@ impl TodoView {
                 h_flex()
                     .gap_1()
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(date_button)
                     .child(IconButton::new("add-priority", IconName::Flag).size(px(24.)).icon_size(IconSize::Small).icon_color(priority_color).on_click(open_menu(false)))
                     .child(IconButton::new("add-list", IconName::Inbox).size(px(24.)).icon_size(IconSize::Small).on_click(open_menu(true)))
                     .child(self.add_field_popovers(
@@ -3233,7 +3387,7 @@ impl Render for TodoView {
                     })
                     .child(Icon::new(IconName::Plus))
                     .child(div().flex_1().min_w_0().child(self.input.clone()))
-                    .children(self.quick_add_due.map(|(date, time)| {
+                    .children(self.shown_add_due().map(|(date, time)| {
                         let (label, _) = task_rows::due_label(date, time, Self::today(), strings);
                         h_flex()
                             .flex_none()
@@ -3246,6 +3400,7 @@ impl Render for TodoView {
                             .relative()
                             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                             .child(
+                                h_flex().child(self.add_date_button(Placement::BelowRight, strings, cx)).child(
                                 // The original's "▾": priority, list, template and note for the
                                 // next task; its flag takes the chosen priority's color.
                                 IconButton::new("add-options", IconName::ChevronDown)
@@ -3256,7 +3411,7 @@ impl Render for TodoView {
                                         this.add_list_side = false;
                                         cx.notify();
                                     })),
-                            )
+                            ))
                             .map(|el| self.add_field_popovers(el, strings, cx)),
                     ),
             ))

@@ -1,10 +1,9 @@
 // A release build on Windows opens no console window next to the app.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
-/// The room the original keeps at the top of its window for the title bar's buttons: every
-/// column starts this far down. On Windows it is the app's own title bar, as tall as the
-/// caption buttons (see `title_bar`).
-pub const TOP_INSET: f32 = if title_bar::INTEGRATED { 32. } else { 13. };
+/// Every column starts this far down: the app's own title bar, which moves the window and holds
+/// its buttons (see `title_bar`).
+pub const TOP_INSET: f32 = title_bar::HEIGHT;
 
 mod actions;
 mod app_view;
@@ -46,7 +45,7 @@ use std::rc::Rc;
 
 use anyhow::{Context as _, Result};
 use fern_core::Store;
-use gpui::{App, Bounds, TitlebarOptions, WindowBounds, WindowOptions, prelude::*, px, size};
+use gpui::{App, Bounds, WindowBounds, WindowDecorations, WindowOptions, prelude::*, px, size};
 
 use crate::actions::Quit;
 use crate::app_view::AppView;
@@ -142,12 +141,10 @@ fn main() -> Result<()> {
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
-                // On Windows the app draws its own title bar (`title_bar`).
-                titlebar: Some(TitlebarOptions {
-                    title: Some("Fern".into()),
-                    appears_transparent: title_bar::INTEGRATED,
-                    ..Default::default()
-                }),
+                // The app draws its own title bar on every platform (`title_bar`).
+                titlebar: Some(title_bar::titlebar_options()),
+                window_decorations: Some(WindowDecorations::Client),
+                app_owns_titlebar_drag: true,
                 // Overridable so that window-manager rules can target dev builds (used for UI screenshots).
                 app_id: Some(std::env::var("FERN_APP_ID").unwrap_or_else(|_| "fern-tasks".into())),
                 window_min_size: Some(size(px(900.), px(400.))),

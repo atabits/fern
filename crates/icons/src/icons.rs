@@ -128,6 +128,11 @@ pub enum IconName {
     Trash,
     Underline,
     User,
+    /// The caption buttons of the app's own title bar on Linux (`title_bar`).
+    WindowClose,
+    WindowMaximize,
+    WindowMinimize,
+    WindowRestore,
     X,
     Zap,
 }

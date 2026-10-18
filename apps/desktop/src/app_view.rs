@@ -953,7 +953,7 @@ impl Render for AppView {
                 .then(|| PopoverAttachment::new(Placement::RightBottom, self.render_notices(cx)).into_any_element()),
         };
 
-        h_flex()
+        let root = h_flex()
             .relative()
             .key_context("Workspace")
             .on_action(cx.listener(Self::new_task))
@@ -985,9 +985,7 @@ impl Render for AppView {
                 })
             })
             // Over the columns but under the dialogs, which keep their own clicks.
-            .when(crate::title_bar::INTEGRATED, |el| {
-                el.child(crate::title_bar::drag_area()).child(crate::title_bar::caption_buttons(window, cx))
-            })
+            .child(crate::title_bar::render(window, cx))
             .when(self.shortcuts_open, |el| el.child(self.render_shortcuts(cx)))
             .when_some(self.settings.clone(), |el, settings| {
                 el.child(
@@ -1005,7 +1003,8 @@ impl Render for AppView {
             })
             .when_some(self.search.clone(), |el, search| {
                 el.child(div().absolute().top(px(160.)).left_0().right_0().flex().justify_center().child(search))
-            })
+            });
+        crate::title_bar::client_side_decorations(root, window, cx)
     }
 }
 

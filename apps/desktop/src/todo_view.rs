@@ -2068,19 +2068,25 @@ impl TodoView {
             .cursor_pointer()
             .on_click(cx.listener(move |this, _, _, cx| this.select(id, cx)))
             .child(line(task, SharedString::from(format!("card-check-{id}")), cx))
-            .when(!task.tags.is_empty() || due.is_some(), |el| {
+            // As the original's cards: the tags on a line, the date under them with a repeating
+            // task's mark, and a note with text its small page.
+            .when(!task.tags.is_empty(), |el| {
+                el.child(h_flex().pl(px(24.)).gap_1().flex_wrap().children(task.tags.iter().map(|tag| {
+                    Chip::new(tag.clone(), tag_colors.get(tag).copied().unwrap_or(theme.colors().text_muted))
+                })))
+            })
+            .when_some(due, |el, (label, overdue)| {
+                let color = if overdue { Color::Error } else { Color::Accent };
                 el.child(
                     h_flex()
                         .pl(px(24.))
                         .gap_1()
-                        .flex_wrap()
-                        .children(task.tags.iter().map(|tag| {
-                            Chip::new(tag.clone(), tag_colors.get(tag).copied().unwrap_or(theme.colors().text_muted))
-                        }))
-                        .when_some(due, |el, (label, overdue)| {
-                            el.child(Label::new(label).size(LabelSize::XSmall).color(if overdue { Color::Error } else { Color::Accent }))
-                        }),
+                        .child(Label::new(label).size(LabelSize::XSmall).color(color))
+                        .when(task.repeat.is_some(), |el| el.child(Icon::new(IconName::Repeat).size(IconSize::XSmall).color(Color::Muted))),
                 )
+            })
+            .when(task.kind == fern_core::Kind::Note && !task.notes.trim().is_empty(), |el| {
+                el.child(div().pl(px(24.)).child(Icon::new(IconName::FileText).size(IconSize::XSmall).color(Color::Muted)))
             })
             .children(subtasks.iter().map(|sub| {
                 div().pl(px(16.)).child(line(sub, SharedString::from(format!("card-check-{}", sub.id)), cx))

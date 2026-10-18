@@ -168,6 +168,10 @@ impl AppView {
             if state.contains("calendar-menu=open") {
                 this.calendar.update(cx, |c, cx| c.dev_open_menu(cx));
             }
+            // `matrix=header-menu|add` opens the Matrix's "…" or quadrant I's new task field.
+            if let Some(what) = state.split(';').find_map(|part| part.strip_prefix("matrix=")) {
+                this.matrix.update(cx, |view, cx| view.dev_header(what, window, cx));
+            }
             if state.contains("section=matrix") {
                 this.select(Section::Matrix, window, cx);
             }

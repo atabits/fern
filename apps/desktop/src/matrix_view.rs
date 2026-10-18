@@ -9,10 +9,10 @@ use std::rc::Rc;
 use chrono::Local;
 use fern_core::matrix::{MatrixDate, QuadrantRule, quadrant_of};
 use fern_core::{Id, List, Priority, Store, Task, View};
-use gpui::{Entity, EventEmitter, FontWeight};
+use gpui::{Entity, EventEmitter, Focusable, FontWeight};
 use ui::{Placement, PopoverAttachment, popover};
 
-use crate::text_input::{Mode, TextInput};
+use crate::text_input::{Cancelled, Mode, Submitted, TextInput};
 use ui::prelude::*;
 
 use crate::drag::DraggedTask;
@@ -118,6 +118,11 @@ pub struct MatrixView {
     editing: Option<(usize, QuadrantRule)>,
     name_input: Entity<TextInput>,
     tags: Vec<String>,
+    /// A quadrant's "+": the quadrant and its field for the new task's title.
+    adding: Option<(usize, Entity<TextInput>)>,
+    /// The header's "…" menu, and its Show Completed choice (kept in the settings).
+    header_menu: bool,
+    show_completed: bool,
 }
 
 impl EventEmitter<OpenTask> for MatrixView {}
@@ -136,6 +141,9 @@ impl MatrixView {
             editing: None,
             name_input,
             tags: Vec::new(),
+            adding: None,
+            header_menu: false,
+            show_completed: false,
         };
         this.reload(cx);
         this
@@ -143,12 +151,14 @@ impl MatrixView {
 
     pub fn reload(&mut self, cx: &mut Context<Self>) {
         let today = Local::now().date_naive();
+        self.show_completed = self.store.setting("matrix_show_completed").ok().flatten().is_some_and(|v| v == "1");
+        let show_completed = self.show_completed;
         self.tasks = self
             .store
             .tasks_in(&View::All, today)
             .unwrap_or_default()
             .into_iter()
-            .filter(|t| !t.is_completed())
+            .filter(|t| show_completed || !t.is_completed())
             .collect();
         self.lists = self.store.lists().unwrap_or_default();
         self.rules = self.store.matrix_rules().unwrap_or_else(|_| QuadrantRule::defaults());
@@ -156,6 +166,53 @@ impl MatrixView {
             *view = self.store.setting(&format!("matrix_view_{i}")).ok().flatten().map(|s| QuadrantView::from_storage(&s)).unwrap_or_default();
         }
         self.tags = self.store.tags().unwrap_or_default().into_iter().map(|t| t.name).collect();
+        cx.notify();
+    }
+
+    /// A quadrant's "+": a field at the quadrant's top; the task it adds gets what the quadrant's
+    /// rule asks for, so that it lands there.
+    fn start_add(&mut self, quadrant: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let strings = i18n::t(cx);
+        let input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.matrix_add_placeholder, cx));
+        cx.subscribe_in(&input, window, move |this, input, Submitted(title), window, cx| {
+            if title.trim().is_empty() {
+                return;
+            }
+            let today = Local::now().date_naive();
+            let (priority, date) = this.rules[quadrant].new_task_defaults(today);
+            let result = this.store.add_task(title).and_then(|task| {
+                if let Some(priority) = priority {
+                    this.store.set_priority(task.id, priority)?;
+                }
+                if date.is_some() {
+                    this.store.set_due(task.id, date, None)?;
+                }
+                Ok(())
+            });
+            if let Err(err) = result {
+                eprintln!("failed to add the task: {err:#}");
+            }
+            input.update(cx, |input, cx| input.clear(window, cx));
+            this.reload(cx);
+        })
+        .detach();
+        cx.subscribe(&input, |this, _, _: &Cancelled, cx| {
+            this.adding = None;
+            cx.notify();
+        })
+        .detach();
+        window.focus(&input.focus_handle(cx), cx);
+        self.adding = Some((quadrant, input));
+        cx.notify();
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn dev_header(&mut self, what: &str, window: &mut Window, cx: &mut Context<Self>) {
+        match what {
+            "header-menu" => self.header_menu = true,
+            "add" => self.start_add(0, window, cx),
+            _ => {}
+        }
         cx.notify();
     }
 
@@ -599,6 +656,15 @@ impl MatrixView {
                             .child(numeral),
                     )
                     .child(div().flex_1().child(Label::new(title).color(Color::Custom(color))))
+                    // The original's "+" on a hovered header: a new task for this quadrant.
+                    .child(
+                        div()
+                            .opacity(0.)
+                            .group_hover("quadrant-header", |s| s.opacity(1.))
+                            .child(IconButton::new("quadrant-add", IconName::Plus).size(px(22.)).icon_size(IconSize::Small).on_click(
+                                cx.listener(move |this, _, window, cx| this.start_add(quadrant, window, cx)),
+                            )),
+                    )
                     // The original's "…" on a hovered header; its Edit opens "Edit Matrix".
                     .child(
                         div()
@@ -642,7 +708,21 @@ impl MatrixView {
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
-                    .when(empty, |el| {
+                    .children(self.adding.as_ref().filter(|(q, _)| *q == quadrant).map(|(_, input)| {
+                        h_flex()
+                            .h(px(34.))
+                            .flex_none()
+                            .mx_1()
+                            .mb_1()
+                            .px_2()
+                            .gap_2()
+                            .rounded(px(6.))
+                            .border_1()
+                            .border_color(color)
+                            .child(Icon::new(IconName::Plus).size(IconSize::Small).color(Color::Muted))
+                            .child(div().flex_1().child(input.clone()))
+                    }))
+                    .when(empty && self.adding.as_ref().is_none_or(|(q, _)| *q != quadrant), |el| {
                         el.items_center()
                             .justify_center()
                             .child(Label::new(strings.no_tasks).size(LabelSize::Small).color(Color::Muted))
@@ -668,7 +748,40 @@ impl Render for MatrixView {
                     .flex_none()
                     .px(px(22.))
                     .child(div().flex_1().child(Label::new(strings.section_matrix).size(LabelSize::Large).weight(FontWeight::SEMIBOLD)))
-                    .child(IconButton::new("matrix-more", IconName::Ellipsis)),
+                    // The original's "…": Show / Hide Completed.
+                    .child(
+                        div()
+                            .relative()
+                            .child(IconButton::new("matrix-more", IconName::Ellipsis).on_click(cx.listener(|this, _, _, cx| {
+                                this.header_menu = !this.header_menu;
+                                cx.notify();
+                            })))
+                            .when(self.header_menu, |el| {
+                                el.child(PopoverAttachment::new(
+                                    Placement::BelowRight,
+                                    popover(cx)
+                                        .w(px(200.))
+                                        .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                                            this.header_menu = false;
+                                            cx.notify();
+                                        }))
+                                        .child(
+                                            ListItem::new("matrix-show-completed")
+                                                .height(px(34.))
+                                                .start_slot(Icon::new(IconName::SquareCheck).color(Color::Muted))
+                                                .child(Label::new(if self.show_completed { strings.hide_completed } else { strings.show_completed }))
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.header_menu = false;
+                                                    let value = if this.show_completed { "0" } else { "1" };
+                                                    if let Err(err) = this.store.set_setting("matrix_show_completed", value) {
+                                                        eprintln!("failed to save the setting: {err:#}");
+                                                    }
+                                                    this.reload(cx);
+                                                })),
+                                        ),
+                                ))
+                            }),
+                    ),
             )
             .child(
                 v_flex()

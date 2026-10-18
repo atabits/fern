@@ -70,6 +70,14 @@ impl QuadrantRule {
         ]
     }
 
+    /// What a task added with a quadrant's "+" gets, as the original's new task there: the
+    /// rule's first priority, and today when the rule takes today but not undated tasks (the
+    /// original's card for quadrant I starts on "Today").
+    pub fn new_task_defaults(&self, today: NaiveDate) -> (Option<Priority>, Option<NaiveDate>) {
+        let date = (self.dates.contains(&MatrixDate::Today) && !self.dates.contains(&MatrixDate::NoDate)).then_some(today);
+        (self.priorities.first().copied(), date)
+    }
+
     pub fn matches(&self, task: &Task, today: NaiveDate) -> bool {
         (self.lists.is_empty() || self.lists.contains(&task.list_id))
             && (self.tags.is_empty()
@@ -147,6 +155,16 @@ impl Store {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn new_tasks_land_in_their_quadrant() {
+        let today = NaiveDate::from_ymd_opt(2026, 10, 18).unwrap();
+        let [q1, q2, _, q4] = QuadrantRule::defaults();
+        assert_eq!(q1.new_task_defaults(today), (Some(Priority::High), Some(today)));
+        assert_eq!(q2.new_task_defaults(today), (Some(Priority::High), None));
+        assert_eq!(q4.new_task_defaults(today), (Some(Priority::Low), None));
+    }
+
     use super::*;
 
     #[test]

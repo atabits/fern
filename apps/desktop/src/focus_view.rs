@@ -2683,7 +2683,7 @@ impl FocusView {
                     .child(div().flex_1().child(
                         Label::new(strings.focus_record)
                             .size(if large { LabelSize::Large } else { LabelSize::Default })
-                            .weight(FontWeight::SEMIBOLD),
+                            .weight(if large { FontWeight::MEDIUM } else { FontWeight::SEMIBOLD }),
                     ))
                     .child(
                         div()
@@ -3315,31 +3315,32 @@ impl Render for FocusView {
             .border_color(theme.colors().border)
             .child(
                 h_flex()
+                    .relative()
                     .h(px(52.))
                     .flex_none()
                     .px(px(22.))
                     .gap_2()
                     .child(div().flex_1().child(Label::new(strings.pomodoro).size(LabelSize::Large).weight(FontWeight::SEMIBOLD)))
-                    // The original's Active and Archived tabs over the timers.
-                    .child(h_flex().p_0p5().rounded(px(8.)).bg(theme.colors().element_hover).children(
+                    // The original's Active and Archived tabs, centered over the timers.
+                    .child(div().absolute().left_0().right_0().top_0().h_full().flex().items_center().justify_center().child(h_flex().p(px(2.)).rounded(px(18.)).bg(theme.colors().element_hover).children(
                         [(false, strings.habit_active), (true, strings.habit_archived)].map(|(archived, label)| {
                             let on = self.archived_tab == archived;
                             div()
                                 .id(SharedString::from(format!("timers-tab-{archived}")))
-                                .px_3()
-                                .h(px(24.))
+                                .px_5()
+                                .h(px(32.))
                                 .flex()
                                 .items_center()
-                                .rounded(px(6.))
+                                .rounded(px(16.))
                                 .cursor_pointer()
                                 .when(on, |el| el.bg(theme.colors().element_selected))
-                                .child(Label::new(label).size(LabelSize::Small).color(if on { Color::Default } else { Color::Muted }))
+                                .child(Label::new(label).color(if on { Color::Default } else { Color::Muted }))
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.archived_tab = archived;
                                     this.reload(cx);
                                 }))
                         }),
-                    ))
+                    )))
                     .child(IconButton::new("timer-add", IconName::Plus).on_click(cx.listener(|this, _, window, cx| this.open_timer(None, window, cx))))
                     .child(
                         div()
@@ -3406,22 +3407,26 @@ impl Render for FocusView {
                                 .on_click(cx.listener(|this, _, _, cx| this.finish(cx))),
                         )
                     })
+                    // The original's round button, tinted with the accent.
                     .child(
-                        IconButton::new("focus-play", if running && !paused { IconName::Pause } else { IconName::Play })
-                            .icon_color(Color::Accent)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                if running { this.toggle_pause(cx) } else { this.start(None, cx) }
-                            })),
+                        div().size(px(40.)).flex().items_center().justify_center().rounded_full().bg(theme.colors().accent.opacity(0.18)).child(
+                            IconButton::new("focus-play", if running && !paused { IconName::Pause } else { IconName::Play })
+                                .icon_color(Color::Accent)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if running { this.toggle_pause(cx) } else { this.start(None, cx) }
+                                })),
+                        ),
                     ),
             );
 
         let record = self.render_record(strings, cx);
+        // As in the original, the overview and records take 40% of the width.
         let right = v_flex()
-            .w(px(380.))
+            .w(gpui::relative(0.4))
             .flex_none()
             .h_full()
-            .px_4()
-            .child(h_flex().h(px(52.)).child(Label::new(strings.focus_overview).size(LabelSize::Large).weight(FontWeight::SEMIBOLD)))
+            .px_5()
+            .child(h_flex().h(px(52.)).child(Label::new(strings.focus_overview).size(LabelSize::Large).weight(FontWeight::MEDIUM)))
             .child(self.render_overview(strings, cx))
             .child(self.render_record_header(true, cx))
             .when_some(self.message.clone(), |el, message| {

@@ -371,10 +371,6 @@ impl TaskDetail {
         lists_panel::color(color, cx)
     }
 
-    fn restore(&mut self, cx: &mut Context<Self>) {
-        self.save(cx, |store, id| store.restore_task(id));
-    }
-
     fn toggle_completed(&mut self, cx: &mut Context<Self>) {
         let Some(task) = self.task.as_mut() else { return };
         let completed = !task.is_completed();
@@ -884,33 +880,7 @@ impl Render for TaskDetail {
                             }),
                     ),
             )
-            .when(task.is_deleted(), |el| {
-                el.child(
-                    h_flex()
-                        .gap_2()
-                        .px_5()
-                        .py_2()
-                        .bg(theme.colors().surface_background)
-                        .border_b_1()
-                        .border_color(theme.colors().border)
-                        .child(Icon::new(IconName::Trash).size(IconSize::Small))
-                        .child(div().flex_1().child(Label::new(strings.trash).size(LabelSize::Small).color(Color::Muted)))
-                        .child(
-                            h_flex()
-                                .id("restore-task")
-                                .gap_1()
-                                .px_2()
-                                .py_0p5()
-                                .rounded(px(4.))
-                                .cursor_pointer()
-                                .hover(|s| s.bg(theme.colors().element_hover))
-                                .child(Icon::new(IconName::RotateCcw).size(IconSize::Small).color(Color::Accent))
-                                .child(Label::new(strings.restore).size(LabelSize::Small).color(Color::Accent))
-                                .on_click(cx.listener(|this, _, _, cx| this.restore(cx))),
-                        ),
-                )
-            })
-            // Title, tags, checklist and notes; clicking empty space puts the caret into the notes.
+            // Title, checklist, notes and tags; clicking empty space puts the caret into the notes.
             .child(
                 v_flex()
                     .id("detail-body")
@@ -948,7 +918,6 @@ impl Render for TaskDetail {
                                     ),
                             ),
                     )
-                    .child(self.render_tags_row(strings, cx))
                     .when(self.show_checklist, |el| el.child(self.render_checklist(cx)))
                     .child(
                         div()
@@ -957,6 +926,8 @@ impl Render for TaskDetail {
                             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                             .child(self.notes.clone()),
                     )
+                    // Tags sit under the notes, as in the original.
+                    .child(self.render_tags_row(strings, cx))
                     .child(div().pt_2().child(Divider::horizontal()))
                     .child(self.render_subtasks(strings, cx)),
             )

@@ -308,7 +308,7 @@ impl TodoView {
 
     /// Task ids in the order they are shown, for keyboard navigation.
     fn visible_task_ids(&self) -> Vec<Id> {
-        task_rows::build_rows(&self.tasks, &self.collapsed_tasks, &self.collapsed_sections)
+        task_rows::build_rows(&self.tasks, &self.collapsed_tasks, &self.collapsed_sections, self.view != View::Trash)
             .into_iter()
             .filter_map(|row| match row {
                 Row::Task { task, .. } => Some(task.id),
@@ -815,7 +815,7 @@ impl Render for TodoView {
             .iter()
             .map(|t| (t.name.clone(), lists_panel::color(t.color.as_deref(), cx)))
             .collect();
-        let rows = task_rows::build_rows(&self.tasks, &self.collapsed_tasks, &self.collapsed_sections);
+        let rows = task_rows::build_rows(&self.tasks, &self.collapsed_tasks, &self.collapsed_sections, self.view != View::Trash);
         let rows: Vec<_> = rows
             .iter()
             .map(|row| match row {
@@ -873,8 +873,14 @@ impl Render for TodoView {
                                 }
                             }),
                     )
-                    .child(IconButton::new("sort", IconName::ArrowDownUp))
-                    .child(
+                    .when(self.view == View::Trash, |el| {
+                        el.child(
+                            IconButton::new("empty-trash-button", IconName::BrushCleaning)
+                                .on_click(cx.listener(|this, _, _, cx| this.empty_trash(cx))),
+                        )
+                    })
+                    .when(self.view != View::Trash, |el| el.child(IconButton::new("sort", IconName::ArrowDownUp)))
+                    .when(self.view != View::Trash, |el| el.child(
                         div()
                             .relative()
                             .child(IconButton::new("more", IconName::Ellipsis).on_click(cx.listener(
@@ -889,7 +895,7 @@ impl Render for TodoView {
                                     self.render_header_menu(strings, cx),
                                 ))
                             }),
-                    ),
+                    )),
             )
             .when(!self.is_read_only_view(), |el| el.child(
                 h_flex()

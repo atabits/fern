@@ -10,6 +10,7 @@ pub enum IconName {
     ArrowDownUp,
     Baseline,
     Bell,
+    BrushCleaning,
     CalendarCheck,
     CalendarDays,
     CalendarHeart,

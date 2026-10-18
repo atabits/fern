@@ -43,24 +43,29 @@ pub enum Row {
     Task { task: Task, depth: usize, has_children: bool, collapsed: bool },
 }
 
-/// Rows for the list. Group headers appear only when more than one group is non-empty.
+/// Rows for the list. Group headers appear only when `grouped` is set and more than one group is
+/// non-empty; ungrouped lists (the trash) keep their order and only nest subtasks.
 /// A subtask nests under its parent when the parent is in the same group; otherwise it is
 /// shown at the top level.
 pub fn build_rows(
     tasks: &[Task],
     collapsed_tasks: &HashSet<Id>,
     collapsed_sections: &HashSet<Section>,
+    grouped: bool,
 ) -> Vec<Row> {
-    let sections = [Section::Tasks, Section::Notes, Section::Completed];
-    let grouped: Vec<(Section, Vec<&Task>)> = sections
-        .iter()
-        .map(|&section| (section, tasks.iter().filter(|t| Section::of(t) == section).collect::<Vec<_>>()))
-        .filter(|(_, tasks)| !tasks.is_empty())
-        .collect();
-    let with_headers = grouped.len() > 1;
+    let groups: Vec<(Section, Vec<&Task>)> = if grouped {
+        [Section::Tasks, Section::Notes, Section::Completed]
+            .iter()
+            .map(|&section| (section, tasks.iter().filter(|t| Section::of(t) == section).collect::<Vec<_>>()))
+            .filter(|(_, tasks)| !tasks.is_empty())
+            .collect()
+    } else {
+        vec![(Section::Tasks, tasks.iter().collect())]
+    };
+    let with_headers = groups.len() > 1;
 
     let mut rows = Vec::new();
-    for (section, tasks) in grouped {
+    for (section, tasks) in groups {
         let collapsed = with_headers && collapsed_sections.contains(&section);
         if with_headers {
             rows.push(Row::Section { section, count: tasks.len(), collapsed });
@@ -194,13 +199,14 @@ mod tests {
         child.parent_id = Some(parent.id);
         let mut grandchild = task("grandchild");
         grandchild.parent_id = Some(child.id);
-        let rows = build_rows(&[grandchild, parent.clone(), child.clone()], &HashSet::new(), &HashSet::new());
+        let rows = build_rows(&[grandchild, parent.clone(), child.clone()], &HashSet::new(), &HashSet::new(), true);
         assert_eq!(shape(&rows), ["parent", "  child", "    grandchild"]);
 
         let rows = build_rows(
             &[parent.clone(), child.clone()],
             &HashSet::from([parent.id]),
             &HashSet::new(),
+            true,
         );
         assert_eq!(shape(&rows), ["parent"]);
         assert!(matches!(rows[0], Row::Task { has_children: true, collapsed: true, .. }));
@@ -213,8 +219,17 @@ mod tests {
         note.kind = Kind::Note;
         let mut done = task("done");
         done.completed_at = Some(1);
-        let rows = build_rows(&[a, note, done], &HashSet::new(), &HashSet::from([Section::Completed]));
+        let rows = build_rows(&[a, note, done], &HashSet::new(), &HashSet::from([Section::Completed]), true);
         assert_eq!(shape(&rows), ["# Tasks 1", "a task", "# Notes 1", "a note", "# Completed 1"]);
+    }
+
+    #[test]
+    fn ungrouped_lists_have_no_headers() {
+        let a = task("open");
+        let mut done = task("done");
+        done.completed_at = Some(1);
+        let rows = build_rows(&[a, done], &HashSet::new(), &HashSet::new(), false);
+        assert_eq!(shape(&rows), ["open", "done"]);
     }
 
     #[test]
@@ -223,7 +238,7 @@ mod tests {
         let mut child = task("finished child");
         child.parent_id = Some(parent.id);
         child.completed_at = Some(1);
-        let rows = build_rows(&[parent, child], &HashSet::new(), &HashSet::new());
+        let rows = build_rows(&[parent, child], &HashSet::new(), &HashSet::new(), true);
         assert_eq!(shape(&rows), ["# Tasks 1", "parent", "# Completed 1", "finished child"]);
     }
 

@@ -35,7 +35,7 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 | Lists (projects), Inbox | ✅ | create, delete, move tasks with subtasks |
 | Custom sections inside a list (columns) | ⬜ | groups are by kind for now |
 | Manual ordering (`sortOrder`) | ✅ | new tasks on top; renumbered with gaps on move |
-| Trash, "Won't Do" | 🟡 | trash with restore, delete forever and "Empty trash"; no "Won't Do"; deleting a list still deletes its tasks permanently |
+| Trash, "Won't Do" | 🟡 | trash matched to the original: flat list, broom button empties it, trashed tasks open in the normal panel; restore and delete-forever on row hover; no "Won't Do" |
 | Reminders | ⬜ | |
 | Settings (UI language) | ✅ | |
 
@@ -59,7 +59,7 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 | Details: checkbox, title, notes | ✅ | |
 | Details: due date | 🟡 | quick options, month calendar, preset times, daily/weekly/monthly/yearly repeat; no custom time or "every N" in the picker |
 | Details: priority (flag) | ✅ | |
-| Details: tags | ✅ | chips under the title, picker with "+ Tag" |
+| Details: tags | ✅ | chips under the notes as in the original; the "+ Tag" picker is our addition (TickTick adds tags with "#" in the text) |
 | Details: list | ✅ | list button in the bottom bar |
 | Details: checklist | ✅ | Enter adds the next item; progress "1/3" in rows |
 | Details: subtasks | ✅ | list with checkboxes, open a subtask, "Add subtask" |
@@ -73,7 +73,7 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 ## How changes are checked
 
 - Every feature is checked against a screenshot of the same TickTick screen before and after it
-  is built. Features built before this rule (trash, search, repeat picker) still need that comparison.
+  is built. Features built before this rule (search, repeat picker) still need that comparison.
 
 - `cargo test` covers the core (storage, smart views, tags, subtasks, lists, quick add) and the
   desktop's row, date and calendar logic in both languages.

@@ -681,7 +681,7 @@ impl TodoView {
                     GroupBy::Custom => {
                         task_rows::build_rows(&tasks, collapsed_tasks, collapsed_sections, true)
                     }
-                    group => task_rows::grouped_rows(&tasks, group, Self::today(), strings),
+                    group => task_rows::grouped_rows(&tasks, group, Self::today(), self.preferences.task_defaults.overdue_last, strings),
                 }
             }
         }

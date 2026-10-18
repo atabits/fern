@@ -479,6 +479,7 @@ pub struct Strings {
     pub default_priority: &'static str,
     pub default_tag: &'static str,
     pub default_add_to: &'static str,
+    pub overdue_section_at: &'static str,
     pub add_to_top: &'static str,
     pub add_to_bottom: &'static str,
     /// "None" in a settings dropdown.
@@ -885,6 +886,7 @@ pub static EN: Strings = Strings {
     default_priority: "Default Priority",
     default_tag: "Default Tag",
     default_add_to: "Default Add to",
+    overdue_section_at: "Overdue Section shows at",
     add_to_top: "Top of List",
     add_to_bottom: "Bottom of List",
     none_option: "None",
@@ -1289,6 +1291,7 @@ pub static RU: Strings = Strings {
     default_priority: "Приоритет по умолчанию",
     default_tag: "Тег по умолчанию",
     default_add_to: "Куда добавлять",
+    overdue_section_at: "Раздел «Просрочено»",
     add_to_top: "В начало списка",
     add_to_bottom: "В конец списка",
     none_option: "Нет",

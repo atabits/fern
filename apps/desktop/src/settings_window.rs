@@ -36,6 +36,7 @@ enum Menu {
     DefaultPriority,
     DefaultTag,
     AddTo,
+    OverdueAt,
     TimeFormat,
     DateFormat,
     WeekStart,
@@ -139,6 +140,7 @@ impl SettingsWindow {
             "list" => Some(Menu::DefaultList),
             "duration" => Some(Menu::DefaultDuration),
             "add-to" => Some(Menu::AddTo),
+            "overdue" => Some(Menu::OverdueAt),
             "reminder" => Some(Menu::TimedReminder),
             _ => None,
         };
@@ -660,7 +662,27 @@ impl SettingsWindow {
                                 options,
                                 cx,
                             )
-                        })),
+                        }))
+                        .child({
+                            let last = self.preferences.task_defaults.overdue_last;
+                            let options = [(false, strings.add_to_top), (true, strings.add_to_bottom)]
+                                .into_iter()
+                                .map(|(choice, name)| {
+                                    let pick: Box<dyn Fn(&mut Self, &mut Window, &mut Context<Self>)> = Box::new(move |this, window, cx| {
+                                        this.update(window, cx, |p| p.task_defaults.overdue_last = choice)
+                                    });
+                                    (SharedString::from(name), choice == last, pick)
+                                })
+                                .collect();
+                            self.select_row(
+                                None,
+                                strings.overdue_section_at,
+                                (if last { strings.add_to_bottom } else { strings.add_to_top }).into(),
+                                Menu::OverdueAt,
+                                options,
+                                cx,
+                            )
+                        }),
                 )
                 .into_any_element()
             }

@@ -214,14 +214,15 @@ pub fn sort_tasks(tasks: &mut [Task], sort: SortBy) {
 }
 
 /// Rows grouped by date, creation day, tag or priority (or not at all), with completed tasks in
-/// a last group. Groups follow a fixed order: by date, overdue first and undated last.
-pub fn grouped_rows(tasks: &[Task], group: GroupBy, today: NaiveDate, strings: &Strings) -> Vec<Row> {
+/// a last group. Groups follow a fixed order: by date, overdue first (or, with `overdue_last` —
+/// Settings → "Overdue Section shows at" — after the undated ones) and undated last.
+pub fn grouped_rows(tasks: &[Task], group: GroupBy, today: NaiveDate, overdue_last: bool, strings: &Strings) -> Vec<Row> {
     let (open, done): (Vec<&Task>, Vec<&Task>) = tasks.iter().partition(|t| !t.is_completed());
     // Each group's order, label and what dropping a task into it does.
     let key = |task: &Task| -> (i64, String) {
         match group {
             GroupBy::Date => match task.due_date {
-                Some(d) if d < today => (0, strings.group_overdue.to_owned()),
+                Some(d) if d < today => (if overdue_last { 6 } else { 0 }, strings.group_overdue.to_owned()),
                 Some(d) if d == today => (1, strings.today.to_owned()),
                 Some(d) if d == today + chrono::Duration::days(1) => (2, strings.tomorrow.to_owned()),
                 Some(d) if d <= today + chrono::Duration::days(7) => (3, strings.next_7_days.to_owned()),
@@ -707,23 +708,27 @@ mod tests {
         sort_tasks(&mut sorted, SortBy::Modified);
         assert_eq!(sorted[0].modified_at, Some(10));
 
-        assert_eq!(shape(&grouped_rows(&tasks, GroupBy::Date, today, &EN)), [
+        assert_eq!(shape(&grouped_rows(&tasks, GroupBy::Date, today, false, &EN)), [
             "## Overdue 1", "banana", "## Today 1", "Apple", "## No Date 1", "cherry", "## Completed 1", "done"
         ]);
-        assert_eq!(shape(&grouped_rows(&tasks, GroupBy::Tag, today, &EN)), [
+        assert_eq!(shape(&grouped_rows(&tasks, GroupBy::Tag, today, false, &EN)), [
             "## home 1", "cherry", "## work 1", "Apple", "## No Tags 1", "banana", "## Completed 1", "done"
         ]);
-        assert_eq!(shape(&grouped_rows(&tasks, GroupBy::None, today, &EN)), ["banana", "Apple", "cherry", "done"]);
+        assert_eq!(shape(&grouped_rows(&tasks, GroupBy::None, today, false, &EN)), ["banana", "Apple", "cherry", "done"]);
+        // "Overdue Section shows at: Bottom of List".
+        assert_eq!(shape(&grouped_rows(&tasks, GroupBy::Date, today, true, &EN)), [
+            "## Today 1", "Apple", "## No Date 1", "cherry", "## Overdue 1", "banana", "## Completed 1", "done"
+        ]);
         let drops = |rows: Vec<Row>| -> Vec<Option<DropTarget>> {
             rows.into_iter().filter_map(|r| match r { Row::Day { drop, .. } => Some(drop), _ => None }).collect()
         };
-        assert_eq!(drops(grouped_rows(&tasks, GroupBy::Date, today, &EN)), [
+        assert_eq!(drops(grouped_rows(&tasks, GroupBy::Date, today, false, &EN)), [
             None,
             Some(DropTarget::Due(Some(today))),
             Some(DropTarget::Due(None)),
             Some(DropTarget::Complete),
         ]);
-        assert_eq!(drops(grouped_rows(&tasks, GroupBy::Tag, today, &EN))[..2], [
+        assert_eq!(drops(grouped_rows(&tasks, GroupBy::Tag, today, false, &EN))[..2], [
             Some(DropTarget::Tag(Some("home".into()))),
             Some(DropTarget::Tag(Some("work".into()))),
         ]);

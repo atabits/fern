@@ -627,7 +627,7 @@ impl Store {
                 "INSERT INTO task_tags (task_id, tag) SELECT ?2, tag FROM task_tags WHERE task_id = ?1",
                 params![id.to_string(), copy.to_string()],
             )?;
-            let next = repeat.next_after(due);
+            let next = repeat.next_for(due, chrono::Local::now().date_naive());
             // A duration moves with its start.
             let end = task.end_date.map(|end| (end + (next - due)).format(DATE_FORMAT).to_string());
             tx.execute(

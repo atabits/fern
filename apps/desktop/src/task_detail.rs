@@ -422,6 +422,19 @@ impl TaskDetail {
                 });
                 return;
             }
+            // The custom repeat's monthly "Workday", daily "Skip Weekends" and "By Completion Date".
+            "due-custom-workday" | "due-custom-skip" | "due-custom-completion" => {
+                self.open_popup(Popup::Due, cx);
+                self.update_draft(cx, |d| {
+                    let rule = match popup {
+                        "due-custom-workday" => Recurrence { nth_workday: Some(1), ..Recurrence::new(Frequency::Monthly, 1) },
+                        "due-custom-skip" => Recurrence { skip_weekends: true, ..Recurrence::new(Frequency::Daily, 1) },
+                        _ => Recurrence { from_completion: true, ..Recurrence::new(Frequency::Weekly, 1) },
+                    };
+                    d.menu = Some(DueMenu::Custom(rule));
+                });
+                return;
+            }
             "due-time" | "due-custom" => {
                 self.open_popup(Popup::Due, cx);
                 let today = Local::now().date_naive();
@@ -1573,6 +1586,10 @@ impl TaskDetail {
                             if frequency != Frequency::Monthly {
                                 rule.month_days = 0;
                                 rule.nth_weekday = None;
+                                rule.nth_workday = None;
+                            }
+                            if frequency != Frequency::Daily {
+                                rule.skip_weekends = false;
                             }
                         }
                     })
@@ -1613,12 +1630,56 @@ impl TaskDetail {
                 .when(!primary, |el| el.border_1().border_color(theme.colors().border))
                 .child(Label::new(label).size(LabelSize::Small))
         };
+        // The original's "By Due Dates" / "By Completion Date"; counting from completion drops
+        // the weekdays and days of the month, as there.
+        let mode = div()
+            .id("repeat-mode")
+            .h(px(26.))
+            .px_2()
+            .flex()
+            .items_center()
+            .justify_between()
+            .rounded(px(5.))
+            .border_1()
+            .border_color(theme.colors().border)
+            .cursor_pointer()
+            .child(Label::new(if rule.from_completion { strings.repeat_by_completion } else { strings.repeat_by_due }).size(LabelSize::Small))
+            .child(Icon::new(IconName::ChevronsUpDown).size(IconSize::XSmall).color(Color::Muted))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.update_draft(cx, |d| {
+                    if let Some(DueMenu::Custom(rule)) = d.menu.as_mut() {
+                        rule.from_completion = !rule.from_completion;
+                        if rule.from_completion {
+                            rule.weekdays = 0;
+                            rule.month_days = 0;
+                            rule.nth_weekday = None;
+                            rule.nth_workday = None;
+                            rule.skip_weekends = false;
+                        }
+                    }
+                })
+            }));
+        let skip_weekends = h_flex()
+            .id("repeat-skip-weekends")
+            .gap_2()
+            .cursor_pointer()
+            .child(Checkbox::new("repeat-skip-weekends-box").size(px(14.)).toggle_state(rule.skip_weekends))
+            .child(Label::new(strings.repeat_skip_weekends).size(LabelSize::Small))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.update_draft(cx, |d| {
+                    if let Some(DueMenu::Custom(rule)) = d.menu.as_mut() {
+                        rule.skip_weekends = !rule.skip_weekends;
+                    }
+                })
+            }));
+        let by_due = !rule.from_completion;
         v_flex()
             .gap_2()
             .p_2()
             .rounded(px(6.))
             .border_1()
             .border_color(theme.colors().border)
+            .child(mode)
             .child(
                 h_flex()
                     .gap_2()
@@ -1651,8 +1712,9 @@ impl TaskDetail {
                     ),
             )
             .child(units)
-            .when(rule.frequency == Frequency::Weekly, |el| el.child(weekdays))
-            .when(rule.frequency == Frequency::Monthly, |el| el.child(self.render_monthly_rule(rule, strings, cx)))
+            .when(by_due && rule.frequency == Frequency::Daily, |el| el.child(skip_weekends))
+            .when(by_due && rule.frequency == Frequency::Weekly, |el| el.child(weekdays))
+            .when(by_due && rule.frequency == Frequency::Monthly, |el| el.child(self.render_monthly_rule(rule, strings, cx)))
             .child(
                 h_flex()
                     .gap_2()
@@ -1667,10 +1729,11 @@ impl TaskDetail {
     }
 
     /// Monthly rules, as in the original: "Each" picks days of the month (and the last day),
-    /// "On the" picks the nth weekday.
+    /// "On the" picks the nth weekday, "Workday" the first or last workday.
     fn render_monthly_rule(&self, rule: Recurrence, strings: &'static Strings, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let on_the = rule.nth_weekday.is_some();
+        let workday = rule.nth_workday.is_some();
         let update = move |this: &mut Self, cx: &mut Context<Self>, change: &dyn Fn(&mut Recurrence)| {
             this.update_draft(cx, |d| {
                 if let Some(DueMenu::Custom(rule)) = d.menu.as_mut() {
@@ -1678,7 +1741,8 @@ impl TaskDetail {
                 }
             })
         };
-        let tab = |id: &'static str, label: &'static str, selected: bool, to_on_the: bool| {
+        // Tabs: 0 "Each", 1 "On the", 2 "Workday".
+        let tab = |id: &'static str, label: &'static str, selected: bool, to: u8| {
             div()
                 .id(id)
                 .flex_1()
@@ -1692,11 +1756,19 @@ impl TaskDetail {
                 .child(Label::new(label).size(LabelSize::XSmall))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     update(this, cx, &|rule| {
-                        if to_on_the {
-                            rule.month_days = 0;
-                            rule.nth_weekday.get_or_insert((1, chrono::Weekday::Mon));
-                        } else {
+                        if to != 1 {
                             rule.nth_weekday = None;
+                        }
+                        if to != 2 {
+                            rule.nth_workday = None;
+                        }
+                        if to != 0 {
+                            rule.month_days = 0;
+                        }
+                        match to {
+                            1 => _ = rule.nth_weekday.get_or_insert((1, chrono::Weekday::Mon)),
+                            2 => _ = rule.nth_workday.get_or_insert(1),
+                            _ => {}
                         }
                     })
                 }))
@@ -1738,10 +1810,23 @@ impl TaskDetail {
             .child(
                 h_flex()
                     .gap_1()
-                    .child(tab("monthly-each", strings.repeat_each, !on_the, false))
-                    .child(tab("monthly-on-the", strings.repeat_on_the, on_the, true)),
+                    .child(tab("monthly-each", strings.repeat_each, !on_the && !workday, 0))
+                    .child(tab("monthly-on-the", strings.repeat_on_the, on_the, 1))
+                    .child(tab("monthly-workday", strings.repeat_workday, workday, 2)),
             )
-            .map(|el| match rule.nth_weekday {
+            .map(|el| match rule.nth_workday {
+                Some(nth) => el.child(h_flex().child(cycler(
+                    "monthly-workday-nth",
+                    strings.repeat_workday_nth[usize::from(nth < 0)].to_owned(),
+                    |rule| {
+                        if let Some(nth) = rule.nth_workday.as_mut() {
+                            *nth = if *nth < 0 { 1 } else { -1 };
+                        }
+                    },
+                ))),
+                None => el,
+            })
+            .when(!workday, |el| el.map(|el| match rule.nth_weekday {
                 Some((nth, weekday)) => {
                     let nth_label = if nth < 0 { strings.repeat_nth[4] } else { strings.repeat_nth[(nth as usize).clamp(1, 4) - 1] };
                     el.child(
@@ -1774,7 +1859,7 @@ impl TaskDetail {
                         fern_core::recurrence::LAST_DAY,
                     )),
                 ),
-            })
+            }))
     }
 
     fn render_priority_popup(&self, strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {

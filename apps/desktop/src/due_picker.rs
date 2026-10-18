@@ -410,6 +410,12 @@ pub fn repeat_label(repeat: &Recurrence, strings: &Strings) -> String {
         label.push_str(strings.repeat_on);
         label.push_str(&format!("{nth} {}", strings.weekdays_full[weekday.num_days_from_monday() as usize]));
     }
+    // Monthly "Workday": "the first workday", "the last workday".
+    if let Some(nth) = repeat.nth_workday.filter(|_| repeat.frequency == Frequency::Monthly) {
+        let nth = if nth < 0 { strings.repeat_nth[4] } else { strings.repeat_nth[0] };
+        label.push_str(strings.repeat_on);
+        label.push_str(&format!("{nth} {}", strings.repeat_workday_word));
+    }
     label
 }
 

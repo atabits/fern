@@ -103,6 +103,9 @@ pub struct Countdown {
     pub count_up: bool,
     /// Archived countdowns are kept but listed apart (the original's "Countdown ▾ → Archived").
     pub archived: bool,
+    /// A picture behind the card's numbers, as the original's cards can have: the file's name in
+    /// the app's attachment folder.
+    pub background: Option<String>,
 }
 
 impl Countdown {
@@ -393,6 +396,7 @@ mod tests {
             plus_one_day: false,
             count_up: false,
             archived: false,
+            background: None,
         };
         let list = [trip];
         let fired = |from: NaiveDate, to: NaiveDate| -> Vec<chrono::NaiveDateTime> {
@@ -458,6 +462,7 @@ mod tests {
             plus_one_day: false,
             count_up: false,
             archived: false,
+            background: None,
         };
         let today = d(2026, 10, 18);
         let mum = birthday(d(1970, 12, 5));
@@ -491,6 +496,7 @@ mod tests {
             plus_one_day: false,
             count_up: false,
             archived: false,
+            background: None,
         };
         assert_eq!(once.next_date(d(2026, 10, 18)), d(2026, 9, 13), "without a repeat the date stays");
         let monthly = Countdown { repeat: Some(Recurrence::new(Frequency::Monthly, 1)), ..once.clone() };

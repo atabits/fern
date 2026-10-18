@@ -49,6 +49,9 @@ struct Draft {
     show_in_list: fern_core::countdown::ShowInList,
     plus_one_day: bool,
     count_up: bool,
+    /// The card's picture: the saved one's name, or a new file picked, or nothing.
+    background: Option<String>,
+    new_background: Option<std::path::PathBuf>,
 }
 
 /// The Reminder's Custom form: a Day or Week unit, how many in advance, and the time.
@@ -160,7 +163,15 @@ fn face(countdown: &Countdown, today: NaiveDate, days_only: bool, cx: &App) -> F
     // A birthday counting up shows the time since the birth.
     let date = if countdown.count_up { countdown.date } else { countdown.next_date(today) };
     let span = countdown.span(today);
-    let color = if span.past { theme.status().warning } else { theme.colors().accent };
+    // On a card's picture the numbers are white, as in the original.
+    let on_picture = countdown.background.is_some();
+    let color = if on_picture {
+        gpui::white()
+    } else if span.past {
+        theme.status().warning
+    } else {
+        theme.colors().accent
+    };
     let number = |value: u32, unit: &str| {
         h_flex()
             .items_baseline()
@@ -239,7 +250,7 @@ impl CountdownView {
             Filter::Kind(kind) => kind,
             Filter::All => CountdownKind::Countdown,
         };
-        self.draft = Some(Draft { name, kind, date: today, month: calendar::month_start(today), icon: None, color: None, repeat: None, editing: None, show_age: false, open: None, reminders: fern_core::countdown::DEFAULT_REMINDERS.to_vec(), custom_reminders: Vec::new(), custom: None, constant_reminder: false, show_in_list: Default::default(), plus_one_day: false, count_up: false });
+        self.draft = Some(Draft { name, kind, date: today, month: calendar::month_start(today), icon: None, color: None, repeat: None, editing: None, show_age: false, open: None, reminders: fern_core::countdown::DEFAULT_REMINDERS.to_vec(), custom_reminders: Vec::new(), custom: None, constant_reminder: false, show_in_list: Default::default(), plus_one_day: false, count_up: false, background: None, new_background: None });
         cx.notify();
     }
 
@@ -255,6 +266,23 @@ impl CountdownView {
             }
         }
         cx.notify();
+    }
+
+    /// The Background row's "Choose a picture…": the system's file dialog.
+    fn choose_background(&mut self, cx: &mut Context<Self>) {
+        let chosen = cx.prompt_for_paths(gpui::PathPromptOptions { files: true, directories: false, multiple: false, prompt: None });
+        cx.spawn(async move |this, cx| {
+            let Some(path) = chosen.await.ok().and_then(Result::ok).flatten().and_then(|paths| paths.into_iter().next()) else { return };
+            this.update(cx, |this, cx| {
+                if let Some(draft) = this.draft.as_mut() {
+                    draft.background = path.file_name().map(|n| n.to_string_lossy().into_owned());
+                    draft.new_background = Some(path);
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// The Reminder's Custom: its form, starting as the original's at 1 day and 09:00.
@@ -348,6 +376,7 @@ impl CountdownView {
             draft.show_in_list = countdown.show_in_list;
             draft.plus_one_day = countdown.plus_one_day;
             draft.count_up = countdown.count_up;
+            draft.background = countdown.background.clone();
             draft.editing = Some(id);
         }
         cx.notify();
@@ -391,6 +420,11 @@ impl CountdownView {
             self.store.set_countdown_look(id, draft.icon.as_deref(), draft.color.as_deref())?;
             self.store.set_countdown_show_age(id, draft.kind == CountdownKind::Birthday && draft.show_age)?;
             self.store.set_countdown_reminders(id, &draft.reminders, &draft.custom_reminders, draft.constant_reminder)?;
+            // A new picture is copied in; one taken off is cleared.
+            if draft.new_background.is_some() || draft.background.is_none() {
+                let dir = crate::attachments_dir()?;
+                self.store.set_countdown_background(id, draft.new_background.as_deref(), &dir)?;
+            }
             self.store.set_countdown_display(id, draft.show_in_list, draft.plus_one_day, draft.kind == CountdownKind::Birthday && draft.count_up)
         });
         if let Err(err) = added {
@@ -420,6 +454,12 @@ impl CountdownView {
         let id = countdown.id;
         let group = SharedString::from(format!("countdown-{id}"));
         let Face { color, numbers, subtitle } = face(countdown, today, self.days_only.contains(&id), cx);
+        let background: Option<std::path::PathBuf> = countdown
+            .background
+            .as_ref()
+            .and_then(|name| crate::attachments_dir().ok().map(|dir| dir.join(name)))
+            .filter(|path| path.exists());
+        let has_picture = background.is_some();
 
         v_flex()
             .id(group.clone())
@@ -433,6 +473,11 @@ impl CountdownView {
             .gap_1()
             .rounded(px(8.))
             .bg(theme.colors().surface_background)
+            // The card's picture behind its numbers, darkened so they stay readable.
+            .when_some(background, |el, path| {
+                el.child(gpui::img(path).absolute().inset_0().size_full().rounded(px(8.)).object_fit(gpui::ObjectFit::Cover))
+                    .child(div().absolute().inset_0().rounded(px(8.)).bg(gpui::black().opacity(0.35)))
+            })
             .child(
                 h_flex()
                     .gap_1p5()
@@ -449,7 +494,7 @@ impl CountdownView {
                     .on_click(cx.listener(move |this, _, _, cx| this.toggle_format(id, cx)))
                     .child(numbers),
             )
-            .child(Label::new(subtitle).size(LabelSize::XSmall).color(Color::Muted))
+            .child(div().text_size(px(11.)).when(has_picture, |el| el.text_color(gpui::white().opacity(0.85))).when(!has_picture, |el| el.text_color(theme.colors().text_muted)).child(subtitle))
             // The original's pin, beside the "…": a pinned card stays first and shows it.
             .child({
                 let pinned = countdown.pinned_at.is_some();
@@ -1127,6 +1172,37 @@ impl CountdownView {
             .child(type_row)
             .children(calc_row)
             .child(show_row)
+            // The card's picture: the file's name with "×" to take it off, or the chooser.
+            .child(row(
+                strings.countdown_background,
+                h_flex()
+                    .gap_2()
+                    .child(
+                        div()
+                            .id("countdown-background")
+                            .flex_1()
+                            .min_w_0()
+                            .h(px(32.))
+                            .px_3()
+                            .flex()
+                            .items_center()
+                            .rounded(px(6.))
+                            .border_1()
+                            .border_color(theme.colors().border)
+                            .cursor_pointer()
+                            .child(Label::new(draft.background.clone().unwrap_or_else(|| strings.countdown_choose_image.to_owned())).truncate().color(
+                                if draft.background.is_some() { Color::Default } else { Color::Muted },
+                            ))
+                            .on_click(cx.listener(|this, _, _, cx| this.choose_background(cx))),
+                    )
+                    .when(draft.background.is_some(), |el| {
+                        el.child(IconButton::new("countdown-background-clear", IconName::X).icon_color(Color::Muted).on_click(set(Box::new(|d| {
+                            d.background = None;
+                            d.new_background = None;
+                        }))))
+                    })
+                    .into_any_element(),
+            ))
             .child(div().mt_1().h(px(1.)).bg(theme.colors().border))
             // The original's "Show Age", for a birthday.
             .when(kind == CountdownKind::Birthday, |el| {

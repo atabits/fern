@@ -651,6 +651,9 @@ const MIGRATIONS: &[&str] = &[
     "
     ALTER TABLE countdowns ADD COLUMN archived_at INTEGER;
     ",
+    "
+    ALTER TABLE countdowns ADD COLUMN background TEXT;
+    ",
 ];
 
 const TASK_COLUMNS: &str = "id, parent_id, kind, title, notes, priority, due_date, due_time, \
@@ -1529,7 +1532,7 @@ impl Store {
     /// Countdowns in creation order.
     pub fn countdowns(&self) -> Result<Vec<Countdown>> {
         let mut stmt =
-            self.conn.prepare("SELECT id, name, date, kind, icon, color, repeat, pinned_at, show_age, reminders, constant_reminder, show_in_list, plus_one_day, count_up, archived_at FROM countdowns
+            self.conn.prepare("SELECT id, name, date, kind, icon, color, repeat, pinned_at, show_age, reminders, constant_reminder, show_in_list, plus_one_day, count_up, archived_at, background FROM countdowns
              ORDER BY pinned_at IS NULL, pinned_at DESC, created_at, rowid")?;
         let rows = stmt
             .query_map([], |row| {
@@ -1553,6 +1556,7 @@ impl Store {
                     plus_one_day: row.get(12)?,
                     count_up: row.get(13)?,
                     archived: row.get::<_, Option<i64>>(14)?.is_some(),
+                    background: row.get(15)?,
                 })
             })?
             .collect::<Result<_, _>>()?;
@@ -1562,7 +1566,7 @@ impl Store {
     pub fn add_countdown(&self, name: &str, date: NaiveDate, kind: CountdownKind) -> Result<Countdown> {
         let name = name.trim();
         anyhow::ensure!(!name.is_empty(), "a countdown needs a name");
-        let countdown = Countdown { id: Uuid::now_v7(), name: name.to_owned(), date, kind, icon: None, color: None, repeat: None, pinned_at: None, show_age: false, reminders: Vec::new(), custom_reminders: Vec::new(), constant_reminder: false, show_in_list: Default::default(), plus_one_day: false, count_up: false, archived: false };
+        let countdown = Countdown { id: Uuid::now_v7(), name: name.to_owned(), date, kind, icon: None, color: None, repeat: None, pinned_at: None, show_age: false, reminders: Vec::new(), custom_reminders: Vec::new(), constant_reminder: false, show_in_list: Default::default(), plus_one_day: false, count_up: false, archived: false, background: None };
         self.conn.execute(
             "INSERT INTO countdowns (id, name, date, kind, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
@@ -1622,6 +1626,23 @@ impl Store {
             params![id.to_string(), show.key(), plus_one_day, count_up],
         )?;
         Ok(())
+    }
+
+    /// A countdown's background picture: the file is copied into `dir` (the app's attachment
+    /// folder) as `<id>-background.<ext>`; `None` takes the picture off. Returns the file's name.
+    pub fn set_countdown_background(&self, id: Id, file: Option<&std::path::Path>, dir: &std::path::Path) -> Result<Option<String>> {
+        let name = match file {
+            Some(file) => {
+                let ext = file.extension().and_then(|e| e.to_str()).unwrap_or("png");
+                let name = format!("{id}-background.{ext}");
+                std::fs::create_dir_all(dir)?;
+                std::fs::copy(file, dir.join(&name))?;
+                Some(name)
+            }
+            None => None,
+        };
+        self.conn.execute("UPDATE countdowns SET background = ?2 WHERE id = ?1", params![id.to_string(), name])?;
+        Ok(name)
     }
 
     /// Archives a countdown (kept, listed under Archived) or restores it.
@@ -3190,6 +3211,19 @@ mod tests {
         assert!(store.countdowns()?.iter().find(|c| c.id == release.id).unwrap().archived);
         store.set_countdown_archived(release.id, false)?;
         assert!(!store.countdowns()?.iter().find(|c| c.id == release.id).unwrap().archived);
+
+        // A background picture is copied into the folder and named after the countdown.
+        let dir = std::env::temp_dir().join(format!("fern-backgrounds-{}", Uuid::now_v7()));
+        std::fs::create_dir_all(&dir)?;
+        let photo = dir.join("photo.jpg");
+        std::fs::write(&photo, b"jpeg")?;
+        let name = store.set_countdown_background(release.id, Some(&photo), &dir.join("files"))?.unwrap();
+        assert_eq!(name, format!("{}-background.jpg", release.id));
+        assert!(dir.join("files").join(&name).exists());
+        assert_eq!(store.countdowns()?.iter().find(|c| c.id == release.id).unwrap().background.as_deref(), Some(name.as_str()));
+        store.set_countdown_background(release.id, None, &dir)?;
+        assert!(store.countdowns()?.iter().find(|c| c.id == release.id).unwrap().background.is_none());
+        std::fs::remove_dir_all(&dir)?;
         Ok(())
     }
 

@@ -177,6 +177,16 @@ impl AppView {
                     this.countdown.update(cx, |view, cx| view.reload(cx));
                 }
             }
+            // `countdown-bg=<name part>><picture path>`: that countdown's background picture.
+            if let Some(spec) = state.split(';').find_map(|part| part.strip_prefix("countdown-bg=")) {
+                let (name, path) = spec.split_once('>').unwrap_or((spec, ""));
+                if let Some(countdown) = this.store.countdowns().unwrap_or_default().into_iter().find(|c| c.name.contains(name))
+                    && let Ok(dir) = crate::attachments_dir()
+                {
+                    this.store.set_countdown_background(countdown.id, Some(std::path::Path::new(path)), &dir).ok();
+                    this.countdown.update(cx, |view, cx| view.reload(cx));
+                }
+            }
             // `countdown-pin=<name part>`: that countdown pinned.
             if let Some(name) = state.split(';').find_map(|part| part.strip_prefix("countdown-pin=")) {
                 if let Some(countdown) = this.store.countdowns().unwrap_or_default().into_iter().find(|c| c.name.contains(name)) {

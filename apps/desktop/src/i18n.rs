@@ -254,6 +254,9 @@ pub struct Strings {
     pub countdown_all: &'static str,
     /// The header "…" menu's Hide Group / Show Group (the kind tabs).
     pub countdown_hide_group: &'static str,
+    /// The dialog's Background row: its label, the picture chooser and "none".
+    pub countdown_background: &'static str,
+    pub countdown_choose_image: &'static str,
     pub countdown_show_group: &'static str,
     pub countdown_kind_countdown: &'static str,
     pub countdown_kind_anniversary: &'static str,
@@ -838,6 +841,8 @@ pub static EN: Strings = Strings {
     save: "Save",
     countdown_all: "All",
     countdown_hide_group: "Hide Group",
+    countdown_background: "Background",
+    countdown_choose_image: "Choose a picture…",
     countdown_show_group: "Show Group",
     countdown_kind_countdown: "Countdown",
     countdown_kind_anniversary: "Anniversary",
@@ -1393,6 +1398,8 @@ pub static RU: Strings = Strings {
     save: "Сохранить",
     countdown_all: "Все",
     countdown_hide_group: "Скрыть группы",
+    countdown_background: "Фон",
+    countdown_choose_image: "Выбрать картинку…",
     countdown_show_group: "Показать группы",
     countdown_kind_countdown: "Отсчёт",
     countdown_kind_anniversary: "Годовщина",

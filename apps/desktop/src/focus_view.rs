@@ -239,6 +239,8 @@ struct TimerDraft {
     new: bool,
     /// The icon picker under the name, while open: 0 Emoji, 1 Text (the name's initial).
     icon_tab: Option<usize>,
+    /// The icon and color before the picker opened, which its Cancel puts back.
+    icon_backup: (Option<String>, Option<String>),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -921,7 +923,8 @@ impl FocusView {
         }
         window.focus(&name.focus_handle(cx), cx);
         self.timer_menu = None;
-        self.timer_draft = Some(TimerDraft { timer, name, minutes, new, icon_tab: None });
+        let icon_backup = (timer.icon.clone(), timer.color.clone());
+        self.timer_draft = Some(TimerDraft { timer, name, minutes, new, icon_tab: None, icon_backup });
         cx.notify();
     }
 
@@ -1007,15 +1010,22 @@ impl FocusView {
                     .gap_3()
                     .child(
                         div()
-                            .id("timer-icon-button")
-                            .cursor_pointer()
-                            .child(avatar)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                if let Some(draft) = this.timer_draft.as_mut() {
-                                    draft.icon_tab = if draft.icon_tab.is_some() { None } else { Some(0) };
-                                }
-                                cx.notify();
-                            })),
+                            .relative()
+                            .child(
+                                div()
+                                    .id("timer-icon-button")
+                                    .cursor_pointer()
+                                    .child(avatar)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        if let Some(draft) = this.timer_draft.as_mut() {
+                                            draft.icon_tab = if draft.icon_tab.is_some() { None } else { Some(0) };
+                                            draft.icon_backup = (draft.timer.icon.clone(), draft.timer.color.clone());
+                                        }
+                                        cx.notify();
+                                    })),
+                            )
+                            // Like the original's, the picker hangs under the icon.
+                            .children(icons.map(|icons| PopoverAttachment::new(Placement::BelowLeft, icons))),
                     )
                     .child(
                         h_flex()
@@ -1028,7 +1038,6 @@ impl FocusView {
                             .child(draft.name.clone()),
                     ),
             )
-            .children(icons)
             .child(div().pt_1().child(Label::new(strings.timer_mode).weight(FontWeight::SEMIBOLD)))
             .child(
                 h_flex()
@@ -1079,9 +1088,13 @@ impl FocusView {
             .into_any_element()
     }
 
-    /// The timer's icon picker, like a habit's: an emoji or the name's initial ("Text"), on a
-    /// color.
+    /// The timer's icon picker, laid out as the original's: a round button for the icons and an
+    /// "A" for the name's initial on top, the icons as a grid of colored circles (emoji stand in
+    /// for the original's own artwork, each on a color of the palette, which picking it takes too),
+    /// with the picked one ticked, then Cancel (back to the icon before) and OK. The "A" choice
+    /// shows the palette for its background.
     fn render_timer_icons(&self, timer: &fern_core::focus::FocusTimer, tab: usize, cx: &mut Context<Self>) -> AnyElement {
+        const COLORS: [&str; 8] = crate::lists_panel::LIST_COLORS;
         let strings = i18n::t(cx);
         let theme = cx.theme().clone();
         let edit = |f: Box<dyn Fn(&mut TimerDraft)>| {
@@ -1092,70 +1105,140 @@ impl FocusView {
                 cx.notify();
             })
         };
-        let tabs = h_flex().p_0p5().rounded(px(6.)).bg(theme.colors().background).children(
-            strings.habit_icon_tabs.iter().enumerate().map(|(i, label)| {
-                div()
-                    .id(("timer-icon-tab", i))
-                    .flex_1()
-                    .h(px(24.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded(px(5.))
-                    .cursor_pointer()
-                    .when(i == tab, |el| el.bg(theme.colors().element_selected))
-                    .child(Label::new(*label).size(LabelSize::Small))
-                    .on_click(edit(Box::new(move |d| {
-                        d.icon_tab = Some(i);
-                        // "Text" shows the name's initial.
-                        if i == 1 {
-                            d.timer.icon = None;
-                        }
-                    })))
-            }),
-        );
-        let emoji = div().flex().flex_wrap().gap_0p5().children(HABIT_EMOJI.iter().map(|emoji| {
-            let selected = timer.icon.as_deref() == Some(*emoji);
+        let ring = |on: bool, el: Div| {
             div()
-                .id(SharedString::from(format!("timer-emoji-{emoji}")))
-                .size(px(30.))
+                .p(px(3.))
+                .rounded_full()
+                .border_2()
+                .border_color(if on { theme.colors().accent.opacity(0.6) } else { gpui::transparent_black() })
+                .child(el)
+        };
+        let name = timer.name.clone();
+        let top = h_flex()
+            .gap_2()
+            .child(
+                div()
+                    .id("timer-icons-tab")
+                    .cursor_pointer()
+                    .child(ring(tab == 0, icon_avatar(timer.icon.as_deref().or(Some(HABIT_EMOJI[0])), timer.color.as_deref(), &name, px(32.), cx)))
+                    .on_click(edit(Box::new(|d| d.icon_tab = Some(0)))),
+            )
+            .child(
+                div()
+                    .id("timer-text-tab")
+                    .cursor_pointer()
+                    .child(ring(
+                        tab == 1,
+                        div()
+                            .size(px(32.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_full()
+                            .bg(theme.colors().accent.opacity(0.25))
+                            .child(Label::new("A").color(Color::Accent)),
+                    ))
+                    .on_click(edit(Box::new(|d| {
+                        d.icon_tab = Some(1);
+                        d.timer.icon = None;
+                    }))),
+            );
+        let body: AnyElement = if tab == 0 {
+            div()
+                .id("timer-icon-grid")
+                .h(px(158.))
+                .overflow_y_scroll()
+                .child(div().flex().flex_wrap().gap_y(px(16.)).children(HABIT_EMOJI.iter().enumerate().map(|(i, emoji)| {
+                    let color = COLORS[i % COLORS.len()];
+                    let selected = timer.icon.as_deref() == Some(*emoji);
+                    div()
+                        .id(SharedString::from(format!("timer-emoji-{emoji}")))
+                        .w(px(46.))
+                        .flex()
+                        .justify_center()
+                        .cursor_pointer()
+                        .child(
+                            div()
+                                .relative()
+                                .size(px(30.))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded_full()
+                                .bg(crate::lists_panel::parse_color(Some(color)).unwrap_or(theme.colors().accent).opacity(0.45))
+                                .text_size(px(16.))
+                                .child(*emoji)
+                                .when(selected, |el| {
+                                    el.child(
+                                        div()
+                                            .absolute()
+                                            .right(px(-4.))
+                                            .bottom(px(-4.))
+                                            .size(px(14.))
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .rounded_full()
+                                            .bg(theme.colors().accent)
+                                            .child(Icon::new(IconName::Check).size(IconSize::XSmall).color(Color::Default)),
+                                    )
+                                }),
+                        )
+                        .on_click(edit(Box::new(move |d| {
+                            d.timer.icon = Some((*emoji).to_owned());
+                            d.timer.color = Some(color.to_owned());
+                        })))
+                })))
+                .into_any_element()
+        } else {
+            h_flex()
+                .h(px(40.))
+                .gap_2()
+                .children(std::iter::once(None).chain(COLORS.iter().map(|c| Some(*c))).map(|color| {
+                    let selected = timer.color.as_deref() == color;
+                    let fill = crate::lists_panel::parse_color(color).unwrap_or(theme.colors().accent);
+                    div()
+                        .id(SharedString::from(format!("timer-color-{}", color.unwrap_or("none"))))
+                        .size(px(24.))
+                        .rounded_full()
+                        .cursor_pointer()
+                        .bg(fill.opacity(if color.is_none() { 0.35 } else { 1. }))
+                        .when(selected, |el| el.border_2().border_color(theme.colors().text))
+                        .on_click(edit(Box::new(move |d| d.timer.color = color.map(str::to_owned))))
+                }))
+                .into_any_element()
+        };
+        let button = |id: &'static str, label: &'static str, primary: bool| {
+            div()
+                .id(id)
+                .w(px(100.))
+                .h(px(30.))
                 .flex()
                 .items_center()
                 .justify_center()
                 .rounded(px(6.))
                 .cursor_pointer()
-                .text_size(px(17.))
-                .when(selected, |el| el.bg(theme.colors().element_selected))
-                .hover(|s| s.bg(theme.colors().element_hover))
-                .child(*emoji)
-                .on_click(edit(Box::new(move |d| {
-                    d.timer.icon = Some((*emoji).to_owned());
-                    d.icon_tab = None;
-                })))
-        }));
-        let colors = h_flex().gap_1p5().children(
-            std::iter::once(None).chain(crate::lists_panel::LIST_COLORS.iter().map(|c| Some(*c))).map(|color| {
-                let selected = timer.color.as_deref() == color;
-                let fill = crate::lists_panel::parse_color(color).unwrap_or(theme.colors().accent);
-                div()
-                    .id(SharedString::from(format!("timer-color-{}", color.unwrap_or("none"))))
-                    .size(px(20.))
-                    .rounded_full()
-                    .cursor_pointer()
-                    .bg(fill.opacity(if color.is_none() { 0.35 } else { 1. }))
-                    .when(selected, |el| el.border_2().border_color(theme.colors().text))
-                    .on_click(edit(Box::new(move |d| d.timer.color = color.map(str::to_owned))))
-            }),
-        );
-        v_flex()
-            .gap_2()
-            .p_2()
-            .rounded(px(6.))
-            .border_1()
-            .border_color(theme.colors().border)
-            .child(tabs)
-            .when(tab == 0, |el| el.child(emoji))
-            .child(colors)
+                .when(primary, |el| el.bg(theme.colors().accent))
+                .when(!primary, |el| el.border_1().border_color(theme.colors().border))
+                .child(Label::new(label).size(LabelSize::Small))
+        };
+        popover(cx)
+            .w(px(404.))
+            .px(px(16.))
+            .py(px(20.))
+            .gap(px(16.))
+            .child(top)
+            .child(body)
+            .child(
+                h_flex()
+                    .gap(px(12.))
+                    .justify_end()
+                    .child(button("timer-icon-cancel", strings.cancel, false).on_click(edit(Box::new(|d| {
+                        (d.timer.icon, d.timer.color) = d.icon_backup.clone();
+                        d.icon_tab = None;
+                    }))))
+                    .child(button("timer-icon-ok", strings.ok, true).on_click(edit(Box::new(|d| d.icon_tab = None)))),
+            )
             .into_any_element()
     }
 

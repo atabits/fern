@@ -113,6 +113,9 @@ pub struct TodoView {
     /// The original's Timeline view, and the first day it shows.
     timeline: bool,
     timeline_from: NaiveDate,
+    /// The Timeline's scale: 0 Day, 1 Week, 2 Month; and whether its menu is open.
+    timeline_scale: usize,
+    scale_menu_open: bool,
     /// The current list's sections.
     sections: Vec<fern_core::ListSection>,
     /// The "Add Section" field, while it is shown.
@@ -266,6 +269,8 @@ impl TodoView {
             kanban: false,
             timeline: false,
             timeline_from: Self::today(),
+            timeline_scale: 0,
+            scale_menu_open: false,
             sections: Vec::new(),
             new_section: None,
             section_menu: None,
@@ -432,6 +437,10 @@ impl TodoView {
                 Some(("menu", "templates")) => self.templates_open = true,
                 Some(("menu", "input-box")) => self.input_box_open = true,
                 Some(("menu", "timeline")) => self.set_layout(false, true, cx),
+                Some(("menu", "timeline-week")) => {
+                    self.set_layout(false, true, cx);
+                    self.timeline_scale = 1;
+                }
                 // `menu=add-date-repeat`: the picker with a time and a weekly repeat, Repeat open.
                 Some(("menu", "add-date-repeat")) => {
                     self.add_draft.date = Some(Self::today() + chrono::Duration::days(1));
@@ -573,6 +582,14 @@ impl TodoView {
         self.show_details = self.view_flag("show_details", false);
         self.kanban = self.view_flag("kanban", false);
         self.timeline = self.view_flag("timeline", false);
+        self.timeline_scale = self
+            .store
+            .setting(&format!("timeline_scale:{}", self.view_key()))
+            .ok()
+            .flatten()
+            .and_then(|s| s.parse().ok())
+            .filter(|s| *s < 3)
+            .unwrap_or(0);
         let today = Self::today();
         self.filters = self
             .store
@@ -2183,16 +2200,74 @@ impl TodoView {
         cx.notify();
     }
 
+    /// The Timeline's scale button, "Day ▾", and its menu: Day, Week, Month.
+    fn render_scale_button(&self, strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let labels = [strings.day, strings.week, strings.month];
+        div()
+            .relative()
+            .ml_2()
+            .child(
+                h_flex()
+                    .id("timeline-scale")
+                    .px_2()
+                    .h(px(22.))
+                    .gap_1()
+                    .rounded(px(11.))
+                    .border_1()
+                    .border_color(theme.colors().border)
+                    .cursor_pointer()
+                    .child(Label::new(labels[self.timeline_scale]).size(LabelSize::Small))
+                    .child(Icon::new(IconName::ChevronDown).size(IconSize::XSmall).color(Color::Muted))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.scale_menu_open = !this.scale_menu_open;
+                        cx.notify();
+                    })),
+            )
+            .when(self.scale_menu_open, |el| {
+                el.child(PopoverAttachment::new(
+                    Placement::BelowRight,
+                    popover(cx)
+                        .w(px(150.))
+                        .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                            this.scale_menu_open = false;
+                            cx.notify();
+                        }))
+                        .children(labels.into_iter().enumerate().map(|(i, label)| {
+                            let selected = i == self.timeline_scale;
+                            ListItem::new(SharedString::from(format!("timeline-scale-{i}")))
+                                .child(Label::new(label).color(if selected { Color::Accent } else { Color::Default }))
+                                .when(selected, |item| item.end_slot(Icon::new(IconName::Check).size(IconSize::Small).color(Color::Accent)))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.timeline_scale = i;
+                                    this.scale_menu_open = false;
+                                    let result = this.store.set_setting(&format!("timeline_scale:{}", this.view_key()), &i.to_string());
+                                    this.check(result);
+                                    cx.notify();
+                                }))
+                        }))
+                        .into_any_element(),
+                ))
+            })
+            .into_any_element()
+    }
+
     /// The original's Timeline: the groups as rows, the coming days as columns (weekends shaded),
     /// and each dated task as a bar from its date to the end of its duration; a click opens it.
     fn render_timeline(&self, strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {
-        const DAYS: usize = 10;
+        // The original's scales: Day shows ten days, Week three weeks, Month six; the arrows move
+        // by a week, two weeks or a month.
+        let scale = self.timeline_scale;
+        let days_shown = [10usize, 22, 45][scale];
+        let step = [7i64, 14, 30][scale];
         const LABEL_WIDTH: f32 = 150.;
         let theme = cx.theme().clone();
         let today = Self::today();
         let from = self.timeline_from;
-        let days: Vec<NaiveDate> = (0..DAYS as i64).map(|i| from + chrono::Duration::days(i)).collect();
+        let today_line = theme.status().error;
+        let days: Vec<NaiveDate> = (0..days_shown as i64).map(|i| from + chrono::Duration::days(i)).collect();
         let groups = task_rows::kanban_columns(self.rows_with(strings, &HashSet::new(), &HashSet::new()), strings);
+        let scale_button = self.render_scale_button(strings, cx);
         let weekend = |date: &NaiveDate| matches!(date.weekday(), chrono::Weekday::Sat | chrono::Weekday::Sun);
         let shift = |delta: i64| {
             cx.listener(move |this: &mut Self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>| {
@@ -2212,6 +2287,8 @@ impl TodoView {
                     .border_l_1()
                     .border_color(theme.colors().border_variant)
                     .when(weekend(&date), |el| el.bg(theme.colors().element_hover.opacity(0.5)))
+                    // Week and Month mark today with a red line, as the original does.
+                    .when(scale > 0 && date == today, |el| el.border_l_2().border_color(today_line))
                     .drag_over::<DraggedTask>(move |style, _, _, _| style.bg(accent.opacity(0.15)))
                     .on_drop(cx.listener(move |this, dragged: &DraggedTask, _, cx| {
                         let result = this.store.move_dates(dragged.id, date);
@@ -2226,7 +2303,13 @@ impl TodoView {
                 h_flex()
                     .h(px(30.))
                     .px_3()
-                    .child(div().flex_1().child(Label::new(strings.months_short[from.month0() as usize]).size(LabelSize::Small).color(Color::Muted)))
+                    .child(div().w(px(LABEL_WIDTH - 12.)).flex_none().child(Label::new(strings.months_short[from.month0() as usize]).size(LabelSize::Small).color(Color::Muted)))
+                    // A month's name above its first day, for the scales that cross months.
+                    .child(h_flex().flex_1().mr(px(8.)).children(days.iter().map(|date| {
+                        div().flex_1().when(scale > 0 && date.day() == 1 && *date != from, |el| {
+                            el.child(Label::new(strings.months_short[date.month0() as usize]).size(LabelSize::Small).color(Color::Muted))
+                        })
+                    })))
                     .child(
                         div()
                             .id("timeline-today")
@@ -2243,7 +2326,8 @@ impl TodoView {
                                 this.timeline_from = Self::today();
                                 cx.notify();
                             })),
-                    ),
+                    )
+                    .child(scale_button),
             )
             .child(
                 h_flex()
@@ -2255,26 +2339,34 @@ impl TodoView {
                             .w(px(LABEL_WIDTH))
                             .flex_none()
                             .px_1()
-                            .child(IconButton::new("timeline-prev", IconName::ChevronLeft).size(px(20.)).icon_size(IconSize::XSmall).on_click(shift(-7))),
+                            .child(IconButton::new("timeline-prev", IconName::ChevronLeft).size(px(20.)).icon_size(IconSize::XSmall).on_click(shift(-step))),
                     )
                     .child(h_flex().flex_1().children(days.iter().map(|date| {
                         let is_today = *date == today;
+                        // Month shows every seventh day's number, so that they fit.
+                        let labelled = scale < 2 || (date.day() - 1) % 7 == 0;
+                        let color = match (is_today, scale) {
+                            (true, 0) => Color::Accent,
+                            (true, _) => Color::Custom(today_line),
+                            _ => Color::Default,
+                        };
                         div()
                             .flex_1()
+                            .min_w_0()
                             .h_full()
-                            .px_2()
+                            .px(px(if scale == 0 { 8. } else { 2. }))
                             .flex()
                             .items_center()
                             .when(weekend(date), |el| el.bg(theme.colors().element_hover.opacity(0.5)))
-                            .child(Label::new(date.day().to_string()).size(LabelSize::Small).color(if is_today { Color::Accent } else { Color::Default }))
+                            .when(labelled || is_today, |el| el.child(Label::new(date.day().to_string()).size(LabelSize::Small).color(color)))
                     })))
-                    .child(IconButton::new("timeline-next", IconName::ChevronRight).size(px(20.)).icon_size(IconSize::XSmall).on_click(shift(7))),
+                    .child(IconButton::new("timeline-next", IconName::ChevronRight).size(px(20.)).icon_size(IconSize::XSmall).on_click(shift(step))),
             );
         let rows = groups.into_iter().enumerate().map(|(i, (label, _, cards))| {
             let bars: Vec<(Task, usize, usize)> = cards
                 .into_iter()
                 .flat_map(|(task, subtasks)| std::iter::once(task).chain(subtasks))
-                .filter_map(|task| fern_core::timeline::bar(&task, from, DAYS).map(|(first, span)| (task, first, span)))
+                .filter_map(|task| fern_core::timeline::bar(&task, from, days_shown).map(|(first, span)| (task, first, span)))
                 .collect();
             let height = px(16. + 32. * bars.len().max(1) as f32);
             h_flex()
@@ -2306,8 +2398,8 @@ impl TodoView {
                                 .on_drag(dragged, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
                                 .absolute()
                                 .top(px(8. + 32. * n as f32))
-                                .left(gpui::relative(first as f32 / DAYS as f32))
-                                .w(gpui::relative(span as f32 / DAYS as f32))
+                                .left(gpui::relative(first as f32 / days_shown as f32))
+                                .w(gpui::relative(span as f32 / days_shown as f32))
                                 .h(px(26.))
                                 .px_1()
                                 .child(

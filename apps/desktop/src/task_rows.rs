@@ -497,7 +497,14 @@ pub fn rows_by_day(
     }
     let mut rows = Vec::new();
     for (day, items) in groups {
-        rows.push(Row::Day { label: day_header(day, today, strings), count: items.len(), drop: None });
+        // As the original: "Sunday, Today" and "Saturday, Yesterday" for the last two days.
+        let weekday = strings.weekdays_full[day.weekday().num_days_from_monday() as usize];
+        let label = match (today - day).num_days() {
+            0 => format!("{weekday}, {}", strings.today),
+            1 => format!("{weekday}, {}", strings.yesterday),
+            _ => day_header(day, today, strings),
+        };
+        rows.push(Row::Day { label, count: items.len(), drop: None });
         rows.extend(items.into_iter().map(|task| Row::Task {
             task: task.clone(),
             depth: 0,

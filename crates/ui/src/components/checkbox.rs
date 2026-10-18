@@ -83,7 +83,8 @@ impl RenderOnce for Checkbox {
                 .child("✕")
                 .when_some(self.on_click, |el, handler| el.on_click(handler));
         }
-        let border = if self.checked { colors.accent } else { self.tint.unwrap_or(colors.checkbox_border) };
+        // A checked box is grey, as the original's.
+        let border = if self.checked { colors.text_muted.opacity(0.6) } else { self.tint.unwrap_or(colors.checkbox_border) };
         div()
             .id(self.id)
             .size(self.size)
@@ -95,7 +96,7 @@ impl RenderOnce for Checkbox {
             .border_1()
             .border_color(border)
             .cursor_pointer()
-            .when(self.checked, |el| el.bg(colors.accent).child("✓"))
+            .when(self.checked, |el| el.bg(colors.text_muted.opacity(0.6)).child("✓"))
             .when(self.lines && !self.checked, |el| {
                 el.child(
                     div()

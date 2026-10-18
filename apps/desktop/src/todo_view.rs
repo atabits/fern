@@ -365,6 +365,7 @@ impl TodoView {
                 Some(("view", "today")) => self.set_view(View::Today, cx),
                 Some(("view", "summary")) => self.set_view(View::Summary, cx),
                 Some(("view", "next7")) => self.set_view(View::Next7Days, cx),
+                Some(("view", "completed")) => self.set_view(View::Completed, cx),
                 Some(("view", "tomorrow")) => self.set_view(View::Tomorrow, cx),
                 // `type=<text>`: text in the quick-add field, as if typed (not added).
                 Some(("type", text)) => {
@@ -4271,8 +4272,8 @@ impl TodoView {
                             } else {
                                 task.title.clone().into()
                             })
+                            // As the original: closed tasks are muted, not struck through.
                             .color(if done || wont_do || task.title.is_empty() { Color::Muted } else { Color::Default })
-                            .strikethrough(done)
                             .truncate(),
                         )
                         // "Show Details": the first line of the notes under the title.
@@ -5125,6 +5126,7 @@ impl Render for TodoView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let strings = i18n::t(cx);
         let theme = cx.theme().clone();
+        let closed_header = matches!(self.view, View::Completed | View::WontDo);
         let add_focused = self.input.focus_handle(cx).is_focused(window);
         let input_focus = self.input.focus_handle(cx);
         let today = Self::today();
@@ -5309,7 +5311,9 @@ impl Render for TodoView {
                                 })),
                         )
                     })
-                    .when(self.view != View::Trash, |el| {
+                    // The Completed and Won't Do views have only Print, as the original's.
+                    .when(closed_header, |el| el.child(IconButton::new("print-closed", IconName::Printer).tooltip(Tooltip::text(strings.print)).on_click(cx.listener(|this, _, _, cx| this.print_list(cx)))))
+                    .when(self.view != View::Trash && !closed_header, |el| {
                         el.child(
                             div()
                                 .relative()
@@ -5322,7 +5326,7 @@ impl Render for TodoView {
                                 }),
                         )
                     })
-                    .when(self.view != View::Trash, |el| el.child(
+                    .when(self.view != View::Trash && !closed_header, |el| el.child(
                         div()
                             .relative()
                             .child(IconButton::new("more", IconName::Ellipsis).on_click(cx.listener(

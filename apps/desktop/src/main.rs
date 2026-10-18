@@ -13,6 +13,7 @@ mod i18n;
 mod keymap;
 mod lists_panel;
 mod matrix_view;
+mod print;
 mod reminders;
 mod search_modal;
 mod sidebar;

@@ -543,6 +543,16 @@ impl TaskDetail {
                 .on_click(cx.listener(|this, _, _, cx| this.toggle_kind(cx))),
             )
             .child(div().py_1().child(Divider::horizontal()))
+            .child(item("more-print", IconName::Printer, strings.print).on_click(cx.listener(|this, _, _, cx| {
+                this.close_popup(cx);
+                if let Some(task) = this.task.clone() {
+                    let checklist = this.store.checklist(task.id).unwrap_or_default();
+                    let html = crate::print::task_html(&task, &checklist, Local::now().date_naive(), i18n::t(cx));
+                    if let Err(err) = crate::print::open("task", &html) {
+                        eprintln!("failed to print: {err}");
+                    }
+                }
+            })))
             .child(item("more-delete", IconName::Trash, strings.delete).on_click(cx.listener(|this, _, _, cx| {
                 this.menu_action(cx, |store, id| store.delete_task(id))
             })))

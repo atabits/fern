@@ -59,6 +59,7 @@ pub enum IconName {
     PinOff,
     Play,
     Plus,
+    Printer,
     RefreshCw,
     Repeat,
     RotateCcw,

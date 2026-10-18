@@ -783,6 +783,17 @@ impl TodoView {
         cx.notify();
     }
 
+    fn print_list(&mut self, cx: &mut Context<Self>) {
+        self.header_menu_open = false;
+        let strings = i18n::t(cx);
+        let title = lists_panel::title(&self.view, &self.lists, strings);
+        let html = crate::print::list_html(&title, &self.tasks, Self::today(), strings);
+        if let Err(err) = crate::print::open("list", &html) {
+            self.error = Some(err.to_string());
+        }
+        cx.notify();
+    }
+
     fn open_list_activity(&mut self, cx: &mut Context<Self>) {
         let list = match self.view {
             View::List(id) => Some(id),
@@ -1985,23 +1996,7 @@ impl TodoView {
                         .hover(|s| s.bg(theme.colors().element_hover))
                         .child(Icon::new(icon).color(if on { Color::Accent } else { Color::Muted }))
                 };
-                el.when(in_list || self.view == View::Inbox, |el| {
-                    el.child(
-                        ListItem::new("list-activities")
-                            .start_slot(Icon::new(IconName::ListTree).color(Color::Muted))
-                            .child(Label::new(strings.list_activities))
-                            .on_click(cx.listener(|this, _, _, cx| this.open_list_activity(cx))),
-                    )
-                })
-                .when(in_list, |el| {
-                    el.child(
-                        ListItem::new("add-section")
-                            .start_slot(Icon::new(IconName::Plus).color(Color::Muted))
-                            .child(Label::new(strings.add_section))
-                            .on_click(cx.listener(|this, _, window, cx| this.start_new_section(window, cx))),
-                    )
-                    .child(div().my_1().child(Divider::horizontal()))
-                })
+                el.when(in_list, |el| el.child(div().my_1().child(Divider::horizontal())))
                     .child(div().px_2().pt_1().child(Label::new(strings.view_label).size(LabelSize::Small).color(Color::Muted)))
                     .child(
                         h_flex()
@@ -2031,6 +2026,29 @@ impl TodoView {
                             .start_slot(Icon::new(IconName::FileText).color(Color::Muted))
                             .child(Label::new(if details { strings.hide_details } else { strings.show_details }))
                             .on_click(cx.listener(|this, _, _, cx| this.toggle_view_flag("show_details", false, cx))),
+                    )
+                    .child(div().my_1().child(Divider::horizontal()))
+                    .when(in_list, |el| {
+                        el.child(
+                            ListItem::new("add-section")
+                                .start_slot(Icon::new(IconName::Plus).color(Color::Muted))
+                                .child(Label::new(strings.add_section))
+                                .on_click(cx.listener(|this, _, window, cx| this.start_new_section(window, cx))),
+                        )
+                    })
+                    .when(in_list || self.view == View::Inbox, |el| {
+                        el.child(
+                            ListItem::new("list-activities")
+                                .start_slot(Icon::new(IconName::ListTree).color(Color::Muted))
+                                .child(Label::new(strings.list_activities))
+                                .on_click(cx.listener(|this, _, _, cx| this.open_list_activity(cx))),
+                        )
+                    })
+                    .child(
+                        ListItem::new("print-list")
+                            .start_slot(Icon::new(IconName::Printer).color(Color::Muted))
+                            .child(Label::new(strings.print))
+                            .on_click(cx.listener(|this, _, _, cx| this.print_list(cx))),
                     )
             })
             .when(!in_list && !in_trash && matches!(self.view, View::Completed | View::WontDo | View::Search(_)), |el| {

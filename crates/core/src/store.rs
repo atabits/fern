@@ -8,6 +8,7 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 use uuid::Uuid;
 
 use crate::countdown::{Countdown, CountdownKind};
+use crate::habit::Habit;
 use crate::model::{ChecklistItem, Id, Kind, List, Priority, Tag, Task, View, ViewCounts};
 use crate::recurrence::Recurrence;
 
@@ -86,6 +87,18 @@ const MIGRATIONS: &[&str] = &[
         date       TEXT NOT NULL,
         kind       TEXT NOT NULL,
         created_at INTEGER NOT NULL
+    );
+    ",
+    "
+    CREATE TABLE habits (
+        id         TEXT PRIMARY KEY,
+        name       TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+    );
+    CREATE TABLE habit_checkins (
+        habit_id TEXT NOT NULL REFERENCES habits(id) ON DELETE CASCADE,
+        date     TEXT NOT NULL,
+        PRIMARY KEY (habit_id, date)
     );
     ",
 ];
@@ -609,6 +622,56 @@ impl Store {
         Ok(())
     }
 
+    pub fn habits(&self) -> Result<Vec<Habit>> {
+        let mut stmt = self.conn.prepare("SELECT id, name FROM habits ORDER BY created_at, rowid")?;
+        let habits = stmt
+            .query_map([], |row| Ok(Habit { id: parse_uuid(&row.get::<_, String>(0)?, 0)?, name: row.get(1)? }))?
+            .collect::<Result<_, _>>()?;
+        Ok(habits)
+    }
+
+    pub fn add_habit(&self, name: &str) -> Result<Habit> {
+        let name = name.trim();
+        anyhow::ensure!(!name.is_empty(), "a habit needs a name");
+        let habit = Habit { id: Uuid::now_v7(), name: name.to_owned() };
+        self.conn.execute(
+            "INSERT INTO habits (id, name, created_at) VALUES (?1, ?2, ?3)",
+            params![habit.id.to_string(), habit.name, now_ms()],
+        )?;
+        Ok(habit)
+    }
+
+    pub fn delete_habit(&self, id: Id) -> Result<()> {
+        self.conn.execute("DELETE FROM habits WHERE id = ?1", [id.to_string()])?;
+        Ok(())
+    }
+
+    /// Checks a habit in for `date`, or removes the check-in when it is already there.
+    pub fn toggle_checkin(&self, habit: Id, date: NaiveDate) -> Result<bool> {
+        let date = date.format(DATE_FORMAT).to_string();
+        let removed = self.conn.execute(
+            "DELETE FROM habit_checkins WHERE habit_id = ?1 AND date = ?2",
+            params![habit.to_string(), date],
+        )?;
+        if removed == 0 {
+            self.conn.execute(
+                "INSERT INTO habit_checkins (habit_id, date) VALUES (?1, ?2)",
+                params![habit.to_string(), date],
+            )?;
+        }
+        Ok(removed == 0)
+    }
+
+    /// All check-in dates of a habit.
+    pub fn checkins(&self, habit: Id) -> Result<std::collections::HashSet<NaiveDate>> {
+        let mut stmt = self.conn.prepare("SELECT date FROM habit_checkins WHERE habit_id = ?1")?;
+        let dates = stmt
+            .query_map([habit.to_string()], |row| row.get::<_, String>(0))?
+            .filter_map(|r| r.ok().and_then(|d| NaiveDate::parse_from_str(&d, DATE_FORMAT).ok()))
+            .collect();
+        Ok(dates)
+    }
+
     /// A user setting such as the UI language; `None` when never set.
     pub fn setting(&self, key: &str) -> Result<Option<String>> {
         Ok(self
@@ -1084,6 +1147,22 @@ mod tests {
         assert_eq!(all[1].kind, CountdownKind::Anniversary);
         store.delete_countdown(trip.id)?;
         assert_eq!(store.countdowns()?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn habits_and_checkins() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let floss = store.add_habit(" Floss ")?;
+        let read = store.add_habit("Read")?;
+        assert!(store.add_habit("").is_err());
+        assert!(store.toggle_checkin(floss.id, d(2026, 10, 17))?);
+        assert!(store.toggle_checkin(floss.id, d(2026, 10, 18))?);
+        assert!(!store.toggle_checkin(floss.id, d(2026, 10, 18))?);
+        assert_eq!(store.checkins(floss.id)?, [d(2026, 10, 17)].into());
+        assert!(store.checkins(read.id)?.is_empty());
+        store.delete_habit(floss.id)?;
+        assert_eq!(store.habits()?.iter().map(|h| h.name.as_str()).collect::<Vec<_>>(), ["Read"]);
         Ok(())
     }
 

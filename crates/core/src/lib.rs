@@ -2,12 +2,14 @@
 //! Used by the desktop app and, later, by the mobile clients.
 
 pub mod countdown;
+pub mod habit;
 pub mod model;
 pub mod quick_add;
 pub mod recurrence;
 pub mod store;
 
 pub use countdown::{Countdown, CountdownKind, Span, span};
+pub use habit::{Habit, HabitStats};
 pub use model::{ChecklistItem, Id, Kind, List, Priority, Tag, Task, View, ViewCounts};
 pub use quick_add::{ParsedTask, parse_quick_add};
 pub use recurrence::{Frequency, Recurrence};

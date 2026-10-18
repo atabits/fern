@@ -20,8 +20,8 @@ impl Section {
     pub const ALL: [Section; 7] = [
         Section::Tasks,
         Section::Calendar,
-        Section::Habits,
         Section::Pomodoro,
+        Section::Habits,
         Section::Search,
         Section::Matrix,
         Section::Countdown,
@@ -43,8 +43,9 @@ impl Section {
         match self {
             Section::Tasks => IconName::SquareCheck,
             Section::Calendar => IconName::CalendarDays,
-            Section::Habits => IconName::CircleDot,
-            Section::Pomodoro => IconName::Clock,
+            // The original uses a target for Focus and a clock-like glyph for Habit.
+            Section::Habits => IconName::Clock,
+            Section::Pomodoro => IconName::CircleDot,
             Section::Search => IconName::Search,
             Section::Matrix => IconName::LayoutGrid,
             Section::Countdown => IconName::CalendarHeart,

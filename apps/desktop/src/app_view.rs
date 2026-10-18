@@ -8,6 +8,7 @@ use ui::{Placement, PopoverAttachment, popover};
 use crate::actions::{NewTask, Search, ShowInbox, ShowNext7Days, ShowToday, ShowTomorrow, ToggleSidebar};
 use crate::calendar_view::{self, CalendarView};
 use crate::countdown_view::CountdownView;
+use crate::habit_view::HabitView;
 use crate::i18n::{self, CurrentLocale, Locale};
 use crate::matrix_view::{self, MatrixView};
 use crate::search_modal::{SearchEvent, SearchModal};
@@ -21,6 +22,7 @@ pub struct AppView {
     calendar: gpui::Entity<CalendarView>,
     matrix: gpui::Entity<MatrixView>,
     countdown: gpui::Entity<CountdownView>,
+    habits: gpui::Entity<HabitView>,
     search: Option<gpui::Entity<SearchModal>>,
     account_menu_open: bool,
 }
@@ -50,6 +52,7 @@ impl AppView {
         })
         .detach();
         let countdown = cx.new(|cx| CountdownView::new(store.clone(), cx));
+        let habits = cx.new(|cx| HabitView::new(store.clone(), cx));
         let mut this = Self {
             store,
             section: Section::Tasks,
@@ -57,6 +60,7 @@ impl AppView {
             calendar,
             matrix,
             countdown,
+            habits,
             search: None,
             account_menu_open: false,
         };
@@ -80,6 +84,15 @@ impl AppView {
                     let kind = fern_core::CountdownKind::parse(kind);
                     this.countdown.update(cx, |view, cx| view.dev_add(name, date, kind, cx));
                 }
+            }
+            // `habit=<name>><days ago,…>`, repeatable.
+            for spec in state.split(';').filter_map(|part| part.strip_prefix("habit=")) {
+                let (name, days) = spec.split_once('>').unwrap_or((spec, ""));
+                let days: Vec<i64> = days.split(',').filter_map(|d| d.parse().ok()).collect();
+                this.habits.update(cx, |view, cx| view.dev_add(name, &days, cx));
+            }
+            if state.contains("section=habits") {
+                this.select(Section::Habits, window, cx);
             }
             if state.contains("section=countdown") {
                 this.select(Section::Countdown, window, cx);
@@ -106,6 +119,9 @@ impl AppView {
         }
         if section == Section::Matrix {
             self.matrix.update(cx, |matrix, cx| matrix.reload(cx));
+        }
+        if section == Section::Habits {
+            self.habits.update(cx, |habits, cx| habits.reload(cx));
         }
         if section == Section::Countdown {
             self.countdown.update(cx, |countdown, cx| countdown.reload(cx));
@@ -240,6 +256,7 @@ impl Render for AppView {
                 Section::Calendar => div().flex_1().h_full().child(self.calendar.clone()),
                 Section::Matrix => div().flex_1().h_full().child(self.matrix.clone()),
                 Section::Countdown => div().flex_1().h_full().child(self.countdown.clone()),
+                Section::Habits => div().flex_1().h_full().child(self.habits.clone()),
                 other => v_flex()
                     .flex_1()
                     .h_full()

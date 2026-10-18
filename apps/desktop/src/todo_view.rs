@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
-use amin_core::{Id, Kind, List, Priority, Store, Tag, Task, View, ViewCounts};
+use fern_core::{Id, Kind, List, Priority, Store, Tag, Task, View, ViewCounts};
 use chrono::{Duration, Local, NaiveDate};
 use gpui::{
     AnyElement, Context, Entity, FocusHandle, Focusable, MouseButton, Rgba, SharedString, Window,
@@ -120,11 +120,11 @@ impl TodoView {
     }
 
     /// Debug builds only: puts the UI into a given state without clicks, for screenshots.
-    /// `AMIN_DEV_STATE="add=<quick-add text>;list=<new list>;view=<list name>;select=<title part>;
+    /// `FERN_DEV_STATE="add=<quick-add text>;list=<new list>;view=<list name>;select=<title part>;
     /// popup=due|priority|tags|list;menu=header;new-list=1"`
     #[cfg(debug_assertions)]
     fn apply_dev_state(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Ok(state) = std::env::var("AMIN_DEV_STATE") else { return };
+        let Ok(state) = std::env::var("FERN_DEV_STATE") else { return };
         for part in state.split(';') {
             match part.split_once('=') {
                 Some(("add", text)) => {
@@ -197,7 +197,7 @@ impl TodoView {
     fn add_task(&self, input: &str) -> anyhow::Result<Task> {
         let today = Self::today();
         let list_names: Vec<String> = self.lists.iter().map(|l| l.name.clone()).collect();
-        let parsed = amin_core::parse_quick_add(input, today, &list_names);
+        let parsed = fern_core::parse_quick_add(input, today, &list_names);
         let title = if parsed.title.is_empty() { input.trim() } else { parsed.title.as_str() };
         let task = self.store.add_task(title)?;
 

@@ -1,4 +1,4 @@
-use amin_core::Priority;
+use fern_core::Priority;
 use gpui::{Rgba, rgb, rgba};
 
 pub fn background() -> Rgba {

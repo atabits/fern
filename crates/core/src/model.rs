@@ -71,8 +71,19 @@ pub struct Task {
     /// `None` with a date set means an all-day task.
     pub due_time: Option<NaiveTime>,
     pub tags: Vec<String>,
+    /// Checklist progress as (done, total); `None` when the task has no checklist items.
+    pub checklist: Option<(usize, usize)>,
     pub completed_at: Option<i64>,
     pub created_at: i64,
+}
+
+/// One item of a task's checklist (TickTick's `items`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChecklistItem {
+    pub id: Id,
+    pub task_id: Id,
+    pub title: String,
+    pub completed: bool,
 }
 
 impl Task {

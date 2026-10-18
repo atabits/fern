@@ -1,6 +1,6 @@
 use std::rc::Rc;
 
-use amin_core::Store;
+use fern_core::Store;
 use gpui::{AnyElement, Context, Entity, Window, div, prelude::*, px, svg};
 
 use crate::i18n::{self, CurrentLocale, Locale};

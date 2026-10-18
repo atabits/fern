@@ -1,7 +1,7 @@
 //! Fills a database with generic demo tasks for UI checks and screenshots.
-//! `cargo run -p amin_core --example seed_demo -- /path/to/tasks.db`
+//! `cargo run -p fern_core --example seed_demo -- /path/to/tasks.db`
 
-use amin_core::{Kind, Priority, Store};
+use fern_core::{Kind, Priority, Store};
 use chrono::{Duration, Local};
 
 fn main() -> anyhow::Result<()> {

@@ -1,4 +1,4 @@
-# Amin
+# Fern
 
 An open-source task manager inspired by TickTick: a fast native desktop app written in Rust,
 with mobile clients and sync planned.
@@ -32,15 +32,15 @@ Requirements: Rust stable (see `mise.toml`) and, on Linux, the libraries GPUI ne
 (Wayland or X11, xkbcommon, Vulkan, fontconfig).
 
 ```sh
-cargo run -p amin_desktop        # run the desktop app
+cargo run -p fern_desktop        # run the desktop app
 cargo test --workspace           # run the tests
 ```
 
 GPUI is taken straight from the [Zed repository](https://github.com/zed-industries/zed); the
 first build compiles it and takes a while.
 
-Data is stored in `$XDG_DATA_HOME/amin-task-tracker/tasks.db` (usually
-`~/.local/share/amin-task-tracker/tasks.db`).
+Data is stored in `$XDG_DATA_HOME/fern-tasks/tasks.db` (usually
+`~/.local/share/fern-tasks/tasks.db`).
 
 ## Contributing
 

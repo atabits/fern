@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use amin_core::{Id, Kind, Task};
+use fern_core::{Id, Kind, Task};
 use chrono::{Datelike, NaiveDate, NaiveTime};
 
 use crate::i18n::Strings;
@@ -140,7 +140,7 @@ pub fn due_label(
 mod tests {
     use super::*;
     use crate::i18n::{EN, RU};
-    use amin_core::Priority;
+    use fern_core::Priority;
     use uuid::Uuid;
 
     fn task(title: &str) -> Task {
@@ -155,6 +155,7 @@ mod tests {
             due_date: None,
             due_time: None,
             tags: Vec::new(),
+            checklist: None,
             completed_at: None,
             created_at: 0,
         }

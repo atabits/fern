@@ -2,7 +2,7 @@
 
 use std::rc::Rc;
 
-use amin_core::{Id, List, Priority, Store, Tag, Task};
+use fern_core::{Id, List, Priority, Store, Tag, Task};
 use chrono::{Datelike, Duration, Local, NaiveDate};
 use gpui::{
     AnyElement, Context, Entity, EventEmitter, Focusable, MouseButton, Rgba, SharedString,

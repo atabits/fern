@@ -14,7 +14,7 @@ mod widgets;
 use std::rc::Rc;
 
 use anyhow::{Context as _, Result};
-use amin_core::Store;
+use fern_core::Store;
 use gpui::{
     App, Bounds, KeyBinding, TitlebarOptions, WindowBounds, WindowOptions, actions, prelude::*,
     px, size,
@@ -24,12 +24,12 @@ use crate::app_view::AppView;
 use crate::assets::Assets;
 use crate::i18n::{CurrentLocale, Locale};
 
-actions!(amin, [Quit]);
+actions!(fern, [Quit]);
 
 fn open_store() -> Result<Store> {
     let dir = dirs::data_dir()
         .context("cannot determine the user data directory")?
-        .join("amin-task-tracker");
+        .join("fern-tasks");
     std::fs::create_dir_all(&dir).with_context(|| format!("cannot create {}", dir.display()))?;
     Store::open(dir.join("tasks.db"))
 }
@@ -51,9 +51,9 @@ fn main() -> Result<()> {
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
-                titlebar: Some(TitlebarOptions { title: Some("Amin".into()), ..Default::default() }),
+                titlebar: Some(TitlebarOptions { title: Some("Fern".into()), ..Default::default() }),
                 // Overridable so that window-manager rules can target dev builds (used for UI screenshots).
-                app_id: Some(std::env::var("AMIN_APP_ID").unwrap_or_else(|_| "amin-task-tracker".into())),
+                app_id: Some(std::env::var("FERN_APP_ID").unwrap_or_else(|_| "fern-tasks".into())),
                 window_min_size: Some(size(px(900.), px(400.))),
                 ..Default::default()
             },

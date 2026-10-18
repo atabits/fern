@@ -1,15 +1,15 @@
 [package]
-name = "amin_desktop"
+name = "fern_desktop"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "amin"
+name = "fern"
 path = "src/main.rs"
 
 [dependencies]
-amin_core.workspace = true
+fern_core.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 dirs.workspace = true

@@ -1,6 +1,6 @@
 //! The lists column between the narrow sidebar and the task list, modeled on TickTick's.
 
-use amin_core::{List, Tag, View, ViewCounts};
+use fern_core::{List, Tag, View, ViewCounts};
 use gpui::{
     AnyElement, App, ClickEvent, IntoElement, ParentElement, Rgba, SharedString, Styled, Window,
     div, prelude::*, px, rgb, svg,

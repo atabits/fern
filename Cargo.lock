@@ -156,30 +156,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
-name = "amin_core"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "rusqlite",
- "uuid",
-]
-
-[[package]]
-name = "amin_desktop"
-version = "0.1.0"
-dependencies = [
- "amin_core",
- "anyhow",
- "chrono",
- "dirs",
- "gpui",
- "gpui_platform",
- "unicode-segmentation",
- "uuid",
-]
-
-[[package]]
 name = "android_system_properties"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1465,6 +1441,30 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e6853b52649d4ac5c0bd02320cddc5ba956bdb407c4b75a2c6b75bf51500f8c"
 dependencies = [
  "simd-adler32",
+]
+
+[[package]]
+name = "fern_core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "rusqlite",
+ "uuid",
+]
+
+[[package]]
+name = "fern_desktop"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "dirs",
+ "fern_core",
+ "gpui",
+ "gpui_platform",
+ "unicode-segmentation",
+ "uuid",
 ]
 
 [[package]]

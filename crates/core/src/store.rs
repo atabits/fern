@@ -7,7 +7,7 @@ use chrono::{Duration, NaiveDate, NaiveTime};
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use uuid::Uuid;
 
-use crate::model::{Id, Kind, List, Priority, Tag, Task, View, ViewCounts};
+use crate::model::{ChecklistItem, Id, Kind, List, Priority, Tag, Task, View, ViewCounts};
 
 const MIGRATIONS: &[&str] = &[
     "
@@ -55,6 +55,17 @@ const MIGRATIONS: &[&str] = &[
         key   TEXT PRIMARY KEY,
         value TEXT NOT NULL
     );
+    ",
+    "
+    CREATE TABLE checklist_items (
+        id           TEXT PRIMARY KEY,
+        task_id      TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        title        TEXT NOT NULL,
+        completed_at INTEGER,
+        sort_order   INTEGER NOT NULL,
+        created_at   INTEGER NOT NULL
+    );
+    CREATE INDEX checklist_items_task ON checklist_items(task_id, sort_order);
     ",
 ];
 
@@ -104,10 +115,12 @@ impl Store {
                 tags.entry(id).or_default().push(tag);
             }
         }
+        let progress = self.checklist_progress()?;
         for task in &mut tasks {
             if let Some(task_tags) = tags.remove(&task.id) {
                 task.tags = task_tags;
             }
+            task.checklist = progress.get(&task.id).copied();
         }
         Ok(tasks)
     }
@@ -144,6 +157,7 @@ impl Store {
         let mut stmt =
             self.conn.prepare("SELECT tag FROM task_tags WHERE task_id = ?1 ORDER BY tag")?;
         task.tags = stmt.query_map([id.to_string()], |row| row.get(0))?.collect::<Result<_, _>>()?;
+        task.checklist = self.checklist_progress()?.get(&id).copied();
         Ok(Some(task))
     }
 
@@ -159,6 +173,7 @@ impl Store {
             due_date: None,
             due_time: None,
             tags: Vec::new(),
+            checklist: None,
             completed_at: None,
             created_at: now_ms(),
         };
@@ -329,6 +344,95 @@ impl Store {
         Ok(())
     }
 
+    /// The task's checklist in display order.
+    pub fn checklist(&self, task: Id) -> Result<Vec<ChecklistItem>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, task_id, title, completed_at IS NOT NULL FROM checklist_items
+             WHERE task_id = ?1 ORDER BY sort_order, rowid",
+        )?;
+        let items = stmt
+            .query_map([task.to_string()], |row| {
+                Ok(ChecklistItem {
+                    id: parse_uuid(&row.get::<_, String>(0)?, 0)?,
+                    task_id: parse_uuid(&row.get::<_, String>(1)?, 1)?,
+                    title: row.get(2)?,
+                    completed: row.get(3)?,
+                })
+            })?
+            .collect::<Result<_, _>>()?;
+        Ok(items)
+    }
+
+    /// Adds an item to the end of the checklist, or right after `after` when given.
+    pub fn add_checklist_item(&self, task: Id, title: &str, after: Option<Id>) -> Result<ChecklistItem> {
+        let tx = self.conn.unchecked_transaction()?;
+        let position: i64 = match after {
+            Some(after) => {
+                let position: i64 = tx.query_row(
+                    "SELECT sort_order FROM checklist_items WHERE id = ?1",
+                    [after.to_string()],
+                    |row| row.get(0),
+                )?;
+                tx.execute(
+                    "UPDATE checklist_items SET sort_order = sort_order + 1
+                     WHERE task_id = ?1 AND sort_order > ?2",
+                    params![task.to_string(), position],
+                )?;
+                position + 1
+            }
+            None => tx.query_row(
+                "SELECT COALESCE(MAX(sort_order) + 1, 0) FROM checklist_items WHERE task_id = ?1",
+                [task.to_string()],
+                |row| row.get(0),
+            )?,
+        };
+        let item = ChecklistItem { id: Uuid::now_v7(), task_id: task, title: title.trim().to_owned(), completed: false };
+        tx.execute(
+            "INSERT INTO checklist_items (id, task_id, title, sort_order, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![item.id.to_string(), task.to_string(), item.title, position, now_ms()],
+        )?;
+        tx.commit()?;
+        Ok(item)
+    }
+
+    pub fn set_checklist_item_title(&self, id: Id, title: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE checklist_items SET title = ?2 WHERE id = ?1",
+            params![id.to_string(), title],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_checklist_item_completed(&self, id: Id, completed: bool) -> Result<()> {
+        self.conn.execute(
+            "UPDATE checklist_items SET completed_at = ?2 WHERE id = ?1",
+            params![id.to_string(), completed.then(now_ms)],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_checklist_item(&self, id: Id) -> Result<()> {
+        self.conn.execute("DELETE FROM checklist_items WHERE id = ?1", [id.to_string()])?;
+        Ok(())
+    }
+
+    fn checklist_progress(&self) -> Result<HashMap<Id, (usize, usize)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT task_id, COUNT(completed_at), COUNT(*) FROM checklist_items GROUP BY task_id",
+        )?;
+        let mut progress = HashMap::new();
+        for row in stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?))
+        })? {
+            let (task, done, total) = row?;
+            if let Ok(id) = Uuid::parse_str(&task) {
+                progress.insert(id, (done as usize, total as usize));
+            }
+        }
+        Ok(progress)
+    }
+
     /// A user setting such as the UI language; `None` when never set.
     pub fn setting(&self, key: &str) -> Result<Option<String>> {
         Ok(self
@@ -413,6 +517,7 @@ fn task_from_row(row: &Row) -> rusqlite::Result<Task> {
         due_date: due_date.and_then(|d| NaiveDate::parse_from_str(&d, DATE_FORMAT).ok()),
         due_time: due_time.and_then(|t| NaiveTime::parse_from_str(&t, TIME_FORMAT).ok()),
         tags: Vec::new(),
+        checklist: None,
         completed_at: row.get(8)?,
         created_at: row.get(9)?,
         list_id: row.get::<_, Option<String>>(10)?.map(|l| parse_uuid(&l, 10)).transpose()?,
@@ -463,7 +568,7 @@ mod tests {
 
     #[test]
     fn reopen_keeps_data() -> Result<()> {
-        let dir = std::env::temp_dir().join(format!("amin-test-{}", Uuid::now_v7()));
+        let dir = std::env::temp_dir().join(format!("fern-test-{}", Uuid::now_v7()));
         std::fs::create_dir_all(&dir)?;
         let path = dir.join("tasks.db");
         Store::open(&path)?.add_task("x")?;
@@ -601,6 +706,31 @@ mod tests {
         store.delete_list(work.id)?;
         assert!(store.lists()?.is_empty());
         assert_eq!(titles(&store.tasks()?), ["in the inbox"]);
+        Ok(())
+    }
+
+    #[test]
+    fn checklist_items_order_progress_and_cascade() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let task = store.add_task("pack for the trip")?;
+        let a = store.add_checklist_item(task.id, " passport ", None)?;
+        let c = store.add_checklist_item(task.id, "charger", None)?;
+        let b = store.add_checklist_item(task.id, "tickets", Some(a.id))?;
+        let titles = |store: &Store| -> Result<Vec<String>> {
+            Ok(store.checklist(task.id)?.into_iter().map(|i| i.title).collect())
+        };
+        assert_eq!(titles(&store)?, ["passport", "tickets", "charger"]);
+
+        store.set_checklist_item_completed(b.id, true)?;
+        store.set_checklist_item_title(c.id, "phone charger")?;
+        assert_eq!(store.task(task.id)?.unwrap().checklist, Some((1, 3)));
+        assert_eq!(store.tasks()?[0].checklist, Some((1, 3)));
+        assert!(store.checklist(task.id)?[1].completed);
+
+        store.delete_checklist_item(a.id)?;
+        assert_eq!(titles(&store)?, ["tickets", "phone charger"]);
+        store.delete_task(task.id)?;
+        assert!(store.checklist(task.id)?.is_empty());
         Ok(())
     }
 

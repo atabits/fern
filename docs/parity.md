@@ -71,10 +71,10 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 - `cargo test` covers the core (storage, smart views, tags, subtasks, lists, quick add) and the
   desktop's row, date and calendar logic in both languages.
 - A screenshot of our window next to the original, plus pixel measurements. Demo data:
-  `cargo run -p amin_core --example seed_demo -- <path to database>`.
-- In debug builds `AMIN_DEV_STATE` puts the UI into a given state without clicks, for example
-  `AMIN_DEV_STATE="add=Buy milk tomorrow #home;select=milk;popup=due"`; see
-  `TodoView::apply_dev_state` for all commands. `AMIN_APP_ID` changes the window's app id so
+  `cargo run -p fern_core --example seed_demo -- <path to database>`.
+- In debug builds `FERN_DEV_STATE` puts the UI into a given state without clicks, for example
+  `FERN_DEV_STATE="add=Buy milk tomorrow #home;select=milk;popup=due"`; see
+  `TodoView::apply_dev_state` for all commands. `FERN_APP_ID` changes the window's app id so
   window-manager rules can target dev builds.
 
 ## Next

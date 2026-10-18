@@ -280,6 +280,9 @@ const MIGRATIONS: &[&str] = &[
         created_at INTEGER NOT NULL
     );
     ",
+    "
+    ALTER TABLE focus_sessions ADD COLUMN stopwatch INTEGER NOT NULL DEFAULT 0;
+    ",
 ];
 
 const TASK_COLUMNS: &str = "id, parent_id, kind, title, notes, priority, due_date, due_time, \
@@ -1370,11 +1373,23 @@ impl Store {
 
     /// Records a finished focus session.
     pub fn add_focus_session(&self, task_id: Option<Id>, title: &str, started_at: i64, ended_at: i64) -> Result<FocusSession> {
+        self.add_focus_session_as(task_id, title, started_at, ended_at, false)
+    }
+
+    /// A focus session, timed as a Pomodoro or with the stopwatch.
+    pub fn add_focus_session_as(
+        &self,
+        task_id: Option<Id>,
+        title: &str,
+        started_at: i64,
+        ended_at: i64,
+        stopwatch: bool,
+    ) -> Result<FocusSession> {
         anyhow::ensure!(ended_at >= started_at, "a focus session cannot end before it starts");
-        let session = FocusSession { id: Uuid::now_v7(), task_id, title: title.trim().to_owned(), started_at, ended_at };
+        let session = FocusSession { id: Uuid::now_v7(), task_id, title: title.trim().to_owned(), started_at, ended_at, stopwatch };
         self.conn.execute(
-            "INSERT INTO focus_sessions (id, task_id, title, started_at, ended_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![session.id.to_string(), task_id.map(|t| t.to_string()), session.title, started_at, ended_at],
+            "INSERT INTO focus_sessions (id, task_id, title, started_at, ended_at, stopwatch) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![session.id.to_string(), task_id.map(|t| t.to_string()), session.title, started_at, ended_at, stopwatch],
         )?;
         Ok(session)
     }
@@ -1424,7 +1439,7 @@ impl Store {
     /// Focus sessions, newest first.
     pub fn focus_sessions(&self) -> Result<Vec<FocusSession>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, task_id, title, started_at, ended_at FROM focus_sessions ORDER BY started_at DESC",
+            "SELECT id, task_id, title, started_at, ended_at, stopwatch FROM focus_sessions ORDER BY started_at DESC",
         )?;
         let sessions = stmt
             .query_map([], |row| {
@@ -1434,6 +1449,7 @@ impl Store {
                     title: row.get(2)?,
                     started_at: row.get(3)?,
                     ended_at: row.get(4)?,
+                    stopwatch: row.get(5)?,
                 })
             })?
             .collect::<Result<_, _>>()?;
@@ -2250,6 +2266,9 @@ mod tests {
         store.add_focus_session(Some(task.id), "write report", 1_000, 1_500_000)?;
         store.add_focus_session(None, "reading", 2_000_000, 3_500_000)?;
         assert!(store.add_focus_session(None, "x", 10, 5).is_err());
+        store.add_focus_session_as(None, "timed", 4_000_000, 4_100_000, true)?;
+        assert!(store.focus_sessions()?[0].stopwatch);
+        store.delete_focus_session(store.focus_sessions()?[0].id)?;
         let sessions = store.focus_sessions()?;
         assert_eq!(sessions.iter().map(|s| s.title.as_str()).collect::<Vec<_>>(), ["reading", "write report"]);
         assert_eq!(sessions[1].task_id, Some(task.id));

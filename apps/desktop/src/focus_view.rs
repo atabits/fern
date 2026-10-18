@@ -312,7 +312,8 @@ impl FocusView {
             let strings = i18n::t(cx);
             let (task_id, title) = running.task.map_or((None, strings.focus.to_owned()), |(id, t)| (id, t));
             let start = running.timer.started_at;
-            if let Err(err) = self.store.add_focus_session(task_id, &title, start, start + elapsed) {
+            let stopwatch = running.timer.is_stopwatch();
+            if let Err(err) = self.store.add_focus_session_as(task_id, &title, start, start + elapsed, stopwatch) {
                 eprintln!("failed to record the focus session: {err:#}");
             }
         }
@@ -1571,9 +1572,9 @@ impl FocusView {
     }
 
     #[cfg(debug_assertions)]
-    pub fn dev_record(&mut self, title: &str, minutes_ago: i64, minutes: i64, cx: &mut Context<Self>) {
+    pub fn dev_record(&mut self, title: &str, minutes_ago: i64, minutes: i64, stopwatch: bool, cx: &mut Context<Self>) {
         let start = now_ms() - minutes_ago * 60_000;
-        self.store.add_focus_session(None, title, start, start + minutes * 60_000).ok();
+        self.store.add_focus_session_as(None, title, start, start + minutes * 60_000, stopwatch).ok();
         self.reload(cx);
     }
 
@@ -1667,11 +1668,35 @@ impl FocusView {
                     .items_start()
                     .gap_2()
                     .py_1()
-                    .child(div().mt(px(3.)).size(px(10.)).flex_none().rounded_full().bg(theme.colors().accent))
+                    // As in the original: the session's kind (Pomodoro or stopwatch) in a circle,
+                    // and a line down to a small ring beside the title.
+                    .child(
+                        v_flex()
+                            .w(px(20.))
+                            .flex_none()
+                            .items_center()
+                            .child(
+                                div()
+                                    .size(px(20.))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded_full()
+                                    .bg(theme.colors().accent.opacity(0.2))
+                                    .child(
+                                        Icon::new(if session.stopwatch { IconName::Timer } else { IconName::CircleDot })
+                                            .size(IconSize::XSmall)
+                                            .color(Color::Accent),
+                                    ),
+                            )
+                            .child(div().w(px(1.)).h(px(6.)).bg(theme.colors().accent.opacity(0.5)))
+                            .child(div().size(px(7.)).rounded_full().border_1().border_color(theme.colors().accent)),
+                    )
                     .child(
                         v_flex()
                             .flex_1()
                             .min_w_0()
+                            .gap_1()
                             .child(
                                 Label::new(format!(
                                     "{} - {}",

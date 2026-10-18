@@ -154,10 +154,12 @@ impl AppView {
             // `focus=<title>><minutes ago>><minutes>`, repeatable.
             for spec in state.split(';').filter_map(|part| part.strip_prefix("focus=")) {
                 let parts: Vec<&str> = spec.split('>').collect();
-                if let [title, ago, minutes] = parts[..]
+                // A fourth part `sw` records it as a stopwatch session.
+                if let [title, ago, minutes, ..] = parts[..]
                     && let (Ok(ago), Ok(minutes)) = (ago.parse(), minutes.parse())
                 {
-                    this.focus.update(cx, |view, cx| view.dev_record(title, ago, minutes, cx));
+                    let stopwatch = parts.get(3) == Some(&"sw");
+                    this.focus.update(cx, |view, cx| view.dev_record(title, ago, minutes, stopwatch, cx));
                 }
             }
             if let Some(menu) = state.split(';').find_map(|part| part.strip_prefix("focus-menu=")) {

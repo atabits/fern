@@ -83,6 +83,7 @@ pub enum IconName {
     Sun,
     Sunrise,
     Tag,
+    Timer,
     ToggleRight,
     Trash,
     User,

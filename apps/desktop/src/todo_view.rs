@@ -1,9 +1,9 @@
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
-use fern_core::{Id, Kind, List, Priority, Store, Tag, Task, View, ViewCounts};
+use fern_core::{Id, Kind, List, ListFolder, Priority, Store, Tag, Task, View, ViewCounts};
 use chrono::{Datelike, Duration, Local, NaiveDate, TimeZone as _};
-use gpui::{ElementId, Entity, FocusHandle, Focusable, FontWeight, MouseButton};
+use gpui::{ElementId, Entity, FocusHandle, Focusable, FontWeight, MouseButton, Pixels, Point};
 use ui::prelude::*;
 
 use crate::drag::DraggedTask;
@@ -14,7 +14,8 @@ use crate::actions::{
     SetDate, SetNextWeek, SetToday, SetTomorrow, ToggleComplete,
 };
 use crate::i18n::{self, CurrentLocale, Strings};
-use crate::lists_panel::{self, LIST_COLORS};
+use crate::list_dialog::{DialogEvent, FolderDialog, ListDialog};
+use crate::lists_panel;
 use crate::task_detail::{OpenTask, StartFocus, TaskDetail, TaskUpdated};
 use crate::task_menu;
 use crate::task_rows::{self, ClosedRange, DropTarget, GroupBy, Row, Section, SortBy};
@@ -101,10 +102,14 @@ pub struct TodoView {
     input: Entity<TextInput>,
     /// Focus of the task list itself, for keyboard navigation (the `TaskList` key context).
     list_focus: FocusHandle,
-    new_list: Entity<TextInput>,
-    creating_list: bool,
-    rename_input: Entity<TextInput>,
-    renaming_list: bool,
+    /// The Add List / Edit List dialog and the folder dialog, while open.
+    list_dialog: Option<Entity<ListDialog>>,
+    folder_dialog: Option<Entity<FolderDialog>>,
+    folders: Vec<ListFolder>,
+    collapsed_folders: HashSet<Id>,
+    archived_open: bool,
+    /// A right-clicked list or folder in the lists column, with the point its menu opens at.
+    list_menu: Option<(ListMenuTarget, Point<Pixels>)>,
     search_input: Entity<TextInput>,
     header_menu_open: bool,
     /// Filters of the Completed and Won't Do views; `None` lists means all lists.
@@ -193,27 +198,6 @@ impl TodoView {
         })
         .detach();
 
-        let new_list = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.new_list, cx));
-        cx.subscribe_in(&new_list, window, |this, input, Submitted(name), window, cx| {
-            this.create_list(name, cx);
-            input.update(cx, |input, cx| input.clear(window, cx));
-        })
-        .detach();
-        cx.subscribe(&new_list, |this, _, _: &Cancelled, cx| {
-            this.creating_list = false;
-            cx.notify();
-        })
-        .detach();
-
-        let rename_input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.new_list, cx));
-        cx.subscribe(&rename_input, |this, _, Submitted(name), cx| this.rename_current_list(name, cx))
-            .detach();
-        cx.subscribe(&rename_input, |this, _, _: &Cancelled, cx| {
-            this.renaming_list = false;
-            cx.notify();
-        })
-        .detach();
-
         let add_tag_input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.type_in_tag, cx));
         cx.subscribe(&add_tag_input, |_, _, _: &Changed, cx| cx.notify()).detach();
         // Enter ticks the typed tag, a new one too.
@@ -241,7 +225,6 @@ impl TodoView {
         cx.observe_global::<CurrentLocale>(|this, cx| {
             let strings = i18n::t(cx);
             this.sync_input_placeholder(cx);
-            this.new_list.update(cx, |input, cx| input.set_placeholder(strings.new_list, cx));
             this.search_input.update(cx, |input, cx| input.set_placeholder(strings.search_placeholder, cx));
         })
         .detach();
@@ -268,10 +251,12 @@ impl TodoView {
             collapsed_sections: HashSet::from([Section::Completed]),
             input,
             list_focus: cx.focus_handle(),
-            new_list,
-            creating_list: false,
-            rename_input,
-            renaming_list: false,
+            list_dialog: None,
+            folder_dialog: None,
+            folders: Vec::new(),
+            collapsed_folders: HashSet::new(),
+            archived_open: false,
+            list_menu: None,
             search_input,
             header_menu_open: false,
             closed_range: ClosedRange::All,
@@ -333,7 +318,13 @@ impl TodoView {
                     self.check(result);
                     self.reload(cx);
                 }
-                Some(("list", name)) => self.create_list(name, cx),
+                Some(("list", name)) => {
+                    let result = self.store.create_list(name);
+                    if let Some(list) = self.check(result) {
+                        self.view = View::List(list.id);
+                    }
+                    self.reload(cx);
+                }
                 Some(("view", "trash")) => self.set_view(View::Trash, cx),
                 Some(("view", "wontdo")) => self.set_view(View::WontDo, cx),
                 Some(("view", "today")) => self.set_view(View::Today, cx),
@@ -581,8 +572,56 @@ impl TodoView {
                         self.delete(id, cx);
                     }
                 }
-                Some(("rename", _)) => self.start_rename(window, cx),
                 Some(("new-list", _)) => self.start_new_list(window, cx),
+                // `list-dialog=new|<list name>[>icon|folder|type|smart|new-folder|kanban|timeline]`.
+                Some(("list-dialog", spec)) => {
+                    let (which, menu) = spec.split_once('>').unwrap_or((spec, ""));
+                    let list = self.lists.iter().find(|l| l.name == which).map(|l| l.id);
+                    self.open_list_dialog(list, None, window, cx);
+                    if let Some(dialog) = &self.list_dialog {
+                        dialog.update(cx, |dialog, cx| dialog.dev_open(menu, window, cx));
+                    }
+                }
+                // `folder=<name>><list>,<list>`: a folder with these lists in it (dev data only).
+                Some(("folder", spec)) => {
+                    let (name, lists) = spec.split_once('>').unwrap_or((spec, ""));
+                    if let Ok(folder) = self.store.add_list_folder(name) {
+                        for list in self.lists.clone().iter().filter(|l| lists.split(',').any(|n| n == l.name)) {
+                            let draft = fern_core::ListDraft { folder: Some(folder.id), ..fern_core::ListDraft::of(list) };
+                            let result = self.store.update_list(list.id, &draft);
+                            self.check(result);
+                        }
+                    }
+                    self.reload(cx);
+                }
+                // `list-icon=<list>><emoji>`, `archive-list=<list>`: dev data only.
+                Some(("list-icon", spec)) => {
+                    let (name, icon) = spec.split_once('>').unwrap_or((spec, ""));
+                    if let Some(list) = self.lists.iter().find(|l| l.name == name).cloned() {
+                        let result = self.store.update_list(list.id, &fern_core::ListDraft { icon: Some(icon.to_owned()), ..fern_core::ListDraft::of(&list) });
+                        self.check(result);
+                    }
+                    self.reload(cx);
+                }
+                Some(("archive-list", name)) => {
+                    if let Some(id) = self.lists.iter().find(|l| l.name == name).map(|l| l.id) {
+                        let result = self.store.set_list_archived(id, true);
+                        self.check(result);
+                        self.archived_open = true;
+                    }
+                    self.reload(cx);
+                }
+                // `list-menu=<list>` and `folder-menu=<folder>` open their right-click menus.
+                Some(("list-menu", name)) => {
+                    if let Some(id) = self.lists.iter().find(|l| l.name == name).map(|l| l.id) {
+                        self.list_menu = Some((ListMenuTarget::List(id), gpui::point(px(180.), px(260.))));
+                    }
+                }
+                Some(("folder-menu", name)) => {
+                    if let Some(id) = self.folders.iter().find(|f| f.name == name).map(|f| f.id) {
+                        self.list_menu = Some((ListMenuTarget::Folder(id), gpui::point(px(180.), px(260.))));
+                    }
+                }
                 _ => {}
             }
         }
@@ -648,6 +687,16 @@ impl TodoView {
         if let Some(lists) = self.check(self.store.lists()) {
             self.lists = lists;
         }
+        self.folders = self.store.list_folders().unwrap_or_default();
+        self.collapsed_folders = self
+            .store
+            .setting("collapsed_folders")
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|id| Id::parse_str(id).ok())
+            .collect();
         // The current list may have been deleted.
         if let View::List(id) = self.view
             && !self.lists.iter().any(|l| l.id == id)
@@ -667,7 +716,7 @@ impl TodoView {
         // the current view (for example, after being completed in "Today").
         let selected = self.selected.and_then(|id| self.store.task(id).ok().flatten());
         self.selected = selected.as_ref().map(|t| t.id);
-        let lists = self.lists.clone();
+        let lists = self.active_lists();
         self.detail.update(cx, |detail, cx| {
             detail.set_lists(lists);
             detail.refresh(selected, cx);
@@ -834,7 +883,9 @@ impl TodoView {
         if let Some(Some(list)) = parsed_list.map(Some).or(draft_list).or(view_list.map(Some)).or(default_list.map(Some)) {
             self.store.set_list(task.id, Some(list))?;
         }
-        if self.add_draft.note {
+        // In a note list (the original's List Type), new entries are notes.
+        let note_list = self.store.task(task.id)?.and_then(|t| t.list_id).is_some_and(|id| self.lists.iter().any(|l| l.id == id && l.kind == fern_core::Kind::Note));
+        if self.add_draft.note || note_list {
             self.store.set_kind(task.id, fern_core::Kind::Note)?;
         }
         if !self.add_draft.files.is_empty() {
@@ -1347,7 +1398,7 @@ impl TodoView {
             _ => strings.inbox.to_owned(),
         };
         let list_items = std::iter::once((None, strings.inbox.to_owned()))
-            .chain(self.lists.iter().map(|l| (Some(l.id), l.name.clone())))
+            .chain(self.lists.iter().filter(|l| !l.archived).map(|l| (Some(l.id), l.name.clone())))
             .map(|(id, name)| {
                 let selected = draft.list.unwrap_or(None) == id && (draft.list.is_some() || id.is_none());
                 ListItem::new(SharedString::from(format!("add-list-{}", id.map_or("inbox".to_owned(), |i| i.to_string()))))
@@ -2998,7 +3049,6 @@ impl TodoView {
     pub fn set_view(&mut self, view: View, cx: &mut Context<Self>) {
         self.header_menu_open = false;
         self.list_activity = None;
-        self.renaming_list = false;
         if self.view != view {
             self.view = view;
             self.reload(cx);
@@ -3028,70 +3078,178 @@ impl TodoView {
     }
 
     fn start_new_list(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.creating_list = true;
         self.show_lists = true;
-        window.focus(&self.new_list.focus_handle(cx), cx);
+        self.open_list_dialog(None, None, window, cx);
+    }
+
+    /// Opens the original's Add List dialog (in a folder when given), or Edit List for `list`.
+    fn open_list_dialog(&mut self, list: Option<Id>, folder: Option<Id>, window: &mut Window, cx: &mut Context<Self>) {
+        self.list_menu = None;
+        self.header_menu_open = false;
+        let dialog = cx.new(|cx| ListDialog::new(self.store.clone(), list, folder, window, cx));
+        cx.subscribe_in(&dialog, window, |this, _, event: &DialogEvent, window, cx| {
+            if let DialogEvent::Saved(id) = event {
+                this.view = View::List(*id);
+            }
+            this.list_dialog = None;
+            window.focus(&this.list_focus, cx);
+            this.reload(cx);
+        })
+        .detach();
+        self.list_dialog = Some(dialog);
         cx.notify();
     }
 
-    fn create_list(&mut self, name: &str, cx: &mut Context<Self>) {
-        self.creating_list = false;
-        if name.trim().is_empty() {
-            cx.notify();
-            return;
-        }
-        let result = self.store.create_list(name);
-        if let Some(list) = self.check(result) {
-            self.view = View::List(list.id);
+    /// The New Folder dialog, or Edit Folder for `folder`.
+    fn open_folder_dialog(&mut self, folder: Option<Id>, window: &mut Window, cx: &mut Context<Self>) {
+        self.list_menu = None;
+        let dialog = cx.new(|cx| FolderDialog::new(self.store.clone(), folder, window, cx));
+        cx.subscribe_in(&dialog, window, |this, _, _: &DialogEvent, window, cx| {
+            this.folder_dialog = None;
+            window.focus(&this.list_focus, cx);
+            this.reload(cx);
+        })
+        .detach();
+        self.folder_dialog = Some(dialog);
+        cx.notify();
+    }
+
+    /// The lists not archived, for choosing a list.
+    fn active_lists(&self) -> Vec<List> {
+        self.lists.iter().filter(|l| !l.archived).cloned().collect()
+    }
+
+    fn panel_event(&mut self, event: lists_panel::PanelEvent, cx: &mut Context<Self>) {
+        use lists_panel::PanelEvent;
+        match event {
+            PanelEvent::ToggleFolder(id) => {
+                if !self.collapsed_folders.remove(&id) {
+                    self.collapsed_folders.insert(id);
+                }
+                let value: Vec<String> = self.collapsed_folders.iter().map(Id::to_string).collect();
+                let result = self.store.set_setting("collapsed_folders", &value.join(","));
+                self.check(result);
+            }
+            PanelEvent::ToggleArchived => self.archived_open = !self.archived_open,
+            PanelEvent::ListMenu(id, at) => self.list_menu = Some((ListMenuTarget::List(id), at)),
+            PanelEvent::FolderMenu(id, at) => self.list_menu = Some((ListMenuTarget::Folder(id), at)),
+            PanelEvent::DropList { list, after, folder } => {
+                let result = self.store.place_list(list, after, folder);
+                self.check(result);
+            }
+            PanelEvent::DropListInFolder { list, folder } => {
+                // After the folder's last list; an empty folder takes it where it is.
+                let order: Vec<&List> = self.lists.iter().filter(|l| l.id != list).collect();
+                let after = order.iter().rev().find(|l| l.folder == Some(folder)).map(|l| l.id).or_else(|| {
+                    let at = self.lists.iter().position(|l| l.id == list)?;
+                    self.lists[..at].last().map(|l| l.id)
+                });
+                let result = self.store.place_list(list, after, Some(folder));
+                self.check(result);
+            }
         }
         self.reload(cx);
     }
 
-    fn current_list(&self) -> Option<&List> {
-        match self.view {
-            View::List(id) => self.lists.iter().find(|l| l.id == id),
+    fn list_action(&mut self, action: ListAction, window: &mut Window, cx: &mut Context<Self>) {
+        let target = self.list_menu.take().map(|(t, _)| t);
+        let current = match self.view {
+            View::List(id) => Some(id),
             _ => None,
+        };
+        let list = match target {
+            Some(ListMenuTarget::List(id)) => Some(id),
+            _ => current,
+        };
+        match (action, target) {
+            (ListAction::Edit, Some(ListMenuTarget::Folder(folder))) => return self.open_folder_dialog(Some(folder), window, cx),
+            (ListAction::AddList, Some(ListMenuTarget::Folder(folder))) => return self.open_list_dialog(None, Some(folder), window, cx),
+            (ListAction::Ungroup, Some(ListMenuTarget::Folder(folder))) => {
+                let result = self.store.ungroup_list_folder(folder);
+                self.check(result);
+            }
+            (ListAction::Edit, _) => return self.open_list_dialog(list, None, window, cx),
+            (ListAction::Duplicate, _) => {
+                if let Some(id) = list {
+                    let result = self.store.duplicate_list(id, i18n::t(cx).list_copy_suffix);
+                    if let Some(copy) = self.check(result) {
+                        self.view = View::List(copy.id);
+                    }
+                }
+            }
+            (ListAction::Archive, _) => {
+                if let Some(list) = list.and_then(|id| self.lists.iter().find(|l| l.id == id)) {
+                    let (id, archived) = (list.id, !list.archived);
+                    let result = self.store.set_list_archived(id, archived);
+                    self.check(result);
+                    self.archived_open |= archived;
+                }
+            }
+            (ListAction::Delete, _) => {
+                if let Some(id) = list {
+                    let result = self.store.delete_list(id);
+                    self.check(result);
+                    if current == Some(id) {
+                        self.view = View::Inbox;
+                    }
+                }
+            }
+            _ => {}
         }
-    }
-
-    fn start_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(name) = self.current_list().map(|l| l.name.clone()) else { return };
         self.header_menu_open = false;
-        self.renaming_list = true;
-        self.rename_input.update(cx, |input, cx| input.set_text(name, cx));
-        window.focus(&self.rename_input.focus_handle(cx), cx);
-        cx.notify();
-    }
-
-    fn rename_current_list(&mut self, name: &str, cx: &mut Context<Self>) {
-        self.renaming_list = false;
-        if let View::List(id) = self.view
-            && !name.trim().is_empty()
-        {
-            let result = self.store.rename_list(id, name);
-            self.check(result);
-        }
         self.reload(cx);
     }
 
-    fn set_current_list_color(&mut self, color: Option<&str>, cx: &mut Context<Self>) {
-        if let View::List(id) = self.view {
-            let result = self.store.set_list_color(id, color);
-            self.check(result);
+    /// The menu of a list (Edit, Duplicate, Archive or Unarchive, Delete) or of a folder (Edit,
+    /// Add List, Ungroup), from the list header's "…" or a right click in the lists column.
+    fn render_list_items(&self, target: ListMenuTarget, strings: &'static Strings, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let item = |id: &'static str, icon: IconName, label: &'static str, action: ListAction, cx: &mut Context<Self>| {
+            ListItem::new(id)
+                .height(px(34.))
+                .start_slot(Icon::new(icon).color(if action == ListAction::Delete { Color::Error } else { Color::Muted }))
+                .child(Label::new(label).color(if action == ListAction::Delete { Color::Error } else { Color::Default }))
+                .on_click(cx.listener(move |this, _, window, cx| this.list_action(action, window, cx)))
+                .into_any_element()
+        };
+        match target {
+            ListMenuTarget::List(id) => {
+                let archived = self.lists.iter().any(|l| l.id == id && l.archived);
+                vec![
+                    item("list-menu-edit", IconName::Pencil, strings.edit, ListAction::Edit, cx),
+                    item("list-menu-duplicate", IconName::Copy, strings.duplicate, ListAction::Duplicate, cx),
+                    item(
+                        "list-menu-archive",
+                        if archived { IconName::ArchiveRestore } else { IconName::Archive },
+                        if archived { strings.unarchive_list } else { strings.archive_list },
+                        ListAction::Archive,
+                        cx,
+                    ),
+                    div().my_1().child(Divider::horizontal()).into_any_element(),
+                    item("list-menu-delete", IconName::Trash, strings.delete, ListAction::Delete, cx),
+                ]
+            }
+            ListMenuTarget::Folder(_) => vec![
+                item("folder-menu-edit", IconName::Pencil, strings.edit, ListAction::Edit, cx),
+                item("folder-menu-add", IconName::Plus, strings.add_list, ListAction::AddList, cx),
+                item("folder-menu-ungroup", IconName::FolderOpen, strings.ungroup, ListAction::Ungroup, cx),
+            ],
         }
-        self.header_menu_open = false;
-        self.reload(cx);
     }
 
-    fn delete_current_list(&mut self, cx: &mut Context<Self>) {
-        self.header_menu_open = false;
-        if let View::List(id) = self.view {
-            let result = self.store.delete_list(id);
-            self.check(result);
-            self.view = View::Inbox;
-        }
-        self.reload(cx);
+    fn render_list_menu(&self, strings: &'static Strings, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (target, at) = self.list_menu?;
+        let items = self.render_list_items(target, strings, cx);
+        let menu = popover(cx)
+            .w(px(196.))
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.list_menu = None;
+                cx.notify();
+            }))
+            .children(items)
+            .into_any_element();
+        Some(task_menu::place(at, menu))
     }
+
 
     fn toggle_task_collapsed(&mut self, id: Id, cx: &mut Context<Self>) {
         if !self.collapsed_tasks.remove(&id) {
@@ -3676,7 +3834,7 @@ impl TodoView {
         let task = self.tasks.iter().find(|t| t.id == id).cloned().or_else(|| self.store.task(id).ok().flatten())?;
         let menu = task_menu::render(
             &task,
-            &self.lists,
+            &self.active_lists(),
             task_menu::MenuKind::List,
             self.context_side,
             strings,
@@ -4028,7 +4186,7 @@ impl TodoView {
             .into_any_element()
     }
 
-    fn render_header_menu(&self, strings: &Strings, cx: &mut Context<Self>) -> AnyElement {
+    fn render_header_menu(&self, strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {
         let in_list = matches!(self.view, View::List(_));
         let in_trash = self.view == View::Trash;
         popover(cx)
@@ -4037,39 +4195,10 @@ impl TodoView {
                 this.header_menu_open = false;
                 cx.notify();
             }))
-            .when(in_list, |el| {
-                let current = self.current_list().and_then(|l| l.color.clone());
-                el.child(
-                    ListItem::new("rename-list")
-                        .start_slot(Icon::new(IconName::Pencil))
-                        .child(Label::new(strings.rename_list))
-                        .on_click(cx.listener(|this, _, window, cx| this.start_rename(window, cx))),
-                )
-                .child(div().px_2().pt_1().child(Label::new(strings.color).size(LabelSize::Small).color(Color::Muted)))
-                .child(
-                    h_flex()
-                        .px_2()
-                        .py_1()
-                        .flex_wrap()
-                        .gap_1p5()
-                        .child(
-                            color_swatch("color-none", None, current.is_none(), cx)
-                                .on_click(cx.listener(|this, _, _, cx| this.set_current_list_color(None, cx))),
-                        )
-                        .children(LIST_COLORS.into_iter().map(|color| {
-                            color_swatch(color, Some(color), current.as_deref() == Some(color), cx).on_click(
-                                cx.listener(move |this, _, _, cx| this.set_current_list_color(Some(color), cx)),
-                            )
-                        })),
-                )
-                .child(div().my_1().child(Divider::horizontal()))
-                .child(
-                    ListItem::new("delete-list")
-                        .start_slot(Icon::new(IconName::Trash).color(Color::Error))
-                        .child(Label::new(strings.delete_list).color(Color::Error))
-                        .on_click(cx.listener(|this, _, _, cx| this.delete_current_list(cx))),
-                )
-            })
+            .when_some(match self.view {
+                View::List(id) => Some(id),
+                _ => None,
+            }, |el, id| el.children(self.render_list_items(ListMenuTarget::List(id), strings, cx)).child(div().my_1().child(Divider::horizontal())))
             .when_some(match self.view {
                 View::Filter(id) => self.filters.iter().find(|(f, _)| f.id == id).map(|(f, _)| f.clone()),
                 _ => None,
@@ -4184,20 +4313,6 @@ impl TodoView {
 }
 
 /// A round color option; `None` is "no color", drawn as an outlined circle.
-fn color_swatch(id: &'static str, color: Option<&str>, selected: bool, cx: &App) -> Stateful<Div> {
-    let colors = cx.theme().colors();
-    let ring = if selected { colors.text } else { gpui::transparent_black() };
-    div()
-        .id(id)
-        .size(px(18.))
-        .rounded_full()
-        .cursor_pointer()
-        .map(|el| match lists_panel::parse_color(color) {
-            Some(fill) => el.bg(fill).border_2().border_color(ring),
-            None => el.border_1().border_color(if selected { colors.text } else { colors.text_muted }),
-        })
-}
-
 fn chevron(collapsed: bool) -> Icon {
     Icon::new(if collapsed { IconName::ChevronRight } else { IconName::ChevronDown }).size(IconSize::XSmall)
 }
@@ -4351,8 +4466,6 @@ impl Render for TodoView {
                                             .child(Icon::new(IconName::Search).size(IconSize::Large))
                                             .child(self.search_input.clone()),
                                     )
-                                } else if self.renaming_list {
-                                    el.child(self.rename_input.clone())
                                 } else {
                                     el.truncate().child(self.view_title(strings))
                                 }
@@ -4543,10 +4656,18 @@ impl Render for TodoView {
                         lists: &self.lists,
                         tags: &self.tags,
                         strings,
-                        new_list_input: self.creating_list.then(|| self.new_list.clone().into_any_element()),
+                        folders: &self.folders,
+                        collapsed_folders: &self.collapsed_folders,
+                        archived_open: self.archived_open,
                         mini: lists_panel::MiniCalendar { expanded: self.mini_expanded, month: self.mini_month, busy: &self.busy_days },
                     },
                     on_select,
+                    {
+                        let this = cx.entity().downgrade();
+                        move |event, _: &mut Window, cx: &mut App| {
+                            this.update(cx, |this, cx| this.panel_event(event, cx)).ok();
+                        }
+                    },
                     on_add_list,
                     on_drop_task,
                     cx.listener(|this, _, window, cx| this.open_filter_edit(None, window, cx)),
@@ -4598,5 +4719,25 @@ impl Render for TodoView {
                 )
             })
             .children(self.render_context_menu(strings, cx))
+            .children(self.render_list_menu(strings, cx))
+            .children(self.list_dialog.clone())
+            .children(self.folder_dialog.clone())
     }
+}
+
+/// What a list menu acts on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ListMenuTarget {
+    List(Id),
+    Folder(Id),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ListAction {
+    Edit,
+    Duplicate,
+    Archive,
+    Delete,
+    AddList,
+    Ungroup,
 }

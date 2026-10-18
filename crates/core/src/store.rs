@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -10,7 +10,7 @@ use uuid::Uuid;
 use crate::countdown::{Countdown, CountdownKind};
 use crate::focus::FocusSession;
 use crate::habit::{Checkin, Goal, Habit};
-use crate::model::{Attachment, ChecklistItem, Id, Kind, List, Priority, Tag, Task, View, ViewCounts};
+use crate::model::{Attachment, ChecklistItem, Id, Kind, List, ListDraft, ListFolder, Priority, Tag, Task, View, ViewCounts};
 use crate::recurrence::Recurrence;
 
 const MIGRATIONS: &[&str] = &[
@@ -654,6 +654,38 @@ const MIGRATIONS: &[&str] = &[
     "
     ALTER TABLE countdowns ADD COLUMN background TEXT;
     ",
+    // The original's list settings: an emoji, a folder, the list type, "Show in Smart List",
+    // archiving and the lists' own order; and the folders themselves.
+    "
+    CREATE TABLE list_folders (
+        id         TEXT PRIMARY KEY,
+        name       TEXT NOT NULL,
+        sort_order INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL
+    );
+    ALTER TABLE lists ADD COLUMN icon TEXT;
+    ALTER TABLE lists ADD COLUMN folder_id TEXT;
+    ALTER TABLE lists ADD COLUMN kind TEXT NOT NULL DEFAULT 'task';
+    ALTER TABLE lists ADD COLUMN in_smart_lists INTEGER NOT NULL DEFAULT 1;
+    ALTER TABLE lists ADD COLUMN archived_at INTEGER;
+    ALTER TABLE lists ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0;
+    UPDATE lists SET sort_order = (SELECT COUNT(*) FROM lists l WHERE l.created_at < lists.created_at OR (l.created_at = lists.created_at AND l.rowid < lists.rowid));
+    CREATE TRIGGER sync_list_folders_insert AFTER INSERT ON list_folders
+    WHEN NOT EXISTS (SELECT 1 FROM sync_applying)
+    BEGIN
+        INSERT INTO sync_log (entity, key, at) VALUES ('list_folders', NEW.id, CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER));
+    END;
+    CREATE TRIGGER sync_list_folders_update AFTER UPDATE ON list_folders
+    WHEN NOT EXISTS (SELECT 1 FROM sync_applying)
+    BEGIN
+        INSERT INTO sync_log (entity, key, at) VALUES ('list_folders', NEW.id, CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER));
+    END;
+    CREATE TRIGGER sync_list_folders_delete AFTER DELETE ON list_folders
+    WHEN NOT EXISTS (SELECT 1 FROM sync_applying)
+    BEGIN
+        INSERT INTO sync_log (entity, key, at) VALUES ('list_folders', OLD.id, CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER));
+    END;
+    ",
 ];
 
 const TASK_COLUMNS: &str = "id, parent_id, kind, title, notes, priority, due_date, due_time, \
@@ -794,7 +826,12 @@ impl Store {
             let filter = self.filters()?.into_iter().find(|f| f.id == *id).context("filter not found")?;
             return Ok(self.tasks()?.into_iter().filter(|task| filter.matches(task, today)).collect());
         }
-        Ok(self.tasks()?.into_iter().filter(|task| matches_view(task, view, today)).collect())
+        let hidden = if is_smart(view) { self.hidden_lists()? } else { HashSet::new() };
+        Ok(self
+            .tasks()?
+            .into_iter()
+            .filter(|task| matches_view(task, view, today) && !task.list_id.is_some_and(|l| hidden.contains(&l)))
+            .collect())
     }
 
     /// Saved filters, oldest first.
@@ -864,8 +901,10 @@ impl Store {
 
     pub fn counts(&self, today: NaiveDate) -> Result<ViewCounts> {
         let tasks = self.tasks()?;
+        let hidden = self.hidden_lists()?;
         let count = |view: View| {
-            tasks.iter().filter(|t| !t.is_completed() && matches_view(t, &view, today)).count()
+            let skip = |t: &Task| is_smart(&view) && t.list_id.is_some_and(|l| hidden.contains(&l));
+            tasks.iter().filter(|t| !t.is_completed() && !skip(t) && matches_view(t, &view, today)).count()
         };
         Ok(ViewCounts {
             inbox: count(View::Inbox),
@@ -1373,14 +1412,15 @@ impl Store {
         Ok(())
     }
 
+    /// The lists in their order, archived ones included (see `List::archived`).
     pub fn lists(&self) -> Result<Vec<List>> {
         let mut stmt = self.conn.prepare(
-            "SELECT l.id, l.name, l.color, COUNT(t.id)
+            "SELECT l.id, l.name, l.color, COUNT(t.id), l.icon, l.folder_id, l.kind, l.in_smart_lists, l.archived_at
              FROM lists l
              LEFT JOIN tasks t ON t.list_id = l.id AND t.completed_at IS NULL
                                AND t.deleted_at IS NULL
              GROUP BY l.id
-             ORDER BY l.created_at, l.rowid",
+             ORDER BY l.sort_order, l.created_at, l.rowid",
         )?;
         let lists = stmt
             .query_map([], |row| {
@@ -1389,6 +1429,11 @@ impl Store {
                     name: row.get(1)?,
                     color: row.get(2)?,
                     open_count: row.get::<_, i64>(3)? as usize,
+                    icon: row.get(4)?,
+                    folder: row.get::<_, Option<String>>(5)?.and_then(|f| Uuid::parse_str(&f).ok()),
+                    kind: Kind::parse(&row.get::<_, String>(6)?),
+                    in_smart_lists: row.get(7)?,
+                    archived: row.get::<_, Option<i64>>(8)?.is_some(),
                 })
             })?
             .collect::<Result<_, _>>()?;
@@ -1396,14 +1441,122 @@ impl Store {
     }
 
     pub fn create_list(&self, name: &str) -> Result<List> {
-        let name = name.trim();
+        self.add_list(&ListDraft { name: name.to_owned(), ..ListDraft::default() })
+    }
+
+    /// Adds a list as the Add List dialog describes it, after the others.
+    pub fn add_list(&self, draft: &ListDraft) -> Result<List> {
+        let name = draft.name.trim();
         anyhow::ensure!(!name.is_empty(), "a list needs a name");
-        let list = List { id: Uuid::now_v7(), name: name.to_owned(), color: None, open_count: 0 };
+        let id = Uuid::now_v7();
         self.conn.execute(
-            "INSERT INTO lists (id, name, created_at) VALUES (?1, ?2, ?3)",
-            params![list.id.to_string(), list.name, now_ms()],
+            "INSERT INTO lists (id, name, created_at, sort_order) VALUES (?1, ?2, ?3, (SELECT COALESCE(MAX(sort_order), -1) + 1 FROM lists))",
+            params![id.to_string(), name, now_ms()],
         )?;
-        Ok(list)
+        self.update_list(id, draft)?;
+        self.lists()?.into_iter().find(|l| l.id == id).context("list not found")
+    }
+
+    /// Saves the Edit List dialog's choices.
+    pub fn update_list(&self, id: Id, draft: &ListDraft) -> Result<()> {
+        let name = draft.name.trim();
+        anyhow::ensure!(!name.is_empty(), "a list needs a name");
+        self.conn.execute(
+            "UPDATE lists SET name = ?2, icon = ?3, color = ?4, folder_id = ?5, kind = ?6, in_smart_lists = ?7 WHERE id = ?1",
+            params![
+                id.to_string(),
+                name,
+                draft.icon.as_deref().filter(|i| !i.is_empty()),
+                draft.color,
+                draft.folder.map(|f| f.to_string()),
+                draft.kind.as_str(),
+                draft.in_smart_lists
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Archives a list or brings it back.
+    pub fn set_list_archived(&self, id: Id, archived: bool) -> Result<()> {
+        self.conn.execute(
+            "UPDATE lists SET archived_at = ?2 WHERE id = ?1",
+            params![id.to_string(), archived.then(now_ms)],
+        )?;
+        Ok(())
+    }
+
+    /// The original's Duplicate: a copy of the list, " copy" after its name, with copies of its
+    /// open tasks (subtasks, tags and checklists included), right after it.
+    pub fn duplicate_list(&self, id: Id, suffix: &str) -> Result<List> {
+        let list = self.lists()?.into_iter().find(|l| l.id == id).context("list not found")?;
+        let draft = ListDraft { name: format!("{}{suffix}", list.name), ..ListDraft::of(&list) };
+        let copy = self.add_list(&draft)?;
+        self.place_list(copy.id, Some(id), list.folder)?;
+        for (name, _) in self.list_sections(id)?.into_iter().map(|s| (s.name, s.id)) {
+            self.add_list_section(copy.id, &name)?;
+        }
+        let tasks = self.tasks()?;
+        let roots = tasks.iter().filter(|t| t.list_id == Some(id) && t.parent_id.is_none() && !t.is_completed() && !t.is_deleted());
+        for task in roots {
+            let new = self.duplicate_task(task.id)?;
+            self.set_list(new.id, Some(copy.id))?;
+        }
+        self.lists()?.into_iter().find(|l| l.id == copy.id).context("list not found")
+    }
+
+    /// Moves a list right after `after` (first when `None`) and into `folder`.
+    pub fn place_list(&self, id: Id, after: Option<Id>, folder: Option<Id>) -> Result<()> {
+        let mut order: Vec<Id> = self.lists()?.into_iter().map(|l| l.id).filter(|l| *l != id).collect();
+        let at = after.and_then(|a| order.iter().position(|l| *l == a)).map_or(0, |i| i + 1);
+        order.insert(at, id);
+        let tx = self.conn.unchecked_transaction()?;
+        for (i, list) in order.iter().enumerate() {
+            tx.execute("UPDATE lists SET sort_order = ?2 WHERE id = ?1 AND sort_order != ?2", params![list.to_string(), i as i64])?;
+        }
+        tx.execute("UPDATE lists SET folder_id = ?2 WHERE id = ?1", params![id.to_string(), folder.map(|f| f.to_string())])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The folders of lists, in their order.
+    pub fn list_folders(&self) -> Result<Vec<ListFolder>> {
+        let mut stmt = self.conn.prepare("SELECT id, name FROM list_folders ORDER BY sort_order, created_at, rowid")?;
+        let folders = stmt
+            .query_map([], |row| Ok(ListFolder { id: parse_uuid(&row.get::<_, String>(0)?, 0)?, name: row.get(1)? }))?
+            .collect::<Result<_, _>>()?;
+        Ok(folders)
+    }
+
+    pub fn add_list_folder(&self, name: &str) -> Result<ListFolder> {
+        let name = name.trim();
+        anyhow::ensure!(!name.is_empty(), "a folder needs a name");
+        let folder = ListFolder { id: Uuid::now_v7(), name: name.to_owned() };
+        self.conn.execute(
+            "INSERT INTO list_folders (id, name, created_at, sort_order) VALUES (?1, ?2, ?3, (SELECT COALESCE(MAX(sort_order), -1) + 1 FROM list_folders))",
+            params![folder.id.to_string(), folder.name, now_ms()],
+        )?;
+        Ok(folder)
+    }
+
+    pub fn rename_list_folder(&self, id: Id, name: &str) -> Result<()> {
+        let name = name.trim();
+        anyhow::ensure!(!name.is_empty(), "a folder needs a name");
+        self.conn.execute("UPDATE list_folders SET name = ?2 WHERE id = ?1", params![id.to_string(), name])?;
+        Ok(())
+    }
+
+    /// The original's Ungroup: the folder goes, its lists stay, out of any folder.
+    pub fn ungroup_list_folder(&self, id: Id) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("UPDATE lists SET folder_id = NULL WHERE folder_id = ?1", [id.to_string()])?;
+        tx.execute("DELETE FROM list_folders WHERE id = ?1", [id.to_string()])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Lists whose tasks stay out of the smart lists: archived ones and those set not to show.
+    fn hidden_lists(&self) -> Result<HashSet<Id>> {
+        Ok(self.lists()?.into_iter().filter(|l| l.archived || !l.in_smart_lists).map(|l| l.id).collect())
     }
 
     pub fn rename_list(&self, id: Id, name: &str) -> Result<()> {
@@ -2289,6 +2442,11 @@ impl Store {
     }
 }
 
+/// The smart lists a list can be kept out of with "Show in Smart List".
+fn is_smart(view: &View) -> bool {
+    matches!(view, View::All | View::Today | View::Tomorrow | View::Next7Days | View::Day(_))
+}
+
 fn matches_view(task: &Task, view: &View, today: NaiveDate) -> bool {
     if task.is_deleted() != (*view == View::Trash) {
         return false;
@@ -2788,6 +2946,55 @@ mod tests {
 
         store.delete_template(template.id)?;
         assert!(store.templates()?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn list_settings_folders_and_archive() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let today = NaiveDate::from_ymd_opt(2026, 10, 18).unwrap();
+        let home = store.add_list_folder("Home")?;
+        let draft = ListDraft {
+            name: " Groceries ".into(),
+            icon: Some("🛒".into()),
+            color: Some("#ff6b6b".into()),
+            folder: Some(home.id),
+            kind: Kind::Note,
+            in_smart_lists: true,
+        };
+        let groceries = store.add_list(&draft)?;
+        assert_eq!((groceries.name.as_str(), groceries.icon.as_deref(), groceries.folder, groceries.kind), ("Groceries", Some("🛒"), Some(home.id), Kind::Note));
+        let work = store.create_list("Work")?;
+        let milk = store.add_task("Milk")?;
+        store.set_list(milk.id, Some(groceries.id))?;
+        store.set_due(milk.id, Some(today), None)?;
+        let report = store.add_task("Report")?;
+        store.set_list(report.id, Some(work.id))?;
+        store.set_due(report.id, Some(today), None)?;
+
+        // "Show in Smart List: Do not show" keeps the list's tasks out of Today and All.
+        store.update_list(groceries.id, &ListDraft { in_smart_lists: false, ..ListDraft::of(&groceries) })?;
+        assert_eq!(store.tasks_in(&View::Today, today)?.iter().map(|t| t.title.as_str()).collect::<Vec<_>>(), ["Report"]);
+        assert_eq!(store.counts(today)?.all, 1);
+        assert_eq!(store.tasks_in(&View::List(groceries.id), today)?.len(), 1, "the list itself still shows them");
+        // Archived lists leave the smart lists too.
+        store.set_list_archived(work.id, true)?;
+        assert!(store.tasks_in(&View::Today, today)?.is_empty());
+        assert!(store.lists()?.iter().find(|l| l.id == work.id).unwrap().archived);
+        store.set_list_archived(work.id, false)?;
+
+        // Order: a list placed first comes first; Duplicate goes right after its list.
+        store.place_list(work.id, None, None)?;
+        let names = |store: &Store| store.lists().unwrap().into_iter().map(|l| l.name).collect::<Vec<_>>();
+        assert_eq!(names(&store), ["Work", "Groceries"]);
+        let copy = store.duplicate_list(work.id, " copy")?;
+        assert_eq!(names(&store), ["Work", "Work copy", "Groceries"]);
+        assert_eq!(store.tasks_in(&View::List(copy.id), today)?.iter().map(|t| t.title.as_str()).collect::<Vec<_>>(), ["Report"]);
+
+        // Ungroup keeps the lists and drops the folder.
+        store.ungroup_list_folder(home.id)?;
+        assert!(store.list_folders()?.is_empty());
+        assert_eq!(store.lists()?.iter().find(|l| l.id == groceries.id).unwrap().folder, None);
         Ok(())
     }
 

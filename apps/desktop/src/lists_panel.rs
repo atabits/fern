@@ -3,12 +3,12 @@
 use std::collections::HashSet;
 
 use chrono::{Datelike, Local, NaiveDate};
-use fern_core::{List, Preferences, SmartList, Tag, View, ViewCounts};
-use gpui::{ClickEvent, rgb};
+use fern_core::{Id, List, ListFolder, Preferences, SmartList, Tag, View, ViewCounts};
+use gpui::{ClickEvent, MouseButton, Pixels, Point, rgb};
 use ui::prelude::*;
 
 use crate::calendar;
-use crate::drag::DraggedTask;
+use crate::drag::{DraggedList, DraggedTask};
 use crate::i18n::Strings;
 
 pub const WIDTH: f32 = 212.;
@@ -57,8 +57,11 @@ pub struct Props<'a> {
     pub lists: &'a [List],
     pub tags: &'a [Tag],
     pub strings: &'static Strings,
-    /// The inline "new list" input while the user is creating a list.
-    pub new_list_input: Option<AnyElement>,
+    /// The folders of lists, and the ones folded up.
+    pub folders: &'a [ListFolder],
+    pub collapsed_folders: &'a HashSet<Id>,
+    /// Whether "Archived Lists" is unfolded.
+    pub archived_open: bool,
     /// Saved filters with their task counts.
     pub filters: &'a [(fern_core::SmartFilter, usize)],
     /// Which smart lists Settings → Smart List shows.
@@ -66,23 +69,38 @@ pub struct Props<'a> {
     pub mini: MiniCalendar<'a>,
 }
 
+/// What the lists column asks of the view, besides selecting a view.
+#[derive(Clone, Copy, Debug)]
+pub enum PanelEvent {
+    ToggleFolder(Id),
+    ToggleArchived,
+    /// A right click on a list or a folder, at that point of the window.
+    ListMenu(Id, Point<Pixels>),
+    FolderMenu(Id, Point<Pixels>),
+    /// A list dropped after `after` (first when `None`), into `folder`.
+    DropList { list: Id, after: Option<Id>, folder: Option<Id> },
+    /// A list dropped on a folder's row: into it, after its lists.
+    DropListInFolder { list: Id, folder: Id },
+}
+
 pub fn render(
     props: Props,
     on_select: impl Fn(View, &mut Window, &mut App) + Clone + 'static,
+    on_panel: impl Fn(PanelEvent, &mut Window, &mut App) + Clone + 'static,
     on_add_list: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     on_drop_task: impl Fn(View, fern_core::Id, &mut Window, &mut App) + Clone + 'static,
     on_add_filter: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     on_mini: impl Fn(MiniAction, &mut Window, &mut App) + Clone + 'static,
     cx: &App,
 ) -> impl IntoElement {
-    let Props { active, counts, lists, tags, strings, new_list_input, filters, preferences, mini } = props;
+    let Props { active, counts, lists, tags, strings, folders, collapsed_folders, archived_open, filters, preferences, mini } = props;
     let shows = |list: SmartList, count: usize| preferences.visibility(list).shows(count);
     let colors = cx.theme().colors();
 
     let item = |id: String,
                 view: View,
                 label: SharedString,
-                icon: IconName,
+                icon: AnyElement,
                 count: Option<usize>,
                 dot: Option<Hsla>| {
         let on_select = on_select.clone();
@@ -93,7 +111,7 @@ pub fn render(
         let item = ListItem::new(SharedString::from(id.clone()))
             .height(px(36.))
             .toggle_state(&view == active)
-            .start_slot(Icon::new(icon))
+            .start_slot(icon)
             .child(Label::new(label).truncate())
             .end_slot(
                 h_flex()
@@ -116,7 +134,7 @@ pub fn render(
             .child(item)
     };
     let smart = |view: View, label: &'static str, icon: IconName, count: Option<usize>| {
-        item(format!("view-{label}"), view, label.into(), icon, count, None)
+        item(format!("view-{label}"), view, label.into(), Icon::new(icon).into_any_element(), count, None)
     };
     let separator = || div().my_2().mx_2().child(Divider::horizontal());
     let heading = |text: &'static str| {
@@ -125,6 +143,112 @@ pub fn render(
             .px_2()
             .child(div().flex_1().child(Label::new(text).size(LabelSize::Small).color(Color::Muted)))
     };
+
+    // The lists in their order; a folder sits where its first list is (empty ones last), its
+    // lists indented under it unless it is folded up, as in the original.
+    let list_entry = |list: &List, indent: bool, muted: bool| -> AnyElement {
+        let id = list.id;
+        let entry = item(
+            format!("list-{id}"),
+            View::List(id),
+            list.name.clone().into(),
+            match &list.icon {
+                Some(icon) => div().w(px(16.)).flex().justify_center().text_size(px(14.)).child(icon.clone()).into_any_element(),
+                None => Icon::new(IconName::List).into_any_element(),
+            },
+            Some(list.open_count),
+            parse_color(list.color.as_deref()),
+        );
+        let on_panel = on_panel.clone();
+        let on_drop = on_panel.clone();
+        let folder = list.folder;
+        let accent = colors.accent;
+        let dragged = DraggedList { id, name: list.name.clone().into() };
+        div()
+            .id(SharedString::from(format!("list-entry-{id}")))
+            .when(indent, |el| el.pl(px(14.)))
+            .when(muted, |el| el.opacity(0.6))
+            .on_drag(dragged, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
+            .drag_over::<DraggedList>(move |style, _, _, _| style.border_b_2().border_color(accent))
+            .on_drop(move |dragged: &DraggedList, window, cx| {
+                if dragged.id != id {
+                    on_drop(PanelEvent::DropList { list: dragged.id, after: Some(id), folder }, window, cx)
+                }
+            })
+            .on_mouse_down(MouseButton::Right, move |event, window, cx| {
+                cx.stop_propagation();
+                on_panel(PanelEvent::ListMenu(id, event.position), window, cx)
+            })
+            .child(entry)
+            .into_any_element()
+    };
+    let folder_entry = |folder: &ListFolder, inside: &[&List]| -> AnyElement {
+        let id = folder.id;
+        let collapsed = collapsed_folders.contains(&id);
+        let count: usize = inside.iter().map(|l| l.open_count).sum();
+        let on_panel = on_panel.clone();
+        let on_menu = on_panel.clone();
+        let on_drop = on_panel.clone();
+        let accent = colors.accent;
+        div()
+            .id(SharedString::from(format!("folder-{id}")))
+            .rounded(px(6.))
+            .drag_over::<DraggedList>(move |style, _, _, _| style.bg(accent.opacity(0.18)))
+            .on_drop(move |dragged: &DraggedList, window, cx| on_drop(PanelEvent::DropListInFolder { list: dragged.id, folder: id }, window, cx))
+            .on_mouse_down(MouseButton::Right, move |event, window, cx| {
+                cx.stop_propagation();
+                on_menu(PanelEvent::FolderMenu(id, event.position), window, cx)
+            })
+            .child(
+                ListItem::new(SharedString::from(format!("folder-item-{id}")))
+                    .height(px(36.))
+                    .start_slot(Icon::new(if collapsed { IconName::Folder } else { IconName::FolderOpen }))
+                    .child(Label::new(folder.name.clone()).truncate())
+                    .end_slot(
+                        h_flex()
+                            .gap_1()
+                            .when(collapsed && count > 0, |el| el.child(Label::new(count.to_string()).size(LabelSize::Small).color(Color::Muted)))
+                            .child(Icon::new(if collapsed { IconName::ChevronRight } else { IconName::ChevronDown }).size(IconSize::XSmall).color(Color::Muted)),
+                    )
+                    .on_click(move |_, window, cx| on_panel(PanelEvent::ToggleFolder(id), window, cx)),
+            )
+            .into_any_element()
+    };
+    let active_lists: Vec<&List> = lists.iter().filter(|l| !l.archived).collect();
+    let mut list_entries: Vec<AnyElement> = Vec::new();
+    let mut shown_folders: HashSet<Id> = HashSet::new();
+    for list in &active_lists {
+        match list.folder.and_then(|f| folders.iter().find(|x| x.id == f)) {
+            None => list_entries.push(list_entry(list, false, false)),
+            Some(folder) if shown_folders.insert(folder.id) => {
+                let inside: Vec<&List> = active_lists.iter().copied().filter(|l| l.folder == Some(folder.id)).collect();
+                list_entries.push(folder_entry(folder, &inside));
+                if !collapsed_folders.contains(&folder.id) {
+                    list_entries.extend(inside.iter().map(|l| list_entry(l, true, false)));
+                }
+            }
+            Some(_) => {}
+        }
+    }
+    for folder in folders.iter().filter(|f| !shown_folders.contains(&f.id)) {
+        list_entries.push(folder_entry(folder, &[]));
+    }
+    let archived: Vec<&List> = lists.iter().filter(|l| l.archived).collect();
+    if !archived.is_empty() {
+        let on_panel = on_panel.clone();
+        list_entries.push(
+            ListItem::new("archived-lists")
+                .height(px(36.))
+                .start_slot(Icon::new(IconName::Archive))
+                .child(Label::new(strings.archived_lists))
+                .end_slot(Icon::new(if archived_open { IconName::ChevronDown } else { IconName::ChevronRight }).size(IconSize::XSmall).color(Color::Muted))
+                .on_click(move |_, window, cx| on_panel(PanelEvent::ToggleArchived, window, cx))
+                .into_any_element(),
+        );
+        if archived_open {
+            list_entries.extend(archived.iter().map(|l| list_entry(l, true, true)));
+        }
+    }
 
     let lists_column = v_flex()
         .id("lists-panel")
@@ -155,35 +279,28 @@ pub fn render(
         })
         .when(shows(SmartList::Summary, 1), |el| el.child(smart(View::Summary, strings.summary, IconName::FileText, None)))
         .child(separator())
-        .child(
-            heading(strings.lists).child(
-                IconButton::new("add-list", IconName::Plus)
-                    .size(px(20.))
-                    .icon_size(IconSize::Small)
-                    .on_click(on_add_list),
-            ),
-        )
-        .children(lists.iter().map(|list| {
-            item(
-                format!("list-{}", list.id),
-                View::List(list.id),
-                list.name.clone().into(),
-                IconName::List,
-                Some(list.open_count),
-                parse_color(list.color.as_deref()),
-            )
-        }))
-        .children(new_list_input.map(|input| {
-            h_flex()
-                .h(px(36.))
-                .flex_none()
-                .gap_2()
-                .px_2()
+        .child({
+            // Dropping a list on the heading puts it first, out of any folder.
+            let on_panel = on_panel.clone();
+            let accent = colors.accent;
+            div()
+                .id("lists-heading")
                 .rounded(px(6.))
-                .bg(colors.surface_background)
-                .child(Icon::new(IconName::List))
-                .child(input)
-        }))
+                .drag_over::<DraggedList>(move |style, _, _, _| style.bg(accent.opacity(0.18)))
+                .on_drop(move |dragged: &DraggedList, window, cx| {
+                    on_panel(PanelEvent::DropList { list: dragged.id, after: None, folder: None }, window, cx)
+                })
+                .child(
+                    heading(strings.lists).child(
+                        IconButton::new("add-list", IconName::Plus)
+                            .size(px(20.))
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text(strings.add_list))
+                            .on_click(on_add_list),
+                    ),
+                )
+        })
+        .children(list_entries)
         .child(separator())
         .when(tags.iter().any(|tag| shows(SmartList::Tags, tag.open_count)), |el| {
             el.child(heading(strings.tags))
@@ -192,7 +309,7 @@ pub fn render(
                         format!("tag-{}", tag.name),
                         View::Tag(tag.name.clone()),
                         tag.name.clone().into(),
-                        IconName::Tag,
+                        Icon::new(IconName::Tag).into_any_element(),
                         Some(tag.open_count),
                         Some(color(tag.color.as_deref(), cx)),
                     )
@@ -225,7 +342,7 @@ pub fn render(
                 format!("filter-{}", filter.id),
                 View::Filter(filter.id),
                 filter.name.clone().into(),
-                IconName::Funnel,
+                Icon::new(IconName::Funnel).into_any_element(),
                 Some(*count),
                 None,
             )

@@ -16,6 +16,7 @@ use crate::store::Store;
 
 /// The synced tables, parents before children, with their key columns.
 pub const SYNCED: &[(&str, &[&str])] = &[
+    ("list_folders", &["id"]),
     ("lists", &["id"]),
     ("list_sections", &["id"]),
     ("tags", &["name"]),
@@ -499,6 +500,24 @@ mod tests {
         laptop.save_matrix_rule(0, None)?;
         relay(&laptop, sent, &phone);
         assert_eq!(phone.matrix_rules()?[0], QuadrantRule::defaults()[0]);
+        Ok(())
+    }
+
+    #[test]
+    fn list_folders_travel() -> Result<()> {
+        let laptop = Store::open_in_memory()?;
+        let phone = Store::open_in_memory()?;
+        let work = laptop.add_list_folder("Work")?;
+        let draft = crate::ListDraft { name: "Reports".into(), icon: Some("📊".into()), folder: Some(work.id), ..Default::default() };
+        let reports = laptop.add_list(&draft)?;
+        let sent = relay(&laptop, 0, &phone);
+        assert_eq!(phone.list_folders()?, [work.clone()]);
+        assert_eq!(phone.lists()?[0], reports);
+        // Ungrouping on the laptop takes the folder away on the phone and keeps the list.
+        laptop.ungroup_list_folder(work.id)?;
+        relay(&laptop, sent, &phone);
+        assert!(phone.list_folders()?.is_empty());
+        assert_eq!(phone.lists()?[0].folder, None);
         Ok(())
     }
 

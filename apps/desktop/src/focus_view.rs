@@ -2854,7 +2854,7 @@ impl FocusView {
             (View::Inbox, SharedString::new_static(strings.inbox)),
         ]
         .into_iter()
-        .chain(self.store.lists().unwrap_or_default().into_iter().map(|l| (View::List(l.id), l.name.into())))
+        .chain(self.store.lists().unwrap_or_default().into_iter().filter(|l| !l.archived).map(|l| (View::List(l.id), l.name.into())))
         .collect();
         let view_name = views.iter().find(|(v, _)| *v == self.picker_view).map_or(SharedString::new_static(strings.today), |(_, n)| n.clone());
         match self.picker_tab {

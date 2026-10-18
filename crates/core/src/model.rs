@@ -216,6 +216,54 @@ pub struct List {
     pub color: Option<String>,
     /// Number of open tasks in the list.
     pub open_count: usize,
+    /// An emoji shown instead of the list icon, as the original's lists have.
+    pub icon: Option<String>,
+    /// The folder the list is grouped in.
+    pub folder: Option<Id>,
+    /// The original's List Type: a note list adds notes rather than tasks.
+    pub kind: Kind,
+    /// The original's "Show in Smart List": whether the list's tasks appear in All, Today,
+    /// Tomorrow and Next 7 Days.
+    pub in_smart_lists: bool,
+    /// Archived lists leave the lists column for "Archived Lists" and the smart lists.
+    pub archived: bool,
+}
+
+/// A folder of lists in the lists column, as the original's.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ListFolder {
+    pub id: Id,
+    pub name: String,
+}
+
+/// What the Add List / Edit List dialog sets on a list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ListDraft {
+    pub name: String,
+    pub icon: Option<String>,
+    pub color: Option<String>,
+    pub folder: Option<Id>,
+    pub kind: Kind,
+    pub in_smart_lists: bool,
+}
+
+impl Default for ListDraft {
+    fn default() -> Self {
+        Self { name: String::new(), icon: None, color: None, folder: None, kind: Kind::Task, in_smart_lists: true }
+    }
+}
+
+impl ListDraft {
+    pub fn of(list: &List) -> Self {
+        Self {
+            name: list.name.clone(),
+            icon: list.icon.clone(),
+            color: list.color.clone(),
+            folder: list.folder,
+            kind: list.kind,
+            in_smart_lists: list.in_smart_lists,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

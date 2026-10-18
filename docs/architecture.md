@@ -39,7 +39,7 @@ Attachments' records sync like other rows; their files, and countdowns' backgrou
 (`PUT`/`GET /files/<name>`, kept in `<data>.files`): after a sync the app sends the files the
 server lacks and fetches the ones missing here.
 
-Focus timers and the Matrix's quadrant rules (`matrix_rules`) sync like other rows.
+Focus timers, the Matrix's quadrant rules (`matrix_rules`) and the folders of lists (`list_folders`) sync like other rows.
 
 Not synced: settings (so saved view choices stay per device), task activity, habit snoozes.
 

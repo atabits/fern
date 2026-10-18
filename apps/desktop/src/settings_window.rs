@@ -681,7 +681,7 @@ impl SettingsWindow {
                         default_list.is_none(),
                         Box::new(|this, window, cx| this.update(window, cx, |p| p.default_list = None)),
                     )];
-                list_options.extend(lists.iter().map(|list| {
+                list_options.extend(lists.iter().filter(|l| !l.archived).map(|list| {
                     let id = list.id;
                     let pick: Box<dyn Fn(&mut Self, &mut Window, &mut Context<Self>)> =
                         Box::new(move |this, window, cx| this.update(window, cx, |p| p.default_list = Some(id)));

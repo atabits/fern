@@ -4598,9 +4598,12 @@ impl Render for TodoView {
             .flex_1()
             .min_w_0()
             .h_full()
+            .pt(px(crate::TOP_INSET))
             .child(
                 h_flex()
                     .h(px(60.))
+                    // The title sits 4 px above the row's middle, as the original's.
+                    .pb(px(8.))
                     .flex_none()
                     .gap_2()
                     .pl(px(24.))
@@ -4843,13 +4846,13 @@ impl Render for TodoView {
             })
             .map(|el| {
                 if self.view == View::Summary {
-                    return el.child(div().flex_1().min_w_0().h_full().child(self.summary.clone()));
+                    return el.child(div().flex_1().min_w_0().h_full().pt(px(crate::TOP_INSET)).child(self.summary.clone()));
                 }
                 // As in the original, the Timeline takes the whole width until a task is opened.
                 if timeline_view && self.selected.is_none() && self.list_activity.is_none() {
                     return el.child(list);
                 }
-                el.child(list).child(div().flex_none().w(px(DETAIL_WIDTH)).h_full().map(|el| match self.list_activity.clone() {
+                el.child(list).child(div().flex_none().w(px(DETAIL_WIDTH)).h_full().pt(px(crate::TOP_INSET)).map(|el| match self.list_activity.clone() {
                     Some(entries) => el.child(self.render_list_activity(&entries, cx)),
                     None => el.child(self.detail.clone()),
                 }))

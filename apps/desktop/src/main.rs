@@ -1,3 +1,7 @@
+/// The room the original keeps at the top of its window for the title bar's buttons: every
+/// column starts this far down.
+pub const TOP_INSET: f32 = 13.;
+
 mod actions;
 mod app_view;
 

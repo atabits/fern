@@ -942,11 +942,11 @@ impl Render for AppView {
             .when(!self.statistics_open, |el| {
                 el.child(sidebar::render(self.section, on_select, on_avatar, account_menu, bell, sync_button, features, cx)).child(match self.section {
                 Section::Tasks | Section::Search => div().flex_1().h_full().child(self.todo.clone()),
-                Section::Calendar => div().flex_1().h_full().child(self.calendar.clone()),
-                Section::Matrix => div().flex_1().h_full().child(self.matrix.clone()),
-                Section::Countdown => div().flex_1().h_full().child(self.countdown.clone()),
-                Section::Habits => div().flex_1().h_full().child(self.habits.clone()),
-                    Section::Pomodoro => div().flex_1().h_full().child(self.focus.clone()),
+                Section::Calendar => div().flex_1().h_full().pt(px(crate::TOP_INSET)).child(self.calendar.clone()),
+                Section::Matrix => div().flex_1().h_full().pt(px(crate::TOP_INSET)).child(self.matrix.clone()),
+                Section::Countdown => div().flex_1().h_full().pt(px(crate::TOP_INSET)).child(self.countdown.clone()),
+                Section::Habits => div().flex_1().h_full().pt(px(crate::TOP_INSET)).child(self.habits.clone()),
+                    Section::Pomodoro => div().flex_1().h_full().pt(px(crate::TOP_INSET)).child(self.focus.clone()),
                 })
             })
             .when(self.shortcuts_open, |el| el.child(self.render_shortcuts(cx)))

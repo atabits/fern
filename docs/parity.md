@@ -11,6 +11,7 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 | Element | Value |
 |---|---|
 | Narrow sections sidebar | ≈ 50 wide |
+| Window top | every column starts 13 below the window's top edge, the room the original keeps for its title bar's buttons (sidebar, lists column, task list, details and every section; matched to screenshots) |
 | Lists column | ≈ 212 wide, items ≈ 36 tall, selection radius ≈ 6 |
 | Task row | 40 tall, 1 px separator at the bottom, selection ~6% lighter than the background |
 | "Add task" field | ≈ 38 tall, lighter background |
@@ -96,9 +97,9 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 
 Each item is a whole feature area, done in one pass (it may take several commits).
 
-1. Header heights: every view's title sits about 10 px higher than the original's (its window keeps room for the title bar's buttons); measure the original's header across views and match it in one pass.
-2. Habits pass: the habit page's remaining original features (the habit log, Habit Settings, statistics cards) checked against the original's screens without checking in, in one pass.
-3. Kanban pass: the list kanban view's columns, cards, column menus and adding a column, re-checked against the original's (switching a list's view in the original and back) in one pass.
-4. Timeline pass: the list Timeline view's bars, scales, Arrange Tasks panel and its header menu, re-checked against the original's (switching a list's view in the original and back) in one pass.
+1. Habits pass: the habit page's remaining original features (the habit log, Habit Settings, statistics cards) checked against the original's screens without checking in, in one pass.
+2. Kanban pass: the list kanban view's columns, cards, column menus and adding a column, re-checked against the original's (switching a list's view in the original and back) in one pass.
+3. Timeline pass: the list Timeline view's bars, scales, Arrange Tasks panel and its header menu, re-checked against the original's (switching a list's view in the original and back) in one pass.
+4. Statistics page pass: the page's header (title, tabs and Done) and its cards' sizes against the original's, with the window-top room the other views now have.
 
 Not checkable under the reference rules: whether the original asks for a note when a focus session ends, and its white noise (the desktop original shows no sound choice on the focus page or in Focus Settings; it would only appear with a timer running in the reference account). Fern's record dialog takes a note afterwards.

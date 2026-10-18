@@ -1028,9 +1028,10 @@ impl Render for CalendarView {
             })
             .collect();
         let bordered = |id: &'static str| {
+            // The original's header buttons: 30 px boxes with text at the body size.
             h_flex()
                 .id(id)
-                .h(px(28.))
+                .h(px(30.))
                 .rounded(px(6.))
                 .border_1()
                 .border_color(theme.colors().border)
@@ -1088,7 +1089,7 @@ impl Render for CalendarView {
                     .child(
                         bordered("calendar-add-frame").child(
                             IconButton::new("calendar-add", IconName::Plus)
-                                .size(px(26.))
+                                .size(px(28.))
                                 .icon_size(IconSize::Small)
                                 .on_click(|_, window, cx| window.dispatch_action(Box::new(NewTask), cx)),
                         ),
@@ -1098,7 +1099,7 @@ impl Render for CalendarView {
                             .relative()
                             .child(
                                 bordered("calendar-mode")
-                                    .px_2()
+                                    .px_3()
                                     .gap_1()
                                     .cursor_pointer()
                                     .child(
@@ -1110,8 +1111,7 @@ impl Render for CalendarView {
                                             CalendarMode::Agenda => strings.agenda,
                                             CalendarMode::Year => strings.year,
                                             CalendarMode::MultiWeek(_) => strings.multi_week,
-                                        })
-                                        .size(LabelSize::Small),
+                                        }),
                                     )
                                     .child(Icon::new(IconName::ChevronDown).size(IconSize::XSmall))
                                     .on_click(cx.listener(|this, _, _, cx| {
@@ -1127,21 +1127,26 @@ impl Render for CalendarView {
                         bordered("calendar-nav")
                             .child(
                                 IconButton::new("calendar-prev", IconName::ChevronLeft)
-                                    .size(px(24.))
+                                    .size(px(28.))
                                     .icon_size(IconSize::Small)
                                     .on_click(cx.listener(|this, _, _, cx| this.shift(-1, cx))),
                             )
                             .child(
                                 div()
                                     .id("calendar-today")
-                                    .px_1()
+                                    .h_full()
+                                    .px_3()
+                                    .flex()
+                                    .items_center()
+                                    .border_x_1()
+                                    .border_color(theme.colors().border)
                                     .cursor_pointer()
-                                    .child(Label::new(strings.today).size(LabelSize::Small))
+                                    .child(Label::new(strings.today))
                                     .on_click(cx.listener(|this, _, _, cx| this.go_to_today(cx))),
                             )
                             .child(
                                 IconButton::new("calendar-next", IconName::ChevronRight)
-                                    .size(px(24.))
+                                    .size(px(28.))
                                     .icon_size(IconSize::Small)
                                     .on_click(cx.listener(|this, _, _, cx| this.shift(1, cx))),
                             ),

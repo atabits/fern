@@ -914,7 +914,7 @@ impl AppView {
 }
 
 impl Render for AppView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let this = cx.entity().downgrade();
         let on_select = move |section, window: &mut Window, cx: &mut App| {
@@ -983,6 +983,10 @@ impl Render for AppView {
                 Section::Habits => div().flex_1().h_full().pt(px(crate::TOP_INSET)).child(self.habits.clone()),
                     Section::Pomodoro => div().flex_1().h_full().pt(px(crate::TOP_INSET)).child(self.focus.clone()),
                 })
+            })
+            // Over the columns but under the dialogs, which keep their own clicks.
+            .when(crate::title_bar::INTEGRATED, |el| {
+                el.child(crate::title_bar::drag_area()).child(crate::title_bar::caption_buttons(window, cx))
             })
             .when(self.shortcuts_open, |el| el.child(self.render_shortcuts(cx)))
             .when_some(self.settings.clone(), |el, settings| {

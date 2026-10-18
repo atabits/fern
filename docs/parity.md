@@ -92,5 +92,8 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 
 ## Next
 
+1. Focus: the original's focus items with Active and Archived tabs (the "+" in the Pomodoro header).
+2. Focus: Batch Management's Date, Duration and Linked Status filters.
+3. Summary: a formatting toolbar for the edited report (Markdown shortcuts for the original's buttons).
 
 Not checkable under the reference rules: whether the original asks for a note when a focus session ends (finding out means running a focus timer in the reference account). Fern's record dialog takes a note afterwards.

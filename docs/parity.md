@@ -66,7 +66,7 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 | Drag and drop | 🟡 | reorder rows; drop on a lists-column entry (list, tag, Today/Tomorrow, Completed, Trash) or on a calendar day; between matrix quadrants. The original's drag behavior was not observed (dragging in TickTick would change data); no nesting by drag |
 | Keyboard shortcuts | ✅ | JSON keymap (Zed format): new task, search, smart lists, list navigation, complete, delete |
 | Search | 🟡 | popover matched to the original: Task/Tag/List filters, results grouped with highlighted matches, list name, note excerpts, "View more" opens the full list; no "Event" filter (no calendar events) |
-| Calendar | 🟡 | month grid matched to a screenshot of the original: only the weeks of the month, "Oct 1" labels, today circle, task bars with checkboxes, "+ / Month / ‹ Today ›" header; no week/day views, view switcher is static, tasks can be dragged between days |
+| Calendar | 🟡 | month and week views matched to the original (week: all-day strip, time axis with folded night hours, timed tasks placed by time); view menu with Week/Month; tasks can be dragged between days; no Day, Year, Agenda or multi-day views |
 | Eisenhower Matrix | 🟡 | matched to the original: quadrants by priority (TickTick's default rules), grouped by list, drag a task to another quadrant to change its priority; no custom quadrant rules |
 | Pomodoro, Habits, Countdown | ⬜ | |
 | Sync between devices | ⬜ | |
@@ -87,9 +87,9 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 
 ## Next
 
-1. Week view in the calendar.
-2. Countdown section.
-3. Habits section.
+1. Countdown section.
+2. Habits section.
+3. Pomodoro section.
 3. "Won't Do" status.
 4. Custom time and "every N" in the due-date picker.
 5. Eisenhower matrix view.

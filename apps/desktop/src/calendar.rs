@@ -1,6 +1,6 @@
 //! Date math for the due-date calendar.
 
-use chrono::{Datelike, Duration, Months, NaiveDate};
+use chrono::{Datelike, Duration, Months, NaiveDate, NaiveTime, Timelike};
 
 use crate::i18n::Strings;
 
@@ -45,6 +45,36 @@ pub fn week_of(date: NaiveDate) -> [NaiveDate; 7] {
     std::array::from_fn(|i| monday + Duration::days(i as i64))
 }
 
+/// The week view's time axis, as in the original: the night is folded into two short blocks
+/// (00:00–07:00 and 21:00–24:00) around one row per hour from 08:00 to 20:00.
+pub mod week_axis {
+    use super::*;
+
+    pub const HOUR_HEIGHT: f32 = 60.;
+    pub const FOLDED_HEIGHT: f32 = 40.;
+    pub const FIRST_HOUR: u32 = 8;
+    pub const LAST_HOUR: u32 = 21;
+
+    pub fn total_height() -> f32 {
+        2. * FOLDED_HEIGHT + (LAST_HOUR - FIRST_HOUR) as f32 * HOUR_HEIGHT
+    }
+
+    /// The vertical offset of `time` from the top of the axis.
+    pub fn offset(time: NaiveTime) -> f32 {
+        let minutes = (time.hour() * 60 + time.minute()) as f32;
+        let first = (FIRST_HOUR * 60) as f32;
+        let last = (LAST_HOUR * 60) as f32;
+        if minutes < first {
+            minutes / first * FOLDED_HEIGHT
+        } else if minutes < last {
+            FOLDED_HEIGHT + (minutes - first) / 60. * HOUR_HEIGHT
+        } else {
+            FOLDED_HEIGHT + (LAST_HOUR - FIRST_HOUR) as f32 * HOUR_HEIGHT
+                + (minutes - last) / (24. * 60. - last) * FOLDED_HEIGHT
+        }
+    }
+}
+
 pub fn month_title(month: NaiveDate, strings: &Strings) -> String {
     format!("{} {}", strings.months[month.month0() as usize], month.year())
 }
@@ -77,6 +107,18 @@ mod tests {
         assert_eq!(weeks[4][6], d(2026, 11, 1));
         // February 2027 starts on a Monday and fits in four weeks.
         assert_eq!(month_weeks(d(2027, 2, 1)).len(), 4);
+    }
+
+    #[test]
+    fn week_axis_offsets() {
+        use week_axis::*;
+        let t = |h, m| NaiveTime::from_hms_opt(h, m, 0).unwrap();
+        assert_eq!(offset(t(0, 0)), 0.);
+        assert_eq!(offset(t(4, 0)), FOLDED_HEIGHT / 2.);
+        assert_eq!(offset(t(8, 0)), FOLDED_HEIGHT);
+        assert_eq!(offset(t(9, 30)), FOLDED_HEIGHT + 1.5 * HOUR_HEIGHT);
+        assert_eq!(offset(t(21, 0)), FOLDED_HEIGHT + 13. * HOUR_HEIGHT);
+        assert!(offset(t(23, 59)) < total_height());
     }
 
     #[test]

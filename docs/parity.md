@@ -90,7 +90,7 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 
 ## Next
 
-1. Filled sidebar icons (needs own filled glyphs; Lucide has none).
-2. "Other Date" range in the closed views' date filter.
-3. Habit check-ins with partial amounts and the daily goals chart.
-4. Custom reminders and reminders for habits.
+1. "Other Date" range in the closed views' date filter.
+2. Habit check-ins with partial amounts and the daily goals chart.
+3. Custom reminders and reminders for habits.
+4. Filled sidebar icons (needs own filled glyphs; Lucide has none).

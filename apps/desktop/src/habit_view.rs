@@ -16,6 +16,33 @@ use crate::i18n;
 use crate::text_input::{Cancelled, Mode, Submitted, TextInput};
 
 const CARD_WIDTH: f32 = 365.;
+
+/// Emoji offered for habits; the original's illustrated icon set is its own artwork.
+const HABIT_EMOJI: [&str; 35] = [
+    "💧", "🏃", "🧘", "💪", "🚴", "🏊", "🚶", "📚", "✍️", "🎹", "🎨", "🧠", "🌅", "😴", "🛏️", "🦷", "🥗", "🍎", "☕",
+    "🚭", "🍷", "💊", "🧹", "🪴", "🐕", "💰", "📵", "🙏", "❤️", "📞", "🎯", "⏰", "🌿", "🧴", "☀️",
+];
+
+/// A habit's round avatar: its emoji or text on its color, or the name's initial.
+fn avatar(habit: &Habit, size: Pixels, cx: &App) -> Div {
+    let theme = cx.theme();
+    let label = habit
+        .icon
+        .clone()
+        .unwrap_or_else(|| habit.name.chars().next().map(|c| c.to_uppercase().collect()).unwrap_or_default());
+    let bg = crate::lists_panel::parse_color(habit.color.as_deref()).unwrap_or(theme.colors().accent).opacity(0.35);
+    div()
+        .size(size)
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_full()
+        .bg(bg)
+        .text_size(size * 0.5)
+        .font_weight(FontWeight::BOLD)
+        .child(label)
+}
 const CARD_HEIGHT: f32 = 107.;
 
 /// The "Edit Habit" popover: name and daily goal.
@@ -26,6 +53,11 @@ struct HabitEdit {
     amount: Option<u32>,
     reminders: Vec<chrono::NaiveTime>,
     frequency: HabitFrequency,
+    icon: Option<String>,
+    color: Option<String>,
+    /// The icon picker, with its tab (0 emoji, 1 text), while open.
+    icon_picker: Option<usize>,
+    icon_text: Entity<TextInput>,
     /// A field for adding a reminder time.
     reminder_input: Entity<TextInput>,
 }
@@ -127,8 +159,21 @@ impl HabitView {
             }
         })
         .detach();
+        let icon_text = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.habit_text_placeholder, cx));
+        cx.subscribe(&icon_text, |this, _, Submitted(text), cx| {
+            let text: String = text.trim().chars().take(2).collect();
+            this.update_edit(cx, |e| {
+                e.icon = (!text.is_empty()).then_some(text);
+                e.icon_picker = None;
+            });
+        })
+        .detach();
         window.focus(&name.focus_handle(cx), cx);
         self.editing = Some(HabitEdit {
+            icon: habit.icon.clone(),
+            color: habit.color.clone(),
+            icon_picker: None,
+            icon_text,
             name,
             unit,
             amount: habit.goal.as_ref().map(|g| g.amount),
@@ -149,6 +194,7 @@ impl HabitView {
             .update_habit(id, &name, goal.as_ref())
             .and_then(|()| self.store.set_habit_reminders(id, &edit.reminders))
             .and_then(|()| self.store.set_habit_frequency(id, edit.frequency))
+            .and_then(|()| self.store.set_habit_look(id, edit.icon.as_deref(), edit.color.as_deref()))
         {
             eprintln!("failed to update the habit: {err:#}");
         }
@@ -164,6 +210,9 @@ impl HabitView {
 
     fn render_edit(&self, edit: &HabitEdit, cx: &mut Context<Self>) -> AnyElement {
         let strings = i18n::t(cx);
+        let Some(preview) = self.selected.and_then(|id| self.habits.iter().find(|h| h.id == id)).cloned() else {
+            return div().into_any_element();
+        };
         let theme = cx.theme().clone();
         let option = |id: &'static str, label: &'static str, on: bool| {
             h_flex()
@@ -201,7 +250,25 @@ impl HabitView {
                 cx.notify();
             }))
             .child(Label::new(strings.edit_habit).weight(FontWeight::SEMIBOLD))
-            .child(field(edit.name.clone().into_any_element()))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        div()
+                            .id("habit-icon-button")
+                            .cursor_pointer()
+                            .child(avatar(
+                                &Habit { icon: edit.icon.clone(), color: edit.color.clone(), ..preview.clone() },
+                                px(34.),
+                                cx,
+                            ))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.update_edit(cx, |e| e.icon_picker = if e.icon_picker.is_some() { None } else { Some(0) })
+                            })),
+                    )
+                    .child(div().flex_1().child(field(edit.name.clone().into_any_element()))),
+            )
+            .when_some(edit.icon_picker, |el, tab| el.child(self.render_icon_picker(edit, tab, cx)))
             .child(Label::new(strings.habit_frequency).size(LabelSize::Small).color(Color::Muted))
             .child(self.render_frequency(edit.frequency, cx))
             .child(Label::new(strings.habit_goal).size(LabelSize::Small).color(Color::Muted))
@@ -267,6 +334,88 @@ impl HabitView {
                     })))
                     .child(button("edit-save", strings.save, true).on_click(cx.listener(|this, _, _, cx| this.save_edit(cx)))),
             )
+            .into_any_element()
+    }
+
+    /// The icon picker: emoji or text, and the background color.
+    fn render_icon_picker(&self, edit: &HabitEdit, tab: usize, cx: &mut Context<Self>) -> AnyElement {
+        let strings = i18n::t(cx);
+        let theme = cx.theme().clone();
+        let tabs = h_flex().p_0p5().rounded(px(6.)).bg(theme.colors().background).children(
+            strings.habit_icon_tabs.iter().enumerate().map(|(i, label)| {
+                div()
+                    .id(SharedString::from(format!("icon-tab-{i}")))
+                    .flex_1()
+                    .h(px(24.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(5.))
+                    .cursor_pointer()
+                    .when(i == tab, |el| el.bg(theme.colors().element_selected))
+                    .child(Label::new(*label).size(LabelSize::Small))
+                    .on_click(cx.listener(move |this, _, _, cx| this.update_edit(cx, |e| e.icon_picker = Some(i))))
+            }),
+        );
+        let body: AnyElement = if tab == 0 {
+            div()
+                .flex()
+                .flex_wrap()
+                .gap_1()
+                .children(HABIT_EMOJI.iter().map(|emoji| {
+                    let selected = edit.icon.as_deref() == Some(*emoji);
+                    div()
+                        .id(SharedString::from(format!("emoji-{emoji}")))
+                        .size(px(32.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(6.))
+                        .cursor_pointer()
+                        .text_size(px(18.))
+                        .when(selected, |el| el.bg(theme.colors().element_selected))
+                        .hover(|s| s.bg(theme.colors().element_hover))
+                        .child(*emoji)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.update_edit(cx, |e| {
+                                e.icon = Some((*emoji).to_owned());
+                                e.icon_picker = None;
+                            })
+                        }))
+                }))
+                .into_any_element()
+        } else {
+            h_flex()
+                .h(px(30.))
+                .px_2()
+                .rounded(px(6.))
+                .bg(theme.colors().background)
+                .child(edit.icon_text.clone())
+                .into_any_element()
+        };
+        let colors = h_flex().gap_1p5().children(
+            std::iter::once(None).chain(crate::lists_panel::LIST_COLORS.iter().map(|c| Some(*c))).map(|color| {
+                let selected = edit.color.as_deref() == color;
+                let fill = crate::lists_panel::parse_color(color).unwrap_or(theme.colors().accent);
+                div()
+                    .id(SharedString::from(format!("habit-color-{}", color.unwrap_or("none"))))
+                    .size(px(20.))
+                    .rounded_full()
+                    .cursor_pointer()
+                    .bg(fill.opacity(if color.is_none() { 0.35 } else { 1. }))
+                    .when(selected, |el| el.border_2().border_color(theme.colors().text))
+                    .on_click(cx.listener(move |this, _, _, cx| this.update_edit(cx, |e| e.color = color.map(str::to_owned))))
+            }),
+        );
+        v_flex()
+            .gap_2()
+            .p_2()
+            .rounded(px(6.))
+            .border_1()
+            .border_color(theme.colors().border)
+            .child(tabs)
+            .child(body)
+            .child(colors)
             .into_any_element()
     }
 
@@ -398,6 +547,12 @@ impl HabitView {
             self.store.set_habit_reminders(id, &times).ok();
         } else if let Some(frequency) = command.strip_prefix("freq=") {
             self.store.set_habit_frequency(id, HabitFrequency::from_storage(frequency)).ok();
+        } else if let Some(look) = command.strip_prefix("look=") {
+            let (icon, color) = look.split_once('|').unwrap_or((look, ""));
+            self.store.set_habit_look(id, Some(icon), (!color.is_empty()).then_some(color)).ok();
+        } else if command == "picker" {
+            self.update_edit(cx, |e| e.icon_picker = Some(0));
+            return;
         } else if command == "edit" {
             self.reload(cx);
             self.start_edit(window, cx);
@@ -564,7 +719,6 @@ impl HabitView {
         let empty = HashSet::new();
         let checked = self.checkins.get(&id).unwrap_or(&empty);
         let stats = habit::stats_for(&habit.frequency, checked, today);
-        let initial: String = habit.name.chars().next().map(|c| c.to_uppercase().collect()).unwrap_or_default();
         let group = SharedString::from(format!("habit-{id}"));
 
         v_flex()
@@ -585,15 +739,7 @@ impl HabitView {
                 h_flex()
                     .gap_2()
                     .child(
-                        div()
-                            .size(px(30.))
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded_full()
-                            .bg(theme.colors().accent.opacity(0.35))
-                            .child(Label::new(initial).weight(FontWeight::BOLD)),
+                        avatar(habit, px(30.), cx),
                     )
                     .child(
                         v_flex()
@@ -724,7 +870,6 @@ impl HabitView {
             })
             .collect();
 
-        let initial: String = habit.name.chars().next().map(|c| c.to_uppercase().collect()).unwrap_or_default();
         v_flex()
             .id("habit-detail")
             .size_full()
@@ -738,15 +883,7 @@ impl HabitView {
                     .flex_none()
                     .gap_2()
                     .child(
-                        div()
-                            .size(px(30.))
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded_full()
-                            .bg(theme.colors().accent.opacity(0.35))
-                            .child(Label::new(initial).weight(FontWeight::BOLD)),
+                        avatar(habit, px(30.), cx),
                     )
                     .child(
                         div()

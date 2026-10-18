@@ -17,6 +17,10 @@ pub struct Habit {
     /// Times of day to be reminded, earliest first.
     pub reminders: Vec<NaiveTime>,
     pub frequency: Frequency,
+    /// An emoji or up to two characters shown instead of the name's initial.
+    pub icon: Option<String>,
+    /// The icon's background, a hex color.
+    pub color: Option<String>,
 }
 
 /// How often a habit is meant to be done, as in the original's Frequency menu.
@@ -238,6 +242,8 @@ mod tests {
             goal: None,
             reminders: vec![NaiveTime::from_hms_opt(9, 0, 0).unwrap(), NaiveTime::from_hms_opt(21, 0, 0).unwrap()],
             frequency: Frequency::default(),
+            icon: None,
+            color: None,
         };
         let habits = [habit.clone()];
         let mut done = HashMap::new();

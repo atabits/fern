@@ -133,6 +133,10 @@ const MIGRATIONS: &[&str] = &[
     "
     ALTER TABLE habits ADD COLUMN frequency TEXT;
     ",
+    "
+    ALTER TABLE habits ADD COLUMN icon TEXT;
+    ALTER TABLE habits ADD COLUMN color TEXT;
+    ",
 ];
 
 const TASK_COLUMNS: &str = "id, parent_id, kind, title, notes, priority, due_date, due_time, \
@@ -708,7 +712,7 @@ impl Store {
 
     pub fn habits(&self) -> Result<Vec<Habit>> {
         let mut stmt =
-            self.conn.prepare("SELECT id, name, goal_amount, goal_unit, reminders, frequency FROM habits ORDER BY created_at, rowid")?;
+            self.conn.prepare("SELECT id, name, goal_amount, goal_unit, reminders, frequency, icon, color FROM habits ORDER BY created_at, rowid")?;
         let habits = stmt
             .query_map([], |row| {
                 let goal = row.get::<_, Option<u32>>(2)?.map(|amount| Goal { amount, unit: row.get::<_, Option<String>>(3).ok().flatten().unwrap_or_default() });
@@ -722,7 +726,15 @@ impl Store {
                     .get::<_, Option<String>>(5)?
                     .map(|f| crate::habit::Frequency::from_storage(&f))
                     .unwrap_or_default();
-                Ok(Habit { id: parse_uuid(&row.get::<_, String>(0)?, 0)?, name: row.get(1)?, goal, reminders, frequency })
+                Ok(Habit {
+                    id: parse_uuid(&row.get::<_, String>(0)?, 0)?,
+                    name: row.get(1)?,
+                    goal,
+                    reminders,
+                    frequency,
+                    icon: row.get(6)?,
+                    color: row.get(7)?,
+                })
             })?
             .collect::<Result<_, _>>()?;
         Ok(habits)
@@ -731,7 +743,15 @@ impl Store {
     pub fn add_habit(&self, name: &str) -> Result<Habit> {
         let name = name.trim();
         anyhow::ensure!(!name.is_empty(), "a habit needs a name");
-        let habit = Habit { id: Uuid::now_v7(), name: name.to_owned(), goal: None, reminders: Vec::new(), frequency: Default::default() };
+        let habit = Habit {
+            id: Uuid::now_v7(),
+            name: name.to_owned(),
+            goal: None,
+            reminders: Vec::new(),
+            frequency: Default::default(),
+            icon: None,
+            color: None,
+        };
         self.conn.execute(
             "INSERT INTO habits (id, name, created_at) VALUES (?1, ?2, ?3)",
             params![habit.id.to_string(), habit.name, now_ms()],
@@ -745,6 +765,16 @@ impl Store {
     }
 
     /// Renames a habit and sets its daily goal (`None`: "Achieve it all").
+    /// Sets a habit's icon (an emoji or up to two characters; empty for the initial) and color.
+    pub fn set_habit_look(&self, id: Id, icon: Option<&str>, color: Option<&str>) -> Result<()> {
+        let icon = icon.map(str::trim).filter(|i| !i.is_empty()).map(|i| i.chars().take(2).collect::<String>());
+        self.conn.execute(
+            "UPDATE habits SET icon = ?2, color = ?3 WHERE id = ?1",
+            params![id.to_string(), icon, color],
+        )?;
+        Ok(())
+    }
+
     pub fn set_habit_frequency(&self, id: Id, frequency: crate::habit::Frequency) -> Result<()> {
         self.conn.execute(
             "UPDATE habits SET frequency = ?2 WHERE id = ?1",
@@ -1492,6 +1522,14 @@ mod tests {
         assert_eq!(store.habits()?[0].frequency, Default::default());
         store.set_habit_frequency(water.id, weekly)?;
         assert_eq!(store.habits()?[0].frequency, weekly);
+
+        store.set_habit_look(water.id, Some(" 💧 "), Some("#06B6D4"))?;
+        let habit = store.habits()?.remove(0);
+        assert_eq!((habit.icon.as_deref(), habit.color.as_deref()), (Some("💧"), Some("#06B6D4")));
+        store.set_habit_look(water.id, Some("Water"), None)?;
+        assert_eq!(store.habits()?[0].icon.as_deref(), Some("Wa"));
+        store.set_habit_look(water.id, Some(""), None)?;
+        assert_eq!(store.habits()?[0].icon, None);
         Ok(())
     }
 

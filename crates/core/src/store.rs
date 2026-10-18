@@ -3,7 +3,7 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result};
-use chrono::{Duration, NaiveDate, NaiveTime};
+use chrono::{Duration, NaiveDate, NaiveDateTime, NaiveTime};
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use uuid::Uuid;
 
@@ -286,6 +286,12 @@ const MIGRATIONS: &[&str] = &[
     "
     ALTER TABLE focus_sessions ADD COLUMN note TEXT NOT NULL DEFAULT '';
     ",
+    "
+    CREATE TABLE habit_snoozes (
+        habit_id TEXT NOT NULL REFERENCES habits(id) ON DELETE CASCADE,
+        at       TEXT NOT NULL
+    );
+    ",
 ];
 
 const TASK_COLUMNS: &str = "id, parent_id, kind, title, notes, priority, due_date, due_time, \
@@ -294,6 +300,7 @@ const TASK_COLUMNS: &str = "id, parent_id, kind, title, notes, priority, due_dat
 
 const DATE_FORMAT: &str = "%Y-%m-%d";
 const TIME_FORMAT: &str = "%H:%M";
+const SNOOZE_FORMAT: &str = "%Y-%m-%dT%H:%M:%S";
 
 pub struct Store {
     pub(crate) conn: Connection,
@@ -1309,6 +1316,32 @@ impl Store {
         Ok(())
     }
 
+    /// "Snooze" in a habit's reminder: remind again at `at`. Snoozes more than a day old are
+    /// dropped on the way.
+    pub fn snooze_habit(&self, id: Id, at: NaiveDateTime) -> Result<()> {
+        let stale = (at - chrono::Duration::days(1)).format(SNOOZE_FORMAT).to_string();
+        self.conn.execute("DELETE FROM habit_snoozes WHERE at < ?1", [stale])?;
+        self.conn.execute(
+            "INSERT INTO habit_snoozes (habit_id, at) VALUES (?1, ?2)",
+            params![id.to_string(), at.format(SNOOZE_FORMAT).to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Snoozed habit reminders, as (habit, when to remind again).
+    pub fn habit_snoozes(&self) -> Result<Vec<(Id, NaiveDateTime)>> {
+        let mut stmt = self.conn.prepare("SELECT habit_id, at FROM habit_snoozes ORDER BY at")?;
+        let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+        let mut snoozes = Vec::new();
+        for row in rows {
+            let (id, at) = row?;
+            if let (Ok(id), Ok(at)) = (id.parse(), NaiveDateTime::parse_from_str(&at, SNOOZE_FORMAT)) {
+                snoozes.push((id, at));
+            }
+        }
+        Ok(snoozes)
+    }
+
     pub fn update_habit(&self, id: Id, name: &str, goal: Option<&Goal>) -> Result<()> {
         let name = name.trim();
         anyhow::ensure!(!name.is_empty(), "a habit needs a name");
@@ -1372,6 +1405,22 @@ impl Store {
             )?;
         }
         Ok(next)
+    }
+
+    /// "+1" in a goal habit's reminder: adds to the day's amount, past the goal too, unlike
+    /// [`Self::step_checkin`] which starts a completed day over. Returns the new amount.
+    pub fn add_checkin_amount(&self, habit: Id, date: NaiveDate, delta: u32) -> Result<u32> {
+        let date = date.format(DATE_FORMAT).to_string();
+        self.conn.execute(
+            "INSERT INTO habit_checkins (habit_id, date, value) VALUES (?1, ?2, ?3)
+             ON CONFLICT(habit_id, date) DO UPDATE SET value = value + excluded.value",
+            params![habit.to_string(), date, delta],
+        )?;
+        Ok(self.conn.query_row(
+            "SELECT value FROM habit_checkins WHERE habit_id = ?1 AND date = ?2",
+            params![habit.to_string(), date],
+            |row| row.get(0),
+        )?)
     }
 
     /// Writes the note of an existing check-in; an empty note removes it.
@@ -2414,6 +2463,27 @@ mod tests {
         assert_eq!(store.step_checkin(water.id, day)?, 6);
         store.set_checkin_amount(water.id, day, 0)?;
         assert_eq!(store.step_checkin(water.id, day)?, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn reminder_plus_one_and_snooze() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let water = store.add_habit("Water")?;
+        store.update_habit(water.id, "Water", Some(&crate::habit::Goal { amount: 2, unit: "glasses".into() }))?;
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 10, 18).unwrap();
+        assert_eq!(store.add_checkin_amount(water.id, day, 1)?, 1);
+        assert_eq!(store.add_checkin_amount(water.id, day, 1)?, 2);
+        assert_eq!(store.add_checkin_amount(water.id, day, 1)?, 3, "+1 goes past the goal");
+
+        let at = |h, m| day.and_hms_opt(h, m, 0).unwrap();
+        store.snooze_habit(water.id, at(9, 15))?;
+        assert_eq!(store.habit_snoozes()?, [(water.id, at(9, 15))]);
+        // Snoozing the next day drops the old snooze.
+        store.snooze_habit(water.id, at(9, 15) + Duration::days(2))?;
+        assert_eq!(store.habit_snoozes()?.len(), 1);
+        store.delete_habit(water.id)?;
+        assert!(store.habit_snoozes()?.is_empty());
         Ok(())
     }
 

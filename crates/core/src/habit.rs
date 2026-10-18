@@ -174,6 +174,26 @@ pub fn reminders_between<'a>(
     fired
 }
 
+/// Snoozed habit reminders coming due in `(after, until]`, unless the habit was archived or done
+/// that day meanwhile. `snoozes` are (habit, when to remind again).
+pub fn snoozed_between<'a>(
+    habits: &'a [Habit],
+    done: &HashMap<crate::model::Id, HashSet<NaiveDate>>,
+    snoozes: &[(crate::model::Id, NaiveDateTime)],
+    after: NaiveDateTime,
+    until: NaiveDateTime,
+) -> Vec<(&'a Habit, NaiveDateTime)> {
+    snoozes
+        .iter()
+        .filter(|(_, at)| *at > after && *at <= until)
+        .filter_map(|(id, at)| {
+            let habit = habits.iter().find(|h| h.id == *id && !h.archived)?;
+            let done_that_day = done.get(id).is_some_and(|days| days.contains(&at.date()));
+            (!done_that_day).then_some((habit, *at))
+        })
+        .collect()
+}
+
 /// A daily amount to reach, e.g. 8 glasses.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Goal {
@@ -356,6 +376,15 @@ mod tests {
         // Archived habits are not reminded.
         let archived = [Habit { archived: true, ..habit.clone() }];
         assert!(reminders_between(&archived, &HashMap::new(), at(17, 8), at(18, 23)).is_empty());
+
+        // A snoozed reminder comes back once, unless the day was checked in meanwhile.
+        let snoozes = [(habit.id, at(18, 9) + Duration::minutes(15))];
+        let back = snoozed_between(&habits, &HashMap::new(), &snoozes, at(18, 9), at(18, 10));
+        assert_eq!(back.iter().map(|(_, at)| *at).collect::<Vec<_>>(), [snoozes[0].1]);
+        assert!(snoozed_between(&habits, &HashMap::new(), &snoozes, at(18, 10), at(18, 11)).is_empty());
+        let done_today = HashMap::from([(habit.id, HashSet::from([d(18)]))]);
+        assert!(snoozed_between(&habits, &done_today, &snoozes, at(18, 9), at(18, 10)).is_empty());
+        assert!(snoozed_between(&archived, &HashMap::new(), &snoozes, at(18, 9), at(18, 10)).is_empty());
         assert_eq!(HabitSection::from_key("night"), HabitSection::Night);
         assert_eq!(HabitSection::from_key("custom"), HabitSection::Others);
         let custom = CustomSection { id: uuid::Uuid::now_v7(), name: "Pets".into() };

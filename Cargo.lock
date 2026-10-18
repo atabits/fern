@@ -1564,6 +1564,7 @@ dependencies = [
  "chrono",
  "dirs",
  "fern_core",
+ "futures",
  "gpui",
  "gpui_platform",
  "icons",

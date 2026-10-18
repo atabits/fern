@@ -200,6 +200,13 @@ impl HabitView {
         self.reload(cx);
     }
 
+    /// "Record" in a reminder: the habit's details with today's amount field focused.
+    pub fn record(&mut self, habit: Id, window: &mut Window, cx: &mut Context<Self>) {
+        self.select(habit, cx);
+        let focus = self.amount_input.read(cx).focus_handle(cx);
+        window.focus(&focus, cx);
+    }
+
     pub fn select(&mut self, habit: Id, cx: &mut Context<Self>) {
         if self.selected != Some(habit) {
             self.selected = Some(habit);

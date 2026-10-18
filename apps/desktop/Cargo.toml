@@ -19,6 +19,7 @@ ui.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 dirs.workspace = true
+futures.workspace = true
 gpui.workspace = true
 gpui_platform.workspace = true
 notify-rust.workspace = true

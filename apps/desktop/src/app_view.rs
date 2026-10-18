@@ -14,7 +14,7 @@ use crate::focus_view::FocusView;
 use crate::habit_view::HabitView;
 use crate::i18n;
 use crate::matrix_view::{self, MatrixView};
-use crate::reminders::{self, Notice, Notices, Target};
+use crate::reminders::{self, Notice, NoticeAction, Notices, Reply, Target};
 use crate::search_modal::{SearchEvent, SearchModal};
 use crate::settings_window::{self, SettingsEvent, SettingsWindow};
 use crate::sidebar::{self, Section};
@@ -105,7 +105,7 @@ impl AppView {
             settings: None,
             statistics_open: false,
         };
-        reminders::start(this.store.clone(), cx);
+        reminders::start(this.store.clone(), window.window_handle(), cx);
         settings_window::apply(&this.store.preferences().unwrap_or_default(), window, cx);
         // "Follow System Dark Mode" tracks the system's appearance while the app runs.
         cx.observe_window_appearance(window, |this, window, cx| {
@@ -190,12 +190,14 @@ impl AppView {
             if state.contains("section=countdown") {
                 this.select(Section::Countdown, window, cx);
             }
-            // `notice=<task title part>><hours ago>`: a fired reminder for the bell; `notices=open`.
+            // `notice=<task title or habit name part>><hours ago>`: a fired reminder for the bell; `notices=open`.
             for spec in state.split(';').filter_map(|part| part.strip_prefix("notice=")) {
                 let (needle, ago) = spec.split_once('>').unwrap_or((spec, "0"));
+                let at = chrono::Local::now().naive_local() - chrono::Duration::hours(ago.parse().unwrap_or(0));
                 if let Some(task) = this.store.tasks().unwrap_or_default().into_iter().find(|t| t.title.contains(needle)) {
-                    let at = chrono::Local::now().naive_local() - chrono::Duration::hours(ago.parse().unwrap_or(0));
                     this.add_notices(vec![Notice { target: Target::Task(task.id), title: task.title, at }], cx);
+                } else if let Some(habit) = this.store.habits().unwrap_or_default().into_iter().find(|h| h.name.contains(needle)) {
+                    this.add_notices(vec![Notice { target: Target::Habit(habit.id), title: habit.name, at }], cx);
                 }
             }
             // `theme=light|dark|system`, saved like a pick in the Settings.
@@ -504,9 +506,47 @@ impl AppView {
         }
     }
 
+    /// A click on a reminder, in the bell or on the desktop notification. Answering a habit's
+    /// reminder takes it off the bell.
+    pub fn answer_notice(&mut self, notice: &Notice, reply: Reply, window: &mut Window, cx: &mut Context<Self>) {
+        let Reply::Action(action) = reply else {
+            window.activate_window();
+            self.open_notice(notice.target, window, cx);
+            return;
+        };
+        let Target::Habit(habit) = notice.target else { return };
+        let now = chrono::Local::now().naive_local();
+        let done = match action {
+            NoticeAction::Snooze => self.store.snooze_habit(habit, now + chrono::Duration::minutes(reminders::SNOOZE_MINUTES)),
+            NoticeAction::CheckIn => {
+                let today = now.date();
+                if self.store.checkins(habit).unwrap_or_default().contains(&today) {
+                    Ok(())
+                } else {
+                    self.store.toggle_checkin(habit, today).map(|_| ())
+                }
+            }
+            NoticeAction::PlusOne => self.store.add_checkin_amount(habit, now.date(), 1).map(|_| ()),
+            NoticeAction::Record => {
+                window.activate_window();
+                self.set_notices_open(false, cx);
+                self.select(Section::Habits, window, cx);
+                self.habits.update(cx, |habits, cx| habits.record(habit, window, cx));
+                Ok(())
+            }
+        };
+        if let Err(err) = done {
+            eprintln!("failed to answer the reminder: {err:#}");
+        }
+        self.notices.items.retain(|n| n != notice);
+        self.habits.update(cx, |habits, cx| habits.reload(cx));
+        cx.notify();
+    }
+
     fn render_notices(&self, cx: &mut Context<Self>) -> AnyElement {
         let strings = i18n::t(cx);
         let today = chrono::Local::now().date_naive();
+        let theme = cx.theme().clone();
         popover(cx)
             .w(px(300.))
             .max_h(px(420.))
@@ -519,14 +559,33 @@ impl AppView {
                 v_flex().id("notices").overflow_y_scroll().children(self.notices.items.iter().enumerate().map(|(i, notice)| {
                     let target = notice.target;
                     let (when, _) = crate::task_rows::due_label(notice.at.date(), Some(notice.at.time()), today, strings);
+                    let actions = reminders::actions(&self.store, target);
+                    let buttons = actions.iter().map(|&action| {
+                        let notice = notice.clone();
+                        div()
+                            .id(SharedString::from(format!("notice-{i}-{}", action.key())))
+                            .px_2()
+                            .py_0p5()
+                            .rounded(px(4.))
+                            .border_1().border_color(theme.colors().border)
+                            .hover(|s| s.bg(theme.colors().element_hover))
+                            .cursor_pointer()
+                            .child(Label::new(action.label(strings)).size(LabelSize::Small))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.answer_notice(&notice, Reply::Action(action), window, cx);
+                            }))
+                    });
                     ListItem::new(SharedString::from(format!("notice-{i}")))
-                        .height(px(44.))
+                        .height(px(if actions.is_empty() { 44. } else { 72. }))
                         .start_slot(Icon::new(IconName::AlarmClock).color(Color::Accent))
                         .child(
                             v_flex()
                                 .min_w_0()
+                                .py_1()
                                 .child(Label::new(notice.title.clone()).truncate())
-                                .child(Label::new(when).size(LabelSize::XSmall).color(Color::Muted)),
+                                .child(Label::new(when).size(LabelSize::XSmall).color(Color::Muted))
+                                .child(h_flex().gap_1().children(buttons)),
                         )
                         .on_click(cx.listener(move |this, _, window, cx| this.open_notice(target, window, cx)))
                 })),

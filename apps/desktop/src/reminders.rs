@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use chrono::{Local, NaiveDateTime};
 use fern_core::{Id, Store, reminder};
-use gpui::{AppContext as _, Context};
+use gpui::{AnyWindowHandle, Context};
 
 use crate::app_view::AppView;
 use crate::i18n;
@@ -23,6 +23,60 @@ const STAMP_FORMAT: &str = "%Y-%m-%dT%H:%M:%S";
 pub enum Target {
     Task(Id),
     Habit(Id),
+}
+
+/// What a habit's reminder offers besides opening it, as in the original: "Snooze", and "Check
+/// In" for a habit without a goal, or "Record" (type the amount) and "+1" for one with a goal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NoticeAction {
+    Snooze,
+    CheckIn,
+    Record,
+    PlusOne,
+}
+
+/// How long "Snooze" puts a reminder off.
+pub const SNOOZE_MINUTES: i64 = 15;
+
+impl NoticeAction {
+    pub fn for_habit(has_goal: bool) -> &'static [NoticeAction] {
+        if has_goal {
+            &[NoticeAction::Snooze, NoticeAction::Record, NoticeAction::PlusOne]
+        } else {
+            &[NoticeAction::Snooze, NoticeAction::CheckIn]
+        }
+    }
+
+    pub fn key(self) -> &'static str {
+        match self {
+            NoticeAction::Snooze => "snooze",
+            NoticeAction::CheckIn => "check-in",
+            NoticeAction::Record => "record",
+            NoticeAction::PlusOne => "plus-one",
+        }
+    }
+
+    fn from_key(key: &str) -> Option<Self> {
+        [NoticeAction::Snooze, NoticeAction::CheckIn, NoticeAction::Record, NoticeAction::PlusOne]
+            .into_iter()
+            .find(|action| action.key() == key)
+    }
+
+    pub fn label(self, strings: &'static i18n::Strings) -> &'static str {
+        match self {
+            NoticeAction::Snooze => strings.snooze,
+            NoticeAction::CheckIn => strings.check_in,
+            NoticeAction::Record => strings.habit_record,
+            NoticeAction::PlusOne => "+1",
+        }
+    }
+}
+
+/// What a click on a desktop notification asks for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reply {
+    Open,
+    Action(NoticeAction),
 }
 
 /// A reminder that fired.
@@ -66,12 +120,56 @@ pub fn fired(store: &Store, after: NaiveDateTime, until: NaiveDateTime) -> Vec<N
             .into_iter()
             .map(|(habit, at)| Notice { target: Target::Habit(habit.id), title: habit.name.clone(), at }),
     );
+    let snoozes = store.habit_snoozes().unwrap_or_default();
+    notices.extend(
+        fern_core::habit::snoozed_between(&habits, &done, &snoozes, after, until)
+            .into_iter()
+            .map(|(habit, at)| Notice { target: Target::Habit(habit.id), title: habit.name.clone(), at }),
+    );
     notices
+}
+
+/// The actions a notice offers: none for tasks.
+pub fn actions(store: &Store, target: Target) -> &'static [NoticeAction] {
+    match target {
+        Target::Task(_) => &[],
+        Target::Habit(id) => {
+            let has_goal = store.habits().unwrap_or_default().iter().any(|h| h.id == id && h.goal.is_some());
+            NoticeAction::for_habit(has_goal)
+        }
+    }
+}
+
+/// Shows a desktop notification with its actions as buttons, and waits on a thread of its own for
+/// the one clicked, if any.
+fn show(title: String, body: String, actions: Vec<(&'static str, &'static str)>) -> futures::channel::oneshot::Receiver<Reply> {
+    let (tx, rx) = futures::channel::oneshot::channel();
+    std::thread::spawn(move || {
+        let mut notification = notify_rust::Notification::new();
+        notification.appname("Fern").summary(&title).body(&body).icon("alarm-clock");
+        for (key, label) in &actions {
+            notification.action(key, label);
+        }
+        notification.action("default", &title);
+        match notification.show() {
+            #[cfg(all(unix, not(target_os = "macos")))]
+            Ok(handle) => handle.wait_for_action(|key| {
+                let reply = if key == "default" { Some(Reply::Open) } else { NoticeAction::from_key(key).map(Reply::Action) };
+                if let Some(reply) = reply {
+                    tx.send(reply).ok();
+                }
+            }),
+            #[cfg(not(all(unix, not(target_os = "macos"))))]
+            Ok(_) => drop(tx),
+            Err(err) => eprintln!("failed to show a reminder: {err}"),
+        }
+    });
+    rx
 }
 
 /// Starts checking for reminders: collects the ones missed since the last run, then shows new
 /// ones as desktop notifications.
-pub fn start(store: Rc<Store>, cx: &mut Context<AppView>) {
+pub fn start(store: Rc<Store>, window: AnyWindowHandle, cx: &mut Context<AppView>) {
     // UI screenshots run the app with demo data; they must not notify on the real desktop.
     if std::env::var_os("FERN_DEV_STATE").is_some() {
         return;
@@ -99,23 +197,29 @@ pub fn start(store: Rc<Store>, cx: &mut Context<AppView>) {
             if notices.is_empty() {
                 continue;
             }
-            let shown: Vec<(String, String)> = cx.update(|cx| {
+            let shown: Vec<_> = cx.update(|cx| {
                 let strings = i18n::t(cx);
                 notices
                     .iter()
                     .map(|n| {
                         let due = task_rows::due_label(n.at.date(), Some(n.at.time()), now.date(), strings).0;
-                        (n.title.clone(), due)
+                        let buttons = actions(&store, n.target).iter().map(|a| (a.key(), a.label(strings))).collect();
+                        (n.clone(), due, buttons)
                     })
-                    .collect::<Vec<_>>()
+                    .collect()
             });
-            for (title, due) in shown {
-                cx.background_spawn(async move {
-                    let shown =
-                        notify_rust::Notification::new().appname("Fern").summary(&title).body(&due).icon("alarm-clock").show();
-                    if let Err(err) = shown {
-                        eprintln!("failed to show a reminder: {err}");
-                    }
+            for (notice, due, buttons) in shown {
+                let reply = show(notice.title.clone(), due, buttons);
+                let this = this.clone();
+                cx.spawn(async move |cx| {
+                    let Ok(reply) = reply.await else { return };
+                    cx.update(|cx| {
+                        window
+                            .update(cx, |_, window, cx| {
+                                this.update(cx, |this, cx| this.answer_notice(&notice, reply, window, cx)).ok();
+                            })
+                            .ok();
+                    });
                 })
                 .detach();
             }
@@ -166,5 +270,29 @@ mod tests {
         assert_eq!(notices.iter().map(|n| n.target).collect::<Vec<_>>(), [Target::Habit(habit.id)]);
         store.toggle_checkin(habit.id, day).unwrap();
         assert!(fired(&store, at(9), at(10)).is_empty(), "a habit done today is not reminded");
+    }
+
+    #[test]
+    fn habit_reminder_actions_and_snooze() {
+        let store = Store::open_in_memory().unwrap();
+        let task = store.add_task("water the plants").unwrap();
+        assert!(actions(&store, Target::Task(task.id)).is_empty());
+        let read = store.add_habit("Read").unwrap();
+        assert_eq!(actions(&store, Target::Habit(read.id)), [NoticeAction::Snooze, NoticeAction::CheckIn]);
+        let water = store.add_habit("Water").unwrap();
+        store.update_habit(water.id, "Water", Some(&fern_core::Goal { amount: 8, unit: "glasses".into() })).unwrap();
+        assert_eq!(
+            actions(&store, Target::Habit(water.id)),
+            [NoticeAction::Snooze, NoticeAction::Record, NoticeAction::PlusOne]
+        );
+        for action in actions(&store, Target::Habit(water.id)) {
+            assert_eq!(NoticeAction::from_key(action.key()), Some(*action));
+        }
+
+        // A snoozed reminder fires again when its time comes.
+        let at = NaiveDate::from_ymd_opt(2026, 10, 18).unwrap().and_hms_opt(9, 0, 0).unwrap();
+        store.snooze_habit(read.id, at + chrono::Duration::minutes(SNOOZE_MINUTES)).unwrap();
+        let notices = fired(&store, at, at + chrono::Duration::minutes(20));
+        assert_eq!(notices.iter().map(|n| n.target).collect::<Vec<_>>(), [Target::Habit(read.id)]);
     }
 }

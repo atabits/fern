@@ -3,7 +3,9 @@
 An open-source task manager inspired by TickTick: a fast native desktop app written in Rust,
 with mobile clients and sync planned.
 
-> Status: early development. The desktop app works locally; there is no sync yet.
+> Status: early development. The desktop app works locally and can sync through your own
+> `fern-server` (`FERN_TOKEN=… cargo run -p fern_server -- --listen 0.0.0.0:8650`, then
+> Settings → Sync in the app).
 
 ## Features
 

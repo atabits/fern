@@ -76,6 +76,13 @@ pub struct Bell {
     pub menu: Option<AnyElement>,
 }
 
+/// The sync button: its tooltip says how the last sync went; a failed one shows in red.
+pub struct SyncButton {
+    pub tooltip: String,
+    pub failed: bool,
+    pub on_click: Box<dyn Fn(&ClickEvent, &mut Window, &mut App)>,
+}
+
 /// `account_menu` is rendered next to the avatar while the account menu is open.
 pub fn render(
     active: Section,
@@ -83,6 +90,7 @@ pub fn render(
     on_avatar: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     account_menu: Option<AnyElement>,
     bell: Bell,
+    sync: SyncButton,
     cx: &App,
 ) -> impl IntoElement {
     let colors = cx.theme().colors();
@@ -129,7 +137,12 @@ pub fn render(
                 .on_click(move |_, window, cx| on_select(section, window, cx))
         })))
         .child(div().flex_1())
-        .child(button("sync", IconName::RefreshCw))
+        .child(
+            button("sync", IconName::RefreshCw)
+                .when(sync.failed, |b| b.icon_color(Color::Error))
+                .tooltip(Tooltip::text(sync.tooltip))
+                .on_click(sync.on_click),
+        )
         .child(
             div()
                 .relative()

@@ -33,6 +33,7 @@ pub struct AppView {
     account_menu_open: bool,
     notices: Notices,
     notices_open: bool,
+    sync: crate::sync::SyncStatus,
     /// The "Shortcuts" panel on the right, while open.
     shortcuts_open: bool,
     settings: Option<gpui::Entity<SettingsWindow>>,
@@ -101,11 +102,13 @@ impl AppView {
             account_menu_open: false,
             notices: Notices::default(),
             notices_open: false,
+            sync: crate::sync::SyncStatus::Off,
             shortcuts_open: false,
             settings: None,
             statistics_open: false,
         };
         reminders::start(this.store.clone(), window.window_handle(), cx);
+        this.start_sync(cx);
         settings_window::apply(&this.store.preferences().unwrap_or_default(), window, cx);
         // "Follow System Dark Mode" tracks the system's appearance while the app runs.
         cx.observe_window_appearance(window, |this, window, cx| {
@@ -502,6 +505,108 @@ impl AppView {
             .into_any_element()
     }
 
+    /// Syncs on start, whenever there are local changes to send, and every few minutes to fetch
+    /// other devices' changes. Screenshots of the debug build do not sync.
+    fn start_sync(&mut self, cx: &mut Context<Self>) {
+        if std::env::var_os("FERN_DEV_STATE").is_some() {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let mut since_pull = std::time::Duration::ZERO;
+            let mut first = true;
+            loop {
+                let Ok(due) = this.update(cx, |this, _| {
+                    first || since_pull >= crate::sync::PULL_EVERY || this.store.has_unsent_changes().unwrap_or(false)
+                }) else {
+                    break;
+                };
+                if due {
+                    since_pull = std::time::Duration::ZERO;
+                    if this.update(cx, |this, cx| this.sync_now(cx)).is_err() {
+                        break;
+                    }
+                }
+                first = false;
+                cx.background_executor().timer(crate::sync::PUSH_CHECK_EVERY).await;
+                since_pull += crate::sync::PUSH_CHECK_EVERY;
+            }
+        })
+        .detach();
+    }
+
+    /// One sync with the server from Settings → Sync: sends the local changes, applies the others
+    /// and refreshes the views.
+    pub fn sync_now(&mut self, cx: &mut Context<Self>) {
+        if self.sync == crate::sync::SyncStatus::Running {
+            return;
+        }
+        let config = match self.store.sync_config() {
+            Ok(Some(config)) => config,
+            Ok(None) => {
+                self.sync = crate::sync::SyncStatus::Off;
+                cx.notify();
+                return;
+            }
+            Err(err) => {
+                self.sync = crate::sync::SyncStatus::Failed(format!("{err:#}"));
+                cx.notify();
+                return;
+            }
+        };
+        let request = match self.store.sync_request() {
+            Ok(request) => request,
+            Err(err) => {
+                self.sync = crate::sync::SyncStatus::Failed(format!("{err:#}"));
+                cx.notify();
+                return;
+            }
+        };
+        self.sync = crate::sync::SyncStatus::Running;
+        cx.notify();
+        let body = request.body.clone();
+        let answer = cx.background_spawn(async move { crate::sync::post(&config, &body) });
+        cx.spawn(async move |this, cx| {
+            let answer = answer.await;
+            this.update(cx, |this, cx| {
+                let result = answer.and_then(|answer| this.store.finish_sync(&request, &answer));
+                this.sync = match result {
+                    Ok(received) => {
+                        if received > 0 {
+                            this.reload_all(cx);
+                        }
+                        crate::sync::SyncStatus::Done(chrono::Local::now().naive_local())
+                    }
+                    Err(err) => crate::sync::SyncStatus::Failed(format!("{err:#}")),
+                };
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Re-reads every view, after changes came from another device.
+    fn reload_all(&mut self, cx: &mut Context<Self>) {
+        self.todo.update(cx, |view, cx| view.reload(cx));
+        self.calendar.update(cx, |view, cx| view.reload(cx));
+        self.matrix.update(cx, |view, cx| view.reload(cx));
+        self.countdown.update(cx, |view, cx| view.reload(cx));
+        self.habits.update(cx, |view, cx| view.reload(cx));
+        self.focus.update(cx, |view, cx| view.reload(cx));
+    }
+
+    /// The sync button's tooltip: "Sync" and how the last sync went.
+    fn sync_tooltip(&self, strings: &'static i18n::Strings) -> String {
+        let status = match &self.sync {
+            crate::sync::SyncStatus::Off if self.store.sync_config().ok().flatten().is_some() => strings.sync_never.to_owned(),
+            crate::sync::SyncStatus::Off => strings.sync_off.to_owned(),
+            crate::sync::SyncStatus::Running => strings.sync_running.to_owned(),
+            crate::sync::SyncStatus::Done(at) => strings.sync_done.replace("{time}", &crate::calendar::format_time(at.time())),
+            crate::sync::SyncStatus::Failed(error) => strings.sync_failed.replace("{error}", error),
+        };
+        format!("{}\n{status}", strings.sync)
+    }
+
     pub fn add_notices(&mut self, notices: Vec<Notice>, cx: &mut Context<Self>) {
         if !notices.is_empty() {
             self.notices.push(notices);
@@ -634,6 +739,11 @@ impl Render for AppView {
         let account_menu = self.account_menu_open.then(|| {
             PopoverAttachment::new(Placement::RightTop, self.render_account_menu(cx)).into_any_element()
         });
+        let sync_button = sidebar::SyncButton {
+            tooltip: self.sync_tooltip(i18n::t(cx)),
+            failed: matches!(self.sync, crate::sync::SyncStatus::Failed(_)),
+            on_click: Box::new(cx.listener(|this, _, _, cx| this.sync_now(cx))),
+        };
         let bell = sidebar::Bell {
             unread: self.notices.unread,
             on_click: Box::new(cx.listener(|this, _, _, cx| {
@@ -667,7 +777,7 @@ impl Render for AppView {
             .text_color(theme.colors().text)
             .when(self.statistics_open, |el| el.child(div().size_full().child(self.focus.clone())))
             .when(!self.statistics_open, |el| {
-                el.child(sidebar::render(self.section, on_select, on_avatar, account_menu, bell, cx)).child(match self.section {
+                el.child(sidebar::render(self.section, on_select, on_avatar, account_menu, bell, sync_button, cx)).child(match self.section {
                 Section::Tasks | Section::Search => div().flex_1().h_full().child(self.todo.clone()),
                 Section::Calendar => div().flex_1().h_full().child(self.calendar.clone()),
                 Section::Matrix => div().flex_1().h_full().child(self.matrix.clone()),

@@ -24,7 +24,10 @@ gpui.workspace = true
 gpui_platform.workspace = true
 notify-rust.workspace = true
 unicode-segmentation.workspace = true
+ureq.workspace = true
 
 [dev-dependencies]
+fern_server = { path = "../server" }
+tiny_http.workspace = true
 gpui = { workspace = true, features = ["test-support"] }
 uuid.workspace = true

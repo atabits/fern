@@ -94,6 +94,92 @@ fn is_identifier(name: &str) -> bool {
     !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// Where this device syncs to: the server's address and the token.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SyncConfig {
+    pub server: String,
+    pub token: String,
+}
+
+const SYNC_SERVER: &str = "sync_server";
+const SYNC_TOKEN: &str = "sync_token";
+const SYNC_DEVICE: &str = "sync_device";
+const SYNC_SENT: &str = "sync_sent";
+const SYNC_SEEN: &str = "sync_seen";
+
+/// A sync on its way: the request to send, and what it covers of the local log.
+pub struct SyncRequest {
+    pub body: Json,
+    sent: i64,
+}
+
+impl Store {
+    /// The sync settings, if a server is set.
+    pub fn sync_config(&self) -> Result<Option<SyncConfig>> {
+        let server = self.setting(SYNC_SERVER)?.unwrap_or_default();
+        let token = self.setting(SYNC_TOKEN)?.unwrap_or_default();
+        Ok((!server.trim().is_empty()).then_some(SyncConfig { server, token }))
+    }
+
+    /// Sets the server and token. A different server starts over: everything here is sent to it,
+    /// and everything it has is received.
+    pub fn set_sync_config(&self, config: &SyncConfig) -> Result<()> {
+        let server = config.server.trim();
+        if self.setting(SYNC_SERVER)?.unwrap_or_default() != server {
+            self.set_setting(SYNC_SENT, "0")?;
+            self.set_setting(SYNC_SEEN, "0")?;
+        }
+        self.set_setting(SYNC_SERVER, server)?;
+        self.set_setting(SYNC_TOKEN, config.token.trim())
+    }
+
+    /// This device's id for the server, made once.
+    pub fn sync_device(&self) -> Result<String> {
+        if let Some(id) = self.setting(SYNC_DEVICE)? {
+            return Ok(id);
+        }
+        let id = uuid::Uuid::now_v7().to_string();
+        self.set_setting(SYNC_DEVICE, &id)?;
+        Ok(id)
+    }
+
+    fn sync_number(&self, key: &str) -> Result<i64> {
+        Ok(self.setting(key)?.and_then(|v| v.parse().ok()).unwrap_or(0))
+    }
+
+    /// Whether there are local changes the server has not got yet.
+    pub fn has_unsent_changes(&self) -> Result<bool> {
+        Ok(self.sync_position()? > self.sync_number(SYNC_SENT)?)
+    }
+
+    /// The next sync's request: this device's unsent changes and what it has seen.
+    pub fn sync_request(&self) -> Result<SyncRequest> {
+        let (changes, sent) = self.changes_since(self.sync_number(SYNC_SENT)?)?;
+        let body = serde_json::json!({
+            "device": self.sync_device()?,
+            "since": self.sync_number(SYNC_SEEN)?,
+            "changes": changes.iter().map(Change::to_json).collect::<Vec<_>>(),
+        });
+        Ok(SyncRequest { body, sent })
+    }
+
+    /// Applies the server's answer to `request` and remembers how far both sides got. Returns
+    /// how many changes came in.
+    pub fn finish_sync(&self, request: &SyncRequest, answer: &Json) -> Result<usize> {
+        let received = answer["changes"]
+            .as_array()
+            .context("the server's answer has no changes")?
+            .iter()
+            .map(Change::from_json)
+            .collect::<Result<Vec<_>>>()?;
+        let position = answer["position"].as_i64().context("the server's answer has no position")?;
+        let applied = self.apply_changes(&received)?;
+        self.set_setting(SYNC_SENT, &request.sent.to_string())?;
+        self.set_setting(SYNC_SEEN, &position.to_string())?;
+        Ok(applied)
+    }
+}
+
 impl Store {
     /// The last entry of the change log: what a device has sent up to.
     pub fn sync_position(&self) -> Result<i64> {
@@ -252,6 +338,34 @@ mod tests {
 
         relay(&b, start, &a);
         assert_eq!(a.task(task.id)?.unwrap().title, "From b");
+        Ok(())
+    }
+
+    #[test]
+    fn sync_settings_and_requests() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        assert_eq!(store.sync_config()?, None);
+        let config = SyncConfig { server: " https://fern.example.org ".into(), token: "t0ken".into() };
+        store.set_sync_config(&config)?;
+        assert_eq!(store.sync_config()?.unwrap().server, "https://fern.example.org");
+        let device = store.sync_device()?;
+        assert_eq!(store.sync_device()?, device, "the device id stays");
+
+        store.add_task("Water the plants")?;
+        assert!(store.has_unsent_changes()?);
+        let request = store.sync_request()?;
+        assert_eq!(request.body["device"], device.as_str());
+        assert_eq!(request.body["changes"].as_array().unwrap().len(), 1);
+
+        // The server answers with nothing new: the change counts as sent.
+        store.finish_sync(&request, &serde_json::json!({ "changes": [], "position": 7 }))?;
+        assert!(!store.has_unsent_changes()?);
+        assert_eq!(store.sync_request()?.body["since"], 7);
+        assert!(store.finish_sync(&request, &serde_json::json!({ "oops": true })).is_err());
+
+        // Another server starts over.
+        store.set_sync_config(&SyncConfig { server: "https://other.example.org".into(), token: "x".into() })?;
+        assert!(store.has_unsent_changes()?);
         Ok(())
     }
 

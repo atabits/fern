@@ -20,6 +20,7 @@ mod search_modal;
 mod settings_window;
 mod sidebar;
 mod summary_view;
+mod sync;
 mod task_detail;
 mod task_rows;
 mod text_input;

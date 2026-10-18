@@ -6,7 +6,7 @@ use std::rc::Rc;
 use chrono::Datelike as _;
 use fern_core::reminder::{ALL_DAY_OFFSETS, TIMED_OFFSETS};
 use fern_core::{DURATIONS, DefaultDate, Priority, format_minutes, DateFormat, Preferences, SmartList, Store, ThemeMode, Visibility, WEEK_STARTS};
-use gpui::{EventEmitter, FocusHandle, Focusable, FontWeight, WindowAppearance};
+use gpui::{Entity, EventEmitter, FocusHandle, Focusable, FontWeight, WindowAppearance};
 use theme::Theme;
 use ui::prelude::*;
 use ui::{Placement, PopoverAttachment, popover};
@@ -22,6 +22,8 @@ pub enum Page {
     DateTime,
     Appearance,
     More,
+    /// The sync server's address and token.
+    Sync,
     About,
 }
 
@@ -58,6 +60,9 @@ pub struct SettingsWindow {
     focus_handle: FocusHandle,
     /// The outcome of the last backup or import.
     backup_message: Option<String>,
+    /// Settings → Sync: the server's address and the token, saved as they are typed.
+    sync_server: Entity<crate::text_input::TextInput>,
+    sync_token: Entity<crate::text_input::TextInput>,
 }
 
 impl EventEmitter<SettingsEvent> for SettingsWindow {}
@@ -89,7 +94,38 @@ pub fn apply(preferences: &Preferences, window: &Window, cx: &mut App) {
 impl SettingsWindow {
     pub fn new(store: Rc<Store>, cx: &mut Context<Self>) -> Self {
         let preferences = store.preferences().unwrap_or_default();
-        Self { store, preferences, page: Page::default(), menu: None, focus_handle: cx.focus_handle(), backup_message: None }
+        let config = store.sync_config().ok().flatten().unwrap_or_default();
+        let field = |placeholder: &'static str, text: String, cx: &mut Context<Self>| {
+            let input = cx.new(|cx| {
+                let mut input = crate::text_input::TextInput::new(crate::text_input::Mode::SingleLine, placeholder, cx);
+                input.set_text(text, cx);
+                input
+            });
+            cx.subscribe(&input, |this: &mut Self, _, _: &crate::text_input::Changed, cx| this.save_sync(cx)).detach();
+            input
+        };
+        let sync_server = field("https://fern.example.org", config.server, cx);
+        let sync_token = field("", config.token, cx);
+        Self {
+            store,
+            preferences,
+            page: Page::default(),
+            menu: None,
+            focus_handle: cx.focus_handle(),
+            backup_message: None,
+            sync_server,
+            sync_token,
+        }
+    }
+
+    fn save_sync(&mut self, cx: &mut Context<Self>) {
+        let config = fern_core::sync::SyncConfig {
+            server: self.sync_server.read(cx).text().to_owned(),
+            token: self.sync_token.read(cx).text().to_owned(),
+        };
+        if let Err(err) = self.store.set_sync_config(&config) {
+            eprintln!("failed to save the sync settings: {err:#}");
+        }
     }
 
     pub fn set_page(&mut self, page: Page, cx: &mut Context<Self>) {
@@ -202,6 +238,7 @@ impl SettingsWindow {
             "appearance" => Page::Appearance,
             "more" => Page::More,
             "about" => Page::About,
+            "sync" => Page::Sync,
             _ => Page::DateTime,
         };
         self.menu = match menu {
@@ -342,6 +379,10 @@ impl SettingsWindow {
             .child(page("settings-date-time", IconName::Clock, 1, Page::DateTime))
             .child(page("settings-appearance", IconName::PaintRoller, 2, Page::Appearance))
             .child(page("settings-more", IconName::ToggleRight, 3, Page::More))
+            .child(
+                item("settings-sync", IconName::RefreshCw, strings.sync, self.page == Page::Sync)
+                    .on_click(cx.listener(|this, _, _, cx| this.set_page(Page::Sync, cx))),
+            )
             .child(div().h(px(12.)))
             .child(
                 item("settings-shortcuts", IconName::Keyboard, strings.settings_pages[4], false)
@@ -774,6 +815,34 @@ impl SettingsWindow {
                     )
                 })
                 .into_any_element()
+            }
+            Page::Sync => {
+                let field = |label: &'static str, input: Entity<crate::text_input::TextInput>| {
+                    h_flex()
+                        .h(px(40.))
+                        .px_4()
+                        .gap_4()
+                        .child(div().w(px(80.)).child(Label::new(label)))
+                        .child(
+                            div()
+                                .flex_1()
+                                .h(px(28.))
+                                .px_2()
+                                .flex()
+                                .items_center()
+                                .rounded(px(6.))
+                                .bg(colors.background)
+                                .child(input),
+                        )
+                };
+                body.child(title(strings.sync))
+                    .child(
+                        group()
+                            .child(field(strings.sync_server, self.sync_server.clone()))
+                            .child(field(strings.sync_token, self.sync_token.clone())),
+                    )
+                    .child(div().pt_2().px_1().text_size(px(12.)).text_color(colors.text_muted).child(strings.sync_hint))
+                    .into_any_element()
             }
             Page::About => {
                 let row = |label: &'static str, value: &'static str| {

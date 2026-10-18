@@ -101,6 +101,38 @@ impl Server {
     }
 }
 
+/// Requests larger than this are refused.
+const MAX_BODY: usize = 32 * 1024 * 1024;
+
+/// Answers sync requests on `http` until it closes: `POST /sync` with the bearer `token`.
+pub fn serve(http: &tiny_http::Server, mut server: Server, token: &str) {
+    use std::io::Read as _;
+    use tiny_http::{Header, Method, Response};
+    for mut request in http.incoming_requests() {
+        let auth = request.headers().iter().find(|h| h.field.equiv("Authorization")).map(|h| h.value.as_str().to_owned());
+        let (status, body) = if request.method() != &Method::Post || request.url() != "/sync" {
+            (404, r#"{"error":"not found"}"#.to_owned())
+        } else if !authorized(auth.as_deref(), token) {
+            (401, r#"{"error":"unauthorized"}"#.to_owned())
+        } else {
+            let mut text = String::new();
+            let read = request.as_reader().take(MAX_BODY as u64 + 1).read_to_string(&mut text);
+            match read {
+                Ok(n) if n > MAX_BODY => (413, r#"{"error":"too large"}"#.to_owned()),
+                Ok(_) => match serde_json::from_str(&text).map_err(anyhow::Error::from).and_then(|req| server.sync(&req)) {
+                    Ok(answer) => (200, answer.to_string()),
+                    Err(err) => (400, json!({ "error": format!("{err:#}") }).to_string()),
+                },
+                Err(err) => (400, json!({ "error": err.to_string() }).to_string()),
+            }
+        };
+        let header = Header::from_bytes("Content-Type", "application/json").expect("a valid header");
+        if let Err(err) = request.respond(Response::from_string(body).with_status_code(status).with_header(header)) {
+            eprintln!("failed to answer: {err}");
+        }
+    }
+}
+
 /// Compares a request's `Authorization` header with the token, in constant time.
 pub fn authorized(header: Option<&str>, token: &str) -> bool {
     let Some(given) = header.and_then(|h| h.strip_prefix("Bearer ")) else { return false };
@@ -110,24 +142,14 @@ pub fn authorized(header: Option<&str>, token: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use fern_core::Store;
-    use fern_core::sync::Change;
 
     use super::*;
 
-    /// A device's sync through the server, as the app will do it.
-    fn sync(server: &mut Server, store: &Store, device: &str, sent: &mut i64, seen: &mut i64) {
-        let (changes, position) = store.changes_since(*sent).unwrap();
-        let request = json!({
-            "device": device,
-            "since": *seen,
-            "changes": changes.iter().map(Change::to_json).collect::<Vec<_>>(),
-        });
-        let answer = server.sync(&request).unwrap();
-        let received: Vec<Change> =
-            answer["changes"].as_array().unwrap().iter().map(|c| Change::from_json(c).unwrap()).collect();
-        store.apply_changes(&received).unwrap();
-        *sent = position;
-        *seen = answer["position"].as_i64().unwrap();
+    /// A device's sync through the server, the way the app does it.
+    fn sync(server: &mut Server, store: &Store) {
+        let request = store.sync_request().unwrap();
+        let answer = server.sync(&request.body).unwrap();
+        store.finish_sync(&request, &answer).unwrap();
     }
 
     #[test]
@@ -135,20 +157,19 @@ mod tests {
         let mut server = Server::open_in_memory().unwrap();
         let laptop = Store::open_in_memory().unwrap();
         let phone = Store::open_in_memory().unwrap();
-        let (mut laptop_sent, mut laptop_seen, mut phone_sent, mut phone_seen) = (0, 0, 0, 0);
 
         let task = laptop.add_task("Call the bank").unwrap();
-        sync(&mut server, &laptop, "laptop", &mut laptop_sent, &mut laptop_seen);
-        sync(&mut server, &phone, "phone", &mut phone_sent, &mut phone_seen);
+        sync(&mut server, &laptop);
+        sync(&mut server, &phone);
         assert_eq!(phone.task(task.id).unwrap().unwrap().title, "Call the bank");
 
         phone.set_completed(task.id, true).unwrap();
-        sync(&mut server, &phone, "phone", &mut phone_sent, &mut phone_seen);
-        sync(&mut server, &laptop, "laptop", &mut laptop_sent, &mut laptop_seen);
+        sync(&mut server, &phone);
+        sync(&mut server, &laptop);
         assert!(laptop.task(task.id).unwrap().unwrap().is_completed());
 
         // Nothing new: nothing comes back, and a device never gets its own changes.
-        let answer = server.sync(&json!({ "device": "laptop", "since": laptop_seen })).unwrap();
+        let answer = server.sync(&laptop.sync_request().unwrap().body).unwrap();
         assert!(answer["changes"].as_array().unwrap().is_empty());
     }
 

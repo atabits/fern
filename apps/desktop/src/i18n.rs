@@ -85,6 +85,7 @@ pub struct Strings {
     pub habit_unit_days: &'static str,
     pub habit_select: &'static str,
     pub habit_monthly_completion: &'static str,
+    pub habit_daily_goals: &'static str,
     pub habit_total_completion: &'static str,
     /// "Habit Log on October" / "Журнал: октябрь"; the month name follows.
     pub habit_log_on: &'static str,
@@ -268,6 +269,7 @@ pub static EN: Strings = Strings {
     habit_unit_days: "Days",
     habit_select: "Click a habit to see its statistics",
     habit_monthly_completion: "Monthly completion",
+    habit_daily_goals: "Daily Goals",
     habit_total_completion: "Total completion",
     habit_log_on: "Habit Log on ",
     habit_log_empty: "No check-in thoughts to share this month yet",
@@ -439,6 +441,7 @@ pub static RU: Strings = Strings {
     habit_unit_days: "дн.",
     habit_select: "Выберите привычку, чтобы увидеть статистику",
     habit_monthly_completion: "Выполнено за месяц",
+    habit_daily_goals: "Дневные цели",
     habit_total_completion: "Выполнено всего",
     habit_log_on: "Журнал: ",
     habit_log_empty: "В этом месяце заметок к отметкам пока нет",

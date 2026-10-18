@@ -735,6 +735,40 @@ impl Store {
         Ok(removed == 0)
     }
 
+    /// One more unit towards a habit's daily goal (TickTick's check-in with an amount). A day that
+    /// already reached the goal starts over from nothing. Returns the new amount.
+    pub fn step_checkin(&self, habit: Id, date: NaiveDate) -> Result<u32> {
+        let date = date.format(DATE_FORMAT).to_string();
+        let goal: u32 = self.conn.query_row(
+            "SELECT COALESCE(goal_amount, 1) FROM habits WHERE id = ?1",
+            [habit.to_string()],
+            |row| row.get(0),
+        )?;
+        let current: u32 = self
+            .conn
+            .query_row(
+                "SELECT value FROM habit_checkins WHERE habit_id = ?1 AND date = ?2",
+                params![habit.to_string(), date],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+        let next = if current >= goal { 0 } else { current + 1 };
+        if next == 0 {
+            self.conn.execute(
+                "DELETE FROM habit_checkins WHERE habit_id = ?1 AND date = ?2",
+                params![habit.to_string(), date],
+            )?;
+        } else {
+            self.conn.execute(
+                "INSERT INTO habit_checkins (habit_id, date, value) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(habit_id, date) DO UPDATE SET value = excluded.value",
+                params![habit.to_string(), date, next],
+            )?;
+        }
+        Ok(next)
+    }
+
     /// Writes the note of an existing check-in; an empty note removes it.
     pub fn set_checkin_note(&self, habit: Id, date: NaiveDate, note: &str) -> Result<()> {
         let note = note.trim();
@@ -746,9 +780,10 @@ impl Store {
         Ok(())
     }
 
-    /// All check-in dates of a habit.
+    /// The days a habit was completed: checked in, and with a goal, the goal reached.
     pub fn checkins(&self, habit: Id) -> Result<std::collections::HashSet<NaiveDate>> {
-        Ok(self.checkin_records(habit)?.into_iter().map(|c| c.date).collect())
+        let goal = self.habits()?.into_iter().find(|h| h.id == habit).and_then(|h| h.goal).map_or(1, |g| g.amount);
+        Ok(self.checkin_records(habit)?.into_iter().filter(|c| c.value >= goal).map(|c| c.date).collect())
     }
 
     /// A habit's check-ins with their amounts and notes, oldest first.
@@ -1333,6 +1368,17 @@ mod tests {
         store.set_checkin_note(water.id, d(2026, 10, 18), " Felt great ")?;
         let records = store.checkin_records(water.id)?;
         assert_eq!(records, [Checkin { date: d(2026, 10, 18), value: 8, note: Some("Felt great".into()) }]);
+
+        // Partial amounts count towards the goal but do not complete the day.
+        let day = d(2026, 10, 17);
+        assert_eq!(store.step_checkin(water.id, day)?, 1);
+        assert_eq!(store.step_checkin(water.id, day)?, 2);
+        assert_eq!(store.checkins(water.id)?, [d(2026, 10, 18)].into());
+        for _ in 2..8 {
+            store.step_checkin(water.id, day)?;
+        }
+        assert_eq!(store.checkins(water.id)?, [d(2026, 10, 17), d(2026, 10, 18)].into());
+        assert_eq!(store.step_checkin(water.id, day)?, 0, "a completed day starts over");
 
         store.update_habit(water.id, "Drink water", None)?;
         assert_eq!(store.habits()?[0].goal, None);

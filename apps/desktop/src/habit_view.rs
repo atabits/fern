@@ -79,8 +79,7 @@ impl HabitView {
         self.habits = self.store.habits().unwrap_or_default();
         self.records =
             self.habits.iter().map(|h| (h.id, self.store.checkin_records(h.id).unwrap_or_default())).collect();
-        self.checkins =
-            self.records.iter().map(|(id, records)| (*id, records.iter().map(|c| c.date).collect())).collect();
+        self.checkins = self.habits.iter().map(|h| (h.id, self.store.checkins(h.id).unwrap_or_default())).collect();
         if self.selected.is_some_and(|id| !self.habits.iter().any(|h| h.id == id)) {
             self.selected = None;
         }
@@ -233,6 +232,13 @@ impl HabitView {
             let (days_ago, note) = note.split_once('>').unwrap_or(("0", note));
             let date = Local::now().date_naive() - chrono::Duration::days(days_ago.parse().unwrap_or(0));
             self.store.set_checkin_note(id, date, note).ok();
+        } else if let Some(step) = command.strip_prefix("step=") {
+            // `step=<days ago>x<times>`: check in an amount, one unit at a time.
+            let (ago, times) = step.split_once('x').unwrap_or((step, "1"));
+            let date = Local::now().date_naive() - chrono::Duration::days(ago.parse().unwrap_or(0));
+            for _ in 0..times.parse().unwrap_or(1) {
+                self.store.step_checkin(id, date).ok();
+            }
         } else if command == "edit" {
             self.reload(cx);
             self.start_edit(window, cx);
@@ -248,11 +254,92 @@ impl HabitView {
         }
     }
 
+    /// A click on a check-in dot: toggles the day, or for a habit with an amount goal adds one
+    /// unit (a completed day starts over).
     fn toggle(&mut self, habit: Id, date: NaiveDate, cx: &mut Context<Self>) {
-        if let Err(err) = self.store.toggle_checkin(habit, date) {
+        let has_goal = self.habits.iter().any(|h| h.id == habit && h.goal.is_some());
+        let result =
+            if has_goal { self.store.step_checkin(habit, date).map(|_| ()) } else { self.store.toggle_checkin(habit, date).map(|_| ()) };
+        if let Err(err) = result {
             eprintln!("failed to check in: {err:#}");
         }
         self.reload(cx);
+    }
+
+    /// The amount checked in on a day.
+    fn amount(&self, habit: Id, date: NaiveDate) -> u32 {
+        self.records.get(&habit).and_then(|r| r.iter().find(|c| c.date == date)).map_or(0, |c| c.value)
+    }
+
+    /// A check-in dot: filled when the day is done, lighter for a partial amount.
+    fn dot_color(&self, habit: Id, date: NaiveDate, cx: &App) -> Hsla {
+        let colors = cx.theme().colors();
+        if self.checkins.get(&habit).is_some_and(|c| c.contains(&date)) {
+            colors.accent
+        } else if self.amount(habit, date) > 0 {
+            colors.accent.opacity(0.4)
+        } else {
+            colors.element_hover
+        }
+    }
+
+    /// TickTick's "Daily Goals" chart: the amount per day over the last days, with the goal line.
+    fn render_goal_chart(&self, habit: &Habit, goal: u32, today: NaiveDate, cx: &App) -> AnyElement {
+        const DAYS: i64 = 11;
+        const HEIGHT: f32 = 110.;
+        let strings = i18n::t(cx);
+        let colors = cx.theme().colors();
+        let days: Vec<(NaiveDate, u32)> = (0..DAYS)
+            .rev()
+            .map(|ago| today - chrono::Duration::days(ago))
+            .map(|date| (date, self.amount(habit.id, date)))
+            .collect();
+        let top = days.iter().map(|(_, v)| *v).max().unwrap_or(0).max(goal).max(1) as f32;
+        let unit = habit.goal.as_ref().map(|g| g.unit.clone()).unwrap_or_default();
+        v_flex()
+            .p_3()
+            .gap_2()
+            .rounded(px(8.))
+            .bg(colors.surface_background)
+            .child(
+                h_flex()
+                    .gap_1()
+                    .child(Label::new(strings.habit_daily_goals).weight(FontWeight::SEMIBOLD))
+                    .when(!unit.is_empty(), |el| el.child(Label::new(format!("({unit})")).size(LabelSize::Small).color(Color::Muted))),
+            )
+            .child(
+                div()
+                    .relative()
+                    .h(px(HEIGHT))
+                    .child(
+                        h_flex().absolute().inset_0().items_end().gap_1().children(days.iter().map(|(date, value)| {
+                            let done = *value >= goal;
+                            div()
+                                .flex_1()
+                                .h(px(HEIGHT * *value as f32 / top))
+                                .rounded_t(px(3.))
+                                .bg(if done { colors.accent } else { colors.accent.opacity(0.4) })
+                                .when(*date == today, |el| el.border_1().border_color(colors.text_muted))
+                        })),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .left_0()
+                            .right_0()
+                            .bottom(px(HEIGHT * goal as f32 / top))
+                            .h(px(1.))
+                            .bg(colors.accent),
+                    ),
+            )
+            .child(h_flex().gap_1().children(days.iter().map(|(date, _)| {
+                div().flex_1().flex().justify_center().child(
+                    Label::new(date.day().to_string())
+                        .size(LabelSize::XSmall)
+                        .color(if *date == today { Color::Accent } else { Color::Muted }),
+                )
+            })))
+            .into_any_element()
     }
 
     fn delete(&mut self, habit: Id, cx: &mut Context<Self>) {
@@ -374,13 +461,12 @@ impl HabitView {
                     ),
             )
             .child(h_flex().justify_between().px_1().children(week.map(|date| {
-                let done = checked.contains(&date);
                 div()
                     .id(SharedString::from(format!("checkin-{id}-{date}")))
                     .size(px(16.))
                     .rounded_full()
                     .cursor_pointer()
-                    .bg(if done { theme.colors().accent } else { theme.colors().element_hover })
+                    .bg(self.dot_color(id, date, cx))
                     .when(date > today, |el| el.opacity(0.4))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
@@ -444,7 +530,7 @@ impl HabitView {
                 h_flex()
                     .children(week.iter().map(|&date| {
                         let in_month = date.month() == self.month.month();
-                        let done = checked.contains(&date);
+                        let dot = self.dot_color(id, date, cx);
                         let future = date > today;
                         v_flex()
                             .flex_1()
@@ -462,7 +548,7 @@ impl HabitView {
                                     .id(SharedString::from(format!("detail-checkin-{date}")))
                                     .size(px(26.))
                                     .rounded_full()
-                                    .bg(if done { theme.colors().accent } else { theme.colors().element_hover })
+                                    .bg(dot)
                                     .when(!future, |el| {
                                         el.cursor_pointer()
                                             .on_click(cx.listener(move |this, _, _, cx| this.toggle(id, date, cx)))
@@ -588,6 +674,7 @@ impl HabitView {
                     .child(weekdays)
                     .children(grid),
             )
+            .when_some(habit.goal.as_ref().map(|g| g.amount), |el, goal| el.child(self.render_goal_chart(habit, goal, today, cx)))
             .child(
                 v_flex()
                     .p_3()

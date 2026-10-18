@@ -2,8 +2,9 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 /// The room the original keeps at the top of its window for the title bar's buttons: every
-/// column starts this far down.
-pub const TOP_INSET: f32 = 13.;
+/// column starts this far down. On Windows it is the app's own title bar, as tall as the
+/// caption buttons (see `title_bar`).
+pub const TOP_INSET: f32 = if title_bar::INTEGRATED { 32. } else { 13. };
 
 mod actions;
 mod app_view;
@@ -37,6 +38,7 @@ mod task_detail;
 mod task_menu;
 mod task_rows;
 mod text_input;
+mod title_bar;
 mod undo;
 mod todo_view;
 
@@ -140,7 +142,12 @@ fn main() -> Result<()> {
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
-                titlebar: Some(TitlebarOptions { title: Some("Fern".into()), ..Default::default() }),
+                // On Windows the app draws its own title bar (`title_bar`).
+                titlebar: Some(TitlebarOptions {
+                    title: Some("Fern".into()),
+                    appears_transparent: title_bar::INTEGRATED,
+                    ..Default::default()
+                }),
                 // Overridable so that window-manager rules can target dev builds (used for UI screenshots).
                 app_id: Some(std::env::var("FERN_APP_ID").unwrap_or_else(|_| "fern-tasks".into())),
                 window_min_size: Some(size(px(900.), px(400.))),

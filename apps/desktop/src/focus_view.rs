@@ -1789,7 +1789,7 @@ impl FocusView {
             .max_w(px(1024.))
             .px_8()
             // The original's header sits lower, with the window's top room above it.
-            .pt(px(32.))
+            .pt(px(19. + crate::TOP_INSET))
             .pb_5()
             .gap_4()
             .child(

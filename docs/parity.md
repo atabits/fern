@@ -92,6 +92,8 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 
 ## Next
 
-1. Sync between devices: the self-hosted backend (see docs/architecture.md).
+1. Backup: include attachments in "Generate Backup" and restore them.
+2. Add field's date picker: Time, Reminder and Repeat as in the task's date popover.
+3. Sync between devices: the self-hosted backend (see docs/architecture.md).
 
 Not checkable under the reference rules: whether the original asks for a note when a focus session ends (finding out means running a focus timer in the reference account). Fern's record dialog takes a note afterwards.

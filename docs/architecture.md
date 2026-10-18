@@ -16,6 +16,22 @@ apps/
   desktop/         the desktop app: views (entities), i18n, the text input, main()
 ```
 
+## Sync
+
+Devices sync through a self-hosted server, row by row (`crates/core/src/sync.rs`):
+
+- Triggers log every write to synced data in `sync_log` (table, row key, time), so every write
+  path counts. Rows that existed before the log was added count as changed at time 0.
+- A device sends `changes_since(position)`: each changed row once, as it is now, or as deleted.
+- A device applies what it receives with `apply_changes`: the later change of a row wins, rows
+  may arrive in any order (foreign keys are checked at commit), and applied changes are not
+  logged again, so they do not bounce back. Only the synced tables and plain column names are
+  accepted from outside.
+- The server keeps the latest change of every row with its own sequence number and hands a
+  device the changes after the number it last saw. It is still to be written (`apps/server`).
+
+Not synced: settings, task activity, habit snoozes, attachments' files.
+
 ## Conventions
 
 - Views are GPUI entities implementing `Render`; they talk through `EventEmitter` events and

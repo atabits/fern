@@ -16,6 +16,7 @@ pub mod reminder;
 pub mod stats;
 pub mod store;
 pub mod summary;
+pub mod sync;
 
 pub use countdown::{Countdown, CountdownKind, Span, span};
 pub use filter::{DateRule, SmartFilter};

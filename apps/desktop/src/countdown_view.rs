@@ -52,6 +52,9 @@ struct Draft {
 enum DraftRow {
     Icon,
     Date,
+    Month,
+    Day,
+    Year,
     Reminder,
     Repeat,
     Type,
@@ -238,6 +241,7 @@ impl CountdownView {
         if let Some(draft) = self.draft.as_mut() {
             draft.open = Some(match row {
                 "calc" => DraftRow::CalcMode,
+                "month" => DraftRow::Month,
                 "show" => DraftRow::Show,
                 _ => DraftRow::Reminder,
             });
@@ -615,6 +619,39 @@ impl CountdownView {
             )
             .into_any_element();
 
+        // The original's countdown date: month, day and year fields, each a list.
+        use fern_core::countdown::{DatePart, days_in_month, with_date_part};
+        let part_list = |id: &'static str, items: Vec<(String, DatePart, bool)>| {
+            v_flex()
+                .id(id)
+                .max_h(px(280.))
+                .overflow_y_scroll()
+                .children(items.into_iter().enumerate().map(|(i, (label, part, on))| {
+                    ListItem::new((id, i))
+                        .height(px(34.))
+                        .child(Label::new(label).color(if on { Color::Accent } else { Color::Default }))
+                        .when(on, |item| item.end_slot(Icon::new(IconName::Check).size(IconSize::XSmall).color(Color::Accent)))
+                        .on_click(set(Box::new(move |d| {
+                            d.date = with_date_part(d.date, part);
+                            d.month = calendar::month_start(d.date);
+                            d.open = None;
+                        })))
+                }))
+                .into_any_element()
+        };
+        let month_menu = part_list(
+            "countdown-months",
+            (1..=12).map(|m| (strings.months_short[m as usize - 1].to_owned(), DatePart::Month(m), m == selected.month())).collect(),
+        );
+        let day_menu = part_list(
+            "countdown-days",
+            (1..=days_in_month(selected.year(), selected.month())).map(|d| (d.to_string(), DatePart::Day(d), d == selected.day())).collect(),
+        );
+        let year_menu = part_list(
+            "countdown-years",
+            (today.year() - 100..=today.year() + 50).rev().map(|y| (y.to_string(), DatePart::Year(y), y == selected.year())).collect(),
+        );
+
         // Day Calculation Mode: the original's two choices, each with its explanation.
         let plus_one = draft.plus_one_day;
         let calc_text = strings.countdown_calc_options[plus_one as usize].0.to_owned();
@@ -689,7 +726,7 @@ impl CountdownView {
             })))
             .into_any_element();
 
-        let dropdown = |which: DraftRow, text: String, menu: AnyElement, cx: &Context<Self>| -> AnyElement {
+        let dropdown_w = |which: DraftRow, text: String, menu: AnyElement, width: f32, cx: &Context<Self>| -> AnyElement {
             let on = open == Some(which);
             div()
                 .relative()
@@ -715,7 +752,7 @@ impl CountdownView {
                     el.child(PopoverAttachment::new(
                         Placement::BelowLeft,
                         popover(cx)
-                            .w(px(294.))
+                            .w(px(width))
                             .p_2()
                             .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                                 if let Some(draft) = this.draft.as_mut() {
@@ -728,6 +765,7 @@ impl CountdownView {
                 })
                 .into_any_element()
         };
+        let dropdown = |which: DraftRow, text: String, menu: AnyElement, cx: &Context<Self>| dropdown_w(which, text, menu, 294., cx);
         let row = |label: &'static str, content: AnyElement| {
             h_flex()
                 .min_h(px(32.))
@@ -735,7 +773,21 @@ impl CountdownView {
                 .child(div().w(px(80.)).flex_none().child(Label::new(label)))
                 .child(div().flex_1().min_w_0().child(content))
         };
-        let date_row = row(strings.filter_date, dropdown(DraftRow::Date, format_date(selected, strings), date_menu, cx));
+        // A birthday picks its date from a month, as the original's "Select Date"; the others
+        // take month, day and year fields.
+        let date_row = if kind == CountdownKind::Birthday {
+            row(strings.filter_date, dropdown(DraftRow::Date, format_date(selected, strings), date_menu, cx))
+        } else {
+            row(
+                strings.filter_date,
+                h_flex()
+                    .gap_2()
+                    .child(div().flex_1().child(dropdown_w(DraftRow::Month, strings.months_short[selected.month0() as usize].to_owned(), month_menu, 110., cx)))
+                    .child(div().flex_1().child(dropdown_w(DraftRow::Day, selected.day().to_string(), day_menu, 110., cx)))
+                    .child(div().flex_1().child(dropdown_w(DraftRow::Year, selected.year().to_string(), year_menu, 110., cx)))
+                    .into_any_element(),
+            )
+        };
         let reminder_row = row(strings.reminder, dropdown(DraftRow::Reminder, reminder_text, reminder_menu, cx));
         let repeat_row = row(strings.repeat, dropdown(DraftRow::Repeat, repeat_text.to_owned(), repeat_menu, cx));
         let calc_row = row(strings.countdown_calc_mode, dropdown(DraftRow::CalcMode, calc_text, calc_menu, cx));

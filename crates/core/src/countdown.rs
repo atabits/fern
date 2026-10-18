@@ -185,6 +185,32 @@ pub fn reminders_between(countdowns: &[Countdown], after: chrono::NaiveDateTime,
     fired
 }
 
+/// A part of a date, as the original's month / day / year fields set it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DatePart {
+    Month(u32),
+    Day(u32),
+    Year(i32),
+}
+
+/// The date with one part changed; the day is kept within the month (Jan 31 → Feb 28).
+pub fn with_date_part(date: NaiveDate, part: DatePart) -> NaiveDate {
+    let (mut year, mut month, mut day) = (date.year(), date.month(), date.day());
+    match part {
+        DatePart::Month(m) => month = m.clamp(1, 12),
+        DatePart::Day(d) => day = d.max(1),
+        DatePart::Year(y) => year = y,
+    }
+    let last = days_in_month(year, month);
+    NaiveDate::from_ymd_opt(year, month, day.min(last)).unwrap_or(date)
+}
+
+/// The number of days in a month.
+pub fn days_in_month(year: i32, month: u32) -> u32 {
+    let first = NaiveDate::from_ymd_opt(year, month, 1).expect("a month has a first day");
+    (add_months(first, 1) - first).num_days() as u32
+}
+
 /// Reads stored reminder days ("0,3").
 pub fn parse_reminders(text: &str) -> Vec<u32> {
     text.split(',').filter_map(|d| d.trim().parse().ok()).collect()
@@ -248,6 +274,15 @@ mod tests {
     fn month_ends_do_not_overshoot() {
         // Jan 31 → Mar 1: one month (to Feb 28) and one day.
         assert_eq!(ymd(span(d(2026, 1, 31), d(2026, 3, 1))), (0, 1, 1, false));
+    }
+
+    #[test]
+    fn date_parts() {
+        assert_eq!(with_date_part(d(2026, 1, 31), DatePart::Month(2)), d(2026, 2, 28));
+        assert_eq!(with_date_part(d(2024, 2, 29), DatePart::Year(2025)), d(2025, 2, 28));
+        assert_eq!(with_date_part(d(2026, 10, 18), DatePart::Day(31)), d(2026, 10, 31));
+        assert_eq!(with_date_part(d(2026, 11, 18), DatePart::Day(31)), d(2026, 11, 30));
+        assert_eq!(days_in_month(2028, 2), 29);
     }
 
     #[test]

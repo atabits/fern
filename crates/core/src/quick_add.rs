@@ -27,6 +27,9 @@ pub struct ParsedTask {
     pub repeat: Option<Recurrence>,
     /// The list name as the user spelled it when creating the list.
     pub list: Option<String>,
+    /// Byte ranges of the recognized words in the input, neighbouring words joined, for
+    /// highlighting them as the user types ("tomorrow 9am", "#work").
+    pub spans: Vec<std::ops::Range<usize>>,
 }
 
 /// `lists` holds the names of existing lists; `^name` is recognized only for those.
@@ -109,6 +112,22 @@ pub fn parse_quick_add_with(input: &str, today: NaiveDate, lists: &[String], rec
     // A time without a date means today, as in TickTick.
     if parsed.due_time.is_some() && parsed.due_date.is_none() {
         parsed.due_date = Some(today);
+    }
+
+    // Recognized words are those marked used, and kept date words; tags kept in the title too.
+    let starts: Vec<usize> = words.iter().map(|w| w.as_ptr() as usize - input.as_ptr() as usize).collect();
+    let recognized = |i: usize| {
+        used[i] || dates_used[i] || (recognition.tags && words[i].len() > 1 && words[i].starts_with('#'))
+    };
+    for i in 0..words.len() {
+        if !recognized(i) {
+            continue;
+        }
+        let (start, end) = (starts[i], starts[i] + words[i].len());
+        match parsed.spans.last_mut() {
+            Some(last) if i > 0 && recognized(i - 1) && !words[i].starts_with('#') && !words[i - 1].starts_with('#') => last.end = end,
+            _ => parsed.spans.push(start..end),
+        }
     }
 
     parsed.title = words
@@ -441,6 +460,16 @@ mod tests {
         assert_eq!((p.title.as_str(), p.list.as_deref()), ("Report", Some("Work")));
         let p = parse_quick_add("Report ^garden", today(), &lists);
         assert_eq!((p.title.as_str(), p.list), ("Report ^garden", None));
+    }
+
+    #[test]
+    fn recognized_spans() {
+        let lists: [String; 0] = [];
+        let input = "Call mom tomorrow 9am #work";
+        let parsed = parse_quick_add(input, today(), &lists);
+        let spans: Vec<&str> = parsed.spans.iter().map(|r| &input[r.clone()]).collect();
+        assert_eq!(spans, ["tomorrow 9am", "#work"]);
+        assert!(parse_quick_add("just words", today(), &lists).spans.is_empty());
     }
 
     #[test]

@@ -81,6 +81,9 @@ pub struct TextInput {
     marked_range: Option<Range<usize>>,
     last_layout: Option<TextLayout>,
     is_selecting: bool,
+    /// Byte ranges shown in the accent color on a tinted background, such as the date and tags
+    /// quick add recognized.
+    highlights: Vec<Range<usize>>,
 }
 
 /// The layout from the last frame, used for mouse hit-testing, up/down arrows and IME.
@@ -157,6 +160,7 @@ impl TextInput {
             marked_range: None,
             last_layout: None,
             is_selecting: false,
+            highlights: Vec::new(),
         }
     }
 
@@ -172,12 +176,23 @@ impl TextInput {
         self.selection_reversed = false;
         self.marked_range = None;
         self.last_layout = None;
+        self.highlights.clear();
         cx.notify();
     }
 
     pub fn clear(&mut self, window: &Window, cx: &mut Context<Self>) {
         self.set_text("", cx);
         window.notify_text_input_changed(&self.focus_handle);
+    }
+
+    /// Marks ranges of the text (byte offsets) as recognized; out-of-range ones are ignored.
+    pub fn set_highlights(&mut self, ranges: Vec<Range<usize>>, cx: &mut Context<Self>) {
+        let len = self.content.len();
+        let ranges: Vec<Range<usize>> = ranges.into_iter().filter(|r| r.start < r.end && r.end <= len).collect();
+        if ranges != self.highlights {
+            self.highlights = ranges;
+            cx.notify();
+        }
     }
 
     pub fn set_placeholder(&mut self, placeholder: impl Into<SharedString>, cx: &mut Context<Self>) {
@@ -650,6 +665,8 @@ struct PrepaintState {
     layout: Option<TextLayout>,
     cursor: Option<PaintQuad>,
     selection: Vec<PaintQuad>,
+    /// Tinted backgrounds under the highlighted ranges.
+    highlights: Vec<PaintQuad>,
 }
 
 impl IntoElement for TextElement {
@@ -665,6 +682,7 @@ fn display_runs(
     input: &TextInput,
     window: &Window,
     placeholder_color: gpui::Hsla,
+    highlight_color: gpui::Hsla,
 ) -> (SharedString, Vec<TextRun>, bool) {
     let style = window.text_style();
     let is_placeholder = input.content.is_empty();
@@ -698,6 +716,22 @@ fn display_runs(
         .into_iter()
         .filter(|run| run.len > 0)
         .collect(),
+        // Highlighted ranges take the accent color.
+        _ if !is_placeholder && !input.highlights.is_empty() => {
+            let mut runs = Vec::new();
+            let mut at = 0;
+            for range in &input.highlights {
+                if range.start > at {
+                    runs.push(TextRun { len: range.start - at, ..run.clone() });
+                }
+                runs.push(TextRun { len: range.end - range.start, color: highlight_color, ..run.clone() });
+                at = range.end;
+            }
+            if at < text.len() {
+                runs.push(TextRun { len: text.len() - at, ..run.clone() });
+            }
+            runs
+        }
         _ => vec![run],
     };
     (text, runs, is_placeholder)
@@ -747,7 +781,7 @@ impl Element for TextElement {
         }
 
         // The height depends on the width, so it is measured during layout.
-        let (text, runs, _) = display_runs(input, window, placeholder_color);
+        let (text, runs, _) = display_runs(input, window, placeholder_color, cx.theme().colors().accent);
         let font_size = window.text_style().font_size.to_pixels(window.rem_size());
         let layout_id = window.request_measured_layout(style, move |known, available, window, _| {
             let width = known.width.or(match available.width {
@@ -777,7 +811,8 @@ impl Element for TextElement {
         let theme = cx.theme().clone();
         let input = self.input.read(cx);
         let line_height = window.line_height();
-        let (text, runs, is_placeholder) = display_runs(input, window, theme.colors().text_placeholder);
+        let (text, runs, is_placeholder) =
+            display_runs(input, window, theme.colors().text_placeholder, theme.colors().accent);
         let font_size = window.text_style().font_size.to_pixels(window.rem_size());
         let wrap_width = input.mode.wraps().then_some(bounds.size.width);
         let lines = shape(text, &runs, font_size, wrap_width, window);
@@ -827,7 +862,31 @@ impl Element for TextElement {
             }
         }
 
-        PrepaintState { layout: Some(layout), cursor, selection }
+        // A rounded tint under each highlighted range on one line, as the original shows them.
+        let highlights = if is_placeholder {
+            Vec::new()
+        } else {
+            input
+                .highlights
+                .iter()
+                .filter_map(|range| {
+                    let start = layout.position_for_offset(range.start);
+                    let end = layout.position_for_offset(range.end);
+                    (start.y == end.y).then(|| {
+                        fill(
+                            Bounds::from_corners(
+                                bounds.origin + point(start.x - px(3.), start.y + px(1.)),
+                                bounds.origin + point(end.x + px(3.), end.y + line_height - px(1.)),
+                            ),
+                            theme.colors().accent.opacity(0.18),
+                        )
+                        .corner_radii(px(4.))
+                    })
+                })
+                .collect()
+        };
+
+        PrepaintState { layout: Some(layout), cursor, selection, highlights }
     }
 
     fn paint(
@@ -846,6 +905,9 @@ impl Element for TextElement {
             ElementInputHandler::new(bounds, self.input.clone()),
             cx,
         );
+        for quad in prepaint.highlights.drain(..) {
+            window.paint_quad(quad);
+        }
         for quad in prepaint.selection.drain(..) {
             window.paint_quad(quad);
         }

@@ -98,6 +98,8 @@ pub struct TodoView {
     filters: Vec<(fern_core::SmartFilter, usize)>,
     /// Settings → Smart List, read on reload.
     preferences: fern_core::Preferences,
+    /// The date quick add recognized in the field so far, shown at its end.
+    quick_add_due: Option<(NaiveDate, Option<chrono::NaiveTime>)>,
     /// The mini calendar: expanded to a month, which month, and the days with open tasks.
     mini_expanded: bool,
     mini_month: NaiveDate,
@@ -132,10 +134,14 @@ impl TodoView {
             let result = this.add_task(text);
             if this.check(result).is_some() {
                 input.update(cx, |input, cx| input.clear(window, cx));
+                this.quick_add_due = None;
                 this.reload(cx);
             }
         })
         .detach();
+        // As the user types, the recognized date, tags and list are highlighted and the date is
+        // shown at the end of the field, as in the original.
+        cx.subscribe(&input, |this, _, _: &Changed, cx| this.update_quick_add_hint(cx)).detach();
         window.focus(&input.focus_handle(cx), cx);
         // Escape in the quick-add field hands the keyboard to the list.
         cx.subscribe_in(&input, window, |this, _, _: &Cancelled, window, cx| {
@@ -222,6 +228,7 @@ impl TodoView {
             list_activity: None,
             filters: Vec::new(),
             preferences: Default::default(),
+            quick_add_due: None,
             mini_expanded,
             mini_month: crate::calendar::month_start(Self::today()),
             busy_days: HashSet::new(),
@@ -257,6 +264,11 @@ impl TodoView {
                 Some(("view", "wontdo")) => self.set_view(View::WontDo, cx),
                 Some(("view", "today")) => self.set_view(View::Today, cx),
                 Some(("view", "summary")) => self.set_view(View::Summary, cx),
+                // `type=<text>`: text in the quick-add field, as if typed (not added).
+                Some(("type", text)) => {
+                    self.input.update(cx, |input, cx| input.set_text(text.to_owned(), cx));
+                    self.update_quick_add_hint(cx);
+                }
                 // `mini=month`: the mini calendar expanded to the month.
                 Some(("mini", "month")) => self.mini_expanded = true,
                 // `view=day+N`: the mini calendar's day N days from today.
@@ -665,6 +677,17 @@ impl TodoView {
             self.store.set_list(task.id, Some(list))?;
         }
         Ok(task)
+    }
+
+    /// Highlights what quick add recognizes in the field and shows the recognized date.
+    fn update_quick_add_hint(&mut self, cx: &mut Context<Self>) {
+        let text = self.input.read(cx).text().to_owned();
+        let list_names: Vec<String> = self.lists.iter().map(|l| l.name.clone()).collect();
+        let parsed = fern_core::parse_quick_add_with(&text, Self::today(), &list_names, self.preferences.recognition);
+        let spans = parsed.spans.clone();
+        self.input.update(cx, |input, cx| input.set_highlights(spans, cx));
+        self.quick_add_due = parsed.due_date.map(|date| (date, parsed.due_time));
+        cx.notify();
     }
 
     /// Focuses the quick-add field.
@@ -2752,7 +2775,15 @@ impl Render for TodoView {
                         window.focus(&input_focus, cx);
                     })
                     .child(Icon::new(IconName::Plus))
-                    .child(div().flex_1().child(self.input.clone()))
+                    .child(div().flex_1().min_w_0().child(self.input.clone()))
+                    .children(self.quick_add_due.map(|(date, time)| {
+                        let (label, _) = task_rows::due_label(date, time, Self::today(), strings);
+                        h_flex()
+                            .flex_none()
+                            .gap_1()
+                            .child(Icon::new(IconName::CalendarDays).size(IconSize::Small).color(Color::Accent))
+                            .child(Label::new(label).size(LabelSize::Small).color(Color::Accent))
+                    }))
                     .child(
                         div()
                             .relative()

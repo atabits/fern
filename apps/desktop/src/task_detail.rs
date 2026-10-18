@@ -6,7 +6,7 @@ use fern_core::{ChecklistItem, Frequency, Id, Kind, List, Priority, Recurrence, 
 use chrono::{Datelike, Local, NaiveDate, TimeZone as _};
 use gpui::{Entity, EventEmitter, Focusable, FontWeight, MouseButton, Subscription};
 use ui::prelude::*;
-use ui::{Placement, PopoverAttachment, popover};
+use ui::{Placement, PopoverAttachment, SubmenuItem, popover};
 
 use crate::calendar;
 use crate::due_picker::{self, CustomReminder, DueDraft, DueMenu, DueTab, RangeField, ReminderUnit};
@@ -28,6 +28,8 @@ enum Popup {
 
 pub struct TaskDetail {
     store: Rc<Store>,
+    /// The "…" menu's Start Focus side menu, while hovered open.
+    focus_submenu: bool,
     task: Option<Task>,
     title: Entity<TextInput>,
     notes: Entity<TextInput>,
@@ -80,7 +82,7 @@ pub struct OpenTask(pub Id);
 pub struct Undoable(pub crate::undo::UndoAction, pub String);
 
 /// The user asked to focus on the task ("Start Focus").
-pub struct StartFocus(pub Id, pub String);
+pub struct StartFocus(pub Id, pub String, pub bool);
 
 impl EventEmitter<TaskUpdated> for TaskDetail {}
 impl EventEmitter<StartFocus> for TaskDetail {}
@@ -155,6 +157,7 @@ impl TaskDetail {
 
         Self {
             store,
+            focus_submenu: false,
             task: None,
             title,
             notes,
@@ -304,6 +307,7 @@ impl TaskDetail {
     }
 
     fn open_popup(&mut self, popup: Popup, cx: &mut Context<Self>) {
+        self.focus_submenu = false;
         match popup {
             Popup::Due => {
                 let today = Local::now().date_naive();
@@ -337,6 +341,12 @@ impl TaskDetail {
             "tags" => Popup::Tags,
             "list" => Popup::List,
             "more" => Popup::More,
+            // The "…" menu with its Start Focus side menu open.
+            "more-focus" => {
+                self.open_popup(Popup::More, cx);
+                self.focus_submenu = true;
+                return;
+            }
             "link-parent" => Popup::LinkParent,
             "checklist" => {
                 self.start_checklist(cx);
@@ -385,6 +395,7 @@ impl TaskDetail {
 
     fn close_popup(&mut self, cx: &mut Context<Self>) {
         self.popup = None;
+        self.focus_submenu = false;
         cx.notify();
     }
 
@@ -494,6 +505,16 @@ impl TaskDetail {
     }
 
     /// The panel's "…" menu, a subset of the original's: the entries Fern supports so far.
+    /// A "…" menu entry; hovering it closes the Start Focus side menu.
+    fn close_side_menu_on_hover(&self, item: ListItem, cx: &mut Context<Self>) -> impl IntoElement {
+        div().id(item.id()).child(item).on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+            if *hovered && this.focus_submenu {
+                this.focus_submenu = false;
+                cx.notify();
+            }
+        }))
+    }
+
     fn render_more_popup(&self, strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {
         let Some(task) = self.task.as_ref() else { return div().into_any_element() };
         let wont_do = task.is_wont_do();
@@ -504,69 +525,86 @@ impl TaskDetail {
         popover(cx)
             .w(px(220.))
             .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_popup(cx)))
-            .child(item("more-subtask", IconName::CornerDownRight, strings.add_subtask).on_click(cx.listener(
+            .child(self.close_side_menu_on_hover(item("more-subtask", IconName::CornerDownRight, strings.add_subtask).on_click(cx.listener(
                 |this, _, window, cx| {
                     this.close_popup(cx);
                     window.focus(&this.subtask_input.focus_handle(cx), cx);
                 },
-            )))
-            .child(item("more-link-parent", IconName::CornerDownRight, strings.link_parent).on_click(cx.listener(
+            )), cx))
+            .child(self.close_side_menu_on_hover(item("more-link-parent", IconName::CornerDownRight, strings.link_parent).on_click(cx.listener(
                 |this, _, window, cx| {
                     this.open_popup(Popup::LinkParent, cx);
                     window.focus(&this.link_search.focus_handle(cx), cx);
                 },
-            )))
-            .child({
+            )), cx))
+            .child(self.close_side_menu_on_hover({
                 let pinned = task.pinned_at.is_some();
                 item("more-pin", if pinned { IconName::PinOff } else { IconName::Pin }, if pinned { strings.unpin } else { strings.pin })
                     .on_click(cx.listener(move |this, _, _, cx| this.menu_action(cx, move |store, id| store.set_pinned(id, !pinned))))
-            })
-            .child(
+            }, cx))
+            .child(self.close_side_menu_on_hover(
                 item("more-wont-do", if wont_do { IconName::RotateCcw } else { IconName::SquareX }, if wont_do {
                     strings.reopen
                 } else {
                     strings.wont_do
                 })
                 .on_click(cx.listener(|this, _, _, cx| this.toggle_wont_do(cx))),
-            )
-            .child(item("more-tags", IconName::Tag, strings.tags).on_click(cx.listener(|this, _, _, cx| {
+            cx,
+            ))
+            .child(self.close_side_menu_on_hover(item("more-tags", IconName::Tag, strings.tags).on_click(cx.listener(|this, _, _, cx| {
                 this.open_popup(Popup::Tags, cx);
-            })))
+            })), cx))
+            .child(
+                SubmenuItem::new("more-focus", strings.start_focus)
+                    .icon(IconName::CircleDot)
+                    .open(self.focus_submenu)
+                    .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                        if *hovered && !this.focus_submenu {
+                            this.focus_submenu = true;
+                            cx.notify();
+                        }
+                    }))
+                    .items([(false, strings.start_pomo), (true, strings.start_stopwatch)].map(|(stopwatch, label)| {
+                        ListItem::new(SharedString::from(format!("more-focus-{stopwatch}")))
+                            .child(Label::new(label))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.close_popup(cx);
+                                if let Some(task) = this.task.as_ref() {
+                                    cx.emit(StartFocus(task.id, task.title.clone(), stopwatch));
+                                }
+                            }))
+                    })),
+            )
             .child(div().py_1().child(Divider::horizontal()))
-            .child(item("more-activities", IconName::ListTree, strings.task_activities).on_click(cx.listener(
+            .child(self.close_side_menu_on_hover(item("more-activities", IconName::ListTree, strings.task_activities).on_click(cx.listener(
                 |this, _, _, cx| {
                     this.close_popup(cx);
                     this.open_activity(cx);
                 },
-            )))
-            .child(item("more-focus", IconName::CircleDot, strings.start_focus).on_click(cx.listener(|this, _, _, cx| {
-                this.close_popup(cx);
-                if let Some(task) = this.task.as_ref() {
-                    cx.emit(StartFocus(task.id, task.title.clone()));
-                }
-            })))
-            .child(item("more-template", IconName::LayoutTemplate, strings.save_as_template).on_click(cx.listener(
+            )), cx))
+            .child(self.close_side_menu_on_hover(item("more-template", IconName::LayoutTemplate, strings.save_as_template).on_click(cx.listener(
                 |this, _, _, cx| this.menu_action(cx, |store, id| store.save_template(id).map(|_| ())),
-            )))
-            .child(item("more-copy-link", IconName::Link, strings.copy_link).on_click(cx.listener(|this, _, _, cx| {
+            )), cx))
+            .child(self.close_side_menu_on_hover(item("more-copy-link", IconName::Link, strings.copy_link).on_click(cx.listener(|this, _, _, cx| {
                 this.close_popup(cx);
                 if let Some(task) = this.task.as_ref() {
                     cx.write_to_clipboard(gpui::ClipboardItem::new_string(fern_core::link::task_link(task.id)));
                 }
-            })))
-            .child(item("more-duplicate", IconName::Copy, strings.duplicate).on_click(cx.listener(
+            })), cx))
+            .child(self.close_side_menu_on_hover(item("more-duplicate", IconName::Copy, strings.duplicate).on_click(cx.listener(
                 |this, _, _, cx| this.menu_action(cx, |store, id| store.duplicate_task(id).map(|_| ())),
-            )))
-            .child(
+            )), cx))
+            .child(self.close_side_menu_on_hover(
                 item(
                     "more-convert",
                     if is_note { IconName::SquareCheck } else { IconName::FileText },
                     if is_note { strings.convert_to_task } else { strings.convert_to_note },
                 )
                 .on_click(cx.listener(|this, _, _, cx| this.toggle_kind(cx))),
-            )
+            cx,
+            ))
             .child(div().py_1().child(Divider::horizontal()))
-            .child(item("more-print", IconName::Printer, strings.print).on_click(cx.listener(|this, _, _, cx| {
+            .child(self.close_side_menu_on_hover(item("more-print", IconName::Printer, strings.print).on_click(cx.listener(|this, _, _, cx| {
                 this.close_popup(cx);
                 if let Some(task) = this.task.clone() {
                     let checklist = this.store.checklist(task.id).unwrap_or_default();
@@ -575,15 +613,15 @@ impl TaskDetail {
                         eprintln!("failed to print: {err}");
                     }
                 }
-            })))
-            .child(item("more-delete", IconName::Trash, strings.delete).on_click(cx.listener(|this, _, _, cx| {
+            })), cx))
+            .child(self.close_side_menu_on_hover(item("more-delete", IconName::Trash, strings.delete).on_click(cx.listener(|this, _, _, cx| {
                 let task = this.task.as_ref().map(|t| (t.id, t.title.clone()));
                 this.menu_action(cx, |store, id| store.delete_task(id));
                 if let Some((id, title)) = task {
                     let label = i18n::t(cx).undo_deleted.replace("{title}", &title);
                     cx.emit(Undoable(crate::undo::UndoAction::Restore(id), label));
                 }
-            })))
+            })), cx))
             .into_any_element()
     }
 

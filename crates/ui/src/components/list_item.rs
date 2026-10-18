@@ -34,6 +34,10 @@ impl ListItem {
         }
     }
 
+    pub fn id(&self) -> ElementId {
+        self.id.clone()
+    }
+
     pub fn height(mut self, height: Pixels) -> Self {
         self.height = height;
         self

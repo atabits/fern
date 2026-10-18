@@ -55,10 +55,10 @@ impl AppView {
         })
         .detach();
         // "Start Focus" in a task's menu starts a Pomodoro for it in the Focus section.
-        cx.subscribe_in(&todo, window, |this, _, crate::task_detail::StartFocus(id, title), window, cx| {
-            let target = Some((*id, title.clone()));
+        cx.subscribe_in(&todo, window, |this, _, crate::task_detail::StartFocus(id, title, stopwatch), window, cx| {
+            let (target, stopwatch) = ((*id, title.clone()), *stopwatch);
             this.select(Section::Pomodoro, window, cx);
-            this.focus.update(cx, |focus, cx| focus.start(target, cx));
+            this.focus.update(cx, |focus, cx| focus.start_for(Some(target.0), target.1, stopwatch, cx));
         })
         .detach();
         let matrix = cx.new(|cx| MatrixView::new(store.clone(), cx));

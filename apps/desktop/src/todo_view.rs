@@ -179,7 +179,7 @@ impl TodoView {
         let detail = cx.new(|cx| TaskDetail::new(store.clone(), window, cx));
         cx.subscribe(&detail, |this, _, _: &TaskUpdated, cx| this.reload(cx)).detach();
         cx.subscribe(&detail, |this, _, OpenTask(id), cx| this.select(*id, cx)).detach();
-        cx.subscribe(&detail, |_, _, StartFocus(id, title), cx| cx.emit(StartFocus(*id, title.clone()))).detach();
+        cx.subscribe(&detail, |_, _, StartFocus(id, title, stopwatch), cx| cx.emit(StartFocus(*id, title.clone(), *stopwatch))).detach();
         cx.subscribe(&detail, |this, _, crate::task_detail::Undoable(action, label), cx| {
             this.offer_undo(*action, label.clone(), cx);
         })

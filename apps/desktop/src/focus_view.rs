@@ -227,6 +227,11 @@ impl FocusView {
 
     /// "Start Focus" on a habit: a Pomodoro or a stopwatch named after it, in that mode.
     pub fn start_named(&mut self, title: String, stopwatch: bool, cx: &mut Context<Self>) {
+        self.start_for(None, title, stopwatch, cx);
+    }
+
+    /// "Start Focus → Start Pomo / Start Stopwatch" for a task or a habit, in that mode.
+    pub fn start_for(&mut self, task: Option<Id>, title: String, stopwatch: bool, cx: &mut Context<Self>) {
         self.finish(cx);
         self.set_stopwatch_mode(stopwatch, cx);
         let timer = if stopwatch {
@@ -234,7 +239,7 @@ impl FocusView {
         } else {
             FocusTimer::start(now_ms(), self.minutes(POMO_SETTING) * 60_000)
         };
-        self.start_timer(Some((None, title)), None, timer, cx);
+        self.start_timer(Some((task, title)), None, timer, cx);
     }
 
     fn stopwatch_mode(&self) -> bool {

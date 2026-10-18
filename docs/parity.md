@@ -18,7 +18,7 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 | List header | ≈ 60 tall, sidebar toggle on the left, sort and "…" on the right |
 | Tag chip | ≈ 18 tall, fully rounded, tag color at ~30% as background, lighter tag color as text |
 | Due date / repeat in a row | accent blue, right-aligned |
-| Task details panel | top bar ≈ 48 with a 15 px box, bottom bar ≈ 44 with no line over it (matched to a screenshot) |
+| Task details panel | top bar ≈ 48 with a 15 px box, a short line and the date ("Due Date" when there is none), bottom bar ≈ 44 with no line over it (matched to a screenshot) |
 
 ## Data model
 
@@ -99,9 +99,9 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 
 Each item is a whole feature area, done in one pass (it may take several commits).
 
-1. Countdowns in Today: the original's countdown rows in Today (if the reference account shows any) against Fern's, in one pass.
-2. Detail pane's date button: the original's "Due Date" placeholder in the details' top bar for an undated task, matched, in one pass.
-3. Task row hover: the original's row hover and selection colours against Fern's at the current window size, in one pass.
-4. Search results page: "View more" opening the original's full results page and its layout, checked with a read-only query, in one pass.
+1. Task row hover: the original's row hover and selection colours against Fern's at the current window size, in one pass.
+2. Search results page: "View more" opening the original's full results page and its layout, checked with a read-only query, in one pass.
+3. Tag view header: a tag's view header and its "…" menu against the original's, in one pass.
+4. Calendar task card: the popover a calendar task opens in the original against Fern's, in one pass.
 
-Not checkable under the reference rules: the empty states of Today, Next 7 Days, All, the Inbox and the tags (none of them is empty in the reference account); the original's light theme (the reference account uses a theme with its own photo, which switching might not restore); a saved filter's view (the reference account has none); whether the original asks for a note when a focus session ends, and its white noise (the desktop original shows no sound choice on the focus page or in Focus Settings; it would only appear with a timer running in the reference account). Fern's record dialog takes a note afterwards.
+Not checkable under the reference rules: countdowns in Today (the reference account has none due today); the empty states of Today, Next 7 Days, All, the Inbox and the tags (none of them is empty in the reference account); the original's light theme (the reference account uses a theme with its own photo, which switching might not restore); a saved filter's view (the reference account has none); whether the original asks for a note when a focus session ends, and its white noise (the desktop original shows no sound choice on the focus page or in Focus Settings; it would only appear with a timer running in the reference account). Fern's record dialog takes a note afterwards.

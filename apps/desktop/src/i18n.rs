@@ -1175,7 +1175,7 @@ pub static EN: Strings = Strings {
 
     select_task: "Select a task to see its details",
     notes_placeholder: "Write something",
-    due_date: "Due date",
+    due_date: "Due Date",
     next_week: "Next week",
     time: "Time",
     no_time: "None",

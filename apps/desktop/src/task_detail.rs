@@ -2503,7 +2503,7 @@ impl Render for TaskDetail {
             // Top bar: checkbox | due date ……… priority
             .child(
                 h_flex()
-                    .gap_3()
+                    .gap_2()
                     .h(px(48.))
                     .px_5()
                     .border_b_1()
@@ -2517,7 +2517,8 @@ impl Render for TaskDetail {
                             .lines(!self.checklist.is_empty())
                             .on_click(cx.listener(|this, _, _, cx| this.toggle_completed(cx))),
                     )
-                    .child(Divider::vertical())
+                    // The original's short line between the box and the date.
+                    .child(div().w(px(1.)).h(px(14.)).bg(theme.colors().border))
                     .child(
                         label_button("due-date", IconName::CalendarDays, due_text, due_color, cx)
                             .when(repeats, |el| el.child(Icon::new(IconName::Repeat).size(IconSize::Small).color(due_color)))

@@ -92,5 +92,8 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 
 ## Next
 
+1. Settings: the original's Features page (turning the sidebar's sections on and off).
+2. Settings: the original's Notifications page (what of it applies to a desktop app).
+3. Timeline: the original's "Day" scale menu.
 
 Not checkable under the reference rules: whether the original asks for a note when a focus session ends (finding out means running a focus timer in the reference account). Fern's record dialog takes a note afterwards.

@@ -2,7 +2,9 @@
 
 use std::collections::HashSet;
 
-use chrono::{Datelike, Duration, NaiveDate};
+use std::collections::HashMap;
+
+use chrono::{Datelike, Duration, NaiveDate, NaiveDateTime, NaiveTime};
 
 use crate::model::Id;
 
@@ -12,6 +14,34 @@ pub struct Habit {
     pub name: String,
     /// "Reach a certain amount" per day; `None` is the original's "Achieve it all".
     pub goal: Option<Goal>,
+    /// Times of day to be reminded, earliest first.
+    pub reminders: Vec<NaiveTime>,
+}
+
+/// Habit reminders firing in `(after, until]`: every reminder time of every day, unless the habit
+/// is already done that day. `done` maps habits to their completed days.
+pub fn reminders_between<'a>(
+    habits: &'a [Habit],
+    done: &HashMap<crate::model::Id, HashSet<NaiveDate>>,
+    after: NaiveDateTime,
+    until: NaiveDateTime,
+) -> Vec<(&'a Habit, NaiveDateTime)> {
+    let mut fired = Vec::new();
+    for habit in habits {
+        let mut day = after.date();
+        while day <= until.date() {
+            let done_today = done.get(&habit.id).is_some_and(|days| days.contains(&day));
+            for time in &habit.reminders {
+                let at = day.and_time(*time);
+                if at > after && at <= until && !done_today {
+                    fired.push((habit, at));
+                }
+            }
+            day += Duration::days(1);
+        }
+    }
+    fired.sort_by_key(|(_, at)| *at);
+    fired
 }
 
 /// A daily amount to reach, e.g. 8 glasses.
@@ -105,6 +135,24 @@ mod tests {
         assert_eq!(stats(&checked, today), HabitStats { total_days: 3, streak: 1 });
         let checked: HashSet<_> = [d(10), d(15)].into();
         assert_eq!(stats(&checked, today).streak, 0);
+    }
+
+    #[test]
+    fn habit_reminders_skip_done_days() {
+        let at = |day, h| d(day).and_hms_opt(h, 0, 0).unwrap();
+        let habit = Habit {
+            id: uuid::Uuid::now_v7(),
+            name: "Read".into(),
+            goal: None,
+            reminders: vec![NaiveTime::from_hms_opt(9, 0, 0).unwrap(), NaiveTime::from_hms_opt(21, 0, 0).unwrap()],
+        };
+        let habits = [habit.clone()];
+        let mut done = HashMap::new();
+        let fired = reminders_between(&habits, &done, at(17, 8), at(18, 10));
+        let times: Vec<NaiveDateTime> = fired.iter().map(|(_, at)| *at).collect();
+        assert_eq!(times, [at(17, 9), at(17, 21), at(18, 9)]);
+        done.insert(habit.id, HashSet::from([d(17)]));
+        assert_eq!(reminders_between(&habits, &done, at(17, 8), at(18, 10)).len(), 1);
     }
 
     #[test]

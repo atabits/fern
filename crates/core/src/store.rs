@@ -123,6 +123,9 @@ const MIGRATIONS: &[&str] = &[
     "
     ALTER TABLE tasks ADD COLUMN reminders TEXT;
     ",
+    "
+    ALTER TABLE habits ADD COLUMN reminders TEXT;
+    ",
 ];
 
 const TASK_COLUMNS: &str = "id, parent_id, kind, title, notes, priority, due_date, due_time, \
@@ -677,11 +680,17 @@ impl Store {
 
     pub fn habits(&self) -> Result<Vec<Habit>> {
         let mut stmt =
-            self.conn.prepare("SELECT id, name, goal_amount, goal_unit FROM habits ORDER BY created_at, rowid")?;
+            self.conn.prepare("SELECT id, name, goal_amount, goal_unit, reminders FROM habits ORDER BY created_at, rowid")?;
         let habits = stmt
             .query_map([], |row| {
                 let goal = row.get::<_, Option<u32>>(2)?.map(|amount| Goal { amount, unit: row.get::<_, Option<String>>(3).ok().flatten().unwrap_or_default() });
-                Ok(Habit { id: parse_uuid(&row.get::<_, String>(0)?, 0)?, name: row.get(1)?, goal })
+                let reminders = row
+                    .get::<_, Option<String>>(4)?
+                    .map(|times| {
+                        times.split(',').filter_map(|t| NaiveTime::parse_from_str(t.trim(), TIME_FORMAT).ok()).collect()
+                    })
+                    .unwrap_or_default();
+                Ok(Habit { id: parse_uuid(&row.get::<_, String>(0)?, 0)?, name: row.get(1)?, goal, reminders })
             })?
             .collect::<Result<_, _>>()?;
         Ok(habits)
@@ -690,7 +699,7 @@ impl Store {
     pub fn add_habit(&self, name: &str) -> Result<Habit> {
         let name = name.trim();
         anyhow::ensure!(!name.is_empty(), "a habit needs a name");
-        let habit = Habit { id: Uuid::now_v7(), name: name.to_owned(), goal: None };
+        let habit = Habit { id: Uuid::now_v7(), name: name.to_owned(), goal: None, reminders: Vec::new() };
         self.conn.execute(
             "INSERT INTO habits (id, name, created_at) VALUES (?1, ?2, ?3)",
             params![habit.id.to_string(), habit.name, now_ms()],
@@ -704,6 +713,19 @@ impl Store {
     }
 
     /// Renames a habit and sets its daily goal (`None`: "Achieve it all").
+    /// Sets a habit's reminder times; they are kept sorted and without duplicates.
+    pub fn set_habit_reminders(&self, id: Id, times: &[NaiveTime]) -> Result<()> {
+        let mut times = times.to_vec();
+        times.sort();
+        times.dedup();
+        let text: Vec<String> = times.iter().map(|t| t.format(TIME_FORMAT).to_string()).collect();
+        self.conn.execute(
+            "UPDATE habits SET reminders = ?2 WHERE id = ?1",
+            params![id.to_string(), (!text.is_empty()).then(|| text.join(","))],
+        )?;
+        Ok(())
+    }
+
     pub fn update_habit(&self, id: Id, name: &str, goal: Option<&Goal>) -> Result<()> {
         let name = name.trim();
         anyhow::ensure!(!name.is_empty(), "a habit needs a name");
@@ -1382,6 +1404,12 @@ mod tests {
 
         store.update_habit(water.id, "Drink water", None)?;
         assert_eq!(store.habits()?[0].goal, None);
+
+        let t = |h| NaiveTime::from_hms_opt(h, 0, 0).unwrap();
+        store.set_habit_reminders(water.id, &[t(21), t(9), t(21)])?;
+        assert_eq!(store.habits()?[0].reminders, [t(9), t(21)]);
+        store.set_habit_reminders(water.id, &[])?;
+        assert!(store.habits()?[0].reminders.is_empty());
         Ok(())
     }
 

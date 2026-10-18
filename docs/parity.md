@@ -70,7 +70,7 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 | Calendar | 🟡 | month and week views matched to the original (week: all-day strip, time axis with folded night hours, timed tasks placed by time); view menu with Week/Month; tasks can be dragged between days; no Day, Year, Agenda or multi-day views |
 | Eisenhower Matrix | 🟡 | matched to the original: quadrants by priority (TickTick's default rules), grouped by list, drag a task to another quadrant to change its priority; no custom quadrant rules |
 | Countdown | 🟡 | matched to the original: filter tabs, card grid with Y/M/D or days-only (click the numbers), until/since colors, add with name, type and date, delete on hover; no background images, editing or repeating dates |
-| Habits | 🟡 | matched to the original: week strip with daily progress rings, cards with total days, streak and this week's check-ins (click a dot to check in), add; clicking a card opens the details panel: monthly check-ins, total check-ins, monthly rate and current streak cards, a month calendar to check in on past days, "Edit" and delete from its "…" menu. "Edit Habit" (a popover) sets the name and the goal: "Achieve it all" or "Reach a certain amount" per day with a unit; with a goal the panel adds monthly and total completion cards and a "Daily Goals" chart of the last 11 days (bars with the goal line; the original draws a line chart), and each click on a check-in dot adds one unit — partial days show a lighter dot, a completed day starts over. The habit log lists the month's check-in notes, with a field for today's note once checked in. No icons, frequency other than daily, typing an amount, sections, archive or reminders |
+| Habits | 🟡 | matched to the original: week strip with daily progress rings, cards with total days, streak and this week's check-ins (click a dot to check in), add; clicking a card opens the details panel: monthly check-ins, total check-ins, monthly rate and current streak cards, a month calendar to check in on past days, "Edit" and delete from its "…" menu. "Edit Habit" (a popover) sets the name, reminder times (fired daily as desktop notifications and in the bell unless the habit is already done that day) and the goal: "Achieve it all" or "Reach a certain amount" per day with a unit; with a goal the panel adds monthly and total completion cards and a "Daily Goals" chart of the last 11 days (bars with the goal line; the original draws a line chart), and each click on a check-in dot adds one unit — partial days show a lighter dot, a completed day starts over. The habit log lists the month's check-in notes, with a field for today's note once checked in. No icons, frequency other than daily, typing an amount, sections, archive or "Constant Reminder" |
 | Focus (Pomodoro) | 🟡 | matched to the original: today's tasks to focus on, a 25-minute timer bar with pause and stop, Overview (today/total pomos and focus time), Focus Record grouped by day; no Active/Archived focus items, white noise, custom lengths or manual records |
 | Sync between devices | ⬜ | |
 
@@ -90,7 +90,7 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 
 ## Next
 
-1. Reminders for habits.
-2. Duration tab in the due-date picker (start and end time).
-3. Habit frequency (specific weekdays, N times a week).
+1. Duration tab in the due-date picker (start and end time).
+2. Habit frequency (specific weekdays, N times a week).
+3. Habit icons and colors.
 4. Filled sidebar icons (needs own filled glyphs; Lucide has none).

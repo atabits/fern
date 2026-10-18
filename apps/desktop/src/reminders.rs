@@ -18,10 +18,17 @@ const CHECK_EVERY: Duration = Duration::from_secs(20);
 const CHECKED_AT: &str = "reminders_checked_at";
 const STAMP_FORMAT: &str = "%Y-%m-%dT%H:%M:%S";
 
+/// What a reminder is about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Target {
+    Task(Id),
+    Habit(Id),
+}
+
 /// A reminder that fired.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Notice {
-    pub task: Id,
+    pub target: Target,
     pub title: String,
     pub at: NaiveDateTime,
 }
@@ -45,13 +52,21 @@ impl Notices {
     }
 }
 
-/// Reminders of open tasks firing in `(after, until]`.
+/// Reminders of open tasks and of habits not yet done that day, firing in `(after, until]`.
 pub fn fired(store: &Store, after: NaiveDateTime, until: NaiveDateTime) -> Vec<Notice> {
     let tasks = store.tasks().unwrap_or_default();
-    reminder::due_between(&tasks, after, until)
+    let mut notices: Vec<Notice> = reminder::due_between(&tasks, after, until)
         .into_iter()
-        .map(|(task, at)| Notice { task: task.id, title: task.title.clone(), at })
-        .collect()
+        .map(|(task, at)| Notice { target: Target::Task(task.id), title: task.title.clone(), at })
+        .collect();
+    let habits = store.habits().unwrap_or_default();
+    let done = habits.iter().map(|h| (h.id, store.checkins(h.id).unwrap_or_default())).collect();
+    notices.extend(
+        fern_core::habit::reminders_between(&habits, &done, after, until)
+            .into_iter()
+            .map(|(habit, at)| Notice { target: Target::Habit(habit.id), title: habit.name.clone(), at }),
+    );
+    notices
 }
 
 /// Starts checking for reminders: collects the ones missed since the last run, then shows new
@@ -120,7 +135,7 @@ mod tests {
 
     fn notice(title: &str, hour: u32) -> Notice {
         let at = NaiveDate::from_ymd_opt(2026, 10, 18).unwrap().and_hms_opt(hour, 0, 0).unwrap();
-        Notice { task: uuid::Uuid::now_v7(), title: title.into(), at }
+        Notice { target: Target::Task(uuid::Uuid::now_v7()), title: title.into(), at }
     }
 
     #[test]
@@ -144,5 +159,12 @@ mod tests {
         let at = |h| day.and_hms_opt(h, 0, 0).unwrap();
         assert_eq!(fired(&store, at(8), at(10)).len(), 1);
         assert!(fired(&store, at(9), at(10)).is_empty());
+
+        let habit = store.add_habit("Read").unwrap();
+        store.set_habit_reminders(habit.id, &[chrono::NaiveTime::from_hms_opt(9, 30, 0).unwrap()]).unwrap();
+        let notices = fired(&store, at(9), at(10));
+        assert_eq!(notices.iter().map(|n| n.target).collect::<Vec<_>>(), [Target::Habit(habit.id)]);
+        store.toggle_checkin(habit.id, day).unwrap();
+        assert!(fired(&store, at(9), at(10)).is_empty(), "a habit done today is not reminded");
     }
 }

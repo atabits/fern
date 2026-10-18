@@ -24,6 +24,9 @@ struct HabitEdit {
     unit: Entity<TextInput>,
     /// `None`: "Achieve it all".
     amount: Option<u32>,
+    reminders: Vec<chrono::NaiveTime>,
+    /// A field for adding a reminder time.
+    reminder_input: Entity<TextInput>,
 }
 
 pub struct HabitView {
@@ -86,7 +89,7 @@ impl HabitView {
         cx.notify();
     }
 
-    fn select(&mut self, habit: Id, cx: &mut Context<Self>) {
+    pub fn select(&mut self, habit: Id, cx: &mut Context<Self>) {
         if self.selected != Some(habit) {
             self.selected = Some(habit);
             self.month = calendar::month_start(Local::now().date_naive());
@@ -110,8 +113,27 @@ impl HabitView {
             input.set_text(habit.goal.as_ref().map(|g| g.unit.clone()).unwrap_or_default(), cx);
             input
         });
+        let reminder_input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.time_placeholder, cx));
+        cx.subscribe(&reminder_input, |this, input, Submitted(text), cx| {
+            if let Some(time) = crate::due_picker::parse_time(text) {
+                this.update_edit(cx, |e| {
+                    if !e.reminders.contains(&time) {
+                        e.reminders.push(time);
+                        e.reminders.sort();
+                    }
+                });
+                input.update(cx, |input, cx| input.set_text("", cx));
+            }
+        })
+        .detach();
         window.focus(&name.focus_handle(cx), cx);
-        self.editing = Some(HabitEdit { name, unit, amount: habit.goal.as_ref().map(|g| g.amount) });
+        self.editing = Some(HabitEdit {
+            name,
+            unit,
+            amount: habit.goal.as_ref().map(|g| g.amount),
+            reminders: habit.reminders.clone(),
+            reminder_input,
+        });
         self.detail_menu_open = false;
         cx.notify();
     }
@@ -120,7 +142,11 @@ impl HabitView {
         let (Some(edit), Some(id)) = (self.editing.take(), self.selected) else { return };
         let name = edit.name.read(cx).text().to_owned();
         let goal = edit.amount.map(|amount| Goal { amount, unit: edit.unit.read(cx).text().to_owned() });
-        if let Err(err) = self.store.update_habit(id, &name, goal.as_ref()) {
+        if let Err(err) = self
+            .store
+            .update_habit(id, &name, goal.as_ref())
+            .and_then(|()| self.store.set_habit_reminders(id, &edit.reminders))
+        {
             eprintln!("failed to update the habit: {err:#}");
         }
         self.reload(cx);
@@ -201,6 +227,31 @@ impl HabitView {
                         .child(Label::new(strings.habit_per_day).size(LabelSize::Small).color(Color::Muted)),
                 )
             })
+            .child(Label::new(strings.reminder).size(LabelSize::Small).color(Color::Muted))
+            .child(
+                h_flex()
+                    .flex_wrap()
+                    .gap_1()
+                    .children(edit.reminders.iter().map(|&time| {
+                        h_flex()
+                            .id(SharedString::from(format!("habit-reminder-{time}")))
+                            .h(px(24.))
+                            .pl_2()
+                            .gap_0p5()
+                            .rounded(px(5.))
+                            .bg(theme.colors().element_selected)
+                            .child(Label::new(time.format("%H:%M").to_string()).size(LabelSize::Small))
+                            .child(
+                                IconButton::new(SharedString::from(format!("habit-reminder-remove-{time}")), IconName::X)
+                                    .size(px(20.))
+                                    .icon_size(IconSize::XSmall)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.update_edit(cx, |e| e.reminders.retain(|t| *t != time))
+                                    })),
+                            )
+                    }))
+                    .child(div().flex_1().min_w(px(120.)).child(field(edit.reminder_input.clone().into_any_element()))),
+            )
             .child(
                 h_flex()
                     .gap_2()
@@ -239,6 +290,9 @@ impl HabitView {
             for _ in 0..times.parse().unwrap_or(1) {
                 self.store.step_checkin(id, date).ok();
             }
+        } else if let Some(times) = command.strip_prefix("remind=") {
+            let times: Vec<chrono::NaiveTime> = times.split(',').filter_map(crate::due_picker::parse_time).collect();
+            self.store.set_habit_reminders(id, &times).ok();
         } else if command == "edit" {
             self.reload(cx);
             self.start_edit(window, cx);

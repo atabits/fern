@@ -12,7 +12,7 @@ use crate::focus_view::FocusView;
 use crate::habit_view::HabitView;
 use crate::i18n::{self, CurrentLocale, Locale};
 use crate::matrix_view::{self, MatrixView};
-use crate::reminders::{self, Notice, Notices};
+use crate::reminders::{self, Notice, Notices, Target};
 use crate::search_modal::{SearchEvent, SearchModal};
 use crate::sidebar::{self, Section};
 use crate::todo_view::TodoView;
@@ -132,7 +132,7 @@ impl AppView {
                 let (needle, ago) = spec.split_once('>').unwrap_or((spec, "0"));
                 if let Some(task) = this.store.tasks().unwrap_or_default().into_iter().find(|t| t.title.contains(needle)) {
                     let at = chrono::Local::now().naive_local() - chrono::Duration::hours(ago.parse().unwrap_or(0));
-                    this.add_notices(vec![Notice { task: task.id, title: task.title, at }], cx);
+                    this.add_notices(vec![Notice { target: Target::Task(task.id), title: task.title, at }], cx);
                 }
             }
             if state.contains("notices=open") {
@@ -280,13 +280,21 @@ impl AppView {
         cx.notify();
     }
 
-    fn open_notice(&mut self, task: fern_core::Id, window: &mut Window, cx: &mut Context<Self>) {
+    fn open_notice(&mut self, target: Target, window: &mut Window, cx: &mut Context<Self>) {
         self.set_notices_open(false, cx);
-        self.select(Section::Tasks, window, cx);
-        self.todo.update(cx, |todo, cx| {
-            todo.set_view(fern_core::View::All, cx);
-            todo.select(task, cx);
-        });
+        match target {
+            Target::Task(task) => {
+                self.select(Section::Tasks, window, cx);
+                self.todo.update(cx, |todo, cx| {
+                    todo.set_view(fern_core::View::All, cx);
+                    todo.select(task, cx);
+                });
+            }
+            Target::Habit(habit) => {
+                self.select(Section::Habits, window, cx);
+                self.habits.update(cx, |habits, cx| habits.select(habit, cx));
+            }
+        }
     }
 
     fn render_notices(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -302,7 +310,7 @@ impl AppView {
             })
             .child(
                 v_flex().id("notices").overflow_y_scroll().children(self.notices.items.iter().enumerate().map(|(i, notice)| {
-                    let task = notice.task;
+                    let target = notice.target;
                     let (when, _) = crate::task_rows::due_label(notice.at.date(), Some(notice.at.time()), today, strings);
                     ListItem::new(SharedString::from(format!("notice-{i}")))
                         .height(px(44.))
@@ -313,7 +321,7 @@ impl AppView {
                                 .child(Label::new(notice.title.clone()).truncate())
                                 .child(Label::new(when).size(LabelSize::XSmall).color(Color::Muted)),
                         )
-                        .on_click(cx.listener(move |this, _, window, cx| this.open_notice(task, window, cx)))
+                        .on_click(cx.listener(move |this, _, window, cx| this.open_notice(target, window, cx)))
                 })),
             )
             .into_any_element()

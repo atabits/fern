@@ -127,6 +127,8 @@ pub struct Strings {
     pub yesterday: &'static str,
     /// Monday first.
     pub weekdays_short: [&'static str; 7],
+    /// One-letter weekday names, Monday first, for the mini week.
+    pub weekdays_narrow: [&'static str; 7],
     pub months: [&'static str; 12],
     pub months_short: [&'static str; 12],
     /// "13 Nov" (`true`) or "Nov 13" (`false`).
@@ -198,6 +200,7 @@ pub static EN: Strings = Strings {
 
     yesterday: "Yesterday",
     weekdays_short: ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"],
+    weekdays_narrow: ["M", "T", "W", "T", "F", "S", "S"],
     months: [
         "January", "February", "March", "April", "May", "June", "July", "August", "September",
         "October", "November", "December",
@@ -273,6 +276,7 @@ pub static RU: Strings = Strings {
 
     yesterday: "Вчера",
     weekdays_short: ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"],
+    weekdays_narrow: ["П", "В", "С", "Ч", "П", "С", "В"],
     months: [
         "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь", "Июль", "Август", "Сентябрь",
         "Октябрь", "Ноябрь", "Декабрь",

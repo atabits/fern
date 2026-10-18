@@ -1,9 +1,11 @@
 //! The lists column between the narrow sidebar and the task list, modeled on TickTick's.
 
+use chrono::{Datelike, Local};
 use fern_core::{List, Tag, View, ViewCounts};
 use gpui::{ClickEvent, rgb};
 use ui::prelude::*;
 
+use crate::calendar;
 use crate::i18n::Strings;
 
 pub const WIDTH: f32 = 212.;
@@ -98,17 +100,13 @@ pub fn render(
             .child(div().flex_1().child(Label::new(text).size(LabelSize::Small).color(Color::Muted)))
     };
 
-    v_flex()
+    let lists_column = v_flex()
         .id("lists-panel")
-        .flex_none()
-        .w(px(WIDTH))
-        .h_full()
+        .flex_1()
+        .min_h_0()
         .overflow_y_scroll()
         .px_2()
         .py_2()
-        .bg(colors.panel_background)
-        .border_r_1()
-        .border_color(colors.border)
         .child(smart(View::Inbox, strings.inbox, IconName::Inbox, Some(counts.inbox)))
         .child(smart(View::All, strings.all, IconName::Layers, Some(counts.all)))
         .child(smart(View::Today, strings.today, IconName::CalendarCheck, Some(counts.today)))
@@ -165,5 +163,49 @@ pub fn render(
                 .child(separator())
         })
         .child(smart(View::Completed, strings.completed, IconName::SquareCheckBig, None))
-        .child(smart(View::Trash, strings.trash, IconName::Trash, None))
+        .child(smart(View::Trash, strings.trash, IconName::Trash, None));
+
+    v_flex()
+        .flex_none()
+        .w(px(WIDTH))
+        .h_full()
+        .bg(colors.panel_background)
+        .border_r_1()
+        .border_color(colors.border)
+        .child(lists_column)
+        .child(mini_week(strings, cx))
+}
+
+/// The current week pinned to the bottom of the column, as in TickTick.
+fn mini_week(strings: &Strings, cx: &App) -> impl IntoElement {
+    let colors = cx.theme().colors();
+    let today = Local::now().date_naive();
+    v_flex()
+        .flex_none()
+        .h(px(76.))
+        .justify_center()
+        .gap_2()
+        .px_3()
+        .border_t_1()
+        .border_color(colors.border)
+        .child(h_flex().children(strings.weekdays_narrow.iter().map(|day| {
+            div().flex_1().flex().justify_center().child(Label::new(*day).size(LabelSize::Small).color(Color::Muted))
+        })))
+        .child(h_flex().children(calendar::week_of(today).map(|date| {
+            let is_today = date == today;
+            div().flex_1().flex().justify_center().child(
+                div()
+                    .size(px(28.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_full()
+                    .when(is_today, |el| el.bg(colors.element_hover))
+                    .child(
+                        Label::new(date.day().to_string())
+                            .size(LabelSize::Small)
+                            .color(if is_today { Color::Accent } else { Color::Default }),
+                    ),
+            )
+        })))
 }

@@ -49,7 +49,7 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 | Lists column: user lists | ✅ | create inline; rename, color and delete from the "…" menu; no drag and drop |
 | Lists column: tags with color dots and counters | ✅ | |
 | Lists column: Filters, Won't Do, Trash | 🟡 | Completed and Trash |
-| Mini week at the bottom of the lists column | ⬜ | |
+| Mini week at the bottom of the lists column | 🟡 | current week, today highlighted (matched to a screenshot); clicking a day does nothing yet — the original behavior is not verified |
 | List header with sidebar toggle | 🟡 | toggle and "…" work; sorting does not |
 | "Add task" field | ✅ | parses date, time, repeat, tags, priority and `^list`; no live highlighting yet; `^list` matches one-word list names only |
 | Rows by the measurements (40 px, separators) | ✅ | |
@@ -71,6 +71,10 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 | Sync between devices | ⬜ | |
 
 ## How changes are checked
+
+- Every feature is checked against a screenshot of the same TickTick screen before and after it
+  is built. Features built before this rule (calendar, trash, search, repeat picker) still need
+  that comparison.
 
 - `cargo test` covers the core (storage, smart views, tags, subtasks, lists, quick add) and the
   desktop's row, date and calendar logic in both languages.

@@ -26,6 +26,12 @@ pub fn month_grid(month: NaiveDate) -> Vec<NaiveDate> {
     (0..42).map(|i| start + Duration::days(i)).collect()
 }
 
+/// The seven days (Monday to Sunday) of the week that contains `date`.
+pub fn week_of(date: NaiveDate) -> [NaiveDate; 7] {
+    let monday = date - Duration::days(date.weekday().num_days_from_monday() as i64);
+    std::array::from_fn(|i| monday + Duration::days(i as i64))
+}
+
 pub fn month_title(month: NaiveDate, strings: &Strings) -> String {
     format!("{} {}", strings.months[month.month0() as usize], month.year())
 }
@@ -47,6 +53,14 @@ mod tests {
         assert_eq!(grid[0], d(2026, 9, 28));
         assert_eq!(grid[3], d(2026, 10, 1));
         assert!(grid.contains(&d(2026, 10, 31)));
+    }
+
+    #[test]
+    fn week_starts_on_monday() {
+        let week = week_of(d(2026, 10, 18)); // a Sunday
+        assert_eq!(week[0], d(2026, 10, 12));
+        assert_eq!(week[6], d(2026, 10, 18));
+        assert_eq!(week_of(d(2026, 10, 12))[0], d(2026, 10, 12));
     }
 
     #[test]

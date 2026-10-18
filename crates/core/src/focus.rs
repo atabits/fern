@@ -40,6 +40,38 @@ impl FocusTimer {
     }
 }
 
+/// Batch Management's filters, as in the original (without its Custom choices).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RecordFilter {
+    /// 0 All, 1 Today, 2 Yesterday, 3 This Week, 4 Last Week, 5 This Month, 6 Last Month.
+    pub date: u8,
+    /// Shorter than this many minutes; `None` is all.
+    pub under: Option<i64>,
+    /// `Some(true)` only records linked to a task, `Some(false)` only unlinked ones.
+    pub linked: Option<bool>,
+}
+
+impl RecordFilter {
+    pub fn matches(&self, session: &FocusSession, today: NaiveDate, week_start: chrono::Weekday) -> bool {
+        let day = session.start_local().date_naive();
+        let week = today - Duration::days(((today.weekday().num_days_from_monday() + 7 - week_start.num_days_from_monday()) % 7) as i64);
+        let month = today.with_day(1).expect("every month has a first day");
+        let last_month = (month - Duration::days(1)).with_day(1).expect("every month has a first day");
+        let date_ok = match self.date {
+            1 => day == today,
+            2 => day == today - Duration::days(1),
+            3 => day >= week && day <= today,
+            4 => day >= week - Duration::weeks(1) && day < week,
+            5 => day >= month && day <= today,
+            6 => day >= last_month && day < month,
+            _ => true,
+        };
+        date_ok
+            && self.under.is_none_or(|limit| session.minutes() < limit)
+            && self.linked.is_none_or(|linked| session.task_id.is_some() == linked)
+    }
+}
+
 impl FocusSession {
     pub fn minutes(&self) -> i64 {
         ((self.ended_at - self.started_at).max(0) + 30_000) / 60_000
@@ -311,5 +343,38 @@ mod tests {
         let monday = NaiveDate::from_ymd_opt(2026, 10, 12).unwrap();
         let sessions = [session(at(15, 13, 30), at(15, 16, 0)), session(at(13, 23, 0), at(14, 1, 0)), session(at(20, 9, 0), at(20, 10, 0))];
         assert_eq!(timeline(&sessions, monday), [(3, 810, 960), (1, 1380, 1440), (2, 0, 60)]);
+    }
+
+    #[test]
+    fn batch_filters() {
+        let today = NaiveDate::from_ymd_opt(2026, 10, 18).unwrap();
+        let at = |day: NaiveDate, minutes: i64, task: bool| {
+            let start = Local.from_local_datetime(&day.and_hms_opt(10, 0, 0).unwrap()).unwrap().timestamp_millis();
+            FocusSession {
+                id: uuid::Uuid::now_v7(),
+                task_id: task.then(uuid::Uuid::now_v7),
+                title: "x".into(),
+                started_at: start,
+                ended_at: start + minutes * 60_000,
+                stopwatch: false,
+                note: String::new(),
+            }
+        };
+        let monday = chrono::Weekday::Mon;
+        let short_today = at(today, 8, true);
+        let long_yesterday = at(today - Duration::days(1), 50, false);
+        let last_month = at(NaiveDate::from_ymd_opt(2026, 9, 20).unwrap(), 30, false);
+        let all = RecordFilter::default();
+        assert!(all.matches(&last_month, today, monday));
+        let today_only = RecordFilter { date: 1, ..all };
+        assert!(today_only.matches(&short_today, today, monday) && !today_only.matches(&long_yesterday, today, monday));
+        assert!(RecordFilter { date: 2, ..all }.matches(&long_yesterday, today, monday));
+        assert!(RecordFilter { date: 3, ..all }.matches(&long_yesterday, today, monday), "Saturday is in the week of Sunday the 18th");
+        assert!(RecordFilter { date: 6, ..all }.matches(&last_month, today, monday));
+        assert!(!RecordFilter { date: 5, ..all }.matches(&last_month, today, monday));
+        let short = RecordFilter { under: Some(10), ..all };
+        assert!(short.matches(&short_today, today, monday) && !short.matches(&long_yesterday, today, monday));
+        let linked = RecordFilter { linked: Some(true), ..all };
+        assert!(linked.matches(&short_today, today, monday) && !linked.matches(&long_yesterday, today, monday));
     }
 }

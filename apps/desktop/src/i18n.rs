@@ -401,6 +401,11 @@ pub struct Strings {
     /// `{n}` records chosen in Batch Management.
     pub n_selected: &'static str,
     pub select_all: &'static str,
+    /// Batch Management's filters: their names and choices.
+    pub batch_filters: [&'static str; 3],
+    pub batch_dates: [&'static str; 7],
+    pub batch_lengths: [&'static str; 5],
+    pub batch_linked: [&'static str; 3],
     pub notifications_page: &'static str,
     /// Settings → Notifications: each switch's name and what it does.
     pub notification_items: [(&'static str, &'static str); 3],
@@ -921,6 +926,10 @@ pub static EN: Strings = Strings {
     batch_management: "Batch Management",
     n_selected: "{n} Selected",
     select_all: "Select All",
+    batch_filters: ["Date", "Duration", "Linked Status"],
+    batch_dates: ["All", "Today", "Yesterday", "This Week", "Last Week", "This Month", "Last Month"],
+    batch_lengths: ["All", "Less Than 10 Mins", "Less Than 25 Mins", "Less Than 45 Mins", "Less Than 60 Mins"],
+    batch_linked: ["All", "Linked", "Unlinked"],
     notifications_page: "Notifications",
     notification_items: [
         ("Daily Notifications", "Fern reminds you of today's tasks at a set time every day."),
@@ -1425,6 +1434,10 @@ pub static RU: Strings = Strings {
     batch_management: "Пакетное управление",
     n_selected: "Выбрано: {n}",
     select_all: "Выбрать все",
+    batch_filters: ["Дата", "Длительность", "Привязка"],
+    batch_dates: ["Все", "Сегодня", "Вчера", "Эта неделя", "Прошлая неделя", "Этот месяц", "Прошлый месяц"],
+    batch_lengths: ["Все", "Меньше 10 мин", "Меньше 25 мин", "Меньше 45 мин", "Меньше 60 мин"],
+    batch_linked: ["Все", "С задачей", "Без задачи"],
     notifications_page: "Уведомления",
     notification_items: [
         ("Ежедневное уведомление", "Fern каждый день в заданное время напоминает о задачах на сегодня."),

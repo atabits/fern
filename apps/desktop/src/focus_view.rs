@@ -53,8 +53,10 @@ pub struct FocusView {
     timer_menu: Option<Id>,
     /// "Delete All" asks for a second click.
     delete_all_armed: bool,
-    /// The records ticked in Batch Management.
+    /// The records ticked in Batch Management, its filters and the filter whose menu is open.
     batch: HashSet<Id>,
+    batch_filter: fern_core::focus::RecordFilter,
+    batch_menu: Option<u8>,
     add_title: Entity<TextInput>,
     add_start: Entity<TextInput>,
     add_minutes: i64,
@@ -222,6 +224,8 @@ impl FocusView {
             timer_menu: None,
             delete_all_armed: false,
             batch: HashSet::new(),
+            batch_filter: Default::default(),
+            batch_menu: None,
             add_title,
             add_start,
             add_minutes: 25,
@@ -508,15 +512,79 @@ impl FocusView {
     /// "Select All", and Delete for the ticked ones.
     fn render_batch(&self, cx: &mut Context<Self>) -> AnyElement {
         let strings = i18n::t(cx);
+        let today = chrono::Local::now().date_naive();
+        let filter = self.batch_filter;
+        let shown: Vec<&FocusSession> =
+            self.sessions.iter().filter(|s| filter.matches(s, today, crate::calendar::week_start())).collect();
         let mut days: Vec<(chrono::NaiveDate, Vec<&FocusSession>)> = Vec::new();
-        for session in &self.sessions {
+        for session in shown.iter().copied() {
             let day = session.start_local().date_naive();
             match days.last_mut() {
                 Some((d, list)) if *d == day => list.push(session),
                 _ => days.push((day, vec![session])),
             }
         }
-        let all: Vec<Id> = self.sessions.iter().map(|s| s.id).collect();
+        let all: Vec<Id> = shown.iter().map(|s| s.id).collect();
+        // The original's Date, Duration and Linked Status filters, each a dropdown.
+        const LENGTHS: [Option<i64>; 5] = [None, Some(10), Some(25), Some(45), Some(60)];
+        const LINKED: [Option<bool>; 3] = [None, Some(true), Some(false)];
+        let current = [
+            filter.date as usize,
+            LENGTHS.iter().position(|l| *l == filter.under).unwrap_or(0),
+            LINKED.iter().position(|l| *l == filter.linked).unwrap_or(0),
+        ];
+        let choices: [&[&'static str]; 3] = [&strings.batch_dates, &strings.batch_lengths, &strings.batch_linked];
+        let theme = cx.theme().clone();
+        let filters = h_flex().gap_1().children((0..3u8).map(|which| {
+            let open = self.batch_menu == Some(which);
+            let label = if current[which as usize] == 0 { strings.batch_filters[which as usize] } else { choices[which as usize][current[which as usize]] };
+            div()
+                .relative()
+                .child(
+                    h_flex()
+                        .id(SharedString::from(format!("batch-filter-{which}")))
+                        .px_2()
+                        .h(px(22.))
+                        .gap_1()
+                        .rounded(px(4.))
+                        .border_1()
+                        .border_color(theme.colors().border)
+                        .cursor_pointer()
+                        .child(Label::new(label).size(LabelSize::XSmall).color(if current[which as usize] == 0 { Color::Muted } else { Color::Accent }))
+                        .child(Icon::new(IconName::ChevronDown).size(IconSize::XSmall).color(Color::Muted))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.batch_menu = if this.batch_menu == Some(which) { None } else { Some(which) };
+                            cx.notify();
+                        })),
+                )
+                .when(open, |el| {
+                    el.child(PopoverAttachment::new(
+                        Placement::BelowLeft,
+                        popover(cx)
+                            .w(px(170.))
+                            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                                this.batch_menu = None;
+                                cx.notify();
+                            }))
+                            .children(choices[which as usize].iter().enumerate().map(|(i, choice)| {
+                                let selected = current[which as usize] == i;
+                                ListItem::new(SharedString::from(format!("batch-filter-{which}-{i}")))
+                                    .child(Label::new(*choice).size(LabelSize::Small).color(if selected { Color::Accent } else { Color::Default }))
+                                    .when(selected, |item| item.end_slot(Icon::new(IconName::Check).size(IconSize::XSmall).color(Color::Accent)))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        match which {
+                                            0 => this.batch_filter.date = i as u8,
+                                            1 => this.batch_filter.under = LENGTHS[i],
+                                            _ => this.batch_filter.linked = LINKED[i],
+                                        }
+                                        this.batch_menu = None;
+                                        cx.notify();
+                                    }))
+                            }))
+                            .into_any_element(),
+                    ))
+                })
+        }));
         let chosen = self.batch.len();
         let mut rows: Vec<AnyElement> = Vec::new();
         for (day, sessions) in days {
@@ -598,6 +666,7 @@ impl FocusView {
                         cx.listener(|this, _, _, cx| this.set_record_menu(None, cx)),
                     )),
             )
+            .child(filters)
             .child(v_flex().id("batch-list").flex_1().min_h_0().overflow_y_scroll().children(rows))
             .child(
                 h_flex()
@@ -901,6 +970,7 @@ impl FocusView {
                         .child(Label::new(strings.batch_management))
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.batch.clear();
+                            this.batch_filter = Default::default();
                             this.set_record_menu(Some(RecordMenu::Batch), cx)
                         })),
                 )
@@ -2017,6 +2087,7 @@ impl FocusView {
             // Batch Management with the newest record ticked.
             "batch" => {
                 self.batch = self.sessions.first().map(|s| s.id).into_iter().collect();
+                self.batch_menu = Some(1);
                 self.record_menu = Some(RecordMenu::Batch);
                 cx.notify();
                 return;

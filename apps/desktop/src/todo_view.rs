@@ -1816,7 +1816,7 @@ impl TodoView {
             .gap_1p5()
             .rounded(px(8.))
             .border_1()
-            .border_color(if selected { theme.colors().accent } else { theme.colors().border_variant })
+            .border_color(if selected { theme.colors().accent } else { theme.colors().border })
             .bg(theme.colors().surface_background)
             .cursor_pointer()
             .on_click(cx.listener(move |this, _, _, cx| this.select(id, cx)))
@@ -3491,6 +3491,8 @@ impl TodoView {
         // A tag's view is grouped by list until chosen otherwise, as the original's.
         let group = match get("group") {
             key if key.is_empty() && matches!(self.view, View::Tag(_)) => GroupBy::List,
+            // The original's board of a smart list has a column per list.
+            key if key.is_empty() && self.kanban && self.view.shows_list_names() => GroupBy::List,
             key => GroupBy::from_key(&key),
         };
         (SortBy::from_key(&get("sort")), group)
@@ -4466,7 +4468,7 @@ impl TodoView {
                     .gap_1()
                     .rounded(px(8.))
                     .border_1()
-                    .border_color(theme.colors().border_variant)
+                    .border_color(theme.colors().border)
                     .bg(theme.colors().surface_background)
                     .cursor_pointer()
                     .child(
@@ -5225,8 +5227,10 @@ impl Render for TodoView {
                 .flex_1()
                 .items_start()
                 .gap(px(24.))
-                .px_4()
-                .pt_1()
+                // As the original's: the columns start under the header's sidebar button, 41 px
+                // under the title.
+                .px(px(26.))
+                .mt(px(-8.))
                 .pb_4()
                 .overflow_x_scroll()
                 .children(columns.into_iter().enumerate().map(|(i, (title, drop, cards))| {
@@ -5273,8 +5277,9 @@ impl Render for TodoView {
                                     self.render_card(task, subtasks, &tag_colors, today, strings, cx)
                                 })),
                         )
+                        // An empty column is a tinted panel down to the bottom, as the original's.
                         .when(count == 0, |el| {
-                            el.child(div().h(px(40.)).rounded(px(8.)).border_1().border_color(theme.colors().border_variant))
+                            el.h_full().child(div().flex_1().rounded(px(8.)).bg(theme.colors().ghost_element_hover))
                         })
                 }))
                 .children(self.render_habit_column(strings, cx))

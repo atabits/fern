@@ -1,10 +1,15 @@
 #!/usr/bin/env bash
 # Builds Fern and its sync server in release mode for a target and packs them into `dist/`:
 #   macOS    fern-<version>-macos-<arch>.dmg               Fern.app, drag into Applications
-#   Linux    fern-<version>-linux-<arch>.AppImage / .tar.gz
-#   Windows  fern-<version>-windows-<arch>.zip             fern.exe
+#   Linux    fern-<version>-linux-<arch>.AppImage / .deb / .tar.gz
+#   Windows  fern-<version>-windows-<arch>-setup.exe / .zip  installer, or fern.exe to unpack
 #   and      fern-server-<version>-<os>-<arch>.tar.gz/.zip the self-hosted sync server
 # usage: script/package <rust target triple> [version]
+#
+# FERN_PREBUILT=1 packs the binaries already in target/<target>/release (signed in between).
+# On macOS, with APPLE_SIGNING_IDENTITY (a Developer ID certificate in the keychain) the app is
+# signed with it instead of ad hoc, and with APPLE_ID, APPLE_TEAM_ID and APPLE_APP_PASSWORD
+# the DMG is notarized by Apple too, so Gatekeeper opens it without a warning.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -21,7 +26,9 @@ case "$target" in
     *-linux-*) os=linux ;;
 esac
 
-cargo build --release --locked --target "$target" -p fern_desktop -p fern_server
+if [ -z "${FERN_PREBUILT:-}" ]; then
+    cargo build --release --locked --target "$target" -p fern_desktop -p fern_server
+fi
 
 bin="target/$target/release"
 dist="dist"
@@ -83,23 +90,65 @@ case "$os" in
 </dict>
 </plist>
 EOF
-        # An ad-hoc signature: without one Apple Silicon refuses to run the app at all.
-        codesign --force --deep --sign - "$work/Fern.app"
+        if [ -n "${APPLE_SIGNING_IDENTITY:-}" ]; then
+            # Notarization wants the hardened runtime and a secure timestamp.
+            codesign --force --options runtime --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$work/Fern.app"
+        else
+            # An ad-hoc signature: without one Apple Silicon refuses to run the app at all.
+            codesign --force --deep --sign - "$work/Fern.app"
+        fi
         mkdir -p "$work/dmg"
         mv "$work/Fern.app" "$work/dmg/"
         ln -s /Applications "$work/dmg/Applications"
         rm -f "$dist/$name.dmg"
         hdiutil create -volname Fern -srcfolder "$work/dmg" -ov -format UDZO "$dist/$name.dmg" > /dev/null
+        if [ -n "${APPLE_SIGNING_IDENTITY:-}" ]; then
+            codesign --force --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$dist/$name.dmg"
+        fi
+        if [ -n "${APPLE_SIGNING_IDENTITY:-}" ] && [ -n "${APPLE_ID:-}" ]; then
+            xcrun notarytool submit "$dist/$name.dmg" --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" \
+                --password "$APPLE_APP_PASSWORD" --wait
+            xcrun stapler staple "$dist/$name.dmg"
+        fi
         ;;
     windows)
         mkdir -p "$work/$name"
         cp "$bin/fern.exe" LICENSE README.md "$work/$name/"
         (cd "$work" && 7z a -tzip "$OLDPWD/$dist/$name.zip" "$name" > /dev/null)
+        # The installer, with Inno Setup (`choco install innosetup` puts it in Program Files).
+        iscc=$(command -v iscc || echo "/c/Program Files (x86)/Inno Setup 6/ISCC.exe")
+        "$iscc" /Q "/DVersion=$version" "/DSourceDir=$(cygpath -w "$PWD/$bin")" \
+            "/DOutputDir=$(cygpath -w "$PWD/$dist")" "/DOutputName=$name-setup" assets/windows/fern.iss
         ;;
     linux)
         mkdir -p "$work/$name"
         cp "$bin/fern" assets/linux/fern-tasks.desktop assets/linux/fern.svg LICENSE README.md "$work/$name/"
         tar -C "$work" -czf "$dist/$name.tar.gz" "$name"
+
+        # A .deb for Debian and Ubuntu, where it installs with a double click.
+        if command -v dpkg-deb > /dev/null; then
+            deb="$work/deb"
+            mkdir -p "$deb/DEBIAN" "$deb/usr/bin" "$deb/usr/share/applications" \
+                "$deb/usr/share/icons/hicolor/scalable/apps" "$deb/usr/share/doc/fern-tasks"
+            cp "$bin/fern" "$deb/usr/bin/fern"
+            cp assets/linux/fern-tasks.desktop "$deb/usr/share/applications/"
+            cp assets/linux/fern.svg "$deb/usr/share/icons/hicolor/scalable/apps/"
+            cp LICENSE "$deb/usr/share/doc/fern-tasks/copyright"
+            cat > "$deb/DEBIAN/control" <<EOF
+Package: fern-tasks
+Version: $version
+Architecture: $([ "$arch" = arm64 ] && echo arm64 || echo amd64)
+Maintainer: Amin Atabiev <endlessspring.of@gmail.com>
+Homepage: https://github.com/atabits/fern
+Section: utils
+Priority: optional
+Depends: libc6, libfontconfig1, libfreetype6, libvulkan1, libwayland-client0, libx11-xcb1, libxcb1, libxkbcommon0, libxkbcommon-x11-0
+Description: Tasks, calendar, habits and focus in one native app
+ A free, open-source task manager inspired by TickTick. It works offline,
+ needs no account and keeps the data on this computer.
+EOF
+            dpkg-deb --root-owner-group --build "$deb" "$dist/$name.deb" > /dev/null
+        fi
 
         appdir="$work/AppDir"
         mkdir -p "$appdir/usr/bin" "$appdir/usr/share/applications" "$appdir/usr/share/icons/hicolor/scalable/apps"

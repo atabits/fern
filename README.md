@@ -50,16 +50,19 @@ Every [release](https://github.com/atabits/fern/releases/latest) includes these 
 | Platform | File |
 |---|---|
 | macOS (Apple Silicon / Intel) | `fern-<version>-macos-arm64.dmg` / `-macos-x86_64.dmg` |
-| Windows (x86_64) | `fern-<version>-windows-x86_64.zip` |
-| Linux (x86_64 / ARM64) | `fern-<version>-linux-<arch>.AppImage` or `.tar.gz` |
+| Windows (x86_64) | `fern-<version>-windows-x86_64-setup.exe` (installer) or `.zip` (portable) |
+| Debian, Ubuntu (x86_64 / ARM64) | `fern-<version>-linux-<arch>.deb` |
+| Any Linux (x86_64 / ARM64) | `fern-<version>-linux-<arch>.AppImage` or `.tar.gz` |
 | Sync server (every platform) | `fern-server-<version>-<os>-<arch>.tar.gz` / `.zip` |
 
-The builds are not signed yet:
+The builds are not signed yet (see [code signing](docs/code-signing.md)):
 
-- **macOS:** the first time, right-click `Fern.app` and choose Open. You can also run
+- **macOS:** the first time, macOS refuses to open Fern. Open System Settings → Privacy &
+  Security and click "Open Anyway" next to Fern. You can also run
   `xattr -d com.apple.quarantine /Applications/Fern.app`.
 - **Windows:** in SmartScreen, choose "More info" → "Run anyway".
-- **Linux:** `chmod +x fern-*.AppImage`, then run it.
+- **Linux:** the `.deb` installs with a double click or `sudo apt install ./fern-*.deb`. The
+  AppImage runs anywhere after `chmod +x`.
 
 ### Build from Source
 

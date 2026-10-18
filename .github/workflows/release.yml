@@ -33,6 +33,10 @@ jobs:
     defaults:
       run:
         shell: bash
+    # Signing turns on once its credentials are set in the repository (see docs/code-signing.md);
+    # without them the packages are built unsigned, as before.
+    env:
+      APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
     steps:
       - uses: actions/checkout@v4
 
@@ -57,14 +61,87 @@ jobs:
             echo "version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }} -p fern_desktop -p fern_server
+
+      # Windows: SignPath signs the programs with an Authenticode certificate.
+      - name: Upload the programs for signing
+        id: unsigned
+        if: runner.os == 'Windows' && vars.SIGNPATH_ORGANIZATION_ID != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-${{ matrix.target }}
+          path: |
+            target/${{ matrix.target }}/release/fern.exe
+            target/${{ matrix.target }}/release/fern-server.exe
+          if-no-files-found: error
+
+      - name: Sign with SignPath
+        if: steps.unsigned.outcome == 'success'
+        uses: signpath/github-action-submit-signing-request@v1
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: fern
+          signing-policy-slug: ${{ startsWith(github.ref, 'refs/tags/v') && 'release-signing' || 'test-signing' }}
+          artifact-configuration-slug: windows-programs
+          github-artifact-id: ${{ steps.unsigned.outputs.artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 3600
+          output-artifact-directory: target/${{ matrix.target }}/release
+
+      # macOS: a Developer ID certificate for the signature, then Apple's notarization.
+      - name: Import the Developer ID certificate
+        if: runner.os == 'macOS' && env.APPLE_CERTIFICATE != ''
+        uses: apple-actions/import-codesign-certs@v3
+        with:
+          p12-file-base64: ${{ secrets.APPLE_CERTIFICATE }}
+          p12-password: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+
+      - name: Install Inno Setup
+        if: runner.os == 'Windows'
+        run: choco install innosetup --no-progress -y
+
       - name: Package
+        env:
+          FERN_PREBUILT: 1
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
         run: script/package ${{ matrix.target }} ${{ steps.version.outputs.version }}
+
+      # The installer is made from the signed programs, and then signed itself.
+      - name: Upload the installer for signing
+        id: unsigned-installer
+        if: steps.unsigned.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-installer-${{ matrix.target }}
+          path: dist/*-setup.exe
+          if-no-files-found: error
+
+      - name: Sign the installer with SignPath
+        if: steps.unsigned-installer.outcome == 'success'
+        uses: signpath/github-action-submit-signing-request@v1
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: fern
+          signing-policy-slug: ${{ startsWith(github.ref, 'refs/tags/v') && 'release-signing' || 'test-signing' }}
+          artifact-configuration-slug: windows-installer
+          github-artifact-id: ${{ steps.unsigned-installer.outputs.artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 3600
+          output-artifact-directory: dist
 
       - uses: actions/upload-artifact@v4
         with:
           name: fern-${{ matrix.target }}
           path: |
             dist/*.dmg
+            dist/*.exe
+            dist/*.deb
             dist/*.AppImage
             dist/*.tar.gz
             dist/*.zip
@@ -83,6 +160,7 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: dist
+          pattern: fern-*
           merge-multiple: true
 
       - name: Release notes

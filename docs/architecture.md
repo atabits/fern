@@ -35,7 +35,11 @@ Devices sync through a self-hosted server, row by row (`crates/core/src/sync.rs`
   device's changes and returns the other devices' changes after the number the device last saw.
   It speaks plain HTTP; a reverse proxy adds TLS.
 
-Not synced: settings, task activity, habit snoozes, attachments' files.
+Attachments' records sync like other rows; their files go through the server's file store
+(`PUT`/`GET /files/<name>`, kept in `<data>.files`): after a sync the app sends the files the
+server lacks and fetches the ones missing here.
+
+Not synced: settings, task activity, habit snoozes.
 
 ## Conventions
 

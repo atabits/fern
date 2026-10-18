@@ -542,6 +542,27 @@ const MIGRATIONS: &[&str] = &[
         INSERT INTO sync_log (entity, key, at) VALUES ('summary_templates', OLD.id, CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER));
     END;
     ",
+    // Attachments sync too: their records like other rows, their files through the server's
+    // file store; `sync_uploaded` lists the files the server has.
+    "
+    INSERT INTO sync_log (entity, key, at) SELECT 'task_attachments', id, 0 FROM task_attachments;
+    CREATE TRIGGER sync_task_attachments_insert AFTER INSERT ON task_attachments
+    WHEN NOT EXISTS (SELECT 1 FROM sync_applying)
+    BEGIN
+        INSERT INTO sync_log (entity, key, at) VALUES ('task_attachments', NEW.id, CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER));
+    END;
+    CREATE TRIGGER sync_task_attachments_update AFTER UPDATE ON task_attachments
+    WHEN NOT EXISTS (SELECT 1 FROM sync_applying)
+    BEGIN
+        INSERT INTO sync_log (entity, key, at) VALUES ('task_attachments', NEW.id, CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER));
+    END;
+    CREATE TRIGGER sync_task_attachments_delete AFTER DELETE ON task_attachments
+    WHEN NOT EXISTS (SELECT 1 FROM sync_applying)
+    BEGIN
+        INSERT INTO sync_log (entity, key, at) VALUES ('task_attachments', OLD.id, CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER));
+    END;
+    CREATE TABLE sync_uploaded (name TEXT PRIMARY KEY);
+    ",
 ];
 
 const TASK_COLUMNS: &str = "id, parent_id, kind, title, notes, priority, due_date, due_time, \

@@ -570,7 +570,8 @@ impl AppView {
         self.sync = crate::sync::SyncStatus::Running;
         cx.notify();
         let body = request.body.clone();
-        let answer = cx.background_spawn(async move { crate::sync::post(&config, &body) });
+        let sent_config = config.clone();
+        let answer = cx.background_spawn(async move { crate::sync::post(&sent_config, &body) });
         cx.spawn(async move |this, cx| {
             let answer = answer.await;
             this.update(cx, |this, cx| {
@@ -580,11 +581,42 @@ impl AppView {
                         if received > 0 {
                             this.reload_all(cx);
                         }
+                        this.sync_files(config, cx);
                         crate::sync::SyncStatus::Done(chrono::Local::now().naive_local())
                     }
                     Err(err) => crate::sync::SyncStatus::Failed(format!("{err:#}")),
                 };
                 cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// After a sync, sends the attached files the server lacks and fetches the missing ones.
+    fn sync_files(&mut self, config: fern_core::sync::SyncConfig, cx: &mut Context<Self>) {
+        let Ok(dir) = crate::attachments_dir() else { return };
+        let (upload, download) = match self.store.files_to_sync(&dir) {
+            Ok(files) => files,
+            Err(err) => {
+                eprintln!("failed to list the files to sync: {err:#}");
+                return;
+            }
+        };
+        if upload.is_empty() && download.is_empty() {
+            return;
+        }
+        let fetched = !download.is_empty();
+        let done = cx.background_spawn(async move { crate::sync::transfer_files(&config, &dir, &upload, &download) });
+        cx.spawn(async move |this, cx| {
+            let done = done.await;
+            this.update(cx, |this, cx| {
+                if let Err(err) = this.store.mark_files_synced(&done) {
+                    eprintln!("failed to note the synced files: {err:#}");
+                }
+                if fetched {
+                    this.reload_all(cx);
+                }
             })
             .ok();
         })

@@ -17,18 +17,32 @@ use serde_json::{Value, json};
 
 pub struct Server {
     conn: Connection,
+    /// Where attached files are kept (`<data>.files`), sent with `PUT /files/<name>` and fetched
+    /// with `GET /files/<name>`.
+    files: Option<std::path::PathBuf>,
 }
 
 impl Server {
     pub fn open(path: &std::path::Path) -> Result<Self> {
-        Self::init(Connection::open(path)?)
+        let mut files = path.as_os_str().to_owned();
+        files.push(".files");
+        Self::init(Connection::open(path)?, Some(files.into()))
     }
 
     pub fn open_in_memory() -> Result<Self> {
-        Self::init(Connection::open_in_memory()?)
+        Self::init(Connection::open_in_memory()?, None)
     }
 
-    fn init(conn: Connection) -> Result<Self> {
+    /// Where a sent file goes: `None` for a name that is not a plain file name.
+    pub fn file_path(&self, name: &str) -> Option<std::path::PathBuf> {
+        let plain = !name.is_empty()
+            && name.len() <= 255
+            && !name.starts_with('.')
+            && !name.contains(['/', '\\', '\0']);
+        self.files.as_ref().filter(|_| plain).map(|dir| dir.join(name))
+    }
+
+    fn init(conn: Connection, files: Option<std::path::PathBuf>) -> Result<Self> {
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              CREATE TABLE IF NOT EXISTS changes (
@@ -41,7 +55,10 @@ impl Server {
                  UNIQUE (entity, key)
              );",
         )?;
-        Ok(Self { conn })
+        if let Some(dir) = &files {
+            std::fs::create_dir_all(dir)?;
+        }
+        Ok(Self { conn, files })
     }
 
     /// One sync: stores the device's changes (the later change of a row wins) and returns the
@@ -110,10 +127,40 @@ pub fn serve(http: &tiny_http::Server, mut server: Server, token: &str) {
     use tiny_http::{Header, Method, Response};
     for mut request in http.incoming_requests() {
         let auth = request.headers().iter().find(|h| h.field.equiv("Authorization")).map(|h| h.value.as_str().to_owned());
+        let file = request.url().strip_prefix("/files/").map(str::to_owned);
+        if !authorized(auth.as_deref(), token) {
+            let header = Header::from_bytes("Content-Type", "application/json").expect("a valid header");
+            let response = Response::from_string(r#"{"error":"unauthorized"}"#).with_status_code(401).with_header(header);
+            request.respond(response).ok();
+            continue;
+        }
+        if let Some(name) = file {
+            let response = match (request.method(), server.file_path(&name)) {
+                (_, None) => Response::from_data(Vec::new()).with_status_code(400),
+                (Method::Put, Some(path)) => {
+                    let mut data = Vec::new();
+                    match request.as_reader().take(MAX_BODY as u64 + 1).read_to_end(&mut data) {
+                        Ok(n) if n > MAX_BODY => Response::from_data(Vec::new()).with_status_code(413),
+                        Ok(_) => match std::fs::write(&path, &data) {
+                            Ok(()) => Response::from_data(Vec::new()).with_status_code(204),
+                            Err(_) => Response::from_data(Vec::new()).with_status_code(500),
+                        },
+                        Err(_) => Response::from_data(Vec::new()).with_status_code(400),
+                    }
+                }
+                (Method::Get, Some(path)) => match std::fs::read(&path) {
+                    Ok(data) => Response::from_data(data),
+                    Err(_) => Response::from_data(Vec::new()).with_status_code(404),
+                },
+                _ => Response::from_data(Vec::new()).with_status_code(405),
+            };
+            if let Err(err) = request.respond(response) {
+                eprintln!("failed to answer: {err}");
+            }
+            continue;
+        }
         let (status, body) = if request.method() != &Method::Post || request.url() != "/sync" {
             (404, r#"{"error":"not found"}"#.to_owned())
-        } else if !authorized(auth.as_deref(), token) {
-            (401, r#"{"error":"unauthorized"}"#.to_owned())
         } else {
             let mut text = String::new();
             let read = request.as_reader().take(MAX_BODY as u64 + 1).read_to_string(&mut text);
@@ -182,6 +229,17 @@ mod tests {
         let answer = server.sync(&json!({ "device": "c", "since": 0 })).unwrap();
         assert_eq!(answer["changes"][0]["row"]["title"], "new");
         assert!(server.sync(&json!({ "since": 0 })).is_err(), "a device id is required");
+    }
+
+    #[test]
+    fn file_names() {
+        let dir = std::env::temp_dir().join(format!("fern-server-files-{}", std::process::id()));
+        let server = Server::open(&dir.with_extension("db")).unwrap();
+        assert!(server.file_path("0199-plan.txt").is_some());
+        for bad in ["", "../x", "a/b", "a\\b", ".hidden"] {
+            assert!(server.file_path(bad).is_none(), "{bad:?}");
+        }
+        assert!(Server::open_in_memory().unwrap().file_path("x").is_none(), "no file store in memory");
     }
 
     #[test]

@@ -30,6 +30,7 @@ pub const SYNCED: &[(&str, &[&str])] = &[
     ("templates", &["id"]),
     ("filters", &["id"]),
     ("summary_templates", &["id"]),
+    ("task_attachments", &["id"]),
 ];
 
 /// Key parts are joined with this character, as the triggers do.
@@ -182,6 +183,35 @@ impl Store {
 }
 
 impl Store {
+    /// Attached files to move after a sync, by their file names in the attachment folder `dir`:
+    /// the ones here the server does not have yet, and the ones listed here whose file is missing.
+    pub fn files_to_sync(&self, dir: &std::path::Path) -> Result<(Vec<String>, Vec<String>)> {
+        let mut stmt = self.conn.prepare(
+            "SELECT a.id, a.name, u.name IS NOT NULL FROM task_attachments a
+             LEFT JOIN sync_uploaded u ON u.name = a.id || '-' || a.name",
+        )?;
+        let rows: Vec<(String, String, bool)> =
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<_, _>>()?;
+        let (mut upload, mut download) = (Vec::new(), Vec::new());
+        for (id, name, uploaded) in rows {
+            let file = format!("{id}-{name}");
+            match (dir.join(&file).exists(), uploaded) {
+                (true, false) => upload.push(file),
+                (false, _) => download.push(file),
+                (true, true) => {}
+            }
+        }
+        Ok((upload, download))
+    }
+
+    /// Notes that the server has these files (sent from here, or fetched from it).
+    pub fn mark_files_synced(&self, files: &[String]) -> Result<()> {
+        for file in files {
+            self.conn.execute("INSERT OR IGNORE INTO sync_uploaded (name) VALUES (?1)", [file])?;
+        }
+        Ok(())
+    }
+
     /// Keeps one log entry per row, its latest: sending and conflicts only look at that one, so
     /// older entries are dropped whether or not they were sent. Returns how many went.
     pub fn compact_sync_log(&self) -> Result<usize> {
@@ -399,6 +429,31 @@ mod tests {
         let (after, position) = store.changes_since(0)?;
         assert_eq!(after, before);
         assert_eq!(position, store.sync_position()?);
+        Ok(())
+    }
+
+    #[test]
+    fn attachments_and_their_files() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("fern-sync-files-{}", uuid::Uuid::now_v7()));
+        let (laptop_dir, phone_dir) = (dir.join("laptop"), dir.join("phone"));
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(dir.join("plan.txt"), "plan")?;
+        let laptop = Store::open_in_memory()?;
+        let phone = Store::open_in_memory()?;
+        let task = laptop.add_task("Trip")?;
+        let attachment = laptop.add_attachment(task.id, &dir.join("plan.txt"), &laptop_dir)?;
+        let file = attachment.path(&laptop_dir).file_name().unwrap().to_string_lossy().into_owned();
+
+        // The laptop has a file to send; once sent, nothing.
+        assert_eq!(laptop.files_to_sync(&laptop_dir)?, (vec![file.clone()], vec![]));
+        laptop.mark_files_synced(&[file.clone()])?;
+        assert_eq!(laptop.files_to_sync(&laptop_dir)?, (vec![], vec![]));
+
+        // The record reaches the phone, which then has a file to fetch.
+        relay(&laptop, 0, &phone);
+        assert_eq!(phone.attachments(task.id)?, [attachment]);
+        assert_eq!(phone.files_to_sync(&phone_dir)?, (vec![], vec![file]));
+        std::fs::remove_dir_all(&dir)?;
         Ok(())
     }
 

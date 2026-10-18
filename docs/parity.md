@@ -37,7 +37,7 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 | Manual ordering (`sortOrder`) | ✅ | new tasks on top; renumbered with gaps on move |
 | Trash, "Won't Do" | ✅ | trash matched to the original: flat list, broom button empties it; a trashed task's panel has "Restore" and "Delete forever" in its bottom bar. "Won't Do" matched to the original: set from the details "…" menu or by dropping on the entry, a muted box with a cross, its own view grouped by day with list and date on the right; unchecking reopens. Both closed views have the original's "All Dates" (this week, last week, this month, "Other Date" with start and end days) and "All Lists" (several lists, Cancel/OK) filters |
 | Reminders | ⬜ | |
-| Settings window | 🟡 | matched to the original's (the account menu's Settings, or Ctrl+,): Smart List (show, "Show if not empty" or hide each smart list, Tags with "Omit Empty Tags", Filters and the closed-task lists shown or hidden), Date & Time ("Start Week on" Monday, Sunday or Saturday — every calendar and week follows it), Appearance ("Follow System Dark Mode" and the Default (light) and Dark themes), More (language; "Default List" for tasks added outside a list), Shortcuts (opens the Shortcuts panel) and About; Escape closes it. No Assigned to Me or Summary rows (no such lists), time and date formats, notifications, the original's other color and city themes, or account pages |
+| Settings window | 🟡 | matched to the original's (the account menu's Settings, or Ctrl+,): Smart List (show, "Show if not empty" or hide each smart list, Tags with "Omit Empty Tags", Filters and the closed-task lists shown or hidden), Date & Time (the original's "Time Format", 24 hour "13:00" or 12 hour "1:00 PM", used for every time shown — task rows, pickers, reminders, the calendar's axis, focus records; "Start Week on" Monday, Sunday or Saturday — every calendar and week follows it), Appearance ("Follow System Dark Mode" and the Default (light) and Dark themes), More (language; "Default List" for tasks added outside a list), Shortcuts (opens the Shortcuts panel) and About; Escape closes it. No Assigned to Me or Summary rows (no such lists), date format, notifications, the original's other color and city themes, or account pages |
 
 ## Interface
 
@@ -91,8 +91,8 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 
 ## Next
 
-1. Settings → Date & Time: 12/24-hour time format.
-2. Rename and delete habit sections.
-3. Statistics → My Achievement Score.
-4. Summary smart list (the original's report of tasks by period).
+1. Rename and delete habit sections.
+2. Statistics → My Achievement Score.
+3. Summary smart list (the original's report of tasks by period).
+4. Settings → Date & Time: date format and "Show Week Numbers".
 5. Filled sidebar icons (needs own filled glyphs; Lucide has none).

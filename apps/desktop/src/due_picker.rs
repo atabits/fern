@@ -300,7 +300,7 @@ pub fn describe_reminder(offset: i64, has_time: bool, strings: &Strings) -> Stri
     } else {
         fill_days(days as i64)
     };
-    format!("{base} ({})", at.format("%H:%M"))
+    format!("{base} ({})", crate::calendar::format_time(at))
 }
 
 /// The reminder options for the draft, with a hint ("09:00" for all-day tasks).
@@ -308,7 +308,7 @@ pub fn reminder_options(has_time: bool, strings: &Strings) -> Vec<(i64, &'static
     if has_time {
         TIMED_OFFSETS.into_iter().zip(strings.reminders_timed).map(|(m, label)| (m, label, String::new())).collect()
     } else {
-        let hint = format!("{ALL_DAY_REMINDER_HOUR:02}:00");
+        let hint = crate::calendar::format_hour(ALL_DAY_REMINDER_HOUR);
         ALL_DAY_OFFSETS.into_iter().zip(strings.reminders_all_day).map(|(m, label)| (m, label, hint.clone())).collect()
     }
 }
@@ -323,7 +323,7 @@ pub fn reminder_label(reminders: &[i64], has_time: bool, strings: &Strings) -> O
         .map(|offset| {
             let label = describe_reminder(*offset, has_time, strings);
             // The row stays short: preset all-day reminders drop their usual "(09:00)".
-            label.strip_suffix(" (09:00)").map(str::to_owned).unwrap_or(label)
+            label.strip_suffix(&format!(" ({})", crate::calendar::format_hour(ALL_DAY_REMINDER_HOUR))).map(str::to_owned).unwrap_or(label)
         })
         .collect();
     Some(labels.join(", "))
@@ -338,7 +338,7 @@ pub fn range_label(
     strings: &Strings,
 ) -> String {
     let day = |date| crate::task_rows::short_date(date, strings);
-    let time = |t: Option<NaiveTime>| t.map(|t| t.format("%H:%M").to_string());
+    let time = |t: Option<NaiveTime>| t.map(|t| crate::calendar::format_time(t));
     match (time(start_time), time(end_time)) {
         (Some(a), Some(b)) if start == end => format!("{}, {a} - {b}", day(start)),
         (Some(a), Some(b)) => format!("{}, {a} - {}, {b}", day(start), day(end)),

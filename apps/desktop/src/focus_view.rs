@@ -886,8 +886,8 @@ impl FocusView {
                             .child(
                                 Label::new(format!(
                                     "{} - {}",
-                                    start.format("%H:%M"),
-                                    session.end_local().format("%H:%M")
+                                    crate::calendar::format_time(start),
+                                    crate::calendar::format_time(session.end_local())
                                 ))
                                 .size(LabelSize::XSmall)
                                 .color(Color::Muted),

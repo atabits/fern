@@ -618,7 +618,7 @@ impl TaskDetail {
                 let when = chrono::Local
                     .timestamp_millis_opt(entry.at)
                     .single()
-                    .map(|t| t.format("%m/%d %H:%M").to_string())
+                    .map(|t| format!("{} {}", t.format("%m/%d"), crate::calendar::format_time(t)))
                     .unwrap_or_default();
                 h_flex()
                     .items_start()
@@ -840,7 +840,7 @@ impl TaskDetail {
         let day = |date: Option<NaiveDate>| -> SharedString {
             date.map_or(SharedString::default(), |d| task_rows::short_date(d, strings).into())
         };
-        let time = |t: Option<chrono::NaiveTime>| -> SharedString { t.map_or(SharedString::default(), |t| t.format("%H:%M").to_string().into()) };
+        let time = |t: Option<chrono::NaiveTime>| -> SharedString { t.map_or(SharedString::default(), |t| crate::calendar::format_time(t).into()) };
         let line = |label: &'static str, date_chip: AnyElement, time_chip: Option<AnyElement>| {
             h_flex()
                 .gap_2()
@@ -864,7 +864,7 @@ impl TaskDetail {
                         .children(due_picker::time_options().into_iter().map(|t| {
                             ListItem::new(SharedString::from(format!("range-time-{t}")))
                                 .height(px(28.))
-                                .child(Label::new(t.format("%H:%M").to_string()).size(LabelSize::Small))
+                                .child(Label::new(crate::calendar::format_time(t)).size(LabelSize::Small))
                                 .when(current == Some(t), |item| item.end_slot(check_mark()))
                                 .on_click(cx.listener(move |this, _, _, cx| this.update_draft(cx, |d| d.pick_range_time(t))))
                         }))
@@ -982,7 +982,7 @@ impl TaskDetail {
                 }))
         };
         let time_label: SharedString =
-            draft.time.map_or(strings.time.into(), |t| t.format("%H:%M").to_string().into());
+            draft.time.map_or(strings.time.into(), |t| crate::calendar::format_time(t).into());
         let repeat_label: SharedString =
             draft.repeat.as_ref().map_or(strings.repeat.into(), |r| due_picker::repeat_label(r, strings).into());
 
@@ -1007,7 +1007,7 @@ impl TaskDetail {
                         std::iter::once(None)
                             .chain(due_picker::time_options().into_iter().map(Some))
                             .map(|time| {
-                                let label: SharedString = time.map_or(strings.no_time.into(), |t| t.format("%H:%M").to_string().into());
+                                let label: SharedString = time.map_or(strings.no_time.into(), |t| crate::calendar::format_time(t).into());
                                 ListItem::new(SharedString::from(format!("time-{label}")))
                                     .height(px(28.))
                                     .child(Label::new(label).size(LabelSize::Small))
@@ -1272,7 +1272,7 @@ impl TaskDetail {
         let summary = fires.map(|at| {
             strings
                 .reminder_summary
-                .replace("{time}", &at.format("%H:%M").to_string())
+                .replace("{time}", &crate::calendar::format_time(at))
                 .replace("{date}", &format!("{}, {}", task_rows::short_date(at.date(), strings), at.year()))
         });
         let stepper_row = |label: &'static str, value: String, minus: AnyElement, plus: AnyElement| {
@@ -1333,7 +1333,7 @@ impl TaskDetail {
             .when(!has_time, |el| {
                 el.child(stepper_row(
                     strings.reminder_at,
-                    custom.at.format("%H:%M").to_string(),
+                    crate::calendar::format_time(custom.at),
                     small("reminder-earlier", IconName::Minus)
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.update_custom_reminder(cx, |c| c.at = c.at - chrono::Duration::minutes(30))

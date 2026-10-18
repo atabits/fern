@@ -129,6 +129,8 @@ pub const WEEK_STARTS: [Weekday; 3] = [Weekday::Mon, Weekday::Sun, Weekday::Sat]
 pub struct Preferences {
     pub theme: ThemeMode,
     pub week_start: Weekday,
+    /// Settings → Time Format: 12-hour ("1:00 PM") instead of 24-hour ("13:00").
+    pub hour12: bool,
     /// Where tasks added outside a list go (smart lists, tags, filters); `None` is the Inbox.
     pub default_list: Option<Id>,
     /// Settings → Smart List, in the order of `SmartList::ALL`.
@@ -155,6 +157,7 @@ impl Default for Preferences {
         Self {
             theme: ThemeMode::default(),
             week_start: Weekday::Mon,
+            hour12: false,
             default_list: None,
             smart_lists: [Visibility::Show; 10],
         }
@@ -163,6 +166,7 @@ impl Default for Preferences {
 
 const THEME: &str = "theme";
 const WEEK_START: &str = "week_start";
+const TIME_FORMAT: &str = "time_format";
 const DEFAULT_LIST: &str = "default_list";
 
 impl Store {
@@ -183,7 +187,8 @@ impl Store {
                 .map(|_| id),
             None => None,
         };
-        let mut preferences = Preferences { theme, week_start, default_list, ..defaults };
+        let hour12 = self.setting(TIME_FORMAT)?.as_deref() == Some("12");
+        let mut preferences = Preferences { theme, week_start, hour12, default_list, ..defaults };
         for list in SmartList::ALL {
             if let Some(visibility) = self.setting(&smart_list_key(list))?.and_then(|c| Visibility::from_code(&c)) {
                 preferences.set_visibility(list, visibility);
@@ -195,6 +200,7 @@ impl Store {
     pub fn save_preferences(&self, preferences: &Preferences) -> Result<()> {
         self.set_setting(THEME, preferences.theme.code())?;
         self.set_setting(WEEK_START, &preferences.week_start.to_string())?;
+        self.set_setting(TIME_FORMAT, if preferences.hour12 { "12" } else { "24" })?;
         self.set_setting(DEFAULT_LIST, &preferences.default_list.map(|id| id.to_string()).unwrap_or_default())?;
         for list in SmartList::ALL {
             self.set_setting(&smart_list_key(list), preferences.visibility(list).code())?;
@@ -223,7 +229,13 @@ mod tests {
         let store = Store::open_in_memory()?;
         let list = store.create_list("Work")?;
         let preferences =
-            Preferences { theme: ThemeMode::Light, week_start: Weekday::Sun, default_list: Some(list.id), ..Default::default() };
+            Preferences {
+            theme: ThemeMode::Light,
+            week_start: Weekday::Sun,
+            hour12: true,
+            default_list: Some(list.id),
+            ..Default::default()
+        };
         store.save_preferences(&preferences)?;
         assert_eq!(store.preferences()?, preferences);
 

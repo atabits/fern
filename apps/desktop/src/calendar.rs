@@ -26,6 +26,39 @@ thread_local! {
     static WEEK_START: Cell<Weekday> = const { Cell::new(Weekday::Mon) };
 }
 
+thread_local! {
+    /// Settings → Time Format: "1:00 PM" instead of "13:00".
+    static HOUR12: Cell<bool> = const { Cell::new(false) };
+}
+
+pub fn set_hour12(on: bool) {
+    HOUR12.with(|hour12| hour12.set(on));
+}
+
+/// A time of day in the chosen format: "13:05" or "1:05 PM".
+pub fn format_time(time: impl Timelike) -> String {
+    format_time_as(time, HOUR12.with(Cell::get))
+}
+
+pub fn format_time_as(time: impl Timelike, hour12: bool) -> String {
+    if hour12 {
+        let (pm, hour) = time.hour12();
+        format!("{hour}:{:02} {}", time.minute(), if pm { "PM" } else { "AM" })
+    } else {
+        format!("{:02}:{:02}", time.hour(), time.minute())
+    }
+}
+
+/// A whole hour for time axes and hints: "09:00" or "9 AM".
+pub fn format_hour(hour: u32) -> String {
+    if HOUR12.with(Cell::get) {
+        let (pm, hour) = NaiveTime::from_hms_opt(hour % 24, 0, 0).expect("a valid hour").hour12();
+        format!("{hour} {}", if pm { "PM" } else { "AM" })
+    } else {
+        format!("{hour:02}:00")
+    }
+}
+
 pub fn set_week_start(day: Weekday) {
     WEEK_START.with(|start| start.set(day));
 }
@@ -195,6 +228,20 @@ mod tests {
         assert_eq!(week[0], d(2026, 10, 12));
         assert_eq!(week[6], d(2026, 10, 18));
         assert_eq!(week_of(d(2026, 10, 12))[0], d(2026, 10, 12));
+    }
+
+    #[test]
+    fn twelve_and_twenty_four_hour_times() {
+        let t = |h, m| NaiveTime::from_hms_opt(h, m, 0).unwrap();
+        assert_eq!(format_time_as(t(13, 5), false), "13:05");
+        assert_eq!(format_time_as(t(13, 5), true), "1:05 PM");
+        assert_eq!(format_time_as(t(0, 30), true), "12:30 AM");
+        assert_eq!(format_time_as(t(12, 0), true), "12:00 PM");
+        set_hour12(true);
+        assert_eq!(format_hour(9), "9 AM");
+        assert_eq!(format_time(t(21, 0)), "9:00 PM");
+        set_hour12(false);
+        assert_eq!(format_hour(9), "09:00");
     }
 
     #[test]

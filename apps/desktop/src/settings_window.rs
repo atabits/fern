@@ -27,6 +27,7 @@ pub enum Page {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Menu {
     Visibility(SmartList),
+    TimeFormat,
     WeekStart,
     Language,
     DefaultList,
@@ -66,6 +67,7 @@ pub fn apply(preferences: &Preferences, window: &Window, cx: &mut App) {
         theme::set(theme, cx);
     }
     calendar::set_week_start(preferences.week_start);
+    calendar::set_hour12(preferences.hour12);
     cx.refresh_windows();
 }
 
@@ -117,6 +119,7 @@ impl SettingsWindow {
         };
         self.menu = match menu {
             "week" => Some(Menu::WeekStart),
+            "time" => Some(Menu::TimeFormat),
             "today" => Some(Menu::Visibility(SmartList::Today)),
             "tags" => Some(Menu::Visibility(SmartList::Tags)),
             "language" => Some(Menu::Language),
@@ -256,10 +259,26 @@ impl SettingsWindow {
                     })
                     .collect();
                 let current = WEEK_STARTS.iter().position(|d| *d == week_start).unwrap_or(0);
+                let hour12 = self.preferences.hour12;
+                let formats = [false, true]
+                    .into_iter()
+                    .map(|twelve| {
+                        let pick: Box<dyn Fn(&mut Self, &mut Window, &mut Context<Self>)> =
+                            Box::new(move |this, window, cx| this.update(window, cx, |p| p.hour12 = twelve));
+                        (SharedString::from(strings.time_formats[twelve as usize]), twelve == hour12, pick)
+                    })
+                    .collect();
                 body.child(
                     v_flex()
                         .child(title(strings.settings_pages[1]))
                         .child(group().child(self.select_row(
+                            None,
+                            strings.time_format,
+                            strings.time_formats[hour12 as usize].into(),
+                            Menu::TimeFormat,
+                            formats,
+                            cx,
+                        )).child(self.select_row(
                             None,
                             strings.start_week_on,
                             strings.week_start_names[current].into(),

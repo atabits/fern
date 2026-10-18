@@ -528,7 +528,7 @@ pub fn due_label(
         _ => format!("{} {}", day_month(), date.year()),
     };
     if let Some(time) = time {
-        label.push_str(&time.format(" %H:%M").to_string());
+        label.push_str(&format!(" {}", crate::calendar::format_time(time)));
     }
     (label, days < 0)
 }

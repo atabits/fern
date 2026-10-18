@@ -281,7 +281,7 @@ impl CalendarView {
 
         // Time axis labels and hour lines.
         let hour_label = |hour: u32| -> SharedString {
-            if hour == 12 { strings.noon.into() } else { format!("{hour:02}:00").into() }
+            if hour == 12 { strings.noon.into() } else { calendar::format_hour(hour).into() }
         };
         let mut axis = v_flex().w(gutter).flex_none().child(
             div()
@@ -291,8 +291,8 @@ impl CalendarView {
                 .justify_center()
                 .bg(theme.colors().panel_background)
                 .flex_col()
-                .child(Label::new("00:00").size(LabelSize::XSmall).color(Color::Muted))
-                .child(Label::new("– 07:00").size(LabelSize::XSmall).color(Color::Muted)),
+                .child(Label::new(calendar::format_hour(0)).size(LabelSize::XSmall).color(Color::Muted))
+                .child(Label::new(format!("– {}", calendar::format_hour(7))).size(LabelSize::XSmall).color(Color::Muted)),
         );
         for hour in week_axis::FIRST_HOUR..week_axis::LAST_HOUR {
             axis = axis.child(
@@ -312,8 +312,8 @@ impl CalendarView {
                 .justify_center()
                 .bg(theme.colors().panel_background)
                 .flex_col()
-                .child(Label::new("21:00").size(LabelSize::XSmall).color(Color::Muted))
-                .child(Label::new("– 00:00").size(LabelSize::XSmall).color(Color::Muted)),
+                .child(Label::new(calendar::format_hour(21)).size(LabelSize::XSmall).color(Color::Muted))
+                .child(Label::new(format!("– {}", calendar::format_hour(0))).size(LabelSize::XSmall).color(Color::Muted)),
         );
 
         let columns = week.map(|date| {

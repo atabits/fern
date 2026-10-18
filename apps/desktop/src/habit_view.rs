@@ -390,7 +390,7 @@ impl HabitView {
                             .gap_0p5()
                             .rounded(px(5.))
                             .bg(theme.colors().element_selected)
-                            .child(Label::new(time.format("%H:%M").to_string()).size(LabelSize::Small))
+                            .child(Label::new(crate::calendar::format_time(time)).size(LabelSize::Small))
                             .child(
                                 IconButton::new(SharedString::from(format!("habit-reminder-remove-{time}")), IconName::X)
                                     .size(px(20.))

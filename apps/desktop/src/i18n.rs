@@ -387,6 +387,9 @@ pub struct Strings {
     /// Show, Show if not empty, Hide, and Show (Omit Empty Tags) for the Tags section.
     pub visibility_names: [&'static str; 4],
     pub start_week_on: &'static str,
+    pub time_format: &'static str,
+    /// 24-hour, 12-hour.
+    pub time_formats: [&'static str; 2],
     /// Monday, Sunday, Saturday, as in `fern_core::WEEK_STARTS`.
     pub week_start_names: [&'static str; 3],
     pub color_series: &'static str,
@@ -713,6 +716,8 @@ pub static EN: Strings = Strings {
     settings_pages: ["Smart List", "Date & Time", "Appearance", "More", "Shortcuts", "About"],
     visibility_names: ["Show", "Show if not empty", "Hide", "Show (Omit Empty Tags)"],
     start_week_on: "Start Week on",
+    time_format: "Time Format",
+    time_formats: ["24 Hour (13:00)", "12 Hour (1:00 PM)"],
     week_start_names: ["Monday", "Sunday", "Saturday"],
     color_series: "Color Series",
     theme_names: ["Default", "Dark"],
@@ -1038,6 +1043,8 @@ pub static RU: Strings = Strings {
     settings_pages: ["Смарт-списки", "Дата и время", "Оформление", "Ещё", "Горячие клавиши", "О программе"],
     visibility_names: ["Показывать", "Показывать, если не пусто", "Скрыть", "Показывать (без пустых меток)"],
     start_week_on: "Начало недели",
+    time_format: "Формат времени",
+    time_formats: ["24 часа (13:00)", "12 часов (1:00 PM)"],
     week_start_names: ["Понедельник", "Воскресенье", "Суббота"],
     color_series: "Цветовые темы",
     theme_names: ["Светлая", "Тёмная"],

@@ -199,6 +199,12 @@ impl AppView {
                     this.todo.update(cx, |todo, cx| todo.reload(cx));
                 }
             }
+            // `hour12`: Settings → Time Format set to 12 hours.
+            if state.split(';').any(|part| part == "hour12") {
+                let preferences = fern_core::Preferences { hour12: true, ..this.store.preferences().unwrap_or_default() };
+                this.store.save_preferences(&preferences).ok();
+                settings_window::apply(&preferences, window, cx);
+            }
             // `settings=<page>[><menu>]` opens the Settings window (see `SettingsWindow::dev_open`).
             if let Some(spec) = state.split(';').find_map(|part| part.strip_prefix("settings=")) {
                 this.open_settings(window, cx);

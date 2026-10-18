@@ -1390,7 +1390,7 @@ impl TodoView {
             .and_then(|p| task_rows::priority_color(p, &theme))
             .map_or(Color::Muted, Color::Custom);
         v_flex()
-            .mx_2()
+            .mx(px(20.))
             .mb_2()
             .flex_none()
             .gap_1()
@@ -4887,6 +4887,7 @@ impl Render for TodoView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let strings = i18n::t(cx);
         let theme = cx.theme().clone();
+        let add_focused = self.input.focus_handle(cx).is_focused(window);
         let input_focus = self.input.focus_handle(cx);
         let today = Self::today();
         let tag_colors: HashMap<String, Hsla> = self
@@ -5092,14 +5093,18 @@ impl Render for TodoView {
             })
             .when(!self.is_read_only_view() && !kanban_view && self.preferences.detailed_input, |el| el.child(self.render_detailed_add(strings, cx)))
             .when(!self.is_read_only_view() && !kanban_view && !self.preferences.detailed_input, |el| el.child(
+                // As in the original: 20 px in from the column's edge, lined up with the rows,
+                // and outlined in the accent while focused.
                 h_flex()
-                    .mx_2()
+                    .mx(px(20.))
                     .mb_2()
                     .h(px(38.))
                     .flex_none()
                     .gap_2()
                     .px_3()
                     .rounded(px(6.))
+                    .border_1()
+                    .border_color(if add_focused { theme.colors().accent } else { gpui::transparent_black() })
                     .bg(theme.colors().surface_background)
                     .on_mouse_down(MouseButton::Left, move |_, window, cx| {
                         window.focus(&input_focus, cx);
@@ -5156,7 +5161,7 @@ impl Render for TodoView {
                     .on_action(cx.listener(|this, _: &PriorityHigh, _, cx| this.set_selected_priority(Priority::High, cx)))
                     .flex_1()
                     .overflow_y_scroll()
-                    .px_2()
+                    .px(px(14.))
                     .pb_4()
                     // A free day in the mini calendar, as in the original.
                     .when(rows.is_empty() && matches!(self.view, View::Day(_)), |el| {

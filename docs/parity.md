@@ -14,7 +14,7 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 | Window top | every column starts 13 below the window's top edge, the room the original keeps for its title bar's buttons (sidebar, lists column, task list, details and every section; matched to screenshots) |
 | Lists column | ≈ 212 wide, items 38 apart, selection radius ≈ 6; Lists, Tags and Filters follow one another without lines, their "+" shown on hover, an empty Lists section with the original's hint (matched to a screenshot; the reference account, which has no lists, shows Tags above Lists — whether the original keeps that order once there are lists was not seen, so Fern keeps Lists first) |
 | Task row | 40 tall, 1 px separator at the bottom, selection ~6% lighter than the background |
-| "Add task" field | ≈ 38 tall, lighter background |
+| "Add task" field | ≈ 38 tall, lighter background, 20 in from the column's edge like the rows, an accent outline while focused (matched to a screenshot) |
 | List header | ≈ 60 tall, sidebar toggle on the left, sort and "…" on the right |
 | Tag chip | ≈ 18 tall, fully rounded, tag color at ~30% as background, lighter tag color as text |
 | Due date / repeat in a row | accent blue, right-aligned |
@@ -98,9 +98,9 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 
 Each item is a whole feature area, done in one pass (it may take several commits).
 
-1. Add-task pass: the list's add field, its date and "▾" popovers and the Detailed input box against the original's at the current window size (without adding anything), in one pass.
-2. Settings window pass: every Settings page's rows and controls against the original's at the current window size, in one pass.
-3. Agenda's "No tasks today": the original's banner when today has nothing, with Fern's own picture (not the original's artwork).
-4. Task details pane pass: the pane's top bar, title, description and bottom bar sizes against the original's at the current window size, in one pass.
+1. Settings window pass: every Settings page's rows and controls against the original's at the current window size, in one pass.
+2. Agenda's "No tasks today": the original's banner when today has nothing, with Fern's own picture (not the original's artwork).
+3. Task details pane pass: the pane's top bar, title, description and bottom bar sizes against the original's at the current window size, in one pass.
+4. Notifications pass: the bell's list of fired reminders against the original's look (from its documentation of the panel, without opening the reference account's list, which would mark them read).
 
 Not checkable under the reference rules: whether the original asks for a note when a focus session ends, and its white noise (the desktop original shows no sound choice on the focus page or in Focus Settings; it would only appear with a timer running in the reference account). Fern's record dialog takes a note afterwards.

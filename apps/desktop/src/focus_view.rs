@@ -2269,7 +2269,8 @@ impl FocusView {
             Bucket::Week => strings.stats_from_last_week,
             Bucket::Month => strings.stats_from_last_month,
         };
-        let card = || v_flex().min_w_0().p_4().gap_2().rounded(px(10.)).bg(theme.colors().surface_background);
+        // As the original's, the Task tab's cards are as tall as the Overview's.
+        let card = || v_flex().min_w_0().min_h(px(CARD_HEIGHT)).p_4().gap_2().rounded(px(10.)).bg(theme.colors().surface_background);
         let value = |v: String, label: &'static str, change: String| {
             v_flex()
                 .flex_1()
@@ -2331,7 +2332,7 @@ impl FocusView {
                     .gap_6()
                     .justify_center()
                     .child(
-                        Donut::new(kind_rows.iter().map(|(color, n, _)| (*n as f32, *color))).center(
+                        Donut::new(kind_rows.iter().map(|(color, n, _)| (*n as f32, *color))).size(px(216.)).thickness(px(14.)).center(
                             v_flex()
                                 .items_center()
                                 .child(div().text_size(px(20.)).font_weight(FontWeight::SEMIBOLD).child(if kinds.total() == 0 {
@@ -2382,14 +2383,16 @@ impl FocusView {
             None => (rate_card, None),
         };
         vec![
+            // As the original's: the period and the day in 34 px boxes, 12 px under the tabs.
             h_flex()
                 .gap_2()
+                .pt(px(12.))
                 .child(
                     h_flex()
                         .id("task-period")
                         .relative()
                         .px_3()
-                        .h(px(28.))
+                        .h(px(34.))
                         .gap_1()
                         .rounded(px(8.))
                         .bg(theme.colors().surface_background)
@@ -2401,7 +2404,7 @@ impl FocusView {
                 )
                 .child(
                     h_flex()
-                        .h(px(28.))
+                        .h(px(34.))
                         .px_1()
                         .gap_1()
                         .rounded(px(8.))
@@ -2422,10 +2425,14 @@ impl FocusView {
                     card()
                         .flex_1()
                         .child(div().text_size(px(16.)).font_weight(FontWeight::SEMIBOLD).child(strings.focus_overview))
+                        // As the original's, the two values in the middle of the card with a line
+                        // between them.
                         .child(
                             h_flex()
-                                .py_4()
+                                .flex_1()
+                                .items_center()
                                 .child(value(count(first, last).to_string(), strings.stats_completed_tasks, signed(count(first, last) - count(prev_first, prev_last), "")))
+                                .child(div().w(px(1.)).h(px(38.)).flex_none().bg(theme.colors().border))
                                 .child(value(
                                     format!("{}%", rate(first, last)),
                                     strings.stats_completion_rate,
@@ -2523,7 +2530,7 @@ impl FocusView {
                                 .gap_6()
                                 .justify_center()
                                 .child(
-                                    Donut::new(slices.iter().map(|(_, n, color)| (*n as f32, *color))).center(
+                                    Donut::new(slices.iter().map(|(_, n, color)| (*n as f32, *color))).size(px(216.)).thickness(px(14.)).center(
                                         v_flex()
                                             .items_center()
                                             .child(div().text_size(px(20.)).font_weight(FontWeight::SEMIBOLD).child(if completed == 0 {
@@ -2638,6 +2645,11 @@ impl FocusView {
                     p.details_by = 2;
                     p.details_menu = Some(0);
                 });
+                return;
+            }
+            "stats-task-day" => {
+                self.open_stats(cx);
+                self.update_stats(cx, |p| p.tab = 1);
                 return;
             }
             "stats-task-week" | "stats-task-tags" => {

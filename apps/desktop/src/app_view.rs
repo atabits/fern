@@ -412,6 +412,13 @@ impl AppView {
             if state.contains("statistics=open") {
                 this.open_statistics(cx);
             }
+            // `statistics=task` / `statistics=focus`: the page on its Task (by day) or Focus tab.
+            for (key, menu) in [("statistics=task", "stats-task-day"), ("statistics=focus", "stats-focus")] {
+                if state.contains(key) {
+                    this.open_statistics(cx);
+                    this.focus.update(cx, |view, cx| view.dev_menu(menu, window, cx));
+                }
+            }
             if state.contains("account-menu=open") {
                 this.account_menu_open = true;
             }

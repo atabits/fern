@@ -202,6 +202,24 @@ pub fn completed_by_list_in(tasks: &[Task], first: NaiveDate, last: NaiveDate) -
     counts
 }
 
+/// Tasks completed between `first` and `last` per tag (`None`: without tags), most first; a
+/// task with several tags counts for each.
+pub fn completed_by_tag_in(tasks: &[Task], first: NaiveDate, last: NaiveDate) -> Vec<(Option<String>, usize)> {
+    let mut counts: Vec<(Option<String>, usize)> = Vec::new();
+    for task in tasks.iter().filter(|t| !t.is_deleted() && completed_on(t).is_some_and(|d| d >= first && d <= last)) {
+        let keys: Vec<Option<String>> =
+            if task.tags.is_empty() { vec![None] } else { task.tags.iter().cloned().map(Some).collect() };
+        for key in keys {
+            match counts.iter_mut().find(|(tag, _)| *tag == key) {
+                Some((_, n)) => *n += 1,
+                None => counts.push((key, 1)),
+            }
+        }
+    }
+    counts.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+    counts
+}
+
 /// Points for "My Achievement Score". The original does not publish its rules, so Fern uses its
 /// own: a completed task is worth 2 points and 1 more when finished by its due date, a focus
 /// session 2 points and a habit check-in 1.
@@ -349,5 +367,23 @@ mod tests {
         assert_eq!(kinds, CompletionKinds { overdue: 1, on_time: 1, undated: 1, uncompleted: 1 });
         assert_eq!(kinds.total(), 4);
         assert_eq!(completed_by_list_in(&tasks, today, today), [(None, 3)]);
+    }
+
+    #[test]
+    fn completion_by_tag() {
+        let store = Store::open_in_memory().unwrap();
+        let today = Local::now().date_naive();
+        let both = store.add_task("both").unwrap();
+        store.set_tags(both.id, &["home".to_owned(), "work".to_owned()]).unwrap();
+        store.set_completed(both.id, true).unwrap();
+        let home = store.add_task("home").unwrap();
+        store.set_tags(home.id, &["home".to_owned()]).unwrap();
+        store.set_completed(home.id, true).unwrap();
+        let plain = store.add_task("plain").unwrap();
+        store.set_completed(plain.id, true).unwrap();
+        let tasks = store.tasks().unwrap();
+        let counts = completed_by_tag_in(&tasks, today, today);
+        assert_eq!(counts[0], (Some("home".to_owned()), 2));
+        assert!(counts.contains(&(Some("work".to_owned()), 1)) && counts.contains(&(None, 1)));
     }
 }

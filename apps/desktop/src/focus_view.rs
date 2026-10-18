@@ -71,6 +71,9 @@ struct StatsPage {
     /// The Task tab's Daily / Weekly / Monthly report, and whether its menu is open.
     task_period: Bucket,
     task_menu: bool,
+    /// Classified Completion Statistics by tag instead of by list, and whether its menu is open.
+    by_tag: bool,
+    classify_menu: bool,
 }
 
 /// Bars for the statistics charts, with a label under each; `highlight` marks one bar.
@@ -489,6 +492,8 @@ impl FocusView {
             curve_menu: None,
             task_period: Bucket::Day,
             task_menu: false,
+            by_tag: false,
+            classify_menu: false,
         });
         cx.notify();
     }
@@ -1144,23 +1149,82 @@ impl FocusView {
                 .child(
                     card()
                         .flex_1()
-                        .child(Label::new(strings.stats_by_list).weight(FontWeight::SEMIBOLD))
+                        .child(
+                            h_flex()
+                                .child(div().flex_1().child(Label::new(strings.stats_by_list).weight(FontWeight::SEMIBOLD)))
+                                .child({
+                                    let names = [strings.stats_by_list_option, strings.stats_by_tag_option];
+                                    let menu = page.classify_menu.then(|| {
+                                        PopoverAttachment::new(
+                                            Placement::BelowRight,
+                                            popover(cx)
+                                                .w(px(140.))
+                                                .on_mouse_down_out(cx.listener(|this, _, _, cx| this.update_stats(cx, |p| p.classify_menu = false)))
+                                                .children([false, true].into_iter().map(|tag| {
+                                                    let selected = tag == page.by_tag;
+                                                    ListItem::new(SharedString::from(format!("classify-{tag}")))
+                                                        .child(Label::new(names[tag as usize]).color(if selected { Color::Accent } else { Color::Default }))
+                                                        .when(selected, |item| item.end_slot(Icon::new(IconName::Check).size(IconSize::Small).color(Color::Accent)))
+                                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                                            this.update_stats(cx, |p| {
+                                                                p.by_tag = tag;
+                                                                p.classify_menu = false;
+                                                            })
+                                                        }))
+                                                })),
+                                        )
+                                    });
+                                    h_flex()
+                                        .id("classify-by")
+                                        .relative()
+                                        .px_2()
+                                        .h(px(22.))
+                                        .gap_0p5()
+                                        .rounded(px(11.))
+                                        .border_1()
+                                        .border_color(if page.classify_menu { theme.colors().accent } else { theme.colors().border })
+                                        .cursor_pointer()
+                                        .child(Label::new(names[page.by_tag as usize]).size(LabelSize::XSmall))
+                                        .child(Icon::new(IconName::ChevronDown).size(IconSize::XSmall).color(Color::Muted))
+                                        .on_click(cx.listener(|this, _, _, cx| this.update_stats(cx, |p| p.classify_menu = !p.classify_menu)))
+                                        .children(menu)
+                                }),
+                        )
                         .child({
                             // Each list in its own color, or one from a palette.
                             let palette = [theme.colors().accent, status.success, status.warning, status.error, theme.colors().text_muted];
-                            let slices: Vec<(SharedString, usize, Hsla)> = by_list
-                                .iter()
-                                .enumerate()
-                                .map(|(i, (list, n))| {
-                                    let list = list.and_then(|id| lists.iter().find(|l| l.id == id));
-                                    let name: SharedString = list.map_or(strings.inbox.into(), |l| l.name.clone().into());
-                                    let color = list
-                                        .and_then(|l| crate::lists_panel::parse_color(l.color.as_deref()))
-                                        .unwrap_or(palette[i % palette.len()]);
-                                    (name, *n, color)
-                                })
-                                .collect();
-                            let completed: usize = slices.iter().map(|(_, n, _)| n).sum();
+                            let slices: Vec<(SharedString, usize, Hsla)> = if page.by_tag {
+                                let tags = self.store.tags().unwrap_or_default();
+                                stats::completed_by_tag_in(&tasks, first, last)
+                                    .into_iter()
+                                    .enumerate()
+                                    .map(|(i, (tag, n))| {
+                                        let color = tag
+                                            .as_ref()
+                                            .and_then(|name| tags.iter().find(|t| &t.name == name))
+                                            .and_then(|t| crate::lists_panel::parse_color(t.color.as_deref()))
+                                            .unwrap_or(palette[i % palette.len()]);
+                                        let name: SharedString = tag.map_or(strings.group_no_tags.into(), |t| format!("#{t}").into());
+                                        (name, n, color)
+                                    })
+                                    .collect()
+                            } else {
+                                by_list
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(i, (list, n))| {
+                                        let list = list.and_then(|id| lists.iter().find(|l| l.id == id));
+                                        let name: SharedString = list.map_or(strings.inbox.into(), |l| l.name.clone().into());
+                                        let color = list
+                                            .and_then(|l| crate::lists_panel::parse_color(l.color.as_deref()))
+                                            .unwrap_or(palette[i % palette.len()]);
+                                        (name, *n, color)
+                                    })
+                                    .collect()
+                            };
+                            // A task with several tags counts once in the middle.
+                            let unique: usize = by_list.iter().map(|(_, n)| n).sum();
+                            let completed = unique;
                             h_flex()
                                 .py_2()
                                 .gap_6()
@@ -1214,11 +1278,14 @@ impl FocusView {
                 });
                 return;
             }
-            "stats-task-week" => {
+            "stats-task-week" | "stats-task-tags" => {
+                let tags = menu == "stats-task-tags";
                 self.open_stats(cx);
                 self.update_stats(cx, |p| {
                     p.tab = 1;
                     p.task_period = Bucket::Week;
+                    p.by_tag = tags;
+                    p.classify_menu = tags;
                 });
                 return;
             }

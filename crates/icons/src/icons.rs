@@ -14,6 +14,8 @@ pub enum IconName {
     Ban,
     Baseline,
     Bell,
+    BetweenVerticalEnd,
+    BetweenVerticalStart,
     Bold,
     Bookmark,
     BrushCleaning,

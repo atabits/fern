@@ -140,6 +140,14 @@ pub struct TodoView {
     sections: Vec<fern_core::ListSection>,
     /// The "Add Section" field, while it is shown.
     new_section: Option<Entity<TextInput>>,
+    /// Where the new section goes among the list's sections (the column menu's Add Section to
+    /// Left / Right); `None` puts it last.
+    new_section_index: Option<usize>,
+    /// The kanban: a column's "+" field (its index and value), its "…" menu (the section and
+    /// whether Move to's side menu is open), and a section being renamed.
+    column_add: Option<(usize, DropTarget, Entity<TextInput>)>,
+    column_menu: Option<(Id, bool)>,
+    section_rename: Option<(Id, Entity<TextInput>)>,
     /// The "Undo" toast after completing or deleting a task, with its timer.
     undo: Option<(crate::undo::UndoAction, String, gpui::Task<()>)>,
     /// Saved filters with their task counts, for the lists column.
@@ -282,6 +290,10 @@ impl TodoView {
             arrange_open: false,
             sections: Vec::new(),
             new_section: None,
+            new_section_index: None,
+            column_add: None,
+            column_menu: None,
+            section_rename: None,
             section_menu: None,
             templates_open: false,
             add_menu_open: false,
@@ -443,6 +455,9 @@ impl TodoView {
                         self.drop_on_column(id, target, cx);
                     }
                 }
+                Some(("column-menu", name)) => {
+                    self.column_menu = self.sections.iter().find(|s| s.name == name).map(|s| (s.id, false));
+                }
                 Some(("section-menu", name)) => {
                     self.section_menu = self.sections.iter().find(|s| s.name == name).map(|s| s.id);
                 }
@@ -454,6 +469,7 @@ impl TodoView {
                 Some(("menu", "templates")) => self.templates_open = true,
                 Some(("menu", "input-box")) => self.input_box_open = true,
                 Some(("menu", "timeline")) => self.set_layout(false, true, cx),
+                Some(("menu", "kanban")) => self.set_layout(true, false, cx),
                 Some(("menu", "arrange")) => {
                     self.set_layout(false, true, cx);
                     self.arrange_open = true;
@@ -1726,20 +1742,25 @@ impl TodoView {
             h_flex()
                 .items_start()
                 .gap_2()
-                .child(
-                    Checkbox::new(id)
-                        .toggle_state(done)
-                        .tint(task_rows::priority_color(task.priority, &theme))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            cx.stop_propagation();
-                            this.toggle(task_id, !done, cx);
-                        })),
-                )
+                // A note shows the note icon, as the original's cards, not a box.
+                .map(|el| if task.kind == Kind::Note {
+                    el.child(Icon::new(IconName::FileText).size(IconSize::Small).color(Color::Muted))
+                } else {
+                    el.child(
+                        Checkbox::new(id)
+                            .toggle_state(done)
+                            .tint(task_rows::priority_color(task.priority, &theme))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.toggle(task_id, !done, cx);
+                            })),
+                    )
+                })
                 .child(
                     div()
                         .flex_1()
                         .min_w_0()
-                        .text_size(px(13.))
+                        .text_size(px(14.))
                         .text_color(if done { theme.colors().text_muted } else { theme.colors().text })
                         .child(if task.title.is_empty() { strings.untitled.to_owned() } else { task.title.clone() }),
                 )
@@ -2555,7 +2576,7 @@ impl TodoView {
         let input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.section_name, cx));
         cx.subscribe(&input, |this, _, Submitted(name), cx| {
             if let View::List(list) = this.view {
-                let result = this.store.add_list_section(list, name);
+                let result = this.store.insert_list_section(list, name, this.new_section_index.take());
                 this.check(result);
             }
             this.new_section = None;
@@ -2571,6 +2592,175 @@ impl TodoView {
         self.new_section = Some(input);
         self.header_menu_open = false;
         cx.notify();
+    }
+
+    /// A kanban column's "+": a field at the column's top; the task it adds takes the column's
+    /// value, as one dropped there.
+    fn start_column_add(&mut self, column: usize, target: DropTarget, window: &mut Window, cx: &mut Context<Self>) {
+        let strings = i18n::t(cx);
+        let input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.add_task, cx));
+        cx.subscribe_in(&input, window, move |this, input, Submitted(text), window, cx| {
+            if !text.trim().is_empty() {
+                let result = this.add_task(text);
+                if let Some(task) = this.check(result)
+                    && let Some((_, target, _)) = this.column_add.clone()
+                {
+                    this.drop_on_column(task.id, target, cx);
+                }
+                input.update(cx, |input, cx| input.clear(window, cx));
+                this.reload(cx);
+            }
+        })
+        .detach();
+        cx.subscribe(&input, |this, _, _: &Cancelled, cx| {
+            this.column_add = None;
+            cx.notify();
+        })
+        .detach();
+        window.focus(&input.focus_handle(cx), cx);
+        self.column_add = Some((column, target, input));
+        cx.notify();
+    }
+
+    /// A column's header, as the original's: the name and count, then "+" and, for a section,
+    /// "…" with Rename, Add Section to Left / Right, Move to › and Delete.
+    fn render_column_header(
+        &self,
+        column: usize,
+        title: String,
+        count: usize,
+        target: Option<DropTarget>,
+        strings: &'static Strings,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let section = match target {
+            Some(DropTarget::Section(Some(id))) => Some(id),
+            _ => None,
+        };
+        let renaming = self.section_rename.as_ref().filter(|(id, _)| Some(*id) == section).map(|(_, input)| input.clone());
+        let menu_open = self.column_menu.is_some_and(|(id, _)| Some(id) == section);
+        h_flex()
+            .h(px(30.))
+            .gap_1()
+            .map(|el| match renaming {
+                Some(input) => el.child(div().flex_1().child(input)),
+                None => el
+                    .child(Label::new(title).weight(FontWeight::SEMIBOLD))
+                    .child(Label::new(count.to_string()).size(LabelSize::Small).color(Color::Muted))
+                    .child(div().flex_1()),
+            })
+            .when_some(target.filter(|t| !matches!(t, DropTarget::Complete)), |el, target| {
+                el.child(
+                    IconButton::new(SharedString::from(format!("kanban-add-{column}")), IconName::Plus)
+                        .icon_color(Color::Muted)
+                        .tooltip(Tooltip::text(strings.add_task))
+                        .on_click(cx.listener(move |this, _, window, cx| this.start_column_add(column, target.clone(), window, cx))),
+                )
+            })
+            .when_some(section, |el, id| {
+                el.child(
+                    div()
+                        .relative()
+                        .child(
+                            IconButton::new(SharedString::from(format!("kanban-menu-{column}")), IconName::Ellipsis)
+                                .icon_color(Color::Muted)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.column_menu = if this.column_menu.is_some_and(|(open, _)| open == id) { None } else { Some((id, false)) };
+                                    cx.notify();
+                                })),
+                        )
+                        .when(menu_open, |el| el.child(PopoverAttachment::new(Placement::BelowRight, self.render_column_menu(id, column, strings, cx)))),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn render_column_menu(&self, section: Id, column: usize, strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {
+        let item = |key: &'static str, icon: IconName, label: &'static str| {
+            ListItem::new(key).height(px(34.)).start_slot(Icon::new(icon).color(Color::Muted)).child(Label::new(label))
+        };
+        // The section's place among the list's sections, for Add Section to Left / Right.
+        let index = self.sections.iter().position(|s| s.id == section).unwrap_or(column);
+        let side = self.column_menu.is_some_and(|(_, side)| side);
+        let lists: Vec<ListItem> = self
+            .active_lists()
+            .into_iter()
+            .filter(|l| Some(l.id) != match self.view { View::List(id) => Some(id), _ => None })
+            .map(|list| {
+                let to = list.id;
+                ListItem::new(SharedString::from(format!("section-move-{to}")))
+                    .start_slot(Icon::new(IconName::List).color(Color::Muted))
+                    .child(Label::new(list.name.clone()))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.column_menu = None;
+                        let result = this.store.move_list_section(section, to);
+                        this.check(result);
+                        this.reload(cx);
+                    }))
+            })
+            .collect();
+        let view = cx.entity().downgrade();
+        popover(cx)
+            .w(px(220.))
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.column_menu = None;
+                cx.notify();
+            }))
+            .child(item("section-rename", IconName::Pencil, strings.rename_section).on_click(cx.listener(move |this, _, window, cx| {
+                this.column_menu = None;
+                let strings = i18n::t(cx);
+                let input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.section_name, cx));
+                let name = this.sections.iter().find(|s| s.id == section).map(|s| s.name.clone()).unwrap_or_default();
+                input.update(cx, |input, cx| input.set_text(name, cx));
+                cx.subscribe(&input, move |this, _, Submitted(name), cx| {
+                    let result = this.store.rename_list_section(section, name);
+                    this.check(result);
+                    this.section_rename = None;
+                    this.reload(cx);
+                })
+                .detach();
+                cx.subscribe(&input, |this, _, _: &Cancelled, cx| {
+                    this.section_rename = None;
+                    cx.notify();
+                })
+                .detach();
+                window.focus(&input.focus_handle(cx), cx);
+                this.section_rename = Some((section, input));
+                cx.notify();
+            })))
+            .child(item("section-left", IconName::BetweenVerticalStart, strings.add_section_left).on_click(cx.listener(move |this, _, window, cx| {
+                this.column_menu = None;
+                this.start_new_section(window, cx);
+                this.new_section_index = Some(index);
+            })))
+            .child(item("section-right", IconName::BetweenVerticalEnd, strings.add_section_right).on_click(cx.listener(move |this, _, window, cx| {
+                this.column_menu = None;
+                this.start_new_section(window, cx);
+                this.new_section_index = Some(index + 1);
+            })))
+            .child(
+                SubmenuItem::new("section-move", strings.move_to)
+                    .icon(IconName::Inbox)
+                    .height(px(34.))
+                    .open(side)
+                    .on_hover(move |hovered: &bool, _, cx: &mut App| {
+                        if *hovered && !side {
+                            view.update(cx, |this, cx| {
+                                this.column_menu = Some((section, true));
+                                cx.notify();
+                            })
+                            .ok();
+                        }
+                    })
+                    .items(lists),
+            )
+            .child(item("section-delete", IconName::Trash, strings.delete).on_click(cx.listener(move |this, _, _, cx| {
+                this.column_menu = None;
+                let result = this.store.delete_list_section(section);
+                this.check(result);
+                this.reload(cx);
+            })))
+            .into_any_element()
     }
 
     /// A card dropped on a kanban column takes the column's value: its section, kind, date,
@@ -4498,6 +4688,8 @@ impl Render for TodoView {
             && !matches!(self.view, View::Trash | View::Completed | View::WontDo | View::Search(_));
         let kanban_view = (self.kanban || timeline_view)
             && !matches!(self.view, View::Trash | View::Completed | View::WontDo | View::Search(_));
+        // The original's kanban has no add field on top: each column has its own "+".
+        let kanban_only = kanban_view && !timeline_view;
         let board: Option<AnyElement> = if timeline_view {
             Some(self.render_timeline(strings, cx))
         } else {
@@ -4510,8 +4702,9 @@ impl Render for TodoView {
                 .id("kanban")
                 .flex_1()
                 .items_start()
-                .gap_3()
+                .gap(px(24.))
                 .px_4()
+                .pt_1()
                 .pb_4()
                 .overflow_x_scroll()
                 .children(columns.into_iter().enumerate().map(|(i, (title, drop, cards))| {
@@ -4527,17 +4720,28 @@ impl Render for TodoView {
                                     this.drop_on_column(dragged.id, drop.clone(), cx)
                                 }))
                         })
-                        .w(px(270.))
+                        .w(px(258.))
                         .flex_none()
                         .max_h_full()
                         .gap_2()
-                        .child(self.render_group_header(
+                        .child(self.render_column_header(
+                            i,
                             if title.is_empty() { strings.group_tasks.to_owned() } else { title },
                             count,
-                            drop_for_header.as_ref(),
-                            30.,
+                            drop_for_header,
+                            strings,
                             cx,
                         ))
+                        .children(self.column_add.as_ref().filter(|(at, _, _)| *at == i).map(|(_, _, input)| {
+                            h_flex()
+                                .h(px(36.))
+                                .px_3()
+                                .rounded(px(8.))
+                                .border_1()
+                                .border_color(theme.colors().accent)
+                                .bg(theme.colors().surface_background)
+                                .child(input.clone())
+                        }))
                         .child(
                             v_flex()
                                 .id(SharedString::from(format!("kanban-cards-{i}")))
@@ -4553,7 +4757,7 @@ impl Render for TodoView {
                 }))
                 .when(matches!(self.view, View::List(_)), |el| {
                     el.child(
-                        v_flex().w(px(220.)).flex_none().pt_1().map(|el| match self.new_section.clone() {
+                        v_flex().w(px(220.)).flex_none().pt(px(6.)).map(|el| match self.new_section.clone() {
                             Some(input) => el.child(
                                 h_flex().h(px(30.)).px_2().rounded(px(6.)).bg(theme.colors().surface_background).child(input),
                             ),
@@ -4672,8 +4876,8 @@ impl Render for TodoView {
             .when(matches!(self.view, View::Completed | View::WontDo), |el| {
                 el.child(self.render_closed_filters(strings, cx))
             })
-            .when(!self.is_read_only_view() && self.preferences.detailed_input, |el| el.child(self.render_detailed_add(strings, cx)))
-            .when(!self.is_read_only_view() && !self.preferences.detailed_input, |el| el.child(
+            .when(!self.is_read_only_view() && !kanban_only && self.preferences.detailed_input, |el| el.child(self.render_detailed_add(strings, cx)))
+            .when(!self.is_read_only_view() && !kanban_only && !self.preferences.detailed_input, |el| el.child(
                 h_flex()
                     .mx_2()
                     .mb_2()
@@ -4849,7 +5053,7 @@ impl Render for TodoView {
                     return el.child(div().flex_1().min_w_0().h_full().pt(px(crate::TOP_INSET)).child(self.summary.clone()));
                 }
                 // As in the original, the Timeline takes the whole width until a task is opened.
-                if timeline_view && self.selected.is_none() && self.list_activity.is_none() {
+                if (timeline_view || kanban_only) && self.selected.is_none() && self.list_activity.is_none() {
                     return el.child(list);
                 }
                 el.child(list).child(div().flex_none().w(px(DETAIL_WIDTH)).h_full().pt(px(crate::TOP_INSET)).map(|el| match self.list_activity.clone() {

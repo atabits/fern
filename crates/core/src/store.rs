@@ -716,6 +716,11 @@ const MIGRATIONS: &[&str] = &[
         INSERT INTO sync_log (entity, key, at) VALUES ('task_comments', OLD.id, CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER));
     END;
     ",
+    // The kanban's "Add Section to Left / Right": sections keep their own order.
+    "
+    ALTER TABLE list_sections ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0;
+    UPDATE list_sections SET sort_order = (SELECT COUNT(*) FROM list_sections s WHERE s.list_id = list_sections.list_id AND (s.created_at < list_sections.created_at OR (s.created_at = list_sections.created_at AND s.rowid < list_sections.rowid)));
+    ",
 ];
 
 const TASK_COLUMNS: &str = "id, parent_id, kind, title, notes, priority, due_date, due_time, \
@@ -1295,7 +1300,7 @@ impl Store {
     /// Sections of a list ("Add Section"), oldest first.
     pub fn list_sections(&self, list: Id) -> Result<Vec<crate::model::ListSection>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, list_id, name FROM list_sections WHERE list_id = ?1 ORDER BY created_at, rowid",
+            "SELECT id, list_id, name FROM list_sections WHERE list_id = ?1 ORDER BY sort_order, created_at, rowid",
         )?;
         let sections = stmt
             .query_map([list.to_string()], |row| {
@@ -1310,14 +1315,41 @@ impl Store {
     }
 
     pub fn add_list_section(&self, list: Id, name: &str) -> Result<crate::model::ListSection> {
+        self.insert_list_section(list, name, None)
+    }
+
+    /// Adds a section at `index` among the list's sections (last for `None`), as the kanban's
+    /// "Add Section to Left / Right".
+    pub fn insert_list_section(&self, list: Id, name: &str, index: Option<usize>) -> Result<crate::model::ListSection> {
         let name = name.trim();
         anyhow::ensure!(!name.is_empty(), "a section needs a name");
         let section = crate::model::ListSection { id: Uuid::now_v7(), list_id: list, name: name.to_owned() };
-        self.conn.execute(
+        let mut order: Vec<Id> = self.list_sections(list)?.into_iter().map(|s| s.id).collect();
+        let at = index.unwrap_or(order.len()).min(order.len());
+        order.insert(at, section.id);
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
             "INSERT INTO list_sections (id, list_id, name, created_at) VALUES (?1, ?2, ?3, ?4)",
             params![section.id.to_string(), list.to_string(), section.name, now_ms()],
         )?;
+        for (i, id) in order.iter().enumerate() {
+            tx.execute("UPDATE list_sections SET sort_order = ?2 WHERE id = ?1 AND sort_order != ?2", params![id.to_string(), i as i64])?;
+        }
+        tx.commit()?;
         Ok(section)
+    }
+
+    /// The kanban column menu's "Move to": the section and its tasks go to another list, after
+    /// its sections.
+    pub fn move_list_section(&self, id: Id, to: Id) -> Result<()> {
+        let tasks: Vec<Id> = self.tasks()?.into_iter().filter(|t| t.section_id == Some(id) && t.parent_id.is_none()).map(|t| t.id).collect();
+        let order = self.list_sections(to)?.len() as i64;
+        self.conn.execute("UPDATE list_sections SET list_id = ?2, sort_order = ?3 WHERE id = ?1", params![id.to_string(), to.to_string(), order])?;
+        for task in tasks {
+            self.set_list(task, Some(to))?;
+            self.set_section(task, Some(id))?;
+        }
+        Ok(())
     }
 
     pub fn rename_list_section(&self, id: Id, name: &str) -> Result<()> {
@@ -3252,6 +3284,27 @@ mod tests {
         store.ungroup_list_folder(home.id)?;
         assert!(store.list_folders()?.is_empty());
         assert_eq!(store.lists()?.iter().find(|l| l.id == groceries.id).unwrap().folder, None);
+        Ok(())
+    }
+
+    #[test]
+    fn sections_left_right_and_moved() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let work = store.create_list("Work")?;
+        let home = store.create_list("Home")?;
+        let doing = store.add_list_section(work.id, "Doing")?;
+        store.insert_list_section(work.id, "To do", Some(0))?;
+        store.insert_list_section(work.id, "Done", None)?;
+        let names = |list| store.list_sections(list).unwrap().into_iter().map(|s| s.name).collect::<Vec<_>>();
+        assert_eq!(names(work.id), ["To do", "Doing", "Done"]);
+        let task = store.add_task("Paint")?;
+        store.set_list(task.id, Some(work.id))?;
+        store.set_section(task.id, Some(doing.id))?;
+        store.move_list_section(doing.id, home.id)?;
+        assert_eq!(names(work.id), ["To do", "Done"]);
+        assert_eq!(names(home.id), ["Doing"]);
+        let moved = store.task(task.id)?.unwrap();
+        assert_eq!((moved.list_id, moved.section_id), (Some(home.id), Some(doing.id)));
         Ok(())
     }
 

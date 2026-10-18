@@ -8,6 +8,7 @@ use ui::{Placement, PopoverAttachment, popover};
 use crate::actions::{NewTask, Search, ShowInbox, ShowNext7Days, ShowToday, ShowTomorrow, ToggleSidebar};
 use crate::calendar_view::{self, CalendarView};
 use crate::i18n::{self, CurrentLocale, Locale};
+use crate::matrix_view::{self, MatrixView};
 use crate::search_modal::{SearchEvent, SearchModal};
 use crate::sidebar::{self, Section};
 use crate::todo_view::TodoView;
@@ -17,6 +18,7 @@ pub struct AppView {
     section: Section,
     todo: gpui::Entity<TodoView>,
     calendar: gpui::Entity<CalendarView>,
+    matrix: gpui::Entity<MatrixView>,
     search: Option<gpui::Entity<SearchModal>>,
     account_menu_open: bool,
 }
@@ -35,11 +37,25 @@ impl AppView {
             });
         })
         .detach();
-        let mut this = Self { store, section: Section::Tasks, todo, calendar, search: None, account_menu_open: false };
+        let matrix = cx.new(|cx| MatrixView::new(store.clone(), cx));
+        cx.subscribe_in(&matrix, window, |this, _, matrix_view::OpenTask(id), window, cx| {
+            let id = *id;
+            this.select(Section::Tasks, window, cx);
+            this.todo.update(cx, |todo, cx| {
+                todo.set_view(fern_core::View::All, cx);
+                todo.select(id, cx);
+            });
+        })
+        .detach();
+        let mut this =
+            Self { store, section: Section::Tasks, todo, calendar, matrix, search: None, account_menu_open: false };
         #[cfg(debug_assertions)]
         if let Ok(state) = std::env::var("FERN_DEV_STATE") {
             if state.contains("section=calendar") {
                 this.select(Section::Calendar, window, cx);
+            }
+            if state.contains("section=matrix") {
+                this.select(Section::Matrix, window, cx);
             }
             if let Some(query) = state.split(';').find_map(|part| part.strip_prefix("search-popover=")) {
                 this.open_search(window, cx);
@@ -60,6 +76,9 @@ impl AppView {
         self.todo.update(cx, |todo, cx| todo.stop_search(cx));
         if section == Section::Calendar {
             self.calendar.update(cx, |calendar, cx| calendar.reload(cx));
+        }
+        if section == Section::Matrix {
+            self.matrix.update(cx, |matrix, cx| matrix.reload(cx));
         }
         self.section = section;
         cx.notify();
@@ -189,6 +208,7 @@ impl Render for AppView {
             .child(match self.section {
                 Section::Tasks | Section::Search => div().flex_1().h_full().child(self.todo.clone()),
                 Section::Calendar => div().flex_1().h_full().child(self.calendar.clone()),
+                Section::Matrix => div().flex_1().h_full().child(self.matrix.clone()),
                 other => v_flex()
                     .flex_1()
                     .h_full()

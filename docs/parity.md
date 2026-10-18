@@ -43,7 +43,7 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 
 | Feature | Status | Notes |
 |---|---|---|
-| Narrow sections sidebar | 🟡 | Tasks, Calendar and Search work; outline icons where TickTick uses filled ones; no notification badge |
+| Narrow sections sidebar | 🟡 | Tasks, Calendar, Search and Matrix work; outline icons where TickTick uses filled ones; no notification badge |
 | Account menu with language switch | ✅ | English (default) and Russian |
 | Lists column: Inbox / All / Today / Tomorrow / Next 7 Days | ✅ | counters; a new task gets the due date or tag of the current view |
 | Lists column: user lists | ✅ | create inline; rename, color and delete from the "…" menu; no drag and drop |
@@ -67,7 +67,8 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 | Keyboard shortcuts | ✅ | JSON keymap (Zed format): new task, search, smart lists, list navigation, complete, delete |
 | Search | 🟡 | popover matched to the original: Task/Tag/List filters, results grouped with highlighted matches, list name, note excerpts, "View more" opens the full list; no "Event" filter (no calendar events) |
 | Calendar | 🟡 | month grid matched to a screenshot of the original: only the weeks of the month, "Oct 1" labels, today circle, task bars with checkboxes, "+ / Month / ‹ Today ›" header; no week/day views, view switcher is static, no dragging between days |
-| Pomodoro, Habits, Matrix, Countdown | ⬜ | |
+| Eisenhower Matrix | 🟡 | matched to the original: quadrants by priority (TickTick's default rules), grouped by list, drag a task to another quadrant to change its priority; no custom quadrant rules |
+| Pomodoro, Habits, Countdown | ⬜ | |
 | Sync between devices | ⬜ | |
 
 ## How changes are checked
@@ -87,8 +88,8 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 ## Next
 
 1. Drag tasks onto calendar days and onto lists in the lists column.
-2. Eisenhower matrix view.
-3. Week view in the calendar.
+2. Week view in the calendar.
+3. Countdown section.
 3. "Won't Do" status.
 4. Custom time and "every N" in the due-date picker.
 5. Eisenhower matrix view.

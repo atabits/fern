@@ -110,6 +110,9 @@ pub struct TodoView {
     show_details: bool,
     /// The current list's layout: cards in columns instead of rows (the menu's View).
     kanban: bool,
+    /// The original's Timeline view, and the first day it shows.
+    timeline: bool,
+    timeline_from: NaiveDate,
     /// The current list's sections.
     sections: Vec<fern_core::ListSection>,
     /// The "Add Section" field, while it is shown.
@@ -261,6 +264,8 @@ impl TodoView {
             sort_menu: None,
             show_details: false,
             kanban: false,
+            timeline: false,
+            timeline_from: Self::today(),
             sections: Vec::new(),
             new_section: None,
             section_menu: None,
@@ -426,6 +431,7 @@ impl TodoView {
                 }
                 Some(("menu", "templates")) => self.templates_open = true,
                 Some(("menu", "input-box")) => self.input_box_open = true,
+                Some(("menu", "timeline")) => self.set_layout(false, true, cx),
                 // `menu=add-date-repeat`: the picker with a time and a weekly repeat, Repeat open.
                 Some(("menu", "add-date-repeat")) => {
                     self.add_draft.date = Some(Self::today() + chrono::Duration::days(1));
@@ -566,6 +572,7 @@ impl TodoView {
             .collect();
         self.show_details = self.view_flag("show_details", false);
         self.kanban = self.view_flag("kanban", false);
+        self.timeline = self.view_flag("timeline", false);
         let today = Self::today();
         self.filters = self
             .store
@@ -2157,8 +2164,157 @@ impl TodoView {
         self.check(result);
         self.show_details = self.view_flag("show_details", false);
         self.kanban = self.view_flag("kanban", false);
+        self.timeline = self.view_flag("timeline", false);
         self.header_menu_open = false;
         cx.notify();
+    }
+
+    /// The header menu's View: list, kanban or timeline, one at a time.
+    fn set_layout(&mut self, kanban: bool, timeline: bool, cx: &mut Context<Self>) {
+        let key = self.view_key();
+        for (name, on) in [("kanban", kanban), ("timeline", timeline)] {
+            let result = self.store.set_setting(&format!("{name}:{key}"), if on { "1" } else { "0" });
+            self.check(result);
+        }
+        self.kanban = kanban;
+        self.timeline = timeline;
+        self.timeline_from = Self::today();
+        self.header_menu_open = false;
+        cx.notify();
+    }
+
+    /// The original's Timeline: the groups as rows, the coming days as columns (weekends shaded),
+    /// and each dated task as a bar from its date to the end of its duration; a click opens it.
+    fn render_timeline(&self, strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {
+        const DAYS: usize = 10;
+        const LABEL_WIDTH: f32 = 150.;
+        let theme = cx.theme().clone();
+        let today = Self::today();
+        let from = self.timeline_from;
+        let days: Vec<NaiveDate> = (0..DAYS as i64).map(|i| from + chrono::Duration::days(i)).collect();
+        let groups = task_rows::kanban_columns(self.rows_with(strings, &HashSet::new(), &HashSet::new()), strings);
+        let weekend = |date: &NaiveDate| matches!(date.weekday(), chrono::Weekday::Sat | chrono::Weekday::Sun);
+        let shift = |delta: i64| {
+            cx.listener(move |this: &mut Self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>| {
+                this.timeline_from += chrono::Duration::days(delta);
+                cx.notify();
+            })
+        };
+        // The day columns behind each row, so that weekends stay shaded all the way down.
+        let backdrop = |height: Pixels| {
+            h_flex().absolute().top_0().left_0().w_full().h(height).children(days.iter().map(|date| {
+                div()
+                    .flex_1()
+                    .h_full()
+                    .border_l_1()
+                    .border_color(theme.colors().border_variant)
+                    .when(weekend(date), |el| el.bg(theme.colors().element_hover.opacity(0.5)))
+            }))
+        };
+        let header = v_flex()
+            .flex_none()
+            .child(
+                h_flex()
+                    .h(px(30.))
+                    .px_3()
+                    .child(div().flex_1().child(Label::new(strings.months_short[from.month0() as usize]).size(LabelSize::Small).color(Color::Muted)))
+                    .child(
+                        div()
+                            .id("timeline-today")
+                            .px_2()
+                            .h(px(22.))
+                            .flex()
+                            .items_center()
+                            .rounded(px(11.))
+                            .border_1()
+                            .border_color(theme.colors().border)
+                            .cursor_pointer()
+                            .child(Label::new(strings.today).size(LabelSize::Small))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.timeline_from = Self::today();
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .h(px(28.))
+                    .border_b_1()
+                    .border_color(theme.colors().border_variant)
+                    .child(
+                        h_flex()
+                            .w(px(LABEL_WIDTH))
+                            .flex_none()
+                            .px_1()
+                            .child(IconButton::new("timeline-prev", IconName::ChevronLeft).size(px(20.)).icon_size(IconSize::XSmall).on_click(shift(-7))),
+                    )
+                    .child(h_flex().flex_1().children(days.iter().map(|date| {
+                        let is_today = *date == today;
+                        div()
+                            .flex_1()
+                            .h_full()
+                            .px_2()
+                            .flex()
+                            .items_center()
+                            .when(weekend(date), |el| el.bg(theme.colors().element_hover.opacity(0.5)))
+                            .child(Label::new(date.day().to_string()).size(LabelSize::Small).color(if is_today { Color::Accent } else { Color::Default }))
+                    })))
+                    .child(IconButton::new("timeline-next", IconName::ChevronRight).size(px(20.)).icon_size(IconSize::XSmall).on_click(shift(7))),
+            );
+        let rows = groups.into_iter().enumerate().map(|(i, (label, _, cards))| {
+            let bars: Vec<(Task, usize, usize)> = cards
+                .into_iter()
+                .flat_map(|(task, subtasks)| std::iter::once(task).chain(subtasks))
+                .filter_map(|task| fern_core::timeline::bar(&task, from, DAYS).map(|(first, span)| (task, first, span)))
+                .collect();
+            let height = px(16. + 32. * bars.len().max(1) as f32);
+            h_flex()
+                .h(height)
+                .border_b_1()
+                .border_color(theme.colors().border_variant)
+                .child(
+                    div()
+                        .w(px(LABEL_WIDTH))
+                        .flex_none()
+                        .h_full()
+                        .px_3()
+                        .pt_2()
+                        .child(Label::new(label).size(LabelSize::Small).weight(FontWeight::SEMIBOLD)),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .h_full()
+                        .mr(px(20.))
+                        .relative()
+                        .child(backdrop(height))
+                        .children(bars.into_iter().enumerate().map(|(n, (task, first, span))| {
+                            let id = task.id;
+                            let tint = task_rows::priority_color(task.priority, &theme).unwrap_or(theme.colors().accent);
+                            div()
+                                .id(SharedString::from(format!("timeline-{i}-{id}")))
+                                .absolute()
+                                .top(px(8. + 32. * n as f32))
+                                .left(gpui::relative(first as f32 / DAYS as f32))
+                                .w(gpui::relative(span as f32 / DAYS as f32))
+                                .h(px(26.))
+                                .px_1()
+                                .child(
+                                    div()
+                                        .size_full()
+                                        .px_2()
+                                        .flex()
+                                        .items_center()
+                                        .rounded(px(6.))
+                                        .bg(tint.opacity(if task.is_completed() { 0.3 } else { 0.75 }))
+                                        .cursor_pointer()
+                                        .child(Label::new(task.title.clone()).size(LabelSize::Small).truncate()),
+                                )
+                                .on_click(cx.listener(move |this, _, _, cx| this.select(id, cx)))
+                        })),
+                )
+        });
+        v_flex().id("timeline").flex_1().min_h_0().overflow_y_scroll().child(header).children(rows).into_any_element()
     }
 
     fn sort_settings(&self) -> (SortBy, GroupBy) {
@@ -3294,6 +3450,7 @@ impl TodoView {
                 let completed = self.view_flag("show_completed", true);
                 let details = self.view_flag("show_details", false);
                 let kanban = self.kanban;
+                let timeline = self.timeline && !kanban;
                 let theme = cx.theme().clone();
                 let layout = |id: &'static str, icon: IconName, on: bool| {
                     div()
@@ -3316,16 +3473,9 @@ impl TodoView {
                             .px_2()
                             .py_1()
                             .gap_1()
-                            .child(layout("layout-list", IconName::List, !kanban).on_click(cx.listener(move |this, _, _, cx| {
-                                if kanban {
-                                    this.toggle_view_flag("kanban", false, cx)
-                                }
-                            })))
-                            .child(layout("layout-kanban", IconName::Kanban, kanban).on_click(cx.listener(move |this, _, _, cx| {
-                                if !kanban {
-                                    this.toggle_view_flag("kanban", false, cx)
-                                }
-                            }))),
+                            .child(layout("layout-list", IconName::List, !kanban && !timeline).on_click(cx.listener(|this, _, _, cx| this.set_layout(false, false, cx))))
+                            .child(layout("layout-kanban", IconName::Kanban, kanban).on_click(cx.listener(|this, _, _, cx| this.set_layout(true, false, cx))))
+                            .child(layout("layout-timeline", IconName::ChartGantt, timeline).on_click(cx.listener(|this, _, _, cx| this.set_layout(false, true, cx)))),
                     )
                     .child(div().my_1().child(Divider::horizontal()))
                     .child(
@@ -3407,9 +3557,17 @@ impl Render for TodoView {
             .iter()
             .map(|t| (t.name.clone(), lists_panel::color(t.color.as_deref(), cx)))
             .collect();
-        let kanban_view = self.kanban
+        let timeline_view = self.timeline
+            && !self.kanban
             && !matches!(self.view, View::Trash | View::Completed | View::WontDo | View::Search(_));
-        let board: Option<AnyElement> = kanban_view.then(|| {
+        let kanban_view = (self.kanban || timeline_view)
+            && !matches!(self.view, View::Trash | View::Completed | View::WontDo | View::Search(_));
+        let board: Option<AnyElement> = if timeline_view {
+            Some(self.render_timeline(strings, cx))
+        } else {
+            None
+        };
+        let board: Option<AnyElement> = board.or_else(|| kanban_view.then(|| {
             let columns = task_rows::kanban_columns(self.rows_with(strings, &HashSet::new(), &HashSet::new()), strings);
             let theme = cx.theme().clone();
             h_flex()
@@ -3476,7 +3634,7 @@ impl Render for TodoView {
                     )
                 })
                 .into_any_element()
-        });
+        }));
         let rows = if kanban_view { Vec::new() } else { self.rows(strings) };
         let rows: Vec<_> = rows
             .iter()
@@ -3741,6 +3899,10 @@ impl Render for TodoView {
             .map(|el| {
                 if self.view == View::Summary {
                     return el.child(div().flex_1().min_w_0().h_full().child(self.summary.clone()));
+                }
+                // As in the original, the Timeline takes the whole width until a task is opened.
+                if timeline_view && self.selected.is_none() && self.list_activity.is_none() {
+                    return el.child(list);
                 }
                 el.child(list).child(div().flex_none().w(px(DETAIL_WIDTH)).h_full().map(|el| match self.list_activity.clone() {
                     Some(entries) => el.child(self.render_list_activity(&entries, cx)),

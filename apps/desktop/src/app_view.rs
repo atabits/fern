@@ -452,6 +452,10 @@ impl AppView {
             return;
         }
         self.todo.update(cx, |todo, cx| todo.stop_search(cx));
+        // Other sections change tasks and check habits in.
+        if section == Section::Tasks && self.section != Section::Tasks {
+            self.todo.update(cx, |todo, cx| todo.reload(cx));
+        }
         if section == Section::Calendar {
             self.calendar.update(cx, |calendar, cx| calendar.reload(cx));
             window.focus(&self.calendar.focus_handle(cx), cx);

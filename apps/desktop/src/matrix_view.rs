@@ -117,7 +117,7 @@ pub struct MatrixView {
     /// "Edit Matrix": the quadrant and its rule being edited, with the name field.
     editing: Option<(usize, QuadrantRule)>,
     name_input: Entity<TextInput>,
-    tags: Vec<String>,
+    tags: Vec<fern_core::Tag>,
     /// A quadrant's "+": the quadrant and its field for the new task's title.
     adding: Option<(usize, Entity<TextInput>)>,
     /// The header's "…" menu, and its Show Completed choice (kept in the settings).
@@ -165,7 +165,7 @@ impl MatrixView {
         for (i, view) in self.views.iter_mut().enumerate() {
             *view = self.store.setting(&format!("matrix_view_{i}")).ok().flatten().map(|s| QuadrantView::from_storage(&s)).unwrap_or_default();
         }
-        self.tags = self.store.tags().unwrap_or_default().into_iter().map(|t| t.name).collect();
+        self.tags = self.store.tags().unwrap_or_default();
         cx.notify();
     }
 
@@ -431,7 +431,7 @@ impl MatrixView {
             ));
         }
         let mut tag_chips = vec![all("matrix-tags-all", rule.tags.is_empty(), Box::new(|r: &mut QuadrantRule| r.tags.clear()))];
-        for tag in &self.tags {
+        for tag in self.tags.iter().map(|t| &t.name) {
             let name = tag.clone();
             tag_chips.push(chip(
                 SharedString::from(format!("matrix-tag-{tag}")),
@@ -532,8 +532,7 @@ impl MatrixView {
         let id = task.id;
         let today = Local::now().date_naive();
         let tag_color = |name: &str| {
-            let tags = self.store.tags().unwrap_or_default();
-            lists_panel::color(tags.iter().find(|t| t.name == name).and_then(|t| t.color.as_deref()), cx)
+            lists_panel::color(self.tags.iter().find(|t| t.name == name).and_then(|t| t.color.as_deref()), cx)
         };
         let due = task.due_date.map(|date| task_rows::due_label(date, task.due_time, today, strings));
         let dragged = DraggedTask { id, title: task.title.clone().into() };

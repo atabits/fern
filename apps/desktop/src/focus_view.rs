@@ -40,10 +40,21 @@ struct Running {
     _ticker: GpuiTask<()>,
 }
 
+/// All tasks, lists, tags and habits with their check-ins, for the Statistics page.
+#[derive(Default)]
+struct StatsData {
+    tasks: Vec<fern_core::Task>,
+    lists: Vec<fern_core::List>,
+    tags: Vec<fern_core::Tag>,
+    habits: Vec<(fern_core::Habit, std::collections::HashSet<NaiveDate>)>,
+}
+
 pub struct FocusView {
     store: Rc<Store>,
     tasks: Vec<Task>,
     sessions: Vec<FocusSession>,
+    /// What the Statistics page reads, loaded with the view rather than on every frame.
+    stats_data: StatsData,
     running: Option<Running>,
     record_menu: Option<RecordMenu>,
     /// The Pomodoro list's timers (the original's "Add Timer"), the tab showing (archived or
@@ -291,6 +302,7 @@ impl FocusView {
             store,
             tasks: Vec::new(),
             sessions: Vec::new(),
+            stats_data: StatsData::default(),
             running: None,
             record_menu: None,
             timers: Vec::new(),
@@ -324,6 +336,21 @@ impl FocusView {
         self.tasks = self.store.tasks_in(&View::Today, today).unwrap_or_default();
         self.sessions = self.store.focus_sessions().unwrap_or_default();
         self.timers = self.store.focus_timers(self.archived_tab).unwrap_or_default();
+        self.stats_data = StatsData {
+            tasks: self.store.tasks().unwrap_or_default(),
+            lists: self.store.lists().unwrap_or_default(),
+            tags: self.store.tags().unwrap_or_default(),
+            habits: self
+                .store
+                .habits()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|h| {
+                    let checkins = self.store.checkins(h.id).unwrap_or_default();
+                    (h, checkins)
+                })
+                .collect(),
+        };
         cx.notify();
     }
 
@@ -1872,13 +1899,13 @@ impl FocusView {
         let strings = i18n::t(cx);
         let theme = cx.theme().clone();
         let status = theme.status().clone();
-        let tasks = self.store.tasks().unwrap_or_default();
-        let lists = self.store.lists().unwrap_or_default();
-        let all_tags = self.store.tags().unwrap_or_default();
+        let tasks = &self.stats_data.tasks;
+        let lists = &self.stats_data.lists;
+        let all_tags = &self.stats_data.tags;
         let week_start = crate::calendar::week_start();
         let period = page.details_period;
         let (first, last) = stats::buckets(period, page.details_day, week_start, 1)[0];
-        let totals = fern_core::focus::focus_by(&self.sessions, &tasks, page.details_by, first, last);
+        let totals = fern_core::focus::focus_by(&self.sessions, tasks, page.details_by, first, last);
         let palette = [theme.colors().accent, status.success, status.warning, status.error, theme.colors().text_muted];
         let slices: Vec<(SharedString, i64, Hsla)> = totals
             .into_iter()
@@ -2031,13 +2058,13 @@ impl FocusView {
     fn render_overview_tab(&self, page: StatsPage, today: NaiveDate, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let strings = i18n::t(cx);
         let theme = cx.theme().clone();
-        let tasks = self.store.tasks().unwrap_or_default();
-        let lists = self.store.lists().unwrap_or_default();
+        let tasks = &self.stats_data.tasks;
+        let lists = &self.stats_data.lists;
         let focus = focus_stats(&self.sessions, today);
         let completed_total = tasks.iter().filter(|t| t.is_completed() && !t.is_deleted()).count();
         let open_total = tasks.iter().filter(|t| !t.is_closed() && !t.is_deleted()).count();
         let start = today - chrono::Duration::days(6);
-        let completed = fern_core::stats::completed_by_day(&tasks, start, 7);
+        let completed = fern_core::stats::completed_by_day(tasks, start, 7);
         let card = || v_flex().min_w_0().p_4().gap_2().rounded(px(10.)).bg(theme.colors().surface_background);
         let day_labels: Vec<String> =
             (0..7).map(|i| (start + chrono::Duration::days(i)).day().to_string()).collect();
@@ -2065,7 +2092,7 @@ impl FocusView {
             ("{tasks}", open_total.to_string()),
             ("{completed}", completed_total.to_string()),
             ("{lists}", lists.len().to_string()),
-            ("{days}", fern_core::stats::days_using(&tasks, today).to_string()),
+            ("{days}", fern_core::stats::days_using(tasks, today).to_string()),
         ];
         let summary = h_flex().children(summary_parts(strings.stats_summary, &counts).into_iter().map(|(text, count)| {
             Label::new(text).when(count, |l| l.weight(FontWeight::SEMIBOLD))
@@ -2088,19 +2115,13 @@ impl FocusView {
                 })
                 .collect()
         };
-        let completed_curve: Vec<i64> = stats::completed_in(&tasks, &periods(0)).into_iter().map(|n| n as i64).collect();
-        let rates: Vec<i64> = stats::completion_rate_in(&tasks, &periods(1)).into_iter().map(i64::from).collect();
+        let completed_curve: Vec<i64> = stats::completed_in(tasks, &periods(0)).into_iter().map(|n| n as i64).collect();
+        let rates: Vec<i64> = stats::completion_rate_in(tasks, &periods(1)).into_iter().map(i64::from).collect();
         let pomos: Vec<i64> = stats::focus_in(&self.sessions, &periods(2)).into_iter().map(|(n, _)| n as i64).collect();
         let minutes: Vec<i64> = stats::focus_in(&self.sessions, &periods(3)).into_iter().map(|(_, m)| m).collect();
-        let productive = stats::more_productive_than(&tasks, today);
-        let checkins: Vec<NaiveDate> = self
-            .store
-            .habits()
-            .unwrap_or_default()
-            .iter()
-            .flat_map(|h| self.store.checkins(h.id).unwrap_or_default())
-            .collect();
-        let scores = fern_core::stats::achievement_scores(&tasks, &self.sessions, &checkins, start, 7);
+        let productive = stats::more_productive_than(tasks, today);
+        let checkins: Vec<NaiveDate> = self.stats_data.habits.iter().flat_map(|(_, done)| done.iter().copied()).collect();
+        let scores = fern_core::stats::achievement_scores(tasks, &self.sessions, &checkins, start, 7);
         let score = scores.last().copied().unwrap_or(0);
         let chart = |curve: usize, title: &'static str, values: Vec<i64>, line: bool, cx: &mut Context<Self>| {
             let bucket = page.curves[curve];
@@ -2164,9 +2185,9 @@ impl FocusView {
         };
 
         // The week's habits: the share of active habits done each day.
-        let habits: Vec<fern_core::Habit> = self.store.habits().unwrap_or_default().into_iter().filter(|h| !h.archived).collect();
-        let done: Vec<std::collections::HashSet<NaiveDate>> =
-            habits.iter().map(|h| self.store.checkins(h.id).unwrap_or_default()).collect();
+        let habits: Vec<&fern_core::Habit> = self.stats_data.habits.iter().filter(|(h, _)| !h.archived).map(|(h, _)| h).collect();
+        let done: Vec<&std::collections::HashSet<NaiveDate>> =
+            self.stats_data.habits.iter().filter(|(h, _)| !h.archived).map(|(_, done)| done).collect();
         let week = crate::calendar::week_of(today);
         let habit_week = h_flex().justify_between().children(week.iter().map(|date| {
             let share = if habits.is_empty() { 0. } else { done.iter().filter(|d| d.contains(date)).count() as f32 / habits.len() as f32 };
@@ -2293,16 +2314,16 @@ impl FocusView {
     fn render_task_tab(&self, page: StatsPage, today: NaiveDate, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let strings = i18n::t(cx);
         let theme = cx.theme().clone();
-        let tasks = self.store.tasks().unwrap_or_default();
-        let lists = self.store.lists().unwrap_or_default();
+        let tasks = &self.stats_data.tasks;
+        let lists = &self.stats_data.lists;
         let week_start = crate::calendar::week_start();
         let period = page.task_period;
         // The period containing a day, and the one before it.
         let range = |day: NaiveDate| stats::buckets(period, day, week_start, 1)[0];
         let (first, last) = range(page.day);
         let (prev_first, prev_last) = range(first - chrono::Duration::days(1));
-        let count = |a: NaiveDate, b: NaiveDate| stats::completed_in(&tasks, &[(a, b)])[0] as i64;
-        let rate = |a: NaiveDate, b: NaiveDate| stats::completion_rate_in(&tasks, &[(a, b)])[0] as i64;
+        let count = |a: NaiveDate, b: NaiveDate| stats::completed_in(tasks, &[(a, b)])[0] as i64;
+        let rate = |a: NaiveDate, b: NaiveDate| stats::completion_rate_in(tasks, &[(a, b)])[0] as i64;
         let from = match period {
             Bucket::Day => strings.stats_from_yesterday,
             Bucket::Week => strings.stats_from_last_week,
@@ -2353,8 +2374,8 @@ impl FocusView {
             if forward { last + chrono::Duration::days(1) } else { first - chrono::Duration::days(1) }
         };
 
-        let by_list = stats::completed_by_list_in(&tasks, first, last);
-        let kinds = stats::completion_kinds(&tasks, first, last);
+        let by_list = stats::completed_by_list_in(tasks, first, last);
+        let kinds = stats::completion_kinds(tasks, first, last);
         let status = theme.status().clone();
         let kind_rows = [
             (status.error, kinds.overdue, strings.stats_overdue),
@@ -2397,7 +2418,7 @@ impl FocusView {
         // Weekly and Monthly add the completion per day, as in the original.
         let distribution = (period != Bucket::Day).then(|| {
             let days = (last - first).num_days() as usize + 1;
-            let values: Vec<i64> = stats::completed_by_day(&tasks, first, days).into_iter().map(|n| n as i64).collect();
+            let values: Vec<i64> = stats::completed_by_day(tasks, first, days).into_iter().map(|n| n as i64).collect();
             let labels: Vec<String> = (0..days)
                 .map(|i| {
                     let day = first + chrono::Duration::days(i as i64);
@@ -2535,8 +2556,8 @@ impl FocusView {
                             // Each list in its own color, or one from a palette.
                             let palette = [theme.colors().accent, status.success, status.warning, status.error, theme.colors().text_muted];
                             let slices: Vec<(SharedString, usize, Hsla)> = if page.by_tag {
-                                let tags = self.store.tags().unwrap_or_default();
-                                stats::completed_by_tag_in(&tasks, first, last)
+                                let tags = &self.stats_data.tags;
+                                stats::completed_by_tag_in(tasks, first, last)
                                     .into_iter()
                                     .enumerate()
                                     .map(|(i, (tag, n))| {

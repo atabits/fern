@@ -3,7 +3,7 @@ use std::rc::Rc;
 
 use fern_core::{Id, Kind, List, ListFolder, Priority, Store, Tag, Task, View, ViewCounts};
 use chrono::{Datelike, Duration, Local, NaiveDate, TimeZone as _};
-use gpui::{ElementId, Entity, FocusHandle, Focusable, FontWeight, MouseButton, Pixels, Point};
+use gpui::{ElementId, Entity, FocusHandle, Focusable, FontWeight, ListAlignment, ListState, MouseButton, Pixels, Point, list};
 use ui::prelude::*;
 
 use crate::drag::DraggedTask;
@@ -108,6 +108,11 @@ pub struct TodoView {
     input: Entity<TextInput>,
     /// Focus of the task list itself, for keyboard navigation (the `TaskList` key context).
     list_focus: FocusHandle,
+    /// The task list, drawn as Zed's lists: only the rows in view are built. `list_entries` are
+    /// what it showed last, to tell it which rows changed.
+    list_state: ListState,
+    list_entries: Vec<ListEntry>,
+    tag_colors: HashMap<String, Hsla>,
     /// The Add List / Edit List dialog and the folder dialog, while open.
     list_dialog: Option<Entity<ListDialog>>,
     folder_dialog: Option<Entity<FolderDialog>>,
@@ -172,6 +177,9 @@ pub struct TodoView {
     mini_expanded: bool,
     mini_month: NaiveDate,
     busy_days: HashSet<NaiveDate>,
+    /// Today and Next 7 Days: the habits due today, whether each is checked in and its amount;
+    /// empty elsewhere or when the habit settings keep them out.
+    today_habits: Vec<(fern_core::Habit, bool, u32)>,
     /// The Summary smart list's report.
     summary: Entity<crate::summary_view::SummaryView>,
     /// The "Add Filter" / "Edit Filter" dialog, while it is open.
@@ -279,6 +287,9 @@ impl TodoView {
             collapsed_sections: HashSet::from([Section::Completed]),
             input,
             list_focus: cx.focus_handle(),
+            list_state: ListState::new(0, ListAlignment::Top, px(400.)),
+            list_entries: Vec::new(),
+            tag_colors: HashMap::new(),
             list_dialog: None,
             folder_dialog: None,
             folders: Vec::new(),
@@ -329,6 +340,7 @@ impl TodoView {
             mini_expanded,
             mini_month: crate::calendar::month_start(Self::today()),
             busy_days: HashSet::new(),
+            today_habits: Vec::new(),
             summary,
             filter_edit: None,
             undo: None,
@@ -740,10 +752,9 @@ impl TodoView {
     pub fn reload(&mut self, cx: &mut Context<Self>) {
         self.preferences = self.store.preferences().unwrap_or_default();
         self.sync_input_placeholder(cx);
-        self.busy_days = self
-            .store
-            .tasks()
-            .unwrap_or_default()
+        // Loaded once: the views, counts and filters below are all selections of it.
+        let all_tasks = self.store.tasks().unwrap_or_default();
+        self.busy_days = all_tasks
             .iter()
             .filter(|t| !t.is_closed() && !t.is_deleted())
             .filter_map(|t| t.due_date)
@@ -766,7 +777,7 @@ impl TodoView {
             .unwrap_or_default()
             .into_iter()
             .map(|f| {
-                let count = self.store.tasks_in(&View::Filter(f.id), today).map_or(0, |t| t.len());
+                let count = all_tasks.iter().filter(|t| f.matches(t, today)).count();
                 (f, count)
             })
             .collect();
@@ -796,15 +807,16 @@ impl TodoView {
         {
             self.view = View::Inbox;
         }
-        if let Some(tasks) = self.check(self.store.tasks_in(&self.view, today)) {
-            self.tasks = tasks;
-        }
-        if let Some(counts) = self.check(self.store.counts(today)) {
+        if let Some(counts) = self.check(self.store.counts_from(&all_tasks, today)) {
             self.counts = counts;
+        }
+        if let Some(tasks) = self.check(self.store.tasks_in_from(all_tasks, &self.view, today)) {
+            self.tasks = tasks;
         }
         if let Some(tags) = self.check(self.store.tags()) {
             self.tags = tags;
         }
+        self.reload_today_habits();
         // The details panel keeps showing a task as long as it exists, even when it has left
         // the current view (for example, after being completed in "Today").
         let selected = self.selected.and_then(|id| self.store.task(id).ok().flatten());
@@ -815,6 +827,26 @@ impl TodoView {
             detail.refresh(selected, cx);
         });
         cx.notify();
+    }
+
+    /// Today and Next 7 Days list the habits due today, as in the original, unless turned off
+    /// in the habit settings.
+    fn reload_today_habits(&mut self) {
+        self.today_habits.clear();
+        if !matches!(self.view, View::Today | View::Next7Days)
+            || self.store.setting(crate::habit_view::IN_TODAY_SETTING).ok().flatten().as_deref() == Some("0")
+        {
+            return;
+        }
+        let today = Self::today();
+        for habit in self.store.habits().unwrap_or_default().into_iter().filter(|h| !h.archived) {
+            let done = self.store.checkins(habit.id).unwrap_or_default();
+            if habit.is_due(today, &done) {
+                let amount = self.store.checkin_records(habit.id).unwrap_or_default().into_iter().find(|c| c.date == today).map_or(0, |c| c.value);
+                let checked = done.contains(&today);
+                self.today_habits.push((habit, checked, amount));
+            }
+        }
     }
 
     /// Creates a task from the quick-add line: due date, time, tags, priority and list come from
@@ -1946,6 +1978,62 @@ impl TodoView {
     }
 
     /// The rows of the current view: closed tasks by day, the trash flat, everything else grouped.
+    /// Tells the list which entries changed since it last drew: the ones between the unchanged
+    /// start and end get measured again, and the scroll position stays put. Habits and
+    /// countdowns are read elsewhere, so they are always measured again.
+    fn sync_list(&mut self, entries: Vec<ListEntry>) {
+        let old = &self.list_entries;
+        let start = old.iter().zip(&entries).take_while(|(a, b)| a == b).count();
+        let end = old[start..].iter().rev().zip(entries[start..].iter().rev()).take_while(|(a, b)| a == b).count();
+        if start < old.len() || old.len() != entries.len() {
+            self.list_state.splice(start..old.len() - end, entries.len() - start - end);
+        }
+        for (ix, entry) in entries.iter().enumerate() {
+            if !matches!(entry, ListEntry::Row(_)) {
+                self.list_state.remeasure_items(ix..ix + 1);
+            }
+        }
+        self.list_entries = entries;
+    }
+
+    fn render_entry(&mut self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
+        // Each entry spans the list's width, as in the column the list replaced.
+        div().w_full().px(px(14.)).child(self.render_entry_content(ix, cx)).into_any_element()
+    }
+
+    fn render_entry_content(&mut self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
+        let strings = i18n::t(cx);
+        let empty = || div().into_any_element();
+        match self.list_entries.get(ix).cloned() {
+            Some(ListEntry::NewSection) => match self.new_section.clone() {
+                Some(input) => h_flex()
+                    .h(px(32.))
+                    .mx(px(GUTTER))
+                    .px_2()
+                    .rounded(px(6.))
+                    .bg(cx.theme().colors().surface_background)
+                    .child(input)
+                    .into_any_element(),
+                None => empty(),
+            },
+            Some(ListEntry::Habits) => self.render_habits(strings, cx).unwrap_or_else(empty),
+            Some(ListEntry::Countdowns) => self.render_countdowns(strings, cx).unwrap_or_else(empty),
+            Some(ListEntry::Row(Row::Section { section, count, collapsed })) => {
+                self.render_section(section, count, collapsed, strings, cx)
+            }
+            Some(ListEntry::Row(Row::Day { label, count, drop })) => {
+                div().pl(px(GUTTER)).child(self.render_group_header(label, count, drop.as_ref(), 36., cx)).into_any_element()
+            }
+            Some(ListEntry::Row(Row::Task { task, depth, has_children, collapsed })) => {
+                let tag_colors = std::mem::take(&mut self.tag_colors);
+                let row = self.render_task(&task, depth, has_children, collapsed, &tag_colors, Self::today(), strings, cx);
+                self.tag_colors = tag_colors;
+                row
+            }
+            None => empty(),
+        }
+    }
+
     fn rows(&self, strings: &Strings) -> Vec<Row> {
         self.rows_with(strings, &self.collapsed_tasks, &self.collapsed_sections)
     }
@@ -3840,6 +3928,10 @@ impl TodoView {
             None => ids.len() - 1,
         };
         self.select(ids[next], cx);
+        let id = ids[next];
+        if let Some(ix) = self.list_entries.iter().position(|e| matches!(e, ListEntry::Row(Row::Task { task, .. }) if task.id == id)) {
+            self.list_state.scroll_to_reveal_item(ix);
+        }
     }
 
     fn select_next(&mut self, _: &SelectNext, _: &mut Window, cx: &mut Context<Self>) {
@@ -4692,25 +4784,10 @@ impl TodoView {
     /// due today with its icon and name and "Today 0 / 2 unit" (or "0 / 1" without a goal); a
     /// click checks it in or adds a step.
     fn render_habit_column(&self, strings: &'static Strings, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if !matches!(self.view, View::Today | View::Next7Days)
-            || self.store.setting(crate::habit_view::IN_TODAY_SETTING).ok().flatten().as_deref() == Some("0")
-        {
-            return None;
-        }
         let theme = cx.theme().clone();
         let today = Self::today();
-        let habits: Vec<(fern_core::Habit, u32)> = self
-            .store
-            .habits()
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|h| !h.archived)
-            .filter_map(|h| {
-                let done = self.store.checkins(h.id).unwrap_or_default();
-                let amount = self.store.checkin_records(h.id).unwrap_or_default().into_iter().find(|c| c.date == today).map_or(0, |c| c.value);
-                h.is_due(today, &done).then_some((h, amount))
-            })
-            .collect();
+        let habits: Vec<(fern_core::Habit, u32)> =
+            self.today_habits.iter().map(|(habit, _, amount)| (habit.clone(), *amount)).collect();
         if habits.is_empty() {
             return None;
         }
@@ -4750,6 +4827,7 @@ impl TodoView {
                             this.store.toggle_checkin(id, today).map(|_| ())
                         };
                         this.check(result);
+                        this.reload_today_habits();
                         cx.notify();
                     }))
                     .into_any_element()
@@ -4773,28 +4851,9 @@ impl TodoView {
     }
 
     fn render_habits(&self, strings: &Strings, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if !matches!(self.view, View::Today | View::Next7Days)
-            || self.store.setting(crate::habit_view::IN_TODAY_SETTING).ok().flatten().as_deref() == Some("0")
-        {
-            return None;
-        }
         let theme = cx.theme().clone();
         let today = Self::today();
-        let habits: Vec<(fern_core::Habit, bool, u32)> = self
-            .store
-            .habits()
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|h| !h.archived)
-            .filter_map(|h| {
-                let done = self.store.checkins(h.id).unwrap_or_default();
-                let amount = self.store.checkin_records(h.id).unwrap_or_default().into_iter().find(|c| c.date == today).map_or(0, |c| c.value);
-                h.is_due(today, &done).then(|| {
-                    let checked = done.contains(&today);
-                    (h, checked, amount)
-                })
-            })
-            .collect();
+        let habits = self.today_habits.clone();
         if habits.is_empty() {
             return None;
         }
@@ -4845,6 +4904,7 @@ impl TodoView {
                                 this.store.toggle_checkin(id, today).map(|_| ())
                             };
                             this.check(result);
+                            this.reload_today_habits();
                             cx.notify();
                         }))
                         .border_b_1()
@@ -5563,27 +5623,24 @@ impl Render for TodoView {
                 .into_any_element()
         }));
         let rows = if kanban_view { Vec::new() } else { self.rows(strings) };
-        let rows: Vec<_> = rows
-            .iter()
-            .map(|row| match row {
-                Row::Section { section, count, collapsed } => {
-                    self.render_section(*section, *count, *collapsed, strings, cx)
-                }
-                Row::Day { label, count, drop } => {
-                    div().pl(px(GUTTER)).child(self.render_group_header(label.clone(), *count, drop.as_ref(), 36., cx)).into_any_element()
-                }
-                Row::Task { task, depth, has_children, collapsed } => self.render_task(
-                    task,
-                    *depth,
-                    *has_children,
-                    *collapsed,
-                    &tag_colors,
-                    today,
-                    strings,
-                    cx,
-                ),
-            })
-            .collect();
+        let rows_empty = rows.is_empty();
+        if !kanban_view {
+            self.tag_colors = tag_colors.clone();
+            let mut entries = Vec::with_capacity(rows.len() + 3);
+            if self.new_section.is_some() {
+                entries.push(ListEntry::NewSection);
+            }
+            // In Next 7 Days today's habits come first, as the original's.
+            if self.view == View::Next7Days {
+                entries.push(ListEntry::Habits);
+            }
+            entries.extend(rows.into_iter().map(ListEntry::Row));
+            if self.view != View::Next7Days {
+                entries.push(ListEntry::Habits);
+            }
+            entries.push(ListEntry::Countdowns);
+            self.sync_list(entries);
+        }
 
         let list = v_flex()
             .flex_1()
@@ -5751,11 +5808,11 @@ impl Render for TodoView {
                     .on_action(cx.listener(|this, _: &PriorityMedium, _, cx| this.set_selected_priority(Priority::Medium, cx)))
                     .on_action(cx.listener(|this, _: &PriorityHigh, _, cx| this.set_selected_priority(Priority::High, cx)))
                     .flex_1()
-                    .overflow_y_scroll()
-                    .px(px(14.))
-                    .pb_4()
+                    .min_h_0()
+                    .flex()
+                    .flex_col()
                     // A free day in the mini calendar, as in the original.
-                    .when(rows.is_empty() && matches!(self.view, View::Day(_)), |el| {
+                    .when(rows_empty && matches!(self.view, View::Day(_)), |el| {
                         el.child(
                             v_flex()
                                 .pt(px(160.))
@@ -5767,7 +5824,7 @@ impl Render for TodoView {
                         )
                     })
                     // An empty Tomorrow, as the original's: a map in a soft patch and its words.
-                    .when(rows.is_empty() && self.view == View::Tomorrow, |el| {
+                    .when(rows_empty && self.view == View::Tomorrow, |el| {
                         el.child(
                             v_flex()
                                 .pt(px(160.))
@@ -5788,7 +5845,7 @@ impl Render for TodoView {
                                 .child(Label::new(strings.plan_ahead).size(LabelSize::Small).color(Color::Muted)),
                         )
                     })
-                    .when(rows.is_empty() && !matches!(self.view, View::Day(_) | View::Tomorrow), |el| {
+                    .when(rows_empty && !matches!(self.view, View::Day(_) | View::Tomorrow), |el| {
                         el.child(div().px_3().pt_8().child(
                             Label::new(match &self.view {
                                 View::Completed => strings.no_completed_tasks,
@@ -5801,22 +5858,11 @@ impl Render for TodoView {
                             .color(Color::Muted),
                         ))
                     })
-                    .when_some(self.new_section.clone().filter(|_| !kanban_view), |el, input| {
-                        el.child(
-                            h_flex()
-                                .h(px(32.))
-                                .mx(px(GUTTER))
-                                .px_2()
-                                .rounded(px(6.))
-                                .bg(cx.theme().colors().surface_background)
-                                .child(input),
-                        )
-                    })
-                    // In Next 7 Days today's habits come first, as the original's.
-                    .when(self.view == View::Next7Days, |el| el.children(self.render_habits(strings, cx)))
-                    .children(rows)
-                    .when(self.view != View::Next7Days, |el| el.children(self.render_habits(strings, cx)))
-                    .children(self.render_countdowns(strings, cx)),
+                    .child(
+                        list(self.list_state.clone(), cx.processor(|this, ix, _, cx| this.render_entry(ix, cx)))
+                            .flex_1()
+                            .pb_4(),
+                    ),
             ))
             .when_some(self.error.clone(), |el, error| {
                 el.child(
@@ -5993,4 +6039,16 @@ enum ListAction {
     AddSubtag,
     Merge,
     ShowTags(fern_core::Visibility),
+}
+
+/// An entry of the task list: a row, or what the list shows around the rows.
+#[derive(Clone, PartialEq)]
+enum ListEntry {
+    /// The field for a new section's name.
+    NewSection,
+    /// Today's habits.
+    Habits,
+    /// The countdowns shown in Today.
+    Countdowns,
+    Row(Row),
 }

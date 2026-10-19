@@ -10,7 +10,7 @@ use rust_embed::RustEmbed;
 #[derive(RustEmbed)]
 #[folder = "../../assets"]
 #[include = "icons/**/*"]
-#[include = "icon/icon.svg"]
+#[include = "icon/icon-64.png"]
 #[include = "keymaps/**/*"]
 #[include = "fonts/**/*.ttf"]
 #[exclude = "*.DS_Store"]

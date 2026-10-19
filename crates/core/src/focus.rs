@@ -409,11 +409,12 @@ mod tests {
         let report = store.add_task("report").unwrap();
         store.set_list(report.id, Some(work.id)).unwrap();
         store.set_tags(report.id, &["deep".to_owned(), "office".to_owned()]).unwrap();
-        let now = Local::now().timestamp_millis();
+        // Noon, so the sessions stay on the same day whenever the test runs.
+        let today = Local::now().date_naive();
+        let now = today.and_hms_opt(12, 0, 0).unwrap().and_local_timezone(Local).unwrap().timestamp_millis();
         store.add_focus_session(Some(report.id), "report", now - 50 * 60_000, now - 25 * 60_000).unwrap();
         store.add_focus_session(None, "Reading", now - 20 * 60_000, now - 10 * 60_000).unwrap();
         let (sessions, tasks) = (store.focus_sessions().unwrap(), store.tasks().unwrap());
-        let today = Local::now().date_naive();
 
         assert_eq!(focus_by(&sessions, &tasks, 0, today, today), [(FocusKey::List(Some(work.id)), 25), (FocusKey::List(None), 10)]);
         let by_tag = focus_by(&sessions, &tasks, 1, today, today);

@@ -190,7 +190,7 @@ impl Store {
     /// Attached files to move after a sync, by their file names in the attachment folder `dir`:
     /// the ones here the server does not have yet, and the ones listed here whose file is missing.
     pub fn files_to_sync(&self, dir: &std::path::Path) -> Result<(Vec<String>, Vec<String>)> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT a.id, a.name, u.name IS NOT NULL FROM task_attachments a
              LEFT JOIN sync_uploaded u ON u.name = a.id || '-' || a.name",
         )?;
@@ -198,7 +198,7 @@ impl Store {
             .query_map([], |r| Ok((format!("{}-{}", r.get::<_, String>(0)?, r.get::<_, String>(1)?), r.get(2)?)))?
             .collect::<Result<_, _>>()?;
         // Countdowns' background pictures go the same way.
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT c.background, u.name IS NOT NULL FROM countdowns c
              LEFT JOIN sync_uploaded u ON u.name = c.background WHERE c.background IS NOT NULL",
         )?;
@@ -243,7 +243,7 @@ impl Store {
     /// The rows changed here after log entry `since`, as they are now, each once with its
     /// latest change time; and the log position they reach.
     pub fn changes_since(&self, since: i64) -> Result<(Vec<Change>, i64)> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT entity, key, MAX(at), MAX(seq) FROM sync_log WHERE seq > ?1 GROUP BY entity, key ORDER BY MAX(seq)",
         )?;
         let logged: Vec<(String, String, i64, i64)> =
@@ -262,7 +262,7 @@ impl Store {
         let keys = keys_of(entity)?;
         let parts: Vec<&str> = key.split(KEY_SEPARATOR).collect();
         let condition: Vec<String> = keys.iter().enumerate().map(|(i, k)| format!("{k} = ?{}", i + 1)).collect();
-        let mut stmt = self.conn.prepare(&format!("SELECT * FROM {entity} WHERE {}", condition.join(" AND ")))?;
+        let mut stmt = self.conn.prepare_cached(&format!("SELECT * FROM {entity} WHERE {}", condition.join(" AND ")))?;
         let names: Vec<String> = stmt.column_names().into_iter().map(str::to_owned).collect();
         Ok(stmt
             .query_row(params_from_iter(parts), |row| {

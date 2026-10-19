@@ -753,6 +753,8 @@ const MIGRATIONS: &[&str] = &[
     END;
     PRAGMA foreign_keys = ON;
     ",
+    // Tag counts and renames look tasks up by tag.
+    "CREATE INDEX task_tags_tag ON task_tags(tag, task_id);",
 ];
 
 const TASK_COLUMNS: &str = "id, parent_id, kind, title, notes, priority, due_date, due_time, \
@@ -778,7 +780,12 @@ impl Store {
 
     fn init(conn: Connection) -> Result<Self> {
         conn.pragma_update(None, "journal_mode", "WAL")?;
+        // With WAL, a commit waits for the disk only at checkpoints; a power cut can lose the
+        // last changes but never corrupts the file.
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", true)?;
+        // The views run the same queries on every change; parse each once.
+        conn.set_prepared_statement_cache_capacity(64);
         Self::migrate(&conn)?;
         Ok(Self { conn })
     }
@@ -872,7 +879,7 @@ impl Store {
                     std::fs::remove_dir_all(dir)?;
                 }
                 std::fs::create_dir_all(dir)?;
-                let mut stmt = self.conn.prepare("SELECT name, data FROM backup_files")?;
+                let mut stmt = self.conn.prepare_cached("SELECT name, data FROM backup_files")?;
                 let files = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)))?;
                 for file in files {
                     let (name, data) = file?;
@@ -889,14 +896,14 @@ impl Store {
 
     /// All tasks: open ones first (newest on top), then completed ones (most recent on top).
     pub fn tasks(&self) -> Result<Vec<Task>> {
-        let mut stmt = self.conn.prepare(&format!(
+        let mut stmt = self.conn.prepare_cached(&format!(
             "SELECT {TASK_COLUMNS} FROM tasks
              ORDER BY completed_at IS NOT NULL, completed_at DESC, sort_order, rowid DESC"
         ))?;
         let mut tasks: Vec<Task> = stmt.query_map([], task_from_row)?.collect::<Result<_, _>>()?;
 
         let mut tags: HashMap<Id, Vec<String>> = HashMap::new();
-        let mut stmt = self.conn.prepare("SELECT task_id, tag FROM task_tags ORDER BY tag")?;
+        let mut stmt = self.conn.prepare_cached("SELECT task_id, tag FROM task_tags ORDER BY tag")?;
         for row in stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))? {
             let (task_id, tag) = row?;
             if let Ok(id) = Uuid::parse_str(&task_id) {
@@ -915,21 +922,25 @@ impl Store {
 
     /// Tasks for a view. `today` is passed in so tests do not depend on the clock or time zone.
     pub fn tasks_in(&self, view: &View, today: NaiveDate) -> Result<Vec<Task>> {
+        self.tasks_in_from(self.tasks()?, view, today)
+    }
+
+    /// [`Self::tasks_in`] out of `tasks`, all of them as [`Self::tasks`] loaded them: views that
+    /// need several selections load the tasks once.
+    pub fn tasks_in_from(&self, tasks: Vec<Task>, view: &View, today: NaiveDate) -> Result<Vec<Task>> {
         if let View::Filter(id) = view {
             let filter = self.filters()?.into_iter().find(|f| f.id == *id).context("filter not found")?;
-            return Ok(self.tasks()?.into_iter().filter(|task| filter.matches(task, today)).collect());
+            return Ok(tasks.into_iter().filter(|task| filter.matches(task, today)).collect());
         }
         if let View::Tag(tag) = view {
             let family = self.tag_family(tag)?;
-            return Ok(self
-                .tasks()?
+            return Ok(tasks
                 .into_iter()
                 .filter(|task| family.iter().any(|t| matches_view(task, &View::Tag(t.clone()), today)))
                 .collect());
         }
         let hidden = if is_smart(view) { self.hidden_lists()? } else { HashSet::new() };
-        Ok(self
-            .tasks()?
+        Ok(tasks
             .into_iter()
             .filter(|task| matches_view(task, view, today) && !task.list_id.is_some_and(|l| hidden.contains(&l)))
             .collect())
@@ -937,7 +948,7 @@ impl Store {
 
     /// Saved filters, oldest first.
     pub fn filters(&self) -> Result<Vec<crate::filter::SmartFilter>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT id, name, lists, tags, date, priorities, keywords, kind, match_any, chain FROM filters ORDER BY created_at, rowid",
         )?;
         let filters = stmt
@@ -1001,7 +1012,11 @@ impl Store {
     }
 
     pub fn counts(&self, today: NaiveDate) -> Result<ViewCounts> {
-        let tasks = self.tasks()?;
+        self.counts_from(&self.tasks()?, today)
+    }
+
+    /// [`Self::counts`] out of `tasks`, all of them as [`Self::tasks`] loaded them.
+    pub fn counts_from(&self, tasks: &[Task], today: NaiveDate) -> Result<ViewCounts> {
         let hidden = self.hidden_lists()?;
         let count = |view: View| {
             let skip = |t: &Task| is_smart(&view) && t.list_id.is_some_and(|l| hidden.contains(&l));
@@ -1027,9 +1042,14 @@ impl Store {
             .optional()?;
         let Some(mut task) = task else { return Ok(None) };
         let mut stmt =
-            self.conn.prepare("SELECT tag FROM task_tags WHERE task_id = ?1 ORDER BY tag")?;
+            self.conn.prepare_cached("SELECT tag FROM task_tags WHERE task_id = ?1 ORDER BY tag")?;
         task.tags = stmt.query_map([id.to_string()], |row| row.get(0))?.collect::<Result<_, _>>()?;
-        task.checklist = self.checklist_progress()?.get(&id).copied();
+        let (done, total): (i64, i64) = self.conn.query_row(
+            "SELECT COUNT(completed_at), COUNT(*) FROM checklist_items WHERE task_id = ?1",
+            [id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        task.checklist = (total > 0).then_some((done as usize, total as usize));
         Ok(Some(task))
     }
 
@@ -1086,7 +1106,7 @@ impl Store {
         if id == target {
             return Ok(());
         }
-        let mut stmt = self.conn.prepare("SELECT id FROM tasks ORDER BY sort_order, rowid DESC")?;
+        let mut stmt = self.conn.prepare_cached("SELECT id FROM tasks ORDER BY sort_order, rowid DESC")?;
         let mut order: Vec<String> = stmt.query_map([], |row| row.get(0))?.collect::<Result<_, _>>()?;
         let (id, target) = (id.to_string(), target.to_string());
         order.retain(|other| *other != id);
@@ -1320,7 +1340,7 @@ impl Store {
     pub fn templates(&self) -> Result<Vec<crate::model::Template>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT id, title, notes, priority, tags, checklist FROM templates ORDER BY created_at DESC, rowid DESC")?;
+            .prepare_cached("SELECT id, title, notes, priority, tags, checklist FROM templates ORDER BY created_at DESC, rowid DESC")?;
         let lines = |text: String| -> Vec<String> { text.lines().filter(|l| !l.is_empty()).map(str::to_owned).collect() };
         let templates = stmt
             .query_map([], |row| {
@@ -1358,7 +1378,7 @@ impl Store {
     /// Sections of a list ("Add Section"), oldest first.
     /// A list's sections, or the Inbox's for `None`.
     pub fn list_sections(&self, list: Option<Id>) -> Result<Vec<crate::model::ListSection>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT id, list_id, name FROM list_sections WHERE list_id IS ?1 ORDER BY sort_order, created_at, rowid",
         )?;
         let sections = stmt
@@ -1468,7 +1488,7 @@ impl Store {
 
     /// The task's comments, oldest first.
     pub fn comments(&self, task: Id) -> Result<Vec<crate::model::Comment>> {
-        let mut stmt = self.conn.prepare("SELECT id, text, created_at FROM task_comments WHERE task_id = ?1 ORDER BY created_at, rowid")?;
+        let mut stmt = self.conn.prepare_cached("SELECT id, text, created_at FROM task_comments WHERE task_id = ?1 ORDER BY created_at, rowid")?;
         let comments = stmt
             .query_map([task.to_string()], |row| {
                 Ok(crate::model::Comment { id: parse_uuid(&row.get::<_, String>(0)?, 0)?, task, text: row.get(1)?, created_at: row.get(2)? })
@@ -1530,7 +1550,7 @@ impl Store {
     pub fn set_tags(&self, id: Id, tags: &[String]) -> Result<()> {
         let existing: Vec<String> = self
             .conn
-            .prepare("SELECT name FROM tags")?
+            .prepare_cached("SELECT name FROM tags")?
             .query_map([], |row| row.get(0))?
             .collect::<Result<_, _>>()?;
         let tx = self.conn.unchecked_transaction()?;
@@ -1556,7 +1576,7 @@ impl Store {
     }
 
     pub fn tags(&self) -> Result<Vec<Tag>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT t.name, t.color, COUNT(tk.id), t.parent, t.pinned_at
              FROM tags t
              LEFT JOIN task_tags tt ON tt.tag = t.name
@@ -1682,7 +1702,7 @@ impl Store {
 
     /// The lists in their order, archived ones included (see `List::archived`).
     pub fn lists(&self) -> Result<Vec<List>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT l.id, l.name, l.color, COUNT(t.id), l.icon, l.folder_id, l.kind, l.in_smart_lists, l.archived_at
              FROM lists l
              LEFT JOIN tasks t ON t.list_id = l.id AND t.completed_at IS NULL
@@ -1788,7 +1808,7 @@ impl Store {
 
     /// The folders of lists, in their order.
     pub fn list_folders(&self) -> Result<Vec<ListFolder>> {
-        let mut stmt = self.conn.prepare("SELECT id, name FROM list_folders ORDER BY sort_order, created_at, rowid")?;
+        let mut stmt = self.conn.prepare_cached("SELECT id, name FROM list_folders ORDER BY sort_order, created_at, rowid")?;
         let folders = stmt
             .query_map([], |row| Ok(ListFolder { id: parse_uuid(&row.get::<_, String>(0)?, 0)?, name: row.get(1)? }))?
             .collect::<Result<_, _>>()?;
@@ -1863,7 +1883,7 @@ impl Store {
 
     /// The task's checklist in display order.
     pub fn checklist(&self, task: Id) -> Result<Vec<ChecklistItem>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT id, task_id, title, completed_at IS NOT NULL FROM checklist_items
              WHERE task_id = ?1 ORDER BY sort_order, rowid",
         )?;
@@ -1935,7 +1955,7 @@ impl Store {
     }
 
     fn checklist_progress(&self) -> Result<HashMap<Id, (usize, usize)>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT task_id, COUNT(completed_at), COUNT(*) FROM checklist_items GROUP BY task_id",
         )?;
         let mut progress = HashMap::new();
@@ -1953,7 +1973,7 @@ impl Store {
     /// Countdowns in creation order.
     pub fn countdowns(&self) -> Result<Vec<Countdown>> {
         let mut stmt =
-            self.conn.prepare("SELECT id, name, date, kind, icon, color, repeat, pinned_at, show_age, reminders, constant_reminder, show_in_list, plus_one_day, count_up, archived_at, background FROM countdowns
+            self.conn.prepare_cached("SELECT id, name, date, kind, icon, color, repeat, pinned_at, show_age, reminders, constant_reminder, show_in_list, plus_one_day, count_up, archived_at, background FROM countdowns
              ORDER BY pinned_at IS NULL, pinned_at DESC, created_at, rowid")?;
         let rows = stmt
             .query_map([], |row| {
@@ -2113,7 +2133,7 @@ impl Store {
 
     /// A task's attachments, oldest first.
     pub fn attachments(&self, task: Id) -> Result<Vec<Attachment>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT id, task_id, name, size, created_at FROM task_attachments WHERE task_id = ?1 ORDER BY created_at, rowid",
         )?;
         let rows = stmt
@@ -2147,7 +2167,7 @@ impl Store {
 
     pub fn habits(&self) -> Result<Vec<Habit>> {
         let mut stmt =
-            self.conn.prepare("SELECT id, name, goal_amount, goal_unit, reminders, frequency, icon, color, start_date, goal_days, section, archived_at, icon_checkins, constant_reminder FROM habits ORDER BY created_at, rowid")?;
+            self.conn.prepare_cached("SELECT id, name, goal_amount, goal_unit, reminders, frequency, icon, color, start_date, goal_days, section, archived_at, icon_checkins, constant_reminder FROM habits ORDER BY created_at, rowid")?;
         let habits = stmt
             .query_map([], |row| {
                 let goal = row.get::<_, Option<u32>>(2)?.map(|amount| Goal { amount, unit: row.get::<_, Option<String>>(3).ok().flatten().unwrap_or_default() });
@@ -2243,7 +2263,7 @@ impl Store {
 
     /// Sections the user added, oldest first.
     pub fn habit_sections(&self) -> Result<Vec<crate::habit::CustomSection>> {
-        let mut stmt = self.conn.prepare("SELECT id, name FROM habit_sections ORDER BY created_at, rowid")?;
+        let mut stmt = self.conn.prepare_cached("SELECT id, name FROM habit_sections ORDER BY created_at, rowid")?;
         let sections = stmt
             .query_map([], |row| {
                 Ok(crate::habit::CustomSection { id: parse_uuid(&row.get::<_, String>(0)?, 0)?, name: row.get(1)? })
@@ -2333,7 +2353,7 @@ impl Store {
 
     /// Snoozed habit reminders, as (habit, when to remind again).
     pub fn habit_snoozes(&self) -> Result<Vec<(Id, NaiveDateTime)>> {
-        let mut stmt = self.conn.prepare("SELECT habit_id, at FROM habit_snoozes ORDER BY at")?;
+        let mut stmt = self.conn.prepare_cached("SELECT habit_id, at FROM habit_snoozes ORDER BY at")?;
         let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
         let mut snoozes = Vec::new();
         for row in rows {
@@ -2464,7 +2484,7 @@ impl Store {
     /// A habit's check-ins with their amounts and notes, oldest first.
     pub fn checkin_records(&self, habit: Id) -> Result<Vec<Checkin>> {
         let mut stmt =
-            self.conn.prepare("SELECT date, value, note FROM habit_checkins WHERE habit_id = ?1 ORDER BY date")?;
+            self.conn.prepare_cached("SELECT date, value, note FROM habit_checkins WHERE habit_id = ?1 ORDER BY date")?;
         let records = stmt
             .query_map([habit.to_string()], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?, row.get::<_, Option<String>>(2)?))
@@ -2504,7 +2524,7 @@ impl Store {
     /// "List Activities": what happened to the tasks of a list (`None` is the inbox), newest
     /// first, with each task's id and title.
     pub fn list_activity(&self, list: Option<Id>, limit: usize) -> Result<Vec<(crate::model::Activity, Id, String)>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT a.at, a.kind, t.id, t.title FROM task_activity a JOIN tasks t ON t.id = a.task_id
              WHERE t.list_id IS ?1 ORDER BY a.at DESC, a.rowid DESC LIMIT ?2",
         )?;
@@ -2523,7 +2543,7 @@ impl Store {
     /// A task's activity, oldest first.
     pub fn task_activity(&self, task: Id) -> Result<Vec<crate::model::Activity>> {
         let mut stmt =
-            self.conn.prepare("SELECT at, kind FROM task_activity WHERE task_id = ?1 ORDER BY at, rowid")?;
+            self.conn.prepare_cached("SELECT at, kind FROM task_activity WHERE task_id = ?1 ORDER BY at, rowid")?;
         let activity = stmt
             .query_map([task.to_string()], |row| {
                 Ok(crate::model::Activity { at: row.get(0)?, kind: row.get(1)? })
@@ -2545,7 +2565,7 @@ impl Store {
 
     /// The Pomodoro list's timers ("Add Timer"), oldest first; active ones or archived ones.
     pub fn focus_timers(&self, archived: bool) -> Result<Vec<crate::focus::FocusTimer>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT id, name, icon, minutes, stopwatch, archived_at, color FROM focus_timers
              WHERE (archived_at IS NOT NULL) = ?1 ORDER BY created_at, rowid",
         )?;
@@ -2609,7 +2629,7 @@ impl Store {
 
     /// Focus sessions, newest first.
     pub fn focus_sessions(&self) -> Result<Vec<FocusSession>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT id, task_id, title, started_at, ended_at, stopwatch, note FROM focus_sessions ORDER BY started_at DESC",
         )?;
         let sessions = stmt
@@ -2694,7 +2714,7 @@ impl Store {
 
     /// Subtasks of a task, at any depth.
     pub fn descendants(&self, id: Id) -> Result<Vec<Id>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "WITH RECURSIVE sub(id) AS (
                  SELECT id FROM tasks WHERE parent_id = ?1
                  UNION ALL
@@ -3374,13 +3394,14 @@ mod tests {
 
     #[test]
     fn inbox_sections_migration_keeps_tasks_in_their_sections() -> Result<()> {
-        // A database one migration behind, with a task in a list's section.
+        // A database just before the inbox sections' migration, with a task in a list's section.
         let conn = Connection::open_in_memory()?;
         conn.pragma_update(None, "foreign_keys", true)?;
-        for sql in &MIGRATIONS[..MIGRATIONS.len() - 1] {
+        let before = MIGRATIONS.iter().position(|sql| sql.contains("PRAGMA foreign_keys = OFF")).unwrap();
+        for sql in &MIGRATIONS[..before] {
             conn.execute_batch(sql)?;
         }
-        conn.pragma_update(None, "user_version", MIGRATIONS.len() - 1)?;
+        conn.pragma_update(None, "user_version", before)?;
         conn.execute_batch(
             "INSERT INTO lists (id, name, created_at) VALUES ('l', 'Home', 0);
              INSERT INTO list_sections (id, list_id, name, created_at) VALUES ('s', 'l', 'Kitchen', 0);",

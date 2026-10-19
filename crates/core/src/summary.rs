@@ -278,7 +278,7 @@ pub struct SummaryTemplate {
 
 impl crate::store::Store {
     pub fn summary_templates(&self) -> anyhow::Result<Vec<SummaryTemplate>> {
-        let mut stmt = self.conn.prepare("SELECT id, name, options FROM summary_templates ORDER BY created_at, rowid")?;
+        let mut stmt = self.conn.prepare_cached("SELECT id, name, options FROM summary_templates ORDER BY created_at, rowid")?;
         let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)))?;
         let mut templates = Vec::new();
         for row in rows {

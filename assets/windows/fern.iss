@@ -62,3 +62,11 @@ Root: HKA; Subkey: "Software\Classes\fern\shell\open\command"; ValueType: string
 
 [Run]
 Filename: "{app}\{#AppExe}"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags: nowait postinstall skipifsilent
+; Fern's own updates run the installer silently with /RELAUNCH=1 and start Fern again after it.
+Filename: "{app}\{#AppExe}"; Flags: nowait runasoriginaluser; Check: Relaunch
+
+[Code]
+function Relaunch: Boolean;
+begin
+  Result := ExpandConstant('{param:RELAUNCH|0}') = '1';
+end;

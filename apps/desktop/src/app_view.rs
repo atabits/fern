@@ -113,7 +113,7 @@ impl AppView {
         // Mutated only by the debug-build dev state below.
         #[cfg_attr(not(debug_assertions), allow(unused_mut))]
         let mut this = Self {
-            title_bar: cx.new(|_| TitleBar::new()),
+            title_bar: cx.new(TitleBar::new),
             store,
             section: Section::Tasks,
             todo,

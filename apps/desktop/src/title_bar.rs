@@ -42,16 +42,49 @@ pub fn window_options() -> (TitlebarOptions, WindowDecorations) {
 pub struct TitleBar {
     /// Linux and macOS: a press on the bar turns into a window move once the mouse moves.
     should_move: bool,
+    _updates: Option<gpui::Subscription>,
 }
 
 impl TitleBar {
-    pub fn new() -> Self {
-        Self { should_move: false }
+    pub fn new(cx: &mut Context<Self>) -> Self {
+        let updates = crate::updater::updater(cx).map(|updater| cx.observe(&updater, |_, _, cx| cx.notify()));
+        Self { should_move: false, _updates: updates }
+    }
+
+    /// "Restart to Update" once a new version is downloaded, or "Update to …" when it is out
+    /// but this installation is updated some other way.
+    fn update_button(&self, cx: &App) -> Option<AnyElement> {
+        let updater = crate::updater::updater(cx)?;
+        let strings = crate::i18n::t(cx);
+        let label = match updater.read(cx).status() {
+            crate::updater::Status::Ready(_) => strings.restart_to_update.to_owned(),
+            crate::updater::Status::Available { version, .. } => strings.update_to.replace("{version}", version),
+            _ => return None,
+        };
+        let hover = cx.theme().colors().ghost_element_hover;
+        Some(
+            div()
+                .id("update-button")
+                .flex_none()
+                .mr_2()
+                .px_2()
+                .py_0p5()
+                .rounded(px(6.))
+                .cursor_pointer()
+                // Clickable inside the bar's drag area.
+                .occlude()
+                .hover(move |el| el.bg(hover))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .child(Label::new(label).size(LabelSize::Small).color(Color::Accent))
+                .on_click(move |_, _, cx| updater.update(cx, |updater, cx| updater.restart_to_update(cx)))
+                .into_any_element(),
+        )
     }
 }
 
 impl Render for TitleBar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let update_button = self.update_button(cx);
         let colors = cx.theme().colors();
         let decorations = window.window_decorations();
         let client_side = matches!(decorations, Decorations::Client { .. });
@@ -123,6 +156,7 @@ impl Render for TitleBar {
                     .child(gpui::img("icon/icon-64.png").size(px(16.)).flex_none())
                     .child(Label::new("Fern").size(LabelSize::Small).color(Color::Muted)),
             )
+            .children(update_button)
             .children(right_buttons)
     }
 }

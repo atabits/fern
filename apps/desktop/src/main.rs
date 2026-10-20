@@ -36,6 +36,7 @@ mod text_input;
 mod title_bar;
 mod touch_keyboard;
 mod undo;
+mod updater;
 mod todo_view;
 
 use std::rc::Rc;
@@ -133,6 +134,7 @@ fn main() -> Result<()> {
             Err(err) => eprintln!("failed to load the keymap: {err:#}"),
         }
         cx.on_action(|_: &Quit, cx| cx.quit());
+        updater::init(store.clone(), cx);
 
         let bounds = Bounds::centered(None, size(px(1280.), px(760.)), cx);
         let (titlebar, decorations) = title_bar::window_options();

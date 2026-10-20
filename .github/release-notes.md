@@ -12,7 +12,8 @@ computer. Sync between your devices through your own `fern-server` is optional.
 > - **Back up what matters.** Fern keeps a daily copy of your data. Settings → About → Generate
 >   Backup makes one on demand.
 > - **Desktop only.** No mobile app yet, and sync needs your own `fern-server`.
-> - **No automatic updates.** Watch the repository's releases to hear about new versions.
+> - **Updates.** From 0.1.6 on, Fern downloads new releases itself and installs them on
+>   **Restart to Update**. Older versions need this release installed by hand once.
 
 ## Downloads
 

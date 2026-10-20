@@ -71,6 +71,7 @@ pub struct SettingsWindow {
     /// Settings → Sync: the server's address and the token, saved as they are typed.
     sync_server: Entity<crate::text_input::TextInput>,
     sync_token: Entity<crate::text_input::TextInput>,
+    _updates: Option<gpui::Subscription>,
 }
 
 impl EventEmitter<SettingsEvent> for SettingsWindow {}
@@ -117,6 +118,7 @@ impl SettingsWindow {
         };
         let sync_server = field("https://fern.example.org", config.server, false, cx);
         let sync_token = field("", config.token, true, cx);
+        let updates = crate::updater::updater(cx).map(|updater| cx.observe(&updater, |_, _, cx| cx.notify()));
         Self {
             store,
             preferences,
@@ -126,6 +128,7 @@ impl SettingsWindow {
             backup_message: None,
             sync_server,
             sync_token,
+            _updates: updates,
         }
     }
 
@@ -460,6 +463,82 @@ impl SettingsWindow {
                     .children(dropdown),
             )
             .into_any_element()
+    }
+
+    /// About → Updates: the automatic checks, how the last one went and what to do next.
+    fn render_updates(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        use crate::updater::Status;
+        let updater = crate::updater::updater(cx).filter(|updater| updater.read(cx).supported())?;
+        let strings = i18n::t(cx);
+        let colors = cx.theme().colors().clone();
+        let (status, automatic) = {
+            let updater = updater.read(cx);
+            (updater.status().clone(), updater.automatic())
+        };
+        let version = |text: &str, version: &str| text.replace("{version}", version);
+        let (message, action) = match &status {
+            Status::Idle => (None, Some(strings.check_for_updates.to_owned())),
+            Status::Checking => (Some(strings.update_checking.to_owned()), None),
+            Status::UpToDate => (Some(strings.update_up_to_date.to_owned()), Some(strings.check_for_updates.to_owned())),
+            Status::Downloading(v) => (Some(version(strings.update_downloading, v)), None),
+            Status::Ready(v) => (Some(version(strings.update_ready, v)), Some(strings.restart_to_update.to_owned())),
+            Status::Available { version: v, .. } => (Some(version(strings.update_available, v)), Some(version(strings.update_to, v))),
+            Status::Failed(error) => (Some(strings.update_failed.replace("{error}", error)), Some(strings.check_for_updates.to_owned())),
+        };
+        let install = matches!(status, Status::Ready(_) | Status::Available { .. });
+        let switch_updater = updater.clone();
+        Some(
+            v_flex()
+                .child(div().pb_3().child(Label::new(strings.updates).weight(FontWeight::MEDIUM)))
+                .child(
+                    v_flex()
+                        .py_1p5()
+                        .rounded(px(8.))
+                        .bg(colors.surface_background)
+                        .child(
+                            h_flex()
+                                .id("auto-update")
+                                .h(px(ROW_HEIGHT))
+                                .px_4()
+                                .cursor_pointer()
+                                .child(div().flex_1().child(Label::new(strings.check_updates_automatically)))
+                                .child(Switch::new().toggle_state(automatic))
+                                .on_click(move |_, _, cx| switch_updater.update(cx, |updater, cx| updater.set_automatic(!automatic, cx))),
+                        )
+                        .child(
+                            h_flex()
+                                .min_h(px(ROW_HEIGHT))
+                                .py_2()
+                                .px_4()
+                                .gap_4()
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .text_size(px(13.))
+                                        .text_color(colors.text_muted)
+                                        .child(message.unwrap_or_else(|| format!("Fern {}", env!("CARGO_PKG_VERSION")))),
+                                )
+                                .children(action.map(|action| {
+                                    div()
+                                        .id("update-action")
+                                        .flex_none()
+                                        .cursor_pointer()
+                                        .child(Label::new(action).color(Color::Accent))
+                                        .on_click(move |_, _, cx| {
+                                            updater.update(cx, |updater, cx| {
+                                                if install {
+                                                    updater.restart_to_update(cx)
+                                                } else {
+                                                    updater.check(cx)
+                                                }
+                                            })
+                                        })
+                                })),
+                        ),
+                )
+                .into_any_element(),
+        )
     }
 
     fn render_page(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
@@ -989,6 +1068,7 @@ impl SettingsWindow {
                         .child(row(strings.version, env!("CARGO_PKG_VERSION")))
                         .child(row(strings.license, "AGPL-3.0-or-later")),
                 )
+                .children(self.render_updates(cx))
                 .child(
                     v_flex()
                         .child(title(strings.backup_restore))

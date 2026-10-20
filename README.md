@@ -171,8 +171,11 @@ Fern 0.1 is an early preview. Here is what to expect:
   (`crates/core`, through UniFFI).
 - **No hosted sync.** Fern works fully offline on one computer. To sync several devices, you
   run `fern-server` yourself.
-- **No automatic updates.** To hear about new versions, choose Watch → Custom → Releases on
-  GitHub.
+- **Updates come from GitHub Releases.** Fern checks for a new release every few hours,
+  downloads it in the background and installs it when you click **Restart to Update**
+  (Settings → About → Updates turns the checks off). Versions before 0.1.6 can't update
+  themselves, and the `.deb` is updated through your package manager: Fern only says that a new
+  version is out.
 - **Two languages.** The interface is in English and Russian. More languages are welcome.
 - **Not everything from TickTick yet.** [docs/parity.md](docs/parity.md) tracks what matches the
   original and what is still missing. Team features such as shared lists and assignees are

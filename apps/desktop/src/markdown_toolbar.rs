@@ -69,7 +69,7 @@ pub fn render<V: 'static>(id: &'static str, headings_open: bool, attach: bool, c
                     .on_click(listener(ToolbarAction::Format(Some(Format::Heading(level))), cx))
             })
             .collect();
-        PopoverAttachment::new(Placement::BelowLeft, popover(cx).w(px(170.)).on_mouse_down_out(close).children(items))
+        PopoverAttachment::new(Placement::BelowLeft, popover(cx).min_w(px(170.)).on_mouse_down_out(close).children(items))
     });
     let mut row = h_flex().when(!attach, |el| el.gap_0p5()).child(
         div()

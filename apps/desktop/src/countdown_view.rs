@@ -548,7 +548,7 @@ impl CountdownView {
                         el.child(PopoverAttachment::new(
                             Placement::BelowRight,
                             popover(cx)
-                                .w(px(150.))
+                                .min_w(px(150.))
                                 .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                                     this.card_menu = None;
                                     cx.notify();
@@ -1092,7 +1092,7 @@ impl CountdownView {
             PopoverAttachment::new(
                 Placement::BelowRight,
                 popover(cx)
-                    .w(px(260.))
+                    .min_w(px(260.))
                     .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                         if let Some(draft) = this.draft.as_mut() {
                             draft.open = None;
@@ -1308,7 +1308,7 @@ impl Render for CountdownView {
                                 el.child(PopoverAttachment::new(
                                     Placement::BelowLeft,
                                     popover(cx)
-                                        .w(px(162.))
+                                        .min_w(px(162.))
                                         .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                                             this.title_menu = false;
                                             cx.notify();
@@ -1340,7 +1340,7 @@ impl Render for CountdownView {
                                 el.child(PopoverAttachment::new(
                                     Placement::BelowRight,
                                     popover(cx)
-                                        .w(px(162.))
+                                        .min_w(px(162.))
                                         .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                                             this.add_menu = false;
                                             cx.notify();
@@ -1371,7 +1371,7 @@ impl Render for CountdownView {
                                 el.child(PopoverAttachment::new(
                                     Placement::BelowRight,
                                     popover(cx)
-                                        .w(px(162.))
+                                        .min_w(px(162.))
                                         .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                                             this.header_menu = false;
                                             cx.notify();

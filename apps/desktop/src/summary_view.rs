@@ -637,7 +637,7 @@ impl SummaryView {
             PopoverAttachment::new(
                 Placement::BelowRight,
                 popover(cx)
-                    .w(px(200.))
+                    .min_w(px(200.))
                     .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                         this.more_side = None;
                         this.set_menu(None, cx);
@@ -951,7 +951,7 @@ impl Render for SummaryView {
                                 PopoverAttachment::new(
                                     Placement::AboveRight,
                                     popover(cx)
-                                        .w(px(180.))
+                                        .min_w(px(180.))
                                         .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                                             this.save_menu = false;
                                             cx.notify();

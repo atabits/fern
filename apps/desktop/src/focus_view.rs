@@ -806,7 +806,7 @@ impl FocusView {
                     el.child(PopoverAttachment::new(
                         Placement::BelowLeft,
                         popover(cx)
-                            .w(px(170.))
+                            .min_w(px(170.))
                             .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                                 this.batch_menu = None;
                                 cx.notify();
@@ -1332,7 +1332,7 @@ impl FocusView {
                         el.child(PopoverAttachment::new(
                             Placement::BelowRight,
                             popover(cx)
-                                .w(px(160.))
+                                .min_w(px(160.))
                                 .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                                     this.timer_menu = None;
                                     cx.notify();
@@ -1388,9 +1388,9 @@ impl FocusView {
         let theme = cx.theme().clone();
         let close = cx.listener(|this, _, _, cx| this.set_record_menu(None, cx));
         match menu {
-            // As the original's: 163 px wide, a row every 34 px.
+            // As the original's: 163 px wide (wider when a label needs it), a row every 34 px.
             RecordMenu::HeaderMore => popover(cx)
-                .w(px(163.))
+                .min_w(px(163.))
                 .on_mouse_down_out(close)
                 .child(
                     ListItem::new("focus-statistics")
@@ -1436,9 +1436,9 @@ impl FocusView {
                     .into_any_element()
             }
             RecordMenu::Batch => self.render_batch(cx),
-            // As the original's: 178 px wide, a row every 34 px, Delete All in red only once armed.
+            // As the original's: 178 px wide (wider when a label needs it), a row every 34 px, Delete All in red only once armed.
             RecordMenu::More => popover(cx)
-                .w(px(178.))
+                .min_w(px(178.))
                 .on_mouse_down_out(close)
                 .child(
                     ListItem::new("focus-batch")
@@ -1956,7 +1956,7 @@ impl FocusView {
                 PopoverAttachment::new(
                     Placement::BelowRight,
                     popover(cx)
-                        .w(px(140.))
+                        .min_w(px(140.))
                         .on_mouse_down_out(cx.listener(|this, _, _, cx| this.update_stats(cx, |p| p.details_menu = None)))
                         .children((0..options.len()).map(|i| {
                             let (name, selected, _) = &options[i];
@@ -2132,7 +2132,7 @@ impl FocusView {
                 PopoverAttachment::new(
                     Placement::BelowRight,
                     popover(cx)
-                        .w(px(140.))
+                        .min_w(px(140.))
                         .on_mouse_down_out(cx.listener(|this, _, _, cx| this.update_stats(cx, |p| p.curve_menu = None)))
                         .children(Bucket::ALL.into_iter().zip(names).enumerate().map(|(i, (choice, name))| {
                             ListItem::new(SharedString::from(format!("curve-{curve}-{i}")))
@@ -2354,7 +2354,7 @@ impl FocusView {
             PopoverAttachment::new(
                 Placement::BelowLeft,
                 popover(cx)
-                    .w(px(140.))
+                    .min_w(px(140.))
                     .on_mouse_down_out(cx.listener(|this, _, _, cx| this.update_stats(cx, |p| p.task_menu = false)))
                     .children(Bucket::ALL.into_iter().zip(names).enumerate().map(|(i, (choice, name))| {
                         ListItem::new(SharedString::from(format!("task-period-{i}")))
@@ -2520,7 +2520,7 @@ impl FocusView {
                                         PopoverAttachment::new(
                                             Placement::BelowRight,
                                             popover(cx)
-                                                .w(px(140.))
+                                                .min_w(px(140.))
                                                 .on_mouse_down_out(cx.listener(|this, _, _, cx| this.update_stats(cx, |p| p.classify_menu = false)))
                                                 .children([false, true].into_iter().map(|tag| {
                                                     let selected = tag == page.by_tag;

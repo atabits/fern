@@ -134,7 +134,7 @@ pub fn render<V: 'static>(
         cx.listener(move |this: &mut V, _: &gpui::MouseDownEvent, window: &mut Window, cx: &mut Context<V>| act(this, MenuAction::Close, window, cx))
     };
     popover(cx)
-        .w(px(196.))
+        .min_w(px(196.))
         .on_mouse_down_out(close)
         .child(heading(strings.filter_date))
         .child(date_row)

@@ -376,7 +376,7 @@ impl Render for ListDialog {
                     el.child(PopoverAttachment::new(
                         Placement::BelowLeft,
                         popover(cx)
-                            .w(px(213.))
+                            .min_w(px(213.))
                             .on_mouse_down_out(cx.listener(|this, _, _, cx| this.update(cx, |this| this.open = None)))
                             .children(items),
                     ))

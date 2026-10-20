@@ -923,9 +923,9 @@ impl TaskDetail {
         let item = |id: &'static str, icon: IconName, label: &'static str| {
             ListItem::new(id).height(px(34.)).start_slot(Icon::new(icon).color(Color::Muted)).child(Label::new(label))
         };
-        // The original's menu: 178 px wide, a row every 34 px.
+        // The original's menu: 178 px wide (wider when a label needs it), a row every 34 px.
         popover(cx)
-            .w(px(178.))
+            .min_w(px(178.))
             .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_popup(cx)))
             .child(self.close_side_menu_on_hover(item("more-subtask", IconName::CornerDownRight, strings.add_subtask_item).on_click(cx.listener(
                 |this, _, window, cx| {
@@ -2319,7 +2319,7 @@ impl TaskDetail {
             (Priority::None, "priority-none", strings.priority_none),
         ];
         popover(cx)
-            .w(px(190.))
+            .min_w(px(190.))
             .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_popup(cx)))
             .children(items.into_iter().map(|(priority, id, label)| {
                 let color = task_rows::priority_color(priority, &theme).unwrap_or(theme.colors().checkbox_border);
@@ -2388,7 +2388,7 @@ impl TaskDetail {
                         let current_section = current.and_then(|(l, s)| if l == list { s } else { None });
                         el.child(PopoverAttachment::new(
                             Placement::RightSide,
-                            popover(cx).w(px(162.)).children(sections.into_iter().map(|section| {
+                            popover(cx).min_w(px(162.)).children(sections.into_iter().map(|section| {
                                 let section_id = section.id;
                                 let ticked = current_section == Some(section_id);
                                 let color = if ticked { Color::Accent } else { Color::Default };

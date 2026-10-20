@@ -681,7 +681,7 @@ impl MatrixView {
                                 el.child(PopoverAttachment::new(
                                     Placement::BelowRight,
                                     popover(cx)
-                                        .w(px(230.))
+                                        .min_w(px(230.))
                                         .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                                             this.menu = None;
                                             this.menu_row = None;
@@ -760,7 +760,7 @@ impl Render for MatrixView {
                                 el.child(PopoverAttachment::new(
                                     Placement::BelowRight,
                                     popover(cx)
-                                        .w(px(200.))
+                                        .min_w(px(200.))
                                         .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                                             this.header_menu = false;
                                             cx.notify();

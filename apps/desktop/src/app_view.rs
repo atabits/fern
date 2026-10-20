@@ -535,7 +535,7 @@ impl AppView {
     fn render_account_menu(&self, cx: &mut Context<Self>) -> AnyElement {
         let strings = i18n::t(cx);
         popover(cx)
-            .w(px(180.))
+            .min_w(px(180.))
             .on_mouse_down_out(cx.listener(|this, _, _, cx| this.set_account_menu(false, cx)))
             .child(
                 ListItem::new("account-settings")

@@ -273,7 +273,7 @@ impl CalendarView {
             ListItem::new(id).height(px(34.)).start_slot(Icon::new(icon).color(Color::Muted)).child(Label::new(label))
         };
         popover(cx)
-            .w(px(184.))
+            .min_w(px(184.))
             .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                 this.more_menu = false;
                 cx.notify();
@@ -1217,7 +1217,7 @@ impl CalendarView {
         ];
 
         popover(cx)
-            .w(px(170.))
+            .min_w(px(170.))
             .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                 this.mode_menu_open = false;
                 cx.notify();

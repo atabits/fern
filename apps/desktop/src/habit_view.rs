@@ -1311,7 +1311,7 @@ impl HabitView {
                             el.child(PopoverAttachment::new(
                                 Placement::BelowLeft,
                                 popover(cx)
-                                    .w(px(200.))
+                                    .min_w(px(200.))
                                     .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                                         this.section_menu = None;
                                         cx.notify();
@@ -1437,9 +1437,9 @@ impl HabitView {
             cx.notify();
         });
         match more {
-            // The original's measures: 162 px wide, a row every 34 px.
+            // The original's measures: 162 px wide (wider when a label needs it), a row every 34 px.
             HeaderMore::Menu => popover(cx)
-                .w(px(162.))
+                .min_w(px(162.))
                 .on_mouse_down_out(close)
                 .child(
                     ListItem::new("habit-settings")
@@ -1720,9 +1720,9 @@ impl HabitView {
                             .when(self.detail_menu_open, |el| {
                                 el.child(PopoverAttachment::new(
                                     Placement::BelowRight,
-                                    // The original's measures: 178 px wide, a row every 34 px.
+                                    // The original's measures: 178 px wide (wider when a label needs it), a row every 34 px.
                                     popover(cx)
-                                        .w(px(178.))
+                                        .min_w(px(178.))
                                         .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                                             this.detail_submenu = None;
                                             this.detail_menu_open = false;
@@ -2030,9 +2030,9 @@ impl Render for HabitView {
                                 let archived = self.show_archived;
                                 el.child(PopoverAttachment::new(
                                     Placement::BelowLeft,
-                                    // The original's measures: 162 px wide, a row every 34 px.
+                                    // The original's measures: 162 px wide (wider when a label needs it), a row every 34 px.
                                     popover(cx)
-                                        .w(px(162.))
+                                        .min_w(px(162.))
                                         .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                                             this.header_menu_open = false;
                                             cx.notify();

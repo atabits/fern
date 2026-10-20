@@ -1800,9 +1800,9 @@ impl TodoView {
                     }))
             })
             .collect::<Vec<_>>();
-        // As the original's: 181 px wide, a row every 34 px, no line under the flags.
+        // As the original's: 181 px wide (wider when a label needs it), a row every 34 px, no line under the flags.
         popover(cx)
-            .w(px(181.))
+            .min_w(px(181.))
             .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                 this.add_menu_open = false;
                 cx.notify();
@@ -2250,7 +2250,7 @@ impl TodoView {
                             el.child(PopoverAttachment::new(
                                 Placement::BelowRight,
                                 popover(cx)
-                                    .w(px(200.))
+                                    .min_w(px(200.))
                                     .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                                         this.section_menu = None;
                                         cx.notify();
@@ -2431,7 +2431,7 @@ impl TodoView {
                 PopoverAttachment::new(
                     Placement::BelowLeft,
                     popover(cx)
-                        .w(px(180.))
+                        .min_w(px(180.))
                         .on_mouse_down_out(cx.listener(|this, _, _, cx| this.update_chain(cx, |_, menu| *menu = None)))
                         .children(Field::ALL.into_iter().map(|field| {
                             let selected = field == link.field;
@@ -2511,7 +2511,7 @@ impl TodoView {
             PopoverAttachment::new(
                 Placement::AboveRight,
                 popover(cx)
-                    .w(px(260.))
+                    .min_w(px(260.))
                     .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                         if let Some(edit) = this.filter_edit.as_mut() {
                             edit.examples_open = false;
@@ -3135,7 +3135,7 @@ impl TodoView {
             PopoverAttachment::new(
                 Placement::BelowRight,
                 popover(cx)
-                    .w(px(196.))
+                    .min_w(px(196.))
                     .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                         this.view_options = Some(false);
                         cx.notify();
@@ -3387,7 +3387,7 @@ impl TodoView {
             .collect();
         let view = cx.entity().downgrade();
         popover(cx)
-            .w(px(220.))
+            .min_w(px(220.))
             .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                 this.column_menu = None;
                 cx.notify();
@@ -3537,7 +3537,7 @@ impl TodoView {
                 el.child(PopoverAttachment::new(
                     Placement::BelowRight,
                     popover(cx)
-                        .w(px(150.))
+                        .min_w(px(150.))
                         .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                             this.scale_menu_open = false;
                             cx.notify();
@@ -3900,7 +3900,7 @@ impl TodoView {
                 .when(selected, |item| item.end_slot(Label::new("✓").color(Color::Accent)))
         };
         popover(cx)
-            .w(px(250.))
+            .min_w(px(250.))
             .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                 this.sort_menu = None;
                 cx.notify();
@@ -4340,7 +4340,7 @@ impl TodoView {
         };
         let items = self.render_list_items(target, strings, cx);
         let menu = popover(cx)
-            .w(px(width))
+            .min_w(px(width))
             .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                 this.list_menu = None;
                 cx.notify();
@@ -5317,7 +5317,7 @@ impl TodoView {
         let check = || Label::new("✓").color(Color::Accent);
 
         let dates_menu = popover(cx)
-            .w(px(180.))
+            .min_w(px(180.))
             .on_mouse_down_out(cx.listener(|this, _, _, cx| this.set_closed_menu(None, cx)))
             .children(ClosedRange::PRESETS.into_iter().map(|range| {
                 let selected = range == self.closed_range;
@@ -5352,7 +5352,7 @@ impl TodoView {
             .chain(self.lists.iter().map(|l| (Some(Some(l.id)), l.name.clone().into(), IconName::List)))
             .collect();
         let lists_menu = popover(cx)
-            .w(px(240.))
+            .min_w(px(240.))
             .on_mouse_down_out(cx.listener(|this, _, _, cx| this.set_closed_menu(None, cx)))
             .children(entries.into_iter().map(|(list, label, icon)| {
                 let selected = match (&list, &draft) {
@@ -5454,7 +5454,7 @@ impl TodoView {
         let in_list = matches!(self.view, View::List(_));
         let in_trash = self.view == View::Trash;
         popover(cx)
-            .w(px(236.))
+            .min_w(px(236.))
             .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                 this.header_menu_open = false;
                 cx.notify();

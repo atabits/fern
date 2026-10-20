@@ -233,7 +233,7 @@ impl Render for TagDialog {
                 el.child(PopoverAttachment::new(
                     Placement::BelowLeft,
                     popover(cx)
-                        .w(px(260.))
+                        .min_w(px(260.))
                         .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                             this.parent_open = false;
                             cx.notify();
@@ -369,7 +369,7 @@ impl Render for MergeDialog {
                 el.child(PopoverAttachment::new(
                     Placement::BelowLeft,
                     popover(cx)
-                        .w(px(220.))
+                        .min_w(px(220.))
                         .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                             this.open = false;
                             cx.notify();

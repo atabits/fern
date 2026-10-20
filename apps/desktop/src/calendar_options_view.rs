@@ -194,7 +194,7 @@ impl CalendarOptionsDialog {
             PopoverAttachment::new(
                 Placement::BelowRight,
                 popover(cx)
-                    .w(px(162.))
+                    .min_w(px(162.))
                     .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                         this.color_menu = false;
                         cx.notify();

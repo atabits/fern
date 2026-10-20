@@ -2,15 +2,22 @@ name: Release
 
 # A tag such as `v0.1.0` builds Fern for every platform and attaches the packages to a draft
 # GitHub release of that tag, published by hand; the tag must match the version in Cargo.toml.
-# "Run workflow" builds them without a release, as artifacts of the run.
+# "Run workflow" builds them without a release, as artifacts of the run; with "release" ticked on
+# main it makes the draft too, for v<the version in Cargo.toml>, and publishing it creates the tag.
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      release:
+        description: "Make a draft release of Cargo.toml's version (main only)"
+        type: boolean
+        default: false
 
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
+  RELEASE: ${{ startsWith(github.ref, 'refs/tags/v') || (inputs.release && github.ref == 'refs/heads/main') }}
 
 jobs:
   package:
@@ -57,9 +64,9 @@ jobs:
         id: version
         run: |
           crate_version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+          if [ "$RELEASE" = true ]; then
             # The app shows Cargo.toml's version in Settings → About and in its file properties.
-            if [ "${GITHUB_REF_NAME#v}" != "$crate_version" ]; then
+            if [[ "$GITHUB_REF" == refs/tags/v* ]] && [ "${GITHUB_REF_NAME#v}" != "$crate_version" ]; then
               echo "::error::The tag $GITHUB_REF_NAME does not match version $crate_version in Cargo.toml"
               exit 1
             fi
@@ -90,7 +97,7 @@ jobs:
           api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
           organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
           project-slug: fern
-          signing-policy-slug: ${{ startsWith(github.ref, 'refs/tags/v') && 'release-signing' || 'test-signing' }}
+          signing-policy-slug: ${{ env.RELEASE == 'true' && 'release-signing' || 'test-signing' }}
           artifact-configuration-slug: windows-programs
           github-artifact-id: ${{ steps.unsigned.outputs.artifact-id }}
           wait-for-completion: true
@@ -135,7 +142,7 @@ jobs:
           api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
           organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
           project-slug: fern
-          signing-policy-slug: ${{ startsWith(github.ref, 'refs/tags/v') && 'release-signing' || 'test-signing' }}
+          signing-policy-slug: ${{ env.RELEASE == 'true' && 'release-signing' || 'test-signing' }}
           artifact-configuration-slug: windows-installer
           github-artifact-id: ${{ steps.unsigned-installer.outputs.artifact-id }}
           wait-for-completion: true
@@ -156,7 +163,8 @@ jobs:
 
   release:
     name: GitHub release
-    if: startsWith(github.ref, 'refs/tags/v')
+    # The same as RELEASE above: a job's `if` cannot read `env`.
+    if: startsWith(github.ref, 'refs/tags/v') || (inputs.release && github.ref == 'refs/heads/main')
     needs: package
     runs-on: ubuntu-24.04
     permissions:
@@ -172,8 +180,14 @@ jobs:
 
       # What is new in this version (.github/changes/<version>.md), then the page for every release.
       - name: Release notes
+        id: notes
         run: |
-          version=${GITHUB_REF_NAME#v}
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [[ "$GITHUB_REF" != refs/tags/v* ]] && git ls-remote --exit-code --tags origin "v$version" > /dev/null; then
+            echo "::error::v$version is already released; raise the version in Cargo.toml"
+            exit 1
+          fi
           if [ -f ".github/changes/$version.md" ]; then
             { cat ".github/changes/$version.md"; echo; } > notes.md
           fi
@@ -181,7 +195,9 @@ jobs:
 
       - uses: softprops/action-gh-release@v2
         with:
-          name: Fern ${{ github.ref_name }}
+          name: Fern v${{ steps.notes.outputs.version }}
+          tag_name: v${{ steps.notes.outputs.version }}
+          target_commitish: ${{ github.sha }}
           body_path: notes.md
           files: dist/*
           # Published by hand once the packages are checked.

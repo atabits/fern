@@ -1589,6 +1589,7 @@ dependencies = [
  "gpui_platform",
  "icons",
  "notify-rust",
+ "raw-window-handle",
  "serde",
  "serde_json",
  "sys-locale",
@@ -1598,6 +1599,7 @@ dependencies = [
  "unicode-segmentation",
  "ureq",
  "uuid",
+ "windows 0.62.2",
  "winresource",
 ]
 

@@ -8,13 +8,16 @@ use gpui::{
     App, AvailableSpace, Bounds, ClipboardItem, Context, CursorStyle, ElementId,
     ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable,
     GlobalElementId, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, PaintQuad, Pixels, Point, SharedString, Style, TextRun, UTF16Selection,
+    MouseUpEvent, PaintQuad, Pixels, Point, SharedString, Style, Subscription, TextRun,
+    UTF16Selection,
     UnderlineStyle, Window, WrappedLine, actions, div, fill, point, prelude::*, px, relative,
     size,
 };
 use unicode_segmentation::*;
 
 use theme::ActiveTheme;
+
+use crate::touch_keyboard;
 
 actions!(
     text_input,
@@ -87,6 +90,8 @@ pub struct TextInput {
     /// A password field: the text shows as "*", one per byte so that every offset stays the
     /// same, and it cannot be copied.
     masked: bool,
+    /// Hides the touch keyboard this input opened once it loses focus.
+    keyboard_blur: Option<Subscription>,
 }
 
 /// The layout from the last frame, used for mouse hit-testing, up/down arrows and IME.
@@ -165,6 +170,7 @@ impl TextInput {
             is_selecting: false,
             highlights: Vec::new(),
             masked: false,
+            keyboard_blur: None,
         }
     }
 
@@ -330,6 +336,14 @@ impl TextInput {
     ) {
         self.is_selecting = true;
         window.request_virtual_keyboard();
+        if touch_keyboard::show_for_tap(window, &self.focus_handle) && self.keyboard_blur.is_none()
+        {
+            self.keyboard_blur = Some(cx.on_blur(&self.focus_handle, window, |this, window, cx| {
+                // Later, so that an input tapped next takes the keyboard over without it closing.
+                let focus = this.focus_handle.clone();
+                window.defer(cx, move |_, _| touch_keyboard::release(&focus));
+            }));
+        }
 
         if event.modifiers.shift {
             self.select_to(self.index_for_mouse_position(event.position), window, cx);
@@ -1004,6 +1018,12 @@ impl Render for TextInput {
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .child(TextElement { input: cx.entity() })
+    }
+}
+
+impl Drop for TextInput {
+    fn drop(&mut self) {
+        touch_keyboard::release(&self.focus_handle);
     }
 }
 

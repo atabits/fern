@@ -34,6 +34,7 @@ mod task_menu;
 mod task_rows;
 mod text_input;
 mod title_bar;
+mod touch_keyboard;
 mod undo;
 mod todo_view;
 

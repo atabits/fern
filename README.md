@@ -173,7 +173,7 @@ Fern 0.1 is an early preview. Here is what to expect:
   run `fern-server` yourself.
 - **Updates come from GitHub Releases.** Fern checks for a new release every few hours,
   downloads it in the background and installs it when you click **Restart to Update**
-  (Settings → About → Updates turns the checks off). Versions before 0.1.6 can't update
+  (Settings → About → Updates turns the checks off). Versions before 0.1.5 can't update
   themselves, and the `.deb` is updated through your package manager: Fern only says that a new
   version is out.
 - **Two languages.** The interface is in English and Russian. More languages are welcome.

@@ -11,7 +11,12 @@ use crate::calendar;
 use crate::drag::{DraggedList, DraggedTask};
 use crate::i18n::Strings;
 
+/// The column's width by default and the range its edge drags in; dragged narrower than
+/// `COLLAPSE_BELOW`, the column hides, as the sidebar toggle does.
 pub const WIDTH: f32 = 212.;
+pub const MIN_WIDTH: f32 = 180.;
+pub const MAX_WIDTH: f32 = 360.;
+pub const COLLAPSE_BELOW: f32 = 120.;
 
 /// Colors offered for lists, as stored in the database.
 pub const LIST_COLORS: [&str; 8] =
@@ -70,6 +75,7 @@ pub struct Props<'a> {
     /// Which smart lists Settings → Smart List shows.
     pub preferences: &'a Preferences,
     pub mini: MiniCalendar<'a>,
+    pub width: f32,
 }
 
 /// What the lists column asks of the view, besides selecting a view.
@@ -105,7 +111,7 @@ pub fn render(
     on_mini: impl Fn(MiniAction, &mut Window, &mut App) + Clone + 'static,
     cx: &App,
 ) -> impl IntoElement {
-    let Props { active, counts, lists, tags, strings, folders, collapsed_folders, archived_open, collapsed_tags, tags_collapsed, filters, preferences, mini } = props;
+    let Props { active, counts, lists, tags, strings, folders, collapsed_folders, archived_open, collapsed_tags, tags_collapsed, filters, preferences, mini, width } = props;
     let shows = |list: SmartList, count: usize| preferences.visibility(list).shows(count);
     let colors = cx.theme().colors();
 
@@ -525,8 +531,7 @@ pub fn render(
 
     v_flex()
         .flex_none()
-        .w(px(WIDTH))
-        
+        .w(px(width))
         .h_full()
         .bg(colors.panel_background)
         .border_r_1()

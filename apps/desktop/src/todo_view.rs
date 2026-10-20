@@ -17,6 +17,7 @@ use crate::i18n::{self, CurrentLocale, Strings};
 use crate::list_dialog::{DialogEvent, FolderDialog, ListDialog};
 use crate::tag_dialog::{MergeDialog, TagDialog, TagEvent};
 use crate::lists_panel;
+use crate::resize::{self, DraggedEdge, Panel};
 use crate::task_detail::{OpenTask, StartFocus, TaskDetail, TaskUpdated};
 use crate::task_menu;
 use crate::task_rows::{self, ClosedRange, DropTarget, GroupBy, Row, Section, SortBy};
@@ -25,7 +26,11 @@ use crate::text_input::{Cancelled, Changed, Mode, Submitted, TextInput};
 /// The share of a task row, from the left, where a dropped task goes before it; the rest of the
 /// row nests it.
 const NEST_ZONE: f32 = 0.6;
+/// The details' width by default and the narrowest its edge drags to; the task list keeps at
+/// least `LIST_MIN_WIDTH`, which also bounds how wide the details get.
 const DETAIL_WIDTH: f32 = 419.;
+const DETAIL_MIN_WIDTH: f32 = 340.;
+const LIST_MIN_WIDTH: f32 = 360.;
 const ROW_HEIGHT: f32 = 40.;
 /// Below this width the window is narrow, for View Options' Task Detail Layout.
 const NARROW_WINDOW: f32 = 1200.;
@@ -103,6 +108,13 @@ pub struct TodoView {
     lists: Vec<List>,
     tags: Vec<Tag>,
     show_lists: bool,
+    /// The lists column's and the details' widths, as their edges were dragged.
+    lists_width: f32,
+    detail_width: f32,
+    /// The edge being dragged, if any.
+    resizing: Option<Panel>,
+    /// Saves the widths once the drag has rested a moment.
+    save_widths: Option<gpui::Task<()>>,
     collapsed_tasks: HashSet<Id>,
     collapsed_sections: HashSet<Section>,
     input: Entity<TextInput>,
@@ -274,6 +286,9 @@ impl TodoView {
         })
         .detach();
 
+        let width = |key: &str, default: f32| store.setting(key).ok().flatten().and_then(|value| value.parse().ok()).unwrap_or(default);
+        let lists_width = width("lists_width", lists_panel::WIDTH).clamp(lists_panel::MIN_WIDTH, lists_panel::MAX_WIDTH);
+        let detail_width = width("detail_width", DETAIL_WIDTH).max(DETAIL_MIN_WIDTH);
         let mut this = Self {
             store,
             view: View::Inbox,
@@ -282,6 +297,10 @@ impl TodoView {
             lists: Vec::new(),
             tags: Vec::new(),
             show_lists: true,
+            lists_width,
+            detail_width,
+            resizing: None,
+            save_widths: None,
             collapsed_tasks: HashSet::new(),
             // As in TickTick, completed tasks sit collapsed at the bottom of the list.
             collapsed_sections: HashSet::from([Section::Completed]),
@@ -4351,6 +4370,74 @@ impl TodoView {
         cx.notify();
     }
 
+    /// Follows a dragged panel edge. `event.bounds` is this view's.
+    fn resize_panel(&mut self, event: &gpui::DragMoveEvent<DraggedEdge>, _: &mut Window, cx: &mut Context<Self>) {
+        let panel = event.drag(cx).0;
+        let bounds = event.bounds;
+        let x = event.event.position.x;
+        self.resizing = Some(panel);
+        match panel {
+            Panel::Lists => {
+                let width = f32::from(x - bounds.left());
+                // Dragged almost shut, the column hides; dragged back out, it shows again.
+                self.show_lists = width >= lists_panel::COLLAPSE_BELOW;
+                if self.show_lists {
+                    self.lists_width = width.clamp(lists_panel::MIN_WIDTH, lists_panel::MAX_WIDTH);
+                }
+            }
+            Panel::Detail => {
+                let width = f32::from(bounds.right() - x);
+                self.detail_width = width.clamp(DETAIL_MIN_WIDTH, self.max_detail_width(f32::from(bounds.size.width)).max(DETAIL_MIN_WIDTH));
+            }
+        }
+        self.schedule_save_widths(cx);
+        cx.notify();
+    }
+
+    /// The widest the details may be in a view `view_width` wide, leaving the task list its room.
+    fn max_detail_width(&self, view_width: f32) -> f32 {
+        let lists = if self.show_lists { self.lists_width } else { 0. };
+        view_width - lists - LIST_MIN_WIDTH
+    }
+
+    /// A double click on an edge: the panel's default width.
+    fn reset_panel_width(&mut self, panel: Panel, cx: &mut Context<Self>) {
+        match panel {
+            Panel::Lists => self.lists_width = lists_panel::WIDTH,
+            Panel::Detail => self.detail_width = DETAIL_WIDTH,
+        }
+        self.schedule_save_widths(cx);
+        cx.notify();
+    }
+
+    fn schedule_save_widths(&mut self, cx: &mut Context<Self>) {
+        self.save_widths = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(std::time::Duration::from_millis(300)).await;
+            this.update(cx, |this, _| {
+                for (key, width) in [("lists_width", this.lists_width), ("detail_width", this.detail_width)] {
+                    if let Err(err) = this.store.set_setting(key, &width.round().to_string()) {
+                        eprintln!("failed to save the panel width: {err:#}");
+                    }
+                }
+            })
+            .ok();
+        }));
+    }
+
+    /// An edge's handle; `panel` takes its width from where the edge is dropped.
+    fn resize_handle(&self, panel: Panel, cx: &mut Context<Self>) -> impl IntoElement {
+        let this = cx.entity().downgrade();
+        let dragged = self.resizing == Some(panel) && cx.has_active_drag();
+        resize::handle(
+            panel,
+            dragged,
+            move |_, cx| {
+                this.update(cx, |this, cx| this.reset_panel_width(panel, cx)).ok();
+            },
+            cx,
+        )
+    }
+
     /// Database errors are shown in a line at the bottom of the window instead of crashing.
     fn check<T>(&mut self, result: anyhow::Result<T>) -> Option<T> {
         match result {
@@ -5525,6 +5612,9 @@ impl Render for TodoView {
             .collect();
         // The original's "too narrow" window: the details then follow View Options' layout.
         let popup_details = self.preferences.popup_details && window.viewport_size().width < px(NARROW_WINDOW);
+        // The dragged width, narrowed while the window leaves the task list too little room.
+        let view_width = f32::from(window.viewport_size().width) - crate::sidebar::WIDTH;
+        let detail_width = self.detail_width.min(self.max_detail_width(view_width)).max(DETAIL_MIN_WIDTH);
         let timeline_view = self.timeline
             && !self.kanban
             && !matches!(self.view, View::Trash | View::Completed | View::WontDo | View::Search(_));
@@ -5892,8 +5982,9 @@ impl Render for TodoView {
             .bg(theme.colors().background)
             .text_color(theme.colors().text)
             .text_size(px(14.))
+            .on_drag_move(cx.listener(Self::resize_panel))
             .when(self.show_lists, |el| {
-                el.child(lists_panel::render(
+                el.child(div().relative().flex_none().h_full().child(lists_panel::render(
                     lists_panel::Props {
                         filters: &self.filters,
                         preferences: &self.preferences,
@@ -5908,6 +5999,7 @@ impl Render for TodoView {
                         collapsed_tags: &self.collapsed_tags,
                         tags_collapsed: self.tags_collapsed,
                         mini: lists_panel::MiniCalendar { expanded: self.mini_expanded, month: self.mini_month, busy: &self.busy_days },
+                        width: self.lists_width,
                     },
                     on_select,
                     {
@@ -5926,7 +6018,7 @@ impl Render for TodoView {
                         }
                     },
                     cx,
-                ))
+                )).child(self.resize_handle(Panel::Lists, cx)))
             })
             .map(|el| {
                 if self.view == View::Summary {
@@ -5958,7 +6050,7 @@ impl Render for TodoView {
                             .child(
                                 div()
                                     .id("detail-popup-card")
-                                    .w(px(DETAIL_WIDTH))
+                                    .w(px(detail_width))
                                     .h(gpui::relative(0.8))
                                     .rounded(px(10.))
                                     .overflow_hidden()
@@ -5974,10 +6066,18 @@ impl Render for TodoView {
                             ),
                     );
                 }
-                el.child(list).child(div().flex_none().w(px(DETAIL_WIDTH)).h_full().map(|el| match self.list_activity.clone() {
-                    Some(entries) => el.child(self.render_list_activity(&entries, cx)),
-                    None => el.child(self.detail.clone()),
-                }))
+                el.child(list).child(
+                    div()
+                        .relative()
+                        .flex_none()
+                        .w(px(detail_width))
+                        .h_full()
+                        .map(|el| match self.list_activity.clone() {
+                            Some(entries) => el.child(self.render_list_activity(&entries, cx)),
+                            None => el.child(self.detail.clone()),
+                        })
+                        .child(self.resize_handle(Panel::Detail, cx)),
+                )
             })
             .when_some(self.filter_edit.as_ref().map(|edit| self.render_filter_edit(edit, cx)), |el, dialog| el.child(dialog))
             .when_some(self.undo.as_ref().map(|(_, label, _)| label.clone()), |el, label| {

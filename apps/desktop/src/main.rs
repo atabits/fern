@@ -23,6 +23,7 @@ mod markdown_toolbar;
 mod matrix_view;
 mod print;
 mod reminders;
+mod resize;
 mod search_modal;
 mod settings_window;
 mod sidebar;

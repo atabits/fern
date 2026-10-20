@@ -41,7 +41,8 @@ mod imp {
         if extra & SIGNATURE_MASK != MI_WP_SIGNATURE {
             return false;
         }
-        let Ok(handle) = window.window_handle() else {
+        // The trait's method: `Window` has an inherent `window_handle` too.
+        let Ok(handle) = HasWindowHandle::window_handle(window) else {
             return false;
         };
         let RawWindowHandle::Win32(handle) = handle.as_raw() else {

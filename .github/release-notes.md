@@ -6,9 +6,8 @@ computer. Sync between your devices through your own `fern-server` is optional.
 > **Early preview.** Please read before installing:
 > - **Unsigned builds.** Windows SmartScreen and macOS Gatekeeper warn on first launch. See
 >   Installation below.
-> - **Little testing on macOS and Windows.** Fern is developed on Linux. The macOS and Windows
->   builds pass CI, but few people have run them yet.
->   [Report issues](https://github.com/{repo}/issues).
+> - **Little testing on macOS.** Fern is developed on Linux. The macOS builds pass CI, but few
+>   people have run them yet. [Report issues](https://github.com/{repo}/issues).
 > - **Back up what matters.** Fern keeps a daily copy of your data. Settings → About → Generate
 >   Backup makes one on demand.
 > - **Desktop only.** No mobile app yet, and sync needs your own `fern-server`.

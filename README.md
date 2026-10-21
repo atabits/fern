@@ -161,8 +161,8 @@ Fern 0.1 is an early preview. Here is what to expect:
 - **Unsigned builds.** On first launch, Windows SmartScreen shows "Windows protected your PC"
   and macOS refuses to open the app. [Download](#download) explains how to open it anyway.
   Signing is being set up (see [code signing](docs/code-signing.md)).
-- **Little testing on macOS and Windows.** Fern is developed and used daily on Linux. The
-  macOS and Windows builds are built and tested in CI, but few people have run them yet.
+- **Little testing on macOS.** Fern is developed and used daily on Linux. The macOS builds
+  are built and tested in CI, but few people have run them yet.
   Please [report](https://github.com/atabits/fern/issues) anything that looks wrong.
 - **Young software.** Bugs are likely. Fern keeps a daily copy of your data for the last week.
   Still, for anything important, use Settings → About → Generate Backup now and then. Newer

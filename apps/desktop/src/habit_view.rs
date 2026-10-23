@@ -1296,7 +1296,7 @@ impl HabitView {
                 el.child(
                     div()
                         .relative()
-                        .opacity(if open { 1. } else { 0. })
+                        .opacity(if open || crate::touch::active() { 1. } else { 0. })
                         .group_hover(group, |s| s.opacity(1.))
                         .child(
                             IconButton::new(SharedString::from(format!("habit-section-more-{id}")), IconName::Ellipsis)

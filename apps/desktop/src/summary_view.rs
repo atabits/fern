@@ -480,7 +480,7 @@ impl SummaryView {
                             .cursor_pointer()
                             .child(Label::new(template.name).size(LabelSize::Small).color(if selected { Color::Accent } else { Color::Default }))
                             .child(
-                                div().invisible().group_hover(group, |s| s.visible()).child(
+                                div().when(!crate::touch::active(), |el| el.invisible()).group_hover(group, |s| s.visible()).child(
                                     IconButton::new(SharedString::from(format!("delete-template-{id}")), IconName::X)
                                         .size(px(16.))
                                         .icon_size(IconSize::XSmall)

@@ -36,9 +36,10 @@ mod imp {
     }
 
     pub fn show_for_tap(window: &Window, focus: &FocusHandle) -> bool {
-        // GPUI handles a mouse message while it is being dispatched, so this is the press.
+        // GPUI handles a mouse message while it is being dispatched, so this is the press: a
+        // finger's tap is made by `touch`, a pen's press comes marked by Windows.
         let extra = unsafe { GetMessageExtraInfo() }.0;
-        if extra & SIGNATURE_MASK != MI_WP_SIGNATURE {
+        if !crate::touch::tapping() && extra & SIGNATURE_MASK != MI_WP_SIGNATURE {
             return false;
         }
         // The trait's method: `Window` has an inherent `window_handle` too.

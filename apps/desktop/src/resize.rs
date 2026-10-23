@@ -9,6 +9,8 @@ use ui::prelude::*;
 
 /// The strip along the border that takes the drag.
 const HANDLE_WIDTH: f32 = 6.;
+/// The strip when used with a finger.
+const TOUCH_HANDLE_WIDTH: f32 = 16.;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Panel {
@@ -42,12 +44,14 @@ pub fn handle(panel: Panel, dragged: bool, on_reset: impl Fn(&mut Window, &mut A
         .absolute()
         .top_0()
         .bottom_0()
-        .w(px(HANDLE_WIDTH))
+        .w(px(if crate::touch::active() { TOUCH_HANDLE_WIDTH } else { HANDLE_WIDTH }))
         .map(|el| match panel {
             Panel::Lists => el.right_0(),
             Panel::Detail => el.left_0(),
         })
         .cursor(CursorStyle::ResizeColumn)
+        // A finger's swipe here drags the edge instead of scrolling.
+        .child(gpui::canvas(|bounds, _, _| crate::touch::drag_zone(bounds), |_, _, _, _| {}).absolute().size_full())
         .child(
             // The line sits on the panel's border, which is on the strip's outer side.
             div()

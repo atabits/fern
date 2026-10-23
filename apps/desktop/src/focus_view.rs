@@ -1322,7 +1322,7 @@ impl FocusView {
             .child(
                 div()
                     .relative()
-                    .opacity(if menu_open { 1. } else { 0. })
+                    .opacity(if menu_open || crate::touch::active() { 1. } else { 0. })
                     .group_hover(group, |s| s.opacity(1.))
                     .child(IconButton::new("timer-more", IconName::Ellipsis).size(px(22.)).icon_size(IconSize::Small).on_click(cx.listener(move |this, _, _, cx| {
                         this.timer_menu = if this.timer_menu == Some(id) { None } else { Some(id) };
@@ -2895,7 +2895,7 @@ impl FocusView {
                     )
                     .child(Label::new(format_minutes(session.minutes())).size(LabelSize::XSmall).color(Color::Muted))
                     .child(
-                        div().opacity(0.).group_hover(group, |s| s.opacity(1.)).child(
+                        div().opacity(if crate::touch::active() { 1. } else { 0. }).group_hover(group, |s| s.opacity(1.)).child(
                             IconButton::new(SharedString::from(format!("delete-record-{session_id}")), IconName::X)
                                 .size(px(20.))
                                 .icon_size(IconSize::XSmall)

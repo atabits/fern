@@ -659,7 +659,7 @@ impl MatrixView {
                     // The original's "+" on a hovered header: a new task for this quadrant.
                     .child(
                         div()
-                            .opacity(0.)
+                            .opacity(if crate::touch::active() { 1. } else { 0. })
                             .group_hover("quadrant-header", |s| s.opacity(1.))
                             .child(IconButton::new("quadrant-add", IconName::Plus).size(px(22.)).icon_size(IconSize::Small).on_click(
                                 cx.listener(move |this, _, window, cx| this.start_add(quadrant, window, cx)),
@@ -669,7 +669,7 @@ impl MatrixView {
                     .child(
                         div()
                             .relative()
-                            .opacity(if self.menu == Some(quadrant) { 1. } else { 0. })
+                            .opacity(if self.menu == Some(quadrant) || crate::touch::active() { 1. } else { 0. })
                             .group_hover("quadrant-header", |s| s.opacity(1.))
                             .child(IconButton::new("quadrant-more", IconName::Ellipsis).size(px(22.)).icon_size(IconSize::Small).on_click(
                                 cx.listener(move |this, _, _, cx| {

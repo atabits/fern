@@ -124,6 +124,7 @@ pub fn render(
                 menu: Option<SmartList>| {
         let on_select = on_select.clone();
         let on_panel = on_panel.clone();
+        let on_secondary = on_panel.clone();
         let group = SharedString::from(format!("row-{id}"));
         let on_drop_task = on_drop_task.clone();
         let drop_view = view.clone();
@@ -173,6 +174,13 @@ pub fn render(
             .rounded(px(6.))
             .drag_over::<DraggedTask>(move |style, _, _, _| style.bg(accent.opacity(0.18)))
             .on_drop(move |dragged: &DraggedTask, window, cx| on_drop_task(drop_view.clone(), dragged.id, window, cx))
+            // The "…" menu on a right click too, and so on a finger's long press.
+            .when_some(menu, |el, list| {
+                el.on_mouse_down(MouseButton::Right, move |event, window, cx| {
+                    cx.stop_propagation();
+                    on_secondary(PanelEvent::SmartMenu(list, event.position), window, cx)
+                })
+            })
             .child(item)
     };
     let smart = |view: View, label: &'static str, icon: IconName, count: Option<usize>| {
@@ -200,7 +208,7 @@ pub fn render(
             .child(div().flex_1().child(Label::new(text).size(LabelSize::Small).color(Color::Muted)))
     };
     let on_hover_only = |text: &'static str, button: IconButton| {
-        div().invisible().group_hover(SharedString::from(format!("heading-{text}")), |s| s.visible()).child(button)
+        div().when(!crate::touch::active(), |el| el.invisible()).group_hover(SharedString::from(format!("heading-{text}")), |s| s.visible()).child(button)
     };
 
     // The lists in their order; a folder sits where its first list is (empty ones last), its
@@ -371,7 +379,7 @@ pub fn render(
     let any_tags = tags.iter().any(|t| shows(SmartList::Tags, t.open_count));
     let tags_heading = {
         let (on_add, on_menu, on_fold) = (on_panel.clone(), on_panel.clone(), on_panel.clone());
-        let hover = |el: Stateful<Div>| el.invisible().group_hover("tags-heading", |s| s.visible());
+        let hover = |el: Stateful<Div>| el.when(!crate::touch::active(), |el| el.invisible()).group_hover("tags-heading", |s| s.visible());
         h_flex()
             .id("tags-heading")
             .group("tags-heading")
@@ -620,7 +628,7 @@ fn mini_calendar(
         .right_0()
         .flex()
         .justify_center()
-        .invisible()
+        .when(!crate::touch::active(), |el| el.invisible())
         .group_hover("mini-calendar", |s| s.visible())
         .child(
             div()

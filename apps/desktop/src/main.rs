@@ -35,6 +35,7 @@ mod task_menu;
 mod task_rows;
 mod text_input;
 mod title_bar;
+mod touch;
 mod touch_keyboard;
 mod undo;
 mod updater;
@@ -152,6 +153,7 @@ fn main() -> Result<()> {
                 ..Default::default()
             },
             |window, cx| {
+                touch::init(window, cx);
                 // `fern fern://task/<id>` opens that task ("Copy Link").
                 let link = std::env::args().skip(1).find_map(|arg| fern_core::link::parse_task_link(&arg));
                 cx.new(|cx| {

@@ -510,7 +510,7 @@ impl CountdownView {
                     .absolute()
                     .top(px(6.))
                     .right(px(32.))
-                    .opacity(if pinned { 1. } else { 0. })
+                    .opacity(if pinned || crate::touch::active() { 1. } else { 0. })
                     .group_hover(group.clone(), |s| s.opacity(1.))
                     .child(
                         IconButton::new("countdown-pin", IconName::Pin)
@@ -531,7 +531,7 @@ impl CountdownView {
                     .absolute()
                     .top(px(6.))
                     .right(px(6.))
-                    .opacity(0.)
+                    .opacity(if crate::touch::active() { 1. } else { 0. })
                     .group_hover(group, |s| s.opacity(1.))
                     .when(self.card_menu == Some(id), |el| el.opacity(1.))
                     .child(

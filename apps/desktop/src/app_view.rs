@@ -922,6 +922,7 @@ impl AppView {
 
 impl Render for AppView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::touch::begin_frame(window);
         let theme = cx.theme().clone();
         let this = cx.entity().downgrade();
         let on_select = move |section, window: &mut Window, cx: &mut App| {
@@ -1012,11 +1013,27 @@ impl Render for AppView {
                 el.child(div().absolute().top(px(160.)).left_0().right_0().flex().justify_center().child(search))
             });
         let root = v_flex()
+            .relative()
             .size_full()
             .bg(theme.colors().background)
             .text_color(theme.colors().text)
             .child(self.title_bar.clone())
-            .child(content);
+            .child(content)
+            // A ring under a finger held long enough: lifting it opens the context menu.
+            .when_some(crate::touch::held(), |el, at| {
+                let accent = theme.colors().accent;
+                el.child(
+                    div()
+                        .absolute()
+                        .left(at.x - px(24.))
+                        .top(at.y - px(24.))
+                        .size(px(48.))
+                        .rounded_full()
+                        .border_2()
+                        .border_color(accent)
+                        .bg(accent.opacity(0.15)),
+                )
+            });
         title_bar::window_frame(root, window, cx)
     }
 }

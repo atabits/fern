@@ -932,7 +932,7 @@ impl TodoView {
                             .child(Label::new(checklist.to_string()).size(LabelSize::XSmall).color(Color::Muted))
                     })
                     .child(
-                        div().opacity(0.).group_hover(group, |s| s.opacity(1.)).child(
+                        div().opacity(if crate::touch::active() { 1. } else { 0. }).group_hover(group, |s| s.opacity(1.)).child(
                             IconButton::new(SharedString::from(format!("delete-template-{id}")), IconName::X)
                                 .size(px(20.))
                                 .icon_size(IconSize::XSmall)
@@ -2141,15 +2141,20 @@ impl TodoView {
                 .map(|el| if task.kind == Kind::Note {
                     el.child(Icon::new(IconName::FileText).size(IconSize::Small).color(Color::Muted))
                 } else {
-                    el.child(
-                        Checkbox::new(id)
-                            .toggle_state(done)
-                            .tint(task_rows::priority_color(task.priority, &theme))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.toggle(task_id, !done, cx);
-                            })),
-                    )
+                    let checkbox = Checkbox::new(id)
+                        .toggle_state(done)
+                        .tint(task_rows::priority_color(task.priority, &theme))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.toggle(task_id, !done, cx);
+                        }));
+                    // A finger gets a wider target around the box, which does the same.
+                    el.child(div().id("card-box").when(crate::touch::active(), |el| {
+                        el.p(px(8.)).m(px(-8.)).on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.toggle(task_id, !done, cx);
+                        }))
+                    }).child(checkbox))
                 })
                 .child(
                     div()
@@ -2235,7 +2240,7 @@ impl TodoView {
                 el.child(div().flex_1()).child(
                     div()
                         .relative()
-                        .opacity(if self.section_menu == Some(id) { 1. } else { 0. })
+                        .opacity(if self.section_menu == Some(id) || crate::touch::active() { 1. } else { 0. })
                         .group_hover(group, |s| s.opacity(1.))
                         .child(
                             IconButton::new(SharedString::from(format!("section-more-{id}")), IconName::Ellipsis)
@@ -4647,6 +4652,21 @@ impl TodoView {
                 }))
                 .into_any_element()
         };
+        // A finger gets a wider target around the box, which does the same.
+        let marker = if crate::touch::active() && task.kind != Kind::Note {
+            div()
+                .id("marker-target")
+                .p(px(8.))
+                .m(px(-8.))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.toggle(id, !done && !wont_do, cx);
+                }))
+                .child(marker)
+                .into_any_element()
+        } else {
+            marker
+        };
 
         let due = task.due_date.map(|date| {
             if matches!(self.view, View::Completed | View::WontDo) {
@@ -4810,7 +4830,7 @@ impl TodoView {
                             div()
                                 .id("restore")
                                 .flex_none()
-                                .opacity(0.)
+                                .opacity(if crate::touch::active() { 1. } else { 0. })
                                 .group_hover(group.clone(), |s| s.opacity(1.))
                                 .child(
                                     IconButton::new("restore-button", IconName::RotateCcw)

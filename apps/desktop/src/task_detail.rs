@@ -392,7 +392,7 @@ impl TaskDetail {
                             .child(Label::new(when).size(LabelSize::XSmall).color(Color::Muted)),
                     )
                     .child(
-                        div().invisible().group_hover("comment", |s| s.visible()).child(
+                        div().when(!crate::touch::active(), |el| el.invisible()).group_hover("comment", |s| s.visible()).child(
                             IconButton::new(SharedString::from(format!("comment-delete-{id}")), IconName::X)
                                 .icon_size(IconSize::XSmall)
                                 .icon_color(Color::Muted)
@@ -1292,7 +1292,7 @@ impl TaskDetail {
                             .flex_none()
                             .px_1()
                             .text_color(theme.colors().text_muted)
-                            .opacity(0.)
+                            .opacity(if crate::touch::active() { 1. } else { 0. })
                             .group_hover("checklist-item", |s| s.opacity(1.))
                             .hover(|s| s.text_color(theme.status().error))
                             .cursor_pointer()

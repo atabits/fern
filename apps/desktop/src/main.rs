@@ -15,6 +15,7 @@ mod due_picker;
 mod focus_timer;
 mod focus_mini;
 mod focus_view;
+mod hotkeys;
 mod http;
 mod habit_view;
 mod i18n;
@@ -152,7 +153,7 @@ fn main() -> Result<()> {
 
         let bounds = Bounds::centered(None, size(px(1280.), px(760.)), cx);
         let (titlebar, decorations) = title_bar::window_options();
-        cx.open_window(
+        let main_window = cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 titlebar: Some(titlebar),
@@ -178,6 +179,7 @@ fn main() -> Result<()> {
             },
         )
         .expect("failed to open the main window");
+        hotkeys::init(main_window, cx);
         cx.activate(true);
     });
     Ok(())

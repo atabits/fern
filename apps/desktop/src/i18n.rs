@@ -424,6 +424,10 @@ pub struct Strings {
     pub focus_collapse: &'static str,
     /// The focus page's button that opens the clock in a small window over the others.
     pub focus_mini_window: &'static str,
+    /// The Shortcuts panel's system-wide shortcuts (Windows).
+    pub global_shortcuts: &'static str,
+    pub global_quick_add: &'static str,
+    pub global_show_hide: &'static str,
     /// The focus page's picker tabs: Task, Timer, Habit.
     pub focus_picker_tabs: [&'static str; 3],
     pub focus_picker_search: &'static str,
@@ -1167,6 +1171,9 @@ pub static EN: Strings = Strings {
     focus_end: "End",
     focus_collapse: "Collapse",
     focus_mini_window: "Mini Window",
+    global_shortcuts: "Anywhere",
+    global_quick_add: "Quick Add",
+    global_show_hide: "Show / Hide Fern",
     focus_picker_tabs: ["Task", "Timer", "Habit"],
     focus_picker_search: "Search",
     timer_mins: "mins",
@@ -1886,6 +1893,9 @@ pub static RU: Strings = Strings {
     focus_end: "Завершить",
     focus_collapse: "Свернуть",
     focus_mini_window: "Мини-окно",
+    global_shortcuts: "Везде",
+    global_quick_add: "Быстрое добавление",
+    global_show_hide: "Показать / скрыть Fern",
     focus_picker_tabs: ["Задача", "Таймер", "Привычка"],
     focus_picker_search: "Поиск",
     timer_mins: "мин",

@@ -510,6 +510,11 @@ impl AppView {
     }
 
     fn new_task(&mut self, _: &NewTask, window: &mut Window, cx: &mut Context<Self>) {
+        self.quick_add(window, cx);
+    }
+
+    /// The add field of the task list, focused: New Task and the system-wide Quick Add.
+    pub fn quick_add(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.select(Section::Tasks, window, cx);
         self.todo.update(cx, |todo, cx| todo.focus_new_task(window, cx));
     }
@@ -638,6 +643,13 @@ impl AppView {
             if !keys.is_empty() {
                 body = body.child(row(strings.shortcut_labels[i], keys));
             }
+        }
+        // The system-wide ones, which work while another app is in front (see `hotkeys`).
+        if cfg!(windows) {
+            body = body
+                .child(heading(strings.global_shortcuts))
+                .child(row(strings.global_quick_add, vec!["Ctrl+Shift+A".into()]))
+                .child(row(strings.global_show_hide, vec!["Ctrl+Shift+E".into()]));
         }
         body = body.child(heading(strings.shortcut_groups[2]));
         for (what, example) in strings.quick_add_help {

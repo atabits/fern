@@ -96,6 +96,7 @@ pub enum IconName {
     PanelLeft,
     Paperclip,
     Pause,
+    PictureInPicture2,
     Pencil,
     Percent,
     Pin,

@@ -224,6 +224,9 @@ pub struct TodoView {
     /// A section being renamed, with its field.
     renaming_section: Option<(Id, Entity<TextInput>)>,
     detail: Entity<TaskDetail>,
+    /// The board's task card, opened beside a clicked card as the original's, and its task.
+    card_detail: Entity<TaskDetail>,
+    card: Option<Id>,
     selected: Option<Id>,
     /// A task row's right-click menu: the task and where the click was (window coordinates).
     context_menu: Option<(Id, gpui::Point<Pixels>)>,
@@ -286,6 +289,20 @@ impl TodoView {
         cx.subscribe(&detail, |this, _, OpenTask(id), cx| this.select(*id, cx)).detach();
         cx.subscribe(&detail, |_, _, StartFocus(id, title, stopwatch), cx| cx.emit(StartFocus(*id, title.clone(), *stopwatch))).detach();
         cx.subscribe(&detail, |this, _, crate::task_detail::Undoable(action, label), cx| {
+            this.offer_undo(*action, label.clone(), cx);
+        })
+        .detach();
+
+        let card_detail = cx.new(|cx| {
+            let mut detail = TaskDetail::new(store.clone(), window, cx);
+            detail.set_card(false);
+            detail
+        });
+        cx.subscribe(&card_detail, |this, _, _: &TaskUpdated, cx| this.card_updated(cx)).detach();
+        // A subtask or parent clicked in the card opens in the card.
+        cx.subscribe(&card_detail, |this, _, OpenTask(id), cx| this.open_card(*id, cx)).detach();
+        cx.subscribe(&card_detail, |_, _, StartFocus(id, title, stopwatch), cx| cx.emit(StartFocus(*id, title.clone(), *stopwatch))).detach();
+        cx.subscribe(&card_detail, |this, _, crate::task_detail::Undoable(action, label), cx| {
             this.offer_undo(*action, label.clone(), cx);
         })
         .detach();
@@ -371,6 +388,8 @@ impl TodoView {
             undo: None,
             renaming_section: None,
             detail,
+            card_detail,
+            card: None,
             selected: None,
             context_menu: None,
             context_side: None,
@@ -2139,8 +2158,68 @@ impl TodoView {
     }
 
     /// A kanban card: the task with its tags and date, and its subtasks under it.
+    /// Opens a board card's details beside it, as the original's board does.
+    fn open_card(&mut self, id: Id, cx: &mut Context<Self>) {
+        let Ok(Some(task)) = self.store.task(id) else { return };
+        let lists = self.lists.clone();
+        self.card_detail.update(cx, |detail, cx| {
+            detail.set_lists(lists);
+            detail.show(Some(task), cx);
+        });
+        self.card = Some(id);
+        cx.notify();
+    }
+
+    fn close_card(&mut self, cx: &mut Context<Self>) {
+        if self.card.take().is_some() {
+            self.card_detail.update(cx, |detail, cx| detail.show(None, cx));
+            cx.notify();
+        }
+    }
+
+    /// The card's task changed: the board shows it, and the card closes when the task is gone.
+    fn card_updated(&mut self, cx: &mut Context<Self>) {
+        self.reload(cx);
+        let Some(id) = self.card else { return };
+        match self.store.task(id) {
+            Ok(Some(task)) if !task.is_deleted() => self.card_detail.update(cx, |detail, cx| detail.refresh(Some(task), cx)),
+            _ => self.close_card(cx),
+        }
+    }
+
+    /// The board's task card: the details, framed, closed by a click elsewhere or Escape.
+    fn render_card_details(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        div()
+            .id("board-task-card")
+            .occlude()
+            .w(px(402.))
+            .h(px(301.))
+            .rounded(px(10.))
+            .overflow_hidden()
+            .border_1()
+            .border_color(theme.colors().border)
+            .bg(theme.colors().background)
+            .shadow_lg()
+            // The details' own popovers lie outside the card; a click in them keeps it open.
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                if !this.card_detail.read(cx).has_popup() {
+                    this.close_card(cx);
+                }
+            }))
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                if event.keystroke.key == "escape" && !this.card_detail.read(cx).has_popup() {
+                    this.close_card(cx);
+                }
+            }))
+            .child(self.card_detail.clone())
+            .into_any_element()
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn render_card(
         &self,
+        column: usize,
         task: &Task,
         subtasks: &[Task],
         tag_colors: &HashMap<String, Hsla>,
@@ -2149,7 +2228,7 @@ impl TodoView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = cx.theme().clone();
-        let selected = self.selected == Some(task.id);
+        let selected = self.selected == Some(task.id) || self.card == Some(task.id);
         let line = |task: &Task, id: SharedString, cx: &mut Context<Self>| {
             let task_id = task.id;
             let done = task.is_completed();
@@ -2197,7 +2276,13 @@ impl TodoView {
             .border_color(if selected { theme.colors().accent } else { theme.colors().border })
             .bg(theme.colors().surface_background)
             .cursor_pointer()
-            .on_click(cx.listener(move |this, _, _, cx| this.select(id, cx)))
+            .on_click(cx.listener(move |this, _, _, cx| this.open_card(id, cx)))
+            // As the original's, the card opens on the right of the first columns, on the left of
+            // the others.
+            .when(self.card == Some(id), |el| {
+                let placement = if column < 2 { Placement::RightOf } else { Placement::LeftOf };
+                el.relative().child(PopoverAttachment::new(placement, self.render_card_details(cx)))
+            })
             .child(line(task, SharedString::from(format!("card-check-{id}")), cx))
             // As the original's cards: the tags on a line, the date under them with a repeating
             // task's mark, and a note with text its small page.
@@ -5786,7 +5871,7 @@ impl Render for TodoView {
                                 .gap_2()
                                 .overflow_y_scroll()
                                 .children(cards.iter().map(|(task, subtasks)| {
-                                    self.render_card(task, subtasks, &tag_colors, today, strings, cx)
+                                    self.render_card(i, task, subtasks, &tag_colors, today, strings, cx)
                                 })),
                         )
                         // An empty column is a tinted panel down to the bottom, as the original's.

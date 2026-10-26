@@ -125,7 +125,7 @@ impl CalendarView {
         let today = Local::now().date_naive();
         let detail = cx.new(|cx| {
             let mut detail = TaskDetail::new(store.clone(), window, cx);
-            detail.set_card();
+            detail.set_card(true);
             detail
         });
         cx.subscribe(&detail, |this, _, _: &TaskUpdated, cx| this.card_updated(cx)).detach();

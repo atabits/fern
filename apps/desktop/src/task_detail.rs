@@ -106,8 +106,11 @@ pub struct TaskDetail {
     /// An input to focus on the next render (focusing needs the window).
     pending_focus: Option<FocusTarget>,
     popup: Option<Popup>,
-    /// Shown as the calendar's task card, framed by the card instead of a left border.
+    /// Shown as a task card (the calendar's or the board's), framed by the card instead of a
+    /// left border.
     card: bool,
+    /// The calendar's card writes its date out with the weekday.
+    calendar_card: bool,
     /// The Add Subtask field shown while the task has no subtasks, from the "…" menu.
     subtask_open: bool,
     /// The due-date popover's draft, while it is open.
@@ -267,6 +270,7 @@ impl TaskDetail {
             pending_focus: None,
             popup: None,
             card: false,
+            calendar_card: false,
             subtask_open: false,
             due_draft: None,
             activity: None,
@@ -274,9 +278,10 @@ impl TaskDetail {
         }
     }
 
-    /// Makes this the calendar's task card, which draws its own frame.
-    pub fn set_card(&mut self) {
+    /// Makes this a task card, which draws its own frame; `calendar` for the calendar's.
+    pub fn set_card(&mut self, calendar: bool) {
         self.card = true;
+        self.calendar_card = calendar;
     }
 
     /// Whether one of the details' popovers is open, which a click outside the card closes first.
@@ -2586,7 +2591,7 @@ impl Render for TaskDetail {
                     None => label,
                 };
                 // The calendar's card writes the date out, as the original's.
-                let label = if self.card && task.end_date.is_none() {
+                let label = if self.calendar_card && task.end_date.is_none() {
                     task_rows::card_due_label(date, task.due_time, today, strings)
                 } else {
                     task_rows::detail_due_label(label, date, today, strings)

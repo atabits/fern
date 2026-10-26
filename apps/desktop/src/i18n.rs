@@ -1670,7 +1670,7 @@ pub static RU: Strings = Strings {
     habit_section_name: "Название раздела",
     habit_sections: ["Утро", "День", "Вечер", "Другое"],
     habit_active: "Активные",
-    habit_archived: "В архиве",
+    habit_archived: "Архив",
     habit_archive: "В архив",
     habit_unarchive: "Вернуть из архива",
     habit_no_archived: "В архиве пусто",

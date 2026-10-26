@@ -1343,7 +1343,6 @@ impl TaskDetail {
                             subtask.title.clone().into()
                         })
                         .color(if done { Color::Muted } else { Color::Default })
-                        .strikethrough(done)
                         .truncate(),
                     )
                     .end_slot(Icon::new(IconName::ChevronRight).size(IconSize::XSmall))

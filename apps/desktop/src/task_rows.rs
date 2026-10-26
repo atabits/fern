@@ -514,6 +514,28 @@ pub fn rows_by_day(
     rows
 }
 
+/// Leaves out the tasks of the day and section groups whose titles are in `collapsed`; their
+/// headers stay, as the original folds a group by its arrow.
+pub fn fold_days(rows: Vec<Row>, collapsed: &HashSet<String>) -> Vec<Row> {
+    if collapsed.is_empty() {
+        return rows;
+    }
+    let mut folded = false;
+    rows.into_iter()
+        .filter(|row| match row {
+            Row::Day { label, .. } => {
+                folded = collapsed.contains(label);
+                true
+            }
+            Row::Section { .. } => {
+                folded = false;
+                true
+            }
+            Row::Task { .. } => !folded,
+        })
+        .collect()
+}
+
 /// Writes `date` by a template of the language: `{weekday}` and `{wd}` the full and short
 /// weekday, `{month}` and `{mon}` the month written out (as after a day) and short, `{d}` the
 /// day, and `{dd}`, `{mm}` and `{yyyy}` the numeric date.

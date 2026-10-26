@@ -117,6 +117,8 @@ pub struct TodoView {
     save_widths: Option<gpui::Task<()>>,
     collapsed_tasks: HashSet<Id>,
     collapsed_sections: HashSet<Section>,
+    /// Day and section groups folded by their header's arrow, by their title.
+    collapsed_days: HashSet<String>,
     input: Entity<TextInput>,
     /// Focus of the task list itself, for keyboard navigation (the `TaskList` key context).
     list_focus: FocusHandle,
@@ -306,6 +308,7 @@ impl TodoView {
             collapsed_tasks: HashSet::new(),
             // As in TickTick, completed tasks sit collapsed at the bottom of the list.
             collapsed_sections: HashSet::from([Section::Completed]),
+            collapsed_days: HashSet::new(),
             input,
             list_focus: cx.focus_handle(),
             list_state: ListState::new(0, ListAlignment::Top, px(400.)),
@@ -2043,8 +2046,21 @@ impl TodoView {
             Some(ListEntry::Row(Row::Section { section, count, collapsed })) => {
                 self.render_section(section, count, collapsed, strings, cx)
             }
+            // As the original's, a group folds by its header, the arrow in the gutter.
             Some(ListEntry::Row(Row::Day { label, count, drop })) => {
-                div().pl(px(GUTTER)).child(self.render_group_header(label, count, drop.as_ref(), 36., cx)).into_any_element()
+                let collapsed = self.collapsed_days.contains(&label);
+                let key = label.clone();
+                h_flex()
+                    .id(SharedString::from(format!("day-{label}")))
+                    .cursor_pointer()
+                    .child(div().w(px(GUTTER)).flex_none().pl(px(4.)).child(chevron(collapsed)))
+                    .child(div().flex_1().min_w_0().child(self.render_group_header(label, count, drop.as_ref(), 36., cx)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if this.renaming_section.is_none() {
+                            this.toggle_day(key.clone(), cx);
+                        }
+                    }))
+                    .into_any_element()
             }
             Some(ListEntry::Row(Row::Task { task, depth, has_children, collapsed })) => {
                 let tag_colors = std::mem::take(&mut self.tag_colors);
@@ -2057,7 +2073,7 @@ impl TodoView {
     }
 
     fn rows(&self, strings: &Strings) -> Vec<Row> {
-        self.rows_with(strings, &self.collapsed_tasks, &self.collapsed_sections)
+        task_rows::fold_days(self.rows_with(strings, &self.collapsed_tasks, &self.collapsed_sections), &self.collapsed_days)
     }
 
     /// Rows with the given collapsed tasks and groups; the kanban board shows everything.
@@ -2252,6 +2268,7 @@ impl TodoView {
                                 .size(px(22.))
                                 .icon_size(IconSize::Small)
                                 .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
                                     this.section_menu = Some(id);
                                     cx.notify();
                                 })),
@@ -2297,6 +2314,7 @@ impl TodoView {
                                 .cursor_pointer()
                                 .child(Label::new(strings.postpone).size(LabelSize::Small).color(Color::Accent))
                                 .on_click(cx.listener(|this, _, _, cx| {
+                                    cx.stop_propagation();
                                     this.postpone_menu = true;
                                     cx.notify();
                                 })),
@@ -4414,6 +4432,13 @@ impl TodoView {
     fn toggle_task_collapsed(&mut self, id: Id, cx: &mut Context<Self>) {
         if !self.collapsed_tasks.remove(&id) {
             self.collapsed_tasks.insert(id);
+        }
+        cx.notify();
+    }
+
+    fn toggle_day(&mut self, label: String, cx: &mut Context<Self>) {
+        if !self.collapsed_days.remove(&label) {
+            self.collapsed_days.insert(label);
         }
         cx.notify();
     }

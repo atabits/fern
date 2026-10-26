@@ -152,7 +152,7 @@ pub fn render<V: 'static>(
                 cx,
             ))
         })
-        .child(item("task-menu-wont-do", IconName::SquareX, strings.wont_do, MenuAction::WontDo, cx))
+        .child(item("task-menu-wont-do", IconName::SquareX, strings.mark_wont_do, MenuAction::WontDo, cx))
         .child(
             SubmenuItem::new("task-menu-move", strings.move_to)
                 .icon(IconName::Inbox)

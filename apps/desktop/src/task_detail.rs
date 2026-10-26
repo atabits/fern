@@ -959,7 +959,7 @@ impl TaskDetail {
                 item("more-wont-do", if wont_do { IconName::RotateCcw } else { IconName::SquareX }, if wont_do {
                     strings.reopen
                 } else {
-                    strings.wont_do
+                    strings.mark_wont_do
                 })
                 .on_click(cx.listener(|this, _, _, cx| this.toggle_wont_do(cx))),
             cx,

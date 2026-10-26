@@ -507,8 +507,8 @@ impl TodoView {
                         self.set_view(View::List(id), cx);
                     }
                 }
-                Some(("section", spec)) => {
-                    // `section=<name>` adds a section to the current list; `section=<name>><task>` also files a task.
+                Some(("list-section", spec)) => {
+                    // `list-section=<name>` adds a section to the current list; `list-section=<name>><task>` also files a task.
                     let (name, task) = spec.split_once('>').map_or((spec, None), |(n, t)| (n, Some(t)));
                     if let Some(list) = self.section_owner() {
                         let existing = self.store.list_sections(list).unwrap_or_default().into_iter().find(|s| s.name == name);

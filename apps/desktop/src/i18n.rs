@@ -347,6 +347,8 @@ pub struct Strings {
     pub next_7_days_short: &'static str,
     pub completed: &'static str,
     pub wont_do: &'static str,
+    /// The menus' item that marks a task "Won't Do".
+    pub mark_wont_do: &'static str,
     /// The task's right-click menu: "Move to", a list side menu.
     pub move_to: &'static str,
     pub all_dates: &'static str,
@@ -1069,6 +1071,7 @@ pub static EN: Strings = Strings {
     next_7_days_short: "Next 7 Days",
     completed: "Completed",
     wont_do: "Won't Do",
+    mark_wont_do: "Won't Do",
     move_to: "Move to",
     all_dates: "All Dates",
     this_week: "This Week",
@@ -1767,6 +1770,8 @@ pub static RU: Strings = Strings {
     next_7_days_short: "Следующие 7 дней",
     completed: "Выполненные",
     wont_do: "Не будет выполнено",
+    // The menus' item, as the original words it apart from the view's name.
+    mark_wont_do: "Не буду делать",
     move_to: "Переместить в",
     all_dates: "Все время",
     this_week: "Эта неделя",
@@ -1784,7 +1789,7 @@ pub static RU: Strings = Strings {
     save_as_template: "Сохранить как шаблон",
     start_focus: "Начать фокус",
     print: "Печать",
-    copy_link: "Скопировать ссылку",
+    copy_link: "Копировать ссылку",
     shortcuts: "Горячие клавиши",
     shortcut_labels: [
         "Новая задача", "Поиск", "Скрыть/показать панель", "Входящие", "Сегодня", "Завтра", "Следующие 7 дней",
@@ -1852,7 +1857,7 @@ pub static RU: Strings = Strings {
     hide_completed: "Скрыть выполненные",
     show_details: "Показывать подробности",
     hide_details: "Скрыть подробности",
-    link_parent: "Сделать подзадачей",
+    link_parent: "Связать родительскую задачу",
     unpin: "Открепить",
     task_activities: "История задачи",
     list_activities: "История списка",
@@ -1861,7 +1866,7 @@ pub static RU: Strings = Strings {
         "дата убрана", "изменён приоритет", "задача перемещена", "задача в корзине", "задача восстановлена",
         "отмечено «Не буду делать»",
     ],
-    convert_to_note: "Превратить в заметку",
+    convert_to_note: "Преобразовать в заметку",
     snooze: "Отложить",
     postpone: "Отложить",
     check_in: "Отметить",

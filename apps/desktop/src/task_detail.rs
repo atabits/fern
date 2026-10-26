@@ -2696,12 +2696,11 @@ impl Render for TaskDetail {
                         div()
                             .id("notes-formatted")
                             .cursor_text()
-                            .on_mouse_down(MouseButton::Left, {
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            // On the release, so that a click on a link opens it instead.
+                            .on_click({
                                 let focus = notes_focus_click.clone();
-                                move |_, window, cx| {
-                                    cx.stop_propagation();
-                                    window.focus(&focus, cx);
-                                }
+                                move |_, window, cx| window.focus(&focus, cx)
                             })
                             .child(render_markdown(&task.notes, cx))
                             .into_any_element()
@@ -2907,8 +2906,24 @@ fn render_markdown(text: &str, cx: &App) -> AnyElement {
         .gap_1p5()
         .text_size(px(15.))
         .line_height(px(22.))
-        .children(blocks(text).into_iter().map(|block| {
-            let body = div().flex_1().min_w_0().child(styled(block.text, block.runs));
+        .children(blocks(text).into_iter().enumerate().map(|(ix, block)| {
+            // Links open in the browser on a click, as Zed's Markdown opens them. The click is
+            // taken on the release by the block, before the description's own click opens it for
+            // editing; the text only gives links the pointing hand.
+            let links: Vec<_> = block.runs.iter().filter_map(|(range, style)| Some((range.clone(), style.link.clone()?))).collect();
+            let ranges = links.iter().map(|(range, _)| range.clone()).collect();
+            let styled_text = styled(block.text.clone(), block.runs);
+            let layout = styled_text.layout().clone();
+            let text = gpui::InteractiveText::new(("md-block", ix), styled_text).on_click(ranges, |_, _, _| {});
+            let body = div().id(("md-body", ix)).flex_1().min_w_0().child(text).when(!links.is_empty(), |el| {
+                el.on_click(move |event, _, cx| {
+                    let Ok(at) = layout.index_for_position(event.position()) else { return };
+                    if let Some((_, url)) = links.iter().find(|(range, _)| range.contains(&at)) {
+                        cx.stop_propagation();
+                        cx.open_url(url);
+                    }
+                })
+            });
             match block.kind {
                 BlockKind::Heading(level) => div()
                     .font_weight(FontWeight::BOLD)
@@ -2937,6 +2952,31 @@ fn render_markdown(text: &str, cx: &App) -> AnyElement {
                     .into_any_element(),
                 BlockKind::Quote => div().pl_3().border_l_2().border_color(accent).text_color(muted).child(body).into_any_element(),
                 BlockKind::Divider => div().my_1().h(px(1.)).bg(theme.colors().border).into_any_element(),
+                // An image line shows the image at most as wide as the panel, as the original; a
+                // relative address is a file among the attachments.
+                BlockKind::Image(url) => {
+                    let source: gpui::ImageSource = if url.starts_with("http://") || url.starts_with("https://") {
+                        gpui::SharedUri::from(url).into()
+                    } else {
+                        let path = std::path::PathBuf::from(url.strip_prefix("file://").unwrap_or(&url));
+                        let path = if path.is_relative() { crate::attachments_dir().map(|dir| dir.join(&path)).unwrap_or(path) } else { path };
+                        path.into()
+                    };
+                    let alt = SharedString::from(block.text);
+                    // In a block of its own, as Zed's Markdown wraps its images, so that the
+                    // column does not squeeze it to nothing.
+                    div()
+                        .flex_none()
+                        .child(
+                            gpui::img(source)
+                                .id(("md-image", ix))
+                                .min_w_0()
+                                .max_w_full()
+                                .rounded_md()
+                                .with_fallback(move || div().text_color(muted).child(alt.clone()).into_any_element()),
+                        )
+                        .into_any_element()
+                }
                 BlockKind::Paragraph => body.into_any_element(),
             }
         }))

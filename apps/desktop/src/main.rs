@@ -14,6 +14,7 @@ mod export;
 mod due_picker;
 mod focus_timer;
 mod focus_view;
+mod http;
 mod habit_view;
 mod i18n;
 mod keymap;
@@ -55,6 +56,12 @@ use crate::i18n::{CurrentLocale, Locale};
 
 /// Where Fern keeps its data.
 pub fn data_dir() -> Result<std::path::PathBuf> {
+    // Debug builds can be pointed at throwaway data, so that checking a change leaves the real
+    // data alone.
+    #[cfg(debug_assertions)]
+    if let Some(dir) = std::env::var_os("FERN_DATA_DIR") {
+        return Ok(dir.into());
+    }
     Ok(dirs::data_dir().context("cannot determine the user data directory")?.join("fern-tasks"))
 }
 
@@ -127,6 +134,7 @@ fn main() -> Result<()> {
 
     gpui_platform::application().with_assets(Assets).run(move |cx: &mut App| {
         theme::init(cx);
+        cx.set_http_client(http::UreqHttpClient::new());
         if let Err(err) = Assets.load_fonts(cx) {
             eprintln!("failed to load the fonts: {err:#}");
         }

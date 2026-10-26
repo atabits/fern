@@ -189,6 +189,8 @@ pub enum BlockKind {
     Check(bool),
     Quote,
     Divider,
+    /// An image line, `![alt](url)`, with the image's address; the block's text is the alt text.
+    Image(String),
 }
 
 /// Inline styles of a run of text.
@@ -220,6 +222,9 @@ pub fn blocks(text: &str) -> Vec<Block> {
         .filter(|line| !line.trim().is_empty())
         .map(|line| {
             let trimmed = line.trim_start();
+            if let Some((alt, url)) = image(trimmed.trim_end()) {
+                return Block { kind: BlockKind::Image(url.to_owned()), text: alt.to_owned(), runs: Vec::new() };
+            }
             let (kind, rest) = if trimmed == "---" || trimmed == "***" {
                 (BlockKind::Divider, "")
             } else if let Some(rest) = trimmed.strip_prefix("- [ ] ") {
@@ -241,6 +246,13 @@ pub fn blocks(text: &str) -> Vec<Block> {
             Block { kind, text, runs }
         })
         .collect()
+}
+
+/// A line that is just an image, `![alt](url)`: its alt text and address.
+fn image(line: &str) -> Option<(&str, &str)> {
+    let rest = line.strip_prefix("![")?.strip_suffix(')')?;
+    let (alt, url) = rest.split_once("](")?;
+    (!url.is_empty() && !url.contains(char::is_whitespace)).then_some((alt, url))
 }
 
 fn heading(line: &str) -> Option<(u8, &str)> {
@@ -343,6 +355,8 @@ mod tests {
         assert_eq!(blocks[6].text, "plain bright and gone");
         assert!(blocks[6].runs[0].1.highlight && blocks[6].runs[1].1.strike);
         assert_eq!(super::blocks("Привет, мир")[0].text, "Привет, мир", "non-ASCII text is kept");
+        let image = &super::blocks("![cat](https://x.org/cat.png)")[0];
+        assert_eq!((&image.kind, image.text.as_str()), (&BlockKind::Image("https://x.org/cat.png".into()), "cat"));
     }
 
     fn run(text: &str, selection: Range<usize>, format: Format) -> (String, String) {

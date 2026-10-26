@@ -25,7 +25,7 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 | Feature | Status | Notes |
 |---|---|---|
 | Task: title, completion | ✅ | |
-| Task notes (`content`) | ✅ | as the original's, a description is drawn formatted while it is not edited — headings, numbered items with their numbers in the accent color and hanging lines, bullets, check items, quotes and lines, with bold, italic, underlined, struck, highlighted, code and link runs (`[text](url)` and bare addresses) — and a click opens its Markdown for editing (matched to a screenshot of one of the reference account's notes) |
+| Task notes (`content`) | ✅ | as the original's, a description is drawn formatted while it is not edited — headings, numbered items with their numbers in the accent color and hanging lines, bullets, check items, quotes and lines, with bold, italic, underlined, struck, highlighted, code and link runs (`[text](url)` and bare addresses; a click on a link opens it in the browser) and image lines (`![alt](url)`: a web address, a file path, or a file among the attachments; at most as wide as the panel, the alt text if it cannot be loaded) — and a click elsewhere opens its Markdown for editing (matched to a screenshot of one of the reference account's notes) |
 | Due date (`dueDate`, all-day or with time) | ✅ | |
 | Priority 0/1/3/5 | ✅ | same values as TickTick |
 | Tags with colors | ✅ | case-insensitive, including non-ASCII |
@@ -93,7 +93,7 @@ Status: ✅ done · 🟡 partial / visual only · ⬜ missing
 - In debug builds `FERN_DEV_STATE` puts the UI into a given state without clicks, for example
   `FERN_DEV_STATE="add=Buy milk tomorrow #home;select=milk;popup=due"`; see
   `TodoView::apply_dev_state` for all commands. `FERN_APP_ID` changes the window's app id so
-  window-manager rules can target dev builds.
+  window-manager rules can target dev builds. `FERN_DATA_DIR` points a debug build at throwaway data (for example a folder filled by `seed_demo`), so that checking a change by hand leaves the real data alone.
 
 ## Next
 
@@ -102,6 +102,5 @@ Each item is a whole feature area, done in one pass (it may take several commits
 1. Summary page against the original's at the same window size: the report, its toolbar and the right column's options, opened without changing anything, in one pass.
 2. Trash and Won't Do against the original's at the same window size: their rows, headers and the Trash's bottom bar for a deleted task, opened without restoring or deleting anything, in one pass.
 3. Completed view against the original's at the same window size: its date groups, rows and the header's range and list filters, opened without changing anything, in one pass.
-4. Links in a formatted description open in the browser on a click, and an image line (`![](…)`) shows the image, as the original's, in one pass.
 
 Not checkable under the reference rules: the search's full results page (typing a query needs TickTick focused, and the search closes when the focus goes back); countdowns in Today (the reference account has none due today); the empty states of Today, Next 7 Days, All, the Inbox and the tags (none of them is empty in the reference account); the original's light theme (the reference account uses a theme with its own photo, which switching might not restore); a saved filter's view (the reference account has none); whether the original asks for a note when a focus session ends, and its white noise (the desktop original shows no sound choice on the focus page or in Focus Settings; it would only appear with a timer running in the reference account). Fern's record dialog takes a note afterwards.

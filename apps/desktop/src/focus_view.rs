@@ -448,7 +448,30 @@ impl FocusView {
         cx.notify();
     }
 
-    fn toggle_pause(&mut self, cx: &mut Context<Self>) {
+    /// The clock as shown at `now`, what it is for (the task, the habit or the break), and
+    /// whether a session runs and is paused; the timer bar, the page and the mini window show it.
+    pub fn clock_state(&self, now: i64, strings: &'static i18n::Strings) -> (String, SharedString, bool, bool) {
+        match &self.running {
+            Some(r) => (
+                format_clock(r.timer.display(now)),
+                match r.on_break {
+                    Some(BreakKind::Short) => SharedString::new_static(strings.focus_short_break),
+                    Some(BreakKind::Long) => SharedString::new_static(strings.focus_long_break),
+                    None => r.task.as_ref().map_or(SharedString::new_static(strings.focus), |(_, t)| t.clone().into()),
+                },
+                true,
+                r.timer.is_paused(),
+            ),
+            None => (
+                format_clock(if self.stopwatch_mode() { 0 } else { self.minutes(POMO_SETTING) * 60_000 }),
+                SharedString::new_static(strings.focus),
+                false,
+                false,
+            ),
+        }
+    }
+
+    pub fn toggle_pause(&mut self, cx: &mut Context<Self>) {
         if let Some(running) = self.running.as_mut() {
             let now = now_ms();
             if running.timer.is_paused() { running.timer.resume(now) } else { running.timer.pause(now) }
@@ -457,7 +480,7 @@ impl FocusView {
     }
 
     /// Stops the timer and records the session if it lasted at least a minute.
-    fn finish(&mut self, cx: &mut Context<Self>) {
+    pub fn finish(&mut self, cx: &mut Context<Self>) {
         let Some(running) = self.running.take() else { return };
         let now = now_ms();
         let elapsed = running.timer.elapsed(now);
@@ -2949,7 +2972,7 @@ impl FocusView {
     }
 
     /// The page's Start: the picked task, timer or habit, or a plain session.
-    fn start_next(&mut self, cx: &mut Context<Self>) {
+    pub fn start_next(&mut self, cx: &mut Context<Self>) {
         match self.next.take() {
             Some(NextFocus::Task(id, title)) => self.start(Some((id, title)), cx),
             Some(NextFocus::Timer(timer)) => self.start_from_timer(&timer, cx),
@@ -3202,7 +3225,19 @@ impl FocusView {
                     )
                     .when(!running, |el| el.child(self.render_mode_switch(LabelSize::Small, cx)))
                     .child(
-                        h_flex().flex_1().justify_end().child(
+                        h_flex().flex_1().justify_end().gap_1()
+                        // The original's mini window: the clock in a small window over the others.
+                        .child(
+                            IconButton::new("focus-page-mini", IconName::PictureInPicture2)
+                                .icon_color(Color::Muted)
+                                .tooltip(ui::Tooltip::text(strings.focus_mini_window))
+                                // Deferred: the window draws at once and reads this view.
+                                .on_click(cx.listener(|_, _, _, cx| {
+                                    let focus = cx.entity();
+                                    cx.defer(move |cx| crate::focus_mini::open(focus, cx));
+                                })),
+                        )
+                        .child(
                             div()
                                 .relative()
                                 .child(IconButton::new("focus-page-more", IconName::Ellipsis).on_click(cx.listener(|this, _, _, cx| {
@@ -3399,24 +3434,7 @@ impl Render for FocusView {
             })
             .collect();
 
-        let (clock, label, running, paused) = match &self.running {
-            Some(r) => (
-                format_clock(r.timer.display(now)),
-                match r.on_break {
-                    Some(BreakKind::Short) => SharedString::new_static(strings.focus_short_break),
-                    Some(BreakKind::Long) => SharedString::new_static(strings.focus_long_break),
-                    None => r.task.as_ref().map_or(SharedString::new_static(strings.focus), |(_, t)| t.clone().into()),
-                },
-                true,
-                r.timer.is_paused(),
-            ),
-            None => (
-                format_clock(if self.stopwatch_mode() { 0 } else { self.minutes(POMO_SETTING) * 60_000 }),
-                SharedString::new_static(strings.focus),
-                false,
-                false,
-            ),
-        };
+        let (clock, label, running, paused) = self.clock_state(now, strings);
 
         if self.expanded {
             return self.render_page(clock, label, running, paused, cx);

@@ -171,7 +171,7 @@ impl Render for StickyNote {
 
 /// Keeps the window over the other windows, or puts it back among them: the original's pin.
 #[cfg(windows)]
-fn set_topmost(window: &Window, topmost: bool) {
+pub(crate) fn set_topmost(window: &Window, topmost: bool) {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::{HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetWindowPos};

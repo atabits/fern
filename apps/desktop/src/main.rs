@@ -13,6 +13,7 @@ mod emoji;
 mod export;
 mod due_picker;
 mod focus_timer;
+mod focus_mini;
 mod focus_view;
 mod http;
 mod habit_view;

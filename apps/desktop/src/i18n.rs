@@ -422,6 +422,8 @@ pub struct Strings {
     pub focus_continue: &'static str,
     pub focus_end: &'static str,
     pub focus_collapse: &'static str,
+    /// The focus page's button that opens the clock in a small window over the others.
+    pub focus_mini_window: &'static str,
     /// The focus page's picker tabs: Task, Timer, Habit.
     pub focus_picker_tabs: [&'static str; 3],
     pub focus_picker_search: &'static str,
@@ -1164,6 +1166,7 @@ pub static EN: Strings = Strings {
     focus_continue: "Continue",
     focus_end: "End",
     focus_collapse: "Collapse",
+    focus_mini_window: "Mini Window",
     focus_picker_tabs: ["Task", "Timer", "Habit"],
     focus_picker_search: "Search",
     timer_mins: "mins",
@@ -1882,6 +1885,7 @@ pub static RU: Strings = Strings {
     focus_continue: "Продолжить",
     focus_end: "Завершить",
     focus_collapse: "Свернуть",
+    focus_mini_window: "Мини-окно",
     focus_picker_tabs: ["Задача", "Таймер", "Привычка"],
     focus_picker_search: "Поиск",
     timer_mins: "мин",

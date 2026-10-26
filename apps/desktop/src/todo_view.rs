@@ -984,14 +984,27 @@ impl TodoView {
             .into_any_element()
     }
 
+    /// The system-wide Quick Add's task: added as from All, so that it takes the Settings'
+    /// defaults (the default list among them) and nothing from the view or the add field's menu.
+    pub fn add_quick(&mut self, text: &str, cx: &mut Context<Self>) {
+        let result = self.add_task_as(text, &View::All, &AddDraft::default());
+        self.check(result);
+        self.reload(cx);
+    }
+
     fn add_task(&self, input: &str) -> anyhow::Result<Task> {
+        self.add_task_as(input, &self.view, &self.add_draft)
+    }
+
+    /// Adds a task from the add field's text as if typed in `view` with `draft`'s choices.
+    fn add_task_as(&self, input: &str, view: &View, draft: &AddDraft) -> anyhow::Result<Task> {
         let today = Self::today();
         let list_names: Vec<String> = self.lists.iter().map(|l| l.name.clone()).collect();
         let parsed = fern_core::parse_quick_add_with(input, today, &list_names, self.preferences.recognition);
         let title = if parsed.title.is_empty() { input.trim() } else { parsed.title.as_str() };
         let task = self.store.add_task_at(title, !self.preferences.task_defaults.add_to_bottom)?;
 
-        let view_due = match &self.view {
+        let view_due = match view {
             View::Today | View::Next7Days => Some(today),
             View::Tomorrow => Some(today + Duration::days(1)),
             View::Day(day) => Some(*day),
@@ -1000,14 +1013,14 @@ impl TodoView {
         // Settings → More → Task Default fills in what neither the text nor the view gives.
         let defaults = &self.preferences.task_defaults;
         // The date picker's time and reminders go with its date, not with a typed one.
-        let from_picker = parsed.due_date.is_none() && self.add_draft.date.is_some();
-        let due_time = if from_picker { self.add_draft.time } else { parsed.due_time };
-        if let Some(date) = parsed.due_date.or(self.add_draft.date).or(view_due).or(defaults.date.map(|d| d.date(today))) {
+        let from_picker = parsed.due_date.is_none() && draft.date.is_some();
+        let due_time = if from_picker { draft.time } else { parsed.due_time };
+        if let Some(date) = parsed.due_date.or(draft.date).or(view_due).or(defaults.date.map(|d| d.date(today))) {
             self.store.set_due(task.id, Some(date), due_time)?;
-            if from_picker && self.add_draft.end.is_some() {
-                self.store.set_due_end(task.id, self.add_draft.end)?;
+            if from_picker && draft.end.is_some() {
+                self.store.set_due_end(task.id, draft.end)?;
             }
-            match self.add_draft.reminders.as_ref().filter(|_| from_picker) {
+            match draft.reminders.as_ref().filter(|_| from_picker) {
                 Some(reminders) => self.store.set_reminders(task.id, reminders)?,
                 None => {
                     let reminder = if due_time.is_some() { defaults.timed_reminder } else { defaults.all_day_reminder };
@@ -1024,12 +1037,12 @@ impl TodoView {
         {
             tags.push(tag.clone());
         }
-        if let View::Tag(tag) = &self.view
+        if let View::Tag(tag) = view
             && !tags.iter().any(|t| t.to_lowercase() == tag.to_lowercase())
         {
             tags.push(tag.clone());
         }
-        for tag in &self.add_draft.tags {
+        for tag in &draft.tags {
             if !tags.iter().any(|t| t.to_lowercase() == tag.to_lowercase()) {
                 tags.push(tag.clone());
             }
@@ -1037,10 +1050,10 @@ impl TodoView {
         if !tags.is_empty() {
             self.store.set_tags(task.id, &tags)?;
         }
-        if let Some(repeat) = parsed.repeat.or_else(|| self.add_draft.repeat.clone().filter(|_| self.add_draft.date.is_some())) {
+        if let Some(repeat) = parsed.repeat.or_else(|| draft.repeat.clone().filter(|_| draft.date.is_some())) {
             self.store.set_repeat(task.id, Some(repeat), today)?;
         }
-        let draft_priority = self.add_draft.priority.filter(|p| *p != fern_core::Priority::None);
+        let draft_priority = draft.priority.filter(|p| *p != fern_core::Priority::None);
         if let Some(priority) = parsed
             .priority
             .or(draft_priority)
@@ -1051,28 +1064,28 @@ impl TodoView {
 
         let parsed_list =
             parsed.list.and_then(|name| self.lists.iter().find(|l| l.name == name)).map(|l| l.id);
-        let view_list = match self.view {
-            View::List(id) => Some(id),
+        let view_list = match view {
+            View::List(id) => Some(*id),
             _ => None,
         };
         // Outside the Inbox and lists, new tasks go to the default list from the Settings.
-        let default_list = match self.view {
+        let default_list = match view {
             View::Inbox | View::List(_) => None,
             _ => self.store.preferences().ok().and_then(|p| p.default_list),
         };
         // The "▾" menu's list goes before the view's and the default one.
-        let draft_list = self.add_draft.list;
+        let draft_list = draft.list;
         if let Some(Some(list)) = parsed_list.map(Some).or(draft_list).or(view_list.map(Some)).or(default_list.map(Some)) {
             self.store.set_list(task.id, Some(list))?;
         }
         // In a note list (the original's List Type), new entries are notes.
         let note_list = self.store.task(task.id)?.and_then(|t| t.list_id).is_some_and(|id| self.lists.iter().any(|l| l.id == id && l.kind == fern_core::Kind::Note));
-        if self.add_draft.note || note_list {
+        if draft.note || note_list {
             self.store.set_kind(task.id, fern_core::Kind::Note)?;
         }
-        if !self.add_draft.files.is_empty() {
+        if !draft.files.is_empty() {
             let dir = crate::attachments_dir()?;
-            for file in &self.add_draft.files {
+            for file in &draft.files {
                 self.store.add_attachment(task.id, file, &dir)?;
             }
         }

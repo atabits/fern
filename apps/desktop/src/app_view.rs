@@ -513,7 +513,12 @@ impl AppView {
         self.quick_add(window, cx);
     }
 
-    /// The add field of the task list, focused: New Task and the system-wide Quick Add.
+    /// A task from the Quick Add window.
+    pub fn add_quick_task(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.todo.update(cx, |todo, cx| todo.add_quick(text, cx));
+    }
+
+    /// The add field of the task list, focused: New Task.
     pub fn quick_add(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.select(Section::Tasks, window, cx);
         self.todo.update(cx, |todo, cx| todo.focus_new_task(window, cx));

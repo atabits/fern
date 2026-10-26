@@ -25,6 +25,7 @@ mod lists_panel;
 mod markdown_toolbar;
 mod matrix_view;
 mod print;
+mod quick_add_window;
 mod reminders;
 mod resize;
 mod search_modal;

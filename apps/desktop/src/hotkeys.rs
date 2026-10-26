@@ -1,7 +1,7 @@
 //! System-wide shortcuts, as the original's desktop app has them: they work while another app
 //! is in front. Windows only, where `RegisterHotKey` makes them; GPUI has no such shortcuts.
 //!
-//! - Ctrl+Shift+A: Quick Add, the main window in front with the add field focused.
+//! - Ctrl+Shift+A: Quick Add, a small field over every window (see `quick_add_window`).
 //! - Ctrl+Shift+E: shows the main window, or hides it (minimized) when it is in front.
 
 use gpui::{App, WindowHandle};
@@ -19,6 +19,11 @@ enum Hotkey {
 pub fn init(window: WindowHandle<AppView>, cx: &mut App) {
     use futures::StreamExt as _;
 
+    // Debug builds: `FERN_DEV_STATE=quick-add-window` opens Quick Add, as its shortcut would.
+    #[cfg(debug_assertions)]
+    if std::env::var("FERN_DEV_STATE").is_ok_and(|state| state.contains("quick-add-window")) {
+        cx.defer(move |cx| crate::quick_add_window::open(window, cx));
+    }
     let (tx, mut rx) = futures::channel::mpsc::unbounded();
     std::thread::Builder::new()
         .name("hotkeys".into())
@@ -26,14 +31,17 @@ pub fn init(window: WindowHandle<AppView>, cx: &mut App) {
         .ok();
     cx.spawn(async move |cx| {
         while let Some(hotkey) = rx.next().await {
-            let handled = window.update(cx, |view, window, cx| match hotkey {
+            let handled = match hotkey {
                 Hotkey::QuickAdd => {
-                    window.activate_window();
-                    view.quick_add(window, cx);
+                    cx.update(|cx| crate::quick_add_window::open(window, cx));
+                    Ok(())
                 }
-                Hotkey::ShowHide if window.is_window_active() => window.minimize_window(),
-                Hotkey::ShowHide => window.activate_window(),
-            });
+                Hotkey::ShowHide => window
+                    .update(cx, |_, window, _| {
+                        if window.is_window_active() { window.minimize_window() } else { window.activate_window() }
+                    })
+                    .map_err(|_| ()),
+            };
             if handled.is_err() {
                 break;
             }

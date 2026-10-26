@@ -40,6 +40,9 @@ pub struct AppView {
     features: fern_core::Features,
     /// The "Shortcuts" panel on the right, while open.
     shortcuts_open: bool,
+    /// The system-wide shortcut being recorded in the Shortcuts panel, and the panel's focus.
+    recording_hotkey: Option<usize>,
+    shortcuts_focus: gpui::FocusHandle,
     settings: Option<gpui::Entity<SettingsWindow>>,
     /// The Statistics page opened from the account menu, which covers the whole window.
     statistics_open: bool,
@@ -129,6 +132,8 @@ impl AppView {
             sync: crate::sync::SyncStatus::Off,
             features: store_features,
             shortcuts_open: false,
+            recording_hotkey: None,
+            shortcuts_focus: cx.focus_handle(),
             settings: None,
             statistics_open: false,
             nav_hovered: None,
@@ -650,17 +655,68 @@ impl AppView {
             }
         }
         // The system-wide ones, which work while another app is in front (see `hotkeys`).
+        // Each is changed by clicking it and pressing the new keys, as in the original's Settings.
         if cfg!(windows) {
-            body = body
-                .child(heading(strings.global_shortcuts))
-                .child(row(strings.global_quick_add, vec!["Ctrl+Shift+A".into()]))
-                .child(row(strings.global_show_hide, vec!["Ctrl+Shift+E".into()]));
+            body = body.child(heading(strings.global_shortcuts));
+            let labels = [strings.global_quick_add, strings.global_show_hide];
+            for (i, (binding, taken)) in crate::hotkeys::bindings(cx).into_iter().enumerate() {
+                let recording = self.recording_hotkey == Some(i);
+                let text = if recording {
+                    strings.press_shortcut.to_owned()
+                } else {
+                    binding.map_or_else(|| strings.shortcut_off.to_owned(), |b| b.label())
+                };
+                body = body.child(
+                    h_flex()
+                        .h(px(32.))
+                        .gap_2()
+                        .child(div().flex_1().child(Label::new(labels[i]).size(LabelSize::Small)))
+                        .when(taken && !recording, |el| el.child(Label::new(strings.shortcut_taken).size(LabelSize::XSmall).color(Color::Error)))
+                        .child(
+                            div()
+                                .id(("global-shortcut", i))
+                                .px_2()
+                                .h(px(22.))
+                                .flex()
+                                .items_center()
+                                .rounded(px(4.))
+                                .border_1()
+                                .border_color(if recording { theme.colors().accent } else { theme.colors().border })
+                                .cursor_pointer()
+                                .child(Label::new(text).size(LabelSize::XSmall).color(if recording { Color::Accent } else { Color::Muted }))
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.recording_hotkey = Some(i);
+                                    window.focus(&this.shortcuts_focus, cx);
+                                    cx.notify();
+                                })),
+                        ),
+                );
+            }
         }
         body = body.child(heading(strings.shortcut_groups[2]));
         for (what, example) in strings.quick_add_help {
             body = body.child(row(what, vec![example.to_owned()]));
         }
         v_flex()
+            .id("shortcuts-panel")
+            .track_focus(&self.shortcuts_focus)
+            // While a system-wide shortcut is recorded, the keys pressed set it: Escape keeps
+            // the old one, Backspace turns it off.
+            .capture_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                let Some(index) = this.recording_hotkey else { return };
+                cx.stop_propagation();
+                match event.keystroke.key.as_str() {
+                    "escape" => {}
+                    "backspace" | "delete" => crate::hotkeys::set(index, None, cx),
+                    _ => match crate::hotkeys::Binding::from_keystroke(&event.keystroke) {
+                        Some(binding) => crate::hotkeys::set(index, Some(binding), cx),
+                        // A modifier alone, or a key that cannot be one: keep listening.
+                        None => return,
+                    },
+                }
+                this.recording_hotkey = None;
+                cx.notify();
+            }))
             .absolute()
             .top_0()
             .right_0()

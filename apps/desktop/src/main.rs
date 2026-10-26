@@ -154,6 +154,7 @@ fn main() -> Result<()> {
 
         let bounds = Bounds::centered(None, size(px(1280.), px(760.)), cx);
         let (titlebar, decorations) = title_bar::window_options();
+        let store_for_hotkeys = store.clone();
         let main_window = cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -180,7 +181,7 @@ fn main() -> Result<()> {
             },
         )
         .expect("failed to open the main window");
-        hotkeys::init(main_window, cx);
+        hotkeys::init(main_window, store_for_hotkeys, cx);
         cx.activate(true);
     });
     Ok(())

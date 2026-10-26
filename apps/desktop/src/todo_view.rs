@@ -217,6 +217,8 @@ pub struct TodoView {
     add_date_row: Option<u8>,
     /// The section whose "…" menu is open.
     section_menu: Option<Id>,
+    /// The overdue group's "Postpone" menu is open.
+    postpone_menu: bool,
     /// A section being renamed, with its field.
     renaming_section: Option<(Id, Entity<TextInput>)>,
     detail: Entity<TaskDetail>,
@@ -342,6 +344,7 @@ impl TodoView {
             suggestions_open: None,
             section_rename: None,
             section_menu: None,
+            postpone_menu: false,
             templates_open: false,
             add_menu_open: false,
             add_list_side: false,
@@ -2217,6 +2220,8 @@ impl TodoView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let strings = i18n::t(cx);
+        // Matched by name: the overdue group is the one header of a date view with this title.
+        let overdue = drop.is_none() && label == strings.group_overdue;
         let section = match drop {
             Some(DropTarget::Section(Some(id))) => Some(*id),
             _ => None,
@@ -2281,7 +2286,57 @@ impl TodoView {
                         }),
                 )
             })
+            // The overdue group's "Postpone" moves its tasks to a later day, as the original's.
+            .when(overdue, |el| {
+                el.child(div().flex_1()).child(
+                    div()
+                        .relative()
+                        .child(
+                            div()
+                                .id("postpone")
+                                .cursor_pointer()
+                                .child(Label::new(strings.postpone).size(LabelSize::Small).color(Color::Accent))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.postpone_menu = true;
+                                    cx.notify();
+                                })),
+                        )
+                        .when(self.postpone_menu, |el| {
+                            el.child(PopoverAttachment::new(
+                                Placement::BelowRight,
+                                popover(cx)
+                                    .min_w(px(180.))
+                                    .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                                        this.postpone_menu = false;
+                                        cx.notify();
+                                    }))
+                                    .children(fern_core::DefaultDate::ALL.iter().zip(strings.default_dates).map(|(&choice, name)| {
+                                        ListItem::new(SharedString::from(format!("postpone-{name}")))
+                                            .child(Label::new(name))
+                                            .on_click(cx.listener(move |this, _, _, cx| this.postpone_overdue(choice.date(Self::today()), cx)))
+                                    })),
+                            ))
+                        }),
+                )
+            })
             .into_any_element()
+    }
+
+    /// Moves every overdue task in view to `day`, keeping its time.
+    fn postpone_overdue(&mut self, day: NaiveDate, cx: &mut Context<Self>) {
+        self.postpone_menu = false;
+        let today = Self::today();
+        let overdue: Vec<_> = self
+            .tasks
+            .iter()
+            .filter(|t| !t.is_closed() && t.due_date.is_some_and(|d| d < today))
+            .map(|t| (t.id, t.due_time))
+            .collect();
+        for (id, time) in overdue {
+            let result = self.store.set_due(id, Some(day), time);
+            self.check(result);
+        }
+        self.reload(cx);
     }
 
     fn start_rename_section(&mut self, id: Id, window: &mut Window, cx: &mut Context<Self>) {

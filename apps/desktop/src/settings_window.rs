@@ -730,15 +730,38 @@ impl SettingsWindow {
         }
         match form {
             Some(form) => page.push(form),
-            None => page.push(
-                div()
-                    .id("subscription-add")
-                    .px_1()
-                    .cursor_pointer()
-                    .child(Label::new(strings.add_calendar).color(Color::Accent))
-                    .on_click(cx.listener(|this, _, window, cx| this.open_subscription_form(None, window, cx)))
-                    .into_any_element(),
-            ),
+            None => {
+                // The original's Holidays: the public holidays of the language's country, a
+                // calendar like any other once added.
+                let has_holidays = feeds.calendars().iter().any(|c| c.subscription.url == strings.holidays_url);
+                page.push(
+                    h_flex()
+                        .px_1()
+                        .gap_5()
+                        .child(
+                            div()
+                                .id("subscription-add")
+                                .cursor_pointer()
+                                .child(Label::new(strings.add_calendar).color(Color::Accent))
+                                .on_click(cx.listener(|this, _, window, cx| this.open_subscription_form(None, window, cx))),
+                        )
+                        .when(!has_holidays, |el| {
+                            el.child(
+                                div()
+                                    .id("subscription-holidays")
+                                    .cursor_pointer()
+                                    .child(Label::new(strings.add_holidays).color(Color::Accent))
+                                    .on_click(cx.listener(|_, _, _, cx| {
+                                        let strings = i18n::t(cx);
+                                        if let Some(feeds) = crate::subscriptions::feeds(cx) {
+                                            feeds.update(cx, |feeds, cx| feeds.add(strings.holidays_name, strings.holidays_url, Some("#22C55E"), cx));
+                                        }
+                                    })),
+                            )
+                        })
+                        .into_any_element(),
+                )
+            }
         }
         page
     }

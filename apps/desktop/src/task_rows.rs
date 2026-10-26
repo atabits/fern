@@ -498,11 +498,10 @@ pub fn rows_by_day(
     let mut rows = Vec::new();
     for (day, items) in groups {
         // As the original: "Sunday, Today" and "Saturday, Yesterday" for the last two days.
-        let weekday = strings.weekdays_full[day.weekday().num_days_from_monday() as usize];
         let label = match (today - day).num_days() {
-            0 => format!("{weekday}, {}", strings.today),
-            1 => format!("{weekday}, {}", strings.yesterday),
-            _ => day_header(day, today, strings),
+            0 => relative_day(day, strings.today, strings),
+            1 => relative_day(day, strings.yesterday, strings),
+            _ => closed_day(day, today, strings),
         };
         rows.push(Row::Day { label, count: items.len(), drop: None });
         rows.extend(items.into_iter().map(|task| Row::Task {
@@ -513,6 +512,32 @@ pub fn rows_by_day(
         }));
     }
     rows
+}
+
+/// Writes `date` by a template of the language: `{weekday}` and `{wd}` the full and short
+/// weekday, `{month}` and `{mon}` the month written out (as after a day) and short, `{d}` the
+/// day, and `{dd}`, `{mm}` and `{yyyy}` the numeric date.
+pub fn format_day(template: &str, date: NaiveDate, strings: &Strings) -> String {
+    let weekday = date.weekday().num_days_from_monday() as usize;
+    template
+        .replace("{weekday}", strings.weekdays_full[weekday])
+        .replace("{wd}", strings.weekdays_short[weekday])
+        .replace("{month}", strings.months_genitive[date.month0() as usize])
+        .replace("{mon}", strings.months_short[date.month0() as usize])
+        .replace("{dd}", &format!("{:02}", date.day()))
+        .replace("{d}", &date.day().to_string())
+        .replace("{mm}", &format!("{:02}", date.month()))
+        .replace("{yyyy}", &date.year().to_string())
+}
+
+/// A closed task's day group, as the original: "Sunday, September 27" / "17 окт Сб".
+pub fn closed_day(day: NaiveDate, today: NaiveDate, strings: &Strings) -> String {
+    format_day(strings.closed_day[usize::from(day.year() != today.year())], day, strings)
+}
+
+/// A day named after today, with its weekday: "Sunday, Today" / "Пн, Сегодня".
+pub fn relative_day(day: NaiveDate, name: &str, strings: &Strings) -> String {
+    format_day(strings.relative_day, day, strings).replace("{rel}", name)
 }
 
 /// "Sunday, September 27", with the year when it is not the current one.
@@ -533,10 +558,9 @@ pub fn day_header(day: NaiveDate, today: NaiveDate, strings: &Strings) -> String
 /// A day's header in Next 7 Days, as the original's: "Sunday, Today", "Monday, Tomorrow",
 /// "Wednesday, October 21", and "Next Saturday, October 24" for a day in the next week.
 pub fn next_days_header(day: NaiveDate, today: NaiveDate, week_start: chrono::Weekday, strings: &Strings) -> String {
-    let weekday = strings.weekdays_full[day.weekday().num_days_from_monday() as usize];
     let offset = (day - today).num_days();
     if offset == 0 || offset == 1 {
-        return format!("{weekday}, {}", if offset == 0 { strings.today } else { strings.tomorrow });
+        return relative_day(day, if offset == 0 { strings.today } else { strings.tomorrow }, strings);
     }
     let week = |d: NaiveDate| (d - chrono::Duration::days(((7 + d.weekday().num_days_from_monday() - week_start.num_days_from_monday()) % 7) as i64)).num_days_from_ce();
     let label = day_header(day, today, strings);
@@ -632,9 +656,7 @@ pub fn detail_due_label(label: String, date: NaiveDate, today: NaiveDate, string
 /// A closed task's date, as the original's Completed and Won't Do show it: the date itself,
 /// "Oct 15" ("Oct 15, 2025" in another year), never "Today" or "Tomorrow".
 pub fn closed_due_label(date: NaiveDate, today: NaiveDate, strings: &Strings) -> String {
-    let month = strings.months_short[date.month0() as usize];
-    let day = if strings.day_before_month { format!("{} {month}", date.day()) } else { format!("{month} {}", date.day()) };
-    if date.year() == today.year() { day } else { format!("{day}, {}", date.year()) }
+    format_day(strings.closed_date[usize::from(date.year() != today.year())], date, strings)
 }
 
 /// A task row's date with the View Options' "Show Date by": Task Time is `due_label`; Countdown
@@ -957,10 +979,12 @@ mod tests {
         assert_eq!(row_due_label(today, None, today, &EN, true).0, "Today");
         assert_eq!(closed_due_label(today, today, &EN), "Oct 18", "a closed task shows the date itself");
         assert_eq!(closed_due_label(d(2025, 9, 26), today, &EN), "Sep 26, 2025");
+        assert_eq!(closed_due_label(d(2025, 9, 24), today, &RU), "24.09.2025", "as the Russian original");
+        assert_eq!(closed_day(d(2026, 10, 17), today, &RU), "17 окт Сб");
         let label = |date| due_label(date, None, today, &RU).0;
         assert_eq!(label(today), "Сегодня");
         assert_eq!(label(d(2026, 10, 24)), "Сб");
-        assert_eq!(label(d(2026, 11, 13)), "13 нояб.");
-        assert_eq!(label(d(2027, 1, 5)), "5 янв. 2027");
+        assert_eq!(label(d(2026, 11, 13)), "13 ноя");
+        assert_eq!(label(d(2027, 1, 5)), "5 янв 2027");
     }
 }

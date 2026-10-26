@@ -4777,9 +4777,10 @@ impl TodoView {
                             el.child(Label::new(line.trim().to_owned()).size(LabelSize::XSmall).color(Color::Muted).truncate())
                         }),
                     )
+                    // A closed task's tags are muted with it, as the original's.
                     .children(task.tags.iter().map(|tag| {
                         let color = tag_colors.get(tag).copied().unwrap_or(theme.colors().text_muted);
-                        Chip::new(tag.clone(), color)
+                        div().flex_none().when(closed_view, |el| el.opacity(0.45)).child(Chip::new(tag.clone(), color))
                     }))
                     // As the original's, a view across lists names each task's list after its tags.
                     .when(self.view.shows_list_names(), |el| {
@@ -4976,7 +4977,7 @@ impl TodoView {
                         .pl(px(GUTTER))
                         // Next 7 Days names today's habits by the day, as the original: "Sunday, Today's Habit".
                         .child(Label::new(if self.view == View::Next7Days {
-                            format!("{}, {}", strings.weekdays_full[today.weekday().num_days_from_monday() as usize], strings.todays_habit)
+                            task_rows::relative_day(today, strings.todays_habit, strings)
                         } else {
                             strings.section_habits.to_owned()
                         }).weight(FontWeight::BOLD))

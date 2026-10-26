@@ -307,6 +307,9 @@ pub struct Strings {
     pub countdown_empty: &'static str,
     /// Unit letters for years, months, days in countdown cards.
     pub unit_letters: [&'static str; 3],
+    /// A countdown's date under its numbers, as a `task_rows::format_day` template; `None` for
+    /// the numeric date format.
+    pub countdown_date: Option<&'static str>,
     /// "MM/DD/YYYY" (`false`) or "DD.MM.YYYY" (`true`) in countdown subtitles.
     pub dotted_dates: bool,
     pub matrix_urgent_important: &'static str,
@@ -1032,6 +1035,7 @@ pub static EN: Strings = Strings {
     countdown_switch_hint: "Tap the date to switch formats.",
     countdown_empty: "No countdowns yet",
     unit_letters: ["Y", "M", "D"],
+    countdown_date: None,
     dotted_dates: false,
     matrix_urgent_important: "Urgent & Important",
     matrix_not_urgent_important: "Not Urgent & Important",
@@ -1695,7 +1699,7 @@ pub static RU: Strings = Strings {
     countdown_background: "Фон",
     countdown_choose_image: "Выбрать картинку…",
     countdown_show_group: "Показать группы",
-    countdown_kind_countdown: "Отсчёт",
+    countdown_kind_countdown: "Обратный отсчёт",
     countdown_kind_anniversary: "Годовщина",
     countdown_kind_holiday: "Праздник",
     countdown_kind_birthday: "День рождения",
@@ -1727,7 +1731,9 @@ pub static RU: Strings = Strings {
     countdown_days_since: "Дней с",
     countdown_switch_hint: "Нажмите на дату, чтобы сменить формат.",
     countdown_empty: "Пока нет отсчётов",
-    unit_letters: ["Г", "М", "Д"],
+    unit_letters: ["л", "мес", "д"],
+    // As the Russian original: "Дней до 1 янв 2027 г.".
+    countdown_date: Some("{d} {mon} {yyyy} г."),
     dotted_dates: true,
     matrix_urgent_important: "Срочно и важно",
     matrix_not_urgent_important: "Не срочно, но важно",

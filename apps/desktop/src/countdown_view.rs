@@ -124,7 +124,10 @@ fn kind_label(kind: CountdownKind, strings: &Strings) -> &'static str {
 }
 
 fn format_date(date: NaiveDate, strings: &Strings) -> String {
-    crate::calendar::format_date(date, strings)
+    match strings.countdown_date {
+        Some(template) => crate::task_rows::format_day(template, date, strings),
+        None => crate::calendar::format_date(date, strings),
+    }
 }
 
 /// The color a countdown's dot and icon take: its own, or the accent.

@@ -90,6 +90,8 @@ pub struct TaskDetail {
     new_item: Entity<TextInput>,
     /// Direct subtasks of the shown task.
     subtasks: Vec<Task>,
+    /// The shown subtask's parent, named over its title.
+    parent: Option<Task>,
     subtask_input: Entity<TextInput>,
     /// The due-date popover's field for typing a time.
     time_input: Entity<TextInput>,
@@ -255,6 +257,7 @@ impl TaskDetail {
             checklist: Vec::new(),
             new_item,
             subtasks: Vec::new(),
+            parent: None,
             subtask_input,
             time_input,
             link_search,
@@ -550,6 +553,8 @@ impl TaskDetail {
             Some(id) => self.store.subtasks(id).unwrap_or_default(),
             None => Vec::new(),
         };
+        let parent_id = self.task.as_ref().and_then(|task| task.parent_id);
+        self.parent = parent_id.and_then(|id| self.store.task(id).ok().flatten());
     }
 
     fn toggle_subtask(&mut self, id: Id, completed: bool, cx: &mut Context<Self>) {
@@ -2662,6 +2667,22 @@ impl Render for TaskDetail {
                     .gap_3()
                     .on_mouse_down(MouseButton::Left, move |_, window, cx| {
                         window.focus(&notes_focus, cx);
+                    })
+                    // A subtask names its parent over the title, as the original; a click opens it.
+                    .when_some(self.parent.as_ref(), |el, parent| {
+                        let id = parent.id;
+                        el.child(
+                            h_flex()
+                                .id("detail-parent")
+                                .mb(px(-6.))
+                                .gap_1()
+                                .min_w_0()
+                                .cursor_pointer()
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .on_click(cx.listener(move |_, _, _, cx| cx.emit(OpenTask(id))))
+                                .child(Label::new(if parent.title.is_empty() { strings.untitled.into() } else { SharedString::from(parent.title.clone()) }).color(Color::Muted).truncate())
+                                .child(Icon::new(IconName::ChevronRight).size(IconSize::Small).color(Color::Muted)),
+                        )
                     })
                     .child(
                         h_flex()

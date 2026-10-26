@@ -4825,6 +4825,8 @@ impl TodoView {
                     .when(task.kind == fern_core::Kind::Note && !task.notes.trim().is_empty(), |el| {
                         el.child(Icon::new(IconName::FileText).size(IconSize::XSmall).color(Color::Muted))
                     })
+                    // And a task with subtasks a small tree, open or folded.
+                    .when(has_children, |el| el.child(Icon::new(IconName::ListTree).size(IconSize::XSmall).color(Color::Muted)))
                     .when(self.view == View::Trash, |el| {
                         el.child(
                             div()

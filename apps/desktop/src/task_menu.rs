@@ -31,6 +31,8 @@ pub enum MenuAction {
     Focus(bool),
     Duplicate,
     CopyLink,
+    /// The original's "Open as Sticky Note".
+    StickyNote,
     Convert,
     Delete,
     /// A side menu opened (0 Move to, 1 Start Focus) by hovering its item.
@@ -174,6 +176,8 @@ pub fn render<V: 'static>(
         .child(div().py_1().child(Divider::horizontal()))
         .child(item("task-menu-duplicate", IconName::Copy, strings.duplicate, MenuAction::Duplicate, cx))
         .child(item("task-menu-link", IconName::Link, strings.copy_link, MenuAction::CopyLink, cx))
+        .child(div().py_1().child(Divider::horizontal()))
+        .child(item("task-menu-sticky", IconName::StickyNote, strings.open_sticky_note, MenuAction::StickyNote, cx))
         .child(item("task-menu-convert", IconName::FileText, if note { strings.convert_to_task } else { strings.convert_to_note }, MenuAction::Convert, cx))
         .child(item("task-menu-delete", IconName::Trash, strings.delete, MenuAction::Delete, cx))
         .into_any_element()

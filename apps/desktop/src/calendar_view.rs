@@ -525,6 +525,7 @@ impl CalendarView {
             MenuAction::AddSubtask => cx.emit(OpenTaskPicker(id, "subtask")),
             MenuAction::Focus(stopwatch) => cx.emit(crate::task_detail::StartFocus(id, task.title.clone(), stopwatch)),
             MenuAction::CopyLink => cx.write_to_clipboard(gpui::ClipboardItem::new_string(fern_core::link::task_link(id))),
+            MenuAction::StickyNote => crate::sticky_note::open(self.store.clone(), id, cx),
             MenuAction::Delete => {
                 if let Err(err) = self.store.delete_task(id) {
                     eprintln!("failed to delete the task: {err:#}");

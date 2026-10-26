@@ -1,5 +1,5 @@
 use gpui::{
-    AnyElement, Anchor, App, Div, IntoElement, ParentElement, RenderOnce, Styled, Window,
+    AnyElement, Anchor, App, Div, InteractiveElement, IntoElement, ParentElement, RenderOnce, Styled, Window,
     anchored, deferred, div, px,
 };
 use theme::ActiveTheme;
@@ -9,6 +9,8 @@ use theme::ActiveTheme;
 pub fn popover(cx: &App) -> Div {
     let colors = cx.theme().colors();
     div()
+        // As Zed's menus: the pointer does not reach what lies under it.
+        .occlude()
         .flex()
         .flex_col()
         .p_1p5()

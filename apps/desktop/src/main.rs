@@ -28,6 +28,7 @@ mod resize;
 mod search_modal;
 mod settings_window;
 mod sidebar;
+mod sticky_note;
 mod summary_view;
 mod sync;
 mod tag_dialog;

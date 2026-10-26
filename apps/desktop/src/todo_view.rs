@@ -276,6 +276,14 @@ impl TodoView {
         })
         .detach();
 
+        // A change made in a sticky note shows here.
+        cx.observe_global::<crate::sticky_note::DataVersion>(|this, cx| {
+            if crate::sticky_note::changed_elsewhere(cx.entity_id(), cx) {
+                this.reload(cx);
+            }
+        })
+        .detach();
+
         // Placeholders live inside the inputs, so they are updated when the language changes.
         cx.observe_global::<CurrentLocale>(|this, cx| {
             let strings = i18n::t(cx);
@@ -794,6 +802,8 @@ impl TodoView {
     }
 
     pub fn reload(&mut self, cx: &mut Context<Self>) {
+        // Sticky notes show the change.
+        crate::sticky_note::data_changed(cx.entity_id(), cx);
         self.preferences = self.store.preferences().unwrap_or_default();
         self.sync_input_placeholder(cx);
         // Loaded once: the views, counts and filters below are all selections of it.
@@ -5273,6 +5283,7 @@ impl TodoView {
             MenuAction::Tags => self.start_detail(id, "tags", window, cx),
             MenuAction::Focus(stopwatch) => cx.emit(StartFocus(id, task.title.clone(), stopwatch)),
             MenuAction::CopyLink => cx.write_to_clipboard(gpui::ClipboardItem::new_string(fern_core::link::task_link(id))),
+            MenuAction::StickyNote => crate::sticky_note::open(self.store.clone(), id, cx),
             // Deleting goes the list's usual way, with its Undo.
             MenuAction::Delete => self.delete(id, cx),
             _ => {}

@@ -119,6 +119,7 @@ pub enum IconName {
     SquareCheck,
     SquareCheckBig,
     SquareX,
+    StickyNote,
     Strikethrough,
     Sun,
     Sunrise,

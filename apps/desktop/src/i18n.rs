@@ -368,6 +368,8 @@ pub struct Strings {
     pub start_focus: &'static str,
     pub print: &'static str,
     pub copy_link: &'static str,
+    /// The task menu's item that opens the task in a window of its own over the others.
+    pub open_sticky_note: &'static str,
     pub shortcuts: &'static str,
     /// Labels of `keymap::LISTED_ACTIONS`, in order.
     pub shortcut_labels: [&'static str; 24],
@@ -1090,6 +1092,7 @@ pub static EN: Strings = Strings {
     start_focus: "Start Focus",
     print: "Print",
     copy_link: "Copy Link",
+    open_sticky_note: "Open as Sticky Note",
     shortcuts: "Shortcuts",
     shortcut_labels: [
         "Add task", "Search", "Toggle sidebar", "Go to Inbox", "Go to Today", "Go to Tomorrow", "Go to Next 7 Days",
@@ -1790,6 +1793,7 @@ pub static RU: Strings = Strings {
     start_focus: "Начать фокус",
     print: "Печать",
     copy_link: "Копировать ссылку",
+    open_sticky_note: "Открыть как заметку на экране",
     shortcuts: "Горячие клавиши",
     shortcut_labels: [
         "Новая задача", "Поиск", "Скрыть/показать панель", "Входящие", "Сегодня", "Завтра", "Следующие 7 дней",

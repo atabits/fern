@@ -5,9 +5,10 @@
 use std::rc::Rc;
 
 use fern_core::{Id, Store};
-use gpui::{App, Bounds, Entity, EntityId, Global, MouseButton, WindowBounds, WindowControlArea, WindowKind, WindowOptions, size};
+use gpui::{App, Bounds, Entity, EntityId, Global, MouseButton, TitlebarOptions, WindowBounds, WindowControlArea, WindowDecorations, WindowOptions, size};
 use ui::prelude::*;
 
+use crate::i18n;
 use crate::task_detail::{OpenTask, TaskDetail, TaskUpdated};
 
 /// Counts the changes made in any window, so that the other windows show them; `by` is the view
@@ -36,14 +37,17 @@ pub fn changed_elsewhere(observer: EntityId, cx: &App) -> bool {
 const WIDTH: f32 = 320.;
 const HEIGHT: f32 = 360.;
 
-/// Opens a task as a sticky note over the other windows.
+/// Opens a task as a sticky note: a window of its own, drawn by the app as the main one, which
+/// its pin keeps over the others.
 pub fn open(store: Rc<Store>, id: Id, cx: &mut App) {
+    let title = store.task(id).ok().flatten().map(|task| task.title).unwrap_or_default();
     let bounds = Bounds::centered(None, size(px(WIDTH), px(HEIGHT)), cx);
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
-        titlebar: None,
-        // Above every other window, as the original's notes stay.
-        kind: WindowKind::PopUp,
+        titlebar: Some(TitlebarOptions { title: Some(title.into()), appears_transparent: true, traffic_light_position: None }),
+        window_decorations: Some(WindowDecorations::Client),
+        app_owns_titlebar_drag: true,
+        window_min_size: Some(size(px(240.), px(200.))),
         app_id: Some(std::env::var("FERN_APP_ID").unwrap_or_else(|_| "fern-tasks".into())),
         ..Default::default()
     };
@@ -57,6 +61,8 @@ pub struct StickyNote {
     detail: Entity<TaskDetail>,
     /// Linux and macOS: a press on the bar turns into a window move once the mouse moves.
     should_move: bool,
+    /// Kept over the other windows by its pin (Windows).
+    pinned: bool,
 }
 
 impl StickyNote {
@@ -79,7 +85,7 @@ impl StickyNote {
             }
         })
         .detach();
-        let mut this = Self { store, detail, should_move: false };
+        let mut this = Self { store, detail, should_move: false, pinned: false };
         this.show(id, cx);
         this
     }
@@ -136,6 +142,22 @@ impl Render for StickyNote {
                                     }))
                             }),
                     )
+                    // The pin keeps the note over the other windows, off at first as the original's.
+                    .when(cfg!(windows), |bar| {
+                        bar.child(
+                            IconButton::new("sticky-pin", if self.pinned { IconName::PinOff } else { IconName::Pin })
+                                .size(px(22.))
+                                .icon_size(IconSize::Small)
+                                .icon_color(if self.pinned { Color::Accent } else { Color::Muted })
+                                .tooltip(Tooltip::text(if self.pinned { i18n::t(cx).unpin } else { i18n::t(cx).pin }))
+                                .on_click(cx.listener(|this, _, _window, cx| {
+                                    this.pinned = !this.pinned;
+                                    #[cfg(windows)]
+                                    set_topmost(_window, this.pinned);
+                                    cx.notify();
+                                })),
+                        )
+                    })
                     .child(
                         IconButton::new("sticky-close", IconName::X)
                             .size(px(22.))
@@ -144,5 +166,22 @@ impl Render for StickyNote {
                     ),
             )
             .child(div().flex_1().min_h_0().child(self.detail.clone()))
+    }
+}
+
+/// Keeps the window over the other windows, or puts it back among them: the original's pin.
+#[cfg(windows)]
+fn set_topmost(window: &Window, topmost: bool) {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetWindowPos};
+
+    // The trait's method: `Window` has an inherent `window_handle` too.
+    let Ok(handle) = HasWindowHandle::window_handle(window) else { return };
+    let RawWindowHandle::Win32(handle) = handle.as_raw() else { return };
+    let after = if topmost { HWND_TOPMOST } else { HWND_NOTOPMOST };
+    let hwnd = HWND(handle.hwnd.get() as _);
+    if let Err(err) = unsafe { SetWindowPos(hwnd, Some(after), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE) } {
+        eprintln!("failed to pin the sticky note: {err}");
     }
 }

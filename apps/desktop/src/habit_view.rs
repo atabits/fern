@@ -1569,7 +1569,7 @@ impl HabitView {
                                     .child(
                                         h_flex()
                                             .gap_0p5()
-                                            .child(Icon::new(IconName::MapPin).size(IconSize::XSmall).color(Color::Accent))
+                                            .child(Icon::new(IconName::Zap).size(IconSize::XSmall).color(Color::Accent))
                                             .child(
                                                 Label::new(match habit.goal_days {
                                                     Some(goal) => format!("{}/{goal} {}", stats.total_days, strings.habit_days),
@@ -1582,7 +1582,7 @@ impl HabitView {
                                     .child(
                                         h_flex()
                                             .gap_0p5()
-                                            .child(Icon::new(IconName::Flame).size(IconSize::XSmall))
+                                            .child(Icon::new(IconName::Flame).size(IconSize::XSmall).color(Color::Muted))
                                             .child(
                                                 Label::new(format!("{} {}", stats.streak, strings.habit_streak))
                                                     .size(LabelSize::XSmall)
@@ -1926,7 +1926,8 @@ impl Render for HabitView {
         let strings = i18n::t(cx);
         let theme = cx.theme().clone();
         let today = Local::now().date_naive();
-        let week = calendar::week_of(today);
+        // As the original's, the strip and the cards show the last seven days, today on the right.
+        let week: [NaiveDate; 7] = std::array::from_fn(|i| today - chrono::Duration::days(6 - i as i64));
         let habits = self.habits.clone();
         // Cards of the chosen side (active or archived), grouped by section once sections are used.
         let visible: Vec<&Habit> = habits.iter().filter(|h| h.archived == self.show_archived).collect();

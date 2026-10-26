@@ -206,11 +206,16 @@ impl CalendarView {
     /// on today only), the day's focus records, and its countdowns.
     /// The subscribed calendars' events on `date`, all-day ones first, then by time.
     fn events_on(&self, date: NaiveDate, cx: &App) -> Vec<EventBar> {
+        self.events_between(date, date, cx)
+    }
+
+    /// The subscribed calendars' events covering any day from `from` to `to`.
+    fn events_between(&self, from: NaiveDate, to: NaiveDate, cx: &App) -> Vec<EventBar> {
         let Some(feeds) = crate::subscriptions::feeds(cx) else { return Vec::new() };
         let accent = cx.theme().colors().accent;
         let mut events: Vec<EventBar> = feeds
             .read(cx)
-            .occurrences(date, date)
+            .occurrences(from, to)
             .into_iter()
             .map(|occurrence| EventBar {
                 key: occurrence.event.uid.clone(),
@@ -305,6 +310,40 @@ impl CalendarView {
                         .child(event.notes.trim().to_owned()),
                 )
             })
+            .into_any_element()
+    }
+
+    /// An event's row in the Agenda, as a task's: its time, the calendar's dot and a card in the
+    /// calendar's color, which opens the event's card.
+    fn agenda_event_row(&self, event: EventBar, date: NaiveDate, cx: &mut Context<Self>) -> AnyElement {
+        let strings = i18n::t(cx);
+        let when = event.start_time.filter(|_| event.start == date).map_or(strings.range_all_day.to_owned(), calendar::format_time);
+        let key = (event.key.clone(), event.start);
+        let open = self.open_event.as_ref() == Some(&key);
+        h_flex()
+            .gap_3()
+            .child(div().w(px(72.)).flex_none().child(Label::new(when).size(LabelSize::Small).color(Color::Muted)))
+            .child(div().w(px(16.)).flex_none().flex().justify_center().child(div().size(px(10.)).rounded_full().bg(event.color)))
+            .child(
+                h_flex()
+                    .id(SharedString::from(format!("agenda-event-{}-{}", event.key, event.start)))
+                    .flex_1()
+                    .min_w_0()
+                    .h(px(40.))
+                    .px_3()
+                    .rounded(px(6.))
+                    .border_l_3()
+                    .border_color(event.color)
+                    .bg(event.color.opacity(0.12))
+                    .hover(|s| s.bg(event.color.opacity(0.2)))
+                    .cursor_pointer()
+                    .child(div().flex_1().min_w_0().child(Label::new(event.title.clone()).truncate()))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.open_event = if this.open_event.as_ref() == Some(&key) { None } else { Some(key.clone()) };
+                        cx.notify();
+                    }))
+                    .when(open, |el| el.relative().child(PopoverAttachment::new(Placement::BelowRight, self.render_event_card(&event, cx)))),
+            )
             .into_any_element()
     }
 
@@ -1157,6 +1196,18 @@ impl CalendarView {
         if start == today && days.first().is_none_or(|(date, _)| *date != today) {
             days.insert(0, (today, Vec::new()));
         }
+        // The subscribed calendars' events on their first day (or the Agenda's first, for one
+        // begun before), with a day of their own where there are no tasks.
+        let mut events: std::collections::BTreeMap<NaiveDate, Vec<EventBar>> = Default::default();
+        for event in self.events_between(start, start + chrono::Duration::days(AGENDA_DAYS), cx) {
+            events.entry(event.start.max(start)).or_default().push(event);
+        }
+        for date in events.keys() {
+            if !days.iter().any(|(day, _)| day == date) {
+                days.push((*date, Vec::new()));
+            }
+        }
+        days.sort_by_key(|(date, _)| *date);
         let mut month = calendar::month_start(start);
         let mut rows: Vec<AnyElement> = Vec::new();
         for (date, items) in days {
@@ -1195,7 +1246,8 @@ impl CalendarView {
                             .color(if is_today { Color::Accent } else { Color::Muted }),
                     ),
                 );
-            let entries: Vec<AnyElement> = if items.is_empty() {
+            let day_events = events.remove(&date).unwrap_or_default();
+            let entries: Vec<AnyElement> = if items.is_empty() && day_events.is_empty() {
                 vec![
                     h_flex()
                         .gap_3()
@@ -1323,6 +1375,9 @@ impl CalendarView {
                             )
                             .into_any_element()
                     })
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .chain(day_events.into_iter().map(|event| self.agenda_event_row(event, date, cx)))
                     .collect()
             };
             rows.push(

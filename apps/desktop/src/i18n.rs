@@ -1946,7 +1946,7 @@ pub static RU: Strings = Strings {
     no_actions: "Нет действий",
 
     add_task: "Добавить задачу",
-    no_tasks: "Задач нет",
+    no_tasks: "Нет задач",
     free_day: "Свободный день",
     free_day_hint: "Можно отдохнуть",
     no_completed_tasks: "Выполненных задач нет",

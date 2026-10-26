@@ -655,7 +655,7 @@ impl MatrixView {
                             .font_weight(FontWeight::BOLD)
                             .child(numeral),
                     )
-                    .child(div().flex_1().child(Label::new(title).color(Color::Custom(color))))
+                    .child(div().flex_1().child(Label::new(title).weight(FontWeight::SEMIBOLD).color(Color::Custom(color))))
                     // The original's "+" on a hovered header: a new task for this quadrant.
                     .child(
                         div()
@@ -725,7 +725,7 @@ impl MatrixView {
                     .when(empty && self.adding.as_ref().is_none_or(|(q, _)| *q != quadrant), |el| {
                         el.items_center()
                             .justify_center()
-                            .child(Label::new(strings.no_tasks).size(LabelSize::Small).color(Color::Muted))
+                            .child(Label::new(strings.no_tasks).color(Color::Muted))
                     })
                     .children(content),
             )

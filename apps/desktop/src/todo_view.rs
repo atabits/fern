@@ -5274,7 +5274,7 @@ impl TodoView {
         use task_menu::MenuAction;
         let Some((id, _)) = self.context_menu else { return };
         if let MenuAction::Side(side) = action {
-            self.context_side = Some(side);
+            self.context_side = side;
             cx.notify();
             return;
         }

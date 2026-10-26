@@ -35,8 +35,9 @@ pub enum MenuAction {
     StickyNote,
     Convert,
     Delete,
-    /// A side menu opened (0 Move to, 1 Start Focus) by hovering its item.
-    Side(u8),
+    /// A side menu opened (0 Move to, 1 Start Focus) by hovering its item, or closed (`None`)
+    /// by hovering another item.
+    Side(Option<u8>),
     Close,
 }
 
@@ -112,8 +113,16 @@ pub fn render<V: 'static>(
         icon_button(SharedString::from(format!("task-menu-priority-{}", priority.to_i64())), IconName::Flag, color, task.priority == priority)
             .on_click(on_click(&act, MenuAction::Priority(priority), cx))
     }));
+    // While a side menu is open, hovering any other item closes it, as menus do.
+    let closes_side = |key: &'static str, el: AnyElement, cx: &mut Context<V>| -> AnyElement {
+        match side {
+            Some(_) => div().id(SharedString::from(format!("{key}-closes-side"))).on_hover(close_side(&act, cx)).child(el).into_any_element(),
+            None => el,
+        }
+    };
     let item = |key: &'static str, icon: IconName, label: &'static str, action: MenuAction, cx: &mut Context<V>| {
-        ListItem::new(key).height(px(34.)).start_slot(Icon::new(icon).color(Color::Muted)).child(Label::new(label)).on_click(on_click(&act, action, cx))
+        let el = ListItem::new(key).height(px(34.)).start_slot(Icon::new(icon).color(Color::Muted)).child(Label::new(label)).on_click(on_click(&act, action, cx));
+        closes_side(key, el.into_any_element(), cx)
     };
     let pinned = task.pinned_at.is_some();
     let note = task.kind == Kind::Note;
@@ -139,9 +148,9 @@ pub fn render<V: 'static>(
         .min_w(px(196.))
         .on_mouse_down_out(close)
         .child(heading(strings.filter_date))
-        .child(date_row)
+        .child(closes_side("task-menu-dates", date_row.into_any_element(), cx))
         .child(heading(strings.filter_priority))
-        .child(priority_row)
+        .child(closes_side("task-menu-priorities", priority_row.into_any_element(), cx))
         .child(div().py_1().child(Divider::horizontal()))
         .when(kind == MenuKind::List, |el| el.child(item("task-menu-subtask", IconName::CornerDownRight, strings.add_subtask_item, MenuAction::AddSubtask, cx)))
         .child(item("task-menu-parent", IconName::ListTree, strings.link_parent, MenuAction::LinkParent, cx))
@@ -192,11 +201,21 @@ fn on_click<V: 'static>(act: &Act<V>, action: MenuAction, cx: &Context<V>) -> im
     }
 }
 
+/// Closes the open side menu when the pointer comes onto another item.
+fn close_side<V: 'static>(act: &Act<V>, cx: &Context<V>) -> impl Fn(&bool, &mut Window, &mut App) + 'static + use<V> {
+    let (act, view) = (act.clone(), cx.entity().downgrade());
+    move |hovered: &bool, window: &mut Window, cx: &mut App| {
+        if *hovered {
+            view.update(cx, |this, cx| act(this, MenuAction::Side(None), window, cx)).ok();
+        }
+    }
+}
+
 fn on_hover<V: 'static>(act: &Act<V>, index: u8, side: Option<u8>, cx: &Context<V>) -> impl Fn(&bool, &mut Window, &mut App) + 'static + use<V> {
     let (act, view) = (act.clone(), cx.entity().downgrade());
     move |hovered: &bool, window: &mut Window, cx: &mut App| {
         if *hovered && side != Some(index) {
-            view.update(cx, |this, cx| act(this, MenuAction::Side(index), window, cx)).ok();
+            view.update(cx, |this, cx| act(this, MenuAction::Side(Some(index)), window, cx)).ok();
         }
     }
 }

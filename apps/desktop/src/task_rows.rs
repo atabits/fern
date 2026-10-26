@@ -669,10 +669,14 @@ pub fn card_due_label(date: NaiveDate, time: Option<NaiveTime>, today: NaiveDate
 }
 
 /// The details' date as the original's: a date two days off or more says how many are left,
-/// "Nov 13, 26d left".
+/// "Nov 13, 26d left", or how long it is overdue, "Oct 21, 5d overdue".
 pub fn detail_due_label(label: String, date: NaiveDate, today: NaiveDate, strings: &Strings) -> String {
     let days = (date - today).num_days();
-    if days >= 2 { format!("{label}, {}", strings.days_left.replace("{n}", &days.to_string())) } else { label }
+    match days {
+        2.. => format!("{label}, {}", strings.days_left.replace("{n}", &days.to_string())),
+        ..=-2 => format!("{label}, {}", strings.days_overdue.replace("{n}", &(-days).to_string())),
+        _ => label,
+    }
 }
 
 /// A closed task's date, as the original's Completed and Won't Do show it: the date itself,
@@ -984,6 +988,7 @@ mod tests {
         assert_eq!(detail_due_label("Nov 13".into(), d(2026, 11, 13), today, &EN), "Nov 13, 26d left");
         assert_eq!(detail_due_label("Tomorrow".into(), d(2026, 10, 19), today, &EN), "Tomorrow");
         assert_eq!(detail_due_label("Yesterday".into(), d(2026, 10, 17), today, &EN), "Yesterday");
+        assert_eq!(detail_due_label("Oct 13".into(), d(2026, 10, 13), today, &EN), "Oct 13, 5d overdue");
     }
 
     #[test]

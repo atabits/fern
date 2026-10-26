@@ -782,6 +782,8 @@ pub struct Strings {
     /// The board's "+ New section" after its last column.
     pub new_section: &'static str,
     pub days_left: &'static str,
+    /// After an overdue date in the details: "Oct 21, 5d overdue".
+    pub days_overdue: &'static str,
     pub comment_tip: &'static str,
     pub show_habits: &'static str,
     pub show_focus: &'static str,
@@ -1477,6 +1479,7 @@ pub static EN: Strings = Strings {
     set_reminder: "Set Reminder",
     new_section: "New section",
     days_left: "{n}d left",
+    days_overdue: "{n}d overdue",
     comment_tip: "Comment",
     show_habits: "Show Habit",
     show_focus: "Show Focus Records",
@@ -1958,7 +1961,8 @@ pub static RU: Strings = Strings {
     group_overdue: "Просрочено",
     group_later: "Позже",
     group_no_date: "Без даты",
-    group_no_tags: "Без меток",
+    // As the original writes this group, though it says «Метки» elsewhere.
+    group_no_tags: "Без тегов",
 
     select_task: "Выбери задачу, чтобы увидеть подробности",
     notes_placeholder: "Напиши что-нибудь",
@@ -2173,6 +2177,7 @@ pub static RU: Strings = Strings {
     set_reminder: "Напоминание",
     new_section: "Новый раздел",
     days_left: "ещё {n} дн.",
+    days_overdue: "просрочено на {n} дн.",
     comment_tip: "Комментарий",
     show_habits: "Показывать привычки",
     show_focus: "Показывать записи фокуса",

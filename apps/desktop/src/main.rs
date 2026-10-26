@@ -29,6 +29,7 @@ mod search_modal;
 mod settings_window;
 mod sidebar;
 mod sticky_note;
+mod subscriptions;
 mod summary_view;
 mod sync;
 mod tag_dialog;
@@ -146,6 +147,7 @@ fn main() -> Result<()> {
         }
         cx.on_action(|_: &Quit, cx| cx.quit());
         updater::init(store.clone(), cx);
+        subscriptions::init(store.clone(), cx);
 
         let bounds = Bounds::centered(None, size(px(1280.), px(760.)), cx);
         let (titlebar, decorations) = title_bar::window_options();

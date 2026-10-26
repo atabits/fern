@@ -48,6 +48,7 @@ pub enum IconName {
     CornerDownRight,
     Ellipsis,
     Eye,
+    EyeOff,
     FernCalendar,
     FernCountdown,
     FernFocus,

@@ -31,6 +31,8 @@ pub enum Page {
     More,
     /// The sync server's address and token.
     Sync,
+    /// The original's Integrations: calendars subscribed to by address.
+    Integrations,
     About,
 }
 
@@ -71,7 +73,13 @@ pub struct SettingsWindow {
     /// Settings → Sync: the server's address and the token, saved as they are typed.
     sync_server: Entity<crate::text_input::TextInput>,
     sync_token: Entity<crate::text_input::TextInput>,
+    /// Integrations: the subscription being added (`Some(None)`) or changed, its color, and its
+    /// name and address fields.
+    subscription_form: Option<(Option<fern_core::Id>, Option<String>)>,
+    subscription_name: Entity<crate::text_input::TextInput>,
+    subscription_url: Entity<crate::text_input::TextInput>,
     _updates: Option<gpui::Subscription>,
+    _feeds: Option<gpui::Subscription>,
 }
 
 impl EventEmitter<SettingsEvent> for SettingsWindow {}
@@ -119,6 +127,12 @@ impl SettingsWindow {
         let sync_server = field("https://fern.example.org", config.server, false, cx);
         let sync_token = field("", config.token, true, cx);
         let updates = crate::updater::updater(cx).map(|updater| cx.observe(&updater, |_, _, cx| cx.notify()));
+        let feeds = crate::subscriptions::feeds(cx).map(|feeds| cx.observe(&feeds, |_, _, cx| cx.notify()));
+        let plain = |placeholder: &'static str, cx: &mut Context<Self>| {
+            cx.new(|cx| crate::text_input::TextInput::new(crate::text_input::Mode::SingleLine, placeholder, cx))
+        };
+        let subscription_name = plain(i18n::t(cx).subscription_name_placeholder, cx);
+        let subscription_url = plain("https://…/calendar.ics", cx);
         Self {
             store,
             preferences,
@@ -128,7 +142,11 @@ impl SettingsWindow {
             backup_message: None,
             sync_server,
             sync_token,
+            subscription_form: None,
+            subscription_name,
+            subscription_url,
             _updates: updates,
+            _feeds: feeds,
         }
     }
 
@@ -253,6 +271,7 @@ impl SettingsWindow {
             "more" => Page::More,
             "about" => Page::About,
             "sync" => Page::Sync,
+            "integrations" => Page::Integrations,
             "features" => Page::Features,
             "notifications" => Page::Notifications,
             _ => Page::DateTime,
@@ -407,6 +426,10 @@ impl SettingsWindow {
                 item("settings-sync", IconName::RefreshCw, strings.data_and_sync, self.page == Page::Sync)
                     .on_click(cx.listener(|this, _, _, cx| this.set_page(Page::Sync, cx))),
             )
+            .child(
+                item("settings-integrations", IconName::CalendarDays, strings.integrations, self.page == Page::Integrations)
+                    .on_click(cx.listener(|this, _, _, cx| this.set_page(Page::Integrations, cx))),
+            )
             .child(div().h(px(12.)))
             .child(
                 item("settings-shortcuts", IconName::Keyboard, strings.settings_pages[4], false)
@@ -539,6 +562,185 @@ impl SettingsWindow {
                 )
                 .into_any_element(),
         )
+    }
+
+    /// Opens the subscription form, empty for a new calendar or filled from `id`'s.
+    fn open_subscription_form(&mut self, id: Option<fern_core::Id>, window: &mut Window, cx: &mut Context<Self>) {
+        let current = id.and_then(|id| {
+            let feeds = crate::subscriptions::feeds(cx)?;
+            let feeds = feeds.read(cx);
+            feeds.calendars().iter().find(|c| c.subscription.id == id).map(|c| c.subscription.clone())
+        });
+        let (name, url, color) = current.map_or((String::new(), String::new(), None), |s| (s.name, s.url, s.color));
+        self.subscription_name.update(cx, |input, cx| input.set_text(name, cx));
+        self.subscription_url.update(cx, |input, cx| input.set_text(url, cx));
+        self.subscription_form = Some((id, color));
+        window.focus(&self.subscription_url.focus_handle(cx), cx);
+        cx.notify();
+    }
+
+    fn save_subscription_form(&mut self, cx: &mut Context<Self>) {
+        let Some((id, color)) = self.subscription_form.take() else { return };
+        let name = self.subscription_name.read(cx).text().to_owned();
+        let url = self.subscription_url.read(cx).text().to_owned();
+        if let Some(feeds) = crate::subscriptions::feeds(cx)
+            && !url.trim().is_empty()
+        {
+            feeds.update(cx, |feeds, cx| match id {
+                Some(id) => {
+                    let hidden = feeds.calendars().iter().find(|c| c.subscription.id == id).is_some_and(|c| c.subscription.hidden);
+                    feeds.update_subscription(id, &name, &url, color.as_deref(), hidden, cx);
+                }
+                None => feeds.add(&name, &url, color.as_deref(), cx),
+            });
+        }
+        cx.notify();
+    }
+
+    /// Integrations, as the original's URL calendars: each subscribed calendar with its color,
+    /// whether it is read and when, show or hide, change and unsubscribe; and the form that adds
+    /// or changes one (name, address, color).
+    fn render_integrations(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let strings = i18n::t(cx);
+        let colors = cx.theme().colors().clone();
+        let Some(feeds) = crate::subscriptions::feeds(cx) else { return Vec::new() };
+        let feeds = feeds.read(cx);
+        let rows: Vec<AnyElement> = feeds
+            .calendars()
+            .iter()
+            .map(|calendar| {
+                let subscription = &calendar.subscription;
+                let id = subscription.id;
+                let hidden = subscription.hidden;
+                let status = if feeds.is_reading(id) {
+                    (strings.subscription_reading.to_owned(), Color::Muted)
+                } else if let Some(error) = &subscription.error {
+                    (error.clone(), Color::Error)
+                } else {
+                    (strings.subscription_events.replace("{n}", &calendar.events.len().to_string()), Color::Muted)
+                };
+                let dot = crate::lists_panel::parse_color(subscription.color.as_deref()).unwrap_or(colors.accent);
+                h_flex()
+                    .id(SharedString::from(format!("subscription-{id}")))
+                    .min_h(px(ROW_HEIGHT))
+                    .px_4()
+                    .gap_3()
+                    .child(div().size(px(10.)).flex_none().rounded_full().bg(dot))
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .child(Label::new(subscription.title().to_owned()).truncate().color(if hidden { Color::Muted } else { Color::Default }))
+                            .child(Label::new(status.0).size(LabelSize::XSmall).color(status.1).truncate()),
+                    )
+                    .child(
+                        IconButton::new(SharedString::from(format!("subscription-show-{id}")), if hidden { IconName::EyeOff } else { IconName::Eye })
+                            .icon_color(Color::Muted)
+                            .tooltip(Tooltip::text(if hidden { strings.subscription_show } else { strings.subscription_hide }))
+                            .on_click(cx.listener(move |_, _, _, cx| {
+                                if let Some(feeds) = crate::subscriptions::feeds(cx) {
+                                    feeds.update(cx, |feeds, cx| {
+                                        if let Some(s) = feeds.calendars().iter().find(|c| c.subscription.id == id).map(|c| c.subscription.clone()) {
+                                            feeds.update_subscription(id, &s.name, &s.url, s.color.as_deref(), !hidden, cx);
+                                        }
+                                    });
+                                }
+                            })),
+                    )
+                    .child(
+                        IconButton::new(SharedString::from(format!("subscription-read-{id}")), IconName::RefreshCw)
+                            .icon_color(Color::Muted)
+                            .tooltip(Tooltip::text(strings.subscription_read_now))
+                            .on_click(cx.listener(move |_, _, _, cx| {
+                                if let Some(feeds) = crate::subscriptions::feeds(cx) {
+                                    feeds.update(cx, |feeds, cx| feeds.read(id, cx));
+                                }
+                            })),
+                    )
+                    .child(
+                        IconButton::new(SharedString::from(format!("subscription-edit-{id}")), IconName::Pencil)
+                            .icon_color(Color::Muted)
+                            .tooltip(Tooltip::text(strings.subscription_edit))
+                            .on_click(cx.listener(move |this, _, window, cx| this.open_subscription_form(Some(id), window, cx))),
+                    )
+                    .child(
+                        IconButton::new(SharedString::from(format!("subscription-delete-{id}")), IconName::Trash)
+                            .icon_color(Color::Muted)
+                            .tooltip(Tooltip::text(strings.subscription_delete))
+                            .on_click(cx.listener(move |_, _, _, cx| {
+                                if let Some(feeds) = crate::subscriptions::feeds(cx) {
+                                    feeds.update(cx, |feeds, cx| feeds.delete(id, cx));
+                                }
+                            })),
+                    )
+                    .into_any_element()
+            })
+            .collect();
+        let group = || v_flex().py_1p5().rounded(px(8.)).bg(colors.surface_background);
+        let field = |label: &'static str, input: Entity<crate::text_input::TextInput>| {
+            h_flex()
+                .h(px(40.))
+                .px_4()
+                .gap_4()
+                .child(div().w(px(80.)).child(Label::new(label)))
+                .child(div().flex_1().min_w_0().overflow_hidden().h(px(28.)).px_2().flex().items_center().rounded(px(6.)).bg(colors.background).child(input))
+        };
+        let form = self.subscription_form.as_ref().map(|(_, color)| {
+            let swatches = h_flex().gap_1p5().children(std::iter::once(None).chain(crate::lists_panel::LIST_COLORS.iter().map(|c| Some(*c))).map(|swatch| {
+                let selected = color.as_deref() == swatch;
+                let fill = crate::lists_panel::parse_color(swatch).unwrap_or(colors.accent);
+                div()
+                    .id(SharedString::from(format!("subscription-color-{}", swatch.unwrap_or("none"))))
+                    .size(px(20.))
+                    .rounded_full()
+                    .cursor_pointer()
+                    .bg(fill.opacity(if swatch.is_none() { 0.35 } else { 1. }))
+                    .when(selected, |el| el.border_2().border_color(colors.text))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some((_, color)) = &mut this.subscription_form {
+                            *color = swatch.map(str::to_owned);
+                        }
+                        cx.notify();
+                    }))
+            }));
+            group()
+                .child(field(strings.subscription_name, self.subscription_name.clone()))
+                .child(field("URL", self.subscription_url.clone()))
+                .child(h_flex().h(px(40.)).px_4().gap_4().child(div().w(px(80.)).child(Label::new(strings.subscription_color))).child(swatches))
+                .child(
+                    h_flex()
+                        .px_4()
+                        .py_2()
+                        .gap_2()
+                        .justify_end()
+                        .child(form_button("subscription-cancel", strings.cancel, false, &colors).on_click(cx.listener(|this, _, _, cx| {
+                            this.subscription_form = None;
+                            cx.notify();
+                        })))
+                        .child(form_button("subscription-save", strings.ok, true, &colors).on_click(cx.listener(|this, _, _, cx| this.save_subscription_form(cx)))),
+                )
+                .into_any_element()
+        });
+        let mut page = vec![
+            div().pb_3().child(Label::new(strings.subscribed_calendars).weight(FontWeight::MEDIUM)).into_any_element(),
+            div().pb_2().px_1().text_size(px(12.)).text_color(colors.text_muted).child(strings.subscriptions_hint).into_any_element(),
+        ];
+        if !rows.is_empty() {
+            page.push(group().children(rows).into_any_element());
+        }
+        match form {
+            Some(form) => page.push(form),
+            None => page.push(
+                div()
+                    .id("subscription-add")
+                    .px_1()
+                    .cursor_pointer()
+                    .child(Label::new(strings.add_calendar).color(Color::Accent))
+                    .on_click(cx.listener(|this, _, window, cx| this.open_subscription_form(None, window, cx)))
+                    .into_any_element(),
+            ),
+        }
+        page
     }
 
     fn render_page(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
@@ -1005,6 +1207,8 @@ impl SettingsWindow {
                         .child(
                             div()
                                 .flex_1()
+                                .min_w_0()
+                                .overflow_hidden()
                                 .h(px(28.))
                                 .px_2()
                                 .flex()
@@ -1047,6 +1251,7 @@ impl SettingsWindow {
                     .child(div().pt_2().px_1().text_size(px(12.)).text_color(colors.text_muted).child(strings.sync_hint))
                     .into_any_element()
             }
+            Page::Integrations => body.children(self.render_integrations(cx)).into_any_element(),
             Page::About => {
                 let row = |label: &'static str, value: &'static str| {
                     h_flex()
@@ -1157,4 +1362,20 @@ fn visibility_label(list: SmartList, visibility: Visibility, strings: &i18n::Str
         Visibility::IfNotEmpty => strings.visibility_names[1],
         Visibility::Hide => strings.visibility_names[2],
     }
+}
+
+/// A small dialog button: the accent for the one that confirms, a frame for the other.
+fn form_button(id: &'static str, label: &'static str, primary: bool, colors: &theme::ThemeColors) -> Stateful<Div> {
+    div()
+        .id(id)
+        .w(px(80.))
+        .h(px(28.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(6.))
+        .cursor_pointer()
+        .when(primary, |el| el.bg(colors.accent))
+        .when(!primary, |el| el.border_1().border_color(colors.border))
+        .child(Label::new(label).size(LabelSize::Small))
 }

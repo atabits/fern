@@ -7,6 +7,7 @@ pub mod countdown;
 pub mod filter;
 pub mod focus;
 pub mod habit;
+pub mod ical;
 pub mod import;
 pub mod link;
 pub mod markdown;

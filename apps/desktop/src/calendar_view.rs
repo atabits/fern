@@ -85,6 +85,8 @@ pub struct CalendarView {
     /// The task card a click on a task opens beside it, as in the original: the task, the day
     /// it was clicked on, and the details it shows.
     card: Option<(Id, NaiveDate)>,
+    /// A subscribed calendar's event whose card is open: its UID and the day it starts.
+    open_event: Option<(String, NaiveDate)>,
     detail: gpui::Entity<TaskDetail>,
     /// View Options, the header's "…" menu and the dialog it opens.
     options: CalendarOptions,
@@ -128,6 +130,10 @@ impl CalendarView {
             detail.set_card(true);
             detail
         });
+        // A subscribed calendar read anew shows its events.
+        if let Some(feeds) = crate::subscriptions::feeds(cx) {
+            cx.observe(&feeds, |_, _, cx| cx.notify()).detach();
+        }
         cx.subscribe(&detail, |this, _, _: &TaskUpdated, cx| this.card_updated(cx)).detach();
         cx.subscribe(&detail, |_, _, StartFocus(id, title, stopwatch), cx| cx.emit(StartFocus(*id, title.clone(), *stopwatch))).detach();
         // A subtask clicked in the card opens in the card.
@@ -155,6 +161,7 @@ impl CalendarView {
             year_day: None,
             context_side: None,
             card: None,
+            open_event: None,
             detail,
             options: CalendarOptions::default(),
             more_menu: false,
@@ -197,6 +204,110 @@ impl CalendarView {
 
     /// The extra items of a day, as View Options say: today's habits (as the original's calendar,
     /// on today only), the day's focus records, and its countdowns.
+    /// The subscribed calendars' events on `date`, all-day ones first, then by time.
+    fn events_on(&self, date: NaiveDate, cx: &App) -> Vec<EventBar> {
+        let Some(feeds) = crate::subscriptions::feeds(cx) else { return Vec::new() };
+        let accent = cx.theme().colors().accent;
+        let mut events: Vec<EventBar> = feeds
+            .read(cx)
+            .occurrences(date, date)
+            .into_iter()
+            .map(|occurrence| EventBar {
+                key: occurrence.event.uid.clone(),
+                title: occurrence.event.title.clone(),
+                start: occurrence.start,
+                end: occurrence.end(),
+                start_time: occurrence.event.start_time,
+                end_time: occurrence.event.end_time,
+                location: occurrence.event.location.clone(),
+                notes: occurrence.event.notes.clone(),
+                calendar: occurrence.calendar.title().to_owned(),
+                color: crate::lists_panel::parse_color(occurrence.calendar.color.as_deref()).unwrap_or(accent),
+            })
+            .collect();
+        events.sort_by_key(|event| (event.start_time.is_some(), event.start_time));
+        events
+    }
+
+    /// An event's bar: the calendar's color, its time when it has one, and a card with the rest
+    /// on a click. Events cannot be changed here: they belong to the calendar they come from.
+    fn event_bar(&self, event: EventBar, date: NaiveDate, cx: &mut Context<Self>) -> Stateful<Div> {
+        let open = self.open_event.as_ref() == Some(&(event.key.clone(), event.start));
+        let key = (event.key.clone(), event.start);
+        let column = calendar::week_of(date).iter().position(|d| *d == date).unwrap_or(0);
+        h_flex()
+            .id(SharedString::from(format!("calendar-event-{}-{}-{date}", event.key, event.start)))
+            .h(px(18.))
+            .flex_none()
+            .gap_1()
+            .px_1()
+            .rounded(px(3.))
+            .cursor_pointer()
+            .bg(event.color.opacity(0.18))
+            .border_l_2()
+            .border_color(event.color)
+            .when_some(event.start_time.filter(|_| event.start == date), |el, time| {
+                el.child(Label::new(calendar::format_time(time)).size(LabelSize::XSmall).color(Color::Muted))
+            })
+            .child(div().flex_1().min_w_0().child(Label::new(event.title.clone()).size(LabelSize::XSmall).truncate()))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.open_event = if this.open_event.as_ref() == Some(&key) { None } else { Some(key.clone()) };
+                cx.notify();
+            }))
+            .when(open, |el| {
+                let placement = if column < 3 { Placement::RightOf } else { Placement::LeftOf };
+                el.relative().child(PopoverAttachment::new(placement, self.render_event_card(&event, cx)))
+            })
+    }
+
+    /// An event's card: its title, when it is, its calendar, place and description.
+    fn render_event_card(&self, event: &EventBar, cx: &mut Context<Self>) -> AnyElement {
+        let strings = i18n::t(cx);
+        let day = |date: NaiveDate| task_rows::format_day(strings.closed_date[0], date, strings);
+        let when = match (event.start_time, event.end_time) {
+            (Some(from), Some(to)) if event.start == event.end => format!("{}, {} – {}", day(event.start), calendar::format_time(from), calendar::format_time(to)),
+            (Some(from), Some(to)) => format!("{} {} – {} {}", day(event.start), calendar::format_time(from), day(event.end), calendar::format_time(to)),
+            (Some(from), None) => format!("{}, {}", day(event.start), calendar::format_time(from)),
+            (None, _) if event.start == event.end => format!("{}, {}", day(event.start), strings.range_all_day),
+            (None, _) => format!("{} – {}", day(event.start), day(event.end)),
+        };
+        popover(cx)
+            .w(px(300.))
+            .p_3()
+            .gap_2()
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.open_event = None;
+                cx.notify();
+            }))
+            .child(Label::new(event.title.clone()).weight(FontWeight::SEMIBOLD))
+            .child(Label::new(when).size(LabelSize::Small).color(Color::Muted))
+            .child(
+                h_flex()
+                    .gap_1p5()
+                    .child(div().size(px(8.)).rounded_full().bg(event.color))
+                    .child(Label::new(event.calendar.clone()).size(LabelSize::Small).color(Color::Muted)),
+            )
+            .when(!event.location.trim().is_empty(), |el| {
+                el.child(
+                    h_flex()
+                        .gap_1p5()
+                        .child(Icon::new(IconName::MapPin).size(IconSize::XSmall).color(Color::Muted))
+                        .child(Label::new(event.location.clone()).size(LabelSize::Small)),
+                )
+            })
+            .when(!event.notes.trim().is_empty(), |el| {
+                el.child(
+                    div()
+                        .id("calendar-event-notes")
+                        .max_h(px(160.))
+                        .overflow_y_scroll()
+                        .text_size(px(12.))
+                        .child(event.notes.trim().to_owned()),
+                )
+            })
+            .into_any_element()
+    }
+
     fn day_extras(&self, date: NaiveDate, cx: &App) -> Vec<AnyElement> {
         let theme = cx.theme();
         let today = Local::now().date_naive();
@@ -715,8 +826,11 @@ impl CalendarView {
         let theme = cx.theme().clone();
         let tasks = self.tasks_on(date);
         let extras = self.day_extras(date, cx);
-        let hidden = (tasks.len() + extras.len()).saturating_sub(TASKS_PER_DAY);
-        let room = TASKS_PER_DAY.saturating_sub(tasks.len());
+        let events = self.events_on(date, cx);
+        let hidden = (tasks.len() + events.len() + extras.len()).saturating_sub(TASKS_PER_DAY);
+        // The subscribed calendars' events after the tasks, then the habits and the rest.
+        let event_room = TASKS_PER_DAY.saturating_sub(tasks.len());
+        let room = event_room.saturating_sub(events.len());
         // The first day of a month carries the month name, as in the original: "Oct 1".
         let number = if date.day() == 1 {
             let month = strings.months_short[date.month0() as usize];
@@ -761,6 +875,7 @@ impl CalendarView {
                 ),
             )
             .children(tasks.iter().take(TASKS_PER_DAY).map(|task| self.task_bar(task, Some(date), cx)))
+            .children(events.into_iter().take(event_room).map(|event| self.event_bar(event, date, cx)))
             // Habits, focus records and countdowns, as in the original's month.
             .children(extras.into_iter().take(room))
             .when(hidden > 0, |el| {
@@ -849,6 +964,7 @@ impl CalendarView {
                     .map(|t| self.task_bar(t, Some(date), cx).into_any_element())
                     .collect::<Vec<_>>()
                     .into_iter()
+                    .chain(self.events_on(date, cx).into_iter().filter(|e| e.start_time.is_none()).map(|e| self.event_bar(e, date, cx).into_any_element()).collect::<Vec<_>>())
                     .chain(self.day_extras(date, cx))
                     .collect();
                 v_flex()
@@ -938,6 +1054,30 @@ impl CalendarView {
                         .into_any_element()
                 })
                 .collect();
+            // The subscribed calendars' timed events, as blocks from their start to their end.
+            let timed_events: Vec<AnyElement> = self
+                .events_on(date, cx)
+                .into_iter()
+                .filter_map(|event| {
+                    let from = if event.start == date { event.start_time? } else { chrono::NaiveTime::MIN };
+                    let to = match event.end_time {
+                        Some(to) if event.end == date => to,
+                        _ if event.end > date => chrono::NaiveTime::from_hms_opt(23, 59, 0)?,
+                        _ => from + chrono::Duration::minutes(30),
+                    };
+                    let height = (week_axis::offset(to) - week_axis::offset(from)).max(18.);
+                    Some(
+                        div()
+                            .absolute()
+                            .top(px(week_axis::offset(from)))
+                            .left(px(2.))
+                            .right(px(2.))
+                            .h(px(height))
+                            .child(self.event_bar(event, date, cx).h(px(height)).items_start().pt(px(1.)))
+                            .into_any_element(),
+                    )
+                })
+                .collect();
             let mut hour_lines = Vec::new();
             for hour in week_axis::FIRST_HOUR..=week_axis::LAST_HOUR {
                 let time = chrono::NaiveTime::from_hms_opt(hour, 0, 0).unwrap_or_default();
@@ -957,6 +1097,7 @@ impl CalendarView {
                 .on_drop(cx.listener(move |this, dragged: &DraggedTask, _, cx| this.drop_on_day(dragged.id, date, cx)))
                 .children(hour_lines)
                 .children(timed)
+                .children(timed_events)
                 // The original's red line at the current time, with a dot where it starts.
                 .when(date == today && week_axis::unfolded(Local::now().time()), |el| {
                     let top = week_axis::offset(Local::now().time());
@@ -1632,4 +1773,19 @@ impl Render for CalendarView {
             .children(self.options_dialog.clone())
             .children(self.render_context_menu(cx))
     }
+}
+
+/// A subscribed calendar's event as the calendar draws it.
+#[derive(Clone)]
+struct EventBar {
+    key: String,
+    title: String,
+    start: NaiveDate,
+    end: NaiveDate,
+    start_time: Option<chrono::NaiveTime>,
+    end_time: Option<chrono::NaiveTime>,
+    location: String,
+    notes: String,
+    calendar: String,
+    color: gpui::Hsla,
 }

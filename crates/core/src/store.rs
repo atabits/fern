@@ -755,6 +755,21 @@ const MIGRATIONS: &[&str] = &[
     ",
     // Tag counts and renames look tasks up by tag.
     "CREATE INDEX task_tags_tag ON task_tags(tag, task_id);",
+    // Subscribed calendars (the original's URL calendars) with the last feed read from each, kept
+    // on this device.
+    "
+    CREATE TABLE calendar_subscriptions (
+        id         TEXT PRIMARY KEY,
+        name       TEXT NOT NULL,
+        url        TEXT NOT NULL,
+        color      TEXT,
+        hidden     INTEGER NOT NULL DEFAULT 0,
+        feed       TEXT NOT NULL DEFAULT '',
+        fetched_at INTEGER,
+        error      TEXT,
+        created_at INTEGER NOT NULL
+    );
+    ",
 ];
 
 const TASK_COLUMNS: &str = "id, parent_id, kind, title, notes, priority, due_date, due_time, \
@@ -1971,6 +1986,73 @@ impl Store {
     }
 
     /// Countdowns in creation order.
+    /// The subscribed calendars, in the order they were added.
+    pub fn subscriptions(&self) -> Result<Vec<crate::ical::Subscription>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT id, name, url, color, hidden, feed, fetched_at, error FROM calendar_subscriptions ORDER BY created_at, rowid",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(crate::ical::Subscription {
+                    id: parse_uuid(&row.get::<_, String>(0)?, 0)?,
+                    name: row.get(1)?,
+                    url: row.get(2)?,
+                    color: row.get(3)?,
+                    hidden: row.get(4)?,
+                    feed: row.get(5)?,
+                    fetched_at: row.get(6)?,
+                    error: row.get(7)?,
+                })
+            })?
+            .collect::<Result<_, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn add_subscription(&self, name: &str, url: &str, color: Option<&str>) -> Result<Id> {
+        let url = url.trim();
+        anyhow::ensure!(!url.is_empty(), "a subscription needs an address");
+        let id = Uuid::now_v7();
+        self.conn.execute(
+            "INSERT INTO calendar_subscriptions (id, name, url, color, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![id.to_string(), name.trim(), url, color, now_ms()],
+        )?;
+        Ok(id)
+    }
+
+    /// Changes a subscription; a new address drops the feed read from the old one.
+    pub fn update_subscription(&self, id: Id, name: &str, url: &str, color: Option<&str>, hidden: bool) -> Result<()> {
+        self.conn.execute(
+            "UPDATE calendar_subscriptions SET name = ?2, color = ?4, hidden = ?5,
+                 feed = CASE WHEN url = ?3 THEN feed ELSE '' END,
+                 fetched_at = CASE WHEN url = ?3 THEN fetched_at END,
+                 url = ?3
+             WHERE id = ?1",
+            params![id.to_string(), name.trim(), url.trim(), color, hidden],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_subscription(&self, id: Id) -> Result<()> {
+        self.conn.execute("DELETE FROM calendar_subscriptions WHERE id = ?1", params![id.to_string()])?;
+        Ok(())
+    }
+
+    /// Keeps what was read from a subscription's address: the feed, or the error that kept it
+    /// (the last feed read then stays).
+    pub fn save_subscription_feed(&self, id: Id, feed: Result<&str, &str>) -> Result<()> {
+        match feed {
+            Ok(feed) => self.conn.execute(
+                "UPDATE calendar_subscriptions SET feed = ?2, fetched_at = ?3, error = NULL WHERE id = ?1",
+                params![id.to_string(), feed, now_ms()],
+            )?,
+            Err(error) => self.conn.execute(
+                "UPDATE calendar_subscriptions SET error = ?2 WHERE id = ?1",
+                params![id.to_string(), error],
+            )?,
+        };
+        Ok(())
+    }
+
     pub fn countdowns(&self) -> Result<Vec<Countdown>> {
         let mut stmt =
             self.conn.prepare_cached("SELECT id, name, date, kind, icon, color, repeat, pinned_at, show_age, reminders, constant_reminder, show_in_list, plus_one_day, count_up, archived_at, background FROM countdowns

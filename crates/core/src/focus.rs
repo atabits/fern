@@ -41,18 +41,27 @@ impl FocusTimer {
         Self { id: uuid::Uuid::now_v7(), name: name.to_owned(), icon: None, minutes: 25, stopwatch: false, archived: false, color: None }
     }
 
+    /// The shortest Pomo a timer takes, in minutes.
+    pub const MIN_MINUTES: i64 = 5;
+
     /// The longest Pomo a timer takes, in minutes.
     pub const MAX_MINUTES: i64 = 180;
 
-    /// Reads the dialog's minutes field: a whole number of minutes from 1 to [`Self::MAX_MINUTES`].
+    /// Reads the dialog's minutes field within the supported Pomo range.
     pub fn parse_minutes(text: &str) -> Option<i64> {
-        text.trim().parse::<i64>().ok().filter(|m| (1..=Self::MAX_MINUTES).contains(m))
+        text.trim().parse::<i64>().ok().filter(|m| (Self::MIN_MINUTES..=Self::MAX_MINUTES).contains(m))
+    }
+
+    /// Effective duration for saved timers, including older values outside the current range.
+    pub fn pomo_minutes(&self) -> i64 {
+        let minutes = if self.minutes == 0 { 25 } else { self.minutes };
+        minutes.clamp(Self::MIN_MINUTES, Self::MAX_MINUTES)
     }
 
     /// How long a session of this timer runs: its own Pomo length, or `None` for a stopwatch,
     /// which counts up until stopped.
     pub fn length_ms(&self) -> Option<i64> {
-        (!self.stopwatch).then(|| self.minutes.max(1) * 60_000)
+        (!self.stopwatch).then(|| self.pomo_minutes() * 60_000)
     }
 }
 
@@ -456,10 +465,13 @@ mod tests {
         let mut timer = FocusTimer::new("Reading");
         timer.minutes = 45;
         assert_eq!(timer.length_ms(), Some(45 * 60_000), "a timer runs its own Pomo length");
+        timer.minutes = 2;
+        assert_eq!(timer.length_ms(), Some(5 * 60_000));
+        assert_eq!(FocusTimer::parse_minutes(&timer.pomo_minutes().to_string()), Some(5));
         timer.stopwatch = true;
         assert_eq!(timer.length_ms(), None);
         assert_eq!(FocusTimer::parse_minutes(" 20 "), Some(20));
-        for bad in ["", "0", "-5", "181", "20m"] {
+        for bad in ["", "0", "-5", "4", "181", "20m"] {
             assert_eq!(FocusTimer::parse_minutes(bad), None, "{bad:?}");
         }
     }

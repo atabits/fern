@@ -156,11 +156,11 @@ pub struct Strings {
     /// In the order of `summary::Period::ALL`.
     pub summary_periods: [&'static str; 8],
     /// All, Completed, Uncompleted, Won't Do.
-    pub summary_statuses: [&'static str; 4],
+    pub summary_statuses: [&'static str; 5],
     /// In the order of `summary::Grouping::ALL`.
     pub summary_groupings: [&'static str; 6],
     /// In the order of `summary::Field::ALL`.
-    pub summary_fields: [&'static str; 5],
+    pub summary_fields: [&'static str; 10],
     pub stats_achievement_score: &'static str,
     /// "{n}" is replaced by the share in percent, which is highlighted.
     pub stats_more_productive: &'static str,
@@ -939,9 +939,9 @@ pub static EN: Strings = Strings {
     summary_copied: "Copied",
     summary_empty: "No tasks in this period.",
     summary_periods: ["Today", "Tomorrow", "Yesterday", "This Week", "Next Week", "Last Week", "This Month", "Last Month"],
-    summary_statuses: ["All Status", "Completed", "Uncompleted", "Won't Do"],
+    summary_statuses: ["All Status", "Completed", "Uncompleted", "Won't Do", "In Progress"],
     summary_groupings: ["By Completion Status", "By List", "By Completion Date", "By Task Date", "By Tag", "By Priority"],
-    summary_fields: ["Status", "Completion Time", "Task Time", "List", "Tag"],
+    summary_fields: ["Status", "Completion Time", "Task Time", "List", "Tag", "Title", "Progress", "Parent Task", "Focus", "Description"],
     stats_achievement_score: "My Achievement Score",
     stats_more_productive: "Today you are more productive than on {n} of your days",
     stats_day: "Day",
@@ -1662,9 +1662,9 @@ pub static RU: Strings = Strings {
     summary_copied: "Скопировано",
     summary_empty: "За этот период задач нет.",
     summary_periods: ["Сегодня", "Завтра", "Вчера", "Эта неделя", "Следующая неделя", "Прошлая неделя", "Этот месяц", "Прошлый месяц"],
-    summary_statuses: ["Все статусы", "Выполнено", "Не выполнено", "Не буду делать"],
+    summary_statuses: ["Все статусы", "Выполнено", "Не выполнено", "Не буду делать", "В процессе"],
     summary_groupings: ["По статусу", "По списку", "По дате выполнения", "По дате задачи", "По метке", "По приоритету"],
-    summary_fields: ["Статус", "Время выполнения", "Дата задачи", "Список", "Метка"],
+    summary_fields: ["Статус", "Время выполнения", "Дата задачи", "Список", "Метка", "Название", "Прогресс", "Родительская задача", "Фокус", "Описание"],
     stats_achievement_score: "Мои очки достижений",
     stats_more_productive: "Сегодня вы продуктивнее, чем в {n} ваших дней",
     stats_day: "День",

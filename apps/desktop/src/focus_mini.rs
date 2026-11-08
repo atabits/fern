@@ -98,7 +98,7 @@ impl Render for FocusMini {
                     button("focus-mini-stop", IconName::Square)
                         .icon_color(Color::Muted)
                         .tooltip(Tooltip::text(strings.focus_end))
-                        .on_click(cx.listener(|this, _, _, cx| this.focus.update(cx, |focus, cx| focus.finish(cx)))),
+                        .on_click(cx.listener(|this, _, window, cx| this.focus.update(cx, |focus, cx| focus.request_finish(window, cx)))),
                 )
             })
             .when(cfg!(windows), |el| {

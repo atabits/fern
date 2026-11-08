@@ -17,6 +17,8 @@ use crate::calendar;
 use crate::i18n::{self, Strings};
 use crate::task_rows::{local_day, short_date};
 use crate::text_input::{Cancelled, Mode, Submitted, TextInput};
+#[path = "summary_fields.rs"]
+mod summary_fields;
 
 /// What picking a dropdown option does.
 type Pick = Box<dyn Fn(&mut SummaryView, &mut Window, &mut Context<SummaryView>)>;
@@ -141,7 +143,7 @@ fn line(task: &Task, fields: &[Field], lists: &[List], strings: &Strings) -> Str
     {
         out.push_str(&format!("[{}] ", short_date(day, strings)));
     }
-    out.push_str(&task.title);
+    if fields.contains(&Field::Title) { out.push_str(&task.title); }
     if fields.contains(&Field::TaskTime)
         && let Some(due) = task.due_date
     {
@@ -367,7 +369,11 @@ impl SummaryView {
         // `summary=image:<path>`: what "Save as → Image" writes, to a given file.
         if let Some(path) = menu.strip_prefix("image:") {
             let report = self.current_report(cx);
-            std::fs::write(path, crate::print::report_svg(&report.heading, &report.groups)).ok();
+            if path.ends_with(".svg") {
+                std::fs::write(path, crate::print::report_svg(&report.heading, &report.groups)).ok();
+            } else if let Ok(png) = crate::report_image::png(&report.heading, &report.groups) {
+                std::fs::write(path, png).ok();
+            }
         }
         if let Some(name) = menu.strip_prefix("template:") {
             self.store.save_summary_template(name, &self.options).ok();
@@ -385,6 +391,7 @@ impl SummaryView {
         let lists = self.store.lists().unwrap_or_default();
         let groups = summarize(&tasks, &self.options, today, calendar::week_start());
         let mut report = report(&groups, &self.options, &lists, today, strings);
+        summary_fields::decorate(&mut report, &groups, &self.options, &tasks, &self.store.focus_sessions().unwrap_or_default());
         // The Lists filter's "Habit": each habit's check-ins in the period.
         let habits = self.store.habits().unwrap_or_default();
         let checkins = habits.iter().map(|h| (h.id, self.store.checkins(h.id).unwrap_or_default())).collect();
@@ -429,6 +436,9 @@ impl SummaryView {
             PopoverAttachment::new(
                 Placement::BelowRight,
                 popover(cx)
+                    .id("summary-options-scroll")
+                    .max_h(px(280.))
+                    .overflow_y_scroll()
                     .min_w(px(200.))
                     .on_mouse_down_out(cx.listener(|this, _, _, cx| this.set_menu(None, cx)))
                     .children(items),
@@ -829,7 +839,7 @@ impl SummaryView {
                     .child(self.row(strings.summary_grouping, strings.summary_groupings[grouping_index].to_owned(), Menu::Grouping, groupings, false, cx))
                     .child(self.row(
                         strings.summary_fields_label,
-                        strings.summary_selected.replace("{n}", &(options.fields.len() + 1).to_string()),
+                        strings.summary_selected.replace("{n}", &options.fields.len().to_string()),
                         Menu::Fields,
                         fields,
                         true,
@@ -862,7 +872,8 @@ impl Render for SummaryView {
             Some(text) => format!("mailto:?subject={}&body={}", percent_encode(&subject), percent_encode(text)),
             None => report.mailto(&subject),
         };
-        let (report_heading, report_groups) = (format!("{} {}", strings.summary, report.heading), report.groups.clone());
+        let export_report = summary_fields::export_report(format!("{} {}", strings.summary, report.heading), report.groups.clone(), edited.as_deref());
+        let (report_heading, report_groups) = (export_report.heading, export_report.groups);
 
         let editor = self.editor.clone().filter(|_| self.editing);
         let body = v_flex()
@@ -897,9 +908,10 @@ impl Render for SummaryView {
                         .child(editor),
                 )
             })
-            .when(editor.is_none(), |el| el.child(div().text_size(px(20.)).font_weight(FontWeight::SEMIBOLD).pb_1().child(report.heading.clone())))
-            .when(editor.is_none() && empty, |el| el.child(Label::new(strings.summary_empty).color(Color::Muted)))
-            .children(report.groups.into_iter().filter(|_| editor.is_none()).map(|(title, lines)| {
+            .when(editor.is_none() && edited.is_some(), |el| el.child(crate::task_detail::render_markdown(&markdown, None, cx)))
+            .when(editor.is_none() && edited.is_none(), |el| el.child(div().text_size(px(20.)).font_weight(FontWeight::SEMIBOLD).pb_1().child(report.heading.clone())))
+            .when(editor.is_none() && edited.is_none() && empty, |el| el.child(Label::new(strings.summary_empty).color(Color::Muted)))
+            .children(report.groups.into_iter().filter(|_| editor.is_none() && edited.is_none()).map(|(title, lines)| {
                 v_flex()
                     .pt_1()
                     .child(div().pb_1().text_size(px(17.)).font_weight(FontWeight::SEMIBOLD).child(title))
@@ -976,14 +988,7 @@ impl Render for SummaryView {
                                                 .child(Label::new(strings.summary_image))
                                                 .on_click(cx.listener(move |this, _, _, cx| {
                                                     this.save_menu = false;
-                                                    let name = format!("fern-summary-{}.svg", Local::now().format("%Y-%m-%d"));
-                                                    let svg = crate::print::report_svg(&heading, &groups).into_bytes();
-                                                    crate::export::save_as(name, svg, cx, |this, result, cx| {
-                                                        if let Some(message) = crate::export::outcome(result, i18n::t(cx)) {
-                                                            this.saved = Some(message);
-                                                        }
-                                                        cx.notify();
-                                                    });
+                                                    this.save_png(heading.clone(), groups.clone(), cx);
                                                     cx.notify();
                                                 }))
                                         })
@@ -1045,7 +1050,7 @@ mod tests {
         let tasks = store.tasks().unwrap();
         let options = SummaryOptions {
             period: Period::Today,
-            fields: vec![Field::Status, Field::CompletionTime, Field::Tag],
+            fields: vec![Field::Status, Field::CompletionTime, Field::Tag, Field::Title],
             ..Default::default()
         };
         let groups = summarize(&tasks, &options, today, calendar::week_start());

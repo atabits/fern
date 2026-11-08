@@ -14,6 +14,8 @@ use ui::{Placement, PopoverAttachment, popover};
 use crate::actions::DismissSettings;
 use crate::calendar;
 use crate::i18n::{self, CurrentLocale, Locale};
+#[path = "sticky_settings_view.rs"]
+mod sticky_settings_view;
 
 /// A row of a Settings page, and of the sections column, as the original's.
 const ROW_HEIGHT: f32 = 40.;
@@ -33,6 +35,7 @@ pub enum Page {
     Sync,
     /// The original's Integrations: calendars subscribed to by address.
     Integrations,
+    Sticky,
     About,
 }
 
@@ -219,6 +222,7 @@ impl SettingsWindow {
                             .replace("{lists}", &summary.lists.to_string()),
                         Err(err) => format!("{err:#}"),
                     });
+                    crate::sticky_note::data_changed(cx.entity_id(), cx);
                     cx.notify();
                 })
                 .ok();
@@ -264,6 +268,7 @@ impl SettingsWindow {
                     .replace("{lists}", &summary.lists.to_string()),
                 Err(err) => format!("{err:#}"),
             });
+            crate::sticky_note::data_changed(cx.entity_id(), cx);
         }
         self.page = match page {
             "smart-list" => Page::SmartList,
@@ -272,6 +277,7 @@ impl SettingsWindow {
             "about" => Page::About,
             "sync" => Page::Sync,
             "integrations" => Page::Integrations,
+            "sticky" => Page::Sticky,
             "features" => Page::Features,
             "notifications" => Page::Notifications,
             _ => Page::DateTime,
@@ -422,6 +428,10 @@ impl SettingsWindow {
             .child(page("settings-date-time", IconName::Clock, 1, Page::DateTime))
             .child(page("settings-appearance", IconName::PaintRoller, 2, Page::Appearance))
             .child(page("settings-more", IconName::ToggleRight, 3, Page::More))
+            .child(
+                item("settings-sticky", IconName::FileText, crate::sticky_settings::labels(strings.inbox == "Входящие")[0], self.page == Page::Sticky)
+                    .on_click(cx.listener(|this, _, _, cx| this.set_page(Page::Sticky, cx))),
+            )
             .child(
                 item("settings-sync", IconName::RefreshCw, strings.data_and_sync, self.page == Page::Sync)
                     .on_click(cx.listener(|this, _, _, cx| this.set_page(Page::Sync, cx))),
@@ -1275,6 +1285,7 @@ impl SettingsWindow {
                     .into_any_element()
             }
             Page::Integrations => body.children(self.render_integrations(cx)).into_any_element(),
+            Page::Sticky => body.child(self.render_sticky(cx)).into_any_element(),
             Page::About => {
                 let row = |label: &'static str, value: &'static str| {
                     h_flex()

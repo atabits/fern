@@ -231,7 +231,7 @@ fn listen(shared: Arc<Mutex<Shared>>, tx: futures::channel::mpsc::UnboundedSende
     };
     // The queue exists once the thread has asked for a message; only then can it be woken.
     let mut msg = MSG::default();
-    unsafe { PeekMessageW(&mut msg, None, WM_USER, WM_USER, PM_NOREMOVE) }.ok();
+    let _ = unsafe { PeekMessageW(&mut msg, None, WM_USER, WM_USER, PM_NOREMOVE) };
     shared.lock().unwrap_or_else(|e| e.into_inner()).thread = Some(unsafe { GetCurrentThreadId() });
     register(&shared);
     if tx.unbounded_send(Event::Registered).is_err() {

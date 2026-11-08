@@ -56,6 +56,12 @@ impl FocusTimer {
     pub fn finished(&self, now: i64) -> bool {
         self.remaining(now) == 0
     }
+
+    /// Scheduled completion, including pauses, even when a tick arrives late.
+    /// FocusTimer's completion callback, RVA 0x005af1dc.
+    pub fn completed_at(&self) -> i64 {
+        self.started_at + self.paused_total + self.length_ms
+    }
 }
 
 /// A stopwatch's length: far beyond any session, so it never finishes.
@@ -68,12 +74,52 @@ pub enum BreakKind {
     Long,
 }
 
-/// Pomodoros between long breaks.
-pub const POMOS_PER_LONG_BREAK: usize = 4;
+/// FocusConfig's runtime counter, independent of saved records and calendar dates.
+/// StartFocus/GetRelaxMinutes/Reset: RVAs 0x000c8fb0/0x000c9134/0x000c92e0.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FocusCycle {
+    count: usize,
+    last_completed_at: Option<i64>,
+}
 
-/// The break after the `pomos_today`-th Pomodoro of the day: every fourth gets a long one.
-pub fn break_after(pomos_today: usize) -> BreakKind {
-    if pomos_today > 0 && pomos_today % POMOS_PER_LONG_BREAK == 0 { BreakKind::Long } else { BreakKind::Short }
+pub const DEFAULT_LONG_BREAK_EVERY: usize = 4;
+const CYCLE_IDLE_MS: i64 = 60 * 60_000;
+/// Constants::get_MinFocusDuration, RVA 0x002556af, with HasSyncedShortFocus=false.
+pub const MIN_FOCUS_MS: i64 = 5 * 60_000;
+
+/// FocusConfig::SetStartSeconds, RVA 0x000c91c0 (normal local capability).
+pub fn pomo_length_ms(minutes: i64) -> i64 {
+    if minutes == 0 { 25 * 60_000 } else { minutes.max(MIN_FOCUS_MS / 60_000) * 60_000 }
+}
+
+impl FocusCycle {
+    fn idle_too_long(&self, now: i64) -> bool {
+        self.last_completed_at.is_none_or(|last| now - last > CYCLE_IDLE_MS)
+    }
+
+    pub fn start(&mut self, now: i64, stopwatch: bool, interval: usize) {
+        if stopwatch || self.idle_too_long(now) || (interval > 0 && self.count > 0 && self.count % interval == 0) {
+            self.count = 0;
+        }
+        self.count += 1;
+    }
+
+    pub fn complete(&mut self, completed_at: i64) {
+        self.last_completed_at = Some(completed_at);
+    }
+
+    pub fn break_kind(&self, now: i64, interval: usize) -> BreakKind {
+        if self.idle_too_long(now) || (interval > 0 && self.count > 0 && self.count % interval != 0) {
+            BreakKind::Short
+        } else {
+            BreakKind::Long
+        }
+    }
+
+    /// Reset clears the count but retains LastPomoCompleteTime in the original.
+    pub fn reset(&mut self) {
+        self.count = 0;
+    }
 }
 
 /// "25:00", "04:05".
@@ -102,10 +148,71 @@ mod tests {
     }
 
     #[test]
-    fn every_fourth_pomo_gets_a_long_break() {
-        let kinds: Vec<BreakKind> = (1..=8).map(break_after).collect();
-        assert_eq!(kinds.iter().filter(|k| **k == BreakKind::Long).count(), 2);
-        assert_eq!((kinds[3], kinds[7], kinds[0]), (BreakKind::Long, BreakKind::Long, BreakKind::Short));
+    fn cycle_uses_runtime_starts_and_completions() {
+        let mut cycle = FocusCycle::default();
+        for n in 1..=8 {
+            let start = (n - 1) * 30 * MIN;
+            cycle.start(start, false, DEFAULT_LONG_BREAK_EVERY);
+            cycle.complete(start + 25 * MIN);
+            assert_eq!(cycle.break_kind(start + 25 * MIN, DEFAULT_LONG_BREAK_EVERY), if n % 4 == 0 { BreakKind::Long } else { BreakKind::Short });
+        }
+    }
+
+    #[test]
+    fn cycle_resets_after_strictly_more_than_an_hour() {
+        let mut cycle = FocusCycle { count: 3, last_completed_at: Some(0) };
+        let mut late = cycle;
+        cycle.start(60 * MIN, false, 4);
+        cycle.complete(85 * MIN);
+        assert_eq!(cycle.break_kind(85 * MIN, 4), BreakKind::Long);
+        late.start(60 * MIN + 1, false, 4);
+        late.complete(85 * MIN + 1);
+        assert_eq!(late.break_kind(85 * MIN + 1, 4), BreakKind::Short);
+        assert_eq!(cycle.break_kind(145 * MIN, 4), BreakKind::Long);
+        assert_eq!(cycle.break_kind(145 * MIN + 1, 4), BreakKind::Short);
+    }
+
+    #[test]
+    fn reset_and_stopwatch_do_not_use_saved_session_totals() {
+        let mut cycle = FocusCycle { count: 3, last_completed_at: Some(0) };
+        cycle.reset();
+        cycle.start(MIN, false, 4);
+        assert_eq!(cycle.count, 1);
+        cycle.count = 3;
+        cycle.start(2 * MIN, true, 4);
+        assert_eq!(cycle.count, 1);
+        cycle.start(3 * MIN, false, 4);
+        assert_eq!(cycle.count, 2);
+    }
+
+    #[test]
+    fn cycle_accepts_configured_intervals() {
+        let mut cycle = FocusCycle::default();
+        for n in 1..=3 {
+            cycle.start(n * MIN, false, 3);
+            cycle.complete(n * MIN);
+        }
+        assert_eq!(cycle.break_kind(3 * MIN, 3), BreakKind::Long);
+        cycle.start(4 * MIN, false, 3);
+        assert_eq!(cycle.count, 1);
+    }
+
+    #[test]
+    fn countdown_uses_normal_minimum_and_zero_fallback() {
+        assert_eq!(pomo_length_ms(0), 25 * MIN);
+        assert_eq!(pomo_length_ms(1), 5 * MIN);
+        assert_eq!(pomo_length_ms(-1), 5 * MIN);
+        assert_eq!(pomo_length_ms(40), 40 * MIN);
+        assert_eq!(MIN_FOCUS_MS, 300_000);
+    }
+
+    #[test]
+    fn late_tick_keeps_scheduled_completion_including_pauses() {
+        let mut timer = FocusTimer::start(10 * MIN, 25 * MIN);
+        timer.pause(20 * MIN);
+        timer.resume(25 * MIN);
+        assert!(timer.finished(100 * MIN));
+        assert_eq!(timer.completed_at(), 40 * MIN);
     }
 
     #[test]

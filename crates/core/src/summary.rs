@@ -75,7 +75,7 @@ impl Period {
     }
 }
 
-/// The original's Status filter (without "In Progress", which needs checklist progress).
+/// Status selection, including open checklists with partial progress.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum StatusFilter {
     #[default]
@@ -83,11 +83,12 @@ pub enum StatusFilter {
     Completed,
     Uncompleted,
     WontDo,
+    InProgress,
 }
 
 impl StatusFilter {
-    pub const ALL: [StatusFilter; 4] =
-        [StatusFilter::All, StatusFilter::Completed, StatusFilter::Uncompleted, StatusFilter::WontDo];
+    pub const ALL: [StatusFilter; 5] =
+        [StatusFilter::All, StatusFilter::Completed, StatusFilter::Uncompleted, StatusFilter::WontDo, StatusFilter::InProgress];
 }
 
 /// The original's Grouping (without "By Assignee": there are no shared lists).
@@ -121,10 +122,15 @@ pub enum Field {
     TaskTime,
     List,
     Tag,
+    Title,
+    Progress,
+    Parent,
+    Focus,
+    Detail,
 }
 
 impl Field {
-    pub const ALL: [Field; 5] = [Field::Status, Field::CompletionTime, Field::TaskTime, Field::List, Field::Tag];
+    pub const ALL: [Field; 10] = [Field::Status, Field::CompletionTime, Field::TaskTime, Field::List, Field::Tag, Field::Title, Field::Progress, Field::Parent, Field::Focus, Field::Detail];
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -132,7 +138,7 @@ pub struct SummaryOptions {
     pub period: Period,
     pub status: StatusFilter,
     pub grouping: Grouping,
-    /// The original's default: completion time (and the title, always shown).
+    /// The verified original defaults: completion time, title and progress.
     pub fields: Vec<Field>,
     /// The original's Lists filter: `None` is "All Lists"; `Some(None)` in the set is the Inbox.
     pub lists: Option<Vec<Option<Id>>>,
@@ -150,7 +156,7 @@ impl SummaryOptions {
     /// The "More" filters (tag and priority) a task must pass.
     fn passes_more(&self, task: &Task) -> bool {
         let tag_ok = self.tags.as_ref().is_none_or(|tags| {
-            task.tags.iter().any(|t| tags.iter().any(|wanted| wanted.eq_ignore_ascii_case(t)))
+            task.tags.iter().any(|t| tags.iter().any(|wanted| wanted.to_lowercase() == t.to_lowercase()))
         });
         let priority_ok = self.priorities.as_ref().is_none_or(|p| p.contains(&task.priority));
         tag_ok && priority_ok
@@ -163,7 +169,7 @@ impl Default for SummaryOptions {
             period: Period::default(),
             status: StatusFilter::default(),
             grouping: Grouping::default(),
-            fields: vec![Field::CompletionTime],
+            fields: vec![Field::CompletionTime, Field::Title, Field::Progress],
             lists: None,
             next_period: false,
             habits: false,
@@ -175,9 +181,9 @@ impl Default for SummaryOptions {
 
 const PERIOD_CODES: [&str; 8] =
     ["today", "tomorrow", "yesterday", "this_week", "next_week", "last_week", "this_month", "last_month"];
-const STATUS_CODES: [&str; 4] = ["all", "completed", "uncompleted", "wont_do"];
+const STATUS_CODES: [&str; 5] = ["all", "completed", "uncompleted", "wont_do", "in_progress"];
 const GROUPING_CODES: [&str; 6] = ["status", "list", "completion_date", "task_date", "tag", "priority"];
-const FIELD_CODES: [&str; 5] = ["status", "completion_time", "task_time", "list", "tag"];
+const FIELD_CODES: [&str; 10] = ["status", "completion_time", "task_time", "list", "tag", "title", "progress", "parent", "focus", "detail"];
 /// Where the options are kept between runs.
 const SETTING: &str = "summary_options";
 
@@ -206,7 +212,7 @@ impl SummaryOptions {
             .as_ref()
             .map_or("all".to_owned(), |p| p.iter().map(|p| p.to_i64().to_string()).collect::<Vec<_>>().join(","));
         format!(
-            "period={period};status={};grouping={};fields={};lists={};next={};habits={};tags={tags};priorities={priorities}",
+            "version=2;period={period};status={};grouping={};fields={};lists={};next={};habits={};tags={tags};priorities={priorities}",
             code_of(&StatusFilter::ALL, &STATUS_CODES, self.status),
             code_of(&Grouping::ALL, &GROUPING_CODES, self.grouping),
             fields.join(","),
@@ -252,6 +258,10 @@ impl SummaryOptions {
                 }
                 _ => {}
             }
+        }
+        // Older versions always showed the title and had no title toggle.
+        if !text.split(';').any(|part| part == "version=2") && !options.fields.contains(&Field::Title) {
+            options.fields.push(Field::Title);
         }
         options
     }
@@ -350,6 +360,7 @@ pub fn summarize(tasks: &[Task], options: &SummaryOptions, today: NaiveDate, wee
             StatusFilter::Completed => t.is_completed(),
             StatusFilter::Uncompleted => !t.is_closed(),
             StatusFilter::WontDo => t.is_wont_do(),
+            StatusFilter::InProgress => !t.is_closed() && t.checklist.is_some_and(|(done, total)| done > 0 && done < total),
         })
         .collect();
     // Newest first within a group, as in the original.

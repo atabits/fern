@@ -73,7 +73,7 @@ pub fn report_html(heading: &str, groups: &[(String, Vec<String>)]) -> String {
     for (title, lines) in groups {
         body.push_str(&format!("<h2>{}</h2><ul>", escape(title)));
         for line in lines {
-            body.push_str(&format!("<li>{}</li>", escape(line)));
+            body.push_str(&format!("<li class=\"notes\">{}</li>", escape(line)));
         }
         body.push_str("</ul>");
     }

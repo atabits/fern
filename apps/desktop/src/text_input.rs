@@ -79,6 +79,7 @@ pub struct TextInput {
     mode: Mode,
     content: SharedString,
     placeholder: SharedString,
+    placeholder_color: Option<gpui::Hsla>,
     selected_range: Range<usize>,
     selection_reversed: bool,
     marked_range: Option<Range<usize>>,
@@ -163,6 +164,7 @@ impl TextInput {
             mode,
             content: "".into(),
             placeholder: placeholder.into(),
+            placeholder_color: None,
             selected_range: 0..0,
             selection_reversed: false,
             marked_range: None,
@@ -182,6 +184,11 @@ impl TextInput {
 
     pub fn text(&self) -> &str {
         &self.content
+    }
+
+    pub fn set_placeholder_color(&mut self, color: gpui::Hsla, cx: &mut Context<Self>) {
+        self.placeholder_color = Some(color);
+        cx.notify();
     }
 
     /// Replaces the text without emitting [`Changed`], for loading data from outside.
@@ -733,7 +740,7 @@ fn display_runs(
     let style = window.text_style();
     let is_placeholder = input.content.is_empty();
     let (text, color) = if is_placeholder {
-        (input.placeholder.clone(), placeholder_color)
+        (input.placeholder.clone(), input.placeholder_color.unwrap_or(placeholder_color))
     } else if input.masked {
         (masked_text(&input.content), style.color)
     } else {

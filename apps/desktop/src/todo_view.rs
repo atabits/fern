@@ -100,10 +100,21 @@ struct AddDraft {
     end: Option<(NaiveDate, Option<chrono::NaiveTime>)>,
 }
 
+/// The saved task stays in its original group briefly while its checkbox settles.
+/// Only presentation is held; the store and the details already have the committed state.
+struct CompletingTask {
+    before: Task,
+    index: usize,
+    view: View,
+    undo: crate::undo::UndoAction,
+    _timer: gpui::Task<()>,
+}
+
 pub struct TodoView {
     store: Rc<Store>,
     view: View,
     tasks: Vec<Task>,
+    completing: HashMap<Id, CompletingTask>,
     counts: ViewCounts,
     lists: Vec<List>,
     tags: Vec<Tag>,
@@ -179,6 +190,7 @@ pub struct TodoView {
     /// The header menu's View Options dialog and its Show Date by dropdown, while open.
     view_options: Option<bool>,
     section_rename: Option<(Id, Entity<TextInput>)>,
+    title_edit: Option<(Id, Entity<TextInput>, gpui::Subscription)>,
     /// The "Undo" toast after completing or deleting a task, with its timer.
     undo: Option<(crate::undo::UndoAction, String, gpui::Task<()>)>,
     /// Saved filters with their task counts, for the lists column.
@@ -322,6 +334,7 @@ impl TodoView {
             store,
             view: View::Inbox,
             tasks: Vec::new(),
+            completing: HashMap::new(),
             counts: ViewCounts::default(),
             lists: Vec::new(),
             tags: Vec::new(),
@@ -371,6 +384,7 @@ impl TodoView {
             view_options: None,
             suggestions_open: None,
             section_rename: None,
+            title_edit: None,
             section_menu: None,
             postpone_menu: false,
             templates_open: false,
@@ -808,6 +822,19 @@ impl TodoView {
         self.sync_input_placeholder(cx);
         // Loaded once: the views, counts and filters below are all selections of it.
         let all_tasks = self.store.tasks().unwrap_or_default();
+        self.completing.retain(|id, pending| {
+            pending.view == self.view && !cx.reduce_motion()
+                && all_tasks.iter().any(|task| {
+                    task.id == *id && !task.is_deleted() && !task.is_wont_do()
+                        && task.list_id == pending.before.list_id
+                        && match pending.undo {
+                            crate::undo::UndoAction::Reopen(_) => task.is_completed(),
+                            crate::undo::UndoAction::ReopenRepeat { copy, .. } => all_tasks.iter()
+                                .any(|copy_task| copy_task.id == copy && copy_task.is_completed() && !copy_task.is_deleted()),
+                            _ => false,
+                        }
+                })
+        });
         self.busy_days = all_tasks
             .iter()
             .filter(|t| !t.is_closed() && !t.is_deleted())
@@ -864,7 +891,8 @@ impl TodoView {
         if let Some(counts) = self.check(self.store.counts_from(&all_tasks, today)) {
             self.counts = counts;
         }
-        if let Some(tasks) = self.check(self.store.tasks_in_from(all_tasks, &self.view, today)) {
+        let show_completed = self.view == View::Today && self.view_flag("show_completed", true);
+        if let Some(tasks) = self.check(self.store.tasks_in_from_with_today_completed(all_tasks, &self.view, today, show_completed)) {
             self.tasks = tasks;
         }
         if let Some(tags) = self.check(self.store.tags()) {
@@ -2118,12 +2146,29 @@ impl TodoView {
         task_rows::fold_days(self.rows_with(strings, &self.collapsed_tasks, &self.collapsed_sections), &self.collapsed_days)
     }
 
+    fn tasks_for_rows(&self) -> Vec<Task> {
+        let mut tasks = self.tasks.clone();
+        let mut pending: Vec<_> = self.completing.values().collect();
+        pending.sort_by_key(|pending| pending.index);
+        for pending in pending {
+            if let crate::undo::UndoAction::ReopenRepeat { copy, .. } = pending.undo {
+                tasks.retain(|task| task.id != copy);
+            }
+            if let Some(task) = tasks.iter_mut().find(|task| task.id == pending.before.id) {
+                *task = pending.before.clone();
+            } else {
+                tasks.insert(pending.index.min(tasks.len()), pending.before.clone());
+            }
+        }
+        tasks
+    }
+
     /// Rows with the given collapsed tasks and groups; the kanban board shows everything.
     fn rows_with(&self, strings: &Strings, collapsed_tasks: &HashSet<Id>, collapsed_sections: &HashSet<Section>) -> Vec<Row> {
+        let tasks = self.tasks_for_rows();
         let closed = |closed_at: fn(&Task) -> Option<i64>| {
             let today = Self::today();
-            let tasks: Vec<Task> = self
-                .tasks
+            let tasks: Vec<Task> = tasks
                 .iter()
                 .filter(|t| {
                     let day = closed_at(t).and_then(task_rows::local_day).unwrap_or(today);
@@ -2138,14 +2183,14 @@ impl TodoView {
             View::Completed => closed(|t| t.completed_at),
             View::WontDo => closed(|t| t.wont_do_at),
             View::Trash | View::Search(_) => task_rows::build_rows(
-                &self.tasks,
+                &tasks,
                 collapsed_tasks,
                 collapsed_sections,
                 self.view != View::Trash,
             ),
             _ => {
                 let (sort, group) = self.sort_settings();
-                let mut tasks = self.tasks.clone();
+                let mut tasks = tasks;
                 if !self.view_flag("show_completed", true) {
                     tasks.retain(|t| !t.is_completed());
                 }
@@ -2254,7 +2299,7 @@ impl TodoView {
         let selected = self.selected == Some(task.id) || self.card == Some(task.id);
         let line = |task: &Task, id: SharedString, cx: &mut Context<Self>| {
             let task_id = task.id;
-            let done = task.is_completed();
+            let done = task.is_completed() || self.completing.contains_key(&task.id);
             h_flex()
                 .items_start()
                 .gap_2()
@@ -2264,13 +2309,14 @@ impl TodoView {
                 } else {
                     let checkbox = Checkbox::new(id)
                         .toggle_state(done)
+                        .animate_completion(crate::completion_mark::started(task_id, cx))
                         .tint(task_rows::priority_color(task.priority, &theme))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             cx.stop_propagation();
                             this.toggle(task_id, !done, cx);
                         }));
                     // A finger gets a wider target around the box, which does the same.
-                    el.child(div().id("card-box").when(crate::touch::active(), |el| {
+                    el.child(div().id("card-box").debug_selector(|| format!("kanban-checkbox-{task_id}")).when(crate::touch::active(), |el| {
                         el.p(px(8.)).m(px(-8.)).on_click(cx.listener(move |this, _, _, cx| {
                             cx.stop_propagation();
                             this.toggle(task_id, !done, cx);
@@ -3678,11 +3724,19 @@ impl TodoView {
         self.kanban = self.view_flag("kanban", false);
         self.timeline = self.view_flag("timeline", false);
         self.header_menu_open = false;
-        cx.notify();
+        if name == "show_completed" && self.view == View::Today {
+            if value {
+                self.collapsed_sections.remove(&Section::Completed);
+            }
+            self.reload(cx);
+        } else {
+            cx.notify();
+        }
     }
 
     /// The header menu's View: list, kanban or timeline, one at a time.
     fn set_layout(&mut self, kanban: bool, timeline: bool, cx: &mut Context<Self>) {
+        self.completing.clear();
         let key = self.view_key();
         for (name, on) in [("kanban", kanban), ("timeline", timeline)] {
             let result = self.store.set_setting(&format!("{name}:{key}"), if on { "1" } else { "0" });
@@ -4148,9 +4202,12 @@ impl TodoView {
     }
 
     fn toggle_selected(&mut self, _: &ToggleComplete, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(task) = self.selected.and_then(|id| self.tasks.iter().find(|t| t.id == id)) {
-            let (id, done) = (task.id, task.is_completed());
-            self.toggle(id, !done, cx);
+        if let Some(id) = self.selected {
+            if self.completing.contains_key(&id) {
+                self.toggle(id, false, cx);
+            } else if let Some(task) = self.tasks.iter().find(|task| task.id == id) {
+                self.toggle(id, !task.is_completed(), cx);
+            }
         }
     }
 
@@ -4204,6 +4261,8 @@ impl TodoView {
         self.header_menu_open = false;
         self.list_activity = None;
         if self.view != view {
+            self.finish_title_edit(true, cx);
+            self.completing.clear();
             self.view = view;
             self.reload(cx);
         }
@@ -4662,6 +4721,20 @@ impl TodoView {
     }
 
     fn toggle(&mut self, id: Id, completed: bool, cx: &mut Context<Self>) {
+        if let Some(pending) = self.completing.get(&id) {
+            // A second click cancels this completion, including a repeating occurrence.
+            // Repeated complete commands must not advance the recurrence again.
+            if completed { return; }
+            let action = pending.undo;
+            if self.check(action.apply(&self.store)).is_some() {
+                self.completing.remove(&id);
+                if self.undo.as_ref().is_some_and(|(undo, _, _)| *undo == action) {
+                    self.undo = None;
+                }
+            }
+            self.reload(cx);
+            return;
+        }
         // Unchecking a "Won't Do" task reopens it, as in the original.
         let wont_do = self.tasks.iter().any(|t| t.id == id && t.is_wont_do());
         let task = self.tasks.iter().find(|t| t.id == id).cloned();
@@ -4672,6 +4745,7 @@ impl TodoView {
                 if let Some(action) = self.check(result) {
                     let label = i18n::t(cx).undo_completed.replace("{title}", &task.title);
                     self.offer_undo(action, label, cx);
+                    crate::completion_mark::record(id, cx);
                 }
             }
             _ => {
@@ -4685,6 +4759,25 @@ impl TodoView {
 
     /// Shows the "Undo" toast for a few seconds.
     fn offer_undo(&mut self, action: crate::undo::UndoAction, label: String, cx: &mut Context<Self>) {
+        let completed = match action {
+            crate::undo::UndoAction::Reopen(id) | crate::undo::UndoAction::ReopenRepeat { id, .. } => Some(id),
+            _ => None,
+        };
+        if !cx.reduce_motion()
+            && let Some(id) = completed
+            && let Some(index) = self.tasks.iter().position(|task| task.id == id && !task.is_closed())
+        {
+            let timer = cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(crate::completion_mark::SETTLE_DURATION).await;
+                this.update(cx, |this, cx| {
+                    this.completing.remove(&id);
+                    cx.notify();
+                }).ok();
+            });
+            self.completing.insert(id, CompletingTask {
+                before: self.tasks[index].clone(), index, view: self.view.clone(), undo: action, _timer: timer,
+            });
+        }
         let timer = cx.spawn(async move |this, cx| {
             cx.background_executor().timer(std::time::Duration::from_secs(5)).await;
             this.update(cx, |this, cx| {
@@ -4702,7 +4795,9 @@ impl TodoView {
     fn apply_undo(&mut self, cx: &mut Context<Self>) {
         if let Some((action, _, _)) = self.undo.take() {
             let result = action.apply(&self.store);
-            self.check(result);
+            if self.check(result).is_some() {
+                self.completing.retain(|_, pending| pending.undo != action);
+            }
             self.reload(cx);
         }
     }
@@ -4805,6 +4900,43 @@ impl TodoView {
             .into_any_element()
     }
 
+    fn start_title_edit(&mut self, id: Id, window: &mut Window, cx: &mut Context<Self>) {
+        self.finish_title_edit(true, cx);
+        let Some(task) = self.tasks.iter().find(|task| task.id == id && !task.is_deleted()) else { return };
+        let title = task.title.clone();
+        self.select(id, cx);
+        let input = cx.new(|cx| {
+            let mut input = TextInput::new(Mode::SingleLine, "", cx);
+            input.set_text(title, cx);
+            input
+        });
+        cx.subscribe_in(&input, window, |this, _, _: &Submitted, window, cx| {
+            this.finish_title_edit(true, cx);
+            window.focus(&this.list_focus, cx);
+        }).detach();
+        cx.subscribe_in(&input, window, |this, _, _: &Cancelled, window, cx| {
+            this.finish_title_edit(false, cx);
+            window.focus(&this.list_focus, cx);
+        }).detach();
+        let focus = input.focus_handle(cx);
+        let blur = cx.on_blur(&focus, window, |this, _, cx| this.finish_title_edit(true, cx));
+        self.title_edit = Some((id, input, blur));
+        window.focus(&focus, cx);
+        cx.notify();
+    }
+
+    fn finish_title_edit(&mut self, save: bool, cx: &mut Context<Self>) {
+        let Some((id, input, _blur)) = self.title_edit.take() else { return };
+        let title = input.read(cx).text().trim();
+        if save && !title.is_empty() && self.tasks.iter().any(|task| task.id == id && task.title != title) {
+            let result = self.store.set_title(id, title);
+            if self.check(result).is_some() {
+                self.reload(cx);
+            }
+        }
+        cx.notify();
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn render_task(
         &self,
@@ -4819,7 +4951,8 @@ impl TodoView {
     ) -> AnyElement {
         let theme = cx.theme().clone();
         let id = task.id;
-        let done = task.is_completed();
+        let title_input = self.title_edit.as_ref().filter(|(editing, _, _)| *editing == id).map(|(_, input, _)| input.clone());
+        let done = task.is_completed() || self.completing.contains_key(&id);
         let details = self.show_details && !task.notes.trim().is_empty();
         let wont_do = task.is_wont_do();
         let closed_view = matches!(self.view, View::Completed | View::WontDo);
@@ -4831,6 +4964,7 @@ impl TodoView {
         } else {
             Checkbox::new("marker")
                 .toggle_state(done)
+                .animate_completion(crate::completion_mark::started(id, cx))
                 .dismissed(wont_do)
                 .lines(task.checklist.is_some())
                 .tint(task_rows::priority_color(task.priority, &theme))
@@ -4864,7 +4998,7 @@ impl TodoView {
             }
         });
 
-        let draggable = self.view != View::Trash;
+        let draggable = self.view != View::Trash && title_input.is_none();
         let dragged = DraggedTask { id, title: task.title.clone().into() };
         let accent = theme.colors().accent;
 
@@ -4909,6 +5043,9 @@ impl TodoView {
             .when(selected, |el| el.bg(theme.colors().ghost_element_selected))
             .when(!selected, |el| el.hover(|s| s.bg(theme.colors().ghost_element_hover)))
             .on_click(cx.listener(move |this, _, window, cx| {
+                if this.title_edit.as_ref().is_some_and(|(editing, _, _)| *editing == id) {
+                    return;
+                }
                 window.focus(&this.list_focus, cx);
                 this.select(id, cx);
             }))
@@ -4950,16 +5087,27 @@ impl TodoView {
                         el.child(Icon::new(IconName::Pin).size(IconSize::XSmall).color(Color::Accent))
                     })
                     .child(
-                        v_flex().flex_1().min_w_0().child(
-                            Label::new(if task.title.is_empty() {
+                        v_flex().flex_1().min_w_0().child(if let Some(input) = title_input {
+                            input.into_any_element()
+                        } else {
+                            div().id("task-title").child(Label::new(if task.title.is_empty() {
                                 SharedString::new_static(strings.untitled)
                             } else {
                                 task.title.clone().into()
                             })
                             // As the original: closed tasks are muted, not struck through.
                             .color(if done || wont_do || task.title.is_empty() { Color::Muted } else { Color::Default })
-                            .truncate(),
-                        )
+                            .truncate())
+                            .debug_selector(|| format!("task-title-{id}"))
+                            .when(!task.is_deleted(), |el| el.on_mouse_down(MouseButton::Left, cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                                // Handle the press before the draggable row can take the click.
+                                if this.selected == Some(id) || event.click_count > 1 {
+                                    cx.stop_propagation();
+                                    this.start_title_edit(id, window, cx);
+                                }
+                            })))
+                            .into_any_element()
+                        })
                         // "Show Details": the first line of the notes under the title.
                         .when_some(details.then(|| task.notes.lines().find(|l| !l.trim().is_empty())).flatten(), |el, line| {
                             el.child(Label::new(line.trim().to_owned()).size(LabelSize::XSmall).color(Color::Muted).truncate())
@@ -6363,4 +6511,253 @@ enum ListEntry {
     /// The countdowns shown in Today.
     Countdowns,
     Row(Row),
+}
+
+#[cfg(all(test, debug_assertions))]
+mod tests {
+    use super::*;
+    use gpui::{Modifiers, TestAppContext, point};
+
+    #[gpui::test]
+    fn completion_stays_in_place_until_the_check_settles(cx: &mut TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let first = store.add_task("Finish one").unwrap();
+        let second = store.add_task("Finish two").unwrap();
+        store.set_setting("show_completed:today", "0").unwrap();
+        for task in [&first, &second] {
+            store.set_due(task.id, Some(TodoView::today()), None).unwrap();
+        }
+        cx.update(|cx| {
+            theme::init(cx);
+            cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| TodoView::new(store.clone(), window, cx));
+        // Exercise the virtual list and the board, also with completed tasks filtered out.
+        for kanban in [false, true] {
+            for task in [&first, &second] { store.set_completed(task.id, false).unwrap(); }
+            cx.update(|_, cx| view.update(cx, |view, cx| {
+                view.set_view(View::Today, cx);
+                view.set_layout(kanban, false, cx);
+                view.reload(cx);
+            }));
+            cx.run_until_parked();
+            let selector = |id| -> &'static str {
+                format!("{}-{id}", if kanban { "kanban-checkbox" } else { "task-title" }).leak()
+            };
+            let first_selector = selector(first.id);
+            let second_selector = selector(second.id);
+            let first_bounds = cx.debug_bounds(first_selector).unwrap();
+            let second_bounds = cx.debug_bounds(second_selector).unwrap();
+            let at = |bounds: gpui::Bounds<Pixels>| {
+                if kanban { bounds.center() } else { point(bounds.left() - px(18.), bounds.center().y) }
+            };
+            cx.simulate_click(at(first_bounds), Modifiers::default());
+            assert!(store.task(first.id).unwrap().unwrap().is_completed());
+            assert_eq!(cx.debug_bounds(first_selector), Some(first_bounds));
+            assert_eq!(cx.debug_bounds(second_selector), Some(second_bounds));
+            cx.simulate_click(at(second_bounds), Modifiers::default());
+            assert!(store.task(second.id).unwrap().unwrap().is_completed());
+            cx.update(|_, cx| {
+                assert!(crate::completion_mark::started(first.id, cx).is_some());
+                assert!(crate::completion_mark::started(second.id, cx).is_some());
+            });
+            cx.executor().advance_clock(std::time::Duration::from_millis(200));
+            cx.run_until_parked();
+            assert_eq!(cx.debug_bounds(first_selector), Some(first_bounds));
+            assert_eq!(cx.debug_bounds(second_selector), Some(second_bounds));
+            cx.executor().advance_clock(std::time::Duration::from_millis(80));
+            cx.run_until_parked();
+            assert!(cx.debug_bounds(first_selector).is_none());
+            assert!(cx.debug_bounds(second_selector).is_none());
+        }
+    }
+
+    #[gpui::test]
+    fn a_second_click_reverts_a_repeating_completion_during_the_animation(cx: &mut TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let task = store.add_task("Daily task").unwrap();
+        let today = TodoView::today();
+        store.set_repeat(task.id, Some(fern_core::Recurrence::new(fern_core::Frequency::Daily, 1)), today).unwrap();
+        cx.update(|cx| {
+            theme::init(cx);
+            cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| TodoView::new(store.clone(), window, cx));
+        let selector = format!("task-title-{}", task.id).leak();
+        let bounds = cx.debug_bounds(selector).unwrap();
+        let position = point(bounds.left() - px(18.), bounds.center().y);
+        cx.simulate_click(position, Modifiers::default());
+        assert_eq!(store.task(task.id).unwrap().unwrap().due_date, Some(today + Duration::days(1)));
+        cx.executor().advance_clock(std::time::Duration::from_millis(100));
+        cx.simulate_click(position, Modifiers::default());
+        assert_eq!(store.task(task.id).unwrap().unwrap().due_date, Some(today));
+        assert_eq!(store.tasks().unwrap().len(), 1);
+        cx.update(|_, cx| assert!(view.read(cx).completing.is_empty()));
+        // Completing again must survive the cancelled transition's original deadline.
+        cx.simulate_click(position, Modifiers::default());
+        cx.executor().advance_clock(std::time::Duration::from_millis(180));
+        cx.run_until_parked();
+        cx.update(|_, cx| assert!(view.read(cx).completing.contains_key(&task.id)));
+        cx.update(|_, cx| view.update(cx, |view, cx| view.apply_undo(cx)));
+        cx.executor().advance_clock(std::time::Duration::from_millis(100));
+        cx.run_until_parked();
+        assert_eq!(store.task(task.id).unwrap().unwrap().due_date, Some(today));
+        assert_eq!(store.tasks().unwrap().len(), 1);
+    }
+
+    #[gpui::test]
+    fn completion_respects_navigation_and_reduced_motion(cx: &mut TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let task = store.add_task("Complete immediately").unwrap();
+        cx.update(|cx| {
+            theme::init(cx);
+            cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| TodoView::new(store.clone(), window, cx));
+        cx.update(|_, cx| view.update(cx, |view, cx| {
+            view.toggle(task.id, true, cx);
+            assert!(view.completing.contains_key(&task.id));
+            view.set_view(View::Completed, cx);
+            assert!(view.completing.is_empty());
+            view.toggle(task.id, false, cx);
+            view.set_view(View::Inbox, cx);
+            cx.set_reduce_motion(true);
+            view.toggle(task.id, true, cx);
+            assert!(view.completing.is_empty());
+            assert!(view.tasks[0].is_completed());
+        }));
+    }
+
+    #[gpui::test]
+    fn unchecking_a_kanban_card_reopens_the_task(cx: &mut TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let task = store.add_task("Reopen on board").unwrap();
+        store.set_completed(task.id, true).unwrap();
+        cx.update(|cx| {
+            theme::init(cx);
+            cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let mut view = TodoView::new(store.clone(), window, cx);
+            view.set_layout(true, false, cx);
+            view
+        });
+        let selector = format!("kanban-checkbox-{}", task.id).leak();
+        let position = cx.debug_bounds(selector).expect("completed kanban card is rendered").center();
+        let modifiers = Modifiers::default();
+        cx.simulate_mouse_move(position, None, modifiers);
+        cx.simulate_click(position, modifiers);
+        assert!(!store.task(task.id).unwrap().unwrap().is_closed());
+        cx.update(|_, cx| {
+            assert!(view.read(cx).tasks.iter().any(|task| !task.is_closed()));
+        });
+    }
+
+    #[gpui::test]
+    fn unchecking_a_completed_row_reopens_the_task(cx: &mut TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let task = store.add_task("Reopen me").unwrap();
+        let today = TodoView::today();
+        store.set_due(task.id, Some(today), None).unwrap();
+        store.set_completed(task.id, true).unwrap();
+        cx.update(|cx| {
+            theme::init(cx);
+            cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let mut view = TodoView::new(store.clone(), window, cx);
+            view.set_view(View::Completed, cx);
+            view
+        });
+        let selector = format!("task-title-{}", task.id).leak();
+        let click_checkbox = |cx: &mut gpui::VisualTestContext| {
+            let title = cx.debug_bounds(selector).expect("completed task is rendered");
+            // The 16px checkbox is immediately before the title, with a 10px gap.
+            let position = point(title.left() - px(18.), title.center().y);
+            let modifiers = Modifiers::default();
+            cx.simulate_mouse_move(position, None, modifiers);
+            cx.simulate_click(position, modifiers);
+        };
+        click_checkbox(cx);
+        assert!(!store.task(task.id).unwrap().unwrap().is_closed());
+        cx.update(|_, cx| assert!(view.read(cx).tasks.is_empty()));
+        cx.update(|_, cx| view.update(cx, |view, cx| view.set_view(View::Today, cx)));
+        cx.update(|_, cx| {
+            let tasks = &view.read(cx).tasks;
+            assert_eq!(tasks.len(), 1);
+            assert_eq!(tasks[0].id, task.id);
+            assert_eq!(tasks[0].due_date, Some(today));
+            assert!(!tasks[0].is_closed());
+        });
+
+        store.set_completed(task.id, true).unwrap();
+        cx.update(|_, cx| view.update(cx, |view, cx| {
+            view.toggle_view_flag("show_completed", true, cx);
+            assert!(view.tasks.is_empty());
+            view.toggle_view_flag("show_completed", true, cx);
+            assert!(view.tasks[0].is_completed());
+        }));
+        cx.run_until_parked();
+        click_checkbox(cx);
+        cx.update(|_, cx| {
+            let view = view.read(cx);
+            assert_eq!(view.tasks[0].id, task.id);
+            assert!(!view.tasks[0].is_closed());
+            assert!(!view.rows(i18n::t(cx)).iter().any(|row| {
+                matches!(row, Row::Section { section: Section::Completed, .. })
+            }));
+        });
+
+        let list = store.create_list("Reopen test").unwrap();
+        for (page, list_id) in [
+            (View::Inbox, None),
+            (View::All, None),
+            (View::Search("Reopen me".into()), None),
+            (View::List(list.id), Some(list.id)),
+        ] {
+            store.set_list(task.id, list_id).unwrap();
+            store.set_completed(task.id, true).unwrap();
+            cx.update(|_, cx| view.update(cx, |view, cx| view.set_view(page.clone(), cx)));
+            cx.run_until_parked();
+            click_checkbox(cx);
+            cx.update(|_, cx| {
+                let tasks = &view.read(cx).tasks;
+                assert_eq!(tasks.len(), 1, "{page:?}");
+                assert_eq!(tasks[0].id, task.id, "{page:?}");
+                assert!(!tasks[0].is_closed(), "{page:?}");
+                assert_eq!(tasks[0].list_id, list_id, "{page:?}");
+            });
+        }
+    }
+
+    #[gpui::test]
+    fn clicking_the_selected_title_edits_and_saves_it_in_the_list(cx: &mut TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let task = store.add_task("Original").unwrap();
+        cx.update(|cx| {
+            theme::init(cx);
+            cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+            crate::keymap::load_default(&assets::Assets, cx).unwrap();
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| TodoView::new(store.clone(), window, cx));
+        let selector = format!("task-title-{}", task.id).leak();
+        let bounds = cx.debug_bounds(selector).expect("task title is rendered");
+        let position = point(bounds.left() + px(8.), bounds.center().y);
+        let modifiers = Modifiers::default();
+        cx.simulate_mouse_move(position, None, modifiers);
+        cx.simulate_click(position, modifiers);
+        cx.update(|_, cx| {
+            assert_eq!(view.read(cx).selected, Some(task.id));
+            assert!(view.read(cx).title_edit.is_none());
+        });
+        cx.simulate_click(position, modifiers);
+        cx.update(|window, cx| {
+            let (_, input, _) = view.read(cx).title_edit.as_ref().expect("inline editor opens");
+            assert!(input.focus_handle(cx).is_focused(window));
+        });
+        cx.simulate_input("!");
+        cx.simulate_keystrokes("enter");
+        assert_eq!(store.task(task.id).unwrap().unwrap().title, "Original!");
+        cx.update(|_, cx| assert!(view.read(cx).title_edit.is_none()));
+    }
 }

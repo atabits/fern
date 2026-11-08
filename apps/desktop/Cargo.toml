@@ -27,6 +27,7 @@ notify-rust.workspace = true
 unicode-segmentation.workspace = true
 sys-locale.workspace = true
 ureq.workspace = true
+resvg = "0.46"
 
 [target.'cfg(windows)'.dependencies]
 raw-window-handle = "0.6"

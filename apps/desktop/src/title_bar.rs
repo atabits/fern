@@ -29,6 +29,15 @@ pub fn height() -> Pixels {
     if cfg!(target_os = "windows") { px(32.) } else { px(36.) }
 }
 
+pub fn frame_vertical_inset(window: &Window) -> Pixels {
+    if cfg!(any(target_os = "linux", target_os = "freebsd"))
+        && let Decorations::Client { tiling } = window.window_decorations()
+    {
+        return (SHADOW + px(1.)) * (u8::from(!tiling.top) + u8::from(!tiling.bottom)) as f32;
+    }
+    px(0.)
+}
+
 /// The window options that hide the system title bar.
 pub fn window_options() -> (TitlebarOptions, WindowDecorations) {
     let titlebar = TitlebarOptions {

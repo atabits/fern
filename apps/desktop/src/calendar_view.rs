@@ -19,6 +19,17 @@ use crate::task_rows;
 
 /// How many tasks a day cell shows before collapsing the rest into "+N".
 const TASKS_PER_DAY: usize = 5;
+const CALENDAR_HEADER_HEIGHT: f32 = 50.;
+const WEEKDAY_HEADER_HEIGHT: f32 = 22.;
+const DAY_HEADER_HEIGHT: f32 = 26.;
+const DAY_ITEM_HEIGHT: f32 = 18.;
+const DAY_ITEM_GAP: f32 = 2.;
+const DAY_TOP_PADDING: f32 = 4.;
+
+fn day_item_slots(height: Pixels) -> usize {
+    let available = f32::from(height) - DAY_HEADER_HEIGHT - DAY_TOP_PADDING - 1.;
+    (available / (DAY_ITEM_HEIGHT + DAY_ITEM_GAP)).floor().max(0.) as usize
+}
 
 /// The user clicked a task in the calendar.
 
@@ -860,15 +871,21 @@ impl CalendarView {
         self.reload(cx);
     }
 
-    fn render_day(&self, date: NaiveDate, today: NaiveDate, cx: &mut Context<Self>) -> AnyElement {
+    fn render_day(&self, date: NaiveDate, today: NaiveDate, slots: usize, cx: &mut Context<Self>) -> AnyElement {
         let strings = i18n::t(cx);
         let theme = cx.theme().clone();
         let tasks = self.tasks_on(date);
         let extras = self.day_extras(date, cx);
         let events = self.events_on(date, cx);
-        let hidden = (tasks.len() + events.len() + extras.len()).saturating_sub(TASKS_PER_DAY);
+        let total = tasks.len() + events.len() + extras.len();
+        let visible = if total > slots.min(TASKS_PER_DAY) {
+            slots.saturating_sub(1).min(TASKS_PER_DAY)
+        } else {
+            total
+        };
+        let hidden = total - visible;
         // The subscribed calendars' events after the tasks, then the habits and the rest.
-        let event_room = TASKS_PER_DAY.saturating_sub(tasks.len());
+        let event_room = visible.saturating_sub(tasks.len());
         let room = event_room.saturating_sub(events.len());
         // The first day of a month carries the month name, as in the original: "Oct 1".
         let number = if date.day() == 1 {
@@ -884,16 +901,17 @@ impl CalendarView {
             .flex_1()
             .min_w_0()
             .h_full()
+            .overflow_hidden()
             .drag_over::<DraggedTask>(move |style, _, _, _| style.bg(accent.opacity(0.12)))
             .on_drop(cx.listener(move |this, dragged: &DraggedTask, _, cx| this.drop_on_day(dragged.id, date, cx)))
-            .gap(px(2.))
+            .gap(px(DAY_ITEM_GAP))
             .px(px(2.))
-            .pt_1()
+            .pt(px(DAY_TOP_PADDING))
             .border_r_1()
             .border_b_1()
             .border_color(theme.colors().border_variant)
             .child(
-                h_flex().h(px(26.)).px_1().child(
+                h_flex().h(px(DAY_HEADER_HEIGHT)).flex_none().px_1().child(
                     div()
                         .min_w(px(22.))
                         .h(px(22.))
@@ -913,12 +931,13 @@ impl CalendarView {
                         )),
                 ),
             )
-            .children(tasks.iter().take(TASKS_PER_DAY).map(|task| self.task_bar(task, Some(date), cx)))
+            .children(tasks.iter().take(visible).map(|task| self.task_bar(task, Some(date), cx)))
             .children(events.into_iter().take(event_room).map(|event| self.event_bar(event, date, cx)))
             // Habits, focus records and countdowns, as in the original's month.
             .children(extras.into_iter().take(room))
-            .when(hidden > 0, |el| {
-                el.child(div().px_1().child(Label::new(format!("+{hidden}")).size(LabelSize::XSmall).color(Color::Muted)))
+            .when(hidden > 0 && slots > 0, |el| {
+                el.child(h_flex().h(px(DAY_ITEM_HEIGHT)).flex_none().px_1()
+                    .child(Label::new(format!("+{hidden}")).size(LabelSize::XSmall).color(Color::Muted)))
             })
             .into_any_element()
     }
@@ -935,6 +954,7 @@ impl CalendarView {
         let dragged = DraggedTask { id, title: task.title.clone().into() };
         h_flex()
             .id(SharedString::from(format!("calendar-task-{id}")))
+            .debug_selector(|| format!("calendar-task-{id}"))
             .on_drag(dragged, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
             .h(px(18.))
             .flex_none()
@@ -1613,6 +1633,10 @@ impl Render for CalendarView {
             CalendarMode::MultiWeek(n) => calendar::weeks_from(self.anchor, n as usize),
             _ => calendar::month_weeks(self.month),
         };
+        let grid_height = window.viewport_size().height - crate::title_bar::height()
+            - crate::title_bar::frame_vertical_inset(window)
+            - px(CALENDAR_HEADER_HEIGHT + WEEKDAY_HEADER_HEIGHT + 1.);
+        let slots = day_item_slots(grid_height / shown_weeks.len().max(1) as f32);
         let weeks: Vec<AnyElement> = shown_weeks
             .into_iter()
             .map(|week| {
@@ -1632,7 +1656,7 @@ impl Render for CalendarView {
                                 .child(Label::new(format!("W{}", calendar::week_number(&week))).size(LabelSize::XSmall).color(Color::Muted)),
                         )
                     })
-                    .children(week.into_iter().filter(|d| self.options.shows_day(*d)).map(|date| self.render_day(date, today, cx)))
+                    .children(week.into_iter().filter(|d| self.options.shows_day(*d)).map(|date| self.render_day(date, today, slots, cx)))
                     .into_any_element()
             })
             .collect();
@@ -1654,7 +1678,7 @@ impl Render for CalendarView {
             .h_full()
             .child(
                 h_flex()
-                    .h(px(50.))
+                    .h(px(CALENDAR_HEADER_HEIGHT))
                     .flex_none()
                     .pl(px(16.))
                     .pr(px(12.))
@@ -1766,7 +1790,7 @@ impl Render for CalendarView {
             .when(!matches!(self.mode, CalendarMode::Agenda | CalendarMode::Year), |el| el.child(
                 h_flex()
                     .flex_none()
-                    .h(px(22.))
+                    .h(px(WEEKDAY_HEADER_HEIGHT))
                     .when(self.mode.is_timed(), |el| el.child(div().w(px(56.)).flex_none()))
                     .when(matches!(self.mode, CalendarMode::Month | CalendarMode::MultiWeek(_)) && calendar::week_numbers(), |el| {
                         el.child(div().w(px(WEEK_NUMBER_WIDTH)).flex_none())
@@ -1843,4 +1867,42 @@ struct EventBar {
     notes: String,
     calendar: String,
     color: gpui::Hsla,
+}
+
+#[cfg(all(test, debug_assertions))]
+mod tests {
+    use super::*;
+    use gpui::{Modifiers, TestAppContext, point};
+
+    #[gpui::test]
+    fn unchecking_a_calendar_card_reopens_the_task(cx: &mut TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let task = store.add_task("Reopen in calendar").unwrap();
+        let today = Local::now().date_naive();
+        store.set_due(task.id, Some(today), None).unwrap();
+        store.set_completed(task.id, true).unwrap();
+        cx.update(|cx| {
+            theme::init(cx);
+            cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| CalendarView::new(store.clone(), window, cx));
+        let selector = format!("calendar-task-{}", task.id).leak();
+        let position = cx.debug_bounds(selector).expect("completed task is rendered in the calendar").center();
+        let modifiers = Modifiers::default();
+        cx.simulate_mouse_move(position, None, modifiers);
+        cx.simulate_click(position, modifiers);
+        cx.update(|_, cx| assert_eq!(view.read(cx).card, Some((task.id, today))));
+        let header = cx.debug_bounds("task-detail-header").expect("calendar task card is rendered");
+        let position = point(header.left() + px(27.), header.center().y);
+        cx.simulate_mouse_move(position, None, modifiers);
+        cx.simulate_click(position, modifiers);
+        let reopened = store.task(task.id).unwrap().unwrap();
+        assert!(!reopened.is_closed());
+        assert_eq!(reopened.due_date, Some(today));
+        cx.update(|_, cx| {
+            let view = view.read(cx);
+            assert_eq!(view.card, Some((task.id, today)));
+            assert!(view.tasks_on(today).iter().any(|task| !task.is_closed()));
+        });
+    }
 }

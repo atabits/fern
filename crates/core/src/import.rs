@@ -2,7 +2,7 @@
 //! few lines about the backup, then a header row ("Folder Name", "List Name", "Title", …) and one
 //! row per task. Columns are found by their names, so their order does not matter.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context as _, Result};
 use chrono::{DateTime, FixedOffset, Local, NaiveDateTime};
@@ -15,6 +15,9 @@ use crate::store::Store;
 /// One task of a backup, as written there.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct BackupTask {
+    pub folder: String,
+    pub column: String,
+    pub column_order: i64,
     /// "Inbox" for tasks in the Inbox.
     pub list: String,
     pub title: String,
@@ -26,6 +29,7 @@ pub struct BackupTask {
     pub start: Option<DateTime<FixedOffset>>,
     pub due: Option<DateTime<FixedOffset>>,
     pub all_day: bool,
+    pub floating: bool,
     /// Reminder triggers, e.g. "TRIGGER:-PT15M".
     pub reminders: Vec<String>,
     pub repeat: Option<Recurrence>,
@@ -88,7 +92,8 @@ pub fn parse_csv(text: &str) -> Vec<Vec<String>> {
 
 fn parse_time(value: &str) -> Option<DateTime<FixedOffset>> {
     let value = value.trim();
-    DateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S%z").ok()
+    DateTime::parse_from_rfc3339(value).ok()
+        .or_else(|| DateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S%z").ok())
 }
 
 /// Reads the tasks of a TickTick backup.
@@ -106,9 +111,12 @@ pub fn parse_backup(text: &str) -> Result<Vec<BackupTask>> {
         if title.is_empty() && get("Content").trim().is_empty() {
             continue;
         }
-        let is_checklist = get("Is Check list").eq_ignore_ascii_case("Y");
+        let is_checklist = get("Is Check list").eq_ignore_ascii_case("Y") || get("Kind").eq_ignore_ascii_case("CHECKLIST");
         let (content, checklist) = if is_checklist { split_checklist(get("Content")) } else { (get("Content").to_owned(), Vec::new()) };
         tasks.push(BackupTask {
+            folder: get("Folder Name").trim().to_owned(),
+            column: get("Column Name").trim().to_owned(),
+            column_order: get("Column Order").trim().parse().unwrap_or(0),
             list: get("List Name").trim().to_owned(),
             title: title.to_owned(),
             kind: if get("Kind").eq_ignore_ascii_case("NOTE") { Kind::Note } else { Kind::Task },
@@ -122,6 +130,7 @@ pub fn parse_backup(text: &str) -> Result<Vec<BackupTask>> {
             start: parse_time(get("Start Date")),
             due: parse_time(get("Due Date")),
             all_day: get("Is All Day").eq_ignore_ascii_case("true"),
+            floating: get("Is Floating").eq_ignore_ascii_case("true"),
             reminders: get("Reminder").split(',').map(|r| r.trim().to_owned()).filter(|r| !r.is_empty()).collect(),
             repeat: get("Repeat").trim().parse().ok(),
             priority: Priority::from_i64(get("Priority").trim().parse().unwrap_or(0)),
@@ -198,31 +207,84 @@ fn local(time: DateTime<FixedOffset>) -> NaiveDateTime {
 }
 
 impl Store {
-    /// Adds the tasks of a TickTick backup to the ones here: lists are matched by name or
+    /// Adds the tasks of a TickTick backup to the ones here: lists match by folder and name or
     /// created, subtasks keep their parents, completed tasks keep their completion time. The
     /// backup is read whole before anything is added; the adding itself is not one transaction,
     /// as the store's own steps open theirs.
     pub fn import_ticktick(&self, text: &str) -> Result<ImportSummary> {
         let backup = parse_backup(text)?;
+        // Reject malformed hierarchies before adding anything. A cyclic parent tree makes
+        // recursive views and lifecycle operations unsafe, and duplicate IDs are ambiguous.
+        let mut parents = HashMap::new();
+        for item in &backup {
+            if !item.id.is_empty() {
+                anyhow::ensure!(parents.insert(item.id.as_str(), item.parent_id.as_str()).is_none(), "duplicate task ID in backup: {}", item.id);
+            }
+        }
+        let mut validated = HashSet::new();
+        for item in &backup {
+            let mut seen = HashSet::new();
+            let mut cursor = item.id.as_str();
+            while !cursor.is_empty() && !validated.contains(cursor) {
+                anyhow::ensure!(seen.insert(cursor), "cyclic task hierarchy in backup: {}", item.title);
+                let Some(parent) = parents.get(cursor) else { break };
+                cursor = parent;
+            }
+            validated.extend(seen);
+        }
         let mut summary = ImportSummary::default();
-        let mut lists: HashMap<String, Id> = self.lists()?.into_iter().map(|l| (l.name.to_lowercase(), l.id)).collect();
+        let mut folders: HashMap<String, Id> = self.list_folders()?.into_iter().map(|f| (f.name.to_lowercase(), f.id)).collect();
+        let mut lists: HashMap<(Option<Id>, String), Id> = self.lists()?.into_iter()
+            .filter(|l| !l.archived).map(|l| ((l.folder, l.name.to_lowercase()), l.id)).collect();
+        let mut sections: HashMap<(Option<Id>, String), Id> = HashMap::new();
+        let mut imported_columns: Vec<_> = backup.iter().filter(|item| !item.column.is_empty()).collect();
+        imported_columns.sort_by_key(|item| item.column_order);
+        // Resolve lists in file order, then sections in their explicit column order below.
+        for item in &backup {
+            if item.list.is_empty() || item.list.eq_ignore_ascii_case("inbox") { continue; }
+            let folder = if item.folder.is_empty() { None } else {
+                let key = item.folder.to_lowercase();
+                Some(match folders.get(&key) {
+                    Some(id) => *id,
+                    None => {
+                        let folder = self.add_list_folder(&item.folder)?;
+                        folders.insert(key, folder.id);
+                        folder.id
+                    }
+                })
+            };
+            let key = (folder, item.list.to_lowercase());
+            if let std::collections::hash_map::Entry::Vacant(entry) = lists.entry(key) {
+                let list = self.add_list(&crate::model::ListDraft { name: item.list.clone(), folder, ..Default::default() })?;
+                entry.insert(list.id);
+                summary.lists += 1;
+            }
+        }
+        let list_for = |item: &BackupTask| {
+            if item.list.is_empty() || item.list.eq_ignore_ascii_case("inbox") { return None; }
+            let folder = folders.get(&item.folder.to_lowercase()).copied();
+            lists.get(&(folder, item.list.to_lowercase())).copied()
+        };
+        for item in imported_columns {
+            let list = list_for(item);
+            let key = (list, item.column.to_lowercase());
+            if let std::collections::hash_map::Entry::Vacant(entry) = sections.entry(key) {
+                let existing = self.list_sections(list)?.into_iter().find(|s| s.name.to_lowercase() == item.column.to_lowercase());
+                let section = match existing { Some(section) => section, None => self.add_list_section(list, &item.column)? };
+                entry.insert(section.id);
+            }
+        }
         let mut ids: HashMap<&str, Id> = HashMap::new();
         for item in &backup {
-            let list = if item.list.is_empty() || item.list.eq_ignore_ascii_case("inbox") {
-                None
-            } else if let Some(id) = lists.get(&item.list.to_lowercase()) {
-                Some(*id)
-            } else {
-                let list = self.create_list(&item.list)?;
-                summary.lists += 1;
-                lists.insert(item.list.to_lowercase(), list.id);
-                Some(list.id)
-            };
+            let list = list_for(item);
             let task = self.add_task_at(&item.title, false)?;
             if !item.id.is_empty() {
                 ids.insert(&item.id, task.id);
             }
             self.set_list(task.id, list)?;
+            if let Some(section) = sections.get(&(list, item.column.to_lowercase())) {
+                self.set_section(task.id, Some(*section))?;
+            }
             if item.kind == Kind::Note {
                 self.set_kind(task.id, Kind::Note)?;
             }
@@ -243,10 +305,11 @@ impl Store {
                 }
                 after = Some(entry.id);
             }
-            if let Some(start) = item.start.or(item.due).map(local) {
+            let as_local = |time: DateTime<FixedOffset>| if item.all_day || item.floating { time.naive_local() } else { local(time) };
+            if let Some(start) = item.start.or(item.due).map(as_local) {
                 let time = (!item.all_day).then_some(start.time());
                 self.set_due(task.id, Some(start.date()), time)?;
-                if let (Some(_), Some(end)) = (item.start, item.due.map(local)) {
+                if let (Some(_), Some(end)) = (item.start, item.due.map(as_local)) {
                     // A due date after the start date is the end of a duration; all-day spans end
                     // at midnight after their last day.
                     let end = if item.all_day { end - chrono::Duration::days(1) } else { end };
@@ -280,10 +343,7 @@ impl Store {
         }
         for item in &backup {
             if let (Some(id), Some(parent)) = (ids.get(item.id.as_str()), ids.get(item.parent_id.as_str())) {
-                self.conn.execute(
-                    "UPDATE tasks SET parent_id = ?2 WHERE id = ?1",
-                    params![id.to_string(), parent.to_string()],
-                )?;
+                self.set_parent(*id, Some(*parent))?;
             }
         }
         Ok(summary)
@@ -353,7 +413,8 @@ mod tests {
     #[test]
     fn imports_into_the_store() -> Result<()> {
         let store = Store::open_in_memory()?;
-        let existing = store.create_list("chores")?;
+        let folder = store.add_list_folder("home")?;
+        let existing = store.add_list(&crate::model::ListDraft { name: "chores".into(), folder: Some(folder.id), ..Default::default() })?;
         let summary = store.import_ticktick(BACKUP)?;
         assert_eq!(summary, ImportSummary { tasks: 4, lists: 0 }, "lists match by name, ignoring case");
 

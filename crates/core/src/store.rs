@@ -770,6 +770,13 @@ const MIGRATIONS: &[&str] = &[
         created_at INTEGER NOT NULL
     );
     ",
+    "
+    CREATE TABLE repeat_checklist_copies (
+        copy_id TEXT PRIMARY KEY REFERENCES checklist_items(id) ON DELETE CASCADE,
+        source_id TEXT NOT NULL REFERENCES checklist_items(id) ON DELETE CASCADE
+    );
+    CREATE INDEX repeat_checklist_copies_source ON repeat_checklist_copies(source_id);
+    ",
 ];
 
 const TASK_COLUMNS: &str = "id, parent_id, kind, title, notes, priority, due_date, due_time, \
@@ -943,6 +950,13 @@ impl Store {
     /// [`Self::tasks_in`] out of `tasks`, all of them as [`Self::tasks`] loaded them: views that
     /// need several selections load the tasks once.
     pub fn tasks_in_from(&self, tasks: Vec<Task>, view: &View, today: NaiveDate) -> Result<Vec<Task>> {
+        self.tasks_in_from_with_today_completed(tasks, view, today, false)
+    }
+
+    /// Includes tasks due today or completed today in the Today view when requested.
+    pub fn tasks_in_from_with_today_completed(
+        &self, tasks: Vec<Task>, view: &View, today: NaiveDate, show_completed: bool,
+    ) -> Result<Vec<Task>> {
         if let View::Filter(id) = view {
             let filter = self.filters()?.into_iter().find(|f| f.id == *id).context("filter not found")?;
             return Ok(tasks.into_iter().filter(|task| filter.matches(task, today)).collect());
@@ -957,7 +971,18 @@ impl Store {
         let hidden = if is_smart(view) { self.hidden_lists()? } else { HashSet::new() };
         Ok(tasks
             .into_iter()
-            .filter(|task| matches_view(task, view, today) && !task.list_id.is_some_and(|l| hidden.contains(&l)))
+            .filter(|task| {
+                if task.list_id.is_some_and(|l| hidden.contains(&l)) {
+                    return false;
+                }
+                if show_completed && *view == View::Today && task.is_completed() {
+                    return !task.is_deleted() && !task.is_wont_do()
+                        && (task.due_date == Some(today)
+                            || task.completed_at.and_then(chrono::DateTime::from_timestamp_millis)
+                                .is_some_and(|at| at.with_timezone(&chrono::Local).date_naive() == today));
+                }
+                matches_view(task, view, today)
+            })
             .collect())
     }
 
@@ -1208,6 +1233,23 @@ impl Store {
                 "INSERT INTO task_tags (task_id, tag) SELECT ?2, tag FROM task_tags WHERE task_id = ?1",
                 params![id.to_string(), copy.to_string()],
             )?;
+            // The completed occurrence owns a snapshot of the checklist. Besides preserving
+            // its history, this lets Undo restore the exact checked state transactionally.
+            let items = {
+                let mut statement = tx.prepare("SELECT id, title, sort_order, completed_at, created_at FROM checklist_items WHERE task_id = ?1")?;
+                statement.query_map([id.to_string()], |row| Ok((
+                    row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?,
+                    row.get::<_, Option<i64>>(3)?, row.get::<_, i64>(4)?,
+                )))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            for (source_id, title, order, completed_at, created_at) in items {
+                let copy_id = Uuid::now_v7().to_string();
+                tx.execute("INSERT INTO checklist_items (id, task_id, title, sort_order, completed_at, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![copy_id, copy.to_string(), title, order, completed_at, created_at])?;
+                tx.execute("INSERT INTO repeat_checklist_copies (copy_id, source_id) VALUES (?1, ?2)",
+                    params![copy_id, source_id])?;
+            }
             // A duration moves with its start.
             let end = task.end_date.map(|end| (end + (next - due)).format(DATE_FORMAT).to_string());
             tx.execute(
@@ -1228,6 +1270,12 @@ impl Store {
     /// its earlier dates.
     pub fn undo_repeat(&self, id: Id, copy: Id, due: Option<NaiveDate>, end: Option<NaiveDate>) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "UPDATE checklist_items AS original SET completed_at = copied.completed_at
+             FROM repeat_checklist_copies AS mapping JOIN checklist_items AS copied ON copied.id = mapping.copy_id
+             WHERE original.id = mapping.source_id AND original.task_id = ?1 AND copied.task_id = ?2",
+            params![id.to_string(), copy.to_string()],
+        )?;
         tx.execute("DELETE FROM tasks WHERE id = ?1", [copy.to_string()])?;
         tx.execute(
             "UPDATE tasks SET due_date = ?2, end_date = ?3 WHERE id = ?1",
@@ -3000,6 +3048,9 @@ mod tests {
         store.set_completed(done.id, true)?;
 
         assert_eq!(titles(&store.tasks_in(&View::Today, today)?), ["today", "overdue"]);
+        let with_completed = store.tasks_in_from_with_today_completed(store.tasks()?, &View::Today, today, true)?;
+        assert!(with_completed.iter().any(|task| task.id == done.id));
+        assert_eq!(with_completed.len(), 3);
         assert_eq!(titles(&store.tasks_in(&View::Tomorrow, today)?), ["tomorrow"]);
         assert_eq!(
             titles(&store.tasks_in(&View::Next7Days, today)?),

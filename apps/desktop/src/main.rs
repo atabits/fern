@@ -2,9 +2,12 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod actions;
+#[cfg(test)]
+mod feature_regressions;
 mod app_view;
 
 mod calendar;
+mod completion_mark;
 mod calendar_options_view;
 mod calendar_view;
 mod countdown_view;
@@ -27,11 +30,14 @@ mod matrix_view;
 mod print;
 mod quick_add_window;
 mod reminders;
+mod report_image;
 mod resize;
 mod search_modal;
 mod settings_window;
 mod sidebar;
 mod sticky_note;
+mod sticky_settings;
+mod sticky_windows;
 mod subscriptions;
 mod summary_view;
 mod sync;
@@ -181,6 +187,7 @@ fn main() -> Result<()> {
             },
         )
         .expect("failed to open the main window");
+        sticky_note::restore(store_for_hotkeys.clone(), cx);
         hotkeys::init(main_window, store_for_hotkeys, cx);
         cx.activate(true);
     });

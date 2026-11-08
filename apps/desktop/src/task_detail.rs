@@ -109,6 +109,7 @@ pub struct TaskDetail {
     /// Shown as a task card (the calendar's or the board's), framed by the card instead of a
     /// left border.
     card: bool,
+    sticky_style: Option<crate::sticky_settings::StickySettings>,
     /// The calendar's card writes its date out with the weekday.
     calendar_card: bool,
     /// The Add Subtask field shown while the task has no subtasks, from the "…" menu.
@@ -270,6 +271,7 @@ impl TaskDetail {
             pending_focus: None,
             popup: None,
             card: false,
+            sticky_style: None,
             calendar_card: false,
             subtask_open: false,
             due_draft: None,
@@ -1257,6 +1259,7 @@ impl TaskDetail {
         if let Some(action) = undo {
             let label = i18n::t(cx).undo_completed.replace("{title}", &task.title);
             cx.emit(Undoable(action, label));
+            crate::completion_mark::record(task.id, cx);
         }
         if let Ok(Some(fresh)) = self.store.task(task.id) {
             *task = fresh;
@@ -1446,7 +1449,7 @@ impl TaskDetail {
             .into_any_element()
     }
 
-    fn render_due_popup(&self, strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {
+    fn render_due_popup(&self, strings: &'static Strings, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let Some(draft) = self.due_draft.clone() else { return div().into_any_element() };
         let theme = cx.theme().clone();
         let locale = i18n::locale(cx);
@@ -1740,11 +1743,9 @@ impl TaskDetail {
             })))
             .child(v_flex().gap_0p5().children(weeks))
             .into_any_element();
-        popover(cx)
-            .w(px(260.))
-            .p_2()
+        let content = v_flex()
+            .flex_none()
             .gap_2()
-            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_popup(cx)))
             .child(h_flex().p_0p5().rounded(px(6.)).bg(theme.colors().background).children(
                 [(DueTab::Date, "due-tab-date", strings.date_tab), (DueTab::Duration, "due-tab-duration", strings.duration_tab)].map(
                     |(tab, id, label)| {
@@ -1788,13 +1789,30 @@ impl TaskDetail {
             ))
             .children(reminder_menu)
             .child(row("due-repeat-row", IconName::Repeat, repeat_label, draft.repeat.is_some(), DueMenu::Repeat, cx))
-            .children(repeat_menu)
+            .children(repeat_menu);
+        let viewport = window.viewport_size();
+        let sticky = self.sticky_style.is_some();
+        popover(cx)
+            .w(if sticky { px(260.).min(viewport.width - px(16.)) } else { px(260.) })
+            .when(sticky, |el| el.max_h(viewport.height - px(16.)))
+            .p_2()
+            .gap_2()
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_popup(cx)))
+            .child(
+                v_flex()
+                    .id("due-popup-content")
+                    .min_h_0()
+                    .when(sticky, |el| el.overflow_y_scroll())
+                    .child(content),
+            )
             .child(
                 h_flex()
+                    .flex_none()
                     .gap_2()
                     .pt_1()
                     .child(button("due-clear", strings.clear, false).on_click(cx.listener(|this, _, _, cx| this.clear_due(cx))))
-                    .child(button("due-ok", strings.ok, true).on_click(cx.listener(|this, _, _, cx| this.apply_due(cx)))),
+                    .child(button("due-ok", strings.ok, true).debug_selector(|| "due-popup-ok".into())
+                        .on_click(cx.listener(|this, _, _, cx| this.apply_due(cx)))),
             )
             .into_any_element()
     }
@@ -2480,7 +2498,13 @@ impl TaskDetail {
                 div()
                     .id(SharedString::from(format!("tag-chip-{tag}")))
                     .cursor_pointer()
-                    .child(Chip::new(tag.clone(), self.tag_color(&tag, cx)))
+                    .child(match self.sticky_style {
+                        Some(style) => div().h(px(18.)).px(px(6.)).rounded_full()
+                            .bg(gpui::rgb(style.foreground()).opacity(0.12))
+                            .text_color(gpui::rgb(style.foreground())).text_size(px(11.))
+                            .child(tag.clone()).into_any_element(),
+                        None => Chip::new(tag.clone(), self.tag_color(&tag, cx)).into_any_element(),
+                    })
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.open_popup(Popup::Tags, cx);
                         window.focus(&this.tag_input.focus_handle(cx), cx);
@@ -2534,8 +2558,7 @@ fn check_mark() -> impl IntoElement {
 }
 
 /// A text button with an icon, used for the due date and the list.
-fn label_button(id: &'static str, icon: IconName, label: SharedString, color: Color, cx: &App) -> Stateful<Div> {
-    let hover = cx.theme().colors().element_hover;
+fn label_button(id: &'static str, icon: IconName, label: SharedString, color: Color, hover: Hsla) -> Stateful<Div> {
     h_flex()
         .id(id)
         .relative()
@@ -2549,10 +2572,22 @@ fn label_button(id: &'static str, icon: IconName, label: SharedString, color: Co
         .child(Label::new(label).color(color))
 }
 
+impl TaskDetail {
+    pub fn set_sticky_style(&mut self, settings: crate::sticky_settings::StickySettings, cx: &mut Context<Self>) {
+        self.sticky_style = Some(settings);
+        let muted = gpui::rgb(if settings.color >= 9 { 0xbcc5d6 } else { 0x525566 }).into();
+        self.notes.update(cx, |input, cx| input.set_placeholder_color(muted, cx));
+        cx.notify();
+    }
+}
+
 impl Render for TaskDetail {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let strings = i18n::t(cx);
         let theme = cx.theme().clone();
+        let sticky_foreground: Option<Hsla> = self.sticky_style.map(|style| gpui::rgb(style.foreground()).into());
+        let button_hover = sticky_foreground.map_or(theme.colors().element_hover, |color| color.opacity(0.12));
+        let muted = sticky_foreground.map_or(Color::Muted, |color| Color::Custom(color.opacity(0.8)));
         if let Some(target) = self.pending_focus.take() {
             let input = match target {
                 FocusTarget::NewItem => Some(self.new_item.clone()),
@@ -2566,9 +2601,12 @@ impl Render for TaskDetail {
         }
         let panel = v_flex()
             .size_full()
-            .bg(theme.colors().background)
-            .text_color(theme.colors().text)
-            .when(!self.card, |el| el.border_l_1().border_color(theme.colors().border));
+            .map(|el| match self.sticky_style {
+                Some(style) => el.text_color(gpui::rgb(style.foreground())),
+                None => el.bg(theme.colors().background)
+                    .text_color(theme.colors().text)
+                    .when(!self.card, |el| el.border_l_1().border_color(theme.colors().border)),
+            });
 
         let Some(task) = self.task.as_ref() else {
             return panel
@@ -2598,7 +2636,7 @@ impl Render for TaskDetail {
                 (label.into(), if overdue && !done { Color::Error } else { Color::Accent })
             }
             // A note, as the original's, offers a reminder rather than a due date.
-            None => ((if task.kind == Kind::Note { strings.set_reminder } else { strings.due_date }).into(), Color::Muted),
+            None => ((if task.kind == Kind::Note { strings.set_reminder } else { strings.due_date }).into(), muted),
         };
         let priority_color = task_rows::priority_color(task.priority, &theme).map_or(Color::Muted, Color::Custom);
         let list_name: SharedString = task
@@ -2612,6 +2650,7 @@ impl Render for TaskDetail {
             // Top bar: checkbox | due date ……… priority
             .child(
                 h_flex()
+                    .debug_selector(|| "task-detail-header".into())
                     .gap_2()
                     .h(px(48.))
                     .px_5()
@@ -2623,6 +2662,7 @@ impl Render for TaskDetail {
                             Checkbox::new("detail-checkbox")
                                 .size(px(15.))
                                 .toggle_state(done)
+                                .animate_completion(crate::completion_mark::started(task.id, cx))
                                 .dismissed(task.is_wont_do())
                                 .lines(!self.checklist.is_empty())
                                 .on_click(cx.listener(|this, _, _, cx| this.toggle_completed(cx))),
@@ -2630,13 +2670,14 @@ impl Render for TaskDetail {
                         .child(div().w(px(1.)).h(px(14.)).bg(theme.colors().border))
                     })
                     .child(
-                        label_button("due-date", IconName::CalendarDays, due_text, due_color, cx)
+                        label_button("due-date", IconName::CalendarDays, due_text, due_color, button_hover)
+                            .debug_selector(|| "task-detail-due-date".into())
                             .when(repeats, |el| el.child(Icon::new(IconName::Repeat).size(IconSize::Small).color(due_color)))
                             .on_click(cx.listener(|this, _, _, cx| this.open_popup(Popup::Due, cx)))
                             .when(self.popup == Some(Popup::Due), |el| {
                                 el.child(PopoverAttachment::new(
                                     Placement::BelowLeft,
-                                    self.render_due_popup(strings, cx),
+                                    self.render_due_popup(strings, window, cx),
                                 ))
                             }),
                     )
@@ -2663,6 +2704,7 @@ impl Render for TaskDetail {
             .child(
                 v_flex()
                     .id("detail-body")
+                    .when_some(self.sticky_style, |el, style| el.text_size(px(style.font_px())))
                     .flex_1()
                     .overflow_y_scroll()
                     .px_5()
@@ -2697,7 +2739,9 @@ impl Render for TaskDetail {
                                     .flex_1()
                                     .min_w_0()
                                     .text_size(px(20.))
+                                    .when_some(self.sticky_style, |el, style| el.text_size(px(style.font_px() + 6.)))
                                     .line_height(px(28.))
+                                    .when_some(self.sticky_style, |el, style| el.line_height(px(style.font_px() + 12.)))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .when(done, |el| el.text_color(theme.colors().text_muted))
                                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
@@ -2727,12 +2771,13 @@ impl Render for TaskDetail {
                                 let focus = notes_focus_click.clone();
                                 move |_, window, cx| window.focus(&focus, cx)
                             })
-                            .child(render_markdown(&task.notes, cx))
+                            .child(render_markdown(&task.notes, self.sticky_style, cx))
                             .into_any_element()
                     } else {
                         div()
                             .text_size(px(15.))
                             .line_height(px(22.))
+                            .when_some(self.sticky_style, |el, style| el.text_size(px(style.font_px())).line_height(px(style.font_px() + 8.)))
                             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                             .child(self.notes.clone())
                             .into_any_element()
@@ -2778,7 +2823,7 @@ impl Render for TaskDetail {
                     .map(|bar| {
                         if task.is_deleted() {
                             bar.child(
-                                label_button("restore-task", IconName::ArchiveRestore, strings.restore.into(), Color::Default, cx)
+                                label_button("restore-task", IconName::ArchiveRestore, strings.restore.into(), Color::Default, button_hover)
                                     .on_click(cx.listener(|this, _, _, cx| this.restore(cx))),
                             )
                             .child(div().flex_1())
@@ -2790,7 +2835,7 @@ impl Render for TaskDetail {
                         } else {
                             bar.child(
                                 with_tip(
-                                    label_button("list", list_icon, list_name, Color::Muted, cx),
+                                    label_button("list", list_icon, list_name, muted, button_hover),
                                     "list-tip",
                                     strings.move_to,
                                     TipSide::Above,
@@ -2891,11 +2936,11 @@ mod size_tests {
 /// A description drawn as the original shows it while it is not edited: headings, numbered items
 /// with their numbers in the accent color, bullets, check items, quotes and lines, with bold,
 /// italic, underlined, struck, highlighted, code and link runs.
-fn render_markdown(text: &str, cx: &App) -> AnyElement {
+pub(crate) fn render_markdown(text: &str, sticky: Option<crate::sticky_settings::StickySettings>, cx: &App) -> AnyElement {
     use fern_core::markdown::{BlockKind, blocks};
     let theme = cx.theme();
-    let accent = theme.colors().accent;
-    let muted = theme.colors().text_muted;
+    let accent = sticky.map_or(theme.colors().accent, |s| gpui::rgb(if s.color >= 9 { 0x95b7ff } else { 0x254c9e }).into());
+    let muted = sticky.map_or(theme.colors().text_muted, |s| gpui::rgb(if s.color >= 9 { 0xbcc5d6 } else { 0x525566 }).into());
     let styled = |text: String, runs: Vec<(std::ops::Range<usize>, fern_core::markdown::Style)>| {
         let highlights = runs
             .into_iter()
@@ -2931,6 +2976,7 @@ fn render_markdown(text: &str, cx: &App) -> AnyElement {
         .gap_1p5()
         .text_size(px(15.))
         .line_height(px(22.))
+        .when_some(sticky, |el, settings| el.text_size(px(settings.font_px())).line_height(px(settings.font_px() + 8.)))
         .children(blocks(text).into_iter().enumerate().map(|(ix, block)| {
             // Links open in the browser on a click, as Zed's Markdown opens them. The click is
             // taken on the release by the block, before the description's own click opens it for

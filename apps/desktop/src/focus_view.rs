@@ -13,19 +13,22 @@ use gpui::{Entity, Focusable as _, FontWeight, Task as GpuiTask};
 use ui::{Donut, Placement, PopoverAttachment, popover};
 use ui::prelude::*;
 
-use crate::focus_timer::{BreakKind, FocusTimer, break_after, format_clock};
+use crate::focus_timer::{BreakKind, DEFAULT_LONG_BREAK_EVERY, FocusCycle, FocusTimer, MIN_FOCUS_MS, format_clock, pomo_length_ms};
 use crate::habit_view::{HABIT_EMOJI, icon_avatar};
 use crate::i18n::{self, Strings};
 use crate::text_input::{Mode, TextInput};
+#[path = "focus_controls.rs"]
+mod focus_controls;
+#[path = "focus_review.rs"]
+mod focus_review;
 
-/// Timer lengths in minutes, from the Focus Settings: (setting, default, minimum, maximum).
+/// Timer lengths in minutes: (setting, default, minimum, maximum).
+/// Verified against PomoSettings::.cctor, RVA 0x000d1a68.
 const POMO_SETTING: (&str, i64, i64, i64) = ("focus_pomo_minutes", 25, 5, 180);
 const SHORT_BREAK_SETTING: (&str, i64, i64, i64) = ("focus_short_break_minutes", 5, 1, 60);
-const LONG_BREAK_SETTING: (&str, i64, i64, i64) = ("focus_long_break_minutes", 15, 1, 90);
+const LONG_BREAK_SETTING: (&str, i64, i64, i64) = ("focus_long_break_minutes", 15, 1, 60);
 /// "pomo" or "stopwatch".
 const MODE_SETTING: &str = "focus_mode";
-/// Shorter sessions are not recorded.
-const MIN_RECORDED_MS: i64 = 60_000;
 
 fn now_ms() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
@@ -56,6 +59,11 @@ pub struct FocusView {
     /// What the Statistics page reads, loaded with the view rather than on every frame.
     stats_data: StatsData,
     running: Option<Running>,
+    finish_prompt: bool,
+    review_window: Option<gpui::WindowHandle<focus_review::FocusReview>>,
+    continuation: Option<(Option<(Option<Id>, String)>, i64)>,
+    completed_in_chain: usize,
+    cycle: FocusCycle,
     record_menu: Option<RecordMenu>,
     /// The Pomodoro list's timers (the original's "Add Timer"), the tab showing (archived or
     /// active), the "Add Timer"/edit popover and the timer whose "…" menu is open.
@@ -304,6 +312,11 @@ impl FocusView {
             sessions: Vec::new(),
             stats_data: StatsData::default(),
             running: None,
+            finish_prompt: false,
+            review_window: None,
+            continuation: None,
+            completed_in_chain: 0,
+            cycle: FocusCycle::default(),
             record_menu: None,
             timers: Vec::new(),
             archived_tab: false,
@@ -368,11 +381,14 @@ impl FocusView {
 
     /// Starts a Pomodoro, or a stopwatch in the stopwatch mode.
     pub fn start(&mut self, task: Option<(Id, String)>, cx: &mut Context<Self>) {
+        if self.finish_prompt { return; }
         self.finish(cx);
+        if self.running.is_some() { return; }
+        self.completed_in_chain = 0;
         let timer = if self.stopwatch_mode() {
             FocusTimer::stopwatch(now_ms())
         } else {
-            FocusTimer::start(now_ms(), self.minutes(POMO_SETTING) * 60_000)
+            FocusTimer::start(now_ms(), pomo_length_ms(self.minutes(POMO_SETTING)))
         };
         self.start_timer(task.map(|(id, title)| (Some(id), title)), None, timer, cx);
     }
@@ -384,12 +400,15 @@ impl FocusView {
 
     /// "Start Focus → Start Pomo / Start Stopwatch" for a task or a habit, in that mode.
     pub fn start_for(&mut self, task: Option<Id>, title: String, stopwatch: bool, cx: &mut Context<Self>) {
+        if self.finish_prompt { return; }
         self.finish(cx);
+        if self.running.is_some() { return; }
+        self.completed_in_chain = 0;
         self.set_stopwatch_mode(stopwatch, cx);
         let timer = if stopwatch {
             FocusTimer::stopwatch(now_ms())
         } else {
-            FocusTimer::start(now_ms(), self.minutes(POMO_SETTING) * 60_000)
+            FocusTimer::start(now_ms(), pomo_length_ms(self.minutes(POMO_SETTING)))
         };
         self.start_timer(Some((task, title)), None, timer, cx);
     }
@@ -397,11 +416,15 @@ impl FocusView {
     /// A timer's play button: a session named after it, with its own Pomo length or as a
     /// stopwatch.
     fn start_from_timer(&mut self, timer: &fern_core::focus::FocusTimer, cx: &mut Context<Self>) {
+        if self.finish_prompt { return; }
         self.finish(cx);
+        if self.running.is_some() { return; }
+        self.completed_in_chain = 0;
         self.set_stopwatch_mode(timer.stopwatch, cx);
+        let now = now_ms();
         let clock = match timer.length_ms() {
-            Some(length) => FocusTimer::start(now_ms(), length),
-            None => FocusTimer::stopwatch(now_ms()),
+            Some(length) => FocusTimer::start(now, length),
+            None => FocusTimer::stopwatch(now),
         };
         self.start_timer(Some((None, timer.name.clone())), None, clock, cx);
     }
@@ -418,6 +441,9 @@ impl FocusView {
     }
 
     fn start_timer(&mut self, task: Option<(Option<Id>, String)>, on_break: Option<BreakKind>, timer: FocusTimer, cx: &mut Context<Self>) {
+        if on_break.is_none() {
+            self.cycle.start(timer.started_at, timer.is_stopwatch(), self.interval());
+        }
         let ticker = cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(Duration::from_secs(1)).await;
@@ -433,16 +459,30 @@ impl FocusView {
     /// A finished Pomodoro is recorded and followed by a break, as in the original; a finished
     /// break just ends.
     fn tick(&mut self, cx: &mut Context<Self>) {
-        if self.running.as_ref().is_some_and(|r| r.timer.finished(now_ms())) {
+        if self.finish_prompt { return; }
+        let now = now_ms();
+        if self.stop_at_stopwatch_limit(now, cx) { return; }
+        if self.running.as_ref().is_some_and(|r| !r.timer.is_paused() && r.timer.finished(now)) {
             let was_focus = self.running.as_ref().is_some_and(|r| r.on_break.is_none());
-            self.finish(cx);
             if was_focus {
-                let today = Local::now().date_naive();
-                let pomos = self.sessions.iter().filter(|s| s.start_local().date_naive() == today).count();
-                let kind = break_after(pomos);
+                self.continuation = self.running.as_ref().map(|r| (r.task.clone(), r.timer.length_ms));
+                self.completed_in_chain += 1;
+            }
+            self.finish_at(now, true, cx);
+            if self.running.is_some() { return; }
+            if was_focus {
+                let kind = self.cycle.break_kind(now, self.interval());
                 let setting = if kind == BreakKind::Long { LONG_BREAK_SETTING } else { SHORT_BREAK_SETTING };
                 let length = self.minutes(setting) * 60_000;
-                self.start_timer(None, Some(kind), FocusTimer::start(now_ms(), length), cx);
+                let mut timer = FocusTimer::start(now, length);
+                if !self.automatic("focus_auto_break") { timer.pause(now); }
+                self.start_timer(None, Some(kind), timer, cx);
+            } else if self.automatic("focus_auto_next")
+                && self.completed_in_chain < self.minutes(("focus_auto_count", 4, 2, 10)) as usize
+                && let Some((task, length)) = self.continuation.take() {
+                self.start_timer(task, None, FocusTimer::start(now, length), cx);
+            } else {
+                self.continuation = None;
             }
         }
         cx.notify();
@@ -472,6 +512,8 @@ impl FocusView {
     }
 
     pub fn toggle_pause(&mut self, cx: &mut Context<Self>) {
+        if self.finish_prompt { return; }
+        if self.stop_at_stopwatch_limit(now_ms(), cx) { return; }
         if let Some(running) = self.running.as_mut() {
             let now = now_ms();
             if running.timer.is_paused() { running.timer.resume(now) } else { running.timer.pause(now) }
@@ -479,19 +521,34 @@ impl FocusView {
         cx.notify();
     }
 
-    /// Stops the timer and records the session if it lasted at least a minute.
+    /// Stops the timer and records focus of at least five minutes (normal local capability).
     pub fn finish(&mut self, cx: &mut Context<Self>) {
-        let Some(running) = self.running.take() else { return };
-        let now = now_ms();
+        if self.finish_prompt { return; }
+        let limited = self.stop_at_stopwatch_limit(now_ms(), cx);
+        self.finish_at(now_ms(), false, cx);
+        self.continuation = None;
+        if limited && self.running.is_none() { self.message = None; }
+    }
+
+    fn finish_at(&mut self, now: i64, completed: bool, cx: &mut Context<Self>) {
+        let Some(mut running) = self.running.take() else { return };
         let elapsed = running.timer.elapsed(now);
-        if running.on_break.is_none() && elapsed >= MIN_RECORDED_MS {
+        if running.on_break.is_none() && elapsed >= MIN_FOCUS_MS {
             let strings = i18n::t(cx);
-            let (task_id, title) = running.task.map_or((None, strings.focus.to_owned()), |(id, t)| (id, t));
+            let (task_id, title) = running.task.clone().map_or((None, strings.focus.to_owned()), |(id, t)| (id, t));
             let start = running.timer.started_at;
             let stopwatch = running.timer.is_stopwatch();
             if let Err(err) = self.store.add_focus_session_as(task_id, &title, start, start + elapsed, stopwatch) {
-                eprintln!("failed to record the focus session: {err:#}");
+                self.message = Some(err.to_string());
+                running.timer.pause(now);
+                self.running = Some(running);
+                cx.notify();
+                return;
             }
+        }
+        if running.on_break.is_none() {
+            if completed && !running.timer.is_stopwatch() { self.cycle.complete(running.timer.completed_at()); }
+            else { self.cycle.reset(); }
         }
         self.reload(cx);
     }
@@ -985,7 +1042,12 @@ impl FocusView {
     fn open_timer(&mut self, timer: Option<fern_core::focus::FocusTimer>, window: &mut Window, cx: &mut Context<Self>) {
         let strings = i18n::t(cx);
         let new = timer.is_none();
-        let timer = timer.unwrap_or_else(|| fern_core::focus::FocusTimer::new(""));
+        // AddTimerWindow::GetDefaultTimer (RVA 0x000c6170) inherits PomoDuration.
+        let timer = timer.unwrap_or_else(|| {
+            let mut timer = fern_core::focus::FocusTimer::new("");
+            timer.minutes = self.minutes(POMO_SETTING);
+            timer
+        });
         let name = cx.new(|cx| {
             let mut input = TextInput::new(Mode::SingleLine, strings.timer_name, cx);
             input.set_text(timer.name.clone(), cx);
@@ -993,7 +1055,7 @@ impl FocusView {
         });
         let minutes = cx.new(|cx| {
             let mut input = TextInput::new(Mode::SingleLine, "", cx);
-            input.set_text(timer.minutes.to_string(), cx);
+            input.set_text(timer.pomo_minutes().to_string(), cx);
             input
         });
         for input in [&name, &minutes] {
@@ -1437,12 +1499,12 @@ impl FocusView {
                         .child(div().flex_1().child(Label::new(label).size(LabelSize::Small)))
                         .child(
                             IconButton::new(SharedString::from(format!("{id}-less")), IconName::Minus)
-                                .on_click(cx.listener(move |this, _, _, cx| this.set_minutes(setting, -5, cx))),
+                                .on_click(cx.listener(move |this, _, _, cx| this.set_minutes(setting, -1, cx))),
                         )
                         .child(div().min_w(px(28.)).flex().justify_center().child(Label::new(self.minutes(setting).to_string())))
                         .child(
                             IconButton::new(SharedString::from(format!("{id}-more")), IconName::Plus)
-                                .on_click(cx.listener(move |this, _, _, cx| this.set_minutes(setting, 5, cx))),
+                                .on_click(cx.listener(move |this, _, _, cx| this.set_minutes(setting, 1, cx))),
                         )
                         .child(Label::new(strings.minutes).size(LabelSize::XSmall).color(Color::Muted))
                 };
@@ -1456,6 +1518,7 @@ impl FocusView {
                     .child(row("pomo", strings.focus_pomo_duration, POMO_SETTING, cx))
                     .child(row("short-break", strings.focus_short_break, SHORT_BREAK_SETTING, cx))
                     .child(row("long-break", strings.focus_long_break, LONG_BREAK_SETTING, cx))
+                    .child(self.render_automation(cx))
                     .into_any_element()
             }
             RecordMenu::Batch => self.render_batch(cx),
@@ -3200,7 +3263,7 @@ impl FocusView {
             h_flex()
                 .gap_3()
                 .child(pill("focus-page-pause", if paused { strings.focus_continue } else { strings.focus_pause }, true).on_click(cx.listener(|this, _, _, cx| this.toggle_pause(cx))))
-                .child(pill("focus-page-end", strings.focus_end, false).on_click(cx.listener(|this, _, _, cx| this.finish(cx))))
+                .child(pill("focus-page-end", strings.focus_end, false).on_click(cx.listener(|this, _, window, cx| this.request_finish(window, cx))))
         } else {
             h_flex().child(pill("focus-page-start", strings.focus_start, true).on_click(cx.listener(|this, _, _, cx| this.start_next(cx))))
         };
@@ -3536,7 +3599,7 @@ impl Render for FocusView {
                     .when(running, |el| {
                         el.child(
                             IconButton::new("focus-stop", IconName::Square)
-                                .on_click(cx.listener(|this, _, _, cx| this.finish(cx))),
+                                .on_click(cx.listener(|this, _, window, cx| this.request_finish(window, cx))),
                         )
                     })
                     // The original's round button, tinted with the accent.

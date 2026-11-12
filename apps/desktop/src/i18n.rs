@@ -3,32 +3,52 @@
 
 use gpui::{App, Global};
 
+// Set this to Some(&ZH_CN) when the Simplified Chinese translation is ready.
+const ZH_CN_STRINGS: Option<&Strings> = None;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Locale {
     #[default]
     En,
     Ru,
+    ZhCn,
 }
 
 impl Locale {
-    pub const ALL: [Locale; 2] = [Locale::En, Locale::Ru];
+    pub fn available() -> impl Iterator<Item = Self> {
+        [Self::En, Self::Ru, Self::ZhCn]
+            .into_iter()
+            .filter(|locale| locale.translation().is_some())
+    }
 
     pub fn code(self) -> &'static str {
         match self {
             Locale::En => "en",
             Locale::Ru => "ru",
+            Locale::ZhCn => "zh-CN",
         }
     }
 
     pub fn from_code(code: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|l| l.code() == code)
+        Self::available().find(|locale| locale.code() == code)
     }
 
     /// The system's language when Fern speaks it, else English: the language of the first start.
     pub fn system() -> Self {
         sys_locale::get_locales()
-            .find_map(|tag| Self::from_code(&tag.split(['-', '_']).next().unwrap_or_default().to_lowercase()))
+            .find_map(|tag| Self::from_system_tag(&tag))
             .unwrap_or_default()
+    }
+
+    fn from_system_tag(tag: &str) -> Option<Self> {
+        let tag = tag.to_ascii_lowercase();
+        let mut subtags = tag.split(['-', '_']);
+        let language = subtags.next()?;
+        let code = match (language, subtags.next()) {
+            ("zh", None | Some("hans" | "cn" | "sg")) => "zh-CN",
+            _ => language,
+        };
+        Self::from_code(code)
     }
 
     /// The language name in that language, for the language menu.
@@ -36,13 +56,19 @@ impl Locale {
         match self {
             Locale::En => "English",
             Locale::Ru => "Русский",
+            Locale::ZhCn => "简体中文",
         }
     }
 
     pub fn strings(self) -> &'static Strings {
+        self.translation().unwrap_or(&EN)
+    }
+
+    fn translation(self) -> Option<&'static Strings> {
         match self {
-            Locale::En => &EN,
-            Locale::Ru => &RU,
+            Locale::En => Some(&EN),
+            Locale::Ru => Some(&RU),
+            Locale::ZhCn => ZH_CN_STRINGS,
         }
     }
 }

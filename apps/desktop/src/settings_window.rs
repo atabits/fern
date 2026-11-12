@@ -978,8 +978,7 @@ impl SettingsWindow {
             }
             Page::More => {
                 let current = i18n::locale(cx);
-                let languages = Locale::ALL
-                    .into_iter()
+                let languages = Locale::available()
                     .map(|locale| {
                         let pick: Box<dyn Fn(&mut Self, &mut Window, &mut Context<Self>)> =
                             Box::new(move |this, _, cx| this.set_locale(locale, cx));

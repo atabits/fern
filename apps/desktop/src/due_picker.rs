@@ -368,7 +368,11 @@ pub fn repeat_options(date: NaiveDate, strings: &Strings, locale: Locale) -> Vec
     let weekday = strings.weekdays_full[date.weekday().num_days_from_monday() as usize];
     let day = ordinal(date.day(), locale);
     let month = strings.months_short[date.month0() as usize];
-    let yearly = if strings.day_before_month { format!("{} {month}", date.day()) } else { format!("{month} {day}") };
+    let yearly = match locale {
+        Locale::ZhCn => format!("{}月{day}", date.month()),
+        _ if strings.day_before_month => format!("{} {month}", date.day()),
+        _ => format!("{month} {day}"),
+    };
     vec![
         (Recurrence::new(Frequency::Daily, 1), strings.repeat_daily.to_owned(), String::new()),
         (Recurrence::new(Frequency::Weekly, 1), strings.repeat_weekly.to_owned(), weekday.to_owned()),
@@ -429,10 +433,11 @@ pub fn unit_index(frequency: Frequency) -> usize {
     UNITS.iter().position(|f| *f == frequency).unwrap_or(0)
 }
 
-/// "18th" in English, "18-го" in Russian.
+/// The day of the month as it appears in repeat options.
 pub fn ordinal(day: u32, locale: Locale) -> String {
     match locale {
         Locale::Ru => format!("{day}-го"),
+        Locale::ZhCn => format!("{day}日"),
         Locale::En => {
             let suffix = match (day % 10, day % 100) {
                 (1, 11) | (2, 12) | (3, 13) => "th",
@@ -462,6 +467,7 @@ mod tests {
             "1st", "2nd", "3rd", "4th", "11th", "12th", "13th", "21st", "22nd", "31st"
         ]);
         assert_eq!(ordinal(18, Locale::Ru), "18-го");
+        assert_eq!(ordinal(18, Locale::ZhCn), "18日");
     }
 
     #[test]

@@ -199,7 +199,8 @@ script/package <target>    # release packages into dist/, e.g. x86_64-unknown-li
 ```
 
 - CI builds and tests every push on Linux, macOS and Windows.
-- Pushing a `v*` tag builds packages for all five targets and publishes a GitHub release.
+- Run the Release workflow on `main` with **release** enabled to build packages for all five
+  targets and create a draft. Publishing the draft creates the version tag.
 
 Read `docs/architecture.md` before you start. The code follows Zed's conventions.
 

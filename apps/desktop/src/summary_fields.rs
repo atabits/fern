@@ -1,4 +1,6 @@
 //! Additional fields of Summary, using the same task/session snapshots as the report.
+use std::collections::HashMap;
+
 use fern_core::{FocusSession, Task, format_minutes};
 use fern_core::summary::{Field, SummaryGroup, SummaryOptions};
 use super::Report;
@@ -23,6 +25,12 @@ impl super::SummaryView {
 }
 
 pub(super) fn decorate(report: &mut Report, groups: &[SummaryGroup], options: &SummaryOptions, tasks: &[Task], sessions: &[FocusSession]) {
+    let mut focus_by_task = HashMap::new();
+    for session in sessions {
+        if let Some(id) = session.task_id {
+            *focus_by_task.entry(id).or_insert(0) += (session.ended_at - session.started_at).max(0);
+        }
+    }
     for ((_, lines), group) in report.groups.iter_mut().zip(groups) {
         for (line, task) in lines.iter_mut().zip(&group.tasks) {
             if options.fields.contains(&Field::Progress) {
@@ -35,8 +43,7 @@ pub(super) fn decorate(report: &mut Report, groups: &[SummaryGroup], options: &S
                 line.push_str(&format!(" · {}", parent.title));
             }
             if options.fields.contains(&Field::Focus) {
-                let millis: i64 = sessions.iter().filter(|s| s.task_id == Some(task.id))
-                    .map(|s| (s.ended_at - s.started_at).max(0)).sum();
+                let millis = focus_by_task.get(&task.id).copied().unwrap_or_default();
                 line.push_str(&format!(" · {}", format_minutes(millis / 60_000)));
             }
             if options.fields.contains(&Field::Detail) && !task.notes.trim().is_empty() {

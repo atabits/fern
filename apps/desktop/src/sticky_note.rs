@@ -173,6 +173,7 @@ impl StickyNote {
             return;
         }
         self.show(id, cx);
+        self.refresh(cx);
         self.remember(window, cx);
     }
 
@@ -202,10 +203,10 @@ impl StickyNote {
 }
 
 impl Render for StickyNote {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         #[cfg(windows)]
-        set_opacity(window, self.settings.opacity);
+        set_opacity(_window, self.settings.opacity);
         let foreground: gpui::Hsla = gpui::rgb(self.settings.foreground()).into();
         v_flex()
             .size_full()
@@ -384,6 +385,30 @@ mod tests {
             }).unwrap();
             let notes = sticky_windows::load(&store);
             assert!(notes.iter().any(|note| note.task == second && note.open));
+        });
+    }
+
+    #[gpui::test]
+    fn navigating_to_a_closed_note_applies_its_saved_color(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            theme::init(cx);
+            let store = Rc::new(Store::open_in_memory().unwrap());
+            let first = store.add_task("First").unwrap().id;
+            let second = store.add_task("Second").unwrap().id;
+            open(store.clone(), first, cx);
+            open(store.clone(), second, cx);
+            let [first_handle, second_handle] = cx.global::<OpenNotes>().0[..] else { panic!("expected two notes") };
+            second_handle.update(cx, |note, window, cx| {
+                note.color = Some(10);
+                note.remember(window, cx);
+                note.forget(cx);
+                window.remove_window();
+            }).unwrap();
+            first_handle.update(cx, |note, window, cx| {
+                note.navigate(second, window, cx);
+                assert_eq!(note.detail.read(cx).task_id(), Some(second));
+                assert_eq!(note.settings.color, 10);
+            }).unwrap();
         });
     }
 

@@ -463,14 +463,13 @@ impl FocusView {
         let now = now_ms();
         if self.stop_at_stopwatch_limit(now, cx) { return; }
         if self.running.as_ref().is_some_and(|r| !r.timer.is_paused() && r.timer.finished(now)) {
-            let was_focus = self.running.as_ref().is_some_and(|r| r.on_break.is_none());
-            if was_focus {
-                self.continuation = self.running.as_ref().map(|r| (r.task.clone(), r.timer.length_ms));
-                self.completed_in_chain += 1;
-            }
+            let continuation = self.running.as_ref().filter(|r| r.on_break.is_none())
+                .map(|r| (r.task.clone(), r.timer.length_ms));
             self.finish_at(now, true, cx);
             if self.running.is_some() { return; }
-            if was_focus {
+            if let Some(continuation) = continuation {
+                self.continuation = Some(continuation);
+                self.completed_in_chain += 1;
                 let kind = self.cycle.break_kind(now, self.interval());
                 let setting = if kind == BreakKind::Long { LONG_BREAK_SETTING } else { SHORT_BREAK_SETTING };
                 let length = self.minutes(setting) * 60_000;
@@ -524,10 +523,10 @@ impl FocusView {
     /// Stops the timer and records focus of at least five minutes (normal local capability).
     pub fn finish(&mut self, cx: &mut Context<Self>) {
         if self.finish_prompt { return; }
-        let limited = self.stop_at_stopwatch_limit(now_ms(), cx);
-        self.finish_at(now_ms(), false, cx);
+        let now = now_ms();
+        self.stop_at_stopwatch_limit(now, cx);
+        self.finish_at(now, false, cx);
         self.continuation = None;
-        if limited && self.running.is_none() { self.message = None; }
     }
 
     fn finish_at(&mut self, now: i64, completed: bool, cx: &mut Context<Self>) {
@@ -550,6 +549,7 @@ impl FocusView {
             if completed && !running.timer.is_stopwatch() { self.cycle.complete(running.timer.completed_at()); }
             else { self.cycle.reset(); }
         }
+        self.message = None;
         self.reload(cx);
     }
 

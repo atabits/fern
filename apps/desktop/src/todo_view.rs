@@ -4765,7 +4765,8 @@ impl TodoView {
         };
         if !cx.reduce_motion()
             && let Some(id) = completed
-            && let Some(index) = self.tasks.iter().position(|task| task.id == id && !task.is_closed())
+            && let Some((index, before)) = self.tasks_for_rows().into_iter().enumerate()
+                .find(|(_, task)| task.id == id && !task.is_closed())
         {
             let timer = cx.spawn(async move |this, cx| {
                 cx.background_executor().timer(crate::completion_mark::SETTLE_DURATION).await;
@@ -4775,7 +4776,7 @@ impl TodoView {
                 }).ok();
             });
             self.completing.insert(id, CompletingTask {
-                before: self.tasks[index].clone(), index, view: self.view.clone(), undo: action, _timer: timer,
+                before, index, view: self.view.clone(), undo: action, _timer: timer,
             });
         }
         let timer = cx.spawn(async move |this, cx| {
@@ -6521,8 +6522,8 @@ mod tests {
     #[gpui::test]
     fn completion_stays_in_place_until_the_check_settles(cx: &mut TestAppContext) {
         let store = Rc::new(Store::open_in_memory().unwrap());
-        let first = store.add_task("Finish one").unwrap();
         let second = store.add_task("Finish two").unwrap();
+        let first = store.add_task("Finish one").unwrap();
         store.set_setting("show_completed:today", "0").unwrap();
         for task in [&first, &second] {
             store.set_due(task.id, Some(TodoView::today()), None).unwrap();
@@ -6548,6 +6549,7 @@ mod tests {
             let second_selector = selector(second.id);
             let first_bounds = cx.debug_bounds(first_selector).unwrap();
             let second_bounds = cx.debug_bounds(second_selector).unwrap();
+            assert!(first_bounds.top() < second_bounds.top());
             let at = |bounds: gpui::Bounds<Pixels>| {
                 if kanban { bounds.center() } else { point(bounds.left() - px(18.), bounds.center().y) }
             };
@@ -6558,6 +6560,8 @@ mod tests {
             cx.simulate_click(at(second_bounds), Modifiers::default());
             assert!(store.task(second.id).unwrap().unwrap().is_completed());
             cx.update(|_, cx| {
+                let view = view.read(cx);
+                assert!(view.completing[&first.id].index < view.completing[&second.id].index);
                 assert!(crate::completion_mark::started(first.id, cx).is_some());
                 assert!(crate::completion_mark::started(second.id, cx).is_some());
             });

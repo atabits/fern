@@ -391,7 +391,12 @@ impl SummaryView {
         let lists = self.store.lists().unwrap_or_default();
         let groups = summarize(&tasks, &self.options, today, calendar::week_start());
         let mut report = report(&groups, &self.options, &lists, today, strings);
-        summary_fields::decorate(&mut report, &groups, &self.options, &tasks, &self.store.focus_sessions().unwrap_or_default());
+        let sessions = if self.options.fields.contains(&Field::Focus) {
+            self.store.focus_sessions().unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        summary_fields::decorate(&mut report, &groups, &self.options, &tasks, &sessions);
         // The Lists filter's "Habit": each habit's check-ins in the period.
         let habits = self.store.habits().unwrap_or_default();
         let checkins = habits.iter().map(|h| (h.id, self.store.checkins(h.id).unwrap_or_default())).collect();

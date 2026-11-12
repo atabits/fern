@@ -2632,7 +2632,8 @@ impl Store {
         self.add_focus_session_as(task_id, title, started_at, ended_at, false)
     }
 
-    /// A focus session, timed as a Pomodoro or with the stopwatch.
+    /// A focus session, timed as a Pomodoro or with the stopwatch. If the task
+    /// was removed while the timer ran, the session still keeps its title.
     pub fn add_focus_session_as(
         &self,
         task_id: Option<Id>,
@@ -2642,13 +2643,16 @@ impl Store {
         stopwatch: bool,
     ) -> Result<FocusSession> {
         anyhow::ensure!(ended_at >= started_at, "a focus session cannot end before it starts");
-        let session =
-            FocusSession { id: Uuid::now_v7(), task_id, title: title.trim().to_owned(), started_at, ended_at, stopwatch, note: String::new() };
-        self.conn.execute(
-            "INSERT INTO focus_sessions (id, task_id, title, started_at, ended_at, stopwatch) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![session.id.to_string(), task_id.map(|t| t.to_string()), session.title, started_at, ended_at, stopwatch],
+        let id = Uuid::now_v7();
+        let title = title.trim().to_owned();
+        let task_id = self.conn.query_row(
+            "INSERT INTO focus_sessions (id, task_id, title, started_at, ended_at, stopwatch)
+             VALUES (?1, (SELECT id FROM tasks WHERE id = ?2), ?3, ?4, ?5, ?6)
+             RETURNING task_id",
+            params![id.to_string(), task_id.map(|t| t.to_string()), title, started_at, ended_at, stopwatch],
+            |row| row.get::<_, Option<String>>(0)?.map(|id| parse_uuid(&id, 0)).transpose(),
         )?;
-        Ok(session)
+        Ok(FocusSession { id, task_id, title, started_at, ended_at, stopwatch, note: String::new() })
     }
 
     /// "List Activities": what happened to the tasks of a list (`None` is the inbox), newest
@@ -3818,6 +3822,10 @@ mod tests {
         // Deleting the task keeps the record.
         store.purge_task(task.id)?;
         assert_eq!(store.focus_sessions()?[1].task_id, None);
+        // A timer can also finish after its task has already been deleted.
+        let finished = store.add_focus_session_as(Some(task.id), "write report", 5_000_000, 5_300_000, true)?;
+        assert_eq!(finished.task_id, None);
+        assert_eq!(store.focus_sessions()?[0], finished);
         let all = store.focus_sessions()?;
         store.delete_focus_session(all[0].id)?;
         assert_eq!(store.focus_sessions()?.len(), all.len() - 1);

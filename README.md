@@ -33,7 +33,8 @@ Download it and start working: no account, no server, your data stays on your ma
 - **⌨️ Quick add that understands you.** `Lunch with Sam friday 1pm #personal !2 ^Work` sets the date, time, tag, priority and list as you type.
 - **🔒 Works out of the box, offline.** Download it and start adding tasks. There is no account, no sign-up and no cloud. Everything lives in one file on your disk, and Fern saves a copy of it every day.
 - **🔄 Sync if you want it.** To use Fern on several devices, run your own `fern-server`. This is optional.
-- **🌍 English and Russian.** Switch the language at runtime.
+- **🌍 English, Russian, and Simplified Chinese (简体中文).** Switch under Settings → More → Language.
+  Simplified Chinese is available starting with v0.1.10.
 - **🆓 Free forever.** AGPL-3.0, no subscriptions, no ads.
 
 ---
@@ -176,7 +177,8 @@ Fern 0.1 is an early preview. Here is what to expect:
   (Settings → About → Updates turns the checks off). Versions before 0.1.5 can't update
   themselves, and the `.deb` is updated through your package manager: Fern only says that a new
   version is out.
-- **Two languages.** The interface is in English and Russian. More languages are welcome.
+- **Quick Add language support.** Natural-language date and repeat keywords are recognized in English
+  and Russian, regardless of the interface language.
 - **Not everything from TickTick yet.** [docs/parity.md](docs/parity.md) tracks what matches the
   original and what is still missing. Team features such as shared lists and assignees are
   not planned.
@@ -207,6 +209,9 @@ Read `docs/architecture.md` before you start. The code follows Zed's conventions
 Contributions are welcome:
 - Code, comments, docs and commit messages are in English.
 - UI strings live in `apps/desktop/src/i18n.rs`. To add a language, fill in the `Strings` struct for it.
+
+Thanks to [HeliusHao](https://github.com/HeliusHao) for contributing the Simplified Chinese
+translation in [PR #5](https://github.com/atabits/fern/pull/5).
 
 ---
 

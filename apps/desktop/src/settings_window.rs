@@ -400,7 +400,11 @@ impl SettingsWindow {
     fn render_nav(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let strings = i18n::t(cx);
         let item = |id: &'static str, icon: IconName, label: &'static str, selected: bool| {
-            ListItem::new(id).height(px(37.)).toggle_state(selected).start_slot(Icon::new(icon)).child(Label::new(label))
+            ListItem::new(id)
+                .height(px(37.))
+                .toggle_state(selected)
+                .start_slot(Icon::new(icon))
+                .child(Label::new(label).truncate())
         };
         let page = |id, icon, index: usize, target: Page| {
             item(id, icon, strings.settings_pages[index], self.page == target)
@@ -408,7 +412,7 @@ impl SettingsWindow {
         };
         v_flex()
             .flex_none()
-            .w(px(200.))
+            .w(px(240.))
             .h_full()
             .p_2()
             .gap_0p5()
@@ -1351,7 +1355,7 @@ impl Render for SettingsWindow {
             .track_focus(&self.focus_handle)
             .key_context("Settings")
             .on_action(cx.listener(|_, _: &DismissSettings, _, cx| cx.emit(SettingsEvent::Dismissed)))
-            .w(px(800.))
+            .w(px(840.))
             .h(px(680.))
             .relative()
             .rounded(px(12.))

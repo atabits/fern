@@ -1236,7 +1236,7 @@ impl TodoView {
                 .child(div().flex_1().child(Label::new(label).size(LabelSize::Small).color(if selected { Color::Accent } else { Color::Default })))
                 .when(selected, |el| el.child(Icon::new(IconName::Check).size(IconSize::XSmall).color(Color::Accent)))
         };
-        let time_label = draft.time.map_or(strings.time.to_owned(), crate::calendar::format_time);
+        let time_label = draft.time.map_or(strings.time.to_owned(), |time| crate::calendar::format_time(time, strings));
         let reminder_label = draft
             .reminders
             .as_ref()
@@ -1253,7 +1253,7 @@ impl TodoView {
         if open == Some(0) && !duration {
             let times = std::iter::once(None).chain(crate::due_picker::time_options().into_iter().map(Some));
             rows = rows.child(v_flex().id("add-date-times").max_h(px(150.)).overflow_y_scroll().children(times.map(|time| {
-                let label = time.map_or(strings.no_time.to_owned(), crate::calendar::format_time);
+                let label = time.map_or(strings.no_time.to_owned(), |time| crate::calendar::format_time(time, strings));
                 choice(SharedString::from(format!("add-time-{label}")), label, draft.time == time).on_click(cx.listener(move |this, _, _, cx| {
                     this.add_draft.time = time;
                     this.add_draft.date.get_or_insert_with(Self::today);
@@ -1510,7 +1510,7 @@ impl TodoView {
                 }))
         };
         let day = |date: Option<NaiveDate>| -> SharedString { date.map_or(SharedString::default(), |d| task_rows::short_date(d, strings).into()) };
-        let time = |t: Option<chrono::NaiveTime>| -> SharedString { t.map_or(SharedString::default(), |t| crate::calendar::format_time(t).into()) };
+        let time = |t: Option<chrono::NaiveTime>| -> SharedString { t.map_or(SharedString::default(), |t| crate::calendar::format_time(t, strings).into()) };
         let line = |label: &'static str, date_chip: AnyElement, time_chip: Option<AnyElement>| {
             h_flex().gap_2().child(div().w(px(40.)).child(Label::new(label).size(LabelSize::Small))).child(date_chip).children(time_chip)
         };
@@ -1570,7 +1570,7 @@ impl TodoView {
                         .children(crate::due_picker::time_options().into_iter().map(|t| {
                             ListItem::new(SharedString::from(format!("add-range-time-{t}")))
                                 .height(px(28.))
-                                .child(Label::new(crate::calendar::format_time(t)).size(LabelSize::Small))
+                                .child(Label::new(crate::calendar::format_time(t, strings)).size(LabelSize::Small))
                                 .when(current == Some(t), |item| item.end_slot(Icon::new(IconName::Check).size(IconSize::Small).color(Color::Accent)))
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     if let Some(range) = this.add_range.as_mut() {
@@ -2620,7 +2620,7 @@ impl TodoView {
                                             })),
                                     ),
                             )
-                            .child(Label::new(format!("{} {}", crate::calendar::format_day_month(when.date_naive(), strings), crate::calendar::format_time(when))).size(LabelSize::XSmall).color(Color::Muted)),
+                            .child(Label::new(format!("{} {}", crate::calendar::format_day_month(when.date_naive(), strings), crate::calendar::format_time(when, strings))).size(LabelSize::XSmall).color(Color::Muted)),
                     )
                     .into_any_element(),
             );

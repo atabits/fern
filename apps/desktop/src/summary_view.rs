@@ -149,7 +149,7 @@ fn line(task: &Task, fields: &[Field], lists: &[List], strings: &Strings) -> Str
     {
         out.push_str(&format!(" · {}", short_date(due, strings)));
         if let Some(time) = task.due_time {
-            out.push_str(&format!(" {}", calendar::format_time(time)));
+            out.push_str(&format!(" {}", calendar::format_time(time, strings)));
         }
     }
     if fields.contains(&Field::List) {
@@ -304,7 +304,7 @@ impl SummaryView {
             let selection = input.selection();
             let (text, selection) = match format {
                 Some(format) => markdown::apply(input.text(), selection, format),
-                None => markdown::insert(input.text(), selection, &calendar::format_time(Local::now().time())),
+                None => markdown::insert(input.text(), selection, &calendar::format_time(Local::now().time(), i18n::t(cx))),
             };
             input.edit(text, selection, window, cx);
         });

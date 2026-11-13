@@ -865,7 +865,7 @@ impl AppView {
             crate::sync::SyncStatus::Off if self.store.sync_config().ok().flatten().is_some() => strings.sync_never.to_owned(),
             crate::sync::SyncStatus::Off => strings.sync_off.to_owned(),
             crate::sync::SyncStatus::Running => strings.sync_running.to_owned(),
-            crate::sync::SyncStatus::Done(at) => strings.sync_done.replace("{time}", &crate::calendar::format_time(at.time())),
+            crate::sync::SyncStatus::Done(at) => strings.sync_done.replace("{time}", &crate::calendar::format_time(at.time(), strings)),
             crate::sync::SyncStatus::Failed(error) => strings.sync_failed.replace("{error}", error),
         };
         format!("{}\n{status}", strings.sync)

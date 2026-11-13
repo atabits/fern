@@ -433,7 +433,7 @@ impl SettingsWindow {
             .child(page("settings-appearance", IconName::PaintRoller, 2, Page::Appearance))
             .child(page("settings-more", IconName::ToggleRight, 3, Page::More))
             .child(
-                item("settings-sticky", IconName::FileText, crate::sticky_settings::labels(strings.inbox == "Входящие")[0], self.page == Page::Sticky)
+                item("settings-sticky", IconName::FileText, strings.sticky_notes, self.page == Page::Sticky)
                     .on_click(cx.listener(|this, _, _, cx| this.set_page(Page::Sticky, cx))),
             )
             .child(
@@ -720,7 +720,7 @@ impl SettingsWindow {
             group()
                 .child(field(strings.subscription_name, self.subscription_name.clone()))
                 .child(field("URL", self.subscription_url.clone()))
-                .child(h_flex().h(px(40.)).px_4().gap_4().child(div().w(px(80.)).child(Label::new(strings.subscription_color))).child(swatches))
+                .child(h_flex().h(px(40.)).px_4().gap_4().child(div().w(px(80.)).child(Label::new(strings.color))).child(swatches))
                 .child(
                     h_flex()
                         .px_4()
@@ -1166,7 +1166,7 @@ impl SettingsWindow {
                     .filter_map(|h| chrono::NaiveTime::from_hms_opt(h, 0, 0))
                     .map(|time| {
                         let option: (SharedString, bool, Box<dyn Fn(&mut Self, &mut Window, &mut Context<Self>)>) = (
-                            calendar::format_time(time).into(),
+                            calendar::format_time(time, strings).into(),
                             n.daily == Some(time),
                             Box::new(move |this: &mut Self, window: &mut Window, cx: &mut Context<Self>| {
                                 this.update(window, cx, |p| p.notifications.daily = Some(time))
@@ -1175,7 +1175,7 @@ impl SettingsWindow {
                         option
                     })
                     .collect();
-                let mut daily_time = n.daily.map(|t| self.select_row(None, strings.daily_time, calendar::format_time(t).into(), Menu::DailyTime, times, cx));
+                let mut daily_time = n.daily.map(|t| self.select_row(None, strings.daily_time, calendar::format_time(t, strings).into(), Menu::DailyTime, times, cx));
                 body.child(title(strings.notifications_page)).child(group().children(
                     strings.notification_items.into_iter().zip(values).zip(toggles).enumerate().map(|(i, (((name, hint), on), toggle))| {
                         v_flex()

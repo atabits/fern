@@ -37,10 +37,10 @@ fn duration(text: &str, maximum: i64) -> Option<i64> {
 impl FocusView {
     pub(super) fn open_stopwatch_review(&mut self, title: String, elapsed: i64, paused: bool, limited: bool, parent: &mut Window, cx: &mut Context<Self>) {
         let focus = cx.entity();
-        let ru = i18n::t(cx).inbox == "Входящие";
+        let strings = i18n::t(cx);
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(Bounds::centered(parent.display(cx).map(|display| display.id()), size(px(460.), px(400.)), cx))),
-            titlebar: Some(TitlebarOptions { title: Some(if ru { "Сохранить фокус" } else { "Save focus" }.into()), ..Default::default() }),
+            titlebar: Some(TitlebarOptions { title: Some(strings.focus_review_title.into()), ..Default::default() }),
             is_resizable: false,
             app_id: Some(std::env::var("FERN_APP_ID").unwrap_or_else(|_| "fern-tasks".into())),
             ..Default::default()
@@ -51,7 +51,8 @@ impl FocusView {
             Err(error) => {
                 self.finish_prompt = false;
                 if !paused && !limited && let Some(running) = self.running.as_mut() { running.timer.resume(now_ms()); }
-                self.message = Some(error.to_string());
+                eprintln!("failed to open the focus review: {error:#}");
+                self.message = Some(strings.focus_review_open_failed.to_owned());
             }
         }
         cx.notify();
@@ -67,7 +68,7 @@ pub(super) struct FocusReview {
     paused: bool,
     limited: bool,
     resolved: bool,
-    error: Option<String>,
+    error: Option<&'static str>,
 }
 
 impl FocusReview {
@@ -190,18 +191,20 @@ impl FocusReview {
 
     pub(super) fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.resolved { return; }
+        let strings = i18n::t(cx);
         let Some(value) = self.selected_duration(cx) else {
-            let ru = i18n::t(cx).inbox == "Входящие";
-            self.error = Some(if ru { "Введите целые часы и минуты от 0 до 59 в указанном диапазоне." }
-                else { "Enter whole hours and minutes from 0 to 59 within the shown range." }.to_owned());
+            self.error = Some(strings.focus_review_invalid_duration);
             cx.notify();
             return;
         };
-        let result = self.focus.update(cx, |focus, cx| -> anyhow::Result<()> {
-            let running = focus.running.as_ref().ok_or_else(|| anyhow::anyhow!("Focus session is no longer available"))?;
-            let (task, title) = running.task.as_ref().map_or((None, i18n::t(cx).focus), |(id, title)| (*id, title.as_str()));
+        let result = self.focus.update(cx, |focus, cx| -> Result<(), &'static str> {
+            let running = focus.running.as_ref().ok_or(strings.focus_session_unavailable)?;
+            let (task, title) = running.task.as_ref().map_or((None, strings.focus), |(id, title)| (*id, title.as_str()));
             let start = running.timer.started_at;
-            focus.store.add_focus_session_as(task, title, start, start + value, true)?;
+            focus.store.add_focus_session_as(task, title, start, start + value, true).map_err(|error| {
+                eprintln!("failed to save the focus session: {error:#}");
+                strings.focus_save_failed
+            })?;
             focus.running = None;
             focus.continuation = None;
             focus.cycle.reset();
@@ -213,14 +216,14 @@ impl FocusReview {
         });
         match result {
             Ok(()) => { self.resolved = true; window.remove_window(); }
-            Err(error) => { self.error = Some(error.to_string()); cx.notify(); }
+            Err(error) => { self.error = Some(error); cx.notify(); }
         }
     }
 }
 
 impl Render for FocusReview {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let ru = i18n::t(cx).inbox == "Входящие";
+        let strings = i18n::t(cx);
         let colors = cx.theme().colors().clone();
         let can_save = self.selected_duration(cx).is_some();
         v_flex().size_full().p_5().gap_3().bg(colors.background).text_color(colors.text)
@@ -232,34 +235,35 @@ impl Render for FocusReview {
                     cx.stop_propagation();
                 }
             }))
-            .child(Label::new(if ru { "Сохранить время фокуса" } else { "Save focused time" }).size(LabelSize::Large).weight(FontWeight::SEMIBOLD))
+            .child(Label::new(strings.focus_review_heading).size(LabelSize::Large).weight(FontWeight::SEMIBOLD))
             .child(Label::new(self.title.clone()).truncate())
             .child(Label::new(if self.limited {
-                if ru { "Достигнут лимит 12 часов. Уточните время перед сохранением." } else { "The 12-hour limit was reached. Review the time before saving." }
-            } else if ru { "Секундомер на паузе. При необходимости уменьшите длительность." }
-            else { "The stopwatch is paused. Reduce the duration if needed." }).size(LabelSize::Small))
+                strings.focus_review_limit
+            } else {
+                strings.focus_review_paused
+            }).size(LabelSize::Small))
             .child(h_flex().gap_3()
                 .child(v_flex().flex_1().gap_2()
-                    .child(Label::new(if ru { "Часы" } else { "Hours" }).size(LabelSize::Small))
+                    .child(Label::new(strings.focus_review_hours).size(LabelSize::Small))
                     .child(div().p_2().rounded(px(6.)).border_1().border_color(colors.border).child(self.hours.clone())))
                 .child(v_flex().flex_1().gap_2()
-                    .child(Label::new(if ru { "Минуты" } else { "Minutes" }).size(LabelSize::Small))
+                    .child(Label::new(strings.focus_review_minutes).size(LabelSize::Small))
                     .child(div().p_2().rounded(px(6.)).border_1().border_color(colors.border).child(self.minutes.clone()))))
             .child(Label::new(format!("{} – {}", clock(MIN_FOCUS_MS), clock(self.maximum))).size(LabelSize::Small).color(Color::Muted))
-            .when_some(self.error.clone(), |el, error| el.child(Label::new(error).size(LabelSize::Small)))
+            .when_some(self.error, |el, error| el.child(Label::new(error).size(LabelSize::Small)))
             .child(div().flex_1())
             .child(h_flex().gap_2()
                 .child(div().id("focus-review-discard").px_3().py_2().rounded(px(6.)).cursor_pointer().hover(|el| el.bg(colors.element_hover))
-                    .child(Label::new(if ru { "Не сохранять" } else { "Discard" }))
+                    .child(Label::new(strings.focus_discard))
                     .on_click(cx.listener(|this, _, window, cx| this.discard(window, cx))))
                 .child(div().flex_1())
                 .when(!self.limited, |el| el.child(div().id("focus-review-cancel").px_3().py_2().rounded(px(6.)).cursor_pointer().hover(|el| el.bg(colors.element_hover))
-                    .child(Label::new(if ru { "Продолжить" } else { "Continue" }))
+                    .child(Label::new(strings.focus_continue))
                     .on_click(cx.listener(|this, _, window, cx| this.cancel(window, cx)))))
                 .child(div().id("focus-review-save").px_3().py_2().rounded(px(6.)).bg(colors.accent)
                     .when(can_save, |el| el.cursor_pointer())
                     .when(!can_save, |el| el.opacity(0.5))
-                    .child(Label::new(if ru { "Сохранить" } else { "Save" }).color(Color::Custom(gpui::rgb(0xffffff).into())))
+                    .child(Label::new(strings.save).color(Color::Custom(gpui::rgb(0xffffff).into())))
                     .when(can_save, |el| el.on_click(cx.listener(|this, _, window, cx| this.save(window, cx))))))
     }
 }
@@ -356,7 +360,7 @@ mod tests {
 
     #[gpui::test]
     fn review_preserves_task_and_saves_edited_time_only_once(cx: &mut TestAppContext) {
-        cx.update(|cx| { theme::init(cx); cx.set_global(i18n::CurrentLocale(i18n::Locale::En)); });
+        cx.update(|cx| { theme::init(cx); cx.set_global(i18n::CurrentLocale(i18n::Locale::ZhCn)); });
         let store = Rc::new(Store::open_in_memory().unwrap());
         let task = store.add_task("Prepare project").unwrap();
         let handle = cx.add_window(|_, cx| FocusView::new(store.clone(), cx));
@@ -372,7 +376,7 @@ mod tests {
             review.hours.update(cx, |input, cx| input.set_text("3", cx));
             review.minutes.update(cx, |input, cx| input.set_text("00", cx));
             review.save(window, cx);
-            assert!(review.error.is_some());
+            assert_eq!(review.error, Some(i18n::ZH_CN.focus_review_invalid_duration));
             assert!(store.focus_sessions().unwrap().is_empty());
             review.hours.update(cx, |input, cx| input.set_text("1", cx));
             for invalid in ["", "60", "-1", "1:15", "9999999999999999999999999"] {

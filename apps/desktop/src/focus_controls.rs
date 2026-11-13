@@ -19,12 +19,7 @@ impl FocusView {
             // A delayed tick can arrive after the deadline; retain prior pause time.
             running.timer.resume(now);
             running.timer.pause(now - (elapsed - STOPWATCH_LIMIT_MS));
-            let ru = i18n::t(cx).inbox == "Входящие";
-            self.message = Some(if ru {
-                "Достигнут лимит 12 часов фокуса. Нажмите «Завершить», чтобы сохранить или удалить сессию."
-            } else {
-                "The 12-hour focus limit was reached. Choose End to save or discard this session."
-            }.to_owned());
+            self.message = Some(i18n::t(cx).focus_limit_notice.to_owned());
             cx.notify();
         }
         true
@@ -39,7 +34,7 @@ impl FocusView {
     }
 
     pub(super) fn render_automation(&self, cx: &mut Context<Self>) -> AnyElement {
-        let ru = i18n::t(cx).inbox == "Входящие";
+        let strings = i18n::t(cx);
         let number = |id: &'static str, title: &'static str, setting: (&'static str, i64, i64, i64), cx: &mut Context<Self>| {
             h_flex().gap_2()
                 .child(div().flex_1().child(Label::new(title).size(LabelSize::Small)))
@@ -55,15 +50,18 @@ impl FocusView {
                 .child(Switch::new().toggle_state(self.automatic(key)))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     let value = if this.automatic(key) { "0" } else { "1" };
-                    if let Err(err) = this.store.set_setting(key, value) { this.message = Some(err.to_string()); }
+                    if let Err(err) = this.store.set_setting(key, value) {
+                        eprintln!("failed to save the focus setting: {err:#}");
+                        this.message = Some(i18n::t(cx).focus_settings_save_failed.to_owned());
+                    }
                     cx.notify();
                 }))
         };
         v_flex().gap_2()
-            .child(number("long-break-every", if ru { "Длинный перерыв через" } else { "Long break after" }, ("focus_long_break_every", 4, 1, 60), cx))
-            .child(toggle("focus_auto_break", if ru { "Автоматически начинать перерыв" } else { "Start breaks automatically" }, cx))
-            .child(toggle("focus_auto_next", if ru { "Автоматически начинать фокус" } else { "Start next Pomodoro automatically" }, cx))
-            .child(number("auto-pomo-count", if ru { "Сессий в автоматической серии" } else { "Pomodoros in automatic series" }, ("focus_auto_count", 4, 2, 10), cx))
+            .child(number("long-break-every", strings.focus_long_break_every, ("focus_long_break_every", 4, 1, 60), cx))
+            .child(toggle("focus_auto_break", strings.focus_auto_break, cx))
+            .child(toggle("focus_auto_next", strings.focus_auto_next, cx))
+            .child(number("auto-pomo-count", strings.focus_auto_count, ("focus_auto_count", 4, 2, 10), cx))
             .into_any_element()
     }
 
@@ -92,28 +90,23 @@ impl FocusView {
             return;
         }
         let enough = elapsed >= MIN_FOCUS_MS;
-        let ru = i18n::t(cx).inbox == "Входящие";
-        let title = match (ru, limited) {
-            (true, true) => "Достигнут лимит 12 часов",
-            (false, true) => "12-hour limit reached",
-            (true, false) => "Завершить фокус?",
-            (false, false) => "End focus?",
-        };
-        let detail = match (ru, enough, limited) {
-            (true, _, true) => "Секундомер остановлен. Сохранить 12 часов фокуса или удалить сессию?",
-            (false, _, true) => "The stopwatch has stopped. Save 12 hours of focus or discard this session?",
-            (true, true, false) => "Сохранить время в истории фокуса или удалить эту сессию?",
-            (false, true, false) => "Save the focused time to your history or discard this session?",
-            (true, false, false) => "Сессия короче 5 минут не попадёт в историю. Завершить её?",
-            (false, false, false) => "Sessions shorter than 5 minutes are not recorded. End this session?",
-        };
-        let answers = match (ru, enough, limited) {
-            (true, _, true) => vec!["Сохранить", "Не сохранять", "Позже"],
-            (false, _, true) => vec!["Save", "Discard", "Later"],
-            (true, true, false) => vec!["Сохранить", "Не сохранять", "Продолжить"],
-            (false, true, false) => vec!["Save", "Discard", "Continue"],
-            (true, false, false) => vec!["Завершить", "Продолжить"],
-            (false, false, false) => vec!["End", "Continue"],
+        let strings = i18n::t(cx);
+        let (title, detail, answers) = match (enough, limited) {
+            (_, true) => (
+                strings.focus_limit_title,
+                strings.focus_end_limit_detail,
+                vec![strings.save, strings.focus_discard, strings.focus_later],
+            ),
+            (true, false) => (
+                strings.focus_end_question,
+                strings.focus_end_save_detail,
+                vec![strings.save, strings.focus_discard, strings.focus_continue],
+            ),
+            (false, false) => (
+                strings.focus_end_question,
+                strings.focus_end_short_detail,
+                vec![strings.focus_end, strings.focus_continue],
+            ),
         };
         let chosen = window.prompt(gpui::PromptLevel::Info, title, Some(detail), &answers, cx);
         self.finish_prompt = true;
@@ -241,7 +234,7 @@ mod tests {
     async fn stop_confirmation_matches_original_boundaries(cx: &mut TestAppContext) {
         cx.update(|cx| {
             theme::init(cx);
-            cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+            cx.set_global(i18n::CurrentLocale(i18n::Locale::ZhCn));
         });
         // Pause at exact elapsed boundaries so wall-clock scheduling cannot change them.
         for (stopwatch, seconds, prompt, saved) in [
@@ -274,7 +267,7 @@ mod tests {
                 review.update(cx, |review, window, cx| review.cancel(window, cx)).unwrap();
                 handle.update(cx, |view, _, _| assert!(view.running.as_ref().unwrap().timer.is_paused())).unwrap();
             } else if prompt {
-                cx.simulate_prompt_answer("Continue");
+                cx.simulate_prompt_answer("继续");
                 cx.run_until_parked();
                 handle.update(cx, |view, _, _| {
                     assert!(view.running.as_ref().unwrap().timer.is_paused());

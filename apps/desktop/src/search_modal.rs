@@ -3,7 +3,7 @@
 
 use std::rc::Rc;
 
-use chrono::{Datelike, Local, NaiveDate};
+use chrono::Local;
 use fern_core::search::{DateRange, TagRule, TaskFilter};
 use fern_core::{Id, List, Priority, Store, Tag, Task, View};
 use gpui::{Entity, EventEmitter, FocusHandle, Focusable, FontWeight, HighlightStyle, StyledText};
@@ -160,10 +160,7 @@ impl SearchModal {
     /// A Date choice's words: "This Week (Oct 12 - Oct 18)", as the original's.
     fn range_label(range: DateRange, strings: &'static crate::i18n::Strings) -> String {
         let today = Local::now().date_naive();
-        let short = |d: NaiveDate| {
-            let month = strings.months_short[d.month0() as usize];
-            if strings.day_before_month { format!("{} {month}", d.day()) } else { format!("{month} {}", d.day()) }
-        };
+        let short = |date| task_rows::short_date(date, strings);
         let name = match range {
             DateRange::All => strings.all_option,
             DateRange::ThisWeek => strings.this_week,

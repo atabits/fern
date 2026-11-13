@@ -467,8 +467,7 @@ impl ClosedRange {
 
 /// "Oct 18" / "18 окт".
 pub fn short_date(date: NaiveDate, strings: &Strings) -> String {
-    let month = strings.months_short[date.month0() as usize];
-    if strings.day_before_month { format!("{} {month}", date.day()) } else { format!("{month} {}", date.day()) }
+    format_day(strings.short_date[0], date, strings)
 }
 
 /// The local day of a timestamp in milliseconds.
@@ -564,17 +563,7 @@ pub fn relative_day(day: NaiveDate, name: &str, strings: &Strings) -> String {
 
 /// "Sunday, September 27", with the year when it is not the current one.
 pub fn day_header(day: NaiveDate, today: NaiveDate, strings: &Strings) -> String {
-    let weekday = strings.weekdays_full[day.weekday().num_days_from_monday() as usize];
-    let month = strings.months_genitive[day.month0() as usize];
-    let mut label = if strings.day_before_month {
-        format!("{weekday}, {} {month}", day.day())
-    } else {
-        format!("{weekday}, {month} {}", day.day())
-    };
-    if day.year() != today.year() {
-        label.push_str(&format!(", {}", day.year()));
-    }
-    label
+    format_day(strings.day_header[usize::from(day.year() != today.year())], day, strings)
 }
 
 /// A day's header in Next 7 Days, as the original's: "Sunday, Today", "Monday, Tomorrow",
@@ -635,24 +624,15 @@ pub fn due_label(
     strings: &Strings,
 ) -> (String, bool) {
     let days = (date - today).num_days();
-    let day_month = || {
-        let month = strings.months_short[date.month0() as usize];
-        if strings.day_before_month {
-            format!("{} {month}", date.day())
-        } else {
-            format!("{month} {}", date.day())
-        }
-    };
     let mut label = match days {
         0 => strings.today.to_owned(),
         1 => strings.tomorrow.to_owned(),
         -1 => strings.yesterday.to_owned(),
         2..=6 => strings.weekdays_short[date.weekday().num_days_from_monday() as usize].to_owned(),
-        _ if date.year() == today.year() => day_month(),
-        _ => format!("{} {}", day_month(), date.year()),
+        _ => format_day(strings.short_date[usize::from(date.year() != today.year())], date, strings),
     };
     if let Some(time) = time {
-        label.push_str(&format!(" {}", crate::calendar::format_time(time)));
+        label.push_str(&format!(" {}", crate::calendar::format_time(time, strings)));
     }
     (label, days < 0)
 }
@@ -663,7 +643,7 @@ pub fn card_due_label(date: NaiveDate, time: Option<NaiveTime>, today: NaiveDate
     let weekday = strings.weekdays_short[date.weekday().num_days_from_monday() as usize];
     let mut label = format!("{weekday}, {}", closed_due_label(date, today, strings));
     if let Some(time) = time {
-        label.push_str(&format!(" {}", crate::calendar::format_time(time)));
+        label.push_str(&format!(" {}", crate::calendar::format_time(time, strings)));
     }
     label
 }

@@ -59,12 +59,16 @@ pub fn week_number(week: &[NaiveDate; 7]) -> u32 {
 /// A numeric date in the chosen format: "12/31/2026", "31/12/2026" or "2026/12/31"; without a
 /// choice, the language's own ("31.12.2026" in Russian).
 pub fn format_date(date: NaiveDate, strings: &Strings) -> String {
-    format_date_as(date, DATE_FORMAT.with(Cell::get), strings.dotted_dates, true)
+    format_date_as(date, selected_date_format(strings), strings.dotted_dates, true)
 }
 
 /// A numeric day and month: "12/31", "31/12" or "31.12".
 pub fn format_day_month(date: NaiveDate, strings: &Strings) -> String {
-    format_date_as(date, DATE_FORMAT.with(Cell::get), strings.dotted_dates, false)
+    format_date_as(date, selected_date_format(strings), strings.dotted_dates, false)
+}
+
+fn selected_date_format(strings: &Strings) -> Option<fern_core::DateFormat> {
+    DATE_FORMAT.with(Cell::get).or(strings.year_first_dates.then_some(fern_core::DateFormat::YearMonthDay))
 }
 
 /// A typed date: ISO ("2026-10-18"), or the numeric format dates are shown in, with or without
@@ -76,7 +80,7 @@ pub fn parse_date(text: &str, today: NaiveDate, strings: &Strings) -> Option<Nai
     }
     let parts: Vec<u32> = text.split(['.', '/', '-']).map(|p| p.trim().parse().ok()).collect::<Option<_>>()?;
     use fern_core::DateFormat::*;
-    let format = DATE_FORMAT.with(Cell::get).unwrap_or(if strings.dotted_dates { DayMonthYear } else { MonthDayYear });
+    let format = selected_date_format(strings).unwrap_or(if strings.dotted_dates { DayMonthYear } else { MonthDayYear });
     let (y, m, d) = match (format, parts.as_slice()) {
         (YearMonthDay, &[y, m, d]) => (y as i32, m, d),
         (DayMonthYear, &[d, m, y]) => (y as i32, m, d),
@@ -108,25 +112,25 @@ pub fn set_hour12(on: bool) {
     HOUR12.with(|hour12| hour12.set(on));
 }
 
-/// A time of day in the chosen format: "13:05" or "1:05 PM".
-pub fn format_time(time: impl Timelike) -> String {
-    format_time_as(time, HOUR12.with(Cell::get))
+/// A time of day in the chosen format, with the locale's 12-hour labels.
+pub fn format_time(time: impl Timelike, strings: &Strings) -> String {
+    format_time_as(time, HOUR12.with(Cell::get), strings)
 }
 
-pub fn format_time_as(time: impl Timelike, hour12: bool) -> String {
+fn format_time_as(time: impl Timelike, hour12: bool, strings: &Strings) -> String {
     if hour12 {
         let (pm, hour) = time.hour12();
-        format!("{hour}:{:02} {}", time.minute(), if pm { "PM" } else { "AM" })
+        strings.time_meridiem[usize::from(pm)].replace("{time}", &format!("{hour}:{:02}", time.minute()))
     } else {
         format!("{:02}:{:02}", time.hour(), time.minute())
     }
 }
 
 /// A whole hour for time axes and hints: "09:00" or "9 AM".
-pub fn format_hour(hour: u32) -> String {
+pub fn format_hour(hour: u32, strings: &Strings) -> String {
     if HOUR12.with(Cell::get) {
         let (pm, hour) = NaiveTime::from_hms_opt(hour % 24, 0, 0).expect("a valid hour").hour12();
-        format!("{hour} {}", if pm { "PM" } else { "AM" })
+        strings.time_meridiem[usize::from(pm)].replace("{time}", &hour.to_string())
     } else {
         format!("{hour:02}:00")
     }
@@ -241,13 +245,17 @@ pub fn timed_segment(task: &fern_core::Task, date: NaiveDate) -> Option<(NaiveTi
 }
 
 pub fn month_title(month: NaiveDate, strings: &Strings) -> String {
-    format!("{} {}", strings.months[month.month0() as usize], month.year())
+    let index = month.month0() as usize;
+    strings.month_title
+        .replace("{month}", strings.months[index])
+        .replace("{mon}", strings.months_short[index])
+        .replace("{yyyy}", &month.year().to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::i18n::{EN, RU};
+    use crate::i18n::{EN, RU, ZH_CN};
 
     fn d(y: i32, m: u32, day: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(y, m, day).unwrap()
@@ -344,17 +352,39 @@ mod tests {
     }
 
     #[test]
+    fn chinese_dates_follow_the_locale_and_explicit_overrides() {
+        use fern_core::DateFormat::DayMonthYear;
+        let date = d(2026, 11, 2);
+        assert_eq!(format_date(date, &ZH_CN), "2026/11/02");
+        assert_eq!(format_day_month(date, &ZH_CN), "11/02");
+        assert_eq!(parse_date("2026/11/02", date, &ZH_CN), Some(date));
+        assert_eq!(parse_date("11/02", date, &ZH_CN), Some(date));
+
+        set_date_format(Some(DayMonthYear));
+        assert_eq!(format_date(date, &ZH_CN), "02/11/2026");
+        assert_eq!(format_day_month(date, &ZH_CN), "02/11");
+        assert_eq!(parse_date("02/11/2026", date, &ZH_CN), Some(date));
+        assert_eq!(parse_date("02/11", date, &ZH_CN), Some(date));
+        set_date_format(None);
+    }
+
+    #[test]
     fn twelve_and_twenty_four_hour_times() {
         let t = |h, m| NaiveTime::from_hms_opt(h, m, 0).unwrap();
-        assert_eq!(format_time_as(t(13, 5), false), "13:05");
-        assert_eq!(format_time_as(t(13, 5), true), "1:05 PM");
-        assert_eq!(format_time_as(t(0, 30), true), "12:30 AM");
-        assert_eq!(format_time_as(t(12, 0), true), "12:00 PM");
+        assert_eq!(format_time_as(t(13, 5), false, &EN), "13:05");
+        assert_eq!(format_time_as(t(13, 5), true, &EN), "1:05 PM");
+        assert_eq!(format_time_as(t(0, 30), true, &EN), "12:30 AM");
+        assert_eq!(format_time_as(t(12, 0), true, &RU), "12:00 PM");
+        assert_eq!(format_time_as(t(13, 5), false, &ZH_CN), "13:05");
+        assert_eq!(format_time_as(t(0, 30), true, &ZH_CN), "上午12:30");
+        assert_eq!(format_time_as(t(12, 0), true, &ZH_CN), "下午12:00");
         set_hour12(true);
-        assert_eq!(format_hour(9), "9 AM");
-        assert_eq!(format_time(t(21, 0)), "9:00 PM");
+        assert_eq!(format_hour(9, &EN), "9 AM");
+        assert_eq!(format_hour(9, &ZH_CN), "上午9");
+        assert_eq!(format_time(t(21, 0), &EN), "9:00 PM");
+        assert_eq!(format_time(t(21, 0), &ZH_CN), "下午9:00");
         set_hour12(false);
-        assert_eq!(format_hour(9), "09:00");
+        assert_eq!(format_hour(9, &EN), "09:00");
     }
 
     #[test]
@@ -376,6 +406,7 @@ mod tests {
         assert_eq!(add_months(d(2026, 1, 15), -1), d(2025, 12, 1));
         assert_eq!(month_title(d(2026, 10, 18), &EN), "October 2026");
         assert_eq!(month_title(d(2026, 10, 18), &RU), "Октябрь 2026");
+        assert_eq!(month_title(d(2026, 10, 18), &ZH_CN), "2026年10月");
     }
 
     #[test]

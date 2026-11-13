@@ -205,6 +205,7 @@ impl StickyNote {
 impl Render for StickyNote {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
+        let strings = i18n::t(cx);
         #[cfg(windows)]
         set_opacity(_window, self.settings.opacity);
         let foreground: gpui::Hsla = gpui::rgb(self.settings.foreground()).into();
@@ -246,7 +247,7 @@ impl Render for StickyNote {
                                 .size(px(22.))
                                 .icon_size(IconSize::Small)
                                 .icon_color(Color::Custom(foreground))
-                                .tooltip(Tooltip::text(if self.pinned { i18n::t(cx).unpin } else { i18n::t(cx).pin }))
+                                .tooltip(Tooltip::text(if self.pinned { strings.unpin } else { strings.pin }))
                                 .on_click(cx.listener(|this, _, _window, cx| {
                                     this.pinned = !this.pinned;
                                     #[cfg(windows)]
@@ -259,7 +260,7 @@ impl Render for StickyNote {
                     .child(
                         div().relative().child(IconButton::new("sticky-color", IconName::PaintRoller)
                             .size(px(22.)).icon_size(IconSize::Small).icon_color(Color::Custom(foreground))
-                            .tooltip(Tooltip::text(crate::sticky_settings::labels(i18n::t(cx).inbox == "Входящие")[1]))
+                            .tooltip(Tooltip::text(strings.color))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.palette_open = !this.palette_open;
                                 cx.notify();
@@ -287,7 +288,7 @@ impl Render for StickyNote {
                             .icon_color(Color::Custom(foreground))
                             .size(px(22.))
                             .icon_size(IconSize::Small)
-                            .tooltip(Tooltip::text(i18n::t(cx).close))
+                            .tooltip(Tooltip::text(strings.close))
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.forget(cx);
                                 window.remove_window();

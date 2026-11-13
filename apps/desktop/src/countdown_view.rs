@@ -305,7 +305,7 @@ impl CountdownView {
             })
         };
         let count = field("1", cx);
-        let time = field(&calendar::format_time(fern_core::countdown::reminder_time()), cx);
+        let time = field(&calendar::format_time(fern_core::countdown::reminder_time(), i18n::t(cx)), cx);
         for input in [&count, &time] {
             cx.subscribe(input, |_, _, _: &crate::text_input::Changed, cx| cx.notify()).detach();
             cx.subscribe(input, |this, _, _: &Submitted, cx| this.confirm_custom_reminder(cx)).detach();
@@ -699,7 +699,7 @@ impl CountdownView {
         // The Reminder dropdown: the original's None, the days before at 09:00 (several may be
         // ticked), and Constant Reminder.
         let custom_label = |days: u32, time: chrono::NaiveTime| {
-            format!("{} ({})", strings.countdown_custom_label.replace("{n}", &days.to_string()), crate::calendar::format_time(time))
+            format!("{} ({})", strings.countdown_custom_label.replace("{n}", &days.to_string()), crate::calendar::format_time(time, strings))
         };
         let reminder_text = if draft.reminders.is_empty() && draft.custom_reminders.is_empty() {
             strings.none_option.to_owned()
@@ -713,7 +713,7 @@ impl CountdownView {
                 .collect::<Vec<_>>()
                 .join(", ")
         };
-        let time = crate::calendar::format_time(fern_core::countdown::reminder_time());
+        let time = crate::calendar::format_time(fern_core::countdown::reminder_time(), strings);
         let constant = draft.constant_reminder;
         let custom_form = draft.custom.as_ref().map(|custom| {
             let weeks = custom.weeks;

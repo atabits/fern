@@ -339,7 +339,7 @@ impl TaskDetail {
                     let selection = input.selection();
                     let (text, selection) = match format {
                         Some(format) => fern_core::markdown::apply(input.text(), selection, format),
-                        None => fern_core::markdown::insert(input.text(), selection, &crate::calendar::format_time(Local::now().time())),
+                        None => fern_core::markdown::insert(input.text(), selection, &crate::calendar::format_time(Local::now().time(), i18n::t(cx))),
                     };
                     input.edit(text, selection, window, cx);
                 });
@@ -383,7 +383,7 @@ impl TaskDetail {
                 let id = comment.id;
                 let when = chrono::DateTime::from_timestamp_millis(comment.created_at)
                     .map(|t| t.with_timezone(&Local).naive_local())
-                    .map(|t| format!("{} {}", crate::calendar::format_date(t.date(), strings), crate::calendar::format_time(t.time())))
+                    .map(|t| format!("{} {}", crate::calendar::format_date(t.date(), strings), crate::calendar::format_time(t.time(), strings)))
                     .unwrap_or_default();
                 h_flex()
                     .id(SharedString::from(format!("comment-{id}")))
@@ -1088,7 +1088,7 @@ impl TaskDetail {
                 let when = chrono::Local
                     .timestamp_millis_opt(entry.at)
                     .single()
-                    .map(|t| format!("{} {}", calendar::format_day_month(t.date_naive(), strings), calendar::format_time(t)))
+                    .map(|t| format!("{} {}", calendar::format_day_month(t.date_naive(), strings), calendar::format_time(t, strings)))
                     .unwrap_or_default();
                 h_flex()
                     .items_start()
@@ -1399,7 +1399,7 @@ impl TaskDetail {
         let day = |date: Option<NaiveDate>| -> SharedString {
             date.map_or(SharedString::default(), |d| task_rows::short_date(d, strings).into())
         };
-        let time = |t: Option<chrono::NaiveTime>| -> SharedString { t.map_or(SharedString::default(), |t| crate::calendar::format_time(t).into()) };
+        let time = |t: Option<chrono::NaiveTime>| -> SharedString { t.map_or(SharedString::default(), |t| crate::calendar::format_time(t, strings).into()) };
         let line = |label: &'static str, date_chip: AnyElement, time_chip: Option<AnyElement>| {
             h_flex()
                 .gap_2()
@@ -1423,7 +1423,7 @@ impl TaskDetail {
                         .children(due_picker::time_options().into_iter().map(|t| {
                             ListItem::new(SharedString::from(format!("range-time-{t}")))
                                 .height(px(28.))
-                                .child(Label::new(crate::calendar::format_time(t)).size(LabelSize::Small))
+                                .child(Label::new(crate::calendar::format_time(t, strings)).size(LabelSize::Small))
                                 .when(current == Some(t), |item| item.end_slot(check_mark()))
                                 .on_click(cx.listener(move |this, _, _, cx| this.update_draft(cx, |d| d.pick_range_time(t))))
                         }))
@@ -1541,7 +1541,7 @@ impl TaskDetail {
                 }))
         };
         let time_label: SharedString =
-            draft.time.map_or(strings.time.into(), |t| crate::calendar::format_time(t).into());
+            draft.time.map_or(strings.time.into(), |t| crate::calendar::format_time(t, strings).into());
         let repeat_label: SharedString =
             draft.repeat.as_ref().map_or(strings.repeat.into(), |r| due_picker::repeat_label(r, strings).into());
 
@@ -1566,7 +1566,7 @@ impl TaskDetail {
                         std::iter::once(None)
                             .chain(due_picker::time_options().into_iter().map(Some))
                             .map(|time| {
-                                let label: SharedString = time.map_or(strings.no_time.into(), |t| crate::calendar::format_time(t).into());
+                                let label: SharedString = time.map_or(strings.no_time.into(), |t| crate::calendar::format_time(t, strings).into());
                                 ListItem::new(SharedString::from(format!("time-{label}")))
                                     .height(px(28.))
                                     .child(Label::new(label).size(LabelSize::Small))
@@ -1847,8 +1847,8 @@ impl TaskDetail {
         let summary = fires.map(|at| {
             strings
                 .reminder_summary
-                .replace("{time}", &crate::calendar::format_time(at))
-                .replace("{date}", &format!("{}, {}", task_rows::short_date(at.date(), strings), at.year()))
+                .replace("{time}", &crate::calendar::format_time(at, strings))
+                .replace("{date}", &task_rows::format_day(strings.short_date[1], at.date(), strings))
         });
         let stepper_row = |label: &'static str, value: String, minus: AnyElement, plus: AnyElement| {
             h_flex()
@@ -1908,7 +1908,7 @@ impl TaskDetail {
             .when(!has_time, |el| {
                 el.child(stepper_row(
                     strings.reminder_at,
-                    crate::calendar::format_time(custom.at),
+                    crate::calendar::format_time(custom.at, strings),
                     small("reminder-earlier", IconName::Minus)
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.update_custom_reminder(cx, |c| c.at = c.at - chrono::Duration::minutes(30))

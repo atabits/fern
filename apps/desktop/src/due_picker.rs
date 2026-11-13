@@ -182,16 +182,18 @@ pub fn custom_start(repeat: Option<Recurrence>, date: NaiveDate) -> Recurrence {
     })
 }
 
-/// A time typed by hand: "7", "7:45", "745", "19.30", "7pm", "7:45 am".
+/// A time typed by hand: "7", "7:45", "745", "19.30", "7pm", "7:45 am", "下午7:45".
 pub fn parse_time(text: &str) -> Option<NaiveTime> {
-    let text = text.trim().to_lowercase();
-    let (text, meridiem) = match text.strip_suffix("am").or_else(|| text.strip_suffix("a")) {
-        Some(rest) => (rest.trim().to_owned(), Some(false)),
-        None => match text.strip_suffix("pm").or_else(|| text.strip_suffix("p")) {
-            Some(rest) => (rest.trim().to_owned(), Some(true)),
-            None => (text.clone(), None),
-        },
-    };
+    let input = text.trim().to_ascii_lowercase();
+    let (text, meridiem) = [
+        (input.strip_prefix("上午"), false),
+        (input.strip_prefix("下午"), true),
+        (input.strip_suffix("am").or_else(|| input.strip_suffix("a")), false),
+        (input.strip_suffix("pm").or_else(|| input.strip_suffix("p")), true),
+    ]
+    .into_iter()
+    .find_map(|(text, pm)| text.map(|text| (text.trim(), Some(pm))))
+    .unwrap_or((&input, None));
     let (hour, minute) = match text.split_once([':', '.', ' ']) {
         Some((h, m)) => (h.trim().parse::<u32>().ok()?, m.trim().parse::<u32>().ok()?),
         None if text.len() >= 3 && text.chars().all(|c| c.is_ascii_digit()) => {
@@ -301,7 +303,7 @@ pub fn describe_reminder(offset: i64, has_time: bool, strings: &Strings) -> Stri
     } else {
         fill_days(days as i64)
     };
-    format!("{base} ({})", crate::calendar::format_time(at))
+    format!("{base} ({})", crate::calendar::format_time(at, strings))
 }
 
 /// The reminder options for the draft, with a hint ("09:00" for all-day tasks).
@@ -309,7 +311,7 @@ pub fn reminder_options(has_time: bool, strings: &Strings) -> Vec<(i64, &'static
     if has_time {
         TIMED_OFFSETS.into_iter().zip(strings.reminders_timed).map(|(m, label)| (m, label, String::new())).collect()
     } else {
-        let hint = crate::calendar::format_hour(ALL_DAY_REMINDER_HOUR);
+        let hint = crate::calendar::format_hour(ALL_DAY_REMINDER_HOUR, strings);
         ALL_DAY_OFFSETS.into_iter().zip(strings.reminders_all_day).map(|(m, label)| (m, label, hint.clone())).collect()
     }
 }
@@ -324,7 +326,7 @@ pub fn reminder_label(reminders: &[i64], has_time: bool, strings: &Strings) -> O
         .map(|offset| {
             let label = describe_reminder(*offset, has_time, strings);
             // The row stays short: preset all-day reminders drop their usual "(09:00)".
-            label.strip_suffix(&format!(" ({})", crate::calendar::format_hour(ALL_DAY_REMINDER_HOUR))).map(str::to_owned).unwrap_or(label)
+            label.strip_suffix(&format!(" ({})", crate::calendar::format_hour(ALL_DAY_REMINDER_HOUR, strings))).map(str::to_owned).unwrap_or(label)
         })
         .collect();
     Some(labels.join(", "))
@@ -339,7 +341,7 @@ pub fn range_label(
     strings: &Strings,
 ) -> String {
     let day = |date| crate::task_rows::short_date(date, strings);
-    let time = |t: Option<NaiveTime>| t.map(|t| crate::calendar::format_time(t));
+    let time = |t: Option<NaiveTime>| t.map(|t| crate::calendar::format_time(t, strings));
     match (time(start_time), time(end_time)) {
         (Some(a), Some(b)) if start == end => format!("{}, {a} - {b}", day(start)),
         (Some(a), Some(b)) => format!("{}, {a} - {}, {b}", day(start), day(end)),
@@ -560,6 +562,10 @@ mod tests {
         assert_eq!(parse_time("7pm"), t(19, 0));
         assert_eq!(parse_time("12 am"), t(0, 0));
         assert_eq!(parse_time("7:45 PM"), t(19, 45));
+        assert_eq!(parse_time("下午7:45"), t(19, 45));
+        assert_eq!(parse_time("上午12:30"), t(0, 30));
+        assert_eq!(parse_time("下午12:00"), t(12, 0));
+        assert_eq!(parse_time("下午13:00"), None);
         assert_eq!(parse_time("25"), None);
         assert_eq!(parse_time("13pm"), None);
         assert_eq!(parse_time("soon"), None);

@@ -248,6 +248,7 @@ impl CalendarView {
     /// An event's bar: the calendar's color, its time when it has one, and a card with the rest
     /// on a click. Events cannot be changed here: they belong to the calendar they come from.
     fn event_bar(&self, event: EventBar, date: NaiveDate, cx: &mut Context<Self>) -> Stateful<Div> {
+        let strings = i18n::t(cx);
         let open = self.open_event.as_ref() == Some(&(event.key.clone(), event.start));
         let key = (event.key.clone(), event.start);
         let column = calendar::week_of(date).iter().position(|d| *d == date).unwrap_or(0);
@@ -263,7 +264,7 @@ impl CalendarView {
             .border_l_2()
             .border_color(event.color)
             .when_some(event.start_time.filter(|_| event.start == date), |el, time| {
-                el.child(Label::new(calendar::format_time(time)).size(LabelSize::XSmall).color(Color::Muted))
+                el.child(Label::new(calendar::format_time(time, strings)).size(LabelSize::XSmall).color(Color::Muted))
             })
             .child(div().flex_1().min_w_0().child(Label::new(event.title.clone()).size(LabelSize::XSmall).truncate()))
             .on_click(cx.listener(move |this, _, _, cx| {
@@ -281,9 +282,9 @@ impl CalendarView {
         let strings = i18n::t(cx);
         let day = |date: NaiveDate| task_rows::format_day(strings.closed_date[0], date, strings);
         let when = match (event.start_time, event.end_time) {
-            (Some(from), Some(to)) if event.start == event.end => format!("{}, {} – {}", day(event.start), calendar::format_time(from), calendar::format_time(to)),
-            (Some(from), Some(to)) => format!("{} {} – {} {}", day(event.start), calendar::format_time(from), day(event.end), calendar::format_time(to)),
-            (Some(from), None) => format!("{}, {}", day(event.start), calendar::format_time(from)),
+            (Some(from), Some(to)) if event.start == event.end => format!("{}, {} – {}", day(event.start), calendar::format_time(from, strings), calendar::format_time(to, strings)),
+            (Some(from), Some(to)) => format!("{} {} – {} {}", day(event.start), calendar::format_time(from, strings), day(event.end), calendar::format_time(to, strings)),
+            (Some(from), None) => format!("{}, {}", day(event.start), calendar::format_time(from, strings)),
             (None, _) if event.start == event.end => format!("{}, {}", day(event.start), strings.range_all_day),
             (None, _) => format!("{} – {}", day(event.start), day(event.end)),
         };
@@ -328,7 +329,7 @@ impl CalendarView {
     /// calendar's color, which opens the event's card.
     fn agenda_event_row(&self, event: EventBar, date: NaiveDate, cx: &mut Context<Self>) -> AnyElement {
         let strings = i18n::t(cx);
-        let when = event.start_time.filter(|_| event.start == date).map_or(strings.range_all_day.to_owned(), calendar::format_time);
+        let when = event.start_time.filter(|_| event.start == date).map_or(strings.range_all_day.to_owned(), |time| calendar::format_time(time, strings));
         let key = (event.key.clone(), event.start);
         let open = self.open_event.as_ref() == Some(&key);
         h_flex()
@@ -359,6 +360,7 @@ impl CalendarView {
     }
 
     fn day_extras(&self, date: NaiveDate, cx: &App) -> Vec<AnyElement> {
+        let strings = i18n::t(cx);
         let theme = cx.theme();
         let today = Local::now().date_naive();
         let bar = |tint: gpui::Hsla| h_flex().h(px(18.)).flex_none().gap_1().px_1().rounded(px(3.)).bg(tint.opacity(0.28));
@@ -392,7 +394,7 @@ impl CalendarView {
                     .border_color(theme.colors().accent.opacity(0.4))
                     .child(Icon::new(IconName::Timer).size(IconSize::XSmall).color(Color::Muted))
                     .child(div().flex_1().min_w_0().child(Label::new(session.title.clone()).size(LabelSize::XSmall).color(Color::Muted).truncate()))
-                    .when_some(start, |el, start| el.child(Label::new(calendar::format_time(start)).size(LabelSize::XSmall).color(Color::Muted)))
+                    .when_some(start, |el, start| el.child(Label::new(calendar::format_time(start, strings)).size(LabelSize::XSmall).color(Color::Muted)))
                     .into_any_element(),
             );
         }
@@ -889,8 +891,7 @@ impl CalendarView {
         let room = event_room.saturating_sub(events.len());
         // The first day of a month carries the month name, as in the original: "Oct 1".
         let number = if date.day() == 1 {
-            let month = strings.months_short[date.month0() as usize];
-            if strings.day_before_month { format!("1 {month}") } else { format!("{month} 1") }
+            task_rows::short_date(date, strings)
         } else {
             date.day().to_string()
         };
@@ -1057,7 +1058,7 @@ impl CalendarView {
 
         // Time axis labels and hour lines.
         let hour_label = |hour: u32| -> SharedString {
-            if hour == 12 { strings.noon.into() } else { calendar::format_hour(hour).into() }
+            if hour == 12 { strings.noon.into() } else { calendar::format_hour(hour, strings).into() }
         };
         let now_color = theme.status().error;
         let mut axis = v_flex().w(gutter).flex_none().child(
@@ -1068,8 +1069,8 @@ impl CalendarView {
                 .justify_center()
                 .bg(theme.colors().panel_background)
                 .flex_col()
-                .child(Label::new(calendar::format_hour(0)).size(LabelSize::XSmall).color(Color::Muted))
-                .child(Label::new(format!("– {}", calendar::format_hour(7))).size(LabelSize::XSmall).color(Color::Muted)),
+                .child(Label::new(calendar::format_hour(0, strings)).size(LabelSize::XSmall).color(Color::Muted))
+                .child(Label::new(format!("– {}", calendar::format_hour(7, strings))).size(LabelSize::XSmall).color(Color::Muted)),
         );
         for hour in week_axis::FIRST_HOUR..week_axis::LAST_HOUR {
             axis = axis.child(
@@ -1089,8 +1090,8 @@ impl CalendarView {
                 .justify_center()
                 .bg(theme.colors().panel_background)
                 .flex_col()
-                .child(Label::new(calendar::format_hour(21)).size(LabelSize::XSmall).color(Color::Muted))
-                .child(Label::new(format!("– {}", calendar::format_hour(0))).size(LabelSize::XSmall).color(Color::Muted)),
+                .child(Label::new(calendar::format_hour(21, strings)).size(LabelSize::XSmall).color(Color::Muted))
+                .child(Label::new(format!("– {}", calendar::format_hour(0, strings))).size(LabelSize::XSmall).color(Color::Muted)),
         );
 
         let columns = week.iter().copied().map(|date| {
@@ -1193,7 +1194,7 @@ impl CalendarView {
                                             .px_0p5()
                                             .bg(theme.colors().background)
                                             .child(
-                                                Label::new(calendar::format_time(now))
+                                                Label::new(calendar::format_time(now, strings))
                                                     .size(LabelSize::XSmall)
                                                     .color(Color::Custom(now_color)),
                                             ),
@@ -1316,7 +1317,7 @@ impl CalendarView {
                         } else {
                             task_rows::priority_color(item.priority, &theme).unwrap_or(theme.colors().accent)
                         };
-                        let when = item.time.map_or(strings.range_all_day.to_owned(), calendar::format_time);
+                        let when = item.time.map_or(strings.range_all_day.to_owned(), |time| calendar::format_time(time, strings));
                         h_flex()
                             .gap_3()
                             .child(div().w(px(72.)).flex_none().child(Label::new(when).size(LabelSize::Small).color(Color::Muted)))

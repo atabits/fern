@@ -538,7 +538,8 @@ impl FocusView {
             let start = running.timer.started_at;
             let stopwatch = running.timer.is_stopwatch();
             if let Err(err) = self.store.add_focus_session_as(task_id, &title, start, start + elapsed, stopwatch) {
-                self.message = Some(err.to_string());
+                eprintln!("failed to save the focus session: {err:#}");
+                self.message = Some(strings.focus_save_failed.to_owned());
                 running.timer.pause(now);
                 self.running = Some(running);
                 cx.notify();
@@ -609,8 +610,8 @@ impl FocusView {
         let when = format!(
             "{}, {} - {}",
             crate::task_rows::short_date(start.date_naive(), strings),
-            crate::calendar::format_time(start),
-            crate::calendar::format_time(session.end_local())
+            crate::calendar::format_time(start, strings),
+            crate::calendar::format_time(session.end_local(), strings)
         );
         Some(
             div()
@@ -952,8 +953,8 @@ impl FocusView {
                 let on = self.batch.contains(&id);
                 let span = format!(
                     "{} - {}",
-                    crate::calendar::format_time(session.start_local().time()),
-                    crate::calendar::format_time(session.end_local().time())
+                    crate::calendar::format_time(session.start_local().time(), strings),
+                    crate::calendar::format_time(session.end_local().time(), strings)
                 );
                 rows.push(
                     h_flex()
@@ -1783,7 +1784,7 @@ impl FocusView {
                     .items_start()
                     .gap_2()
                     .child(v_flex().w(px(40.)).h(px(TIMELINE)).justify_between().children((0..=6).map(|i| {
-                        Label::new(crate::calendar::format_hour((i * 4) % 24)).size(LabelSize::XSmall).color(Color::Muted)
+                        Label::new(crate::calendar::format_hour((i * 4) % 24, strings)).size(LabelSize::XSmall).color(Color::Muted)
                     })))
                     .child(
                         div()
@@ -2919,12 +2920,9 @@ impl FocusView {
             let date = start.date_naive();
             if current != Some(date) {
                 current = Some(date);
-                let month = strings.months_short[date.month0() as usize];
-                let mut label =
-                    if strings.day_before_month { format!("{} {month}", date.day()) } else { format!("{month} {}", date.day()) };
-                if date.year() != today.year() {
-                    label = format!("{label}, {}", date.year());
-                }
+                let label = crate::task_rows::format_day(
+                    strings.short_date[usize::from(date.year() != today.year())], date, strings,
+                );
                 out.push(div().pt_3().pb_1().child(Label::new(label).size(LabelSize::Small).color(Color::Muted)).into_any_element());
             }
             out.push(
@@ -2968,8 +2966,8 @@ impl FocusView {
                             .child(
                                 Label::new(format!(
                                     "{} - {}",
-                                    crate::calendar::format_time(start),
-                                    crate::calendar::format_time(session.end_local())
+                                    crate::calendar::format_time(start, strings),
+                                    crate::calendar::format_time(session.end_local(), strings)
                                 ))
                                 .size(LabelSize::XSmall)
                                 .color(Color::Muted),

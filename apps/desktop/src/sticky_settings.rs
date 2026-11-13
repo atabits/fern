@@ -40,16 +40,6 @@ impl StickySettings {
     pub fn foreground(self) -> u32 { if self.color >= 9 { 0xf5f5f5 } else { 0x24262b } }
 }
 
-pub fn labels(russian: bool) -> [&'static str; 5] {
-    if russian { ["Закреплённые заметки", "Цвет", "Непрозрачность", "Размер шрифта", "Закреплять поверх окон"] }
-    else { ["Sticky Notes", "Color", "Opacity", "Font Size", "Pin by Default"] }
-}
-
-pub fn font_labels(russian: bool) -> [&'static str; 4] {
-    if russian { ["Маленький", "Обычный", "Крупный", "Очень крупный"] }
-    else { ["Small", "Normal", "Large", "Extra Large"] }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

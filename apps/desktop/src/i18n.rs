@@ -4,7 +4,7 @@
 use gpui::{App, Global};
 
 // Set this to Some(&ZH_CN) when the Simplified Chinese translation is ready.
-const ZH_CN_STRINGS: Option<&Strings> = Some(&ZH_CN);
+const ZH_CN_STRINGS: Option<&Strings> = None;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Locale {

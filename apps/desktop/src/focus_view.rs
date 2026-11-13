@@ -1888,61 +1888,58 @@ impl FocusView {
                     }))),
             );
 
-        // As in the original, the page keeps a readable width, centered in wide windows.
-        div()
-            .id("focus-stats")
-            .size_full()
-            .overflow_y_scroll()
-            .flex()
-            .justify_center()
-            .bg(theme.colors().background)
-            .text_color(theme.colors().text)
-            .child(v_flex()
+        let header = h_flex()
+            .debug_selector(|| "statistics-header".to_owned())
             .w_full()
-            // 960 px of cards, as the original's, between 32 px margins.
             .max_w(px(1024.))
             .px_8()
             .pt(px(19.))
+            .pb_4()
+            .flex_none()
+            .child(div().flex_1().child(div().text_size(px(28.)).font_weight(FontWeight::MEDIUM).child(strings.statistics)))
+            .child(h_flex().p(px(2.)).rounded(px(18.)).bg(theme.colors().surface_background).children(
+                strings.stats_tabs.iter().enumerate().map(|(i, label)| {
+                    div()
+                        .id(SharedString::from(format!("stats-tab-{i}")))
+                        .debug_selector(|| format!("statistics-tab-{i}"))
+                        .px_5()
+                        .h(px(32.))
+                        .flex()
+                        .items_center()
+                        .rounded(px(16.))
+                        .cursor_pointer()
+                        .when(i == page.tab, |el| el.bg(theme.colors().element_selected))
+                        .child(Label::new(*label))
+                        .on_click(cx.listener(move |this, _, _, cx| this.update_stats(cx, |p| p.tab = i)))
+                }),
+            ))
+            .child(div().flex_1())
+            .child(
+                div()
+                    .id("stats-done")
+                    .w(px(100.))
+                    .h(px(40.))
+                    .justify_center()
+                    .flex()
+                    .items_center()
+                    .rounded(px(8.))
+                    .bg(theme.colors().accent)
+                    .cursor_pointer()
+                    .child(Label::new(strings.done))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.stats = None;
+                        cx.emit(StatsClosed);
+                        cx.notify();
+                    })),
+            );
+
+        let content = v_flex()
+            .debug_selector(|| "statistics-content".to_owned())
+            .w_full()
+            .max_w(px(1024.))
+            .px_8()
             .pb_5()
             .gap_4()
-            .child(
-                h_flex()
-                    .child(div().flex_1().child(div().text_size(px(28.)).font_weight(FontWeight::MEDIUM).child(strings.statistics)))
-                    .child(h_flex().p(px(2.)).rounded(px(18.)).bg(theme.colors().surface_background).children(
-                        strings.stats_tabs.iter().enumerate().map(|(i, label)| {
-                            div()
-                                .id(SharedString::from(format!("stats-tab-{i}")))
-                                .px_5()
-                                .h(px(32.))
-                                .flex()
-                                .items_center()
-                                .rounded(px(16.))
-                                .cursor_pointer()
-                                .when(i == page.tab, |el| el.bg(theme.colors().element_selected))
-                                .child(Label::new(*label))
-                                .on_click(cx.listener(move |this, _, _, cx| this.update_stats(cx, |p| p.tab = i)))
-                        }),
-                    ))
-                    .child(div().flex_1())
-                    .child(
-                        div()
-                            .id("stats-done")
-                            .w(px(100.))
-                            .h(px(40.))
-                            .justify_center()
-                            .flex()
-                            .items_center()
-                            .rounded(px(8.))
-                            .bg(theme.colors().accent)
-                            .cursor_pointer()
-                            .child(Label::new(strings.done))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.stats = None;
-                                cx.emit(StatsClosed);
-                                cx.notify();
-                            })),
-                    ),
-            )
             .map(|el| match page.tab {
                 0 => el.children(self.render_overview_tab(page, today, cx)),
                 1 => el.children(self.render_task_tab(page, today, cx)),
@@ -1963,7 +1960,7 @@ impl FocusView {
                                     .rounded(px(10.))
                                     .bg(theme.colors().surface_background)
                                     .min_h(px(CARD_HEIGHT))
-                    .child(self.render_record_header(false, cx))
+                                    .child(self.render_record_header(false, cx))
                                     .child(
                                         v_flex()
                                             .id("stats-focus-record")
@@ -1976,7 +1973,26 @@ impl FocusView {
                     .child(h_flex().items_start().gap_4().child(trends).child(timeline))
                     // Most Focused Time and Year Grids side by side, as in the original.
                     .child(h_flex().items_start().gap_4().child(most_focused).child(year_grid)),
-            }))
+            });
+
+        v_flex()
+            .size_full()
+            .items_center()
+            .bg(theme.colors().background)
+            .text_color(theme.colors().text)
+            .child(header)
+            .child(
+                h_flex()
+                    .id(("focus-stats", page.tab))
+                    .debug_selector(|| "statistics-scroll".to_owned())
+                    .w_full()
+                    .flex_1()
+                    .min_h_0()
+                    .items_start()
+                    .justify_center()
+                    .overflow_y_scroll()
+                    .child(content),
+            )
             .into_any_element()
     }
 
@@ -3654,6 +3670,45 @@ impl Render for FocusView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn statistics_scrolls_below_its_header_and_resets_on_tab_change(cx: &mut gpui::TestAppContext) {
+        use gpui::{Modifiers, ScrollDelta, ScrollWheelEvent, TouchPhase, point};
+
+        cx.update(|cx| {
+            theme::init(cx);
+            cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+        });
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let (_, cx) = cx.add_window_view(|_, cx| {
+            let mut view = FocusView::new(store, cx);
+            view.open_stats_overview(cx);
+            view
+        });
+        let viewport = cx.debug_bounds("statistics-scroll").unwrap();
+        let header = cx.debug_bounds("statistics-header").unwrap();
+        let content = cx.debug_bounds("statistics-content").unwrap();
+        assert!(content.size.height > viewport.size.height);
+
+        let position = viewport.center();
+        let modifiers = Modifiers::default();
+        cx.simulate_mouse_move(position, None, modifiers);
+        cx.simulate_event(ScrollWheelEvent {
+            position,
+            delta: ScrollDelta::Pixels(point(px(0.), px(-180.))),
+            modifiers,
+            touch_phase: TouchPhase::Moved,
+        });
+
+        assert!(cx.debug_bounds("statistics-content").unwrap().top() < content.top());
+        assert_eq!(cx.debug_bounds("statistics-header"), Some(header));
+
+        let task_tab = cx.debug_bounds("statistics-tab-1").unwrap().center();
+        cx.simulate_mouse_move(task_tab, None, modifiers);
+        cx.simulate_click(task_tab, modifiers);
+        assert_eq!(cx.debug_bounds("statistics-content").unwrap().top(), content.top());
+    }
 
     #[test]
     fn summary_counts_stand_apart() {

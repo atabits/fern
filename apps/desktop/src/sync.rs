@@ -96,6 +96,65 @@ mod tests {
         assert!(post(&wrong, &laptop.sync_request().unwrap().body).is_err(), "a wrong token is refused");
     }
 
+    #[test]
+    fn independent_filter_rules_roundtrip_through_current_server() -> anyhow::Result<()> {
+        use fern_core::{Condition, ConditionValue as V, DateRule, FilterRules, SmartFilter, View};
+
+        let http = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = http.server_addr().to_ip().unwrap().port();
+        std::thread::spawn(move || {
+            fern_server::serve(&http, fern_server::Server::open_in_memory().unwrap(), "filter-test")
+        });
+        let config = SyncConfig {
+            server: format!("http://127.0.0.1:{port}"),
+            token: "filter-test".into(),
+        };
+        let sync = |store: &Store| -> anyhow::Result<_> {
+            let request = store.sync_request()?;
+            store.finish_sync(&request, &post(&config, &request.body)?)
+        };
+        let a = Store::open_in_memory()?;
+        let b = Store::open_in_memory()?;
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 11, 13).unwrap();
+        let task = a.add_task("Both tags")?;
+        a.set_tags(task.id, &["work".into(), "urgent".into()])?;
+        a.set_due(task.id, Some(today), None)?;
+        let tags = |name: &str| Condition::new(V::Tags {
+            names: vec![name.into()],
+            untagged: false,
+        });
+        let mut filter = SmartFilter {
+            name: "Synced filter".into(),
+            rules: FilterRules {
+                advanced: true,
+                conditions: vec![
+                    tags("work"),
+                    tags("urgent"),
+                    Condition::new(V::Date(vec![
+                        DateRule::Overdue,
+                        DateRule::Span { from: Some(0), to: Some(13) },
+                    ])),
+                ],
+                ..FilterRules::default()
+            },
+            ..SmartFilter::new()
+        };
+        let view = View::Filter(filter.id);
+        a.save_filter(&filter)?;
+        sync(&a)?;
+        sync(&b)?;
+        assert_eq!(b.filters()?, [filter.clone()]);
+        let matching: Vec<_> = b.tasks_in(&view, today)?.into_iter().map(|t| t.id).collect();
+        assert_eq!(matching, [task.id]);
+        filter.rules.conditions[1].not = true;
+        b.save_filter(&filter)?;
+        sync(&b)?;
+        sync(&a)?;
+        assert_eq!(a.filters()?, [filter]);
+        assert!(a.tasks_in(&view, today)?.is_empty());
+        Ok(())
+    }
+
     /// An attached file travels from one device to the other through the server's file store.
     #[test]
     fn attachments_over_http() {

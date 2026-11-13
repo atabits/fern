@@ -777,6 +777,8 @@ const MIGRATIONS: &[&str] = &[
     );
     CREATE INDEX repeat_checklist_copies_source ON repeat_checklist_copies(source_id);
     ",
+    // Versioned, independent filter clauses. NULL rows retain their legacy representation.
+    "ALTER TABLE filters ADD COLUMN rules TEXT;",
 ];
 
 const TASK_COLUMNS: &str = "id, parent_id, kind, title, notes, priority, due_date, due_time, \
@@ -816,8 +818,17 @@ impl Store {
         let version: usize = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
         anyhow::ensure!(version <= MIGRATIONS.len(), "the data comes from a newer version of Fern");
         for (i, sql) in MIGRATIONS.iter().enumerate().skip(version) {
-            conn.execute_batch(sql)?;
-            conn.pragma_update(None, "user_version", i + 1)?;
+            // The historical section rebuild toggles foreign keys, which SQLite can only do
+            // outside a transaction. All other migrations advance the version atomically.
+            if sql.contains("PRAGMA foreign_keys = OFF") {
+                conn.execute_batch(sql)?;
+                conn.pragma_update(None, "user_version", i + 1)?;
+            } else {
+                let tx = conn.unchecked_transaction()?;
+                tx.execute_batch(sql)?;
+                tx.pragma_update(None, "user_version", i + 1)?;
+                tx.commit()?;
+            }
         }
         Ok(())
     }
@@ -959,7 +970,8 @@ impl Store {
     ) -> Result<Vec<Task>> {
         if let View::Filter(id) = view {
             let filter = self.filters()?.into_iter().find(|f| f.id == *id).context("filter not found")?;
-            return Ok(tasks.into_iter().filter(|task| filter.matches(task, today)).collect());
+            let week_start = self.preferences()?.week_start;
+            return Ok(tasks.into_iter().filter(|task| filter.matches(task, today, week_start)).collect());
         }
         if let View::Tag(tag) = view {
             let family = self.tag_family(tag)?;
@@ -988,60 +1000,46 @@ impl Store {
 
     /// Saved filters, oldest first.
     pub fn filters(&self) -> Result<Vec<crate::filter::SmartFilter>> {
+        use crate::filter::{ConditionValue as V, DateRule, FilterRules, SmartFilter};
         let mut stmt = self.conn.prepare_cached(
-            "SELECT id, name, lists, tags, date, priorities, keywords, kind, match_any, chain FROM filters ORDER BY created_at, rowid",
+            "SELECT id, name, lists, tags, date, priorities, keywords, kind, match_any, chain, rules FROM filters ORDER BY created_at, rowid",
         )?;
-        let filters = stmt
-            .query_map([], |row| {
-                let lists: String = row.get(2)?;
-                let tags: String = row.get(3)?;
-                let priorities: String = row.get(5)?;
-                Ok(crate::filter::SmartFilter {
-                    id: parse_uuid(&row.get::<_, String>(0)?, 0)?,
-                    name: row.get(1)?,
-                    lists: lists
-                        .split(',')
-                        .filter(|l| !l.is_empty())
-                        .map(|l| if l == "inbox" { None } else { Uuid::parse_str(l).ok() })
-                        .collect(),
-                    tags: tags.lines().filter(|t| !t.is_empty()).map(str::to_owned).collect(),
-                    date: crate::filter::DateRule::from_key(&row.get::<_, String>(4)?),
-                    priorities: priorities.split(',').filter_map(|p| p.parse().ok()).map(Priority::from_i64).collect(),
-                    keywords: row.get(6)?,
-                    kind: row.get::<_, Option<String>>(7)?.map(|k| Kind::parse(&k)),
-                    match_any: row.get(8)?,
-                    chain: crate::filter::chain_from_storage(&row.get::<_, String>(9)?),
-                })
-            })?
-            .collect::<Result<_, _>>()?;
+        let filters = stmt.query_map([], |row| {
+            let read = || -> Result<SmartFilter> {
+                let rules = match row.get::<_, Option<String>>(10)? {
+                    Some(text) => FilterRules::from_storage(&text)?,
+                    None => {
+                        let lists: String = row.get(2)?;
+                        let tags: String = row.get(3)?;
+                        let priorities: String = row.get(5)?;
+                        let date = DateRule::from_key(&row.get::<_, String>(4)?).unwrap_or(DateRule::All);
+                        let values = vec![
+                            V::Lists(lists.split(',').filter(|s| !s.is_empty()).map(|s| Uuid::parse_str(s).ok()).collect()),
+                            V::Tags { names: tags.lines().filter(|s| !s.is_empty()).map(str::to_owned).collect(), untagged: false },
+                            V::Date(if date == DateRule::All { vec![] } else { vec![date] }),
+                            V::Priority(priorities.split(',').filter_map(|s| s.parse().ok()).map(Priority::from_i64).collect()),
+                            V::Include(row.get(6)?),
+                            V::Type(row.get::<_, Option<String>>(7)?.map(|k| Kind::parse(&k))),
+                        ];
+                        crate::filter::from_legacy(values, row.get(8)?, &row.get::<_, String>(9)?)?
+                    }
+                };
+                Ok(SmartFilter { id: Uuid::parse_str(&row.get::<_, String>(0)?)?, name: row.get(1)?, rules })
+            };
+            read().map_err(|e| rusqlite::Error::FromSqlConversionFailure(10, rusqlite::types::Type::Text, e.into()))
+        })?.collect::<Result<_, _>>()?;
         Ok(filters)
     }
 
-    /// Adds a filter, or replaces the one with the same id.
+    /// Adds or replaces a filter. Legacy columns remain for reading older databases and sync rows.
     pub fn save_filter(&self, filter: &crate::filter::SmartFilter) -> Result<()> {
         anyhow::ensure!(!filter.name.trim().is_empty(), "a filter needs a name");
-        let lists: Vec<String> =
-            filter.lists.iter().map(|l| l.map_or_else(|| "inbox".to_owned(), |id| id.to_string())).collect();
-        let priorities: Vec<String> = filter.priorities.iter().map(|p| p.to_i64().to_string()).collect();
+        let rules = filter.rules.to_storage()?;
         self.conn.execute(
-            "INSERT INTO filters (id, name, lists, tags, date, priorities, keywords, kind, created_at, match_any, chain)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
-             ON CONFLICT(id) DO UPDATE SET name = excluded.name, lists = excluded.lists, tags = excluded.tags,
-                 date = excluded.date, priorities = excluded.priorities, keywords = excluded.keywords,
-                 kind = excluded.kind, match_any = excluded.match_any, chain = excluded.chain",
-            params![
-                filter.id.to_string(),
-                filter.name.trim(),
-                lists.join(","),
-                filter.tags.join("\n"),
-                filter.date.key(),
-                priorities.join(","),
-                filter.keywords.trim(),
-                filter.kind.map(|k| k.as_str()),
-                now_ms(),
-                filter.match_any,
-                crate::filter::chain_to_storage(&filter.chain)
-            ],
+            "INSERT INTO filters (id, name, lists, tags, date, priorities, keywords, kind, created_at, match_any, chain, rules)
+             VALUES (?1, ?2, '', '', 'all', '', '', NULL, ?3, 0, '', ?4)
+             ON CONFLICT(id) DO UPDATE SET name = excluded.name, rules = excluded.rules",
+            params![filter.id.to_string(), filter.name.trim(), now_ms(), rules],
         )?;
         Ok(())
     }
@@ -3303,50 +3301,6 @@ mod tests {
         assert!(store.checkins(read.id)?.is_empty());
         store.delete_habit(floss.id)?;
         assert_eq!(store.habits()?.iter().map(|h| h.name.as_str()).collect::<Vec<_>>(), ["Read"]);
-        Ok(())
-    }
-
-    #[test]
-    fn filters_are_stored_and_listed() -> Result<()> {
-        let store = Store::open_in_memory()?;
-        let today = d(2026, 10, 18);
-        let work = store.create_list("Work")?;
-        let report = store.add_task("report")?;
-        store.set_list(report.id, Some(work.id))?;
-        store.set_priority(report.id, Priority::High)?;
-        store.add_task("milk")?;
-        let mut filter = crate::filter::SmartFilter {
-            id: Uuid::now_v7(),
-            name: "Urgent work".into(),
-            lists: vec![Some(work.id), None],
-            priorities: vec![Priority::High],
-            tags: vec!["a".into(), "b c".into()],
-            kind: Some(Kind::Task),
-            ..Default::default()
-        };
-        assert!(store.save_filter(&crate::filter::SmartFilter { name: " ".into(), ..filter.clone() }).is_err());
-        store.save_filter(&filter)?;
-        assert_eq!(store.filters()?, [filter.clone()]);
-        filter.tags.clear();
-        filter.name = "Urgent".into();
-        store.save_filter(&filter)?;
-        assert_eq!(store.filters()?, [filter.clone()]);
-        let any = crate::filter::SmartFilter { id: Uuid::now_v7(), name: "Any".into(), match_any: true, ..filter.clone() };
-        store.save_filter(&any)?;
-        assert!(store.filters()?[1].match_any);
-        let chained = crate::filter::SmartFilter {
-            id: Uuid::now_v7(),
-            name: "Chain".into(),
-            chain: crate::filter::chain_from_storage("lists or:tags!"),
-            ..filter.clone()
-        };
-        store.save_filter(&chained)?;
-        assert_eq!(store.filters()?[2].chain, chained.chain);
-        store.delete_filter(chained.id)?;
-        store.delete_filter(any.id)?;
-        assert_eq!(titles(&store.tasks_in(&View::Filter(filter.id), today)?), ["report"]);
-        store.delete_filter(filter.id)?;
-        assert!(store.filters()?.is_empty());
         Ok(())
     }
 

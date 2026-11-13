@@ -63,21 +63,8 @@ enum RangeEnd {
 
 impl gpui::EventEmitter<StartFocus> for TodoView {}
 
-/// The filter dialog: the filter being edited and its text fields.
-struct FilterEdit {
-    draft: fern_core::SmartFilter,
-    is_new: bool,
-    /// The "Advanced" tab: a chain of conditions with AND and OR between them.
-    advanced: bool,
-    name: Entity<TextInput>,
-    keywords: Entity<TextInput>,
-    /// The chain condition whose menu is open (field, NOT, remove).
-    chain_menu: Option<usize>,
-    /// "Preview": the tasks the filter would show, in place of the conditions.
-    preview: bool,
-    /// The Advanced tab's "Examples" menu, while open.
-    examples_open: bool,
-}
+mod filters;
+use filters::FilterEdit;
 
 /// What the add field's "▾" menu set for the next task.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -635,7 +622,8 @@ impl TodoView {
                     }
                     if mode == "chain" {
                         if let Some(edit) = self.filter_edit.as_mut() {
-                            edit.draft.chain = fern_core::filter::chain_from_storage("lists and:tags! or:date");
+                            edit.draft.rules = fern_core::filter::examples()[2].rules.clone();
+                            edit.inputs = Self::filter_inputs(&edit.draft, cx);
                             edit.chain_menu = Some(1);
                         }
                     }
@@ -645,7 +633,7 @@ impl TodoView {
                     let (name, tag) = spec.split_once('>').unwrap_or((spec, ""));
                     let filter = fern_core::SmartFilter {
                         name: name.to_owned(),
-                        tags: (!tag.is_empty()).then(|| vec![tag.to_owned()]).unwrap_or_default(),
+                        rules: fern_core::FilterRules { conditions: vec![fern_core::Condition::new(fern_core::ConditionValue::Tags { names: (!tag.is_empty()).then(|| vec![tag.to_owned()]).unwrap_or_default(), untagged: false })], ..Default::default() },
                         ..fern_core::SmartFilter::new()
                     };
                     if self.store.save_filter(&filter).is_ok() {
@@ -822,6 +810,22 @@ impl TodoView {
         self.sync_input_placeholder(cx);
         // Loaded once: the views, counts and filters below are all selections of it.
         let all_tasks = self.store.tasks().unwrap_or_default();
+        let today = Self::today();
+        let week_start = self.preferences.week_start;
+        if let Some(filters) = self.check(self.store.filters()) {
+            self.filters = filters
+                .into_iter()
+                .map(|filter| {
+                    let count = all_tasks.iter().filter(|t| filter.matches(t, today, week_start)).count();
+                    (filter, count)
+                })
+                .collect();
+            if let View::Filter(id) = self.view
+                && !self.filters.iter().any(|(filter, _)| filter.id == id)
+            {
+                self.view = View::Inbox;
+            }
+        }
         self.completing.retain(|id, pending| {
             pending.view == self.view && !cx.reduce_motion()
                 && all_tasks.iter().any(|task| {
@@ -851,22 +855,10 @@ impl TodoView {
             .and_then(|s| s.parse().ok())
             .filter(|s| *s < 3)
             .unwrap_or(0);
-        let today = Self::today();
-        self.filters = self
-            .store
-            .filters()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|f| {
-                let count = all_tasks.iter().filter(|t| f.matches(t, today)).count();
-                (f, count)
-            })
-            .collect();
         self.sections = match self.section_owner() {
             Some(list) => self.store.list_sections(list).unwrap_or_default(),
             None => Vec::new(),
         };
-        let today = Self::today();
         if let Some(lists) = self.check(self.store.lists()) {
             self.lists = lists;
         }
@@ -2551,546 +2543,6 @@ impl TodoView {
     fn view_title(&self, strings: &Strings) -> SharedString {
         let filters: Vec<fern_core::SmartFilter> = self.filters.iter().map(|(f, _)| f.clone()).collect();
         lists_panel::title(&self.view, &self.lists, &filters, strings)
-    }
-
-    /// Opens the filter dialog for a new filter, or for the current one.
-    fn open_filter_edit(&mut self, existing: Option<fern_core::SmartFilter>, window: &mut Window, cx: &mut Context<Self>) {
-        let strings = i18n::t(cx);
-        let is_new = existing.is_none();
-        let draft = existing.unwrap_or_else(fern_core::SmartFilter::new);
-        let field = |placeholder: &'static str, text: String, cx: &mut Context<Self>| {
-            cx.new(|cx| {
-                let mut input = TextInput::new(Mode::SingleLine, placeholder, cx);
-                input.set_text(text, cx);
-                input
-            })
-        };
-        let name = field(strings.filter_name, draft.name.clone(), cx);
-        let keywords = field(strings.filter_keywords, draft.keywords.clone(), cx);
-        window.focus(&name.focus_handle(cx), cx);
-        self.header_menu_open = false;
-        let advanced = draft.match_any || !draft.chain.is_empty();
-        self.filter_edit = Some(FilterEdit { draft, is_new, advanced, name, keywords, chain_menu: None, preview: false, examples_open: false });
-        cx.notify();
-    }
-
-    fn update_filter_draft(&mut self, cx: &mut Context<Self>, change: impl FnOnce(&mut fern_core::SmartFilter)) {
-        if let Some(edit) = self.filter_edit.as_mut() {
-            change(&mut edit.draft);
-        }
-        cx.notify();
-    }
-
-    /// The dialog's Normal / Advanced tabs. Advanced starts its chain from the set conditions,
-    /// joined as "all" or "any" were; Normal drops the chain.
-    fn set_filter_advanced(&mut self, advanced: bool, cx: &mut Context<Self>) {
-        let Some(edit) = self.filter_edit.as_mut() else { return };
-        edit.advanced = advanced;
-        edit.chain_menu = None;
-        let draft = &mut edit.draft;
-        if !advanced {
-            draft.match_any = false;
-            draft.chain.clear();
-        } else if draft.chain.is_empty() {
-            use fern_core::{Field, Join, Link};
-            let set = [
-                (Field::Lists, !draft.lists.is_empty()),
-                (Field::Tags, !draft.tags.is_empty()),
-                (Field::Date, draft.date != fern_core::DateRule::All),
-                (Field::Priority, !draft.priorities.is_empty()),
-                (Field::Include, !draft.keywords.trim().is_empty()),
-                (Field::Type, draft.kind.is_some()),
-            ];
-            let join = if draft.match_any { Join::Or } else { Join::And };
-            draft.chain = set.into_iter().filter(|(_, on)| *on).map(|(field, _)| Link::new(join, field)).collect();
-            if draft.chain.is_empty() {
-                draft.chain = vec![Link::new(Join::And, Field::Lists)];
-            }
-        }
-        cx.notify();
-    }
-
-    fn update_chain(&mut self, cx: &mut Context<Self>, change: impl FnOnce(&mut Vec<fern_core::Link>, &mut Option<usize>)) {
-        if let Some(edit) = self.filter_edit.as_mut() {
-            change(&mut edit.draft.chain, &mut edit.chain_menu);
-        }
-        cx.notify();
-    }
-
-    /// The Advanced chain, as the original lays it out: condition, Logic, condition … and "+".
-    /// A condition's chip opens its menu: the field, NOT and remove; Logic switches AND and OR.
-    fn render_filter_chain(&self, edit: &FilterEdit, cx: &mut Context<Self>) -> AnyElement {
-        use fern_core::{Field, Join, Link};
-        let strings = i18n::t(cx);
-        let theme = cx.theme().clone();
-        let field_name = |field: Field| match field {
-            Field::Lists => strings.filter_lists,
-            Field::Tags => strings.tags,
-            Field::Date => strings.filter_date,
-            Field::Priority => strings.filter_priority,
-            Field::Include => strings.filter_include,
-            Field::Type => strings.filter_type,
-        };
-        let cell = |id: SharedString, dashed: bool| {
-            div()
-                .id(id)
-                .h(px(28.))
-                .px_3()
-                .flex()
-                .items_center()
-                .rounded(px(6.))
-                .border_1()
-                .border_color(theme.colors().border)
-                .when(dashed, |el| el.border_dashed())
-                .cursor_pointer()
-                .hover(|s| s.bg(theme.colors().element_hover))
-        };
-        let mut row = h_flex().flex_wrap().gap_2();
-        for (i, link) in edit.draft.chain.iter().copied().enumerate() {
-            if i > 0 {
-                row = row.child(
-                    cell(SharedString::from(format!("filter-logic-{i}")), true)
-                        .child(Label::new(strings.filter_logic[(link.join == Join::Or) as usize]).size(LabelSize::Small).color(Color::Accent))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.update_chain(cx, |chain, _| {
-                                chain[i].join = if chain[i].join == Join::And { Join::Or } else { Join::And };
-                            })
-                        })),
-                );
-            }
-            let label = if link.not { format!("{} {}", strings.filter_not, field_name(link.field)) } else { field_name(link.field).to_owned() };
-            let menu = (edit.chain_menu == Some(i)).then(|| {
-                PopoverAttachment::new(
-                    Placement::BelowLeft,
-                    popover(cx)
-                        .min_w(px(180.))
-                        .on_mouse_down_out(cx.listener(|this, _, _, cx| this.update_chain(cx, |_, menu| *menu = None)))
-                        .children(Field::ALL.into_iter().map(|field| {
-                            let selected = field == link.field;
-                            ListItem::new(SharedString::from(format!("filter-chain-{i}-{}", field.key())))
-                                .child(Label::new(field_name(field)).size(LabelSize::Small).color(if selected { Color::Accent } else { Color::Default }))
-                                .when(selected, |item| item.end_slot(Icon::new(IconName::Check).size(IconSize::XSmall).color(Color::Accent)))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.update_chain(cx, |chain, menu| {
-                                        chain[i].field = field;
-                                        *menu = None;
-                                    })
-                                }))
-                        }))
-                        .child(div().h(px(1.)).my_1().bg(theme.colors().border_variant))
-                        .child(
-                            ListItem::new(SharedString::from(format!("filter-chain-{i}-not")))
-                                .child(Label::new(strings.filter_not).size(LabelSize::Small))
-                                .when(link.not, |item| item.end_slot(Icon::new(IconName::Check).size(IconSize::XSmall).color(Color::Accent)))
-                                .on_click(cx.listener(move |this, _, _, cx| this.update_chain(cx, |chain, _| chain[i].not = !chain[i].not))),
-                        )
-                        .when(edit.draft.chain.len() > 1, |el| {
-                            el.child(
-                                ListItem::new(SharedString::from(format!("filter-chain-{i}-remove")))
-                                    .start_slot(Icon::new(IconName::Trash).size(IconSize::Small).color(Color::Error))
-                                    .child(Label::new(strings.delete).size(LabelSize::Small).color(Color::Error))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.update_chain(cx, |chain, menu| {
-                                            chain.remove(i);
-                                            *menu = None;
-                                        })
-                                    })),
-                            )
-                        })
-                        .into_any_element(),
-                )
-            });
-            row = row.child(
-                div()
-                    .relative()
-                    .child(
-                        cell(SharedString::from(format!("filter-cond-{i}")), false)
-                            .child(Label::new(label).size(LabelSize::Small))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.update_chain(cx, |_, menu| *menu = if *menu == Some(i) { None } else { Some(i) })
-                            })),
-                    )
-                    .children(menu),
-            );
-        }
-        row.child(
-            cell("filter-chain-add".into(), false)
-                .child(Icon::new(IconName::Plus).size(IconSize::Small).color(Color::Muted))
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.update_chain(cx, |chain, _| {
-                        // The next condition not in the chain yet, or Lists again.
-                        let field = Field::ALL.into_iter().find(|f| !chain.iter().any(|l| l.field == *f)).unwrap_or(Field::Lists);
-                        chain.push(Link::new(Join::And, field));
-                    })
-                })),
-        )
-        .into_any_element()
-    }
-
-    fn set_filter_preview(&mut self, preview: bool, cx: &mut Context<Self>) {
-        if let Some(edit) = self.filter_edit.as_mut() {
-            edit.preview = preview;
-            edit.examples_open = false;
-            edit.chain_menu = None;
-        }
-        cx.notify();
-    }
-
-    /// "Examples" in the Advanced tab: ready-made chains, applied with a click (the name stays).
-    fn render_filter_examples(&self, open: bool, cx: &mut Context<Self>) -> AnyElement {
-        let strings = i18n::t(cx);
-        let menu = open.then(|| {
-            PopoverAttachment::new(
-                Placement::AboveRight,
-                popover(cx)
-                    .min_w(px(260.))
-                    .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                        if let Some(edit) = this.filter_edit.as_mut() {
-                            edit.examples_open = false;
-                        }
-                        cx.notify();
-                    }))
-                    .children(fern_core::filter::examples().into_iter().enumerate().map(|(i, example)| {
-                        ListItem::new(("filter-example", i))
-                            .child(Label::new(strings.filter_example_names[i]).size(LabelSize::Small))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                if let Some(edit) = this.filter_edit.as_mut() {
-                                    let (id, name) = (edit.draft.id, edit.draft.name.clone());
-                                    edit.draft = fern_core::SmartFilter { id, name, ..example.clone() };
-                                    edit.examples_open = false;
-                                    let keywords = edit.keywords.clone();
-                                    let text = edit.draft.keywords.clone();
-                                    keywords.update(cx, |input, cx| input.set_text(text, cx));
-                                }
-                                cx.notify();
-                            }))
-                    }))
-                    .into_any_element(),
-            )
-        });
-        div()
-            .relative()
-            .child(
-                div()
-                    .id("filter-examples")
-                    .px_2()
-                    .cursor_pointer()
-                    .child(Label::new(strings.filter_examples).size(LabelSize::Small).color(Color::Muted))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        if let Some(edit) = this.filter_edit.as_mut() {
-                            edit.examples_open = !edit.examples_open;
-                        }
-                        cx.notify();
-                    })),
-            )
-            .children(menu)
-            .into_any_element()
-    }
-
-    /// The original's "Preview": the open tasks the filter would show, by list with a count,
-    /// then Cancel (back to the conditions) or Save.
-    fn render_filter_preview(&self, edit: &FilterEdit, cx: &mut Context<Self>) -> AnyElement {
-        let strings = i18n::t(cx);
-        let theme = cx.theme().clone();
-        let today = Self::today();
-        let mut draft = edit.draft.clone();
-        draft.keywords = edit.keywords.read(cx).text().to_owned();
-        let tasks = self.store.tasks().unwrap_or_default();
-        let shown = draft.preview(&tasks, today);
-        let lists: Vec<(Option<Id>, SharedString)> = std::iter::once((None, SharedString::new_static(strings.inbox)))
-            .chain(self.lists.iter().map(|l| (Some(l.id), l.name.clone().into())))
-            .collect();
-        let mut body = v_flex().id("filter-preview-tasks").max_h(px(420.)).overflow_y_scroll().gap_0p5();
-        if shown.is_empty() {
-            body = body.child(div().py_4().child(Label::new(strings.filter_preview_empty).color(Color::Muted)));
-        }
-        for (list, name) in lists {
-            let in_list: Vec<&&Task> = shown.iter().filter(|t| t.list_id == list).collect();
-            if in_list.is_empty() {
-                continue;
-            }
-            body = body.child(
-                h_flex()
-                    .gap_2()
-                    .pt_1()
-                    .child(Icon::new(IconName::ChevronDown).size(IconSize::XSmall).color(Color::Muted))
-                    .child(Label::new(name).size(LabelSize::Small).weight(FontWeight::SEMIBOLD))
-                    .child(Label::new(in_list.len().to_string()).size(LabelSize::XSmall).color(Color::Muted)),
-            );
-            for task in in_list {
-                let due = task.due_date.map(|date| crate::task_rows::due_label(date, task.due_time, today, strings));
-                body = body.child(
-                    h_flex()
-                        .h(px(34.))
-                        .pl_4()
-                        .gap_2()
-                        .border_b_1()
-                        .border_color(theme.colors().border_variant)
-                        .child(
-                            Icon::new(if task.kind == Kind::Note { IconName::FileText } else { IconName::Square })
-                                .size(IconSize::Small)
-                                .color(Color::Muted),
-                        )
-                        .child(div().flex_1().min_w_0().child(Label::new(task.title.clone()).size(LabelSize::Small).truncate()))
-                        .children(task.tags.iter().map(|tag| Label::new(tag.clone()).size(LabelSize::XSmall).color(Color::Muted)))
-                        .children(due.map(|(label, overdue)| {
-                            Label::new(label).size(LabelSize::XSmall).color(if overdue { Color::Error } else { Color::Accent })
-                        })),
-                );
-            }
-        }
-        let button = |id: &'static str, label: &'static str, primary: bool| {
-            div()
-                .id(id)
-                .px_4()
-                .h(px(30.))
-                .flex()
-                .items_center()
-                .rounded(px(6.))
-                .cursor_pointer()
-                .when(primary, |el| el.bg(theme.colors().accent))
-                .when(!primary, |el| el.border_1().border_color(theme.colors().border))
-                .child(Label::new(label).size(LabelSize::Small))
-        };
-        div()
-            .absolute()
-            .inset_0()
-            .flex()
-            .items_center()
-            .justify_center()
-            .bg(gpui::black().opacity(0.35))
-            .child(
-                v_flex()
-                    .id("filter-preview-dialog")
-                    .w(px(560.))
-                    .p_4()
-                    .gap_2()
-                    .rounded(px(10.))
-                    .border_1()
-                    .border_color(theme.colors().border)
-                    .bg(theme.colors().elevated_surface_background)
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .child(h_flex().justify_center().child(Label::new(strings.filter_preview).weight(FontWeight::SEMIBOLD)))
-                    .child(body)
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .pt_2()
-                            .justify_end()
-                            .child(button("filter-preview-cancel", strings.cancel, false).on_click(cx.listener(|this, _, _, cx| this.set_filter_preview(false, cx))))
-                            .child(button("filter-preview-save", strings.save, true).on_click(cx.listener(|this, _, _, cx| this.save_filter(cx)))),
-                    ),
-            )
-            .into_any_element()
-    }
-
-    fn save_filter(&mut self, cx: &mut Context<Self>) {
-        let Some(edit) = self.filter_edit.as_ref() else { return };
-        let mut filter = edit.draft.clone();
-        filter.name = edit.name.read(cx).text().trim().to_owned();
-        filter.keywords = edit.keywords.read(cx).text().trim().to_owned();
-        if filter.name.is_empty() {
-            return;
-        }
-        let result = self.store.save_filter(&filter);
-        if self.check(result).is_some() {
-            self.filter_edit = None;
-            self.view = View::Filter(filter.id);
-            self.reload(cx);
-        }
-    }
-
-    fn delete_current_filter(&mut self, cx: &mut Context<Self>) {
-        if let View::Filter(id) = self.view {
-            let result = self.store.delete_filter(id);
-            self.check(result);
-            self.header_menu_open = false;
-            self.view = View::Inbox;
-            self.reload(cx);
-        }
-    }
-
-    /// The original's "Add Filter" dialog: name, lists, tags, date, priority, keywords, type.
-    fn render_filter_edit(&self, edit: &FilterEdit, cx: &mut Context<Self>) -> AnyElement {
-        let strings = i18n::t(cx);
-        let theme = cx.theme().clone();
-        let draft = &edit.draft;
-        let chip = |id: String, label: SharedString, on: bool| {
-            div()
-                .id(SharedString::from(id))
-                .h(px(24.))
-                .px_2()
-                .flex()
-                .items_center()
-                .rounded(px(12.))
-                .cursor_pointer()
-                .when(on, |el| el.bg(theme.colors().accent.opacity(0.25)))
-                .when(!on, |el| el.bg(theme.colors().element_hover))
-                .child(Label::new(label).size(LabelSize::XSmall).color(if on { Color::Accent } else { Color::Default }))
-        };
-        let row = |label: &'static str, content: AnyElement| {
-            h_flex()
-                .items_start()
-                .gap_3()
-                .child(div().w(px(72.)).pt_1().child(Label::new(label).size(LabelSize::Small)))
-                .child(div().flex_1().min_w_0().child(content))
-        };
-        let field = |input: Entity<TextInput>| {
-            h_flex().h(px(30.)).px_2().rounded(px(6.)).bg(theme.colors().background).child(input)
-        };
-        // Lists: "All" or any of the inbox and lists.
-        let list_options: Vec<(Option<Id>, SharedString)> = std::iter::once((None, SharedString::new_static(strings.inbox)))
-            .chain(self.lists.iter().map(|l| (Some(l.id), l.name.clone().into())))
-            .collect();
-        let lists = h_flex()
-            .flex_wrap()
-            .gap_1()
-            .child(chip("filter-lists-all".into(), strings.filter_all.into(), draft.lists.is_empty()).on_click(
-                cx.listener(|this, _, _, cx| this.update_filter_draft(cx, |d| d.lists.clear())),
-            ))
-            .children(list_options.into_iter().map(|(list, name)| {
-                let on = draft.lists.contains(&list);
-                chip(format!("filter-list-{list:?}"), name, on).on_click(cx.listener(move |this, _, _, cx| {
-                    this.update_filter_draft(cx, |d| {
-                        if let Some(at) = d.lists.iter().position(|l| *l == list) {
-                            d.lists.remove(at);
-                        } else {
-                            d.lists.push(list);
-                        }
-                    })
-                }))
-            }));
-        let tags = h_flex()
-            .flex_wrap()
-            .gap_1()
-            .child(chip("filter-tags-all".into(), strings.filter_all.into(), draft.tags.is_empty()).on_click(
-                cx.listener(|this, _, _, cx| this.update_filter_draft(cx, |d| d.tags.clear())),
-            ))
-            .children(self.tags.iter().map(|tag| {
-                let name = tag.name.clone();
-                let on = draft.tags.iter().any(|t| t.to_lowercase() == name.to_lowercase());
-                chip(format!("filter-tag-{name}"), format!("#{name}").into(), on).on_click(cx.listener(move |this, _, _, cx| {
-                    let name = name.clone();
-                    this.update_filter_draft(cx, |d| {
-                        if let Some(at) = d.tags.iter().position(|t| t.to_lowercase() == name.to_lowercase()) {
-                            d.tags.remove(at);
-                        } else {
-                            d.tags.push(name);
-                        }
-                    })
-                }))
-            }));
-        let dates = h_flex().flex_wrap().gap_1().children(fern_core::DateRule::ALL.into_iter().enumerate().map(|(i, rule)| {
-            let label = if i == 0 { strings.filter_all } else { strings.filter_dates[i - 1] };
-            chip(format!("filter-date-{}", rule.key()), label.into(), draft.date == rule)
-                .on_click(cx.listener(move |this, _, _, cx| this.update_filter_draft(cx, |d| d.date = rule)))
-        }));
-        let priorities = h_flex()
-            .flex_wrap()
-            .gap_1()
-            .child(chip("filter-priority-all".into(), strings.filter_all.into(), draft.priorities.is_empty()).on_click(
-                cx.listener(|this, _, _, cx| this.update_filter_draft(cx, |d| d.priorities.clear())),
-            ))
-            .children(
-                [
-                    (Priority::High, strings.priority_high),
-                    (Priority::Medium, strings.priority_medium),
-                    (Priority::Low, strings.priority_low),
-                    (Priority::None, strings.priority_none),
-                ]
-                .into_iter()
-                .map(|(priority, label)| {
-                    chip(format!("filter-priority-{}", priority.to_i64()), label.into(), draft.priorities.contains(&priority))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.update_filter_draft(cx, |d| {
-                                if let Some(at) = d.priorities.iter().position(|p| *p == priority) {
-                                    d.priorities.remove(at);
-                                } else {
-                                    d.priorities.push(priority);
-                                }
-                            })
-                        }))
-                }),
-            );
-        let kinds = h_flex().gap_1().children([(None, strings.filter_all), (Some(Kind::Task), strings.filter_kinds[0]), (Some(Kind::Note), strings.filter_kinds[1])].into_iter().map(
-            |(kind, label)| {
-                chip(format!("filter-kind-{kind:?}"), label.into(), draft.kind == kind)
-                    .on_click(cx.listener(move |this, _, _, cx| this.update_filter_draft(cx, |d| d.kind = kind)))
-            },
-        ));
-        let button = |id: &'static str, label: &'static str, primary: bool| {
-            div()
-                .id(id)
-                .px_4()
-                .h(px(30.))
-                .flex()
-                .items_center()
-                .rounded(px(6.))
-                .cursor_pointer()
-                .when(primary, |el| el.bg(theme.colors().accent))
-                .when(!primary, |el| el.border_1().border_color(theme.colors().border))
-                .child(Label::new(label).size(LabelSize::Small))
-        };
-        let is_new = edit.is_new;
-        if edit.preview {
-            return self.render_filter_preview(edit, cx);
-        }
-        let chain = edit.advanced.then(|| self.render_filter_chain(edit, cx));
-        let examples = edit.advanced.then(|| self.render_filter_examples(edit.examples_open, cx));
-        let shows = |field: fern_core::Field| !edit.advanced || edit.draft.chain.iter().any(|l| l.field == field);
-        div()
-            .absolute()
-            .inset_0()
-            .flex()
-            .items_center()
-            .justify_center()
-            .bg(gpui::black().opacity(0.35))
-            .child(
-                v_flex()
-                    .id("filter-dialog")
-                    .w(px(480.))
-                    .p_4()
-                    .gap_3()
-                    .rounded(px(10.))
-                    .border_1()
-                    .border_color(theme.colors().border)
-                    .bg(theme.colors().elevated_surface_background)
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .child(Label::new(if is_new { strings.add_filter } else { strings.edit_filter }).weight(FontWeight::SEMIBOLD))
-                    .child(h_flex().justify_center().gap_1().children([false, true].map(|advanced| {
-                        chip(format!("filter-mode-{advanced}"), strings.filter_modes[advanced as usize].into(), edit.advanced == advanced)
-                            .on_click(cx.listener(move |this, _, _, cx| this.set_filter_advanced(advanced, cx)))
-                    })))
-                    .child(field(edit.name.clone()))
-                    .children(chain)
-                    // In the Advanced tab only the chain's conditions are set.
-                    .when(shows(fern_core::Field::Lists), |el| el.child(row(strings.filter_lists, lists.into_any_element())))
-                    .when(shows(fern_core::Field::Tags), |el| el.child(row(strings.tags, tags.into_any_element())))
-                    .when(shows(fern_core::Field::Date), |el| el.child(row(strings.filter_date, dates.into_any_element())))
-                    .when(shows(fern_core::Field::Priority), |el| el.child(row(strings.filter_priority, priorities.into_any_element())))
-                    .when(shows(fern_core::Field::Include), |el| el.child(row(strings.filter_include, field(edit.keywords.clone()).into_any_element())))
-                    .when(shows(fern_core::Field::Type), |el| el.child(row(strings.filter_type, kinds.into_any_element())))
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .pt_2()
-                            .child(
-                                div()
-                                    .id("filter-preview")
-                                    .cursor_pointer()
-                                    .child(Label::new(strings.filter_preview).size(LabelSize::Small).color(Color::Accent))
-                                    .on_click(cx.listener(|this, _, _, cx| this.set_filter_preview(true, cx))),
-                            )
-                            .child(div().flex_1())
-                            .children(examples)
-                            .child(button("filter-close", strings.close, false).on_click(cx.listener(|this, _, _, cx| {
-                                this.filter_edit = None;
-                                cx.notify();
-                            })))
-                            .child(button("filter-save", strings.save, true).on_click(cx.listener(|this, _, _, cx| this.save_filter(cx)))),
-                    ),
-            )
-            .into_any_element()
     }
 
     fn open_list_activity(&mut self, cx: &mut Context<Self>) {
@@ -6440,7 +5892,7 @@ impl Render for TodoView {
                         .child(self.resize_handle(Panel::Detail, cx)),
                 )
             })
-            .when_some(self.filter_edit.as_ref().map(|edit| self.render_filter_edit(edit, cx)), |el, dialog| el.child(dialog))
+            .when_some(self.filter_edit.as_ref().map(|edit| self.render_filter_edit(edit, window, cx)), |el, dialog| el.child(dialog))
             .when_some(self.undo.as_ref().map(|(_, label, _)| label.clone()), |el, label| {
                 el.child(
                     div().absolute().bottom(px(24.)).left_0().right_0().flex().justify_center().child(

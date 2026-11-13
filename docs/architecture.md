@@ -41,6 +41,10 @@ server lacks and fetches the ones missing here.
 
 Focus timers, the Matrix's quadrant rules (`matrix_rules`) and the folders of lists (`list_folders`) sync like other rows.
 
+Saved filter rules use the existing sync row format. Older clients can still sync tasks and other
+data, but show an empty result for filters saved by a newer client. Edit those filters on a client
+that supports the new rules.
+
 Not synced: settings (so saved view choices stay per device), task activity, habit snoozes.
 
 ## Conventions

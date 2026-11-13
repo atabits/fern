@@ -38,7 +38,7 @@ tiny_http = "0.12"
 ureq = "3"
 unicode-segmentation = "1"
 sys-locale = "0.3"
-uuid = { version = "1", features = ["v7"] }
+uuid = { version = "1", features = ["v7", "serde"] }
 
 gpui = { git = "https://github.com/zed-industries/zed", default-features = false, features = ["font-kit", "wayland", "x11"] }
 gpui_platform = { git = "https://github.com/zed-industries/zed", default-features = false, features = ["font-kit", "wayland", "x11"] }

@@ -1569,7 +1569,9 @@ version = "0.1.9"
 dependencies = [
  "anyhow",
  "chrono",
+ "hex",
  "rusqlite",
+ "serde",
  "serde_json",
  "uuid",
 ]

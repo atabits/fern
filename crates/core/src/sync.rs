@@ -39,6 +39,7 @@ pub const SYNCED: &[(&str, &[&str])] = &[
 
 /// Key parts are joined with this character, as the triggers do.
 const KEY_SEPARATOR: char = '\u{1f}';
+const FILTER_RULES_PREFIX: &str = "lists! fern_rules_v1:";
 
 /// One row's change: the row as it is now, or `None` when it was deleted.
 #[derive(Clone, Debug, PartialEq)]
@@ -264,7 +265,7 @@ impl Store {
         let condition: Vec<String> = keys.iter().enumerate().map(|(i, k)| format!("{k} = ?{}", i + 1)).collect();
         let mut stmt = self.conn.prepare_cached(&format!("SELECT * FROM {entity} WHERE {}", condition.join(" AND ")))?;
         let names: Vec<String> = stmt.column_names().into_iter().map(str::to_owned).collect();
-        Ok(stmt
+        let mut row = stmt
             .query_row(params_from_iter(parts), |row| {
                 let mut map = Map::new();
                 for (i, name) in names.iter().enumerate() {
@@ -272,7 +273,19 @@ impl Store {
                 }
                 Ok(map)
             })
-            .optional()?)
+            .optional()?;
+        if entity == "filters"
+            && let Some(row) = &mut row
+            && let Some(Json::String(rules)) = row.remove("rules")
+        {
+            // Older clients insert every wire field into SQLite. Keep their column names and
+            // give them a filter that matches nothing until they can read the new rules.
+            row.insert("lists".into(), Json::from(""));
+            row.insert("chain".into(), Json::from(format!(
+                "{FILTER_RULES_PREFIX}{}", hex::encode(rules)
+            )));
+        }
+        Ok(row)
     }
 
     /// Applies changes from another device. A row changed here later than the incoming change
@@ -301,6 +314,13 @@ impl Store {
             let parts: Vec<&str> = change.key.split(KEY_SEPARATOR).collect();
             match &change.row {
                 Some(row) => {
+                    let filter_row;
+                    let row = if change.entity == "filters" {
+                        filter_row = decode_filter_row(row)?;
+                        &filter_row
+                    } else {
+                        row
+                    };
                     let columns: Vec<&String> = row.keys().filter(|c| is_identifier(c)).collect();
                     let placeholders: Vec<String> = (1..=columns.len()).map(|i| format!("?{i}")).collect();
                     let updates: Vec<String> = columns
@@ -329,6 +349,24 @@ impl Store {
         tx.commit()?;
         Ok(applied)
     }
+}
+
+fn decode_filter_row(row: &Map<String, Json>) -> Result<Map<String, Json>> {
+    let mut row = row.clone();
+    let mut rules = row.remove("rules").unwrap_or(Json::Null);
+    if rules.is_null()
+        && let Some(encoded) = row.get("chain").and_then(Json::as_str)
+            .and_then(|chain| chain.strip_prefix(FILTER_RULES_PREFIX))
+    {
+        rules = Json::from(String::from_utf8(hex::decode(encoded)?)?);
+        row.insert("chain".into(), Json::from("lists!"));
+    }
+    if !rules.is_null() {
+        let json = rules.as_str().context("filter rules must be a string")?;
+        crate::filter::FilterRules::from_storage(json)?;
+    }
+    row.insert("rules".into(), rules);
+    Ok(row)
 }
 
 #[cfg(test)]

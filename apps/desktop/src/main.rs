@@ -15,6 +15,7 @@ mod drag;
 mod emoji;
 mod export;
 mod due_picker;
+mod filter_draft;
 mod focus_timer;
 mod focus_mini;
 mod focus_view;

@@ -6,7 +6,8 @@ use crate::recurrence::Recurrence;
 pub type Id = Uuid;
 
 /// Stored as 0/1/3/5, the same values TickTick uses, so imports need no mapping table.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Priority {
     #[default]
     None,
@@ -36,7 +37,8 @@ impl Priority {
 }
 
 /// A checkable task or a note (TickTick's `kind` TEXT / NOTE).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Kind {
     #[default]
     Task,

@@ -2939,6 +2939,7 @@ mod size_tests {
 pub(crate) fn render_markdown(text: &str, sticky: Option<crate::sticky_settings::StickySettings>, cx: &App) -> AnyElement {
     use fern_core::markdown::{BlockKind, blocks};
     let theme = cx.theme();
+    let line_height = px(sticky.map_or(22., |style| style.font_px() + 8.));
     let accent = sticky.map_or(theme.colors().accent, |s| gpui::rgb(if s.color >= 9 { 0x95b7ff } else { 0x254c9e }).into());
     let muted = sticky.map_or(theme.colors().text_muted, |s| gpui::rgb(if s.color >= 9 { 0xbcc5d6 } else { 0x525566 }).into());
     let styled = |text: String, runs: Vec<(std::ops::Range<usize>, fern_core::markdown::Style)>| {
@@ -2975,8 +2976,8 @@ pub(crate) fn render_markdown(text: &str, sticky: Option<crate::sticky_settings:
     v_flex()
         .gap_1p5()
         .text_size(px(15.))
-        .line_height(px(22.))
-        .when_some(sticky, |el, settings| el.text_size(px(settings.font_px())).line_height(px(settings.font_px() + 8.)))
+        .line_height(line_height)
+        .when_some(sticky, |el, settings| el.text_size(px(settings.font_px())))
         .children(blocks(text).into_iter().enumerate().map(|(ix, block)| {
             // Links open in the browser on a click, as Zed's Markdown opens them. The click is
             // taken on the release by the block, before the description's own click opens it for
@@ -2996,6 +2997,7 @@ pub(crate) fn render_markdown(text: &str, sticky: Option<crate::sticky_settings:
                 })
             });
             match block.kind {
+                BlockKind::BlankLine => div().h(line_height).flex_none().into_any_element(),
                 BlockKind::Heading(level) => div()
                     .font_weight(FontWeight::BOLD)
                     .text_size(px(match level {

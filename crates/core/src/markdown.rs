@@ -182,6 +182,7 @@ fn prefix_lines(text: &str, selection: Range<usize>, format: Format) -> (String,
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BlockKind {
     Paragraph,
+    BlankLine,
     Heading(u8),
     /// A numbered item, with its number.
     Numbered(u32),
@@ -214,18 +215,18 @@ pub struct Block {
     pub runs: Vec<(std::ops::Range<usize>, Style)>,
 }
 
-/// Splits a description into blocks, one per line (blank lines dropped), as the original draws
-/// them: headings, numbered and bulleted items, check items, quotes and lines, with the inline
-/// markers the toolbar writes taken out and turned into styles.
+/// Splits a description into blocks, one per line. Blank lines are kept so the preview preserves
+/// the spacing entered in the editor. Inline markers are turned into styles.
 pub fn blocks(text: &str) -> Vec<Block> {
     text.lines()
-        .filter(|line| !line.trim().is_empty())
         .map(|line| {
             let trimmed = line.trim_start();
             if let Some((alt, url)) = image(trimmed.trim_end()) {
                 return Block { kind: BlockKind::Image(url.to_owned()), text: alt.to_owned(), runs: Vec::new() };
             }
-            let (kind, rest) = if trimmed == "---" || trimmed == "***" {
+            let (kind, rest) = if trimmed.is_empty() {
+                (BlockKind::BlankLine, "")
+            } else if trimmed == "---" || trimmed == "***" {
                 (BlockKind::Divider, "")
             } else if let Some(rest) = trimmed.strip_prefix("- [ ] ") {
                 (BlockKind::Check(false), rest)
@@ -333,7 +334,7 @@ mod tests {
 
     #[test]
     fn blocks_as_the_original_draws_them() {
-        let text = "# Plan\n1. Keyboard **shortcuts**\n2. A week\n\n- [x] done\n* item with [a link](https://x.org)\n> said\nplain ::bright:: and ~~gone~~";
+        let text = "# Plan\n1. Keyboard **shortcuts**\n2. A week\n- [x] done\n* item with [a link](https://x.org)\n> said\nplain ::bright:: and ~~gone~~";
         let blocks = blocks(text);
         let kinds: Vec<_> = blocks.iter().map(|b| b.kind.clone()).collect();
         assert_eq!(
@@ -357,6 +358,15 @@ mod tests {
         assert_eq!(super::blocks("Привет, мир")[0].text, "Привет, мир", "non-ASCII text is kept");
         let image = &super::blocks("![cat](https://x.org/cat.png)")[0];
         assert_eq!((&image.kind, image.text.as_str()), (&BlockKind::Image("https://x.org/cat.png".into()), "cat"));
+    }
+
+    #[test]
+    fn preserves_blank_lines_between_list_items() {
+        let blocks = blocks("- first\r\n\r\n \t\r\n- second\r\n");
+        assert_eq!(
+            blocks.iter().map(|b| &b.kind).collect::<Vec<_>>(),
+            [&BlockKind::Bullet, &BlockKind::BlankLine, &BlockKind::BlankLine, &BlockKind::Bullet]
+        );
     }
 
     fn run(text: &str, selection: Range<usize>, format: Format) -> (String, String) {

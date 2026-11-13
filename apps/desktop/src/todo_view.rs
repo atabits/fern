@@ -6764,4 +6764,40 @@ mod tests {
         assert_eq!(store.task(task.id).unwrap().unwrap().title, "Original!");
         cx.update(|_, cx| assert!(view.read(cx).title_edit.is_none()));
     }
+
+    #[gpui::test]
+    fn backspace_edits_text_but_only_delete_trashes_the_selected_task(cx: &mut TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let task = store.add_task("Original").unwrap();
+        cx.update(|cx| {
+            theme::init(cx);
+            cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+            let errors = crate::keymap::load_default(&assets::Assets, cx).unwrap();
+            assert!(errors.is_empty(), "{errors:?}");
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| TodoView::new(store.clone(), window, cx));
+        let selector = format!("task-title-{}", task.id).leak();
+        let bounds = cx.debug_bounds(selector).expect("task title is rendered");
+        let position = point(bounds.left() + px(8.), bounds.center().y);
+        let modifiers = Modifiers::default();
+
+        cx.simulate_mouse_move(position, None, modifiers);
+        cx.simulate_click(position, modifiers);
+        cx.update(|window, cx| {
+            let view = view.read(cx);
+            assert_eq!(view.selected, Some(task.id));
+            assert!(view.list_focus.is_focused(window));
+        });
+        cx.simulate_keystrokes("backspace");
+        assert!(!store.task(task.id).unwrap().unwrap().is_deleted());
+
+        cx.simulate_click(position, modifiers);
+        cx.simulate_keystrokes("end backspace enter");
+        let edited = store.task(task.id).unwrap().unwrap();
+        assert_eq!(edited.title, "Origina");
+        assert!(!edited.is_deleted());
+
+        cx.simulate_keystrokes("delete");
+        assert!(store.task(task.id).unwrap().unwrap().is_deleted());
+    }
 }

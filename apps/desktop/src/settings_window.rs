@@ -14,6 +14,7 @@ use ui::{Placement, PopoverAttachment, popover};
 use crate::actions::DismissSettings;
 use crate::calendar;
 use crate::i18n::{self, CurrentLocale, Locale};
+use crate::release_notes::{self, ReleaseNotes, action_button};
 #[path = "sticky_settings_view.rs"]
 mod sticky_settings_view;
 
@@ -73,6 +74,8 @@ pub struct SettingsWindow {
     focus_handle: FocusHandle,
     /// The outcome of the last backup or import.
     backup_message: Option<String>,
+    installed_notes: Option<Rc<ReleaseNotes>>,
+    release_notes: Option<Rc<ReleaseNotes>>,
     /// Settings → Sync: the server's address and the token, saved as they are typed.
     sync_server: Entity<crate::text_input::TextInput>,
     sync_token: Entity<crate::text_input::TextInput>,
@@ -136,6 +139,7 @@ impl SettingsWindow {
         };
         let subscription_name = plain(i18n::t(cx).subscription_name_placeholder, cx);
         let subscription_url = plain("https://…/calendar.ics", cx);
+        let installed_notes = release_notes::installed(&store).map(Rc::new);
         Self {
             store,
             preferences,
@@ -143,6 +147,8 @@ impl SettingsWindow {
             menu: None,
             focus_handle: cx.focus_handle(),
             backup_message: None,
+            installed_notes,
+            release_notes: None,
             sync_server,
             sync_token,
             subscription_form: None,
@@ -166,7 +172,19 @@ impl SettingsWindow {
     pub fn set_page(&mut self, page: Page, cx: &mut Context<Self>) {
         self.page = page;
         self.menu = None;
+        self.release_notes = None;
         cx.notify();
+    }
+
+    pub fn show_release_notes(&mut self, notes: Rc<ReleaseNotes>, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_page(Page::About, cx);
+        self.release_notes = Some(notes);
+        window.focus(&self.focus_handle, cx);
+    }
+
+    fn back_to_about(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_page(Page::About, cx);
+        window.focus(&self.focus_handle, cx);
     }
 
     fn set_menu(&mut self, menu: Option<Menu>, cx: &mut Context<Self>) {
@@ -518,11 +536,15 @@ impl SettingsWindow {
             Status::Checking => (Some(strings.update_checking.to_owned()), None),
             Status::UpToDate => (Some(strings.update_up_to_date.to_owned()), Some(strings.check_for_updates.to_owned())),
             Status::Downloading(v) => (Some(version(strings.update_downloading, v)), None),
-            Status::Ready(v) => (Some(version(strings.update_ready, v)), Some(strings.restart_to_update.to_owned())),
-            Status::Available { version: v, .. } => (Some(version(strings.update_available, v)), Some(version(strings.update_to, v))),
+            Status::Ready(notes) => (Some(version(strings.update_ready, &notes.version)), Some(strings.restart_to_update.to_owned())),
+            Status::Available(notes) => (Some(version(strings.update_available, &notes.version)), Some(version(strings.update_to, &notes.version))),
             Status::Failed(error) => (Some(strings.update_failed.replace("{error}", error)), Some(strings.check_for_updates.to_owned())),
         };
-        let install = matches!(status, Status::Ready(_) | Status::Available { .. });
+        let notes = match status {
+            Status::Ready(notes) | Status::Available(notes) => Some(notes),
+            _ => None,
+        };
+        let install = notes.is_some();
         let switch_updater = updater.clone();
         Some(
             v_flex()
@@ -547,31 +569,43 @@ impl SettingsWindow {
                                 .min_h(px(ROW_HEIGHT))
                                 .py_2()
                                 .px_4()
-                                .gap_4()
+                                .gap_x_3()
+                                .gap_y_1()
+                                .flex_wrap()
                                 .child(
                                     div()
                                         .flex_1()
-                                        .min_w_0()
+                                        .min_w(px(110.))
                                         .text_size(px(13.))
-                                        .text_color(colors.text_muted)
+                                        .text_color(if install { colors.text } else { colors.text_muted })
                                         .child(message.unwrap_or_else(|| format!("Fern {}", env!("CARGO_PKG_VERSION")))),
                                 )
-                                .children(action.map(|action| {
-                                    div()
-                                        .id("update-action")
-                                        .flex_none()
-                                        .cursor_pointer()
-                                        .child(Label::new(action).color(Color::Accent))
-                                        .on_click(move |_, _, cx| {
-                                            updater.update(cx, |updater, cx| {
-                                                if install {
-                                                    updater.restart_to_update(cx)
-                                                } else {
-                                                    updater.check(cx)
-                                                }
+                                .child(h_flex().gap_2().flex_none().flex_wrap()
+                                    .children(notes.map(|notes| {
+                                        action_button("update-notes", cx)
+                                            .debug_selector(|| "update-notes".to_owned())
+                                            .border_color(colors.border)
+                                            .child(Label::new(strings.whats_new).size(LabelSize::Small))
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                this.show_release_notes(notes.clone(), window, cx);
+                                            }))
+                                    }))
+                                    .children(action.map(|action| {
+                                        action_button("update-action", cx)
+                                            .debug_selector(|| "update-action".to_owned())
+                                            .when(install, |el| el.bg(colors.accent.opacity(0.12)).border_color(colors.accent.opacity(0.35)))
+                                            .child(Label::new(action).size(LabelSize::Small).weight(FontWeight::MEDIUM))
+                                            .on_click(move |_, _, cx| {
+                                                updater.update(cx, |updater, cx| {
+                                                    if install {
+                                                        updater.restart_to_update(cx)
+                                                    } else {
+                                                        updater.check(cx)
+                                                    }
+                                                });
                                             })
-                                        })
-                                })),
+                                    })),
+                                ),
                         ),
                 )
                 .into_any_element(),
@@ -1307,7 +1341,17 @@ impl SettingsWindow {
                 )
                 .child(
                     group()
-                        .child(row(strings.version, env!("CARGO_PKG_VERSION")))
+                        .child(row(strings.version, release_notes::CURRENT_VERSION))
+                        .children(self.installed_notes.as_ref().map(|notes| {
+                            let title = strings.whats_new_in_version.replace("{version}", &notes.version);
+                            let notes = notes.clone();
+                            action_button("installed-release-notes", cx)
+                                .mx_2()
+                                .min_h(px(ROW_HEIGHT))
+                                .child(div().flex_1().child(Label::new(title)))
+                                .child(Icon::new(IconName::ChevronRight).size(IconSize::Small).color(Color::Muted))
+                                .on_click(cx.listener(move |this, _, window, cx| this.show_release_notes(notes.clone(), window, cx)))
+                        }))
                         .child(row(strings.license, "AGPL-3.0-or-later")),
                 )
                 .children(self.render_updates(cx))
@@ -1345,18 +1389,73 @@ impl SettingsWindow {
             }
         }
     }
+
+    fn render_release_notes(&self, notes: &ReleaseNotes, cx: &App) -> AnyElement {
+        let strings = i18n::t(cx);
+        let title = strings.whats_new_in_version.replace("{version}", &notes.version);
+        let url = notes.url.clone();
+        v_flex()
+            .id(SharedString::from(format!("release-notes-page-{}", notes.version)))
+            .debug_selector(|| "release-notes-page".to_owned())
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .px_6()
+            .pt_2()
+            .pb_6()
+            .gap_4()
+            .child(Label::new(title).size(LabelSize::Large).weight(FontWeight::SEMIBOLD))
+            .child(if notes.markdown.is_empty() {
+                div().text_size(px(14.)).child(strings.release_notes_missing).into_any_element()
+            } else {
+                crate::task_detail::render_release_markdown(&notes.markdown, cx)
+            })
+            .child(
+                action_button("release-notes-github", cx)
+                    .self_start()
+                    .border_color(cx.theme().colors().border)
+                    .child(Label::new(strings.release_on_github).size(LabelSize::Small))
+                    .child(Icon::new(IconName::SquareArrowOutUpRight).size(IconSize::Small).color(Color::Muted))
+                    .on_click(move |_, _, cx| cx.open_url(&url)),
+            )
+            .into_any_element()
+    }
 }
 
 impl Render for SettingsWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let colors = cx.theme().colors();
+        let colors = cx.theme().colors().clone();
+        let notes_open = self.release_notes.is_some();
+        let about = i18n::t(cx).settings_pages[5];
+        let page = match &self.release_notes {
+            Some(notes) => self.render_release_notes(notes, cx),
+            None => self.render_page(window, cx),
+        };
         h_flex()
             .id("settings-window")
             .track_focus(&self.focus_handle)
+            .tab_group()
             .key_context("Settings")
-            .on_action(cx.listener(|_, _: &DismissSettings, _, cx| cx.emit(SettingsEvent::Dismissed)))
+            .on_action(cx.listener(|this, _: &DismissSettings, window, cx| {
+                if this.release_notes.is_some() {
+                    this.back_to_about(window, cx);
+                } else {
+                    cx.emit(SettingsEvent::Dismissed);
+                }
+            }))
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                if (this.release_notes.is_some() || (this.page == Page::About && this.installed_notes.is_some())) && event.keystroke.key == "tab" {
+                    if event.keystroke.modifiers.shift {
+                        window.focus_prev(cx);
+                    } else {
+                        window.focus_next(cx);
+                    }
+                    cx.stop_propagation();
+                }
+            }))
             .w(px(840.))
             .h(px(680.))
+            .when(notes_open, |el| el.max_w_full().max_h_full())
             .relative()
             .rounded(px(12.))
             .overflow_hidden()
@@ -1366,7 +1465,29 @@ impl Render for SettingsWindow {
             .shadow_lg()
             .text_color(colors.text)
             .child(self.render_nav(cx))
-            .child(self.render_page(window, cx))
+            .child(if notes_open {
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .bg(colors.background)
+                    .child(
+                        h_flex()
+                            .h(px(44.))
+                            .flex_none()
+                            .px_3()
+                            .child(
+                                action_button("release-notes-back", cx)
+                                    .child(Icon::new(IconName::ChevronLeft).size(IconSize::Small).color(Color::Muted))
+                                    .child(Label::new(about).size(LabelSize::Small))
+                                    .on_click(cx.listener(|this, _, window, cx| this.back_to_about(window, cx))),
+                            ),
+                    )
+                    .child(page)
+                    .into_any_element()
+            } else {
+                page
+            })
             .child(
                 div().absolute().top_3().right_3().child(
                     IconButton::new("close-settings", IconName::X)

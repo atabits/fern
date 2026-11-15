@@ -2937,7 +2937,46 @@ mod size_tests {
 /// with their numbers in the accent color, bullets, check items, quotes and lines, with bold,
 /// italic, underlined, struck, highlighted, code and link runs.
 pub(crate) fn render_markdown(text: &str, sticky: Option<crate::sticky_settings::StickySettings>, cx: &App) -> AnyElement {
-    use fern_core::markdown::{BlockKind, blocks};
+    render_markdown_blocks(fern_core::markdown::blocks(text), sticky, true, cx)
+}
+
+pub(crate) fn render_release_markdown(text: &str, cx: &App) -> AnyElement {
+    use fern_core::markdown::{Block, BlockKind, blocks};
+
+    // The published Markdown is hard-wrapped in the source. Let the window wrap its prose,
+    // keeping paragraph breaks and list markers where the author put them.
+    let source = text.lines().map(str::trim_start).collect::<Vec<_>>().join("\n");
+    let mut reflowed: Vec<Block> = Vec::new();
+    for mut block in blocks(&source) {
+        for (_, style) in &mut block.runs {
+            if style.link.as_deref().is_some_and(|url| !url.starts_with("https://") && !url.starts_with("http://")) {
+                style.link = None;
+            }
+        }
+        if block.kind == BlockKind::Paragraph
+            && let Some(previous) = reflowed.last_mut()
+            && matches!(previous.kind, BlockKind::Paragraph | BlockKind::Bullet | BlockKind::Numbered(_))
+        {
+            previous.text.push(' ');
+            let offset = previous.text.len();
+            previous.text.push_str(&block.text);
+            previous.runs.extend(block.runs.into_iter().map(|(range, style)| {
+                ((range.start + offset)..(range.end + offset), style)
+            }));
+        } else {
+            reflowed.push(block);
+        }
+    }
+    render_markdown_blocks(reflowed, None, false, cx)
+}
+
+fn render_markdown_blocks(
+    blocks: Vec<fern_core::markdown::Block>,
+    sticky: Option<crate::sticky_settings::StickySettings>,
+    show_images: bool,
+    cx: &App,
+) -> AnyElement {
+    use fern_core::markdown::BlockKind;
     let theme = cx.theme();
     let line_height = px(sticky.map_or(22., |style| style.font_px() + 8.));
     let accent = sticky.map_or(theme.colors().accent, |s| gpui::rgb(if s.color >= 9 { 0x95b7ff } else { 0x254c9e }).into());
@@ -2978,7 +3017,7 @@ pub(crate) fn render_markdown(text: &str, sticky: Option<crate::sticky_settings:
         .text_size(px(15.))
         .line_height(line_height)
         .when_some(sticky, |el, settings| el.text_size(px(settings.font_px())))
-        .children(blocks(text).into_iter().enumerate().map(|(ix, block)| {
+        .children(blocks.into_iter().enumerate().map(|(ix, block)| {
             // Links open in the browser on a click, as Zed's Markdown opens them. The click is
             // taken on the release by the block, before the description's own click opens it for
             // editing; the text only gives links the pointing hand.
@@ -3025,6 +3064,7 @@ pub(crate) fn render_markdown(text: &str, sticky: Option<crate::sticky_settings:
                     .into_any_element(),
                 BlockKind::Quote => div().pl_3().border_l_2().border_color(accent).text_color(muted).child(body).into_any_element(),
                 BlockKind::Divider => div().my_1().h(px(1.)).bg(theme.colors().border).into_any_element(),
+                BlockKind::Image(_) if !show_images => body.text_color(muted).into_any_element(),
                 // An image line shows the image at most as wide as the panel, as the original; a
                 // relative address is a file among the attachments.
                 BlockKind::Image(url) => {

@@ -9,12 +9,17 @@
 //! - Linux asks the compositor for client-side decorations. When it draws its own (server-side),
 //!   the bar stays but without window buttons.
 
+use std::rc::Rc;
+
 use gpui::{
-    Bounds, CursorStyle, Decorations, Global, HitboxBehavior, MouseButton, Point, ResizeEdge, Size,
+    Bounds, CursorStyle, Decorations, EventEmitter, Global, HitboxBehavior, MouseButton, Point, ResizeEdge, Size,
     TitlebarOptions, Tiling, WindowButton, WindowButtonLayout, WindowControlArea, WindowDecorations,
     canvas, point, rgb, transparent_black,
 };
 use ui::prelude::*;
+
+use crate::release_notes::{ReleaseNotes, action_button};
+use crate::updater::Status;
 
 /// The radius of the window's corners with client-side decorations.
 const ROUNDING: Pixels = px(10.);
@@ -54,6 +59,10 @@ pub struct TitleBar {
     _updates: Option<gpui::Subscription>,
 }
 
+pub struct ShowReleaseNotes(pub Rc<ReleaseNotes>);
+
+impl EventEmitter<ShowReleaseNotes> for TitleBar {}
+
 impl TitleBar {
     pub fn new(cx: &mut Context<Self>) -> Self {
         let updates = crate::updater::updater(cx).map(|updater| cx.observe(&updater, |_, _, cx| cx.notify()));
@@ -62,30 +71,44 @@ impl TitleBar {
 
     /// "Restart to Update" once a new version is downloaded, or "Update to …" when it is out
     /// but this installation is updated some other way.
-    fn update_button(&self, cx: &App) -> Option<AnyElement> {
+    fn update_buttons(&self, cx: &Context<Self>) -> Option<AnyElement> {
         let updater = crate::updater::updater(cx)?;
         let strings = crate::i18n::t(cx);
-        let label = match updater.read(cx).status() {
-            crate::updater::Status::Ready(_) => strings.restart_to_update.to_owned(),
-            crate::updater::Status::Available { version, .. } => strings.update_to.replace("{version}", version),
+        let (notes, label) = match updater.read(cx).status() {
+            Status::Ready(notes) => (notes.clone(), strings.restart_to_update.to_owned()),
+            Status::Available(notes) => (notes.clone(), strings.update_to.replace("{version}", &notes.version)),
             _ => return None,
         };
-        let hover = cx.theme().colors().ghost_element_hover;
+        let accent = cx.theme().colors().accent;
         Some(
-            div()
-                .id("update-button")
+            h_flex()
                 .flex_none()
                 .mr_2()
-                .px_2()
-                .py_0p5()
-                .rounded(px(6.))
-                .cursor_pointer()
-                // Clickable inside the bar's drag area.
-                .occlude()
-                .hover(move |el| el.bg(hover))
-                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .child(Label::new(label).size(LabelSize::Small).color(Color::Accent))
-                .on_click(move |_, _, cx| updater.update(cx, |updater, cx| updater.restart_to_update(cx)))
+                .gap_1()
+                .child(
+                    action_button("title-bar-update-notes", cx)
+                        .debug_selector(|| "title-bar-update-notes".to_owned())
+                        .occlude()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .child(Label::new(strings.whats_new).size(LabelSize::Small))
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            cx.stop_propagation();
+                            cx.emit(ShowReleaseNotes(notes.clone()));
+                        })),
+                )
+                .child(
+                    action_button("update-button", cx)
+                        .debug_selector(|| "title-bar-restart-update".to_owned())
+                        .bg(accent.opacity(0.12))
+                        .border_color(accent.opacity(0.35))
+                        .occlude()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .child(Label::new(label).size(LabelSize::Small).weight(gpui::FontWeight::MEDIUM))
+                        .on_click(move |_, _, cx| {
+                            cx.stop_propagation();
+                            updater.update(cx, |updater, cx| updater.restart_to_update(cx));
+                        }),
+                )
                 .into_any_element(),
         )
     }
@@ -93,7 +116,7 @@ impl TitleBar {
 
 impl Render for TitleBar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let update_button = self.update_button(cx);
+        let update_buttons = self.update_buttons(cx);
         let colors = cx.theme().colors();
         let decorations = window.window_decorations();
         let client_side = matches!(decorations, Decorations::Client { .. });
@@ -165,7 +188,7 @@ impl Render for TitleBar {
                     .child(gpui::img("icon/icon-64.png").size(px(16.)).flex_none())
                     .child(Label::new("Fern").size(LabelSize::Small).color(Color::Muted)),
             )
-            .children(update_button)
+            .children(update_buttons)
             .children(right_buttons)
     }
 }

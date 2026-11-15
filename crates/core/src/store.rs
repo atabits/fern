@@ -2802,6 +2802,15 @@ impl Store {
         Ok(())
     }
 
+    /// Inserts a setting only if absent. Returns whether this connection inserted it.
+    pub fn insert_setting(&self, key: &str, value: &str) -> Result<bool> {
+        let inserted = self.conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO NOTHING",
+            params![key, value],
+        )?;
+        Ok(inserted != 0)
+    }
+
     /// Moves the task and its subtasks to the trash.
     pub fn delete_task(&self, id: Id) -> Result<()> {
         self.set_deleted(id, Some(now_ms()))

@@ -1959,41 +1959,48 @@ impl Render for HabitView {
             .and_then(|id| habits.iter().find(|h| h.id == id))
             .map(|habit| self.render_detail(habit, today, cx));
 
-        // As the original's, the habits start 35 px under the week's rings.
-        let strip = h_flex().px(px(22.)).pt(px(18.)).pb(px(34.)).children(week.map(|date| {
-            let progress = self.day_progress(date);
-            let is_today = date == today;
-            let ring = if progress >= 1. {
-                theme.colors().accent
-            } else if progress > 0. {
-                theme.colors().accent.opacity(0.6)
-            } else {
-                theme.colors().text_muted
-            };
-            v_flex()
-                .flex_1()
-                .items_center()
-                .gap_0p5()
-                .child(
-                    Label::new(strings.weekdays_short[date.weekday().num_days_from_monday() as usize])
-                        .size(LabelSize::XSmall)
-                        .color(if is_today { Color::Accent } else { Color::Muted }),
-                )
-                .child(
-                    Label::new(date.day().to_string())
-                        .size(LabelSize::Small)
-                        .weight(FontWeight::SEMIBOLD)
-                        .color(if is_today { Color::Accent } else { Color::Default }),
-                )
-                .child(
-                    div()
-                        .size(px(22.))
-                        .rounded_full()
-                        .border_2()
-                        .border_color(ring)
-                        .when(progress >= 1., |el| el.bg(theme.colors().accent.opacity(0.3))),
-                )
-        }));
+        // The weekly summary belongs to Active. The archive only shows each habit's history.
+        let strip = (!self.show_archived).then(|| {
+            h_flex()
+                .debug_selector(|| "habit-week-progress".to_owned())
+                .px(px(22.))
+                .pt(px(18.))
+                .pb(px(34.))
+                .children(week.map(|date| {
+                    let progress = self.day_progress(date);
+                    let is_today = date == today;
+                    let ring = if progress >= 1. {
+                        theme.colors().accent
+                    } else if progress > 0. {
+                        theme.colors().accent.opacity(0.6)
+                    } else {
+                        theme.colors().text_muted
+                    };
+                    v_flex()
+                        .flex_1()
+                        .items_center()
+                        .gap_0p5()
+                        .child(
+                            Label::new(strings.weekdays_short[date.weekday().num_days_from_monday() as usize])
+                                .size(LabelSize::XSmall)
+                                .color(if is_today { Color::Accent } else { Color::Muted }),
+                        )
+                        .child(
+                            Label::new(date.day().to_string())
+                                .size(LabelSize::Small)
+                                .weight(FontWeight::SEMIBOLD)
+                                .color(if is_today { Color::Accent } else { Color::Default }),
+                        )
+                        .child(
+                            div()
+                                .size(px(22.))
+                                .rounded_full()
+                                .border_2()
+                                .border_color(ring)
+                                .when(progress >= 1., |el| el.bg(theme.colors().accent.opacity(0.3))),
+                        )
+                }))
+        });
 
         // As in the original, the habits take a left column; the right side is left for details.
         // As in the original, the habits take about 64% of the width and the details the rest,
@@ -2094,7 +2101,7 @@ impl Render for HabitView {
             .when_some(self.export_message.clone(), |el, message| {
                 el.child(div().px(px(22.)).pb_2().child(Label::new(message).size(LabelSize::XSmall).color(Color::Muted)))
             })
-            .child(strip)
+            .children(strip)
             .child(
                 div()
                     .id("habit-grid")
@@ -2145,4 +2152,48 @@ impl Render for HabitView {
 /// "Day" for 0 or 1 days and "Days" for more, as the original's statistics cards say.
 fn day_unit(days: i64, strings: &i18n::Strings) -> &'static str {
     if days <= 1 { strings.habit_unit_day } else { strings.habit_unit_days }
+}
+
+#[cfg(all(test, debug_assertions))]
+mod tests {
+    use super::*;
+    use gpui::TestAppContext;
+
+    #[gpui::test]
+    fn restoring_the_last_archived_habit_shows_its_weekly_progress_only_in_active(cx: &mut TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let today = Local::now().date_naive();
+        let habit = store.add_habit("Read").unwrap();
+        assert!(store.toggle_checkin(habit.id, today).unwrap());
+        store.set_habit_archived(habit.id, true).unwrap();
+
+        cx.update(theme::init);
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let mut view = HabitView::new(store.clone(), cx);
+            view.show_archived = true;
+            view.selected = Some(habit.id);
+            view
+        });
+        assert!(cx.debug_bounds("habit-week-progress").is_none());
+
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| view.set_archived(habit.id, false, cx));
+        });
+        assert!(cx.debug_bounds("habit-week-progress").is_none());
+        cx.update(|_, cx| {
+            let view = view.read(cx);
+            assert!(view.show_archived);
+            assert!(view.habits.iter().all(|habit| !habit.archived));
+            assert!(view.selected.is_none());
+        });
+
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.show_archived = false;
+                cx.notify();
+            });
+        });
+        assert!(cx.debug_bounds("habit-week-progress").is_some());
+        cx.update(|_, cx| assert_eq!(view.read(cx).day_progress(today), 1.));
+    }
 }

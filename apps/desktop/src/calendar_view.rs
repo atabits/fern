@@ -7,7 +7,7 @@ use chrono::{Datelike, Local, NaiveDate};
 use fern_core::{CalendarOptions, ColorBy, Id, Priority, Store, Task};
 use gpui::{EventEmitter, FontWeight};
 use ui::prelude::*;
-use ui::{Placement, PopoverAttachment, SubmenuItem, popover};
+use ui::{Placement, PopoverAttachment, popover};
 
 use crate::actions::{AgendaView, CalendarToday, DayView, MonthView, NextYear, PreviousYear, PrintYear, NewTask, ToggleSidebar, WeekView, YearView};
 use crate::calendar::{self, week_axis};
@@ -60,7 +60,7 @@ pub enum CalendarMode {
     MultiWeek(u8),
 }
 
-/// The Multi-Week counts the menu's stepper goes through.
+const MULTI_DAYS: std::ops::RangeInclusive<u8> = 1..=14;
 const MULTI_WEEKS: std::ops::RangeInclusive<u8> = 2..=6;
 
 impl CalendarMode {
@@ -79,12 +79,9 @@ pub struct CalendarView {
     anchor: NaiveDate,
     mode_menu_open: bool,
     focus_handle: gpui::FocusHandle,
-    /// The mode menu's Multi-Day side menu, while hovered open.
-    multi_day_menu: bool,
-    /// The weeks Multi-Week shows, set with the menu's stepper; and whether its row is hovered,
-    /// which shows the stepper, as in the original.
+    /// The counts last chosen in the mode menu.
+    multi_days: u8,
     multi_weeks: u8,
-    multi_week_hovered: bool,
     tasks: Vec<Task>,
     /// The Agenda's days, from today (or the shown month's first day, when later) a year on.
     agenda: Vec<(NaiveDate, Vec<fern_core::agenda::AgendaItem>)>,
@@ -172,9 +169,8 @@ impl CalendarView {
             anchor: today,
             mode_menu_open: false,
             focus_handle: cx.focus_handle(),
-            multi_day_menu: false,
+            multi_days: 1,
             multi_weeks: 5,
-            multi_week_hovered: false,
             tasks: Vec::new(),
             agenda: Vec::new(),
             countdowns: Vec::new(),
@@ -857,17 +853,26 @@ impl CalendarView {
     }
 
     pub fn set_mode(&mut self, mode: CalendarMode, cx: &mut Context<Self>) {
-        self.mode = mode;
         self.mode_menu_open = false;
+        self.apply_mode(mode, cx);
+    }
+
+    fn apply_mode(&mut self, mode: CalendarMode, cx: &mut Context<Self>) {
+        self.mode = mode;
         self.year_day = None;
         self.year_scroll = calendar_year::YearScroll::default();
         self.year_jump = None;
-        if mode == CalendarMode::Year {
-            let day = calendar_year::clamp_year_day(self.month);
-            if day != self.month {
-                self.anchor = day;
+        match mode {
+            CalendarMode::Year => {
+                let day = calendar_year::clamp_year_day(self.month);
+                if day != self.month {
+                    self.anchor = day;
+                }
+                self.month = NaiveDate::from_ymd_opt(day.year(), 1, 1).unwrap();
             }
-            self.month = NaiveDate::from_ymd_opt(day.year(), 1, 1).unwrap();
+            CalendarMode::MultiDay(days) => self.multi_days = days,
+            CalendarMode::MultiWeek(weeks) => self.multi_weeks = weeks,
+            _ => {}
         }
         if (mode.is_timed() || matches!(mode, CalendarMode::MultiWeek(_))) && calendar::month_start(self.anchor) != self.month {
             self.anchor = self.month;
@@ -886,7 +891,7 @@ impl CalendarView {
         cx.notify();
     }
 
-    /// The mode menu with its Multi-Day side menu open, for the debug-build dev state.
+    /// Opens the mode menu for the debug-build dev state.
     #[cfg(debug_assertions)]
     pub fn dev_year_day(&mut self, day: NaiveDate, cx: &mut Context<Self>) {
         self.year_day = Some((calendar::month_start(day), day));
@@ -896,7 +901,6 @@ impl CalendarView {
     #[cfg(debug_assertions)]
     pub fn dev_open_menu(&mut self, cx: &mut Context<Self>) {
         self.mode_menu_open = true;
-        self.multi_day_menu = true;
         cx.notify();
     }
 
@@ -1487,95 +1491,99 @@ impl CalendarView {
         ];
 
         popover(cx)
-            .min_w(px(170.))
+            .debug_selector(|| "calendar-mode-menu".to_owned())
+            .min_w(px(192.))
             .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                 this.mode_menu_open = false;
                 cx.notify();
             }))
             .children(items.into_iter().map(|(mode, label, hint)| {
-                let selected = self.mode == mode;
-                ListItem::new(label)
-                    .start_slot(div().w(px(14.)).when(selected, |el| el.child(Label::new("✓").color(Color::Accent))))
-                    .child(Label::new(label).size(LabelSize::Small).color(if selected { Color::Accent } else { Color::Default }))
+                self.mode_item(mode, label, cx)
                     .end_slot(Label::new(hint).size(LabelSize::XSmall).color(Color::Muted))
-                    .on_click(cx.listener(move |this, _, _, cx| this.set_mode(mode, cx)))
             }))
             .child(div().py_1().child(Divider::horizontal()))
-            // The original's Multi-Day, with the number of days in a side menu.
-            .child(
-                SubmenuItem::new("multi-day", strings.multi_day)
-                    .open(self.multi_day_menu)
-                    .placement(Placement::LeftSide)
-                    .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
-                        if *hovered && !this.multi_day_menu {
-                            this.multi_day_menu = true;
-                            cx.notify();
-                        }
-                    }))
-                    .items((2..=6u8).map(|n| {
-                        let selected = self.mode == CalendarMode::MultiDay(n);
-                        ListItem::new(SharedString::from(format!("multi-day-{n}")))
-                            .child(Label::new(strings.n_days.replace("{n}", &n.to_string())).color(if selected { Color::Accent } else { Color::Default }))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.multi_day_menu = false;
-                                this.set_mode(CalendarMode::MultiDay(n), cx)
-                            }))
-                    }))
-
-            )
-            .child(self.render_multi_week_item(cx))
+            .child(self.render_multi_mode_item(CalendarMode::MultiDay(self.multi_days), cx))
+            .child(self.render_multi_mode_item(CalendarMode::MultiWeek(self.multi_weeks), cx))
             .into_any_element()
     }
 
-    /// The menu's Multi-Week row: the week count, and while hovered a "− n +" stepper, as in the
-    /// original. Clicking the row shows that many weeks.
-    fn render_multi_week_item(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn mode_item(&self, mode: CalendarMode, label: &'static str, cx: &Context<Self>) -> ListItem {
+        let selected = self.mode == mode;
+        ListItem::new(label)
+            .start_slot(div().w(px(14.)).when(selected, |el| {
+                el.child(Icon::new(IconName::Check).size(IconSize::XSmall).color(Color::Accent))
+            }))
+            .child(Label::new(label).size(LabelSize::Small).color(if selected { Color::Accent } else { Color::Default }))
+            .on_click(cx.listener(move |this, _, _, cx| this.set_mode(mode, cx)))
+    }
+
+    fn render_multi_mode_item(&self, mode: CalendarMode, cx: &Context<Self>) -> impl IntoElement {
         let strings = i18n::t(cx);
-        let theme = cx.theme().clone();
-        let n = self.multi_weeks;
-        let selected = matches!(self.mode, CalendarMode::MultiWeek(_));
-        let step = |id: &'static str, icon: IconName, delta: i8| {
-            IconButton::new(id, icon).size(px(20.)).icon_size(IconSize::XSmall).on_click(cx.listener(move |this, _, _, cx| {
-                cx.stop_propagation();
-                let n = (this.multi_weeks as i8 + delta).clamp(*MULTI_WEEKS.start() as i8, *MULTI_WEEKS.end() as i8) as u8;
-                this.multi_weeks = n;
-                if matches!(this.mode, CalendarMode::MultiWeek(_)) {
-                    this.mode = CalendarMode::MultiWeek(n);
-                    this.reload(cx);
-                }
-                cx.notify();
-            }))
-        };
-        h_flex()
-            .id("multi-week")
-            .h(px(32.))
-            .mx_1()
-            .px_2()
-            .gap_2()
-            .rounded(px(6.))
-            .cursor_pointer()
-            .hover(|s| s.bg(theme.colors().element_hover))
-            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
-                this.multi_week_hovered = *hovered;
-                cx.notify();
-            }))
-            .child(div().w(px(14.)).when(selected, |el| el.child(Label::new("✓").color(Color::Accent))))
-            .child(
-                div().flex_1().child(
-                    Label::new(strings.multi_week).size(LabelSize::Small).color(if selected { Color::Accent } else { Color::Default }),
-                ),
-            )
-            .map(|el| {
-                if self.multi_week_hovered {
-                    el.child(step("multi-week-fewer", IconName::Minus, -1))
-                        .child(Label::new(n.to_string()).size(LabelSize::Small))
-                        .child(step("multi-week-more", IconName::Plus, 1))
+        let (group, label, count, hint, limits, mode_with_count) = match mode {
+            CalendarMode::MultiDay(days) => (
+                "calendar-multi-day",
+                strings.multi_day,
+                days,
+                if days == 1 {
+                    strings.one_day.to_owned()
                 } else {
-                    el.child(Label::new(strings.n_weeks.replace("{n}", &n.to_string())).size(LabelSize::XSmall).color(Color::Muted))
-                }
-            })
-            .on_click(cx.listener(move |this, _, _, cx| this.set_mode(CalendarMode::MultiWeek(this.multi_weeks), cx)))
-            .into_any_element()
+                    strings.n_days.replace("{n}", &days.to_string())
+                },
+                MULTI_DAYS,
+                CalendarMode::MultiDay as fn(u8) -> CalendarMode,
+            ),
+            CalendarMode::MultiWeek(weeks) => (
+                "calendar-multi-week",
+                strings.multi_week,
+                weeks,
+                strings.n_weeks.replace("{n}", &weeks.to_string()),
+                MULTI_WEEKS,
+                CalendarMode::MultiWeek as fn(u8) -> CalendarMode,
+            ),
+            _ => unreachable!("only multi-day and multi-week have count controls"),
+        };
+        let step = |id: &'static str, icon: IconName, delta: i8| {
+            let next = count.checked_add_signed(delta).filter(|next| limits.contains(next));
+            div().debug_selector(|| format!("{group}-{id}")).child(
+                IconButton::new(id, icon)
+                    .size(px(20.))
+                    .icon_size(IconSize::XSmall)
+                    .when(next.is_none(), |button| button.icon_color(Color::Placeholder))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        if let Some(next) = next {
+                            this.apply_mode(mode_with_count(next), cx);
+                        }
+                    })),
+            )
+        };
+        let touch = crate::touch::active();
+        let count_controls = div()
+            .relative()
+            .flex_none()
+            .child(
+                // Keep the controls in the layout so hover only changes visibility.
+                h_flex()
+                    .when(!touch, |el| el.invisible().group_hover(group, |style| style.visible()))
+                    .child(step("fewer", IconName::Minus, -1))
+                    .child(
+                        div().w(px(22.)).flex().justify_center()
+                            .child(Label::new(count.to_string()).size(LabelSize::Small)),
+                    )
+                    .child(step("more", IconName::Plus, 1)),
+            )
+            .when(!touch, |el| {
+                el.child(
+                    div().absolute().inset_0().flex().items_center().justify_end()
+                        .group_hover(group, |style| style.invisible())
+                        .child(Label::new(hint).size(LabelSize::XSmall).color(Color::Muted).truncate()),
+                )
+            });
+        div()
+            .id(group)
+            .group(group)
+            .debug_selector(|| group.to_owned())
+            .child(self.mode_item(mode, label, cx).end_slot(count_controls))
     }
 }
 
@@ -1680,6 +1688,7 @@ impl Render for CalendarView {
                             .relative()
                             .child(
                                 bordered("calendar-mode")
+                                    .debug_selector(|| "calendar-mode-button".to_owned())
                                     .px_3()
                                     .gap_1()
                                     .cursor_pointer()
@@ -1695,8 +1704,9 @@ impl Render for CalendarView {
                                         }),
                                     )
                                     .child(Icon::new(IconName::ChevronDown).size(IconSize::XSmall))
-                                    .on_click(cx.listener(|this, _, _, cx| {
+                                    .on_click(cx.listener(|this, _, window, cx| {
                                         this.mode_menu_open = true;
+                                        window.focus(&this.focus_handle, cx);
                                         cx.notify();
                                     })),
                             )
@@ -2013,6 +2023,57 @@ mod tests {
             let view = view.read(cx);
             assert_eq!(view.card, Some((task.id, today)));
             assert!(view.tasks_on(today).iter().any(|task| !task.is_closed()));
+        });
+    }
+
+    #[gpui::test]
+    fn calendar_mode_menu_keeps_its_bounds_while_adjusting_days_and_weeks(cx: &mut TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        cx.update(|cx| {
+            theme::init(cx);
+            cx.set_global(i18n::CurrentLocale(i18n::Locale::Ru));
+            assert!(crate::keymap::load_default(&assets::Assets, cx).unwrap().is_empty());
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let mut view = CalendarView::new(store, window, cx);
+            view.multi_days = 9;
+            view
+        });
+        let modifiers = Modifiers::default();
+        let button = cx.debug_bounds("calendar-mode-button").unwrap().center();
+        cx.simulate_mouse_move(button, None, modifiers);
+        cx.simulate_click(button, modifiers);
+        let menu = cx.debug_bounds("calendar-mode-menu").unwrap();
+
+        for (row, more, mode) in [
+            ("calendar-multi-day", "calendar-multi-day-more", CalendarMode::MultiDay(10)),
+            ("calendar-multi-week", "calendar-multi-week-more", CalendarMode::MultiWeek(6)),
+        ] {
+            let row = cx.debug_bounds(row).unwrap().center();
+            cx.simulate_mouse_move(row, None, modifiers);
+            assert_eq!(cx.debug_bounds("calendar-mode-menu"), Some(menu));
+
+            let more = cx.debug_bounds(more).expect("stepper button appears on hover").center();
+            cx.simulate_mouse_move(more, None, modifiers);
+            cx.simulate_click(more, modifiers);
+            cx.update(|_, cx| assert_eq!(view.read(cx).mode, mode));
+            assert_eq!(cx.debug_bounds("calendar-mode-menu"), Some(menu));
+        }
+
+        let more = cx.debug_bounds("calendar-multi-week-more").unwrap().center();
+        cx.simulate_click(more, modifiers);
+        cx.update(|_, cx| assert_eq!(view.read(cx).mode, CalendarMode::MultiWeek(6)));
+        assert_eq!(cx.debug_bounds("calendar-mode-menu"), Some(menu));
+
+        cx.simulate_mouse_move(button, None, modifiers);
+        assert_eq!(cx.debug_bounds("calendar-mode-menu"), Some(menu));
+        cx.simulate_click(point(px(10.), px(10.)), modifiers);
+        assert!(cx.debug_bounds("calendar-mode-menu").is_none());
+        cx.update(|window, cx| {
+            let view = view.read(cx);
+            assert_eq!(view.multi_days, 10);
+            assert_eq!(view.multi_weeks, 6);
+            assert!(view.focus_handle.is_focused(window));
         });
     }
 }

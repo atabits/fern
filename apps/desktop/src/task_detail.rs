@@ -2764,6 +2764,7 @@ impl Render for TaskDetail {
                     .child(if !notes_editing && !task.notes.trim().is_empty() {
                         div()
                             .id("notes-formatted")
+                            .debug_selector(|| "task-notes-preview".to_owned())
                             .cursor_text()
                             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                             // On the release, so that a click on a link opens it instead.
@@ -2775,6 +2776,7 @@ impl Render for TaskDetail {
                             .into_any_element()
                     } else {
                         div()
+                            .debug_selector(|| "task-notes-editor".to_owned())
                             .text_size(px(15.))
                             .line_height(px(22.))
                             .when_some(self.sticky_style, |el, style| el.text_size(px(style.font_px())).line_height(px(style.font_px() + 8.)))
@@ -2906,6 +2908,34 @@ impl Render for TaskDetail {
     }
 }
 
+#[cfg(all(test, debug_assertions))]
+mod tests {
+    use super::*;
+    use gpui::TestAppContext;
+
+    #[gpui::test]
+    fn blank_lines_keep_their_height_when_task_notes_lose_focus(cx: &mut TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let task = store.add_task("Task").unwrap();
+        store.set_notes(task.id, "First.\n\nSecond.\n\n\nThird.").unwrap();
+        let task = store.task(task.id).unwrap().unwrap();
+        cx.update(theme::init);
+        let (detail, cx) = cx.add_window_view(|window, cx| {
+            let mut detail = TaskDetail::new(store, window, cx);
+            detail.show(Some(task), cx);
+            window.focus(&detail.notes.focus_handle(cx), cx);
+            detail
+        });
+        let editor = cx.debug_bounds("task-notes-editor").expect("notes editor is visible");
+
+        cx.update(|window, cx| window.focus(&detail.read(cx).title.focus_handle(cx), cx));
+        cx.run_until_parked();
+        let preview = cx.debug_bounds("task-notes-preview").expect("notes preview is visible");
+
+        assert_eq!(preview.size.height, editor.size.height);
+    }
+}
+
 /// A file size the way people read it: "512 B", "12 KB", "3.4 MB".
 fn format_size(bytes: u64) -> String {
     match bytes {
@@ -3012,8 +3042,8 @@ fn render_markdown_blocks(
             .collect::<Vec<_>>();
         gpui::StyledText::new(text).with_highlights(highlights)
     };
+    // Each Markdown block already accounts for its source line, including blank lines.
     v_flex()
-        .gap_1p5()
         .text_size(px(15.))
         .line_height(line_height)
         .when_some(sticky, |el, settings| el.text_size(px(settings.font_px())))

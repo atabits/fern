@@ -61,6 +61,25 @@ impl Kind {
     }
 }
 
+/// Fields written together when creating a task from an editor or quick-add form.
+#[derive(Clone, Default)]
+pub struct TaskDraft {
+    pub title: String,
+    pub notes: String,
+    pub list_id: Option<Id>,
+    pub kind: Kind,
+    pub priority: Priority,
+    pub due_date: Option<NaiveDate>,
+    pub due_time: Option<NaiveTime>,
+    pub repeat: Option<Recurrence>,
+    pub reminders: Vec<i64>,
+    pub tags: Vec<String>,
+    pub end_date: Option<NaiveDate>,
+    pub end_time: Option<NaiveTime>,
+    pub section_id: Option<Id>,
+    pub checklist: Vec<(String, bool)>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Task {
     pub id: Id,

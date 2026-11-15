@@ -10,7 +10,7 @@ use uuid::Uuid;
 use crate::countdown::{Countdown, CountdownKind};
 use crate::focus::FocusSession;
 use crate::habit::{Checkin, Goal, Habit};
-use crate::model::{Attachment, ChecklistItem, Id, Kind, List, ListDraft, ListFolder, Priority, Tag, Task, View, ViewCounts};
+use crate::model::{Attachment, ChecklistItem, Id, Kind, List, ListDraft, ListFolder, Priority, Tag, Task, TaskDraft, View, ViewCounts};
 use crate::recurrence::Recurrence;
 
 const MIGRATIONS: &[&str] = &[
@@ -1097,28 +1097,64 @@ impl Store {
 
     /// Adds a task at the top of the lists, or at the bottom ("Default Add to" in the settings).
     pub fn add_task_at(&self, title: &str, top: bool) -> Result<Task> {
+        self.create_task(TaskDraft { title: title.to_owned(), ..Default::default() }, top)
+    }
+
+    /// Creates the task, tags and checklist atomically so a failed submission can be retried.
+    pub fn create_task(&self, draft: TaskDraft, top: bool) -> Result<Task> {
+        let tx = self.conn.unchecked_transaction()?;
+        let task = self.insert_task_draft(draft, top)?;
+        tx.commit()?;
+        Ok(task)
+    }
+
+    fn insert_task_draft(&self, mut draft: TaskDraft, top: bool) -> Result<Task> {
+        let tags = std::mem::take(&mut draft.tags);
+        let checklist = std::mem::take(&mut draft.checklist);
+        let section = draft.section_id;
+        let task = self.insert_task(draft, top)?;
+        if section.is_none() && tags.is_empty() && checklist.is_empty() {
+            return Ok(task);
+        }
+        if section.is_some() {
+            self.set_section(task.id, section)?;
+        }
+        if !tags.is_empty() {
+            self.replace_task_tags(task.id, &tags)?;
+        }
+        for (position, (title, completed)) in checklist.into_iter().enumerate() {
+            self.conn.execute(
+                "INSERT INTO checklist_items (id, task_id, title, sort_order, completed_at, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![Uuid::now_v7().to_string(), task.id.to_string(), title.trim(), position as i64, completed.then(now_ms), now_ms()],
+            )?;
+        }
+        self.task(task.id)?.context("created task not found")
+    }
+
+    fn insert_task(&self, draft: TaskDraft, top: bool) -> Result<Task> {
         let task = Task {
             id: Uuid::now_v7(),
-            list_id: None,
+            list_id: draft.list_id,
             parent_id: None,
-            kind: Kind::Task,
-            title: title.trim().to_owned(),
-            notes: String::new(),
-            priority: Priority::None,
-            due_date: None,
-            due_time: None,
-            repeat: None,
+            kind: draft.kind,
+            title: draft.title.trim().to_owned(),
+            notes: draft.notes,
+            priority: draft.priority,
+            due_date: draft.due_date,
+            due_time: draft.due_date.and(draft.due_time),
+            repeat: draft.repeat,
             tags: Vec::new(),
             checklist: None,
             completed_at: None,
             deleted_at: None,
             wont_do_at: None,
-            end_date: None,
-            end_time: None,
+            end_date: draft.due_date.and(draft.end_date),
+            end_time: draft.due_date.and(draft.end_date).and(draft.end_time),
             modified_at: None,
             pinned_at: None,
             section_id: None,
-            reminders: Vec::new(),
+            reminders: draft.reminders,
             estimate: None,
             created_at: now_ms(),
         };
@@ -1128,8 +1164,19 @@ impl Store {
             "(SELECT COALESCE(MAX(sort_order), 0) + 1024 FROM tasks)"
         };
         self.conn.execute(
-            &format!("INSERT INTO tasks (id, title, created_at, sort_order) VALUES (?1, ?2, ?3, {order})"),
-            params![task.id.to_string(), task.title, task.created_at],
+            &format!("INSERT INTO tasks (id, title, notes, list_id, kind, priority, due_date, due_time,
+                      repeat, reminders, created_at, end_date, end_time, sort_order)
+                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, {order})"),
+            params![
+                task.id.to_string(), task.title, task.notes, task.list_id.map(|id| id.to_string()),
+                task.kind.as_str(), task.priority.to_i64(),
+                task.due_date.map(|date| date.format(DATE_FORMAT).to_string()),
+                task.due_time.map(|time| time.format(TIME_FORMAT).to_string()),
+                task.repeat.as_ref().map(ToString::to_string), crate::reminder::format(&task.reminders),
+                task.created_at,
+                task.end_date.map(|date| date.format(DATE_FORMAT).to_string()),
+                task.end_time.map(|time| time.format(TIME_FORMAT).to_string()),
+            ],
         )?;
         Ok(task)
     }
@@ -1353,19 +1400,24 @@ impl Store {
         Ok(())
     }
 
-    /// Moves a task to start on `date`, keeping its time and the length of its duration: a bar
-    /// dragged in the Timeline.
+    /// Moves both dates if the task has a duration, keeping their local times.
     pub fn move_dates(&self, id: Id, date: NaiveDate) -> Result<()> {
         let task = self.task(id)?.context("task not found")?;
-        let shift = task.due_date.map(|due| date - due);
-        let end = match (task.end_date, shift) {
-            (Some(end), Some(shift)) => Some((end + shift, task.end_time)),
+        let end = match (task.due_date, task.end_date) {
+            (Some(start), Some(end)) => Some(
+                end.checked_add_signed(date - start).context("task duration is outside the calendar")?,
+            ),
             _ => None,
         };
-        self.set_due(id, Some(date), task.due_time)?;
-        if task.end_date.is_some() {
-            self.set_due_end(id, end)?;
-        }
+        self.conn.execute(
+            "UPDATE tasks SET due_date = ?2, end_date = ?3, end_time = ?4 WHERE id = ?1",
+            params![
+                id.to_string(),
+                date.format(DATE_FORMAT).to_string(),
+                end.map(|date| date.format(DATE_FORMAT).to_string()),
+                end.and(task.end_time).map(|time| time.format(TIME_FORMAT).to_string()),
+            ],
+        )?;
         Ok(())
     }
 
@@ -1609,30 +1661,37 @@ impl Store {
     /// Replaces the task's tags; unknown tags are created.
     /// Tags match case-insensitively in Rust, because SQLite's `NOCASE` only folds ASCII.
     pub fn set_tags(&self, id: Id, tags: &[String]) -> Result<()> {
-        let existing: Vec<String> = self
+        let tx = self.conn.unchecked_transaction()?;
+        self.replace_task_tags(id, tags)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn replace_task_tags(&self, id: Id, tags: &[String]) -> Result<()> {
+        let mut existing: Vec<String> = self
             .conn
             .prepare_cached("SELECT name FROM tags")?
             .query_map([], |row| row.get(0))?
             .collect::<Result<_, _>>()?;
-        let tx = self.conn.unchecked_transaction()?;
-        tx.execute("DELETE FROM task_tags WHERE task_id = ?1", [id.to_string()])?;
+        let id = id.to_string();
+        self.conn.execute("DELETE FROM task_tags WHERE task_id = ?1", [&id])?;
         for tag in tags.iter().map(|t| t.trim()).filter(|t| !t.is_empty()) {
             let name = match existing.iter().find(|e| e.to_lowercase() == tag.to_lowercase()) {
                 Some(name) => name.clone(),
                 None => {
-                    tx.execute(
+                    self.conn.execute(
                         "INSERT OR IGNORE INTO tags (name, created_at) VALUES (?1, ?2)",
                         params![tag, now_ms()],
                     )?;
+                    existing.push(tag.to_owned());
                     tag.to_owned()
                 }
             };
-            tx.execute(
+            self.conn.execute(
                 "INSERT OR IGNORE INTO task_tags (task_id, tag) VALUES (?1, ?2)",
-                params![id.to_string(), name],
+                params![id, name],
             )?;
         }
-        tx.commit()?;
         Ok(())
     }
 
@@ -3864,6 +3923,28 @@ mod tests {
         assert_eq!(store.step_checkin(water.id, day)?, 6);
         store.set_checkin_amount(water.id, day, 0)?;
         assert_eq!(store.step_checkin(water.id, day)?, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn task_creation_rolls_back_when_tag_insertion_fails() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        store.conn.execute_batch(
+            "CREATE TEMP TRIGGER reject_tag BEFORE INSERT ON task_tags
+             BEGIN SELECT RAISE(ABORT, 'tag could not be saved'); END;",
+        )?;
+        let draft = || TaskDraft {
+            title: "Submit once".into(),
+            tags: vec!["work".into()],
+            ..TaskDraft::default()
+        };
+        assert!(store.create_task(draft(), true).is_err());
+        assert!(store.tasks()?.is_empty());
+        assert!(store.changes_since(0)?.0.is_empty());
+
+        store.conn.execute_batch("DROP TRIGGER reject_tag")?;
+        let task = store.create_task(draft(), true)?;
+        assert_eq!(store.tasks()?, [task]);
         Ok(())
     }
 

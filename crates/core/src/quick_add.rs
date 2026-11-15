@@ -21,6 +21,8 @@ use crate::recurrence::{Frequency, Recurrence};
 pub struct ParsedTask {
     pub title: String,
     pub due_date: Option<NaiveDate>,
+    /// A date was typed, rather than inferred as today from a time alone.
+    pub explicit_date: bool,
     pub due_time: Option<NaiveTime>,
     pub priority: Option<Priority>,
     pub tags: Vec<String>,
@@ -54,6 +56,16 @@ pub fn parse_quick_add(input: &str, today: NaiveDate, lists: &[String]) -> Parse
 }
 
 pub fn parse_quick_add_with(input: &str, today: NaiveDate, lists: &[String], recognition: Recognition) -> ParsedTask {
+    parse_quick_add_context(input, today, lists, recognition, false)
+}
+
+/// A calendar cell already supplies the date. Recognize time without replacing that date
+/// or consuming date/repeat words from the title, as the calendar's time-only editor does.
+pub fn parse_quick_add_on_day(input: &str, day: NaiveDate, lists: &[String], recognition: Recognition) -> ParsedTask {
+    parse_quick_add_context(input, day, lists, recognition, true)
+}
+
+fn parse_quick_add_context(input: &str, today: NaiveDate, lists: &[String], recognition: Recognition, time_only: bool) -> ParsedTask {
     let words: Vec<&str> = input.split_whitespace().collect();
     let lower: Vec<String> = words.iter().map(|w| w.to_lowercase()).collect();
     let mut used = vec![false; words.len()];
@@ -82,6 +94,7 @@ pub fn parse_quick_add_with(input: &str, today: NaiveDate, lists: &[String], rec
             parsed.priority = Some(priority);
             used[i] = true;
         } else if recognition.dates
+            && !time_only
             && parsed.repeat.is_none()
             && let Some((repeat, len)) = parse_repeat(&lower[i..])
         {
@@ -98,10 +111,12 @@ pub fn parse_quick_add_with(input: &str, today: NaiveDate, lists: &[String], rec
             parsed.due_time = Some(time);
             mark_with_preposition(if recognition.remove_date_text { &mut used } else { &mut dates_used }, &lower, i, 1);
         } else if recognition.dates
+            && !time_only
             && parsed.due_date.is_none()
             && let Some((date, len)) = parse_date(&lower[i..], today)
         {
             parsed.due_date = Some(date);
+            parsed.explicit_date = true;
             mark_with_preposition(if recognition.remove_date_text { &mut used } else { &mut dates_used }, &lower, i, len);
             i += len;
             continue;
@@ -339,6 +354,17 @@ fn parse_month(word: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn calendar_cell_recognizes_time_without_consuming_date_words() {
+        let day = NaiveDate::from_ymd_opt(2028, 7, 6).unwrap();
+        let parsed = parse_quick_add_on_day("Plan tomorrow 9am #work", day, &[], Recognition::default());
+        assert_eq!(parsed.title, "Plan tomorrow");
+        assert_eq!(parsed.due_date, Some(day));
+        assert_eq!(parsed.due_time, NaiveTime::from_hms_opt(9, 0, 0));
+        assert!(!parsed.explicit_date);
+        assert_eq!(parsed.tags, ["work"]);
+    }
 
     // 18 October 2026 is a Sunday.
     fn today() -> NaiveDate {

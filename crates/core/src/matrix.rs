@@ -70,11 +70,20 @@ impl QuadrantRule {
         ]
     }
 
-    /// What a task added with a quadrant's "+" gets, as the original's new task there: the
-    /// rule's first priority, and today when the rule takes today but not undated tasks (the
-    /// original's card for quadrant I starts on "Today").
+    /// Use the first priority and the nearest upcoming date admitted by the quadrant.
+    /// An overdue-only rule starts today, matching the original's draft behavior.
     pub fn new_task_defaults(&self, today: NaiveDate) -> (Option<Priority>, Option<NaiveDate>) {
-        let date = (self.dates.contains(&MatrixDate::Today) && !self.dates.contains(&MatrixDate::NoDate)).then_some(today);
+        let date = if self.dates.is_empty() || self.dates.contains(&MatrixDate::NoDate) {
+            None
+        } else if self.dates.contains(&MatrixDate::Today) {
+            Some(today)
+        } else if self.dates.contains(&MatrixDate::Tomorrow) {
+            today.succ_opt()
+        } else if self.dates.contains(&MatrixDate::Later) {
+            today.checked_add_signed(Duration::days(2))
+        } else {
+            Some(today)
+        };
         (self.priorities.first().copied(), date)
     }
 

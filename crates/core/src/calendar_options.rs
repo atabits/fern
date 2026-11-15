@@ -82,7 +82,7 @@ impl Default for CalendarOptions {
         Self {
             color_by: ColorBy::List,
             modern: false,
-            heatmap: false,
+            heatmap: true,
             show_weekends: true,
             show_completed: true,
             show_repeats: true,
@@ -243,7 +243,7 @@ mod tests {
     fn options_are_saved() -> Result<()> {
         let store = Store::open_in_memory()?;
         assert_eq!(store.calendar_options()?, CalendarOptions::default());
-        let options = CalendarOptions { color_by: ColorBy::Priority, modern: true, show_weekends: false, ..Default::default() };
+        let options = CalendarOptions { color_by: ColorBy::Priority, modern: true, heatmap: false, show_weekends: false, ..Default::default() };
         store.save_calendar_options(&options)?;
         assert_eq!(store.calendar_options()?, options);
         let colors = CalendarOptions {

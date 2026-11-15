@@ -1,6 +1,9 @@
 //! "Print": a list or a task as a plain HTML page, opened in the browser to print from there.
 
-use chrono::NaiveDate;
+use std::collections::BTreeMap;
+use std::fmt::Write as _;
+
+use chrono::{Datelike, NaiveDate};
 use fern_core::{ChecklistItem, Task};
 
 use crate::i18n::Strings;
@@ -120,6 +123,59 @@ fn page(title: &str, body: &str) -> String {
     )
 }
 
+/// A complete year on one landscape page, using the current week and heatmap settings.
+pub fn year_html(
+    year: i32,
+    today: NaiveDate,
+    counts: &BTreeMap<NaiveDate, usize>,
+    week_numbers: bool,
+    strings: &Strings,
+) -> String {
+    use crate::calendar;
+    let mut months = String::new();
+    for month in 1..=12 {
+        let first = NaiveDate::from_ymd_opt(year, month, 1).unwrap();
+        let _ = write!(months, "<section><h2>{}</h2><table><thead><tr>", escape(strings.months[month as usize - 1]));
+        if week_numbers {
+            months.push_str("<th></th>");
+        }
+        for label in calendar::weekday_labels(&strings.weekdays_year) {
+            let _ = write!(months, "<th>{}</th>", escape(label));
+        }
+        months.push_str("</tr></thead><tbody>");
+        for week in calendar::month_grid(first).chunks_exact(7) {
+            months.push_str("<tr>");
+            if week_numbers {
+                let _ = write!(months, "<th>{}</th>", calendar::week_number(week.try_into().unwrap()));
+            }
+            for date in week {
+                let class = if date.month() != month {
+                    "outside".to_owned()
+                } else if *date == today {
+                    "today".to_owned()
+                } else {
+                    format!("heat-{}", calendar::heatmap_level(counts.get(date).copied().unwrap_or(0)))
+                };
+                let _ = write!(months, "<td class=\"{class}\">{}</td>", date.day());
+            }
+            months.push_str("</tr>");
+        }
+        months.push_str("</tbody></table></section>");
+    }
+    format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>{year}</title><style>\
+        @page{{size:landscape;margin:10mm}}\
+        body{{font:11pt system-ui,sans-serif;color:#222;print-color-adjust:exact;margin:0}}\
+        h1{{font-size:19pt;margin:0 0 3mm}}h2{{font-size:12pt;margin:0 0 1mm}}\
+        main{{display:grid;grid-template-columns:repeat(4,1fr);gap:3mm 5mm}}section{{break-inside:avoid}}\
+        table{{border-collapse:collapse;table-layout:fixed;width:100%;text-align:center;font-size:9pt}}\
+        td,th{{padding:0;height:4.5mm}}th,.outside{{color:#666;font-weight:normal}}\
+        .today{{background:#4772fa;color:#fff}}.heat-1{{background:#e3ebf9}}.heat-2{{background:#ceddfa}}\
+        .heat-3{{background:#b7ccfa}}.heat-4{{background:#a0bbf8}}</style></head>\
+        <body><h1>{year}</h1><main>{months}</main><script>window.print()</script></body></html>"
+    )
+}
+
 /// Writes the page to a temporary file and opens it in the default browser.
 pub fn open(name: &str, html: &str) -> std::io::Result<()> {
     let path = std::env::temp_dir().join(format!("fern-print-{name}.html"));
@@ -168,5 +224,16 @@ mod tests {
         let svg = report_svg("Oct 12 - Oct 18", &[("Completed".into(), vec!["Fix <the> tap".into()])]);
         assert!(svg.starts_with("<svg") && svg.ends_with("</svg>"));
         assert!(svg.contains("Fix &lt;the&gt; tap") && svg.contains(">Completed<"));
+    }
+
+    #[test]
+    fn prints_twelve_months_and_the_heatmap() {
+        let today = NaiveDate::from_ymd_opt(2032, 2, 29).unwrap();
+        let busy = today.succ_opt().unwrap();
+        let html = year_html(2032, today, &BTreeMap::from([(busy, 7)]), true, &EN);
+        assert_eq!(html.matches("<section>").count(), 12);
+        assert_eq!(html.matches("<td class=\"today\">29</td>").count(), 1);
+        assert_eq!(html.matches("<td class=\"heat-3\">1</td>").count(), 1);
+        assert_eq!(html.matches("<th></th>").count(), 12);
     }
 }

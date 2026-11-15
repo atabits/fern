@@ -728,6 +728,8 @@ pub struct Strings {
     pub yesterday: &'static str,
     /// Monday first.
     pub weekdays_short: [&'static str; 7],
+    /// Compact column headings for the year overview, Monday first.
+    pub weekdays_year: [&'static str; 7],
     /// One-letter weekday names, Monday first, for the mini week.
     pub weekdays_narrow: [&'static str; 7],
     /// Full weekday names, Monday first.
@@ -920,6 +922,9 @@ pub struct Strings {
     pub item_style_hint: &'static str,
     pub style_modern: &'static str,
     pub style_classic: &'static str,
+    pub calendar_go_to_date: &'static str,
+    pub calendar_year_date_hint: &'static str,
+    pub calendar_invalid_year_date: &'static str,
     pub heatmap: &'static str,
     pub heatmap_hint: &'static str,
     pub heatmap_hide: &'static str,
@@ -1523,6 +1528,7 @@ pub static EN: Strings = Strings {
 
     yesterday: "Yesterday",
     weekdays_short: ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"],
+    weekdays_year: ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"],
     weekdays_narrow: ["M", "T", "W", "T", "F", "S", "S"],
     weekdays_full: ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"],
     months: [
@@ -1698,6 +1704,9 @@ pub static EN: Strings = Strings {
     item_style_hint: "Choose a style for tasks and other items.",
     style_modern: "Modern",
     style_classic: "Classic",
+    calendar_go_to_date: "Go to Date",
+    calendar_year_date_hint: "Year or YYYY-MM-DD",
+    calendar_invalid_year_date: "Enter a valid year or date.",
     heatmap: "Heatmap",
     heatmap_hint: "Show a heatmap of all items by quantity in the yearly view.",
     heatmap_hide: "Hide",
@@ -2297,6 +2306,7 @@ pub static ZH_CN: Strings = Strings {
     add_subtask: "新增子任务",
     yesterday: "昨天",
     weekdays_short: ["周一", "周二", "周三", "周四", "周五", "周六", "周日"],
+    weekdays_year: ["周一", "周二", "周三", "周四", "周五", "周六", "周日"],
     weekdays_narrow: ["一", "二", "三", "四", "五", "六", "日"],
     weekdays_full: ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"],
     months: [
@@ -2472,6 +2482,9 @@ pub static ZH_CN: Strings = Strings {
     item_style_hint: "选择任务等条目的外观风格",
     style_modern: "现代风格",
     style_classic: "经典风格",
+    calendar_go_to_date: "跳转到日期",
+    calendar_year_date_hint: "年份或 YYYY-MM-DD",
+    calendar_invalid_year_date: "请输入有效的年份或日期。",
     heatmap: "热力图",
     heatmap_hint: "年度视图中按数量展示全部条目的热力分布",
     heatmap_hide: "关闭",
@@ -3078,6 +3091,7 @@ pub static RU: Strings = Strings {
 
     yesterday: "Вчера",
     weekdays_short: ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"],
+    weekdays_year: ["ПН.", "ВТ.", "СР.", "ЧТ.", "ПТ.", "СБ.", "ВС."],
     weekdays_narrow: ["П", "В", "С", "Ч", "П", "С", "В"],
     weekdays_full: ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"],
     months: [
@@ -3254,6 +3268,9 @@ pub static RU: Strings = Strings {
     item_style_hint: "Выберите, как выглядят задачи и другие элементы.",
     style_modern: "Современный",
     style_classic: "Классический",
+    calendar_go_to_date: "Перейти к дате",
+    calendar_year_date_hint: "Год или ГГГГ-ММ-ДД",
+    calendar_invalid_year_date: "Введите корректный год или дату.",
     heatmap: "Тепловая карта",
     heatmap_hint: "Окрашивать дни в годовом виде по числу элементов.",
     heatmap_hide: "Скрыть",

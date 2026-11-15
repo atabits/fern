@@ -10,7 +10,7 @@ use chrono::{Datelike, Local, NaiveDate};
 use fern_core::stats::{self, Bucket};
 use fern_core::{FocusSession, Id, Store, Task, View, focus_stats, format_minutes};
 use gpui::{Entity, Focusable as _, FontWeight, Task as GpuiTask};
-use ui::{Donut, Placement, PopoverAttachment, popover};
+use ui::{Donut, Placement, PopoverAttachment, VerticalScrollbar, popover};
 use ui::prelude::*;
 
 use crate::focus_timer::{BreakKind, DEFAULT_LONG_BREAK_EVERY, FocusCycle, FocusTimer, MIN_FOCUS_MS, format_clock, pomo_length_ms};
@@ -97,6 +97,7 @@ pub struct FocusView {
     message: Option<String>,
     /// The Statistics page, while it is open.
     stats: Option<StatsPage>,
+    stats_scrollbar: VerticalScrollbar,
     /// The focus record whose dialog is open, and its note field.
     open_record: Option<Id>,
     record_note: Entity<TextInput>,
@@ -337,6 +338,7 @@ impl FocusView {
             add_minutes: 25,
             message: None,
             stats: None,
+            stats_scrollbar: VerticalScrollbar::default(),
             open_record: None,
             record_note: cx.new(|cx| TextInput::new(Mode::MultiLine, strings.focus_note_placeholder, cx)),
         };
@@ -1603,6 +1605,7 @@ impl FocusView {
     fn open_stats(&mut self, cx: &mut Context<Self>) {
         let today = Local::now().date_naive();
         self.record_menu = None;
+        self.stats_scrollbar = VerticalScrollbar::default();
         self.stats = Some(StatsPage {
             tab: 2,
             day: today,
@@ -1633,7 +1636,11 @@ impl FocusView {
 
     fn update_stats(&mut self, cx: &mut Context<Self>, change: impl FnOnce(&mut StatsPage)) {
         if let Some(stats) = self.stats.as_mut() {
+            let tab = stats.tab;
             change(stats);
+            if tab != stats.tab {
+                self.stats_scrollbar = VerticalScrollbar::default();
+            }
         }
         cx.notify();
     }
@@ -1982,16 +1989,23 @@ impl FocusView {
             .text_color(theme.colors().text)
             .child(header)
             .child(
-                h_flex()
-                    .id(("focus-stats", page.tab))
-                    .debug_selector(|| "statistics-scroll".to_owned())
+                div()
+                    .relative()
                     .w_full()
                     .flex_1()
                     .min_h_0()
-                    .items_start()
-                    .justify_center()
-                    .overflow_y_scroll()
-                    .child(content),
+                    .child(
+                        h_flex()
+                            .id(("focus-stats", page.tab))
+                            .debug_selector(|| "statistics-scroll".to_owned())
+                            .size_full()
+                            .items_start()
+                            .justify_center()
+                            .overflow_y_scroll()
+                            .track_scroll(self.stats_scrollbar.scroll_handle())
+                            .child(content),
+                    )
+                    .child(self.stats_scrollbar.clone()),
             )
             .into_any_element()
     }
@@ -3674,7 +3688,7 @@ mod tests {
     #[cfg(debug_assertions)]
     #[gpui::test]
     fn statistics_scrolls_below_its_header_and_resets_on_tab_change(cx: &mut gpui::TestAppContext) {
-        use gpui::{Modifiers, ScrollDelta, ScrollWheelEvent, TouchPhase, point};
+        use gpui::{Modifiers, MouseButton, ScrollDelta, ScrollWheelEvent, TouchPhase, point, size};
 
         cx.update(|cx| {
             theme::init(cx);
@@ -3691,7 +3705,7 @@ mod tests {
         let content = cx.debug_bounds("statistics-content").unwrap();
         assert!(content.size.height > viewport.size.height);
 
-        let position = viewport.center();
+        let position = point(viewport.right() - px(9.), viewport.center().y);
         let modifiers = Modifiers::default();
         cx.simulate_mouse_move(position, None, modifiers);
         cx.simulate_event(ScrollWheelEvent {
@@ -3704,10 +3718,29 @@ mod tests {
         assert!(cx.debug_bounds("statistics-content").unwrap().top() < content.top());
         assert_eq!(cx.debug_bounds("statistics-header"), Some(header));
 
+        let scrollbar_end = point(viewport.right() - px(9.), viewport.bottom() - px(6.));
+        cx.simulate_mouse_move(scrollbar_end, None, modifiers);
+        cx.simulate_click(scrollbar_end, modifiers);
+        assert!((cx.debug_bounds("statistics-content").unwrap().bottom() - viewport.bottom()).abs() < px(1.));
+
+        let drag_end = point(scrollbar_end.x, viewport.top() - px(8.));
+        cx.simulate_mouse_down(scrollbar_end, MouseButton::Left, modifiers);
+        cx.simulate_mouse_move(drag_end, MouseButton::Left, modifiers);
+        cx.simulate_mouse_up(drag_end, MouseButton::Left, modifiers);
+        assert_eq!(cx.debug_bounds("statistics-content").unwrap().top(), content.top());
+        cx.simulate_click(scrollbar_end, modifiers);
+
         let task_tab = cx.debug_bounds("statistics-tab-1").unwrap().center();
         cx.simulate_mouse_move(task_tab, None, modifiers);
         cx.simulate_click(task_tab, modifiers);
         assert_eq!(cx.debug_bounds("statistics-content").unwrap().top(), content.top());
+
+        cx.simulate_resize(size(px(1280.), px(1800.)));
+        let viewport = cx.debug_bounds("statistics-scroll").unwrap();
+        let content = cx.debug_bounds("statistics-content").unwrap();
+        assert!(content.size.height < viewport.size.height);
+        cx.simulate_click(point(viewport.right() - px(9.), viewport.bottom() - px(6.)), modifiers);
+        assert_eq!(cx.debug_bounds("statistics-content"), Some(content));
     }
 
     #[test]

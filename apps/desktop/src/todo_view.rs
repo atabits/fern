@@ -4543,11 +4543,11 @@ impl TodoView {
         div()
             .id(ElementId::Uuid(id))
             .group(group.clone())
+            .relative()
             .when(draggable, |el| {
                 // Two drop zones, as in the original: on the left a dragged task goes before this
                 // one; on the right it becomes this task's subtask.
                 el.on_drag(dragged, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
-                    .relative()
                     .child(
                         div()
                             .absolute()
@@ -4616,7 +4616,8 @@ impl TodoView {
                     .min_w_0()
                     .h_full()
                     .gap(px(10.))
-                    .pr_3()
+                    // Reserve the menu button's width and gap even when it is hidden.
+                    .pr(px(36.))
                     .border_b_1()
                     .border_color(theme.colors().border_variant)
                     .child(marker)
@@ -4720,17 +4721,18 @@ impl TodoView {
                         )
                     }),
             )
-            // As the original's, "…" right of a hovered row, outside its highlight, opens the
-            // task's menu there.
+            // Keep the menu button inside the row, including in Trash and while editing.
             .child(
                 div()
                     .id("row-more")
                     .absolute()
-                    .right(px(-17.))
+                    .right(px(6.))
                     .top_0()
+                    .w(px(20.))
                     .h_full()
                     .flex()
                     .items_center()
+                    .justify_center()
                     .opacity(0.)
                     .group_hover(group.clone(), |s| s.opacity(1.))
                     .child(Icon::new(IconName::Ellipsis).size(IconSize::XSmall).color(Color::Muted))

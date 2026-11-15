@@ -111,6 +111,9 @@ The first build compiles GPUI straight from the Zed repository, so it takes a wh
 | `Space` | Complete or reopen the selected task |
 | `Delete` | Move the selected task to the trash |
 
+On Windows, enable **Minimize to notification area** under Settings → Notifications to hide the
+minimized window from the taskbar. Click the Fern icon in the notification area to restore it.
+
 Key bindings are defined in `assets/keymaps/default.json`.
 
 **Your data** stays on your computer. Fern needs no account or server, and the first start

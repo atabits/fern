@@ -580,6 +580,8 @@ pub struct Strings {
     pub notifications_page: &'static str,
     /// Settings → Notifications: each switch's name and what it does.
     pub notification_items: [(&'static str, &'static str); 3],
+    #[cfg(windows)]
+    pub minimize_to_tray: &'static str,
     pub daily_time: &'static str,
     /// The daily notification's title; `{n}` is how many tasks.
     pub daily_title: &'static str,
@@ -1394,6 +1396,8 @@ pub static EN: Strings = Strings {
         ("Desktop Reminder", "Reminders pop up as desktop notifications; off, they only go to the bell."),
         ("Constant Reminder", "Reminders stay on screen until you dismiss them."),
     ],
+    #[cfg(windows)]
+    minimize_to_tray: "Minimize to notification area",
     daily_time: "Time",
     daily_title: "Today: {n} tasks",
     daily_empty: "Nothing due today.",
@@ -2180,6 +2184,8 @@ pub static ZH_CN: Strings = Strings {
         ("桌面弹窗提醒", "提醒以桌面弹窗弹出；关闭后仅显示在通知铃铛内。"),
         ("常驻提醒", "提醒弹窗保持显示直到手动关闭。"),
     ],
+    #[cfg(windows)]
+    minimize_to_tray: "最小化到通知区域",
     daily_time: "时间",
     daily_title: "今日：{n} 个任务",
     daily_empty: "今日无待办任务",
@@ -2966,6 +2972,8 @@ pub static RU: Strings = Strings {
         ("Уведомления на рабочем столе", "Напоминания появляются как уведомления системы; если выключить, они только попадают в колокольчик."),
         ("Постоянное напоминание", "Напоминания остаются на экране, пока вы их не закроете."),
     ],
+    #[cfg(windows)]
+    minimize_to_tray: "Сворачивать в область уведомлений",
     daily_time: "Время",
     daily_title: "Сегодня: задач — {n}",
     daily_empty: "На сегодня ничего нет.",

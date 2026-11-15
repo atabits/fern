@@ -1213,7 +1213,7 @@ impl SettingsWindow {
                     })
                     .collect();
                 let mut daily_time = n.daily.map(|t| self.select_row(None, strings.daily_time, calendar::format_time(t, strings).into(), Menu::DailyTime, times, cx));
-                body.child(title(strings.notifications_page)).child(group().children(
+                let body = body.child(title(strings.notifications_page)).child(group().children(
                     strings.notification_items.into_iter().zip(values).zip(toggles).enumerate().map(|(i, (((name, hint), on), toggle))| {
                         v_flex()
                             .px_4()
@@ -1238,8 +1238,29 @@ impl SettingsWindow {
                         std::iter::once(row).chain(extra)
                     })
                     .collect::<Vec<_>>(),
-                ))
-                .into_any_element()
+                ));
+                #[cfg(windows)]
+                let body = {
+                    let enabled = crate::tray::enabled(&self.store);
+                    body.child(group().child(
+                        h_flex()
+                            .id("minimize-to-tray")
+                            .h(px(ROW_HEIGHT))
+                            .px_4()
+                            .gap_2()
+                            .cursor_pointer()
+                            .child(Checkbox::new("minimize-to-tray-checkbox").accent().toggle_state(enabled))
+                            .child(Label::new(strings.minimize_to_tray))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                let enabled = crate::tray::enabled(&this.store);
+                                if let Err(err) = crate::tray::set_enabled(&this.store, !enabled) {
+                                    eprintln!("failed to save the notification area setting: {err:#}");
+                                }
+                                cx.notify();
+                            })),
+                    ))
+                };
+                body.into_any_element()
             }
             Page::Features => {
                 let features = self.preferences.features;

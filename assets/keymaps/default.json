@@ -52,6 +52,12 @@
     }
   },
   {
+    "context": "TaskDraft",
+    "bindings": {
+      "secondary-enter": "task_detail::SaveDraft"
+    }
+  },
+  {
     "context": "CalendarYear",
     "bindings": {
       "up": "calendar::PreviousYear",

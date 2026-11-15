@@ -1,10 +1,12 @@
 //! The task details panel on the right, modeled on TickTick's.
 
+use std::path::PathBuf;
 use std::rc::Rc;
 
+use fern_core::attachment::PreparedAttachment;
 use fern_core::{ChecklistItem, Frequency, Id, Kind, List, Priority, Recurrence, Store, Tag, Task};
 use chrono::{Datelike, Local, NaiveDate, TimeZone as _};
-use gpui::{Entity, EventEmitter, Focusable, FontWeight, MouseButton, Subscription, WeakFocusHandle};
+use gpui::{Entity, EventEmitter, ExternalPaths, Focusable, FontWeight, MouseButton, Subscription, WeakFocusHandle};
 use ui::prelude::*;
 use ui::{Placement, PopoverAttachment, SubmenuItem, TipSide, popover, with_tip};
 
@@ -17,6 +19,9 @@ use crate::task_rows;
 use crate::markdown_toolbar::ToolbarAction;
 use crate::text_input::{Cancelled, Changed, Mode, Submitted, TextInput};
 
+mod draft;
+pub use draft::DraftClosed;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Popup {
     Due,
@@ -25,6 +30,7 @@ enum Popup {
     InlineTags,
     List,
     More,
+    Templates,
     /// "Link Parent Task": a searchable list of tasks to nest this one under.
     LinkParent,
     /// Start Focus → "Estimation": the expected pomos or duration.
@@ -70,8 +76,10 @@ impl EstimateDraft {
 
 pub struct TaskDetail {
     store: Rc<Store>,
+    attachments_dir: Option<PathBuf>,
     /// The task's attached files.
     attachments: Vec<fern_core::Attachment>,
+    attachment_errors: Vec<String>,
     /// The task's comments, the bottom bar's comment field (while open) and its emoji menu.
     comments: Vec<fern_core::Comment>,
     comment_input: Entity<TextInput>,
@@ -86,6 +94,7 @@ pub struct TaskDetail {
     focus_submenu: bool,
     estimate_draft: EstimateDraft,
     task: Option<Task>,
+    draft: Option<draft::NewTask>,
     title: Entity<TextInput>,
     notes: Entity<TextInput>,
     tag_input: Entity<TextInput>,
@@ -177,14 +186,26 @@ impl TaskDetail {
         let subscriptions = vec![
             cx.subscribe(&title, |this, input, _: &Changed, cx| {
                 let text = input.read(cx).text().to_owned();
+                if this.edit_draft(cx, |task, _| task.title = text.clone()) {
+                    this.refresh_draft_title(cx);
+                    return;
+                }
                 this.save(cx, |store, id| store.set_title(id, &text));
             }),
-            // Enter in the title moves to the notes.
             cx.subscribe_in(&title, window, |this, _, _: &Submitted, window, cx| {
-                window.focus(&this.notes.focus_handle(cx), cx);
+                if this.draft.is_some() {
+                    match this.popup {
+                        Some(Popup::Due) => this.apply_due(window, cx),
+                        None => { this.finish_draft(cx); }
+                        Some(_) => {}
+                    }
+                } else {
+                    window.focus(&this.notes.focus_handle(cx), cx);
+                }
             }),
             cx.subscribe(&notes, |this, input, _: &Changed, cx| {
                 let text = input.read(cx).text().to_owned();
+                if this.edit_draft(cx, |task, _| task.notes = text.clone()) { return; }
                 this.save(cx, |store, id| store.set_notes(id, &text));
             }),
             cx.subscribe(&tag_input, |_, _, _: &Changed, cx| cx.notify()),
@@ -192,9 +213,10 @@ impl TaskDetail {
             cx.subscribe_in(&new_item, window, |this, input, Submitted(text), window, cx| {
                 if !text.trim().is_empty() {
                     let text = text.clone();
-                    this.save(cx, |store, id| store.add_checklist_item(id, &text, None).map(|_| ()));
-                    input.update(cx, |input, cx| input.clear(window, cx));
-                    this.sync_checklist(cx);
+                    if this.add_checklist_item(&text, None, cx).is_some() {
+                        input.update(cx, |input, cx| input.clear(window, cx));
+                        this.sync_checklist(cx);
+                    }
                 }
             }),
             cx.subscribe_in(&subtask_input, window, |this, input, Submitted(text), window, cx| {
@@ -237,7 +259,8 @@ impl TaskDetail {
             }),
             cx.observe_global::<CurrentLocale>(|this, cx| {
                 let strings = i18n::t(cx);
-                this.title.update(cx, |input, cx| input.set_placeholder(strings.untitled, cx));
+                let placeholder = if this.draft.is_some() { strings.new_task_prompt } else { strings.untitled };
+                this.title.update(cx, |input, cx| input.set_placeholder(placeholder, cx));
                 this.notes.update(cx, |input, cx| input.set_placeholder(strings.notes_placeholder, cx));
                 this.tag_input.update(cx, |input, cx| input.set_placeholder(strings.type_in_tag, cx));
                 this.new_item.update(cx, |input, cx| input.set_placeholder(strings.add_item, cx));
@@ -250,7 +273,9 @@ impl TaskDetail {
         Self {
             store,
             focus_submenu: false,
+            attachments_dir: crate::attachments_dir().ok(),
             attachments: Vec::new(),
+            attachment_errors: Vec::new(),
             comments: Vec::new(),
             comment_input,
             comment_open: false,
@@ -260,6 +285,7 @@ impl TaskDetail {
             specific_month: None,
             estimate_draft: EstimateDraft { minutes: false, amount: 0 },
             task: None,
+            draft: None,
             title,
             notes,
             tag_input,
@@ -310,6 +336,8 @@ impl TaskDetail {
 
     /// Shows a task, or the empty panel for `None`.
     pub fn show(&mut self, task: Option<Task>, cx: &mut Context<Self>) {
+        self.draft = None;
+        self.title.update(cx, |input, cx| input.set_placeholder(i18n::t(cx).untitled, cx));
         let (title, notes) = task
             .as_ref()
             .map_or((String::new(), String::new()), |t| (t.title.clone(), t.notes.clone()));
@@ -319,6 +347,7 @@ impl TaskDetail {
         self.popup = None;
         self.popup_return_focus = None;
         self.tag_draft = None;
+        self.attachment_errors.clear();
         self.subtask_open = false;
         self.activity = None;
         self.all_tags = self.store.tags().unwrap_or_default();
@@ -497,6 +526,10 @@ impl TaskDetail {
     }
 
     fn sync_attachments(&mut self) {
+        if let Some(draft) = &self.draft {
+            self.attachments = draft.attachments.iter().map(|prepared| prepared.metadata().clone()).collect();
+            return;
+        }
         self.attachments = match self.task_id() {
             Some(id) => self.store.attachments(id).unwrap_or_default(),
             None => Vec::new(),
@@ -506,15 +539,61 @@ impl TaskDetail {
     /// "Upload Attachment": files picked in the system's dialog are copied to the app's folder.
     fn upload_attachment(&mut self, cx: &mut Context<Self>) {
         self.popup = None;
-        let Some(task) = self.task_id() else { return };
+        let Some(task) = self.task.as_ref().filter(|task| !task.is_deleted()).map(|task| task.id) else { return };
         let chosen = cx.prompt_for_paths(gpui::PathPromptOptions { files: true, directories: false, multiple: true, prompt: None });
         cx.spawn(async move |this, cx| {
             let Some(paths) = chosen.await.ok().and_then(Result::ok).flatten() else { return };
+            this.update(cx, |this, cx| this.attach_paths(task, paths, cx)).ok();
+        })
+        .detach();
+    }
+
+    fn attach_paths(&mut self, task: Id, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        if self.task_id() == Some(task) {
+            self.attachment_errors.clear();
+            cx.notify();
+        }
+        let Some(dir) = self.attachments_dir.clone() else {
+            eprintln!("failed to locate the attachment folder");
+            return;
+        };
+        let staging_dir = dir.clone();
+        let is_draft = self.draft.is_some() && self.task_id() == Some(task);
+        if is_draft { self.draft.as_mut().unwrap().pending_attachments += 1; }
+        let copies = cx.background_spawn(async move {
+            paths
+                .into_iter()
+                .map(|path| {
+                    let prepared = PreparedAttachment::copy(task, &path, &staging_dir);
+                    (path, prepared)
+                })
+                .collect::<Vec<_>>()
+        });
+        cx.spawn(async move |this, cx| {
+            let copies = copies.await;
             this.update(cx, |this, cx| {
-                let added = crate::attachments_dir()
-                    .and_then(|dir| paths.iter().try_for_each(|path| this.store.add_attachment(task, path, &dir).map(|_| ())));
-                if let Err(err) = added {
-                    eprintln!("failed to attach the file: {err:#}");
+                // A file picker or copy can finish after its draft has been closed/replaced.
+                if is_draft && (this.task_id() != Some(task) || this.draft.is_none()) { return; }
+                if is_draft { this.draft.as_mut().unwrap().pending_attachments -= 1; }
+                let strings = i18n::t(cx);
+                for (path, prepared) in copies {
+                    let result = prepared.and_then(|copy| {
+                        if is_draft {
+                            this.draft.as_mut().unwrap().attachments.push(copy);
+                            Ok(())
+                        } else {
+                            this.store.save_attachment(copy, &dir).map(|_| ())
+                        }
+                    });
+                    if let Err(err) = result {
+                        eprintln!("failed to attach {}: {err:#}", path.display());
+                        if this.task_id() == Some(task) {
+                            let name = path.file_name().unwrap_or(path.as_os_str()).to_string_lossy();
+                            this.attachment_errors.push(strings.attachment_failed
+                                .replace("{file}", &name)
+                                .replace("{error}", &crate::sync::attachment_error(&err, strings)));
+                        }
+                    }
                 }
                 this.sync_attachments();
                 cx.notify();
@@ -527,12 +606,15 @@ impl TaskDetail {
     /// The attached files under the notes: a click opens one with the system's app.
     fn render_attachments(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
-        let dir = crate::attachments_dir().ok();
         v_flex().gap_1().children(self.attachments.iter().map(|attachment| {
-            let path = dir.as_ref().map(|dir| attachment.path(dir));
+            let path = match &self.draft {
+                Some(draft) => draft.attachments.iter().find(|prepared| prepared.metadata().id == attachment.id).map(|prepared| prepared.path().to_owned()),
+                None => self.attachments_dir.as_ref().map(|dir| attachment.path(dir)),
+            };
             let removed = attachment.clone();
             h_flex()
                 .id(SharedString::from(format!("attachment-{}", attachment.id)))
+                .debug_selector(|| "task-attachment".to_owned())
                 .group("attachment")
                 .h(px(36.))
                 .px_2()
@@ -549,7 +631,14 @@ impl TaskDetail {
                     IconButton::new("attachment-delete", IconName::X).size(px(20.)).icon_size(IconSize::XSmall).on_click(
                         cx.listener(move |this, _, _, cx| {
                             cx.stop_propagation();
-                            let result = crate::attachments_dir().and_then(|dir| this.store.delete_attachment(&removed, &dir));
+                            if let Some(draft) = &mut this.draft {
+                                draft.attachments.retain(|prepared| prepared.metadata().id != removed.id);
+                                this.sync_attachments();
+                                cx.notify();
+                                return;
+                            }
+                            let Some(dir) = &this.attachments_dir else { return };
+                            let result = this.store.delete_attachment(&removed, dir);
                             if let Err(err) = result {
                                 eprintln!("failed to remove the attachment: {err:#}");
                             }
@@ -588,7 +677,7 @@ impl TaskDetail {
             self.checklist.clear();
             return;
         };
-        let items = self.store.checklist(task).unwrap_or_default();
+        let items = self.draft.as_ref().map_or_else(|| self.store.checklist(task).unwrap_or_default(), |draft| draft.checklist.clone());
         let mut old: Vec<ChecklistRow> = std::mem::take(&mut self.checklist);
         for item in items {
             let row = match old.iter().position(|row| row.item.id == item.id) {
@@ -615,16 +704,16 @@ impl TaskDetail {
         let subscriptions = [
             cx.subscribe(&input, move |this, input, _: &Changed, cx| {
                 let text = input.read(cx).text().to_owned();
+                if this.edit_draft(cx, |_, draft| {
+                    if let Some(item) = draft.checklist.iter_mut().find(|item| item.id == id) { item.title = text.clone(); }
+                }) { return; }
                 this.save(cx, |store, _| store.set_checklist_item_title(id, &text));
             }),
             // Enter adds the next item right below, as in TickTick.
             cx.subscribe(&input, move |this, _, _: &Submitted, cx| {
-                let created = this
-                    .task_id()
-                    .and_then(|task| this.store.add_checklist_item(task, "", Some(id)).ok());
+                let created = this.add_checklist_item("", Some(id), cx);
                 if let Some(created) = created {
                     this.pending_focus = Some(FocusTarget::Item(created.id));
-                    cx.emit(TaskUpdated);
                     this.sync_checklist(cx);
                 }
             }),
@@ -633,12 +722,18 @@ impl TaskDetail {
     }
 
     fn toggle_checklist_item(&mut self, id: Id, completed: bool, cx: &mut Context<Self>) {
-        self.save(cx, |store, _| store.set_checklist_item_completed(id, completed));
+        if !self.edit_draft(cx, |_, draft| {
+            if let Some(item) = draft.checklist.iter_mut().find(|item| item.id == id) { item.completed = completed; }
+        }) {
+            self.save(cx, |store, _| store.set_checklist_item_completed(id, completed));
+        }
         self.sync_checklist(cx);
     }
 
     fn delete_checklist_item(&mut self, id: Id, cx: &mut Context<Self>) {
-        self.save(cx, |store, _| store.delete_checklist_item(id));
+        if !self.edit_draft(cx, |_, draft| draft.checklist.retain(|item| item.id != id)) {
+            self.save(cx, |store, _| store.delete_checklist_item(id));
+        }
         self.sync_checklist(cx);
     }
 
@@ -662,6 +757,8 @@ impl TaskDetail {
     }
 
     fn save(&mut self, cx: &mut Context<Self>, write: impl FnOnce(&Store, Id) -> anyhow::Result<()>) {
+        // A new task is written only by finish_draft, with all of its fields together.
+        if self.draft.is_some() { return; }
         let Some(id) = self.task_id() else { return };
         if let Err(err) = write(&self.store, id) {
             eprintln!("failed to save the task: {err:#}");
@@ -677,7 +774,7 @@ impl TaskDetail {
         match popup {
             Popup::Due => {
                 let today = Local::now().date_naive();
-                self.due_draft = self.task.as_ref().map(|task| DueDraft::from_task(task, today));
+                self.due_draft = self.task.as_ref().map(|task| self.due_preview(task, today));
             }
             Popup::Tags | Popup::InlineTags => {
                 self.all_tags = self.store.tags().unwrap_or_default();
@@ -689,7 +786,7 @@ impl TaskDetail {
                 self.list_search.update(cx, |input, cx| input.set_text("", cx));
                 self.list_submenu = None;
             }
-            Popup::Priority | Popup::More => {}
+            Popup::Priority | Popup::More | Popup::Templates => {}
             Popup::LinkParent => self.link_search.update(cx, |input, cx| input.set_text("", cx)),
             Popup::Estimate => self.estimate_draft = EstimateDraft::from(self.task.as_ref().and_then(|t| t.estimate)),
         }
@@ -875,46 +972,88 @@ impl TaskDetail {
 
     fn update_draft(&mut self, cx: &mut Context<Self>, change: impl FnOnce(&mut DueDraft)) {
         if let Some(draft) = self.due_draft.as_mut() {
+            let was_timed = draft.time.is_some();
+            let had_date = draft.date.is_some();
             change(draft);
+            let timed = draft.time.is_some();
+            if !draft.reminders_changed
+                && let Some(task_draft) = &self.draft
+                && (was_timed != timed || had_date != draft.date.is_some())
+            {
+                draft.reminders = task_draft.default_reminder(timed)
+                    .filter(|_| draft.date.is_some())
+                    .into_iter()
+                    .collect();
+            }
             cx.notify();
         }
     }
 
     /// "OK": saves the draft's date, time and repeat.
-    fn apply_due(&mut self, cx: &mut Context<Self>) {
+    fn apply_due(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(draft) = self.due_draft.take() {
             let today = Local::now().date_naive();
-            self.save(cx, |store, id| {
-                store.set_due(id, draft.date, draft.time)?;
-                store.set_due_end(id, draft.end())?;
-                store.set_reminders(id, if draft.date.is_some() { &draft.reminders } else { &[] })?;
-                store.set_repeat(id, draft.repeat, today)
+            let changed = self.task.as_ref().is_some_and(|task| {
+                let before = self.due_preview(task, today);
+                draft.date != before.date || draft.time != before.time
+                    || draft.end() != before.end() || draft.repeat != before.repeat
             });
+            if !self.edit_draft(cx, |task, state| {
+                if changed {
+                    task.due_date = draft.date;
+                    task.due_time = draft.date.and(draft.time);
+                    task.end_date = draft.end().map(|(date, _)| date);
+                    task.end_time = draft.end().and_then(|(_, time)| time);
+                    task.repeat = draft.repeat.clone();
+                    state.date_changed = true;
+                }
+                task.reminders = if draft.date.is_some() { draft.reminders.clone() } else { Vec::new() };
+                state.reminders_changed = draft.reminders_changed;
+            }) {
+                self.save(cx, |store, id| {
+                    store.set_due(id, draft.date, draft.time)?;
+                    store.set_due_end(id, draft.end())?;
+                    store.set_reminders(id, if draft.date.is_some() { &draft.reminders } else { &[] })?;
+                    store.set_repeat(id, draft.repeat, today)
+                });
+            } else {
+                self.refresh_draft_title(cx);
+            }
         }
-        self.close_popup(cx);
+        self.dismiss_popup(window, cx);
     }
 
     /// "Clear": removes the due date, time and repeat.
-    fn clear_due(&mut self, cx: &mut Context<Self>) {
+    fn clear_due(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.due_draft = None;
         let today = Local::now().date_naive();
-        self.save(cx, |store, id| {
+        if !self.edit_draft(cx, |task, state| {
+            task.due_date = None; task.due_time = None; task.end_date = None; task.end_time = None;
+            task.reminders.clear(); task.repeat = None; state.date_changed = true;
+            state.reminders_changed = false;
+        }) { self.save(cx, |store, id| {
             store.set_due(id, None, None)?;
             store.set_due_end(id, None)?;
             store.set_reminders(id, &[])?;
             store.set_repeat(id, None, today)
-        });
-        self.close_popup(cx);
+        }); } else {
+            self.refresh_draft_title(cx);
+        }
+        self.dismiss_popup(window, cx);
     }
 
     fn set_priority(&mut self, priority: Priority, cx: &mut Context<Self>) {
-        self.save(cx, |store, id| store.set_priority(id, priority));
+        if !self.edit_draft(cx, |task, draft| { task.priority = priority; draft.priority_changed = true; }) {
+            self.save(cx, |store, id| store.set_priority(id, priority));
+        }
         self.close_popup(cx);
     }
 
-    fn set_list(&mut self, list: Option<Id>, cx: &mut Context<Self>) {
-        self.save(cx, |store, id| store.set_list(id, list));
-        self.close_popup(cx);
+    fn set_list(&mut self, list: Option<Id>, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.edit_draft(cx, |task, draft| { task.list_id = list; task.section_id = None; draft.list_changed = true; }) {
+            self.save(cx, |store, id| store.set_list(id, list));
+        }
+        self.dismiss_popup(window, cx);
     }
 
     fn shift_month(&mut self, delta: i32, cx: &mut Context<Self>) {
@@ -958,6 +1097,13 @@ impl TaskDetail {
     }
 
     fn apply_tags(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.draft.is_some() {
+            if let Some(tags) = self.tag_draft.as_ref().map(|draft| draft.picked.clone()) {
+                self.edit_draft(cx, |task, _| task.tags = tags);
+            }
+            self.dismiss_popup(window, cx);
+            return;
+        }
         let (Some(id), Some(draft)) = (self.task_id(), &mut self.tag_draft) else { return };
         let contains = |tags: &[String], name: &str| tags.iter().any(|tag| same_tag(tag, name));
         let save = (|| -> anyhow::Result<bool> {
@@ -1017,11 +1163,18 @@ impl TaskDetail {
     }
 
     fn toggle_kind(&mut self, cx: &mut Context<Self>) {
-        let kind = match self.task.as_ref().map(|t| t.kind) {
+        let kind = match self.task.as_ref().map(|task| self.kind_preview(task)) {
             Some(Kind::Note) => Kind::Task,
             _ => Kind::Note,
         };
-        self.menu_action(cx, |store, id| store.set_kind(id, kind));
+        if self.edit_draft(cx, |task, draft| {
+            task.kind = kind;
+            draft.kind_changed = true;
+        }) {
+            self.close_popup(cx);
+        } else {
+            self.menu_action(cx, |store, id| store.set_kind(id, kind));
+        }
     }
 
     /// The panel's "…" menu, a subset of the original's: the entries Fern supports so far.
@@ -1036,6 +1189,7 @@ impl TaskDetail {
     }
 
     fn render_more_popup(&self, strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {
+        if self.draft.is_some() { return self.render_draft_menu(strings, cx); }
         let Some(task) = self.task.as_ref() else { return div().into_any_element() };
         let wont_do = task.is_wont_do();
         let is_note = task.kind == Kind::Note;
@@ -1318,7 +1472,9 @@ impl TaskDetail {
             .collect();
         popover(cx)
             .w(px(340.))
-            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_popup(cx)))
+            .on_mouse_down_out(cx.listener(|this, _, window, cx| {
+                this.dismiss_popup(window, cx);
+            }))
             .child(
                 h_flex()
                     .h(px(34.))
@@ -1339,8 +1495,8 @@ impl TaskDetail {
                     .start_slot(Icon::new(IconName::Circle).size(IconSize::Small).color(Color::Muted))
                     .child(Label::new(candidate.title.clone()).truncate())
                     .end_slot(Label::new(list).size(LabelSize::XSmall).color(Color::Muted))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.close_popup(cx);
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.dismiss_popup(window, cx);
                         this.save(cx, |store, id| store.link_parent(id, parent));
                     }))
             })))
@@ -1898,18 +2054,19 @@ impl TaskDetail {
             .child(row("due-repeat-row", IconName::Repeat, repeat_label, draft.repeat.is_some(), DueMenu::Repeat, cx))
             .children(repeat_menu);
         let viewport = window.viewport_size();
-        let sticky = self.sticky_style.is_some();
         popover(cx)
-            .w(if sticky { px(260.).min(viewport.width - px(16.)) } else { px(260.) })
-            .when(sticky, |el| el.max_h(viewport.height - px(16.)))
+            .w(px(260.).min((viewport.width - px(16.)).max(px(0.))))
+            .max_h((viewport.height - px(16.)).max(px(0.)))
             .p_2()
             .gap_2()
-            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_popup(cx)))
+            .on_mouse_down_out(cx.listener(|this, _, window, cx| {
+                this.dismiss_popup(window, cx);
+            }))
             .child(
                 v_flex()
                     .id("due-popup-content")
                     .min_h_0()
-                    .when(sticky, |el| el.overflow_y_scroll())
+                    .overflow_y_scroll()
                     .child(content),
             )
             .child(
@@ -1917,9 +2074,9 @@ impl TaskDetail {
                     .flex_none()
                     .gap_2()
                     .pt_1()
-                    .child(button("due-clear", strings.clear, false).on_click(cx.listener(|this, _, _, cx| this.clear_due(cx))))
+                    .child(button("due-clear", strings.clear, false).on_click(cx.listener(|this, _, window, cx| this.clear_due(window, cx))))
                     .child(button("due-ok", strings.ok, true).debug_selector(|| "due-popup-ok".into())
-                        .on_click(cx.listener(|this, _, _, cx| this.apply_due(cx)))),
+                        .on_click(cx.listener(|this, _, window, cx| this.apply_due(window, cx)))),
             )
             .into_any_element()
     }
@@ -2482,7 +2639,9 @@ impl TaskDetail {
             .w(px(200.))
             .h(px(240.))
             .p_0()
-            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_popup(cx)))
+            .on_mouse_down_out(cx.listener(|this, _, window, cx| {
+                this.dismiss_popup(window, cx);
+            }))
             .child(
                 h_flex()
                     .h(px(39.))
@@ -2516,7 +2675,7 @@ impl TaskDetail {
                             .start_slot(Icon::new(icon).color(color))
                             .child(Label::new(name).color(color).truncate())
                             .when(has_sections, |item| item.end_slot(Icon::new(IconName::ChevronRight).size(IconSize::Small).color(Color::Muted)))
-                            .on_click(cx.listener(move |this, _, _, cx| this.set_list(list, cx))),
+                            .on_click(cx.listener(move |this, _, window, cx| this.set_list(list, window, cx))),
                     )
                     .when(open, |el| {
                         let current_section = current.and_then(|(l, s)| if l == list { s } else { None });
@@ -2531,12 +2690,14 @@ impl TaskDetail {
                                     .start_slot(Icon::new(IconName::PanelBottom).color(color))
                                     .child(Label::new(section.name).color(color).truncate())
                                     .when(ticked, |item| item.end_slot(Icon::new(IconName::Check).size(IconSize::Small).color(Color::Accent)))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.save(cx, |store, task| {
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        if !this.edit_draft(cx, |task, draft| {
+                                            task.list_id = list; task.section_id = Some(section_id); draft.list_changed = true;
+                                        }) { this.save(cx, |store, task| {
                                             store.set_list(task, list)?;
                                             store.set_section(task, Some(section_id))
-                                        });
-                                        this.close_popup(cx);
+                                        }); }
+                                        this.dismiss_popup(window, cx);
                                     }))
                             })),
                         ))
@@ -2684,13 +2845,13 @@ pub fn activity_text<'a>(kind: &'a str, strings: &'static Strings) -> &'a str {
 }
 
 /// Whether a list's name matches the list menu's search, ignoring case.
-fn same_tag(left: &str, right: &str) -> bool {
-    left.to_lowercase() == right.to_lowercase()
-}
-
 fn list_matches(name: &str, query: &str) -> bool {
     let query = query.trim().to_lowercase();
     query.is_empty() || name.to_lowercase().contains(&query)
+}
+
+fn same_tag(left: &str, right: &str) -> bool {
+    left.to_lowercase() == right.to_lowercase()
 }
 
 fn check_mark() -> impl IntoElement {
@@ -2741,9 +2902,16 @@ impl Render for TaskDetail {
         }
         let panel = v_flex()
             .size_full()
+            .key_context(if self.draft.is_some() { "TaskDetail TaskDraft" } else { "TaskDetail" })
+            .on_action(cx.listener(|this, _: &crate::actions::SaveDraft, window, cx| {
+                if this.draft.is_some() && this.popup == Some(Popup::Due) {
+                    this.apply_due(window, cx);
+                }
+                this.finish_draft(cx);
+            }))
             .on_action(cx.listener(|this, _: &DismissTransient, window, cx| {
                 if !this.dismiss_popup(window, cx) {
-                    cx.propagate();
+                    if this.draft.is_some() { this.finish_draft(cx); } else { cx.propagate(); }
                 }
             }))
             .map(|el| match self.sticky_style {
@@ -2764,45 +2932,59 @@ impl Render for TaskDetail {
         let notes_editing = notes_focus.is_focused(window);
         let notes_focus_click = notes_focus.clone();
         let today = Local::now().date_naive();
-        let repeats = task.repeat.is_some();
-        let (due_text, due_color): (SharedString, Color) = match task.due_date {
+        let preview = self.draft.as_ref().map(|_| self.due_preview(task, today));
+        let (date, time, repeats) = preview.as_ref().map_or(
+            (task.due_date, task.due_time, task.repeat.is_some()),
+            |due| (due.date, due.time, due.repeat.is_some()),
+        );
+        let kind = self.kind_preview(task);
+        let (due_text, due_color): (SharedString, Color) = match date {
             Some(date) => {
-                let (label, overdue) = task_rows::due_label(date, task.due_time, today, strings);
+                let (label, overdue) = task_rows::due_label(date, time, today, strings);
                 let label = match task.end_date {
-                    Some(end) => due_picker::range_label(date, task.due_time, end, task.end_time, strings),
+                    Some(end) => due_picker::range_label(date, time, end, task.end_time, strings),
                     None => label,
                 };
                 // The calendar's card writes the date out, as the original's.
                 let label = if self.calendar_card && task.end_date.is_none() {
-                    task_rows::card_due_label(date, task.due_time, today, strings)
+                    task_rows::card_due_label(date, time, today, strings)
                 } else {
                     task_rows::detail_due_label(label, date, today, strings)
                 };
                 (label.into(), if overdue && !done { Color::Error } else { Color::Accent })
             }
             // A note, as the original's, offers a reminder rather than a due date.
-            None => ((if task.kind == Kind::Note { strings.set_reminder } else { strings.due_date }).into(), muted),
+            None => ((if kind == Kind::Note { strings.set_reminder } else { strings.due_date }).into(), muted),
         };
         let priority_color = task_rows::priority_color(task.priority, &theme).map_or(Color::Muted, Color::Custom);
-        let list_name: SharedString = task
-            .list_id
+        let list_id = self.list_preview(task);
+        let list_name: SharedString = list_id
             .and_then(|id| self.lists.iter().find(|l| l.id == id))
             .map(|l| l.name.clone().into())
             .unwrap_or_else(|| strings.inbox.into());
-        let list_icon = if task.list_id.is_some() { IconName::List } else { IconName::Inbox };
+        let list_icon = if list_id.is_some() { IconName::List } else { IconName::Inbox };
+        let task_id = task.id;
+        let drop_color = theme.colors().accent.opacity(0.08);
 
         panel
+            .when(!task.is_deleted(), |el| {
+                el.drag_over::<ExternalPaths>(move |style, _, _, _| style.bg(drop_color))
+                    .on_drop(cx.listener(move |this, paths: &ExternalPaths, _, cx| {
+                        this.attach_paths(task_id, paths.paths().to_vec(), cx);
+                    }))
+            })
             // Top bar: checkbox | due date ……… priority
             .child(
                 h_flex()
                     .debug_selector(|| "task-detail-header".into())
                     .gap_2()
                     .h(px(48.))
+                    .flex_none()
                     .px_5()
                     .border_b_1()
                     .border_color(theme.colors().border)
                     // The original's 15 px box and the short line after it; a note has neither.
-                    .when(task.kind != Kind::Note, |el| {
+                    .when(task.kind != Kind::Note && self.draft.is_none(), |el| {
                         el.child(
                             Checkbox::new("detail-checkbox")
                                 .size(px(15.))
@@ -2829,13 +3011,14 @@ impl Render for TaskDetail {
                     .child(div().flex_1())
                     .child(
                         div()
+                            .debug_selector(|| "task-detail-priority".to_owned())
                             .relative()
                             .child(
                                 // A note's priority shows as the original's "!" in a circle.
-                                IconButton::new("priority", if task.kind == Kind::Note { IconName::CircleAlert } else { IconName::Flag })
+                                IconButton::new("priority", if kind == Kind::Note { IconName::CircleAlert } else { IconName::Flag })
                                     .icon_color(priority_color)
                                     .tip(strings.summary_priority, TipSide::Below)
-                                    .on_click(cx.listener(|this, _, window, cx| this.open_popup_from_ui(Popup::Priority, window, cx))),
+                                    .on_click(cx.listener(|this, _, _, cx| this.open_popup(Popup::Priority, cx))),
                             )
                             .when(self.popup == Some(Popup::Priority), |el| {
                                 el.child(PopoverAttachment::new(
@@ -2852,6 +3035,7 @@ impl Render for TaskDetail {
                     .debug_selector(|| "task-detail-body".to_owned())
                     .when_some(self.sticky_style, |el, style| el.text_size(px(style.font_px())))
                     .flex_1()
+                    .min_h_0()
                     .overflow_y_scroll()
                     .px_5()
                     .pt_4()
@@ -2882,6 +3066,7 @@ impl Render for TaskDetail {
                             .gap_3()
                             .child(
                                 div()
+                                    .debug_selector(|| "task-detail-title".to_owned())
                                     .flex_1()
                                     .min_w_0()
                                     .text_size(px(20.))
@@ -2895,6 +3080,7 @@ impl Render for TaskDetail {
                             )
                             .child(
                                 div()
+                                    .debug_selector(|| "task-detail-checklist-toggle".to_owned())
                                     .pt_0p5()
                                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                                     .child(
@@ -2932,6 +3118,7 @@ impl Render for TaskDetail {
                     })
                     .when(self.show_checklist, |el| el.child(self.render_checklist(cx)))
                     .when(!self.attachments.is_empty(), |el| el.child(self.render_attachments(cx)))
+                    .children(self.attachment_errors.iter().map(|error| Label::new(error.clone()).color(Color::Error)))
                     // Tags sit under the notes, as in the original.
                     // The calendar's card leaves out the empty tags and subtasks, as the original's.
                     // As the original's, the tags row only once there are tags (the "…" menu's Tags
@@ -2944,6 +3131,12 @@ impl Render for TaskDetail {
                     })
                     .when(!self.comments.is_empty(), |el| el.child(self.render_comments(strings, cx))),
             )
+            .when(self.draft.as_ref().is_some_and(|draft| draft.save_failed), |el| {
+                el.child(div().px_5().py_1().child(Label::new(strings.task_save_failed).color(Color::Error)))
+            })
+            .when(self.draft.as_ref().is_some_and(|draft| draft.pending_attachments > 0), |el| {
+                el.child(div().px_5().py_1().child(Label::new(strings.attachment_preparing).color(Color::Muted)))
+            })
             // The bottom bar's "A" shows the description's Markdown toolbar over it, as the original.
             .when(self.format_bar && !task.is_deleted(), |el| {
                 let on_action: crate::markdown_toolbar::OnAction<Self> = Rc::new(|this, action, window, cx| this.toolbar_action(action, window, cx));
@@ -2969,6 +3162,7 @@ impl Render for TaskDetail {
                     .gap_2()
                     // As the original's: no line over the bottom bar.
                     .h(px(44.))
+                    .flex_none()
                     .px_5()
                     .map(|bar| {
                         if task.is_deleted() {
@@ -2985,7 +3179,7 @@ impl Render for TaskDetail {
                         } else {
                             bar.child(
                                 with_tip(
-                                    label_button("list", list_icon, list_name, muted, button_hover),
+                                    label_button("list", list_icon, list_name, muted, button_hover).debug_selector(|| "task-detail-list".to_owned()),
                                     "list-tip",
                                     strings.move_to,
                                     TipSide::Above,
@@ -3001,7 +3195,7 @@ impl Render for TaskDetail {
                                     }),
                             )
                             .child(div().flex_1())
-                            .child(
+                            .when(self.draft.is_none(), |bar| bar.child(
                                 IconButton::new("format", IconName::Baseline)
                                     .toggle_state(self.format_bar)
                                     .tip(strings.text_format, TipSide::Above)
@@ -3022,7 +3216,7 @@ impl Render for TaskDetail {
                                         }
                                         cx.notify();
                                     })),
-                            )
+                            ))
                             .child(
                                 div()
                                     .debug_selector(|| "task-detail-more".to_owned())
@@ -3030,7 +3224,7 @@ impl Render for TaskDetail {
                                     .child(
                                         IconButton::new("more", IconName::Ellipsis)
                                             .when(!matches!(self.popup, Some(Popup::More | Popup::Tags)), |b| b.tip(strings.more, TipSide::Above))
-                                            .on_click(cx.listener(|this, _, window, cx| this.open_popup_from_ui(Popup::More, window, cx))),
+                                            .on_click(cx.listener(|this, _, _, cx| this.open_popup(Popup::More, cx))),
                                     )
                                     .when(self.popup == Some(Popup::More), |el| {
                                         el.child(PopoverAttachment::new(
@@ -3040,6 +3234,9 @@ impl Render for TaskDetail {
                                     })
                                     .when(self.popup == Some(Popup::Tags), |el| {
                                         el.child(PopoverAttachment::new(Placement::AboveRight, self.render_tags_popup(cx)))
+                                    })
+                                    .when(self.popup == Some(Popup::Templates), |el| {
+                                        el.child(PopoverAttachment::new(Placement::AboveRight, self.render_draft_templates(cx)))
                                     })
                                     .when(self.popup == Some(Popup::Estimate), |el| {
                                         el.child(PopoverAttachment::new(
@@ -3060,10 +3257,33 @@ impl Render for TaskDetail {
     }
 }
 
+/// A file size the way people read it: "512 B", "12 KB", "3.4 MB".
 #[cfg(all(test, debug_assertions))]
 mod tests {
     use super::*;
-    use gpui::TestAppContext;
+    use gpui::{FileDropEvent, InputEvent as _, TestAppContext};
+
+    #[gpui::test]
+    fn blank_lines_keep_their_height_when_task_notes_lose_focus(cx: &mut TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let task = store.add_task("Task").unwrap();
+        store.set_notes(task.id, "First.\n\nSecond.\n\n\nThird.").unwrap();
+        let task = store.task(task.id).unwrap().unwrap();
+        cx.update(theme::init);
+        let (detail, cx) = cx.add_window_view(|window, cx| {
+            let mut detail = TaskDetail::new(store, window, cx);
+            detail.show(Some(task), cx);
+            window.focus(&detail.notes.focus_handle(cx), cx);
+            detail
+        });
+        let editor = cx.debug_bounds("task-notes-editor").expect("notes editor is visible");
+
+        cx.update(|window, cx| window.focus(&detail.read(cx).title.focus_handle(cx), cx));
+        cx.run_until_parked();
+        let preview = cx.debug_bounds("task-notes-preview").expect("notes preview is visible");
+
+        assert_eq!(preview.size.height, editor.size.height);
+    }
 
     #[gpui::test]
     fn escape_in_task_detail_closes_the_picker_and_preserves_editor_focus(cx: &mut TestAppContext) {
@@ -3100,29 +3320,60 @@ mod tests {
     }
 
     #[gpui::test]
-    fn blank_lines_keep_their_height_when_task_notes_lose_focus(cx: &mut TestAppContext) {
+    fn dropped_paths_stay_with_the_task_that_received_them(cx: &mut TestAppContext) {
+        let dir = std::env::temp_dir().join(format!("fern-drop-{}", uuid::Uuid::now_v7()));
+        let file = dir.join("receipt.txt");
+        let folder = dir.join("plans");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(&file, "paid").unwrap();
+        std::fs::write(folder.join("next.txt"), "tomorrow").unwrap();
+
+        let attachments_dir = dir.join("attachments");
         let store = Rc::new(Store::open_in_memory().unwrap());
-        let task = store.add_task("Task").unwrap();
-        store.set_notes(task.id, "First.\n\nSecond.\n\n\nThird.").unwrap();
-        let task = store.task(task.id).unwrap().unwrap();
-        cx.update(theme::init);
-        let (detail, cx) = cx.add_window_view(|window, cx| {
-            let mut detail = TaskDetail::new(store, window, cx);
-            detail.show(Some(task), cx);
-            window.focus(&detail.notes.focus_handle(cx), cx);
+        let first = store.add_task("First task").unwrap();
+        let second = store.add_task("Second task").unwrap();
+        cx.update(|cx| {
+            theme::init(cx);
+            cx.set_global(CurrentLocale(i18n::Locale::En));
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let mut detail = TaskDetail::new(store.clone(), window, cx);
+            detail.attachments_dir = Some(attachments_dir.clone());
+            detail.show(Some(first.clone()), cx);
             detail
         });
-        let editor = cx.debug_bounds("task-notes-editor").expect("notes editor is visible");
 
-        cx.update(|window, cx| window.focus(&detail.read(cx).title.focus_handle(cx), cx));
+        let position = cx.debug_bounds("task-detail-body").unwrap().center();
+        cx.simulate_event(FileDropEvent::Entered { position, paths: ExternalPaths([file.clone(), folder].into_iter().collect()) });
+        cx.update(|window, cx| {
+            window.dispatch_event(FileDropEvent::Submit { position }.to_platform_input(), cx);
+            assert!(store.attachments(first.id).unwrap().is_empty());
+            view.update(cx, |detail, cx| detail.show(Some(second.clone()), cx));
+        });
         cx.run_until_parked();
-        let preview = cx.debug_bounds("task-notes-preview").expect("notes preview is visible");
 
-        assert_eq!(preview.size.height, editor.size.height);
+        let attached = store.attachments(first.id).unwrap();
+        assert_eq!(attached.iter().map(|attachment| attachment.name.as_str()).collect::<Vec<_>>(), ["receipt.txt", "plans.zip"]);
+        assert_eq!(std::fs::read_to_string(attached[0].path(&attachments_dir)).unwrap(), "paid");
+        assert!(store.attachments(second.id).unwrap().is_empty());
+        assert!(cx.debug_bounds("task-attachment").is_none());
+        cx.update(|_, cx| view.update(cx, |detail, cx| detail.show(Some(first), cx)));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("task-attachment").is_some());
+
+        store.delete_task(second.id).unwrap();
+        let deleted = store.task(second.id).unwrap();
+        cx.update(|_, cx| view.update(cx, |detail, cx| detail.show(deleted, cx)));
+        cx.run_until_parked();
+        let position = cx.debug_bounds("task-detail-body").unwrap().center();
+        cx.simulate_event(FileDropEvent::Entered { position, paths: ExternalPaths([file].into_iter().collect()) });
+        cx.simulate_event(FileDropEvent::Submit { position });
+        assert!(store.attachments(second.id).unwrap().is_empty());
+        assert!(cx.debug_bounds("task-attachment").is_none());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
 
-/// A file size the way people read it: "512 B", "12 KB", "3.4 MB".
 fn format_size(bytes: u64) -> String {
     match bytes {
         0..1024 => format!("{bytes} B"),

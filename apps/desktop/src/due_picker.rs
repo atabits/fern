@@ -27,6 +27,8 @@ pub struct DueDraft {
     pub repeat: Option<Recurrence>,
     /// Minutes before the due time, see `fern_core::reminder`.
     pub reminders: Vec<i64>,
+    /// Whether the user chose reminders in this picker, including switching the last one off.
+    pub reminders_changed: bool,
     /// The month shown in the calendar.
     pub month: NaiveDate,
     pub menu: Option<DueMenu>,
@@ -61,6 +63,7 @@ impl DueDraft {
             time: task.due_time,
             repeat: task.repeat.clone(),
             reminders: task.reminders.clone(),
+            reminders_changed: false,
             tab: if task.end_date.is_some() { DueTab::Duration } else { DueTab::Date },
             end_date: task.end_date,
             end_time: task.end_time,
@@ -144,6 +147,7 @@ impl DueDraft {
 
     /// Turns a reminder on or off; like a time, a reminder without a date schedules today.
     pub fn toggle_reminder(&mut self, minutes: i64, today: NaiveDate) {
+        self.reminders_changed = true;
         if let Some(at) = self.reminders.iter().position(|m| *m == minutes) {
             self.reminders.remove(at);
         } else {
@@ -480,6 +484,7 @@ mod tests {
             time: None,
             repeat: None,
             reminders: Vec::new(),
+            reminders_changed: false,
             month: today,
             tab: DueTab::Date,
             end_date: None,
@@ -525,6 +530,7 @@ mod tests {
             time: None,
             repeat: None,
             reminders: Vec::new(),
+            reminders_changed: false,
             month: today,
             tab: DueTab::Date,
             end_date: None,
@@ -599,6 +605,7 @@ mod tests {
             time: None,
             repeat: None,
             reminders: Vec::new(),
+            reminders_changed: false,
             month: today,
             tab: DueTab::Date,
             end_date: None,
@@ -610,7 +617,7 @@ mod tests {
         assert_eq!((draft.date, draft.menu), (Some(today), None));
 
         let mut draft =
-            DueDraft { date: None, time: None, repeat: None, reminders: Vec::new(), month: today,
+            DueDraft { date: None, time: None, repeat: None, reminders: Vec::new(), reminders_changed: false, month: today,
             tab: DueTab::Date,
             end_date: None,
             end_time: None,

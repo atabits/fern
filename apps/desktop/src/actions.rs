@@ -20,6 +20,7 @@ actions!(
 );
 
 actions!(settings, [DismissSettings]);
+actions!(task_detail, [SaveDraft]);
 
 actions!(calendar, [DayView, WeekView, MonthView, YearView, AgendaView, PreviousYear, NextYear, CalendarToday, PrintYear]);
 

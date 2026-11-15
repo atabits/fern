@@ -1159,6 +1159,7 @@ impl Render for AppView {
                         .occlude()
                         .bg(gpui::black().opacity(0.35))
                         .flex()
+                        .p_2()
                         .items_center()
                         .justify_center()
                         .child(settings),
@@ -1211,19 +1212,56 @@ mod tests {
             .unwrap();
         let (app, cx) = cx.add_window_view(|window, cx| AppView::new(store, false, window, cx));
 
-        cx.simulate_resize(gpui::size(px(900.), px(600.)));
+        cx.simulate_resize(gpui::size(px(900.), px(400.)));
         let bell = cx.debug_bounds("notification-bell").unwrap();
         let notice = cx.debug_bounds("update-notice").unwrap();
+        let button = cx.debug_bounds("updated-whats-new").unwrap();
         assert!(notice.left() >= bell.right());
         assert_eq!(notice.bottom(), bell.bottom());
-
-        cx.simulate_resize(gpui::size(px(900.), px(400.)));
-        let notice = cx.debug_bounds("update-notice").unwrap();
-        let button = cx.debug_bounds("updated-whats-new").unwrap();
         assert!(notice.top() >= title_bar::height() && notice.bottom() <= px(400.));
         assert!(cx.debug_bounds("release-notes-page").is_none());
         cx.simulate_click(button.center(), gpui::Modifiers::default());
         assert!(cx.debug_bounds("release-notes-page").is_some());
         cx.update(|_, cx| assert!(app.read(cx).update_notice.is_none()));
+    }
+
+    #[gpui::test]
+    fn settings_scroll_below_the_header_in_a_short_window(cx: &mut gpui::TestAppContext) {
+        use gpui::{Modifiers, ScrollDelta, ScrollWheelEvent, TouchPhase, point, size};
+
+        cx.update(|cx| theme::init(cx));
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let (app, cx) = cx.add_window_view(|window, cx| AppView::new(store, true, window, cx));
+        cx.simulate_resize(size(px(900.), px(400.)));
+        cx.update(|window, cx| app.update(cx, |app, cx| {
+            app.open_settings(None, window, cx);
+            app.settings.as_ref().unwrap().update(cx, |settings, cx| settings.set_page(settings_window::Page::More, cx));
+        }));
+        let header = cx.debug_bounds("settings-header").unwrap();
+        let page = cx.debug_bounds("settings-page").unwrap();
+        let language = cx.debug_bounds("settings-language").unwrap();
+        assert!(header.top() >= title_bar::height());
+        assert_eq!(page.top(), header.bottom());
+        assert!(page.bottom() < px(400.));
+        assert!(language.top() >= page.top());
+
+        let position = page.center();
+        let modifiers = Modifiers::default();
+        cx.simulate_mouse_move(position, None, modifiers);
+        cx.simulate_event(ScrollWheelEvent {
+            position,
+            delta: ScrollDelta::Pixels(point(px(0.), px(-160.))),
+            modifiers,
+            touch_phase: TouchPhase::Moved,
+        });
+        assert!(cx.debug_bounds("settings-language").unwrap().top() < language.top());
+        assert_eq!(cx.debug_bounds("settings-header"), Some(header));
+
+        for page in [settings_window::Page::SmartList, settings_window::Page::More] {
+            cx.update(|_, cx| app.update(cx, |app, cx| {
+                app.settings.as_ref().unwrap().update(cx, |settings, cx| settings.set_page(page, cx));
+            }));
+        }
+        assert_eq!(cx.debug_bounds("settings-language"), Some(language));
     }
 }

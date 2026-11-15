@@ -6,7 +6,7 @@ use std::rc::Rc;
 use chrono::Datelike as _;
 use fern_core::reminder::{ALL_DAY_OFFSETS, TIMED_OFFSETS};
 use fern_core::{DURATIONS, DefaultDate, Priority, format_minutes, DateFormat, Preferences, SmartList, Store, ThemeMode, Visibility, WEEK_STARTS};
-use gpui::{Entity, EventEmitter, FocusHandle, Focusable, FontWeight, WindowAppearance};
+use gpui::{Entity, EventEmitter, FocusHandle, Focusable, FontWeight, ScrollHandle, WindowAppearance, point};
 use theme::Theme;
 use ui::prelude::*;
 use ui::{Placement, PopoverAttachment, popover};
@@ -70,6 +70,7 @@ pub struct SettingsWindow {
     store: Rc<Store>,
     preferences: Preferences,
     page: Page,
+    page_scroll: ScrollHandle,
     menu: Option<Menu>,
     focus_handle: FocusHandle,
     /// The outcome of the last backup or import.
@@ -144,6 +145,7 @@ impl SettingsWindow {
             store,
             preferences,
             page: Page::default(),
+            page_scroll: ScrollHandle::new(),
             menu: None,
             focus_handle: cx.focus_handle(),
             backup_message: None,
@@ -170,6 +172,9 @@ impl SettingsWindow {
     }
 
     pub fn set_page(&mut self, page: Page, cx: &mut Context<Self>) {
+        if self.page != page {
+            self.page_scroll.set_offset(point(px(0.), px(0.)));
+        }
         self.page = page;
         self.menu = None;
         self.release_notes = None;
@@ -291,7 +296,7 @@ impl SettingsWindow {
             });
             crate::sticky_note::data_changed(cx.entity_id(), cx);
         }
-        self.page = match page {
+        let page = match page {
             "smart-list" => Page::SmartList,
             "appearance" => Page::Appearance,
             "more" => Page::More,
@@ -303,6 +308,7 @@ impl SettingsWindow {
             "notifications" => Page::Notifications,
             _ => Page::DateTime,
         };
+        self.set_page(page, cx);
         self.menu = match menu {
             "week" => Some(Menu::WeekStart),
             "time" => Some(Menu::TimeFormat),
@@ -432,9 +438,11 @@ impl SettingsWindow {
                 .on_click(cx.listener(move |this, _, _, cx| this.set_page(target, cx)))
         };
         v_flex()
+            .id("settings-navigation")
             .flex_none()
             .w(px(240.))
             .h_full()
+            .overflow_y_scroll()
             .p_2()
             .gap_0p5()
             .bg(cx.theme().colors().panel_background)
@@ -822,7 +830,17 @@ impl SettingsWindow {
         let colors = cx.theme().colors().clone();
         let group = || v_flex().py_1p5().rounded(px(8.)).bg(colors.surface_background);
         let title = |text: &'static str| div().pb_3().child(Label::new(text).weight(FontWeight::MEDIUM));
-        let body = v_flex().id("settings-page").flex_1().min_w_0().h_full().overflow_y_scroll().bg(colors.background).pt(px(48.)).px_6().pb_6().gap_4();
+        let body = v_flex()
+            .id("settings-page")
+            .debug_selector(|| "settings-page".to_owned())
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .track_scroll(&self.page_scroll)
+            .pt_1()
+            .px_6()
+            .pb_6()
+            .gap_4();
         match self.page {
             Page::SmartList => {
                 let row = |this: &Self, list: SmartList, cx: &mut Context<Self>| {
@@ -1044,7 +1062,7 @@ impl SettingsWindow {
                         Box::new(move |this, window, cx| this.update(window, cx, |p| p.default_list = Some(id)));
                     (SharedString::from(list.name.clone()), default_list == Some(id), pick)
                 }));
-                body.child(group().child(self.select_row(
+                body.child(group().debug_selector(|| "settings-language".to_owned()).child(self.select_row(
                     None,
                     strings.language,
                     current.native_name().into(),
@@ -1468,7 +1486,7 @@ impl Render for SettingsWindow {
                 }
             }))
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
-                if (this.release_notes.is_some() || (this.page == Page::About && this.installed_notes.is_some())) && event.keystroke.key == "tab" {
+                if this.page == Page::About && event.keystroke.key == "tab" {
                     if event.keystroke.modifiers.shift {
                         window.focus_prev(cx);
                     } else {
@@ -1479,7 +1497,9 @@ impl Render for SettingsWindow {
             }))
             .w(px(840.))
             .h(px(680.))
-            .when(notes_open, |el| el.max_w_full().max_h_full())
+            .max_w_full()
+            .max_h_full()
+            .flex_none()
             .relative()
             .rounded(px(12.))
             .overflow_hidden()
@@ -1489,7 +1509,7 @@ impl Render for SettingsWindow {
             .shadow_lg()
             .text_color(colors.text)
             .child(self.render_nav(cx))
-            .child(if notes_open {
+            .child(
                 v_flex()
                     .flex_1()
                     .min_w_0()
@@ -1497,26 +1517,21 @@ impl Render for SettingsWindow {
                     .bg(colors.background)
                     .child(
                         h_flex()
+                            .debug_selector(|| "settings-header".to_owned())
                             .h(px(44.))
                             .flex_none()
                             .px_3()
-                            .child(
+                            .when(!notes_open, |el| el.justify_end())
+                            .when(notes_open, |el| el.justify_between().child(
                                 action_button("release-notes-back", cx)
                                     .child(Icon::new(IconName::ChevronLeft).size(IconSize::Small).color(Color::Muted))
                                     .child(Label::new(about).size(LabelSize::Small))
                                     .on_click(cx.listener(|this, _, window, cx| this.back_to_about(window, cx))),
-                            ),
+                            ))
+                            .child(IconButton::new("close-settings", IconName::X)
+                                .on_click(cx.listener(|_, _, _, cx| cx.emit(SettingsEvent::Dismissed)))),
                     )
-                    .child(page)
-                    .into_any_element()
-            } else {
-                page
-            })
-            .child(
-                div().absolute().top_3().right_3().child(
-                    IconButton::new("close-settings", IconName::X)
-                        .on_click(cx.listener(|_, _, _, cx| cx.emit(SettingsEvent::Dismissed))),
-                ),
+                    .child(page),
             )
     }
 }

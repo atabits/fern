@@ -130,6 +130,7 @@ pub fn render(
             div()
                 .id("avatar")
                 .relative()
+                .flex_none()
                 .mb_3()
                 .size(px(30.))
                 .rounded_full()
@@ -142,26 +143,35 @@ pub fn render(
                 .child(Icon::new(IconName::User).color(Color::Default))
                 .children(account_menu),
         )
-        // The sections, spaced and sized as in the original (50px apart, 24px glyphs).
-        .child(v_flex().gap(px(10.)).children(Section::ALL.into_iter().filter(|s| s.enabled(features)).map(|section| {
-            let on_select = on_select.clone();
-            let on_hover = on_hover.clone();
-            // As in the original, the open section's icon turns bright, with no background even
-            // when hovered, and the section's name shows beside the icon.
-            div()
-                .id(section.id())
-                .relative()
-                .on_hover(move |hovered: &bool, _, cx| on_hover(section, *hovered, cx))
-                .size(px(40.))
-                .flex()
+        // Scroll the section icons in a short window so the controls below stay reachable.
+        .child(
+            v_flex()
+                .id("sidebar-sections")
+                .flex_1()
+                .min_h_0()
+                .w_full()
                 .items_center()
-                .justify_center()
-                .cursor_pointer()
-                .child(Icon::new(section.icon()).size(IconSize::Custom(px(24.))).color(if section == active { Color::Default } else { Color::Muted }))
-                .on_click(move |_, window, cx| on_select(section, window, cx))
-                .when(hovered == Some(section), |el| el.child(side_tooltip(section.title(strings), cx)))
-        })))
-        .child(div().flex_1())
+                .overflow_y_scroll()
+                .gap(px(10.))
+                .children(Section::ALL.into_iter().filter(|s| s.enabled(features)).map(|section| {
+                    let on_select = on_select.clone();
+                    let on_hover = on_hover.clone();
+                    // The open section's icon turns bright, and its name shows on hover.
+                    div()
+                        .id(section.id())
+                        .relative()
+                        .flex_none()
+                        .on_hover(move |hovered: &bool, _, cx| on_hover(section, *hovered, cx))
+                        .size(px(40.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .child(Icon::new(section.icon()).size(IconSize::Custom(px(24.))).color(if section == active { Color::Default } else { Color::Muted }))
+                        .on_click(move |_, window, cx| on_select(section, window, cx))
+                        .when(hovered == Some(section), |el| el.child(side_tooltip(section.title(strings), cx)))
+                })),
+        )
         .children(sync.map(|sync| {
             button("sync", IconName::RefreshCw)
                 .when(sync.failed, |b| b.icon_color(Color::Error))
@@ -173,6 +183,7 @@ pub fn render(
                 .id("notification-bell")
                 .debug_selector(|| "notification-bell".to_owned())
                 .relative()
+                .flex_none()
                 .child(button("notifications", IconName::Bell).tooltip(Tooltip::text(strings.notifications)).on_click(bell.on_click))
                 .when(bell.unread > 0, |el| {
                     el.child(

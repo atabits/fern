@@ -8,11 +8,12 @@ use std::rc::Rc;
 
 use chrono::Local;
 use fern_core::matrix::{MatrixDate, QuadrantRule, quadrant_of};
-use fern_core::{Id, List, Priority, Store, Task, View};
-use gpui::{Entity, EventEmitter, Focusable, FontWeight};
+use fern_core::{Id, List, Priority, Store, Task, TaskDraft, View};
+use gpui::{Entity, EventEmitter, FocusHandle, Focusable, FontWeight};
 use ui::{Placement, PopoverAttachment, popover};
 
-use crate::text_input::{Cancelled, Mode, Submitted, TextInput};
+use crate::actions::DismissTransient;
+use crate::text_input::{Mode, Submitted, TextInput};
 use ui::prelude::*;
 
 use crate::drag::DraggedTask;
@@ -106,6 +107,7 @@ pub fn arrange(mut tasks: Vec<Task>, view: QuadrantView, lists: &[List], today: 
 
 pub struct MatrixView {
     store: Rc<Store>,
+    focus: FocusHandle,
     tasks: Vec<Task>,
     lists: Vec<List>,
     rules: [QuadrantRule; 4],
@@ -120,18 +122,31 @@ pub struct MatrixView {
     tags: Vec<fern_core::Tag>,
     /// A quadrant's "+": the quadrant and its field for the new task's title.
     adding: Option<(usize, Entity<TextInput>)>,
+    add_notice: Option<AddNotice>,
     /// The header's "…" menu, and its Show Completed choice (kept in the settings).
     header_menu: bool,
     show_completed: bool,
 }
 
+enum AddNotice {
+    SavedElsewhere(SharedString),
+    Failed,
+}
+
 impl EventEmitter<OpenTask> for MatrixView {}
+
+impl Focusable for MatrixView {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus.clone()
+    }
+}
 
 impl MatrixView {
     pub fn new(store: Rc<Store>, cx: &mut Context<Self>) -> Self {
-        let name_input = cx.new(|cx| TextInput::new(Mode::SingleLine, "", cx));
+        let name_input = cx.new(|cx| TextInput::new(Mode::SingleLine, "", cx).without_cancel());
         let mut this = Self {
             store,
+            focus: cx.focus_handle(),
             tasks: Vec::new(),
             lists: Vec::new(),
             rules: QuadrantRule::defaults(),
@@ -142,6 +157,7 @@ impl MatrixView {
             name_input,
             tags: Vec::new(),
             adding: None,
+            add_notice: None,
             header_menu: false,
             show_completed: false,
         };
@@ -161,6 +177,8 @@ impl MatrixView {
             .filter(|t| show_completed || !t.is_completed())
             .collect();
         self.lists = self.store.lists().unwrap_or_default();
+        // An empty list filter means all lists. Keep explicit selections even when a list
+        // is unavailable; only quick add needs to pick a writable destination.
         self.rules = self.store.matrix_rules().unwrap_or_else(|_| QuadrantRule::defaults());
         for (i, view) in self.views.iter_mut().enumerate() {
             *view = self.store.setting(&format!("matrix_view_{i}")).ok().flatten().map(|s| QuadrantView::from_storage(&s)).unwrap_or_default();
@@ -173,37 +191,112 @@ impl MatrixView {
     /// rule asks for, so that it lands there.
     fn start_add(&mut self, quadrant: usize, window: &mut Window, cx: &mut Context<Self>) {
         let strings = i18n::t(cx);
-        let input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.matrix_add_placeholder, cx));
+        let input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.matrix_add_placeholder, cx).without_cancel());
         cx.subscribe_in(&input, window, move |this, input, Submitted(title), window, cx| {
             if title.trim().is_empty() {
                 return;
             }
             let today = Local::now().date_naive();
-            let (priority, date) = this.rules[quadrant].new_task_defaults(today);
-            let result = this.store.add_task(title).and_then(|task| {
-                if let Some(priority) = priority {
-                    this.store.set_priority(task.id, priority)?;
+            let task = match this.add_quadrant_task(quadrant, title, today) {
+                Ok(task) => task,
+                Err(err) => {
+                    eprintln!("failed to add the task: {err:#}");
+                    this.add_notice = Some(AddNotice::Failed);
+                    cx.notify();
+                    return;
                 }
-                if date.is_some() {
-                    this.store.set_due(task.id, date, None)?;
-                }
-                Ok(())
-            });
-            if let Err(err) = result {
-                eprintln!("failed to add the task: {err:#}");
-            }
+            };
             input.update(cx, |input, cx| input.clear(window, cx));
             this.reload(cx);
-        })
-        .detach();
-        cx.subscribe(&input, |this, _, _: &Cancelled, cx| {
-            this.adding = None;
-            cx.notify();
+            this.add_notice = this.destination_notice(quadrant, &task, today, i18n::t(cx));
         })
         .detach();
         window.focus(&input.focus_handle(cx), cx);
         self.adding = Some((quadrant, input));
+        self.add_notice = None;
         cx.notify();
+    }
+
+    fn destination_notice(&self, quadrant: usize, task: &Task, today: chrono::NaiveDate, strings: &Strings) -> Option<AddNotice> {
+        // An explicit date, priority or list can place the task elsewhere. Tell the user
+        // where the matrix actually put it, including when no rule matches.
+        let shown = self.tasks.iter().any(|visible| visible.id == task.id);
+        let actual = shown.then(|| quadrant_of(&self.rules, task, today)).flatten();
+        if actual == Some(quadrant) {
+            return None;
+        }
+        let destination = match actual {
+            Some(actual) => self.quadrant_title(actual, strings).1,
+            None => task.list_id.and_then(|id| self.lists.iter().find(|list| list.id == id))
+                .map_or_else(|| strings.inbox.into(), |list| list.name.clone().into()),
+        };
+        Some(AddNotice::SavedElsewhere(destination))
+    }
+
+    fn add_quadrant_task(&self, quadrant: usize, input: &str, today: chrono::NaiveDate) -> anyhow::Result<Task> {
+        let preferences = self.store.preferences()?;
+        let lists = self.store.lists()?;
+        let available = |id: Id| lists.iter().any(|list| list.id == id && !list.archived);
+        let list_names: Vec<_> = lists.iter().filter(|list| !list.archived).map(|list| list.name.clone()).collect();
+        let mut parsed = fern_core::parse_quick_add_with(input, today, &list_names, preferences.recognition);
+        let title = if parsed.title.is_empty() { input.trim() } else { &parsed.title };
+        let rule = &self.rules[quadrant];
+        let (priority, date) = rule.new_task_defaults(today);
+        let preferred = preferences.default_list.filter(|id| available(*id));
+        let default_list = if rule.lists.contains(&preferred) {
+            preferred
+        } else {
+            rule.lists.iter().copied().find(|id| id.is_none_or(available)).unwrap_or(preferred)
+        };
+        let selected_list = parsed.list.and_then(|name| lists.iter().find(|list| list.name == name && !list.archived));
+        let list_id = selected_list.map(|list| list.id).or(default_list);
+        let kind = lists.iter().find(|list| Some(list.id) == list_id).map_or(fern_core::Kind::Task, |list| list.kind);
+        let defaults = &preferences.task_defaults;
+        let default_tag = rule.tags.first().or(defaults.tag.as_ref());
+        if let Some(tag) = default_tag
+            && !rule.tags.iter().any(|required| parsed.tags.iter().any(|tag| required.to_lowercase() == tag.to_lowercase()))
+            && !parsed.tags.iter().any(|existing| existing.to_lowercase() == tag.to_lowercase())
+        {
+            parsed.tags.push(tag.clone());
+        }
+        let due_date = parsed.due_date.filter(|_| parsed.explicit_date).or(date)
+            .or_else(|| defaults.date.filter(|_| rule.dates.is_empty()).map(|date| date.date(today)))
+            .or(parsed.due_date)
+            .or_else(|| parsed.repeat.is_some().then_some(today));
+        let reminder = if parsed.due_time.is_some() { defaults.timed_reminder } else { defaults.all_day_reminder };
+        self.store.create_task(TaskDraft {
+            title: title.to_owned(),
+            list_id,
+            kind,
+            priority: parsed.priority.or(priority).unwrap_or(defaults.priority),
+            due_date,
+            due_time: parsed.due_time,
+            repeat: parsed.repeat,
+            reminders: reminder.filter(|_| due_date.is_some()).into_iter().collect(),
+            tags: parsed.tags,
+            ..Default::default()
+        }, !defaults.add_to_bottom)
+    }
+
+    fn dismiss_transient(&mut self, _: &DismissTransient, window: &mut Window, cx: &mut Context<Self>) {
+        if self.editing.is_some() {
+            self.finish_edit(None, cx);
+        } else if self.menu_row.take().is_some() {
+            cx.notify();
+            return;
+        } else if self.menu.take().is_some() || std::mem::take(&mut self.header_menu) {
+            cx.notify();
+        } else if self.adding.take().is_some() || self.add_notice.take().is_some() {
+            cx.notify();
+        } else {
+            cx.propagate();
+            return;
+        }
+        let focus = self.adding.as_ref().map_or_else(
+            || self.focus.clone(),
+            |(_, input)| input.focus_handle(cx),
+        );
+        window.focus(&focus, cx);
     }
 
     #[cfg(debug_assertions)]
@@ -422,7 +515,13 @@ impl MatrixView {
         let all = |id: &'static str, empty: bool, clear: Box<dyn Fn(&mut QuadrantRule)>| chip(id.into(), strings.filter_all.into(), empty, clear);
 
         let mut list_chips = vec![all("matrix-lists-all", rule.lists.is_empty(), Box::new(|r: &mut QuadrantRule| r.lists.clear()))];
-        for (id, name) in std::iter::once((None, strings.inbox.to_owned())).chain(self.lists.iter().map(|l| (Some(l.id), l.name.clone()))) {
+        let unavailable = rule.lists.iter().flatten().copied()
+            .filter(|id| !self.lists.iter().any(|list| list.id == *id))
+            .map(|id| (Some(id), strings.matrix_unavailable_list.to_owned()));
+        let list_choices = std::iter::once((None, strings.inbox.to_owned()))
+            .chain(self.lists.iter().map(|list| (Some(list.id), list.name.clone())))
+            .chain(unavailable);
+        for (id, name) in list_choices {
             list_chips.push(chip(
                 SharedString::from(format!("matrix-list-{}", id.map_or("inbox".to_owned(), |i| i.to_string()))),
                 name.into(),
@@ -672,8 +771,10 @@ impl MatrixView {
                             .opacity(if self.menu == Some(quadrant) || crate::touch::active() { 1. } else { 0. })
                             .group_hover("quadrant-header", |s| s.opacity(1.))
                             .child(IconButton::new("quadrant-more", IconName::Ellipsis).size(px(22.)).icon_size(IconSize::Small).on_click(
-                                cx.listener(move |this, _, _, cx| {
+                                cx.listener(move |this, _, window, cx| {
                                     this.menu = if this.menu == Some(quadrant) { None } else { Some(quadrant) };
+                                    this.menu_row = None;
+                                    window.focus(&this.focus, cx);
                                     cx.notify();
                                 }),
                             ))
@@ -740,6 +841,8 @@ impl Render for MatrixView {
         let [q1, q2, q3, q4] = [0, 1, 2, 3].map(|quadrant| self.render_quadrant(quadrant, cx));
         v_flex()
             .size_full()
+            .track_focus(&self.focus)
+            .on_action(cx.listener(Self::dismiss_transient))
             .bg(theme.colors().background)
             .text_color(theme.colors().text)
             .child(
@@ -751,9 +854,11 @@ impl Render for MatrixView {
                     // The original's "…": Show / Hide Completed.
                     .child(
                         div()
+                            .debug_selector(|| "matrix-header-menu-trigger".to_owned())
                             .relative()
-                            .child(IconButton::new("matrix-more", IconName::Ellipsis).on_click(cx.listener(|this, _, _, cx| {
+                            .child(IconButton::new("matrix-more", IconName::Ellipsis).on_click(cx.listener(|this, _, window, cx| {
                                 this.header_menu = !this.header_menu;
+                                window.focus(&this.focus, cx);
                                 cx.notify();
                             })))
                             .when(self.header_menu, |el| {
@@ -783,6 +888,26 @@ impl Render for MatrixView {
                             }),
                     ),
             )
+            .when_some(self.add_notice.as_ref(), |el, notice| {
+                let (message, color) = match notice {
+                    AddNotice::SavedElsewhere(destination) => (
+                        strings.matrix_saved_elsewhere.replace("{destination}", destination.as_ref()),
+                        Color::Default,
+                    ),
+                    AddNotice::Failed => (strings.task_save_failed.to_owned(), Color::Error),
+                };
+                el.child(
+                    h_flex().flex_none().mx(px(21.)).px_2().py_1().gap_2()
+                        .rounded(px(6.)).bg(theme.colors().surface_background)
+                        .child(div().flex_1().min_w_0().child(Label::new(message).color(color)))
+                        .child(IconButton::new("matrix-dismiss-add-notice", IconName::X)
+                            .tip(strings.close, ui::TipSide::Above)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.add_notice = None;
+                                cx.notify();
+                            }))),
+                )
+            })
             .child(
                 v_flex()
                     .flex_1()
@@ -803,6 +928,176 @@ mod tests {
     use fern_core::Store;
 
     use super::*;
+
+    #[gpui::test]
+    fn quadrant_quick_add_saves_recognized_tags(cx: &mut gpui::TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 10, 18).unwrap();
+        cx.update(|cx| {
+            let matrix = cx.new(|cx| MatrixView::new(store.clone(), cx));
+            let add = |cx: &App, input| {
+                let id = matrix.read(cx).add_quadrant_task(0, input, today).unwrap().id;
+                store.task(id).unwrap().unwrap()
+            };
+            let task = add(cx, "Plan the sprint #work #team #Work");
+            assert_eq!(task.title, "Plan the sprint");
+            assert_eq!(task.tags, ["team", "work"]);
+            assert_eq!((task.priority, task.due_date), (Priority::High, Some(today)));
+
+            let mut preferences = store.preferences().unwrap();
+            preferences.recognition.remove_tag_text = false;
+            store.save_preferences(&preferences).unwrap();
+            let task = add(cx, "Plan the sprint #work");
+            assert_eq!(task.title, "Plan the sprint #work");
+            assert_eq!(task.tags, ["work"]);
+
+            preferences.recognition.tags = false;
+            store.save_preferences(&preferences).unwrap();
+            let task = add(cx, "Plan the sprint #work");
+            assert_eq!(task.title, "Plan the sprint #work");
+            assert!(task.tags.is_empty());
+        });
+    }
+
+    #[gpui::test]
+    fn quadrant_quick_add_uses_an_available_list_after_deletion(cx: &mut gpui::TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let removed = store.create_list("Remove me").unwrap();
+        let available = store.create_list("Still available").unwrap();
+        let mut preferences = store.preferences().unwrap();
+        preferences.default_list = Some(removed.id);
+        store.save_preferences(&preferences).unwrap();
+        let mut rule = QuadrantRule::defaults()[0].clone();
+        rule.lists = vec![Some(removed.id), Some(available.id)];
+        store.save_matrix_rule(0, Some(&rule)).unwrap();
+        let today = Local::now().date_naive();
+
+        cx.update(|cx| {
+            let matrix = cx.new(|cx| MatrixView::new(store.clone(), cx));
+            store.delete_list(removed.id).unwrap();
+            let id = matrix.read(cx).add_quadrant_task(0, "First #work", today).unwrap().id;
+            let tasks = store.tasks().unwrap();
+            assert_eq!(tasks.len(), 1);
+            assert_eq!(tasks[0].id, id);
+            assert_eq!(tasks[0].list_id, Some(available.id));
+            assert_eq!(tasks[0].tags, ["work"]);
+
+            rule.lists = vec![Some(removed.id)];
+            store.save_matrix_rule(0, Some(&rule)).unwrap();
+            matrix.update(cx, |matrix, cx| matrix.reload(cx));
+            let view = matrix.read(cx);
+            assert_eq!(view.rules[0].lists, rule.lists);
+            let unrelated = &tasks[0];
+            assert!(!view.rules[0].matches(unrelated, today));
+
+            // Editing another part of the rule must not silently clear the unavailable list.
+            matrix.update(cx, |matrix, cx| {
+                matrix.start_edit(0, cx);
+                matrix.name_input.update(cx, |input, cx| input.set_text("Scoped quadrant", cx));
+                matrix.finish_edit(Some(true), cx);
+            });
+            assert_eq!(store.matrix_rules().unwrap()[0].lists, rule.lists);
+
+            let id = matrix.read(cx).add_quadrant_task(0, "Second", today).unwrap().id;
+            assert_eq!(store.task(id).unwrap().unwrap().list_id, None);
+            assert_eq!(store.tasks().unwrap().len(), 2);
+        });
+    }
+
+    #[gpui::test]
+    fn archiving_the_last_list_keeps_the_quadrant_restricted_until_restore(cx: &mut gpui::TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let today = Local::now().date_naive();
+        let list = store.create_list("Restricted").unwrap();
+        let fallback = store.create_list("Available").unwrap();
+        let mut preferences = store.preferences().unwrap();
+        preferences.default_list = Some(fallback.id);
+        store.save_preferences(&preferences).unwrap();
+
+        let task = |title: &str, list_id| {
+            store.create_task(TaskDraft {
+                title: title.into(),
+                list_id: Some(list_id),
+                priority: Priority::High,
+                due_date: Some(today),
+                ..TaskDraft::default()
+            }, true).unwrap()
+        };
+        let restricted = task("In the restricted list", list.id);
+        let unrelated = task("In another list", fallback.id);
+        let mut rule = QuadrantRule::defaults()[0].clone();
+        rule.lists = vec![Some(list.id)];
+        store.save_matrix_rule(0, Some(&rule)).unwrap();
+
+        cx.update(|cx| {
+            let matrix = cx.new(|cx| MatrixView::new(store.clone(), cx));
+            store.set_list_archived(list.id, true).unwrap();
+            matrix.update(cx, |matrix, cx| matrix.reload(cx));
+            let view = matrix.read(cx);
+            assert_eq!(view.rules[0].lists, rule.lists);
+            assert!(!view.tasks.iter().any(|task| quadrant_of(&view.rules, task, today) == Some(0)));
+            let added = view.add_quadrant_task(0, "Saved in available list", today).unwrap();
+            assert_eq!(added.list_id, Some(fallback.id));
+
+            store.set_list_archived(list.id, false).unwrap();
+            matrix.update(cx, |matrix, cx| matrix.reload(cx));
+            let view = matrix.read(cx);
+            assert!(view.tasks.iter().any(|task| task.id == restricted.id));
+            assert_eq!(quadrant_of(&view.rules, &restricted, today), Some(0));
+            assert_ne!(quadrant_of(&view.rules, &unrelated, today), Some(0));
+            assert_ne!(quadrant_of(&view.rules, &added, today), Some(0));
+        });
+    }
+
+    #[gpui::test]
+    fn matrix_uses_rule_date_without_an_explicit_date_and_explains_other_destinations(cx: &mut gpui::TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 10, 18).unwrap();
+        let mut rule = QuadrantRule::defaults()[0].clone();
+        rule.dates = vec![MatrixDate::Tomorrow];
+        store.save_matrix_rule(0, Some(&rule)).unwrap();
+
+        cx.update(|cx| {
+            let matrix = cx.new(|cx| MatrixView::new(store, cx));
+            let task = matrix.read(cx).add_quadrant_task(0, "Plan 9am", today).unwrap();
+            assert_eq!(task.due_date, today.succ_opt());
+            assert_eq!(task.due_time, chrono::NaiveTime::from_hms_opt(9, 0, 0));
+            let other = matrix.read(cx).add_quadrant_task(0, "Plan today", today).unwrap();
+            assert_eq!(other.due_date, Some(today));
+            matrix.update(cx, |matrix, cx| {
+                matrix.reload(cx);
+                let strings = i18n::t(cx);
+                assert!(matrix.destination_notice(0, &task, today, strings).is_none());
+                assert!(matches!(
+                    matrix.destination_notice(0, &other, today, strings),
+                    Some(AddNotice::SavedElsewhere(ref list)) if list.as_ref() == strings.inbox,
+                ));
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn escape_dismisses_the_matrix_header_menu(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            theme::init(cx);
+            assert!(crate::keymap::load_default(&assets::Assets, cx).unwrap().is_empty());
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let view = MatrixView::new(Rc::new(Store::open_in_memory().unwrap()), cx);
+            window.focus(&view.focus_handle(cx), cx);
+            view
+        });
+        let trigger = cx.debug_bounds("matrix-header-menu-trigger").unwrap().center();
+        cx.simulate_click(trigger, gpui::Modifiers::default());
+        cx.update(|_, cx| assert!(view.read(cx).header_menu));
+        cx.simulate_keystrokes("escape");
+        cx.update(|window, cx| {
+            assert!(!view.read(cx).header_menu);
+            assert!(view.read(cx).focus_handle(cx).is_focused(window));
+        });
+        cx.simulate_keystrokes("escape");
+        cx.update(|window, cx| assert!(view.read(cx).focus_handle(cx).is_focused(window)));
+    }
 
     #[test]
     fn quadrant_views() {

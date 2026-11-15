@@ -479,6 +479,7 @@ impl AppView {
         }
         if section == Section::Matrix {
             self.matrix.update(cx, |matrix, cx| matrix.reload(cx));
+            window.focus(&self.matrix.focus_handle(cx), cx);
         }
         if section == Section::Pomodoro {
             self.focus.update(cx, |focus, cx| focus.reload(cx));
@@ -609,7 +610,12 @@ impl AppView {
             if !this.section.enabled(this.features) {
                 this.select(Section::Tasks, window, cx);
             }
-            window.focus(&this.todo.focus_handle(cx), cx);
+            let focus = match this.section {
+                Section::Calendar => this.calendar.focus_handle(cx),
+                Section::Matrix => this.matrix.focus_handle(cx),
+                _ => this.todo.focus_handle(cx),
+            };
+            window.focus(&focus, cx);
             cx.notify();
         })
         .detach();

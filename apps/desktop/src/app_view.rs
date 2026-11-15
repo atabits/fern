@@ -6,7 +6,8 @@ use ui::prelude::*;
 use ui::{Placement, PopoverAttachment, popover};
 
 use crate::actions::{
-    DismissTransient, NewTask, OpenSettings, Search, ShowInbox, ShowNext7Days, ShowShortcuts, ShowToday, ShowTomorrow, ToggleSidebar,
+    CloseWindow, DismissTransient, NewTask, OpenSettings, Quit, Search, ShowInbox, ShowNext7Days, ShowShortcuts,
+    ShowToday, ShowTomorrow, ToggleSidebar,
 };
 use crate::calendar_view::{self, CalendarView};
 use crate::countdown_view::CountdownView;
@@ -53,23 +54,51 @@ pub struct AppView {
 }
 
 impl AppView {
+    pub fn register_window_actions(main_window: gpui::WindowHandle<Self>, cx: &mut App) {
+        // Action dispatch may be using the main window. Wait until GPUI has put it back.
+        cx.on_action(move |_: &CloseWindow, cx| {
+            cx.defer(move |cx| {
+                let _ = main_window.update(cx, |view, window, cx| {
+                    if view.prepare_to_leave_calendar(window, cx) {
+                        window.remove_window();
+                    }
+                });
+            });
+        });
+        cx.on_action(move |_: &Quit, cx| {
+            cx.defer(move |cx| {
+                let can_quit = main_window.update(cx, |view, window, cx| {
+                    let can_quit = view.prepare_to_leave_calendar(window, cx);
+                    if !can_quit {
+                        window.activate_window();
+                    }
+                    can_quit
+                }).unwrap_or(true);
+                if can_quit {
+                    cx.quit();
+                }
+            });
+        });
+    }
+
     pub fn new(store: Rc<Store>, first_start: bool, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let app_view = cx.weak_entity();
+        window.on_window_should_close(cx, move |window, cx| {
+            app_view.update(cx, |view, cx| view.prepare_to_leave_calendar(window, cx)).unwrap_or(true)
+        });
         let todo = cx.new(|cx| TodoView::new(store.clone(), window, cx));
         let calendar = cx.new(|cx| CalendarView::new(store.clone(), window, cx));
         // A task clicked in the calendar opens in the task list with its details.
         cx.subscribe_in(&calendar, window, |this, _, calendar_view::OpenTask(id), window, cx| {
-            let id = *id;
-            this.select(Section::Tasks, window, cx);
-            this.todo.update(cx, |todo, cx| {
-                todo.set_view(fern_core::View::All, cx);
-                todo.select(id, cx);
-            });
+            this.open_task(*id, window, cx);
         })
         .detach();
         // A picker asked for in the calendar's right-click menu opens with the task in the list.
         cx.subscribe_in(&calendar, window, |this, _, calendar_view::OpenTaskPicker(id, what), window, cx| {
             let (id, what) = (*id, *what);
-            this.select(Section::Tasks, window, cx);
+            if !this.select(Section::Tasks, window, cx) {
+                return;
+            }
             this.todo.update(cx, |todo, cx| {
                 todo.set_view(fern_core::View::All, cx);
                 todo.start_detail(id, what, window, cx);
@@ -78,25 +107,22 @@ impl AppView {
         .detach();
         cx.subscribe_in(&calendar, window, |this, _, crate::task_detail::StartFocus(id, title, stopwatch), window, cx| {
             let (target, stopwatch) = ((*id, title.clone()), *stopwatch);
-            this.select(Section::Pomodoro, window, cx);
-            this.focus.update(cx, |focus, cx| focus.start_for(Some(target.0), target.1, stopwatch, cx));
+            if this.select(Section::Pomodoro, window, cx) {
+                this.focus.update(cx, |focus, cx| focus.start_for(Some(target.0), target.1, stopwatch, cx));
+            }
         })
         .detach();
         // "Start Focus" in a task's menu starts a Pomodoro for it in the Focus section.
         cx.subscribe_in(&todo, window, |this, _, crate::task_detail::StartFocus(id, title, stopwatch), window, cx| {
             let (target, stopwatch) = ((*id, title.clone()), *stopwatch);
-            this.select(Section::Pomodoro, window, cx);
-            this.focus.update(cx, |focus, cx| focus.start_for(Some(target.0), target.1, stopwatch, cx));
+            if this.select(Section::Pomodoro, window, cx) {
+                this.focus.update(cx, |focus, cx| focus.start_for(Some(target.0), target.1, stopwatch, cx));
+            }
         })
         .detach();
         let matrix = cx.new(|cx| MatrixView::new(store.clone(), cx));
         cx.subscribe_in(&matrix, window, |this, _, matrix_view::OpenTask(id), window, cx| {
-            let id = *id;
-            this.select(Section::Tasks, window, cx);
-            this.todo.update(cx, |todo, cx| {
-                todo.set_view(fern_core::View::All, cx);
-                todo.select(id, cx);
-            });
+            this.open_task(*id, window, cx);
         })
         .detach();
         let countdown = cx.new(|cx| CountdownView::new(store.clone(), cx));
@@ -104,8 +130,9 @@ impl AppView {
         // "Start Focus" in a habit's menu starts a Pomodoro or a stopwatch named after it.
         cx.subscribe_in(&habits, window, |this, _, event: &crate::habit_view::StartFocus, window, cx| {
             let (title, stopwatch) = (event.title.clone(), event.stopwatch);
-            this.select(Section::Pomodoro, window, cx);
-            this.focus.update(cx, |focus, cx| focus.start_named(title, stopwatch, cx));
+            if this.select(Section::Pomodoro, window, cx) {
+                this.focus.update(cx, |focus, cx| focus.start_named(title, stopwatch, cx));
+            }
         })
         .detach();
         let focus = cx.new(|cx| FocusView::new(store.clone(), cx));
@@ -462,11 +489,24 @@ impl AppView {
         this
     }
 
-    fn select(&mut self, section: Section, window: &mut Window, cx: &mut Context<Self>) {
+    fn prepare_to_leave_calendar(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.section != Section::Calendar
+            || self.calendar.update(cx, |calendar, cx| calendar.finish_task_before_navigation(cx))
+        {
+            return true;
+        }
+        window.focus(&self.calendar.focus_handle(cx), cx);
+        false
+    }
+
+    fn select(&mut self, section: Section, window: &mut Window, cx: &mut Context<Self>) -> bool {
         // Search is a popover over the current screen, as in the original.
         if section == Section::Search {
             self.open_search(window, cx);
-            return;
+            return true;
+        }
+        if section != Section::Calendar && !self.prepare_to_leave_calendar(window, cx) {
+            return false;
         }
         self.todo.update(cx, |todo, cx| todo.stop_search(cx));
         // Other sections change tasks and check habits in.
@@ -492,6 +532,7 @@ impl AppView {
         }
         self.section = section;
         cx.notify();
+        true
     }
 
     fn open_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -500,22 +541,17 @@ impl AppView {
             this.search = None;
             match event {
                 SearchEvent::OpenTask(id) => {
-                    let id = *id;
-                    this.select(Section::Tasks, window, cx);
-                    this.todo.update(cx, |todo, cx| {
-                        todo.set_view(fern_core::View::All, cx);
-                        todo.select(id, cx);
-                    });
+                    this.open_task(*id, window, cx);
                 }
                 SearchEvent::OpenView(fern_core::View::Search(query)) => {
                     let query = query.clone();
-                    this.select(Section::Tasks, window, cx);
-                    this.todo.update(cx, |todo, cx| todo.show_search_results(query, cx));
+                    if this.select(Section::Tasks, window, cx) {
+                        this.todo.update(cx, |todo, cx| todo.show_search_results(query, cx));
+                    }
                 }
                 SearchEvent::OpenView(view) => {
                     let view = view.clone();
-                    this.select(Section::Tasks, window, cx);
-                    this.todo.update(cx, |todo, cx| todo.set_view(view, cx));
+                    this.show_view(view, window, cx);
                 }
                 SearchEvent::Dismissed => {}
             }
@@ -538,8 +574,9 @@ impl AppView {
 
     /// The add field of the task list, focused: New Task.
     pub fn quick_add(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.select(Section::Tasks, window, cx);
-        self.todo.update(cx, |todo, cx| todo.focus_new_task(window, cx));
+        if self.select(Section::Tasks, window, cx) {
+            self.todo.update(cx, |todo, cx| todo.focus_new_task(window, cx));
+        }
     }
 
     fn search(&mut self, _: &Search, window: &mut Window, cx: &mut Context<Self>) {
@@ -551,8 +588,9 @@ impl AppView {
     }
 
     fn show_view(&mut self, view: fern_core::View, window: &mut Window, cx: &mut Context<Self>) {
-        self.select(Section::Tasks, window, cx);
-        self.todo.update(cx, |todo, cx| todo.set_view(view, cx));
+        if self.select(Section::Tasks, window, cx) {
+            self.todo.update(cx, |todo, cx| todo.set_view(view, cx));
+        }
     }
 
     fn set_account_menu(&mut self, open: bool, cx: &mut Context<Self>) {
@@ -684,11 +722,12 @@ impl AppView {
 impl AppView {
     /// Opens a task from a `fern://task/…` link, in All with its details.
     pub fn open_task(&mut self, task: fern_core::Id, window: &mut Window, cx: &mut Context<Self>) {
-        self.select(Section::Tasks, window, cx);
-        self.todo.update(cx, |todo, cx| {
-            todo.set_view(fern_core::View::All, cx);
-            todo.select(task, cx);
-        });
+        if self.select(Section::Tasks, window, cx) {
+            self.todo.update(cx, |todo, cx| {
+                todo.set_view(fern_core::View::All, cx);
+                todo.select(task, cx);
+            });
+        }
     }
 
     fn toggle_shortcuts(&mut self, cx: &mut Context<Self>) {
@@ -1027,18 +1066,15 @@ impl AppView {
     fn open_notice(&mut self, target: Target, window: &mut Window, cx: &mut Context<Self>) {
         self.set_notices_open(false, cx);
         match target {
-            Target::Task(task) => {
-                self.select(Section::Tasks, window, cx);
-                self.todo.update(cx, |todo, cx| {
-                    todo.set_view(fern_core::View::All, cx);
-                    todo.select(task, cx);
-                });
-            }
+            Target::Task(task) => self.open_task(task, window, cx),
             Target::Habit(habit) => {
-                self.select(Section::Habits, window, cx);
-                self.habits.update(cx, |habits, cx| habits.select(habit, cx));
+                if self.select(Section::Habits, window, cx) {
+                    self.habits.update(cx, |habits, cx| habits.select(habit, cx));
+                }
             }
-            Target::Countdown(_) => self.select(Section::Countdown, window, cx),
+            Target::Countdown(_) => {
+                self.select(Section::Countdown, window, cx);
+            }
         }
     }
 
@@ -1066,7 +1102,9 @@ impl AppView {
             NoticeAction::Record => {
                 window.activate_window();
                 self.set_notices_open(false, cx);
-                self.select(Section::Habits, window, cx);
+                if !self.select(Section::Habits, window, cx) {
+                    return;
+                }
                 self.habits.update(cx, |habits, cx| habits.record(habit, window, cx));
                 Ok(())
             }
@@ -1307,6 +1345,68 @@ mod tests {
             assert_eq!(app.read(cx).section, Section::Tasks);
             assert!(app.read(cx).settings.is_none());
         });
+    }
+
+    #[gpui::test]
+    fn switching_modules_finishes_the_calendar_draft_and_keeps_the_destination_focus(cx: &mut gpui::TestAppContext) {
+        cx.update(theme::init);
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let (app, cx) = cx.add_window_view(|window, cx| {
+            let mut app = AppView::new(store.clone(), true, window, cx);
+            app.select(Section::Calendar, window, cx);
+            app
+        });
+        cx.simulate_resize(gpui::size(px(1200.), px(650.)));
+        let modifiers = gpui::Modifiers::default();
+        let add = cx.debug_bounds("calendar-add-frame").unwrap().center();
+        cx.simulate_click(add, modifiers);
+        cx.simulate_input("Save before switching modules");
+        let date = cx.debug_bounds("task-detail-due-date").unwrap().center();
+        cx.simulate_click(date, modifiers);
+        assert!(cx.debug_bounds("due-popup-ok").is_some());
+
+        cx.update(|window, cx| app.update(cx, |app, cx| assert!(app.select(Section::Matrix, window, cx))));
+
+        assert!(cx.debug_bounds("calendar-task-editor").is_none());
+        assert!(cx.debug_bounds("matrix-header-menu-trigger").is_some());
+        cx.update(|window, cx| assert!(app.read(cx).matrix.focus_handle(cx).is_focused(window)));
+        let tasks = store.tasks().unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].title, "Save before switching modules");
+    }
+
+    #[gpui::test]
+    fn window_close_and_quit_finish_the_calendar_draft(cx: &mut gpui::TestAppContext) {
+        cx.update(theme::init);
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let mut app = AppView::new(store.clone(), true, window, cx);
+            app.select(Section::Calendar, window, cx);
+            app
+        });
+        cx.update(|window, cx| AppView::register_window_actions(window.window_handle().downcast().unwrap(), cx));
+        cx.simulate_resize(gpui::size(px(1200.), px(650.)));
+
+        for (index, (title, action)) in [
+            ("Native close", None),
+            ("Quit action", Some(Box::new(Quit) as Box<dyn gpui::Action>)),
+            ("Close action", Some(Box::new(CloseWindow) as Box<dyn gpui::Action>)),
+        ].into_iter().enumerate() {
+            let add = cx.debug_bounds("calendar-add-frame").unwrap().center();
+            cx.simulate_click(add, gpui::Modifiers::default());
+            cx.simulate_input(title);
+            assert_eq!(store.tasks().unwrap().len(), index);
+
+            if let Some(action) = action {
+                cx.update(|window, cx| window.dispatch_action(action, cx));
+            } else {
+                assert!(cx.simulate_close());
+            }
+
+            let tasks = store.tasks().unwrap();
+            assert_eq!(tasks.len(), index + 1);
+            assert!(tasks.iter().any(|task| task.title == title));
+        }
     }
 
     #[gpui::test]

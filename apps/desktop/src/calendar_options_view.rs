@@ -413,11 +413,6 @@ impl Render for CalendarOptionsDialog {
                     .shadow_lg()
                     // Clicks inside stay inside.
                     .on_click(|_, _, cx| cx.stop_propagation())
-                    .on_key_down(cx.listener(|_, event: &gpui::KeyDownEvent, _, cx| {
-                        if event.keystroke.key == "escape" {
-                            cx.emit(OptionsEvent::Closed);
-                        }
-                    }))
                     .child(body),
             )
     }

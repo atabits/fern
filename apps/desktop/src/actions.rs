@@ -6,6 +6,7 @@ actions!(
     fern,
     [
         Quit,
+        CloseWindow,
         NewTask,
         Search,
         ToggleSidebar,

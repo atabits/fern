@@ -18,6 +18,7 @@ use gpui::{
 };
 use ui::prelude::*;
 
+use crate::actions::CloseWindow;
 use crate::release_notes::{ReleaseNotes, action_button};
 use crate::updater::Status;
 
@@ -265,7 +266,7 @@ fn window_button(button: WindowButton, maximized: bool, cx: &App) -> impl IntoEl
                 match button {
                     WindowButton::Minimize => window.minimize_window(),
                     WindowButton::Maximize => window.zoom_window(),
-                    WindowButton::Close => window.remove_window(),
+                    WindowButton::Close => window.dispatch_action(Box::new(CloseWindow), cx),
                 }
             })
         })

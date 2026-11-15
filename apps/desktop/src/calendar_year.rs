@@ -14,7 +14,7 @@ use ui::{Placement, PopoverAttachment, popover};
 
 use super::{CalendarMode, CalendarView, calendar, i18n};
 use crate::drag::DraggedTask;
-use crate::text_input::{Cancelled, Changed, Mode, Submitted, TextInput};
+use crate::text_input::{Changed, Mode, Submitted, TextInput};
 
 pub(super) struct YearJump {
     input: Entity<TextInput>,
@@ -170,11 +170,15 @@ impl CalendarView {
             NaiveDate::from_ymd_opt(*YEAR_RANGE.start(), 1, 1).unwrap(),
             NaiveDate::from_ymd_opt(*YEAR_RANGE.end(), 1, 1).unwrap(),
         );
-        if target == self.month && self.year_scroll.precise_position.is_none() {
+        if (target == self.month && self.year_scroll.precise_position.is_none())
+            || !self.finish_task_before_navigation(cx)
+        {
             return;
         }
         self.begin_year_transition(target, cx);
         self.month = target;
+        self.selected_day = None;
+        self.sidebar_month = None;
         self.year_day = None;
         self.card = None;
         self.open_event = None;
@@ -187,6 +191,7 @@ impl CalendarView {
             && self.options_dialog.is_none()
             && !self.mode_menu_open
             && !self.more_menu
+            && self.task_editor.is_none()
         {
             self.shift(delta, cx);
         } else {
@@ -206,6 +211,9 @@ impl CalendarView {
         let Some(size) = self.year_size else { return };
         let layout = YearLayout::new(size, calendar::week_numbers());
         if event.delta.precise() {
+            if !self.finish_task_before_navigation(cx) {
+                return;
+            }
             let now = cx.background_executor().now();
             let current = self
                 .year_scroll
@@ -224,6 +232,7 @@ impl CalendarView {
             self.year_scroll.precise_position = Some(position);
             self.year_scroll.transition = None;
             self.month = layout.closest_month(position);
+            self.selected_day = None;
             self.year_day = None;
             self.open_event = None;
             self.close_card(cx);
@@ -242,8 +251,13 @@ impl CalendarView {
     }
 
     fn jump_from_year(&mut self, date: NaiveDate, mode: CalendarMode, cx: &mut Context<Self>) {
+        if !self.finish_task_before_navigation(cx) {
+            return;
+        }
         self.month = calendar::month_start(date);
         self.anchor = date;
+        self.selected_day = Some(date);
+        self.sidebar_month = None;
         self.open_event = None;
         self.set_mode(mode, cx);
     }
@@ -342,13 +356,9 @@ impl CalendarView {
         self.open_event = None;
         self.close_card(cx);
         let hint = i18n::t(cx).calendar_year_date_hint;
-        let input = cx.new(|cx| TextInput::new(Mode::SingleLine, hint, cx));
+        let input = cx.new(|cx| TextInput::new(Mode::SingleLine, hint, cx).without_cancel());
         cx.subscribe_in(&input, window, |this, _, Submitted(text), window, cx| {
             this.submit_year_jump(text, window, cx);
-        })
-        .detach();
-        cx.subscribe_in(&input, window, |this, _, _: &Cancelled, window, cx| {
-            this.close_year_jump(window, cx);
         })
         .detach();
         cx.subscribe(&input, |this, _, _: &Changed, cx| {
@@ -726,6 +736,7 @@ impl CalendarView {
                 } else {
                     this.close_card(cx);
                     this.open_event = None;
+                    this.selected_day = Some(date);
                     this.year_day = (this.year_day != Some((month, date))).then_some((month, date));
                     cx.notify();
                 }
@@ -1017,7 +1028,8 @@ mod tests {
         cx.update(theme::init);
         let (view, cx) = cx.add_window_view(|window, cx| {
             let mut view = CalendarView::new(store, window, cx);
-            view.month = day(2099, 12, 1);
+            view.select_day(day(2099, 12, 31), cx);
+            view.set_mode(CalendarMode::Month, cx);
             view.shift(1, cx);
             assert_eq!(view.month, day(2100, 1, 1));
             view.set_mode(CalendarMode::Year, cx);
@@ -1032,12 +1044,9 @@ mod tests {
 
         cx.update(|_, cx| {
             view.update(cx, |view, cx| {
-                view.month = day(1910, 1, 1);
-                view.set_mode(CalendarMode::Month, cx);
-                view.shift(-1, cx);
-                assert_eq!(view.month, day(1909, 12, 1));
-                view.set_mode(CalendarMode::Year, cx);
+                view.select_day(day(1909, 12, 31), cx);
                 assert_eq!(view.month, day(1910, 1, 1));
+                assert_eq!(view.selected_day, Some(day(1910, 1, 1)));
                 assert!(!view.can_shift(-1));
             });
         });

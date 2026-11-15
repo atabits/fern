@@ -64,7 +64,6 @@ use anyhow::{Context as _, Result};
 use fern_core::Store;
 use gpui::{App, Bounds, WindowBounds, WindowOptions, prelude::*, px, size};
 
-use crate::actions::Quit;
 use crate::app_view::AppView;
 use assets::Assets;
 use crate::i18n::{CurrentLocale, Locale};
@@ -172,7 +171,6 @@ fn main() -> Result<()> {
             Ok(errors) => errors.iter().for_each(|err| eprintln!("keymap: {err}")),
             Err(err) => eprintln!("failed to load the keymap: {err:#}"),
         }
-        cx.on_action(|_: &Quit, cx| cx.quit());
         updater::init(store.clone(), cx);
         subscriptions::init(store.clone(), cx);
 
@@ -207,6 +205,7 @@ fn main() -> Result<()> {
             },
         )
         .expect("failed to open the main window");
+        AppView::register_window_actions(main_window, cx);
         sticky_note::restore(store_for_hotkeys.clone(), cx);
         hotkeys::init(main_window, store_for_hotkeys, cx);
         cx.activate(true);

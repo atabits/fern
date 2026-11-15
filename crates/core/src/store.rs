@@ -7,6 +7,7 @@ use chrono::{Duration, NaiveDate, NaiveDateTime, NaiveTime};
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use uuid::Uuid;
 
+use crate::attachment::PreparedAttachment;
 use crate::countdown::{Countdown, CountdownKind};
 use crate::focus::FocusSession;
 use crate::habit::{Checkin, Goal, Habit};
@@ -1130,6 +1131,39 @@ impl Store {
             )?;
         }
         self.task(task.id)?.context("created task not found")
+    }
+
+    /// Keeps staged files available for retry and rolls back the task if any file cannot be
+    /// published. The caller owns the staged files until the whole draft is committed.
+    pub fn create_task_with_attachments(&self, draft: TaskDraft, top: bool, attachments: &mut [PreparedAttachment], dir: &Path) -> Result<Task> {
+        if attachments.is_empty() {
+            return self.create_task(draft, top);
+        }
+        std::fs::create_dir_all(dir)?;
+        let tx = self.conn.unchecked_transaction()?;
+        let result = (|| -> Result<Task> {
+            let task = self.insert_task_draft(draft, top)?;
+            for prepared in attachments.iter() {
+                let attachment = prepared.metadata();
+                self.conn.execute(
+                    "INSERT INTO task_attachments (id, task_id, name, size, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![attachment.id.to_string(), task.id.to_string(), attachment.name, attachment.size as i64, attachment.created_at],
+                )?;
+            }
+            for prepared in attachments.iter_mut() {
+                prepared.publish(dir)?;
+            }
+            tx.commit()?;
+            Ok(task)
+        })();
+        for prepared in attachments {
+            if result.is_ok() {
+                prepared.keep_publication();
+            } else if let Err(error) = prepared.rollback_publication() {
+                eprintln!("failed to roll back attachment publication: {error:#}");
+            }
+        }
+        result
     }
 
     fn insert_task(&self, draft: TaskDraft, top: bool) -> Result<Task> {
@@ -2299,22 +2333,25 @@ impl Store {
         Ok(())
     }
 
-    /// "Upload Attachment": copies a file into `dir` (the app's attachment folder) as
-    /// `<id>-<name>` and lists it on the task.
-    pub fn add_attachment(&self, task: Id, file: &std::path::Path, dir: &std::path::Path) -> Result<Attachment> {
-        let name = file
-            .file_name()
-            .and_then(|n| n.to_str())
-            .context("the file has no name")?
-            .to_owned();
-        let id = Uuid::now_v7();
-        std::fs::create_dir_all(dir)?;
-        let size = std::fs::copy(file, dir.join(format!("{id}-{name}")))?;
-        let attachment = Attachment { id, task_id: task, name, size, created_at: now_ms() };
-        self.conn.execute(
-            "INSERT INTO task_attachments (id, task_id, name, size, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![id.to_string(), task.to_string(), attachment.name, size as i64, attachment.created_at],
-        )?;
+    /// Copies a file or archives a directory in `dir` and lists it on the task.
+    pub fn add_attachment(&self, task: Id, source: &Path, dir: &Path) -> Result<Attachment> {
+        self.save_attachment(PreparedAttachment::copy(task, source, dir)?, dir)
+    }
+
+    /// Publishes a staged copy and records it on the task. Staging can run away from the UI.
+    pub fn save_attachment(&self, mut prepared: PreparedAttachment, dir: &Path) -> Result<Attachment> {
+        let attachment = prepared.metadata().clone();
+        prepared.publish(dir)?;
+        let inserted = self.conn.execute(
+            "INSERT INTO task_attachments (id, task_id, name, size, created_at)
+             SELECT ?1, ?2, ?3, ?4, ?5 WHERE EXISTS (SELECT 1 FROM tasks WHERE id = ?2 AND deleted_at IS NULL)",
+            params![attachment.id.to_string(), attachment.task_id.to_string(), attachment.name, attachment.size as i64, attachment.created_at],
+        ).map_err(anyhow::Error::from).and_then(|count| {
+            anyhow::ensure!(count == 1, "cannot attach to a deleted or missing task");
+            Ok(())
+        });
+        inserted?;
+        prepared.keep_publication();
         Ok(attachment)
     }
 
@@ -3007,7 +3044,7 @@ fn task_from_row(row: &Row) -> rusqlite::Result<Task> {
     })
 }
 
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
 }
 
@@ -3927,6 +3964,75 @@ mod tests {
     }
 
     #[test]
+    fn task_draft_commits_duration_section_checklist_and_files_together() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let list = store.create_list("Work")?;
+        let section = store.insert_list_section(Some(list.id), "Next", None)?;
+        let dir = tempfile::tempdir()?;
+        let source = dir.path().join("brief.txt");
+        std::fs::write(&source, "Task brief")?;
+        let attachments_dir = dir.path().join("attachments");
+        let mut prepared = PreparedAttachment::copy(Uuid::now_v7(), &source, &attachments_dir)?;
+        assert_eq!(prepared.path().extension().unwrap(), "txt");
+        let destination = prepared.metadata().path(&attachments_dir);
+        let fields = TaskDraft {
+            title: "Plan".into(), list_id: Some(list.id), section_id: Some(section.id),
+            due_date: NaiveDate::from_ymd_opt(2028, 7, 6), due_time: NaiveTime::from_hms_opt(9, 0, 0),
+            end_date: NaiveDate::from_ymd_opt(2028, 7, 7), end_time: NaiveTime::from_hms_opt(10, 0, 0),
+            tags: vec!["work".into()], reminders: vec![15],
+            checklist: vec![("First".into(), true), ("Second".into(), false)],
+            ..Default::default()
+        };
+        store.conn.execute_batch("CREATE TEMP TRIGGER reject_attachment BEFORE INSERT ON task_attachments BEGIN SELECT RAISE(ABORT, 'file unavailable'); END;")?;
+        assert!(store.create_task_with_attachments(fields.clone(), true, std::slice::from_mut(&mut prepared), &attachments_dir).is_err());
+        assert!(store.tasks()?.is_empty());
+        assert!(!destination.exists());
+        assert!(prepared.path().exists(), "a failed save keeps the staged copy for retry");
+        store.conn.execute_batch("DROP TRIGGER reject_attachment")?;
+        let task = store.create_task_with_attachments(fields.clone(), true, std::slice::from_mut(&mut prepared), &attachments_dir)?;
+        assert_eq!(task.section_id, Some(section.id));
+        assert_eq!(task.end_date, fields.end_date);
+        assert_eq!(task.end_time, fields.end_time);
+        assert_eq!(task.checklist, Some((1, 2)));
+        assert_eq!(task.tags, ["work"]);
+        assert_eq!(task.reminders, [15]);
+        assert_eq!(store.attachments(task.id)?.len(), 1);
+        assert_eq!(std::fs::read_to_string(destination)?, "Task brief");
+        assert!(store.create_task(TaskDraft { section_id: Some(section.id), ..Default::default() }, true).is_err());
+        assert_eq!(store.tasks()?.len(), 1, "an invalid section cannot leave an extra task");
+        Ok(())
+    }
+
+    #[test]
+    fn task_draft_rolls_back_files_published_before_a_collision() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let dir = tempfile::tempdir()?;
+        let source = dir.path().join("plan.txt");
+        let files = dir.path().join("attachments");
+        std::fs::write(&source, "plan")?;
+        let provisional_id = Uuid::now_v7();
+        let mut staged = [
+            PreparedAttachment::copy(provisional_id, &source, &files)?,
+            PreparedAttachment::copy(provisional_id, &source, &files)?,
+        ];
+        let first = staged[0].metadata().path(&files);
+        let second = staged[1].metadata().path(&files);
+        std::fs::write(&second, "existing file")?;
+        let draft = TaskDraft { title: "Plan".into(), ..TaskDraft::default() };
+        assert!(store.create_task_with_attachments(draft.clone(), true, &mut staged, &files).is_err());
+        assert!(store.tasks()?.is_empty());
+        assert!(!first.exists());
+        assert_eq!(std::fs::read_to_string(&second)?, "existing file");
+        assert!(staged.iter().all(|attachment| attachment.path().exists()));
+        std::fs::remove_file(&second)?;
+        let task = store.create_task_with_attachments(draft, true, &mut staged, &files)?;
+        assert_eq!(store.attachments(task.id)?.len(), 2);
+        assert_eq!(std::fs::read_to_string(first)?, "plan");
+        assert_eq!(std::fs::read_to_string(second)?, "plan");
+        Ok(())
+    }
+
+    #[test]
     fn task_creation_rolls_back_when_tag_insertion_fails() -> Result<()> {
         let store = Store::open_in_memory()?;
         store.conn.execute_batch(
@@ -3965,6 +4071,71 @@ mod tests {
         assert!(store.attachments(task.id)?.is_empty());
         assert!(!attachment.path(&folder).exists());
         std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn directory_attachment_keeps_nested_files_and_empty_folders() -> Result<()> {
+        use std::io::Read as _;
+
+        let dir = tempfile::tempdir()?;
+        let source = dir.path().join("trip");
+        std::fs::create_dir_all(source.join("plans/empty"))?;
+        std::fs::write(source.join("plans/tickets.txt"), "seat 14C")?;
+        let store = Store::open_in_memory()?;
+        let task = store.add_task("Pack for the trip")?;
+        let folder = source.join("attachments");
+
+        let attachment = store.add_attachment(task.id, &source, &folder)?;
+        assert_eq!(attachment.name, "trip.zip");
+        assert_eq!(store.attachments(task.id)?, [attachment.clone()]);
+        let mut zip = zip::ZipArchive::new(std::fs::File::open(attachment.path(&folder))?)?;
+        let mut ticket = String::new();
+        zip.by_name("trip/plans/tickets.txt")?.read_to_string(&mut ticket)?;
+        assert_eq!(ticket, "seat 14C");
+        assert!(zip.by_name("trip/plans/empty/")?.is_dir());
+        assert!(zip.by_name("trip/attachments/.pending/").is_err());
+        drop(zip);
+        store.delete_attachment(&attachment, &folder)?;
+        assert!(!attachment.path(&folder).exists());
+        Ok(())
+    }
+
+    #[test]
+    fn oversized_attachments_leave_no_file_or_record() -> Result<()> {
+        use crate::attachment::{AttachmentTooLarge, MAX_ATTACHMENT_BYTES};
+        use std::io::Write as _;
+
+        let dir = tempfile::tempdir()?;
+        let source = dir.path().join("source");
+        let attachments = dir.path().join("attachments");
+        std::fs::create_dir_all(&source)?;
+        let file_path = source.join("data.bin");
+        let mut file = std::fs::File::create(&file_path)?;
+        file.set_len(MAX_ATTACHMENT_BYTES + 1)?;
+        let store = Store::open_in_memory()?;
+        let task = store.add_task("Has attachments")?;
+        let error = store.add_attachment(task.id, &file_path, &attachments).unwrap_err();
+        assert!(error.is::<AttachmentTooLarge>());
+
+        // Incompressible data makes the finished ZIP exceed the same limit.
+        let mut state = 1u64;
+        let mut block = [0; 64 * 1024];
+        for _ in 0..(MAX_ATTACHMENT_BYTES / block.len() as u64 + 1) {
+            for bytes in block.chunks_exact_mut(8) {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                bytes.copy_from_slice(&state.to_le_bytes());
+            }
+            file.write_all(&block)?;
+        }
+        drop(file);
+        let error = store.add_attachment(task.id, &source, &attachments).unwrap_err();
+        assert!(error.is::<AttachmentTooLarge>());
+        assert!(store.attachments(task.id)?.is_empty());
+        assert_eq!(attachments.read_dir()?.count(), 1, "only the staging directory remains");
+        assert_eq!(attachments.join(".pending").read_dir()?.count(), 0);
         Ok(())
     }
 

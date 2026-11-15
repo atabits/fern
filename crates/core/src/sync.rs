@@ -14,6 +14,9 @@ use serde_json::{Map, Value as Json};
 
 use crate::store::Store;
 
+/// The sync server stores an attachment key as one file-name component.
+pub const MAX_FILE_KEY_BYTES: usize = 255;
+
 /// The synced tables, parents before children, with their key columns.
 pub const SYNCED: &[(&str, &[&str])] = &[
     ("list_folders", &["id"]),
@@ -131,12 +134,16 @@ impl Store {
     /// and everything it has is received.
     pub fn set_sync_config(&self, config: &SyncConfig) -> Result<()> {
         let server = config.server.trim();
+        let tx = self.conn.unchecked_transaction()?;
         if self.setting(SYNC_SERVER)?.unwrap_or_default() != server {
             self.set_setting(SYNC_SENT, "0")?;
             self.set_setting(SYNC_SEEN, "0")?;
+            self.conn.execute("DELETE FROM sync_uploaded", [])?;
         }
         self.set_setting(SYNC_SERVER, server)?;
-        self.set_setting(SYNC_TOKEN, config.token.trim())
+        self.set_setting(SYNC_TOKEN, config.token.trim())?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// This device's id for the server, made once.
@@ -500,7 +507,9 @@ mod tests {
         // The record reaches the phone, which then has a file to fetch.
         relay(&laptop, 0, &phone);
         assert_eq!(phone.attachments(task.id)?, [attachment]);
-        assert_eq!(phone.files_to_sync(&phone_dir)?, (vec![], vec![file]));
+        assert_eq!(phone.files_to_sync(&phone_dir)?, (vec![], vec![file.clone()]));
+        laptop.set_sync_config(&SyncConfig { server: "https://other.example.org".into(), token: "new".into() })?;
+        assert_eq!(laptop.files_to_sync(&laptop_dir)?, (vec![file], vec![]));
         std::fs::remove_dir_all(&dir)?;
         Ok(())
     }

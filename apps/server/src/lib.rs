@@ -12,6 +12,7 @@
 //! time: `{ "changes": […], "position": 57 }`.
 
 use anyhow::{Context as _, Result, bail};
+use fern_core::sync::MAX_FILE_KEY_BYTES;
 use rusqlite::{Connection, OptionalExtension as _, params};
 use serde_json::{Value, json};
 
@@ -36,7 +37,7 @@ impl Server {
     /// Where a sent file goes: `None` for a name that is not a plain file name.
     pub fn file_path(&self, name: &str) -> Option<std::path::PathBuf> {
         let plain = !name.is_empty()
-            && name.len() <= 255
+            && name.len() <= MAX_FILE_KEY_BYTES
             && !name.starts_with('.')
             && !name.contains(['/', '\\', '\0']);
         self.files.as_ref().filter(|_| plain).map(|dir| dir.join(name))
@@ -123,6 +124,7 @@ const MAX_BODY: usize = 32 * 1024 * 1024;
 
 /// Answers sync requests on `http` until it closes: `POST /sync` with the bearer `token`.
 pub fn serve(http: &tiny_http::Server, mut server: Server, token: &str) {
+    use fern_core::attachment::MAX_ATTACHMENT_BYTES;
     use std::io::Read as _;
     use tiny_http::{Header, Method, Response};
     for mut request in http.incoming_requests() {
@@ -139,8 +141,8 @@ pub fn serve(http: &tiny_http::Server, mut server: Server, token: &str) {
                 (_, None) => Response::from_data(Vec::new()).with_status_code(400),
                 (Method::Put, Some(path)) => {
                     let mut data = Vec::new();
-                    match request.as_reader().take(MAX_BODY as u64 + 1).read_to_end(&mut data) {
-                        Ok(n) if n > MAX_BODY => Response::from_data(Vec::new()).with_status_code(413),
+                    match request.as_reader().take(MAX_ATTACHMENT_BYTES + 1).read_to_end(&mut data) {
+                        Ok(n) if n as u64 > MAX_ATTACHMENT_BYTES => Response::from_data(Vec::new()).with_status_code(413),
                         Ok(_) => match std::fs::write(&path, &data) {
                             Ok(()) => Response::from_data(Vec::new()).with_status_code(204),
                             Err(_) => Response::from_data(Vec::new()).with_status_code(500),

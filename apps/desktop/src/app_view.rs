@@ -877,18 +877,20 @@ impl AppView {
         cx.spawn(async move |this, cx| {
             let answer = answer.await;
             this.update(cx, |this, cx| {
-                let result = answer.and_then(|answer| this.store.finish_sync(&request, &answer));
-                this.sync = match result {
+                if this.store.sync_config().ok().flatten().as_ref() != Some(&config) {
+                    this.sync = crate::sync::SyncStatus::Off;
+                    cx.notify();
+                    return;
+                }
+                match answer.and_then(|answer| this.store.finish_sync(&request, &answer)) {
                     Ok(received) => {
                         if received > 0 {
                             this.reload_all(cx);
                         }
                         this.sync_files(config, cx);
-                        crate::sync::SyncStatus::Done(chrono::Local::now().naive_local())
                     }
-                    Err(err) => crate::sync::SyncStatus::Failed(format!("{err:#}")),
-                };
-                cx.notify();
+                    Err(err) => this.complete_sync(Err(err), cx),
+                }
             })
             .ok();
         })
@@ -897,32 +899,63 @@ impl AppView {
 
     /// After a sync, sends the attached files the server lacks and fetches the missing ones.
     fn sync_files(&mut self, config: fern_core::sync::SyncConfig, cx: &mut Context<Self>) {
-        let Ok(dir) = crate::attachments_dir() else { return };
-        let (upload, download) = match self.store.files_to_sync(&dir) {
+        let (dir, upload, download) = match crate::attachments_dir().and_then(|dir| {
+            let (upload, download) = self.store.files_to_sync(&dir)?;
+            Ok((dir, upload, download))
+        }) {
             Ok(files) => files,
             Err(err) => {
-                eprintln!("failed to list the files to sync: {err:#}");
+                self.complete_sync(Err(err), cx);
                 return;
             }
         };
         if upload.is_empty() && download.is_empty() {
+            self.complete_sync(Ok(()), cx);
             return;
         }
-        let fetched = !download.is_empty();
-        let done = cx.background_spawn(async move { crate::sync::transfer_files(&config, &dir, &upload, &download) });
+        let transfer_config = config.clone();
+        let transfer = cx.background_spawn(async move { crate::sync::transfer_files(&transfer_config, &dir, &upload, &download) });
         cx.spawn(async move |this, cx| {
-            let done = done.await;
+            let outcome = transfer.await;
             this.update(cx, |this, cx| {
-                if let Err(err) = this.store.mark_files_synced(&done) {
-                    eprintln!("failed to note the synced files: {err:#}");
-                }
-                if fetched {
+                if outcome.downloaded {
                     this.reload_all(cx);
                 }
+                if this.store.sync_config().ok().flatten().as_ref() != Some(&config) {
+                    this.sync = crate::sync::SyncStatus::Off;
+                    cx.notify();
+                    return;
+                }
+                let result = this.store.mark_files_synced(&outcome.synced).and_then(|()| {
+                    if outcome.failed.is_empty() {
+                        return Ok(());
+                    }
+                    let strings = i18n::t(cx);
+                    let errors = outcome.failed.iter().map(|(name, error)| {
+                        let display_name = name.get(..36)
+                            .filter(|id| fern_core::Id::parse_str(id).is_ok())
+                            .and_then(|_| name.get(36..))
+                            .and_then(|suffix| suffix.strip_prefix('-'))
+                            .unwrap_or(name);
+                        strings.sync_file_failed
+                            .replace("{file}", display_name)
+                            .replace("{error}", &crate::sync::attachment_error(error, strings))
+                    }).collect::<Vec<_>>().join("\n");
+                    Err(anyhow::anyhow!(errors))
+                });
+                this.complete_sync(result, cx);
             })
             .ok();
         })
         .detach();
+    }
+
+    fn complete_sync(&mut self, result: anyhow::Result<()>, cx: &mut Context<Self>) {
+        self.sync = match result {
+            Ok(()) => crate::sync::SyncStatus::Done(chrono::Local::now().naive_local()),
+            Err(err) => crate::sync::SyncStatus::Failed(format!("{err:#}")),
+        };
+        cx.notify();
     }
 
     /// Re-reads every view, after changes came from another device.

@@ -2,6 +2,7 @@
 //! Used by the desktop app and, later, by the mobile clients.
 
 pub mod agenda;
+pub mod attachment;
 pub mod calendar_options;
 pub mod countdown;
 pub mod filter;

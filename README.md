@@ -31,7 +31,7 @@ Download it and start working: no account, no server, your data stays on your ma
 - **⚡️ Native and fast.** Rust and [GPUI](https://github.com/zed-industries/zed), the GPU-rendered UI framework behind the Zed editor. No Electron and no web view.
 - **🗂️ Everything in one place.** Lists, tags, smart views, kanban boards, a calendar, an Eisenhower matrix, habits, a Pomodoro timer, countdowns and statistics.
 - **⌨️ Quick add that understands you.** `Lunch with Sam friday 1pm #personal !2 ^Work` sets the date, time, tag, priority and list as you type.
-- **🔒 Works out of the box, offline.** Download it and start adding tasks. There is no account, no sign-up and no cloud. Everything lives in one file on your disk, and Fern saves a copy of it every day.
+- **🔒 Works out of the box, offline.** Download it and start adding tasks. There is no account, no sign-up and no cloud. Your data stays on your disk, and Fern backs it up every day.
 - **🔄 Sync if you want it.** To use Fern on several devices, run your own `fern-server`. This is optional.
 - **🌍 English, Russian, and Simplified Chinese (简体中文).** Switch under Settings → More → Language.
   Simplified Chinese is available starting with v0.1.10.
@@ -118,11 +118,14 @@ minimized window from the taskbar. Click the Fern icon in the notification area 
 Configurable key bindings are defined in `assets/keymaps/default.json`.
 
 **Your data** stays on your computer. Fern needs no account or server, and the first start
-adds a few tips to the Inbox. Everything is kept in `tasks.db` in the `fern-tasks` folder of the
-platform's data directory. Settings → Data & Sync shows the folder and has a button to open it.
+adds a few tips to the Inbox. The `fern-tasks` folder in your platform's data directory contains
+`tasks.db` and its attachments. Settings → Data & Sync shows the folder and has a button to open it.
 - Linux: `~/.local/share/fern-tasks/`
 - macOS: `~/Library/Application Support/fern-tasks/`
 - Windows: `%APPDATA%\fern-tasks\`
+
+To add attachments, drop files or folders onto the selected task's details. Fern keeps its own
+copy of each file and saves each folder as a ZIP archive.
 
 **Portable mode:** Create an empty file named `.portable` in the writable folder containing the Fern
 executable on Windows or Linux, the `.AppImage` on Linux, or `Fern.app` on macOS. At startup, Fern stores

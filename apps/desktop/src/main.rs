@@ -30,6 +30,7 @@ mod lists_panel;
 mod markdown_toolbar;
 mod matrix_view;
 mod print;
+mod portable;
 mod quick_add_window;
 mod reminders;
 mod report_image;
@@ -75,7 +76,20 @@ pub fn data_dir() -> Result<std::path::PathBuf> {
     if let Some(dir) = std::env::var_os("FERN_DATA_DIR") {
         return Ok(dir.into());
     }
+    if let Some(dir) = portable::data_dir() {
+        return Ok(dir.to_owned());
+    }
     Ok(dirs::data_dir().context("cannot determine the user data directory")?.join("fern-tasks"))
+}
+
+/// Where temporary files for printing and backup exports are written.
+fn scratch_dir() -> std::io::Result<std::path::PathBuf> {
+    let Some(dir) = portable::data_dir() else {
+        return Ok(std::env::temp_dir());
+    };
+    let cache = dir.join("cache");
+    std::fs::create_dir_all(&cache)?;
+    Ok(cache)
 }
 
 /// Where attached files are kept, as copies.

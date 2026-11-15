@@ -120,6 +120,17 @@ platform's data directory. Settings → Data & Sync shows the folder and has a b
 - macOS: `~/Library/Application Support/fern-tasks/`
 - Windows: `%APPDATA%\fern-tasks\`
 
+**Portable mode:** Create an empty file named `.portable` in the writable folder containing the Fern
+executable on Windows or Linux, the `.AppImage` on Linux, or `Fern.app` on macOS. At startup, Fern stores
+its settings, database, attachments, backups, and cache in a `Data/` folder next to that marker. Close
+Fern before moving the folder to another computer. Portable mode starts with its own library. To bring
+your existing tasks and settings, export a backup and import it from the portable copy of Fern.
+
+On macOS, if a previous version used `.portable` and `Data/` inside `Fern.app/Contents/MacOS/`, Fern
+continues to open that profile and only checks for updates. To enable in-app updates, quit Fern and move
+both `.portable` and `Data/` to the folder containing `Fern.app`. If that folder already has a `Data/`
+profile, keep the two profiles in separate folders so neither is overwritten.
+
 Every day Fern saves a copy of the data to `backups/` and keeps the last seven. To restore
 one, use Settings → About → Import Backups.
 

@@ -1,9 +1,8 @@
 //! "Print": a list or a task as a plain HTML page, opened in the browser to print from there.
 
+use chrono::{Datelike, NaiveDate};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
-
-use chrono::{Datelike, NaiveDate};
 use fern_core::{ChecklistItem, Task};
 
 use crate::i18n::Strings;
@@ -178,20 +177,33 @@ pub fn year_html(
 
 /// Writes the page to a temporary file and opens it in the default browser.
 pub fn open(name: &str, html: &str) -> std::io::Result<()> {
-    let path = std::env::temp_dir().join(format!("fern-print-{name}.html"));
+    let path = crate::scratch_dir()?.join(format!("fern-print-{name}.html"));
     std::fs::write(&path, html)?;
-    #[cfg(target_os = "macos")]
-    let mut command = std::process::Command::new("open");
-    // `start` is a shell built-in on Windows; its first quoted argument is the window title.
-    #[cfg(target_os = "windows")]
-    let mut command = {
-        let mut command = std::process::Command::new("cmd");
-        command.args(["/C", "start", ""]);
-        command
+    open_print_file(&path)
+}
+
+#[cfg(windows)]
+fn open_print_file(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use windows::Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL};
+    use windows::core::{PCWSTR, w};
+
+    // Pass the path directly so the executable's folder can contain shell metacharacters.
+    let path: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+    let result = unsafe {
+        ShellExecuteW(None, w!("open"), PCWSTR(path.as_ptr()), PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL)
     };
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    let mut command = std::process::Command::new("xdg-open");
-    command.arg(&path).spawn().map(|_| ())
+    let status = result.0 as isize;
+    if status <= 32 {
+        return Err(std::io::Error::other(format!("could not open the print page (ShellExecuteW: {status})")));
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn open_print_file(path: &std::path::Path) -> std::io::Result<()> {
+    let program = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+    std::process::Command::new(program).arg(path).spawn().map(|_| ())
 }
 
 #[cfg(test)]

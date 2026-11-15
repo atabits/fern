@@ -207,7 +207,7 @@ enum Install {
     AppImage(PathBuf),
     /// Linux: `fern` unpacked from the tar.gz.
     Tarball(PathBuf),
-    /// Linux: installed by the package manager, which also updates it.
+    /// Managed outside Fern by a package manager, or by an install with an in-bundle profile.
     Managed,
 }
 
@@ -227,11 +227,14 @@ impl Install {
             return Some(Install::WindowsPortable(exe));
         }
         if cfg!(target_os = "macos") {
-            let app = exe.ancestors().find(|path| path.extension().is_some_and(|ext| ext == "app"))?;
+            let app = crate::portable::mac_bundle(&exe)?;
+            if mac_bundle_has_profiles(app) {
+                return Some(Install::Managed);
+            }
             return Some(Install::MacApp(app.to_owned()));
         }
-        if let Some(path) = std::env::var_os("APPIMAGE") {
-            return Some(Install::AppImage(path.into()));
+        if let Some(path) = crate::portable::app_image() {
+            return Some(Install::AppImage(path));
         }
         if exe.starts_with("/usr") {
             return Some(Install::Managed);
@@ -261,7 +264,10 @@ impl Install {
                 std::fs::remove_file(old_path(exe)).ok();
             }
             Install::MacApp(app) => {
-                std::fs::remove_dir_all(old_path(app)).ok();
+                let old = old_path(app);
+                if !crate::portable::has_legacy_mac_profile(&old) {
+                    std::fs::remove_dir_all(old).ok();
+                }
             }
             _ => {}
         }
@@ -290,6 +296,8 @@ impl Install {
                 command(exe).spawn()?;
             }
             Install::MacApp(app) => {
+                anyhow::ensure!(!mac_bundle_has_profiles(app), "move the portable profile outside the app bundle before updating");
+                anyhow::ensure!(!staged.canonicalize()?.starts_with(app.canonicalize()?), "the staged update is inside the app bundle");
                 let old = old_path(app);
                 std::fs::remove_dir_all(&old).ok();
                 std::fs::rename(app, &old).with_context(|| format!("cannot move {}", app.display()))?;
@@ -311,6 +319,10 @@ impl Install {
         }
         Ok(())
     }
+}
+
+fn mac_bundle_has_profiles(app: &Path) -> bool {
+    crate::portable::has_legacy_mac_profile(app) || crate::portable::has_legacy_mac_profile(&old_path(app))
 }
 
 /// `<path>.old`, where the replaced version waits to be removed.
@@ -561,6 +573,27 @@ mod tests {
         // An Intel Mac, with only the Apple Silicon package out.
         let release = self::release("0.2.0", &["fern-0.2.0-macos-arm64.dmg"]);
         assert!(matches!(pick(&release, &Install::MacApp("Fern.app".into()), "0.1.5", "macos", "x86_64"), Found::Available(_)));
+    }
+
+    #[test]
+    fn mac_update_preserves_a_legacy_profile_in_the_previous_bundle() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("fern-test-mac-update-{}", uuid::Uuid::now_v7()));
+        let app = root.join("Fern.app");
+        let previous_profile = old_path(&app).join("Contents").join("MacOS").join("Data");
+        std::fs::create_dir_all(&app)?;
+        std::fs::create_dir_all(&previous_profile)?;
+        let database = previous_profile.join("tasks.db");
+        std::fs::write(&database, "previous profile")?;
+        let stage = root.join("staged");
+        std::fs::create_dir(&stage)?;
+        let install = Install::MacApp(app.clone());
+
+        assert!(install.apply(&stage).unwrap_err().to_string().contains("portable profile"));
+        assert!(app.is_dir());
+        assert!(stage.is_dir());
+        assert_eq!(std::fs::read_to_string(database)?, "previous profile");
+        std::fs::remove_dir_all(root)?;
+        Ok(())
     }
 
     #[test]

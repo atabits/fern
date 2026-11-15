@@ -6400,6 +6400,42 @@ mod tests {
     }
 
     #[gpui::test]
+    fn a_task_without_tags_can_open_the_picker_and_save_its_first_tag(cx: &mut TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let task = store.add_task("No tags yet").unwrap();
+        cx.update(|cx| {
+            theme::init(cx);
+            cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+            crate::keymap::load_default(&assets::Assets, cx).unwrap();
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| TodoView::new(store.clone(), window, cx));
+        cx.update(|window, cx| view.update(cx, |view, cx| {
+            window.focus(&view.list_focus, cx);
+            view.start_detail(task.id, "tags", window, cx);
+        }));
+        assert!(cx.debug_bounds("task-tag-picker").is_some());
+        cx.simulate_input("work");
+        cx.simulate_keystrokes("enter");
+        assert!(store.task(task.id).unwrap().unwrap().tags.is_empty());
+        assert!(cx.debug_bounds("task-tag-picker").is_some());
+        cx.simulate_keystrokes("escape");
+        assert!(cx.debug_bounds("task-tag-picker").is_none());
+        assert!(store.tags().unwrap().is_empty(), "Esc discards new tags too");
+        cx.update(|window, cx| {
+            assert!(view.read(cx).list_focus.is_focused(window));
+            view.update(cx, |view, cx| view.start_detail(task.id, "tags", window, cx));
+        });
+        cx.simulate_input("work");
+        cx.simulate_keystrokes("enter");
+        let ok = cx.debug_bounds("task-tags-ok").unwrap().center();
+        cx.simulate_mouse_move(ok, None, Modifiers::default());
+        cx.simulate_click(ok, Modifiers::default());
+        assert_eq!(store.task(task.id).unwrap().unwrap().tags, ["work"]);
+        assert!(cx.debug_bounds("task-tag-picker").is_none());
+        cx.update(|window, cx| assert!(view.read(cx).list_focus.is_focused(window)));
+    }
+
+    #[gpui::test]
     fn backspace_edits_text_but_only_delete_trashes_the_selected_task(cx: &mut TestAppContext) {
         let store = Rc::new(Store::open_in_memory().unwrap());
         let task = store.add_task("Original").unwrap();

@@ -22,12 +22,19 @@ enum Popup {
     Due,
     Priority,
     Tags,
+    InlineTags,
     List,
     More,
     /// "Link Parent Task": a searchable list of tasks to nest this one under.
     LinkParent,
     /// Start Focus → "Estimation": the expected pomos or duration.
     Estimate,
+}
+
+struct TagDraft {
+    original: Vec<String>,
+    picked: Vec<String>,
+    save_failed: bool,
 }
 
 /// The Estimation popover's draft: minutes instead of pomos, and the amount.
@@ -82,6 +89,7 @@ pub struct TaskDetail {
     title: Entity<TextInput>,
     notes: Entity<TextInput>,
     tag_input: Entity<TextInput>,
+    tag_draft: Option<TagDraft>,
     /// All tags, for the tag picker and chip colors.
     all_tags: Vec<Tag>,
     /// All lists, for the list picker and the list button label.
@@ -158,7 +166,7 @@ impl TaskDetail {
         let strings = i18n::t(cx);
         let title = cx.new(|cx| TextInput::new(Mode::Wrapped, strings.untitled, cx).without_cancel());
         let notes = cx.new(|cx| TextInput::new(Mode::MultiLine, strings.notes_placeholder, cx).without_cancel());
-        let tag_input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.new_tag, cx).without_cancel());
+        let tag_input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.type_in_tag, cx).without_cancel());
         let new_item = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.add_item, cx).without_cancel());
         let subtask_input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.add_subtask, cx).without_cancel());
         let time_input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.time_placeholder, cx).without_cancel());
@@ -179,13 +187,8 @@ impl TaskDetail {
                 let text = input.read(cx).text().to_owned();
                 this.save(cx, |store, id| store.set_notes(id, &text));
             }),
-            cx.subscribe_in(&tag_input, window, |this, input, Submitted(text), window, cx| {
-                let name = text.trim().trim_start_matches('#').to_owned();
-                if !name.is_empty() {
-                    this.add_tag(name, cx);
-                }
-                input.update(cx, |input, cx| input.clear(window, cx));
-            }),
+            cx.subscribe(&tag_input, |_, _, _: &Changed, cx| cx.notify()),
+            cx.subscribe_in(&tag_input, window, |this, _, _: &Submitted, window, cx| this.pick_typed_tag(window, cx)),
             cx.subscribe_in(&new_item, window, |this, input, Submitted(text), window, cx| {
                 if !text.trim().is_empty() {
                     let text = text.clone();
@@ -236,7 +239,7 @@ impl TaskDetail {
                 let strings = i18n::t(cx);
                 this.title.update(cx, |input, cx| input.set_placeholder(strings.untitled, cx));
                 this.notes.update(cx, |input, cx| input.set_placeholder(strings.notes_placeholder, cx));
-                this.tag_input.update(cx, |input, cx| input.set_placeholder(strings.new_tag, cx));
+                this.tag_input.update(cx, |input, cx| input.set_placeholder(strings.type_in_tag, cx));
                 this.new_item.update(cx, |input, cx| input.set_placeholder(strings.add_item, cx));
                 this.subtask_input.update(cx, |input, cx| input.set_placeholder(strings.add_subtask, cx));
                 this.time_input.update(cx, |input, cx| input.set_placeholder(strings.time_placeholder, cx));
@@ -260,6 +263,7 @@ impl TaskDetail {
             title,
             notes,
             tag_input,
+            tag_draft: None,
             all_tags: Vec::new(),
             lists: Vec::new(),
             checklist: Vec::new(),
@@ -314,6 +318,7 @@ impl TaskDetail {
         self.task = task;
         self.popup = None;
         self.popup_return_focus = None;
+        self.tag_draft = None;
         self.subtask_open = false;
         self.activity = None;
         self.all_tags = self.store.tags().unwrap_or_default();
@@ -668,12 +673,18 @@ impl TaskDetail {
     fn open_popup(&mut self, popup: Popup, cx: &mut Context<Self>) {
         self.focus_submenu = false;
         self.popup_return_focus = None;
+        self.tag_draft = None;
         match popup {
             Popup::Due => {
                 let today = Local::now().date_naive();
                 self.due_draft = self.task.as_ref().map(|task| DueDraft::from_task(task, today));
             }
-            Popup::Tags => self.all_tags = self.store.tags().unwrap_or_default(),
+            Popup::Tags | Popup::InlineTags => {
+                self.all_tags = self.store.tags().unwrap_or_default();
+                let original = self.task_tags();
+                self.tag_draft = Some(TagDraft { picked: original.clone(), original, save_failed: false });
+                self.tag_input.update(cx, |input, cx| input.set_text("", cx));
+            }
             Popup::List => {
                 self.list_search.update(cx, |input, cx| input.set_text("", cx));
                 self.list_submenu = None;
@@ -831,13 +842,14 @@ impl TaskDetail {
     fn close_popup(&mut self, cx: &mut Context<Self>) {
         self.popup = None;
         self.popup_return_focus = None;
+        self.tag_draft = None;
         self.focus_submenu = false;
         cx.notify();
     }
 
     fn popup_input_focused(&self, window: &Window, cx: &App) -> bool {
         let input = match self.popup {
-            Some(Popup::Tags) => &self.tag_input,
+            Some(Popup::Tags | Popup::InlineTags) => &self.tag_input,
             Some(Popup::LinkParent) => &self.link_search,
             Some(Popup::Due) => &self.time_input,
             Some(Popup::List) => &self.list_search,
@@ -913,25 +925,71 @@ impl TaskDetail {
         self.task.as_ref().map(|t| t.tags.clone()).unwrap_or_default()
     }
 
-    fn add_tag(&mut self, name: String, cx: &mut Context<Self>) {
-        let mut tags = self.task_tags();
-        if !tags.iter().any(|t| t.to_lowercase() == name.to_lowercase()) {
-            tags.push(name);
-            self.save(cx, |store, id| store.set_tags(id, &tags));
-            self.all_tags = self.store.tags().unwrap_or_default();
+    fn tag_query<'a>(&self, cx: &'a App) -> &'a str {
+        self.tag_input.read(cx).text().trim().trim_start_matches('#').trim()
+    }
+
+    fn pick_typed_tag(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let query = self.tag_query(cx).to_owned();
+        if query.is_empty() {
+            return;
+        }
+        let name = self.all_tags.iter().find(|tag| same_tag(&tag.name, &query)).map_or(query, |tag| tag.name.clone());
+        if let Some(draft) = &mut self.tag_draft {
+            if !draft.picked.iter().any(|picked| same_tag(picked, &name)) {
+                draft.picked.push(name);
+            }
+            draft.save_failed = false;
+            self.tag_input.update(cx, |input, cx| input.clear(window, cx));
+            cx.notify();
         }
     }
 
-    fn remove_tag(&mut self, name: &str, cx: &mut Context<Self>) {
-        let tags: Vec<String> = self.task_tags().into_iter().filter(|t| t != name).collect();
-        self.save(cx, |store, id| store.set_tags(id, &tags));
+    fn toggle_picked_tag(&mut self, name: String, cx: &mut Context<Self>) {
+        if let Some(draft) = &mut self.tag_draft {
+            if let Some(index) = draft.picked.iter().position(|picked| same_tag(picked, &name)) {
+                draft.picked.remove(index);
+            } else {
+                draft.picked.push(name);
+            }
+            draft.save_failed = false;
+            cx.notify();
+        }
     }
 
-    fn toggle_tag(&mut self, name: String, cx: &mut Context<Self>) {
-        if self.task_tags().contains(&name) {
-            self.remove_tag(&name, cx);
-        } else {
-            self.add_tag(name, cx);
+    fn apply_tags(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(id), Some(draft)) = (self.task_id(), &mut self.tag_draft) else { return };
+        let contains = |tags: &[String], name: &str| tags.iter().any(|tag| same_tag(tag, name));
+        let save = (|| -> anyhow::Result<bool> {
+            let Some(mut task) = self.store.task(id)?.filter(|task| !task.is_deleted()) else {
+                anyhow::bail!("cannot save tags for a missing or deleted task");
+            };
+            // Apply the user's changes to the current tags, which may have synced since opening.
+            let before = task.tags.clone();
+            task.tags.retain(|tag| !contains(&draft.original, tag) || contains(&draft.picked, tag));
+            for tag in &draft.picked {
+                if !contains(&draft.original, tag) && !contains(&task.tags, tag) {
+                    task.tags.push(tag.clone());
+                }
+            }
+            if task.tags == before {
+                return Ok(false);
+            }
+            self.store.set_tags(id, &task.tags)?;
+            Ok(true)
+        })();
+        match save {
+            Ok(changed) => {
+                self.dismiss_popup(window, cx);
+                if changed {
+                    cx.emit(TaskUpdated);
+                }
+            }
+            Err(error) => {
+                eprintln!("failed to save task tags: {error:#}");
+                draft.save_failed = true;
+                cx.notify();
+            }
         }
     }
 
@@ -2489,31 +2547,62 @@ impl TaskDetail {
 
     fn render_tags_popup(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
-        let current = self.task_tags();
+        let strings = i18n::t(cx);
+        let Some(draft) = &self.tag_draft else { return div().into_any_element() };
+        let query = self.tag_query(cx).to_owned();
+        let folded = query.to_lowercase();
+        let mut names: Vec<&str> = self.all_tags.iter().map(|tag| tag.name.as_str()).collect();
+        for name in &draft.picked {
+            if !names.iter().any(|known| same_tag(known, name)) {
+                names.push(name);
+            }
+        }
+        let offer_new = !query.is_empty() && !names.iter().any(|name| same_tag(name, &query));
+        let button = |id: &'static str, label: &'static str, primary: bool| {
+            div().id(id).flex_1().h(px(28.)).flex().items_center().justify_center()
+                .rounded(px(6.)).cursor_pointer()
+                .when(primary, |el| el.bg(theme.colors().accent))
+                .when(!primary, |el| el.border_1().border_color(theme.colors().border))
+                .child(Label::new(label).size(LabelSize::Small))
+        };
         popover(cx)
-            .w(px(220.))
+            .debug_selector(|| "task-tag-picker".to_owned())
+            .w(px(240.))
             .gap_1()
-            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_popup(cx)))
+            .on_mouse_down_out(cx.listener(|this, _, window, cx| {
+                this.dismiss_popup(window, cx);
+            }))
             .child(
                 h_flex()
                     .h(px(30.))
                     .px_2()
+                    .gap_2()
                     .rounded(px(4.))
                     .bg(theme.colors().background)
-                    .child(self.tag_input.clone()),
+                    .child(Icon::new(IconName::Search).size(IconSize::Small).color(Color::Muted))
+                    .child(div().flex_1().min_w_0().child(self.tag_input.clone())),
             )
-            .children(self.all_tags.iter().map(|tag| {
-                let name = tag.name.clone();
-                ListItem::new(SharedString::from(format!("tag-option-{}", tag.name)))
-                    .start_slot(
-                        Icon::new(IconName::Tag)
-                            .size(IconSize::Large)
-                            .color(lists_panel::color(tag.color.as_deref(), cx)),
-                    )
-                    .child(Label::new(tag.name.clone()))
-                    .when(current.contains(&tag.name), |item| item.end_slot(check_mark()))
-                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_tag(name.clone(), cx)))
-            }))
+            .child(v_flex().id("task-tag-options").max_h(px(200.)).overflow_y_scroll()
+                .children(names.into_iter().filter(|name| name.to_lowercase().contains(&folded)).map(|name| {
+                    let name = name.to_owned();
+                    let checked = draft.picked.iter().any(|picked| same_tag(picked, &name));
+                    ListItem::new(SharedString::from(format!("tag-option-{name}")))
+                        .start_slot(Icon::new(IconName::Tag).size(IconSize::Small).color(self.tag_color(&name, cx)))
+                        .child(Label::new(name.clone()).truncate())
+                        .when(checked, |item| item.end_slot(check_mark()))
+                        .on_click(cx.listener(move |this, _, _, cx| this.toggle_picked_tag(name.clone(), cx)))
+                }))
+                .when(offer_new, |el| el.child(ListItem::new("task-tag-create")
+                    .start_slot(Icon::new(IconName::Plus).size(IconSize::Small).color(Color::Accent))
+                    .child(Label::new(format!("{}: {query}", strings.new_tag)).truncate())
+                    .on_click(cx.listener(|this, _, window, cx| this.pick_typed_tag(window, cx))))))
+            .when(draft.save_failed, |el| el.child(Label::new(strings.task_save_failed).color(Color::Error)))
+            .child(h_flex().gap_2().p_1()
+                .child(button("task-tags-cancel", strings.cancel, false).on_click(cx.listener(|this, _, window, cx| {
+                    this.dismiss_popup(window, cx);
+                })))
+                .child(button("task-tags-ok", strings.ok, true).debug_selector(|| "task-tags-ok".to_owned())
+                    .on_click(cx.listener(|this, _, window, cx| this.apply_tags(window, cx)))))
             .into_any_element()
     }
 
@@ -2555,7 +2644,7 @@ impl TaskDetail {
                         None => Chip::new(tag.clone(), self.tag_color(&tag, cx)).into_any_element(),
                     })
                     .on_click(cx.listener(|this, _, window, cx| {
-                        this.open_tags(Popup::Tags, window, cx);
+                        this.open_tags(Popup::InlineTags, window, cx);
                     }))
             }))
             .child(
@@ -2574,9 +2663,9 @@ impl TaskDetail {
                     .hover(|s| s.bg(theme.colors().element_hover))
                     .child(Icon::new(IconName::Plus).size(IconSize::Custom(px(11.))).color(Color::Accent))
                     .on_click(cx.listener(|this, _, window, cx| {
-                        this.open_tags(Popup::Tags, window, cx);
+                        this.open_tags(Popup::InlineTags, window, cx);
                     }))
-                    .when(self.popup == Some(Popup::Tags), |el| {
+                    .when(self.popup == Some(Popup::InlineTags), |el| {
                         el.child(PopoverAttachment::new(Placement::BelowLeft, self.render_tags_popup(cx)))
                     }),
             )
@@ -2595,6 +2684,10 @@ pub fn activity_text<'a>(kind: &'a str, strings: &'static Strings) -> &'a str {
 }
 
 /// Whether a list's name matches the list menu's search, ignoring case.
+fn same_tag(left: &str, right: &str) -> bool {
+    left.to_lowercase() == right.to_lowercase()
+}
+
 fn list_matches(name: &str, query: &str) -> bool {
     let query = query.trim().to_lowercase();
     query.is_empty() || name.to_lowercase().contains(&query)
@@ -2843,7 +2936,9 @@ impl Render for TaskDetail {
                     // The calendar's card leaves out the empty tags and subtasks, as the original's.
                     // As the original's, the tags row only once there are tags (the "…" menu's Tags
                     // adds the first), and the subtasks only once there are some or one is begun.
-                    .when(!task.tags.is_empty() || task.estimate.is_some(), |el| el.child(div().pt(px(18.)).child(self.render_tags_row(strings, cx))))
+                    .when(!task.tags.is_empty() || task.estimate.is_some() || self.popup == Some(Popup::InlineTags), |el| {
+                        el.child(div().pt(px(18.)).child(self.render_tags_row(strings, cx)))
+                    })
                     .when(!self.subtasks.is_empty() || self.subtask_open, |el| {
                         el.child(div().pt_2().child(Divider::horizontal())).child(self.render_subtasks(strings, cx))
                     })
@@ -2930,10 +3025,11 @@ impl Render for TaskDetail {
                             )
                             .child(
                                 div()
+                                    .debug_selector(|| "task-detail-more".to_owned())
                                     .relative()
                                     .child(
                                         IconButton::new("more", IconName::Ellipsis)
-                                            .when(self.popup != Some(Popup::More), |b| b.tip(strings.more, TipSide::Above))
+                                            .when(!matches!(self.popup, Some(Popup::More | Popup::Tags)), |b| b.tip(strings.more, TipSide::Above))
                                             .on_click(cx.listener(|this, _, window, cx| this.open_popup_from_ui(Popup::More, window, cx))),
                                     )
                                     .when(self.popup == Some(Popup::More), |el| {
@@ -2941,6 +3037,9 @@ impl Render for TaskDetail {
                                             Placement::AboveRight,
                                             self.render_more_popup(strings, cx),
                                         ))
+                                    })
+                                    .when(self.popup == Some(Popup::Tags), |el| {
+                                        el.child(PopoverAttachment::new(Placement::AboveRight, self.render_tags_popup(cx)))
                                     })
                                     .when(self.popup == Some(Popup::Estimate), |el| {
                                         el.child(PopoverAttachment::new(
@@ -2987,7 +3086,7 @@ mod tests {
 
         cx.update(|window, cx| view.update(cx, |detail, cx| {
             window.focus(&detail.notes.focus_handle(cx), cx);
-            detail.open_popup_from_ui(Popup::Due, window, cx);
+            detail.open_tags(Popup::Tags, window, cx);
         }));
         cx.simulate_keystrokes("escape");
         cx.update(|window, cx| {

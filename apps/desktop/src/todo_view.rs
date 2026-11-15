@@ -234,6 +234,7 @@ pub struct TodoView {
     /// Its side menu open: 0 Move to, 1 Start Focus.
     context_side: Option<u8>,
     error: Option<String>,
+    add_attachment_error: Option<String>,
 }
 
 impl TodoView {
@@ -413,6 +414,7 @@ impl TodoView {
             context_menu: None,
             context_side: None,
             error: None,
+            add_attachment_error: None,
         };
         this.reload(cx);
         #[cfg(debug_assertions)]
@@ -429,8 +431,7 @@ impl TodoView {
         for part in state.split(';') {
             match part.split_once('=') {
                 Some(("add", text)) => {
-                    let result = self.add_task(text);
-                    self.check(result);
+                    self.add_task(text, cx);
                     self.reload(cx);
                 }
                 Some(("list", name)) => {
@@ -1022,8 +1023,19 @@ impl TodoView {
         self.reload(cx);
     }
 
-    fn add_task(&self, input: &str) -> anyhow::Result<Task> {
-        self.add_task_as(input, &self.view, &self.add_draft)
+    fn add_task(&mut self, input: &str, cx: &App) -> Option<Task> {
+        let result = self.add_task_as(input, &self.view, &self.add_draft);
+        let task = self.check(result)?;
+        let strings = i18n::t(cx);
+        let errors: Vec<_> = std::mem::take(&mut self.add_draft.files).into_iter().filter_map(|file| {
+            let result = crate::attachments_dir().and_then(|dir| self.store.add_attachment(task.id, &file, &dir));
+            let error = result.err()?;
+            let name = file.file_name().unwrap_or(file.as_os_str()).to_string_lossy();
+            Some(strings.attachment_failed.replace("{file}", &name)
+                .replace("{error}", &crate::sync::attachment_error(&error, strings)))
+        }).collect();
+        self.add_attachment_error = (!errors.is_empty()).then(|| errors.join("\n"));
+        Some(task)
     }
 
     /// Adds a task from the add field's text as if typed in `view` with `draft`'s choices.
@@ -1113,12 +1125,6 @@ impl TodoView {
         if draft.note || note_list {
             self.store.set_kind(task.id, fern_core::Kind::Note)?;
         }
-        if !draft.files.is_empty() {
-            let dir = crate::attachments_dir()?;
-            for file in &draft.files {
-                self.store.add_attachment(task.id, file, &dir)?;
-            }
-        }
         Ok(task)
     }
 
@@ -1157,8 +1163,7 @@ impl TodoView {
         if text.trim().is_empty() {
             return;
         }
-        let result = self.add_task(text);
-        if self.check(result).is_some() {
+        if self.add_task(text, cx).is_some() {
             self.input.update(cx, |input, cx| input.clear(window, cx));
             self.quick_add_due = None;
             self.add_draft = AddDraft::default();
@@ -2986,8 +2991,7 @@ impl TodoView {
         let input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.add_task, cx));
         cx.subscribe_in(&input, window, move |this, input, Submitted(text), window, cx| {
             if !text.trim().is_empty() {
-                let result = this.add_task(text);
-                if let Some(task) = this.check(result)
+                if let Some(task) = this.add_task(text, cx)
                     && let Some((_, target, _)) = this.column_add.clone()
                 {
                     this.drop_on_column(task.id, target, cx);
@@ -5845,7 +5849,7 @@ impl Render for TodoView {
                             .pb_4(),
                     ),
             ))
-            .when_some(self.error.clone(), |el, error| {
+            .when_some(self.error.clone().or_else(|| self.add_attachment_error.clone()), |el, error| {
                 el.child(
                     div()
                         .px_6()
@@ -6359,6 +6363,36 @@ mod tests {
             let view = view.read(cx);
             assert!(view.card.is_none());
             assert!(view.list_focus.is_focused(window));
+        });
+    }
+
+    #[gpui::test]
+    fn a_rejected_quick_add_attachment_does_not_repeat_the_saved_task(cx: &mut TestAppContext) {
+        use fern_core::attachment::MAX_ATTACHMENT_BYTES;
+
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let file = std::env::temp_dir().join(format!("fern-oversized-{}.bin", Id::now_v7()));
+        std::fs::File::create(&file).unwrap().set_len(MAX_ATTACHMENT_BYTES + 1).unwrap();
+        cx.update(|cx| {
+            theme::init(cx);
+            cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+            assert!(crate::keymap::load_default(&assets::Assets, cx).unwrap().is_empty());
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let mut view = TodoView::new(store.clone(), window, cx);
+            view.add_draft.files.push(file.clone());
+            window.focus(&view.input.focus_handle(cx), cx);
+            view
+        });
+        cx.simulate_input("One task");
+        cx.simulate_keystrokes("enter enter");
+        std::fs::remove_file(file).unwrap();
+        let tasks = store.tasks().unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert!(store.attachments(tasks[0].id).unwrap().is_empty());
+        cx.update(|_, cx| {
+            assert!(view.read(cx).input.read(cx).text().is_empty());
+            assert!(view.read(cx).add_attachment_error.as_deref().is_some_and(|error| error.contains("32 MiB")));
         });
     }
 

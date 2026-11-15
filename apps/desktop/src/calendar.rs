@@ -175,6 +175,17 @@ pub fn month_grid(month: NaiveDate) -> Vec<NaiveDate> {
     (0..42).map(|i| start + Duration::days(i)).collect()
 }
 
+/// The year overview's heatmap levels, based on the number of visible items.
+pub fn heatmap_level(count: usize) -> u8 {
+    match count {
+        0 => 0,
+        1..=3 => 1,
+        4..=6 => 2,
+        7..=9 => 3,
+        _ => 4,
+    }
+}
+
 /// The seven days of the week that contains `date`.
 pub fn week_of(date: NaiveDate) -> [NaiveDate; 7] {
     week_from(date, week_start())

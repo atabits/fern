@@ -51,6 +51,17 @@
     }
   },
   {
+    "context": "CalendarYear",
+    "bindings": {
+      "up": "calendar::PreviousYear",
+      "left": "calendar::PreviousYear",
+      "down": "calendar::NextYear",
+      "right": "calendar::NextYear",
+      "t": "calendar::CalendarToday",
+      "secondary-p": "calendar::PrintYear"
+    }
+  },
+  {
     "context": "SummaryEditor",
     "bindings": {
       "secondary-b": "markdown::Bold",

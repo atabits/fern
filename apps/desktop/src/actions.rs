@@ -20,7 +20,7 @@ actions!(
 
 actions!(settings, [DismissSettings]);
 
-actions!(calendar, [DayView, WeekView, MonthView, YearView, AgendaView]);
+actions!(calendar, [DayView, WeekView, MonthView, YearView, AgendaView, PreviousYear, NextYear, CalendarToday, PrintYear]);
 
 actions!(
     task_list,

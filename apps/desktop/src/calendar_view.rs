@@ -1,7 +1,7 @@
 //! The calendar: tasks placed on their due dates in a month grid or a week with a time axis,
 //! matched to TickTick's Calendar section.
 
-use std::rc::Rc;
+use std::{collections::BTreeMap, rc::Rc};
 
 use chrono::{Datelike, Local, NaiveDate};
 use fern_core::{CalendarOptions, ColorBy, Id, Priority, Store, Task};
@@ -9,13 +9,16 @@ use gpui::{EventEmitter, FontWeight};
 use ui::prelude::*;
 use ui::{Placement, PopoverAttachment, SubmenuItem, popover};
 
-use crate::actions::{AgendaView, DayView, MonthView, NewTask, ToggleSidebar, WeekView, YearView};
+use crate::actions::{AgendaView, CalendarToday, DayView, MonthView, NextYear, PreviousYear, PrintYear, NewTask, ToggleSidebar, WeekView, YearView};
 use crate::calendar::{self, week_axis};
 use crate::drag::DraggedTask;
 use crate::i18n;
 use crate::calendar_options_view::{CalendarOptionsDialog, OptionsEvent, Page};
 use crate::task_detail::{StartFocus, TaskDetail, TaskUpdated};
 use crate::task_rows;
+
+#[path = "calendar_year.rs"]
+mod calendar_year;
 
 /// How many tasks a day cell shows before collapsing the rest into "+N".
 const TASKS_PER_DAY: usize = 5;
@@ -92,7 +95,12 @@ pub struct CalendarView {
     context_menu: Option<(Id, gpui::Point<Pixels>)>,
     context_side: Option<u8>,
     /// The Year view's day card, opened by clicking a day.
-    year_day: Option<NaiveDate>,
+    year_day: Option<(NaiveDate, NaiveDate)>,
+    year_size: Option<gpui::Size<Pixels>>,
+    year_scroll: calendar_year::YearScroll,
+    year_heatmap: BTreeMap<i32, BTreeMap<NaiveDate, usize>>,
+    year_heatmap_day: NaiveDate,
+    year_jump: Option<calendar_year::YearJump>,
     /// The task card a click on a task opens beside it, as in the original: the task, the day
     /// it was clicked on, and the details it shows.
     card: Option<(Id, NaiveDate)>,
@@ -143,7 +151,10 @@ impl CalendarView {
         });
         // A subscribed calendar read anew shows its events.
         if let Some(feeds) = crate::subscriptions::feeds(cx) {
-            cx.observe(&feeds, |_, _, cx| cx.notify()).detach();
+            cx.observe(&feeds, |this, _, cx| {
+                this.year_heatmap.clear();
+                cx.notify();
+            }).detach();
         }
         cx.subscribe(&detail, |this, _, _: &TaskUpdated, cx| this.card_updated(cx)).detach();
         cx.subscribe(&detail, |_, _, StartFocus(id, title, stopwatch), cx| cx.emit(StartFocus(*id, title.clone(), *stopwatch))).detach();
@@ -170,6 +181,11 @@ impl CalendarView {
             open_countdown: None,
             context_menu: None,
             year_day: None,
+            year_size: None,
+            year_scroll: calendar_year::YearScroll::default(),
+            year_heatmap: BTreeMap::new(),
+            year_heatmap_day: today,
+            year_jump: None,
             context_side: None,
             card: None,
             open_event: None,
@@ -447,6 +463,12 @@ impl CalendarView {
                 this.arrange = Some(this.arrange.unwrap_or(0));
                 this.reload(cx);
             })))
+            .when(self.mode == CalendarMode::Year, |el| {
+                el.child(row("calendar-go-to-date", IconName::CalendarDays, strings.calendar_go_to_date)
+                    .on_click(cx.listener(|this, _, window, cx| this.open_year_jump(window, cx))))
+                    .child(row("calendar-print-year", IconName::Printer, strings.print)
+                        .on_click(cx.listener(|this, _, _, cx| this.print_year(cx))))
+            })
             .into_any_element()
     }
 
@@ -726,6 +748,7 @@ impl CalendarView {
     }
 
     pub fn reload(&mut self, cx: &mut Context<Self>) {
+        self.year_heatmap.clear();
         self.options = self.store.calendar_options().unwrap_or_default();
         let lists = self.store.lists().unwrap_or_default();
         self.list_colors = lists.iter().filter_map(|l| crate::lists_panel::parse_color(l.color.as_deref()).map(|c| (l.id, c))).collect();
@@ -750,37 +773,37 @@ impl CalendarView {
             cx.notify();
             return;
         }
-        let (start, end) = match self.mode {
-            CalendarMode::MultiWeek(n) => {
-                let weeks = calendar::weeks_from(self.anchor, n as usize);
-                (weeks[0][0], weeks[weeks.len() - 1][6])
-            }
-            // The original's Year marks no tasks on the days, but a day's card lists them.
-            CalendarMode::Year => {
-                let year = self.month.year();
-                (NaiveDate::from_ymd_opt(year, 1, 1).unwrap_or(self.month), NaiveDate::from_ymd_opt(year, 12, 31).unwrap_or(self.month))
-            }
-            CalendarMode::Month => {
-                let weeks = calendar::month_weeks(self.month);
-                (weeks[0][0], weeks[weeks.len() - 1][6])
-            }
-            _ => {
-                let days = self.shown_days();
-                (days[0], days[days.len() - 1])
-            }
-        };
-        match self.store.tasks_due_between(start, end) {
-            Ok(tasks) => self.tasks = tasks,
-            Err(err) => eprintln!("failed to load calendar tasks: {err:#}"),
-        }
-        // Repeating tasks due earlier come back on the shown days ("Show All Repeat Cycle"),
-        // and the Arrange panel lists the undated ones.
         let all = self.store.tasks().unwrap_or_default();
-        if self.options.show_repeats {
-            let shown: std::collections::HashSet<Id> = self.tasks.iter().map(|t| t.id).collect();
-            self.tasks.extend(
-                all.iter().filter(|t| t.repeat.is_some() && !t.is_closed() && !t.is_deleted() && t.due_date.is_some_and(|d| d < start) && !shown.contains(&t.id)).cloned(),
-            );
+        if self.mode == CalendarMode::Year {
+            // Year navigation moves a viewport across the same dated tasks in every year.
+            self.tasks = all.iter().filter(|task| task.due_date.is_some() && !task.is_deleted()).cloned().collect();
+            self.tasks.sort_by_key(|task| (task.due_date, task.due_time.is_some(), task.due_time));
+        } else {
+            let (start, end) = match self.mode {
+                CalendarMode::MultiWeek(n) => {
+                    let weeks = calendar::weeks_from(self.anchor, n as usize);
+                    (weeks[0][0], weeks[weeks.len() - 1][6])
+                }
+                CalendarMode::Month => {
+                    let weeks = calendar::month_weeks(self.month);
+                    (weeks[0][0], weeks[weeks.len() - 1][6])
+                }
+                _ => {
+                    let days = self.shown_days();
+                    (days[0], days[days.len() - 1])
+                }
+            };
+            match self.store.tasks_due_between(start, end) {
+                Ok(tasks) => self.tasks = tasks,
+                Err(err) => eprintln!("failed to load calendar tasks: {err:#}"),
+            }
+            // Repeating tasks due earlier come back on the shown days ("Show All Repeat Cycle").
+            if self.options.show_repeats {
+                let shown: std::collections::HashSet<Id> = self.tasks.iter().map(|t| t.id).collect();
+                self.tasks.extend(
+                    all.iter().filter(|t| t.repeat.is_some() && !t.is_closed() && !t.is_deleted() && t.due_date.is_some_and(|d| d < start) && !shown.contains(&t.id)).cloned(),
+                );
+            }
         }
         self.undated = all.into_iter().filter(|t| t.due_date.is_none() && !t.is_closed() && !t.is_deleted() && t.parent_id.is_none()).collect();
         self.countdowns = self.store.countdowns().unwrap_or_default();
@@ -804,10 +827,20 @@ impl CalendarView {
         Local::now().date_naive().max(self.month)
     }
 
+    fn can_shift(&self, delta: i32) -> bool {
+        self.mode != CalendarMode::Year || calendar_year::YEAR_RANGE.contains(&(self.month.year() + delta))
+    }
+
     fn shift(&mut self, delta: i32, cx: &mut Context<Self>) {
+        if self.mode == CalendarMode::Year {
+            if self.can_shift(delta) {
+                let january = NaiveDate::from_ymd_opt(self.month.year() + delta, 1, 1).unwrap();
+                self.navigate_year(january, cx);
+            }
+            return;
+        }
         match self.mode {
             CalendarMode::Month | CalendarMode::Agenda => self.month = calendar::add_months(self.month, delta),
-            CalendarMode::Year => self.month = calendar::add_months(self.month, 12 * delta),
             mode => {
                 let step = match mode {
                     CalendarMode::Day => 1,
@@ -826,6 +859,16 @@ impl CalendarView {
     pub fn set_mode(&mut self, mode: CalendarMode, cx: &mut Context<Self>) {
         self.mode = mode;
         self.mode_menu_open = false;
+        self.year_day = None;
+        self.year_scroll = calendar_year::YearScroll::default();
+        self.year_jump = None;
+        if mode == CalendarMode::Year {
+            let day = calendar_year::clamp_year_day(self.month);
+            if day != self.month {
+                self.anchor = day;
+            }
+            self.month = NaiveDate::from_ymd_opt(day.year(), 1, 1).unwrap();
+        }
         if (mode.is_timed() || matches!(mode, CalendarMode::MultiWeek(_))) && calendar::month_start(self.anchor) != self.month {
             self.anchor = self.month;
         }
@@ -846,7 +889,7 @@ impl CalendarView {
     /// The mode menu with its Multi-Day side menu open, for the debug-build dev state.
     #[cfg(debug_assertions)]
     pub fn dev_year_day(&mut self, day: NaiveDate, cx: &mut Context<Self>) {
-        self.year_day = Some(day);
+        self.year_day = Some((calendar::month_start(day), day));
         cx.notify();
     }
 
@@ -868,8 +911,17 @@ impl CalendarView {
 
     fn go_to_today(&mut self, cx: &mut Context<Self>) {
         let today = Local::now().date_naive();
-        self.month = calendar::month_start(today);
-        self.anchor = today;
+        if self.mode == CalendarMode::Year {
+            self.anchor = calendar_year::clamp_year_day(today);
+            self.month = NaiveDate::from_ymd_opt(self.anchor.year(), 1, 1).unwrap();
+            self.year_day = None;
+            self.open_event = None;
+            self.year_scroll = calendar_year::YearScroll::default();
+            self.close_card(cx);
+        } else {
+            self.month = calendar::month_start(today);
+            self.anchor = today;
+        }
         self.reload(cx);
     }
 
@@ -1525,104 +1577,6 @@ impl CalendarView {
             .on_click(cx.listener(move |this, _, _, cx| this.set_mode(CalendarMode::MultiWeek(this.multi_weeks), cx)))
             .into_any_element()
     }
-
-    /// The original's Year: the twelve months in three columns, today marked; a click on a day
-    /// opens it in the Day view.
-    /// The Year view, as the original's: the months as small calendars filling the view, four
-    /// columns when it is wide and three otherwise; a click on a day opens its card beside it.
-    fn render_year(&self, today: NaiveDate, width: Pixels, cx: &mut Context<Self>) -> AnyElement {
-        let strings = i18n::t(cx);
-        let theme = cx.theme().clone();
-        let year = self.month.year();
-        let columns = if width >= px(1400.) { 4 } else { 3 };
-        let open = self.year_day;
-        let months: Vec<AnyElement> = (1..=12u32)
-            .map(|m| {
-                let month = NaiveDate::from_ymd_opt(year, m, 1).expect("every month has a first day");
-                let days = calendar::month_grid(month);
-                v_flex()
-                    .flex_1()
-                    .min_w_0()
-                    .child(div().pb_3().text_size(px(18.)).font_weight(FontWeight::MEDIUM).child(strings.months[month.month0() as usize]))
-                    .child(h_flex().h(px(30.)).children(calendar::weekday_labels(&strings.weekdays_narrow).map(|day| {
-                        div().flex_1().flex().justify_center().child(Label::new(day).size(LabelSize::Small).color(Color::Muted))
-                    })))
-                    .children(days.chunks(7).map(|week| {
-                        h_flex().flex_1().min_h(px(22.)).children(week.iter().map(|&date| {
-                            let outside = date.month() != month.month();
-                            let is_open = open == Some(date) && !outside;
-                            div()
-                                .flex_1()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .child(
-                                    div()
-                                        .id(SharedString::from(format!("year-{month}-{date}")))
-                                        .relative()
-                                        .size(px(26.))
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .rounded_full()
-                                        .cursor_pointer()
-                                        .when(date == today && !outside, |el| el.bg(theme.colors().accent))
-                                        .when(is_open && date != today, |el| el.bg(theme.colors().element_selected))
-                                        // Style → Heatmap: a day tinted by how many items it has.
-                                        .when(self.options.heatmap && !outside && date != today && !is_open, |el| {
-                                            let count = self.tasks_on(date).len();
-                                            el.when(count > 0, |el| el.rounded(px(4.)).bg(theme.colors().accent.opacity((0.2 + 0.15 * count as f32).min(0.8))))
-                                        })
-                                        .hover(|s| s.bg(theme.colors().element_hover))
-                                        .child(Label::new(date.day().to_string()).color(if outside { Color::Muted } else { Color::Default }))
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.year_day = if this.year_day == Some(date) { None } else { Some(date) };
-                                            cx.notify();
-                                        }))
-                                        .when(is_open, |el| el.child(PopoverAttachment::new(Placement::RightTop, self.render_year_card(date, cx)))),
-                                )
-                        }))
-                    }))
-                    .into_any_element()
-            })
-            .collect();
-        let mut months = months.into_iter().peekable();
-        let mut rows = Vec::new();
-        while months.peek().is_some() {
-            rows.push(h_flex().flex_1().min_h(px(240.)).items_stretch().gap(px(60.)).children(months.by_ref().take(columns)));
-        }
-        v_flex()
-            .id("year")
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .px(px(60.))
-            .pt_2()
-            .pb_4()
-            .gap(px(24.))
-            .children(rows)
-            .into_any_element()
-    }
-
-    /// The original's day card in the Year view: the date, then the day's tasks or "No tasks
-    /// scheduled."; a task opens as from the month.
-    fn render_year_card(&self, date: NaiveDate, cx: &mut Context<Self>) -> AnyElement {
-        let strings = i18n::t(cx);
-        let tasks: Vec<Task> = self.tasks_on(date).into_iter().cloned().collect();
-        let bars: Vec<_> = tasks.iter().map(|task| self.task_bar(task, None, cx).h(px(22.))).collect();
-        popover(cx)
-            .w(px(328.))
-            .p_3()
-            .gap_1p5()
-            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                this.year_day = None;
-                cx.notify();
-            }))
-            .child(Label::new(calendar::format_date(date, strings)).weight(FontWeight::SEMIBOLD))
-            .when(bars.is_empty(), |el| el.child(Label::new(strings.no_tasks_scheduled).size(LabelSize::Small).color(Color::Muted)))
-            .children(bars)
-            .into_any_element()
-    }
 }
 
 impl Render for CalendarView {
@@ -1756,6 +1710,7 @@ impl Render for CalendarView {
                                 IconButton::new("calendar-prev", IconName::ChevronLeft)
                                     .size(px(28.))
                                     .icon_size(IconSize::Small)
+                                    .when(!self.can_shift(-1), |el| el.icon_color(Color::Placeholder))
                                     .on_click(cx.listener(|this, _, _, cx| this.shift(-1, cx))),
                             )
                             .child(
@@ -1775,6 +1730,7 @@ impl Render for CalendarView {
                                 IconButton::new("calendar-next", IconName::ChevronRight)
                                     .size(px(28.))
                                     .icon_size(IconSize::Small)
+                                    .when(!self.can_shift(1), |el| el.icon_color(Color::Placeholder))
                                     .on_click(cx.listener(|this, _, _, cx| this.shift(1, cx))),
                             ),
                     )
@@ -1785,7 +1741,8 @@ impl Render for CalendarView {
                                 this.more_menu = !this.more_menu;
                                 cx.notify();
                             })))
-                            .when(self.more_menu, |el| el.child(PopoverAttachment::new(Placement::BelowRight, self.render_more_menu(cx)))),
+                            .when(self.more_menu, |el| el.child(PopoverAttachment::new(Placement::BelowRight, self.render_more_menu(cx))))
+                            .when_some(self.render_year_jump(cx), |el, jump| el.child(PopoverAttachment::new(Placement::BelowRight, jump))),
                     ),
             )
             .when(!matches!(self.mode, CalendarMode::Agenda | CalendarMode::Year), |el| el.child(
@@ -1819,7 +1776,7 @@ impl Render for CalendarView {
             ))
             .map(|el| match self.mode {
                 CalendarMode::Agenda => el.child(self.render_agenda(today, cx)),
-                CalendarMode::Year => el.child(self.render_year(today, window.viewport_size().width, cx)),
+                CalendarMode::Year => el.child(self.render_year(today, window, cx)),
                 CalendarMode::Month | CalendarMode::MultiWeek(_) => el.child(
                     v_flex()
                         .flex_1()
@@ -1833,13 +1790,21 @@ impl Render for CalendarView {
         h_flex()
             .relative()
             .track_focus(&self.focus_handle)
-            .key_context("Calendar")
+            .key_context(match self.mode {
+                _ if self.year_jump.is_some() => "CalendarDateInput",
+                CalendarMode::Year => "Calendar CalendarYear",
+                _ => "Calendar",
+            })
             // The view menu's keys, as in the original: D/1, W/2, M/3.
             .on_action(cx.listener(|this, _: &DayView, _, cx| this.set_mode(CalendarMode::Day, cx)))
             .on_action(cx.listener(|this, _: &WeekView, _, cx| this.set_mode(CalendarMode::Week, cx)))
             .on_action(cx.listener(|this, _: &MonthView, _, cx| this.set_mode(CalendarMode::Month, cx)))
             .on_action(cx.listener(|this, _: &AgendaView, _, cx| this.set_mode(CalendarMode::Agenda, cx)))
             .on_action(cx.listener(|this, _: &YearView, _, cx| this.set_mode(CalendarMode::Year, cx)))
+            .on_action(cx.listener(|this, _: &PreviousYear, _, cx| this.shift_year_using_keys(-1, cx)))
+            .on_action(cx.listener(|this, _: &NextYear, _, cx| this.shift_year_using_keys(1, cx)))
+            .on_action(cx.listener(|this, _: &CalendarToday, _, cx| this.go_to_today(cx)))
+            .on_action(cx.listener(|this, _: &PrintYear, _, cx| this.print_year(cx)))
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
                 if event.keystroke.key == "escape" && this.options_dialog.take().is_some() {
                     cx.notify();
@@ -1873,7 +1838,151 @@ struct EventBar {
 #[cfg(all(test, debug_assertions))]
 mod tests {
     use super::*;
-    use gpui::{Modifiers, TestAppContext, point};
+    use gpui::{Modifiers, MouseButton, MouseDownEvent, MouseUpEvent, ScrollDelta, ScrollWheelEvent, TestAppContext, TouchPhase, point, size};
+
+    #[gpui::test]
+    fn the_whole_calendar_year_fits_and_scrolls_by_month_rows(cx: &mut TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        cx.update(|cx| {
+            theme::init(cx);
+            cx.set_reduce_motion(true);
+            assert!(crate::keymap::load_default(&assets::Assets, cx).unwrap().is_empty());
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let mut view = CalendarView::new(store, window, cx);
+            view.arrange = Some(0);
+            view.set_mode(CalendarMode::Year, cx);
+            window.focus(&view.focus_handle, cx);
+            view
+        });
+        cx.simulate_resize(size(px(850.), px(368.)));
+        cx.run_until_parked();
+        let grid = cx.debug_bounds("calendar-year").unwrap();
+        let year = cx.update(|_, cx| view.read(cx).month.year());
+        let months: Vec<_> = (1..=12).map(|month| {
+            let selector = format!("year-month-{year}-{month}").leak();
+            let bounds = cx.debug_bounds(selector).unwrap();
+            assert!(bounds.left() >= grid.left() && bounds.right() <= grid.right());
+            assert!(bounds.top() >= grid.top() && bounds.bottom() <= grid.bottom());
+            bounds
+        }).collect();
+        assert_eq!(months[0].top(), months[3].top());
+        assert!(months[4].top() > months[0].top());
+        let position = grid.center();
+        cx.simulate_mouse_move(position, None, Modifiers::default());
+        cx.simulate_event(ScrollWheelEvent {
+            position,
+            delta: ScrollDelta::Lines(point(0., -1.)),
+            modifiers: Modifiers::default(),
+            touch_phase: TouchPhase::Moved,
+        });
+        cx.update(|_, cx| assert_eq!(view.read(cx).month, NaiveDate::from_ymd_opt(year, 5, 1).unwrap()));
+        assert_eq!(cx.debug_bounds("calendar-year"), Some(grid));
+        cx.simulate_keystrokes("right");
+        cx.update(|_, cx| assert_eq!(view.read(cx).month, NaiveDate::from_ymd_opt(year + 1, 1, 1).unwrap()));
+        cx.simulate_keystrokes("left");
+        cx.update(|_, cx| assert_eq!(view.read(cx).month.year(), year));
+
+        cx.simulate_resize(size(px(850.), px(900.)));
+        cx.run_until_parked();
+        let grid = cx.debug_bounds("calendar-year").unwrap();
+        let january = cx.debug_bounds(format!("year-month-{year}-1").leak()).unwrap();
+        let april = cx.debug_bounds(format!("year-month-{year}-4").leak()).unwrap();
+        let december = cx.debug_bounds(format!("year-month-{year}-12").leak()).unwrap();
+        assert_eq!(january.left(), april.left());
+        assert!(april.top() > january.top());
+        assert!(december.bottom() <= grid.bottom());
+    }
+
+    #[gpui::test]
+    fn a_task_dropped_on_the_year_grid_keeps_its_duration(cx: &mut TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let start = NaiveDate::from_ymd_opt(2032, 1, 12).unwrap();
+        let target = NaiveDate::from_ymd_opt(2032, 12, 10).unwrap();
+        let time = chrono::NaiveTime::from_hms_opt(9, 30, 0).unwrap();
+        let task = store.add_task("A two-day trip").unwrap();
+        store.set_due(task.id, Some(start), Some(time)).unwrap();
+        store.set_due_end(task.id, Some((start.succ_opt().unwrap(), Some(time)))).unwrap();
+        cx.update(theme::init);
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let mut view = CalendarView::new(store.clone(), window, cx);
+            view.month = calendar::month_start(start);
+            view.set_mode(CalendarMode::Year, cx);
+            view
+        });
+        let start = format!("year-date-{}-{start}", calendar::month_start(start)).leak();
+        let end = format!("year-date-{}-{target}", calendar::month_start(target)).leak();
+        let date = cx.debug_bounds(start).unwrap().center();
+        let modifiers = Modifiers::default();
+        cx.simulate_mouse_move(date, None, modifiers);
+        cx.simulate_click(date, modifiers);
+        let selector = format!("calendar-task-{}", task.id).leak();
+        let bar = cx.debug_bounds(selector).unwrap().center();
+        let end = cx.debug_bounds(end).unwrap().center();
+        cx.simulate_mouse_move(bar, None, modifiers);
+        cx.simulate_mouse_down(bar, MouseButton::Left, modifiers);
+        cx.simulate_mouse_move(point(bar.x + px(5.), bar.y), Some(MouseButton::Left), modifiers);
+        cx.simulate_mouse_move(end, Some(MouseButton::Left), modifiers);
+        cx.simulate_mouse_up(end, MouseButton::Left, modifiers);
+        let task = store.task(task.id).unwrap().unwrap();
+        assert_eq!((task.due_date, task.due_time), (Some(target), Some(time)));
+        assert_eq!((task.end_date, task.end_time), (target.succ_opt(), Some(time)));
+    }
+
+    #[gpui::test]
+    fn calendar_year_day_card_and_jumps_use_the_clicked_date(cx: &mut TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let day = NaiveDate::from_ymd_opt(2032, 4, 13).unwrap();
+        let month = calendar::month_start(day);
+        let task = store.add_task("Prepare the report").unwrap();
+        store.set_due(task.id, Some(day), None).unwrap();
+        cx.update(|cx| {
+            theme::init(cx);
+            assert!(crate::keymap::load_default(&assets::Assets, cx).unwrap().is_empty());
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let mut view = CalendarView::new(store, window, cx);
+            window.focus(&view.focus_handle, cx);
+            view.set_mode(CalendarMode::Year, cx);
+            view.open_year_jump(window, cx);
+            view
+        });
+        cx.simulate_input("2032-04-13");
+        cx.simulate_keystrokes("enter");
+        assert!(cx.debug_bounds("calendar-year-jump").is_none());
+        cx.update(|_, cx| assert_eq!(view.read(cx).anchor, day));
+
+        let selector = format!("year-date-{month}-{day}").leak();
+        let modifiers = Modifiers::default();
+        let date = cx.debug_bounds(selector).unwrap().center();
+        cx.simulate_mouse_move(date, None, modifiers);
+        cx.simulate_click(date, modifiers);
+        assert!(cx.debug_bounds("year-day-card").is_some());
+        let task_selector = format!("calendar-task-{}", task.id).leak();
+        assert!(cx.debug_bounds(task_selector).is_some());
+        let task_position = cx.debug_bounds(task_selector).unwrap().center();
+        cx.simulate_mouse_move(task_position, None, modifiers);
+        cx.simulate_click(task_position, modifiers);
+        cx.update(|_, cx| assert_eq!(view.read(cx).card, Some((task.id, day))));
+
+        cx.simulate_mouse_move(date, None, modifiers);
+        cx.simulate_event(MouseDownEvent { position: date, button: MouseButton::Left, modifiers, click_count: 2, first_mouse: false });
+        cx.simulate_event(MouseUpEvent { position: date, button: MouseButton::Left, modifiers, click_count: 2 });
+        cx.update(|_, cx| {
+            let view = view.read(cx);
+            assert_eq!(view.mode, CalendarMode::Week);
+            assert!(view.shown_days().contains(&day));
+        });
+        cx.simulate_keystrokes("y");
+        let october = cx.debug_bounds("year-heading-2032-10").unwrap().center();
+        cx.simulate_mouse_move(october, None, modifiers);
+        cx.simulate_click(october, modifiers);
+        cx.update(|_, cx| {
+            let view = view.read(cx);
+            assert_eq!(view.mode, CalendarMode::Month);
+            assert_eq!(view.month, NaiveDate::from_ymd_opt(2032, 10, 1).unwrap());
+        });
+    }
 
     #[gpui::test]
     fn unchecking_a_calendar_card_reopens_the_task(cx: &mut TestAppContext) {

@@ -902,9 +902,10 @@ impl TodoView {
             self.tags = tags;
         }
         self.reload_today_habits();
-        // The details panel keeps showing a task as long as it exists, even when it has left
-        // the current view (for example, after being completed in "Today").
-        let selected = self.selected.and_then(|id| self.store.task(id).ok().flatten());
+        // Keep completed tasks open after they leave a view like Today. A deleted task is only
+        // shown in Trash; otherwise the detail panel returns to its empty state.
+        let selected = self.selected.and_then(|id| self.store.task(id).ok().flatten())
+            .filter(|task| task.is_deleted() == (self.view == View::Trash));
         self.selected = selected.as_ref().map(|t| t.id);
         let lists = self.active_lists();
         self.detail.update(cx, |detail, cx| {
@@ -6430,5 +6431,16 @@ mod tests {
 
         cx.simulate_keystrokes("delete");
         assert!(store.task(task.id).unwrap().unwrap().is_deleted());
+        cx.update(|_, cx| {
+            assert!(view.read(cx).tasks.is_empty());
+            assert_eq!(view.read(cx).selected, None);
+        });
+
+        cx.update(|_, cx| view.update(cx, |view, cx| {
+            view.set_view(View::Trash, cx);
+            view.select(task.id, cx);
+            view.reload(cx);
+            assert_eq!(view.selected, Some(task.id), "Trash still shows the selected deleted task");
+        }));
     }
 }

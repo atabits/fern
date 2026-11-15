@@ -15,6 +15,7 @@ actions!(
         ShowNext7Days,
         ShowShortcuts,
         OpenSettings,
+        DismissTransient,
     ]
 );
 

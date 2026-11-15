@@ -12,7 +12,7 @@ use serde::Deserialize;
 pub const DEFAULT_KEYMAP_PATH: &str = "keymaps/default.json";
 
 /// Actions shown in the shortcut list, in order; text editing keys are left out.
-pub const LISTED_ACTIONS: [&str; 24] = [
+pub const LISTED_ACTIONS: [&str; 25] = [
     "fern::NewTask",
     "fern::Search",
     "fern::ToggleSidebar",
@@ -23,6 +23,7 @@ pub const LISTED_ACTIONS: [&str; 24] = [
     "fern::ShowShortcuts",
     "fern::OpenSettings",
     "fern::Quit",
+    "fern::DismissTransient",
     "task_list::SelectNext",
     "task_list::SelectPrevious",
     "task_list::ToggleComplete",
@@ -75,6 +76,7 @@ pub fn display_keys(keystroke: &str) -> String {
             "left" => "←".to_owned(),
             "right" => "→".to_owned(),
             "delete" => "Del".to_owned(),
+            "escape" => "Esc".to_owned(),
             other => {
                 let mut chars = other.chars();
                 chars.next().map_or_else(String::new, |c| c.to_uppercase().chain(chars).collect())
@@ -146,6 +148,7 @@ mod tests {
         assert_eq!(list.len(), super::LISTED_ACTIONS.len());
         let keys = |action: &str| list.iter().find(|(a, _)| *a == action).unwrap().1.clone();
         assert!(!keys("fern::NewTask").is_empty());
+        assert_eq!(keys("fern::DismissTransient"), ["Esc"]);
         let mut next = keys("task_list::SelectNext");
         next.sort();
         assert_eq!(next, ["J", "↓"]);

@@ -10,8 +10,8 @@ use crate::drag::DraggedTask;
 use ui::{Placement, PopoverAttachment, SubmenuItem, popover};
 
 use crate::actions::{
-    ClearDate, DeleteTask, PinTask, PriorityHigh, PriorityLow, PriorityMedium, PriorityNone, SelectNext, SelectPrevious,
-    SetDate, SetNextWeek, SetToday, SetTomorrow, ToggleComplete,
+    ClearDate, DeleteTask, DismissTransient, PinTask, PriorityHigh, PriorityLow, PriorityMedium, PriorityNone,
+    SelectNext, SelectPrevious, SetDate, SetNextWeek, SetToday, SetTomorrow, ToggleComplete,
 };
 use crate::i18n::{self, CurrentLocale, Strings};
 use crate::list_dialog::{DialogEvent, FolderDialog, ListDialog};
@@ -146,6 +146,8 @@ pub struct TodoView {
     closed_menu: Option<ClosedMenu>,
     /// The header's sort menu: `Some(None)` when open, with the expanded submenu otherwise.
     sort_menu: Option<Option<SortMenu>>,
+    sort_menu_focus: FocusHandle,
+    sort_menu_return_focus: Option<FocusHandle>,
     /// The current list's "Show Details", read when the list loads.
     show_details: bool,
     /// The current list's layout: cards in columns instead of rows (the menu's View).
@@ -248,12 +250,18 @@ impl TodoView {
         window.focus(&input.focus_handle(cx), cx);
         // Escape in the quick-add field hands the keyboard to the list.
         cx.subscribe_in(&input, window, |this, _, _: &Cancelled, window, cx| {
-            window.focus(&this.list_focus, cx);
+            if !this.dismiss_transient(window, cx) {
+                window.focus(&this.list_focus, cx);
+            }
         })
         .detach();
 
         let add_tag_input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.type_in_tag, cx));
         cx.subscribe(&add_tag_input, |_, _, _: &Changed, cx| cx.notify()).detach();
+        cx.subscribe_in(&add_tag_input, window, |this, _, _: &Cancelled, window, cx| {
+            this.dismiss_transient(window, cx);
+        })
+        .detach();
         // Enter ticks the typed tag, a new one too.
         cx.subscribe(&add_tag_input, |this, input, Submitted(text), cx| {
             let tag = text.trim().trim_start_matches('#').to_owned();
@@ -355,6 +363,8 @@ impl TodoView {
             closed_lists: None,
             closed_menu: None,
             sort_menu: None,
+            sort_menu_focus: cx.focus_handle(),
+            sort_menu_return_focus: None,
             show_details: false,
             kanban: false,
             timeline: false,
@@ -676,8 +686,8 @@ impl TodoView {
                 Some(("menu", "sort")) => self.sort_menu = Some(Some(SortMenu::Sort)),
                 Some(("menu", "sort-root")) => self.sort_menu = Some(None),
                 Some(("menu", "group")) => self.sort_menu = Some(Some(SortMenu::Group)),
-                Some(("group", key)) => self.set_sort(None, Some(GroupBy::from_key(key)), cx),
-                Some(("sort", key)) => self.set_sort(Some(SortBy::from_key(key)), None, cx),
+                Some(("group", key)) => self.set_sort(None, Some(GroupBy::from_key(key)), window, cx),
+                Some(("sort", key)) => self.set_sort(Some(SortBy::from_key(key)), None, window, cx),
                 Some(("menu", "dates")) => self.closed_menu = Some(ClosedMenu::Dates),
                 Some(("menu", "other-date")) => {
                     self.open_other_date(cx);
@@ -2237,6 +2247,13 @@ impl TodoView {
         }
     }
 
+    fn dismiss_card(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.card_detail.update(cx, |detail, cx| detail.dismiss_popup(window, cx)) {
+            self.close_card(cx);
+            window.focus(&self.list_focus, cx);
+        }
+    }
+
     /// The card's task changed: the board shows it, and the card closes when the task is gone.
     fn card_updated(&mut self, cx: &mut Context<Self>) {
         self.reload(cx);
@@ -2267,10 +2284,8 @@ impl TodoView {
                     this.close_card(cx);
                 }
             }))
-            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
-                if event.keystroke.key == "escape" && !this.card_detail.read(cx).has_popup() {
-                    this.close_card(cx);
-                }
+            .on_action(cx.listener(|this, _: &DismissTransient, window, cx| {
+                this.dismiss_card(window, cx);
             }))
             .child(self.card_detail.clone())
             .into_any_element()
@@ -3550,7 +3565,7 @@ impl TodoView {
         (SortBy::from_key(&get("sort")), group)
     }
 
-    fn set_sort(&mut self, sort: Option<SortBy>, group: Option<GroupBy>, cx: &mut Context<Self>) {
+    fn set_sort(&mut self, sort: Option<SortBy>, group: Option<GroupBy>, window: &mut Window, cx: &mut Context<Self>) {
         let key = self.view_key();
         let result = sort
             .map(|s| self.store.set_setting(&format!("sort:{key}"), s.key()))
@@ -3558,8 +3573,75 @@ impl TodoView {
             .chain(group.map(|g| self.store.set_setting(&format!("group:{key}"), g.key())))
             .collect::<anyhow::Result<Vec<()>>>();
         self.check(result);
-        self.sort_menu = None;
+        self.close_sort_menu(window, cx);
+    }
+
+    fn open_sort_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.sort_menu.is_none() {
+            self.sort_menu_return_focus = window.focused(cx);
+            window.focus(&self.sort_menu_focus, cx);
+        }
+        self.sort_menu = Some(None);
         cx.notify();
+    }
+
+    fn close_sort_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.sort_menu = None;
+        let previous = self.sort_menu_return_focus.take();
+        if self.sort_menu_focus.is_focused(window) {
+            if let Some(previous) = previous {
+                window.focus(&previous, cx);
+            } else {
+                window.blur(cx);
+            }
+        }
+        cx.notify();
+    }
+
+    fn dismiss_transient(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.sort_menu.is_some() {
+            self.close_sort_menu(window, cx);
+            return true;
+        }
+        if self.add_tags.take().is_some() {
+            if self.add_tag_input.focus_handle(cx).is_focused(window) {
+                window.focus(&self.input.focus_handle(cx), cx);
+            }
+            cx.notify();
+            return true;
+        }
+
+        // These menus don't move keyboard focus when opened from the list.
+        let dismissed_menu = [
+            self.context_menu.take().is_some(),
+            self.list_menu.take().is_some(),
+            self.closed_menu.take().is_some(),
+            self.column_menu.take().is_some(),
+            self.section_menu.take().is_some(),
+            self.view_options.take().is_some(),
+            std::mem::take(&mut self.header_menu_open),
+            std::mem::take(&mut self.postpone_menu),
+            std::mem::take(&mut self.scale_menu_open),
+            std::mem::take(&mut self.templates_open),
+            std::mem::take(&mut self.input_box_open),
+            std::mem::take(&mut self.add_menu_open),
+            self.add_date_month.take().is_some(),
+        ].into_iter().any(|was_open| was_open);
+        if dismissed_menu {
+            self.context_side = None;
+            self.add_list_side = false;
+            self.add_date_row = None;
+            self.add_range = None;
+            cx.notify();
+            return true;
+        }
+
+        if self.card.is_some() {
+            self.dismiss_card(window, cx);
+            return true;
+        }
+        self.detail.read(cx).has_popup()
+            && self.detail.update(cx, |detail, cx| detail.dismiss_popup(window, cx))
     }
 
     /// The original's sort menu: "Group by" and "Sort by", each opening its options in place.
@@ -3593,22 +3675,20 @@ impl TodoView {
         };
         popover(cx)
             .min_w(px(250.))
-            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                this.sort_menu = None;
-                cx.notify();
-            }))
+            .track_focus(&self.sort_menu_focus)
+            .on_mouse_down_out(cx.listener(|this, _, window, cx| this.close_sort_menu(window, cx)))
             .child(row("group-by", IconName::Rows3, strings.group_by, group.label(strings), SortMenu::Group))
             .when(expanded == Some(SortMenu::Group), |el| {
                 el.children(GroupBy::ALL.into_iter().map(|g| {
                     option(format!("group-{}", g.key()), g.label(strings), g == group)
-                        .on_click(cx.listener(move |this, _, _, cx| this.set_sort(None, Some(g), cx)))
+                        .on_click(cx.listener(move |this, _, window, cx| this.set_sort(None, Some(g), window, cx)))
                 }))
             })
             .child(row("sort-by", IconName::ArrowDownUp, strings.sort_by, sort.label(strings), SortMenu::Sort))
             .when(expanded == Some(SortMenu::Sort), |el| {
                 el.children(SortBy::ALL.into_iter().map(|s| {
                     option(format!("sort-{}", s.key()), s.label(strings), s == sort)
-                        .on_click(cx.listener(move |this, _, _, cx| this.set_sort(Some(s), None, cx)))
+                        .on_click(cx.listener(move |this, _, window, cx| this.set_sort(Some(s), None, window, cx)))
                 }))
             })
             // The original's Order: Ascending or Descending, kept per list; with the manual
@@ -3616,12 +3696,11 @@ impl TodoView {
             .when(sort != SortBy::Custom, |el| el.child(row("order-by", IconName::ArrowDownUp, strings.order, strings.order_directions[descending as usize], SortMenu::Order)))
             .when(sort != SortBy::Custom && expanded == Some(SortMenu::Order), |el| {
                 el.children([false, true].map(|value| {
-                    option(format!("order-{value}"), strings.order_directions[value as usize], value == descending).on_click(cx.listener(move |this, _, _, cx| {
+                    option(format!("order-{value}"), strings.order_directions[value as usize], value == descending).on_click(cx.listener(move |this, _, window, cx| {
                         if this.view_flag("descending", false) != value {
                             this.toggle_view_flag("descending", false, cx);
                         }
-                        this.sort_menu = None;
-                        cx.notify();
+                        this.close_sort_menu(window, cx);
                     }))
                 }))
             })
@@ -5446,6 +5525,7 @@ impl Render for TodoView {
             let theme = cx.theme().clone();
             h_flex()
                 .id("kanban")
+                .track_focus(&self.list_focus)
                 .flex_1()
                 .items_start()
                 .gap(px(24.))
@@ -5608,10 +5688,8 @@ impl Render for TodoView {
                         el.child(
                             div()
                                 .relative()
-                                .child(IconButton::new("sort", IconName::ArrowDownUp).tip(strings.group_and_sort, ui::TipSide::Below).on_click(cx.listener(|this, _, _, cx| {
-                                    this.sort_menu = Some(None);
-                                    cx.notify();
-                                })))
+                                .debug_selector(|| "task-sort-menu-trigger".to_owned())
+                                .child(IconButton::new("sort", IconName::ArrowDownUp).tip(strings.group_and_sort, ui::TipSide::Below).on_click(cx.listener(|this, _, window, cx| this.open_sort_menu(window, cx))))
                                 .when_some(self.sort_menu, |el, expanded| {
                                     el.child(PopoverAttachment::new(Placement::BelowRight, self.render_sort_menu(expanded, strings, cx)))
                                 }),
@@ -5792,6 +5870,11 @@ impl Render for TodoView {
             .relative()
             .size_full()
             .items_start()
+            .on_action(cx.listener(|this, _: &DismissTransient, window, cx| {
+                if !this.dismiss_transient(window, cx) {
+                    cx.propagate();
+                }
+            }))
             .bg(theme.colors().background)
             .text_color(theme.colors().text)
             .text_size(px(14.))
@@ -6215,6 +6298,68 @@ mod tests {
         cx.simulate_keystrokes("enter");
         assert_eq!(store.task(task.id).unwrap().unwrap().title, "Original!");
         cx.update(|_, cx| assert!(view.read(cx).title_edit.is_none()));
+    }
+
+    #[gpui::test]
+    fn escape_closes_the_sort_menu_and_restores_focus(cx: &mut TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        cx.update(|cx| {
+            theme::init(cx);
+            cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+            assert!(crate::keymap::load_default(&assets::Assets, cx).unwrap().is_empty());
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| TodoView::new(store.clone(), window, cx));
+        let sort = cx.debug_bounds("task-sort-menu-trigger").unwrap().center();
+        let modifiers = Modifiers::default();
+
+        let previous = cx.update(|window, cx| window.focused(cx).expect("quick-add field has focus"));
+        cx.simulate_mouse_move(sort, None, modifiers);
+        cx.simulate_click(sort, modifiers);
+        cx.update(|window, cx| {
+            let view = view.read(cx);
+            assert_eq!(view.sort_menu, Some(None));
+            assert!(view.sort_menu_focus.is_focused(window));
+        });
+
+        cx.simulate_keystrokes("escape");
+        cx.update(|window, cx| {
+            assert!(view.read(cx).sort_menu.is_none());
+            assert!(previous.is_focused(window));
+        });
+    }
+
+    #[gpui::test]
+    fn escape_returns_focus_to_the_board_when_it_closes_a_card(cx: &mut TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let task = store.add_task("Board task").unwrap();
+        cx.update(|cx| {
+            theme::init(cx);
+            cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+            assert!(crate::keymap::load_default(&assets::Assets, cx).unwrap().is_empty());
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let mut view = TodoView::new(store.clone(), window, cx);
+            view.set_layout(true, false, cx);
+            view.open_card(task.id, cx);
+            view
+        });
+        let body = cx.debug_bounds("task-detail-body").expect("board card is rendered").center();
+        let modifiers = Modifiers::default();
+        cx.simulate_mouse_move(body, None, modifiers);
+        cx.simulate_click(body, modifiers);
+        cx.update(|window, cx| {
+            let view = view.read(cx);
+            assert_eq!(view.card, Some(task.id));
+            assert!(view.list_focus.contains_focused(window, cx));
+            assert!(!view.list_focus.is_focused(window));
+        });
+
+        cx.simulate_keystrokes("escape");
+        cx.update(|window, cx| {
+            let view = view.read(cx);
+            assert!(view.card.is_none());
+            assert!(view.list_focus.is_focused(window));
+        });
     }
 
     #[gpui::test]

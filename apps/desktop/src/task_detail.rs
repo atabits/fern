@@ -4,10 +4,11 @@ use std::rc::Rc;
 
 use fern_core::{ChecklistItem, Frequency, Id, Kind, List, Priority, Recurrence, Store, Tag, Task};
 use chrono::{Datelike, Local, NaiveDate, TimeZone as _};
-use gpui::{Entity, EventEmitter, Focusable, FontWeight, MouseButton, Subscription};
+use gpui::{Entity, EventEmitter, Focusable, FontWeight, MouseButton, Subscription, WeakFocusHandle};
 use ui::prelude::*;
 use ui::{Placement, PopoverAttachment, SubmenuItem, TipSide, popover, with_tip};
 
+use crate::actions::DismissTransient;
 use crate::calendar;
 use crate::due_picker::{self, CustomReminder, DueDraft, DueMenu, DueTab, RangeField, ReminderUnit};
 use crate::i18n::{self, CurrentLocale, Strings};
@@ -106,6 +107,8 @@ pub struct TaskDetail {
     /// An input to focus on the next render (focusing needs the window).
     pending_focus: Option<FocusTarget>,
     popup: Option<Popup>,
+    /// The field or list that owned focus before the popover opened.
+    popup_return_focus: Option<WeakFocusHandle>,
     /// Shown as a task card (the calendar's or the board's), framed by the card instead of a
     /// left border.
     card: bool,
@@ -153,14 +156,14 @@ impl EventEmitter<OpenTask> for TaskDetail {}
 impl TaskDetail {
     pub fn new(store: Rc<Store>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let strings = i18n::t(cx);
-        let title = cx.new(|cx| TextInput::new(Mode::Wrapped, strings.untitled, cx));
-        let notes = cx.new(|cx| TextInput::new(Mode::MultiLine, strings.notes_placeholder, cx));
-        let tag_input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.new_tag, cx));
-        let new_item = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.add_item, cx));
-        let subtask_input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.add_subtask, cx));
-        let time_input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.time_placeholder, cx));
-        let link_search = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.search_placeholder, cx));
-        let list_search = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.section_search, cx));
+        let title = cx.new(|cx| TextInput::new(Mode::Wrapped, strings.untitled, cx).without_cancel());
+        let notes = cx.new(|cx| TextInput::new(Mode::MultiLine, strings.notes_placeholder, cx).without_cancel());
+        let tag_input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.new_tag, cx).without_cancel());
+        let new_item = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.add_item, cx).without_cancel());
+        let subtask_input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.add_subtask, cx).without_cancel());
+        let time_input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.time_placeholder, cx).without_cancel());
+        let link_search = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.search_placeholder, cx).without_cancel());
+        let list_search = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.section_search, cx).without_cancel());
         let comment_input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.write_comment, cx));
 
         let subscriptions = vec![
@@ -217,8 +220,9 @@ impl TaskDetail {
                     cx.notify();
                 }
             }),
-            cx.subscribe(&comment_input, |this, _, _: &Cancelled, cx| {
+            cx.subscribe_in(&comment_input, window, |this, _, _: &Cancelled, window, cx| {
                 this.comment_open = false;
+                window.focus(&this.title.focus_handle(cx), cx);
                 cx.notify();
             }),
             // A time typed by hand in the due-date popover's time menu.
@@ -270,6 +274,7 @@ impl TaskDetail {
             show_checklist: false,
             pending_focus: None,
             popup: None,
+            popup_return_focus: None,
             card: false,
             sticky_style: None,
             calendar_card: false,
@@ -308,6 +313,7 @@ impl TaskDetail {
         self.notes.update(cx, |input, cx| input.set_text(notes, cx));
         self.task = task;
         self.popup = None;
+        self.popup_return_focus = None;
         self.subtask_open = false;
         self.activity = None;
         self.all_tags = self.store.tags().unwrap_or_default();
@@ -597,7 +603,7 @@ impl TaskDetail {
         let id = item.id;
         let title = item.title.clone();
         let input = cx.new(|cx| {
-            let mut input = TextInput::new(Mode::Wrapped, "", cx);
+            let mut input = TextInput::new(Mode::Wrapped, "", cx).without_cancel();
             input.set_text(title, cx);
             input
         });
@@ -661,6 +667,7 @@ impl TaskDetail {
 
     fn open_popup(&mut self, popup: Popup, cx: &mut Context<Self>) {
         self.focus_submenu = false;
+        self.popup_return_focus = None;
         match popup {
             Popup::Due => {
                 let today = Local::now().date_naive();
@@ -677,6 +684,21 @@ impl TaskDetail {
         }
         self.popup = Some(popup);
         cx.notify();
+    }
+
+    fn open_popup_from_ui(&mut self, popup: Popup, window: &Window, cx: &mut Context<Self>) {
+        let return_focus = if self.popup_input_focused(window, cx) {
+            self.popup_return_focus.clone()
+        } else {
+            window.focused(cx).map(|focus| focus.downgrade())
+        };
+        self.open_popup(popup, cx);
+        self.popup_return_focus = return_focus;
+    }
+
+    fn open_tags(&mut self, popup: Popup, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_popup_from_ui(popup, window, cx);
+        window.focus(&self.tag_input.focus_handle(cx), cx);
     }
 
     /// Opens the due-date picker (the "Set date" shortcut).
@@ -696,10 +718,10 @@ impl TaskDetail {
                 self.subtask_open = true;
                 window.focus(&self.subtask_input.focus_handle(cx), cx);
             }
-            "due" => self.open_popup(Popup::Due, cx),
-            "tags" => self.open_popup(Popup::Tags, cx),
+            "due" => self.open_popup_from_ui(Popup::Due, window, cx),
+            "tags" => self.open_tags(Popup::Tags, window, cx),
             "link-parent" => {
-                self.open_popup(Popup::LinkParent, cx);
+                self.open_popup_from_ui(Popup::LinkParent, window, cx);
                 window.focus(&self.link_search.focus_handle(cx), cx);
             }
             _ => {}
@@ -808,8 +830,35 @@ impl TaskDetail {
 
     fn close_popup(&mut self, cx: &mut Context<Self>) {
         self.popup = None;
+        self.popup_return_focus = None;
         self.focus_submenu = false;
         cx.notify();
+    }
+
+    fn popup_input_focused(&self, window: &Window, cx: &App) -> bool {
+        let input = match self.popup {
+            Some(Popup::Tags) => &self.tag_input,
+            Some(Popup::LinkParent) => &self.link_search,
+            Some(Popup::Due) => &self.time_input,
+            Some(Popup::List) => &self.list_search,
+            _ => return false,
+        };
+        input.focus_handle(cx).is_focused(window)
+    }
+
+    /// Dismisses a popover even if focus is still in the task list or calendar.
+    pub fn dismiss_popup(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.popup.is_none() {
+            return false;
+        }
+        if self.popup_input_focused(window, cx) {
+            let focus = self.popup_return_focus.take()
+                .and_then(|focus| focus.upgrade())
+                .unwrap_or_else(|| self.title.focus_handle(cx));
+            window.focus(&focus, cx);
+        }
+        self.close_popup(cx);
+        true
     }
 
     fn update_draft(&mut self, cx: &mut Context<Self>, change: impl FnOnce(&mut DueDraft)) {
@@ -948,7 +997,7 @@ impl TaskDetail {
             )), cx))
             .child(self.close_side_menu_on_hover(item("more-link-parent", IconName::CornerDownRight, strings.link_parent).on_click(cx.listener(
                 |this, _, window, cx| {
-                    this.open_popup(Popup::LinkParent, cx);
+                    this.open_popup_from_ui(Popup::LinkParent, window, cx);
                     window.focus(&this.link_search.focus_handle(cx), cx);
                 },
             )), cx))
@@ -966,8 +1015,8 @@ impl TaskDetail {
                 .on_click(cx.listener(|this, _, _, cx| this.toggle_wont_do(cx))),
             cx,
             ))
-            .child(self.close_side_menu_on_hover(item("more-tags", IconName::Tag, strings.tags).on_click(cx.listener(|this, _, _, cx| {
-                this.open_popup(Popup::Tags, cx);
+            .child(self.close_side_menu_on_hover(item("more-tags", IconName::Tag, strings.tags).on_click(cx.listener(|this, _, window, cx| {
+                this.open_tags(Popup::Tags, window, cx);
             })), cx))
             .child(self.close_side_menu_on_hover(
                 item("more-attachment", IconName::Paperclip, strings.upload_attachment)
@@ -2506,8 +2555,7 @@ impl TaskDetail {
                         None => Chip::new(tag.clone(), self.tag_color(&tag, cx)).into_any_element(),
                     })
                     .on_click(cx.listener(|this, _, window, cx| {
-                        this.open_popup(Popup::Tags, cx);
-                        window.focus(&this.tag_input.focus_handle(cx), cx);
+                        this.open_tags(Popup::Tags, window, cx);
                     }))
             }))
             .child(
@@ -2526,8 +2574,7 @@ impl TaskDetail {
                     .hover(|s| s.bg(theme.colors().element_hover))
                     .child(Icon::new(IconName::Plus).size(IconSize::Custom(px(11.))).color(Color::Accent))
                     .on_click(cx.listener(|this, _, window, cx| {
-                        this.open_popup(Popup::Tags, cx);
-                        window.focus(&this.tag_input.focus_handle(cx), cx);
+                        this.open_tags(Popup::Tags, window, cx);
                     }))
                     .when(self.popup == Some(Popup::Tags), |el| {
                         el.child(PopoverAttachment::new(Placement::BelowLeft, self.render_tags_popup(cx)))
@@ -2601,6 +2648,11 @@ impl Render for TaskDetail {
         }
         let panel = v_flex()
             .size_full()
+            .on_action(cx.listener(|this, _: &DismissTransient, window, cx| {
+                if !this.dismiss_popup(window, cx) {
+                    cx.propagate();
+                }
+            }))
             .map(|el| match self.sticky_style {
                 Some(style) => el.text_color(gpui::rgb(style.foreground())),
                 None => el.bg(theme.colors().background)
@@ -2673,7 +2725,7 @@ impl Render for TaskDetail {
                         label_button("due-date", IconName::CalendarDays, due_text, due_color, button_hover)
                             .debug_selector(|| "task-detail-due-date".into())
                             .when(repeats, |el| el.child(Icon::new(IconName::Repeat).size(IconSize::Small).color(due_color)))
-                            .on_click(cx.listener(|this, _, _, cx| this.open_popup(Popup::Due, cx)))
+                            .on_click(cx.listener(|this, _, window, cx| this.open_popup_from_ui(Popup::Due, window, cx)))
                             .when(self.popup == Some(Popup::Due), |el| {
                                 el.child(PopoverAttachment::new(
                                     Placement::BelowLeft,
@@ -2690,7 +2742,7 @@ impl Render for TaskDetail {
                                 IconButton::new("priority", if task.kind == Kind::Note { IconName::CircleAlert } else { IconName::Flag })
                                     .icon_color(priority_color)
                                     .tip(strings.summary_priority, TipSide::Below)
-                                    .on_click(cx.listener(|this, _, _, cx| this.open_popup(Popup::Priority, cx))),
+                                    .on_click(cx.listener(|this, _, window, cx| this.open_popup_from_ui(Popup::Priority, window, cx))),
                             )
                             .when(self.popup == Some(Popup::Priority), |el| {
                                 el.child(PopoverAttachment::new(
@@ -2704,6 +2756,7 @@ impl Render for TaskDetail {
             .child(
                 v_flex()
                     .id("detail-body")
+                    .debug_selector(|| "task-detail-body".to_owned())
                     .when_some(self.sticky_style, |el, style| el.text_size(px(style.font_px())))
                     .flex_1()
                     .overflow_y_scroll()
@@ -2844,7 +2897,7 @@ impl Render for TaskDetail {
                                     window,
                                     cx,
                                 )
-                                    .on_click(cx.listener(|this, _, _, cx| this.open_popup(Popup::List, cx)))
+                                    .on_click(cx.listener(|this, _, window, cx| this.open_popup_from_ui(Popup::List, window, cx)))
                                     .when(self.popup == Some(Popup::List), |el| {
                                         el.child(PopoverAttachment::new(
                                             Placement::AboveLeft,
@@ -2881,7 +2934,7 @@ impl Render for TaskDetail {
                                     .child(
                                         IconButton::new("more", IconName::Ellipsis)
                                             .when(self.popup != Some(Popup::More), |b| b.tip(strings.more, TipSide::Above))
-                                            .on_click(cx.listener(|this, _, _, cx| this.open_popup(Popup::More, cx))),
+                                            .on_click(cx.listener(|this, _, window, cx| this.open_popup_from_ui(Popup::More, window, cx))),
                                     )
                                     .when(self.popup == Some(Popup::More), |el| {
                                         el.child(PopoverAttachment::new(
@@ -2912,6 +2965,40 @@ impl Render for TaskDetail {
 mod tests {
     use super::*;
     use gpui::TestAppContext;
+
+    #[gpui::test]
+    fn escape_in_task_detail_closes_the_picker_and_preserves_editor_focus(cx: &mut TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let task = store.add_task("Task").unwrap();
+        cx.update(|cx| {
+            theme::init(cx);
+            cx.set_global(CurrentLocale(i18n::Locale::En));
+            assert!(crate::keymap::load_default(&assets::Assets, cx).unwrap().is_empty());
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let mut detail = TaskDetail::new(store, window, cx);
+            detail.show(Some(task), cx);
+            window.focus(&detail.title.focus_handle(cx), cx);
+            detail
+        });
+
+        cx.simulate_keystrokes("escape");
+        cx.update(|window, cx| assert!(view.read(cx).title.focus_handle(cx).is_focused(window)));
+
+        cx.update(|window, cx| view.update(cx, |detail, cx| {
+            window.focus(&detail.notes.focus_handle(cx), cx);
+            detail.open_popup_from_ui(Popup::Due, window, cx);
+        }));
+        cx.simulate_keystrokes("escape");
+        cx.update(|window, cx| {
+            let detail = view.read(cx);
+            assert!(!detail.has_popup());
+            assert!(detail.notes.focus_handle(cx).is_focused(window));
+        });
+
+        cx.simulate_keystrokes("escape");
+        cx.update(|window, cx| assert!(view.read(cx).notes.focus_handle(cx).is_focused(window)));
+    }
 
     #[gpui::test]
     fn blank_lines_keep_their_height_when_task_notes_lose_focus(cx: &mut TestAppContext) {

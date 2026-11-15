@@ -10,7 +10,8 @@
       "secondary-3": "fern::ShowTomorrow",
       "secondary-4": "fern::ShowNext7Days",
       "secondary-/": "fern::ShowShortcuts",
-      "secondary-,": "fern::OpenSettings"
+      "secondary-,": "fern::OpenSettings",
+      "escape": "fern::DismissTransient"
     }
   },
   {

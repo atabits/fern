@@ -85,6 +85,7 @@ pub struct TextInput {
     marked_range: Option<Range<usize>>,
     last_layout: Option<TextLayout>,
     is_selecting: bool,
+    cancellable: bool,
     /// Byte ranges shown in the accent color on a tinted background, such as the date and tags
     /// quick add recognized.
     highlights: Vec<Range<usize>>,
@@ -170,10 +171,17 @@ impl TextInput {
             marked_range: None,
             last_layout: None,
             is_selecting: false,
+            cancellable: true,
             highlights: Vec::new(),
             masked: false,
             keyboard_blur: None,
         }
+    }
+
+    /// Lets the containing view handle Escape when this field has no edit to cancel.
+    pub fn without_cancel(mut self) -> Self {
+        self.cancellable = false;
+        self
     }
 
     /// Makes this a password field.
@@ -1019,7 +1027,7 @@ impl Render for TextInput {
             .on_action(cx.listener(Self::cut))
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::enter))
-            .on_action(cx.listener(Self::cancel))
+            .when(self.cancellable, |el| el.on_action(cx.listener(Self::cancel)))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))

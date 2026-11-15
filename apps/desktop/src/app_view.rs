@@ -6,7 +6,7 @@ use ui::prelude::*;
 use ui::{Placement, PopoverAttachment, popover};
 
 use crate::actions::{
-    NewTask, OpenSettings, Search, ShowInbox, ShowNext7Days, ShowShortcuts, ShowToday, ShowTomorrow, ToggleSidebar,
+    DismissTransient, NewTask, OpenSettings, Search, ShowInbox, ShowNext7Days, ShowShortcuts, ShowToday, ShowTomorrow, ToggleSidebar,
 };
 use crate::calendar_view::{self, CalendarView};
 use crate::countdown_view::CountdownView;
@@ -687,7 +687,22 @@ impl AppView {
 
     fn toggle_shortcuts(&mut self, cx: &mut Context<Self>) {
         self.shortcuts_open = !self.shortcuts_open;
+        if !self.shortcuts_open {
+            self.recording_hotkey = None;
+        }
         cx.notify();
+    }
+
+    fn dismiss_transient(&mut self, _: &DismissTransient, _: &mut Window, cx: &mut Context<Self>) {
+        if self.account_menu_open {
+            self.set_account_menu(false, cx);
+        } else if self.notices_open {
+            self.set_notices_open(false, cx);
+        } else if self.shortcuts_open {
+            self.toggle_shortcuts(cx);
+        } else {
+            cx.propagate();
+        }
     }
 
     /// The original's Shortcuts panel: the keymap's bindings by group, and quick add syntax.
@@ -776,6 +791,13 @@ impl AppView {
         v_flex()
             .id("shortcuts-panel")
             .track_focus(&self.shortcuts_focus)
+            .on_action(cx.listener(|this, _: &DismissTransient, _, cx| {
+                if this.recording_hotkey.take().is_some() {
+                    cx.notify();
+                } else {
+                    cx.propagate();
+                }
+            }))
             // While a system-wide shortcut is recorded, the keys pressed set it: Escape keeps
             // the old one, Backspace turns it off.
             .capture_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
@@ -1204,6 +1226,7 @@ impl Render for AppView {
         let root = v_flex()
             .relative()
             .size_full()
+            .on_action(cx.listener(Self::dismiss_transient))
             .bg(theme.colors().background)
             .text_color(theme.colors().text)
             .child(self.title_bar.clone())
@@ -1256,6 +1279,28 @@ mod tests {
         cx.simulate_click(button.center(), gpui::Modifiers::default());
         assert!(cx.debug_bounds("release-notes-page").is_some());
         cx.update(|_, cx| assert!(app.read(cx).update_notice.is_none()));
+    }
+
+    #[gpui::test]
+    fn escape_dismisses_focused_ui_and_keeps_the_main_view(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            theme::init(cx);
+            assert!(crate::keymap::load_default(&assets::Assets, cx).unwrap().is_empty());
+        });
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let (app, cx) = cx.add_window_view(|window, cx| AppView::new(store, true, window, cx));
+
+        cx.simulate_keystrokes("escape");
+        cx.update(|window, cx| assert!(!app.read(cx).todo.focus_handle(cx).is_focused(window)));
+
+        cx.update(|window, cx| app.update(cx, |app, cx| app.open_settings(None, window, cx)));
+        cx.simulate_keystrokes("escape");
+        cx.update(|_, cx| assert!(app.read(cx).settings.is_none()));
+        cx.simulate_keystrokes("escape escape");
+        cx.update(|_, cx| {
+            assert_eq!(app.read(cx).section, Section::Tasks);
+            assert!(app.read(cx).settings.is_none());
+        });
     }
 
     #[gpui::test]

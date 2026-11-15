@@ -24,6 +24,7 @@ mod http;
 mod habit_view;
 mod i18n;
 mod keymap;
+mod release_notes;
 mod list_dialog;
 mod lists_panel;
 mod markdown_toolbar;
@@ -179,7 +180,7 @@ fn main() -> Result<()> {
                 // `fern fern://task/<id>` opens that task ("Copy Link").
                 let link = std::env::args().skip(1).find_map(|arg| fern_core::link::parse_task_link(&arg));
                 cx.new(|cx| {
-                    let mut view = AppView::new(store, window, cx);
+                    let mut view = AppView::new(store, first_start, window, cx);
                     if let Some(task) = link {
                         view.open_task(task, window, cx);
                     }

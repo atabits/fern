@@ -84,7 +84,7 @@ pub const WIDTH: f32 = 50.;
 pub struct Bell {
     pub unread: usize,
     pub on_click: Box<dyn Fn(&ClickEvent, &mut Window, &mut App)>,
-    /// The notification list, while it is open.
+    /// The notification list or the update notice attached to the bell.
     pub menu: Option<AnyElement>,
 }
 
@@ -170,6 +170,8 @@ pub fn render(
         }))
         .child(
             div()
+                .id("notification-bell")
+                .debug_selector(|| "notification-bell".to_owned())
                 .relative()
                 .child(button("notifications", IconName::Bell).tooltip(Tooltip::text(strings.notifications)).on_click(bell.on_click))
                 .when(bell.unread > 0, |el| {

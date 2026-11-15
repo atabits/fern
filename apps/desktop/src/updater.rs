@@ -15,8 +15,9 @@ use gpui::{App, AppContext as _, AsyncApp, Context, Entity, Global, WeakEntity};
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 
+use crate::release_notes::{CURRENT_VERSION, ReleaseNotes, is_newer};
+
 const LATEST_RELEASE: &str = "https://api.github.com/repos/atabits/fern/releases/latest";
-const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Not right at startup, so that the first frame does not wait on the network.
 const FIRST_CHECK_AFTER: Duration = Duration::from_secs(10);
 const CHECK_EVERY: Duration = Duration::from_secs(6 * 60 * 60);
@@ -32,9 +33,9 @@ pub enum Status {
     UpToDate,
     Downloading(String),
     /// Downloaded and checked: installs on "Restart to Update".
-    Ready(String),
+    Ready(Rc<ReleaseNotes>),
     /// Newer, but installed in a way Fern does not update itself: the release's page.
-    Available { version: String, url: String },
+    Available(Rc<ReleaseNotes>),
     Failed(String),
 }
 
@@ -127,22 +128,22 @@ impl Updater {
                 let install = install.clone();
                 cx.background_executor().spawn(async move { find_update(&install) }).await
             };
-            let (version, asset) = match found {
-                Ok(Found::Download { version, asset }) => (version, asset),
-                Ok(Found::Available { version, url }) => return set_status(&this, cx, Status::Available { version, url }),
+            let (notes, asset) = match found {
+                Ok(Found::Download { notes, asset }) => (notes, asset),
+                Ok(Found::Available(notes)) => return set_status(&this, cx, Status::Available(Rc::new(notes))),
                 Ok(Found::Current) => return set_status(&this, cx, Status::UpToDate),
                 Err(err) => return set_status(&this, cx, Status::Failed(format!("{err:#}"))),
             };
-            set_status(&this, cx, Status::Downloading(version.clone()));
+            set_status(&this, cx, Status::Downloading(notes.version.clone()));
             let staged = {
-                let (install, version) = (install.clone(), version.clone());
+                let (install, version) = (install.clone(), notes.version.clone());
                 cx.background_executor().spawn(async move { download_and_stage(&install, &version, &asset) }).await
             };
             this.update(cx, |this, cx| {
                 match staged {
                     Ok(path) => {
                         this.staged = Some(path);
-                        this.status = Status::Ready(version);
+                        this.status = Status::Ready(Rc::new(notes));
                     }
                     Err(err) => {
                         eprintln!("failed to download the update: {err:#}");
@@ -159,8 +160,15 @@ impl Updater {
     /// "Restart to Update": puts the downloaded version in place, starts it and quits; "Update
     /// to …" without a download opens the release's page.
     pub fn restart_to_update(&mut self, cx: &mut Context<Self>) {
-        if let Status::Available { url, .. } = &self.status {
-            cx.open_url(url);
+        let notes = match &self.status {
+            Status::Ready(notes) | Status::Available(notes) => notes,
+            _ => return,
+        };
+        if let Err(err) = notes.cache_for_restart(&self.store) {
+            eprintln!("failed to cache release notes: {err:#}");
+        }
+        if matches!(self.status, Status::Available(_)) {
+            cx.open_url(&notes.url);
             return;
         }
         let (Some(install), Some(staged)) = (&self.install, &self.staged) else {
@@ -361,6 +369,7 @@ fn updates_dir() -> Result<PathBuf> {
 struct Release {
     tag_name: String,
     html_url: String,
+    body: Option<String>,
     #[serde(default)]
     assets: Vec<Asset>,
 }
@@ -376,8 +385,8 @@ struct Asset {
 #[derive(Debug, PartialEq)]
 enum Found {
     Current,
-    Download { version: String, asset: Asset },
-    Available { version: String, url: String },
+    Download { notes: ReleaseNotes, asset: Asset },
+    Available(ReleaseNotes),
 }
 
 fn user_agent() -> String {
@@ -407,20 +416,10 @@ fn pick(release: &Release, install: &Install, current: &str, os: &str, arch: &st
         .package_suffix()
         .map(|suffix| format!("fern-{version}-{os}-{arch}{suffix}"))
         .and_then(|name| release.assets.iter().find(|asset| asset.name == name));
+    let notes = ReleaseNotes::new(version, &release.html_url, release.body.as_deref().unwrap_or_default());
     match asset {
-        Some(asset) => Found::Download { version: version.to_owned(), asset: asset.clone() },
-        None => Found::Available { version: version.to_owned(), url: release.html_url.clone() },
-    }
-}
-
-/// Whether version `a` comes after `b`; both `major.minor.patch`, anything after `-` ignored.
-fn is_newer(a: &str, b: &str) -> bool {
-    let parts = |version: &str| -> Option<Vec<u64>> {
-        version.split('-').next()?.split('.').map(|part| part.parse().ok()).collect()
-    };
-    match (parts(a), parts(b)) {
-        (Some(a), Some(b)) => a > b,
-        _ => false,
+        Some(asset) => Found::Download { notes, asset: asset.clone() },
+        None => Found::Available(notes),
     }
 }
 
@@ -505,6 +504,7 @@ mod tests {
         Release {
             tag_name: format!("v{version}"),
             html_url: format!("https://github.com/atabits/fern/releases/tag/v{version}"),
+            body: Some("- A quicker calendar.".into()),
             assets: names
                 .iter()
                 .map(|name| Asset {
@@ -539,8 +539,9 @@ mod tests {
         ];
         let release = release("0.2.0", &names);
         let name = |install: Install, os: &str, arch: &str| match pick(&release, &install, "0.1.5", os, arch) {
-            Found::Download { version, asset } => {
-                assert_eq!(version, "0.2.0");
+            Found::Download { notes, asset } => {
+                assert_eq!(notes.version, "0.2.0");
+                assert_eq!(notes.markdown, "- A quicker calendar.");
                 asset.name
             }
             other => panic!("{other:?}"),
@@ -555,11 +556,11 @@ mod tests {
     #[test]
     fn points_to_the_release_page_without_a_package() {
         let release = release("0.2.0", &["fern-0.2.0-linux-x86_64.deb"]);
-        let expected = Found::Available { version: "0.2.0".into(), url: release.html_url.clone() };
+        let expected = Found::Available(ReleaseNotes::new("0.2.0", &release.html_url, "- A quicker calendar."));
         assert_eq!(pick(&release, &Install::Managed, "0.1.5", "linux", "x86_64"), expected);
         // An Intel Mac, with only the Apple Silicon package out.
         let release = self::release("0.2.0", &["fern-0.2.0-macos-arm64.dmg"]);
-        assert!(matches!(pick(&release, &Install::MacApp("Fern.app".into()), "0.1.5", "macos", "x86_64"), Found::Available { .. }));
+        assert!(matches!(pick(&release, &Install::MacApp("Fern.app".into()), "0.1.5", "macos", "x86_64"), Found::Available(_)));
     }
 
     #[test]
@@ -574,6 +575,40 @@ mod tests {
             "assets":[{"name":"fern-0.2.0-linux-x86_64.tar.gz","browser_download_url":"https://github.com/x","digest":"sha256:ab","size":1}]}"#;
         let release: Release = serde_json::from_str(json).unwrap();
         assert_eq!(release.assets[0].digest.as_deref(), Some("sha256:ab"));
+        assert_eq!(release.body, None);
+    }
+
+    #[gpui::test]
+    fn release_preview_is_next_to_restart_in_the_title_bar_and_settings(cx: &mut gpui::TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        cx.update(|cx| {
+            theme::init(cx);
+            assert!(crate::keymap::load_default(&assets::Assets, cx).unwrap().is_empty());
+            let notes = ReleaseNotes::new("99.0.0", "https://example.com/v99.0.0", "- Calendar improvements.");
+            let updater = cx.new(|_| Updater {
+                store: store.clone(),
+                install: Some(Install::Tarball("fern".into())),
+                status: Status::Ready(Rc::new(notes)),
+                staged: None,
+            });
+            cx.set_global(GlobalUpdater(updater));
+        });
+        let (_, cx) = cx.add_window_view(|window, cx| crate::app_view::AppView::new(store, true, window, cx));
+        let preview = cx.debug_bounds("title-bar-update-notes").unwrap();
+        let restart = cx.debug_bounds("title-bar-restart-update").unwrap();
+        assert!(preview.right() <= restart.left());
+        assert_eq!(preview.center().y, restart.center().y);
+        cx.simulate_click(preview.center(), gpui::Modifiers::default());
+        assert!(cx.debug_bounds("release-notes-page").is_some());
+
+        cx.simulate_keystrokes("escape");
+        assert!(cx.debug_bounds("release-notes-page").is_none());
+        let preview = cx.debug_bounds("update-notes").unwrap();
+        let restart = cx.debug_bounds("update-action").unwrap();
+        assert!(preview.right() <= restart.left());
+        assert_eq!(preview.center().y, restart.center().y);
+        cx.simulate_click(preview.center(), gpui::Modifiers::default());
+        assert!(cx.debug_bounds("release-notes-page").is_some());
     }
 
     #[test]

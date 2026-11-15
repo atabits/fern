@@ -14,11 +14,12 @@ use crate::focus_view::FocusView;
 use crate::habit_view::HabitView;
 use crate::i18n;
 use crate::matrix_view::{self, MatrixView};
+use crate::release_notes::{self, ReleaseNotes, action_button};
 use crate::reminders::{self, Notice, NoticeAction, Notices, Reply, Target};
 use crate::search_modal::{SearchEvent, SearchModal};
 use crate::settings_window::{self, SettingsEvent, SettingsWindow};
 use crate::sidebar::{self, Section};
-use crate::title_bar::{self, TitleBar};
+use crate::title_bar::{self, ShowReleaseNotes, TitleBar};
 use crate::todo_view::TodoView;
 
 pub struct AppView {
@@ -44,6 +45,7 @@ pub struct AppView {
     recording_hotkey: Option<usize>,
     shortcuts_focus: gpui::FocusHandle,
     settings: Option<gpui::Entity<SettingsWindow>>,
+    update_notice: Option<Rc<ReleaseNotes>>,
     /// The Statistics page opened from the account menu, which covers the whole window.
     statistics_open: bool,
     /// The sidebar icon under the pointer, whose name shows beside it.
@@ -51,7 +53,7 @@ pub struct AppView {
 }
 
 impl AppView {
-    pub fn new(store: Rc<Store>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(store: Rc<Store>, first_start: bool, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let todo = cx.new(|cx| TodoView::new(store.clone(), window, cx));
         let calendar = cx.new(|cx| CalendarView::new(store.clone(), window, cx));
         // A task clicked in the calendar opens in the task list with its details.
@@ -113,10 +115,19 @@ impl AppView {
         })
         .detach();
         let store_features = store.preferences().map(|p| p.features).unwrap_or_default();
+        let update_notice = release_notes::take_update_notice(&store, first_start).unwrap_or_else(|err| {
+            eprintln!("failed to read the update notification: {err:#}");
+            None
+        }).map(Rc::new);
+        let title_bar = cx.new(TitleBar::new);
+        cx.subscribe_in(&title_bar, window, |this, _, ShowReleaseNotes(notes), window, cx| {
+            this.open_settings(Some(notes.clone()), window, cx);
+        })
+        .detach();
         // Mutated only by the debug-build dev state below.
         #[cfg_attr(not(debug_assertions), allow(unused_mut))]
         let mut this = Self {
-            title_bar: cx.new(TitleBar::new),
+            title_bar,
             store,
             section: Section::Tasks,
             todo,
@@ -135,6 +146,7 @@ impl AppView {
             recording_hotkey: None,
             shortcuts_focus: cx.focus_handle(),
             settings: None,
+            update_notice,
             statistics_open: false,
             nav_hovered: None,
         };
@@ -412,7 +424,7 @@ impl AppView {
             }
             // `settings=<page>[><menu>]` opens the Settings window (see `SettingsWindow::dev_open`).
             if let Some(spec) = state.split(';').find_map(|part| part.strip_prefix("settings=")) {
-                this.open_settings(window, cx);
+                this.open_settings(None, window, cx);
                 if let Some(settings) = &this.settings {
                     settings.update(cx, |settings, cx| settings.dev_open(spec, cx));
                 }
@@ -556,7 +568,7 @@ impl AppView {
                 ListItem::new("account-settings")
                     .start_slot(Icon::new(IconName::Settings))
                     .child(Label::new(strings.settings))
-                    .on_click(cx.listener(|this, _, window, cx| this.open_settings(window, cx))),
+                    .on_click(cx.listener(|this, _, window, cx| this.open_settings(None, window, cx))),
             )
             .child(
                 ListItem::new("account-statistics")
@@ -574,8 +586,16 @@ impl AppView {
         cx.notify();
     }
 
-    fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn open_settings(&mut self, notes: Option<Rc<ReleaseNotes>>, window: &mut Window, cx: &mut Context<Self>) {
         self.account_menu_open = false;
+        if let Some(notes) = &notes {
+            self.search = None;
+            if let Some(settings) = &self.settings {
+                settings.update(cx, |settings, cx| settings.show_release_notes(notes.clone(), window, cx));
+                cx.notify();
+                return;
+            }
+        }
         let settings = cx.new(|cx| SettingsWindow::new(self.store.clone(), cx));
         cx.subscribe_in(&settings, window, |this, _, event, window, cx| {
             this.settings = None;
@@ -593,9 +613,65 @@ impl AppView {
             cx.notify();
         })
         .detach();
-        window.focus(&settings.focus_handle(cx), cx);
+        if let Some(notes) = notes {
+            settings.update(cx, |settings, cx| settings.show_release_notes(notes, window, cx));
+        } else {
+            window.focus(&settings.focus_handle(cx), cx);
+        }
         self.settings = Some(settings);
         cx.notify();
+    }
+
+    fn render_update_notice(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let notes = self.update_notice.as_ref()?;
+        let strings = i18n::t(cx);
+        let colors = cx.theme().colors().clone();
+        let message = strings.update_installed.replace("{version}", &notes.version);
+        Some(
+            popover(cx)
+                .id("update-notice")
+                .debug_selector(|| "update-notice".to_owned())
+                .w(px(296.))
+                .p_2()
+                .gap_1()
+                .child(
+                    h_flex().items_start().gap_2()
+                        .child(div().flex_none().pl_1().pt(px(5.)).child(
+                            Icon::new(IconName::CircleCheck).size(IconSize::Small).color(Color::Accent),
+                        ))
+                        .child(div().flex_1().min_w_0().pt_1().child(
+                            Label::new(message).weight(gpui::FontWeight::MEDIUM),
+                        ))
+                        .child(
+                            action_button("dismiss-update-notice", cx)
+                                .debug_selector(|| "dismiss-update-notice".to_owned())
+                                .size(px(26.))
+                                .min_h(px(26.))
+                                .px_0()
+                                .justify_center()
+                                .tooltip(Tooltip::text(strings.close))
+                                .child(Icon::new(IconName::X).size(IconSize::Small).color(Color::Muted))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.update_notice = None;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+                .child(
+                    h_flex().pl(px(26.)).pb_1().child(
+                        action_button("updated-whats-new", cx)
+                            .debug_selector(|| "updated-whats-new".to_owned())
+                            .border_color(colors.border)
+                            .child(Label::new(strings.whats_new).size(LabelSize::Small).weight(gpui::FontWeight::MEDIUM))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                if let Some(notes) = this.update_notice.take() {
+                                    this.open_settings(Some(notes), window, cx);
+                                }
+                            })),
+                    ),
+                )
+                .into_any_element(),
+        )
     }
 }
 
@@ -1023,15 +1099,21 @@ impl Render for AppView {
             failed: matches!(self.sync, crate::sync::SyncStatus::Failed(_)),
             on_click: Box::new(cx.listener(|this, _, _, cx| this.sync_now(cx))),
         });
+        let bell_panel = if self.notices_open {
+            Some(self.render_notices(cx))
+        } else if self.settings.is_none() && self.search.is_none() && !self.account_menu_open {
+            self.render_update_notice(cx)
+        } else {
+            None
+        };
         let bell = sidebar::Bell {
             unread: self.notices.unread,
             on_click: Box::new(cx.listener(|this, _, _, cx| {
+                this.update_notice = None;
                 let open = !this.notices_open;
                 this.set_notices_open(open, cx)
             })),
-            menu: self
-                .notices_open
-                .then(|| PopoverAttachment::new(Placement::RightBottom, self.render_notices(cx)).into_any_element()),
+            menu: bell_panel.map(|panel| PopoverAttachment::new(Placement::RightBottom, panel).into_any_element()),
         };
 
         let content = h_flex()
@@ -1044,7 +1126,7 @@ impl Render for AppView {
             .on_action(cx.listener(Self::search))
             .on_action(cx.listener(Self::toggle_sidebar))
             .on_action(cx.listener(|this, _: &ShowShortcuts, _, cx| this.toggle_shortcuts(cx)))
-            .on_action(cx.listener(|this, _: &OpenSettings, window, cx| this.open_settings(window, cx)))
+            .on_action(cx.listener(|this, _: &OpenSettings, window, cx| this.open_settings(None, window, cx)))
             .on_action(cx.listener(|this, _: &ShowInbox, window, cx| this.show_view(fern_core::View::Inbox, window, cx)))
             .on_action(cx.listener(|this, _: &ShowToday, window, cx| this.show_view(fern_core::View::Today, window, cx)))
             .on_action(cx.listener(|this, _: &ShowTomorrow, window, cx| {
@@ -1114,4 +1196,34 @@ impl Render for AppView {
 /// Where the task list's shortcuts start in `keymap::LISTED_ACTIONS`.
 fn list_group_start(index: usize) -> bool {
     crate::keymap::LISTED_ACTIONS.iter().position(|a| a.starts_with("task_list::")) == Some(index)
+}
+
+#[cfg(all(test, debug_assertions))]
+mod tests {
+    use super::*;
+
+    #[gpui::test]
+    fn update_notification_opens_the_installed_notes_without_an_updater(cx: &mut gpui::TestAppContext) {
+        cx.update(theme::init);
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        ReleaseNotes::new(release_notes::CURRENT_VERSION, "https://example.com/fern", "- Cached release changes.")
+            .cache_for_restart(&store)
+            .unwrap();
+        let (app, cx) = cx.add_window_view(|window, cx| AppView::new(store, false, window, cx));
+
+        cx.simulate_resize(gpui::size(px(900.), px(600.)));
+        let bell = cx.debug_bounds("notification-bell").unwrap();
+        let notice = cx.debug_bounds("update-notice").unwrap();
+        assert!(notice.left() >= bell.right());
+        assert_eq!(notice.bottom(), bell.bottom());
+
+        cx.simulate_resize(gpui::size(px(900.), px(400.)));
+        let notice = cx.debug_bounds("update-notice").unwrap();
+        let button = cx.debug_bounds("updated-whats-new").unwrap();
+        assert!(notice.top() >= title_bar::height() && notice.bottom() <= px(400.));
+        assert!(cx.debug_bounds("release-notes-page").is_none());
+        cx.simulate_click(button.center(), gpui::Modifiers::default());
+        assert!(cx.debug_bounds("release-notes-page").is_some());
+        cx.update(|_, cx| assert!(app.read(cx).update_notice.is_none()));
+    }
 }

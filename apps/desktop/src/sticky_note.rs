@@ -692,6 +692,59 @@ mod tests {
 
     #[gpui::test]
     #[cfg(debug_assertions)]
+    fn losing_popup_activation_keeps_the_note_open(cx: &mut TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let task = store.add_task("Keep this note").unwrap();
+        cx.update(theme::init);
+        let (note, cx) = cx.add_window_view(|window, cx| StickyNote::new(store.clone(), task.id, false, None, None, window, cx));
+        let more = cx.debug_bounds("task-detail-more").unwrap().center();
+        cx.simulate_click(more, Modifiers::default());
+        let popup = cx.update(|_, cx| note.read(cx).detail_popup.unwrap());
+        let popup_id = cx.update(|_, cx| popup.update(cx, |_, _, cx| cx.entity_id()).unwrap());
+        let mut popup_cx = gpui::VisualTestContext::from_window(popup.into(), cx);
+        popup_cx.update(|window, _| window.activate_window());
+        // The note reads its popup during rendering to check whether it still exists.
+        let owner = cx.update(|window, cx| { window.refresh(); window.draw(cx).clear(cx); window.window_handle() });
+        cx.cx.update(|cx| {
+            assert_eq!(cx.with_window(popup_id, |window, _| window.window_handle()), Some(owner));
+        });
+        popup_cx.deactivate_window();
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            assert_eq!(cx.windows().len(), 1, "only the transient menu should close");
+            assert!(note.read(cx).detail_popup.is_none());
+            assert_eq!(note.read(cx).detail.read(cx).task_id(), Some(task.id));
+        });
+        assert!(sticky_windows::load(&store).iter().any(|saved| saved.task == task.id && saved.open));
+    }
+
+    #[gpui::test]
+    #[cfg(debug_assertions)]
+    fn menu_state_observer_closes_the_popup_after_the_owner_renders_last(cx: &mut TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let task = store.add_task("Keep the owner").unwrap();
+        cx.update(theme::init);
+        let (note, cx) = cx.add_window_view(|window, cx| StickyNote::new(store, task.id, false, None, None, window, cx));
+        let more = cx.debug_bounds("task-detail-more").unwrap().center();
+        cx.simulate_click(more, Modifiers::default());
+        let popup = cx.update(|_, cx| note.read(cx).detail_popup.unwrap());
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+            let detail = note.read(cx).detail.clone();
+            detail.update(cx, |detail, cx| { detail.dismiss_popup(window, cx); });
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            assert_eq!(cx.windows().len(), 1);
+            assert!(popup.read(cx).is_err(), "the menu window must be removed");
+            assert!(note.read(cx).detail_popup.is_none());
+            assert_eq!(window.root::<StickyNote>().unwrap(), Some(note.clone()));
+        });
+    }
+
+    #[gpui::test]
+    #[cfg(debug_assertions)]
     fn small_note_menu_reaches_the_last_action_and_escape_restores_focus(cx: &mut TestAppContext) {
         let store = Rc::new(Store::open_in_memory().unwrap());
         let task = store.add_task("Small note").unwrap();

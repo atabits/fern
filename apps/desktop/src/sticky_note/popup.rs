@@ -286,25 +286,38 @@ impl DetailPopup {
             window.focus(&focus, cx);
         }
         let inputs = detail.update(cx, |detail, cx| detail.bind_popup_window(window, cx));
-        cx.observe_in(&detail, window, |this, _, window, cx| {
-            if this.detail.read(cx).has_popup() {
-                cx.notify();
-            } else {
-                this.close(true, window, cx);
-            }
+        // The owner reads this view during rendering, so GPUI's implicit entity
+        // window can point at the note. Lifecycle callbacks must target the popup.
+        let popup_window = window.window_handle();
+        cx.observe(&detail, move |_, _, cx| {
+            let popup = cx.weak_entity();
+            cx.defer(move |cx| {
+                popup_window.update(cx, |_, window, cx| {
+                    popup.update(cx, |this, cx| {
+                        if this.detail.read(cx).has_popup() {
+                            cx.notify();
+                        } else {
+                            this.close(true, window, cx);
+                        }
+                    }).ok();
+                }).ok();
+            });
         })
         .detach();
         cx.observe_window_activation(window, |this, window, cx| {
             if !window.is_window_active() && !this.replacing {
                 // Activating an owned window can briefly activate its owner on Windows.
-                cx.defer_in(window, |this, window, cx| {
-                    let owner_active = this
-                        .note
-                        .update(cx, |_, owner, _| owner.is_window_active())
-                        .unwrap_or(false);
-                    if !window.is_window_active() && !owner_active && !this.replacing {
-                        this.close(false, window, cx);
-                    }
+                let popup = cx.weak_entity();
+                window.defer(cx, move |window, cx| {
+                    popup.update(cx, |this, cx| {
+                        let owner_active = this
+                            .note
+                            .update(cx, |_, owner, _| owner.is_window_active())
+                            .unwrap_or(false);
+                        if !window.is_window_active() && !owner_active && !this.replacing {
+                            this.close(false, window, cx);
+                        }
+                    }).ok();
                 });
             }
         })

@@ -1801,7 +1801,7 @@ impl TodoView {
             .border_color(theme.colors().border)
             .bg(theme.colors().surface_background)
             .on_mouse_down(MouseButton::Left, move |_, window, cx| window.focus(&input_focus, cx))
-            .child(h_flex().gap_2().child(div().flex_1().min_w_0().child(self.input.clone())).children(
+            .child(h_flex().gap_2().child(div().flex_1().min_w_0().debug_selector(|| "quick-add-input".to_owned()).child(self.input.clone())).children(
                 self.shown_add_due().map(|(date, time)| {
                     let (label, _) = task_rows::due_label(date, time, Self::today(), strings);
                     let label = match self.add_draft.end.filter(|_| self.quick_add_due.is_none()) {
@@ -1876,7 +1876,7 @@ impl TodoView {
             .map(|(id, name)| {
                 let selected = draft.list.unwrap_or(None) == id && (draft.list.is_some() || id.is_none());
                 ListItem::new(SharedString::from(format!("add-list-{}", id.map_or("inbox".to_owned(), |i| i.to_string()))))
-                    .child(Label::new(name).color(if selected { Color::Accent } else { Color::Default }))
+                    .child(Label::new(name).color(if selected { Color::Accent } else { Color::Default }).truncate())
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.add_draft.list = Some(id);
                         this.add_menu_open = false;
@@ -1999,7 +1999,7 @@ impl TodoView {
             let ticked = picked.iter().any(|t| t.to_lowercase() == name.to_lowercase());
             ListItem::new(SharedString::from(format!("add-tag-{name}")))
                 .start_slot(Icon::new(IconName::Tag).color(Color::Muted))
-                .child(Label::new(name.clone()))
+                .child(Label::new(name.clone()).truncate())
                 .when(ticked, |item| item.end_slot(Icon::new(IconName::Check).size(IconSize::Small).color(Color::Accent)))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     if let Some(picked) = this.add_tags.as_mut() {
@@ -2418,10 +2418,10 @@ impl TodoView {
             .gap_2()
             .map(|el| match renaming {
                 Some(input) => el.child(
-                    h_flex().flex_1().h(px(28.)).px_2().rounded(px(6.)).bg(cx.theme().colors().surface_background).child(input),
+                    h_flex().flex_1().min_w_0().h(px(28.)).px_2().rounded(px(6.)).bg(cx.theme().colors().surface_background).child(input),
                 ),
                 None => el
-                    .child(Label::new(label).weight(FontWeight::BOLD))
+                    .child(Label::new(label).weight(FontWeight::BOLD).truncate())
                     .child(Label::new(count.to_string()).size(LabelSize::Small).color(Color::Muted)),
             })
             .when_some(section, |el, id| {
@@ -3033,9 +3033,9 @@ impl TodoView {
             .h(px(30.))
             .gap_1()
             .map(|el| match renaming {
-                Some(input) => el.child(div().flex_1().child(input)),
+                Some(input) => el.child(div().flex_1().min_w_0().child(input)),
                 None => el
-                    .child(Label::new(title).weight(FontWeight::SEMIBOLD))
+                    .child(Label::new(title).weight(FontWeight::SEMIBOLD).truncate())
                     .child(Label::new(count.to_string()).size(LabelSize::Small).color(Color::Muted))
                     .child(div().flex_1()),
             })
@@ -4625,7 +4625,7 @@ impl TodoView {
                         el.child(Icon::new(IconName::Pin).size(IconSize::XSmall).color(Color::Accent))
                     })
                     .child(
-                        v_flex().flex_1().min_w_0().child(if let Some(input) = title_input {
+                        v_flex().flex_1().min_w_0().debug_selector(|| format!("task-title-field-{id}")).child(if let Some(input) = title_input {
                             input.into_any_element()
                         } else {
                             div().id("task-title").child(Label::new(if task.title.is_empty() {
@@ -5741,7 +5741,7 @@ impl Render for TodoView {
                         window.focus(&input_focus, cx);
                     })
                     .child(Icon::new(IconName::Plus))
-                    .child(div().flex_1().min_w_0().child(self.input.clone()))
+                    .child(div().flex_1().min_w_0().debug_selector(|| "quick-add-input".to_owned()).child(self.input.clone()))
                     .children(self.shown_add_due().map(|(date, time)| {
                         let (label, _) = task_rows::due_label(date, time, Self::today(), strings);
                         // A picked duration shows its span, as the original's "Today, 22:00 - 23:00".
@@ -6059,7 +6059,92 @@ enum ListEntry {
 #[cfg(all(test, debug_assertions))]
 mod tests {
     use super::*;
-    use gpui::{Modifiers, TestAppContext, point};
+    use gpui::{EntityInputHandler, Modifiers, TestAppContext, point};
+
+    #[gpui::test]
+    fn long_quick_add_keeps_the_caret_inside_both_input_layouts(cx: &mut TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        cx.update(|cx| {
+            theme::init(cx);
+            cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+            crate::keymap::load_default(&assets::Assets, cx).unwrap();
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| TodoView::new(store.clone(), window, cx));
+        let title = format!("{}конец", "Длинное название 日本語 🧑‍💻 ".repeat(80));
+        for detailed in [false, true] {
+            cx.update(|window, cx| view.update(cx, |view, cx| {
+                view.preferences.detailed_input = detailed;
+                window.focus(&view.input.focus_handle(cx), cx);
+                cx.notify();
+            }));
+            cx.simulate_resize(gpui::size(px(540.), px(480.)));
+            let empty_bounds = cx.debug_bounds("quick-add-input").unwrap();
+            cx.simulate_input(&title);
+            cx.run_until_parked();
+            assert_eq!(cx.debug_bounds("quick-add-input").unwrap(), empty_bounds);
+            for width in [540., 340.] {
+                cx.simulate_resize(gpui::size(px(width), px(480.)));
+                let field = cx.debug_bounds("quick-add-input").unwrap();
+                let end = title.encode_utf16().count();
+                for (key, offset) in [("home", 0), ("end", end)] {
+                    cx.simulate_keystrokes(key);
+                    cx.run_until_parked();
+                    cx.update(|window, cx| {
+                        let input = view.read(cx).input.clone();
+                        let caret = input.update(cx, |input, cx| {
+                            input.bounds_for_range(offset..offset, gpui::Bounds::default(), window, cx).unwrap()
+                        });
+                        assert!(caret.left() >= field.left() && caret.right() <= field.right(), "{detailed}: {caret:?} outside {field:?}");
+                    });
+                }
+            }
+            cx.simulate_keystrokes("enter");
+            cx.update(|_, cx| assert!(view.read(cx).input.read(cx).text().is_empty()));
+        }
+        let tasks = store.tasks().unwrap();
+        assert_eq!(tasks.len(), 2);
+        assert!(tasks.iter().all(|task| task.title == title));
+    }
+
+    #[gpui::test]
+    fn long_inline_title_stays_inside_its_column_and_saves_in_full(cx: &mut TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let title = "Long task title 日本語 🧑‍💻 ".repeat(80).trim().to_owned();
+        let task = store.add_task(&title).unwrap();
+        store.set_completed(task.id, true).unwrap();
+        cx.update(|cx| {
+            theme::init(cx);
+            cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+            crate::keymap::load_default(&assets::Assets, cx).unwrap();
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let mut view = TodoView::new(store.clone(), window, cx);
+            view.set_view(View::Completed, cx);
+            view
+        });
+        cx.simulate_resize(gpui::size(px(900.), px(480.)));
+        let selector = format!("task-title-field-{}", task.id).leak();
+        let original_field = cx.debug_bounds(selector).unwrap();
+        assert!(original_field.size.width > px(50.));
+        cx.update(|window, cx| view.update(cx, |view, cx| view.start_title_edit(task.id, window, cx)));
+        cx.run_until_parked();
+        let field = cx.debug_bounds(selector).unwrap();
+        assert_eq!(field.left(), original_field.left());
+        assert_eq!(field.right(), original_field.right());
+        cx.simulate_input("!");
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let (_, input, _) = view.read(cx).title_edit.as_ref().unwrap();
+            let input = input.clone();
+            let end = title.encode_utf16().count() + 1;
+            let caret = input.update(cx, |input, cx| {
+                input.bounds_for_range(end..end, gpui::Bounds::default(), window, cx).unwrap()
+            });
+            assert!(caret.left() >= original_field.left() && caret.right() <= original_field.right(), "{caret:?} outside {original_field:?}");
+        });
+        cx.simulate_keystrokes("enter");
+        assert_eq!(store.task(task.id).unwrap().unwrap().title, format!("{title}!"));
+    }
 
     #[gpui::test]
     fn completion_stays_in_place_until_the_check_settles(cx: &mut TestAppContext) {

@@ -754,7 +754,7 @@ impl MatrixView {
                             .font_weight(FontWeight::BOLD)
                             .child(numeral),
                     )
-                    .child(div().flex_1().child(Label::new(title).weight(FontWeight::SEMIBOLD).color(Color::Custom(color))))
+                    .child(div().flex_1().min_w_0().child(Label::new(title).weight(FontWeight::SEMIBOLD).color(Color::Custom(color)).truncate()))
                     // The original's "+" on a hovered header: a new task for this quadrant.
                     .child(
                         div()
@@ -821,7 +821,7 @@ impl MatrixView {
                             .border_1()
                             .border_color(color)
                             .child(Icon::new(IconName::Plus).size(IconSize::Small).color(Color::Muted))
-                            .child(div().flex_1().child(input.clone()))
+                            .child(div().flex_1().min_w_0().debug_selector(|| format!("matrix-add-input-{quadrant}")).child(input.clone()))
                     }))
                     .when(empty && self.adding.as_ref().is_none_or(|(q, _)| *q != quadrant), |el| {
                         el.items_center()
@@ -926,8 +926,46 @@ impl Render for MatrixView {
 #[cfg(test)]
 mod tests {
     use fern_core::Store;
+    use gpui::EntityInputHandler;
 
     use super::*;
+
+    #[gpui::test]
+    fn long_quadrant_input_stays_visible_and_saves_in_full(cx: &mut gpui::TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        cx.update(|cx| {
+            theme::init(cx);
+            crate::keymap::load_default(&assets::Assets, cx).unwrap();
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let mut view = MatrixView::new(store.clone(), cx);
+            view.start_add(0, window, cx);
+            view
+        });
+        cx.simulate_resize(gpui::size(px(700.), px(500.)));
+        let empty_field = cx.debug_bounds("matrix-add-input-0").unwrap();
+        let title = format!("{}конец", "ДлинноеНазвание日本語🧑‍💻".repeat(100));
+        cx.simulate_input(&title);
+        cx.run_until_parked();
+        assert_eq!(cx.debug_bounds("matrix-add-input-0").unwrap(), empty_field);
+        for width in [700., 480.] {
+            cx.simulate_resize(gpui::size(px(width), px(500.)));
+            let field = cx.debug_bounds("matrix-add-input-0").unwrap();
+            cx.update(|window, cx| {
+                let input = view.read(cx).adding.as_ref().unwrap().1.clone();
+                let end = title.encode_utf16().count();
+                let caret = input.update(cx, |input, cx| {
+                    input.bounds_for_range(end..end, gpui::Bounds::default(), window, cx).unwrap()
+                });
+                assert!(caret.left() >= field.left() && caret.right() <= field.right(), "{caret:?} outside {field:?}");
+            });
+        }
+        cx.simulate_keystrokes("enter");
+        let tasks = store.tasks().unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].title, title);
+        cx.update(|_, cx| assert!(view.read(cx).adding.as_ref().unwrap().1.read(cx).text().is_empty()));
+    }
 
     #[gpui::test]
     fn quadrant_quick_add_saves_recognized_tags(cx: &mut gpui::TestAppContext) {

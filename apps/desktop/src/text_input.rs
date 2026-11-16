@@ -5,7 +5,7 @@
 use std::ops::Range;
 
 use gpui::{
-    App, AvailableSpace, Bounds, ClipboardItem, Context, CursorStyle, ElementId,
+    App, AvailableSpace, Bounds, ClipboardItem, ContentMask, Context, CursorStyle, ElementId,
     ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable,
     GlobalElementId, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, PaintQuad, Pixels, Point, SharedString, Style, Subscription, TextRun,
@@ -102,6 +102,8 @@ struct TextLayout {
     paragraphs: Vec<Paragraph>,
     line_height: Pixels,
     bounds: Bounds<Pixels>,
+    /// Horizontal viewport position. Text coordinates remain independent of scrolling.
+    scroll_left: Pixels,
     /// The layout is of the placeholder, so its positions do not map to the text.
     is_placeholder: bool,
 }
@@ -113,9 +115,13 @@ struct Paragraph {
 }
 
 impl TextLayout {
-    /// The caret position for a byte offset, relative to the input's top-left corner.
+    fn origin(&self) -> Point<Pixels> {
+        self.bounds.origin - point(self.scroll_left, px(0.))
+    }
+
+    /// The caret position for a byte offset in unscrolled text coordinates.
     fn position_for_offset(&self, offset: usize) -> Point<Pixels> {
-        if self.is_placeholder {
+        if self.is_placeholder || self.paragraphs.is_empty() {
             return point(px(0.), px(0.));
         }
         let paragraph = self
@@ -132,9 +138,9 @@ impl TextLayout {
         point(position.x, position.y + paragraph.top)
     }
 
-    /// The closest offset for a point relative to the input's top-left corner.
+    /// The closest offset for a point in unscrolled text coordinates.
     fn offset_for_position(&self, position: Point<Pixels>) -> usize {
-        if self.is_placeholder {
+        if self.is_placeholder || self.paragraphs.is_empty() {
             return 0;
         }
         let paragraph = self
@@ -452,7 +458,7 @@ impl TextInput {
         if target_y >= total_height {
             return self.content.len();
         }
-        layout.offset_for_position(point(position.x, target_y))
+        self.offset_for_text_position(layout, point(position.x, target_y))
     }
 
     /// The start or end of the visual line the caret is on.
@@ -463,7 +469,7 @@ impl TextInput {
         };
         let y = layout.position_for_offset(cursor).y + layout.line_height * 0.5;
         let x = if end { px(f32::MAX / 4.) } else { px(0.) };
-        layout.offset_for_position(point(x, y))
+        self.offset_for_text_position(layout, point(x, y))
     }
 
     fn index_for_mouse_position(&self, position: Point<Pixels>) -> usize {
@@ -476,7 +482,22 @@ impl TextInput {
         if position.y > layout.bounds.bottom() {
             return self.content.len();
         }
-        layout.offset_for_position(position - layout.bounds.origin)
+        self.offset_for_text_position(layout, position - layout.origin())
+    }
+
+    fn offset_for_text_position(&self, layout: &TextLayout, position: Point<Pixels>) -> usize {
+        let offset = layout.offset_for_position(position);
+        if self.masked {
+            // Each mask glyph represents a byte, but editing must never split the
+            // original UTF-8 character or an emoji/combining-character sequence.
+            self.content.grapheme_indices(true)
+                .map(|(index, _)| index)
+                .chain(std::iter::once(self.content.len()))
+                .min_by_key(|index| index.abs_diff(offset))
+                .unwrap_or(0)
+        } else {
+            offset
+        }
     }
 
     fn select_to(&mut self, offset: usize, window: &Window, cx: &mut Context<Self>) {
@@ -682,7 +703,7 @@ impl EntityInputHandler for TextInput {
         let range = self.range_from_utf16(&range_utf16);
         let start = layout.position_for_offset(range.start);
         let end = layout.position_for_offset(range.end);
-        let origin = layout.bounds.origin;
+        let origin = layout.origin();
         Some(Bounds::from_corners(
             origin + start,
             origin + point(end.x, end.y + layout.line_height),
@@ -708,8 +729,8 @@ impl EntityInputHandler for TextInput {
         _cx: &mut Context<Self>,
     ) -> Option<usize> {
         let layout = self.last_layout.as_ref()?;
-        let local = layout.bounds.localize(&point)?;
-        Some(self.offset_to_utf16(layout.offset_for_position(local)))
+        layout.bounds.localize(&point)?;
+        Some(self.offset_to_utf16(self.offset_for_text_position(layout, point - layout.origin())))
     }
 }
 
@@ -723,6 +744,12 @@ struct PrepaintState {
     selection: Vec<PaintQuad>,
     /// Tinted backgrounds under the highlighted ranges.
     highlights: Vec<PaintQuad>,
+}
+
+const CARET_WIDTH: Pixels = px(2.);
+
+fn text_width(width: Pixels) -> Pixels {
+    (width - CARET_WIDTH).max(px(0.))
 }
 
 impl IntoElement for TextElement {
@@ -835,6 +862,7 @@ impl Element for TextElement {
     ) -> (LayoutId, Self::RequestLayoutState) {
         let mut style = Style::default();
         style.size.width = relative(1.).into();
+        style.min_size.width = px(0.).into();
         let line_height = window.line_height();
         let placeholder_color = cx.theme().colors().text_placeholder;
         let input = self.input.read(cx);
@@ -851,7 +879,7 @@ impl Element for TextElement {
                 AvailableSpace::Definite(width) => Some(width),
                 _ => None,
             });
-            let lines = shape(text.clone(), &runs, font_size, width, window);
+            let lines = shape(text.clone(), &runs, font_size, width.map(text_width), window);
             let height = lines
                 .iter()
                 .map(|line| line.size(line_height).height)
@@ -877,7 +905,7 @@ impl Element for TextElement {
         let (text, runs, is_placeholder) =
             display_runs(input, window, theme.colors().text_placeholder, theme.colors().accent);
         let font_size = window.text_style().font_size.to_pixels(window.rem_size());
-        let wrap_width = input.mode.wraps().then_some(bounds.size.width);
+        let wrap_width = input.mode.wraps().then_some(text_width(bounds.size.width));
         let lines = shape(text, &runs, font_size, wrap_width, window);
 
         let mut paragraphs = Vec::with_capacity(lines.len());
@@ -889,7 +917,31 @@ impl Element for TextElement {
             start += len + 1;
             top += height;
         }
-        let layout = TextLayout { paragraphs, line_height, bounds, is_placeholder };
+        let mut layout = TextLayout {
+            paragraphs,
+            line_height,
+            bounds,
+            scroll_left: px(0.),
+            is_placeholder,
+        };
+        if !input.mode.wraps() && !is_placeholder {
+            let viewport_width = text_width(bounds.size.width);
+            let content_width = layout.paragraphs.iter()
+                .map(|paragraph| paragraph.line.width())
+                .fold(px(0.), Pixels::max);
+            let max_scroll = (content_width - viewport_width).max(px(0.));
+            layout.scroll_left = input.last_layout.as_ref()
+                .map_or(px(0.), |layout| layout.scroll_left)
+                .min(max_scroll);
+            if input.focus_handle.is_focused(window) || input.is_selecting {
+                let caret_x = layout.position_for_offset(input.cursor_offset()).x;
+                layout.scroll_left = layout.scroll_left
+                    .max(caret_x - viewport_width)
+                    .min(caret_x)
+                    .clamp(px(0.), max_scroll);
+            }
+        }
+        let origin = layout.origin();
 
         let selected_range = input.selected_range.clone();
         let mut selection = Vec::new();
@@ -897,7 +949,7 @@ impl Element for TextElement {
         if selected_range.is_empty() {
             let position = layout.position_for_offset(input.cursor_offset());
             cursor = Some(fill(
-                Bounds::new(bounds.origin + position, size(px(2.), line_height)),
+                Bounds::new(origin + position, size(CARET_WIDTH, line_height)),
                 theme.colors().accent,
             ));
         } else {
@@ -906,8 +958,8 @@ impl Element for TextElement {
             let rect = |from: Point<Pixels>, to_x: Pixels| {
                 fill(
                     Bounds::from_corners(
-                        bounds.origin + from,
-                        bounds.origin + point(to_x, from.y + line_height),
+                        origin + from,
+                        origin + point(to_x, from.y + line_height),
                     ),
                     theme.colors().text_selection,
                 )
@@ -938,8 +990,8 @@ impl Element for TextElement {
                     (start.y == end.y).then(|| {
                         fill(
                             Bounds::from_corners(
-                                bounds.origin + point(start.x - px(3.), start.y + px(1.)),
-                                bounds.origin + point(end.x + px(3.), end.y + line_height - px(1.)),
+                                origin + point(start.x - px(3.), start.y + px(1.)),
+                                origin + point(end.x + px(3.), end.y + line_height - px(1.)),
                             ),
                             theme.colors().accent.opacity(0.18),
                         )
@@ -968,32 +1020,36 @@ impl Element for TextElement {
             ElementInputHandler::new(bounds, self.input.clone()),
             cx,
         );
-        for quad in prepaint.highlights.drain(..) {
-            window.paint_quad(quad);
-        }
-        for quad in prepaint.selection.drain(..) {
-            window.paint_quad(quad);
-        }
         let layout = prepaint.layout.take().unwrap();
-        for paragraph in &layout.paragraphs {
-            paragraph
-                .line
-                .paint(
-                    bounds.origin + point(px(0.), paragraph.top),
-                    layout.line_height,
-                    gpui::TextAlign::Left,
-                    Some(bounds),
-                    window,
-                    cx,
-                )
-                .ok();
-        }
+        // WrappedLine's bounds control alignment, not clipping. Keep every text layer
+        // inside the field, independently of whether its parent also clips overflow.
+        window.with_content_mask(Some(ContentMask { bounds }), |window| {
+            for quad in prepaint.highlights.drain(..) {
+                window.paint_quad(quad);
+            }
+            for quad in prepaint.selection.drain(..) {
+                window.paint_quad(quad);
+            }
+            for paragraph in &layout.paragraphs {
+                paragraph
+                    .line
+                    .paint(
+                        layout.origin() + point(px(0.), paragraph.top),
+                        layout.line_height,
+                        gpui::TextAlign::Left,
+                        Some(bounds),
+                        window,
+                        cx,
+                    )
+                    .ok();
+            }
 
-        if focus_handle.is_focused(window)
-            && let Some(cursor) = prepaint.cursor.take()
-        {
-            window.paint_quad(cursor);
-        }
+            if focus_handle.is_focused(window)
+                && let Some(cursor) = prepaint.cursor.take()
+            {
+                window.paint_quad(cursor);
+            }
+        });
 
         self.input.update(cx, |input, _cx| {
             input.last_layout = Some(layout);
@@ -1006,6 +1062,7 @@ impl Render for TextInput {
         div()
             .flex()
             .w_full()
+            .min_w_0()
             .key_context("TextInput")
             .track_focus(&self.focus_handle(cx))
             .cursor(CursorStyle::IBeam)
@@ -1049,12 +1106,5 @@ impl Focusable for TextInput {
 }
 
 #[cfg(test)]
-mod tests {
-    #[test]
-    fn masked_text_keeps_offsets() {
-        let text = "s3cret-é";
-        let masked = super::masked_text(text);
-        assert_eq!(masked.len(), text.len());
-        assert!(masked.chars().all(|c| c == '*'));
-    }
-}
+#[path = "text_input/tests.rs"]
+mod tests;

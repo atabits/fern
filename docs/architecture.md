@@ -57,6 +57,13 @@ Not synced: settings (so saved view choices stay per device), task activity, hab
 - Icons are referenced by `IconName`, never by path. A new icon is a new SVG in `assets/icons`
   (snake_case file name) plus a variant; a test checks that every variant has a file.
 - User-visible strings come from `apps/desktop/src/i18n.rs`.
+- Editable text uses the shared `TextInput`. The component clips text, selection and the
+  caret to its viewport; single-line fields scroll to the caret, and wrapped fields grow
+  vertically. Mouse and IME coordinates must use the same viewport offset as painting.
+  Flex layouts must give fields a bounded, shrinkable width (`flex_1().min_w_0()`) and
+  reserve room for adjacent controls. Display labels in bounded rows use `truncate()`;
+  clipping must not change the stored text or impose a length limit. Changes to these
+  contracts need regression coverage with long text, Unicode and a narrow viewport.
 - Actions are declared with `actions!` (`apps/desktop/src/actions.rs`) and handled with
   `on_action` inside a key context (`Workspace`, `TaskList`, `TextInput`). Key bindings are data in
   `assets/keymaps/default.json`, in Zed's keymap format; a test loads it and fails on unknown

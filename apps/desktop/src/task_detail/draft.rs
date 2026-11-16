@@ -564,7 +564,7 @@ mod tests {
             store.tasks().unwrap().is_empty(),
             "Escape closes the nested picker first"
         );
-        cx.simulate_keystrokes("ctrl-enter");
+        cx.simulate_keystrokes(if cfg!(target_os = "macos") { "cmd-enter" } else { "ctrl-enter" });
         let tasks = store.tasks().unwrap();
         assert_eq!(tasks.len(), 1);
         let task = &tasks[0];

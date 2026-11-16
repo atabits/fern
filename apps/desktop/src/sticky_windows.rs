@@ -3,6 +3,10 @@ use fern_core::{Id, Store};
 use gpui::{App, Bounds, Pixels, point, px, size};
 use serde::{Deserialize, Serialize};
 
+pub const MIN_WIDTH: f32 = 240.;
+pub const MIN_EXPANDED_HEIGHT: f32 = 200.;
+pub const COMPACT_HEIGHT: f32 = 24.;
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct NoteWindow {
     pub task: Id,
@@ -14,25 +18,32 @@ pub struct NoteWindow {
     pub height: f32,
     #[serde(default)]
     pub color: Option<usize>,
+    #[serde(default)]
+    pub compact: bool,
 }
 
 impl NoteWindow {
     pub fn capture(task: Id, pinned: bool, bounds: Bounds<Pixels>) -> Self {
         Self { task, open: true, pinned, x: bounds.origin.x.into(), y: bounds.origin.y.into(),
-            width: bounds.size.width.into(), height: bounds.size.height.into(), color: None }
+            width: bounds.size.width.into(), height: bounds.size.height.into(), color: None, compact: false }
+    }
+
+    pub fn expanded_height(&self) -> Pixels {
+        px(if self.height.is_finite() { self.height.clamp(MIN_EXPANDED_HEIGHT, 4096.) } else { 360. })
     }
 
     pub fn bounds(&self, cx: &App) -> Bounds<Pixels> {
-        let width = if self.width.is_finite() { self.width.clamp(240., 4096.) } else { 320. };
-        let height = if self.height.is_finite() { self.height.clamp(200., 4096.) } else { 360. };
-        let candidate = Bounds::new(point(px(self.x), px(self.y)), size(px(width), px(height)));
+        let width = px(if self.width.is_finite() { self.width.clamp(MIN_WIDTH, 4096.) } else { 320. });
+        let height = if self.compact { px(COMPACT_HEIGHT) } else { self.expanded_height() };
+        let size = size(width, height);
+        let candidate = Bounds::new(point(px(self.x), px(self.y)), size);
         // Keep the entire drag strip reachable after unplugging a monitor or changing scaling.
         if self.x.is_finite() && self.y.is_finite() && cx.displays().iter().any(|display| {
             let screen = display.bounds();
             candidate.origin.x >= screen.origin.x && candidate.origin.y >= screen.origin.y
                 && candidate.origin.x + px(120.) <= screen.right()
-                && candidate.origin.y + px(28.) <= screen.bottom()
-        }) { candidate } else { Bounds::centered(None, size(px(width), px(height)), cx) }
+                && candidate.origin.y + px(COMPACT_HEIGHT) <= screen.bottom()
+        }) { candidate } else { Bounds::centered(None, size, cx) }
     }
 }
 

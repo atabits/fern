@@ -1,3 +1,5 @@
+use std::{cell::Cell, rc::Rc};
+
 use gpui::{
     AnyElement, App, ElementId, InteractiveElement, IntoElement, ParentElement, RenderOnce,
     StatefulInteractiveElement,
@@ -21,6 +23,7 @@ pub struct SubmenuItem {
     on_hover: Option<HoverHandler>,
     items: Vec<AnyElement>,
     height: Option<gpui::Pixels>,
+    bounds: Option<Rc<Cell<Option<gpui::Bounds<gpui::Pixels>>>>>,
 }
 
 impl SubmenuItem {
@@ -34,6 +37,7 @@ impl SubmenuItem {
             on_hover: None,
             items: Vec::new(),
             height: None,
+            bounds: None,
         }
     }
 
@@ -65,6 +69,12 @@ impl SubmenuItem {
         self
     }
 
+    /// Lets the parent menu include this deferred surface in its outside-click check.
+    pub fn track_bounds(mut self, bounds: Rc<Cell<Option<gpui::Bounds<gpui::Pixels>>>>) -> Self {
+        self.bounds = Some(bounds);
+        self
+    }
+
     pub fn items(mut self, items: impl IntoIterator<Item = impl IntoElement>) -> Self {
         self.items.extend(items.into_iter().map(IntoElement::into_any_element));
         self
@@ -73,15 +83,26 @@ impl SubmenuItem {
 
 impl RenderOnce for SubmenuItem {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let debug_selector = format!("submenu-{}", self.id);
         let item = ListItem::new(self.id.clone())
             .toggle_state(self.open)
             .when_some(self.icon, |item, icon| item.start_slot(Icon::new(icon).color(Color::Muted)))
             .child(Label::new(self.label))
             .end_slot(Icon::new(IconName::ChevronRight).size(IconSize::Small).color(Color::Muted))
             .when_some(self.height, |item, height| item.height(height));
-        let menu = self.open.then(|| PopoverAttachment::new(self.placement, popover(cx).min_w(gpui::px(180.)).children(self.items)));
+        let menu_selector = format!("submenu-content-{}", self.id);
+        let menu = self.open.then(|| PopoverAttachment::new(self.placement, popover(cx)
+            .debug_selector(move || menu_selector.clone())
+            .relative()
+            .min_w(gpui::px(180.))
+            .children(self.items)
+            .when_some(self.bounds, |menu, bounds| menu.child(
+                gpui::canvas(move |area, _, _| bounds.set(Some(area)), |_, _, _, _| {})
+                    .absolute().inset_0(),
+            ))));
         div()
             .id(self.id)
+            .debug_selector(move || debug_selector.clone())
             .relative()
             .when_some(self.on_hover, |el, handler| el.on_hover(handler))
             .child(item)

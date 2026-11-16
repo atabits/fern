@@ -18,6 +18,7 @@ pub struct IconButton {
     icon_color: Color,
     size: Pixels,
     selected: bool,
+    hover_color: Option<gpui::Hsla>,
     on_click: Option<ClickHandler>,
     tooltip: Option<Box<dyn Fn(&mut Window, &mut App) -> AnyView + 'static>>,
     tip: Option<(gpui::SharedString, crate::TipSide)>,
@@ -32,6 +33,7 @@ impl IconButton {
             icon_color: Color::Muted,
             size: px(26.),
             selected: false,
+            hover_color: None,
             on_click: None,
             tooltip: None,
             tip: None,
@@ -45,6 +47,12 @@ impl IconButton {
 
     pub fn icon_color(mut self, color: impl Into<Color>) -> Self {
         self.icon_color = color.into();
+        self
+    }
+
+    /// A hover tint for buttons drawn on a surface with its own palette.
+    pub fn hover_color(mut self, color: gpui::Hsla) -> Self {
+        self.hover_color = Some(color);
         self
     }
 
@@ -86,6 +94,7 @@ impl RenderOnce for IconButton {
         let colors = cx.theme().colors();
         let icon_color = if self.selected { Color::Default } else { self.icon_color };
         let tip = self.tip;
+        let hover_color = self.hover_color.unwrap_or(colors.element_hover);
         let tip_key = gpui::ElementId::NamedChild(std::sync::Arc::new(self.id.clone()), "tip".into());
         let button = div()
             .id(self.id)
@@ -97,7 +106,7 @@ impl RenderOnce for IconButton {
             .rounded(px(6.))
             .cursor_pointer()
             .when(self.selected, |el| el.bg(colors.element_selected))
-            .hover(|style| style.bg(colors.element_hover))
+            .hover(|style| style.bg(hover_color))
             .when_some(self.on_click, |el, handler| el.on_click(handler))
             .when_some(self.tooltip, |el, tooltip| el.tooltip(tooltip))
             .child(Icon::new(self.icon).size(self.icon_size).color(icon_color));

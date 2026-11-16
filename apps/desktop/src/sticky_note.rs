@@ -5,14 +5,18 @@
 use std::rc::Rc;
 
 use fern_core::{Id, Store};
-use gpui::{App, Bounds, Entity, EntityId, Global, MouseButton, TitlebarOptions, WindowBounds, WindowControlArea, WindowDecorations, WindowHandle, WindowOptions, size};
+use gpui::{App, Bounds, Entity, EntityId, FocusHandle, FontWeight, Global, MouseButton, Pixels, TitlebarOptions, WindowBounds, WindowControlArea, WindowDecorations, WindowHandle, WindowKind, WindowOptions, point, size};
 use ui::prelude::*;
-use ui::{Placement, PopoverAttachment};
 
+use crate::actions::DismissTransient;
 use crate::i18n;
 use crate::sticky_settings::{PALETTE, StickySettings};
 use crate::task_detail::{OpenTask, TaskDetail, TaskUpdated};
-use crate::sticky_windows::{self, NoteWindow};
+use crate::sticky_windows::{self, COMPACT_HEIGHT, MIN_EXPANDED_HEIGHT, MIN_WIDTH, NoteWindow};
+
+mod popup;
+#[cfg(windows)]
+mod sizing;
 
 #[derive(Default)]
 struct OpenNotes(Vec<WindowHandle<StickyNote>>);
@@ -51,8 +55,8 @@ pub fn changed_elsewhere(observer: EntityId, cx: &App) -> bool {
 }
 
 /// The note's size when it opens.
-const WIDTH: f32 = 320.;
-const HEIGHT: f32 = 360.;
+const WIDTH: f32 = 240.;
+const HEIGHT: f32 = 212.;
 
 fn activate_existing(id: Id, cx: &mut App) -> bool {
     let handles = cx.default_global::<OpenNotes>().0.clone();
@@ -77,18 +81,19 @@ pub fn open(store: Rc<Store>, id: Id, cx: &mut App) {
     let bounds = saved.as_ref().map(|note| note.bounds(cx))
         .unwrap_or_else(|| Bounds::centered(None, size(px(WIDTH), px(HEIGHT)), cx));
     let pinned = saved.as_ref().map(|note| note.pinned).unwrap_or_else(|| StickySettings::load(&store).pin_default);
-    let color = saved.and_then(|note| note.color).filter(|color| *color < PALETTE.len());
+    let color = saved.as_ref().and_then(|note| note.color).filter(|color| *color < PALETTE.len());
+    let compact = saved.as_ref().filter(|note| note.compact).map(NoteWindow::expanded_height);
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
         titlebar: Some(TitlebarOptions { title: Some(title.into()), appears_transparent: true, traffic_light_position: None }),
         window_decorations: Some(WindowDecorations::Client),
         app_owns_titlebar_drag: true,
-        window_min_size: Some(size(px(240.), px(200.))),
+        window_min_size: Some(size(px(MIN_WIDTH), px(COMPACT_HEIGHT))),
         app_id: Some(std::env::var("FERN_APP_ID").unwrap_or_else(|_| "fern-tasks".into())),
         ..Default::default()
     };
     match cx.open_window(options, |window, cx| {
-        cx.new(|cx| StickyNote::new(store, id, pinned, color, window, cx))
+        cx.new(|cx| StickyNote::new(store, id, pinned, color, compact, window, cx))
     }) {
         Ok(handle) => {
             let live = cx.default_global::<OpenNotes>().0.clone().into_iter().filter(|h| h.read(cx).is_ok()).collect();
@@ -109,11 +114,23 @@ pub struct StickyNote {
     settings: StickySettings,
     saved_task: Option<Id>,
     color: Option<usize>,
-    palette_open: bool,
+    palette: Option<WindowHandle<StickyPalette>>,
+    detail_popup: Option<WindowHandle<popup::DetailPopup>>,
+    compact: bool,
+    expanded_height: Pixels,
+    last_bounds: Bounds<Pixels>,
 }
 
 impl StickyNote {
-    fn new(store: Rc<Store>, id: Id, pinned: bool, color: Option<usize>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(
+        store: Rc<Store>,
+        id: Id,
+        pinned: bool,
+        color: Option<usize>,
+        compact_height: Option<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let detail = cx.new(|cx| {
             let mut detail = TaskDetail::new(store.clone(), window, cx);
             detail.set_card(false);
@@ -134,26 +151,147 @@ impl StickyNote {
             }
         })
         .detach();
+        cx.observe_in(&detail, window, |this, _, _, cx| {
+            this.sync_detail_popup(cx);
+        }).detach();
         let settings = StickySettings::load(&store);
         #[cfg(windows)]
-        set_topmost(window, pinned);
-        cx.observe_window_bounds(window, |this, window, cx| this.remember(window, cx)).detach();
+        {
+            sizing::set_compact(window, compact_height.is_some());
+            set_topmost(window, pinned);
+        }
+        cx.observe_window_bounds(window, |this, window, cx| this.bounds_changed(window, cx)).detach();
         let weak = cx.weak_entity();
         window.on_window_should_close(cx, move |_, cx| {
             weak.update(cx, |this, cx| this.forget(cx)).ok();
             true
         });
-        let mut this = Self { store, detail, should_move: false, pinned, settings, saved_task: None, color, palette_open: false };
+        let mut this = Self {
+            store, detail, should_move: false, pinned, settings, saved_task: None, color,
+            palette: None, detail_popup: None,
+            compact: compact_height.is_some(),
+            expanded_height: compact_height.unwrap_or_else(|| window.viewport_size().height.max(px(MIN_EXPANDED_HEIGHT))),
+            last_bounds: window.bounds(),
+        };
         this.show(id, cx);
         this.refresh(cx);
         this.remember(window, cx);
         this
     }
 
+    fn bounds_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let bounds = window.bounds();
+        // Windows also emits this notification when an owned popup changes the z-order.
+        // Only an actual move or resize invalidates its anchor.
+        if self.last_bounds == bounds { return; }
+        self.last_bounds = bounds;
+        self.dismiss_transients(window, cx);
+        let viewport = window.viewport_size();
+        if !self.compact {
+            // Windows enforces this before resizing, through WM_GETMINMAXINFO.
+            // The other backends do not expose a mutable native minimum yet.
+            #[cfg(not(windows))]
+            if viewport.height < px(MIN_EXPANDED_HEIGHT) {
+                window.resize(size(viewport.width, self.expanded_height));
+                return;
+            }
+            self.expanded_height = viewport.height.max(px(MIN_EXPANDED_HEIGHT));
+        }
+        self.remember(window, cx);
+    }
+
+    fn toggle_compact(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.compact = !self.compact;
+        self.should_move = false;
+        self.dismiss_transients(window, cx);
+        #[cfg(windows)]
+        sizing::set_compact(window, self.compact);
+        let height = if self.compact { px(COMPACT_HEIGHT) } else { self.expanded_height };
+        window.resize(size(window.viewport_size().width, height));
+        self.remember(window, cx);
+        cx.notify();
+    }
+
+    fn close_palette(&mut self, cx: &mut App) -> bool {
+        self.palette.take().is_some_and(|palette| {
+            palette.update(cx, |_, window, _| window.remove_window()).is_ok()
+        })
+    }
+
+    fn toggle_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.close_palette(cx) {
+            return;
+        }
+        self.dismiss_transients(window, cx);
+        let Some(note) = window.window_handle().downcast::<Self>() else { return };
+        #[cfg(windows)]
+        let owner = win32_window_handle(window);
+        let note_bounds = window.bounds();
+        let popup_size = size(px(288.), px(102.));
+        let anchor = popup::Anchor {
+            point: point(note_bounds.right(), note_bounds.top() + px(COMPACT_HEIGHT)),
+            above: false, right: true, screen: popup::screen(window, cx),
+        };
+        match popup::open(window, anchor, popup_size, true, |_, window, cx| {
+            window.set_window_title(i18n::t(cx).color);
+            #[cfg(windows)]
+            popup::attach(owner, window, false);
+            cx.new(|cx| StickyPalette::new(note, self.settings.color, self.pinned, window, cx))
+        }, cx) {
+            Ok(palette) => self.palette = Some(palette),
+            Err(err) => eprintln!("failed to open sticky note colors: {err:#}"),
+        }
+    }
+
+    fn dismiss_transients(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_palette(cx);
+        if let Some(popup) = self.detail_popup.take() {
+            popup.update(cx, |_, window, _| window.remove_window()).ok();
+        }
+        self.detail.update(cx, |detail, cx| { detail.dismiss_popup(window, cx); });
+    }
+
+    fn sync_detail_popup(&mut self, cx: &mut Context<Self>) {
+        if !self.detail.read(cx).has_popup()
+            || self.detail_popup.is_some_and(|popup| popup.read(cx).is_ok()) { return; }
+        // Measuring elements uses GPUI's layout state and must happen during render.
+        cx.notify();
+    }
+
+    fn popup_anchor(&self, window: &Window, cx: &App) -> popup::Anchor {
+        let bounds = window.bounds();
+        popup::Anchor {
+            point: point(bounds.right() - px(4.), bounds.bottom() - px(27.)),
+            above: true, right: true, screen: popup::screen(window, cx),
+        }
+    }
+
+    fn open_detail_popup(&mut self, anchor: popup::Anchor, measured: gpui::Size<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.detail.read(cx).has_popup()
+            || self.detail_popup.is_some_and(|popup| popup.read(cx).is_ok()) { return; }
+        self.close_palette(cx);
+        let Some(note) = window.window_handle().downcast::<Self>() else { return };
+        let return_focus = Some(self.detail.read(cx).sticky_popup_return_focus(window, cx));
+        let detail = self.detail.clone();
+        #[cfg(windows)]
+        let owner = win32_window_handle(window);
+        match popup::open(window, anchor, measured, true, |anchored, window, cx| {
+            window.set_window_title(i18n::t(cx).more);
+            #[cfg(windows)]
+            popup::attach(owner, window, false);
+            cx.new(|cx| popup::DetailPopup::new(note, detail, anchor, anchored, return_focus, window, cx))
+        }, cx) {
+            Ok(popup) => self.detail_popup = Some(popup),
+            Err(err) => eprintln!("failed to open sticky task menu: {err:#}"),
+        }
+    }
+
     fn remember(&mut self, window: &Window, cx: &App) {
         if let Some(id) = self.detail.read(cx).task_id() {
             let mut note = NoteWindow::capture(id, self.pinned, window.window_bounds().get_bounds());
             note.color = self.color;
+            note.compact = self.compact;
+            note.height = self.expanded_height.into();
             match sticky_windows::save(&self.store, note, self.saved_task) {
                 Ok(()) => self.saved_task = Some(id),
                 Err(err) => eprintln!("failed to save sticky window: {err:#}"),
@@ -161,7 +299,11 @@ impl StickyNote {
         }
     }
 
-    fn forget(&mut self, cx: &App) {
+    fn forget(&mut self, cx: &mut App) {
+        self.close_palette(cx);
+        if let Some(popup) = self.detail_popup.take() {
+            popup.update(cx, |_, window, _| window.remove_window()).ok();
+        }
         if let Some(id) = self.detail.read(cx).task_id().or(self.saved_task)
             && let Err(err) = sticky_windows::close(&self.store, id) {
             eprintln!("failed to close saved note: {err:#}");
@@ -204,33 +346,60 @@ impl StickyNote {
 
 impl Render for StickyNote {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().clone();
+        if self.detail.read(cx).has_popup()
+            && !self.detail_popup.is_some_and(|popup| popup.read(cx).is_ok())
+        {
+            let anchor = self.popup_anchor(_window, cx);
+            let measured = popup::measure_detail(&self.detail, anchor, _window, cx);
+            cx.defer_in(_window, move |this, window, cx| this.open_detail_popup(anchor, measured, window, cx));
+        }
         let strings = i18n::t(cx);
         #[cfg(windows)]
         set_opacity(_window, self.settings.opacity);
         let foreground: gpui::Hsla = gpui::rgb(self.settings.foreground()).into();
+        let (background, titlebar) = PALETTE[self.settings.color];
+        let title = self.detail.read(cx).task_title().unwrap_or_default().trim();
+        let title = SharedString::from(if title.is_empty() { strings.untitled } else { title }.replace(['\r', '\n'], " "));
         v_flex()
+            .id("sticky-window")
+            .group("sticky-window")
             .size_full()
-            .bg(gpui::rgb(PALETTE[self.settings.color].0))
-            .border_1()
-            .border_color(theme.colors().border)
-            .text_color(theme.colors().text)
+            .overflow_hidden()
+            .capture_any_mouse_down(cx.listener(|this, _, window, cx| {
+                if this.detail_popup.is_some() {
+                    this.dismiss_transients(window, cx);
+                }
+            }))
+            .bg(gpui::rgb(background))
+            .text_color(foreground)
             // A strip to move the note by, with its close button.
             .child(
                 h_flex()
                     .flex_none()
-                    .h(px(28.))
-                    .pr_1()
+                    .h(px(if self.compact { COMPACT_HEIGHT } else { 20. }))
+                    .pr(px(5.))
+                    .when(!self.compact, |bar| bar.bg(gpui::rgb(titlebar)))
                     .child(
                         // As the title bar: Windows moves the window from the tagged area, the
                         // others once the pressed mouse moves. The close button stays out of it.
                         div()
                             .id("sticky-drag")
+                            .debug_selector(|| "sticky-title-bar".into())
                             .flex_1()
+                            .min_w_0()
                             .h_full()
                             .window_control_area(WindowControlArea::Drag)
+                            .on_mouse_down(MouseButton::Left, cx.listener(|this, event: &gpui::MouseDownEvent, window, cx| {
+                                this.close_palette(cx);
+                                if event.click_count == 2 {
+                                    cx.stop_propagation();
+                                    this.toggle_compact(window, cx);
+                                } else if !cfg!(windows) {
+                                    this.should_move = true;
+                                }
+                            }))
                             .when(!cfg!(windows), |bar| {
-                                bar.on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, _| this.should_move = true))
+                                bar
                                     .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, _| this.should_move = false))
                                     .on_mouse_move(cx.listener(|this, _, window, _| {
                                         if this.should_move {
@@ -238,16 +407,37 @@ impl Render for StickyNote {
                                             window.start_window_move();
                                         }
                                     }))
+                            })
+                            .when(self.compact, |bar| {
+                                bar.flex().items_center().px(px(12.)).child(
+                                    div()
+                                        .debug_selector(|| "sticky-compact-title".into())
+                                        .w_full()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_size(px(14.))
+                                        .truncate()
+                                        .child(title),
+                                )
                             }),
                     )
-                    // The pin keeps the note over the other windows, off at first as the original's.
-                    .when(cfg!(windows), |bar| {
-                        bar.child(
+                    .child(
+                        h_flex()
+                        .flex_none()
+                        .when(!crate::touch::active(), |bar| bar.opacity(0.).group_hover("sticky-window", |style| style.opacity(1.)))
+                        .child(
+                        IconButton::new("sticky-color", IconName::PaintRoller)
+                            .size(px(20.)).icon_size(IconSize::Small).icon_color(Color::Custom(foreground))
+                            .hover_color(foreground.opacity(0.12))
+                            .tooltip(popup::tooltip(strings.color))
+                            .on_click(cx.listener(|this, _, window, cx| this.toggle_palette(window, cx))),
+                        )
+                        .when(cfg!(windows), |bar| bar.child(
                             IconButton::new("sticky-pin", if self.pinned { IconName::PinOff } else { IconName::Pin })
-                                .size(px(22.))
+                                .size(px(20.))
                                 .icon_size(IconSize::Small)
                                 .icon_color(Color::Custom(foreground))
-                                .tooltip(Tooltip::text(if self.pinned { strings.unpin } else { strings.pin }))
+                                .hover_color(foreground.opacity(0.12))
+                                .tooltip(popup::tooltip(if self.pinned { strings.unpin } else { strings.pin }))
                                 .on_click(cx.listener(|this, _, _window, cx| {
                                     this.pinned = !this.pinned;
                                     #[cfg(windows)]
@@ -255,59 +445,101 @@ impl Render for StickyNote {
                                     this.remember(_window, cx);
                                     cx.notify();
                                 })),
-                        )
-                    })
-                    .child(
-                        div().relative().child(IconButton::new("sticky-color", IconName::PaintRoller)
-                            .size(px(22.)).icon_size(IconSize::Small).icon_color(Color::Custom(foreground))
-                            .tooltip(Tooltip::text(strings.color))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.palette_open = !this.palette_open;
-                                cx.notify();
-                            })))
-                            .when(self.palette_open, |el| el.child(PopoverAttachment::new(Placement::BelowRight,
-                                h_flex().w(px(180.)).p_2().gap_2().flex_wrap()
-                                    .bg(theme.colors().elevated_surface_background).rounded(px(8.))
-                                    .border_1().border_color(theme.colors().border)
-                                    .children(PALETTE.iter().enumerate().map(|(index, (color, _))| {
-                                        div().id(("note-palette", index)).size(px(28.)).rounded_full()
-                                            .bg(gpui::rgb(*color)).border_2()
-                                            .border_color(if self.settings.color == index { theme.colors().accent } else { theme.colors().border })
-                                            .cursor_pointer().on_click(cx.listener(move |this, _, window, cx| {
-                                                this.color = Some(index);
-                                                this.palette_open = false;
-                                                this.refresh(cx);
-                                                this.remember(window, cx);
-                                                cx.notify();
-                                            }))
-                                    }))
-                            ))),
-                    )
-                    .child(
+                        ))
+                        .child(
                         IconButton::new("sticky-close", IconName::X)
                             .icon_color(Color::Custom(foreground))
-                            .size(px(22.))
+                            .size(px(20.))
                             .icon_size(IconSize::Small)
-                            .tooltip(Tooltip::text(strings.close))
+                            .hover_color(foreground.opacity(0.12))
+                            .tooltip(popup::tooltip(strings.close))
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.forget(cx);
                                 window.remove_window();
                             })),
+                        ),
                     ),
             )
-            .child(div().flex_1().min_h_0().child(self.detail.clone()))
+            .when(!self.compact, |note| {
+                note.child(
+                    div().flex_1().min_h_0()
+                        .capture_any_mouse_down(cx.listener(|this, _, _, cx| { this.close_palette(cx); }))
+                        .child(self.detail.clone()),
+                )
+            })
+    }
+}
+
+struct StickyPalette {
+    note: WindowHandle<StickyNote>,
+    selected: usize,
+    focus: FocusHandle,
+}
+
+impl StickyPalette {
+    fn new(note: WindowHandle<StickyNote>, selected: usize, _pinned: bool, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        #[cfg(windows)]
+        set_topmost(window, _pinned);
+        cx.observe_window_activation(window, |this, window, cx| {
+            if !window.is_window_active()
+                && !this.note.update(cx, |_, owner, _| owner.is_window_active()).unwrap_or(false)
+            {
+                window.remove_window();
+            }
+        }).detach();
+        let focus = cx.focus_handle();
+        window.focus(&focus, cx);
+        Self { note, selected, focus }
+    }
+}
+
+impl Render for StickyPalette {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        v_flex()
+            .id("sticky-palette")
+            .track_focus(&self.focus)
+            .on_action(cx.listener(|_, _: &DismissTransient, window, _| window.remove_window()))
+            .size_full()
+            .rounded(px(8.))
+            .bg(theme.colors().elevated_surface_background)
+            .border_1()
+            .border_color(theme.colors().border)
+            .justify_center()
+            .items_center()
+            .gap_2()
+            .children(PALETTE.chunks(6).enumerate().map(|(row, colors)| {
+                h_flex().gap_2().children(colors.iter().enumerate().map(|(column, (color, _))| {
+                    let index = row * 6 + column;
+                    div()
+                        .id(("sticky-palette-color", index))
+                        .debug_selector(move || format!("sticky-palette-color-{index}"))
+                        .size(px(36.))
+                        .rounded(px(5.))
+                        .bg(gpui::rgb(*color))
+                        .border_2()
+                        .border_color(if self.selected == index { theme.colors().accent } else { theme.colors().border })
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.note.update(cx, |note, window, cx| {
+                                note.color = Some(index);
+                                note.palette = None;
+                                note.refresh(cx);
+                                note.remember(window, cx);
+                                cx.notify();
+                            }).ok();
+                            window.remove_window();
+                        }))
+                }))
+            }))
     }
 }
 
 /// Whole-window alpha, including the native surface, rather than a translucent fill.
 #[cfg(windows)]
 fn set_opacity(window: &Window, opacity: u8) {
-    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-    use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::*;
-    let Ok(handle) = HasWindowHandle::window_handle(window) else { return };
-    let RawWindowHandle::Win32(handle) = handle.as_raw() else { return };
-    let hwnd = HWND(handle.hwnd.get() as _);
+    let Some(hwnd) = win32_window_handle(window) else { return };
     unsafe {
         let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
         SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style | WS_EX_LAYERED.0 as isize);
@@ -321,36 +553,111 @@ fn set_opacity(window: &Window, opacity: u8) {
 /// Keeps the window over the other windows, or puts it back among them: the original's pin.
 #[cfg(windows)]
 pub(crate) fn set_topmost(window: &Window, topmost: bool) {
-    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-    use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::{HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetWindowPos};
 
-    // The trait's method: `Window` has an inherent `window_handle` too.
-    let Ok(handle) = HasWindowHandle::window_handle(window) else { return };
-    let RawWindowHandle::Win32(handle) = handle.as_raw() else { return };
+    let Some(hwnd) = win32_window_handle(window) else { return };
     let after = if topmost { HWND_TOPMOST } else { HWND_NOTOPMOST };
-    let hwnd = HWND(handle.hwnd.get() as _);
     if let Err(err) = unsafe { SetWindowPos(hwnd, Some(after), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE) } {
         eprintln!("failed to pin the sticky note: {err}");
     }
 }
 
+#[cfg(windows)]
+fn win32_window_handle(window: &Window) -> Option<windows::Win32::Foundation::HWND> {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    let handle = HasWindowHandle::window_handle(window).ok()?;
+    let RawWindowHandle::Win32(handle) = handle.as_raw() else { return None };
+    Some(windows::Win32::Foundation::HWND(handle.hwnd.get() as _))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::Focusable as _;
     use gpui::{Modifiers, TestAppContext};
 
     #[gpui::test]
     #[cfg(debug_assertions)]
-    fn due_popup_keeps_the_confirm_button_inside_a_small_note(cx: &mut TestAppContext) {
+    fn compact_note_reopens_at_one_line_and_restores_its_previous_height(cx: &mut TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let title = "A long note title that needs to fit on a single line when it is collapsed";
+        let task = store.add_task(title).unwrap().id;
+        cx.update(theme::init);
+        let (note, cx) = cx.add_window_view(|window, cx| {
+            StickyNote::new(store.clone(), task, false, None, None, window, cx)
+        });
+        cx.simulate_resize(size(px(324.), px(318.)));
+
+        let title_bar = cx.debug_bounds("sticky-title-bar").unwrap();
+        cx.simulate_event(gpui::MouseDownEvent {
+            button: MouseButton::Left,
+            position: title_bar.center(),
+            modifiers: Modifiers::default(),
+            click_count: 2,
+            first_mouse: false,
+        });
+        cx.update(|_, cx| assert!(note.read(cx).compact));
+        assert!(cx.debug_bounds("task-detail-body").is_none());
+        let line = cx.debug_bounds("sticky-compact-title").unwrap();
+        assert!(line.size.height <= px(COMPACT_HEIGHT));
+        let saved = sticky_windows::load(&store).pop().unwrap();
+        assert!(saved.compact);
+        assert_eq!(saved.width, 324.);
+        assert_eq!(saved.height, 318.);
+
+        let palette = cx.update(|window, cx| {
+            note.update(cx, |note, cx| {
+                note.toggle_palette(window, cx);
+                note.palette.unwrap()
+            })
+        });
+        let mut palette_cx = gpui::VisualTestContext::from_window(palette.into(), cx);
+        let swatch = palette_cx.debug_bounds("sticky-palette-color-1").unwrap().center();
+        palette_cx.simulate_click(swatch, Modifiers::default());
+        cx.update(|_, cx| {
+            assert!(note.read(cx).compact);
+            assert_eq!(note.read(cx).color, Some(1));
+        });
+        assert_eq!(sticky_windows::load(&store)[0].color, Some(1));
+
+        cx.update(|_, cx| {
+            open(store.clone(), task, cx);
+            let reopened = *cx.global::<OpenNotes>().0.last().unwrap();
+            reopened.update(cx, |note, window, _| {
+                assert!(note.compact);
+                assert_eq!(window.viewport_size().height, px(COMPACT_HEIGHT));
+                window.remove_window();
+            }).unwrap();
+        });
+
+        cx.simulate_event(gpui::MouseDownEvent {
+            button: MouseButton::Left,
+            position: title_bar.center(),
+            modifiers: Modifiers::default(),
+            click_count: 2,
+            first_mouse: false,
+        });
+        cx.update(|_, cx| {
+            assert!(!note.read(cx).compact);
+            assert_eq!(note.read(cx).expanded_height, px(318.));
+        });
+        assert!(cx.debug_bounds("task-detail-body").is_some());
+        assert!(!sticky_windows::load(&store)[0].compact);
+    }
+
+    #[gpui::test]
+    #[cfg(debug_assertions)]
+    fn small_note_opens_a_full_date_picker_and_saves_the_selected_day(cx: &mut TestAppContext) {
         let store = Rc::new(Store::open_in_memory().unwrap());
         let task = store.add_task("Small note").unwrap();
+        let original = chrono::NaiveDate::from_ymd_opt(2026, 11, 15).unwrap();
+        store.set_due(task.id, Some(original), None).unwrap();
         cx.update(|cx| {
             theme::init(cx);
             cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
         });
-        let (_, cx) = cx.add_window_view(|window, cx| {
-            StickyNote::new(store.clone(), task.id, false, None, window, cx)
+        let (note, cx) = cx.add_window_view(|window, cx| {
+            StickyNote::new(store.clone(), task.id, false, None, None, window, cx)
         });
         let viewport = size(px(240.), px(200.));
         cx.simulate_resize(viewport);
@@ -359,12 +666,273 @@ mod tests {
         let modifiers = Modifiers::default();
         cx.simulate_mouse_move(date, None, modifiers);
         cx.simulate_click(date, modifiers);
-        let confirm = cx.debug_bounds("due-popup-ok").expect("date picker is open");
-        assert!(confirm.top() >= px(0.) && confirm.bottom() <= viewport.height);
-        assert!(confirm.left() >= px(0.) && confirm.right() <= viewport.width);
-        cx.simulate_mouse_move(confirm.center(), None, modifiers);
-        cx.simulate_click(confirm.center(), modifiers);
-        assert!(cx.debug_bounds("due-popup-ok").is_none(), "confirm closes the date picker");
+        assert!(cx.debug_bounds("due-popup-ok").is_none(), "the picker is outside the note");
+        let popup = cx.update(|_, cx| note.read(cx).detail_popup.expect("native date picker is open"));
+        cx.simulate_resize(viewport); // Windows sends unchanged bounds when a child popup opens.
+        cx.update(|_, cx| assert_eq!(note.read(cx).detail_popup, Some(popup)));
+        let mut popup_cx = gpui::VisualTestContext::from_window(popup.into(), cx);
+        let picked = chrono::NaiveDate::from_ymd_opt(2026, 12, 1).unwrap();
+        let last_day = popup_cx.debug_bounds("due-day-2026-12-01").unwrap();
+        let confirm = popup_cx.debug_bounds("due-popup-ok").unwrap();
+        popup_cx.update(|window, _| {
+            assert!(last_day.bottom() < confirm.top());
+            assert!(confirm.bottom() <= window.viewport_size().height);
+            assert!(window.viewport_size().height > viewport.height);
+        });
+        popup_cx.simulate_click(last_day.center(), modifiers);
+        assert_eq!(store.task(task.id).unwrap().unwrap().due_date, Some(original), "the picker retains a draft until OK");
+        let confirm = popup_cx.debug_bounds("due-popup-ok").unwrap();
+        popup_cx.simulate_click(confirm.center(), modifiers);
+        assert_eq!(store.task(task.id).unwrap().unwrap().due_date, Some(picked));
+        cx.update(|window, cx| {
+            assert_eq!(window.viewport_size(), viewport, "opening a picker does not resize the note");
+            assert!(note.read(cx).detail_popup.is_none());
+        });
+    }
+
+    #[gpui::test]
+    #[cfg(debug_assertions)]
+    fn small_note_menu_reaches_the_last_action_and_escape_restores_focus(cx: &mut TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let task = store.add_task("Small note").unwrap();
+        cx.update(|cx| {
+            theme::init(cx);
+            assert!(crate::keymap::load_default(&assets::Assets, cx).unwrap().is_empty());
+        });
+        let (note, cx) = cx.add_window_view(|window, cx| StickyNote::new(store, task.id, false, None, None, window, cx));
+        cx.simulate_resize(size(px(240.), px(200.)));
+        let title = cx.debug_bounds("task-detail-title").unwrap().center();
+        cx.simulate_click(title, Modifiers::default());
+        let focused = cx.update(|window, cx| window.focused(cx).unwrap());
+        let more = cx.debug_bounds("task-detail-more").unwrap().center();
+        cx.simulate_click(more, Modifiers::default());
+        let popup = cx.update(|_, cx| note.read(cx).detail_popup.unwrap());
+        let mut popup_cx = gpui::VisualTestContext::from_window(popup.into(), cx);
+        popup_cx.run_until_parked();
+        let resized = popup_cx.update(|window, _| window.window_bounds().get_bounds().size);
+        popup_cx.simulate_resize(resized); // TestWindow does not emit the platform's resize callback.
+        let last = popup_cx.debug_bounds("task-menu-more-delete").unwrap();
+        popup_cx.update(|window, _| assert!(last.bottom() <= window.viewport_size().height, "last={last:?}, viewport={:?}", window.viewport_size()));
+        popup_cx.simulate_keystrokes("escape");
+        cx.update(|window, cx| {
+            assert!(note.read(cx).detail_popup.is_none());
+            assert!(focused.is_focused(window));
+        });
+    }
+
+    #[gpui::test]
+    #[cfg(debug_assertions)]
+    fn sticky_submenus_keep_window_geometry_and_main_menu_paint_stable(cx: &mut TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let task = store.add_task("Submenu regression").unwrap();
+        cx.update(|cx| {
+            theme::init(cx);
+            cx.set_global(i18n::CurrentLocale(i18n::Locale::Ru));
+        });
+        let (note, cx) = cx.add_window_view(|window, cx| StickyNote::new(store, task.id, false, None, None, window, cx));
+        cx.simulate_resize(size(px(240.), px(200.)));
+        let more = cx.debug_bounds("task-detail-more").unwrap().center();
+        cx.simulate_click(more, Modifiers::default());
+        let popup = cx.update(|_, cx| note.read(cx).detail_popup.unwrap());
+        let mut popup_cx = gpui::VisualTestContext::from_window(popup.into(), cx);
+        popup_cx.run_until_parked();
+        let original_window = popup_cx.update(|window, _| window.window_bounds().get_bounds());
+        popup_cx.simulate_resize(original_window.size);
+        let original_menu = popup_cx.debug_bounds("task-more-popup").unwrap();
+        assert!(popup_cx.debug_bounds("submenu-content-more-focus").is_none());
+        let trigger = popup_cx.debug_bounds("submenu-more-focus").unwrap().center();
+        popup_cx.simulate_mouse_move(trigger, None, Modifiers::default());
+        popup_cx.run_until_parked();
+        assert!(popup_cx.debug_bounds("submenu-content-more-focus").is_some());
+        let expanded_menu = popup_cx.debug_bounds("task-more-popup").unwrap();
+        assert_eq!(expanded_menu, original_menu);
+        popup_cx.update(|window, _| {
+            assert_eq!(window.window_bounds().get_bounds(), original_window, "opening a submenu must not resize or move its native window");
+            assert!(expanded_menu.right() <= window.viewport_size().width, "menu={expanded_menu:?}, viewport={:?}", window.viewport_size());
+            let menu = expanded_menu.scale(window.scale_factor());
+            let quads = window.painted_quads();
+            let surface = quads.iter().find(|quad| quad.bounds == menu).expect("main menu surface is painted");
+            assert_eq!(surface.bounds.intersect(&surface.content_mask.bounds), surface.bounds, "the main menu must not be clipped after a submenu opens");
+        });
+        let neighbor = popup_cx.debug_bounds("task-menu-more-attachment").unwrap().center();
+        popup_cx.simulate_mouse_move(neighbor, None, Modifiers::default());
+        popup_cx.run_until_parked();
+        assert!(popup_cx.debug_bounds("submenu-content-more-focus").is_none());
+        assert_eq!(popup_cx.debug_bounds("task-more-popup").unwrap(), original_menu);
+        popup_cx.update(|window, _| assert_eq!(window.window_bounds().get_bounds(), original_window, "closing a submenu must not resize or move its native window"));
+
+        popup_cx.simulate_mouse_move(trigger, None, Modifiers::default());
+        let estimate = popup_cx.debug_bounds("task-focus-estimate").unwrap().center();
+        popup_cx.simulate_click(estimate, Modifiers::default());
+        let (popup, anchor) = cx.update(|window, cx| {
+            let note = note.read(cx);
+            (note.detail_popup.unwrap(), note.popup_anchor(window, cx))
+        });
+        let mut popup_cx = gpui::VisualTestContext::from_window(popup.into(), cx);
+        assert!(popup_cx.debug_bounds("task-estimate-popup").is_some(), "clicking the submenu must execute its action before dismissal");
+        assert!(popup_cx.debug_bounds("task-more-popup").is_none());
+        popup_cx.update(|window, cx| {
+            let bounds = window.bounds();
+            assert_ne!(bounds.size, original_window.size);
+            assert_eq!(bounds, window.pixel_snap_bounds(anchor.bounds(bounds.size)), "a different menu size must remain attached to the note");
+            assert_eq!(cx.windows().len(), 2, "repositioning must retire the previous popup");
+        });
+    }
+
+    #[gpui::test]
+    #[cfg(debug_assertions)]
+    fn sticky_list_sections_keep_the_native_menu_geometry_stable(cx: &mut TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let task = store.add_task("List submenu regression").unwrap();
+        let section = store.add_list_section(None, "Inbox section").unwrap();
+        cx.update(theme::init);
+        let (note, cx) = cx.add_window_view(|window, cx| StickyNote::new(store.clone(), task.id, false, None, None, window, cx));
+        cx.simulate_resize(size(px(240.), px(200.)));
+        cx.update(|_, cx| {
+            note.read(cx).detail.clone().update(cx, |detail, cx| detail.dev_open_popup("list", cx));
+        });
+        let popup = cx.update(|_, cx| note.read(cx).detail_popup.unwrap());
+        let mut popup_cx = gpui::VisualTestContext::from_window(popup.into(), cx);
+        popup_cx.run_until_parked();
+        let original_window = popup_cx.update(|window, _| window.window_bounds().get_bounds());
+        popup_cx.simulate_resize(original_window.size);
+        let original_menu = popup_cx.debug_bounds("task-list-popup").unwrap();
+        assert!(popup_cx.debug_bounds("task-list-sections").is_none());
+
+        let inbox = popup_cx.debug_bounds("move-to-inbox").unwrap().center();
+        popup_cx.simulate_mouse_move(inbox, None, Modifiers::default());
+        popup_cx.run_until_parked();
+        let sections = popup_cx.debug_bounds("task-list-sections").unwrap();
+        assert!(sections.right() <= original_menu.left());
+        assert!(sections.left() >= px(0.));
+        assert_eq!(popup_cx.debug_bounds("task-list-popup").unwrap(), original_menu);
+        popup_cx.update(|window, _| assert_eq!(window.window_bounds().get_bounds(), original_window));
+
+        popup_cx.update(|_, cx| {
+            note.read(cx).detail.clone().update(cx, |detail, cx| detail.dev_open_popup("list", cx));
+        });
+        popup_cx.run_until_parked();
+        assert!(popup_cx.debug_bounds("task-list-sections").is_none());
+        assert_eq!(popup_cx.debug_bounds("task-list-popup").unwrap(), original_menu);
+        popup_cx.update(|window, _| assert_eq!(window.window_bounds().get_bounds(), original_window));
+
+        popup_cx.simulate_mouse_move(point(px(1.), px(1.)), None, Modifiers::default());
+        popup_cx.simulate_mouse_move(inbox, None, Modifiers::default());
+        let section_row = popup_cx.debug_bounds("task-list-sections").unwrap().center();
+        popup_cx.simulate_click(section_row, Modifiers::default());
+        assert_eq!(store.task(task.id).unwrap().unwrap().section_id, Some(section.id));
+        cx.update(|_, cx| assert!(note.read(cx).detail_popup.is_none()));
+    }
+
+    #[gpui::test]
+    #[cfg(debug_assertions)]
+    fn clicking_note_editors_dismisses_native_popups_without_losing_the_click(cx: &mut TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let task = store.add_task("Editable title").unwrap();
+        store.set_notes(task.id, "Editable notes").unwrap();
+        cx.update(|cx| {
+            theme::init(cx);
+            assert!(crate::keymap::load_default(&assets::Assets, cx).unwrap().is_empty());
+        });
+        let (note, cx) = cx.add_window_view(|window, cx| StickyNote::new(store.clone(), task.id, false, None, None, window, cx));
+        cx.simulate_resize(size(px(400.), px(800.)));
+
+        for editor in ["task-detail-title", "task-notes-preview", "task-notes-editor"] {
+            let target = cx.debug_bounds(editor).unwrap().center();
+            let more = cx.debug_bounds("task-detail-more").unwrap().center();
+            cx.simulate_click(more, Modifiers::default());
+            cx.update(|_, cx| assert!(note.read(cx).detail_popup.is_some()));
+            cx.simulate_click(target, Modifiers::default());
+            cx.update(|window, cx| {
+                let note = note.read(cx);
+                assert!(note.detail_popup.is_none(), "clicking {editor} must dismiss the menu");
+                let focused = window.focused(cx).expect("the click still focuses the editor");
+                assert!(note.detail.read(cx).is_editor_focus(&focused, cx));
+            });
+        }
+
+        let titlebar = cx.debug_bounds("sticky-title-bar").unwrap();
+        let color_button = point(titlebar.right() + px(10.), titlebar.center().y);
+        cx.simulate_click(color_button, Modifiers::default());
+        cx.update(|_, cx| assert!(note.read(cx).palette.is_some()));
+        cx.simulate_click(color_button, Modifiers::default());
+        cx.update(|_, cx| assert!(note.read(cx).palette.is_none(), "a second click on Color must close its palette"));
+        cx.simulate_click(color_button, Modifiers::default());
+        let title = cx.debug_bounds("task-detail-title").unwrap().center();
+        cx.simulate_click(title, Modifiers::default());
+        cx.update(|_, cx| assert!(note.read(cx).palette.is_none()));
+        cx.simulate_keystrokes("enter");
+        cx.simulate_input(" after dismissal");
+        assert!(store.task(task.id).unwrap().unwrap().notes.ends_with(" after dismissal"));
+    }
+
+    #[gpui::test]
+    #[cfg(debug_assertions)]
+    fn sticky_tag_picker_submits_in_its_own_window_and_closes_on_real_resize(cx: &mut TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let task = store.add_task("Note with tags").unwrap();
+        cx.update(|cx| {
+            theme::init(cx);
+            assert!(crate::keymap::load_default(&assets::Assets, cx).unwrap().is_empty());
+        });
+        let (note, cx) = cx.add_window_view(|window, cx| StickyNote::new(store.clone(), task.id, false, None, None, window, cx));
+        cx.simulate_resize(size(px(240.), px(200.)));
+        cx.update(|window, cx| note.update(cx, |note, cx| {
+            note.detail.update(cx, |detail, cx| detail.start("tags", window, cx));
+        }));
+        // Follow the currently active surface between keystrokes: backends without
+        // a move API recreate it when the filtered menu's measured size changes.
+        for character in "sticky tag".chars() {
+            let popup = cx.update(|_, cx| note.read(cx).detail_popup.unwrap());
+            cx.dispatch_keystroke(popup.into(), gpui::Keystroke::parse(&character.to_string()).unwrap());
+        }
+        let popup = cx.update(|_, cx| note.read(cx).detail_popup.unwrap());
+        let mut popup_cx = gpui::VisualTestContext::from_window(popup.into(), cx);
+        popup_cx.update(|window, cx| {
+            let (_, [tags, _]) = note.read(cx).detail.read(cx).sticky_popup_inputs(cx);
+            assert_eq!(tags.read(cx).text(), "sticky tag", "resizing must retain the input entity and its draft");
+            assert!(tags.focus_handle(cx).is_focused(window), "resizing must preserve keyboard focus");
+            assert_eq!(cx.windows().len(), 2);
+        });
+        popup_cx.simulate_keystrokes("enter");
+        assert!(store.task(task.id).unwrap().unwrap().tags.is_empty());
+        let popup = cx.update(|_, cx| note.read(cx).detail_popup.unwrap());
+        let mut popup_cx = gpui::VisualTestContext::from_window(popup.into(), cx);
+        let confirm = popup_cx.debug_bounds("task-tags-ok").unwrap();
+        popup_cx.simulate_click(confirm.center(), Modifiers::default());
+        assert_eq!(store.task(task.id).unwrap().unwrap().tags, ["sticky tag"]);
+        let more = cx.debug_bounds("task-detail-more").unwrap().center();
+        cx.simulate_click(more, Modifiers::default());
+        cx.simulate_resize(size(px(280.), px(230.)));
+        cx.update(|_, cx| {
+            assert!(note.read(cx).detail_popup.is_none());
+            assert!(!note.read(cx).detail.read(cx).has_popup());
+        });
+    }
+
+    #[gpui::test]
+    fn compact_note_tooltip_has_its_own_window_and_preserves_keyboard_focus(cx: &mut TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let task = store.add_task("Compact note").unwrap();
+        cx.update(theme::init);
+        let (note, cx) = cx.add_window_view(|window, cx| StickyNote::new(store, task.id, false, None, None, window, cx));
+        let lifetime = cx.update(|window, cx| {
+            note.update(cx, |note, cx| note.toggle_compact(window, cx));
+            let focus = cx.focus_handle();
+            window.focus(&focus, cx);
+            let tooltip = popup::tooltip("Color")(window, cx);
+            assert!(focus.is_focused(window));
+            tooltip
+        });
+        cx.draw(point(px(0.), px(0.)), size(px(0.), px(0.)), |_, _| lifetime.clone().into_any_element());
+        cx.run_until_parked();
+        cx.update(|_, cx| assert_eq!(cx.windows().len(), 2));
+        cx.update(|_, _| drop(lifetime));
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            assert_eq!(cx.windows().len(), 1);
+            assert!(note.read(cx).compact);
+        });
     }
 
     #[gpui::test]

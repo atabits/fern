@@ -102,16 +102,16 @@ impl TaskDetail {
         recognize_date: bool,
         cx: &mut Context<Self>,
     ) {
-        let preferences = self.store.preferences().unwrap_or_default();
+        let preferences = self.session.store.preferences().unwrap_or_default();
         let defaults = preferences.task_defaults;
-        self.lists = self
+        self.session.lists = self.session
             .store
             .lists()
             .unwrap_or_default()
             .into_iter()
             .filter(|list| !list.archived)
             .collect();
-        let list = list.and_then(|id| self.lists.iter().find(|list| list.id == id));
+        let list = list.and_then(|id| self.session.lists.iter().find(|list| list.id == id));
         let task = Task {
             id: Id::now_v7(),
             list_id: list.map(|list| list.id),
@@ -138,7 +138,7 @@ impl TaskDetail {
             created_at: chrono::Utc::now().timestamp_millis(),
         };
         self.show(Some(task), cx);
-        self.draft = Some(NewTask {
+        self.session.draft = Some(NewTask {
             checklist: Vec::new(),
             attachments: Vec::new(),
             pending_attachments: 0,
@@ -162,13 +162,13 @@ impl TaskDetail {
     }
 
     pub(super) fn refresh_draft_title(&mut self, cx: &mut Context<Self>) {
-        let (Some(task), Some(draft)) = (self.task.as_ref(), self.draft.as_mut()) else {
+        let (Some(task), Some(draft)) = (self.session.task.as_ref(), self.session.draft.as_mut()) else {
             return;
         };
         draft.parsed_title = draft.parse_title(
             task,
             self.title.read(cx).text(),
-            &self.lists,
+            &self.session.lists,
             Local::now().date_naive(),
         );
         self.title.update(cx, |input, cx| {
@@ -178,21 +178,21 @@ impl TaskDetail {
     }
 
     pub(super) fn due_preview(&self, task: &Task, today: NaiveDate) -> DueDraft {
-        match &self.draft {
+        match &self.session.draft {
             Some(draft) => draft.due(task, &draft.parsed_title, today),
             None => DueDraft::from_task(task, today),
         }
     }
 
     pub(super) fn list_preview(&self, task: &Task) -> Option<Id> {
-        self.draft.as_ref().map_or(task.list_id, |draft| {
-            draft.list_id(task, &draft.parsed_title, &self.lists)
+        self.session.draft.as_ref().map_or(task.list_id, |draft| {
+            draft.list_id(task, &draft.parsed_title, &self.session.lists)
         })
     }
 
     pub(super) fn kind_preview(&self, task: &Task) -> Kind {
-        self.draft.as_ref().map_or(task.kind, |draft| {
-            draft.kind(task, self.list_preview(task), &self.lists)
+        self.session.draft.as_ref().map_or(task.kind, |draft| {
+            draft.kind(task, self.list_preview(task), &self.session.lists)
         })
     }
 
@@ -202,7 +202,7 @@ impl TaskDetail {
         cx: &mut Context<Self>,
         edit: impl FnOnce(&mut Task, &mut NewTask),
     ) -> bool {
-        let (Some(task), Some(draft)) = (&mut self.task, &mut self.draft) else {
+        let (Some(task), Some(draft)) = (&mut self.session.task, &mut self.session.draft) else {
             return false;
         };
         if !draft.finished {
@@ -214,7 +214,7 @@ impl TaskDetail {
     }
 
     pub fn finish_draft(&mut self, cx: &mut Context<Self>) -> bool {
-        let Some(draft) = &self.draft else {
+        let Some(draft) = &self.session.draft else {
             return true;
         };
         if draft.finished {
@@ -226,7 +226,7 @@ impl TaskDetail {
         let result = self.commit_draft(cx);
         match result {
             Ok(id) => {
-                let draft = self.draft.as_mut().unwrap();
+                let draft = self.session.draft.as_mut().unwrap();
                 draft.finished = true;
                 draft.attachments.clear();
                 cx.emit(DraftClosed(id));
@@ -234,7 +234,7 @@ impl TaskDetail {
             }
             Err(error) => {
                 eprintln!("failed to create task: {error:#}");
-                self.draft.as_mut().unwrap().save_failed = true;
+                self.session.draft.as_mut().unwrap().save_failed = true;
                 cx.notify();
                 false
             }
@@ -242,8 +242,8 @@ impl TaskDetail {
     }
 
     fn commit_draft(&mut self, cx: &App) -> anyhow::Result<Option<Id>> {
-        let draft = self.draft.as_ref().unwrap();
-        let task = self.task.as_ref().unwrap();
+        let draft = self.session.draft.as_ref().unwrap();
+        let task = self.session.task.as_ref().unwrap();
         let text = self.title.read(cx).text().trim();
         let notes = self.notes.read(cx).text();
         let mut checklist: Vec<_> = self
@@ -268,8 +268,8 @@ impl TaskDetail {
         {
             return Ok(None);
         }
-        let preferences = self.store.preferences()?;
-        let lists: Vec<_> = self
+        let preferences = self.session.store.preferences()?;
+        let lists: Vec<_> = self.session
             .store
             .lists()?
             .into_iter()
@@ -290,7 +290,7 @@ impl TaskDetail {
                 .filter(|id| lists.iter().any(|list| list.id == *id));
         }
         let section_id = task.section_id.filter(|id| {
-            self.store
+            self.session.store
                 .list_sections(list_id)
                 .is_ok_and(|sections| sections.iter().any(|section| section.id == *id))
         });
@@ -322,14 +322,14 @@ impl TaskDetail {
         };
         let top = !preferences.task_defaults.add_to_bottom;
         let task = if draft.attachments.is_empty() {
-            self.store.create_task(fields, top)?
+            self.session.store.create_task(fields, top)?
         } else {
-            let dir = self
+            let dir = self.session
                 .attachments_dir
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("attachment directory unavailable"))?;
-            let attachments = &mut self.draft.as_mut().unwrap().attachments;
-            self.store
+            let attachments = &mut self.session.draft.as_mut().unwrap().attachments;
+            self.session.store
                 .create_task_with_attachments(fields, top, attachments, dir)?
         };
         Ok(Some(task.id))
@@ -342,7 +342,7 @@ impl TaskDetail {
         cx: &mut Context<Self>,
     ) -> Option<ChecklistItem> {
         let task = self.task_id()?;
-        if let Some(draft) = &mut self.draft {
+        if let Some(draft) = &mut self.session.draft {
             let item = ChecklistItem {
                 id: Id::now_v7(),
                 task_id: task,
@@ -357,7 +357,7 @@ impl TaskDetail {
             cx.notify();
             Some(item)
         } else {
-            match self.store.add_checklist_item(task, text, after) {
+            match self.session.store.add_checklist_item(task, text, after) {
                 Ok(item) => {
                     cx.emit(TaskUpdated);
                     Some(item)
@@ -375,7 +375,7 @@ impl TaskDetail {
         strings: &'static Strings,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let is_note = self
+        let is_note = self.session
             .task
             .as_ref()
             .is_some_and(|task| self.kind_preview(task) == Kind::Note);
@@ -427,7 +427,7 @@ impl TaskDetail {
     }
 
     pub(super) fn render_draft_templates(&self, cx: &mut Context<Self>) -> AnyElement {
-        let templates = self.store.templates().unwrap_or_default();
+        let templates = self.session.store.templates().unwrap_or_default();
         popover(cx)
             .w(px(260.))
             .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_popup(cx)))
@@ -617,7 +617,7 @@ mod tests {
         cx.simulate_input("Review tomorrow 9am ^Notebook");
         cx.update(|_, cx| {
             let editor = detail.read(cx);
-            let task = editor.task.as_ref().unwrap();
+            let task = editor.session.task.as_ref().unwrap();
             let due = editor.due_preview(task, today);
             assert_eq!(due.date, today.succ_opt());
             assert_eq!(due.time, chrono::NaiveTime::from_hms_opt(9, 0, 0));
@@ -697,7 +697,7 @@ mod tests {
                         .update(cx, |input, cx| input.set_text(title, cx));
                     editor.open_due(cx);
                     editor.update_draft(cx, |due| due.pick_time(Some(time), day));
-                    assert_eq!(editor.due_draft.as_ref().unwrap().reminders, [15]);
+                    assert_eq!(editor.session.due_draft.as_ref().unwrap().reminders, [15]);
                     if remove_reminder {
                         editor.update_draft(cx, |due| due.toggle_reminder(15, day));
                     }
@@ -733,7 +733,7 @@ mod tests {
         cx.update(theme::init);
         let (detail, cx) = cx.add_window_view(|window, cx| {
             let mut detail = TaskDetail::new(store.clone(), window, cx);
-            detail.attachments_dir = Some(attachments_dir.clone());
+            detail.session.attachments_dir = Some(attachments_dir.clone());
             detail.begin_draft(
                 NaiveDate::from_ymd_opt(2028, 7, 6).unwrap(),
                 Some(list.id),

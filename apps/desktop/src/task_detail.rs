@@ -1,12 +1,13 @@
 //! The task details panel on the right, modeled on TickTick's.
 
+use std::cell::Cell;
 use std::path::PathBuf;
 use std::rc::Rc;
 
 use fern_core::attachment::PreparedAttachment;
 use fern_core::{ChecklistItem, Frequency, Id, Kind, List, Priority, Recurrence, Store, Tag, Task};
 use chrono::{Datelike, Local, NaiveDate, TimeZone as _};
-use gpui::{Entity, EventEmitter, ExternalPaths, Focusable, FontWeight, MouseButton, Subscription, WeakFocusHandle};
+use gpui::{Entity, EventEmitter, ExternalPaths, FocusHandle, Focusable, FontWeight, MouseButton, Subscription, WeakFocusHandle};
 use ui::prelude::*;
 use ui::{Placement, PopoverAttachment, SubmenuItem, TipSide, popover, with_tip};
 
@@ -20,7 +21,12 @@ use crate::markdown_toolbar::ToolbarAction;
 use crate::text_input::{Cancelled, Changed, Mode, Submitted, TextInput};
 
 mod draft;
+mod session;
+mod window;
 pub use draft::DraftClosed;
+use session::TaskDetailSession;
+use window::EditorWindow;
+pub(crate) use window::PopupWindow;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Popup {
@@ -75,41 +81,23 @@ impl EstimateDraft {
 }
 
 pub struct TaskDetail {
-    store: Rc<Store>,
-    attachments_dir: Option<PathBuf>,
-    /// The task's attached files.
-    attachments: Vec<fern_core::Attachment>,
-    attachment_errors: Vec<String>,
+    session: TaskDetailSession,
+    editor_window: EditorWindow,
     /// The task's comments, the bottom bar's comment field (while open) and its emoji menu.
-    comments: Vec<fern_core::Comment>,
     comment_input: Entity<TextInput>,
     comment_open: bool,
     comment_emoji: bool,
     /// The bottom bar's "A": the Markdown toolbar for the description, and its headings menu.
     format_bar: bool,
     format_headings: bool,
-    /// The month the custom repeat's "By Specific Dates" calendar shows.
-    specific_month: Option<NaiveDate>,
     /// The "…" menu's Start Focus side menu, while hovered open.
     focus_submenu: bool,
-    estimate_draft: EstimateDraft,
-    task: Option<Task>,
-    draft: Option<draft::NewTask>,
     title: Entity<TextInput>,
     notes: Entity<TextInput>,
     tag_input: Entity<TextInput>,
-    tag_draft: Option<TagDraft>,
-    /// All tags, for the tag picker and chip colors.
-    all_tags: Vec<Tag>,
-    /// All lists, for the list picker and the list button label.
-    lists: Vec<List>,
     /// Checklist items with an input each, in display order.
     checklist: Vec<ChecklistRow>,
     new_item: Entity<TextInput>,
-    /// Direct subtasks of the shown task.
-    subtasks: Vec<Task>,
-    /// The shown subtask's parent, named over its title.
-    parent: Option<Task>,
     subtask_input: Entity<TextInput>,
     /// The due-date popover's field for typing a time.
     time_input: Entity<TextInput>,
@@ -121,11 +109,6 @@ pub struct TaskDetail {
     list_submenu: Option<Option<Id>>,
     /// The checklist is shown when it has items or the user asked to start one.
     show_checklist: bool,
-    /// An input to focus on the next render (focusing needs the window).
-    pending_focus: Option<FocusTarget>,
-    popup: Option<Popup>,
-    /// The field or list that owned focus before the popover opened.
-    popup_return_focus: Option<WeakFocusHandle>,
     /// Shown as a task card (the calendar's or the board's), framed by the card instead of a
     /// left border.
     card: bool,
@@ -134,11 +117,7 @@ pub struct TaskDetail {
     calendar_card: bool,
     /// The Add Subtask field shown while the task has no subtasks, from the "…" menu.
     subtask_open: bool,
-    /// The due-date popover's draft, while it is open.
-    due_draft: Option<DueDraft>,
-    /// The "Task Activities" panel, while it is open.
-    activity: Option<Vec<fern_core::Activity>>,
-    _subscriptions: Vec<Subscription>,
+    _session_subscriptions: Vec<Subscription>,
 }
 
 struct ChecklistRow {
@@ -192,74 +171,20 @@ impl TaskDetail {
                 }
                 this.save(cx, |store, id| store.set_title(id, &text));
             }),
-            cx.subscribe_in(&title, window, |this, _, _: &Submitted, window, cx| {
-                if this.draft.is_some() {
-                    match this.popup {
-                        Some(Popup::Due) => this.apply_due(window, cx),
-                        None => { this.finish_draft(cx); }
-                        Some(_) => {}
-                    }
-                } else {
-                    window.focus(&this.notes.focus_handle(cx), cx);
-                }
-            }),
             cx.subscribe(&notes, |this, input, _: &Changed, cx| {
                 let text = input.read(cx).text().to_owned();
                 if this.edit_draft(cx, |task, _| task.notes = text.clone()) { return; }
                 this.save(cx, |store, id| store.set_notes(id, &text));
             }),
             cx.subscribe(&tag_input, |_, _, _: &Changed, cx| cx.notify()),
-            cx.subscribe_in(&tag_input, window, |this, _, _: &Submitted, window, cx| this.pick_typed_tag(window, cx)),
-            cx.subscribe_in(&new_item, window, |this, input, Submitted(text), window, cx| {
-                if !text.trim().is_empty() {
-                    let text = text.clone();
-                    if this.add_checklist_item(&text, None, cx).is_some() {
-                        input.update(cx, |input, cx| input.clear(window, cx));
-                        this.sync_checklist(cx);
-                    }
-                }
-            }),
-            cx.subscribe_in(&subtask_input, window, |this, input, Submitted(text), window, cx| {
-                if !text.trim().is_empty() {
-                    let text = text.clone();
-                    this.save(cx, |store, id| store.add_subtask(id, &text).map(|_| ()));
-                    input.update(cx, |input, cx| input.clear(window, cx));
-                    this.sync_subtasks();
-                }
-            }),
             cx.subscribe(&link_search, |_, _, _: &Changed, cx| cx.notify()),
             cx.subscribe(&list_search, |this, _, _: &Changed, cx| {
                 this.list_submenu = None;
                 cx.notify();
             }),
-            // Enter posts the comment; Escape closes the field.
-            cx.subscribe_in(&comment_input, window, |this, input, Submitted(text), window, cx| {
-                if let Some(task) = this.task_id()
-                    && !text.trim().is_empty()
-                {
-                    match this.store.add_comment(task, text) {
-                        Ok(_) => input.update(cx, |input, cx| input.clear(window, cx)),
-                        Err(err) => eprintln!("failed to add the comment: {err:#}"),
-                    }
-                    this.sync_comments();
-                    cx.notify();
-                }
-            }),
-            cx.subscribe_in(&comment_input, window, |this, _, _: &Cancelled, window, cx| {
-                this.comment_open = false;
-                window.focus(&this.title.focus_handle(cx), cx);
-                cx.notify();
-            }),
-            // A time typed by hand in the due-date popover's time menu.
-            cx.subscribe_in(&time_input, window, |this, input, Submitted(text), window, cx| {
-                if let Some(time) = due_picker::parse_time(text) {
-                    this.update_draft(cx, |d| d.pick_time(Some(time), Local::now().date_naive()));
-                    input.update(cx, |input, cx| input.clear(window, cx));
-                }
-            }),
             cx.observe_global::<CurrentLocale>(|this, cx| {
                 let strings = i18n::t(cx);
-                let placeholder = if this.draft.is_some() { strings.new_task_prompt } else { strings.untitled };
+                let placeholder = if this.session.draft.is_some() { strings.new_task_prompt } else { strings.untitled };
                 this.title.update(cx, |input, cx| input.set_placeholder(placeholder, cx));
                 this.notes.update(cx, |input, cx| input.set_placeholder(strings.notes_placeholder, cx));
                 this.tag_input.update(cx, |input, cx| input.set_placeholder(strings.type_in_tag, cx));
@@ -270,48 +195,33 @@ impl TaskDetail {
             }),
         ];
 
+        let mut editor_window = EditorWindow::new(&title, &new_item, &subtask_input, &comment_input, window, cx);
+        editor_window.inline_popup = Some(PopupWindow::new(cx.weak_entity(), &tag_input, &time_input, window, cx));
         Self {
-            store,
+            session: TaskDetailSession::new(store),
+            editor_window,
             focus_submenu: false,
-            attachments_dir: crate::attachments_dir().ok(),
-            attachments: Vec::new(),
-            attachment_errors: Vec::new(),
-            comments: Vec::new(),
             comment_input,
             comment_open: false,
             comment_emoji: false,
             format_bar: false,
             format_headings: false,
-            specific_month: None,
-            estimate_draft: EstimateDraft { minutes: false, amount: 0 },
-            task: None,
-            draft: None,
             title,
             notes,
             tag_input,
-            tag_draft: None,
-            all_tags: Vec::new(),
-            lists: Vec::new(),
             checklist: Vec::new(),
             new_item,
-            subtasks: Vec::new(),
-            parent: None,
             subtask_input,
             time_input,
             link_search,
             list_search,
             list_submenu: None,
             show_checklist: false,
-            pending_focus: None,
-            popup: None,
-            popup_return_focus: None,
             card: false,
             sticky_style: None,
             calendar_card: false,
             subtask_open: false,
-            due_draft: None,
-            activity: None,
-            _subscriptions: subscriptions,
+            _session_subscriptions: subscriptions,
         }
     }
 
@@ -323,34 +233,92 @@ impl TaskDetail {
 
     /// Whether one of the details' popovers is open, which a click outside the card closes first.
     pub fn has_popup(&self) -> bool {
-        self.popup.is_some()
+        self.session.popup.is_some()
+    }
+
+    pub(crate) fn is_editor_focus(&self, focus: &FocusHandle, cx: &App) -> bool {
+        [&self.title, &self.notes, &self.comment_input, &self.subtask_input, &self.new_item]
+            .into_iter().any(|input| input.focus_handle(cx) == *focus)
+            || self.checklist.iter().any(|row| row.input.focus_handle(cx) == *focus)
+    }
+
+    pub(crate) fn sticky_popup_return_focus(&self, window: &Window, cx: &App) -> WeakFocusHandle {
+        self.editor_window.popup_return_focus.clone().unwrap_or_else(|| {
+            window.focused(cx).filter(|focus| self.is_editor_focus(focus, cx))
+                .unwrap_or_else(|| self.title.focus_handle(cx)).downgrade()
+        })
+    }
+
+    pub(crate) fn sticky_popup_inputs(&self, cx: &App) -> (Option<FocusHandle>, [Entity<TextInput>; 2]) {
+        let input = match self.session.popup {
+            Some(Popup::Tags | Popup::InlineTags) => Some(&self.tag_input),
+            Some(Popup::List) => Some(&self.list_search),
+            Some(Popup::LinkParent) => Some(&self.link_search),
+            _ => None,
+        };
+        (input.map(|input| input.focus_handle(cx)), [self.tag_input.clone(), self.time_input.clone()])
+    }
+
+    pub(crate) fn bind_popup_window(&self, window: &Window, cx: &mut Context<Self>) -> PopupWindow {
+        PopupWindow::new(cx.weak_entity(), &self.tag_input, &self.time_input, window, cx)
+    }
+
+    /// The same menus and drafts, hosted outside the small native note window.
+    pub(crate) fn render_sticky_popup(&mut self, available: gpui::Size<Pixels>, cx: &mut Context<Self>) -> AnyElement {
+        let strings = i18n::t(cx);
+        match self.session.popup {
+            Some(Popup::Due) => self.render_due_popup_in(available, strings, cx),
+            Some(Popup::More) => div().id("sticky-more-scroll").max_h(available.height)
+                .overflow_y_scroll().child(self.render_more_popup(strings, cx)).into_any_element(),
+            Some(Popup::Priority) => self.render_priority_popup(strings, cx),
+            Some(Popup::List) => self.render_list_popup(strings, cx),
+            Some(Popup::Tags | Popup::InlineTags) => self.render_tags_popup(cx),
+            Some(Popup::Templates) => self.render_draft_templates(cx),
+            Some(Popup::Estimate) => self.render_estimate(strings, cx),
+            Some(Popup::LinkParent) => self.render_link_parent(strings, cx),
+            None => div().into_any_element(),
+        }
+    }
+
+    /// Reserve the side-menu area before it opens. Resizing a native popup on hover
+    /// replaces its render surface and causes a visible flash, even for a single frame.
+    pub(crate) fn sticky_submenu_space(&self) -> Pixels {
+        match self.session.popup {
+            Some(Popup::More) => px(200.),
+            Some(Popup::List) => px(180.),
+            _ => px(0.),
+        }
     }
 
     pub fn task_id(&self) -> Option<Id> {
-        self.task.as_ref().map(|t| t.id)
+        self.session.task.as_ref().map(|t| t.id)
+    }
+
+    pub fn task_title(&self) -> Option<&str> {
+        self.session.task.as_ref().map(|task| task.title.as_str())
     }
 
     pub fn set_lists(&mut self, lists: Vec<List>) {
-        self.lists = lists;
+        self.session.lists = lists;
     }
 
     /// Shows a task, or the empty panel for `None`.
     pub fn show(&mut self, task: Option<Task>, cx: &mut Context<Self>) {
-        self.draft = None;
+        self.session.draft = None;
         self.title.update(cx, |input, cx| input.set_placeholder(i18n::t(cx).untitled, cx));
         let (title, notes) = task
             .as_ref()
             .map_or((String::new(), String::new()), |t| (t.title.clone(), t.notes.clone()));
         self.title.update(cx, |input, cx| input.set_text(title, cx));
         self.notes.update(cx, |input, cx| input.set_text(notes, cx));
-        self.task = task;
-        self.popup = None;
-        self.popup_return_focus = None;
-        self.tag_draft = None;
-        self.attachment_errors.clear();
+        self.session.task = task;
+        self.session.popup = None;
+        self.editor_window.popup_return_focus = None;
+        self.session.tag_draft = None;
+        self.session.attachment_errors.clear();
         self.subtask_open = false;
-        self.activity = None;
-        self.all_tags = self.store.tags().unwrap_or_default();
+        self.session.activity = None;
+        self.session.all_tags = self.session.store.tags().unwrap_or_default();
         self.checklist.clear();
         self.sync_checklist(cx);
         self.show_checklist = !self.checklist.is_empty();
@@ -361,8 +329,8 @@ impl TaskDetail {
     }
 
     fn sync_comments(&mut self) {
-        self.comments = match self.task_id() {
-            Some(id) => self.store.comments(id).unwrap_or_default(),
+        self.session.comments = match self.task_id() {
+            Some(id) => self.session.store.comments(id).unwrap_or_default(),
             None => Vec::new(),
         };
     }
@@ -402,7 +370,7 @@ impl TaskDetail {
             "comment-emoji" => (self.comment_open, self.comment_emoji) = (true, true),
             text if text.starts_with("comment:") => {
                 if let Some(task) = self.task_id() {
-                    let _ = self.store.add_comment(task, &text["comment:".len()..]);
+                    let _ = self.session.store.add_comment(task, &text["comment:".len()..]);
                     self.sync_comments();
                 }
             }
@@ -418,8 +386,8 @@ impl TaskDetail {
         v_flex()
             .pt_3()
             .gap_2()
-            .child(Label::new(format!("{} {}", strings.comments, self.comments.len())).size(LabelSize::Small).color(Color::Muted))
-            .children(self.comments.iter().map(|comment| {
+            .child(Label::new(format!("{} {}", strings.comments, self.session.comments.len())).size(LabelSize::Small).color(Color::Muted))
+            .children(self.session.comments.iter().map(|comment| {
                 let id = comment.id;
                 let when = chrono::DateTime::from_timestamp_millis(comment.created_at)
                     .map(|t| t.with_timezone(&Local).naive_local())
@@ -448,7 +416,7 @@ impl TaskDetail {
                                 .icon_color(Color::Muted)
                                 .tooltip(Tooltip::text(strings.delete))
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    let _ = this.store.delete_comment(id);
+                                    let _ = this.session.store.delete_comment(id);
                                     this.sync_comments();
                                     cx.notify();
                                 })),
@@ -526,20 +494,20 @@ impl TaskDetail {
     }
 
     fn sync_attachments(&mut self) {
-        if let Some(draft) = &self.draft {
-            self.attachments = draft.attachments.iter().map(|prepared| prepared.metadata().clone()).collect();
+        if let Some(draft) = &self.session.draft {
+            self.session.attachments = draft.attachments.iter().map(|prepared| prepared.metadata().clone()).collect();
             return;
         }
-        self.attachments = match self.task_id() {
-            Some(id) => self.store.attachments(id).unwrap_or_default(),
+        self.session.attachments = match self.task_id() {
+            Some(id) => self.session.store.attachments(id).unwrap_or_default(),
             None => Vec::new(),
         };
     }
 
     /// "Upload Attachment": files picked in the system's dialog are copied to the app's folder.
     fn upload_attachment(&mut self, cx: &mut Context<Self>) {
-        self.popup = None;
-        let Some(task) = self.task.as_ref().filter(|task| !task.is_deleted()).map(|task| task.id) else { return };
+        self.session.popup = None;
+        let Some(task) = self.session.task.as_ref().filter(|task| !task.is_deleted()).map(|task| task.id) else { return };
         let chosen = cx.prompt_for_paths(gpui::PathPromptOptions { files: true, directories: false, multiple: true, prompt: None });
         cx.spawn(async move |this, cx| {
             let Some(paths) = chosen.await.ok().and_then(Result::ok).flatten() else { return };
@@ -550,16 +518,16 @@ impl TaskDetail {
 
     fn attach_paths(&mut self, task: Id, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
         if self.task_id() == Some(task) {
-            self.attachment_errors.clear();
+            self.session.attachment_errors.clear();
             cx.notify();
         }
-        let Some(dir) = self.attachments_dir.clone() else {
+        let Some(dir) = self.session.attachments_dir.clone() else {
             eprintln!("failed to locate the attachment folder");
             return;
         };
         let staging_dir = dir.clone();
-        let is_draft = self.draft.is_some() && self.task_id() == Some(task);
-        if is_draft { self.draft.as_mut().unwrap().pending_attachments += 1; }
+        let is_draft = self.session.draft.is_some() && self.task_id() == Some(task);
+        if is_draft { self.session.draft.as_mut().unwrap().pending_attachments += 1; }
         let copies = cx.background_spawn(async move {
             paths
                 .into_iter()
@@ -573,23 +541,23 @@ impl TaskDetail {
             let copies = copies.await;
             this.update(cx, |this, cx| {
                 // A file picker or copy can finish after its draft has been closed/replaced.
-                if is_draft && (this.task_id() != Some(task) || this.draft.is_none()) { return; }
-                if is_draft { this.draft.as_mut().unwrap().pending_attachments -= 1; }
+                if is_draft && (this.task_id() != Some(task) || this.session.draft.is_none()) { return; }
+                if is_draft { this.session.draft.as_mut().unwrap().pending_attachments -= 1; }
                 let strings = i18n::t(cx);
                 for (path, prepared) in copies {
                     let result = prepared.and_then(|copy| {
                         if is_draft {
-                            this.draft.as_mut().unwrap().attachments.push(copy);
+                            this.session.draft.as_mut().unwrap().attachments.push(copy);
                             Ok(())
                         } else {
-                            this.store.save_attachment(copy, &dir).map(|_| ())
+                            this.session.store.save_attachment(copy, &dir).map(|_| ())
                         }
                     });
                     if let Err(err) = result {
                         eprintln!("failed to attach {}: {err:#}", path.display());
                         if this.task_id() == Some(task) {
                             let name = path.file_name().unwrap_or(path.as_os_str()).to_string_lossy();
-                            this.attachment_errors.push(strings.attachment_failed
+                            this.session.attachment_errors.push(strings.attachment_failed
                                 .replace("{file}", &name)
                                 .replace("{error}", &crate::sync::attachment_error(&err, strings)));
                         }
@@ -606,10 +574,10 @@ impl TaskDetail {
     /// The attached files under the notes: a click opens one with the system's app.
     fn render_attachments(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
-        v_flex().gap_1().children(self.attachments.iter().map(|attachment| {
-            let path = match &self.draft {
+        v_flex().gap_1().children(self.session.attachments.iter().map(|attachment| {
+            let path = match &self.session.draft {
                 Some(draft) => draft.attachments.iter().find(|prepared| prepared.metadata().id == attachment.id).map(|prepared| prepared.path().to_owned()),
-                None => self.attachments_dir.as_ref().map(|dir| attachment.path(dir)),
+                None => self.session.attachments_dir.as_ref().map(|dir| attachment.path(dir)),
             };
             let removed = attachment.clone();
             h_flex()
@@ -631,14 +599,14 @@ impl TaskDetail {
                     IconButton::new("attachment-delete", IconName::X).size(px(20.)).icon_size(IconSize::XSmall).on_click(
                         cx.listener(move |this, _, _, cx| {
                             cx.stop_propagation();
-                            if let Some(draft) = &mut this.draft {
+                            if let Some(draft) = &mut this.session.draft {
                                 draft.attachments.retain(|prepared| prepared.metadata().id != removed.id);
                                 this.sync_attachments();
                                 cx.notify();
                                 return;
                             }
-                            let Some(dir) = &this.attachments_dir else { return };
-                            let result = this.store.delete_attachment(&removed, dir);
+                            let Some(dir) = &this.session.attachments_dir else { return };
+                            let result = this.session.store.delete_attachment(&removed, dir);
                             if let Err(err) = result {
                                 eprintln!("failed to remove the attachment: {err:#}");
                             }
@@ -656,12 +624,12 @@ impl TaskDetail {
     }
 
     fn sync_subtasks(&mut self) {
-        self.subtasks = match self.task_id() {
-            Some(id) => self.store.subtasks(id).unwrap_or_default(),
+        self.session.subtasks = match self.task_id() {
+            Some(id) => self.session.store.subtasks(id).unwrap_or_default(),
             None => Vec::new(),
         };
-        let parent_id = self.task.as_ref().and_then(|task| task.parent_id);
-        self.parent = parent_id.and_then(|id| self.store.task(id).ok().flatten());
+        let parent_id = self.session.task.as_ref().and_then(|task| task.parent_id);
+        self.session.parent = parent_id.and_then(|id| self.session.store.task(id).ok().flatten());
     }
 
     fn toggle_subtask(&mut self, id: Id, completed: bool, cx: &mut Context<Self>) {
@@ -677,7 +645,7 @@ impl TaskDetail {
             self.checklist.clear();
             return;
         };
-        let items = self.draft.as_ref().map_or_else(|| self.store.checklist(task).unwrap_or_default(), |draft| draft.checklist.clone());
+        let items = self.session.draft.as_ref().map_or_else(|| self.session.store.checklist(task).unwrap_or_default(), |draft| draft.checklist.clone());
         let mut old: Vec<ChecklistRow> = std::mem::take(&mut self.checklist);
         for item in items {
             let row = match old.iter().position(|row| row.item.id == item.id) {
@@ -709,14 +677,7 @@ impl TaskDetail {
                 }) { return; }
                 this.save(cx, |store, _| store.set_checklist_item_title(id, &text));
             }),
-            // Enter adds the next item right below, as in TickTick.
-            cx.subscribe(&input, move |this, _, _: &Submitted, cx| {
-                let created = this.add_checklist_item("", Some(id), cx);
-                if let Some(created) = created {
-                    this.pending_focus = Some(FocusTarget::Item(created.id));
-                    this.sync_checklist(cx);
-                }
-            }),
+            self.editor_window.checklist(&input, id, cx),
         ];
         ChecklistRow { item, input, _subscriptions: subscriptions }
     }
@@ -739,7 +700,7 @@ impl TaskDetail {
 
     fn start_checklist(&mut self, cx: &mut Context<Self>) {
         self.show_checklist = true;
-        self.pending_focus = Some(FocusTarget::NewItem);
+        self.editor_window.pending_focus = Some(FocusTarget::NewItem);
         cx.notify();
     }
 
@@ -747,7 +708,7 @@ impl TaskDetail {
     pub fn refresh(&mut self, task: Option<Task>, cx: &mut Context<Self>) {
         match task {
             Some(task) if self.task_id() == Some(task.id) => {
-                self.task = Some(task);
+                self.session.task = Some(task);
                 self.sync_checklist(cx);
                 self.sync_subtasks();
                 self.sync_attachments();
@@ -758,9 +719,9 @@ impl TaskDetail {
 
     fn save(&mut self, cx: &mut Context<Self>, write: impl FnOnce(&Store, Id) -> anyhow::Result<()>) {
         // A new task is written only by finish_draft, with all of its fields together.
-        if self.draft.is_some() { return; }
+        if self.session.draft.is_some() { return; }
         let Some(id) = self.task_id() else { return };
-        if let Err(err) = write(&self.store, id) {
+        if let Err(err) = write(&self.session.store, id) {
             eprintln!("failed to save the task: {err:#}");
             return;
         }
@@ -769,17 +730,17 @@ impl TaskDetail {
 
     fn open_popup(&mut self, popup: Popup, cx: &mut Context<Self>) {
         self.focus_submenu = false;
-        self.popup_return_focus = None;
-        self.tag_draft = None;
+        self.editor_window.popup_return_focus = None;
+        self.session.tag_draft = None;
         match popup {
             Popup::Due => {
                 let today = Local::now().date_naive();
-                self.due_draft = self.task.as_ref().map(|task| self.due_preview(task, today));
+                self.session.due_draft = self.session.task.as_ref().map(|task| self.due_preview(task, today));
             }
             Popup::Tags | Popup::InlineTags => {
-                self.all_tags = self.store.tags().unwrap_or_default();
+                self.session.all_tags = self.session.store.tags().unwrap_or_default();
                 let original = self.task_tags();
-                self.tag_draft = Some(TagDraft { picked: original.clone(), original, save_failed: false });
+                self.session.tag_draft = Some(TagDraft { picked: original.clone(), original, save_failed: false });
                 self.tag_input.update(cx, |input, cx| input.set_text("", cx));
             }
             Popup::List => {
@@ -788,20 +749,20 @@ impl TaskDetail {
             }
             Popup::Priority | Popup::More | Popup::Templates => {}
             Popup::LinkParent => self.link_search.update(cx, |input, cx| input.set_text("", cx)),
-            Popup::Estimate => self.estimate_draft = EstimateDraft::from(self.task.as_ref().and_then(|t| t.estimate)),
+            Popup::Estimate => self.session.estimate_draft = EstimateDraft::from(self.session.task.as_ref().and_then(|t| t.estimate)),
         }
-        self.popup = Some(popup);
+        self.session.popup = Some(popup);
         cx.notify();
     }
 
     fn open_popup_from_ui(&mut self, popup: Popup, window: &Window, cx: &mut Context<Self>) {
         let return_focus = if self.popup_input_focused(window, cx) {
-            self.popup_return_focus.clone()
+            self.editor_window.popup_return_focus.clone()
         } else {
             window.focused(cx).map(|focus| focus.downgrade())
         };
         self.open_popup(popup, cx);
-        self.popup_return_focus = return_focus;
+        self.editor_window.popup_return_focus = return_focus;
     }
 
     fn open_tags(&mut self, popup: Popup, window: &mut Window, cx: &mut Context<Self>) {
@@ -812,13 +773,13 @@ impl TaskDetail {
     /// Opens the due-date picker (the "Set date" shortcut).
     /// Settings → Task Default → Default Duration, in minutes.
     fn default_duration(&self) -> i64 {
-        self.store.preferences().map_or(60, |p| p.task_defaults.duration)
+        self.session.store.preferences().map_or(60, |p| p.task_defaults.duration)
     }
 
     /// The details' own pickers, for the task list's right-click menu: `subtask` focuses the Add
     /// Subtask field, `due`, `tags` and `link-parent` open their popovers.
     pub fn start(&mut self, what: &str, window: &mut Window, cx: &mut Context<Self>) {
-        if self.task.is_none() {
+        if self.session.task.is_none() {
             return;
         }
         match what {
@@ -837,7 +798,7 @@ impl TaskDetail {
     }
 
     pub fn open_due(&mut self, cx: &mut Context<Self>) {
-        if self.task.is_some() {
+        if self.session.task.is_some() {
             self.open_popup(Popup::Due, cx);
         }
     }
@@ -852,7 +813,7 @@ impl TaskDetail {
             // The list menu with the task's list's sections open beside it.
             "list-sections" => {
                 self.open_popup(Popup::List, cx);
-                self.list_submenu = Some(self.task.as_ref().and_then(|t| t.list_id));
+                self.list_submenu = Some(self.session.task.as_ref().and_then(|t| t.list_id));
                 return;
             }
             "more" => Popup::More,
@@ -937,15 +898,15 @@ impl TaskDetail {
     }
 
     fn close_popup(&mut self, cx: &mut Context<Self>) {
-        self.popup = None;
-        self.popup_return_focus = None;
-        self.tag_draft = None;
+        self.session.popup = None;
+        self.editor_window.popup_return_focus = None;
+        self.session.tag_draft = None;
         self.focus_submenu = false;
         cx.notify();
     }
 
     fn popup_input_focused(&self, window: &Window, cx: &App) -> bool {
-        let input = match self.popup {
+        let input = match self.session.popup {
             Some(Popup::Tags | Popup::InlineTags) => &self.tag_input,
             Some(Popup::LinkParent) => &self.link_search,
             Some(Popup::Due) => &self.time_input,
@@ -957,11 +918,11 @@ impl TaskDetail {
 
     /// Dismisses a popover even if focus is still in the task list or calendar.
     pub fn dismiss_popup(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        if self.popup.is_none() {
+        if self.session.popup.is_none() {
             return false;
         }
         if self.popup_input_focused(window, cx) {
-            let focus = self.popup_return_focus.take()
+            let focus = self.editor_window.popup_return_focus.take()
                 .and_then(|focus| focus.upgrade())
                 .unwrap_or_else(|| self.title.focus_handle(cx));
             window.focus(&focus, cx);
@@ -971,13 +932,13 @@ impl TaskDetail {
     }
 
     fn update_draft(&mut self, cx: &mut Context<Self>, change: impl FnOnce(&mut DueDraft)) {
-        if let Some(draft) = self.due_draft.as_mut() {
+        if let Some(draft) = self.session.due_draft.as_mut() {
             let was_timed = draft.time.is_some();
             let had_date = draft.date.is_some();
             change(draft);
             let timed = draft.time.is_some();
             if !draft.reminders_changed
-                && let Some(task_draft) = &self.draft
+                && let Some(task_draft) = &self.session.draft
                 && (was_timed != timed || had_date != draft.date.is_some())
             {
                 draft.reminders = task_draft.default_reminder(timed)
@@ -991,9 +952,9 @@ impl TaskDetail {
 
     /// "OK": saves the draft's date, time and repeat.
     fn apply_due(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(draft) = self.due_draft.take() {
+        if let Some(draft) = self.session.due_draft.take() {
             let today = Local::now().date_naive();
-            let changed = self.task.as_ref().is_some_and(|task| {
+            let changed = self.session.task.as_ref().is_some_and(|task| {
                 let before = self.due_preview(task, today);
                 draft.date != before.date || draft.time != before.time
                     || draft.end() != before.end() || draft.repeat != before.repeat
@@ -1025,7 +986,7 @@ impl TaskDetail {
 
     /// "Clear": removes the due date, time and repeat.
     fn clear_due(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.due_draft = None;
+        self.session.due_draft = None;
         let today = Local::now().date_naive();
         if !self.edit_draft(cx, |task, state| {
             task.due_date = None; task.due_time = None; task.end_date = None; task.end_time = None;
@@ -1061,20 +1022,27 @@ impl TaskDetail {
     }
 
     fn task_tags(&self) -> Vec<String> {
-        self.task.as_ref().map(|t| t.tags.clone()).unwrap_or_default()
+        self.session.task.as_ref().map(|t| t.tags.clone()).unwrap_or_default()
     }
 
     fn tag_query<'a>(&self, cx: &'a App) -> &'a str {
         self.tag_input.read(cx).text().trim().trim_start_matches('#').trim()
     }
 
-    fn pick_typed_tag(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn pick_typed_time(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(time) = due_picker::parse_time(text) {
+            self.update_draft(cx, |d| d.pick_time(Some(time), Local::now().date_naive()));
+            self.time_input.update(cx, |input, cx| input.clear(window, cx));
+        }
+    }
+
+    pub(crate) fn pick_typed_tag(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let query = self.tag_query(cx).to_owned();
         if query.is_empty() {
             return;
         }
-        let name = self.all_tags.iter().find(|tag| same_tag(&tag.name, &query)).map_or(query, |tag| tag.name.clone());
-        if let Some(draft) = &mut self.tag_draft {
+        let name = self.session.all_tags.iter().find(|tag| same_tag(&tag.name, &query)).map_or(query, |tag| tag.name.clone());
+        if let Some(draft) = &mut self.session.tag_draft {
             if !draft.picked.iter().any(|picked| same_tag(picked, &name)) {
                 draft.picked.push(name);
             }
@@ -1085,7 +1053,7 @@ impl TaskDetail {
     }
 
     fn toggle_picked_tag(&mut self, name: String, cx: &mut Context<Self>) {
-        if let Some(draft) = &mut self.tag_draft {
+        if let Some(draft) = &mut self.session.tag_draft {
             if let Some(index) = draft.picked.iter().position(|picked| same_tag(picked, &name)) {
                 draft.picked.remove(index);
             } else {
@@ -1097,17 +1065,17 @@ impl TaskDetail {
     }
 
     fn apply_tags(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.draft.is_some() {
-            if let Some(tags) = self.tag_draft.as_ref().map(|draft| draft.picked.clone()) {
+        if self.session.draft.is_some() {
+            if let Some(tags) = self.session.tag_draft.as_ref().map(|draft| draft.picked.clone()) {
                 self.edit_draft(cx, |task, _| task.tags = tags);
             }
             self.dismiss_popup(window, cx);
             return;
         }
-        let (Some(id), Some(draft)) = (self.task_id(), &mut self.tag_draft) else { return };
+        let (Some(id), Some(draft)) = (self.task_id(), &mut self.session.tag_draft) else { return };
         let contains = |tags: &[String], name: &str| tags.iter().any(|tag| same_tag(tag, name));
         let save = (|| -> anyhow::Result<bool> {
-            let Some(mut task) = self.store.task(id)?.filter(|task| !task.is_deleted()) else {
+            let Some(mut task) = self.session.store.task(id)?.filter(|task| !task.is_deleted()) else {
                 anyhow::bail!("cannot save tags for a missing or deleted task");
             };
             // Apply the user's changes to the current tags, which may have synced since opening.
@@ -1121,7 +1089,7 @@ impl TaskDetail {
             if task.tags == before {
                 return Ok(false);
             }
-            self.store.set_tags(id, &task.tags)?;
+            self.session.store.set_tags(id, &task.tags)?;
             Ok(true)
         })();
         match save {
@@ -1140,7 +1108,7 @@ impl TaskDetail {
     }
 
     fn tag_color(&self, name: &str, cx: &App) -> Hsla {
-        let color = self.all_tags.iter().find(|t| t.name == name).and_then(|t| t.color.as_deref());
+        let color = self.session.all_tags.iter().find(|t| t.name == name).and_then(|t| t.color.as_deref());
         lists_panel::color(color, cx)
     }
 
@@ -1158,12 +1126,12 @@ impl TaskDetail {
     }
 
     fn toggle_wont_do(&mut self, cx: &mut Context<Self>) {
-        let wont_do = self.task.as_ref().is_some_and(|t| t.is_wont_do());
+        let wont_do = self.session.task.as_ref().is_some_and(|t| t.is_wont_do());
         self.menu_action(cx, |store, id| store.set_wont_do(id, !wont_do));
     }
 
     fn toggle_kind(&mut self, cx: &mut Context<Self>) {
-        let kind = match self.task.as_ref().map(|task| self.kind_preview(task)) {
+        let kind = match self.session.task.as_ref().map(|task| self.kind_preview(task)) {
             Some(Kind::Note) => Kind::Task,
             _ => Kind::Note,
         };
@@ -1180,7 +1148,8 @@ impl TaskDetail {
     /// The panel's "…" menu, a subset of the original's: the entries Fern supports so far.
     /// A "…" menu entry; hovering it closes the Start Focus side menu.
     fn close_side_menu_on_hover(&self, item: ListItem, cx: &mut Context<Self>) -> impl IntoElement {
-        div().id(item.id()).child(item).on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+        let selector = format!("task-menu-{}", item.id());
+        div().id(item.id()).debug_selector(move || selector.clone()).child(item).on_hover(cx.listener(|this, hovered: &bool, _, cx| {
             if *hovered && this.focus_submenu {
                 this.focus_submenu = false;
                 cx.notify();
@@ -1189,17 +1158,57 @@ impl TaskDetail {
     }
 
     fn render_more_popup(&self, strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {
-        if self.draft.is_some() { return self.render_draft_menu(strings, cx); }
-        let Some(task) = self.task.as_ref() else { return div().into_any_element() };
+        if self.session.draft.is_some() { return self.render_draft_menu(strings, cx); }
+        let Some(task) = self.session.task.as_ref() else { return div().into_any_element() };
         let wont_do = task.is_wont_do();
         let is_note = task.kind == Kind::Note;
+        let submenu_bounds = Rc::new(Cell::new(None::<gpui::Bounds<Pixels>>));
+        let outside_submenu = submenu_bounds.clone();
         let item = |id: &'static str, icon: IconName, label: &'static str| {
             ListItem::new(id).height(px(34.)).start_slot(Icon::new(icon).color(Color::Muted)).child(Label::new(label))
         };
         // The original's menu: 178 px wide (wider when a label needs it), a row every 34 px.
         popover(cx)
+            .debug_selector(|| "task-more-popup".into())
             .min_w(px(178.))
-            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_popup(cx)))
+            .on_mouse_down_out(cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                if !outside_submenu.get().is_some_and(|bounds| bounds.contains(&event.position)) {
+                    this.close_popup(cx);
+                }
+            }))
+            .when(self.sticky_style.is_some(), |menu| {
+                menu.when(!is_note, |menu| {
+                    let label = if task.is_completed() { strings.reopen } else { strings.completed };
+                    menu.child(item("sticky-complete", IconName::SquareCheck, label)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.close_popup(cx);
+                            this.toggle_completed(cx);
+                        })))
+                })
+                .child(item("sticky-checklist", IconName::ListChecks, strings.checklist)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.close_popup(cx);
+                        this.start_checklist(cx);
+                    })))
+                .child(item("sticky-priority", IconName::Flag, strings.summary_priority)
+                    .on_click(cx.listener(|this, _, _, cx| this.open_popup(Popup::Priority, cx))))
+                .child(item("sticky-move", IconName::Inbox, strings.move_to)
+                    .on_click(cx.listener(|this, _, window, cx| this.open_popup_from_ui(Popup::List, window, cx))))
+                .child(item("sticky-format", IconName::Baseline, strings.text_format)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.close_popup(cx);
+                        this.format_bar = !this.format_bar;
+                        this.format_headings = false;
+                    })))
+                .child(item("sticky-comments", IconName::MessageSquareText, strings.comment_tip)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.close_popup(cx);
+                        this.comment_open = !this.comment_open;
+                        if this.comment_open {
+                            window.focus(&this.comment_input.focus_handle(cx), cx);
+                        }
+                    })))
+            })
             .child(self.close_side_menu_on_hover(item("more-subtask", IconName::CornerDownRight, strings.add_subtask_item).on_click(cx.listener(
                 |this, _, window, cx| {
                     this.close_popup(cx);
@@ -1240,6 +1249,7 @@ impl TaskDetail {
                     .icon(IconName::CircleDot)
                     .height(px(34.))
                     .open(self.focus_submenu)
+                    .track_bounds(submenu_bounds)
                     .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
                         if *hovered && !this.focus_submenu {
                             this.focus_submenu = true;
@@ -1252,14 +1262,14 @@ impl TaskDetail {
                             .child(Label::new(label))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.close_popup(cx);
-                                if let Some(task) = this.task.as_ref() {
+                                if let Some(task) = this.session.task.as_ref() {
                                     cx.emit(StartFocus(task.id, task.title.clone(), stopwatch));
                                 }
                             }))
                     }))
                     .items([ListItem::new("more-focus-estimate")
                         .height(px(34.))
-                        .child(Label::new(strings.estimation))
+                        .child(div().debug_selector(|| "task-focus-estimate".into()).child(Label::new(strings.estimation)))
                         .on_click(cx.listener(|this, _, _, cx| this.open_popup(Popup::Estimate, cx)))]),
             )
             .child(div().py_1().child(Divider::horizontal()))
@@ -1277,7 +1287,7 @@ impl TaskDetail {
             )), cx))
             .child(self.close_side_menu_on_hover(item("more-copy-link", IconName::Link, strings.copy_link).on_click(cx.listener(|this, _, _, cx| {
                 this.close_popup(cx);
-                if let Some(task) = this.task.as_ref() {
+                if let Some(task) = this.session.task.as_ref() {
                     cx.write_to_clipboard(gpui::ClipboardItem::new_string(fern_core::link::task_link(task.id)));
                 }
             })), cx))
@@ -1293,8 +1303,8 @@ impl TaskDetail {
             .child(div().py_1().child(Divider::horizontal()))
             .child(self.close_side_menu_on_hover(item("more-print", IconName::Printer, strings.print).on_click(cx.listener(|this, _, _, cx| {
                 this.close_popup(cx);
-                if let Some(task) = this.task.clone() {
-                    let checklist = this.store.checklist(task.id).unwrap_or_default();
+                if let Some(task) = this.session.task.clone() {
+                    let checklist = this.session.store.checklist(task.id).unwrap_or_default();
                     let html = crate::print::task_html(&task, &checklist, Local::now().date_naive(), i18n::t(cx));
                     if let Err(err) = crate::print::open("task", &html) {
                         eprintln!("failed to print: {err}");
@@ -1302,7 +1312,7 @@ impl TaskDetail {
                 }
             })), cx))
             .child(self.close_side_menu_on_hover(item("more-delete", IconName::Trash, strings.delete).on_click(cx.listener(|this, _, _, cx| {
-                let task = this.task.as_ref().map(|t| (t.id, t.title.clone()));
+                let task = this.session.task.as_ref().map(|t| (t.id, t.title.clone()));
                 this.menu_action(cx, |store, id| store.delete_task(id));
                 if let Some((id, title)) = task {
                     let label = i18n::t(cx).undo_deleted.replace("{title}", &title);
@@ -1313,13 +1323,13 @@ impl TaskDetail {
     }
 
     fn open_activity(&mut self, cx: &mut Context<Self>) {
-        let Some(task) = self.task.as_ref() else { return };
-        let mut activity = self.store.task_activity(task.id).unwrap_or_default();
+        let Some(task) = self.session.task.as_ref() else { return };
+        let mut activity = self.session.store.task_activity(task.id).unwrap_or_default();
         // Tasks from before activity was recorded still show when they were created.
         if activity.first().is_none_or(|a| a.kind != "created") {
             activity.insert(0, fern_core::Activity { at: task.created_at, kind: "created".into() });
         }
-        self.activity = Some(activity);
+        self.session.activity = Some(activity);
         cx.notify();
     }
 
@@ -1340,7 +1350,7 @@ impl TaskDetail {
                 h_flex()
                     .child(div().flex_1().child(Label::new(strings.task_activities).weight(FontWeight::SEMIBOLD)))
                     .child(IconButton::new("close-activity", IconName::X).on_click(cx.listener(|this, _, _, cx| {
-                        this.activity = None;
+                        this.session.activity = None;
                         cx.notify();
                     }))),
             )
@@ -1368,7 +1378,7 @@ impl TaskDetail {
     /// the search field, each with its list.
     /// The original's Estimation popover: Estimated Pomo or Estimated Duration, with Cancel / OK.
     fn render_estimate(&self, strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {
-        let draft = self.estimate_draft;
+        let draft = self.session.estimate_draft;
         let theme = cx.theme().clone();
         let kind = |minutes: bool, label: &'static str| {
             div()
@@ -1383,15 +1393,15 @@ impl TaskDetail {
                 .when(draft.minutes == minutes, |el| el.bg(theme.colors().element_selected))
                 .child(Label::new(label).size(LabelSize::Small).color(if draft.minutes == minutes { Color::Default } else { Color::Muted }))
                 .on_click(cx.listener(move |this, _, _, cx| {
-                    if this.estimate_draft.minutes != minutes {
-                        this.estimate_draft = EstimateDraft { minutes, amount: 0 };
+                    if this.session.estimate_draft.minutes != minutes {
+                        this.session.estimate_draft = EstimateDraft { minutes, amount: 0 };
                         cx.notify();
                     }
                 }))
         };
         let step = |id: &'static str, icon: IconName, up: bool| {
             IconButton::new(id, icon).size(px(24.)).icon_size(IconSize::Small).on_click(cx.listener(move |this, _, _, cx| {
-                this.estimate_draft.step(up);
+                this.session.estimate_draft.step(up);
                 cx.notify();
             }))
         };
@@ -1411,6 +1421,7 @@ impl TaskDetail {
                 .child(Label::new(label).size(LabelSize::Small).when(primary, |l| l.color(Color::Custom(gpui::white()))))
         };
         popover(cx)
+            .debug_selector(|| "task-estimate-popup".into())
             .w(px(280.))
             .p_3()
             .gap_3()
@@ -1448,7 +1459,7 @@ impl TaskDetail {
                     .gap_2()
                     .child(button("estimate-cancel", strings.cancel, false).on_click(cx.listener(|this, _, _, cx| this.close_popup(cx))))
                     .child(button("estimate-ok", strings.ok, true).on_click(cx.listener(|this, _, _, cx| {
-                        let estimate = this.estimate_draft.estimate();
+                        let estimate = this.session.estimate_draft.estimate();
                         this.menu_action(cx, move |store, id| store.set_estimate(id, estimate));
                     }))),
             )
@@ -1457,11 +1468,11 @@ impl TaskDetail {
 
     fn render_link_parent(&self, strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
-        let Some(task) = self.task.as_ref() else { return div().into_any_element() };
+        let Some(task) = self.session.task.as_ref() else { return div().into_any_element() };
         let query = self.link_search.read(cx).text().trim().to_lowercase();
         let excluded: std::collections::HashSet<Id> =
-            self.store.descendants(task.id).unwrap_or_default().into_iter().chain([task.id]).collect();
-        let candidates: Vec<Task> = self
+            self.session.store.descendants(task.id).unwrap_or_default().into_iter().chain([task.id]).collect();
+        let candidates: Vec<Task> = self.session
             .store
             .tasks()
             .unwrap_or_default()
@@ -1489,7 +1500,7 @@ impl TaskDetail {
                 let parent = candidate.id;
                 let list: SharedString = candidate
                     .list_id
-                    .and_then(|id| self.lists.iter().find(|l| l.id == id))
+                    .and_then(|id| self.session.lists.iter().find(|l| l.id == id))
                     .map_or(strings.inbox.into(), |l| l.name.clone().into());
                 ListItem::new(SharedString::from(format!("link-{parent}")))
                     .start_slot(Icon::new(IconName::Circle).size(IconSize::Small).color(Color::Muted))
@@ -1504,16 +1515,16 @@ impl TaskDetail {
     }
 
     fn toggle_completed(&mut self, cx: &mut Context<Self>) {
-        let Some(task) = self.task.as_mut() else { return };
+        let Some(task) = self.session.task.as_mut() else { return };
         let completed = !task.is_completed();
         let mut undo = None;
         // Unchecking a "Won't Do" task reopens it.
         let result = if task.is_wont_do() {
-            self.store.set_wont_do(task.id, false)
+            self.session.store.set_wont_do(task.id, false)
         } else if completed {
-            crate::undo::complete(&self.store, task).map(|action| undo = Some(action))
+            crate::undo::complete(&self.session.store, task).map(|action| undo = Some(action))
         } else {
-            self.store.set_completed(task.id, false)
+            self.session.store.set_completed(task.id, false)
         };
         if let Err(err) = result {
             eprintln!("failed to update the task: {err:#}");
@@ -1524,7 +1535,7 @@ impl TaskDetail {
             cx.emit(Undoable(action, label));
             crate::completion_mark::record(task.id, cx);
         }
-        if let Ok(Some(fresh)) = self.store.task(task.id) {
+        if let Ok(Some(fresh)) = self.session.store.task(task.id) {
             *task = fresh;
         }
         cx.emit(TaskUpdated);
@@ -1588,7 +1599,7 @@ impl TaskDetail {
     fn render_subtasks(&self, strings: &'static Strings, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .children(self.subtasks.iter().map(|subtask| {
+            .children(self.session.subtasks.iter().map(|subtask| {
                 let id = subtask.id;
                 let done = subtask.is_completed();
                 ListItem::new(SharedString::from(format!("subtask-{id}")))
@@ -1713,7 +1724,11 @@ impl TaskDetail {
     }
 
     fn render_due_popup(&self, strings: &'static Strings, window: &Window, cx: &mut Context<Self>) -> AnyElement {
-        let Some(draft) = self.due_draft.clone() else { return div().into_any_element() };
+        self.render_due_popup_in(window.viewport_size() - gpui::size(px(16.), px(16.)), strings, cx)
+    }
+
+    fn render_due_popup_in(&self, available: gpui::Size<Pixels>, strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {
+        let Some(draft) = self.session.due_draft.clone() else { return div().into_any_element() };
         let theme = cx.theme().clone();
         let locale = i18n::locale(cx);
         let today = Local::now().date_naive();
@@ -1749,6 +1764,7 @@ impl TaskDetail {
                         div().flex_1().flex().justify_center().child(
                             div()
                                 .id(SharedString::from(format!("day-{date}")))
+                                .debug_selector(move || format!("due-day-{date}"))
                                 .size(px(28.))
                                 .flex()
                                 .items_center()
@@ -2053,10 +2069,9 @@ impl TaskDetail {
             .children(reminder_menu)
             .child(row("due-repeat-row", IconName::Repeat, repeat_label, draft.repeat.is_some(), DueMenu::Repeat, cx))
             .children(repeat_menu);
-        let viewport = window.viewport_size();
         popover(cx)
-            .w(px(260.).min((viewport.width - px(16.)).max(px(0.))))
-            .max_h((viewport.height - px(16.)).max(px(0.)))
+            .w(px(260.).min(available.width.max(px(0.))))
+            .max_h(available.height.max(px(0.)))
             .p_2()
             .gap_2()
             .on_mouse_down_out(cx.listener(|this, _, window, cx| {
@@ -2405,10 +2420,10 @@ impl TaskDetail {
         let strings = i18n::t(cx);
         let theme = cx.theme().clone();
         let today = Local::now().date_naive();
-        let month = self.specific_month.unwrap_or_else(|| calendar::month_start(rule.dates.first().copied().unwrap_or(today)));
+        let month = self.session.specific_month.unwrap_or_else(|| calendar::month_start(rule.dates.first().copied().unwrap_or(today)));
         let nav = |id: &'static str, icon: IconName, delta: i32| {
             IconButton::new(id, icon).size(px(22.)).icon_size(IconSize::XSmall).on_click(cx.listener(move |this, _, _, cx| {
-                this.specific_month = Some(calendar::add_months(month, delta));
+                this.session.specific_month = Some(calendar::add_months(month, delta));
                 cx.notify();
             }))
         };
@@ -2602,7 +2617,7 @@ impl TaskDetail {
 
     fn render_priority_popup(&self, strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
-        let current = self.task.as_ref().map(|t| t.priority).unwrap_or_default();
+        let current = self.session.task.as_ref().map(|t| t.priority).unwrap_or_default();
         let items = [
             (Priority::High, "priority-high", strings.priority_high),
             (Priority::Medium, "priority-medium", strings.priority_medium),
@@ -2629,18 +2644,23 @@ impl TaskDetail {
     /// section ticked. A click on a list or a section moves the task there.
     fn render_list_popup(&self, strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
-        let current = self.task.as_ref().map(|t| (t.list_id, t.section_id));
+        let current = self.session.task.as_ref().map(|t| (t.list_id, t.section_id));
         let query = self.list_search.read(cx).text().to_owned();
+        let submenu_bounds = Rc::new(Cell::new(None::<gpui::Bounds<Pixels>>));
+        let outside_submenu = submenu_bounds.clone();
         let rows: Vec<(Option<Id>, SharedString, IconName)> = std::iter::once((None, SharedString::new_static(strings.inbox), IconName::Inbox))
-            .chain(self.lists.iter().map(|l| (Some(l.id), SharedString::from(l.name.clone()), IconName::List)))
+            .chain(self.session.lists.iter().map(|l| (Some(l.id), SharedString::from(l.name.clone()), IconName::List)))
             .filter(|(_, name, _)| list_matches(name, &query))
             .collect();
         popover(cx)
+            .debug_selector(|| "task-list-popup".into())
             .w(px(200.))
             .h(px(240.))
             .p_0()
-            .on_mouse_down_out(cx.listener(|this, _, window, cx| {
-                this.dismiss_popup(window, cx);
+            .on_mouse_down_out(cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                if !outside_submenu.get().is_some_and(|bounds| bounds.contains(&event.position)) {
+                    this.dismiss_popup(window, cx);
+                }
             }))
             .child(
                 h_flex()
@@ -2656,11 +2676,13 @@ impl TaskDetail {
             .child(v_flex().id("list-menu-rows").flex_1().p_1().overflow_y_scroll().children(rows.into_iter().map(|(list, name, icon)| {
                 let selected = current.is_some_and(|(l, _)| l == list);
                 let color = if selected { Color::Accent } else { Color::Default };
-                let sections = self.store.list_sections(list).unwrap_or_default();
+                let sections = self.session.store.list_sections(list).unwrap_or_default();
                 let open = self.list_submenu == Some(list) && !sections.is_empty();
                 let has_sections = !sections.is_empty();
+                let row_id = format!("move-to-{}", list.map_or("inbox".to_owned(), |id| id.to_string()));
                 div()
-                    .id(SharedString::from(format!("move-to-{}", list.map_or("inbox".to_owned(), |id| id.to_string()))))
+                    .id(SharedString::from(row_id.clone()))
+                    .debug_selector(move || row_id.clone())
                     .relative()
                     .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                         if *hovered && this.list_submenu != Some(list) {
@@ -2674,14 +2696,18 @@ impl TaskDetail {
                             .toggle_state(open)
                             .start_slot(Icon::new(icon).color(color))
                             .child(Label::new(name).color(color).truncate())
-                            .when(has_sections, |item| item.end_slot(Icon::new(IconName::ChevronRight).size(IconSize::Small).color(Color::Muted)))
+                            .when(has_sections, |item| item.end_slot(Icon::new(if self.sticky_style.is_some() { IconName::ChevronLeft } else { IconName::ChevronRight }).size(IconSize::Small).color(Color::Muted)))
                             .on_click(cx.listener(move |this, _, window, cx| this.set_list(list, window, cx))),
                     )
                     .when(open, |el| {
                         let current_section = current.and_then(|(l, s)| if l == list { s } else { None });
+                        let submenu_bounds = submenu_bounds.clone();
                         el.child(PopoverAttachment::new(
-                            Placement::RightSide,
-                            popover(cx).min_w(px(162.)).children(sections.into_iter().map(|section| {
+                            if self.sticky_style.is_some() { Placement::LeftSide } else { Placement::RightSide },
+                            popover(cx).debug_selector(|| "task-list-sections".into()).relative().min_w(px(162.))
+                            .child(gpui::canvas(move |area, _, _| submenu_bounds.set(Some(area)), |_, _, _, _| {})
+                                .absolute().inset_0())
+                            .children(sections.into_iter().map(|section| {
                                 let section_id = section.id;
                                 let ticked = current_section == Some(section_id);
                                 let color = if ticked { Color::Accent } else { Color::Default };
@@ -2709,10 +2735,10 @@ impl TaskDetail {
     fn render_tags_popup(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
         let strings = i18n::t(cx);
-        let Some(draft) = &self.tag_draft else { return div().into_any_element() };
+        let Some(draft) = &self.session.tag_draft else { return div().into_any_element() };
         let query = self.tag_query(cx).to_owned();
         let folded = query.to_lowercase();
-        let mut names: Vec<&str> = self.all_tags.iter().map(|tag| tag.name.as_str()).collect();
+        let mut names: Vec<&str> = self.session.all_tags.iter().map(|tag| tag.name.as_str()).collect();
         for name in &draft.picked {
             if !names.iter().any(|known| same_tag(known, name)) {
                 names.push(name);
@@ -2774,7 +2800,7 @@ impl TaskDetail {
             .gap_1()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             // The Estimation (Start Focus → Estimation), which opens it again.
-            .children(self.task.as_ref().and_then(|t| t.estimate).map(|estimate| {
+            .children(self.session.task.as_ref().and_then(|t| t.estimate).map(|estimate| {
                 let text = match estimate {
                     fern_core::Estimate::Pomos(n) => format!("{n} {}", strings.pomo_unit),
                     fern_core::Estimate::Minutes(n) => fern_core::format_minutes(n as i64),
@@ -2826,7 +2852,7 @@ impl TaskDetail {
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.open_tags(Popup::InlineTags, window, cx);
                     }))
-                    .when(self.popup == Some(Popup::InlineTags), |el| {
+                    .when(self.sticky_style.is_none() && self.session.popup == Some(Popup::InlineTags), |el| {
                         el.child(PopoverAttachment::new(Placement::BelowLeft, self.render_tags_popup(cx)))
                     }),
             )
@@ -2876,6 +2902,7 @@ fn label_button(id: &'static str, icon: IconName, label: SharedString, color: Co
 impl TaskDetail {
     pub fn set_sticky_style(&mut self, settings: crate::sticky_settings::StickySettings, cx: &mut Context<Self>) {
         self.sticky_style = Some(settings);
+        self.editor_window.inline_popup = None;
         let muted = gpui::rgb(if settings.color >= 9 { 0xbcc5d6 } else { 0x525566 }).into();
         self.notes.update(cx, |input, cx| input.set_placeholder_color(muted, cx));
         cx.notify();
@@ -2889,7 +2916,8 @@ impl Render for TaskDetail {
         let sticky_foreground: Option<Hsla> = self.sticky_style.map(|style| gpui::rgb(style.foreground()).into());
         let button_hover = sticky_foreground.map_or(theme.colors().element_hover, |color| color.opacity(0.12));
         let muted = sticky_foreground.map_or(Color::Muted, |color| Color::Custom(color.opacity(0.8)));
-        if let Some(target) = self.pending_focus.take() {
+        let sticky = self.sticky_style.is_some();
+        if let Some(target) = self.editor_window.take_pending_focus(window) {
             let input = match target {
                 FocusTarget::NewItem => Some(self.new_item.clone()),
                 FocusTarget::Item(id) => {
@@ -2902,16 +2930,16 @@ impl Render for TaskDetail {
         }
         let panel = v_flex()
             .size_full()
-            .key_context(if self.draft.is_some() { "TaskDetail TaskDraft" } else { "TaskDetail" })
+            .key_context(if self.session.draft.is_some() { "TaskDetail TaskDraft" } else { "TaskDetail" })
             .on_action(cx.listener(|this, _: &crate::actions::SaveDraft, window, cx| {
-                if this.draft.is_some() && this.popup == Some(Popup::Due) {
+                if this.session.draft.is_some() && this.session.popup == Some(Popup::Due) {
                     this.apply_due(window, cx);
                 }
                 this.finish_draft(cx);
             }))
             .on_action(cx.listener(|this, _: &DismissTransient, window, cx| {
                 if !this.dismiss_popup(window, cx) {
-                    if this.draft.is_some() { this.finish_draft(cx); } else { cx.propagate(); }
+                    if this.session.draft.is_some() { this.finish_draft(cx); } else { cx.propagate(); }
                 }
             }))
             .map(|el| match self.sticky_style {
@@ -2921,7 +2949,7 @@ impl Render for TaskDetail {
                     .when(!self.card, |el| el.border_l_1().border_color(theme.colors().border)),
             });
 
-        let Some(task) = self.task.as_ref() else {
+        let Some(task) = self.session.task.as_ref() else {
             return panel
                 .items_center()
                 .justify_center()
@@ -2932,7 +2960,7 @@ impl Render for TaskDetail {
         let notes_editing = notes_focus.is_focused(window);
         let notes_focus_click = notes_focus.clone();
         let today = Local::now().date_naive();
-        let preview = self.draft.as_ref().map(|_| self.due_preview(task, today));
+        let preview = self.session.draft.as_ref().map(|_| self.due_preview(task, today));
         let (date, time, repeats) = preview.as_ref().map_or(
             (task.due_date, task.due_time, task.repeat.is_some()),
             |due| (due.date, due.time, due.repeat.is_some()),
@@ -2959,7 +2987,7 @@ impl Render for TaskDetail {
         let priority_color = task_rows::priority_color(task.priority, &theme).map_or(Color::Muted, Color::Custom);
         let list_id = self.list_preview(task);
         let list_name: SharedString = list_id
-            .and_then(|id| self.lists.iter().find(|l| l.id == id))
+            .and_then(|id| self.session.lists.iter().find(|l| l.id == id))
             .map(|l| l.name.clone().into())
             .unwrap_or_else(|| strings.inbox.into());
         let list_icon = if list_id.is_some() { IconName::List } else { IconName::Inbox };
@@ -2974,7 +3002,7 @@ impl Render for TaskDetail {
                     }))
             })
             // Top bar: checkbox | due date ……… priority
-            .child(
+            .when(!sticky, |panel| panel.child(
                 h_flex()
                     .debug_selector(|| "task-detail-header".into())
                     .gap_2()
@@ -2984,7 +3012,7 @@ impl Render for TaskDetail {
                     .border_b_1()
                     .border_color(theme.colors().border)
                     // The original's 15 px box and the short line after it; a note has neither.
-                    .when(task.kind != Kind::Note && self.draft.is_none(), |el| {
+                    .when(task.kind != Kind::Note && self.session.draft.is_none(), |el| {
                         el.child(
                             Checkbox::new("detail-checkbox")
                                 .size(px(15.))
@@ -2997,11 +3025,11 @@ impl Render for TaskDetail {
                         .child(div().w(px(1.)).h(px(14.)).bg(theme.colors().border))
                     })
                     .child(
-                        label_button("due-date", IconName::CalendarDays, due_text, due_color, button_hover)
+                        label_button("due-date", IconName::CalendarDays, due_text.clone(), due_color, button_hover)
                             .debug_selector(|| "task-detail-due-date".into())
                             .when(repeats, |el| el.child(Icon::new(IconName::Repeat).size(IconSize::Small).color(due_color)))
                             .on_click(cx.listener(|this, _, window, cx| this.open_popup_from_ui(Popup::Due, window, cx)))
-                            .when(self.popup == Some(Popup::Due), |el| {
+                            .when(self.sticky_style.is_none() && self.session.popup == Some(Popup::Due), |el| {
                                 el.child(PopoverAttachment::new(
                                     Placement::BelowLeft,
                                     self.render_due_popup(strings, window, cx),
@@ -3020,14 +3048,14 @@ impl Render for TaskDetail {
                                     .tip(strings.summary_priority, TipSide::Below)
                                     .on_click(cx.listener(|this, _, _, cx| this.open_popup(Popup::Priority, cx))),
                             )
-                            .when(self.popup == Some(Popup::Priority), |el| {
+                            .when(self.sticky_style.is_none() && self.session.popup == Some(Popup::Priority), |el| {
                                 el.child(PopoverAttachment::new(
                                     Placement::BelowRight,
                                     self.render_priority_popup(strings, cx),
                                 ))
                             }),
                     ),
-            )
+            ))
             // Title, checklist, notes and tags; clicking empty space puts the caret into the notes.
             .child(
                 v_flex()
@@ -3041,11 +3069,12 @@ impl Render for TaskDetail {
                     .pt_4()
                     .pb_6()
                     .gap_3()
+                    .when(sticky, |el| el.px_3().pt_0p5().pb_2().gap_1())
                     .on_mouse_down(MouseButton::Left, move |_, window, cx| {
                         window.focus(&notes_focus, cx);
                     })
                     // A subtask names its parent over the title, as the original; a click opens it.
-                    .when_some(self.parent.as_ref(), |el, parent| {
+                    .when_some(self.session.parent.as_ref(), |el, parent| {
                         let id = parent.id;
                         el.child(
                             h_flex()
@@ -3070,15 +3099,15 @@ impl Render for TaskDetail {
                                     .flex_1()
                                     .min_w_0()
                                     .text_size(px(20.))
-                                    .when_some(self.sticky_style, |el, style| el.text_size(px(style.font_px() + 6.)))
+                                    .when_some(self.sticky_style, |el, style| el.text_size(px(style.font_px())))
                                     .line_height(px(28.))
-                                    .when_some(self.sticky_style, |el, style| el.line_height(px(style.font_px() + 12.)))
+                                    .when_some(self.sticky_style, |el, style| el.line_height(px(style.font_px() + 5.)))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .when(done, |el| el.text_color(theme.colors().text_muted))
                                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                                     .child(self.title.clone()),
                             )
-                            .child(
+                            .when(!sticky, |title| title.child(
                                 div()
                                     .debug_selector(|| "task-detail-checklist-toggle".to_owned())
                                     .pt_0p5()
@@ -3088,7 +3117,7 @@ impl Render for TaskDetail {
                                             .tooltip(Tooltip::text(i18n::t(cx).checklist))
                                             .on_click(cx.listener(|this, _, _, cx| this.start_checklist(cx))),
                                     ),
-                            ),
+                            )),
                     )
                     // As in the original, the description comes first and the checklist under it.
                     // While it is not edited, the description is drawn formatted, as the original
@@ -3109,6 +3138,7 @@ impl Render for TaskDetail {
                     } else {
                         div()
                             .debug_selector(|| "task-notes-editor".to_owned())
+                            .when(sticky && !notes_editing, |el| el.opacity(0.))
                             .text_size(px(15.))
                             .line_height(px(22.))
                             .when_some(self.sticky_style, |el, style| el.text_size(px(style.font_px())).line_height(px(style.font_px() + 8.)))
@@ -3117,24 +3147,24 @@ impl Render for TaskDetail {
                             .into_any_element()
                     })
                     .when(self.show_checklist, |el| el.child(self.render_checklist(cx)))
-                    .when(!self.attachments.is_empty(), |el| el.child(self.render_attachments(cx)))
-                    .children(self.attachment_errors.iter().map(|error| Label::new(error.clone()).color(Color::Error)))
+                    .when(!self.session.attachments.is_empty(), |el| el.child(self.render_attachments(cx)))
+                    .children(self.session.attachment_errors.iter().map(|error| Label::new(error.clone()).color(Color::Error)))
                     // Tags sit under the notes, as in the original.
                     // The calendar's card leaves out the empty tags and subtasks, as the original's.
                     // As the original's, the tags row only once there are tags (the "…" menu's Tags
                     // adds the first), and the subtasks only once there are some or one is begun.
-                    .when(!task.tags.is_empty() || task.estimate.is_some() || self.popup == Some(Popup::InlineTags), |el| {
+                    .when(!task.tags.is_empty() || task.estimate.is_some() || self.session.popup == Some(Popup::InlineTags), |el| {
                         el.child(div().pt(px(18.)).child(self.render_tags_row(strings, cx)))
                     })
-                    .when(!self.subtasks.is_empty() || self.subtask_open, |el| {
+                    .when(!self.session.subtasks.is_empty() || self.subtask_open, |el| {
                         el.child(div().pt_2().child(Divider::horizontal())).child(self.render_subtasks(strings, cx))
                     })
-                    .when(!self.comments.is_empty(), |el| el.child(self.render_comments(strings, cx))),
+                    .when(!self.session.comments.is_empty(), |el| el.child(self.render_comments(strings, cx))),
             )
-            .when(self.draft.as_ref().is_some_and(|draft| draft.save_failed), |el| {
+            .when(self.session.draft.as_ref().is_some_and(|draft| draft.save_failed), |el| {
                 el.child(div().px_5().py_1().child(Label::new(strings.task_save_failed).color(Color::Error)))
             })
-            .when(self.draft.as_ref().is_some_and(|draft| draft.pending_attachments > 0), |el| {
+            .when(self.session.draft.as_ref().is_some_and(|draft| draft.pending_attachments > 0), |el| {
                 el.child(div().px_5().py_1().child(Label::new(strings.attachment_preparing).color(Color::Muted)))
             })
             // The bottom bar's "A" shows the description's Markdown toolbar over it, as the original.
@@ -3154,7 +3184,7 @@ impl Render for TaskDetail {
                 )
             })
             .when(self.comment_open && !task.is_deleted(), |el| el.child(self.render_comment_box(cx)))
-            .when_some(self.activity.clone(), |el, activity| el.child(self.render_activity(&activity, strings, cx)))
+            .when_some(self.session.activity.clone(), |el, activity| el.child(self.render_activity(&activity, strings, cx)))
             // Bottom bar: list ……… formatting, comments, more; for a trashed task, as in the
             // original: Restore ……… delete forever.
             .child(
@@ -3164,6 +3194,7 @@ impl Render for TaskDetail {
                     .h(px(44.))
                     .flex_none()
                     .px_5()
+                    .when(sticky, |bar| bar.h(px(29.)).px_3())
                     .map(|bar| {
                         if task.is_deleted() {
                             bar.child(
@@ -3177,7 +3208,25 @@ impl Render for TaskDetail {
                                     .on_click(cx.listener(|this, _, _, cx| this.delete_forever(cx))),
                             )
                         } else {
-                            bar.child(
+                            bar.when(sticky, |bar| bar.child(
+                                div()
+                                    .id("sticky-date")
+                                    .debug_selector(|| "task-detail-due-date".into())
+                                    .flex()
+                                    .items_center()
+                                    .relative()
+                                    .min_w_0()
+                                    .cursor_pointer()
+                                    .text_size(px(11.))
+                                    .text_color(sticky_foreground.unwrap_or(theme.colors().text).opacity(0.68))
+                                    .when(date.is_none(), |date| date.opacity(0.).group_hover("sticky-window", |style| style.opacity(1.)))
+                                    .child(div().truncate().child(due_text.clone()))
+                                    .on_click(cx.listener(|this, _, window, cx| this.open_popup_from_ui(Popup::Due, window, cx)))
+                                    .when(self.sticky_style.is_none() && self.session.popup == Some(Popup::Due), |el| {
+                                        el.child(PopoverAttachment::new(Placement::AboveLeft, self.render_due_popup(strings, window, cx)))
+                                    }),
+                            ))
+                            .when(!sticky, |bar| bar.child(
                                 with_tip(
                                     label_button("list", list_icon, list_name, muted, button_hover).debug_selector(|| "task-detail-list".to_owned()),
                                     "list-tip",
@@ -3187,15 +3236,15 @@ impl Render for TaskDetail {
                                     cx,
                                 )
                                     .on_click(cx.listener(|this, _, window, cx| this.open_popup_from_ui(Popup::List, window, cx)))
-                                    .when(self.popup == Some(Popup::List), |el| {
+                                    .when(self.sticky_style.is_none() && self.session.popup == Some(Popup::List), |el| {
                                         el.child(PopoverAttachment::new(
                                             Placement::AboveLeft,
                                             self.render_list_popup(strings, cx),
                                         ))
                                     }),
-                            )
+                            ))
                             .child(div().flex_1())
-                            .when(self.draft.is_none(), |bar| bar.child(
+                            .when(!sticky && self.session.draft.is_none(), |bar| bar.child(
                                 IconButton::new("format", IconName::Baseline)
                                     .toggle_state(self.format_bar)
                                     .tip(strings.text_format, TipSide::Above)
@@ -3223,28 +3272,29 @@ impl Render for TaskDetail {
                                     .relative()
                                     .child(
                                         IconButton::new("more", IconName::Ellipsis)
-                                            .when(!matches!(self.popup, Some(Popup::More | Popup::Tags)), |b| b.tip(strings.more, TipSide::Above))
+                                            .when(sticky, |button| button.size(px(20.)).icon_size(IconSize::XSmall).icon_color(muted).hover_color(button_hover))
+                                            .when(!sticky && !matches!(self.session.popup, Some(Popup::More | Popup::Tags)), |b| b.tip(strings.more, TipSide::Above))
                                             .on_click(cx.listener(|this, _, _, cx| this.open_popup(Popup::More, cx))),
                                     )
-                                    .when(self.popup == Some(Popup::More), |el| {
+                                    .when(self.sticky_style.is_none() && self.session.popup == Some(Popup::More), |el| {
                                         el.child(PopoverAttachment::new(
                                             Placement::AboveRight,
                                             self.render_more_popup(strings, cx),
                                         ))
                                     })
-                                    .when(self.popup == Some(Popup::Tags), |el| {
+                                    .when(self.sticky_style.is_none() && self.session.popup == Some(Popup::Tags), |el| {
                                         el.child(PopoverAttachment::new(Placement::AboveRight, self.render_tags_popup(cx)))
                                     })
-                                    .when(self.popup == Some(Popup::Templates), |el| {
+                                    .when(self.sticky_style.is_none() && self.session.popup == Some(Popup::Templates), |el| {
                                         el.child(PopoverAttachment::new(Placement::AboveRight, self.render_draft_templates(cx)))
                                     })
-                                    .when(self.popup == Some(Popup::Estimate), |el| {
+                                    .when(self.sticky_style.is_none() && self.session.popup == Some(Popup::Estimate), |el| {
                                         el.child(PopoverAttachment::new(
                                             Placement::AboveRight,
                                             self.render_estimate(strings, cx),
                                         ))
                                     })
-                                    .when(self.popup == Some(Popup::LinkParent), |el| {
+                                    .when(self.sticky_style.is_none() && self.session.popup == Some(Popup::LinkParent), |el| {
                                         el.child(PopoverAttachment::new(
                                             Placement::AboveRight,
                                             self.render_link_parent(strings, cx),
@@ -3338,7 +3388,7 @@ mod tests {
         });
         let (view, cx) = cx.add_window_view(|window, cx| {
             let mut detail = TaskDetail::new(store.clone(), window, cx);
-            detail.attachments_dir = Some(attachments_dir.clone());
+            detail.session.attachments_dir = Some(attachments_dir.clone());
             detail.show(Some(first.clone()), cx);
             detail
         });

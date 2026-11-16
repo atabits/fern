@@ -15,6 +15,7 @@ use crate::actions::DismissSettings;
 use crate::calendar;
 use crate::i18n::{self, CurrentLocale, Locale};
 use crate::release_notes::{self, ReleaseNotes, action_button};
+use crate::subscriptions::{ChinaHolidaySource, ChinaHolidayStatus};
 #[path = "sticky_settings_view.rs"]
 mod sticky_settings_view;
 
@@ -58,6 +59,7 @@ enum Menu {
     Language,
     DefaultList,
     DailyTime,
+    ChinaHolidays(Option<fern_core::Id>),
 }
 
 pub enum SettingsEvent {
@@ -625,6 +627,7 @@ impl SettingsWindow {
 
     /// Opens the subscription form, empty for a new calendar or filled from `id`'s.
     fn open_subscription_form(&mut self, id: Option<fern_core::Id>, window: &mut Window, cx: &mut Context<Self>) {
+        self.menu = None;
         let current = id.and_then(|id| {
             let feeds = crate::subscriptions::feeds(cx)?;
             let feeds = feeds.read(cx);
@@ -656,6 +659,81 @@ impl SettingsWindow {
         cx.notify();
     }
 
+    fn render_china_holiday_source(
+        &self,
+        current: Option<(fern_core::Id, ChinaHolidaySource)>,
+        enabled: bool,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let strings = i18n::t(cx);
+        let hover = cx.theme().colors().ghost_element_hover;
+        let subscription = current.map(|(id, _)| id);
+        let selected = current.map(|(_, source)| source);
+        let menu = Menu::ChinaHolidays(subscription);
+        let open = enabled && self.menu == Some(menu);
+        let dropdown = open.then(|| {
+            PopoverAttachment::new(
+                Placement::BelowLeft,
+                popover(cx)
+                    .min_w(px(156.))
+                    .debug_selector(|| "china-holiday-source-menu".to_owned())
+                    .on_mouse_down_out(cx.listener(|this, _, _, cx| this.set_menu(None, cx)))
+                    .children(ChinaHolidaySource::ALL.map(|source| {
+                        h_flex()
+                            .id(source.label())
+                            .debug_selector(move || source.label().to_owned())
+                            .tab_index(0)
+                            .h(px(32.))
+                            .gap_2()
+                            .px_2()
+                            .rounded(px(6.))
+                            .cursor_pointer()
+                            .hover(|style| style.bg(hover))
+                            .focus_visible(|style| style.bg(hover))
+                            .child(div().flex_1().child(Label::new(source.label())))
+                            .when(selected == Some(source), |el| {
+                                el.child(Icon::new(IconName::Check).color(Color::Accent).size(IconSize::Small))
+                            })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.set_menu(None, cx);
+                                cx.stop_propagation();
+                                if selected != Some(source)
+                                    && let Some(feeds) = crate::subscriptions::feeds(cx)
+                                {
+                                    feeds.update(cx, |feeds, cx| {
+                                        feeds.select_china_holiday_source(subscription, source, strings.holidays_name, cx);
+                                    });
+                                }
+                            }))
+                    })),
+            )
+        });
+        let color = if enabled { Color::Accent } else { Color::Muted };
+        h_flex()
+            .id(match subscription {
+                Some(id) => SharedString::from(format!("china-holiday-source-{id}")),
+                None => SharedString::from("subscription-holidays"),
+            })
+            .debug_selector(|| "china-holiday-source".to_owned())
+            .relative()
+            .flex_none()
+            .gap_1()
+            .child(
+                Label::new(selected.map_or(strings.add_holidays, ChinaHolidaySource::label))
+                    .color(color)
+                    .when(selected.is_some(), |label| label.size(LabelSize::Small)),
+            )
+            .when(enabled, |el| {
+                el.cursor_pointer()
+                    .tab_index(0)
+                    .child(Icon::new(IconName::ChevronDown).size(IconSize::XSmall).color(color))
+                    .on_click(cx.listener(move |this, _, _, cx| this.set_menu((!open).then_some(menu), cx)))
+                    .when(selected.is_some(), |el| el.tooltip(Tooltip::text(strings.subscription_change_source)))
+            })
+            .children(dropdown)
+            .into_any_element()
+    }
+
     /// Integrations, as the original's URL calendars: each subscribed calendar with its color,
     /// whether it is read and when, show or hide, change and unsubscribe; and the form that adds
     /// or changes one (name, address, color).
@@ -664,6 +742,15 @@ impl SettingsWindow {
         let colors = cx.theme().colors().clone();
         let Some(feeds) = crate::subscriptions::feeds(cx) else { return Vec::new() };
         let feeds = feeds.read(cx);
+        let chinese = i18n::locale(cx) == Locale::ZhCn;
+        let china_status = feeds.china_holiday_status();
+        let china_sources = ChinaHolidaySource::ALL.map(|source| {
+            feeds.calendars().iter().any(|calendar| {
+                ChinaHolidaySource::from_url(&calendar.subscription.url) == Some(source)
+            })
+        });
+        let has_china_holidays = china_sources.into_iter().any(|installed| installed);
+        let can_choose_source = china_status != ChinaHolidayStatus::Reading && !china_sources.into_iter().all(|installed| installed);
         let rows: Vec<AnyElement> = feeds
             .calendars()
             .iter()
@@ -671,6 +758,7 @@ impl SettingsWindow {
                 let subscription = &calendar.subscription;
                 let id = subscription.id;
                 let hidden = subscription.hidden;
+                let china_source = ChinaHolidaySource::from_url(&subscription.url);
                 let status = if feeds.is_reading(id) {
                     (strings.subscription_reading.to_owned(), Color::Muted)
                 } else if let Some(error) = &subscription.error {
@@ -692,6 +780,7 @@ impl SettingsWindow {
                             .child(Label::new(subscription.title().to_owned()).truncate().color(if hidden { Color::Muted } else { Color::Default }))
                             .child(Label::new(status.0).size(LabelSize::XSmall).color(status.1).truncate()),
                     )
+                    .children(china_source.map(|source| self.render_china_holiday_source(Some((id, source)), can_choose_source, cx)))
                     .child(
                         IconButton::new(SharedString::from(format!("subscription-show-{id}")), if hidden { IconName::EyeOff } else { IconName::Eye })
                             .icon_color(Color::Muted)
@@ -787,12 +876,26 @@ impl SettingsWindow {
         if !rows.is_empty() {
             page.push(group().children(rows).into_any_element());
         }
+        if chinese || has_china_holidays {
+            let message = match china_status {
+                ChinaHolidayStatus::Idle => None,
+                ChinaHolidayStatus::Reading => Some((strings.subscription_reading, Color::Muted)),
+                ChinaHolidayStatus::Failed => Some((strings.holiday_source_failed, Color::Error)),
+            };
+            if let Some((text, color)) = message {
+                page.push(div().px_1().child(Label::new(text).size(LabelSize::Small).color(color)).into_any_element());
+            }
+        }
         match form {
             Some(form) => page.push(form),
             None => {
                 // The original's Holidays: the public holidays of the language's country, a
                 // calendar like any other once added.
-                let has_holidays = feeds.calendars().iter().any(|c| c.subscription.url == strings.holidays_url);
+                let has_holidays = if chinese {
+                    has_china_holidays
+                } else {
+                    feeds.calendars().iter().any(|c| c.subscription.url == strings.holidays_url)
+                };
                 page.push(
                     h_flex()
                         .px_1()
@@ -805,6 +908,9 @@ impl SettingsWindow {
                                 .on_click(cx.listener(|this, _, window, cx| this.open_subscription_form(None, window, cx))),
                         )
                         .when(!has_holidays, |el| {
+                            if chinese {
+                                return el.child(self.render_china_holiday_source(None, can_choose_source, cx));
+                            }
                             el.child(
                                 div()
                                     .id("subscription-holidays")
@@ -1479,7 +1585,9 @@ impl Render for SettingsWindow {
             .tab_group()
             .key_context("Settings")
             .on_action(cx.listener(|this, _: &DismissSettings, window, cx| {
-                if this.release_notes.is_some() {
+                if matches!(this.menu, Some(Menu::ChinaHolidays(_))) {
+                    this.set_menu(None, cx);
+                } else if this.release_notes.is_some() {
                     this.back_to_about(window, cx);
                 } else {
                     cx.emit(SettingsEvent::Dismissed);
@@ -1575,4 +1683,36 @@ fn form_button(id: &'static str, label: &'static str, primary: bool, colors: &th
         .when(primary, |el| el.bg(colors.accent))
         .when(!primary, |el| el.border_1().border_color(colors.border))
         .child(Label::new(label).size(LabelSize::Small))
+}
+
+#[cfg(all(test, debug_assertions))]
+mod tests {
+    use super::*;
+
+    #[gpui::test]
+    fn china_holidays_offer_both_sources_in_settings(cx: &mut gpui::TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        cx.update(|cx| {
+            theme::init(cx);
+            assert!(crate::keymap::load_default(&assets::Assets, cx).unwrap().is_empty());
+            cx.set_global(CurrentLocale(Locale::ZhCn));
+            crate::subscriptions::init(store.clone(), cx);
+        });
+        let (settings, cx) = cx.add_window_view(|window, cx| {
+            let mut settings = SettingsWindow::new(store, cx);
+            settings.set_page(Page::Integrations, cx);
+            window.focus(&settings.focus_handle, cx);
+            settings
+        });
+        cx.simulate_resize(gpui::size(px(900.), px(720.)));
+
+        let trigger = cx.debug_bounds("china-holiday-source").unwrap();
+        cx.simulate_click(trigger.center(), gpui::Modifiers::default());
+        for source in ChinaHolidaySource::ALL {
+            assert!(cx.debug_bounds(source.label()).is_some());
+        }
+        cx.simulate_keystrokes("escape");
+        assert!(cx.debug_bounds("china-holiday-source-menu").is_none());
+        cx.update(|_, cx| assert_eq!(settings.read(cx).page, Page::Integrations));
+    }
 }

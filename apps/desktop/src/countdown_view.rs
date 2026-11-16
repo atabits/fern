@@ -5,14 +5,15 @@ use std::collections::HashSet;
 use std::rc::Rc;
 
 use chrono::{Datelike, Local, NaiveDate};
-use fern_core::{Countdown, CountdownKind, Id, Store};
-use gpui::{Entity, Focusable as _, FontWeight};
+use fern_core::countdown::{DatePart, days_in_month, with_date_part};
+use fern_core::{Countdown, CountdownKind, DateFormat, Id, Store};
+use gpui::{Entity, Focusable as _, FontWeight, ScrollHandle, Subscription};
 use ui::prelude::*;
 use ui::{Placement, PopoverAttachment, popover};
 
 use crate::calendar;
 use crate::i18n::{self, Strings};
-use crate::text_input::{Cancelled, Mode, Submitted, TextInput};
+use crate::text_input::{Cancelled, Changed, Mode, Submitted, TextInput};
 
 const CARD_WIDTH: f32 = 289.;
 const CARD_HEIGHT: f32 = 181.;
@@ -28,7 +29,7 @@ struct Draft {
     name: Entity<TextInput>,
     kind: CountdownKind,
     date: NaiveDate,
-    month: NaiveDate,
+    date_inputs: DateInputs,
     /// The icon (an emoji) and its color, as the original's icon picker sets them.
     icon: Option<String>,
     color: Option<String>,
@@ -67,15 +68,135 @@ enum DraftRow {
     Icon,
     Presets,
     Date,
-    Month,
-    Day,
-    Year,
+    DatePart(DateField),
     Reminder,
     Repeat,
     Type,
     CalcMode,
     CountingMode,
     Show,
+}
+
+/// The direct date inputs used by all four countdown types.
+struct DateInputs {
+    fields: [Entity<TextInput>; 3],
+    scroll: ScrollHandle,
+    _focus_subscriptions: Vec<Subscription>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DateField {
+    Year,
+    Month,
+    Day,
+}
+
+impl DateField {
+    const ALL: [Self; 3] = [Self::Year, Self::Month, Self::Day];
+
+    fn ordered(strings: &Strings) -> [Self; 3] {
+        match calendar::effective_date_format(strings) {
+            DateFormat::MonthDayYear => [Self::Month, Self::Day, Self::Year],
+            DateFormat::DayMonthYear => [Self::Day, Self::Month, Self::Year],
+            DateFormat::YearMonthDay | DateFormat::IsoYearMonthDay => Self::ALL,
+        }
+    }
+
+    fn id(self) -> &'static str {
+        match self {
+            Self::Year => "countdown-date-year",
+            Self::Month => "countdown-date-month",
+            Self::Day => "countdown-date-day",
+        }
+    }
+
+    fn label(self, strings: &Strings) -> &'static str {
+        match self {
+            Self::Year => strings.year,
+            Self::Month => strings.month,
+            Self::Day => strings.day,
+        }
+    }
+
+    fn value(self, date: NaiveDate) -> i32 {
+        match self {
+            Self::Year => date.year(),
+            Self::Month => date.month() as i32,
+            Self::Day => date.day() as i32,
+        }
+    }
+
+    fn text(self, date: NaiveDate) -> String {
+        self.value(date).to_string()
+    }
+
+    fn options(self, date: NaiveDate) -> std::ops::RangeInclusive<i32> {
+        match self {
+            Self::Year => 1910..=2099,
+            Self::Month => 1..=12,
+            Self::Day => 1..=days_in_month(date.year(), date.month()) as i32,
+        }
+    }
+
+    fn with_value(self, date: NaiveDate, value: i32) -> NaiveDate {
+        with_date_part(date, match self {
+            Self::Year => DatePart::Year(value),
+            Self::Month => DatePart::Month(value as u32),
+            Self::Day => DatePart::Day(value as u32),
+        })
+    }
+
+    fn parse(self, date: NaiveDate, text: &str) -> Option<NaiveDate> {
+        let text = text.trim();
+        if text == self.text(date) {
+            return Some(date);
+        }
+        if !text.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        let mut value = text.parse::<i32>().ok()?;
+        if self == Self::Year && text.len() == 2 {
+            let pivot = Local::now().year().rem_euclid(100) + 10;
+            value += if value <= pivot { 2000 } else { 1900 };
+        }
+        let valid = match self {
+            Self::Year => matches!(text.len(), 2 | 4) && (1..=9999).contains(&value),
+            Self::Month | Self::Day => text.len() <= 2 && self.options(date).contains(&value),
+        };
+        valid.then(|| self.with_value(date, value))
+    }
+}
+
+impl Draft {
+    fn set_date(&mut self, date: NaiveDate, cx: &mut Context<CountdownView>) {
+        self.date = date;
+        for field in DateField::ALL {
+            let input = &self.date_inputs.fields[field as usize];
+            let text = field.text(date);
+            if input.read(cx).text() != text {
+                input.update(cx, |input, cx| input.set_text(text, cx));
+            }
+        }
+    }
+
+    fn date_from_fields(&self, cx: &App) -> Option<NaiveDate> {
+        let mut date = self.date;
+        for field in DateField::ALL {
+            let text = self.date_inputs.fields[field as usize].read(cx).text();
+            if text != field.text(self.date) {
+                date = field.parse(date, text)?;
+            }
+        }
+        Some(date)
+    }
+
+    fn date_in_popover(&self) -> bool {
+        matches!(self.kind, CountdownKind::Birthday | CountdownKind::Holiday)
+    }
+
+    fn close_date_part(&mut self) {
+        self.open = self.date_in_popover().then_some(DraftRow::Date);
+    }
 }
 
 /// Emoji offered for countdowns; the original's illustrated icon set is its own artwork.
@@ -124,9 +245,9 @@ fn kind_label(kind: CountdownKind, strings: &Strings) -> &'static str {
 }
 
 fn format_date(date: NaiveDate, strings: &Strings) -> String {
-    match strings.countdown_date {
-        Some(template) => crate::task_rows::format_day(template, date, strings),
-        None => crate::calendar::format_date(date, strings),
+    match (calendar::explicit_date_format(), strings.countdown_date) {
+        (None, Some(template)) => crate::task_rows::format_day(template, date, strings),
+        _ => calendar::format_date(date, strings),
     }
 }
 
@@ -244,6 +365,69 @@ impl CountdownView {
         cx.notify();
     }
 
+    fn date_inputs(date: NaiveDate, window: &mut Window, cx: &mut Context<Self>) -> DateInputs {
+        let strings = i18n::t(cx);
+        let mut focus_subscriptions = Vec::new();
+        let fields = DateField::ALL.map(|field| {
+            let input = cx.new(|cx| {
+                let mut input = TextInput::new(Mode::SingleLine, field.label(strings), cx);
+                input.set_text(field.text(date), cx);
+                input
+            });
+            cx.subscribe(&input, |_, _, _: &Changed, cx| cx.notify()).detach();
+            cx.subscribe_in(&input, window, move |this, _, _: &Submitted, window, cx| {
+                let Some(draft) = this.draft.as_mut() else { return };
+                if !Self::commit_date_fields(draft, cx) {
+                    return;
+                }
+                draft.close_date_part();
+                let order = DateField::ordered(i18n::t(cx));
+                if let Some(next) = order.windows(2).find(|pair| pair[0] == field).map(|pair| pair[1]) {
+                    window.focus(&draft.date_inputs.fields[next as usize].focus_handle(cx), cx);
+                }
+                cx.notify();
+            }).detach();
+            cx.subscribe_in(&input, window, move |this, _, _: &Cancelled, window, cx| {
+                let Some(draft) = this.draft.as_mut() else { return };
+                draft.set_date(draft.date, cx);
+                match draft.open {
+                    Some(DraftRow::DatePart(_)) => draft.close_date_part(),
+                    _ => {
+                        draft.open = None;
+                        window.focus(&draft.name.focus_handle(cx), cx);
+                    }
+                }
+                cx.notify();
+            }).detach();
+            focus_subscriptions.push(cx.on_focus(&input.focus_handle(cx), window, |_, _, cx| cx.notify()));
+            focus_subscriptions.push(cx.on_blur(&input.focus_handle(cx), window, |this, _, cx| {
+                if let Some(draft) = this.draft.as_mut() {
+                    // Keep invalid input visible until it is corrected or explicitly cancelled.
+                    Self::commit_date_fields(draft, cx);
+                    cx.notify();
+                }
+            }));
+            input
+        });
+        DateInputs { fields, scroll: ScrollHandle::new(), _focus_subscriptions: focus_subscriptions }
+    }
+
+    fn commit_date_fields(draft: &mut Draft, cx: &mut Context<Self>) -> bool {
+        let Some(date) = draft.date_from_fields(cx) else { return false };
+        draft.set_date(date, cx);
+        true
+    }
+
+    fn open_date_part(draft: &mut Draft, field: DateField) {
+        draft.open = Some(DraftRow::DatePart(field));
+        let options = field.options(draft.date);
+        let value = field.value(draft.date);
+        let selected = value.clamp(*options.start(), *options.end()) - *options.start()
+            + i32::from(value > *options.end());
+        draft.date_inputs.scroll.set_offset(gpui::point(px(0.), px(0.)));
+        draft.date_inputs.scroll.scroll_to_top_of_item(selected.saturating_sub(3).max(0) as usize);
+    }
+
     pub fn start_new(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let strings = i18n::t(cx);
         let name = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.countdown_name, cx));
@@ -259,7 +443,8 @@ impl CountdownView {
             Filter::Kind(kind) => kind,
             Filter::All => CountdownKind::Countdown,
         };
-        self.draft = Some(Draft { name, kind, date: today, month: calendar::month_start(today), icon: None, color: None, repeat: None, editing: None, show_age: false, open: None, reminders: fern_core::countdown::DEFAULT_REMINDERS.to_vec(), custom_reminders: Vec::new(), custom: None, constant_reminder: false, show_in_list: Default::default(), plus_one_day: false, count_up: false, background: None, new_background: None });
+        let date_inputs = Self::date_inputs(today, window, cx);
+        self.draft = Some(Draft { name, kind, date: today, date_inputs, icon: None, color: None, repeat: None, editing: None, show_age: false, open: None, reminders: fern_core::countdown::DEFAULT_REMINDERS.to_vec(), custom_reminders: Vec::new(), custom: None, constant_reminder: false, show_in_list: Default::default(), plus_one_day: false, count_up: false, background: None, new_background: None });
         cx.notify();
     }
 
@@ -342,7 +527,7 @@ impl CountdownView {
                 "calc" => DraftRow::CalcMode,
                 "presets" => DraftRow::Presets,
                 "counting" => DraftRow::CountingMode,
-                "month" => DraftRow::Month,
+                "month" => DraftRow::DatePart(DateField::Month),
                 "show" => DraftRow::Show,
                 _ => DraftRow::Reminder,
             });
@@ -373,8 +558,7 @@ impl CountdownView {
         if let Some(draft) = self.draft.as_mut() {
             draft.name.update(cx, |input, cx| input.set_text(countdown.name.clone(), cx));
             draft.kind = countdown.kind;
-            draft.date = countdown.date;
-            draft.month = calendar::month_start(countdown.date);
+            draft.set_date(countdown.date, cx);
             draft.icon = countdown.icon;
             draft.color = countdown.color;
             draft.repeat = countdown.repeat;
@@ -417,12 +601,19 @@ impl CountdownView {
     }
 
     fn save_draft(&mut self, cx: &mut Context<Self>) {
+        let Some(date) = self.draft.as_ref().and_then(|draft| draft.date_from_fields(cx)) else {
+            if let Some(draft) = self.draft.as_mut() {
+                if draft.date_in_popover() { draft.open = Some(DraftRow::Date); }
+                cx.notify();
+            }
+            return;
+        };
         let Some(draft) = self.draft.take() else { return };
         let name = draft.name.read(cx).text().to_owned();
         let added = match draft.editing {
-            Some(id) => self.store.update_countdown(id, &name, draft.date, draft.kind, draft.repeat.as_ref()).map(|()| id),
-            None => self.store.add_countdown(&name, draft.date, draft.kind).and_then(|countdown| {
-                self.store.update_countdown(countdown.id, &name, draft.date, draft.kind, draft.repeat.as_ref()).map(|()| countdown.id)
+            Some(id) => self.store.update_countdown(id, &name, date, draft.kind, draft.repeat.as_ref()).map(|()| id),
+            None => self.store.add_countdown(&name, date, draft.kind).and_then(|countdown| {
+                self.store.update_countdown(countdown.id, &name, date, draft.kind, draft.repeat.as_ref()).map(|()| countdown.id)
             }),
         }
         .and_then(|id| {
@@ -591,15 +782,180 @@ impl CountdownView {
             .into_any_element()
     }
 
+    fn render_date_options(&self, draft: &Draft, field: DateField, cx: &Context<Self>) -> AnyElement {
+        let strings = i18n::t(cx);
+        let options = field.options(draft.date);
+        let selected = field.value(draft.date);
+        let earlier = (selected < *options.start()).then_some(selected);
+        let later = (selected > *options.end()).then_some(selected);
+        v_flex()
+            .id(("countdown-date-options", field as usize))
+            .debug_selector(|| "countdown-date-options".to_owned())
+            .max_h(px(272.))
+            .w_full()
+            .overflow_y_scroll()
+            .track_scroll(&draft.date_inputs.scroll)
+            .children(earlier.into_iter().chain(options).chain(later).enumerate().map(|(i, value)| {
+                let on = value == selected;
+                let label = if field == DateField::Month {
+                    strings.months_short[value as usize - 1].to_owned()
+                } else {
+                    value.to_string()
+                };
+                ListItem::new((field.id(), i))
+                    .height(px(34.))
+                    .child(Label::new(label).color(if on { Color::Accent } else { Color::Default }))
+                    .when(on, |item| item.end_slot(Icon::new(IconName::Check).size(IconSize::XSmall).color(Color::Accent)))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        if let Some(draft) = this.draft.as_mut() {
+                            draft.set_date(field.with_value(draft.date, value), cx);
+                            draft.close_date_part();
+                            window.focus(&draft.date_inputs.fields[field as usize].focus_handle(cx), cx);
+                            cx.notify();
+                        }
+                    }))
+            }))
+            .into_any_element()
+    }
+
+    fn render_date_fields(&self, draft: &Draft, window: &Window, cx: &Context<Self>) -> Div {
+        let colors = cx.theme().colors();
+        let strings = i18n::t(cx);
+        let active = match draft.open {
+            Some(DraftRow::DatePart(field)) => Some(field),
+            _ => None,
+        };
+        let in_popover = draft.date_in_popover();
+        let fields = h_flex().gap_2().w_full().children(DateField::ordered(strings).map(|field| {
+            let input = &draft.date_inputs.fields[field as usize];
+            let is_open = active == Some(field);
+            let invalid = field.parse(draft.date, input.read(cx).text()).is_none();
+            let focused = input.focus_handle(cx).is_focused(window);
+            let border = if invalid {
+                cx.theme().status().error
+            } else if is_open || focused {
+                colors.accent
+            } else {
+                colors.border
+            };
+            div()
+                .relative()
+                .flex_1()
+                .min_w_0()
+                .child(
+                    h_flex()
+                        .id(field.id())
+                        .debug_selector(move || field.id().to_owned())
+                        .h(px(32.))
+                        .pl_2()
+                        .pr_1()
+                        .rounded(px(6.))
+                        .border_1()
+                        .border_color(border)
+                        .child(div().flex_1().min_w_0().child(input.clone()))
+                        .child(div().debug_selector(move || format!("{}-toggle", field.id())).child(
+                            IconButton::new(("countdown-date-options-toggle", field as usize), IconName::ChevronDown)
+                                    .size(px(20.))
+                                    .icon_size(IconSize::XSmall)
+                                    .icon_color(Color::Muted)
+                                    .tooltip(Tooltip::text(field.label(strings)))
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        if let Some(draft) = this.draft.as_mut() {
+                                            if is_open {
+                                                draft.close_date_part();
+                                            } else {
+                                                Self::open_date_part(draft, field);
+                                            }
+                                            window.focus(&draft.date_inputs.fields[field as usize].focus_handle(cx), cx);
+                                            cx.notify();
+                                        }
+                                    })),
+                        )),
+                )
+                .when(is_open && !in_popover, |el| el.child(PopoverAttachment::new(
+                    Placement::BelowLeft,
+                    popover(cx)
+                        .w(px(110.))
+                        .on_mouse_down_out(cx.listener(move |this, _, _, cx| {
+                            if let Some(draft) = this.draft.as_mut()
+                                && draft.open == Some(DraftRow::DatePart(field))
+                            {
+                                draft.close_date_part();
+                                cx.notify();
+                            }
+                        }))
+                        .child(self.render_date_options(draft, field, cx)),
+                )))
+        }));
+
+        v_flex().gap_1().child(fields).when_some(active.filter(|_| in_popover), |el, field| {
+            el.child(self.render_date_options(draft, field, cx))
+        })
+    }
+
+    fn render_date_editor(&self, draft: &Draft, window: &Window, cx: &Context<Self>) -> Div {
+        if !draft.date_in_popover() {
+            return self.render_date_fields(draft, window, cx);
+        }
+        let strings = i18n::t(cx);
+        let colors = cx.theme().colors();
+        let open = matches!(draft.open, Some(DraftRow::Date | DraftRow::DatePart(_)));
+        div()
+            .relative()
+            .child(
+                h_flex()
+                    .id("countdown-date-popup-trigger")
+                    .debug_selector(|| "countdown-date-popup-trigger".to_owned())
+                    .h(px(32.))
+                    .px_3()
+                    .rounded(px(6.))
+                    .border_1()
+                    .border_color(if open { colors.accent } else { colors.border })
+                    .cursor_pointer()
+                    .child(div().flex_1().min_w_0().child(Label::new(format_date(draft.date, strings)).truncate()))
+                    .child(Icon::new(IconName::ChevronDown).size(IconSize::XSmall).color(Color::Muted))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        if let Some(draft) = this.draft.as_mut() {
+                            draft.open = (!open).then_some(DraftRow::Date);
+                            let target = if open {
+                                draft.name.focus_handle(cx)
+                            } else {
+                                let field = DateField::ordered(i18n::t(cx))[0];
+                                draft.date_inputs.fields[field as usize].focus_handle(cx)
+                            };
+                            window.focus(&target, cx);
+                            cx.notify();
+                        }
+                    })),
+            )
+            .when(open, |el| el.child(PopoverAttachment::new(
+                Placement::BelowLeft,
+                popover(cx)
+                    .w(px(294.))
+                    .p_2()
+                    .on_mouse_down_out(cx.listener(|this, _, window, cx| {
+                        if let Some(draft) = this.draft.as_mut()
+                            && matches!(draft.open, Some(DraftRow::Date | DraftRow::DatePart(_)))
+                        {
+                            let Some(date) = draft.date_from_fields(cx) else { return };
+                            draft.set_date(date, cx);
+                            draft.open = None;
+                            window.focus(&draft.name.focus_handle(cx), cx);
+                            cx.notify();
+                        }
+                    }))
+                    .child(self.render_date_fields(draft, window, cx)),
+            )))
+    }
+
     /// The original's add / edit dialog: the icon and name on top, then a label on the left and
     /// the value in a field with a ▾ for Date, Repeat and Type, "Show Age" for a birthday, and
     /// below a divider Cancel and Save.
-    fn render_draft(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_draft(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let Some(draft) = self.draft.as_ref() else { return div().into_any_element() };
         let strings = i18n::t(cx);
         let theme = cx.theme().clone();
-        let today = Local::now().date_naive();
-        let (selected, month, kind, open) = (draft.date, draft.month, draft.kind, draft.open);
+        let (kind, open) = (draft.kind, draft.open);
         let set = |f: Box<dyn Fn(&mut Draft)>| {
             cx.listener(move |this: &mut Self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>| {
                 if let Some(draft) = this.draft.as_mut() {
@@ -608,55 +964,6 @@ impl CountdownView {
                 cx.notify();
             })
         };
-
-        // The Date dropdown: a month to pick the day in.
-        let days: Vec<AnyElement> = calendar::month_grid(month)
-            .chunks(7)
-            .map(|week| {
-                h_flex()
-                    .children(week.iter().map(|&date| {
-                        let is_selected = date == selected;
-                        div().flex_1().flex().justify_center().child(
-                            div()
-                                .id(SharedString::from(format!("countdown-day-{date}")))
-                                .size(px(26.))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .rounded_full()
-                                .cursor_pointer()
-                                .when(is_selected, |el| el.bg(theme.colors().accent))
-                                .when(!is_selected, |el| el.hover(|s| s.bg(theme.colors().element_hover)))
-                                .child(Label::new(date.day().to_string()).size(LabelSize::Small).color(
-                                    if is_selected || date.month() == month.month() {
-                                        if date == today && !is_selected { Color::Accent } else { Color::Default }
-                                    } else {
-                                        Color::Muted
-                                    },
-                                ))
-                                .on_click(set(Box::new(move |d| {
-                                    d.date = date;
-                                    d.open = None;
-                                }))),
-                        )
-                    }))
-                    .into_any_element()
-            })
-            .collect();
-        let shift = |delta: i32| set(Box::new(move |d| d.month = calendar::add_months(d.month, delta)));
-        let date_menu = v_flex()
-            .gap_1()
-            .child(
-                h_flex()
-                    .child(div().flex_1().child(Label::new(calendar::month_title(month, strings)).size(LabelSize::Small)))
-                    .child(IconButton::new("countdown-prev", IconName::ChevronLeft).size(px(22.)).icon_size(IconSize::Small).on_click(shift(-1)))
-                    .child(IconButton::new("countdown-next", IconName::ChevronRight).size(px(22.)).icon_size(IconSize::Small).on_click(shift(1))),
-            )
-            .child(h_flex().children(crate::calendar::weekday_labels(&strings.weekdays_narrow).iter().map(|day| {
-                div().flex_1().flex().justify_center().child(Label::new(*day).size(LabelSize::XSmall).color(Color::Muted))
-            })))
-            .child(v_flex().children(days))
-            .into_any_element();
 
         // The Repeat dropdown: the original's None, Daily, Weekly, Monthly, Yearly.
         use fern_core::Frequency;
@@ -844,39 +1151,6 @@ impl CountdownView {
         // The original's Custom shows its form in place of the list.
         let reminder_menu = custom_form.unwrap_or(reminder_menu);
 
-        // The original's countdown date: month, day and year fields, each a list.
-        use fern_core::countdown::{DatePart, days_in_month, with_date_part};
-        let part_list = |id: &'static str, items: Vec<(String, DatePart, bool)>| {
-            v_flex()
-                .id(id)
-                .max_h(px(280.))
-                .overflow_y_scroll()
-                .children(items.into_iter().enumerate().map(|(i, (label, part, on))| {
-                    ListItem::new((id, i))
-                        .height(px(34.))
-                        .child(Label::new(label).color(if on { Color::Accent } else { Color::Default }))
-                        .when(on, |item| item.end_slot(Icon::new(IconName::Check).size(IconSize::XSmall).color(Color::Accent)))
-                        .on_click(set(Box::new(move |d| {
-                            d.date = with_date_part(d.date, part);
-                            d.month = calendar::month_start(d.date);
-                            d.open = None;
-                        })))
-                }))
-                .into_any_element()
-        };
-        let month_menu = part_list(
-            "countdown-months",
-            (1..=12).map(|m| (strings.months_short[m as usize - 1].to_owned(), DatePart::Month(m), m == selected.month())).collect(),
-        );
-        let day_menu = part_list(
-            "countdown-days",
-            (1..=days_in_month(selected.year(), selected.month())).map(|d| (d.to_string(), DatePart::Day(d), d == selected.day())).collect(),
-        );
-        let year_menu = part_list(
-            "countdown-years",
-            (today.year() - 100..=today.year() + 50).rev().map(|y| (y.to_string(), DatePart::Year(y), y == selected.year())).collect(),
-        );
-
         // Day Calculation Mode: the original's two choices, each with its explanation.
         let plus_one = draft.plus_one_day;
         let calc_text = strings.countdown_calc_options[plus_one as usize].0.to_owned();
@@ -961,7 +1235,7 @@ impl CountdownView {
             })))
             .into_any_element();
 
-        let dropdown_w = |which: DraftRow, text: String, menu: AnyElement, width: f32, cx: &Context<Self>| -> AnyElement {
+        let dropdown = |which: DraftRow, text: String, menu: AnyElement, cx: &Context<Self>| -> AnyElement {
             let on = open == Some(which);
             div()
                 .relative()
@@ -987,7 +1261,7 @@ impl CountdownView {
                     el.child(PopoverAttachment::new(
                         Placement::BelowLeft,
                         popover(cx)
-                            .w(px(width))
+                            .w(px(294.))
                             .p_2()
                             .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                                 if let Some(draft) = this.draft.as_mut() {
@@ -1000,7 +1274,6 @@ impl CountdownView {
                 })
                 .into_any_element()
         };
-        let dropdown = |which: DraftRow, text: String, menu: AnyElement, cx: &Context<Self>| dropdown_w(which, text, menu, 294., cx);
         let row = |label: &'static str, content: AnyElement| {
             h_flex()
                 .min_h(px(32.))
@@ -1008,21 +1281,7 @@ impl CountdownView {
                 .child(div().w(px(80.)).flex_none().child(Label::new(label)))
                 .child(div().flex_1().min_w_0().child(content))
         };
-        // A birthday or a holiday picks its date from a month, as the original's "Select Date"; the others
-        // take month, day and year fields.
-        let date_row = if matches!(kind, CountdownKind::Birthday | CountdownKind::Holiday) {
-            row(strings.filter_date, dropdown(DraftRow::Date, format_date(selected, strings), date_menu, cx))
-        } else {
-            row(
-                strings.filter_date,
-                h_flex()
-                    .gap_2()
-                    .child(div().flex_1().child(dropdown_w(DraftRow::Month, strings.months_short[selected.month0() as usize].to_owned(), month_menu, 110., cx)))
-                    .child(div().flex_1().child(dropdown_w(DraftRow::Day, selected.day().to_string(), day_menu, 110., cx)))
-                    .child(div().flex_1().child(dropdown_w(DraftRow::Year, selected.year().to_string(), year_menu, 110., cx)))
-                    .into_any_element(),
-            )
-        };
+        let date_row = row(strings.filter_date, self.render_date_editor(draft, window, cx).into_any_element());
         let reminder_row = row(strings.reminder, dropdown(DraftRow::Reminder, reminder_text, reminder_menu, cx));
         let repeat_row = row(strings.repeat, dropdown(DraftRow::Repeat, repeat_text.to_owned(), repeat_menu, cx));
         // As in the original, a birthday has Counting Mode where the others have Day Calculation Mode.
@@ -1079,6 +1338,7 @@ impl CountdownView {
         let button = |id: &'static str, label: &'static str, primary: bool| {
             div()
                 .id(id)
+                .debug_selector(move || id.to_owned())
                 .w(px(100.))
                 .h(px(30.))
                 .flex()
@@ -1244,7 +1504,7 @@ impl CountdownView {
 }
 
 impl Render for CountdownView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let strings = i18n::t(cx);
         let theme = cx.theme().clone();
         let hide_group = self.store.setting(HIDE_GROUP_SETTING).ok().flatten().as_deref() == Some("1");
@@ -1276,7 +1536,7 @@ impl Render for CountdownView {
                 .justify_center()
                 .bg(gpui::black().opacity(0.35))
                 .occlude()
-                .child(self.render_draft(cx))
+                .child(self.render_draft(window, cx))
         });
 
         v_flex()
@@ -1427,5 +1687,151 @@ impl Render for CountdownView {
                     .child(div().flex().flex_wrap().gap(px(20.)).children(cards)),
             )
             .children(modal)
+    }
+}
+
+#[cfg(all(test, debug_assertions))]
+mod tests {
+    use super::*;
+    use fern_core::Frequency;
+    use gpui::{Modifiers, TestAppContext, size};
+
+    #[gpui::test]
+    fn save_click_keeps_invalid_dates_until_corrected_for_every_countdown_kind(cx: &mut TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        cx.update(|cx| {
+            theme::init(cx);
+            calendar::set_date_format(Some(DateFormat::IsoYearMonthDay));
+            assert!(crate::keymap::load_default(&assets::Assets, cx).unwrap().is_empty());
+        });
+        let (view, cx) = cx.add_window_view(|_, cx| CountdownView::new(store.clone(), cx));
+        cx.simulate_resize(size(px(900.), px(700.)));
+        let select_all = if cfg!(target_os = "macos") { "cmd-a" } else { "ctrl-a" };
+        for (index, kind) in [CountdownKind::Countdown, CountdownKind::Anniversary, CountdownKind::Birthday, CountdownKind::Holiday].into_iter().enumerate() {
+            cx.update(|window, cx| view.update(cx, |view, cx| {
+                view.start_new_kind(kind, window, cx);
+                let draft = view.draft.as_mut().unwrap();
+                draft.name.update(cx, |input, cx| input.set_text("Date validation", cx));
+                draft.set_date(NaiveDate::from_ymd_opt(2026, 11, 16).unwrap(), cx);
+            }));
+            if matches!(kind, CountdownKind::Birthday | CountdownKind::Holiday) {
+                let trigger = cx.debug_bounds("countdown-date-popup-trigger").unwrap().center();
+                cx.simulate_click(trigger, Modifiers::default());
+            }
+            let month = cx.debug_bounds(DateField::Month.id()).unwrap().center();
+            cx.simulate_click(month, Modifiers::default());
+            cx.simulate_keystrokes(select_all);
+            cx.simulate_input("13");
+            let save = cx.debug_bounds("countdown-save").unwrap().center();
+            cx.simulate_click(save, Modifiers::default());
+            assert_eq!(store.countdowns().unwrap().len(), index, "Save must reject the invalid {kind:?} date");
+            cx.update(|_, cx| {
+                let draft = view.read(cx).draft.as_ref().unwrap();
+                assert_eq!(draft.date_inputs.fields[DateField::Month as usize].read(cx).text(), "13");
+            });
+
+            let day = cx.debug_bounds(DateField::Day.id()).unwrap().center();
+            cx.simulate_click(day, Modifiers::default());
+            cx.simulate_keystrokes("enter");
+            cx.simulate_click(save, Modifiers::default());
+            assert_eq!(store.countdowns().unwrap().len(), index, "blurring another field must not erase the invalid month");
+
+            let month = cx.debug_bounds(DateField::Month.id()).unwrap().center();
+            cx.simulate_click(month, Modifiers::default());
+            cx.simulate_keystrokes(select_all);
+            cx.simulate_input("12");
+            cx.simulate_click(save, Modifiers::default());
+            let countdowns = store.countdowns().unwrap();
+            assert_eq!(countdowns.len(), index + 1);
+            assert_eq!(countdowns.last().unwrap().date, NaiveDate::from_ymd_opt(2026, 12, 16).unwrap());
+        }
+        cx.update(|_, _| calendar::set_date_format(None));
+    }
+
+    #[gpui::test]
+    fn countdown_kinds_share_the_ordered_date_editor(cx: &mut TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        cx.update(|cx| {
+            theme::init(cx);
+            cx.set_global(i18n::CurrentLocale(i18n::Locale::ZhCn));
+            calendar::set_date_format(None);
+            assert!(crate::keymap::load_default(&assets::Assets, cx).unwrap().is_empty());
+        });
+        let (view, cx) = cx.add_window_view(|_, cx| CountdownView::new(store, cx));
+        cx.simulate_resize(size(px(900.), px(600.)));
+
+        for kind in [CountdownKind::Countdown, CountdownKind::Anniversary, CountdownKind::Birthday, CountdownKind::Holiday] {
+            cx.update(|window, cx| view.update(cx, |view, cx| view.start_new_kind(kind, window, cx)));
+            if matches!(kind, CountdownKind::Birthday | CountdownKind::Holiday) {
+                assert!(cx.debug_bounds(DateField::Year.id()).is_none());
+                let trigger = cx.debug_bounds("countdown-date-popup-trigger").unwrap().center();
+                cx.simulate_click(trigger, Modifiers::default());
+            }
+            let year = cx.debug_bounds(DateField::Year.id()).unwrap();
+            let month = cx.debug_bounds(DateField::Month.id()).unwrap();
+            let day = cx.debug_bounds(DateField::Day.id()).unwrap();
+            assert!(year.right() <= month.left() && month.right() <= day.left());
+        }
+
+        cx.update(|window, cx| {
+            calendar::set_date_format(Some(DateFormat::DayMonthYear));
+            view.update(cx, |view, cx| view.start_new_kind(CountdownKind::Anniversary, window, cx));
+        });
+        let year = cx.debug_bounds(DateField::Year.id()).unwrap();
+        let month = cx.debug_bounds(DateField::Month.id()).unwrap();
+        let day = cx.debug_bounds(DateField::Day.id()).unwrap();
+        assert!(day.right() <= month.left() && month.right() <= year.left());
+        cx.update(|_, _| calendar::set_date_format(None));
+    }
+
+    #[gpui::test]
+    fn birthday_accepts_a_distant_year_and_keeps_leap_day_valid(cx: &mut TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        cx.update(|cx| {
+            theme::init(cx);
+            calendar::set_date_format(Some(DateFormat::IsoYearMonthDay));
+            assert!(crate::keymap::load_default(&assets::Assets, cx).unwrap().is_empty());
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let mut view = CountdownView::new(store.clone(), cx);
+            view.start_new_kind(CountdownKind::Birthday, window, cx);
+            let draft = view.draft.as_mut().unwrap();
+            draft.name.update(cx, |input, cx| input.set_text("Birthday", cx));
+            draft.set_date(NaiveDate::from_ymd_opt(2028, 2, 29).unwrap(), cx);
+            view
+        });
+        cx.simulate_resize(size(px(900.), px(600.)));
+        let trigger = cx.debug_bounds("countdown-date-popup-trigger").unwrap().center();
+        cx.simulate_click(trigger, Modifiers::default());
+        let year_dropdown = cx.debug_bounds("countdown-date-year-toggle").unwrap().center();
+        cx.simulate_click(year_dropdown, Modifiers::default());
+        assert!(cx.debug_bounds("countdown-date-options").is_some());
+
+        let select_all = if cfg!(target_os = "macos") { "cmd-a" } else { "ctrl-a" };
+        cx.simulate_keystrokes(select_all);
+        cx.simulate_input("1910");
+        cx.simulate_keystrokes("enter");
+        assert!(cx.debug_bounds("countdown-date-options").is_none());
+        cx.update(|window, cx| {
+            let draft = view.read(cx).draft.as_ref().unwrap();
+            assert_eq!(draft.date, NaiveDate::from_ymd_opt(1910, 2, 28).unwrap());
+            assert!(draft.date_inputs.fields[DateField::Month as usize].focus_handle(cx).is_focused(window));
+        });
+
+        cx.simulate_keystrokes(select_all);
+        cx.simulate_input("13");
+        cx.simulate_keystrokes("enter");
+        cx.update(|_, cx| view.update(cx, |view, cx| view.save_draft(cx)));
+        assert!(store.countdowns().unwrap().is_empty());
+        cx.simulate_keystrokes("escape");
+        assert!(cx.debug_bounds(DateField::Year.id()).is_none());
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| view.save_draft(cx));
+            calendar::set_date_format(None);
+        });
+        let countdowns = store.countdowns().unwrap();
+        assert_eq!(countdowns.len(), 1);
+        assert_eq!(countdowns[0].date, NaiveDate::from_ymd_opt(1910, 2, 28).unwrap());
+        assert_eq!(countdowns[0].repeat.as_ref().unwrap().frequency, Frequency::Yearly);
     }
 }

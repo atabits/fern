@@ -42,6 +42,10 @@ pub fn set_date_format(format: Option<fern_core::DateFormat>) {
     DATE_FORMAT.with(|f| f.set(format));
 }
 
+pub(crate) fn explicit_date_format() -> Option<fern_core::DateFormat> {
+    DATE_FORMAT.with(Cell::get)
+}
+
 pub fn set_week_numbers(on: bool) {
     WEEK_NUMBERS.with(|w| w.set(on));
 }
@@ -56,19 +60,23 @@ pub fn week_number(week: &[NaiveDate; 7]) -> u32 {
     week.iter().find(|d| d.weekday() == Weekday::Thu).unwrap_or(&week[3]).iso_week().week()
 }
 
-/// A numeric date in the chosen format: "12/31/2026", "31/12/2026" or "2026/12/31"; without a
-/// choice, the language's own ("31.12.2026" in Russian).
+/// A numeric date in the chosen format, such as "2026-12-31", or in the locale's default.
 pub fn format_date(date: NaiveDate, strings: &Strings) -> String {
     format_date_as(date, selected_date_format(strings), strings.dotted_dates, true)
 }
 
-/// A numeric day and month: "12/31", "31/12" or "31.12".
+/// A numeric date with the year omitted.
 pub fn format_day_month(date: NaiveDate, strings: &Strings) -> String {
     format_date_as(date, selected_date_format(strings), strings.dotted_dates, false)
 }
 
 fn selected_date_format(strings: &Strings) -> Option<fern_core::DateFormat> {
-    DATE_FORMAT.with(Cell::get).or(strings.year_first_dates.then_some(fern_core::DateFormat::YearMonthDay))
+    explicit_date_format().or(strings.year_first_dates.then_some(fern_core::DateFormat::YearMonthDay))
+}
+
+pub(crate) fn effective_date_format(strings: &Strings) -> fern_core::DateFormat {
+    use fern_core::DateFormat::{DayMonthYear, MonthDayYear};
+    selected_date_format(strings).unwrap_or(if strings.dotted_dates { DayMonthYear } else { MonthDayYear })
 }
 
 /// A typed date: ISO ("2026-10-18"), or the numeric format dates are shown in, with or without
@@ -80,9 +88,9 @@ pub fn parse_date(text: &str, today: NaiveDate, strings: &Strings) -> Option<Nai
     }
     let parts: Vec<u32> = text.split(['.', '/', '-']).map(|p| p.trim().parse().ok()).collect::<Option<_>>()?;
     use fern_core::DateFormat::*;
-    let format = selected_date_format(strings).unwrap_or(if strings.dotted_dates { DayMonthYear } else { MonthDayYear });
+    let format = effective_date_format(strings);
     let (y, m, d) = match (format, parts.as_slice()) {
-        (YearMonthDay, &[y, m, d]) => (y as i32, m, d),
+        (YearMonthDay | IsoYearMonthDay, &[y, m, d]) => (y as i32, m, d),
         (DayMonthYear, &[d, m, y]) => (y as i32, m, d),
         (MonthDayYear, &[m, d, y]) => (y as i32, m, d),
         (DayMonthYear, &[d, m]) => (today.year(), m, d),
@@ -98,7 +106,9 @@ pub fn format_date_as(date: NaiveDate, format: Option<fern_core::DateFormat>, do
         (Some(MonthDayYear), true) => "%m/%d/%Y",
         (Some(DayMonthYear), true) => "%d/%m/%Y",
         (Some(YearMonthDay), true) => "%Y/%m/%d",
+        (Some(IsoYearMonthDay), true) => "%Y-%m-%d",
         (Some(DayMonthYear), false) => "%d/%m",
+        (Some(IsoYearMonthDay), false) => "%m-%d",
         (Some(_), false) => "%m/%d",
         (None, true) if dotted => "%d.%m.%Y",
         (None, true) => "%m/%d/%Y",
@@ -344,6 +354,8 @@ mod tests {
         assert_eq!(format_date_as(date, Some(MonthDayYear), true, true), "12/31/2026");
         assert_eq!(format_date_as(date, Some(DayMonthYear), false, true), "31/12/2026");
         assert_eq!(format_date_as(date, Some(YearMonthDay), false, true), "2026/12/31");
+        assert_eq!(format_date_as(date, Some(IsoYearMonthDay), true, true), "2026-12-31");
+        assert_eq!(format_date_as(date, Some(IsoYearMonthDay), true, false), "12-31");
         assert_eq!(format_date_as(date, None, true, true), "31.12.2026");
         assert_eq!(format_date_as(date, None, false, false), "12/31");
         assert_eq!(format_date_as(date, Some(DayMonthYear), false, false), "31/12");
@@ -376,6 +388,11 @@ mod tests {
         assert_eq!(format_day_month(date, &ZH_CN), "02/11");
         assert_eq!(parse_date("02/11/2026", date, &ZH_CN), Some(date));
         assert_eq!(parse_date("02/11", date, &ZH_CN), Some(date));
+
+        set_date_format(Some(fern_core::DateFormat::IsoYearMonthDay));
+        assert_eq!(format_date(date, &RU), "2026-11-02");
+        assert_eq!(parse_date("2026-11-02", date, &RU), Some(date));
+        assert_eq!(parse_date("11-02", date, &RU), Some(date));
         set_date_format(None);
     }
 

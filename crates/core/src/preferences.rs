@@ -135,16 +135,24 @@ pub enum DateFormat {
     DayMonthYear,
     /// 2026/12/31
     YearMonthDay,
+    /// 2026-12-31
+    IsoYearMonthDay,
 }
 
 impl DateFormat {
-    pub const ALL: [DateFormat; 3] = [DateFormat::MonthDayYear, DateFormat::DayMonthYear, DateFormat::YearMonthDay];
+    pub const ALL: [DateFormat; 4] = [
+        DateFormat::MonthDayYear,
+        DateFormat::DayMonthYear,
+        DateFormat::YearMonthDay,
+        DateFormat::IsoYearMonthDay,
+    ];
 
     pub fn code(self) -> &'static str {
         match self {
             DateFormat::MonthDayYear => "mdy",
             DateFormat::DayMonthYear => "dmy",
             DateFormat::YearMonthDay => "ymd",
+            DateFormat::IsoYearMonthDay => "iso-ymd",
         }
     }
 
@@ -558,6 +566,9 @@ mod tests {
         };
         store.save_preferences(&preferences)?;
         assert_eq!(store.preferences()?, preferences);
+
+        store.save_preferences(&Preferences { date_format: Some(DateFormat::IsoYearMonthDay), ..preferences.clone() })?;
+        assert_eq!(store.preferences()?.date_format, Some(DateFormat::IsoYearMonthDay));
 
         store.save_preferences(&Preferences { default_list: None, ..preferences.clone() })?;
         assert_eq!(store.preferences()?.default_list, None);

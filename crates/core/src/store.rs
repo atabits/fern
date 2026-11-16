@@ -2148,12 +2148,22 @@ impl Store {
     }
 
     pub fn add_subscription(&self, name: &str, url: &str, color: Option<&str>) -> Result<Id> {
+        self.insert_subscription(name, url, color, None)
+    }
+
+    pub fn add_subscription_with_feed(&self, name: &str, url: &str, color: Option<&str>, feed: &str) -> Result<Id> {
+        self.insert_subscription(name, url, color, Some(feed))
+    }
+
+    fn insert_subscription(&self, name: &str, url: &str, color: Option<&str>, feed: Option<&str>) -> Result<Id> {
         let url = url.trim();
         anyhow::ensure!(!url.is_empty(), "a subscription needs an address");
         let id = Uuid::now_v7();
+        let now = now_ms();
         self.conn.execute(
-            "INSERT INTO calendar_subscriptions (id, name, url, color, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![id.to_string(), name.trim(), url, color, now_ms()],
+            "INSERT INTO calendar_subscriptions (id, name, url, color, created_at, feed, fetched_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![id.to_string(), name.trim(), url, color, now, feed.unwrap_or_default(), feed.map(|_| now)],
         )?;
         Ok(id)
     }
@@ -2176,20 +2186,32 @@ impl Store {
         Ok(())
     }
 
+    /// Keeps the subscription's identity and preferences while replacing its address and feed together.
+    pub fn replace_subscription_source(&self, id: Id, previous_url: &str, url: &str, feed: &str) -> Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE calendar_subscriptions SET url = ?3, feed = ?4, fetched_at = ?5, error = NULL
+             WHERE id = ?1 AND url = ?2 AND NOT EXISTS (
+                 SELECT 1 FROM calendar_subscriptions WHERE url = ?3 AND id != ?1
+             )",
+            params![id.to_string(), previous_url, url, feed, now_ms()],
+        )?;
+        Ok(changed == 1)
+    }
+
     /// Keeps what was read from a subscription's address: the feed, or the error that kept it
     /// (the last feed read then stays).
-    pub fn save_subscription_feed(&self, id: Id, feed: Result<&str, &str>) -> Result<()> {
-        match feed {
+    pub fn save_subscription_feed(&self, id: Id, url: &str, feed: Result<&str, &str>) -> Result<bool> {
+        let changed = match feed {
             Ok(feed) => self.conn.execute(
-                "UPDATE calendar_subscriptions SET feed = ?2, fetched_at = ?3, error = NULL WHERE id = ?1",
-                params![id.to_string(), feed, now_ms()],
+                "UPDATE calendar_subscriptions SET feed = ?3, fetched_at = ?4, error = NULL WHERE id = ?1 AND url = ?2",
+                params![id.to_string(), url, feed, now_ms()],
             )?,
             Err(error) => self.conn.execute(
-                "UPDATE calendar_subscriptions SET error = ?2 WHERE id = ?1",
-                params![id.to_string(), error],
+                "UPDATE calendar_subscriptions SET error = ?3 WHERE id = ?1 AND url = ?2",
+                params![id.to_string(), url, error],
             )?,
         };
-        Ok(())
+        Ok(changed == 1)
     }
 
     pub fn countdowns(&self) -> Result<Vec<Countdown>> {

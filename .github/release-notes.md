@@ -35,8 +35,9 @@ refuses to open it the first time. Open **System Settings → Privacy & Security
 `xattr -d com.apple.quarantine /Applications/Fern.app`.
 
 **Windows** — run the installer. It needs no administrator rights and adds Fern to the Start
-menu. The ZIP is a portable version: unpack it and run `fern.exe`. If SmartScreen warns about an
-unknown publisher, choose **More info → Run anyway**.
+menu. The ZIP runs without installation: unpack it and run `fern.exe`. To keep your data beside
+`fern.exe`, create an empty `.portable` file there before starting Fern. If SmartScreen warns
+about an unknown publisher, choose **More info → Run anyway**.
 
 **Linux** — on Debian and Ubuntu, open the `.deb` or run `sudo apt install ./fern-{version}-linux-*.deb`.
 Elsewhere, `chmod +x fern-{version}-linux-*.AppImage` and run it. You can also unpack the

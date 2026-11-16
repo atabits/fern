@@ -47,6 +47,15 @@ that supports the new rules.
 
 Not synced: settings (so saved view choices stay per device), task activity, habit snoozes.
 
+## Calendar subscriptions
+
+Keep the original ICS feed in the store. Parsed events retain their source date/time form
+and time zone; expand recurrences in that source calendar before converting each occurrence
+to the display time zone. Calendar views consume occurrence start/end times, not the first
+instance's times. All-day dates and floating times do not pass through UTC. Unknown time
+zones must be reported instead of silently assumed to be local. Time-zone regressions use an
+explicit display zone so they remain deterministic across developer machines and CI runners.
+
 ## Conventions
 
 - Views are GPUI entities implementing `Render`; they talk through `EventEmitter` events and

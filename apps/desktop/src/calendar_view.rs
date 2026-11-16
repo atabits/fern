@@ -268,10 +268,10 @@ impl CalendarView {
             .map(|occurrence| EventBar {
                 key: occurrence.event.uid.clone(),
                 title: occurrence.event.title.clone(),
-                start: occurrence.start,
-                end: occurrence.end(),
-                start_time: occurrence.event.start_time,
-                end_time: occurrence.event.end_time,
+                start: occurrence.times.start,
+                end: occurrence.times.end,
+                start_time: occurrence.times.start_time,
+                end_time: occurrence.times.end_time,
                 location: occurrence.event.location.clone(),
                 notes: occurrence.event.notes.clone(),
                 calendar: occurrence.calendar.title().to_owned(),
@@ -2193,7 +2193,37 @@ struct EventBar {
 #[cfg(all(test, debug_assertions))]
 mod tests {
     use super::*;
+    use chrono::TimeZone as _;
     use gpui::{Modifiers, MouseButton, MouseDownEvent, MouseUpEvent, ScrollDelta, ScrollWheelEvent, TestAppContext, TouchPhase, point, size};
+
+    #[gpui::test]
+    fn subscribed_event_bars_use_each_occurrences_local_time(cx: &mut TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        store.add_subscription_with_feed("Synthetic meetings", "https://example.com/test.ics", None, concat!(
+            "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:weekly-ny\nSUMMARY:Weekly meeting\n",
+            "DTSTART;TZID=America/New_York:20261025T090000\n",
+            "DTEND;TZID=America/New_York:20261025T100000\n",
+            "RRULE:FREQ=WEEKLY;BYDAY=SU;COUNT=3\nEND:VEVENT\nEND:VCALENDAR",
+        )).unwrap();
+        cx.update(|cx| {
+            theme::init(cx);
+            crate::subscriptions::init(store.clone(), cx);
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| CalendarView::new(store, window, cx));
+        let expected = [(10, 25, 13), (11, 1, 14), (11, 8, 14)].map(|(month, day, hour)| {
+            chrono::Utc.with_ymd_and_hms(2026, month, day, hour, 0, 0).unwrap().with_timezone(&Local)
+        });
+        cx.update(|_, cx| {
+            let mut events = view.read(cx).events_between(expected[0].date_naive(), expected[2].date_naive(), cx);
+            events.sort_by_key(|event| (event.start, event.start_time));
+            assert_eq!(events.len(), expected.len());
+            for (event, start) in events.iter().zip(expected) {
+                let end = start + chrono::Duration::hours(1);
+                assert_eq!((event.start, event.start_time), (start.date_naive(), Some(start.time())));
+                assert_eq!((event.end, event.end_time), (end.date_naive(), Some(end.time())));
+            }
+        });
+    }
 
     #[gpui::test]
     fn the_whole_calendar_year_fits_and_scrolls_by_month_rows(cx: &mut TestAppContext) {

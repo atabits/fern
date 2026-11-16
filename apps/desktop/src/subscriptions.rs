@@ -7,7 +7,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result};
-use chrono::NaiveDate;
+use chrono::{Local, NaiveDate, TimeZone};
 use fern_core::ical::{self, Event, Subscription};
 use fern_core::{Id, Store};
 use gpui::{App, AppContext as _, Context, Entity, Global};
@@ -66,14 +66,7 @@ pub struct Calendar {
 pub struct Occurrence<'a> {
     pub event: &'a Event,
     pub calendar: &'a Subscription,
-    pub start: NaiveDate,
-}
-
-impl Occurrence<'_> {
-    /// The last day this occurrence covers.
-    pub fn end(&self) -> NaiveDate {
-        self.start + (self.event.end - self.event.start)
-    }
+    pub times: ical::Occurrence,
 }
 
 pub struct Feeds {
@@ -133,7 +126,17 @@ impl Feeds {
             .subscriptions()
             .unwrap_or_default()
             .into_iter()
-            .map(|subscription| Calendar { events: ical::parse(&subscription.feed), subscription })
+            .map(|mut subscription| {
+                let parsed = ical::parse_with_warnings(&subscription.feed);
+                if !parsed.warnings.is_empty() {
+                    let warning = parsed.warnings.join("; ");
+                    subscription.error = Some(match subscription.error {
+                        Some(error) => format!("{error}; {warning}"),
+                        None => warning,
+                    });
+                }
+                Calendar { events: parsed.events, subscription }
+            })
             .collect();
     }
 
@@ -151,12 +154,17 @@ impl Feeds {
 
     /// The events of the shown calendars that cover any day from `from` to `to`.
     pub fn occurrences(&self, from: NaiveDate, to: NaiveDate) -> Vec<Occurrence<'_>> {
+        self.occurrences_in_timezone(from, to, &Local)
+    }
+
+    fn occurrences_in_timezone<Tz: TimeZone>(&self, from: NaiveDate, to: NaiveDate, timezone: &Tz) -> Vec<Occurrence<'_>> {
         self.calendars
             .iter()
             .filter(|calendar| !calendar.subscription.hidden)
             .flat_map(|calendar| {
                 calendar.events.iter().flat_map(move |event| {
-                    event.starts_in(from, to).into_iter().map(move |start| Occurrence { event, calendar: &calendar.subscription, start })
+                    event.occurrences_in_timezone(from, to, timezone).into_iter()
+                        .map(move |times| Occurrence { event, calendar: &calendar.subscription, times })
                 })
             })
             .collect()
@@ -336,6 +344,83 @@ mod tests {
     use super::*;
 
     const FEED: &str = "BEGIN:VCALENDAR\nBEGIN:VEVENT\nUID:new-year\nSUMMARY:New Year\nDTSTART;VALUE=DATE:20260101\nEND:VEVENT\nEND:VCALENDAR";
+
+    #[test]
+    fn subscribed_tzid_and_utc_events_keep_the_same_time_after_reload() -> Result<()> {
+        // The reported Windows/Moscow case, fetched through the same path as a URL subscription.
+        let feed = concat!(
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\n",
+            "BEGIN:VEVENT\r\nUID:NY\r\nSUMMARY:NY\r\n",
+            "DTSTART;TZID=America/New_York:20261115T090000\r\n",
+            "DTEND;TZID=America/New_York:20261115T100000\r\nEND:VEVENT\r\n",
+            "BEGIN:VEVENT\r\nUID:UTC\r\nSUMMARY:UTC\r\n",
+            "DTSTART:20261115T140000Z\r\nDTEND:20261115T150000Z\r\n",
+            "END:VEVENT\r\nEND:VCALENDAR\r\n",
+        );
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/calendar.ics", server.server_addr());
+        let worker = std::thread::spawn(move || {
+            let request = server.recv_timeout(Duration::from_secs(10)).unwrap().expect("feed requested");
+            request.respond(tiny_http::Response::from_string(feed)).unwrap();
+        });
+        let fetched = fetch(&url);
+        worker.join().unwrap();
+        let fetched = fetched?;
+        let store = Rc::new(Store::open_in_memory()?);
+        let id = store.add_subscription("Synthetic calendar", &url, None)?;
+        store.save_subscription_feed(id, &url, Ok(&fetched))?;
+        let mut feeds = Feeds::new(store.clone());
+        let day = NaiveDate::from_ymd_opt(2026, 11, 15).unwrap();
+        let moscow = chrono::FixedOffset::east_opt(3 * 3600).unwrap();
+        for offline in [false, true] {
+            if offline {
+                store.save_subscription_feed(id, &url, Err("offline"))?;
+                feeds.load();
+            }
+            let occurrences = feeds.occurrences_in_timezone(day, day, &moscow);
+            assert_eq!(occurrences.len(), 2);
+            assert_eq!(occurrences[0].times, occurrences[1].times);
+            for occurrence in occurrences {
+                assert_eq!((occurrence.times.start, occurrence.times.end), (day, day));
+                assert_eq!(occurrence.times.start_time, chrono::NaiveTime::from_hms_opt(17, 0, 0));
+                assert_eq!(occurrence.times.end_time, chrono::NaiveTime::from_hms_opt(18, 0, 0));
+            }
+            assert_eq!(store.subscriptions()?[0].feed, feed, "source data must remain intact");
+        }
+        // A new display timezone must not require fetching or reparsing the feed.
+        let utc = feeds.occurrences_in_timezone(day, day, &chrono::Utc);
+        assert_eq!(utc[0].times.start_time, chrono::NaiveTime::from_hms_opt(14, 0, 0));
+        assert_eq!(utc[0].times, utc[1].times);
+        Ok(())
+    }
+
+    #[test]
+    fn unsupported_timezone_is_reported_without_discarding_valid_events() -> Result<()> {
+        let unknown = FEED.replace("END:VCALENDAR", concat!(
+            "BEGIN:VEVENT\nUID:unknown\nSUMMARY:Unsupported zone\n",
+            "DTSTART;TZID=Unknown/Timezone:20260101T090000\nEND:VEVENT\nEND:VCALENDAR",
+        ));
+        let store = Rc::new(Store::open_in_memory()?);
+        let url = "https://example.com/synthetic.ics";
+        let id = store.add_subscription_with_feed("Mixed calendar", url, None, &unknown)?;
+        let mut feeds = Feeds::new(store.clone());
+        let calendar = &feeds.calendars()[0];
+        assert_eq!(calendar.events.len(), 1);
+        assert!(calendar.subscription.error.as_ref().unwrap().contains("Unknown/Timezone"));
+        assert!(store.subscriptions()?[0].error.is_none(), "parse warnings are separate from fetch errors");
+        assert_eq!(store.subscriptions()?[0].feed, unknown);
+
+        store.save_subscription_feed(id, url, Err("offline"))?;
+        feeds.load();
+        let error = feeds.calendars()[0].subscription.error.as_ref().unwrap();
+        assert!(error.contains("offline") && error.contains("Unknown/Timezone"));
+
+        store.save_subscription_feed(id, url, Ok(FEED))?;
+        feeds.load();
+        assert!(feeds.calendars()[0].subscription.error.is_none());
+        assert_eq!(feeds.calendars()[0].events.len(), 1);
+        Ok(())
+    }
 
     #[test]
     fn holiday_source_changes_only_after_a_successful_read() -> Result<()> {

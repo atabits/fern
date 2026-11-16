@@ -769,6 +769,7 @@ impl SettingsWindow {
                 let dot = crate::lists_panel::parse_color(subscription.color.as_deref()).unwrap_or(colors.accent);
                 h_flex()
                     .id(SharedString::from(format!("subscription-{id}")))
+                    .when_some(subscription.error.as_ref(), |el, error| el.tooltip(Tooltip::text(error.clone())))
                     .min_h(px(ROW_HEIGHT))
                     .px_4()
                     .gap_3()

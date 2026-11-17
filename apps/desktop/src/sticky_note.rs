@@ -17,6 +17,8 @@ use crate::sticky_windows::{self, COMPACT_HEIGHT, MIN_EXPANDED_HEIGHT, MIN_WIDTH
 mod popup;
 #[cfg(windows)]
 mod sizing;
+#[cfg(windows)]
+mod taskbar;
 
 #[derive(Default)]
 struct OpenNotes(Vec<WindowHandle<StickyNote>>);
@@ -58,12 +60,26 @@ pub fn changed_elsewhere(observer: EntityId, cx: &App) -> bool {
 const WIDTH: f32 = 240.;
 const HEIGHT: f32 = 212.;
 
+fn display_title(text: &str, cx: &App) -> SharedString {
+    let text = text.trim();
+    if text.is_empty() {
+        return i18n::t(cx).untitled.into();
+    }
+    text.replace("\r\n", " ").replace(['\r', '\n'], " ").into()
+}
+
 fn activate_existing(id: Id, cx: &mut App) -> bool {
     let handles = cx.default_global::<OpenNotes>().0.clone();
     handles.into_iter().any(|handle| {
         handle.update(cx, |note, window, cx| {
             let matches = note.detail.read(cx).task_id() == Some(id);
-            if matches { window.activate_window(); }
+            if matches {
+                #[cfg(windows)]
+                if let Some(button) = &mut note.taskbar {
+                    button.set_hidden(note.settings.hide_from_taskbar, cx);
+                }
+                window.activate_window();
+            }
             matches
         }).unwrap_or(false)
     })
@@ -76,16 +92,18 @@ pub fn open(store: Rc<Store>, id: Id, cx: &mut App) {
     if activate_existing(id, cx) {
         return;
     }
-    let saved = sticky_windows::load(&store).into_iter().find(|n| n.task == id);
-    let title = task.title;
-    let bounds = saved.as_ref().map(|note| note.bounds(cx))
-        .unwrap_or_else(|| Bounds::centered(None, size(px(WIDTH), px(HEIGHT)), cx));
-    let pinned = saved.as_ref().map(|note| note.pinned).unwrap_or_else(|| StickySettings::load(&store).pin_default);
-    let color = saved.as_ref().and_then(|note| note.color).filter(|color| *color < PALETTE.len());
-    let compact = saved.as_ref().filter(|note| note.compact).map(NoteWindow::expanded_height);
+    let settings = StickySettings::current(&store, cx);
+    let note = sticky_windows::load(&store).into_iter().find(|n| n.task == id).unwrap_or_else(|| {
+        NoteWindow::capture(id, settings.pin_default, Bounds::centered(None, size(px(WIDTH), px(HEIGHT)), cx))
+    });
+    let bounds = note.bounds(cx);
+    // GPUI normally shows the HWND before it builds the view. Install the
+    // saved taskbar policy first, then let GPUI show it at its initial placement.
+    let show = !(cfg!(windows) && settings.hide_from_taskbar);
     let options = WindowOptions {
+        show,
         window_bounds: Some(WindowBounds::Windowed(bounds)),
-        titlebar: Some(TitlebarOptions { title: Some(title.into()), appears_transparent: true, traffic_light_position: None }),
+        titlebar: Some(TitlebarOptions { title: Some(display_title(&task.title, cx)), appears_transparent: true, traffic_light_position: None }),
         window_decorations: Some(WindowDecorations::Client),
         app_owns_titlebar_drag: true,
         window_min_size: Some(size(px(MIN_WIDTH), px(COMPACT_HEIGHT))),
@@ -93,7 +111,10 @@ pub fn open(store: Rc<Store>, id: Id, cx: &mut App) {
         ..Default::default()
     };
     match cx.open_window(options, |window, cx| {
-        cx.new(|cx| StickyNote::new(store, id, pinned, color, compact, window, cx))
+        let initial_bounds = if show { window.window_bounds().get_bounds() } else { bounds };
+        let view = cx.new(|cx| StickyNote::new(store, note, initial_bounds, settings, window, cx));
+        if !show { window.activate_window(); }
+        view
     }) {
         Ok(handle) => {
             let live = cx.default_global::<OpenNotes>().0.clone().into_iter().filter(|h| h.read(cx).is_ok()).collect();
@@ -111,7 +132,10 @@ pub struct StickyNote {
     should_move: bool,
     /// Kept over the other windows by its pin (Windows).
     pinned: bool,
+    #[cfg(windows)]
+    taskbar: Option<taskbar::TaskbarButton>,
     settings: StickySettings,
+    title: SharedString,
     saved_task: Option<Id>,
     color: Option<usize>,
     palette: Option<WindowHandle<StickyPalette>>,
@@ -124,10 +148,9 @@ pub struct StickyNote {
 impl StickyNote {
     fn new(
         store: Rc<Store>,
-        id: Id,
-        pinned: bool,
-        color: Option<usize>,
-        compact_height: Option<Pixels>,
+        note: NoteWindow,
+        initial_bounds: Bounds<Pixels>,
+        settings: StickySettings,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -136,29 +159,35 @@ impl StickyNote {
             detail.set_card(false);
             detail
         });
-        cx.subscribe(&detail, |this, _, _: &TaskUpdated, cx| {
+        cx.subscribe_in(&detail, window, |this, _, _: &TaskUpdated, window, cx| {
             data_changed(cx.entity_id(), cx);
-            this.refresh(cx);
+            this.refresh_task(window, cx);
         })
         .detach();
         // A subtask or parent clicked in the note opens in the note.
         cx.subscribe_in(&detail, window, |this, _, OpenTask(id), window, cx| {
             this.navigate(*id, window, cx);
         }).detach();
-        cx.observe_global::<DataVersion>(|this, cx| {
+        cx.observe_global_in::<DataVersion>(window, |this, window, cx| {
             if changed_elsewhere(cx.entity_id(), cx) {
-                this.refresh(cx);
+                this.refresh_task(window, cx);
             }
         })
         .detach();
+        cx.observe_global_in::<StickySettings>(window, |this, window, cx| {
+            this.settings_changed(*cx.global::<StickySettings>(), window, cx);
+        }).detach();
+        cx.observe_global_in::<i18n::CurrentLocale>(window, |this, window, cx| {
+            this.update_title(window, cx);
+        }).detach();
         cx.observe_in(&detail, window, |this, _, _, cx| {
             this.sync_detail_popup(cx);
         }).detach();
-        let settings = StickySettings::load(&store);
         #[cfg(windows)]
         {
-            sizing::set_compact(window, compact_height.is_some());
-            set_topmost(window, pinned);
+            sizing::set_compact(window, note.compact);
+            set_topmost(window, note.pinned);
+            set_opacity(window, settings.opacity);
         }
         cx.observe_window_bounds(window, |this, window, cx| this.bounds_changed(window, cx)).detach();
         let weak = cx.weak_entity();
@@ -167,15 +196,17 @@ impl StickyNote {
             true
         });
         let mut this = Self {
-            store, detail, should_move: false, pinned, settings, saved_task: None, color,
+            store, detail, should_move: false, pinned: note.pinned, settings, title: SharedString::default(),
+            saved_task: None, color: note.color.filter(|color| *color < PALETTE.len()),
+            #[cfg(windows)]
+            taskbar: win32_window_handle(window).map(|hwnd| taskbar::TaskbarButton::new(hwnd, settings.hide_from_taskbar, cx)),
             palette: None, detail_popup: None,
-            compact: compact_height.is_some(),
-            expanded_height: compact_height.unwrap_or_else(|| window.viewport_size().height.max(px(MIN_EXPANDED_HEIGHT))),
-            last_bounds: window.bounds(),
+            compact: note.compact,
+            expanded_height: if note.compact { note.expanded_height() } else { initial_bounds.size.height.max(px(MIN_EXPANDED_HEIGHT)) },
+            last_bounds: initial_bounds,
         };
-        this.show(id, cx);
-        this.refresh(cx);
-        this.remember(window, cx);
+        this.show(note.task, window, cx);
+        this.remember_bounds(initial_bounds, cx);
         this
     }
 
@@ -227,16 +258,17 @@ impl StickyNote {
         #[cfg(windows)]
         let owner = win32_window_handle(window);
         let note_bounds = window.bounds();
+        let below_bar = if self.compact { note_bounds.bottom() } else { note_bounds.top() + px(COMPACT_HEIGHT) };
         let popup_size = size(px(288.), px(102.));
         let anchor = popup::Anchor {
-            point: point(note_bounds.right(), note_bounds.top() + px(COMPACT_HEIGHT)),
+            point: point(note_bounds.right(), below_bar),
             above: false, right: true, screen: popup::screen(window, cx),
         };
         match popup::open(window, anchor, popup_size, true, |_, window, cx| {
             window.set_window_title(i18n::t(cx).color);
             #[cfg(windows)]
             popup::attach(owner, window, false);
-            cx.new(|cx| StickyPalette::new(note, self.settings.color, self.pinned, window, cx))
+            cx.new(|cx| StickyPalette::new(note, self.style().color, self.pinned, window, cx))
         }, cx) {
             Ok(palette) => self.palette = Some(palette),
             Err(err) => eprintln!("failed to open sticky note colors: {err:#}"),
@@ -287,8 +319,12 @@ impl StickyNote {
     }
 
     fn remember(&mut self, window: &Window, cx: &App) {
+        self.remember_bounds(window.window_bounds().get_bounds(), cx);
+    }
+
+    fn remember_bounds(&mut self, bounds: Bounds<Pixels>, cx: &App) {
         if let Some(id) = self.detail.read(cx).task_id() {
-            let mut note = NoteWindow::capture(id, self.pinned, window.window_bounds().get_bounds());
+            let mut note = NoteWindow::capture(id, self.pinned, bounds);
             note.color = self.color;
             note.compact = self.compact;
             note.height = self.expanded_height.into();
@@ -310,16 +346,15 @@ impl StickyNote {
         }
     }
 
-    fn navigate(&mut self, id: Id, window: &Window, cx: &mut Context<Self>) {
+    fn navigate(&mut self, id: Id, window: &mut Window, cx: &mut Context<Self>) {
         if self.detail.read(cx).task_id() == Some(id) || activate_existing(id, cx) {
             return;
         }
-        self.show(id, cx);
-        self.refresh(cx);
+        self.show(id, window, cx);
         self.remember(window, cx);
     }
 
-    fn show(&mut self, id: Id, cx: &mut Context<Self>) {
+    fn show(&mut self, id: Id, window: &mut Window, cx: &mut Context<Self>) {
         if self.saved_task.is_some_and(|previous| previous != id) {
             self.color = sticky_windows::load(&self.store).into_iter().find(|n| n.task == id)
                 .and_then(|note| note.color).filter(|color| *color < PALETTE.len());
@@ -330,17 +365,54 @@ impl StickyNote {
             detail.set_lists(lists);
             detail.show(task, cx);
         });
+        self.update_style(cx);
+        self.update_title(window, cx);
     }
 
-    /// Shows the task as it is now; a task deleted elsewhere leaves the note empty.
-    fn refresh(&mut self, cx: &mut Context<Self>) {
-        self.settings = StickySettings::load(&self.store);
-        if let Some(color) = self.color { self.settings.color = color; }
-        let settings = self.settings;
-        self.detail.update(cx, |detail, cx| detail.set_sticky_style(settings, cx));
+    fn style(&self) -> StickySettings {
+        StickySettings { color: self.color.unwrap_or(self.settings.color), ..self.settings }
+    }
+
+    fn update_style(&self, cx: &mut Context<Self>) {
+        let style = self.style();
+        self.detail.update(cx, |detail, cx| detail.set_sticky_style(style, cx));
+        cx.notify();
+    }
+
+    fn settings_changed(&mut self, settings: StickySettings, _window: &Window, cx: &mut Context<Self>) {
+        let old = self.style();
+        self.settings = settings;
+        #[cfg(windows)]
+        {
+            if let Some(button) = &mut self.taskbar {
+                button.set_hidden(settings.hide_from_taskbar, cx);
+            }
+            if old.opacity != settings.opacity {
+                set_opacity(_window, settings.opacity);
+            }
+        }
+        if old.color != self.style().color || old.font != settings.font {
+            self.update_style(cx);
+        }
+    }
+
+    fn update_title(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let title = display_title(self.detail.read(cx).task_title().unwrap_or_default(), cx);
+        if self.title != title {
+            window.set_window_title(&title);
+            self.title = title;
+            cx.notify();
+        }
+    }
+
+    fn refresh_task(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(id) = self.detail.read(cx).task_id() else { return };
         let task = self.store.task(id).ok().flatten().filter(|task| !task.is_deleted());
-        self.detail.update(cx, |detail, cx| detail.refresh(task, cx));
+        self.detail.update(cx, |detail, cx| {
+            detail.refresh(task, cx);
+            cx.notify();
+        });
+        self.update_title(window, cx);
     }
 }
 
@@ -354,12 +426,9 @@ impl Render for StickyNote {
             cx.defer_in(_window, move |this, window, cx| this.open_detail_popup(anchor, measured, window, cx));
         }
         let strings = i18n::t(cx);
-        #[cfg(windows)]
-        set_opacity(_window, self.settings.opacity);
-        let foreground: gpui::Hsla = gpui::rgb(self.settings.foreground()).into();
-        let (background, titlebar) = PALETTE[self.settings.color];
-        let title = self.detail.read(cx).task_title().unwrap_or_default().trim();
-        let title = SharedString::from(if title.is_empty() { strings.untitled } else { title }.replace(['\r', '\n'], " "));
+        let style = self.style();
+        let foreground: gpui::Hsla = gpui::rgb(style.foreground()).into();
+        let (background, titlebar) = PALETTE[style.color];
         v_flex()
             .id("sticky-window")
             .group("sticky-window")
@@ -376,9 +445,9 @@ impl Render for StickyNote {
             .child(
                 h_flex()
                     .flex_none()
-                    .h(px(if self.compact { COMPACT_HEIGHT } else { 20. }))
+                    .h_full()
                     .pr(px(5.))
-                    .when(!self.compact, |bar| bar.bg(gpui::rgb(titlebar)))
+                    .when(!self.compact, |bar| bar.h(px(20.)).bg(gpui::rgb(titlebar)))
                     .child(
                         // As the title bar: Windows moves the window from the tagged area, the
                         // others once the pressed mouse moves. The close button stays out of it.
@@ -416,13 +485,15 @@ impl Render for StickyNote {
                                         .w_full()
                                         .font_weight(FontWeight::SEMIBOLD)
                                         .text_size(px(14.))
+                                        .line_height(px(20.))
                                         .truncate()
-                                        .child(title),
+                                        .child(self.title.clone()),
                                 )
                             }),
                     )
                     .child(
                         h_flex()
+                        .debug_selector(|| "sticky-title-controls".into())
                         .flex_none()
                         .when(!crate::touch::active(), |bar| bar.opacity(0.).group_hover("sticky-window", |style| style.opacity(1.)))
                         .child(
@@ -525,9 +596,8 @@ impl Render for StickyPalette {
                             this.note.update(cx, |note, window, cx| {
                                 note.color = Some(index);
                                 note.palette = None;
-                                note.refresh(cx);
+                                note.update_style(cx);
                                 note.remember(window, cx);
-                                cx.notify();
                             }).ok();
                             window.remove_window();
                         }))
@@ -577,6 +647,48 @@ mod tests {
     use gpui::Focusable as _;
     use gpui::{Modifiers, TestAppContext};
 
+    fn new_note(store: Rc<Store>, id: Id, window: &mut Window, cx: &mut Context<StickyNote>) -> StickyNote {
+        let bounds = window.window_bounds().get_bounds();
+        let note = NoteWindow::capture(id, false, bounds);
+        let settings = StickySettings::current(&store, cx);
+        StickyNote::new(store, note, bounds, settings, window, cx)
+    }
+
+    #[gpui::test]
+    fn native_title_follows_renames_and_navigation_in_its_own_note(cx: &mut TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let first = store.add_task("First").unwrap().id;
+        let second = store.add_task("Second").unwrap().id;
+        let child = store.add_subtask(first, "Child").unwrap().id;
+        let (first_window, second_window) = cx.update(|cx| {
+            theme::init(cx);
+            cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+            open(store.clone(), first, cx);
+            open(store.clone(), second, cx);
+            let handles = &cx.global::<OpenNotes>().0;
+            (handles[0], handles[1])
+        });
+        let mut first_cx = gpui::VisualTestContext::from_window(first_window.into(), cx);
+        let mut second_cx = gpui::VisualTestContext::from_window(second_window.into(), cx);
+        assert_eq!(first_cx.window_title().as_deref(), Some("First"));
+
+        store.set_title(first, " New\r\ntitle ").unwrap();
+        first_window.update(cx, |note, _, cx| {
+            note.detail.update(cx, |_, cx| cx.emit(TaskUpdated));
+        }).unwrap();
+        assert_eq!(first_cx.window_title().as_deref(), Some("New title"));
+
+        store.set_title(first, "").unwrap();
+        second_window.update(cx, |_, _, cx| data_changed(cx.entity_id(), cx)).unwrap();
+        assert_eq!(first_cx.window_title().as_deref(), Some("Untitled"));
+        cx.update(|cx| cx.set_global(i18n::CurrentLocale(i18n::Locale::Ru)));
+        assert_eq!(first_cx.window_title().as_deref(), Some(i18n::Locale::Ru.strings().untitled));
+
+        first_window.update(cx, |note, window, cx| note.navigate(child, window, cx)).unwrap();
+        assert_eq!(first_cx.window_title().as_deref(), Some("Child"));
+        assert_eq!(second_cx.window_title().as_deref(), Some("Second"));
+    }
+
     #[gpui::test]
     #[cfg(debug_assertions)]
     fn compact_note_reopens_at_one_line_and_restores_its_previous_height(cx: &mut TestAppContext) {
@@ -585,7 +697,7 @@ mod tests {
         let task = store.add_task(title).unwrap().id;
         cx.update(theme::init);
         let (note, cx) = cx.add_window_view(|window, cx| {
-            StickyNote::new(store.clone(), task, false, None, None, window, cx)
+            new_note(store.clone(), task, window, cx)
         });
         cx.simulate_resize(size(px(324.), px(318.)));
 
@@ -607,8 +719,14 @@ mod tests {
             });
         }
         assert!(cx.debug_bounds("task-detail-body").is_none());
-        let line = cx.debug_bounds("sticky-compact-title").unwrap();
-        assert!(line.size.height <= px(COMPACT_HEIGHT));
+        for height in [COMPACT_HEIGHT, COMPACT_HEIGHT + 10.] {
+            cx.simulate_resize(size(px(324.), px(height)));
+            for selector in ["sticky-compact-title", "sticky-title-controls"] {
+                let bounds = cx.debug_bounds(selector).unwrap();
+                assert!(bounds.size.height <= px(COMPACT_HEIGHT));
+                assert!((bounds.center().y - px(height / 2.)).abs() <= px(1.), "{selector}: {bounds:?}");
+            }
+        }
         let saved = sticky_windows::load(&store).pop().unwrap();
         assert!(saved.compact);
         assert_eq!(saved.width, 324.);
@@ -661,7 +779,7 @@ mod tests {
             cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
         });
         let (note, cx) = cx.add_window_view(|window, cx| {
-            StickyNote::new(store.clone(), task.id, false, None, None, window, cx)
+            new_note(store.clone(), task.id, window, cx)
         });
         let viewport = size(px(240.), px(200.));
         cx.simulate_resize(viewport);
@@ -700,7 +818,7 @@ mod tests {
         let store = Rc::new(Store::open_in_memory().unwrap());
         let task = store.add_task("Keep this note").unwrap();
         cx.update(theme::init);
-        let (note, cx) = cx.add_window_view(|window, cx| StickyNote::new(store.clone(), task.id, false, None, None, window, cx));
+        let (note, cx) = cx.add_window_view(|window, cx| new_note(store.clone(), task.id, window, cx));
         let more = cx.debug_bounds("task-detail-more").unwrap().center();
         cx.simulate_click(more, Modifiers::default());
         let popup = cx.update(|_, cx| note.read(cx).detail_popup.unwrap());
@@ -728,7 +846,7 @@ mod tests {
         let store = Rc::new(Store::open_in_memory().unwrap());
         let task = store.add_task("Keep the owner").unwrap();
         cx.update(theme::init);
-        let (note, cx) = cx.add_window_view(|window, cx| StickyNote::new(store, task.id, false, None, None, window, cx));
+        let (note, cx) = cx.add_window_view(|window, cx| new_note(store, task.id, window, cx));
         let more = cx.debug_bounds("task-detail-more").unwrap().center();
         cx.simulate_click(more, Modifiers::default());
         let popup = cx.update(|_, cx| note.read(cx).detail_popup.unwrap());
@@ -756,7 +874,7 @@ mod tests {
             theme::init(cx);
             assert!(crate::keymap::load_default(&assets::Assets, cx).unwrap().is_empty());
         });
-        let (note, cx) = cx.add_window_view(|window, cx| StickyNote::new(store, task.id, false, None, None, window, cx));
+        let (note, cx) = cx.add_window_view(|window, cx| new_note(store, task.id, window, cx));
         cx.simulate_resize(size(px(240.), px(200.)));
         let title = cx.debug_bounds("task-detail-title").unwrap().center();
         cx.simulate_click(title, Modifiers::default());
@@ -786,7 +904,7 @@ mod tests {
             theme::init(cx);
             cx.set_global(i18n::CurrentLocale(i18n::Locale::Ru));
         });
-        let (note, cx) = cx.add_window_view(|window, cx| StickyNote::new(store, task.id, false, None, None, window, cx));
+        let (note, cx) = cx.add_window_view(|window, cx| new_note(store, task.id, window, cx));
         cx.simulate_resize(size(px(240.), px(200.)));
         let more = cx.debug_bounds("task-detail-more").unwrap().center();
         cx.simulate_click(more, Modifiers::default());
@@ -851,7 +969,7 @@ mod tests {
         let task = store.add_task("List submenu regression").unwrap();
         let section = store.add_list_section(None, "Inbox section").unwrap();
         cx.update(theme::init);
-        let (note, cx) = cx.add_window_view(|window, cx| StickyNote::new(store.clone(), task.id, false, None, None, window, cx));
+        let (note, cx) = cx.add_window_view(|window, cx| new_note(store.clone(), task.id, window, cx));
         cx.simulate_resize(size(px(240.), px(200.)));
         cx.update(|_, cx| {
             note.read(cx).detail.clone().update(cx, |detail, cx| detail.dev_open_popup("list", cx));
@@ -899,7 +1017,7 @@ mod tests {
             theme::init(cx);
             assert!(crate::keymap::load_default(&assets::Assets, cx).unwrap().is_empty());
         });
-        let (note, cx) = cx.add_window_view(|window, cx| StickyNote::new(store.clone(), task.id, false, None, None, window, cx));
+        let (note, cx) = cx.add_window_view(|window, cx| new_note(store.clone(), task.id, window, cx));
         cx.simulate_resize(size(px(400.), px(800.)));
 
         for editor in ["task-detail-title", "task-notes-preview", "task-notes-editor"] {
@@ -940,7 +1058,7 @@ mod tests {
             theme::init(cx);
             assert!(crate::keymap::load_default(&assets::Assets, cx).unwrap().is_empty());
         });
-        let (note, cx) = cx.add_window_view(|window, cx| StickyNote::new(store.clone(), task.id, false, None, None, window, cx));
+        let (note, cx) = cx.add_window_view(|window, cx| new_note(store.clone(), task.id, window, cx));
         cx.simulate_resize(size(px(240.), px(200.)));
         cx.update(|window, cx| note.update(cx, |note, cx| {
             note.detail.update(cx, |detail, cx| detail.start("tags", window, cx));
@@ -980,7 +1098,7 @@ mod tests {
         let store = Rc::new(Store::open_in_memory().unwrap());
         let task = store.add_task("Compact note").unwrap();
         cx.update(theme::init);
-        let (note, cx) = cx.add_window_view(|window, cx| StickyNote::new(store, task.id, false, None, None, window, cx));
+        let (note, cx) = cx.add_window_view(|window, cx| new_note(store, task.id, window, cx));
         let lifetime = cx.update(|window, cx| {
             note.update(cx, |note, cx| note.toggle_compact(window, cx));
             let focus = cx.focus_handle();
@@ -1041,7 +1159,7 @@ mod tests {
             first_handle.update(cx, |note, window, cx| {
                 note.navigate(second, window, cx);
                 assert_eq!(note.detail.read(cx).task_id(), Some(second));
-                assert_eq!(note.settings.color, 10);
+                assert_eq!(note.style().color, 10);
             }).unwrap();
         });
     }
@@ -1067,7 +1185,7 @@ mod tests {
             let handle = *cx.global::<OpenNotes>().0.last().unwrap();
             handle.update(cx, |note, window, cx| {
                 assert!(note.pinned);
-                assert_eq!(note.settings.color, 10);
+                assert_eq!(note.style().color, 10);
                 note.forget(cx);
                 window.remove_window();
             }).unwrap();

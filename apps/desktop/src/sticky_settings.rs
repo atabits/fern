@@ -1,5 +1,6 @@
 //! Sticky-note preferences, with the original's twelve verified color pairs.
 use fern_core::Store;
+use gpui::{App, Global};
 use serde::{Deserialize, Serialize};
 
 pub const PALETTE: [(u32, u32); 12] = [
@@ -16,13 +17,25 @@ pub struct StickySettings {
     pub opacity: u8,
     pub font: usize,
     pub pin_default: bool,
+    pub hide_from_taskbar: bool,
 }
 
+impl Global for StickySettings {}
+
 impl Default for StickySettings {
-    fn default() -> Self { Self { color: 0, opacity: 100, font: 1, pin_default: false } }
+    fn default() -> Self { Self { color: 0, opacity: 100, font: 1, pin_default: false, hide_from_taskbar: false } }
 }
 
 impl StickySettings {
+    pub fn current(store: &Store, cx: &mut App) -> Self {
+        if let Some(settings) = cx.try_global::<Self>() {
+            return *settings;
+        }
+        let settings = Self::load(store);
+        cx.set_global(settings);
+        settings
+    }
+
     pub fn load(store: &Store) -> Self {
         let mut settings: Self = store.setting("sticky_settings").ok().flatten()
             .and_then(|text| serde_json::from_str(&text).ok()).unwrap_or_default();
@@ -47,12 +60,14 @@ mod tests {
     fn persistence_and_invalid_preferences() {
         let store = Store::open_in_memory().unwrap();
         assert_eq!(StickySettings::load(&store), StickySettings::default());
-        let saved = StickySettings { color: 10, opacity: 60, font: 3, pin_default: true };
+        let saved = StickySettings { color: 10, opacity: 60, font: 3, pin_default: true, hide_from_taskbar: true };
         saved.save(&store).unwrap();
         assert_eq!(StickySettings::load(&store), saved);
-        store.set_setting("sticky_settings", r#"{"color":99,"opacity":0,"font":99}"#).unwrap();
+        store.set_setting("sticky_settings", r#"{"color":99,"opacity":0,"font":99,"pin_default":true}"#).unwrap();
         let settings = StickySettings::load(&store);
         assert_eq!((settings.color, settings.opacity, settings.font), (11, 10, 3));
+        assert!(settings.pin_default);
+        assert!(!settings.hide_from_taskbar);
         store.set_setting("sticky_settings", "invalid").unwrap();
         assert_eq!(StickySettings::load(&store), StickySettings::default());
     }

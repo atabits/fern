@@ -704,10 +704,13 @@ impl TaskDetail {
         cx.notify();
     }
 
-    /// Updates the task data without touching the inputs, so the caret stays where it is.
+    /// Changes from another window can rename the task. Keep the caret for edits already in the input.
     pub fn refresh(&mut self, task: Option<Task>, cx: &mut Context<Self>) {
         match task {
             Some(task) if self.task_id() == Some(task.id) => {
+                if self.task_title() != Some(task.title.as_str()) && self.title.read(cx).text() != task.title {
+                    self.title.update(cx, |input, cx| input.set_text(task.title.clone(), cx));
+                }
                 self.session.task = Some(task);
                 self.sync_checklist(cx);
                 self.sync_subtasks();

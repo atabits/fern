@@ -4,7 +4,7 @@ use crate::sticky_settings::{PALETTE, StickySettings};
 impl SettingsWindow {
     pub(super) fn render_sticky(&self, cx: &mut Context<Self>) -> AnyElement {
         let strings = i18n::t(cx);
-        let settings = StickySettings::load(&self.store);
+        let settings = StickySettings::current(&self.store, cx);
         let row = |label: &'static str| h_flex().min_h(px(40.)).px_4().gap_2()
             .child(div().flex_1().child(Label::new(label)));
         let palette = h_flex().gap_2().flex_wrap().children(PALETTE.iter().enumerate().map(|(index, (background, _))| {
@@ -27,18 +27,46 @@ impl SettingsWindow {
             .when(cfg!(windows), |panel| panel.child(row(strings.sticky_pin_default).id("sticky-pin-default").cursor_pointer()
                 .child(Switch::new().toggle_state(settings.pin_default))
                 .on_click(cx.listener(|this, _, _, cx| this.update_sticky(cx, |s| s.pin_default = !s.pin_default)))))
+            .when(cfg!(windows), |panel| panel.child(v_flex()
+                .child(row(strings.sticky_hide_from_taskbar).id("sticky-hide-from-taskbar").cursor_pointer()
+                    .child(Switch::new().toggle_state(settings.hide_from_taskbar))
+                    .on_click(cx.listener(|this, _, _, cx| this.update_sticky(cx, |s| s.hide_from_taskbar = !s.hide_from_taskbar))))
+                .child(div().px_4().child(Label::new(strings.sticky_task_view_hint).size(LabelSize::Small).color(Color::Muted)))))
             .children(self.backup_message.clone().map(|message| Label::new(message).color(Color::Error)))
             .into_any_element()
     }
 
     fn update_sticky(&mut self, cx: &mut Context<Self>, change: impl FnOnce(&mut StickySettings)) {
-        let mut settings = StickySettings::load(&self.store);
+        let mut settings = StickySettings::current(&self.store, cx);
         change(&mut settings);
-        self.backup_message = settings.save(&self.store).err().map(|err| {
-            eprintln!("failed to save sticky note settings: {err:#}");
-            i18n::t(cx).sticky_save_failed.to_owned()
-        });
-        crate::sticky_note::data_changed(cx.entity_id(), cx);
+        self.backup_message = match settings.save(&self.store) {
+            Ok(()) => {
+                cx.set_global(settings);
+                None
+            }
+            Err(err) => {
+                eprintln!("failed to save sticky note settings: {err:#}");
+                Some(i18n::t(cx).sticky_save_failed.to_owned())
+            }
+        };
         cx.notify();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[gpui::test]
+    fn saving_note_preferences_leaves_task_data_untouched(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let store = Rc::new(Store::open_in_memory().unwrap());
+            let settings = cx.new(|cx| SettingsWindow::new(store.clone(), cx));
+            settings.update(cx, |settings, cx| settings.update_sticky(cx, |prefs| prefs.font = 3));
+            let saved = StickySettings::load(&store);
+            assert_eq!(saved.font, 3);
+            assert_eq!(*cx.global::<StickySettings>(), saved);
+            assert!(cx.try_global::<crate::sticky_note::DataVersion>().is_none());
+        });
     }
 }

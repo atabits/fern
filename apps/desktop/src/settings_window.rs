@@ -21,6 +21,10 @@ mod sticky_settings_view;
 
 /// A row of a Settings page, and of the sections column, as the original's.
 const ROW_HEIGHT: f32 = 40.;
+const WINDOW_RADIUS: f32 = 12.;
+const WINDOW_BORDER_WIDTH: f32 = 1.;
+// GPUI clips overflow to a rectangle, so each panel rounds its own outer corners.
+const PANEL_RADIUS: Pixels = px(WINDOW_RADIUS - WINDOW_BORDER_WIDTH);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Page {
@@ -447,6 +451,8 @@ impl SettingsWindow {
             .overflow_y_scroll()
             .p_2()
             .gap_0p5()
+            .rounded_tl(PANEL_RADIUS)
+            .rounded_bl(PANEL_RADIUS)
             .bg(cx.theme().colors().panel_background)
             .border_r_1()
             .border_color(cx.theme().colors().border)
@@ -514,6 +520,7 @@ impl SettingsWindow {
             )
         });
         h_flex()
+            .debug_selector(|| format!("settings-row-{menu:?}"))
             .h(px(ROW_HEIGHT))
             .px_4()
             .gap_2()
@@ -1169,6 +1176,21 @@ impl SettingsWindow {
                         Box::new(move |this, window, cx| this.update(window, cx, |p| p.default_list = Some(id)));
                     (SharedString::from(list.name.clone()), default_list == Some(id), pick)
                 }));
+                let position_row = |label, menu, bottom, set: fn(&mut fern_core::TaskDefaults, bool), cx: &mut Context<Self>| {
+                    let top_label = strings.add_to_top;
+                    let bottom_label = strings.add_to_bottom;
+                    let options = [(false, top_label), (true, bottom_label)]
+                        .into_iter()
+                        .map(|(choice, name)| {
+                            let pick: Box<dyn Fn(&mut Self, &mut Window, &mut Context<Self>)> =
+                                Box::new(move |this, window, cx| this.update(window, cx, |p| set(&mut p.task_defaults, choice)));
+                            (name.into(), choice == bottom, pick)
+                        })
+                        .collect();
+                    let value = if bottom { bottom_label } else { top_label };
+                    self.select_row(None, label, value.into(), menu, options, cx)
+                };
+                let defaults = &self.preferences.task_defaults;
                 body.child(group().debug_selector(|| "settings-language".to_owned()).child(self.select_row(
                     None,
                     strings.language,
@@ -1258,46 +1280,22 @@ impl SettingsWindow {
                                 .child(strings.default_list_hint),
                         )
                         .child(div().h_3())
-                        .child(group().child({
-                            let bottom = self.preferences.task_defaults.add_to_bottom;
-                            let options = [(false, strings.add_to_top), (true, strings.add_to_bottom)]
-                                .into_iter()
-                                .map(|(choice, name)| {
-                                    let pick: Box<dyn Fn(&mut Self, &mut Window, &mut Context<Self>)> = Box::new(move |this, window, cx| {
-                                        this.update(window, cx, |p| p.task_defaults.add_to_bottom = choice)
-                                    });
-                                    (SharedString::from(name), choice == bottom, pick)
-                                })
-                                .collect();
-                            self.select_row(
-                                None,
+                        .child(group().children([
+                            position_row(
                                 strings.default_add_to,
-                                (if bottom { strings.add_to_bottom } else { strings.add_to_top }).into(),
                                 Menu::AddTo,
-                                options,
+                                defaults.add_to_bottom,
+                                |defaults, bottom| defaults.add_to_bottom = bottom,
                                 cx,
-                            )
-                        }))
-                        .child({
-                            let last = self.preferences.task_defaults.overdue_last;
-                            let options = [(false, strings.add_to_top), (true, strings.add_to_bottom)]
-                                .into_iter()
-                                .map(|(choice, name)| {
-                                    let pick: Box<dyn Fn(&mut Self, &mut Window, &mut Context<Self>)> = Box::new(move |this, window, cx| {
-                                        this.update(window, cx, |p| p.task_defaults.overdue_last = choice)
-                                    });
-                                    (SharedString::from(name), choice == last, pick)
-                                })
-                                .collect();
-                            self.select_row(
-                                None,
+                            ),
+                            position_row(
                                 strings.overdue_section_at,
-                                (if last { strings.add_to_bottom } else { strings.add_to_top }).into(),
                                 Menu::OverdueAt,
-                                options,
+                                defaults.overdue_last,
+                                |defaults, bottom| defaults.overdue_last = bottom,
                                 cx,
-                            )
-                        }),
+                            ),
+                        ])),
                 )
                 .child({
                     let on = self.preferences.mini_calendar;
@@ -1610,10 +1608,10 @@ impl Render for SettingsWindow {
             .max_h_full()
             .flex_none()
             .relative()
-            .rounded(px(12.))
+            .rounded(px(WINDOW_RADIUS))
             .overflow_hidden()
             .bg(colors.elevated_surface_background)
-            .border_1()
+            .border(px(WINDOW_BORDER_WIDTH))
             .border_color(colors.border)
             .shadow_lg()
             .text_color(colors.text)
@@ -1623,6 +1621,8 @@ impl Render for SettingsWindow {
                     .flex_1()
                     .min_w_0()
                     .h_full()
+                    .rounded_tr(PANEL_RADIUS)
+                    .rounded_br(PANEL_RADIUS)
                     .bg(colors.background)
                     .child(
                         h_flex()
@@ -1689,6 +1689,41 @@ fn form_button(id: &'static str, label: &'static str, primary: bool, colors: &th
 #[cfg(all(test, debug_assertions))]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn task_positions_share_a_painted_settings_surface(cx: &mut gpui::TestAppContext) {
+        cx.update(theme::init);
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let (settings, cx) = cx.add_window_view(|_, cx| {
+            let mut settings = SettingsWindow::new(store, cx);
+            settings.set_page(Page::More, cx);
+            settings
+        });
+        cx.simulate_resize(gpui::size(px(900.), px(720.)));
+
+        for theme in [Theme::light(), Theme::dark()] {
+            let surface = theme.colors().surface_background;
+            cx.update(|_, cx| {
+                theme::set(theme, cx);
+                settings.update(cx, |settings, cx| {
+                    settings.page_scroll.scroll_to_bottom();
+                    cx.notify();
+                });
+            });
+            let add_to = cx.debug_bounds("settings-row-AddTo").unwrap();
+            let overdue = cx.debug_bounds("settings-row-OverdueAt").unwrap();
+            cx.update(|window, _| {
+                let scale = window.scale_factor();
+                let positions = [add_to.center().scale(scale), overdue.center().scale(scale)];
+                assert!(window.painted_quads().iter().any(|quad| {
+                    quad.background.as_solid() == Some(surface)
+                        && positions.iter().all(|point| {
+                            quad.bounds.contains(point) && quad.content_mask.bounds.contains(point)
+                        })
+                }), "both task position rows must be painted on the same settings surface");
+            });
+        }
+    }
 
     #[gpui::test]
     fn china_holidays_offer_both_sources_in_settings(cx: &mut gpui::TestAppContext) {

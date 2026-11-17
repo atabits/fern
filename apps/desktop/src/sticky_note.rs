@@ -391,7 +391,8 @@ impl Render for StickyNote {
                             .window_control_area(WindowControlArea::Drag)
                             .on_mouse_down(MouseButton::Left, cx.listener(|this, event: &gpui::MouseDownEvent, window, cx| {
                                 this.close_palette(cx);
-                                if event.click_count == 2 {
+                                // GPUI keeps counting across consecutive double-clicks.
+                                if event.click_count >= 2 && event.click_count.is_multiple_of(2) {
                                     cx.stop_propagation();
                                     this.toggle_compact(window, cx);
                                 } else if !cfg!(windows) {
@@ -589,14 +590,22 @@ mod tests {
         cx.simulate_resize(size(px(324.), px(318.)));
 
         let title_bar = cx.debug_bounds("sticky-title-bar").unwrap();
-        cx.simulate_event(gpui::MouseDownEvent {
+        let title_press = |click_count| gpui::MouseDownEvent {
             button: MouseButton::Left,
             position: title_bar.center(),
             modifiers: Modifiers::default(),
-            click_count: 2,
+            click_count,
             first_mouse: false,
-        });
-        cx.update(|_, cx| assert!(note.read(cx).compact));
+        };
+        // Two quick double-clicks, followed by another pair after a pause.
+        for (click_count, compact) in [(1, false), (2, true), (3, true), (4, false), (1, false), (2, true)] {
+            cx.simulate_event(title_press(click_count));
+            cx.update(|window, cx| {
+                assert_eq!(note.read(cx).compact, compact, "click {click_count}");
+                let height = if compact { px(COMPACT_HEIGHT) } else { px(318.) };
+                assert_eq!(window.bounds().size, size(px(324.), height));
+            });
+        }
         assert!(cx.debug_bounds("task-detail-body").is_none());
         let line = cx.debug_bounds("sticky-compact-title").unwrap();
         assert!(line.size.height <= px(COMPACT_HEIGHT));
@@ -630,13 +639,8 @@ mod tests {
             }).unwrap();
         });
 
-        cx.simulate_event(gpui::MouseDownEvent {
-            button: MouseButton::Left,
-            position: title_bar.center(),
-            modifiers: Modifiers::default(),
-            click_count: 2,
-            first_mouse: false,
-        });
+        cx.simulate_event(title_press(1));
+        cx.simulate_event(title_press(2));
         cx.update(|_, cx| {
             assert!(!note.read(cx).compact);
             assert_eq!(note.read(cx).expanded_height, px(318.));

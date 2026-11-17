@@ -1,10 +1,12 @@
-//! Enforce the note's minimum before Windows resizes its client area.
+//! Native sizing and caption gestures for sticky notes on Windows.
 
 use gpui::Window;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
-use windows::Win32::UI::WindowsAndMessaging::{MINMAXINFO, WM_GETMINMAXINFO, WM_NCDESTROY};
+use windows::Win32::UI::WindowsAndMessaging::{
+    HTCAPTION, MINMAXINFO, WM_GETMINMAXINFO, WM_NCDESTROY, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN,
+};
 
 use super::{COMPACT_HEIGHT, MIN_EXPANDED_HEIGHT, win32_window_handle};
 
@@ -35,6 +37,11 @@ unsafe extern "system" fn subclass_proc(
     _: usize,
     compact: usize,
 ) -> LRESULT {
+    if message == WM_NCLBUTTONDBLCLK && wparam.0 == HTCAPTION as usize {
+        // GPUI counts both messages as a press. Forward an ordinary caption press
+        // so Windows can still drag the note but only Fern handles the double-click.
+        return unsafe { DefSubclassProc(hwnd, WM_NCLBUTTONDOWN, wparam, lparam) };
+    }
     if message == WM_NCDESTROY {
         let _ = unsafe { RemoveWindowSubclass(hwnd, Some(subclass_proc), SUBCLASS_ID) };
     }

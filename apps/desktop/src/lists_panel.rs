@@ -623,7 +623,7 @@ fn mini_calendar(
     // The hover tab on the top border: "^" expands, "v" collapses.
     let tab = div()
         .absolute()
-        .top(px(-9.))
+        .top(px(-8.))
         .left_0()
         .right_0()
         .flex()
@@ -670,10 +670,7 @@ fn mini_calendar(
         .group("mini-calendar")
         .relative()
         .flex_none()
-        .py_2()
-        .px_2()
-        .border_t_1()
-        .border_color(colors.border)
+        // GPUI paints borders after children. Put the border on the body beneath the tab.
+        .child(body.py_2().px_2().border_t_1().border_color(colors.border))
         .child(tab)
-        .child(body)
 }

@@ -1309,7 +1309,7 @@ impl CalendarView {
     fn task_bar(&self, task: &Task, day: Option<NaiveDate>, cx: &mut Context<Self>) -> Stateful<Div> {
         let theme = cx.theme().clone();
         let id = task.id;
-        // A closed task is muted with a filled box, not struck through, as the original's.
+        // Keep closed titles muted; the checkbox distinguishes completed and dismissed tasks.
         let done = task.is_closed();
         let tint = self.task_tint(task, &theme);
         let modern = self.options.modern;
@@ -1333,13 +1333,10 @@ impl CalendarView {
             .when(modern, |el| el.border_l_2().border_color(tint))
             .hover(|s| s.bg(tint.opacity(0.4)))
             .child(
-                div()
-                    .size(px(10.))
-                    .flex_none()
-                    .rounded(px(2.))
-                    .border_1()
-                    .border_color(theme.colors().text_muted)
-                    .when(done, |el| el.bg(theme.colors().text_muted)),
+                Checkbox::new("calendar-task-checkbox")
+                    .size(px(12.))
+                    .toggle_state(task.is_completed())
+                    .dismissed(task.is_wont_do()),
             )
             .child(
                 Label::new(if task.title.trim().is_empty() { i18n::t(cx).untitled.to_owned() } else { task.title.clone() })

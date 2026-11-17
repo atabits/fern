@@ -8,7 +8,7 @@ use gpui::{
 use theme::ActiveTheme;
 
 use crate::traits::ClickHandler;
-use crate::{Clickable, Toggleable};
+use crate::{Clickable, Icon, IconName, IconSize, Toggleable};
 
 pub const CHECKBOX_COMPLETION_DURATION: Duration = Duration::from_millis(180);
 
@@ -28,13 +28,13 @@ pub struct Checkbox {
 }
 
 enum CheckMark {
-    Glyph,
+    Icon,
     Stroke(Option<Instant>),
 }
 
 impl Checkbox {
     pub fn new(id: impl Into<ElementId>) -> Self {
-        Self { id: id.into(), checked: false, dismissed: false, lines: false, tint: None, size: px(16.), on_click: None, accent: false, check_mark: CheckMark::Glyph }
+        Self { id: id.into(), checked: false, dismissed: false, lines: false, tint: None, size: px(16.), on_click: None, accent: false, check_mark: CheckMark::Icon }
     }
 
     pub fn tint(mut self, tint: Option<Hsla>) -> Self {
@@ -102,9 +102,9 @@ impl RenderOnce for Checkbox {
                 .border_color(colors.text_muted.opacity(0.6))
                 .bg(colors.text_muted.opacity(0.25))
                 .cursor_pointer()
-                .text_size(self.size * 0.7)
-                .text_color(colors.text_muted)
-                .child("✕")
+                .child(Icon::new(IconName::X)
+                    .size(IconSize::Custom(self.size - px(2.)))
+                    .color(colors.text_muted))
                 .when_some(self.on_click, |el, handler| el.on_click(handler));
         }
         if let CheckMark::Stroke(started) = self.check_mark {
@@ -149,7 +149,11 @@ impl RenderOnce for Checkbox {
             .border_1()
             .border_color(border)
             .cursor_pointer()
-            .when(self.checked, |el| el.bg(fill).child("✓"))
+            .when(self.checked, |el| el.bg(fill).child(
+                Icon::new(IconName::Check)
+                    .size(IconSize::Custom(self.size - px(2.)))
+                    .color(colors.background),
+            ))
             .when(self.lines && !self.checked, |el| {
                 el.child(
                     div()
@@ -160,8 +164,6 @@ impl RenderOnce for Checkbox {
                 )
             })
             .when_some(self.tint.filter(|_| !self.checked), |el, tint| el.bg(tint.opacity(0.15)))
-            .text_size(self.size * 0.7)
-            .text_color(colors.background)
             .when_some(self.on_click, |el, handler| el.on_click(handler))
     }
 }

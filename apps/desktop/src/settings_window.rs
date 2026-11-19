@@ -117,6 +117,11 @@ pub fn apply(preferences: &Preferences, window: &Window, cx: &mut App) {
     cx.refresh_windows();
 }
 
+/// Re-applies only the active theme selection (used on live-reload and manual reload).
+pub fn apply_theme_only(selection: &fern_core::ThemeSelection, window: &Window, cx: &mut App) {
+    appearance_view::apply_theme(selection, window, cx);
+}
+
 impl SettingsWindow {
     pub fn new(store: Rc<Store>, cx: &mut Context<Self>) -> Self {
         let preferences = store.preferences().unwrap_or_default();

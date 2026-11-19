@@ -2,12 +2,38 @@
 //! Views consume semantic colors and surfaces from the same resolved palette.
 
 mod presets;
+mod registry;
+mod schema;
 pub use presets::{DARK_PRESETS, LIGHT_PRESETS, ThemePreset};
+pub use registry::{ThemeRegistry, reload_user_themes};
+pub use schema::{
+    BackgroundContent, EXAMPLE_THEME_TEMPLATE, SwatchContent, ThemeContent, ThemeFamilyContent,
+    ThemeStyleContent, load_theme_family_from_str, load_themes_from_dir, parse_theme_family,
+    try_parse_color,
+};
 
 use std::sync::Arc;
 
-use gpui::{App, Background, Global, Hsla, black, rgb, transparent_black, white};
+use gpui::{App, Background, Global, Hsla, SharedString, black, rgb, transparent_black, white};
 use presets::Base;
+
+/// Whether a theme targets a light or dark window appearance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Appearance {
+    Light,
+    Dark,
+}
+
+impl Appearance {
+    pub fn is_dark(self) -> bool {
+        matches!(self, Self::Dark)
+    }
+
+    pub fn is_light(self) -> bool {
+        matches!(self, Self::Light)
+    }
+}
 
 /// Colors of UI elements.
 #[derive(Clone, Debug)]
@@ -77,12 +103,59 @@ pub struct StatusColors {
 
 #[derive(Clone, Debug)]
 pub struct Theme {
-    pub preset: &'static ThemePreset,
-    colors: ThemeColors,
-    status: StatusColors,
+    pub(crate) id: SharedString,
+    pub(crate) name: SharedString,
+    pub(crate) author: Option<SharedString>,
+    pub(crate) appearance: Appearance,
+    pub(crate) is_custom: bool,
+    pub(crate) swatch: [Hsla; 2],
+    pub(crate) colors: ThemeColors,
+    pub(crate) status: StatusColors,
 }
 
 impl Theme {
+    pub fn id(&self) -> &str {
+        self.id.as_ref()
+    }
+
+    pub fn id_shared(&self) -> SharedString {
+        self.id.clone()
+    }
+
+    pub fn name(&self) -> &str {
+        self.name.as_ref()
+    }
+
+    pub fn author(&self) -> Option<&str> {
+        self.author.as_deref()
+    }
+
+    pub fn appearance(&self) -> Appearance {
+        self.appearance
+    }
+
+    pub fn is_dark(&self) -> bool {
+        self.appearance.is_dark()
+    }
+
+    pub fn is_light(&self) -> bool {
+        self.appearance.is_light()
+    }
+
+    pub fn is_custom(&self) -> bool {
+        self.is_custom
+    }
+
+    pub fn swatch(&self) -> Background {
+        let [top, bottom] = self.swatch;
+        if top == bottom { top.into() } else { presets::vertical_gradient(top, bottom) }
+    }
+
+    /// Solid preview color used for selection rings on dark swatches.
+    pub fn swatch_color(&self) -> Hsla {
+        self.swatch[0]
+    }
+
     pub fn colors(&self) -> &ThemeColors {
         &self.colors
     }
@@ -175,7 +248,12 @@ impl Theme {
             accent.opacity(0.12)
         };
         Self {
-            preset,
+            id: preset.id.into(),
+            name: preset.id.into(),
+            author: None,
+            appearance: if dark { Appearance::Dark } else { Appearance::Light },
+            is_custom: false,
+            swatch: preset.preview_colors(),
             colors: ThemeColors {
                 background,
                 sidebar_background: sidebar,
@@ -232,10 +310,6 @@ impl Theme {
     pub fn light() -> Self {
         Self::from_preset(&LIGHT_PRESETS[0])
     }
-
-    pub fn is_light(&self) -> bool {
-        !self.preset.is_dark()
-    }
 }
 
 // Relative luminance in linear sRGB.
@@ -245,12 +319,12 @@ fn luminance(color: Hsla) -> f32 {
     0.2126 * linear(color.r) + 0.7152 * linear(color.g) + 0.0722 * linear(color.b)
 }
 
-fn contrast(a: Hsla, b: Hsla) -> f32 {
+pub(crate) fn contrast(a: Hsla, b: Hsla) -> f32 {
     let (a, b) = (luminance(a), luminance(b));
     (a.max(b) + 0.05) / (a.min(b) + 0.05)
 }
 
-fn foreground_on(stops: &[Hsla], target: f32) -> Hsla {
+pub(crate) fn foreground_on(stops: &[Hsla], target: f32) -> Hsla {
     let minimum = |ink| stops.iter().map(|&stop| contrast(ink, stop)).fold(f32::INFINITY, f32::min);
     let dark = rgb(0x191919).into();
     if minimum(white()) >= target {
@@ -265,7 +339,7 @@ fn foreground_on(stops: &[Hsla], target: f32) -> Hsla {
 }
 
 /// Keep the original fill color for controls while small accent text remains readable.
-fn readable_accent(accent: Hsla, surface: Hsla, ink: Hsla) -> Hsla {
+pub(crate) fn readable_accent(accent: Hsla, surface: Hsla, ink: Hsla) -> Hsla {
     if contrast(accent, surface) >= 4.5 {
         return accent;
     }
@@ -285,14 +359,21 @@ struct GlobalTheme(Arc<Theme>);
 
 impl Global for GlobalTheme {}
 
-/// Installs the default theme. Call once at startup.
+/// Installs the theme registry and default theme. Call once at startup.
 pub fn init(cx: &mut App) {
-    cx.set_global(GlobalTheme(Arc::new(Theme::dark())));
+    registry::init(cx);
+    let default_theme = ThemeRegistry::global(cx).resolve(true, None);
+    cx.set_global(GlobalTheme(default_theme));
 }
 
 /// Replaces the active theme; call `cx.refresh_windows()` afterwards.
 pub fn set(theme: Theme, cx: &mut App) {
-    cx.set_global(GlobalTheme(Arc::new(theme)));
+    set_arc(Arc::new(theme), cx);
+}
+
+/// Replaces the active theme with an existing [`Arc<Theme>`]; call `cx.refresh_windows()` afterwards.
+pub fn set_arc(theme: Arc<Theme>, cx: &mut App) {
+    cx.set_global(GlobalTheme(theme));
 }
 
 pub trait ActiveTheme {

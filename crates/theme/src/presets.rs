@@ -9,7 +9,7 @@ pub struct ThemePreset {
     pub(super) list_ink: u32,
     pub(super) base: Base,
     pub(super) gradient: Option<Gradient>,
-    preview: [u32; 2],
+    pub(super) preview: [u32; 2],
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -39,7 +39,7 @@ impl Gradient {
     }
 }
 
-fn vertical_gradient(top: Hsla, bottom: Hsla) -> Background {
+pub(super) fn vertical_gradient(top: Hsla, bottom: Hsla) -> Background {
     linear_gradient(180., linear_color_stop(top, 0.), linear_color_stop(bottom, 1.))
 }
 
@@ -70,13 +70,22 @@ impl ThemePreset {
     }
 
     pub fn swatch(&self) -> Background {
-        let [top, bottom] = self.preview.map(|c| Hsla::from(rgb(c)));
+        let [top, bottom] = self.preview_colors();
         if top == bottom { top.into() } else { vertical_gradient(top, bottom) }
+    }
+
+    pub(super) fn preview_colors(&self) -> [Hsla; 2] {
+        self.preview.map(|c| Hsla::from(rgb(c)))
     }
 
     /// Solid preview color used for selection rings on dark swatches.
     pub fn swatch_color(&self) -> Hsla {
         rgb(self.preview[0]).into()
+    }
+
+    /// Looks up a bundled preset by exact ID across light and dark groups.
+    pub(super) fn find(id: &str) -> Option<&'static Self> {
+        LIGHT_PRESETS.iter().chain(&DARK_PRESETS).find(|preset| preset.id == id)
     }
 
     /// Unknown IDs and IDs from the other appearance fall back within the requested group.

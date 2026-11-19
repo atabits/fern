@@ -56,6 +56,7 @@ mod touch_keyboard;
 mod tray;
 mod undo;
 mod updater;
+mod user_themes;
 mod todo_view;
 
 use std::rc::Rc;
@@ -165,6 +166,7 @@ fn main() -> Result<()> {
     gpui::Application::with_platform(platform).with_assets(Assets).run(move |cx: &mut App| {
         ui::init_label_metrics(text_system, cx);
         theme::init(cx);
+        user_themes::load(cx);
         cx.set_http_client(http::UreqHttpClient::new());
         if let Err(err) = Assets.load_fonts(cx) {
             eprintln!("failed to load the fonts: {err:#}");
@@ -180,6 +182,7 @@ fn main() -> Result<()> {
         let bounds = Bounds::centered(None, size(px(1280.), px(760.)), cx);
         let (titlebar, decorations) = title_bar::window_options();
         let store_for_hotkeys = store.clone();
+        let store_for_themes = store.clone();
         let main_window = cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -209,6 +212,7 @@ fn main() -> Result<()> {
         )
         .expect("failed to open the main window");
         AppView::register_window_actions(main_window, cx);
+        user_themes::watch(store_for_themes, main_window.into(), cx);
         sticky_note::restore(store_for_hotkeys.clone(), cx);
         hotkeys::init(main_window, store_for_hotkeys, cx);
         cx.activate(true);

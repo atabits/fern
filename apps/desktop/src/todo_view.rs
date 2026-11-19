@@ -2792,7 +2792,7 @@ impl TodoView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = cx.theme().clone();
-        let dark = theme.preset.is_dark();
+        let dark = theme.is_dark();
         let selected = self.selected == Some(task.id) || self.card == Some(task.id);
         let settled_done = task.is_completed();
         let root_done = settled_done || self.completing.contains_key(&task.id);
@@ -6138,7 +6138,7 @@ impl TodoView {
             return None;
         }
         let count = habits.len();
-        let dark = theme.preset.is_dark();
+        let dark = theme.is_dark();
         let base_surface = theme.colors().elevated_surface_background;
         let habit_border: Hsla = if dark { gpui::rgb(0x363636).into() } else { theme.colors().border_variant };
         let habit_hover = base_surface.blend(theme.colors().ghost_element_hover);
@@ -6188,7 +6188,7 @@ impl TodoView {
             })
             .collect();
         let col_width = self.kanban_column_width();
-        let dark = theme.preset.is_dark();
+        let dark = theme.is_dark();
         let tint = self.kanban_column_color.then(|| lists_panel::parse_color(Some("#A5A5A5"))).flatten();
         let card_px = if self.kanban_column_color { px(10.) } else { px(12.) };
         Some(
@@ -6977,7 +6977,7 @@ impl Render for TodoView {
             }
             self.sync_kanban_quick_adds(&columns, strings, cx);
             let theme = cx.theme().clone();
-            let dark = theme.preset.is_dark();
+            let dark = theme.is_dark();
             let col_width = self.kanban_column_width();
             let colored = self.kanban_column_color;
             let card_px = if colored { px(10.) } else { px(12.) };

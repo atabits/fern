@@ -2,6 +2,7 @@
 //! lists column; it also renders the drag preview.
 
 use fern_core::Id;
+use gpui::FontWeight;
 use ui::prelude::*;
 
 #[derive(Clone)]
@@ -44,5 +45,27 @@ impl Render for DraggedList {
             .border_color(colors.border)
             .shadow_lg()
             .child(Label::new(self.name.clone()))
+    }
+}
+
+/// A kanban section column dragged horizontally to reorder sections.
+#[derive(Clone)]
+pub struct DraggedColumn {
+    pub id: Id,
+    pub title: SharedString,
+}
+
+impl Render for DraggedColumn {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = cx.theme().colors();
+        div()
+            .px_3()
+            .py_1p5()
+            .rounded(px(8.))
+            .bg(colors.elevated_surface_background)
+            .border_1()
+            .border_color(colors.border)
+            .shadow_lg()
+            .child(Label::new(self.title.clone()).weight(FontWeight::SEMIBOLD))
     }
 }

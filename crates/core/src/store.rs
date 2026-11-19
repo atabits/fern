@@ -1585,6 +1585,24 @@ impl Store {
         Ok(())
     }
 
+    /// Reorders a section among its list's sections by moving `dragged` to `target`'s position.
+    pub fn reorder_list_sections(&self, list: Option<Id>, dragged: Id, target: Id) -> Result<()> {
+        if dragged == target {
+            return Ok(());
+        }
+        let mut order: Vec<Id> = self.list_sections(list)?.into_iter().map(|s| s.id).collect();
+        let Some(from) = order.iter().position(|&id| id == dragged) else { return Ok(()) };
+        let Some(to) = order.iter().position(|&id| id == target) else { return Ok(()) };
+        let id = order.remove(from);
+        order.insert(to, id);
+        let tx = self.conn.unchecked_transaction()?;
+        for (i, id) in order.iter().enumerate() {
+            tx.execute("UPDATE list_sections SET sort_order = ?2 WHERE id = ?1 AND sort_order != ?2", params![id.to_string(), i as i64])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Deletes a section; its tasks stay in the list without a section.
     pub fn delete_list_section(&self, id: Id) -> Result<()> {
         self.conn.execute("UPDATE tasks SET section_id = NULL WHERE section_id = ?1", [id.to_string()])?;

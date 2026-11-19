@@ -1,16 +1,20 @@
-//! The Settings window from the account menu, modeled on the original's: pages on the left,
-//! grouped rows on the right, values picked from small dropdowns.
+//! The Settings window from the account menu, modeled on the original's separate desktop window:
+//! pages on the left, grouped rows on the right, values picked from small dropdowns.
 
 use std::rc::Rc;
 
 use chrono::Datelike as _;
 use fern_core::reminder::{ALL_DAY_OFFSETS, TIMED_OFFSETS};
 use fern_core::{DURATIONS, DefaultDate, Priority, format_minutes, DateFormat, Preferences, SmartList, Store, Visibility, WEEK_STARTS};
-use gpui::{Entity, EventEmitter, FocusHandle, Focusable, FontWeight, ScrollHandle, point};
+use gpui::{
+    Bounds, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, MouseButton, ScrollHandle,
+    TitlebarOptions, WindowBounds, WindowControlArea, WindowDecorations, WindowHandle, WindowOptions,
+    point, size,
+};
 use ui::prelude::*;
 use ui::{Placement, PopoverAttachment, popover};
 
-use crate::actions::DismissSettings;
+use crate::actions::{CloseWindow, DismissSettings};
 use crate::calendar;
 use crate::i18n::{self, CurrentLocale, Locale};
 use crate::release_notes::{self, ReleaseNotes, action_button};
@@ -22,10 +26,10 @@ mod sticky_settings_view;
 
 /// A row of a Settings page, and of the sections column, as the original's.
 const ROW_HEIGHT: f32 = 40.;
-const WINDOW_RADIUS: f32 = 12.;
-const WINDOW_BORDER_WIDTH: f32 = 1.;
-// GPUI clips overflow to a rectangle, so each panel rounds its own outer corners.
-const PANEL_RADIUS: Pixels = px(WINDOW_RADIUS - WINDOW_BORDER_WIDTH);
+pub const WIDTH: f32 = 840.;
+pub const HEIGHT: f32 = 680.;
+const MIN_WIDTH: f32 = 640.;
+const MIN_HEIGHT: f32 = 400.;
 
 type SelectPick = Box<dyn Fn(&mut SettingsWindow, &mut Window, &mut Context<SettingsWindow>)>;
 type SelectOption = (SharedString, bool, SelectPick);
@@ -71,6 +75,8 @@ enum Menu {
 }
 
 pub enum SettingsEvent {
+    /// A preference was saved and other windows should reflect it immediately.
+    Changed,
     Dismissed,
     /// The "Shortcuts" page, which is the Shortcuts panel.
     ShowShortcuts,
@@ -83,6 +89,8 @@ pub struct SettingsWindow {
     page_scroll: ScrollHandle,
     menu: Option<Menu>,
     focus_handle: FocusHandle,
+    /// Linux and macOS: a press on the drag strip turns into a window move once the mouse moves.
+    should_move: bool,
     /// The outcome of the last backup or import.
     backup_message: Option<String>,
     installed_notes: Option<Rc<ReleaseNotes>>,
@@ -105,6 +113,47 @@ impl Focusable for SettingsWindow {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus_handle.clone()
     }
+}
+
+/// Opens Settings in its own desktop window centered on `parent`'s display.
+pub fn open(
+    store: Rc<Store>,
+    notes: Option<Rc<ReleaseNotes>>,
+    parent: &Window,
+    cx: &mut App,
+) -> anyhow::Result<WindowHandle<SettingsWindow>> {
+    let bounds = Bounds::centered(
+        parent.display(cx).map(|display| display.id()),
+        size(px(WIDTH), px(HEIGHT)),
+        cx,
+    );
+    let options = WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(bounds)),
+        titlebar: Some(TitlebarOptions {
+            title: Some(i18n::t(cx).settings.into()),
+            appears_transparent: true,
+            traffic_light_position: cfg!(target_os = "macos").then_some(point(px(12.), px(14.))),
+        }),
+        window_decorations: Some(WindowDecorations::Client),
+        app_owns_titlebar_drag: true,
+        window_min_size: Some(size(px(MIN_WIDTH), px(MIN_HEIGHT))),
+        app_id: Some(std::env::var("FERN_APP_ID").unwrap_or_else(|_| "fern-tasks".into())),
+        ..Default::default()
+    };
+    let handle = cx.open_window(options, |window, cx| {
+        cx.new(|cx| {
+            let mut view = SettingsWindow::new(store, cx);
+            view.attach_window(window, cx);
+            if let Some(notes) = notes {
+                view.show_release_notes(notes, window, cx);
+            } else {
+                window.focus(&view.focus_handle, cx);
+            }
+            view
+        })
+    })?;
+    handle.update(cx, |_, window, _| window.activate_window()).ok();
+    Ok(handle)
 }
 
 /// Installs the theme and the first day of the week from `preferences`.
@@ -155,6 +204,7 @@ impl SettingsWindow {
             page_scroll: ScrollHandle::new(),
             menu: None,
             focus_handle: cx.focus_handle(),
+            should_move: false,
             backup_message: None,
             installed_notes,
             release_notes: None,
@@ -166,6 +216,23 @@ impl SettingsWindow {
             _updates: updates,
             _feeds: feeds,
         }
+    }
+
+    fn attach_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let weak = cx.weak_entity();
+        window.on_window_should_close(cx, move |_, cx| {
+            weak.update(cx, |_, cx| cx.emit(SettingsEvent::Dismissed)).ok();
+            true
+        });
+        cx.observe_global_in::<CurrentLocale>(window, |_, window, cx| {
+            window.set_window_title(i18n::t(cx).settings);
+        })
+        .detach();
+    }
+
+    fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(SettingsEvent::Dismissed);
+        window.defer(cx, |window, _| window.remove_window());
     }
 
     fn save_sync(&mut self, cx: &mut Context<Self>) {
@@ -200,12 +267,12 @@ impl SettingsWindow {
     }
 
     pub fn dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if matches!(self.menu, Some(Menu::ChinaHolidays(_))) {
+        if self.menu.is_some() {
             self.set_menu(None, cx);
         } else if self.release_notes.is_some() {
             self.back_to_about(window, cx);
         } else {
-            cx.emit(SettingsEvent::Dismissed);
+            self.close(window, cx);
         }
     }
 
@@ -220,6 +287,7 @@ impl SettingsWindow {
             Ok(preferences) => {
                 self.preferences = preferences;
                 apply(&self.preferences, window, cx);
+                cx.emit(SettingsEvent::Changed);
             }
             Err(err) => {
                 eprintln!("failed to save the settings: {err:#}");
@@ -446,7 +514,41 @@ impl SettingsWindow {
         ]
     }
 
-    fn render_nav(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn drag_area(&self, id: &'static str, window: &Window, cx: &Context<Self>) -> Stateful<Div> {
+        let linux = cfg!(any(target_os = "linux", target_os = "freebsd"));
+        let mac = cfg!(target_os = "macos");
+        let windows = cfg!(target_os = "windows");
+        let client_side = matches!(window.window_decorations(), gpui::Decorations::Client { .. });
+        div()
+            .id(id)
+            .window_control_area(WindowControlArea::Drag)
+            .when(!windows, |bar| {
+                bar.on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, _| this.should_move = true))
+                    .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, _| this.should_move = false))
+                    .on_mouse_down_out(cx.listener(|this, _, _, _| this.should_move = false))
+                    .on_mouse_move(cx.listener(|this, _, window, _| {
+                        if this.should_move {
+                            this.should_move = false;
+                            window.start_window_move();
+                        }
+                    }))
+                    .on_click(move |event, window, _| {
+                        if event.click_count() != 2 {
+                            return;
+                        }
+                        if mac {
+                            window.titlebar_double_click();
+                        } else if window.window_controls().maximize && window.is_resizable() {
+                            window.zoom_window();
+                        }
+                    })
+            })
+            .when(linux && client_side && window.window_controls().window_menu, |bar| {
+                bar.on_mouse_down(MouseButton::Right, |event, window, _| window.show_window_menu(event.position))
+            })
+    }
+
+    fn render_nav(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let strings = i18n::t(cx);
         let item = |id: &'static str, icon: IconName, label: &'static str, selected: bool| {
             ListItem::new(id)
@@ -460,50 +562,70 @@ impl SettingsWindow {
                 .on_click(cx.listener(move |this, _, _, cx| this.set_page(target, cx)))
         };
         v_flex()
-            .id("settings-navigation")
             .flex_none()
             .w(px(240.))
             .h_full()
-            .overflow_y_scroll()
-            .p_2()
-            .gap_0p5()
-            .rounded_tl(PANEL_RADIUS)
-            .rounded_bl(PANEL_RADIUS)
             .bg(cx.theme().colors().panel_background)
             .border_r_1()
             .border_color(cx.theme().colors().border)
-            .child(div().px_2().pt_2().pb_3().child(div().text_size(px(18.)).font_weight(FontWeight::SEMIBOLD).child(strings.settings)))
             .child(
-                item("settings-features", IconName::LayoutGrid, strings.features, self.page == Page::Features)
-                    .on_click(cx.listener(|this, _, _, cx| this.set_page(Page::Features, cx))),
-            )
-            .child(page("settings-smart-list", IconName::Funnel, 0, Page::SmartList))
-            .child(
-                item("settings-notifications", IconName::Bell, strings.notifications_page, self.page == Page::Notifications)
-                    .on_click(cx.listener(|this, _, _, cx| this.set_page(Page::Notifications, cx))),
-            )
-            .child(page("settings-date-time", IconName::Clock, 1, Page::DateTime))
-            .child(page("settings-appearance", IconName::PaintRoller, 2, Page::Appearance))
-            .child(page("settings-more", IconName::ToggleRight, 3, Page::More))
-            .child(
-                item("settings-sticky", IconName::FileText, strings.sticky_notes, self.page == Page::Sticky)
-                    .on_click(cx.listener(|this, _, _, cx| this.set_page(Page::Sticky, cx))),
+                self.drag_area("settings-nav-drag", window, cx)
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .h(px(if cfg!(target_os = "macos") { 56. } else { 44. }))
+                    .when(cfg!(target_os = "macos"), |el| el.pt(px(20.)))
+                    .px_4()
+                    .child(div().text_size(px(18.)).font_weight(FontWeight::SEMIBOLD).child(strings.settings)),
             )
             .child(
-                item("settings-sync", IconName::RefreshCw, strings.data_and_sync, self.page == Page::Sync)
-                    .on_click(cx.listener(|this, _, _, cx| this.set_page(Page::Sync, cx))),
+                v_flex()
+                    .id("settings-navigation")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .px_2()
+                    .pb_2()
+                    .gap_0p5()
+                    .child(
+                        item("settings-features", IconName::LayoutGrid, strings.features, self.page == Page::Features)
+                            .on_click(cx.listener(|this, _, _, cx| this.set_page(Page::Features, cx))),
+                    )
+                    .child(page("settings-smart-list", IconName::Funnel, 0, Page::SmartList))
+                    .child(
+                        item("settings-notifications", IconName::Bell, strings.notifications_page, self.page == Page::Notifications)
+                            .on_click(cx.listener(|this, _, _, cx| this.set_page(Page::Notifications, cx))),
+                    )
+                    .child(page("settings-date-time", IconName::Clock, 1, Page::DateTime))
+                    .child(page("settings-appearance", IconName::PaintRoller, 2, Page::Appearance))
+                    .child(page("settings-more", IconName::ToggleRight, 3, Page::More))
+                    .child(
+                        item("settings-sticky", IconName::FileText, strings.sticky_notes, self.page == Page::Sticky)
+                            .on_click(cx.listener(|this, _, _, cx| this.set_page(Page::Sticky, cx))),
+                    )
+                    .child(
+                        item("settings-sync", IconName::RefreshCw, strings.data_and_sync, self.page == Page::Sync)
+                            .on_click(cx.listener(|this, _, _, cx| this.set_page(Page::Sync, cx))),
+                    )
+                    .child(
+                        item("settings-integrations", IconName::CalendarDays, strings.integrations, self.page == Page::Integrations)
+                            .on_click(cx.listener(|this, _, _, cx| this.set_page(Page::Integrations, cx))),
+                    )
+                    .child(div().h(px(12.)))
+                    .child(
+                        div()
+                            .debug_selector(|| "settings-shortcuts".to_owned())
+                            .child(
+                                item("settings-shortcuts", IconName::Keyboard, strings.settings_pages[4], false)
+                                    .on_click(cx.listener(|_, _, window, cx| {
+                                        cx.emit(SettingsEvent::ShowShortcuts);
+                                        window.defer(cx, |window, _| window.remove_window());
+                                    })),
+                            ),
+                    )
+                    .child(div().h(px(12.)))
+                    .child(page("settings-about", IconName::Info, 5, Page::About)),
             )
-            .child(
-                item("settings-integrations", IconName::CalendarDays, strings.integrations, self.page == Page::Integrations)
-                    .on_click(cx.listener(|this, _, _, cx| this.set_page(Page::Integrations, cx))),
-            )
-            .child(div().h(px(12.)))
-            .child(
-                item("settings-shortcuts", IconName::Keyboard, strings.settings_pages[4], false)
-                    .on_click(cx.listener(|_, _, _, cx| cx.emit(SettingsEvent::ShowShortcuts))),
-            )
-            .child(div().h(px(12.)))
-            .child(page("settings-about", IconName::Info, 5, Page::About))
     }
 
     /// A row whose value opens a dropdown of `options` (label, selected, what picking it does).
@@ -1339,6 +1461,7 @@ impl SettingsWindow {
                             .child(
                                 h_flex()
                                     .id(SharedString::from(format!("feature-{i}")))
+                                    .debug_selector(move || format!("settings-feature-{i}"))
                                     .cursor_pointer()
                                     .child(div().flex_1().child(Label::new(name)))
                                     .child(Switch::new().toggle_state(on))
@@ -1505,21 +1628,25 @@ impl SettingsWindow {
 }
 
 impl Render for SettingsWindow {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors().clone();
+        let strings = i18n::t(cx);
         let notes_open = self.release_notes.is_some();
-        let about = i18n::t(cx).settings_pages[5];
+        let about = strings.settings_pages[5];
         let page = match &self.release_notes {
             Some(notes) => self.render_release_notes(notes, cx),
             None => self.render_page(cx),
         };
-        h_flex()
+        let root = h_flex()
             .id("settings-window")
             .track_focus(&self.focus_handle)
             .tab_group()
             .key_context("Settings")
             .on_action(cx.listener(|this, _: &DismissSettings, window, cx| {
                 this.dismiss(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &CloseWindow, window, cx| {
+                this.close(window, cx);
             }))
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
                 if matches!(this.page, Page::About | Page::Appearance) && event.keystroke.key == "tab" {
@@ -1531,27 +1658,17 @@ impl Render for SettingsWindow {
                     cx.stop_propagation();
                 }
             }))
-            .w(px(840.))
-            .h(px(680.))
-            .max_w_full()
-            .max_h_full()
-            .flex_none()
+            .size_full()
             .relative()
-            .rounded(px(WINDOW_RADIUS))
             .overflow_hidden()
-            .bg(colors.elevated_surface_background)
-            .border(px(WINDOW_BORDER_WIDTH))
-            .border_color(colors.border)
-            .shadow_lg()
+            .bg(colors.background)
             .text_color(colors.text)
-            .child(self.render_nav(cx))
+            .child(self.render_nav(window, cx))
             .child(
                 v_flex()
                     .flex_1()
                     .min_w_0()
                     .h_full()
-                    .rounded_tr(PANEL_RADIUS)
-                    .rounded_br(PANEL_RADIUS)
                     .bg(colors.background)
                     .child(
                         h_flex()
@@ -1559,19 +1676,26 @@ impl Render for SettingsWindow {
                             .h(px(44.))
                             .flex_none()
                             .px_3()
-                            .when(!notes_open, |el| el.justify_end())
-                            .when(notes_open, |el| el.justify_between().child(
-                                action_button("release-notes-back", cx)
-                                    .child(Icon::new(IconName::ChevronLeft).size(IconSize::Small).color(Color::Muted))
-                                    .child(Label::new(about).size(LabelSize::Small))
-                                    .on_click(cx.listener(|this, _, window, cx| this.back_to_about(window, cx))),
-                            ))
-                            .child(IconButton::new("close-settings", IconName::X)
-                                .icon_color(Color::Muted)
-                                .on_click(cx.listener(|_, _, _, cx| cx.emit(SettingsEvent::Dismissed)))),
+                            .items_center()
+                            .when(notes_open, |el| {
+                                el.child(
+                                    action_button("release-notes-back", cx)
+                                        .child(Icon::new(IconName::ChevronLeft).size(IconSize::Small).color(Color::Muted))
+                                        .child(Label::new(about).size(LabelSize::Small))
+                                        .on_click(cx.listener(|this, _, window, cx| this.back_to_about(window, cx))),
+                                )
+                            })
+                            .child(self.drag_area("settings-header-drag", window, cx).flex_1().min_w_0().h_full())
+                            .child(
+                                IconButton::new("close-settings", IconName::X)
+                                    .icon_color(Color::Muted)
+                                    .tooltip(Tooltip::text(strings.close))
+                                    .on_click(cx.listener(|this, _, window, cx| this.close(window, cx))),
+                            ),
                     )
                     .child(page),
-            )
+            );
+        crate::title_bar::window_frame(root, window, cx)
     }
 }
 

@@ -71,7 +71,7 @@ pub struct AppView {
     /// The system-wide shortcut being recorded in the Shortcuts panel, and the panel's focus.
     recording_hotkey: Option<usize>,
     shortcuts_focus: gpui::FocusHandle,
-    settings: Option<gpui::Entity<SettingsWindow>>,
+    settings: Option<gpui::WindowHandle<SettingsWindow>>,
     update_notice: Option<Rc<ReleaseNotes>>,
     /// The Statistics page opened from the account menu, which covers the whole window.
     statistics_open: bool,
@@ -88,6 +88,7 @@ impl AppView {
             cx.defer(move |cx| {
                 let _ = main_window.update(cx, |view, window, cx| {
                     if view.prepare_to_leave_calendar(window, cx) {
+                        view.close_settings(cx);
                         window.remove_window();
                     }
                 });
@@ -112,7 +113,13 @@ impl AppView {
     pub fn new(store: Rc<Store>, first_start: bool, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let app_view = cx.weak_entity();
         window.on_window_should_close(cx, move |window, cx| {
-            app_view.update(cx, |view, cx| view.prepare_to_leave_calendar(window, cx)).unwrap_or(true)
+            app_view.update(cx, |view, cx| {
+                if !view.prepare_to_leave_calendar(window, cx) {
+                    return false;
+                }
+                view.close_settings(cx);
+                true
+            }).unwrap_or(true)
         });
         let todo = cx.new(|cx| TodoView::new(store.clone(), window, cx));
         let calendar = cx.new(|cx| CalendarView::new(store.clone(), window, cx));
@@ -493,10 +500,13 @@ impl AppView {
             }
             // `settings=<page>[><menu>]` opens the Settings window (see `SettingsWindow::dev_open`).
             if let Some(spec) = state.split(';').find_map(|part| part.strip_prefix("settings=")) {
-                this.open_settings(None, window, cx);
-                if let Some(settings) = &this.settings {
-                    settings.update(cx, |settings, cx| settings.dev_open(spec, cx));
-                }
+                let spec = spec.to_owned();
+                cx.defer_in(window, move |this, window, cx| {
+                    this.open_settings(None, window, cx);
+                    if let Some(settings) = this.settings {
+                        let _ = settings.update(cx, |settings, _, cx| settings.dev_open(&spec, cx));
+                    }
+                });
             }
             if state.contains("statistics=open") {
                 this.open_statistics(cx);
@@ -744,46 +754,70 @@ impl AppView {
         cx.notify();
     }
 
+    fn close_settings(&mut self, cx: &mut Context<Self>) {
+        if let Some(settings) = self.settings.take() {
+            let _ = settings.update(cx, |_, window, _| window.remove_window());
+        }
+    }
+
+    fn apply_settings_changes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // The default list, smart list visibility, mini calendar and week start show up in the views.
+        self.todo.update(cx, |todo, cx| todo.reload(cx));
+        self.calendar.update(cx, |calendar, cx| calendar.reload(cx));
+        // A section turned off in Features closes.
+        let prefs = self.store.preferences().unwrap_or_default();
+        self.features = prefs.features;
+        self.rail_order = prefs.rail_order;
+        if !self.section.enabled(self.features) {
+            self.select(Section::Tasks, window, cx);
+        }
+        cx.notify();
+    }
+
     fn open_settings(&mut self, notes: Option<Rc<ReleaseNotes>>, window: &mut Window, cx: &mut Context<Self>) {
         self.account_menu_open = false;
-        if let Some(notes) = &notes {
+        if notes.is_some() {
             self.search = None;
-            if let Some(settings) = &self.settings {
-                settings.update(cx, |settings, cx| settings.show_release_notes(notes.clone(), window, cx));
+        }
+        if let Some(settings) = self.settings {
+            let existing = settings.update(cx, |settings, settings_window, cx| {
+                if let Some(notes) = notes.clone() {
+                    settings.show_release_notes(notes, settings_window, cx);
+                } else {
+                    settings_window.focus(&settings.focus_handle(cx), cx);
+                }
+                settings_window.activate_window();
+            });
+            if existing.is_ok() {
                 cx.notify();
                 return;
             }
+            self.settings = None;
         }
-        let settings = cx.new(|cx| SettingsWindow::new(self.store.clone(), cx));
-        cx.subscribe_in(&settings, window, |this, _, event, window, cx| {
-            this.settings = None;
-            if let SettingsEvent::ShowShortcuts = event {
-                this.shortcuts_open = true;
+        let handle = match settings_window::open(self.store.clone(), notes, window, cx) {
+            Ok(handle) => handle,
+            Err(err) => {
+                eprintln!("failed to open Settings: {err:#}");
+                return;
             }
-            // The default list and the week start show up in the views.
-            this.todo.update(cx, |todo, cx| todo.reload(cx));
-            // A section turned off in Features closes.
-            let prefs = this.store.preferences().unwrap_or_default();
-            this.features = prefs.features;
-            this.rail_order = prefs.rail_order;
-            if !this.section.enabled(this.features) {
-                this.select(Section::Tasks, window, cx);
-            }
-            let focus = match this.section {
-                Section::Calendar => this.calendar.focus_handle(cx),
-                Section::Matrix => this.matrix.focus_handle(cx),
-                _ => this.todo.focus_handle(cx),
-            };
-            window.focus(&focus, cx);
-            cx.notify();
-        })
-        .detach();
-        if let Some(notes) = notes {
-            settings.update(cx, |settings, cx| settings.show_release_notes(notes, window, cx));
-        } else {
-            window.focus(&settings.focus_handle(cx), cx);
+        };
+        if let Ok(settings) = handle.update(cx, |_, _, cx| cx.entity()) {
+            cx.subscribe_in(&settings, window, |this, _, event, window, cx| match event {
+                SettingsEvent::Changed => this.apply_settings_changes(window, cx),
+                SettingsEvent::Dismissed => {
+                    this.settings = None;
+                    this.apply_settings_changes(window, cx);
+                }
+                SettingsEvent::ShowShortcuts => {
+                    this.settings = None;
+                    this.shortcuts_open = true;
+                    this.apply_settings_changes(window, cx);
+                    window.activate_window();
+                }
+            })
+            .detach();
         }
-        self.settings = Some(settings);
+        self.settings = Some(handle);
         cx.notify();
     }
 
@@ -900,10 +934,6 @@ impl AppView {
         }
         if self.search.take().is_some() {
             cx.notify();
-            return true;
-        }
-        if let Some(settings) = self.settings.clone() {
-            settings.update(cx, |settings, cx| settings.dismiss(window, cx));
             return true;
         }
         if self.statistics_open {
@@ -1524,23 +1554,6 @@ impl Render for AppView {
                 })
             })
             .when(self.shortcuts_open, |el| el.child(self.render_shortcuts(cx)))
-            .when_some(self.settings.clone(), |el, settings| {
-                el.child(
-                    div()
-                        .id("settings-backdrop")
-                        .absolute()
-                        .inset_0()
-                        .occlude()
-                        .bg(gpui::black().opacity(0.35))
-                        .flex()
-                        .pt(title_bar::height())
-                        .px_2()
-                        .pb_2()
-                        .items_center()
-                        .justify_center()
-                        .child(settings),
-                )
-            })
             .when_some(self.search.clone(), |el, search| {
                 el.child(div().absolute().top(px(160.)).left_0().right_0().flex().justify_center().child(search))
             });
@@ -1599,10 +1612,14 @@ mod tests {
         assert!(notice.left() >= bell.right());
         assert_eq!(notice.bottom(), bell.bottom());
         assert!(notice.top() >= title_bar::height() && notice.bottom() <= px(400.));
-        assert!(cx.debug_bounds("release-notes-page").is_none());
+        assert!(cx.update(|_, cx| app.read(cx).settings.is_none()));
         cx.simulate_click(button.center(), gpui::Modifiers::default());
-        assert!(cx.debug_bounds("release-notes-page").is_some());
-        cx.update(|_, cx| assert!(app.read(cx).update_notice.is_none()));
+        let settings_window = cx.update(|_, cx| {
+            assert!(app.read(cx).update_notice.is_none());
+            app.read(cx).settings.unwrap()
+        });
+        let mut settings_cx = gpui::VisualTestContext::from_window(settings_window.into(), cx);
+        assert!(settings_cx.debug_bounds("release-notes-page").is_some());
     }
 
     #[gpui::test]
@@ -1617,9 +1634,18 @@ mod tests {
         cx.simulate_keystrokes("escape");
         cx.update(|window, cx| assert!(!app.read(cx).todo.focus_handle(cx).is_focused(window)));
 
-        cx.update(|window, cx| app.update(cx, |app, cx| app.open_settings(None, window, cx)));
-        cx.simulate_keystrokes("escape");
-        cx.update(|_, cx| assert!(app.read(cx).settings.is_none()));
+        let settings_window = cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.open_settings(None, window, cx);
+                app.settings.unwrap()
+            })
+        });
+        let mut settings_cx = gpui::VisualTestContext::from_window(settings_window.into(), cx);
+        settings_cx.simulate_keystrokes("escape");
+        cx.update(|_, cx| {
+            assert!(app.read(cx).settings.is_none());
+            assert_eq!(cx.windows().len(), 1);
+        });
         cx.simulate_keystrokes("escape escape");
         cx.update(|_, cx| {
             assert_eq!(app.read(cx).section, Section::Tasks);
@@ -1727,37 +1753,120 @@ mod tests {
         cx.update(theme::init);
         let store = Rc::new(Store::open_in_memory().unwrap());
         let (app, cx) = cx.add_window_view(|window, cx| AppView::new(store, true, window, cx));
-        cx.simulate_resize(size(px(900.), px(400.)));
-        cx.update(|window, cx| app.update(cx, |app, cx| {
-            app.open_settings(None, window, cx);
-            app.settings.as_ref().unwrap().update(cx, |settings, cx| settings.set_page(settings_window::Page::More, cx));
-        }));
-        let header = cx.debug_bounds("settings-header").unwrap();
-        let page = cx.debug_bounds("settings-page").unwrap();
-        let language = cx.debug_bounds("settings-language").unwrap();
-        assert!(header.top() >= title_bar::height());
+        let settings_window = cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.open_settings(None, window, cx);
+                app.settings.unwrap()
+            })
+        });
+        let mut settings_cx = gpui::VisualTestContext::from_window(settings_window.into(), cx);
+        settings_cx.simulate_resize(size(px(900.), px(400.)));
+        settings_window.update(&mut settings_cx, |settings, _, cx| {
+            settings.set_page(settings_window::Page::More, cx);
+        }).unwrap();
+        let header = settings_cx.debug_bounds("settings-header").unwrap();
+        let page = settings_cx.debug_bounds("settings-page").unwrap();
+        let language = settings_cx.debug_bounds("settings-language").unwrap();
+        assert_eq!(header.top(), px(0.));
         assert_eq!(page.top(), header.bottom());
-        assert!(page.bottom() < px(400.));
+        assert!(page.bottom() <= px(400.));
         assert!(language.top() >= page.top());
 
         let position = page.center();
         let modifiers = Modifiers::default();
-        cx.simulate_mouse_move(position, None, modifiers);
-        cx.simulate_event(ScrollWheelEvent {
+        settings_cx.simulate_mouse_move(position, None, modifiers);
+        settings_cx.simulate_event(ScrollWheelEvent {
             position,
             delta: ScrollDelta::Pixels(point(px(0.), px(-160.))),
             modifiers,
             touch_phase: TouchPhase::Moved,
         });
-        assert!(cx.debug_bounds("settings-language").unwrap().top() < language.top());
-        assert_eq!(cx.debug_bounds("settings-header"), Some(header));
+        assert!(settings_cx.debug_bounds("settings-language").unwrap().top() < language.top());
+        assert_eq!(settings_cx.debug_bounds("settings-header"), Some(header));
 
         for page in [settings_window::Page::SmartList, settings_window::Page::More] {
-            cx.update(|_, cx| app.update(cx, |app, cx| {
-                app.settings.as_ref().unwrap().update(cx, |settings, cx| settings.set_page(page, cx));
-            }));
+            settings_window.update(&mut settings_cx, |settings, _, cx| settings.set_page(page, cx)).unwrap();
         }
-        assert_eq!(cx.debug_bounds("settings-language"), Some(language));
+        assert_eq!(settings_cx.debug_bounds("settings-language"), Some(language));
+    }
+
+    #[gpui::test]
+    fn settings_window_is_separate_single_instance_and_updates_main_window_live(cx: &mut gpui::TestAppContext) {
+        cx.update(theme::init);
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let (app, cx) = cx.add_window_view(|window, cx| AppView::new(store.clone(), true, window, cx));
+
+        let first = cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.open_settings(None, window, cx);
+                app.settings.unwrap()
+            })
+        });
+        cx.update(|_, cx| assert_eq!(cx.windows().len(), 2));
+        assert!(cx.debug_bounds("settings-header").is_none(), "settings must not render inside the main window");
+
+        // Opening settings again reuses the existing window instead of spawning a second one.
+        let second = cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.open_settings(None, window, cx);
+                app.settings.unwrap()
+            })
+        });
+        assert_eq!(first, second);
+        cx.update(|_, cx| assert_eq!(cx.windows().len(), 2));
+
+        // Changing a feature in the separate Settings window updates the main window live while
+        // keeping Settings open.
+        let mut settings_cx = gpui::VisualTestContext::from_window(first.into(), cx);
+        first.update(&mut settings_cx, |settings, _, cx| {
+            settings.set_page(settings_window::Page::Features, cx);
+        }).unwrap();
+        cx.update(|window, cx| app.update(cx, |app, cx| assert!(app.select(Section::Calendar, window, cx))));
+        let calendar_toggle = settings_cx.debug_bounds("settings-feature-0").unwrap();
+        settings_cx.simulate_click(calendar_toggle.center(), gpui::Modifiers::default());
+        cx.update(|_, cx| {
+            assert!(!app.read(cx).features.calendar);
+            assert_eq!(app.read(cx).section, Section::Tasks);
+            assert!(app.read(cx).settings.is_some());
+            assert_eq!(cx.windows().len(), 2);
+        });
+
+        // Clicking Shortcuts in Settings closes Settings and opens the Shortcuts panel in main.
+        let shortcuts_item = settings_cx.debug_bounds("settings-shortcuts").unwrap();
+        settings_cx.simulate_click(shortcuts_item.center(), gpui::Modifiers::default());
+        cx.update(|_, cx| {
+            assert!(app.read(cx).settings.is_none());
+            assert!(app.read(cx).shortcuts_open);
+            assert_eq!(cx.windows().len(), 1);
+        });
+
+        // Reopen Settings and verify native close clears AppView::settings.
+        let reopened = cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.open_settings(None, window, cx);
+                app.settings.unwrap()
+            })
+        });
+        let mut reopened_cx = gpui::VisualTestContext::from_window(reopened.into(), cx);
+        assert!(reopened_cx.simulate_close());
+        // `simulate_close` only runs `on_window_should_close`; mirror the OS removing the window.
+        reopened.update(&mut reopened_cx, |_, window, _| window.remove_window()).unwrap();
+        cx.update(|_, cx| {
+            assert!(app.read(cx).settings.is_none());
+            assert_eq!(cx.windows().len(), 1);
+        });
+
+        // Reopen Settings and verify closing the main window also closes the Settings window.
+        cx.update(|window, cx| app.update(cx, |app, cx| app.open_settings(None, window, cx)));
+        cx.update(|_, cx| {
+            assert!(app.read(cx).settings.is_some());
+            assert_eq!(cx.windows().len(), 2);
+        });
+        assert!(cx.simulate_close());
+        cx.update(|_, cx| {
+            assert!(app.read(cx).settings.is_none());
+            assert_eq!(cx.windows().len(), 1);
+        });
     }
 
     #[gpui::test]

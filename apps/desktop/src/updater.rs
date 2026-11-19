@@ -627,21 +627,26 @@ mod tests {
             cx.set_global(GlobalUpdater(updater));
         });
         let (_, cx) = cx.add_window_view(|window, cx| crate::app_view::AppView::new(store, true, window, cx));
+        let main_window = cx.update(|window, _| window.window_handle());
         let preview = cx.debug_bounds("title-bar-update-notes").unwrap();
         let restart = cx.debug_bounds("title-bar-restart-update").unwrap();
         assert!(preview.right() <= restart.left());
         assert_eq!(preview.center().y, restart.center().y);
         cx.simulate_click(preview.center(), gpui::Modifiers::default());
-        assert!(cx.debug_bounds("release-notes-page").is_some());
+        let settings_window = cx
+            .update(|_, cx| cx.windows().into_iter().find(|window| *window != main_window))
+            .expect("clicking What's New opens the separate Settings window");
+        let mut settings_cx = gpui::VisualTestContext::from_window(settings_window, cx);
+        assert!(settings_cx.debug_bounds("release-notes-page").is_some());
 
-        cx.simulate_keystrokes("escape");
-        assert!(cx.debug_bounds("release-notes-page").is_none());
-        let preview = cx.debug_bounds("update-notes").unwrap();
-        let restart = cx.debug_bounds("update-action").unwrap();
+        settings_cx.simulate_keystrokes("escape");
+        assert!(settings_cx.debug_bounds("release-notes-page").is_none());
+        let preview = settings_cx.debug_bounds("update-notes").unwrap();
+        let restart = settings_cx.debug_bounds("update-action").unwrap();
         assert!(preview.right() <= restart.left());
         assert_eq!(preview.center().y, restart.center().y);
-        cx.simulate_click(preview.center(), gpui::Modifiers::default());
-        assert!(cx.debug_bounds("release-notes-page").is_some());
+        settings_cx.simulate_click(preview.center(), gpui::Modifiers::default());
+        assert!(settings_cx.debug_bounds("release-notes-page").is_some());
     }
 
     #[test]

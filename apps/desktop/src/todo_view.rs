@@ -14,8 +14,9 @@ use crate::drag::{
 use ui::{Placement, PopoverAttachment, SubmenuItem, popover};
 
 use crate::actions::{
-    ClearDate, DeleteTask, DismissTransient, PinTask, PriorityHigh, PriorityLow, PriorityMedium, PriorityNone,
-    SelectNext, SelectPrevious, SetDate, SetNextWeek, SetToday, SetTomorrow, ToggleComplete,
+    AddSubtask, ClearDate, DeleteTask, DismissTransient, PinTask, PriorityHigh, PriorityLow, PriorityMedium,
+    PriorityNone, SelectNext, SelectPrevious, SetDate, SetNextWeek, SetToday, SetTomorrow, ToggleAllSubtasks,
+    ToggleComplete,
 };
 use crate::i18n::{self, CurrentLocale, Strings};
 use crate::list_dialog::{DialogEvent, FolderDialog, ListDialog};
@@ -181,6 +182,12 @@ pub struct TodoView {
     /// what it showed last, to tell it which rows changed.
     list_state: ListState,
     list_entries: Vec<ListEntry>,
+    /// Window bounds of currently painted `list_entries` rows, keyed by entry index.
+    list_entry_bounds: Rc<RefCell<HashMap<usize, gpui::Bounds<Pixels>>>>,
+    /// Active task-list drag origin: `(dragged_task_id, start_mouse_x)`.
+    task_drag_origin: Option<(Id, Pixels)>,
+    /// Live drop plan while dragging a task over `#tasks`.
+    task_drop: Option<task_rows::TaskDropPlan>,
     tag_colors: HashMap<String, Hsla>,
     /// The Add List / Edit List dialog and the folder dialog, while open.
     list_dialog: Option<Entity<ListDialog>>,
@@ -384,7 +391,7 @@ impl TodoView {
         cx.subscribe(&detail, |this, _, OpenTask(id), cx| this.select(*id, cx)).detach();
         cx.subscribe(&detail, |_, _, StartFocus(id, title, stopwatch), cx| cx.emit(StartFocus(*id, title.clone(), *stopwatch))).detach();
         cx.subscribe(&detail, |this, _, crate::task_detail::Undoable(action, label), cx| {
-            this.offer_undo(*action, label.clone(), cx);
+            this.offer_undo(action.clone(), label.clone(), cx);
         })
         .detach();
 
@@ -398,7 +405,7 @@ impl TodoView {
         cx.subscribe(&card_detail, |this, _, OpenTask(id), cx| this.open_card(*id, cx)).detach();
         cx.subscribe(&card_detail, |_, _, StartFocus(id, title, stopwatch), cx| cx.emit(StartFocus(*id, title.clone(), *stopwatch))).detach();
         cx.subscribe(&card_detail, |this, _, crate::task_detail::Undoable(action, label), cx| {
-            this.offer_undo(*action, label.clone(), cx);
+            this.offer_undo(action.clone(), label.clone(), cx);
         })
         .detach();
 
@@ -428,6 +435,9 @@ impl TodoView {
             list_focus: cx.focus_handle(),
             list_state: ListState::new(0, ListAlignment::Top, px(400.)),
             list_entries: Vec::new(),
+            list_entry_bounds: Rc::new(RefCell::new(HashMap::new())),
+            task_drag_origin: None,
+            task_drop: None,
             tag_colors: HashMap::new(),
             list_dialog: None,
             folder_dialog: None,
@@ -995,10 +1005,10 @@ impl TodoView {
                 && all_tasks.iter().any(|task| {
                     task.id == *id && !task.is_deleted() && !task.is_wont_do()
                         && task.list_id == pending.before.list_id
-                        && match pending.undo {
-                            crate::undo::UndoAction::Reopen(_) => task.is_completed(),
+                        && match &pending.undo {
+                            crate::undo::UndoAction::Reopen { .. } => task.is_completed(),
                             crate::undo::UndoAction::ReopenRepeat { copy, .. } => all_tasks.iter()
-                                .any(|copy_task| copy_task.id == copy && copy_task.is_completed() && !copy_task.is_deleted()),
+                                .any(|copy_task| copy_task.id == *copy && copy_task.is_completed() && !copy_task.is_deleted()),
                             _ => false,
                         }
                 })
@@ -2321,7 +2331,20 @@ impl TodoView {
 
     fn render_entry(&mut self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
         // Each entry spans the list's width, as in the column the list replaced.
-        div().w_full().px(px(14.)).child(self.render_entry_content(ix, cx)).into_any_element()
+        let entry_bounds = self.list_entry_bounds.clone();
+        div()
+            .relative()
+            .w_full()
+            .px(px(14.))
+            .child(
+                gpui::canvas(move |area, _, _| {
+                    entry_bounds.borrow_mut().insert(ix, area);
+                }, |_, _, _, _| {})
+                .absolute()
+                .size_full(),
+            )
+            .child(self.render_entry_content(ix, cx))
+            .into_any_element()
     }
 
     fn render_entry_content(&mut self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
@@ -2348,9 +2371,21 @@ impl TodoView {
             Some(ListEntry::Row(Row::Day { label, count, drop })) => {
                 let collapsed = self.collapsed_days.contains(&label);
                 let key = label.clone();
+                let accent = cx.theme().colors().accent;
+                let drop_on_header = drop.clone();
                 h_flex()
                     .id(SharedString::from(format!("day-{label}")))
+                    .rounded(px(6.))
                     .cursor_pointer()
+                    .when_some(drop_on_header, |el, target| {
+                        el.drag_over::<DraggedTask>(move |style, _, _, _| style.bg(accent.opacity(0.10)))
+                            .on_drop(cx.listener(move |this, dragged: &DraggedTask, _, cx| {
+                                cx.stop_propagation();
+                                this.task_drop = None;
+                                this.task_drag_origin = None;
+                                this.drop_on_column(dragged.id, target.clone(), cx);
+                            }))
+                    })
                     .child(div().w(px(GUTTER)).flex_none().pl(px(4.)).child(chevron(collapsed)))
                     .child(div().flex_1().min_w_0().child(self.render_group_header(label, count, drop.as_ref(), 36., cx)))
                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -2379,8 +2414,8 @@ impl TodoView {
         let mut pending: Vec<_> = self.completing.values().collect();
         pending.sort_by_key(|pending| pending.index);
         for pending in pending {
-            if let crate::undo::UndoAction::ReopenRepeat { copy, .. } = pending.undo {
-                tasks.retain(|task| task.id != copy);
+            if let crate::undo::UndoAction::ReopenRepeat { copy, .. } = &pending.undo {
+                tasks.retain(|task| task.id != *copy);
             }
             if let Some(task) = tasks.iter_mut().find(|task| task.id == pending.before.id) {
                 *task = pending.before.clone();
@@ -3153,8 +3188,16 @@ impl TodoView {
                     let sub_id = sub.id;
                     let is_last = sub_idx + 1 == subtasks.len();
                     let sub_selected = self.card == Some(sub_id) || self.selected == Some(sub_id);
+                    let sub_draggable = self.view != View::Trash
+                        && self.title_edit.as_ref().is_none_or(|(editing, _, _)| *editing != sub_id);
+                    let dragged_sub = DraggedTask { id: sub_id, title: sub.title.clone().into() };
                     v_flex()
                         .id(SharedString::from(format!("card-sub-{sub_id}")))
+                        .debug_selector(move || format!("card-sub-{sub_id}"))
+                        .when(sub_draggable, |el| {
+                            el.on_drag(dragged_sub, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        })
                         .when(is_last, |el| el.rounded_b(px(9.)))
                         .when(sub_selected, |el| el.bg(sub_selected_bg))
                         .when(!sub_selected, |el| el.hover(move |s| s.bg(sub_hover)))
@@ -4414,9 +4457,6 @@ impl TodoView {
             };
             if nest {
                 self.store.link_parent(dragged, target)?;
-                if let Some(sec) = target_task.section_id {
-                    self.store.set_section(dragged, Some(sec))?;
-                }
             } else {
                 if dragged_task.parent_id.is_some() {
                     self.store.set_parent(dragged, None)?;
@@ -4440,7 +4480,9 @@ impl TodoView {
             }
             Ok(())
         })();
-        self.check(result);
+        if self.check(result).is_some() && nest {
+            self.collapsed_tasks.remove(&target);
+        }
         self.reload(cx);
     }
 
@@ -6757,7 +6799,7 @@ impl TodoView {
             // A second click cancels this completion, including a repeating occurrence.
             // Repeated complete commands must not advance the recurrence again.
             if completed { return; }
-            let action = pending.undo;
+            let action = pending.undo.clone();
             if self.check(action.apply(&self.store)).is_some() {
                 self.completing.remove(&id);
                 if self.undo.as_ref().is_some_and(|(undo, _, _)| *undo == action) {
@@ -6791,8 +6833,8 @@ impl TodoView {
 
     /// Shows the "Undo" toast for a few seconds.
     fn offer_undo(&mut self, action: crate::undo::UndoAction, label: String, cx: &mut Context<Self>) {
-        let completed = match action {
-            crate::undo::UndoAction::Reopen(id) | crate::undo::UndoAction::ReopenRepeat { id, .. } => Some(id),
+        let completed = match &action {
+            crate::undo::UndoAction::Reopen { id, .. } | crate::undo::UndoAction::ReopenRepeat { id, .. } => Some(*id),
             _ => None,
         };
         if !cx.reduce_motion()
@@ -6808,13 +6850,14 @@ impl TodoView {
                 }).ok();
             });
             self.completing.insert(id, CompletingTask {
-                before, index, view: self.view.clone(), undo: action, _timer: timer,
+                before, index, view: self.view.clone(), undo: action.clone(), _timer: timer,
             });
         }
+        let expected = action.clone();
         let timer = cx.spawn(async move |this, cx| {
             cx.background_executor().timer(std::time::Duration::from_secs(5)).await;
             this.update(cx, |this, cx| {
-                if this.undo.as_ref().is_some_and(|(a, _, _)| *a == action) {
+                if this.undo.as_ref().is_some_and(|(a, _, _)| *a == expected) {
                     this.undo = None;
                     cx.notify();
                 }
@@ -6875,22 +6918,199 @@ impl TodoView {
         self.reload(cx);
     }
 
-    /// Drops a dragged task onto the right part of `parent`'s row: it becomes a subtask there,
-    /// in the parent's list. A task cannot go inside itself or its own subtasks.
-    fn nest_task(&mut self, dragged: Id, parent: Id, cx: &mut Context<Self>) {
-        if dragged == parent {
-            return;
-        }
-        let result = self.store.link_parent(dragged, parent);
+    /// Drops a dragged task right before `target`, inheriting `target`'s parent (used by dev-state `move=A>B`).
+    #[cfg(debug_assertions)]
+    fn drop_task(&mut self, dragged: Id, target: Id, cx: &mut Context<Self>) {
+        let parent = self.store.task(target).ok().flatten().and_then(|t| t.parent_id);
+        let result = self.store.move_task_in_tree(dragged, parent, Some((target, false)));
         self.check(result);
         self.reload(cx);
     }
 
-    /// Drops a dragged task right before `target`.
-    fn drop_task(&mut self, dragged: Id, target: Id, cx: &mut Context<Self>) {
-        let result = self.store.move_task(dragged, target, false);
-        self.check(result);
+    /// Whether the active list view renders subtasks nested under their parents.
+    fn allows_tree_nesting(&self) -> bool {
+        !matches!(self.view, View::Completed | View::WontDo | View::Trash | View::Next7Days)
+            && self.sort_settings().1 == GroupBy::Custom
+    }
+
+    fn move_task_drag(&mut self, event: &gpui::DragMoveEvent<DraggedTask>, _: &mut Window, cx: &mut Context<Self>) {
+        if self.view == View::Trash || self.kanban || self.timeline {
+            return;
+        }
+        let pos = event.event.position;
+        if !event.bounds.contains(&pos) {
+            if self.task_drop.take().is_some() {
+                cx.notify();
+            }
+            return;
+        }
+        let dragged_id = event.drag(cx).id;
+        let start_x = match self.task_drag_origin {
+            Some((id, x)) if id == dragged_id => x,
+            _ => {
+                self.task_drag_origin = Some((dragged_id, pos.x));
+                pos.x
+            }
+        };
+        let rows: Vec<Row> = self
+            .list_entries
+            .iter()
+            .filter_map(|e| match e {
+                ListEntry::Row(row) => Some(row.clone()),
+                _ => None,
+            })
+            .collect();
+        let allow_nesting = self.allows_tree_nesting();
+        let bounds_map = self.list_entry_bounds.borrow();
+
+        let mut hit: Option<(usize, gpui::Bounds<Pixels>)> = None;
+        let mut bottommost_row_y: Option<Pixels> = None;
+        for (&ix, &bounds) in bounds_map.iter() {
+            if !matches!(self.list_entries.get(ix), Some(ListEntry::Row(_))) {
+                continue;
+            }
+            bottommost_row_y = Some(bottommost_row_y.map_or(bounds.bottom(), |b| b.max(bounds.bottom())));
+            if pos.y >= bounds.top() && pos.y <= bounds.bottom() {
+                hit = Some((ix, bounds));
+            }
+        }
+        drop(bounds_map);
+
+        let plan = if let Some((ix, bounds)) = hit {
+            match self.list_entries.get(ix) {
+                Some(ListEntry::Row(Row::Task { task, .. })) => {
+                    let mid_y = bounds.top() + bounds.size.height / 2.;
+                    let after = pos.y >= mid_y;
+                    let dx = f32::from(pos.x - start_x);
+                    // Subtract `render_entry`'s 14 px horizontal padding so `rel_x = 0` is the row's left edge.
+                    let rel_x = f32::from(pos.x - bounds.left()) - 14.0;
+                    task_rows::plan_task_drop(
+                        &rows,
+                        dragged_id,
+                        task.id,
+                        after,
+                        dx,
+                        rel_x,
+                        INDENT,
+                        GUTTER,
+                        allow_nesting,
+                    )
+                }
+                _ => None,
+            }
+        } else if bottommost_row_y.is_some_and(|bottom| pos.y > bottom) {
+            task_rows::plan_task_drop_at_end(&rows, dragged_id)
+        } else {
+            None
+        };
+
+        if self.task_drop != plan {
+            self.task_drop = plan;
+            cx.notify();
+        }
+    }
+
+    fn drop_task_in_list(&mut self, dragged: &DraggedTask, _: &mut Window, cx: &mut Context<Self>) {
+        let plan = self.task_drop.take();
+        self.task_drag_origin = None;
+        if let Some(plan) = plan {
+            cx.stop_propagation();
+            self.apply_task_drop(dragged.id, plan, cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    fn apply_task_drop(&mut self, dragged: Id, plan: task_rows::TaskDropPlan, cx: &mut Context<Self>) {
+        let result = (|| -> anyhow::Result<()> {
+            let Some(dragged_task) = self.store.task(dragged)? else { return Ok(()) };
+            if let Some(group_drop) = plan.group_drop {
+                match group_drop {
+                    DropTarget::Section(sec) => {
+                        if dragged_task.is_completed() {
+                            self.store.set_completed(dragged, false)?;
+                        }
+                        if dragged_task.section_id != sec {
+                            self.store.set_section(dragged, sec)?;
+                        }
+                    }
+                    DropTarget::Complete => {
+                        if !dragged_task.is_completed() {
+                            self.store.set_completed(dragged, true)?;
+                        }
+                    }
+                    DropTarget::Kind(kind) => {
+                        if dragged_task.is_completed() {
+                            self.store.set_completed(dragged, false)?;
+                        }
+                        if dragged_task.kind != kind {
+                            self.store.set_kind(dragged, kind)?;
+                        }
+                    }
+                    other => {
+                        if dragged_task.is_completed() {
+                            self.store.set_completed(dragged, false)?;
+                        }
+                        self.apply_column_value(dragged, other)?;
+                    }
+                }
+            } else if dragged_task.is_completed()
+                && self.store.task(plan.target_id)?.is_some_and(|t| !t.is_completed())
+            {
+                self.store.set_completed(dragged, false)?;
+            }
+            self.store.move_task_in_tree(dragged, plan.new_parent, plan.order_target)?;
+            Ok(())
+        })();
+        if self.check(result).is_some()
+            && let Some(parent_id) = plan.expand_parent
+        {
+            self.collapsed_tasks.remove(&parent_id);
+        }
         self.reload(cx);
+    }
+
+    /// Parents in the current view that have at least one visible subtask.
+    fn parent_task_ids(&self, strings: &Strings) -> Vec<Id> {
+        self.rows_with(strings, &HashSet::new(), &HashSet::new())
+            .into_iter()
+            .filter_map(|row| match row {
+                Row::Task { task, has_children: true, .. } => Some(task.id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn toggle_all_subtasks_now(&mut self, cx: &mut Context<Self>) {
+        let parents = self.parent_task_ids(i18n::t(cx));
+        if parents.is_empty() {
+            return;
+        }
+        let any_expanded = parents.iter().any(|id| !self.collapsed_tasks.contains(id));
+        if any_expanded {
+            self.collapsed_tasks.extend(parents);
+        } else {
+            for id in parents {
+                self.collapsed_tasks.remove(&id);
+            }
+        }
+        cx.notify();
+    }
+
+    fn toggle_all_subtasks(&mut self, _: &ToggleAllSubtasks, _: &mut Window, cx: &mut Context<Self>) {
+        if self.title_edit.is_some() {
+            return;
+        }
+        self.toggle_all_subtasks_now(cx);
+    }
+
+    fn add_subtask_selected(&mut self, _: &AddSubtask, window: &mut Window, cx: &mut Context<Self>) {
+        if self.title_edit.is_some() {
+            return;
+        }
+        if let Some(id) = self.selected {
+            self.start_detail(id, "subtask", window, cx);
+        }
     }
 
     fn restore(&mut self, id: Id, cx: &mut Context<Self>) {
@@ -6919,13 +7139,29 @@ impl TodoView {
         strings: &Strings,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let accent = cx.theme().colors().accent;
+        let drop_target = match section {
+            Section::Tasks => DropTarget::Kind(Kind::Task),
+            Section::Notes => DropTarget::Kind(Kind::Note),
+            Section::Completed => DropTarget::Complete,
+        };
         h_flex()
             .id(SharedString::from(format!("group-{section:?}")))
             .h(px(36.))
             // As the original's, the arrow sits 7 px in from the rows' edge.
             .pl(px(7.))
             .gap_1()
+            .rounded(px(6.))
             .cursor_pointer()
+            .when(self.view != View::Trash, |el| {
+                el.drag_over::<DraggedTask>(move |style, _, _, _| style.bg(accent.opacity(0.10)))
+                    .on_drop(cx.listener(move |this, dragged: &DraggedTask, _, cx| {
+                        cx.stop_propagation();
+                        this.task_drop = None;
+                        this.task_drag_origin = None;
+                        this.drop_on_column(dragged.id, drop_target.clone(), cx);
+                    }))
+            })
             .on_click(cx.listener(move |this, _, _, cx| this.toggle_section(section, cx)))
             .child(chevron(collapsed))
             .child(Label::new(section.title(strings)).weight(FontWeight::BOLD))
@@ -7037,39 +7273,59 @@ impl TodoView {
         let draggable = self.view != View::Trash && title_input.is_none();
         let dragged = DraggedTask { id, title: task.title.clone().into() };
         let accent = theme.colors().accent;
+        let is_being_dragged = self.task_drag_origin.is_some_and(|(d, _)| d == id);
+        let drop_indicator = self.task_drop.as_ref().filter(|plan| plan.target_id == id).cloned();
 
         // The separator starts at the checkbox; the gutter to its left holds the chevron.
         div()
             .id(ElementId::Uuid(id))
+            .debug_selector(move || format!("task-row-{id}"))
             .group(group.clone())
             .relative()
             .when(draggable, |el| {
-                // Two drop zones, as in the original: on the left a dragged task goes before this
-                // one; on the right it becomes this task's subtask.
-                el.on_drag(dragged, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
-                    .child(
-                        div()
-                            .absolute()
-                            .top_0()
-                            .left_0()
-                            .h_full()
-                            .w(gpui::relative(NEST_ZONE))
-                            .drag_over::<DraggedTask>(move |style, _, _, _| style.border_t_2().border_color(accent))
-                            .on_drop(cx.listener(move |this, dragged: &DraggedTask, _, cx| this.drop_task(dragged.id, id, cx))),
-                    )
-                    .child(
-                        div()
-                            .absolute()
-                            .top_0()
-                            .right_0()
-                            .h_full()
-                            .w(gpui::relative(1. - NEST_ZONE))
-                            .rounded(px(6.))
-                            .drag_over::<DraggedTask>(move |style, _, _, _| {
-                                style.border_1().border_color(accent).bg(accent.opacity(0.08))
-                            })
-                            .on_drop(cx.listener(move |this, dragged: &DraggedTask, _, cx| this.nest_task(dragged.id, id, cx))),
-                    )
+                let view = cx.entity().downgrade();
+                el.on_drag(dragged, move |dragged, cursor_offset, window, cx| {
+                    let dragged_id = dragged.id;
+                    let fallback_x = window.mouse_position().x;
+                    view.update(cx, |this, cx| {
+                        let start_x = this
+                            .list_entries
+                            .iter()
+                            .position(|e| matches!(e, ListEntry::Row(Row::Task { task, .. }) if task.id == dragged_id))
+                            .and_then(|ix| this.list_entry_bounds.borrow().get(&ix).copied())
+                            .map_or(fallback_x, |area| area.left() + px(14.) + cursor_offset.x);
+                        this.task_drag_origin = Some((dragged_id, start_x));
+                        this.task_drop = None;
+                        cx.notify();
+                    })
+                    .ok();
+                    cx.new(|_| dragged.clone())
+                })
+            })
+            .when(is_being_dragged, |el| el.opacity(0.45))
+            .when_some(drop_indicator, |el, plan| {
+                let left = px(plan.target_level as f32 * INDENT + GUTTER);
+                el.child(
+                    div()
+                        .absolute()
+                        .left(left)
+                        .right_0()
+                        .when(!plan.after, |s| s.top(px(-1.)))
+                        .when(plan.after, |s| s.bottom(px(-1.)))
+                        .h(px(2.))
+                        .bg(accent)
+                        .child(
+                            div()
+                                .absolute()
+                                .left(px(-3.))
+                                .top(px(-2.))
+                                .size(px(6.))
+                                .rounded_full()
+                                .border_2()
+                                .border_color(accent)
+                                .bg(theme.colors().background),
+                        ),
+                )
             })
             .h(px(if details { ROW_HEIGHT + 14. } else { ROW_HEIGHT }))
             .flex()
@@ -7553,6 +7809,7 @@ impl TodoView {
             &task,
             &self.active_lists(),
             task_menu::MenuKind::List,
+            task_menu::TaskNesting::of(&self.store, task.id),
             self.context_side,
             strings,
             cx,
@@ -8012,6 +8269,26 @@ impl TodoView {
                             .child(Label::new(if details { strings.hide_details } else { strings.show_details }))
                             .on_click(cx.listener(|this, _, _, cx| this.toggle_view_flag("show_details", false, cx))),
                     )
+                    .when(!timeline, |el| {
+                        let parents = self.parent_task_ids(strings);
+                        if parents.is_empty() {
+                            return el;
+                        }
+                        let any_expanded = parents.iter().any(|id| !self.collapsed_tasks.contains(id));
+                        el.child(
+                            ListItem::new("toggle-all-subtasks")
+                                .start_slot(Icon::new(IconName::ChevronsUpDown).color(Color::Icon))
+                                .child(Label::new(if any_expanded {
+                                    strings.collapse_all_subtasks
+                                } else {
+                                    strings.expand_all_subtasks
+                                }))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.header_menu_open = false;
+                                    this.toggle_all_subtasks_now(cx);
+                                })),
+                        )
+                    })
                     .child(
                         ListItem::new("view-options")
                             .start_slot(Icon::new(IconName::Settings2).color(Color::Icon))
@@ -8772,10 +9049,20 @@ impl Render for TodoView {
                     .on_action(cx.listener(|this, _: &PriorityLow, _, cx| this.set_selected_priority(Priority::Low, cx)))
                     .on_action(cx.listener(|this, _: &PriorityMedium, _, cx| this.set_selected_priority(Priority::Medium, cx)))
                     .on_action(cx.listener(|this, _: &PriorityHigh, _, cx| this.set_selected_priority(Priority::High, cx)))
+                    .on_action(cx.listener(Self::toggle_all_subtasks))
+                    .on_action(cx.listener(Self::add_subtask_selected))
+                    .on_drag_move(cx.listener(Self::move_task_drag))
+                    .on_drop(cx.listener(Self::drop_task_in_list))
                     .flex_1()
                     .min_h_0()
                     .flex()
                     .flex_col()
+                    .child({
+                        let bounds = self.list_entry_bounds.clone();
+                        gpui::canvas(move |_, _, _| bounds.borrow_mut().clear(), |_, _, _, _| {})
+                            .absolute()
+                            .size_0()
+                    })
                     // A free day in the mini calendar, as in the original.
                     .when(rows_empty && matches!(self.view, View::Day(_)), |el| {
                         el.child(
@@ -8872,7 +9159,17 @@ impl Render for TodoView {
             .on_drag_move(cx.listener(Self::move_parent_tag_drag))
             .on_drag_move(cx.listener(Self::move_filter_drag))
             .capture_any_mouse_up(cx.listener(Self::finish_panel_drag_up))
-            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::finish_panel_drag_up))
+            .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                if this.task_drop.take().is_some() | this.task_drag_origin.take().is_some() {
+                    cx.notify();
+                }
+            }))
+            .on_mouse_up_out(MouseButton::Left, cx.listener(|this, event, window, cx| {
+                if this.task_drop.take().is_some() | this.task_drag_origin.take().is_some() {
+                    cx.notify();
+                }
+                this.finish_panel_drag_up(event, window, cx);
+            }))
             .when(self.show_lists, |el| {
                 let active_drag = self.panel_drag.as_ref().map(|d| &d.item);
                 let highlight_target = self.panel_drag.as_ref().and_then(|d| d.highlight.as_ref());
@@ -10445,5 +10742,126 @@ mod tests {
             view.update(cx, |v, cx| v.drop_on_view(View::List(l1.id), task.id, cx));
         });
         assert_eq!(store.task(task.id).unwrap().unwrap().list_id, Some(l1.id));
+    }
+
+    #[gpui::test]
+    fn nested_tasks_drag_unnest_unlink_and_toggle_all(cx: &mut TestAppContext) {
+        use gpui::{Modifiers, point, size};
+
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let parent = store.add_task("Parent").unwrap();
+        let child = store.add_subtask(parent.id, "Child").unwrap();
+
+        cx.update(|cx| {
+            theme::init(cx);
+            cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+            assert!(crate::keymap::load_default(&assets::Assets, cx).unwrap().is_empty());
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| TodoView::new(store.clone(), window, cx));
+        cx.simulate_resize(size(px(1100.), px(700.)));
+        cx.run_until_parked();
+
+        let bounds = |cx: &mut gpui::VisualTestContext, selector: String| {
+            let selector: &'static str = selector.leak();
+            cx.debug_bounds(selector).unwrap_or_else(|| panic!("missing {selector}"))
+        };
+        let drag = |cx: &mut gpui::VisualTestContext, from: gpui::Point<Pixels>, to: gpui::Point<Pixels>| {
+            let modifiers = Modifiers::default();
+            cx.simulate_mouse_move(from, None, modifiers);
+            cx.simulate_mouse_down(from, MouseButton::Left, modifiers);
+            let step = if to.x < from.x { -6. } else { 6. };
+            cx.simulate_mouse_move(point(from.x + px(step), from.y), Some(MouseButton::Left), modifiers);
+            cx.simulate_mouse_move(to, Some(MouseButton::Left), modifiers);
+            cx.run_until_parked();
+            cx.simulate_mouse_up(to, MouseButton::Left, modifiers);
+            cx.run_until_parked();
+        };
+        let visible_ids = |cx: &mut gpui::VisualTestContext| -> Vec<Id> {
+            cx.update(|_, cx| view.read(cx).visible_task_ids(i18n::t(cx)))
+        };
+
+        // 1. Two-task list: drag Child left by grabbing directly on its title text -> unnested without opening title edit.
+        let child_title_b = bounds(cx, format!("task-title-{}", child.id));
+        let grab_title = child_title_b.center();
+        drag(cx, grab_title, point(grab_title.x - px(48.), grab_title.y));
+        assert_eq!(store.task(child.id).unwrap().unwrap().parent_id, None, "drag left from title unnests child");
+        cx.update(|_, cx| assert!(view.read(cx).title_edit.is_none(), "dragging title does not enter inline edit"));
+        assert_eq!(visible_ids(cx), vec![parent.id, child.id]);
+
+        // 2. Drag Child right on its own row -> nests back under Parent.
+        let child_b = bounds(cx, format!("task-row-{}", child.id));
+        let grab = point(child_b.left() + px(160.), child_b.center().y);
+        drag(cx, grab, point(grab.x + px(48.), grab.y));
+        assert_eq!(store.task(child.id).unwrap().unwrap().parent_id, Some(parent.id), "drag right nests child");
+
+        // 3. Drag Child down into empty whitespace below the list -> unnested at bottom.
+        let child_b = bounds(cx, format!("task-row-{}", child.id));
+        let grab = point(child_b.left() + px(160.), child_b.center().y);
+        drag(cx, grab, point(grab.x, child_b.bottom() + px(80.)));
+        assert_eq!(store.task(child.id).unwrap().unwrap().parent_id, None, "drag below list unnests child");
+
+        // 4. Drag Child onto bottom half of Parent moved right -> nests; then above Parent -> unnested first.
+        let child_b = bounds(cx, format!("task-row-{}", child.id));
+        let parent_b = bounds(cx, format!("task-row-{}", parent.id));
+        let grab = point(child_b.left() + px(160.), child_b.center().y);
+        drag(cx, grab, point(grab.x + px(48.), parent_b.bottom() - px(6.)));
+        assert_eq!(store.task(child.id).unwrap().unwrap().parent_id, Some(parent.id));
+
+        let child_b = bounds(cx, format!("task-row-{}", child.id));
+        let parent_b = bounds(cx, format!("task-row-{}", parent.id));
+        let grab = point(child_b.left() + px(160.), child_b.center().y);
+        drag(cx, grab, point(grab.x, parent_b.top() + px(6.)));
+        assert_eq!(store.task(child.id).unwrap().unwrap().parent_id, None, "drag above parent unnests");
+        assert_eq!(visible_ids(cx), vec![child.id, parent.id], "moved before parent");
+
+        // 5. Unlink parent via TaskDetail parent breadcrumb X button.
+        store.link_parent(child.id, parent.id).unwrap();
+        cx.update(|_, cx| view.update(cx, |v, cx| { v.reload(cx); v.select(child.id, cx); }));
+        cx.run_until_parked();
+        let unlink_b = bounds(cx, "detail-unlink-parent".into());
+        cx.simulate_click(unlink_b.center(), Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(store.task(child.id).unwrap().unwrap().parent_id, None, "breadcrumb unlink clears parent");
+
+        // 6. Unlink parent via Link Parent popover X button.
+        store.link_parent(child.id, parent.id).unwrap();
+        cx.update(|window, cx| view.update(cx, |v, cx| {
+            v.reload(cx);
+            v.start_detail(child.id, "link-parent", window, cx);
+        }));
+        cx.run_until_parked();
+        let pop_unlink_b = bounds(cx, "link-parent-unlink".into());
+        cx.simulate_click(pop_unlink_b.center(), Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(store.task(child.id).unwrap().unwrap().parent_id, None, "popover unlink clears parent");
+
+        // 7. Unlink subtask from Parent's subtask list in TaskDetail.
+        store.link_parent(child.id, parent.id).unwrap();
+        cx.update(|_, cx| view.update(cx, |v, cx| { v.reload(cx); v.select(parent.id, cx); }));
+        cx.run_until_parked();
+        let sub_unlink_b = bounds(cx, format!("subtask-unlink-{}", child.id));
+        cx.simulate_click(sub_unlink_b.center(), Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(store.task(child.id).unwrap().unwrap().parent_id, None, "subtask list unlink clears parent");
+
+        // 8. ToggleAllSubtasks collapses and re-expands all parents.
+        store.link_parent(child.id, parent.id).unwrap();
+        cx.update(|_, cx| view.update(cx, |v, cx| v.reload(cx)));
+        cx.run_until_parked();
+        assert_eq!(visible_ids(cx), vec![parent.id, child.id]);
+        cx.update(|_, cx| view.update(cx, |v, cx| v.toggle_all_subtasks_now(cx)));
+        cx.run_until_parked();
+        assert_eq!(visible_ids(cx), vec![parent.id], "all subtasks collapsed");
+        cx.update(|_, cx| view.update(cx, |v, cx| v.toggle_all_subtasks_now(cx)));
+        cx.run_until_parked();
+        assert_eq!(visible_ids(cx), vec![parent.id, child.id], "all subtasks expanded again");
+
+        // 9. Kanban: dragging a subtask row out of its parent card unnests it.
+        cx.update(|_, cx| view.update(cx, |v, cx| v.set_layout(true, false, cx)));
+        cx.run_until_parked();
+        let sub_card_b = bounds(cx, format!("card-sub-{}", child.id));
+        // Drag the subtask to the top-left reorder zone of its own parent card (above the subtask row).
+        drag(cx, sub_card_b.center(), point(sub_card_b.left() + px(24.), sub_card_b.top() - px(24.)));
+        assert_eq!(store.task(child.id).unwrap().unwrap().parent_id, None, "kanban subtask drag unnests child");
     }
 }

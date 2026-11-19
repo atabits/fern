@@ -43,6 +43,8 @@ actions!(
         PriorityLow,
         PriorityMedium,
         PriorityHigh,
+        ToggleAllSubtasks,
+        AddSubtask,
     ]
 );
 

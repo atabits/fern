@@ -23,6 +23,7 @@ pub enum MenuAction {
     Priority(Priority),
     AddSubtask,
     LinkParent,
+    UnlinkParent,
     Pin,
     WontDo,
     Move(Option<Id>),
@@ -49,6 +50,22 @@ pub enum MenuKind {
     Calendar,
 }
 
+/// Tree nesting state of a task, used to gate subtask/parent/note menu items as in the original.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TaskNesting {
+    pub depth: usize,
+    pub has_subtasks: bool,
+}
+
+impl TaskNesting {
+    pub fn of(store: &Store, id: Id) -> Self {
+        Self {
+            depth: store.task_depth(id).unwrap_or(0),
+            has_subtasks: store.subtasks(id).is_ok_and(|s| !s.is_empty()),
+        }
+    }
+}
+
 /// Applies an action that only edits the task; `None` for the ones the view handles.
 pub fn apply(store: &Store, task: &Task, action: MenuAction, today: NaiveDate) -> Option<anyhow::Result<()>> {
     let id = task.id;
@@ -57,6 +74,7 @@ pub fn apply(store: &Store, task: &Task, action: MenuAction, today: NaiveDate) -
         MenuAction::SkipRecurrence => store.skip_recurrence(id),
         MenuAction::ClearDate => store.set_due(id, None, None),
         MenuAction::Priority(priority) => store.set_priority(id, priority),
+        MenuAction::UnlinkParent => store.unlink_parent(id),
         MenuAction::Pin => store.set_pinned(id, task.pinned_at.is_none()),
         MenuAction::WontDo => store.set_wont_do(id, !task.is_wont_do()),
         MenuAction::Move(list) => store.set_list(id, list),
@@ -68,10 +86,12 @@ pub fn apply(store: &Store, task: &Task, action: MenuAction, today: NaiveDate) -
 
 /// The menu's content (the view places it): 196 px wide with a row every 34 px, as the
 /// original's.
+#[allow(clippy::too_many_arguments)]
 pub fn render<V: 'static>(
     task: &Task,
     lists: &[List],
     kind: MenuKind,
+    nesting: TaskNesting,
     side: Option<u8>,
     strings: &'static Strings,
     cx: &mut Context<V>,
@@ -126,6 +146,8 @@ pub fn render<V: 'static>(
     };
     let pinned = task.pinned_at.is_some();
     let note = task.kind == Kind::Note;
+    let can_add_subtask = kind == MenuKind::List && !note && nesting.depth < fern_core::MAX_SUBTASK_DEPTH;
+    let can_convert = note || (task.parent_id.is_none() && !nesting.has_subtasks);
     let move_items: Vec<ListItem> = std::iter::once((None, SharedString::new_static(strings.inbox)))
         .chain(lists.iter().map(|l| (Some(l.id), SharedString::from(l.name.clone()))))
         .map(|(list, name)| {
@@ -152,8 +174,9 @@ pub fn render<V: 'static>(
         .child(heading(strings.filter_priority))
         .child(closes_side("task-menu-priorities", priority_row.into_any_element(), cx))
         .child(div().py_1().child(Divider::horizontal()))
-        .when(kind == MenuKind::List, |el| el.child(item("task-menu-subtask", IconName::CornerDownRight, strings.add_subtask_item, MenuAction::AddSubtask, cx)))
-        .child(item("task-menu-parent", IconName::ListTree, strings.link_parent, MenuAction::LinkParent, cx))
+        .when(can_add_subtask, |el| el.child(item("task-menu-subtask", IconName::CornerDownRight, strings.add_subtask_item, MenuAction::AddSubtask, cx)))
+        .when(!note, |el| el.child(item("task-menu-parent", IconName::ListTree, strings.link_parent, MenuAction::LinkParent, cx)))
+        .when(!note && task.parent_id.is_some(), |el| el.child(item("task-menu-unlink-parent", IconName::X, strings.unlink_parent, MenuAction::UnlinkParent, cx)))
         .when(kind == MenuKind::List, |el| {
             el.child(item(
                 "task-menu-pin",
@@ -187,7 +210,9 @@ pub fn render<V: 'static>(
         .child(item("task-menu-link", IconName::Link, strings.copy_link, MenuAction::CopyLink, cx))
         .child(div().py_1().child(Divider::horizontal()))
         .child(item("task-menu-sticky", IconName::StickyNote, strings.open_sticky_note, MenuAction::StickyNote, cx))
-        .child(item("task-menu-convert", IconName::FileText, if note { strings.convert_to_task } else { strings.convert_to_note }, MenuAction::Convert, cx))
+        .when(can_convert, |el| {
+            el.child(item("task-menu-convert", IconName::FileText, if note { strings.convert_to_task } else { strings.convert_to_note }, MenuAction::Convert, cx))
+        })
         .child(item("task-menu-delete", IconName::Trash, strings.delete, MenuAction::Delete, cx))
         .into_any_element()
 }
@@ -252,6 +277,12 @@ mod tests {
         apply(&store, &reload(&store), MenuAction::ClearDate, today).unwrap()?;
         assert_eq!(reload(&store).due_date, None, "Clear");
         assert!(apply(&store, &task, MenuAction::Delete, today).is_none(), "deleting is the view's, with its Undo");
+
+        let parent = store.add_task("Parent")?;
+        let child = store.add_subtask(parent.id, "Child")?;
+        assert_eq!(child.parent_id, Some(parent.id));
+        apply(&store, &child, MenuAction::UnlinkParent, today).unwrap()?;
+        assert_eq!(store.task(child.id)?.unwrap().parent_id, None);
         Ok(())
     }
 }

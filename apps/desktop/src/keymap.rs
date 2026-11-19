@@ -95,7 +95,7 @@ pub fn reload(assets: &dyn AssetSource, cx: &mut App) -> Result<Vec<String>> {
 }
 
 /// Actions shown in the shortcut list, in order; text editing keys are left out.
-pub const LISTED_ACTIONS: [&str; 26] = [
+pub const LISTED_ACTIONS: [&str; 28] = [
     "fern::NewTask",
     "fern::Search",
     "fern::ToggleSidebar",
@@ -122,6 +122,8 @@ pub const LISTED_ACTIONS: [&str; 26] = [
     "task_list::PriorityLow",
     "task_list::PriorityMedium",
     "task_list::PriorityHigh",
+    "task_list::ToggleAllSubtasks",
+    "task_list::AddSubtask",
 ];
 
 /// The keys bound to each listed action, as they read on screen ("Ctrl+N", "↓"), in the order

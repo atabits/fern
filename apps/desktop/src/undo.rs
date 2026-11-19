@@ -4,10 +4,10 @@ use anyhow::Result;
 use chrono::NaiveDate;
 use fern_core::{Id, Store, Task};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UndoAction {
-    /// The task was completed.
-    Reopen(Id),
+    /// The task was completed, along with any open subtasks completed in the same cascade.
+    Reopen { id: Id, cascaded: Vec<Id> },
     /// The task went to the trash.
     Restore(Id),
     /// A repeating task was completed: its completed copy goes and its dates come back.
@@ -15,20 +15,26 @@ pub enum UndoAction {
 }
 
 impl UndoAction {
-    pub fn apply(self, store: &Store) -> Result<()> {
+    pub fn apply(&self, store: &Store) -> Result<()> {
         match self {
-            Self::Reopen(id) => store.set_completed(id, false),
-            Self::Restore(id) => store.restore_task(id),
-            Self::ReopenRepeat { id, copy, due, end } => store.undo_repeat(id, copy, due, end),
+            Self::Reopen { id, cascaded } => {
+                let mut ids = Vec::with_capacity(1 + cascaded.len());
+                ids.push(*id);
+                ids.extend_from_slice(cascaded);
+                store.reopen_tasks(&ids)
+            }
+            Self::Restore(id) => store.restore_task(*id),
+            Self::ReopenRepeat { id, copy, due, end } => store.undo_repeat(*id, *copy, *due, *end),
         }
     }
 }
 
 /// Completes a task and returns how to undo it; `task` is its state before.
 pub fn complete(store: &Store, task: &Task) -> Result<UndoAction> {
-    Ok(match store.complete(task.id, true)? {
+    let (copy, cascaded) = store.complete_with_cascaded(task.id, true)?;
+    Ok(match copy {
         Some(copy) => UndoAction::ReopenRepeat { id: task.id, copy, due: task.due_date, end: task.end_date },
-        None => UndoAction::Reopen(task.id),
+        None => UndoAction::Reopen { id: task.id, cascaded },
     })
 }
 
@@ -41,7 +47,7 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let task = store.add_task("water the plants").unwrap();
         store.set_completed(task.id, true).unwrap();
-        UndoAction::Reopen(task.id).apply(&store).unwrap();
+        UndoAction::Reopen { id: task.id, cascaded: Vec::new() }.apply(&store).unwrap();
         assert!(!store.task(task.id).unwrap().unwrap().is_completed());
         store.delete_task(task.id).unwrap();
         UndoAction::Restore(task.id).apply(&store).unwrap();
@@ -56,5 +62,25 @@ mod tests {
         undo.apply(&store).unwrap();
         assert_eq!(store.task(task.id).unwrap().unwrap().due_date, Some(day));
         assert_eq!(store.tasks().unwrap().iter().filter(|t| t.is_completed()).count(), 0);
+    }
+
+    #[test]
+    fn undo_reopens_only_newly_cascaded_subtasks() {
+        let store = Store::open_in_memory().unwrap();
+        let parent = store.add_task("parent").unwrap();
+        let open_child = store.add_subtask(parent.id, "open child").unwrap();
+        let done_child = store.add_subtask(parent.id, "already done").unwrap();
+        store.set_completed(done_child.id, true).unwrap();
+
+        let before = store.task(parent.id).unwrap().unwrap();
+        let undo = complete(&store, &before).unwrap();
+        assert!(store.task(parent.id).unwrap().unwrap().is_completed());
+        assert!(store.task(open_child.id).unwrap().unwrap().is_completed());
+        assert!(store.task(done_child.id).unwrap().unwrap().is_completed());
+
+        undo.apply(&store).unwrap();
+        assert!(!store.task(parent.id).unwrap().unwrap().is_completed());
+        assert!(!store.task(open_child.id).unwrap().unwrap().is_completed());
+        assert!(store.task(done_child.id).unwrap().unwrap().is_completed());
     }
 }

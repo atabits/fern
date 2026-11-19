@@ -678,6 +678,274 @@ pub fn row_due_label(date: NaiveDate, time: Option<NaiveTime>, today: NaiveDate,
     (text, days < 0)
 }
 
+/// Planned result of dropping a dragged task in the list view:
+/// vertical half chooses before/after and horizontal movement chooses the nesting depth.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TaskDropPlan {
+    /// Task row on which to render the horizontal drop indicator line.
+    pub target_id: Id,
+    /// `false` draws the indicator at the top edge of `target_id`; `true` at the bottom edge.
+    pub after: bool,
+    /// Indentation level (`0..=MAX_SUBTASK_DEPTH`) of the drop indicator and resulting task.
+    pub target_level: usize,
+    /// New `parent_id` for the dragged task (`None` = top-level root).
+    pub new_parent: Option<Id>,
+    /// Where to move `dragged_id` in manual `sort_order`: `Some((anchor_id, after))`.
+    pub order_target: Option<(Id, bool)>,
+    /// Collapsed parent that should expand after dropping a child inside it.
+    pub expand_parent: Option<Id>,
+    /// Group header drop semantics when dropping into a section, Completed, or Notes group.
+    pub group_drop: Option<DropTarget>,
+}
+
+fn row_task(row: &Row) -> Option<(&Task, usize, bool)> {
+    match row {
+        Row::Task { task, depth, collapsed, .. } => Some((task, *depth, *collapsed)),
+        Row::Section { .. } | Row::Day { .. } => None,
+    }
+}
+
+fn group_bounds(rows: &[Row], idx: usize) -> (usize, usize, Option<DropTarget>) {
+    let mut start = idx;
+    while start > 0 && matches!(rows[start - 1], Row::Task { .. }) {
+        start -= 1;
+    }
+    let group_drop = start.checked_sub(1).and_then(|h| match &rows[h] {
+        Row::Day { drop, .. } => drop.clone(),
+        Row::Section { section, .. } => Some(match section {
+            Section::Tasks => DropTarget::Kind(Kind::Task),
+            Section::Notes => DropTarget::Kind(Kind::Note),
+            Section::Completed => DropTarget::Complete,
+        }),
+        Row::Task { .. } => None,
+    });
+    let mut end = idx + 1;
+    while end < rows.len() && matches!(rows[end], Row::Task { .. }) {
+        end += 1;
+    }
+    (start, end, group_drop)
+}
+
+fn visible_subtree_end(rows: &[Row], idx: usize, depth: usize, group_end: usize) -> usize {
+    let mut k = idx + 1;
+    while k < group_end {
+        match row_task(&rows[k]) {
+            Some((_, d, _)) if d > depth => k += 1,
+            _ => break,
+        }
+    }
+    k
+}
+
+/// Plans a list-view task drag over `hovered_id`.
+///
+/// - `after`: whether the pointer is in the bottom half of `hovered_id`.
+/// - `dx`: horizontal pointer displacement since drag start (`pointer_x - start_x`).
+/// - `rel_x`: horizontal pointer position relative to the row's left edge.
+/// - `indent`: horizontal pixels per nesting level (24 px).
+/// - `gutter`: left gutter before the root checkbox (20 px).
+/// - `allow_nesting`: whether the active grouping displays nested trees.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_task_drop(
+    rows: &[Row],
+    dragged_id: Id,
+    hovered_id: Id,
+    after: bool,
+    dx: f32,
+    rel_x: f32,
+    indent: f32,
+    gutter: f32,
+    allow_nesting: bool,
+) -> Option<TaskDropPlan> {
+    let hovered_idx = rows.iter().position(|r| row_task(r).is_some_and(|(t, _, _)| t.id == hovered_id))?;
+    let dragged_idx = rows.iter().position(|r| row_task(r).is_some_and(|(t, _, _)| t.id == dragged_id))?;
+    let (dragged_task, dragged_depth, _) = row_task(&rows[dragged_idx])?;
+    let (group_start, group_end, group_drop) = group_bounds(rows, hovered_idx);
+    let (_, dragged_group_end, _) = group_bounds(rows, dragged_idx);
+    let dragged_subtree_end = visible_subtree_end(rows, dragged_idx, dragged_depth, dragged_group_end);
+
+    // Reject dropping a task onto one of its own visible descendants.
+    if hovered_idx > dragged_idx && hovered_idx < dragged_subtree_end {
+        return None;
+    }
+
+    let same_group = dragged_idx >= group_start && dragged_idx < group_end;
+    let in_dragged = |i: usize| same_group && i >= dragged_idx && i < dragged_subtree_end;
+
+    let (prev_idx, next_idx) = if hovered_idx == dragged_idx {
+        let prev = (dragged_idx > group_start).then(|| dragged_idx - 1);
+        let next = (dragged_subtree_end < group_end).then_some(dragged_subtree_end);
+        (prev, next)
+    } else if !after {
+        let prev = (group_start..hovered_idx).rev().find(|&i| !in_dragged(i));
+        (prev, Some(hovered_idx))
+    } else {
+        let next = (hovered_idx + 1..group_end).find(|&i| !in_dragged(i));
+        (Some(hovered_idx), next)
+    };
+
+    let dragged_is_note = dragged_task.kind == Kind::Note;
+    let target_is_notes = matches!(group_drop, Some(DropTarget::Kind(Kind::Note)));
+    // Notes cannot be nested or hold subtasks, nor be dropped inside an expanded subtask block.
+    let can_nest = allow_nesting && !dragged_is_note && !target_is_notes;
+
+    let min_level = if allow_nesting {
+        next_idx.and_then(|i| row_task(&rows[i]).map(|(_, d, _)| d)).unwrap_or(0)
+    } else {
+        0
+    };
+    let max_level = if !can_nest {
+        0
+    } else if let Some(p) = prev_idx {
+        let (prev_task, prev_depth, _) = row_task(&rows[p])?;
+        if prev_task.kind == Kind::Note {
+            0
+        } else {
+            (prev_depth + 1).min(fern_core::MAX_SUBTASK_DEPTH)
+        }
+    } else {
+        0
+    };
+    if min_level > max_level {
+        return None;
+    }
+
+    let target_level = if min_level == max_level {
+        min_level
+    } else {
+        let base_level = if hovered_idx == dragged_idx {
+            dragged_depth
+        } else {
+            prev_idx.and_then(|p| row_task(&rows[p]).map(|(_, d, _)| d)).unwrap_or(0)
+        }
+        .clamp(min_level, max_level);
+
+        const STEP_THRESHOLD: f32 = 18.0;
+        let step_indent = indent.max(1.0);
+        let delta: isize = if dx >= STEP_THRESHOLD {
+            ((dx - STEP_THRESHOLD) / step_indent).floor() as isize + 1
+        } else if dx <= -STEP_THRESHOLD {
+            -(((dx.abs() - STEP_THRESHOLD) / step_indent).floor() as isize + 1)
+        } else {
+            0
+        };
+        let mut desired = (base_level as isize + delta).clamp(min_level as isize, max_level as isize) as usize;
+        // Ergonomic aid when dragging from near the left margin: moving into the root gutter
+        // area snaps cleanly down toward `min_level` even on shorter leftward drags.
+        if dx < -4.0 && rel_x < gutter + (desired as f32) * step_indent - 4.0 {
+            let abs_level = ((rel_x - gutter).max(0.0) / step_indent).floor() as usize;
+            desired = desired.min(abs_level.clamp(min_level, max_level));
+        }
+        desired
+    };
+
+    let new_parent = if target_level == 0 {
+        None
+    } else {
+        let p = prev_idx?;
+        let parent_idx = (group_start..=p)
+            .rev()
+            .filter(|&i| !in_dragged(i))
+            .find(|&i| row_task(&rows[i]).is_some_and(|(_, d, _)| d == target_level - 1))?;
+        let (parent_task, _, _) = row_task(&rows[parent_idx])?;
+        if parent_task.kind == Kind::Note {
+            return None;
+        }
+        Some(parent_task.id)
+    };
+
+    // Suppress no-op drops that leave the task in its exact current slot and parent.
+    let current_prev = (same_group && dragged_idx > group_start).then(|| dragged_idx - 1);
+    let current_next = (same_group && dragged_subtree_end < group_end).then_some(dragged_subtree_end);
+    if same_group && new_parent == dragged_task.parent_id && prev_idx == current_prev && next_idx == current_next {
+        return None;
+    }
+
+    let expand_parent = prev_idx.and_then(|p| {
+        let (prev_task, _, collapsed) = row_task(&rows[p])?;
+        (new_parent == Some(prev_task.id) && collapsed).then_some(prev_task.id)
+    });
+
+    // Order target relative to siblings under `new_parent`:
+    // 1) If `next` is a sibling at `target_level`, place immediately before `next`.
+    // 2) Else if nesting directly under `prev`, place immediately after `prev`.
+    // 3) Else place immediately after the nearest preceding sibling at `target_level`.
+    let order_target = if let Some(n) = next_idx
+        && let Some((next_task, next_depth, _)) = row_task(&rows[n])
+        && next_depth == target_level
+    {
+        Some((next_task.id, false))
+    } else if let Some(p) = prev_idx {
+        let (prev_task, prev_depth, _) = row_task(&rows[p])?;
+        if prev_depth < target_level {
+            Some((prev_task.id, true))
+        } else {
+            let anchor_idx = (group_start..=p)
+                .rev()
+                .filter(|&i| !in_dragged(i))
+                .find(|&i| row_task(&rows[i]).is_some_and(|(_, d, _)| d == target_level))?;
+            Some((row_task(&rows[anchor_idx])?.0.id, true))
+        }
+    } else {
+        None
+    };
+
+    let (target_id, indicator_after) = if hovered_idx == dragged_idx {
+        if target_level < dragged_depth {
+            let last_in_sub = row_task(&rows[dragged_subtree_end - 1])?.0.id;
+            (last_in_sub, true)
+        } else {
+            (dragged_id, false)
+        }
+    } else {
+        (hovered_id, after)
+    };
+
+    Some(TaskDropPlan {
+        target_id,
+        after: indicator_after,
+        target_level,
+        new_parent,
+        order_target,
+        expand_parent,
+        group_drop,
+    })
+}
+
+/// Plans dropping a dragged task into empty space below the last task in the list:
+/// places it as a top-level root task at the end of the last visible group.
+pub fn plan_task_drop_at_end(rows: &[Row], dragged_id: Id) -> Option<TaskDropPlan> {
+    let last_idx = rows.iter().rposition(|r| matches!(r, Row::Task { .. }))?;
+    let dragged_idx = rows.iter().position(|r| row_task(r).is_some_and(|(t, _, _)| t.id == dragged_id))?;
+    let (dragged_task, dragged_depth, _) = row_task(&rows[dragged_idx])?;
+    let (group_start, group_end, group_drop) = group_bounds(rows, last_idx);
+    let (_, dragged_group_end, _) = group_bounds(rows, dragged_idx);
+    let dragged_subtree_end = visible_subtree_end(rows, dragged_idx, dragged_depth, dragged_group_end);
+
+    let same_group = dragged_idx >= group_start && dragged_idx < group_end;
+    if same_group && dragged_task.parent_id.is_none() && dragged_subtree_end == group_end {
+        return None;
+    }
+
+    let in_dragged = |i: usize| same_group && i >= dragged_idx && i < dragged_subtree_end;
+    let last_root = (group_start..group_end)
+        .rev()
+        .filter(|&i| !in_dragged(i))
+        .find(|&i| row_task(&rows[i]).is_some_and(|(_, d, _)| d == 0))
+        .and_then(|i| row_task(&rows[i]).map(|(t, _, _)| t.id));
+
+    let (last_task, _, _) = row_task(&rows[last_idx])?;
+    Some(TaskDropPlan {
+        target_id: last_task.id,
+        after: true,
+        target_level: 0,
+        new_parent: None,
+        order_target: last_root.map(|id| (id, true)),
+        expand_parent: None,
+        group_drop,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -994,5 +1262,132 @@ mod tests {
         assert_eq!(label(d(2026, 10, 24)), "Сб");
         assert_eq!(label(d(2026, 11, 13)), "13 ноя");
         assert_eq!(label(d(2027, 1, 5)), "5 янв 2027");
+    }
+
+    #[test]
+    fn plan_task_drop_unnests_in_two_task_list_by_all_gestures() {
+        let parent = task("parent");
+        let mut child = task("child");
+        child.parent_id = Some(parent.id);
+        let rows = build_rows(&[parent.clone(), child.clone()], &HashSet::new(), &HashSet::new(), true);
+
+        // 1) Drag child left on its own row -> top-level right after parent.
+        let plan = plan_task_drop(&rows, child.id, child.id, false, -24.0, 60.0, 24.0, 20.0, true).unwrap();
+        assert_eq!(plan.target_level, 0);
+        assert_eq!(plan.new_parent, None);
+        assert_eq!(plan.order_target, Some((parent.id, true)));
+        assert_eq!(plan.target_id, child.id);
+        assert!(plan.after);
+
+        // 2) Drag child slightly left near the left gutter -> snaps to root.
+        let plan = plan_task_drop(&rows, child.id, child.id, false, -8.0, 30.0, 24.0, 20.0, true).unwrap();
+        assert_eq!(plan.target_level, 0);
+        assert_eq!(plan.new_parent, None);
+
+        // 3) Drag child above parent -> top-level right before parent regardless of X.
+        let plan = plan_task_drop(&rows, child.id, parent.id, false, 0.0, 120.0, 24.0, 20.0, true).unwrap();
+        assert_eq!(plan.target_level, 0);
+        assert_eq!(plan.new_parent, None);
+        assert_eq!(plan.order_target, Some((parent.id, false)));
+        assert_eq!(plan.target_id, parent.id);
+        assert!(!plan.after);
+
+        // 4) Drag child onto parent's bottom half without moving right -> top-level right after parent.
+        let plan = plan_task_drop(&rows, child.id, parent.id, true, 0.0, 120.0, 24.0, 20.0, true).unwrap();
+        assert_eq!(plan.target_level, 0);
+        assert_eq!(plan.new_parent, None);
+        assert_eq!(plan.order_target, Some((parent.id, true)));
+
+        // 5) Drag child into empty space below the list -> top-level right after parent.
+        let plan = plan_task_drop_at_end(&rows, child.id).unwrap();
+        assert_eq!(plan.target_level, 0);
+        assert_eq!(plan.new_parent, None);
+        assert_eq!(plan.order_target, Some((parent.id, true)));
+
+        // Staying put on own row with no horizontal movement is a no-op.
+        assert!(plan_task_drop(&rows, child.id, child.id, false, 0.0, 120.0, 24.0, 20.0, true).is_none());
+    }
+
+    #[test]
+    fn plan_task_drop_nests_outdents_multi_level_and_guards_cycles_and_notes() {
+        let a = task("a");
+        let mut b = task("b");
+        b.parent_id = Some(a.id);
+        let mut c = task("c");
+        c.parent_id = Some(b.id);
+        let solo = task("solo");
+        let rows = build_rows(&[a.clone(), b.clone(), c.clone(), solo.clone()], &HashSet::new(), &HashSet::new(), true);
+
+        // Cannot drop parent onto its own descendant.
+        assert!(plan_task_drop(&rows, a.id, b.id, true, 0.0, 100.0, 24.0, 20.0, true).is_none());
+        assert!(plan_task_drop(&rows, a.id, c.id, false, 0.0, 100.0, 24.0, 20.0, true).is_none());
+
+        // Drag solo right onto its own row after c (depth 2) -> nests under c (depth 3)?
+        // Wait: solo is depth 0; prev is c (depth 2), so on solo's own row base_level = 0, dx = +24 -> depth 1 (under a!).
+        let plan = plan_task_drop(&rows, solo.id, solo.id, false, 24.0, 120.0, 24.0, 20.0, true).unwrap();
+        assert_eq!(plan.target_level, 1);
+        assert_eq!(plan.new_parent, Some(a.id));
+        assert_eq!(plan.order_target, Some((b.id, true)));
+
+        // Drag solo onto bottom half of c with dx = +24 -> nests under c (depth 3).
+        let plan = plan_task_drop(&rows, solo.id, c.id, true, 24.0, 140.0, 24.0, 20.0, true).unwrap();
+        assert_eq!(plan.target_level, 3);
+        assert_eq!(plan.new_parent, Some(c.id));
+
+        // Drag solo onto bottom half of a (expanded, next is b at depth 1) -> forced to depth 1 before b.
+        let plan = plan_task_drop(&rows, solo.id, a.id, true, 0.0, 100.0, 24.0, 20.0, true).unwrap();
+        assert_eq!(plan.target_level, 1);
+        assert_eq!(plan.new_parent, Some(a.id));
+        assert_eq!(plan.order_target, Some((b.id, false)));
+
+        // Drag c left by 1 step on own row -> becomes sibling of b under a, right after b.
+        let plan = plan_task_drop(&rows, c.id, c.id, false, -24.0, 100.0, 24.0, 20.0, true).unwrap();
+        assert_eq!(plan.target_level, 1);
+        assert_eq!(plan.new_parent, Some(a.id));
+        assert_eq!(plan.order_target, Some((b.id, true)));
+
+        // Drag c left by 2 steps on own row -> becomes root right before solo.
+        let plan = plan_task_drop(&rows, c.id, c.id, false, -48.0, 40.0, 24.0, 20.0, true).unwrap();
+        assert_eq!(plan.target_level, 0);
+        assert_eq!(plan.new_parent, None);
+        assert_eq!(plan.order_target, Some((solo.id, false)));
+
+        // Dragging onto a collapsed parent requests auto-expanding it.
+        let collapsed_rows = build_rows(&[a.clone(), b.clone(), solo.clone()], &HashSet::from([a.id]), &HashSet::new(), true);
+        let plan = plan_task_drop(&collapsed_rows, solo.id, a.id, true, 24.0, 120.0, 24.0, 20.0, true).unwrap();
+        assert_eq!(plan.new_parent, Some(a.id));
+        assert_eq!(plan.expand_parent, Some(a.id));
+
+        // Notes cannot nest or be dropped inside an expanded subtask tree.
+        let mut note = task("note");
+        note.kind = Kind::Note;
+        let note_rows = build_rows(&[a.clone(), b, note.clone()], &HashSet::new(), &HashSet::new(), false);
+        assert!(plan_task_drop(&note_rows, note.id, a.id, true, 24.0, 120.0, 24.0, 20.0, true).is_none());
+        let plan = plan_task_drop(&note_rows, a.id, note.id, true, 24.0, 120.0, 24.0, 20.0, true).unwrap();
+        assert_eq!(plan.target_level, 0);
+        assert_eq!(plan.new_parent, None);
+    }
+
+    #[test]
+    fn plan_task_drop_respects_max_subtask_depth() {
+        let mut chain: Vec<Task> = Vec::new();
+        for i in 0..=fern_core::MAX_SUBTASK_DEPTH {
+            let mut t = task(&format!("L{i}"));
+            if let Some(prev) = chain.last() {
+                t.parent_id = Some(prev.id);
+            }
+            chain.push(t);
+        }
+        let extra = task("extra");
+        let mut all = chain.clone();
+        all.push(extra.clone());
+        let rows = build_rows(&all, &HashSet::new(), &HashSet::new(), true);
+        let deepest = chain.last().unwrap();
+        let parent_of_deepest = &chain[fern_core::MAX_SUBTASK_DEPTH - 1];
+
+        // Even dragging right under a depth-4 task caps at MAX_SUBTASK_DEPTH (4), sibling of deepest.
+        let plan = plan_task_drop(&rows, extra.id, deepest.id, true, 48.0, 220.0, 24.0, 20.0, true).unwrap();
+        assert_eq!(plan.target_level, fern_core::MAX_SUBTASK_DEPTH);
+        assert_eq!(plan.new_parent, Some(parent_of_deepest.id));
     }
 }

@@ -650,9 +650,56 @@ impl TaskDetail {
         self.session.parent = parent_id.and_then(|id| self.session.store.task(id).ok().flatten());
     }
 
+    fn task_depth(&self) -> usize {
+        self.task_id()
+            .and_then(|id| self.session.store.task_depth(id).ok())
+            .unwrap_or(0)
+    }
+
+    fn can_add_subtask(&self) -> bool {
+        self.session
+            .task
+            .as_ref()
+            .is_some_and(|task| task.kind != Kind::Note && !task.is_deleted() && self.task_depth() < fern_core::MAX_SUBTASK_DEPTH)
+    }
+
+    fn can_link_parent(&self) -> bool {
+        self.session
+            .task
+            .as_ref()
+            .is_some_and(|task| task.kind != Kind::Note && !task.is_deleted())
+    }
+
+    fn reload_current_task(&mut self) {
+        if let Some(id) = self.task_id()
+            && let Ok(Some(fresh)) = self.session.store.task(id)
+        {
+            self.session.task = Some(fresh);
+        }
+        self.sync_subtasks();
+    }
+
+    fn unlink_current_parent(&mut self, cx: &mut Context<Self>) {
+        self.save(cx, |store, id| store.unlink_parent(id));
+        self.reload_current_task();
+        cx.notify();
+    }
+
+    fn link_current_parent(&mut self, parent: Id, cx: &mut Context<Self>) {
+        self.save(cx, |store, id| store.link_parent(id, parent));
+        self.reload_current_task();
+        cx.notify();
+    }
+
+    fn unlink_subtask(&mut self, subtask_id: Id, cx: &mut Context<Self>) {
+        self.save(cx, |store, _| store.unlink_parent(subtask_id));
+        self.sync_subtasks();
+        cx.notify();
+    }
+
     fn toggle_subtask(&mut self, id: Id, completed: bool, cx: &mut Context<Self>) {
         self.save(cx, |store, _| store.set_completed(id, completed));
-        self.sync_subtasks();
+        self.reload_current_task();
         cx.notify();
     }
 
@@ -814,13 +861,13 @@ impl TaskDetail {
             return;
         }
         match what {
-            "subtask" => {
+            "subtask" if self.can_add_subtask() => {
                 self.subtask_open = true;
                 window.focus(&self.subtask_input.focus_handle(cx), cx);
             }
             "due" => self.open_popup_from_ui(Popup::Due, window, cx),
             "tags" => self.open_tags(Popup::Tags, window, cx),
-            "link-parent" => {
+            "link-parent" if self.can_link_parent() => {
                 self.open_popup_from_ui(Popup::LinkParent, window, cx);
                 window.focus(&self.link_search.focus_handle(cx), cx);
             }
@@ -1240,19 +1287,31 @@ impl TaskDetail {
                         }
                     })))
             })
-            .child(self.close_side_menu_on_hover(item("more-subtask", IconName::CornerDownRight, strings.add_subtask_item).on_click(cx.listener(
-                |this, _, window, cx| {
-                    this.close_popup(cx);
-                    this.subtask_open = true;
-                    window.focus(&this.subtask_input.focus_handle(cx), cx);
-                },
-            )), cx))
-            .child(self.close_side_menu_on_hover(item("more-link-parent", IconName::CornerDownRight, strings.link_parent).on_click(cx.listener(
-                |this, _, window, cx| {
-                    this.open_popup_from_ui(Popup::LinkParent, window, cx);
-                    window.focus(&this.link_search.focus_handle(cx), cx);
-                },
-            )), cx))
+            .when(self.can_add_subtask(), |el| {
+                el.child(self.close_side_menu_on_hover(item("more-subtask", IconName::CornerDownRight, strings.add_subtask_item).on_click(cx.listener(
+                    |this, _, window, cx| {
+                        this.close_popup(cx);
+                        this.subtask_open = true;
+                        window.focus(&this.subtask_input.focus_handle(cx), cx);
+                    },
+                )), cx))
+            })
+            .when(!is_note, |el| {
+                el.child(self.close_side_menu_on_hover(item("more-link-parent", IconName::ListTree, strings.link_parent).on_click(cx.listener(
+                    |this, _, window, cx| {
+                        this.open_popup_from_ui(Popup::LinkParent, window, cx);
+                        window.focus(&this.link_search.focus_handle(cx), cx);
+                    },
+                )), cx))
+            })
+            .when(!is_note && task.parent_id.is_some(), |el| {
+                el.child(self.close_side_menu_on_hover(item("more-unlink-parent", IconName::X, strings.unlink_parent).on_click(cx.listener(
+                    |this, _, _, cx| {
+                        this.close_popup(cx);
+                        this.unlink_current_parent(cx);
+                    },
+                )), cx))
+            })
             .child(self.close_side_menu_on_hover({
                 let pinned = task.pinned_at.is_some();
                 item("more-pin", if pinned { IconName::PinOff } else { IconName::Pin }, if pinned { strings.unpin } else { strings.pin })
@@ -1322,15 +1381,17 @@ impl TaskDetail {
                     cx.write_to_clipboard(gpui::ClipboardItem::new_string(fern_core::link::task_link(task.id)));
                 }
             })), cx))
-            .child(self.close_side_menu_on_hover(
-                item(
-                    "more-convert",
-                    if is_note { IconName::SquareCheck } else { IconName::FileText },
-                    if is_note { strings.convert_to_task } else { strings.convert_to_note },
-                )
-                .on_click(cx.listener(|this, _, _, cx| this.toggle_kind(cx))),
-            cx,
-            ))
+            .when(is_note || (task.parent_id.is_none() && self.session.subtasks.is_empty()), |el| {
+                el.child(self.close_side_menu_on_hover(
+                    item(
+                        "more-convert",
+                        if is_note { IconName::SquareCheck } else { IconName::FileText },
+                        if is_note { strings.convert_to_task } else { strings.convert_to_note },
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_kind(cx))),
+                cx,
+                ))
+            })
             .child(div().py_1().child(Divider::horizontal()))
             .child(self.close_side_menu_on_hover(item("more-print", IconName::Printer, strings.print).on_click(cx.listener(|this, _, _, cx| {
                 this.close_popup(cx);
@@ -1503,15 +1564,40 @@ impl TaskDetail {
         let query = self.link_search.read(cx).text().trim().to_lowercase();
         let excluded: std::collections::HashSet<Id> =
             self.session.store.descendants(task.id).unwrap_or_default().into_iter().chain([task.id]).collect();
-        let candidates: Vec<Task> = self.session
-            .store
-            .tasks()
-            .unwrap_or_default()
+        let all_tasks = self.session.store.tasks().unwrap_or_default();
+        let parent_map: std::collections::HashMap<Id, Option<Id>> =
+            all_tasks.iter().map(|t| (t.id, t.parent_id)).collect();
+        let depth_of = |id: Id| -> usize {
+            let mut depth = 0;
+            let mut cur = id;
+            while let Some(Some(p)) = parent_map.get(&cur) {
+                depth += 1;
+                cur = *p;
+                if depth > fern_core::MAX_SUBTASK_DEPTH {
+                    break;
+                }
+            }
+            depth
+        };
+        let list_name = |list_id: Option<Id>| -> SharedString {
+            list_id
+                .and_then(|id| self.session.lists.iter().find(|l| l.id == id))
+                .map_or(strings.inbox.into(), |l| l.name.clone().into())
+        };
+        let candidates: Vec<Task> = all_tasks
             .into_iter()
-            .filter(|t| !t.is_closed() && !t.is_deleted() && !excluded.contains(&t.id) && task.parent_id != Some(t.id))
+            .filter(|t| {
+                !t.is_closed()
+                    && !t.is_deleted()
+                    && t.kind != Kind::Note
+                    && !excluded.contains(&t.id)
+                    && task.parent_id != Some(t.id)
+                    && depth_of(t.id) < fern_core::MAX_SUBTASK_DEPTH
+            })
             .filter(|t| query.is_empty() || t.title.to_lowercase().contains(&query))
             .take(30)
             .collect();
+        let linked_parent = query.is_empty().then(|| self.session.parent.clone()).flatten();
         popover(cx)
             .w(px(340.))
             .on_mouse_down_out(cx.listener(|this, _, window, cx| {
@@ -1527,19 +1613,68 @@ impl TaskDetail {
                     .child(Icon::new(IconName::Search).color(Color::Muted))
                     .child(div().flex_1().child(self.link_search.clone())),
             )
+            .when_some(linked_parent, |el, parent| {
+                let parent_title: SharedString = if parent.title.is_empty() {
+                    strings.untitled.into()
+                } else {
+                    parent.title.clone().into()
+                };
+                let parent_list = list_name(parent.list_id);
+                el.child(
+                    v_flex()
+                        .pt_1()
+                        .child(
+                            div()
+                                .px_2()
+                                .py_1()
+                                .child(Label::new(strings.linked_parent).size(LabelSize::XSmall).color(Color::Muted)),
+                        )
+                        .child(
+                            h_flex()
+                                .id("link-parent-current")
+                                .h(px(32.))
+                                .px_2()
+                                .gap_2()
+                                .items_center()
+                                .child(Icon::new(IconName::Circle).size(IconSize::Small).color(Color::Accent))
+                                .child(div().flex_1().min_w_0().child(Label::new(parent_title).truncate()))
+                                .child(Label::new(parent_list).size(LabelSize::XSmall).color(Color::Muted))
+                                .child(
+                                    div()
+                                        .debug_selector(|| "link-parent-unlink".to_owned())
+                                        .child(
+                                            IconButton::new("link-parent-unlink-btn", IconName::X)
+                                                .size(px(24.))
+                                                .icon_size(IconSize::XSmall)
+                                                .icon_color(Color::Muted)
+                                                .tooltip(Tooltip::text(strings.unlink_parent))
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    cx.stop_propagation();
+                                                    this.dismiss_popup(window, cx);
+                                                    this.unlink_current_parent(cx);
+                                                })),
+                                        ),
+                                ),
+                        )
+                        .child(div().my_1().child(Divider::horizontal()))
+                        .child(
+                            div()
+                                .px_2()
+                                .pb_1()
+                                .child(Label::new(strings.link_other_parent).size(LabelSize::XSmall).color(Color::Muted)),
+                        ),
+                )
+            })
             .child(v_flex().id("link-parent-list").max_h(px(320.)).overflow_y_scroll().children(candidates.into_iter().map(|candidate| {
                 let parent = candidate.id;
-                let list: SharedString = candidate
-                    .list_id
-                    .and_then(|id| self.session.lists.iter().find(|l| l.id == id))
-                    .map_or(strings.inbox.into(), |l| l.name.clone().into());
+                let list = list_name(candidate.list_id);
                 ListItem::new(SharedString::from(format!("link-{parent}")))
                     .start_slot(Icon::new(IconName::Circle).size(IconSize::Small).color(Color::Muted))
                     .child(Label::new(candidate.title).truncate())
                     .end_slot(Label::new(list).size(LabelSize::XSmall).color(Color::Muted))
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.dismiss_popup(window, cx);
-                        this.save(cx, |store, id| store.link_parent(id, parent));
+                        this.link_current_parent(parent, cx);
                     }))
             })))
             .into_any_element()
@@ -1629,42 +1764,73 @@ impl TaskDetail {
     }
 
     fn render_subtasks(&self, strings: &'static Strings, cx: &mut Context<Self>) -> impl IntoElement {
+        let can_add = self.can_add_subtask();
+        let can_edit = self.session.task.as_ref().is_some_and(|t| !t.is_deleted());
         v_flex()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .children(self.session.subtasks.iter().map(|subtask| {
                 let id = subtask.id;
                 let done = subtask.is_completed();
-                ListItem::new(SharedString::from(format!("subtask-{id}")))
-                    .height(px(30.))
-                    .start_slot(
-                        Checkbox::new("subtask-checkbox")
-                            .size(px(14.))
-                            .toggle_state(done)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.toggle_subtask(id, !done, cx);
-                            })),
-                    )
-                    .child(
-                        Label::new(if subtask.title.is_empty() {
-                            SharedString::new_static(strings.untitled)
-                        } else {
-                            subtask.title.clone().into()
-                        })
-                        .color(if done { Color::Muted } else { Color::Default })
-                        .truncate(),
-                    )
-                    .end_slot(Icon::new(IconName::ChevronRight).size(IconSize::XSmall))
-                    .on_click(cx.listener(move |_, _, _, cx| cx.emit(OpenTask(id))))
+                let group_name = SharedString::from(format!("subtask-row-{id}"));
+                div().group(group_name.clone()).child(
+                    ListItem::new(SharedString::from(format!("subtask-{id}")))
+                        .height(px(30.))
+                        .start_slot(
+                            Checkbox::new("subtask-checkbox")
+                                .size(px(14.))
+                                .toggle_state(done)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.toggle_subtask(id, !done, cx);
+                                })),
+                        )
+                        .child(
+                            Label::new(if subtask.title.is_empty() {
+                                SharedString::new_static(strings.untitled)
+                            } else {
+                                subtask.title.clone().into()
+                            })
+                            .color(if done { Color::Muted } else { Color::Default })
+                            .truncate(),
+                        )
+                        .end_slot(
+                            h_flex()
+                                .gap_1()
+                                .items_center()
+                                .when(can_edit, |el| {
+                                    el.child(
+                                        div()
+                                            .debug_selector(move || format!("subtask-unlink-{id}"))
+                                            .opacity(if crate::touch::active() { 1. } else { 0. })
+                                            .group_hover(group_name.clone(), |s| s.opacity(1.))
+                                            .child(
+                                                IconButton::new(SharedString::from(format!("subtask-unlink-btn-{id}")), IconName::X)
+                                                    .size(px(22.))
+                                                    .icon_size(IconSize::XSmall)
+                                                    .icon_color(Color::Muted)
+                                                    .tooltip(Tooltip::text(strings.unlink_parent))
+                                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                                        cx.stop_propagation();
+                                                        this.unlink_subtask(id, cx);
+                                                    })),
+                                            ),
+                                    )
+                                })
+                                .child(Icon::new(IconName::ChevronRight).size(IconSize::XSmall)),
+                        )
+                        .on_click(cx.listener(move |_, _, _, cx| cx.emit(OpenTask(id)))),
+                )
             }))
-            .child(
-                h_flex()
-                    .min_h(px(30.))
-                    .px_2()
-                    .gap_2()
-                    .child(Icon::new(IconName::Plus).size(IconSize::Small))
-                    .child(div().flex_1().child(self.subtask_input.clone())),
-            )
+            .when(can_add, |el| {
+                el.child(
+                    h_flex()
+                        .min_h(px(30.))
+                        .px_2()
+                        .gap_2()
+                        .child(Icon::new(IconName::Plus).size(IconSize::Small))
+                        .child(div().flex_1().child(self.subtask_input.clone())),
+                )
+            })
     }
 
     /// The Duration tab: start and end with day and time, "All Day", and a calendar or time list
@@ -3108,20 +3274,70 @@ impl Render for TaskDetail {
                     .on_mouse_down(MouseButton::Left, move |_, window, cx| {
                         window.focus(&notes_focus, cx);
                     })
-                    // A subtask names its parent over the title, as the original; a click opens it.
+                    // A subtask names its parent over the title, as the original; a click opens it,
+                    // and hovering exposes Edit and Unlink Parent Task buttons.
                     .when_some(self.session.parent.as_ref(), |el, parent| {
-                        let id = parent.id;
+                        let parent_id = parent.id;
+                        let parent_title: SharedString = if parent.title.is_empty() {
+                            strings.untitled.into()
+                        } else {
+                            parent.title.clone().into()
+                        };
                         el.child(
                             h_flex()
                                 .id("detail-parent")
+                                .group("detail-parent-row")
                                 .mb(px(-6.))
                                 .gap_1()
                                 .min_w_0()
-                                .cursor_pointer()
+                                .items_center()
                                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                                .on_click(cx.listener(move |_, _, _, cx| cx.emit(OpenTask(id))))
-                                .child(Label::new(if parent.title.is_empty() { strings.untitled.into() } else { SharedString::from(parent.title.clone()) }).color(Color::Muted).truncate())
-                                .child(Icon::new(IconName::ChevronRight).size(IconSize::Small).color(Color::Muted)),
+                                .child(
+                                    h_flex()
+                                        .id("detail-parent-open")
+                                        .min_w_0()
+                                        .gap_1()
+                                        .cursor_pointer()
+                                        .on_click(cx.listener(move |_, _, _, cx| cx.emit(OpenTask(parent_id))))
+                                        .child(Label::new(parent_title).color(Color::Muted).truncate())
+                                        .child(Icon::new(IconName::ChevronRight).size(IconSize::Small).color(Color::Muted)),
+                                )
+                                .when(!task.is_deleted() && !sticky, |el| {
+                                    el.child(
+                                        h_flex()
+                                            .flex_none()
+                                            .gap_0p5()
+                                            .opacity(if crate::touch::active() { 1. } else { 0. })
+                                            .group_hover("detail-parent-row", |s| s.opacity(1.))
+                                            .child(
+                                                IconButton::new("detail-edit-parent", IconName::Pencil)
+                                                    .size(px(22.))
+                                                    .icon_size(IconSize::XSmall)
+                                                    .icon_color(Color::Muted)
+                                                    .tooltip(Tooltip::text(strings.link_parent))
+                                                    .on_click(cx.listener(|this, _, window, cx| {
+                                                        cx.stop_propagation();
+                                                        this.open_popup_from_ui(Popup::LinkParent, window, cx);
+                                                        window.focus(&this.link_search.focus_handle(cx), cx);
+                                                    })),
+                                            )
+                                            .child(
+                                                div()
+                                                    .debug_selector(|| "detail-unlink-parent".to_owned())
+                                                    .child(
+                                                        IconButton::new("detail-unlink-parent-btn", IconName::X)
+                                                            .size(px(22.))
+                                                            .icon_size(IconSize::XSmall)
+                                                            .icon_color(Color::Muted)
+                                                            .tooltip(Tooltip::text(strings.unlink_parent))
+                                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                                cx.stop_propagation();
+                                                                this.unlink_current_parent(cx);
+                                                            })),
+                                                    ),
+                                            ),
+                                    )
+                                }),
                         )
                     })
                     .child(

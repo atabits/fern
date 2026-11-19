@@ -30,6 +30,8 @@
       "tab 1": "task_list::SetToday",
       "tab 2": "task_list::SetTomorrow",
       "tab 3": "task_list::SetNextWeek",
+      "tab e": "task_list::ToggleAllSubtasks",
+      "shift-enter": "task_list::AddSubtask",
       "alt-0": "task_list::PriorityNone",
       "alt-1": "task_list::PriorityLow",
       "alt-2": "task_list::PriorityMedium",

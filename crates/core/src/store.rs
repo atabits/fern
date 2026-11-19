@@ -14,6 +14,9 @@ use crate::habit::{Checkin, Goal, Habit};
 use crate::model::{Attachment, ChecklistItem, Id, Kind, List, ListDraft, ListFolder, Priority, Tag, Task, TaskDraft, View, ViewCounts};
 use crate::recurrence::Recurrence;
 
+/// Maximum nesting depth for subtasks (`0..=4`, i.e. 5 levels total).
+pub const MAX_SUBTASK_DEPTH: usize = 4;
+
 const MIGRATIONS: &[&str] = &[
     "
     CREATE TABLE tasks (
@@ -1321,16 +1324,28 @@ impl Store {
         Ok(subtasks)
     }
 
-    /// Creates a subtask in the parent's list.
+    /// Creates a subtask in the parent's list and section.
     pub fn add_subtask(&self, parent: Id, title: &str) -> Result<Task> {
-        let list = self.task(parent)?.ok_or_else(|| anyhow::anyhow!("parent task not found"))?.list_id;
+        let parent_task = self.task(parent)?.ok_or_else(|| anyhow::anyhow!("parent task not found"))?;
+        anyhow::ensure!(parent_task.kind != Kind::Note, "notes cannot have subtasks");
+        anyhow::ensure!(self.task_depth(parent)? < MAX_SUBTASK_DEPTH, "maximum subtask nesting depth reached");
+        let list = parent_task.list_id;
+        let section = parent_task.section_id;
         let mut task = self.add_task(title)?;
-        self.set_parent(task.id, Some(parent))?;
-        if list.is_some() {
-            self.set_list(task.id, list)?;
-        }
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "UPDATE tasks SET parent_id = ?2, list_id = ?3, section_id = ?4 WHERE id = ?1",
+            params![
+                task.id.to_string(),
+                parent.to_string(),
+                list.map(|l| l.to_string()),
+                section.map(|s| s.to_string()),
+            ],
+        )?;
+        tx.commit()?;
         task.parent_id = Some(parent);
         task.list_id = list;
+        task.section_id = section;
         Ok(task)
     }
 
@@ -1341,6 +1356,13 @@ impl Store {
     /// Completes or reopens a task. Completing a repeating task keeps a completed copy and moves
     /// the task to its next date; the copy is returned so that it can be undone.
     pub fn complete(&self, id: Id, completed: bool) -> Result<Option<Id>> {
+        self.complete_with_cascaded(id, completed).map(|(copy, _)| copy)
+    }
+
+    /// Completes or reopens a task, cascading completion to open descendants and reopening closed
+    /// ancestors when a subtask is reopened. Returns the repeating copy (if
+    /// any) and the list of descendants newly completed alongside `id`.
+    pub fn complete_with_cascaded(&self, id: Id, completed: bool) -> Result<(Option<Id>, Vec<Id>)> {
         if completed
             && let Some(task) = self.task(id)?
             && let (Some(repeat), Some(due)) = (task.repeat.clone(), task.due_date)
@@ -1390,9 +1412,56 @@ impl Store {
                 [id.to_string()],
             )?;
             tx.commit()?;
-            return Ok(Some(copy));
+            return Ok((Some(copy), Vec::new()));
         }
-        self.update(id, "completed_at", completed.then(now_ms)).map(|_| None)
+        if completed {
+            let now = now_ms();
+            let open_descendants: Vec<Id> = self
+                .descendants(id)?
+                .into_iter()
+                .filter(|&sub| {
+                    self.task(sub)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|t| !t.is_deleted() && !t.is_closed())
+                })
+                .collect();
+            let tx = self.conn.unchecked_transaction()?;
+            tx.execute("UPDATE tasks SET completed_at = ?2 WHERE id = ?1", params![id.to_string(), now])?;
+            for &sub in &open_descendants {
+                tx.execute("UPDATE tasks SET completed_at = ?2 WHERE id = ?1", params![sub.to_string(), now])?;
+            }
+            tx.commit()?;
+            Ok((None, open_descendants))
+        } else {
+            let closed_ancestors: Vec<Id> = self
+                .ancestors(id)?
+                .into_iter()
+                .filter(|&anc| {
+                    self.task(anc)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|t| !t.is_deleted() && t.is_closed())
+                })
+                .collect();
+            let tx = self.conn.unchecked_transaction()?;
+            tx.execute("UPDATE tasks SET completed_at = NULL, wont_do_at = NULL WHERE id = ?1", [id.to_string()])?;
+            for anc in closed_ancestors {
+                tx.execute("UPDATE tasks SET completed_at = NULL, wont_do_at = NULL WHERE id = ?1", [anc.to_string()])?;
+            }
+            tx.commit()?;
+            Ok((None, Vec::new()))
+        }
+    }
+
+    /// Reopens an explicit set of tasks (used by Undo after a cascading completion).
+    pub fn reopen_tasks(&self, ids: &[Id]) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        for id in ids {
+            tx.execute("UPDATE tasks SET completed_at = NULL WHERE id = ?1", [id.to_string()])?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// Undoes completing a repeating task: removes the completed copy and puts the task back on
@@ -1430,9 +1499,46 @@ impl Store {
         self.update(id, "repeat", repeat.map(|r| r.to_string()))
     }
 
-    /// Marks a task "Won't Do" (it leaves the open views like a completed task), or reopens it.
+    /// Marks a task "Won't Do" (cascading to open descendants), or reopens it (and closed ancestors).
     pub fn set_wont_do(&self, id: Id, wont_do: bool) -> Result<()> {
-        self.update(id, "wont_do_at", wont_do.then(now_ms))
+        if wont_do {
+            let now = now_ms();
+            let open_descendants: Vec<Id> = self
+                .descendants(id)?
+                .into_iter()
+                .filter(|&sub| {
+                    self.task(sub)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|t| !t.is_deleted() && !t.is_closed())
+                })
+                .collect();
+            let tx = self.conn.unchecked_transaction()?;
+            tx.execute("UPDATE tasks SET wont_do_at = ?2 WHERE id = ?1", params![id.to_string(), now])?;
+            for sub in open_descendants {
+                tx.execute("UPDATE tasks SET wont_do_at = ?2 WHERE id = ?1", params![sub.to_string(), now])?;
+            }
+            tx.commit()?;
+            Ok(())
+        } else {
+            let closed_ancestors: Vec<Id> = self
+                .ancestors(id)?
+                .into_iter()
+                .filter(|&anc| {
+                    self.task(anc)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|t| !t.is_deleted() && t.is_closed())
+                })
+                .collect();
+            let tx = self.conn.unchecked_transaction()?;
+            tx.execute("UPDATE tasks SET wont_do_at = NULL, completed_at = NULL WHERE id = ?1", [id.to_string()])?;
+            for anc in closed_ancestors {
+                tx.execute("UPDATE tasks SET wont_do_at = NULL, completed_at = NULL WHERE id = ?1", [anc.to_string()])?;
+            }
+            tx.commit()?;
+            Ok(())
+        }
     }
 
     /// Copies a task with its tags and checklist (not its subtasks) right below the original.
@@ -1469,6 +1575,14 @@ impl Store {
     }
 
     pub fn set_kind(&self, id: Id, kind: Kind) -> Result<()> {
+        if kind == Kind::Note
+            && let Some(task) = self.task(id)?
+        {
+            anyhow::ensure!(
+                task.parent_id.is_none() && self.subtasks(id)?.is_empty(),
+                "nested tasks cannot be converted to notes"
+            );
+        }
         self.update(id, "kind", kind.as_str())
     }
 
@@ -1662,17 +1776,24 @@ impl Store {
 
     /// Puts a task (and its subtasks) into a section of its list, or out of any.
     pub fn set_section(&self, id: Id, section: Option<Id>) -> Result<()> {
+        let task = self.task(id)?.context("task not found")?;
         if let Some(section) = section {
             let list: Option<Option<String>> = self
                 .conn
                 .query_row("SELECT list_id FROM list_sections WHERE id = ?1", [section.to_string()], |row| row.get(0))
                 .optional()?;
-            let task_list = self.task(id)?.context("task not found")?.list_id.map(|l| l.to_string());
+            let task_list = task.list_id.map(|l| l.to_string());
             anyhow::ensure!(list == Some(task_list), "the section belongs to another list");
         }
-        let section = section.map(|s| s.to_string());
-        for task in std::iter::once(id).chain(self.descendants(id)?) {
-            self.conn.execute("UPDATE tasks SET section_id = ?2 WHERE id = ?1", params![task.to_string(), section])?;
+        let unlink = task.parent_id.is_some_and(|parent_id| {
+            self.task(parent_id).ok().flatten().is_none_or(|parent| parent.section_id != section)
+        });
+        let section_str = section.map(|s| s.to_string());
+        if unlink {
+            self.conn.execute("UPDATE tasks SET parent_id = NULL WHERE id = ?1", [id.to_string()])?;
+        }
+        for sub in std::iter::once(id).chain(self.descendants(id)?) {
+            self.conn.execute("UPDATE tasks SET section_id = ?2 WHERE id = ?1", params![sub.to_string(), section_str])?;
         }
         Ok(())
     }
@@ -1742,22 +1863,176 @@ impl Store {
         Ok(())
     }
 
-    /// Makes the task a subtask of `parent`, or a top-level task for `None`.
-    /// "Link Parent Task": makes a task a subtask of `parent`, moving it to the parent's list.
-    pub fn link_parent(&self, id: Id, parent: Id) -> Result<()> {
-        let list = self.task(parent)?.context("parent task not found")?.list_id;
-        self.set_parent(id, Some(parent))?;
-        self.set_list(id, list)
+    /// Ancestor IDs of `id`, from its immediate parent up to the root (cycle-safe).
+    pub fn ancestors(&self, id: Id) -> Result<Vec<Id>> {
+        let mut out = Vec::new();
+        let mut seen = HashSet::from([id]);
+        let mut current = id;
+        while let Some(parent_str) = self
+            .conn
+            .prepare_cached("SELECT parent_id FROM tasks WHERE id = ?1")?
+            .query_row([current.to_string()], |row| row.get::<_, Option<String>>(0))
+            .optional()?
+            .flatten()
+        {
+            let Ok(parent) = Uuid::parse_str(&parent_str) else { break };
+            if !seen.insert(parent) {
+                break;
+            }
+            out.push(parent);
+            current = parent;
+        }
+        Ok(out)
     }
 
+    /// Nesting depth of `id` (`0` for a top-level task, up to `MAX_SUBTASK_DEPTH`).
+    pub fn task_depth(&self, id: Id) -> Result<usize> {
+        Ok(self.ancestors(id)?.len())
+    }
+
+    /// Removes `id`'s parent link, promoting it (with its own subtasks) to a top-level task.
+    pub fn unlink_parent(&self, id: Id) -> Result<()> {
+        self.set_parent(id, None)
+    }
+
+    /// "Link Parent Task": makes a task a subtask of `parent`, moving it (and its descendants)
+    /// to the parent's list and section and clamping any descendants that exceed `MAX_SUBTASK_DEPTH`.
+    pub fn link_parent(&self, id: Id, parent: Id) -> Result<()> {
+        let parent_task = self.task(parent)?.context("parent task not found")?;
+        self.set_parent(id, Some(parent))?;
+        let list = parent_task.list_id.map(|l| l.to_string());
+        let section = parent_task.section_id.map(|s| s.to_string());
+        let subtree: Vec<Id> = std::iter::once(id).chain(self.descendants(id)?).collect();
+        let tx = self.conn.unchecked_transaction()?;
+        for task_id in &subtree {
+            tx.execute(
+                "UPDATE tasks SET list_id = ?2, section_id = ?3 WHERE id = ?1",
+                params![task_id.to_string(), list, section],
+            )?;
+        }
+        if parent_task.is_completed() {
+            let now = parent_task.completed_at.unwrap_or_else(now_ms);
+            for task_id in &subtree {
+                tx.execute(
+                    "UPDATE tasks SET completed_at = COALESCE(completed_at, ?2) WHERE id = ?1 AND wont_do_at IS NULL AND deleted_at IS NULL",
+                    params![task_id.to_string(), now],
+                )?;
+            }
+        } else if parent_task.is_wont_do() {
+            let now = parent_task.wont_do_at.unwrap_or_else(now_ms);
+            for task_id in &subtree {
+                tx.execute(
+                    "UPDATE tasks SET wont_do_at = COALESCE(wont_do_at, ?2) WHERE id = ?1 AND completed_at IS NULL AND deleted_at IS NULL",
+                    params![task_id.to_string(), now],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Makes the task a subtask of `parent`, or a top-level task for `None`.
+    /// Notes cannot be nested or hold subtasks, and descendants beyond `MAX_SUBTASK_DEPTH`
+    /// are flattened onto level `MAX_SUBTASK_DEPTH`.
     pub fn set_parent(&self, id: Id, parent: Option<Id>) -> Result<()> {
         if let Some(parent) = parent {
             anyhow::ensure!(
                 parent != id && !self.descendants(id)?.contains(&parent),
                 "a task cannot be nested inside itself"
             );
+            let task = self.task(id)?.context("task not found")?;
+            let parent_task = self.task(parent)?.context("parent task not found")?;
+            anyhow::ensure!(task.kind != Kind::Note && parent_task.kind != Kind::Note, "notes cannot be nested");
+            let parent_depth = self.task_depth(parent)?;
+            anyhow::ensure!(parent_depth < MAX_SUBTASK_DEPTH, "maximum subtask nesting depth reached");
+            self.update(id, "parent_id", Some(parent.to_string()))?;
+            self.flatten_subtask_depth(id, parent_depth + 1, parent)?;
+            return Ok(());
         }
-        self.update(id, "parent_id", parent.map(|p| p.to_string()))
+        self.update(id, "parent_id", None::<String>)
+    }
+
+    /// Flattens any descendants of `root` (currently at `root_depth`, child of `root_parent`)
+    /// whose depth would exceed `MAX_SUBTASK_DEPTH` onto `MAX_SUBTASK_DEPTH`.
+    fn flatten_subtask_depth(&self, root: Id, root_depth: usize, root_parent: Id) -> Result<()> {
+        let mut stack: Vec<(Id, usize, Option<Id>)> = vec![(
+            root,
+            root_depth,
+            if root_depth == MAX_SUBTASK_DEPTH {
+                Some(root_parent)
+            } else if root_depth == MAX_SUBTASK_DEPTH - 1 {
+                Some(root)
+            } else {
+                None
+            },
+        )];
+        let mut reparents: Vec<(Id, Id)> = Vec::new();
+        let mut seen = HashSet::from([root]);
+        while let Some((node, depth, cap_parent)) = stack.pop() {
+            let mut stmt = self.conn.prepare_cached("SELECT id FROM tasks WHERE parent_id = ?1")?;
+            let children: Vec<Id> = stmt
+                .query_map([node.to_string()], |row| row.get::<_, String>(0))?
+                .filter_map(|r| r.ok().and_then(|s| Uuid::parse_str(&s).ok()))
+                .collect();
+            for child in children {
+                if !seen.insert(child) {
+                    continue;
+                }
+                let child_depth = depth + 1;
+                if child_depth > MAX_SUBTASK_DEPTH {
+                    if let Some(target_parent) = cap_parent {
+                        reparents.push((child, target_parent));
+                    }
+                    stack.push((child, child_depth, cap_parent));
+                } else {
+                    let next_cap = if child_depth == MAX_SUBTASK_DEPTH - 1 {
+                        Some(child)
+                    } else {
+                        cap_parent
+                    };
+                    stack.push((child, child_depth, next_cap));
+                }
+            }
+        }
+        if !reparents.is_empty() {
+            let tx = self.conn.unchecked_transaction()?;
+            for (child, target_parent) in reparents {
+                tx.execute(
+                    "UPDATE tasks SET parent_id = ?2 WHERE id = ?1",
+                    params![child.to_string(), target_parent.to_string()],
+                )?;
+            }
+            tx.commit()?;
+        }
+        Ok(())
+    }
+
+    /// Moves `id` to `new_parent` (nesting or unnesting) and optionally positions it relative to
+    /// `target` (`(target_id, after)`). When nesting directly after `new_parent`, places `id` as
+    /// the first child of `new_parent`.
+    pub fn move_task_in_tree(&self, id: Id, new_parent: Option<Id>, target: Option<(Id, bool)>) -> Result<()> {
+        match new_parent {
+            Some(parent) => self.link_parent(id, parent)?,
+            None => self.set_parent(id, None)?,
+        }
+        if let Some((target_id, after)) = target {
+            if new_parent == Some(target_id) && after {
+                let first_child: Option<Id> = self
+                    .conn
+                    .prepare_cached("SELECT id FROM tasks WHERE parent_id = ?1 AND id != ?2 AND deleted_at IS NULL ORDER BY sort_order, rowid DESC LIMIT 1")?
+                    .query_row(params![target_id.to_string(), id.to_string()], |row| row.get::<_, String>(0))
+                    .optional()?
+                    .and_then(|s| Uuid::parse_str(&s).ok());
+                if let Some(first_child) = first_child {
+                    self.move_task(id, first_child, false)?;
+                } else if target_id != id {
+                    self.move_task(id, target_id, true)?;
+                }
+            } else if target_id != id {
+                self.move_task(id, target_id, after)?;
+            }
+        }
+        Ok(())
     }
 
     /// Replaces the task's tags; unknown tags are created.
@@ -2442,8 +2717,18 @@ impl Store {
     }
 
     /// Moves the task and its subtasks to a list (`None` means the Inbox).
+    /// Moving a subtask to a different list than its parent unlinks it from that parent.
     pub fn set_list(&self, id: Id, list: Option<Id>) -> Result<()> {
+        let unlink = self
+            .task(id)?
+            .and_then(|t| t.parent_id)
+            .is_some_and(|parent_id| {
+                self.task(parent_id).ok().flatten().is_none_or(|parent| parent.list_id != list)
+            });
         let tx = self.conn.unchecked_transaction()?;
+        if unlink {
+            tx.execute("UPDATE tasks SET parent_id = NULL WHERE id = ?1", [id.to_string()])?;
+        }
         let list = list.map(|l| l.to_string());
         for task in std::iter::once(id).chain(self.descendants(id)?) {
             // A section belongs to its list, so moving to another list leaves it.
@@ -5074,6 +5359,89 @@ mod tests {
                 ("t1".into(), Some("t2".into()), false),
             ]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn nested_tasks_depth_unlink_move_notes_and_completion_cascade() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        // 5 levels: 0 -> 1 -> 2 -> 3 -> 4 (MAX_SUBTASK_DEPTH).
+        let l0 = store.add_task("L0")?;
+        let l1 = store.add_subtask(l0.id, "L1")?;
+        let l2 = store.add_subtask(l1.id, "L2")?;
+        let l3 = store.add_subtask(l2.id, "L3")?;
+        let l4 = store.add_subtask(l3.id, "L4")?;
+        assert_eq!(store.task_depth(l0.id)?, 0);
+        assert_eq!(store.task_depth(l4.id)?, MAX_SUBTASK_DEPTH);
+        assert!(store.add_subtask(l4.id, "L5").is_err(), "cannot nest past level 5");
+
+        // Linking a 3-level subtree under L2 flattens overflow descendants onto level 5 (depth 4).
+        let sub_root = store.add_task("SR")?;
+        let sub_child = store.add_subtask(sub_root.id, "SC")?;
+        let sub_grand = store.add_subtask(sub_child.id, "SG")?;
+        store.link_parent(sub_root.id, l2.id)?;
+        assert_eq!(store.task_depth(sub_root.id)?, 3);
+        assert_eq!(store.task_depth(sub_child.id)?, 4);
+        assert_eq!(store.task_depth(sub_grand.id)?, 4);
+        assert_eq!(store.task(sub_grand.id)?.unwrap().parent_id, Some(sub_root.id));
+
+        // Notes cannot have subtasks, cannot be nested, and nested tasks cannot become notes.
+        let note = store.add_task("My note")?;
+        store.set_kind(note.id, Kind::Note)?;
+        assert!(store.add_subtask(note.id, "nope").is_err());
+        assert!(store.set_parent(note.id, Some(l0.id)).is_err());
+        assert!(store.set_kind(l0.id, Kind::Note).is_err());
+        assert!(store.set_kind(l1.id, Kind::Note).is_err());
+
+        // Unlink promotes a subtask to top-level while keeping its own children attached.
+        store.unlink_parent(sub_root.id)?;
+        assert_eq!(store.task(sub_root.id)?.unwrap().parent_id, None);
+        assert_eq!(store.task(sub_child.id)?.unwrap().parent_id, Some(sub_root.id));
+
+        // Moving a subtask to another list unlinks it from its old parent and moves its subtree.
+        let other = store.create_list("Other")?;
+        store.set_list(sub_child.id, Some(other.id))?;
+        assert_eq!(store.task(sub_child.id)?.unwrap().parent_id, None);
+        assert_eq!(store.task(sub_child.id)?.unwrap().list_id, Some(other.id));
+
+        // Moving a subtask to another section unlinks it from its parent in the old section.
+        let sec = store.add_list_section(Some(other.id), "Done soon")?;
+        let sec_child = store.add_subtask(sub_child.id, "In section")?;
+        store.set_section(sec_child.id, Some(sec.id))?;
+        assert_eq!(store.task(sec_child.id)?.unwrap().parent_id, None);
+        assert_eq!(store.task(sec_child.id)?.unwrap().section_id, Some(sec.id));
+
+        // Completing a parent cascades to open descendants; reopening a subtask reopens ancestors.
+        let p = store.add_task("Parent")?;
+        let c1 = store.add_subtask(p.id, "Child 1")?;
+        let c2 = store.add_subtask(p.id, "Child 2")?;
+        store.set_completed(c1.id, true)?;
+        let (_, cascaded) = store.complete_with_cascaded(p.id, true)?;
+        assert_eq!(cascaded, vec![c2.id]);
+        assert!(store.task(p.id)?.unwrap().is_completed());
+        assert!(store.task(c2.id)?.unwrap().is_completed());
+        // Undo reopens only parent and newly cascaded c2, leaving pre-completed c1 completed.
+        store.reopen_tasks(&[p.id, c2.id])?;
+        assert!(!store.task(p.id)?.unwrap().is_completed());
+        assert!(store.task(c1.id)?.unwrap().is_completed());
+        assert!(!store.task(c2.id)?.unwrap().is_completed());
+        // Completing p again and reopening c2 reopens p as well.
+        store.set_completed(p.id, true)?;
+        store.set_completed(c2.id, false)?;
+        assert!(!store.task(p.id)?.unwrap().is_completed());
+        assert!(!store.task(c2.id)?.unwrap().is_completed());
+
+        // move_task_in_tree nests and unnests cleanly.
+        let a = store.add_task("A")?;
+        let b = store.add_task("B")?;
+        store.move_task_in_tree(b.id, Some(a.id), Some((a.id, true)))?;
+        assert_eq!(store.task(b.id)?.unwrap().parent_id, Some(a.id));
+        store.move_task_in_tree(b.id, None, Some((a.id, false)))?;
+        assert_eq!(store.task(b.id)?.unwrap().parent_id, None);
+        let ids: Vec<Id> = store.tasks()?.into_iter().map(|t| t.id).collect();
+        let pos_b = ids.iter().position(|&id| id == b.id).unwrap();
+        let pos_a = ids.iter().position(|&id| id == a.id).unwrap();
+        assert!(pos_b < pos_a, "unnested B moved before A");
         Ok(())
     }
 }

@@ -37,4 +37,4 @@ pub use model::{Activity, Attachment, Comment, Estimate, ChecklistItem, ListSect
 pub use preferences::{DURATIONS, Features, Notifications, DateFormat, DefaultDate, Preferences, RailSection, SidebarSection, TaskDefaults, SmartList, ThemeMode, ThemeSelection, Visibility, WEEK_STARTS};
 pub use quick_add::{ParsedTask, Recognition, parse_quick_add, parse_quick_add_on_day, parse_quick_add_with};
 pub use recurrence::{Frequency, Recurrence};
-pub use store::{FolderDropTarget, Store};
+pub use store::{FolderDropTarget, MAX_SUBTASK_DEPTH, Store};

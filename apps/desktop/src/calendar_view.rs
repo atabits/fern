@@ -931,6 +931,7 @@ impl CalendarView {
             &task,
             &lists,
             crate::task_menu::MenuKind::Calendar,
+            crate::task_menu::TaskNesting::of(&self.store, task.id),
             self.context_side,
             i18n::t(cx),
             cx,

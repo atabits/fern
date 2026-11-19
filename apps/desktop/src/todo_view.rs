@@ -109,6 +109,7 @@ pub struct TodoView {
     /// The lists column's and the details' widths, as their edges were dragged.
     lists_width: f32,
     detail_width: f32,
+    narrow_viewport: bool,
     /// The edge being dragged, if any.
     resizing: Option<Panel>,
     /// Saves the widths once the drag has rested a moment.
@@ -279,8 +280,7 @@ impl TodoView {
         let search_input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.search_placeholder, cx));
         cx.subscribe(&search_input, |this, input, _: &Changed, cx| {
             let query = input.read(cx).text().to_owned();
-            this.view = View::Search(query);
-            this.reload(cx);
+            this.set_view(View::Search(query), cx);
         })
         .detach();
 
@@ -326,6 +326,7 @@ impl TodoView {
         let width = |key: &str, default: f32| store.setting(key).ok().flatten().and_then(|value| value.parse().ok()).unwrap_or(default);
         let lists_width = width("lists_width", lists_panel::WIDTH).clamp(lists_panel::MIN_WIDTH, lists_panel::MAX_WIDTH);
         let detail_width = width("detail_width", DETAIL_WIDTH).max(DETAIL_MIN_WIDTH);
+        let narrow_viewport = window.viewport_size().width < px(NARROW_WINDOW);
         let mut this = Self {
             store,
             view: View::Inbox,
@@ -337,6 +338,7 @@ impl TodoView {
             show_lists: true,
             lists_width,
             detail_width,
+            narrow_viewport,
             resizing: None,
             save_widths: None,
             collapsed_tasks: HashSet::new(),
@@ -437,9 +439,10 @@ impl TodoView {
                 Some(("list", name)) => {
                     let result = self.store.create_list(name);
                     if let Some(list) = self.check(result) {
-                        self.view = View::List(list.id);
+                        self.set_view(View::List(list.id), cx);
+                    } else {
+                        self.reload(cx);
                     }
-                    self.reload(cx);
                 }
                 Some(("view", "trash")) => self.set_view(View::Trash, cx),
                 Some(("view", "wontdo")) => self.set_view(View::WontDo, cx),
@@ -647,8 +650,7 @@ impl TodoView {
                         ..fern_core::SmartFilter::new()
                     };
                     if self.store.save_filter(&filter).is_ok() {
-                        self.view = View::Filter(filter.id);
-                        self.reload(cx);
+                        self.set_view(View::Filter(filter.id), cx);
                     }
                 }
                 Some(("flag", name)) => {
@@ -813,11 +815,43 @@ impl TodoView {
         cx.notify();
     }
 
+    fn uses_board_layout(&self) -> bool {
+        (self.kanban || self.timeline)
+            && !matches!(self.view, View::Trash | View::Completed | View::WontDo | View::Search(_))
+    }
+
+    fn uses_popup_details(&self) -> bool {
+        self.preferences.popup_details && self.narrow_viewport
+    }
+
+    fn default_task_for_view(&self, cx: &App) -> Option<Task> {
+        if self.view == View::Summary || self.uses_board_layout() || self.uses_popup_details() {
+            return None;
+        }
+        self.rows(i18n::t(cx)).into_iter().find_map(|row| match row {
+            Row::Task { task, .. } => Some(task),
+            Row::Section { .. } | Row::Day { .. } => None,
+        })
+    }
+
+    fn sync_layout_selection(&mut self, cx: &mut Context<Self>) {
+        let selected = self.default_task_for_view(cx);
+        self.selected = selected.as_ref().map(|t| t.id);
+        let lists = self.active_lists();
+        self.detail.update(cx, |detail, cx| {
+            detail.set_lists(lists);
+            detail.show(selected, cx);
+        });
+    }
+
     pub fn reload(&mut self, cx: &mut Context<Self>) {
+        self.reload_inner(false, cx);
+    }
+
+    pub(super) fn reload_inner(&mut self, mut switched: bool, cx: &mut Context<Self>) {
         // Sticky notes show the change.
         crate::sticky_note::data_changed(cx.entity_id(), cx);
         self.preferences = self.store.preferences().unwrap_or_default();
-        self.sync_input_placeholder(cx);
         // Loaded once: the views, counts and filters below are all selections of it.
         let all_tasks = self.store.tasks().unwrap_or_default();
         let today = Self::today();
@@ -834,8 +868,20 @@ impl TodoView {
                 && !self.filters.iter().any(|(filter, _)| filter.id == id)
             {
                 self.view = View::Inbox;
+                switched = true;
             }
         }
+        if let Some(lists) = self.check(self.store.lists()) {
+            self.lists = lists;
+        }
+        // The current list may have been deleted.
+        if let View::List(id) = self.view
+            && !self.lists.iter().any(|l| l.id == id)
+        {
+            self.view = View::Inbox;
+            switched = true;
+        }
+        self.sync_input_placeholder(cx);
         self.completing.retain(|id, pending| {
             pending.view == self.view && !cx.reduce_motion()
                 && all_tasks.iter().any(|task| {
@@ -869,9 +915,6 @@ impl TodoView {
             Some(list) => self.store.list_sections(list).unwrap_or_default(),
             None => Vec::new(),
         };
-        if let Some(lists) = self.check(self.store.lists()) {
-            self.lists = lists;
-        }
         self.folders = self.store.list_folders().unwrap_or_default();
         self.collapsed_folders = self
             .store
@@ -884,12 +927,6 @@ impl TodoView {
             .collect();
         self.collapsed_tags = self.store.setting("collapsed_tags").ok().flatten().unwrap_or_default().lines().map(str::to_owned).collect();
         self.tags_collapsed = self.store.setting("tags_collapsed").ok().flatten().is_some_and(|v| v == "1");
-        // The current list may have been deleted.
-        if let View::List(id) = self.view
-            && !self.lists.iter().any(|l| l.id == id)
-        {
-            self.view = View::Inbox;
-        }
         if let Some(counts) = self.check(self.store.counts_from(&all_tasks, today)) {
             self.counts = counts;
         }
@@ -901,16 +938,28 @@ impl TodoView {
             self.tags = tags;
         }
         self.reload_today_habits();
-        // Keep completed tasks open after they leave a view like Today. A deleted task is only
-        // shown in Trash; otherwise the detail panel returns to its empty state.
-        let selected = self.selected.and_then(|id| self.store.task(id).ok().flatten())
-            .filter(|task| task.is_deleted() == (self.view == View::Trash));
-        self.selected = selected.as_ref().map(|t| t.id);
         let lists = self.active_lists();
-        self.detail.update(cx, |detail, cx| {
-            detail.set_lists(lists);
-            detail.refresh(selected, cx);
-        });
+        if switched {
+            self.reset_view_transients(cx);
+            self.list_state = ListState::new(0, ListAlignment::Top, px(400.));
+            self.list_entries.clear();
+            let selected = self.default_task_for_view(cx);
+            self.selected = selected.as_ref().map(|t| t.id);
+            self.detail.update(cx, |detail, cx| {
+                detail.set_lists(lists);
+                detail.show(selected, cx);
+            });
+        } else {
+            // Keep completed tasks open after they leave a view like Today. A deleted task is only
+            // shown in Trash; otherwise the detail panel returns to its empty state.
+            let selected = self.selected.and_then(|id| self.store.task(id).ok().flatten())
+                .filter(|task| task.is_deleted() == (self.view == View::Trash));
+            self.selected = selected.as_ref().map(|t| t.id);
+            self.detail.update(cx, |detail, cx| {
+                detail.set_lists(lists);
+                detail.refresh(selected, cx);
+            });
+        }
         cx.notify();
     }
 
@@ -3204,7 +3253,9 @@ impl TodoView {
 
     /// The header menu's View: list, kanban or timeline, one at a time.
     fn set_layout(&mut self, kanban: bool, timeline: bool, cx: &mut Context<Self>) {
+        let was_board = self.uses_board_layout();
         self.completing.clear();
+        self.close_card(cx);
         let key = self.view_key();
         for (name, on) in [("kanban", kanban), ("timeline", timeline)] {
             let result = self.store.set_setting(&format!("{name}:{key}"), if on { "1" } else { "0" });
@@ -3214,6 +3265,9 @@ impl TodoView {
         self.timeline = timeline;
         self.timeline_from = Self::today();
         self.header_menu_open = false;
+        if was_board != self.uses_board_layout() {
+            self.sync_layout_selection(cx);
+        }
         cx.notify();
     }
 
@@ -3787,14 +3841,45 @@ impl TodoView {
         }
     }
 
+    fn reset_view_transients(&mut self, cx: &mut Context<Self>) {
+        self.header_menu_open = false;
+        self.list_activity = None;
+        self.close_card(cx);
+        self.context_menu = None;
+        self.context_side = None;
+        self.closed_menu = None;
+        self.sort_menu = None;
+        self.sort_menu_return_focus = None;
+        self.scale_menu_open = false;
+        self.arrange_open = false;
+        self.suggestions_open = None;
+        self.section_menu = None;
+        self.postpone_menu = false;
+        self.column_menu = None;
+        self.column_add = None;
+        self.new_section = None;
+        self.new_section_index = None;
+        self.renaming_section = None;
+        self.completing.clear();
+    }
+
+    pub fn select_view(&mut self, view: View, window: &mut Window, cx: &mut Context<Self>) {
+        self.narrow_viewport = window.viewport_size().width < px(NARROW_WINDOW);
+        let switching = self.view != view;
+        self.set_view(view, cx);
+        if switching && self.view != View::Summary {
+            window.focus(&self.list_focus, cx);
+        }
+    }
+
     pub fn set_view(&mut self, view: View, cx: &mut Context<Self>) {
         self.header_menu_open = false;
         self.list_activity = None;
         if self.view != view {
             self.finish_title_edit(true, cx);
-            self.completing.clear();
+            self.reset_view_transients(cx);
             self.view = view;
-            self.reload(cx);
+            self.reload_inner(true, cx);
         }
     }
 
@@ -3831,12 +3916,19 @@ impl TodoView {
         self.header_menu_open = false;
         let dialog = cx.new(|cx| ListDialog::new(self.store.clone(), list, folder, window, cx));
         cx.subscribe_in(&dialog, window, |this, _, event: &DialogEvent, window, cx| {
-            if let DialogEvent::Saved(id) = event {
-                this.view = View::List(*id);
-            }
             this.list_dialog = None;
             window.focus(&this.list_focus, cx);
+            if let DialogEvent::Saved(id) = event
+                && this.view != View::List(*id)
+            {
+                this.set_view(View::List(*id), cx);
+                return;
+            }
+            let was_board = this.uses_board_layout();
             this.reload(cx);
+            if was_board != this.uses_board_layout() {
+                this.sync_layout_selection(cx);
+            }
         })
         .detach();
         self.list_dialog = Some(dialog);
@@ -3973,7 +4065,9 @@ impl TodoView {
                 let result = self.store.delete_tag(&tag);
                 self.check(result);
                 if self.view == View::Tag(tag) {
-                    self.view = View::Inbox;
+                    self.header_menu_open = false;
+                    self.set_view(View::Inbox, cx);
+                    return;
                 }
             }
             (ListAction::ShowTags(visibility), _) => {
@@ -3990,7 +4084,9 @@ impl TodoView {
                 if let Some(id) = list {
                     let result = self.store.duplicate_list(id, i18n::t(cx).list_copy_suffix);
                     if let Some(copy) = self.check(result) {
-                        self.view = View::List(copy.id);
+                        self.header_menu_open = false;
+                        self.set_view(View::List(copy.id), cx);
+                        return;
                     }
                 }
             }
@@ -4007,7 +4103,9 @@ impl TodoView {
                     let result = self.store.delete_list(id);
                     self.check(result);
                     if current == Some(id) {
-                        self.view = View::Inbox;
+                        self.header_menu_open = false;
+                        self.set_view(View::Inbox, cx);
+                        return;
                     }
                 }
             }
@@ -5518,7 +5616,8 @@ impl Render for TodoView {
             .map(|t| (t.name.clone(), lists_panel::color(t.color.as_deref(), cx)))
             .collect();
         // The original's "too narrow" window: the details then follow View Options' layout.
-        let popup_details = self.preferences.popup_details && window.viewport_size().width < px(NARROW_WINDOW);
+        self.narrow_viewport = window.viewport_size().width < px(NARROW_WINDOW);
+        let popup_details = self.uses_popup_details();
         // The dragged width, narrowed while the window leaves the task list too little room.
         let view_width = f32::from(window.viewport_size().width) - crate::sidebar::WIDTH;
         let detail_width = self.detail_width.min(self.max_detail_width(view_width)).max(DETAIL_MIN_WIDTH);
@@ -5873,8 +5972,8 @@ impl Render for TodoView {
             });
 
         let this = cx.entity().downgrade();
-        let on_select = move |view, _: &mut Window, cx: &mut App| {
-            this.update(cx, |this, cx| this.set_view(view, cx)).ok();
+        let on_select = move |view, window: &mut Window, cx: &mut App| {
+            this.update(cx, |this, cx| this.select_view(view, window, cx)).ok();
         };
         let on_add_list = cx.listener(|this, _, window, cx| this.start_new_list(window, cx));
         let this = cx.entity().downgrade();
@@ -6574,5 +6673,137 @@ mod tests {
             view.reload(cx);
             assert_eq!(view.selected, Some(task.id), "Trash still shows the selected deleted task");
         }));
+    }
+
+    #[gpui::test]
+    fn switching_views_selects_the_first_visible_row_and_syncs_details(cx: &mut TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let l1 = store.create_list("L1").unwrap();
+        let l2 = store.create_list("L2").unwrap();
+        let empty_list = store.create_list("EmptyList").unwrap();
+        let kanban_list = store.create_list("BoardList").unwrap();
+        store.set_setting(&format!("kanban:list:{}", kanban_list.id), "1").unwrap();
+
+        let a2 = store.add_task("A2").unwrap();
+        let a1 = store.add_task("A1").unwrap();
+        for task in [&a1, &a2] {
+            store.set_list(task.id, Some(l1.id)).unwrap();
+            store.set_tags(task.id, &["AAA".to_owned()]).unwrap();
+        }
+        let b2 = store.add_task("B2").unwrap();
+        let b1 = store.add_task("B1").unwrap();
+        for task in [&b1, &b2] {
+            store.set_list(task.id, Some(l2.id)).unwrap();
+            store.set_tags(task.id, &["BBB".to_owned()]).unwrap();
+        }
+        let board_task = store.add_task("Board1").unwrap();
+        store.set_list(board_task.id, Some(kanban_list.id)).unwrap();
+        store.add_tag("EmptyTag", None, None).unwrap();
+
+        let filter_aaa = fern_core::SmartFilter {
+            name: "FilterAAA".to_owned(),
+            rules: fern_core::FilterRules {
+                conditions: vec![fern_core::Condition::new(fern_core::ConditionValue::Tags {
+                    names: vec!["AAA".to_owned()],
+                    untagged: false,
+                })],
+                ..Default::default()
+            },
+            ..fern_core::SmartFilter::new()
+        };
+        store.save_filter(&filter_aaa).unwrap();
+        let empty_filter = fern_core::SmartFilter {
+            name: "EmptyFilter".to_owned(),
+            rules: fern_core::FilterRules {
+                conditions: vec![fern_core::Condition::new(fern_core::ConditionValue::Tags {
+                    names: vec!["EmptyTag".to_owned()],
+                    untagged: false,
+                })],
+                ..Default::default()
+            },
+            ..fern_core::SmartFilter::new()
+        };
+        store.save_filter(&empty_filter).unwrap();
+
+        cx.update(|cx| {
+            theme::init(cx);
+            cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+            let errors = crate::keymap::load_default(&assets::Assets, cx).unwrap();
+            assert!(errors.is_empty(), "{errors:?}");
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| TodoView::new(store.clone(), window, cx));
+        cx.simulate_resize(gpui::size(px(1280.), px(960.)));
+        cx.run_until_parked();
+
+        let click_panel = |selector: &str, cx: &mut gpui::VisualTestContext| {
+            let selector: &'static str = selector.to_owned().leak();
+            let center = cx.debug_bounds(selector).unwrap_or_else(|| panic!("missing {selector}")).center();
+            let modifiers = Modifiers::default();
+            cx.simulate_mouse_move(center, None, modifiers);
+            cx.simulate_click(center, modifiers);
+            cx.run_until_parked();
+        };
+        let detail_state = |cx: &mut gpui::VisualTestContext| {
+            cx.update(|_, cx| {
+                let view = view.read(cx);
+                let detail = view.detail.read(cx);
+                (view.selected, detail.task_id(), detail.task_title().map(str::to_owned))
+            })
+        };
+
+        // Switch to tag BBB, then manually select the second row B2 (matching issue #17).
+        click_panel("lists-item-tag-BBB", cx);
+        assert_eq!(detail_state(cx), (Some(b1.id), Some(b1.id), Some("B1".to_owned())));
+        assert!(cx.debug_bounds("task-detail-header").is_some());
+
+        cx.update(|_, cx| view.update(cx, |view, cx| view.select(b2.id, cx)));
+        cx.run_until_parked();
+        assert_eq!(detail_state(cx), (Some(b2.id), Some(b2.id), Some("B2".to_owned())));
+
+        // Switch to list L1: first visible row A1 is selected and Region C updates to A1.
+        click_panel(&format!("lists-item-list-{}", l1.id), cx);
+        assert_eq!(detail_state(cx), (Some(a1.id), Some(a1.id), Some("A1".to_owned())));
+        cx.update(|window, cx| assert!(view.read(cx).list_focus.is_focused(window)));
+
+        // Keyboard navigation immediately advances from the auto-selected first row to A2.
+        cx.simulate_keystrokes("down");
+        assert_eq!(detail_state(cx), (Some(a2.id), Some(a2.id), Some("A2".to_owned())));
+
+        // Switch to an empty list: selection and Region C are cleared.
+        click_panel(&format!("lists-item-list-{}", empty_list.id), cx);
+        assert_eq!(detail_state(cx), (None, None, None));
+        assert!(cx.debug_bounds("task-detail-header").is_none());
+
+        // Switch to a saved filter with records, then an empty filter, then an empty tag.
+        click_panel(&format!("lists-item-filter-{}", filter_aaa.id), cx);
+        assert_eq!(detail_state(cx), (Some(a1.id), Some(a1.id), Some("A1".to_owned())));
+
+        click_panel(&format!("lists-item-filter-{}", empty_filter.id), cx);
+        assert_eq!(detail_state(cx), (None, None, None));
+        assert!(cx.debug_bounds("task-detail-header").is_none());
+
+        click_panel("lists-item-tag-AAA", cx);
+        assert_eq!(detail_state(cx), (Some(a1.id), Some(a1.id), Some("A1".to_owned())));
+
+        click_panel("lists-item-tag-EmptyTag", cx);
+        assert_eq!(detail_state(cx), (None, None, None));
+
+        // Pinned/sorted order determines the first row in Region B.
+        store.set_pinned(b2.id, true).unwrap();
+        click_panel(&format!("lists-item-list-{}", l2.id), cx);
+        assert_eq!(detail_state(cx), (Some(b2.id), Some(b2.id), Some("B2".to_owned())));
+
+        // Switching to a kanban list clears the side-panel selection so the board takes full width.
+        click_panel(&format!("lists-item-list-{}", kanban_list.id), cx);
+        assert_eq!(detail_state(cx), (None, None, None));
+        assert!(cx.debug_bounds("task-detail-header").is_none());
+
+        // Narrow window with pop-up detail layout does not cover the list with a modal on view switch.
+        cx.update(|_, cx| view.update(cx, |view, cx| view.save_preferences(|p| p.popup_details = true, cx)));
+        cx.simulate_resize(gpui::size(px(900.), px(960.)));
+        cx.run_until_parked();
+        click_panel(&format!("lists-item-list-{}", l1.id), cx);
+        assert_eq!(detail_state(cx), (None, None, None));
+        assert!(cx.debug_bounds("detail-popup").is_none());
     }
 }

@@ -176,8 +176,10 @@ pub fn render(
                     }),
             )
             .on_click(move |_, window, cx| on_select(view.clone(), window, cx));
+        let selector_id = id.clone();
         div()
             .id(SharedString::from(format!("drop-{id}")))
+            .debug_selector(move || format!("lists-item-{selector_id}"))
             .group(group)
             .relative()
             .rounded(px(6.))

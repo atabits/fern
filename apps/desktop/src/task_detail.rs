@@ -311,6 +311,13 @@ impl TaskDetail {
             .map_or((String::new(), String::new()), |t| (t.title.clone(), t.notes.clone()));
         self.title.update(cx, |input, cx| input.set_text(title, cx));
         self.notes.update(cx, |input, cx| input.set_text(notes, cx));
+        self.new_item.update(cx, |input, cx| input.set_text("", cx));
+        self.subtask_input.update(cx, |input, cx| input.set_text("", cx));
+        self.comment_input.update(cx, |input, cx| input.set_text("", cx));
+        self.comment_open = false;
+        self.comment_emoji = false;
+        self.format_headings = false;
+        self.focus_submenu = false;
         self.session.task = task;
         self.session.popup = None;
         self.editor_window.popup_return_focus = None;

@@ -259,16 +259,18 @@ impl TodoView {
         let result = self.store.save_filter(&filter);
         if self.check(result).is_some() {
             self.filter_edit = None;
-            self.view = View::Filter(filter.id);
-            self.reload(cx);
+            if self.view != View::Filter(filter.id) {
+                self.set_view(View::Filter(filter.id), cx);
+            } else {
+                self.reload_inner(true, cx);
+            }
         }
     }
     pub(super) fn delete_current_filter(&mut self, cx: &mut Context<Self>) {
         if let View::Filter(id) = self.view {
             let result = self.store.delete_filter(id);
             if self.check(result).is_some() {
-                self.view = View::Inbox;
-                self.reload(cx);
+                self.set_view(View::Inbox, cx);
             }
         }
     }

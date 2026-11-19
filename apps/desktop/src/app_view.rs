@@ -590,7 +590,7 @@ impl AppView {
 
     fn show_view(&mut self, view: fern_core::View, window: &mut Window, cx: &mut Context<Self>) {
         if self.select(Section::Tasks, window, cx) {
-            self.todo.update(cx, |todo, cx| todo.set_view(view, cx));
+            self.todo.update(cx, |todo, cx| todo.select_view(view, window, cx));
         }
     }
 

@@ -206,7 +206,7 @@ impl SettingsWindow {
                                 ),
                         )),
                 )
-                .child(Label::new(name).size(LabelSize::Small).color(if selected { Color::Default } else { Color::Muted }))
+                .child(Label::new(name).size(LabelSize::Small).centered().color(if selected { Color::Default } else { Color::Muted }))
                 .on_click(cx.listener(move |this, _, window, cx| this.pick_theme(preset, window, cx)))
         };
         let night_owner = owner.clone();
@@ -240,7 +240,7 @@ impl SettingsWindow {
             )
             .child(v_flex().gap_2()
                 .child(Label::new(strings.color_series).weight(FontWeight::SEMIBOLD))
-                .child(h_flex().flex_wrap().gap_1()
+                .child(h_flex().flex_wrap().items_start().gap_1()
                     .children(LIGHT_PRESETS.iter().zip(strings.light_theme_names).map(|(preset, name)| tile(preset, name)))
                     .child(tile(night, strings.dark_theme))))
             .when(!follow && active.is_dark(), |el| el.child(v_flex().gap_2()

@@ -1,7 +1,7 @@
 //! The calendar: tasks placed on their due dates in a month grid or a week with a time axis,
 //! matched to TickTick's Calendar section.
 
-use std::{collections::BTreeMap, rc::Rc, time::Duration};
+use std::{collections::{BTreeMap, HashSet}, rc::Rc, time::Duration};
 
 use chrono::{Datelike, Local, NaiveDate};
 use fern_core::{CalendarOptions, ColorBy, Id, Priority, Store, Task};
@@ -85,8 +85,10 @@ pub struct CalendarView {
     selected_day: Option<NaiveDate>,
     sidebar_open: bool,
     sidebar_month: Option<NaiveDate>,
-    /// No filter, Inbox, or one of the available lists.
-    list_filter: Option<Option<Id>>,
+    /// Calendar sidebar filter: all tasks, or any combination of lists and tags.
+    filter: CalendarFilter,
+    /// Open month/year picker popover on the header title, storing the displayed year.
+    month_picker_open: Option<i32>,
     task_editor: Option<TaskEditor>,
     saved_hint: Option<(String, gpui::Task<()>)>,
     mode_menu_open: bool,
@@ -128,9 +130,106 @@ pub struct CalendarView {
     list_colors: std::collections::HashMap<Id, gpui::Hsla>,
     tag_colors: std::collections::HashMap<String, gpui::Hsla>,
     list_names: Vec<(Id, String)>,
+    tag_names: Vec<String>,
+    sidebar_busy_days: HashSet<NaiveDate>,
     /// With Show Habit, the habits due today; with Show Focus Records, the focus sessions.
     habits_today: Vec<fern_core::Habit>,
     focus_sessions: Vec<fern_core::FocusSession>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CalendarFilter {
+    all: bool,
+    lists: HashSet<Option<Id>>,
+    tags: HashSet<String>,
+}
+
+impl Default for CalendarFilter {
+    fn default() -> Self {
+        Self { all: true, lists: HashSet::new(), tags: HashSet::new() }
+    }
+}
+
+impl CalendarFilter {
+    fn single_list(&self) -> Option<Option<Id>> {
+        (!self.all && self.tags.is_empty() && self.lists.len() == 1)
+            .then(|| *self.lists.iter().next().unwrap())
+    }
+
+    fn matches(&self, task: &Task) -> bool {
+        if self.all {
+            return true;
+        }
+        (!self.lists.is_empty() && self.lists.contains(&task.list_id))
+            || (!self.tags.is_empty() && task.tags.iter().any(|t| self.tags.contains(&t.to_lowercase())))
+    }
+
+    fn parse(raw: &str, valid_lists: &[(Id, String)], valid_tags: &[String]) -> Self {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || trimmed == "all" {
+            return Self::default();
+        }
+        if trimmed == "inbox" {
+            return Self { all: false, lists: HashSet::from([None]), tags: HashSet::new() };
+        }
+        if let Ok(id) = trimmed.parse::<Id>() {
+            if valid_lists.iter().any(|(list, _)| *list == id) {
+                return Self { all: false, lists: HashSet::from([Some(id)]), tags: HashSet::new() };
+            }
+            return Self::default();
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            return Self::default();
+        };
+        let mut lists = HashSet::new();
+        if let Some(arr) = value.get("lists").and_then(|v| v.as_array()) {
+            for item in arr.iter().filter_map(|v| v.as_str()) {
+                if item == "inbox" {
+                    lists.insert(None);
+                } else if let Ok(id) = item.parse::<Id>()
+                    && valid_lists.iter().any(|(list, _)| *list == id)
+                {
+                    lists.insert(Some(id));
+                }
+            }
+        }
+        let mut tags = HashSet::new();
+        if let Some(arr) = value.get("tags").and_then(|v| v.as_array()) {
+            for item in arr.iter().filter_map(|v| v.as_str()) {
+                let lower = item.to_lowercase();
+                if valid_tags.iter().any(|t| t.to_lowercase() == lower) {
+                    tags.insert(lower);
+                }
+            }
+        }
+        if lists.is_empty() && tags.is_empty() {
+            Self::default()
+        } else {
+            Self { all: false, lists, tags }
+        }
+    }
+
+    fn encode(&self) -> String {
+        if self.all || (self.lists.is_empty() && self.tags.is_empty()) {
+            return String::new();
+        }
+        if let Some(single) = self.single_list() {
+            return match single {
+                None => "inbox".to_owned(),
+                Some(id) => id.to_string(),
+            };
+        }
+        let lists: Vec<String> = self
+            .lists
+            .iter()
+            .map(|l| match l {
+                None => "inbox".to_owned(),
+                Some(id) => id.to_string(),
+            })
+            .collect();
+        let tags: Vec<&str> = self.tags.iter().map(String::as_str).collect();
+        serde_json::json!({ "lists": lists, "tags": tags }).to_string()
+    }
 }
 
 /// A new task stays in a draft until it is saved. A day anchors the editor to a month cell;
@@ -199,7 +298,8 @@ impl CalendarView {
             anchor: today,
             selected_day: None,
             sidebar_month: None,
-            list_filter: None,
+            filter: CalendarFilter::default(),
+            month_picker_open: None,
             task_editor: None,
             saved_hint: None,
             mode_menu_open: false,
@@ -229,6 +329,8 @@ impl CalendarView {
             list_colors: Default::default(),
             tag_colors: Default::default(),
             list_names: Vec::new(),
+            tag_names: Vec::new(),
+            sidebar_busy_days: HashSet::new(),
             habits_today: Vec::new(),
             focus_sessions: Vec::new(),
         };
@@ -630,7 +732,10 @@ impl CalendarView {
         if self.context_menu.take().is_some() {
             self.context_side = None;
             cx.notify();
-        } else if std::mem::take(&mut self.mode_menu_open) || std::mem::take(&mut self.more_menu) {
+        } else if std::mem::take(&mut self.mode_menu_open)
+            || std::mem::take(&mut self.more_menu)
+            || self.month_picker_open.take().is_some()
+        {
             cx.notify();
         } else if self.year_jump.is_some() {
             self.close_year_jump(window, cx);
@@ -835,28 +940,32 @@ impl CalendarView {
         let lists = self.store.lists().unwrap_or_default();
         self.list_colors = lists.iter().filter_map(|l| crate::lists_panel::parse_color(l.color.as_deref()).map(|c| (l.id, c))).collect();
         self.list_names = lists.iter().filter(|l| !l.archived).map(|l| (l.id, l.name.clone())).collect();
-        self.list_filter = self.store.setting("calendar_list_filter").ok().flatten().and_then(|filter| {
-            if filter == "inbox" {
-                Some(None)
-            } else {
-                filter.parse::<Id>().ok().filter(|id| self.list_names.iter().any(|(list, _)| list == id)).map(Some)
-            }
-        });
-        let list_filter = self.list_filter;
-        let in_scope = |task: &Task| list_filter.is_none_or(|list| list == task.list_id);
-        self.tag_colors = self
-            .store
-            .tags()
-            .unwrap_or_default()
+        let all_tags = self.store.tags().unwrap_or_default();
+        self.tag_names = all_tags.iter().map(|t| t.name.clone()).collect();
+        self.tag_colors = all_tags
             .into_iter()
             .filter_map(|t| crate::lists_panel::parse_color(t.color.as_deref()).map(|c| (t.name.to_lowercase(), c)))
             .collect();
+        self.filter = self
+            .store
+            .setting("calendar_list_filter")
+            .ok()
+            .flatten()
+            .map(|raw| CalendarFilter::parse(&raw, &self.list_names, &self.tag_names))
+            .unwrap_or_default();
+        let filter = self.filter.clone();
+        let in_scope = |task: &Task| filter.matches(task);
         if self.mode == CalendarMode::Agenda {
             let from = self.agenda_start();
             self.countdowns = self.store.countdowns().unwrap_or_default();
             match self.store.tasks() {
                 Ok(mut tasks) => {
                     tasks.retain(in_scope);
+                    self.sidebar_busy_days = tasks
+                        .iter()
+                        .filter(|t| !t.is_closed() && !t.is_deleted())
+                        .filter_map(|t| t.due_date)
+                        .collect();
                     let countdowns: &[fern_core::Countdown] = if self.options.show_countdowns { &self.countdowns } else { &[] };
                     self.agenda = fern_core::agenda::agenda(&tasks, countdowns, from, from + chrono::Duration::days(AGENDA_DAYS))
                 }
@@ -883,6 +992,11 @@ impl CalendarView {
             return;
         };
         all.retain(in_scope);
+        self.sidebar_busy_days = all
+            .iter()
+            .filter(|t| !t.is_closed() && !t.is_deleted())
+            .filter_map(|t| t.due_date)
+            .collect();
         self.tasks.clear();
         self.undated.clear();
         let mut repeats_before_range = Vec::new();
@@ -1061,19 +1175,115 @@ impl CalendarView {
         cx.notify();
     }
 
-    fn set_list_filter(&mut self, filter: Option<Option<Id>>, cx: &mut Context<Self>) {
+    fn save_filter(&mut self, filter: CalendarFilter, cx: &mut Context<Self>) {
         if !self.finish_task_before_navigation(cx) {
             return;
         }
-        let value = match filter {
-            None => String::new(),
-            Some(None) => "inbox".to_owned(),
-            Some(Some(id)) => id.to_string(),
-        };
-        if let Err(error) = self.store.set_setting("calendar_list_filter", &value) {
+        let encoded = filter.encode();
+        if let Err(error) = self.store.set_setting("calendar_list_filter", &encoded) {
             eprintln!("failed to save the calendar filter: {error:#}");
             return;
         }
+        self.close_card(cx);
+        self.reload(cx);
+    }
+
+    #[cfg(test)]
+    fn set_list_filter(&mut self, filter: Option<Option<Id>>, cx: &mut Context<Self>) {
+        let next = match filter {
+            None => CalendarFilter::default(),
+            Some(list) => CalendarFilter { all: false, lists: HashSet::from([list]), tags: HashSet::new() },
+        };
+        self.save_filter(next, cx);
+    }
+
+    fn select_all_filter(&mut self, cx: &mut Context<Self>) {
+        self.save_filter(CalendarFilter::default(), cx);
+    }
+
+    fn toggle_list_filter(&mut self, list: Option<Id>, cx: &mut Context<Self>) {
+        let mut next = if self.filter.all {
+            CalendarFilter { all: false, lists: HashSet::new(), tags: HashSet::new() }
+        } else {
+            self.filter.clone()
+        };
+        if !next.lists.remove(&list) {
+            next.lists.insert(list);
+        }
+        if next.lists.is_empty() && next.tags.is_empty() {
+            next.all = true;
+        }
+        self.save_filter(next, cx);
+    }
+
+    fn toggle_all_lists_filter(&mut self, cx: &mut Context<Self>) {
+        let all_lists: HashSet<Option<Id>> = std::iter::once(None)
+            .chain(self.list_names.iter().map(|(id, _)| Some(*id)))
+            .collect();
+        let mut next = if self.filter.all {
+            CalendarFilter { all: false, lists: HashSet::new(), tags: HashSet::new() }
+        } else {
+            self.filter.clone()
+        };
+        if all_lists.iter().all(|l| next.lists.contains(l)) {
+            next.lists.clear();
+        } else {
+            next.lists = all_lists;
+        }
+        if next.lists.is_empty() && next.tags.is_empty() {
+            next.all = true;
+        }
+        self.save_filter(next, cx);
+    }
+
+    fn toggle_tag_filter(&mut self, tag: String, cx: &mut Context<Self>) {
+        let key = tag.to_lowercase();
+        let mut next = if self.filter.all {
+            CalendarFilter { all: false, lists: HashSet::new(), tags: HashSet::new() }
+        } else {
+            self.filter.clone()
+        };
+        if !next.tags.remove(&key) {
+            next.tags.insert(key);
+        }
+        if next.lists.is_empty() && next.tags.is_empty() {
+            next.all = true;
+        }
+        self.save_filter(next, cx);
+    }
+
+    fn toggle_all_tags_filter(&mut self, cx: &mut Context<Self>) {
+        let all_tags: HashSet<String> = self.tag_names.iter().map(|t| t.to_lowercase()).collect();
+        let mut next = if self.filter.all {
+            CalendarFilter { all: false, lists: HashSet::new(), tags: HashSet::new() }
+        } else {
+            self.filter.clone()
+        };
+        if !all_tags.is_empty() && all_tags.iter().all(|t| next.tags.contains(t)) {
+            next.tags.clear();
+        } else {
+            next.tags = all_tags;
+        }
+        if next.lists.is_empty() && next.tags.is_empty() {
+            next.all = true;
+        }
+        self.save_filter(next, cx);
+    }
+
+    fn select_month(&mut self, year: i32, month: u32, cx: &mut Context<Self>) {
+        if !self.finish_task_before_navigation(cx) {
+            return;
+        }
+        let today = Local::now().date_naive();
+        let first = NaiveDate::from_ymd_opt(year, month, 1).unwrap_or(self.month);
+        let target = if today.year() == year && today.month() == month { today } else { first };
+        self.month = first;
+        self.anchor = target;
+        self.selected_day = None;
+        self.sidebar_month = None;
+        self.month_picker_open = None;
+        self.year_day = None;
+        self.open_event = None;
         self.close_card(cx);
         self.reload(cx);
     }
@@ -1158,7 +1368,7 @@ impl CalendarView {
         self.open_event = None;
         self.open_countdown = None;
         self.year_day = None;
-        let list = self.list_filter.unwrap_or_else(|| {
+        let list = self.filter.single_list().unwrap_or_else(|| {
             self.store.preferences().ok().and_then(|preferences| preferences.default_list)
                 .filter(|id| self.list_names.iter().any(|(list, _)| list == id))
         });
@@ -1185,10 +1395,13 @@ impl CalendarView {
     }
 
     fn hint_if_outside_filter(&mut self, id: Id, cx: &mut Context<Self>) {
-        let (Some(filter), Ok(Some(task))) = (self.list_filter, self.store.task(id)) else {
+        if self.filter.all {
+            return;
+        }
+        let Ok(Some(task)) = self.store.task(id) else {
             return;
         };
-        if filter == task.list_id {
+        if self.filter.matches(&task) {
             return;
         }
         let strings = i18n::t(cx);
@@ -1208,35 +1421,246 @@ impl CalendarView {
     fn render_calendar_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let strings = i18n::t(cx);
         let theme = cx.theme().clone();
-        let row = |filter, name: String, icon| {
-            ListItem::new(SharedString::from(format!("calendar-filter-{filter:?}")))
-                .height(px(30.))
-                .hover_color(theme.colors().list_hover)
-                .selected_color(theme.colors().list_selected)
-                .start_slot(Icon::new(icon).size(IconSize::Small).color(theme.colors().list_text))
-                .child(Label::new(name).truncate().color(theme.colors().list_text))
-                .toggle_state(self.list_filter == filter)
-                .on_click(cx.listener(move |this, _, _, cx| this.set_list_filter(filter, cx)))
+        let colors = theme.colors();
+        let radio = |selected: bool| {
+            div()
+                .size(px(15.))
+                .flex_none()
+                .rounded_full()
+                .border_1()
+                .border_color(if selected { colors.accent } else { colors.checkbox_border })
+                .flex()
+                .items_center()
+                .justify_center()
+                .when(selected, |el| el.child(div().size(px(7.)).rounded_full().bg(colors.accent)))
         };
-        v_flex().id("calendar-sidebar").debug_selector(|| "calendar-sidebar".to_owned())
-            .flex_none().w(px(CALENDAR_SIDEBAR_WIDTH)).h_full().overflow_y_scroll()
-            .border_r_1().border_color(theme.colors().lists_border)
-            .bg(theme.colors().lists_background)
-            .p_3().gap_2()
+        let all_lists_checked = !self.filter.all
+            && self.filter.lists.contains(&None)
+            && self.list_names.iter().all(|(id, _)| self.filter.lists.contains(&Some(*id)));
+        let all_tags_checked = !self.filter.all
+            && !self.tag_names.is_empty()
+            && self.tag_names.iter().all(|t| self.filter.tags.contains(&t.to_lowercase()));
+        let check_row = |id: SharedString, label: String, bold: bool, icon: Option<(IconName, Hsla)>, checked: bool| {
+            let box_id = SharedString::from(format!("{id}-box"));
+            h_flex()
+                .id(id.clone())
+                .debug_selector(move || id.to_string())
+                .h(px(32.))
+                .px_2()
+                .gap_2()
+                .rounded(px(6.))
+                .cursor_pointer()
+                .hover(|s| s.bg(colors.list_hover))
+                .when_some(icon, |el, (name, color)| el.child(Icon::new(name).size(IconSize::Small).color(color)))
+                .child(
+                    div().flex_1().min_w_0().child(
+                        Label::new(label)
+                            .truncate()
+                            .when(bold, |l| l.weight(FontWeight::SEMIBOLD))
+                            .color(colors.list_text),
+                    ),
+                )
+                .child(Checkbox::new(box_id).size(px(15.)).accent().toggle_state(checked))
+        };
+        v_flex()
+            .id("calendar-sidebar")
+            .debug_selector(|| "calendar-sidebar".to_owned())
+            .flex_none()
+            .w(px(CALENDAR_SIDEBAR_WIDTH))
+            .h_full()
+            .overflow_y_scroll()
+            .border_r_1()
+            .border_color(colors.lists_border)
+            .bg(colors.lists_background)
+            .pt(crate::title_bar::header_inset() + px(13.))
+            .px_3()
+            .pb_3()
+            .gap_3()
             .child(month_picker(
-                self.sidebar_month.unwrap_or(self.month), self.selected_day.unwrap_or(self.anchor),
+                self.sidebar_month.unwrap_or(self.month),
+                self.selected_day,
+                &self.sidebar_busy_days,
                 cx.listener(|this, delta: &i32, _, cx| {
                     this.sidebar_month = Some(calendar::add_months(this.sidebar_month.unwrap_or(this.month), *delta));
                     cx.notify();
+                }),
+                cx.listener(|this, _: &(), _, cx| {
+                    this.sidebar_month = None;
+                    this.go_to_today(cx);
                 }),
                 cx.listener(|this, day: &NaiveDate, _, cx| this.select_day(*day, cx)),
                 cx,
             ))
             .child(Divider::horizontal())
-            .child(Label::new(strings.lists).size(LabelSize::Small).weight(FontWeight::SEMIBOLD).color(theme.colors().list_text))
-            .child(row(None, strings.all_lists.to_owned(), IconName::Layers))
-            .child(row(Some(None), strings.inbox.to_owned(), IconName::Inbox))
-            .children(self.list_names.iter().map(|(id, name)| row(Some(Some(*id)), name.clone(), IconName::List)))
+            .child(
+                v_flex()
+                    .gap(px(2.))
+                    .child(
+                        h_flex()
+                            .id("calendar-filter-all")
+                            .debug_selector(|| "calendar-filter-all".to_owned())
+                            .h(px(32.))
+                            .px_2()
+                            .gap_2()
+                            .rounded(px(6.))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(colors.list_hover))
+                            .child(div().flex_1().min_w_0().child(Label::new(strings.all).weight(FontWeight::SEMIBOLD).color(colors.list_text)))
+                            .child(radio(self.filter.all))
+                            .on_click(cx.listener(|this, _, _, cx| this.select_all_filter(cx))),
+                    )
+                    .when(!self.tag_names.is_empty(), |el| {
+                        el.child(
+                            check_row("calendar-filter-tags".into(), strings.tags.to_owned(), true, None, all_tags_checked)
+                                .on_click(cx.listener(|this, _, _, cx| this.toggle_all_tags_filter(cx))),
+                        )
+                        .children(self.tag_names.iter().map(|tag| {
+                            let lower = tag.to_lowercase();
+                            let checked = !self.filter.all && self.filter.tags.contains(&lower);
+                            let icon_color = self.tag_colors.get(&lower).copied().unwrap_or(colors.list_text_muted);
+                            let tag_name = tag.clone();
+                            check_row(
+                                SharedString::from(format!("calendar-filter-tag-{tag}")),
+                                tag.clone(),
+                                false,
+                                Some((IconName::Tag, icon_color)),
+                                checked,
+                            )
+                            .on_click(cx.listener(move |this, _, _, cx| this.toggle_tag_filter(tag_name.clone(), cx)))
+                        }))
+                    })
+                    .child(
+                        check_row("calendar-filter-lists".into(), strings.lists.to_owned(), true, None, all_lists_checked)
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_all_lists_filter(cx))),
+                    )
+                    .child(
+                        check_row(
+                            "calendar-filter-inbox".into(),
+                            strings.inbox.to_owned(),
+                            false,
+                            Some((IconName::Inbox, colors.list_text_muted)),
+                            !self.filter.all && self.filter.lists.contains(&None),
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| this.toggle_list_filter(None, cx))),
+                    )
+                    .children(self.list_names.iter().map(|(id, name)| {
+                        let list_id = *id;
+                        let checked = !self.filter.all && self.filter.lists.contains(&Some(list_id));
+                        let icon_color = self.list_colors.get(&list_id).copied().unwrap_or(colors.list_text_muted);
+                        check_row(
+                            SharedString::from(format!("calendar-filter-list-{list_id}")),
+                            name.clone(),
+                            false,
+                            Some((IconName::List, icon_color)),
+                            checked,
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| this.toggle_list_filter(Some(list_id), cx)))
+                    })),
+            )
+    }
+
+    fn render_month_picker_popover(
+        &self,
+        picker_year: i32,
+        shown_month: NaiveDate,
+        today: NaiveDate,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let strings = i18n::t(cx);
+        let colors = cx.theme().colors();
+        popover(cx)
+            .debug_selector(|| "calendar-month-picker".to_owned())
+            .w(px(236.))
+            .p_3()
+            .gap_3()
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.month_picker_open = None;
+                cx.notify();
+            }))
+            .child(
+                h_flex()
+                    .px_1()
+                    .gap(px(2.))
+                    .child(
+                        div()
+                            .flex_1()
+                            .child(Label::new(picker_year.to_string()).weight(FontWeight::SEMIBOLD)),
+                    )
+                    .child(
+                        IconButton::new("month-picker-prev-year", IconName::ChevronLeft)
+                            .size(px(24.))
+                            .icon_size(IconSize::Small)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(year) = this.month_picker_open.as_mut() {
+                                    *year = (*year - 1).max(1910);
+                                    cx.notify();
+                                }
+                            })),
+                    )
+                    .child(
+                        IconButton::new("month-picker-this-year", IconName::Circle)
+                            .size(px(24.))
+                            .icon_size(IconSize::Custom(px(8.)))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.month_picker_open = Some(today.year());
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        IconButton::new("month-picker-next-year", IconName::ChevronRight)
+                            .size(px(24.))
+                            .icon_size(IconSize::Small)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(year) = this.month_picker_open.as_mut() {
+                                    *year = (*year + 1).min(2099);
+                                    cx.notify();
+                                }
+                            })),
+                    ),
+            )
+            .children((0..3).map(|row| {
+                h_flex().gap_1().children((0..4).map(|col| {
+                    let month_index = row * 4 + col;
+                    let month_num = (month_index + 1) as u32;
+                    let active = shown_month.year() == picker_year && shown_month.month() == month_num;
+                    let is_current = today.year() == picker_year && today.month() == month_num;
+                    div()
+                        .flex_1()
+                        .h(px(40.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            div()
+                                .id(SharedString::from(format!("calendar-month-pick-{picker_year}-{month_num}")))
+                                .debug_selector(move || format!("calendar-month-pick-{picker_year}-{month_num}"))
+                                .size(px(38.))
+                                .rounded_full()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .cursor_pointer()
+                                .when(active, |el| el.bg(colors.accent))
+                                .when(!active, |el| el.hover(|s| s.bg(colors.element_hover)))
+                                .child(
+                                    Label::new(strings.months_short[month_index])
+                                        .centered()
+                                        .when(active || is_current, |l| l.weight(FontWeight::SEMIBOLD))
+                                        .color(if active {
+                                            Color::OnAccent
+                                        } else if is_current {
+                                            Color::Accent
+                                        } else {
+                                            Color::Default
+                                        }),
+                                )
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.select_month(picker_year, month_num, cx);
+                                })),
+                        )
+                }))
+            }))
+            .into_any_element()
     }
 
     fn render_day(&self, date: NaiveDate, today: NaiveDate, slots: usize, cx: &mut Context<Self>) -> AnyElement {
@@ -2008,7 +2432,19 @@ impl Render for CalendarView {
         };
 
         let arrange = self.arrange.map(|tab| self.render_arrange(tab, cx));
+        let shown_month = match self.mode {
+            CalendarMode::Month | CalendarMode::Agenda | CalendarMode::Year => self.month,
+            CalendarMode::Week | CalendarMode::MultiWeek(_) => calendar::week_of(self.anchor)[0],
+            _ => self.anchor,
+        };
+        let title_text = match self.mode {
+            // The original's Year shows just the year.
+            CalendarMode::Year => self.month.year().to_string(),
+            _ => calendar::month_title(shown_month, strings),
+        };
+        let can_pick_month = self.mode != CalendarMode::Year;
         let toolbar = h_flex()
+            .debug_selector(|| "calendar-toolbar".to_owned())
             .mt(crate::title_bar::header_inset())
             .h(px(CALENDAR_HEADER_HEIGHT))
             .flex_none()
@@ -2020,21 +2456,54 @@ impl Render for CalendarView {
                 .tip(strings.mini_calendar, ui::TipSide::Below)
                 .on_click(cx.listener(|this, _, _, cx| this.toggle_calendar_sidebar(cx))))
             .child(
-                div().flex_1().child(
-                    Label::new(match self.mode {
-                        // The original's Year shows just the year.
-                        CalendarMode::Year => self.month.year().to_string(),
-                        mode => calendar::month_title(
-                            match mode {
-                                CalendarMode::Month | CalendarMode::Agenda => self.month,
-                                CalendarMode::Week | CalendarMode::MultiWeek(_) => calendar::week_of(self.anchor)[0],
-                                _ => self.anchor,
-                            },
-                            strings,
-                        ),
-                    })
-                        .size(LabelSize::Large)
-                        .weight(FontWeight::SEMIBOLD),
+                div().flex_1().flex().items_center().child(
+                    div()
+                        .relative()
+                        .child(
+                            h_flex()
+                                .id("calendar-month-title")
+                                .debug_selector(|| "calendar-month-title".to_owned())
+                                .group("calendar-month-title")
+                                .h(px(30.))
+                                .px_1p5()
+                                .gap_1()
+                                .rounded(px(6.))
+                                .when(can_pick_month, |el| {
+                                    el.cursor_pointer()
+                                        .hover(|s| s.bg(theme.colors().ghost_element_hover))
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            if !this.finish_task_before_navigation(cx) {
+                                                return;
+                                            }
+                                            this.month_picker_open = if this.month_picker_open.is_some() {
+                                                None
+                                            } else {
+                                                Some(shown_month.year())
+                                            };
+                                            window.focus(&this.focus_handle, cx);
+                                            cx.notify();
+                                        }))
+                                })
+                                .child(
+                                    Label::new(title_text)
+                                        .size(LabelSize::Large)
+                                        .weight(FontWeight::SEMIBOLD),
+                                )
+                                .when(can_pick_month, |el| {
+                                    el.child(
+                                        div()
+                                            .opacity(if self.month_picker_open.is_some() { 1. } else { 0. })
+                                            .group_hover("calendar-month-title", |s| s.opacity(1.))
+                                            .child(Icon::new(IconName::ChevronDown).size(IconSize::XSmall).color(Color::Muted)),
+                                    )
+                                }),
+                        )
+                        .when_some(self.month_picker_open, |el, picker_year| {
+                            el.child(PopoverAttachment::new(
+                                Placement::BelowLeft,
+                                self.render_month_picker_popover(picker_year, shown_month, today, cx),
+                            ))
+                        }),
                 ),
             )
             .when(self.mode == CalendarMode::Week && calendar::week_numbers(), |el| {
@@ -2204,14 +2673,11 @@ impl Render for CalendarView {
             .size_full()
             .bg(theme.colors().calendar_background)
             .text_color(theme.colors().text)
+            .when(self.sidebar_open, |el| el.child(self.render_calendar_sidebar(cx)))
             .child(
                 v_flex().flex_1().min_w_0().h_full()
                     .child(toolbar)
-                    .child(
-                        h_flex().flex_1().min_h_0()
-                            .when(self.sidebar_open, |el| el.child(self.render_calendar_sidebar(cx)))
-                            .child(calendar),
-                    ),
+                    .child(calendar),
             )
             .children(arrange)
             .children(self.saved_hint.as_ref().map(|(message, _)| {
@@ -2860,5 +3326,57 @@ mod tests {
         let box_pos = cx.debug_bounds(box_selector).expect("completed task checkbox remains rendered").center();
         cx.simulate_click(box_pos, modifiers);
         assert!(!store.task(task.id).unwrap().unwrap().is_closed());
+    }
+
+    #[gpui::test]
+    #[cfg(debug_assertions)]
+    fn calendar_sidebar_is_full_height_and_header_month_picker_navigates(cx: &mut TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let day = NaiveDate::from_ymd_opt(2026, 11, 19).unwrap();
+        let work = store.create_list("Work").unwrap();
+        let t1 = store.add_task("Tagged task").unwrap();
+        store.set_due(t1.id, Some(day), None).unwrap();
+        store.set_tags(t1.id, &["health".to_owned()]).unwrap();
+        let t2 = store.add_task("Work task").unwrap();
+        store.set_due(t2.id, Some(day), None).unwrap();
+        store.set_list(t2.id, Some(work.id)).unwrap();
+        cx.update(|cx| {
+            theme::init(cx);
+            cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+            assert!(crate::keymap::load_default(&assets::Assets, cx).unwrap().is_empty());
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let mut calendar = CalendarView::new(store.clone(), window, cx);
+            calendar.sidebar_open = true;
+            calendar.month = calendar::month_start(day);
+            calendar.anchor = day;
+            calendar.reload(cx);
+            calendar
+        });
+        let sidebar = cx.debug_bounds("calendar-sidebar").expect("calendar sidebar is rendered");
+        let toolbar = cx.debug_bounds("calendar-toolbar").expect("calendar toolbar is rendered");
+        assert_eq!(sidebar.top(), px(0.), "sidebar extends to the top edge of the calendar view");
+        assert!(toolbar.left() >= sidebar.right() - px(1.), "header sits beside the full-height sidebar");
+
+        // Tag filter checkbox narrows tasks to matching tags; All resets.
+        let modifiers = Modifiers::default();
+        let tag_row = cx.debug_bounds("calendar-filter-tag-health").expect("tag filter row").center();
+        cx.simulate_click(tag_row, modifiers);
+        cx.update(|_, cx| {
+            let ids: Vec<_> = view.read(cx).tasks_on(day).into_iter().map(|t| t.id).collect();
+            assert_eq!(ids, vec![t1.id]);
+        });
+        let all_row = cx.debug_bounds("calendar-filter-all").expect("all filter row").center();
+        cx.simulate_click(all_row, modifiers);
+        cx.update(|_, cx| assert_eq!(view.read(cx).tasks_on(day).len(), 2));
+
+        // Clicking the header month title opens the 4x3 month picker and jumps to the picked month.
+        let title = cx.debug_bounds("calendar-month-title").expect("clickable month title").center();
+        cx.simulate_click(title, modifiers);
+        assert!(cx.debug_bounds("calendar-month-picker").is_some());
+        let march = cx.debug_bounds("calendar-month-pick-2026-3").expect("March cell").center();
+        cx.simulate_click(march, modifiers);
+        assert!(cx.debug_bounds("calendar-month-picker").is_none());
+        cx.update(|_, cx| assert_eq!(view.read(cx).month, NaiveDate::from_ymd_opt(2026, 3, 1).unwrap()));
     }
 }

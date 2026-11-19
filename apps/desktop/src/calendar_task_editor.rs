@@ -1,9 +1,10 @@
 //! Calendar placement and lifetime of the shared task detail editor.
+use std::collections::HashSet;
 use std::rc::Rc;
 
 use chrono::{Datelike, Local, NaiveDate};
 use fern_core::{Id, Store};
-use gpui::{Entity, EventEmitter, FocusHandle, Focusable};
+use gpui::{Entity, EventEmitter, FocusHandle, Focusable, FontWeight};
 use ui::prelude::*;
 
 use crate::task_detail::{DraftClosed, TaskDetail};
@@ -105,8 +106,10 @@ impl Render for CalendarTaskEditor {
 
 pub(super) fn month_picker(
     month: NaiveDate,
-    selected: NaiveDate,
+    selected: Option<NaiveDate>,
+    busy: &HashSet<NaiveDate>,
     shift: impl Fn(&i32, &mut Window, &mut App) + 'static,
+    go_today: impl Fn(&(), &mut Window, &mut App) + 'static,
     pick: impl Fn(&NaiveDate, &mut Window, &mut App) + 'static,
     cx: &App,
 ) -> impl IntoElement {
@@ -118,29 +121,41 @@ pub(super) fn month_picker(
     let arrow = |id, icon, delta| {
         let shift = shift.clone();
         IconButton::new(id, icon)
-            .size(px(24.))
-            .icon_size(IconSize::Small)
+            .size(px(22.))
+            .icon_size(IconSize::XSmall)
             .icon_color(colors.list_text_muted)
             .hover_icon_color(colors.list_text)
             .hover_color(colors.list_hover)
             .on_click(move |_, window, cx| shift(&delta, window, cx))
     };
+    let short_title = format!("{} {}", strings.months_short[month.month0() as usize], month.year());
     v_flex()
         .gap_1()
         .child(
             h_flex()
-                .gap_1()
+                .h(px(24.))
+                .px_1()
+                .gap(px(2.))
                 .child(
                     div()
                         .flex_1()
                         .min_w_0()
-                        .child(Label::new(calendar::month_title(month, strings)).color(colors.list_text).truncate()),
+                        .child(Label::new(short_title).weight(FontWeight::SEMIBOLD).color(colors.list_text).truncate()),
                 )
                 .child(arrow("calendar-picker-prev", IconName::ChevronLeft, -1))
+                .child(
+                    IconButton::new("calendar-picker-today", IconName::Circle)
+                        .size(px(22.))
+                        .icon_size(IconSize::Custom(px(8.)))
+                        .icon_color(colors.list_text_muted)
+                        .hover_icon_color(colors.list_text)
+                        .hover_color(colors.list_hover)
+                        .on_click(move |_, window, cx| go_today(&(), window, cx)),
+                )
                 .child(arrow("calendar-picker-next", IconName::ChevronRight, 1)),
         )
-        .child(h_flex().h(px(20.)).children(
-            calendar::weekday_labels(&strings.weekdays_narrow).map(|day| {
+        .child(h_flex().h(px(22.)).children(
+            calendar::weekday_labels(&strings.weekdays_short).map(|day| {
                 div()
                     .flex_1()
                     .flex()
@@ -151,33 +166,49 @@ pub(super) fn month_picker(
         .children(calendar::month_grid(month).chunks(7).map(|week| {
             h_flex().children(week.iter().map(|&date| {
                 let pick = pick.clone();
-                let color = if date == selected {
+                let is_today = date == today;
+                let is_selected = selected == Some(date);
+                let has_dot = !is_today && busy.contains(&date);
+                let color = if is_today {
                     Color::OnAccent
-                } else if date == today {
-                    Color::Accent
                 } else if date.month() != month.month() {
                     Color::Custom(colors.list_text_muted)
                 } else {
                     Color::Custom(colors.list_text)
                 };
-                div().flex_1().flex().justify_center().child(
-                    div()
+                div().flex_1().h(px(30.)).flex().items_center().justify_center().child(
+                    v_flex()
                         .id(SharedString::from(format!("calendar-picker-{date}")))
-                        .size(px(24.))
-                        .flex()
+                        .w(px(26.))
+                        .h(px(28.))
                         .items_center()
                         .justify_center()
-                        .rounded_full()
                         .cursor_pointer()
-                        .when(date == selected, |el| el.bg(colors.accent))
-                        .when(date != selected, |el| {
-                            el.hover(|style| style.bg(colors.list_hover))
-                        })
                         .child(
-                            Label::new(date.day().to_string())
-                                .centered()
-                                .size(LabelSize::Small)
-                                .color(color),
+                            div()
+                                .size(px(22.))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded_full()
+                                .when(is_today, |el| el.bg(colors.accent))
+                                .when(!is_today && is_selected, |el| el.bg(colors.list_selected))
+                                .when(!is_today && !is_selected, |el| {
+                                    el.hover(|style| style.bg(colors.list_hover))
+                                })
+                                .child(
+                                    Label::new(date.day().to_string())
+                                        .centered()
+                                        .size(LabelSize::Small)
+                                        .when(is_today, |l| l.weight(FontWeight::SEMIBOLD))
+                                        .color(color),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .size(px(3.5))
+                                .rounded_full()
+                                .when(has_dot, |el| el.bg(colors.accent)),
                         )
                         .on_click(move |_, window, cx| pick(&date, window, cx)),
                 )

@@ -2957,7 +2957,7 @@ impl TodoView {
                                 if event.click_count > 1 {
                                     cx.stop_propagation();
                                     this.close_card(cx);
-                                    this.start_title_edit(task_id, window, cx);
+                                    this.start_title_edit(task_id, Some(event.position), window, cx);
                                 }
                             }))
                             .child(if task.title.is_empty() { strings.untitled.to_owned() } else { task.title.clone() })
@@ -6933,7 +6933,7 @@ impl TodoView {
             .into_any_element()
     }
 
-    fn start_title_edit(&mut self, id: Id, window: &mut Window, cx: &mut Context<Self>) {
+    fn start_title_edit(&mut self, id: Id, click: Option<gpui::Point<Pixels>>, window: &mut Window, cx: &mut Context<Self>) {
         self.finish_title_edit(true, cx);
         let Some(task) = self.tasks.iter().find(|task| task.id == id && !task.is_deleted()) else { return };
         let title = task.title.clone();
@@ -6941,6 +6941,9 @@ impl TodoView {
         let input = cx.new(|cx| {
             let mut input = TextInput::new(Mode::SingleLine, "", cx);
             input.set_text(title, cx);
+            if let Some(position) = click {
+                input.place_cursor_at(position, cx);
+            }
             input
         });
         cx.subscribe_in(&input, window, |this, _, _: &Submitted, window, cx| {
@@ -7124,23 +7127,29 @@ impl TodoView {
                         v_flex().flex_1().min_w_0().debug_selector(|| format!("task-title-field-{id}")).child(if let Some(input) = title_input {
                             input.into_any_element()
                         } else {
-                            div().id("task-title").child(Label::new(if task.title.is_empty() {
-                                SharedString::new_static(strings.untitled)
-                            } else {
-                                task.title.clone().into()
-                            })
-                            // As the original: closed tasks are muted, not struck through.
-                            .color(if done || wont_do || task.title.is_empty() { Color::Muted } else { Color::Default })
-                            .truncate())
-                            .debug_selector(|| format!("task-title-{id}"))
-                            .when(!task.is_deleted(), |el| el.on_mouse_down(MouseButton::Left, cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
-                                // Handle the press before the draggable row can take the click.
-                                if this.selected == Some(id) || event.click_count > 1 {
-                                    cx.stop_propagation();
-                                    this.start_title_edit(id, window, cx);
-                                }
-                            })))
-                            .into_any_element()
+                            div()
+                                .id("task-title")
+                                .max_w_full()
+                                .min_w_0()
+                                .self_start()
+                                .child(Label::new(if task.title.is_empty() {
+                                    SharedString::new_static(strings.untitled)
+                                } else {
+                                    task.title.clone().into()
+                                })
+                                // As the original: closed tasks are muted, not struck through.
+                                .color(if done || wont_do || task.title.is_empty() { Color::Muted } else { Color::Default })
+                                .truncate())
+                                .debug_selector(|| format!("task-title-{id}"))
+                                .when(!task.is_deleted(), |el| {
+                                    el.cursor(gpui::CursorStyle::IBeam).on_click(cx.listener(
+                                        move |this, event: &gpui::ClickEvent, window, cx| {
+                                            cx.stop_propagation();
+                                            this.start_title_edit(id, Some(event.position()), window, cx);
+                                        },
+                                    ))
+                                })
+                                .into_any_element()
                         })
                         // "Show Details": the first line of the notes under the title.
                         .when_some(details.then(|| task.notes.lines().find(|l| !l.trim().is_empty())).flatten(), |el, line| {
@@ -9538,7 +9547,7 @@ mod tests {
         let selector = format!("task-title-field-{}", task.id).leak();
         let original_field = cx.debug_bounds(selector).unwrap();
         assert!(original_field.size.width > px(50.));
-        cx.update(|window, cx| view.update(cx, |view, cx| view.start_title_edit(task.id, window, cx)));
+        cx.update(|window, cx| view.update(cx, |view, cx| view.start_title_edit(task.id, None, window, cx)));
         cx.run_until_parked();
         let field = cx.debug_bounds(selector).unwrap();
         assert_eq!(field.left(), original_field.left());
@@ -9785,22 +9794,27 @@ mod tests {
         let (view, cx) = cx.add_window_view(|window, cx| TodoView::new(store.clone(), window, cx));
         let selector = format!("task-title-{}", task.id).leak();
         let bounds = cx.debug_bounds(selector).expect("task title is rendered");
-        let position = point(bounds.left() + px(8.), bounds.center().y);
+        // Single click in the middle of the title immediately starts editing at the clicked offset.
+        let position = bounds.center();
         let modifiers = Modifiers::default();
         cx.simulate_mouse_move(position, None, modifiers);
         cx.simulate_click(position, modifiers);
-        cx.update(|_, cx| {
-            assert_eq!(view.read(cx).selected, Some(task.id));
-            assert!(view.read(cx).title_edit.is_none());
-        });
-        cx.simulate_click(position, modifiers);
+        cx.run_until_parked();
         cx.update(|window, cx| {
-            let (_, input, _) = view.read(cx).title_edit.as_ref().expect("inline editor opens");
+            assert_eq!(view.read(cx).selected, Some(task.id));
+            let (_, input, _) = view.read(cx).title_edit.as_ref().expect("inline editor opens on first click");
             assert!(input.focus_handle(cx).is_focused(window));
+            let selection = input.read(cx).selection();
+            assert!(selection.is_empty());
+            assert!(
+                selection.start > 0 && selection.start < "Original".len(),
+                "caret should land inside the clicked word, got {selection:?}"
+            );
         });
         cx.simulate_input("!");
         cx.simulate_keystrokes("enter");
-        assert_eq!(store.task(task.id).unwrap().unwrap().title, "Original!");
+        let saved = store.task(task.id).unwrap().unwrap().title;
+        assert!(saved.contains('!') && !saved.starts_with('!') && !saved.ends_with('!'), "saved title: {saved}");
         cx.update(|_, cx| assert!(view.read(cx).title_edit.is_none()));
     }
 
@@ -9945,20 +9959,23 @@ mod tests {
         let (view, cx) = cx.add_window_view(|window, cx| TodoView::new(store.clone(), window, cx));
         let selector = format!("task-title-{}", task.id).leak();
         let bounds = cx.debug_bounds(selector).expect("task title is rendered");
-        let position = point(bounds.left() + px(8.), bounds.center().y);
+        let row_empty_space = point(bounds.right() + px(24.), bounds.center().y);
+        let title_click = point(bounds.left() + px(8.), bounds.center().y);
         let modifiers = Modifiers::default();
 
-        cx.simulate_mouse_move(position, None, modifiers);
-        cx.simulate_click(position, modifiers);
+        cx.simulate_mouse_move(row_empty_space, None, modifiers);
+        cx.simulate_click(row_empty_space, modifiers);
         cx.update(|window, cx| {
             let view = view.read(cx);
             assert_eq!(view.selected, Some(task.id));
+            assert!(view.title_edit.is_none());
             assert!(view.list_focus.is_focused(window));
         });
         cx.simulate_keystrokes("backspace");
         assert!(!store.task(task.id).unwrap().unwrap().is_deleted());
 
-        cx.simulate_click(position, modifiers);
+        cx.simulate_mouse_move(title_click, None, modifiers);
+        cx.simulate_click(title_click, modifiers);
         cx.simulate_keystrokes("end backspace enter");
         let edited = store.task(task.id).unwrap().unwrap();
         assert_eq!(edited.title, "Origina");

@@ -147,27 +147,31 @@ fn baseline_offset(line: &WrappedLineLayout, line_height: Pixels) -> Pixels {
     (line_height + line.ascent() - line.descent()) / 2.
 }
 
-/// A single-line text editor paints at a fixed baseline as the user types. Align
-/// its neighboring icons to the capital height of the same shaped font.
+/// A single-line text editor paints at a fixed baseline as the user types. Centers its
+/// capital height inside `bounds` (matching `LabelText`), aligns neighboring icons to the
+/// same axis, and returns the vertical paint offset from `bounds.top()`.
 pub fn align_icons_to_input(
     bounds: Bounds<Pixels>,
     line: &WrappedLineLayout,
     line_height: Pixels,
     window: &Window,
     cx: &App,
-) {
-    if let Some(run) = line.runs().first() {
-        RowCaptions::add(bounds, cx, || {
-            let cap_height = window
-                .text_system()
-                .cap_height(run.font_id, line.font_size());
-            if cap_height > Pixels::ZERO {
-                bounds.top() + baseline_offset(line, line_height) - cap_height / 2.
-            } else {
-                bounds.center().y
-            }
-        });
-    }
+) -> Pixels {
+    let cap_height = line
+        .runs()
+        .first()
+        .map(|run| window.text_system().cap_height(run.font_id, line.font_size()))
+        .unwrap_or(Pixels::ZERO);
+    let (offset, axis) = if cap_height > Pixels::ZERO {
+        let baseline = baseline_offset(line, line_height);
+        let center_y = -cap_height / 2.;
+        let aligned_top = window.pixel_snap(bounds.center().y - center_y) - baseline;
+        (aligned_top - bounds.top(), aligned_top + baseline + center_y)
+    } else {
+        (Pixels::ZERO, bounds.center().y)
+    };
+    RowCaptions::add(bounds, cx, || axis);
+    offset
 }
 
 impl IntoElement for LabelText {

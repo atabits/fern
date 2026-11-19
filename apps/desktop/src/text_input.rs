@@ -84,6 +84,7 @@ pub struct TextInput {
     selection_reversed: bool,
     marked_range: Option<Range<usize>>,
     last_layout: Option<TextLayout>,
+    pending_click: Option<Point<Pixels>>,
     is_selecting: bool,
     cancellable: bool,
     /// Byte ranges shown in the accent color on a tinted background, such as the date and tags
@@ -176,6 +177,7 @@ impl TextInput {
             selection_reversed: false,
             marked_range: None,
             last_layout: None,
+            pending_click: None,
             is_selecting: false,
             cancellable: true,
             highlights: Vec::new(),
@@ -213,7 +215,22 @@ impl TextInput {
         self.selection_reversed = false;
         self.marked_range = None;
         self.last_layout = None;
+        self.pending_click = None;
         self.highlights.clear();
+        cx.notify();
+    }
+
+    /// Places the caret at the character nearest `position` (in window coordinates).
+    /// When called before the first layout, defers resolution until the initial prepaint.
+    pub fn place_cursor_at(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        if self.last_layout.is_some() {
+            let offset = self.index_for_mouse_position(position);
+            self.selected_range = offset..offset;
+            self.selection_reversed = false;
+            self.pending_click = None;
+        } else {
+            self.pending_click = Some(position);
+        }
         cx.notify();
     }
 
@@ -744,6 +761,8 @@ struct PrepaintState {
     selection: Vec<PaintQuad>,
     /// Tinted backgrounds under the highlighted ranges.
     highlights: Vec<PaintQuad>,
+    /// Vertical offset aligning single-line input text with `LabelText`.
+    text_y_offset: Pixels,
 }
 
 const CARET_WIDTH: Pixels = px(2.);
@@ -907,9 +926,13 @@ impl Element for TextElement {
         let font_size = window.text_style().font_size.to_pixels(window.rem_size());
         let wrap_width = input.mode.wraps().then_some(text_width(bounds.size.width));
         let lines = shape(text, &runs, font_size, wrap_width, window);
-        if !input.mode.wraps() && let [line] = lines.as_slice() {
-            ui::align_icons_to_input(bounds, line, line_height, window, cx);
-        }
+        let text_y_offset = if !input.mode.wraps()
+            && let [line] = lines.as_slice()
+        {
+            ui::align_icons_to_input(bounds, line, line_height, window, cx)
+        } else {
+            px(0.)
+        };
 
         let mut paragraphs = Vec::with_capacity(lines.len());
         let (mut start, mut top) = (0, px(0.));
@@ -927,6 +950,23 @@ impl Element for TextElement {
             scroll_left: px(0.),
             is_placeholder,
         };
+        let pending_offset = input.pending_click.map(|position| {
+            if position.y < layout.bounds.top() {
+                0
+            } else if position.y > layout.bounds.bottom() {
+                input.content.len()
+            } else {
+                input.offset_for_text_position(&layout, position - layout.origin())
+            }
+        });
+        if let Some(offset) = pending_offset {
+            self.input.update(cx, |input, _| {
+                input.pending_click = None;
+                input.selected_range = offset..offset;
+                input.selection_reversed = false;
+            });
+        }
+        let input = self.input.read(cx);
         if !input.mode.wraps() && !is_placeholder {
             let viewport_width = text_width(bounds.size.width);
             let content_width = layout.paragraphs.iter()
@@ -1004,7 +1044,7 @@ impl Element for TextElement {
                 .collect()
         };
 
-        PrepaintState { layout: Some(layout), cursor, selection, highlights }
+        PrepaintState { layout: Some(layout), cursor, selection, highlights, text_y_offset }
     }
 
     fn paint(
@@ -1037,7 +1077,7 @@ impl Element for TextElement {
                 paragraph
                     .line
                     .paint(
-                        layout.origin() + point(px(0.), paragraph.top),
+                        layout.origin() + point(px(0.), paragraph.top + prepaint.text_y_offset),
                         layout.line_height,
                         gpui::TextAlign::Left,
                         Some(bounds),

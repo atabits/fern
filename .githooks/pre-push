@@ -1,0 +1,5 @@
+#!/bin/sh
+set -eu
+
+echo "Running pre-push Clippy check..."
+cargo clippy --workspace --all-targets --locked -- -D warnings

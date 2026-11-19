@@ -1,8 +1,10 @@
 //! The narrow sidebar with app sections, modeled on TickTick's.
 
+use fern_core::RailSection;
 use gpui::{AnyElement, ClickEvent};
 use ui::prelude::*;
 
+use crate::drag::DraggedRailSection;
 use crate::i18n::{self, Strings};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -14,6 +16,34 @@ pub enum Section {
     Search,
     Matrix,
     Countdown,
+}
+
+impl From<RailSection> for Section {
+    fn from(section: RailSection) -> Self {
+        match section {
+            RailSection::Tasks => Section::Tasks,
+            RailSection::Calendar => Section::Calendar,
+            RailSection::Pomodoro => Section::Pomodoro,
+            RailSection::Habits => Section::Habits,
+            RailSection::Search => Section::Search,
+            RailSection::Matrix => Section::Matrix,
+            RailSection::Countdown => Section::Countdown,
+        }
+    }
+}
+
+impl From<Section> for RailSection {
+    fn from(section: Section) -> Self {
+        match section {
+            Section::Tasks => RailSection::Tasks,
+            Section::Calendar => RailSection::Calendar,
+            Section::Pomodoro => RailSection::Pomodoro,
+            Section::Habits => RailSection::Habits,
+            Section::Search => RailSection::Search,
+            Section::Matrix => RailSection::Matrix,
+            Section::Countdown => RailSection::Countdown,
+        }
+    }
 }
 
 impl Section {
@@ -51,7 +81,7 @@ impl Section {
         }
     }
 
-    fn icon(self) -> IconName {
+    pub fn icon(self) -> IconName {
         match self {
             // Filled glyphs as in the original, drawn for Fern (`assets/icons/fern_*.svg`): a target
             // for Focus and a clock for Habit.
@@ -83,6 +113,13 @@ pub const WIDTH: f32 = 72.;
 #[cfg(not(target_os = "macos"))]
 pub const WIDTH: f32 = 50.;
 
+/// Height of one rail icon slot (`40 px` icon + `5 px` vertical padding on each side, zero dead gap),
+/// matching TickTick's `px-[4px] py-[5px]` + `w-[40px] h-[40px]` rail entries.
+pub const SLOT_HEIGHT: f32 = 50.;
+
+/// Distance from the top of the sidebar to the first rail icon slot (`avatar 32 + mb 7 + gap 4`).
+pub const SECTIONS_TOP_OFFSET: f32 = 43.;
+
 type ClickCallback = Box<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
 
 /// The notification bell: a red badge with the unread count, as in the original.
@@ -106,8 +143,11 @@ pub struct SyncButton {
 pub fn render(
     active: Section,
     hovered: Option<Section>,
+    order: &[RailSection],
+    dragging: Option<Section>,
     on_hover: impl Fn(Section, bool, &mut App) + Clone + 'static,
     on_select: impl Fn(Section, &mut Window, &mut App) + Clone + 'static,
+    on_start_drag: impl Fn(Section, &mut App) + Clone + 'static,
     on_avatar: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     account_menu: Option<AnyElement>,
     bell: Bell,
@@ -117,6 +157,8 @@ pub fn render(
 ) -> impl IntoElement {
     let colors = cx.theme().colors();
     let strings = i18n::t(cx);
+    let active_drag = cx.has_active_drag();
+    let dragging = dragging.filter(|_| active_drag);
     let button = |id: &'static str, icon: IconName| {
         IconButton::new(id, icon)
             .size(px(36.))
@@ -124,6 +166,11 @@ pub fn render(
             .icon_color(colors.sidebar_icon_bottom)
             .hover_icon_color(colors.sidebar_icon_hover)
             .hover_color(gpui::transparent_black())
+    };
+    let ordered_sections: Vec<Section> = if order.is_empty() {
+        Section::ALL.to_vec()
+    } else {
+        order.iter().copied().map(Section::from).collect()
     };
 
     v_flex()
@@ -143,7 +190,7 @@ pub fn render(
                 .id("avatar")
                 .relative()
                 .flex_none()
-                .mb_3()
+                .mb(px(7.))
                 .size(px(32.))
                 .rounded(px(6.))
                 .bg(colors.avatar_background)
@@ -164,32 +211,61 @@ pub fn render(
                 .w_full()
                 .items_center()
                 .overflow_y_scroll()
-                .gap(px(10.))
-                .children(Section::ALL.into_iter().filter(|s| s.enabled(features)).map(|section| {
+                .children(ordered_sections.into_iter().filter(|s| s.enabled(features)).map(|section| {
                     let on_select = on_select.clone();
                     let on_hover = on_hover.clone();
-                    // The open section's icon turns bright, and its name shows on hover.
+                    let on_start_drag = on_start_drag.clone();
+                    let is_dragged = dragging == Some(section);
+                    let payload = DraggedRailSection {
+                        section: RailSection::from(section),
+                        icon: section.icon(),
+                        active: section == active,
+                    };
+                    // Each entry occupies a contiguous 50 px slot (40 px icon + 5 px top/bottom)
+                    // with zero dead gaps; while dragged, it leaves a vacant slot as neighbors slide.
                     div()
                         .id(section.id())
+                        .debug_selector(move || section.id().to_owned())
                         .relative()
                         .flex_none()
+                        .w(px(48.))
+                        .h(px(SLOT_HEIGHT))
                         .on_hover(move |hovered: &bool, _, cx| on_hover(section, *hovered, cx))
-                        .size(px(40.))
                         .flex()
                         .items_center()
                         .justify_center()
                         .cursor_pointer()
-                        .child(Icon::new(section.icon()).size(IconSize::Custom(px(24.))).color(
-                            if section == active {
-                                colors.sidebar_icon
-                            } else if hovered == Some(section) {
-                                colors.sidebar_icon_hover
-                            } else {
-                                colors.sidebar_icon_muted
-                            },
-                        ))
                         .on_click(move |_, window, cx| on_select(section, window, cx))
-                        .when(hovered == Some(section), |el| el.child(side_tooltip(section.title(strings), cx)))
+                        .on_drag(payload, move |dragged, _, _, cx| {
+                            on_start_drag(section, cx);
+                            cx.new(|_| dragged.clone())
+                        })
+                        .child(if is_dragged {
+                            div()
+                                .size(px(40.))
+                                .rounded(px(8.))
+                                .bg(colors.sidebar_icon_muted.opacity(0.10))
+                                .into_any_element()
+                        } else {
+                            div()
+                                .size(px(40.))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(Icon::new(section.icon()).size(IconSize::Custom(px(24.))).color(
+                                    if section == active {
+                                        colors.sidebar_icon
+                                    } else if hovered == Some(section) && !active_drag {
+                                        colors.sidebar_icon_hover
+                                    } else {
+                                        colors.sidebar_icon_muted
+                                    },
+                                ))
+                                .into_any_element()
+                        })
+                        .when(hovered == Some(section) && !active_drag, |el| {
+                            el.child(side_tooltip(section.title(strings), cx))
+                        })
                 })),
         )
         .children(sync.map(|sync| {

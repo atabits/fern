@@ -782,6 +782,16 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE filters ADD COLUMN rules TEXT;",
 ];
 
+/// Drop target when dragging a list folder relative to another list or folder.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FolderDropTarget {
+    List(Id),
+    Folder(Id),
+}
+
+const TAG_ORDER_KEY: &str = "tag_order";
+const FILTER_ORDER_KEY: &str = "filter_order";
+
 const TASK_COLUMNS: &str = "id, parent_id, kind, title, notes, priority, due_date, due_time, \
                             completed_at, created_at, list_id, deleted_at, repeat, wont_do_at, reminders, end_date, end_time, modified_at, \
                             pinned_at, section_id, estimate";
@@ -999,13 +1009,13 @@ impl Store {
             .collect())
     }
 
-    /// Saved filters, oldest first.
+    /// Saved filters, in custom sidebar order (falling back to creation order).
     pub fn filters(&self) -> Result<Vec<crate::filter::SmartFilter>> {
         use crate::filter::{ConditionValue as V, DateRule, FilterRules, SmartFilter};
         let mut stmt = self.conn.prepare_cached(
             "SELECT id, name, lists, tags, date, priorities, keywords, kind, match_any, chain, rules FROM filters ORDER BY created_at, rowid",
         )?;
-        let filters = stmt.query_map([], |row| {
+        let mut filters: Vec<SmartFilter> = stmt.query_map([], |row| {
             let read = || -> Result<SmartFilter> {
                 let rules = match row.get::<_, Option<String>>(10)? {
                     Some(text) => FilterRules::from_storage(&text)?,
@@ -1029,6 +1039,15 @@ impl Store {
             };
             read().map_err(|e| rusqlite::Error::FromSqlConversionFailure(10, rusqlite::types::Type::Text, e.into()))
         })?.collect::<Result<_, _>>()?;
+        if let Some(saved) = self.setting(FILTER_ORDER_KEY)? {
+            let ranks: HashMap<Id, usize> = saved
+                .split(',')
+                .filter_map(|s| Uuid::parse_str(s.trim()).ok())
+                .enumerate()
+                .map(|(i, id)| (id, i))
+                .collect();
+            filters.sort_by_key(|f| ranks.get(&f.id).copied().unwrap_or(usize::MAX));
+        }
         Ok(filters)
     }
 
@@ -1043,6 +1062,37 @@ impl Store {
             params![filter.id.to_string(), filter.name.trim(), now_ms(), rules],
         )?;
         Ok(())
+    }
+
+    /// Persists the saved-filter display order in a single write.
+    pub fn set_filter_order(&self, order: &[Id]) -> Result<()> {
+        let value: Vec<String> = order.iter().map(Id::to_string).collect();
+        self.set_setting(FILTER_ORDER_KEY, &value.join(","))?;
+        Ok(())
+    }
+
+    /// Reorders a saved filter before (`!after`) or after (`after`) `target`.
+    pub fn move_filter(&self, dragged: Id, target: Id, after: bool) -> Result<()> {
+        if dragged == target {
+            return Ok(());
+        }
+        let mut order: Vec<Id> = self.filters()?.into_iter().map(|f| f.id).collect();
+        let Some(from) = order.iter().position(|&id| id == dragged) else { return Ok(()) };
+        order.remove(from);
+        let Some(to) = order.iter().position(|&id| id == target) else { return Ok(()) };
+        order.insert(to + usize::from(after), dragged);
+        self.set_filter_order(&order)
+    }
+
+    /// Moves a saved filter to the top of the Filters section.
+    pub fn move_filter_first(&self, dragged: Id) -> Result<()> {
+        let mut order: Vec<Id> = self.filters()?.into_iter().map(|f| f.id).collect();
+        if !order.contains(&dragged) {
+            return Ok(());
+        }
+        order.retain(|&id| id != dragged);
+        order.insert(0, dragged);
+        self.set_filter_order(&order)
     }
 
     pub fn delete_filter(&self, id: Id) -> Result<()> {
@@ -1757,7 +1807,7 @@ impl Store {
              GROUP BY t.name
              ORDER BY t.created_at, t.rowid",
         )?;
-        let tags = stmt
+        let mut tags: Vec<Tag> = stmt
             .query_map([], |row| {
                 Ok(Tag {
                     name: row.get(0)?,
@@ -1768,6 +1818,11 @@ impl Store {
                 })
             })?
             .collect::<Result<_, _>>()?;
+        if let Some(saved) = self.setting(TAG_ORDER_KEY)? {
+            let ranks: HashMap<&str, usize> =
+                saved.lines().filter(|s| !s.is_empty()).enumerate().map(|(i, name)| (name, i)).collect();
+            tags.sort_by_key(|t| ranks.get(t.name.as_str()).copied().unwrap_or(usize::MAX));
+        }
         Ok(tags)
     }
 
@@ -1824,6 +1879,10 @@ impl Store {
             tx.execute("UPDATE tags SET parent = ?2 WHERE parent = ?1", params![name, new_name])?;
             tx.execute("DELETE FROM tags WHERE name = ?1", [name])?;
             tx.commit()?;
+            if let Some(saved) = self.setting(TAG_ORDER_KEY)? {
+                let updated: Vec<&str> = saved.lines().map(|n| if n == name { new_name } else { n }).collect();
+                self.set_setting(TAG_ORDER_KEY, &updated.join("\n"))?;
+            }
         }
         self.conn.execute("UPDATE tags SET color = ?2, parent = ?3 WHERE name = ?1", params![new_name, color, parent])?;
         Ok(())
@@ -1831,6 +1890,140 @@ impl Store {
 
     pub fn set_tag_pinned(&self, name: &str, pinned: bool) -> Result<()> {
         self.conn.execute("UPDATE tags SET pinned_at = ?2 WHERE name = ?1", params![name, pinned.then(now_ms)])?;
+        Ok(())
+    }
+
+    /// Reorders or nests `dragged` tag relative to `target` tag, matching TickTick's tag drag rules:
+    /// - `nest = true`: makes `dragged` a sub-tag of `target` (1 level deep: ignored if `dragged`
+    ///   has sub-tags or `target` is itself a sub-tag).
+    /// - `nest = false`: moves `dragged` (together with its sub-tags if it is a parent) before
+    ///   (`!after`) or after (`after`) `target`. A standalone/sub-tag adopts `target`'s parent, so
+    ///   dropping a sub-tag onto a top-level tag's edge promotes it to top-level.
+    pub fn move_tag(&self, dragged: &str, target: &str, after: bool, nest: bool) -> Result<()> {
+        if dragged == target {
+            return Ok(());
+        }
+        let tags = self.tags()?;
+        let Some(dragged_tag) = tags.iter().find(|t| t.name == dragged) else { return Ok(()) };
+        let Some(target_tag) = tags.iter().find(|t| t.name == target) else { return Ok(()) };
+
+        let dragged_children: Vec<String> =
+            tags.iter().filter(|t| t.parent.as_deref() == Some(dragged)).map(|t| t.name.clone()).collect();
+        let dragged_is_parent = !dragged_children.is_empty();
+        let target_parent = target_tag.parent.clone();
+
+        if nest {
+            if dragged_is_parent || target_parent.is_some() {
+                return Ok(());
+            }
+            let mut remaining: Vec<String> = tags.iter().filter(|t| t.name != dragged).map(|t| t.name.clone()).collect();
+            let last_child_pos = remaining.iter().rposition(|name| {
+                tags.iter().any(|t| t.name == *name && t.parent.as_deref() == Some(target))
+            });
+            let insert_at = match last_child_pos {
+                Some(idx) => idx + 1,
+                None => remaining.iter().position(|name| name == target).map_or(remaining.len(), |idx| idx + 1),
+            };
+            remaining.insert(insert_at, dragged.to_owned());
+
+            let tx = self.conn.unchecked_transaction()?;
+            tx.execute(
+                "UPDATE tags SET parent = ?2, pinned_at = NULL WHERE name = ?1",
+                params![dragged, target],
+            )?;
+            tx.commit()?;
+            self.set_setting(TAG_ORDER_KEY, &remaining.join("\n"))?;
+            return Ok(());
+        }
+
+        if dragged_is_parent && target_parent.is_some() {
+            return Ok(());
+        }
+
+        let mut block = Vec::with_capacity(1 + dragged_children.len());
+        block.push(dragged.to_owned());
+        block.extend(dragged_children);
+
+        let mut remaining: Vec<String> =
+            tags.iter().filter(|t| !block.contains(&t.name)).map(|t| t.name.clone()).collect();
+        let Some(target_pos) = remaining.iter().position(|name| name == target) else {
+            return Ok(());
+        };
+        let insert_at = target_pos + usize::from(after);
+        remaining.splice(insert_at..insert_at, block);
+
+        let tx = self.conn.unchecked_transaction()?;
+        if !dragged_is_parent && dragged_tag.parent != target_parent {
+            tx.execute(
+                "UPDATE tags SET parent = ?2 WHERE name = ?1",
+                params![dragged, target_parent.as_deref()],
+            )?;
+        }
+        if target_parent.is_some() {
+            tx.execute("UPDATE tags SET pinned_at = NULL WHERE name = ?1", [dragged])?;
+        } else if dragged_tag.pinned != target_tag.pinned {
+            tx.execute(
+                "UPDATE tags SET pinned_at = ?2 WHERE name = ?1",
+                params![dragged, target_tag.pinned.then(now_ms)],
+            )?;
+        }
+        tx.commit()?;
+        self.set_setting(TAG_ORDER_KEY, &remaining.join("\n"))?;
+        Ok(())
+    }
+
+    /// Moves a tag (and its children if any) to the top of the Tags section, out of any parent.
+    pub fn move_tag_first(&self, dragged: &str) -> Result<()> {
+        let tags = self.tags()?;
+        if !tags.iter().any(|t| t.name == dragged) {
+            return Ok(());
+        }
+        let mut block = vec![dragged.to_owned()];
+        block.extend(tags.iter().filter(|t| t.parent.as_deref() == Some(dragged)).map(|t| t.name.clone()));
+        let mut remaining: Vec<String> =
+            tags.iter().filter(|t| !block.contains(&t.name)).map(|t| t.name.clone()).collect();
+        remaining.splice(0..0, block);
+
+        self.conn.execute("UPDATE tags SET parent = NULL WHERE name = ?1", [dragged])?;
+        self.set_setting(TAG_ORDER_KEY, &remaining.join("\n"))?;
+        Ok(())
+    }
+
+    /// Commits a live-reordered tag slice (hierarchy, pinned state, and display order) atomically.
+    pub fn save_tag_hierarchy_and_order(&self, tags: &[Tag]) -> Result<()> {
+        let existing = self.tags()?;
+        let by_name: HashMap<&str, &Tag> = existing.iter().map(|t| (t.name.as_str(), t)).collect();
+        let valid_roots: HashSet<&str> = tags
+            .iter()
+            .filter(|t| t.parent.is_none())
+            .map(|t| t.name.as_str())
+            .collect();
+
+        let tx = self.conn.unchecked_transaction()?;
+        for tag in tags {
+            let Some(prev) = by_name.get(tag.name.as_str()) else { continue };
+            let parent = tag
+                .parent
+                .as_deref()
+                .filter(|&p| p != tag.name.as_str() && valid_roots.contains(p));
+            let pinned = parent.is_none() && tag.pinned;
+            if prev.parent.as_deref() != parent {
+                tx.execute(
+                    "UPDATE tags SET parent = ?2 WHERE name = ?1",
+                    params![tag.name, parent],
+                )?;
+            }
+            if prev.pinned != pinned {
+                tx.execute(
+                    "UPDATE tags SET pinned_at = ?2 WHERE name = ?1",
+                    params![tag.name, pinned.then(now_ms)],
+                )?;
+            }
+        }
+        tx.commit()?;
+
+        let order: Vec<&str> = tags.iter().map(|t| t.name.as_str()).collect();
+        self.set_setting(TAG_ORDER_KEY, &order.join("\n"))?;
         Ok(())
     }
 
@@ -1974,6 +2167,216 @@ impl Store {
             tx.execute("UPDATE lists SET sort_order = ?2 WHERE id = ?1 AND sort_order != ?2", params![list.to_string(), i as i64])?;
         }
         tx.execute("UPDATE lists SET folder_id = ?2 WHERE id = ?1", params![id.to_string(), folder.map(|f| f.to_string())])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Groups active lists into visual order so each folder's active lists sit contiguously at
+    /// the position of its first active list, followed by archived lists in their existing order.
+    fn visual_list_order(lists: &[List], folders: &[ListFolder]) -> Vec<Id> {
+        let mut result = Vec::with_capacity(lists.len());
+        let mut shown_folders: HashSet<Id> = HashSet::new();
+        for list in lists.iter().filter(|l| !l.archived) {
+            match list.folder.filter(|f| folders.iter().any(|x| x.id == *f)) {
+                None => result.push(list.id),
+                Some(fid) if shown_folders.insert(fid) => {
+                    result.extend(
+                        lists.iter().filter(|l| !l.archived && l.folder == Some(fid)).map(|l| l.id),
+                    );
+                }
+                Some(_) => {}
+            }
+        }
+        result.extend(lists.iter().filter(|l| l.archived).map(|l| l.id));
+        result
+    }
+
+    /// Moves a list right before (`!after`) or right after (`after`) `target`, setting its `folder`.
+    pub fn place_list_relative(&self, id: Id, target: Id, after: bool, folder: Option<Id>) -> Result<()> {
+        if id == target {
+            self.conn.execute(
+                "UPDATE lists SET folder_id = ?2 WHERE id = ?1",
+                params![id.to_string(), folder.map(|f| f.to_string())],
+            )?;
+            return Ok(());
+        }
+        let lists = self.lists()?;
+        let folders = self.list_folders()?;
+        let mut order: Vec<Id> =
+            Self::visual_list_order(&lists, &folders).into_iter().filter(|l| *l != id).collect();
+        let Some(pos) = order.iter().position(|l| *l == target) else {
+            return self.place_list(id, None, folder);
+        };
+        order.insert(pos + usize::from(after), id);
+        let tx = self.conn.unchecked_transaction()?;
+        for (i, list) in order.iter().enumerate() {
+            tx.execute("UPDATE lists SET sort_order = ?2 WHERE id = ?1 AND sort_order != ?2", params![list.to_string(), i as i64])?;
+        }
+        tx.execute("UPDATE lists SET folder_id = ?2 WHERE id = ?1", params![id.to_string(), folder.map(|f| f.to_string())])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Moves a list out of any folder and places it right before (`!after`) or right after (`after`)
+    /// `folder`'s block of active lists.
+    pub fn place_list_around_folder(&self, id: Id, folder: Id, after: bool) -> Result<()> {
+        let lists = self.lists()?;
+        let folders = self.list_folders()?;
+        let was_in_folder = lists.iter().find(|l| l.id == id).is_some_and(|l| l.folder == Some(folder));
+        let visual = Self::visual_list_order(&lists, &folders);
+        let active_by_id: HashMap<Id, &List> = lists.iter().map(|l| (l.id, l)).collect();
+        let mut remaining: Vec<Id> = visual.iter().copied().filter(|&lid| lid != id).collect();
+        let first = remaining.iter().position(|lid| active_by_id.get(lid).is_some_and(|l| !l.archived && l.folder == Some(folder)));
+        let last = remaining.iter().rposition(|lid| active_by_id.get(lid).is_some_and(|l| !l.archived && l.folder == Some(folder)));
+        let insert_at = match (first, last) {
+            (Some(f), Some(l)) => if !after { f } else { l + 1 },
+            _ if was_in_folder => visual.iter().position(|&lid| lid == id).unwrap_or(remaining.len()).min(remaining.len()),
+            _ => remaining
+                .iter()
+                .rposition(|lid| active_by_id.get(lid).is_some_and(|l| !l.archived))
+                .map_or(0, |p| p + 1),
+        };
+        remaining.insert(insert_at, id);
+        let tx = self.conn.unchecked_transaction()?;
+        for (i, list_id) in remaining.iter().enumerate() {
+            tx.execute(
+                "UPDATE lists SET sort_order = ?2 WHERE id = ?1 AND sort_order != ?2",
+                params![list_id.to_string(), i as i64],
+            )?;
+        }
+        tx.execute("UPDATE lists SET folder_id = NULL WHERE id = ?1", [id.to_string()])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Drops `dragged` list onto top-level `target` list, creating a new folder containing both
+    /// at `target`'s position (matching TickTick's `createProjectGroup`).
+    pub fn group_lists_into_folder(&self, dragged: Id, target: Id, folder_name: &str) -> Result<ListFolder> {
+        anyhow::ensure!(dragged != target, "cannot group a list with itself");
+        let name = folder_name.trim();
+        anyhow::ensure!(!name.is_empty(), "a folder needs a name");
+        let lists = self.lists()?;
+        let folders = self.list_folders()?;
+        let target_list = lists.iter().find(|l| l.id == target).context("target list not found")?;
+        anyhow::ensure!(target_list.folder.is_none(), "target list is already inside a folder");
+        anyhow::ensure!(lists.iter().any(|l| l.id == dragged), "dragged list not found");
+
+        let mut order: Vec<Id> =
+            Self::visual_list_order(&lists, &folders).into_iter().filter(|&id| id != dragged).collect();
+        let target_pos = order.iter().position(|&id| id == target).context("target list not found")?;
+        order.insert(target_pos + 1, dragged);
+
+        let folder = ListFolder { id: Uuid::now_v7(), name: name.to_owned() };
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO list_folders (id, name, created_at, sort_order) VALUES (?1, ?2, ?3, (SELECT COALESCE(MAX(sort_order), -1) + 1 FROM list_folders))",
+            params![folder.id.to_string(), folder.name, now_ms()],
+        )?;
+        for (i, list_id) in order.iter().enumerate() {
+            tx.execute(
+                "UPDATE lists SET sort_order = ?2 WHERE id = ?1 AND sort_order != ?2",
+                params![list_id.to_string(), i as i64],
+            )?;
+        }
+        let folder_id_str = folder.id.to_string();
+        tx.execute(
+            "UPDATE lists SET folder_id = ?1 WHERE id IN (?2, ?3)",
+            params![folder_id_str, target.to_string(), dragged.to_string()],
+        )?;
+        tx.commit()?;
+        Ok(folder)
+    }
+
+    /// Reorders an entire folder (and all its active lists together) before (`!after`) or after
+    /// (`after`) another top-level list or folder.
+    pub fn reorder_list_folder(&self, dragged: Id, target: FolderDropTarget, after: bool) -> Result<()> {
+        if target == FolderDropTarget::Folder(dragged) {
+            return Ok(());
+        }
+        let lists = self.lists()?;
+        let folders = self.list_folders()?;
+        if !folders.iter().any(|f| f.id == dragged) {
+            return Ok(());
+        }
+
+        let moving: Vec<Id> = lists.iter().filter(|l| !l.archived && l.folder == Some(dragged)).map(|l| l.id).collect();
+        let remaining_lists: Vec<List> = lists.into_iter().filter(|l| l.archived || l.folder != Some(dragged)).collect();
+
+        let tx = self.conn.unchecked_transaction()?;
+
+        if !moving.is_empty() {
+            let mut visual = Self::visual_list_order(&remaining_lists, &folders);
+            let by_id: HashMap<Id, &List> = remaining_lists.iter().map(|l| (l.id, l)).collect();
+            let insert_at = match target {
+                FolderDropTarget::List(target_list) => {
+                    let Some(pos) = visual.iter().position(|&id| id == target_list) else {
+                        return Ok(());
+                    };
+                    pos + usize::from(after)
+                }
+                FolderDropTarget::Folder(target_folder) => {
+                    let pos = if !after {
+                        visual.iter().position(|id| by_id.get(id).is_some_and(|l| !l.archived && l.folder == Some(target_folder)))
+                    } else {
+                        visual.iter().rposition(|id| by_id.get(id).is_some_and(|l| !l.archived && l.folder == Some(target_folder))).map(|p| p + 1)
+                    };
+                    pos.unwrap_or_else(|| {
+                        visual.iter().rposition(|id| by_id.get(id).is_some_and(|l| !l.archived)).map_or(0, |p| p + 1)
+                    })
+                }
+            };
+            visual.splice(insert_at..insert_at, moving);
+            for (i, list_id) in visual.iter().enumerate() {
+                tx.execute(
+                    "UPDATE lists SET sort_order = ?2 WHERE id = ?1 AND sort_order != ?2",
+                    params![list_id.to_string(), i as i64],
+                )?;
+            }
+        }
+
+        let mut folder_order: Vec<Id> = folders.iter().map(|f| f.id).filter(|&id| id != dragged).collect();
+        let folder_insert = match target {
+            FolderDropTarget::Folder(target_folder) => folder_order
+                .iter()
+                .position(|&id| id == target_folder)
+                .map_or(folder_order.len(), |pos| pos + usize::from(after)),
+            FolderDropTarget::List(_) => if after { folder_order.len() } else { 0 },
+        };
+        folder_order.insert(folder_insert, dragged);
+        for (i, folder_id) in folder_order.iter().enumerate() {
+            tx.execute(
+                "UPDATE list_folders SET sort_order = ?2 WHERE id = ?1 AND sort_order != ?2",
+                params![folder_id.to_string(), i as i64],
+            )?;
+        }
+
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Commits live-reordered lists (including `folder` membership) and `list_folders` order in a
+    /// single transaction.
+    pub fn save_list_and_folder_order(&self, lists: &[List], folders: &[ListFolder]) -> Result<()> {
+        let visual = Self::visual_list_order(lists, folders);
+        let by_id: HashMap<Id, &List> = lists.iter().map(|l| (l.id, l)).collect();
+        let valid_folders: HashSet<Id> = folders.iter().map(|f| f.id).collect();
+        let tx = self.conn.unchecked_transaction()?;
+        for (i, list_id) in visual.iter().enumerate() {
+            if let Some(list) = by_id.get(list_id) {
+                let folder = list.folder.filter(|f| valid_folders.contains(f));
+                tx.execute(
+                    "UPDATE lists SET sort_order = ?2, folder_id = ?3
+                     WHERE id = ?1 AND (sort_order != ?2 OR folder_id IS NOT ?3)",
+                    params![list_id.to_string(), i as i64, folder.map(|f| f.to_string())],
+                )?;
+            }
+        }
+        for (i, folder) in folders.iter().enumerate() {
+            tx.execute(
+                "UPDATE list_folders SET sort_order = ?2 WHERE id = ?1 AND sort_order != ?2",
+                params![folder.id.to_string(), i as i64],
+            )?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -4430,6 +4833,247 @@ mod tests {
 
         store.purge_task(parent.id)?;
         assert!(store.tasks()?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn list_and_folder_drag_reordering_and_grouping() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let a = store.create_list("A")?;
+        let b = store.create_list("B")?;
+        let c = store.create_list("C")?;
+        let d = store.create_list("D")?;
+
+        let names = |store: &Store| -> Result<Vec<(String, Option<Id>)>> {
+            Ok(store.lists()?.into_iter().map(|l| (l.name, l.folder)).collect())
+        };
+
+        // Drop D before B.
+        store.place_list_relative(d.id, b.id, false, None)?;
+        assert_eq!(
+            names(&store)?,
+            vec![("A".into(), None), ("D".into(), None), ("B".into(), None), ("C".into(), None)]
+        );
+
+        // Drop C onto A (middle zone) -> creates a folder at A's position containing A then C.
+        let f1 = store.group_lists_into_folder(c.id, a.id, "New Folder")?;
+        assert_eq!(
+            names(&store)?,
+            vec![
+                ("A".into(), Some(f1.id)),
+                ("C".into(), Some(f1.id)),
+                ("D".into(), None),
+                ("B".into(), None),
+            ]
+        );
+
+        // Cannot group onto a list already inside a folder.
+        assert!(store.group_lists_into_folder(d.id, a.id, "Nested").is_err());
+
+        // Move folder f1 after B.
+        store.reorder_list_folder(f1.id, FolderDropTarget::List(b.id), true)?;
+        assert_eq!(
+            names(&store)?,
+            vec![
+                ("D".into(), None),
+                ("B".into(), None),
+                ("A".into(), Some(f1.id)),
+                ("C".into(), Some(f1.id)),
+            ]
+        );
+
+        // Place D before folder f1 (out of any folder) and C out after folder f1.
+        store.place_list_around_folder(d.id, f1.id, false)?;
+        assert_eq!(
+            names(&store)?,
+            vec![
+                ("B".into(), None),
+                ("D".into(), None),
+                ("A".into(), Some(f1.id)),
+                ("C".into(), Some(f1.id)),
+            ]
+        );
+        store.place_list_around_folder(c.id, f1.id, true)?;
+        assert_eq!(
+            names(&store)?,
+            vec![
+                ("B".into(), None),
+                ("D".into(), None),
+                ("A".into(), Some(f1.id)),
+                ("C".into(), None),
+            ]
+        );
+
+        // Create second folder f2 around B and D, then move f2 after f1.
+        let f2 = store.group_lists_into_folder(d.id, b.id, "Second")?;
+        store.reorder_list_folder(f2.id, FolderDropTarget::Folder(f1.id), true)?;
+        assert_eq!(
+            names(&store)?,
+            vec![
+                ("A".into(), Some(f1.id)),
+                ("B".into(), Some(f2.id)),
+                ("D".into(), Some(f2.id)),
+                ("C".into(), None),
+            ]
+        );
+
+        // Empty folders reorder among themselves via list_folders sort_order.
+        let e1 = store.add_list_folder("Empty 1")?;
+        let e2 = store.add_list_folder("Empty 2")?;
+        store.reorder_list_folder(e2.id, FolderDropTarget::Folder(e1.id), false)?;
+        let empty_order: Vec<Id> = store
+            .list_folders()?
+            .into_iter()
+            .filter(|f| f.id == e1.id || f.id == e2.id)
+            .map(|f| f.id)
+            .collect();
+        assert_eq!(empty_order, vec![e2.id, e1.id]);
+        Ok(())
+    }
+
+    #[test]
+    fn tag_drag_reordering_nesting_and_promotion() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        store.add_tag("work", None, None)?;
+        store.add_tag("home", None, None)?;
+        store.add_tag("errands", None, None)?;
+        store.add_tag("urgent", None, None)?;
+
+        let top_order = |store: &Store| -> Result<Vec<String>> {
+            Ok(store.tags()?.into_iter().filter(|t| t.parent.is_none()).map(|t| t.name).collect())
+        };
+        let children_of = |store: &Store, parent: &str| -> Result<Vec<String>> {
+            Ok(store.tags()?.into_iter().filter(|t| t.parent.as_deref() == Some(parent)).map(|t| t.name).collect())
+        };
+
+        // Nest errands and urgent under work.
+        store.move_tag("errands", "work", false, true)?;
+        store.move_tag("urgent", "work", false, true)?;
+        assert_eq!(top_order(&store)?, vec!["work", "home"]);
+        assert_eq!(children_of(&store, "work")?, vec!["errands", "urgent"]);
+
+        // Reorder sub-tags inside work.
+        store.move_tag("urgent", "errands", false, false)?;
+        assert_eq!(children_of(&store, "work")?, vec!["urgent", "errands"]);
+
+        // 2-level nesting is rejected: parent tag cannot nest under home, nor sub-tag under sub-tag.
+        store.move_tag("work", "home", false, true)?;
+        assert_eq!(store.tags()?.into_iter().find(|t| t.name == "work").unwrap().parent, None);
+        store.move_tag("errands", "urgent", false, true)?;
+        assert_eq!(store.tags()?.into_iter().find(|t| t.name == "errands").unwrap().parent.as_deref(), Some("work"));
+
+        // Move parent tag work after home.
+        store.move_tag("work", "home", true, false)?;
+        assert_eq!(top_order(&store)?, vec!["home", "work"]);
+        assert_eq!(children_of(&store, "work")?, vec!["urgent", "errands"]);
+
+        // Promote sub-tag errands to top-level before home.
+        store.move_tag("errands", "home", false, false)?;
+        assert_eq!(top_order(&store)?, vec!["errands", "home", "work"]);
+        assert_eq!(children_of(&store, "work")?, vec!["urgent"]);
+
+        // Drop a sub-tag on Tags heading promotes it to first.
+        store.move_tag_first("urgent")?;
+        assert_eq!(top_order(&store)?, vec!["urgent", "errands", "home", "work"]);
+
+        // Renaming a tag preserves its custom order.
+        store.update_tag("home", "house", None, None)?;
+        assert_eq!(top_order(&store)?, vec!["urgent", "errands", "house", "work"]);
+
+        // Pinning boundary: dragging an unpinned tag onto a pinned tag adopts pinned state.
+        store.set_tag_pinned("urgent", true)?;
+        store.move_tag("work", "urgent", false, false)?;
+        assert!(store.tags()?.into_iter().find(|t| t.name == "work").unwrap().pinned);
+        Ok(())
+    }
+
+    #[test]
+    fn filter_drag_reordering() -> Result<()> {
+        use crate::filter::{FilterRules, SmartFilter};
+        let store = Store::open_in_memory()?;
+        let f1 = SmartFilter { id: Uuid::now_v7(), name: "First".into(), rules: FilterRules::default() };
+        let f2 = SmartFilter { id: Uuid::now_v7(), name: "Second".into(), rules: FilterRules::default() };
+        let f3 = SmartFilter { id: Uuid::now_v7(), name: "Third".into(), rules: FilterRules::default() };
+        store.save_filter(&f1)?;
+        store.save_filter(&f2)?;
+        store.save_filter(&f3)?;
+
+        let names = |store: &Store| -> Result<Vec<String>> {
+            Ok(store.filters()?.into_iter().map(|f| f.name).collect())
+        };
+        assert_eq!(names(&store)?, vec!["First", "Second", "Third"]);
+
+        store.move_filter(f3.id, f1.id, false)?;
+        assert_eq!(names(&store)?, vec!["Third", "First", "Second"]);
+
+        store.move_filter(f3.id, f2.id, true)?;
+        assert_eq!(names(&store)?, vec!["First", "Second", "Third"]);
+
+        store.move_filter_first(f2.id)?;
+        assert_eq!(names(&store)?, vec!["Second", "First", "Third"]);
+
+        store.set_filter_order(&[f3.id, f1.id, f2.id])?;
+        assert_eq!(names(&store)?, vec!["Third", "First", "Second"]);
+        Ok(())
+    }
+
+    #[test]
+    fn batch_save_list_folder_and_tag_order_commits_atomically() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let a = store.create_list("A")?;
+        let b = store.create_list("B")?;
+        let c = store.create_list("C")?;
+        let f1 = store.add_list_folder("F1")?;
+        let f2 = store.add_list_folder("F2")?;
+
+        let mut lists = store.lists()?;
+        lists.iter_mut().find(|l| l.id == b.id).unwrap().folder = Some(f1.id);
+        // Reorder to [C, B(in F1), A] and folders [F2, F1].
+        let ordered_lists = vec![
+            lists.iter().find(|l| l.id == c.id).unwrap().clone(),
+            lists.iter().find(|l| l.id == b.id).unwrap().clone(),
+            lists.iter().find(|l| l.id == a.id).unwrap().clone(),
+        ];
+        store.save_list_and_folder_order(&ordered_lists, &[f2.clone(), f1.clone()])?;
+
+        let saved_lists: Vec<(String, Option<Id>)> =
+            store.lists()?.into_iter().map(|l| (l.name, l.folder)).collect();
+        assert_eq!(
+            saved_lists,
+            vec![("C".into(), None), ("B".into(), Some(f1.id)), ("A".into(), None)]
+        );
+        let saved_folders: Vec<Id> = store.list_folders()?.into_iter().map(|f| f.id).collect();
+        assert_eq!(saved_folders, vec![f2.id, f1.id]);
+
+        // Re-saving an identical order must not dirty any sync_log rows.
+        store.conn.execute("DELETE FROM sync_log", [])?;
+        store.save_list_and_folder_order(&store.lists()?, &store.list_folders()?)?;
+        let dirty: i64 = store.conn.query_row("SELECT COUNT(*) FROM sync_log", [], |r| r.get(0))?;
+        assert_eq!(dirty, 0, "no-op order save leaves sync_log untouched");
+
+        store.add_tag("t1", None, None)?;
+        store.add_tag("t2", None, None)?;
+        store.add_tag("t3", None, None)?;
+        let mut tags = store.tags()?;
+        tags.iter_mut().find(|t| t.name == "t3").unwrap().pinned = true;
+        tags.iter_mut().find(|t| t.name == "t1").unwrap().parent = Some("t2".into());
+        let ordered_tags = vec![
+            tags.iter().find(|t| t.name == "t3").unwrap().clone(),
+            tags.iter().find(|t| t.name == "t2").unwrap().clone(),
+            tags.iter().find(|t| t.name == "t1").unwrap().clone(),
+        ];
+        store.save_tag_hierarchy_and_order(&ordered_tags)?;
+        let reloaded = store.tags()?;
+        let summary: Vec<(String, Option<String>, bool)> =
+            reloaded.into_iter().map(|t| (t.name, t.parent, t.pinned)).collect();
+        assert_eq!(
+            summary,
+            vec![
+                ("t3".into(), None, true),
+                ("t2".into(), None, false),
+                ("t1".into(), Some("t2".into()), false),
+            ]
+        );
         Ok(())
     }
 }

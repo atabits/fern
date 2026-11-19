@@ -23,6 +23,27 @@ use crate::sidebar::{self, Section};
 use crate::title_bar::{self, ShowReleaseNotes, TitleBar};
 use crate::todo_view::TodoView;
 
+fn reorder_enabled_rail(
+    original: &[fern_core::RailSection],
+    features: fern_core::Features,
+    from: usize,
+    to: usize,
+) -> Vec<fern_core::RailSection> {
+    let mut enabled: Vec<fern_core::RailSection> =
+        original.iter().copied().filter(|&s| Section::from(s).enabled(features)).collect();
+    if from >= enabled.len() || to >= enabled.len() || from == to {
+        return original.to_vec();
+    }
+    let moved = enabled.remove(from);
+    enabled.insert(to, moved);
+    let mut next_enabled = enabled.into_iter();
+    original
+        .iter()
+        .copied()
+        .map(|s| if Section::from(s).enabled(features) { next_enabled.next().unwrap_or(s) } else { s })
+        .collect()
+}
+
 pub struct AppView {
     store: Rc<Store>,
     section: Section,
@@ -40,6 +61,11 @@ pub struct AppView {
     sync: crate::sync::SyncStatus,
     /// Settings → Features: the sections shown in the sidebar.
     features: fern_core::Features,
+    /// Order of icons in the narrow left navigation rail.
+    rail_order: Vec<fern_core::RailSection>,
+    /// The rail icon currently being dragged, and the order before the drag started (for Escape).
+    dragging_rail: Option<Section>,
+    rail_drag_origin: Option<Vec<fern_core::RailSection>>,
     /// The "Shortcuts" panel on the right, while open.
     shortcuts_open: bool,
     /// The system-wide shortcut being recorded in the Shortcuts panel, and the panel's focus.
@@ -143,7 +169,9 @@ impl AppView {
             cx.notify();
         })
         .detach();
-        let store_features = store.preferences().map(|p| p.features).unwrap_or_default();
+        let initial_prefs = store.preferences().unwrap_or_default();
+        let store_features = initial_prefs.features;
+        let rail_order = initial_prefs.rail_order;
         let update_notice = release_notes::take_update_notice(&store, first_start).unwrap_or_else(|err| {
             eprintln!("failed to read the update notification: {err:#}");
             None
@@ -171,6 +199,9 @@ impl AppView {
             notices_open: false,
             sync: crate::sync::SyncStatus::Off,
             features: store_features,
+            rail_order,
+            dragging_rail: None,
+            rail_drag_origin: None,
             shortcuts_open: false,
             recording_hotkey: None,
             shortcuts_focus: cx.focus_handle(),
@@ -189,6 +220,12 @@ impl AppView {
             let preferences = this.store.preferences().unwrap_or_default();
             if preferences.theme.mode == fern_core::ThemeMode::System {
                 settings_window::apply(&preferences, window, cx);
+            }
+        })
+        .detach();
+        cx.observe_keystrokes(|this, event, window, cx| {
+            if event.keystroke.key == "escape" && this.cancel_rail_drag(window, cx) {
+                cx.notify();
             }
         })
         .detach();
@@ -540,6 +577,83 @@ impl AppView {
         true
     }
 
+    fn start_rail_drag(&mut self, section: Section, cx: &mut Context<Self>) {
+        self.rail_drag_origin = Some(self.rail_order.clone());
+        self.dragging_rail = Some(section);
+        self.nav_hovered = None;
+        cx.notify();
+    }
+
+    fn cancel_rail_drag(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.dragging_rail.take().is_some() {
+            cx.stop_active_drag(window);
+            if let Some(origin) = self.rail_drag_origin.take() {
+                self.rail_order = origin;
+            }
+            self.nav_hovered = None;
+            cx.notify();
+            return true;
+        }
+        false
+    }
+
+    fn finish_rail_drag_up(
+        &mut self,
+        event: &gpui::MouseUpEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if event.button != gpui::MouseButton::Left || self.dragging_rail.take().is_none() {
+            return;
+        }
+        cx.stop_active_drag(window);
+        let origin = self.rail_drag_origin.take();
+        if origin.as_ref() != Some(&self.rail_order) {
+            let order = self.rail_order.clone();
+            if let Ok(prefs) = self.store.update_preferences(|p| p.rail_order = order) {
+                self.rail_order = prefs.rail_order;
+            }
+        }
+        self.nav_hovered = None;
+        cx.notify();
+    }
+
+    fn move_rail_drag(
+        &mut self,
+        event: &gpui::DragMoveEvent<crate::drag::DraggedRailSection>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let dragged = event.drag(cx).section;
+        if self.dragging_rail.is_none() {
+            self.rail_drag_origin = Some(self.rail_order.clone());
+        }
+        self.dragging_rail = Some(Section::from(dragged));
+        let enabled_count = self
+            .rail_order
+            .iter()
+            .filter(|&&s| Section::from(s).enabled(self.features))
+            .count();
+        if enabled_count == 0 {
+            return;
+        }
+        let top_y = title_bar::height() + px(sidebar::SECTIONS_TOP_OFFSET);
+        let slot = ((f32::from(event.event.position.y - top_y) / sidebar::SLOT_HEIGHT).floor() as isize)
+            .clamp(0, (enabled_count - 1) as isize) as usize;
+        let current = self
+            .rail_order
+            .iter()
+            .copied()
+            .filter(|&s| Section::from(s).enabled(self.features))
+            .position(|s| s == dragged)
+            .unwrap_or(0);
+        if current != slot {
+            self.rail_order = reorder_enabled_rail(&self.rail_order, self.features, current, slot);
+            self.nav_hovered = None;
+            cx.notify();
+        }
+    }
+
     fn open_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let search = cx.new(|cx| SearchModal::new(self.store.clone(), cx));
         cx.subscribe_in(&search, window, |this, _, event, window, cx| {
@@ -649,7 +763,9 @@ impl AppView {
             // The default list and the week start show up in the views.
             this.todo.update(cx, |todo, cx| todo.reload(cx));
             // A section turned off in Features closes.
-            this.features = this.store.preferences().map(|p| p.features).unwrap_or_default();
+            let prefs = this.store.preferences().unwrap_or_default();
+            this.features = prefs.features;
+            this.rail_order = prefs.rail_order;
             if !this.section.enabled(this.features) {
                 this.select(Section::Tasks, window, cx);
             }
@@ -763,6 +879,9 @@ impl AppView {
     }
 
     fn dismiss_any_transient(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.cancel_rail_drag(window, cx) {
+            return true;
+        }
         if self.account_menu_open {
             self.set_account_menu(false, cx);
             return true;
@@ -1301,6 +1420,11 @@ impl Render for AppView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         crate::touch::begin_frame(window);
         let theme = cx.theme().clone();
+        if !cx.has_active_drag() && self.dragging_rail.take().is_some()
+            && let Some(origin) = self.rail_drag_origin.take()
+        {
+            self.rail_order = origin;
+        }
         let this = cx.entity().downgrade();
         let on_select = move |section, window: &mut Window, cx: &mut App| {
             this.update(cx, |this, cx| this.select(section, window, cx)).ok();
@@ -1316,6 +1440,12 @@ impl Render for AppView {
                     }
                 })
                 .ok();
+        };
+        let on_start_rail_drag = {
+            let this = cx.entity().downgrade();
+            move |section, cx: &mut App| {
+                this.update(cx, |this, cx| this.start_rail_drag(section, cx)).ok();
+            }
         };
         let on_avatar = cx.listener(|this, _, _, cx| this.set_account_menu(true, cx));
         let account_menu = self.account_menu_open.then(|| {
@@ -1369,7 +1499,22 @@ impl Render for AppView {
             .text_color(theme.colors().text)
             .when(self.statistics_open, |el| el.child(div().size_full().child(self.focus.clone())))
             .when(!self.statistics_open, |el| {
-                el.child(sidebar::render(self.section, self.nav_hovered, on_nav_hover, on_select, on_avatar, account_menu, bell, sync_button, features, cx)).child(match self.section {
+                el.child(sidebar::render(
+                    self.section,
+                    self.nav_hovered,
+                    &self.rail_order,
+                    self.dragging_rail,
+                    on_nav_hover,
+                    on_select,
+                    on_start_rail_drag,
+                    on_avatar,
+                    account_menu,
+                    bell,
+                    sync_button,
+                    features,
+                    cx,
+                ))
+                .child(match self.section {
                 Section::Tasks | Section::Search => div().flex_1().h_full().child(self.todo.clone()),
                 Section::Calendar => div().flex_1().h_full().child(self.calendar.clone()),
                 Section::Matrix => div().flex_1().h_full().child(self.matrix.clone()),
@@ -1403,6 +1548,9 @@ impl Render for AppView {
             .relative()
             .size_full()
             .on_action(cx.listener(Self::dismiss_transient))
+            .on_drag_move(cx.listener(Self::move_rail_drag))
+            .capture_any_mouse_up(cx.listener(Self::finish_rail_drag_up))
+            .on_mouse_up_out(gpui::MouseButton::Left, cx.listener(Self::finish_rail_drag_up))
             .bg(theme.colors().background)
             .text_color(theme.colors().text)
             .child(content)
@@ -1645,5 +1793,73 @@ mod tests {
         cx.update(|window, cx| app.update(cx, |app, cx| assert!(app.select(Section::Matrix, window, cx))));
         let matrix_more = cx.debug_bounds("matrix-header-menu-trigger").unwrap();
         assert!(matrix_more.top() >= bar.bottom());
+    }
+
+    #[gpui::test]
+    fn sidebar_rail_drag_reorders_navigation_icons(cx: &mut gpui::TestAppContext) {
+        use fern_core::RailSection;
+        use gpui::{Modifiers, MouseButton, point, size};
+
+        cx.update(theme::init);
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let (app, cx) = cx.add_window_view(|window, cx| AppView::new(store.clone(), true, window, cx));
+        cx.simulate_resize(size(px(1200.), px(700.)));
+        cx.run_until_parked();
+
+        let modifiers = Modifiers::default();
+
+        // Normal click switches sections.
+        let habits = cx.debug_bounds("section-habits").unwrap();
+        cx.simulate_click(habits.center(), modifiers);
+        cx.run_until_parked();
+        cx.update(|_, cx| assert_eq!(app.read(cx).section, Section::Habits));
+
+        // Drag Calendar up onto Tasks through multiple incremental steps: icons reorder LIVE while
+        // dragging, never stick after the initial threshold step, and releasing even far outside
+        // the narrow 50 px rail still commits without switching sections.
+        let cal = cx.debug_bounds("section-calendar").unwrap();
+        let tasks = cx.debug_bounds("section-tasks").unwrap();
+        cx.simulate_mouse_move(cal.center(), None, modifiers);
+        cx.simulate_mouse_down(cal.center(), MouseButton::Left, modifiers);
+        for dy in [5., 12., 25.] {
+            cx.simulate_mouse_move(
+                point(cal.center().x, cal.center().y - px(dy)),
+                Some(MouseButton::Left),
+                modifiers,
+            );
+            cx.run_until_parked();
+        }
+        let lifted_over_tasks = point(tasks.center().x + px(120.), tasks.center().y);
+        cx.simulate_mouse_move(lifted_over_tasks, Some(MouseButton::Left), modifiers);
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("section-calendar").unwrap().top() < cx.debug_bounds("section-tasks").unwrap().top(),
+            "neighbors slide live before MouseUp"
+        );
+        cx.simulate_mouse_up(lifted_over_tasks, MouseButton::Left, modifiers);
+        cx.run_until_parked();
+
+        cx.update(|_, cx| {
+            assert_eq!(app.read(cx).section, Section::Habits, "dragging does not switch active section");
+            assert_eq!(app.read(cx).rail_order[0], RailSection::Calendar);
+            assert_eq!(app.read(cx).rail_order[1], RailSection::Tasks);
+        });
+        assert_eq!(store.preferences().unwrap().rail_order[0], RailSection::Calendar);
+
+        // Escape cancels an in-progress drag and restores the previous order.
+        let cal = cx.debug_bounds("section-calendar").unwrap();
+        cx.simulate_mouse_move(cal.center(), None, modifiers);
+        cx.simulate_mouse_down(cal.center(), MouseButton::Left, modifiers);
+        cx.simulate_mouse_move(point(cal.center().x, cal.center().y + px(8.)), Some(MouseButton::Left), modifiers);
+        cx.run_until_parked();
+        cx.simulate_mouse_move(point(cal.center().x, cal.center().y + px(120.)), Some(MouseButton::Left), modifiers);
+        cx.run_until_parked();
+        cx.update(|_, cx| assert_ne!(app.read(cx).rail_order[0], RailSection::Calendar));
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            assert!(app.read(cx).dragging_rail.is_none());
+            assert_eq!(app.read(cx).rail_order[0], RailSection::Calendar);
+        });
     }
 }

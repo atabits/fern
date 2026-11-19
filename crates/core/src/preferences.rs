@@ -81,6 +81,16 @@ impl SmartList {
         SmartList::Trash,
     ];
 
+    /// The top smart lists in the lists column, in default display order; draggable to reorder.
+    pub const TOP_DRAGGABLE: [SmartList; 6] = [
+        SmartList::Inbox,
+        SmartList::All,
+        SmartList::Today,
+        SmartList::Tomorrow,
+        SmartList::Next7Days,
+        SmartList::Summary,
+    ];
+
     pub fn code(self) -> &'static str {
         match self {
             SmartList::All => "all",
@@ -97,6 +107,10 @@ impl SmartList {
         }
     }
 
+    pub fn from_code(code: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|list| list.code() == code)
+    }
+
     /// The choices the original offers: task lists can hide while empty, the Tags section can
     /// omit tags without open tasks, and the closed-task lists are only shown or hidden.
     pub fn options(self) -> &'static [Visibility] {
@@ -108,6 +122,110 @@ impl SmartList {
             _ => &[Visibility::IfNotEmpty, Visibility::Show, Visibility::Hide],
         }
     }
+}
+
+/// Reorderable middle sections of the lists column, as in the original's sidebar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SidebarSection {
+    Lists,
+    Tags,
+    Filters,
+}
+
+impl SidebarSection {
+    pub const ALL: [SidebarSection; 3] = [
+        SidebarSection::Lists,
+        SidebarSection::Tags,
+        SidebarSection::Filters,
+    ];
+
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Lists => "lists",
+            Self::Tags => "tags",
+            Self::Filters => "filters",
+        }
+    }
+
+    pub fn from_code(code: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|section| section.code() == code)
+    }
+}
+
+/// Reorderable entries in the narrow leftmost navigation rail, as in the original's desktop tab bar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RailSection {
+    Tasks,
+    Calendar,
+    Pomodoro,
+    Habits,
+    Search,
+    Matrix,
+    Countdown,
+}
+
+impl RailSection {
+    pub const ALL: [RailSection; 7] = [
+        RailSection::Tasks,
+        RailSection::Calendar,
+        RailSection::Pomodoro,
+        RailSection::Habits,
+        RailSection::Search,
+        RailSection::Matrix,
+        RailSection::Countdown,
+    ];
+
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Tasks => "tasks",
+            Self::Calendar => "calendar",
+            Self::Pomodoro => "focus",
+            Self::Habits => "habits",
+            Self::Search => "search",
+            Self::Matrix => "matrix",
+            Self::Countdown => "countdown",
+        }
+    }
+
+    pub fn from_code(code: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|section| section.code() == code)
+    }
+}
+
+fn normalize_order<T: Copy + PartialEq>(stored: &str, defaults: &[T], parse: fn(&str) -> Option<T>) -> Vec<T> {
+    let mut order = Vec::with_capacity(defaults.len());
+    for code in stored.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(item) = parse(code)
+            && defaults.contains(&item)
+            && !order.contains(&item)
+        {
+            order.push(item);
+        }
+    }
+    for &item in defaults {
+        if !order.contains(&item) {
+            order.push(item);
+        }
+    }
+    order
+}
+
+fn reorder_relative<T: Copy + PartialEq>(order: &mut Vec<T>, defaults: &[T], dragged: T, target: T, after: bool) {
+    if dragged == target {
+        return;
+    }
+    for &item in defaults {
+        if !order.contains(&item) {
+            order.push(item);
+        }
+    }
+    let Some(from) = order.iter().position(|&item| item == dragged) else { return };
+    order.remove(from);
+    let Some(to) = order.iter().position(|&item| item == target) else {
+        order.push(dragged);
+        return;
+    };
+    order.insert(to + usize::from(after), dragged);
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -267,6 +385,12 @@ pub struct Preferences {
     pub default_list: Option<Id>,
     /// Settings → Smart List, in the order of `SmartList::ALL`.
     pub smart_lists: [Visibility; 11],
+    /// Order of the top draggable smart lists in the lists column.
+    pub smart_list_order: Vec<SmartList>,
+    /// Order of the middle sections (`Lists`, `Tags`, `Filters`) in the lists column.
+    pub sidebar_section_order: Vec<SidebarSection>,
+    /// Order of the icons in the narrow leftmost rail.
+    pub rail_order: Vec<RailSection>,
     /// The list's View Options, as the original's: "Show Date by" Countdown ("in 3 days")
     /// rather than Task Time, and the "Pop-up" task detail layout for a narrow window rather
     /// than "Side peek".
@@ -287,6 +411,18 @@ impl Preferences {
             self.smart_lists[index] = visibility;
         }
     }
+
+    pub fn move_smart_list(&mut self, dragged: SmartList, target: SmartList, after: bool) {
+        reorder_relative(&mut self.smart_list_order, &SmartList::TOP_DRAGGABLE, dragged, target, after);
+    }
+
+    pub fn move_sidebar_section(&mut self, dragged: SidebarSection, target: SidebarSection, after: bool) {
+        reorder_relative(&mut self.sidebar_section_order, &SidebarSection::ALL, dragged, target, after);
+    }
+
+    pub fn move_rail_section(&mut self, dragged: RailSection, target: RailSection, after: bool) {
+        reorder_relative(&mut self.rail_order, &RailSection::ALL, dragged, target, after);
+    }
 }
 
 impl Default for Preferences {
@@ -305,6 +441,9 @@ impl Default for Preferences {
             task_defaults: TaskDefaults::default(),
             default_list: None,
             smart_lists: [Visibility::Show; 11],
+            smart_list_order: SmartList::TOP_DRAGGABLE.to_vec(),
+            sidebar_section_order: SidebarSection::ALL.to_vec(),
+            rail_order: RailSection::ALL.to_vec(),
             countdown_dates: false,
             popup_details: false,
         }
@@ -408,6 +547,9 @@ const OVERDUE_AT: &str = "overdue_at";
 const RECOGNITION: [&str; 4] =
     ["recognize_dates", "remove_date_text", "recognize_tags", "remove_tag_text"];
 const DEFAULT_LIST: &str = "default_list";
+const SMART_LIST_ORDER: &str = "smart_list_order";
+const SIDEBAR_SECTION_ORDER: &str = "sidebar_section_order";
+const RAIL_ORDER: &str = "sidebar_rail_order";
 
 impl Store {
     /// The saved preferences; unknown values and a deleted default list fall back to defaults.
@@ -478,6 +620,18 @@ impl Store {
             add_to_bottom: self.setting(DEFAULT_ADD_TO)?.as_deref() == Some("bottom"),
             overdue_last: self.setting(OVERDUE_AT)?.as_deref() == Some("bottom"),
         };
+        let smart_list_order = self
+            .setting(SMART_LIST_ORDER)?
+            .map(|s| normalize_order(&s, &SmartList::TOP_DRAGGABLE, SmartList::from_code))
+            .unwrap_or_else(|| defaults.smart_list_order.clone());
+        let sidebar_section_order = self
+            .setting(SIDEBAR_SECTION_ORDER)?
+            .map(|s| normalize_order(&s, &SidebarSection::ALL, SidebarSection::from_code))
+            .unwrap_or_else(|| defaults.sidebar_section_order.clone());
+        let rail_order = self
+            .setting(RAIL_ORDER)?
+            .map(|s| normalize_order(&s, &RailSection::ALL, RailSection::from_code))
+            .unwrap_or_else(|| defaults.rail_order.clone());
         let mut preferences = Preferences {
             theme,
             week_start,
@@ -493,6 +647,9 @@ impl Store {
             recognition,
             task_defaults,
             default_list,
+            smart_list_order,
+            sidebar_section_order,
+            rail_order,
             ..defaults
         };
         for list in SmartList::ALL {
@@ -556,6 +713,12 @@ impl Store {
         for list in SmartList::ALL {
             self.set_setting(&smart_list_key(list), preferences.visibility(list).code())?;
         }
+        let smart_order: Vec<&str> = preferences.smart_list_order.iter().map(|l| l.code()).collect();
+        self.set_setting(SMART_LIST_ORDER, &smart_order.join(","))?;
+        let section_order: Vec<&str> = preferences.sidebar_section_order.iter().map(|s| s.code()).collect();
+        self.set_setting(SIDEBAR_SECTION_ORDER, &section_order.join(","))?;
+        let rail_order: Vec<&str> = preferences.rail_order.iter().map(|r| r.code()).collect();
+        self.set_setting(RAIL_ORDER, &rail_order.join(","))?;
         Ok(())
     }
 }
@@ -692,5 +855,44 @@ mod tests {
         assert!(on.daily_due(at(9), None));
         assert!(on.daily_due(at(9), day.pred_opt()));
         assert!(!on.daily_due(at(9), Some(day)), "once a day");
+    }
+
+    #[test]
+    fn sidebar_order_moves_and_persists() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let mut prefs = Preferences::default();
+        assert_eq!(prefs.smart_list_order, SmartList::TOP_DRAGGABLE);
+        assert_eq!(prefs.sidebar_section_order, SidebarSection::ALL);
+        assert_eq!(prefs.rail_order, RailSection::ALL);
+
+        prefs.move_smart_list(SmartList::Today, SmartList::Inbox, false);
+        assert_eq!(prefs.smart_list_order[..3], [SmartList::Today, SmartList::Inbox, SmartList::All]);
+        prefs.move_smart_list(SmartList::Inbox, SmartList::Tomorrow, true);
+        assert_eq!(
+            prefs.smart_list_order[..4],
+            [SmartList::Today, SmartList::All, SmartList::Tomorrow, SmartList::Inbox]
+        );
+
+        prefs.move_sidebar_section(SidebarSection::Filters, SidebarSection::Lists, false);
+        assert_eq!(prefs.sidebar_section_order, [SidebarSection::Filters, SidebarSection::Lists, SidebarSection::Tags]);
+
+        prefs.move_rail_section(RailSection::Countdown, RailSection::Tasks, false);
+        assert_eq!(prefs.rail_order[0], RailSection::Countdown);
+        assert_eq!(prefs.rail_order[1], RailSection::Tasks);
+
+        store.save_preferences(&prefs)?;
+        let loaded = store.preferences()?;
+        assert_eq!(loaded.smart_list_order, prefs.smart_list_order);
+        assert_eq!(loaded.sidebar_section_order, prefs.sidebar_section_order);
+        assert_eq!(loaded.rail_order, prefs.rail_order);
+
+        // Unknown / duplicate entries are ignored and missing items append in default order.
+        store.set_setting(SIDEBAR_SECTION_ORDER, "tags,bogus,tags")?;
+        let recovered = store.preferences()?;
+        assert_eq!(
+            recovered.sidebar_section_order,
+            [SidebarSection::Tags, SidebarSection::Lists, SidebarSection::Filters]
+        );
+        Ok(())
     }
 }

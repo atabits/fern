@@ -140,7 +140,7 @@ impl TodoView {
     ) {
         let strings = i18n::t(cx);
         let is_new = existing.is_none();
-        let mut draft = existing.unwrap_or_else(SmartFilter::new);
+        let mut draft = existing.unwrap_or_default();
         if !draft.rules.advanced {
             // Legacy normal rows may omit empty fields.
             for field in Field::ALL {

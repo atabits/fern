@@ -1403,7 +1403,7 @@ impl Store {
             self.set_checklist_item_completed(new.id, item.completed)?;
         }
         self.move_task(copy.id, id, true)?;
-        Ok(self.task(copy.id)?.context("copy not found")?)
+        self.task(copy.id)?.context("copy not found")
     }
 
     pub fn set_title(&self, id: Id, title: &str) -> Result<()> {
@@ -3441,7 +3441,7 @@ mod tests {
         store.add_checklist_item(task.id, "inbox zero", None)?;
         store.add_checklist_item(task.id, "plan the week", None)?;
         let template = store.save_template(task.id)?;
-        assert_eq!(store.templates()?, [template.clone()]);
+        assert_eq!(store.templates()?, std::slice::from_ref(&template));
 
         let copy = store.add_from_template(template.id)?;
         assert_ne!(copy.id, task.id);
@@ -3656,7 +3656,7 @@ mod tests {
         let work = store.create_list("Work")?;
         let kitchen = store.add_list_section(Some(home.id), " Kitchen ")?;
         assert!(store.add_list_section(Some(home.id), " ").is_err());
-        assert_eq!(store.list_sections(Some(home.id))?, [kitchen.clone()]);
+        assert_eq!(store.list_sections(Some(home.id))?, std::slice::from_ref(&kitchen));
         assert!(store.list_sections(Some(work.id))?.is_empty());
 
         let task = store.add_task("fix the tap")?;
@@ -3870,7 +3870,7 @@ mod tests {
 
         assert!(store.add_habit_section(" ").is_err());
         let pets = store.add_habit_section(" Pets ")?;
-        assert_eq!(store.habit_sections()?, [pets.clone()]);
+        assert_eq!(store.habit_sections()?, std::slice::from_ref(&pets));
         store.set_habit_section(water.id, crate::habit::HabitSection::Custom(pets.id))?;
         assert_eq!(store.habits()?[0].section, crate::habit::HabitSection::Custom(pets.id));
         store.rename_habit_section(pets.id, " Animals ")?;
@@ -4088,7 +4088,7 @@ mod tests {
         let attachment = store.add_attachment(task.id, &source, &folder)?;
         assert_eq!((attachment.name.as_str(), attachment.size), ("receipt.txt", 4));
         assert_eq!(std::fs::read_to_string(attachment.path(&folder))?, "paid");
-        assert_eq!(store.attachments(task.id)?, [attachment.clone()]);
+        assert_eq!(store.attachments(task.id)?, std::slice::from_ref(&attachment));
         store.delete_attachment(&attachment, &folder)?;
         assert!(store.attachments(task.id)?.is_empty());
         assert!(!attachment.path(&folder).exists());
@@ -4110,7 +4110,7 @@ mod tests {
 
         let attachment = store.add_attachment(task.id, &source, &folder)?;
         assert_eq!(attachment.name, "trip.zip");
-        assert_eq!(store.attachments(task.id)?, [attachment.clone()]);
+        assert_eq!(store.attachments(task.id)?, std::slice::from_ref(&attachment));
         let mut zip = zip::ZipArchive::new(std::fs::File::open(attachment.path(&folder))?)?;
         let mut ticket = String::new();
         zip.by_name("trip/plans/tickets.txt")?.read_to_string(&mut ticket)?;
@@ -4144,7 +4144,7 @@ mod tests {
         let mut state = 1u64;
         let mut block = [0; 64 * 1024];
         for _ in 0..(MAX_ATTACHMENT_BYTES / block.len() as u64 + 1) {
-            for bytes in block.chunks_exact_mut(8) {
+            for bytes in block.as_chunks_mut::<8>().0 {
                 state ^= state << 13;
                 state ^= state >> 7;
                 state ^= state << 17;
@@ -4315,7 +4315,7 @@ mod tests {
         other.restore_from(&file, Some(&other_files))?;
         let titles: Vec<String> = other.tasks()?.into_iter().map(|t| t.title).collect();
         assert_eq!(titles, ["kept in the backup"]);
-        assert_eq!(other.attachments(task.id)?, [attachment.clone()]);
+        assert_eq!(other.attachments(task.id)?, std::slice::from_ref(&attachment));
         assert_eq!(std::fs::read_to_string(attachment.path(&other_files))?, "seat 14C");
         assert!(!other_files.join("stale.txt").exists());
         let leftover: bool = other

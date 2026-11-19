@@ -239,7 +239,7 @@ fn listen(shared: Arc<Mutex<Shared>>, tx: futures::channel::mpsc::UnboundedSende
     }
     while unsafe { GetMessageW(&mut msg, None, 0, 0) }.as_bool() {
         let event = match msg.message {
-            WM_HOTKEY => Event::Pressed((msg.wParam.0 as usize).wrapping_sub(1)),
+            WM_HOTKEY => Event::Pressed(msg.wParam.0.wrapping_sub(1)),
             WM_APP => {
                 register(&shared);
                 Event::Registered

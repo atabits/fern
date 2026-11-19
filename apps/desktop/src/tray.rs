@@ -82,7 +82,7 @@ fn add_icon(hwnd: HWND) -> bool {
     // build.rs embeds Fern's icon as resource 1. LoadIconW returns a shared handle.
     let icon = unsafe {
         GetModuleHandleW(PCWSTR::null())
-            .and_then(|module| LoadIconW(Some(HINSTANCE(module.0)), PCWSTR(1 as *const u16)))
+            .and_then(|module| LoadIconW(Some(HINSTANCE(module.0)), PCWSTR(std::ptr::without_provenance(1))))
             .or_else(|_| LoadIconW(None, IDI_APPLICATION))
     };
     let Ok(icon) = icon else { return false };
@@ -156,11 +156,13 @@ unsafe extern "system" fn subclass_proc(
                 }
                 let _ = unsafe { RemoveWindowSubclass(hwnd, Some(subclass_proc), SUBCLASS_ID) };
             }
-            msg if state.in_tray && state.taskbar_created != 0 && msg == state.taskbar_created => {
-                if !add_icon(hwnd) {
-                    // If Explorer restarts and the icon cannot be recreated, make Fern reachable.
-                    restore(hwnd);
-                }
+            msg if state.in_tray
+                && state.taskbar_created != 0
+                && msg == state.taskbar_created
+                && !add_icon(hwnd) =>
+            {
+                // If Explorer restarts and the icon cannot be recreated, make Fern reachable.
+                restore(hwnd);
             }
             _ => {}
         }

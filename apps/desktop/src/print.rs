@@ -84,6 +84,7 @@ pub fn report_html(heading: &str, groups: &[(String, Vec<String>)]) -> String {
 
 /// The Summary's report as an SVG picture, for "Save as → Image": the heading, then each group's
 /// title and lines, dark text on white.
+#[cfg(any(test, debug_assertions))]
 pub fn report_svg(heading: &str, groups: &[(String, Vec<String>)]) -> String {
     const WIDTH: usize = 720;
     const LINE: usize = 26;
@@ -142,10 +143,10 @@ pub fn year_html(
             let _ = write!(months, "<th>{}</th>", escape(label));
         }
         months.push_str("</tr></thead><tbody>");
-        for week in calendar::month_grid(first).chunks_exact(7) {
+        for week in calendar::month_grid(first).as_chunks::<7>().0 {
             months.push_str("<tr>");
             if week_numbers {
-                let _ = write!(months, "<th>{}</th>", calendar::week_number(week.try_into().unwrap()));
+                let _ = write!(months, "<th>{}</th>", calendar::week_number(week));
             }
             for date in week {
                 let class = if date.month() != month {

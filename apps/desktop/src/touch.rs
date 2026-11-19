@@ -256,10 +256,13 @@ mod imp {
             }
             // A mouse that really moved (not one made here or from a pen) ends the touch mode.
             // Windows also sends moves to the same spot, when a window changes under the cursor.
-            WM_MOUSEMOVE if !TAPPING.get() && unsafe { GetMessageExtraInfo() }.0 & SIGNATURE_MASK != MI_WP_SIGNATURE => {
-                if LAST_MOUSE.replace(lparam.0) != lparam.0 && ACTIVE.get() {
-                    set_active(false);
-                }
+            WM_MOUSEMOVE
+                if !TAPPING.get()
+                    && unsafe { GetMessageExtraInfo() }.0 & SIGNATURE_MASK != MI_WP_SIGNATURE
+                    && LAST_MOUSE.replace(lparam.0) != lparam.0
+                    && ACTIVE.get() =>
+            {
+                set_active(false);
             }
             _ => {}
         }

@@ -633,20 +633,21 @@ impl TodoView {
                         edit.preview = mode == "preview";
                         edit.examples_open = mode == "examples";
                     }
-                    if mode == "chain" {
-                        if let Some(edit) = self.filter_edit.as_mut() {
-                            edit.draft.rules = fern_core::filter::examples()[2].rules.clone();
-                            edit.inputs = Self::filter_inputs(&edit.draft, cx);
-                            edit.chain_menu = Some(1);
-                        }
+                    if mode == "chain"
+                        && let Some(edit) = self.filter_edit.as_mut()
+                    {
+                        edit.draft.rules = fern_core::filter::examples()[2].rules.clone();
+                        edit.inputs = Self::filter_inputs(&edit.draft, cx);
+                        edit.chain_menu = Some(1);
                     }
                 }
                 Some(("filter", spec)) => {
                     // `filter=<name>><tag>`: a saved filter of one tag, opened.
                     let (name, tag) = spec.split_once('>').unwrap_or((spec, ""));
+                    let names = if tag.is_empty() { Vec::new() } else { vec![tag.to_owned()] };
                     let filter = fern_core::SmartFilter {
                         name: name.to_owned(),
-                        rules: fern_core::FilterRules { conditions: vec![fern_core::Condition::new(fern_core::ConditionValue::Tags { names: (!tag.is_empty()).then(|| vec![tag.to_owned()]).unwrap_or_default(), untagged: false })], ..Default::default() },
+                        rules: fern_core::FilterRules { conditions: vec![fern_core::Condition::new(fern_core::ConditionValue::Tags { names, untagged: false })], ..Default::default() },
                         ..fern_core::SmartFilter::new()
                     };
                     if self.store.save_filter(&filter).is_ok() {
@@ -6156,6 +6157,7 @@ enum ListAction {
 }
 
 /// An entry of the task list: a row, or what the list shows around the rows.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, PartialEq)]
 enum ListEntry {
     /// The field for a new section's name.

@@ -85,7 +85,7 @@ impl SettingsWindow {
     fn save_theme(&mut self, selection: ThemeSelection, temporary: Option<TemporaryTheme>, window: &mut Window, cx: &mut Context<Self>) {
         if let Err(error) = self.store.save_theme_selection(&selection) {
             let strings = i18n::t(cx);
-            let _ = window.prompt(PromptLevel::Warning, strings.theme_save_failed, Some(&error.to_string()), &[strings.ok], cx);
+            drop(window.prompt(PromptLevel::Warning, strings.theme_save_failed, Some(&error.to_string()), &[strings.ok], cx));
             return;
         }
         self.preferences.theme = selection;

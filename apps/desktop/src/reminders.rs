@@ -57,6 +57,7 @@ impl NoticeAction {
         }
     }
 
+    #[cfg(any(test, all(unix, not(target_os = "macos"))))]
     fn from_key(key: &str) -> Option<Self> {
         [NoticeAction::Snooze, NoticeAction::CheckIn, NoticeAction::Record, NoticeAction::PlusOne]
             .into_iter()
@@ -76,6 +77,7 @@ impl NoticeAction {
 /// What a click on a desktop notification asks for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reply {
+    #[cfg_attr(not(all(unix, not(target_os = "macos"))), allow(dead_code))]
     Open,
     Action(NoticeAction),
 }

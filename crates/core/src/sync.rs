@@ -501,7 +501,7 @@ mod tests {
 
         // The laptop has a file to send; once sent, nothing.
         assert_eq!(laptop.files_to_sync(&laptop_dir)?, (vec![file.clone()], vec![]));
-        laptop.mark_files_synced(&[file.clone()])?;
+        laptop.mark_files_synced(std::slice::from_ref(&file))?;
         assert_eq!(laptop.files_to_sync(&laptop_dir)?, (vec![], vec![]));
 
         // The record reaches the phone, which then has a file to fetch.
@@ -574,7 +574,7 @@ mod tests {
         let draft = crate::ListDraft { name: "Reports".into(), icon: Some("📊".into()), folder: Some(work.id), ..Default::default() };
         let reports = laptop.add_list(&draft)?;
         let sent = relay(&laptop, 0, &phone);
-        assert_eq!(phone.list_folders()?, [work.clone()]);
+        assert_eq!(phone.list_folders()?, std::slice::from_ref(&work));
         assert_eq!(phone.lists()?[0], reports);
         // Ungrouping on the laptop takes the folder away on the phone and keeps the list.
         laptop.ungroup_list_folder(work.id)?;
@@ -595,7 +595,7 @@ mod tests {
         let wedding = laptop.add_countdown("Wedding", chrono::NaiveDate::from_ymd_opt(2024, 8, 27).unwrap(), crate::CountdownKind::Anniversary)?;
         let file = laptop.set_countdown_background(wedding.id, Some(&dir.join("photo.jpg")), &laptop_dir)?.unwrap();
         assert_eq!(laptop.files_to_sync(&laptop_dir)?, (vec![file.clone()], vec![]));
-        laptop.mark_files_synced(&[file.clone()])?;
+        laptop.mark_files_synced(std::slice::from_ref(&file))?;
 
         // The phone gets the countdown, then has its picture to fetch.
         relay(&laptop, 0, &phone);

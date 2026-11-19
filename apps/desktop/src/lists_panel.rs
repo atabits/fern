@@ -101,6 +101,7 @@ pub enum PanelEvent {
     DropListInFolder { list: Id, folder: Id },
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn render(
     props: Props,
     on_select: impl Fn(View, &mut Window, &mut App) + Clone + 'static,

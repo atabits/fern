@@ -27,6 +27,9 @@ const WINDOW_BORDER_WIDTH: f32 = 1.;
 // GPUI clips overflow to a rectangle, so each panel rounds its own outer corners.
 const PANEL_RADIUS: Pixels = px(WINDOW_RADIUS - WINDOW_BORDER_WIDTH);
 
+type SelectPick = Box<dyn Fn(&mut SettingsWindow, &mut Window, &mut Context<SettingsWindow>)>;
+type SelectOption = (SharedString, bool, SelectPick);
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Page {
     /// The original's Features: the optional sections on or off.
@@ -334,7 +337,7 @@ impl SettingsWindow {
     fn render_task_defaults(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let strings = i18n::t(cx);
         let defaults = self.preferences.task_defaults.clone();
-        let pick = |change: Box<dyn Fn(&mut fern_core::TaskDefaults)>| -> Box<dyn Fn(&mut Self, &mut Window, &mut Context<Self>)> {
+        let pick = |change: Box<dyn Fn(&mut fern_core::TaskDefaults)>| -> SelectPick {
             Box::new(move |this, window, cx| this.update(window, cx, |p| change(&mut p.task_defaults)))
         };
         let date_name = |date: Option<DefaultDate>| match date {
@@ -399,7 +402,7 @@ impl SettingsWindow {
         let priority_options = priorities
             .into_iter()
             .map(|(priority, name)| {
-                let pick: Box<dyn Fn(&mut Self, &mut Window, &mut Context<Self>)> =
+                let pick: SelectPick =
                     Box::new(move |this, window, cx| this.update(window, cx, |p| p.task_defaults.priority = priority));
                 (SharedString::from(name), priority == defaults.priority, pick)
             })
@@ -410,7 +413,7 @@ impl SettingsWindow {
             .map(|tag| {
                 let selected = tag == defaults.tag;
                 let label = SharedString::from(tag.clone().unwrap_or_else(|| strings.none_option.to_owned()));
-                let pick: Box<dyn Fn(&mut Self, &mut Window, &mut Context<Self>)> =
+                let pick: SelectPick =
                     Box::new(move |this, window, cx| this.update(window, cx, |p| p.task_defaults.tag = tag.clone()));
                 (label, selected, pick)
             })
@@ -495,7 +498,7 @@ impl SettingsWindow {
         label: &'static str,
         value: SharedString,
         menu: Menu,
-        options: Vec<(SharedString, bool, Box<dyn Fn(&mut Self, &mut Window, &mut Context<Self>)>)>,
+        options: Vec<SelectOption>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let open = self.menu == Some(menu);
@@ -962,7 +965,7 @@ impl SettingsWindow {
                         .options()
                         .iter()
                         .map(|&visibility| {
-                            let pick: Box<dyn Fn(&mut Self, &mut Window, &mut Context<Self>)> = Box::new(
+                            let pick: SelectPick = Box::new(
                                 move |this, window, cx| this.update(window, cx, |p| p.set_visibility(list, visibility)),
                             );
                             (visibility_label(list, visibility, strings).into(), visibility == current, pick)
@@ -990,7 +993,7 @@ impl SettingsWindow {
                     .into_iter()
                     .zip(strings.week_start_names)
                     .map(|(day, name)| {
-                        let pick: Box<dyn Fn(&mut Self, &mut Window, &mut Context<Self>)> =
+                        let pick: SelectPick =
                             Box::new(move |this, window, cx| this.update(window, cx, |p| p.week_start = day));
                         (SharedString::from(name), day == week_start, pick)
                     })
@@ -1004,7 +1007,7 @@ impl SettingsWindow {
                 let date_formats = DateFormat::ALL
                     .into_iter()
                     .map(|format| {
-                        let pick: Box<dyn Fn(&mut Self, &mut Window, &mut Context<Self>)> =
+                        let pick: SelectPick =
                             Box::new(move |this, window, cx| this.update(window, cx, |p| p.date_format = Some(format)));
                         let label = calendar::format_date_as(sample, Some(format), false, true);
                         let selected = current_format == Some(format)
@@ -1015,7 +1018,7 @@ impl SettingsWindow {
                 let formats = [false, true]
                     .into_iter()
                     .map(|twelve| {
-                        let pick: Box<dyn Fn(&mut Self, &mut Window, &mut Context<Self>)> =
+                        let pick: SelectPick =
                             Box::new(move |this, window, cx| this.update(window, cx, |p| p.hour12 = twelve));
                         (SharedString::from(strings.time_formats[twelve as usize]), twelve == hour12, pick)
                     })
@@ -1069,7 +1072,7 @@ impl SettingsWindow {
                 let current = i18n::locale(cx);
                 let languages = Locale::available()
                     .map(|locale| {
-                        let pick: Box<dyn Fn(&mut Self, &mut Window, &mut Context<Self>)> =
+                        let pick: SelectPick =
                             Box::new(move |this, _, cx| this.set_locale(locale, cx));
                         (SharedString::from(locale.native_name()), locale == current, pick)
                     })
@@ -1080,7 +1083,7 @@ impl SettingsWindow {
                     .and_then(|id| lists.iter().find(|l| l.id == id))
                     .map(|l| SharedString::from(l.name.clone()))
                     .unwrap_or(strings.inbox.into());
-                let mut list_options: Vec<(SharedString, bool, Box<dyn Fn(&mut Self, &mut Window, &mut Context<Self>)>)> =
+                let mut list_options: Vec<SelectOption> =
                     vec![(
                         strings.inbox.into(),
                         default_list.is_none(),
@@ -1088,7 +1091,7 @@ impl SettingsWindow {
                     )];
                 list_options.extend(lists.iter().filter(|l| !l.archived).map(|list| {
                     let id = list.id;
-                    let pick: Box<dyn Fn(&mut Self, &mut Window, &mut Context<Self>)> =
+                    let pick: SelectPick =
                         Box::new(move |this, window, cx| this.update(window, cx, |p| p.default_list = Some(id)));
                     (SharedString::from(list.name.clone()), default_list == Some(id), pick)
                 }));
@@ -1098,7 +1101,7 @@ impl SettingsWindow {
                     let options = [(false, top_label), (true, bottom_label)]
                         .into_iter()
                         .map(|(choice, name)| {
-                            let pick: Box<dyn Fn(&mut Self, &mut Window, &mut Context<Self>)> =
+                            let pick: SelectPick =
                                 Box::new(move |this, window, cx| this.update(window, cx, |p| set(&mut p.task_defaults, choice)));
                             (name.into(), choice == bottom, pick)
                         })
@@ -1117,13 +1120,14 @@ impl SettingsWindow {
                 )))
                 .child({
                     let r = self.preferences.recognition;
+                    type RecognitionCheck = (&'static str, bool, fn(&mut fern_core::Recognition));
                     // A switch row with a hint, and the checkbox under it while the switch is on.
                     let section = |id: &'static str,
                                    label: &'static str,
                                    hint: &'static str,
                                    on: bool,
                                    toggle: fn(&mut fern_core::Recognition),
-                                   check: Option<(&'static str, bool, fn(&mut fern_core::Recognition))>,
+                                   check: Option<RecognitionCheck>,
                                    cx: &mut Context<Self>| {
                         v_flex()
                             .px_4()
@@ -1238,10 +1242,10 @@ impl SettingsWindow {
                     |n| n.desktop = !n.desktop,
                     |n| n.constant = !n.constant,
                 ];
-                let times: Vec<(SharedString, bool, Box<dyn Fn(&mut Self, &mut Window, &mut Context<Self>)>)> = (5..=23u32)
+                let times: Vec<SelectOption> = (5..=23u32)
                     .filter_map(|h| chrono::NaiveTime::from_hms_opt(h, 0, 0))
                     .map(|time| {
-                        let option: (SharedString, bool, Box<dyn Fn(&mut Self, &mut Window, &mut Context<Self>)>) = (
+                        let option: SelectOption = (
                             calendar::format_time(time, strings).into(),
                             n.daily == Some(time),
                             Box::new(move |this: &mut Self, window: &mut Window, cx: &mut Context<Self>| {

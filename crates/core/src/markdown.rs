@@ -272,8 +272,9 @@ fn numbered(line: &str) -> Option<(u32, &str)> {
 
 /// Takes the inline markers out of a line: its plain text and the styled runs of it.
 fn inline(line: &str) -> (String, Vec<(std::ops::Range<usize>, Style)>) {
+    type Marker = (&'static str, fn(&mut Style));
     // Longer markers first, so `**` is not read as two `*` and `~~` not as two `~`.
-    const MARKERS: [(&str, fn(&mut Style)); 6] = [
+    const MARKERS: [Marker; 6] = [
         ("**", |s| s.bold = true),
         ("~~", |s| s.strike = true),
         ("::", |s| s.highlight = true),

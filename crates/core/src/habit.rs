@@ -250,9 +250,7 @@ pub fn stats_for(frequency: &Frequency, checkins: &HashSet<NaiveDate>, today: Na
     while day >= oldest {
         if checkins.contains(&day) {
             streak += 1;
-        } else if scheduled(day) {
-            break;
-        } else if !matches!(frequency, Frequency::Daily { .. }) {
+        } else if scheduled(day) || !matches!(frequency, Frequency::Daily { .. }) {
             break;
         }
         day -= Duration::days(1);

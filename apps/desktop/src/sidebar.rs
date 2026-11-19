@@ -80,10 +80,12 @@ impl Section {
 
 pub const WIDTH: f32 = 50.;
 
+type ClickCallback = Box<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
+
 /// The notification bell: a red badge with the unread count, as in the original.
 pub struct Bell {
     pub unread: usize,
-    pub on_click: Box<dyn Fn(&ClickEvent, &mut Window, &mut App)>,
+    pub on_click: ClickCallback,
     /// The notification list or the update notice attached to the bell.
     pub menu: Option<AnyElement>,
 }
@@ -93,10 +95,11 @@ pub struct Bell {
 pub struct SyncButton {
     pub tooltip: String,
     pub failed: bool,
-    pub on_click: Box<dyn Fn(&ClickEvent, &mut Window, &mut App)>,
+    pub on_click: ClickCallback,
 }
 
 /// `account_menu` is rendered next to the avatar while the account menu is open.
+#[allow(clippy::too_many_arguments)]
 pub fn render(
     active: Section,
     hovered: Option<Section>,

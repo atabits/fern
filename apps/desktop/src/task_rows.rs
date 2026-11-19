@@ -37,6 +37,7 @@ impl Section {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq)]
 pub enum Row {
     Section { section: Section, count: usize, collapsed: bool },

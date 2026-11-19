@@ -20,6 +20,7 @@ pub enum TagEvent {
 
 /// The original's dialog frame: a title with ×, the body, and Close with a primary button, over
 /// the window where the list dialogs are (see `list_dialog`).
+#[allow(clippy::too_many_arguments)]
 fn frame(
     id: &'static str,
     title: &'static str,

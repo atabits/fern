@@ -245,11 +245,11 @@ impl AppView {
                 }
             }
             // `countdown-age=<name part>`: that birthday with "Show Age" on.
-            if let Some(name) = state.split(';').find_map(|part| part.strip_prefix("countdown-age=")) {
-                if let Some(countdown) = this.store.countdowns().unwrap_or_default().into_iter().find(|c| c.name.contains(name)) {
-                    this.store.set_countdown_show_age(countdown.id, true).ok();
-                    this.countdown.update(cx, |view, cx| view.reload(cx));
-                }
+            if let Some(name) = state.split(';').find_map(|part| part.strip_prefix("countdown-age="))
+                && let Some(countdown) = this.store.countdowns().unwrap_or_default().into_iter().find(|c| c.name.contains(name))
+            {
+                this.store.set_countdown_show_age(countdown.id, true).ok();
+                this.countdown.update(cx, |view, cx| view.reload(cx));
             }
             // `countdown-bg=<name part>><picture path>`: that countdown's background picture.
             if let Some(spec) = state.split(';').find_map(|part| part.strip_prefix("countdown-bg=")) {
@@ -262,11 +262,11 @@ impl AppView {
                 }
             }
             // `countdown-pin=<name part>`: that countdown pinned.
-            if let Some(name) = state.split(';').find_map(|part| part.strip_prefix("countdown-pin=")) {
-                if let Some(countdown) = this.store.countdowns().unwrap_or_default().into_iter().find(|c| c.name.contains(name)) {
-                    this.store.set_countdown_pinned(countdown.id, true).ok();
-                    this.countdown.update(cx, |view, cx| view.reload(cx));
-                }
+            if let Some(name) = state.split(';').find_map(|part| part.strip_prefix("countdown-pin="))
+                && let Some(countdown) = this.store.countdowns().unwrap_or_default().into_iter().find(|c| c.name.contains(name))
+            {
+                this.store.set_countdown_pinned(countdown.id, true).ok();
+                this.countdown.update(cx, |view, cx| view.reload(cx));
             }
             // `countdown-menu=<name part>` / `countdown-edit=<name part>`: a card's "…" menu or its
             // edit popover.
@@ -1421,7 +1421,7 @@ mod tests {
     fn settings_scroll_below_the_header_in_a_short_window(cx: &mut gpui::TestAppContext) {
         use gpui::{Modifiers, ScrollDelta, ScrollWheelEvent, TouchPhase, point, size};
 
-        cx.update(|cx| theme::init(cx));
+        cx.update(theme::init);
         let store = Rc::new(Store::open_in_memory().unwrap());
         let (app, cx) = cx.add_window_view(|window, cx| AppView::new(store, true, window, cx));
         cx.simulate_resize(size(px(900.), px(400.)));

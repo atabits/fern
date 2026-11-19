@@ -52,6 +52,8 @@ struct StatsData {
     habits: Vec<(fern_core::Habit, std::collections::HashSet<NaiveDate>)>,
 }
 
+type FocusTask = (Option<Id>, String);
+
 pub struct FocusView {
     store: Rc<Store>,
     tasks: Vec<Task>,
@@ -61,7 +63,7 @@ pub struct FocusView {
     running: Option<Running>,
     finish_prompt: bool,
     review_window: Option<gpui::WindowHandle<focus_review::FocusReview>>,
-    continuation: Option<(Option<(Option<Id>, String)>, i64)>,
+    continuation: Option<(Option<FocusTask>, i64)>,
     completed_in_chain: usize,
     cycle: FocusCycle,
     record_menu: Option<RecordMenu>,
@@ -536,7 +538,7 @@ impl FocusView {
         let elapsed = running.timer.elapsed(now);
         if running.on_break.is_none() && elapsed >= MIN_FOCUS_MS {
             let strings = i18n::t(cx);
-            let (task_id, title) = running.task.clone().map_or((None, strings.focus.to_owned()), |(id, t)| (id, t));
+            let (task_id, title) = running.task.clone().unwrap_or((None, strings.focus.to_owned()));
             let start = running.timer.started_at;
             let stopwatch = running.timer.is_stopwatch();
             if let Err(err) = self.store.add_focus_session_as(task_id, &title, start, start + elapsed, stopwatch) {
@@ -2066,7 +2068,8 @@ impl FocusView {
         let by_names = [strings.stats_by_list_option, strings.stats_by_tag_option, strings.stats_by_task_option];
         let period_names = [strings.stats_day, strings.stats_week, strings.stats_month];
         let period_index = Bucket::ALL.iter().position(|b| *b == period).unwrap_or(0);
-        let pill = |id: &'static str, menu: u8, text: &'static str, options: Vec<(&'static str, bool, Box<dyn Fn(&mut StatsPage)>)>, cx: &mut Context<Self>| {
+        type StatsOption = (&'static str, bool, Box<dyn Fn(&mut StatsPage)>);
+        let pill = |id: &'static str, menu: u8, text: &'static str, options: Vec<StatsOption>, cx: &mut Context<Self>| {
             let open = page.details_menu == Some(menu);
             let options = Rc::new(options);
             let dropdown = open.then(|| {
@@ -2609,12 +2612,12 @@ impl FocusView {
                                 .flex_1()
                                 .items_center()
                                 .child({
-                                    let delta = count(first, last) as i64 - count(prev_first, prev_last) as i64;
+                                    let delta = count(first, last) - count(prev_first, prev_last);
                                     value(count(first, last).to_string(), strings.stats_completed_tasks, delta.abs().to_string(), delta)
                                 })
                                 .child(div().w(px(1.)).h(px(38.)).flex_none().bg(theme.colors().border))
                                 .child({
-                                    let delta = rate(first, last) as i64 - rate(prev_first, prev_last) as i64;
+                                    let delta = rate(first, last) - rate(prev_first, prev_last);
                                     value(format!("{}%", rate(first, last)), strings.stats_completion_rate, format!("{}%", delta.abs()), delta)
                                 }),
                         ),
@@ -3684,6 +3687,15 @@ impl Render for FocusView {
     }
 }
 
+/// A change against the period before, as the original's: the amount, then a green arrow up, or a
+/// red one down when it fell.
+fn change_line(text: String, delta: i64) -> impl IntoElement {
+    h_flex()
+        .gap_0p5()
+        .child(Label::new(text).size(LabelSize::XSmall).color(Color::Muted))
+        .child(Icon::new(if delta < 0 { IconName::ArrowDown } else { IconName::ArrowUp }).size(IconSize::XSmall).color(if delta < 0 { Color::Error } else { Color::Success }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3754,13 +3766,4 @@ mod tests {
         let ru = summary_parts("Задач: {tasks}", &counts);
         assert_eq!(ru, [("Задач: ".into(), false), ("14".into(), true)]);
     }
-}
-
-/// A change against the period before, as the original's: the amount, then a green arrow up, or a
-/// red one down when it fell.
-fn change_line(text: String, delta: i64) -> impl IntoElement {
-    h_flex()
-        .gap_0p5()
-        .child(Label::new(text).size(LabelSize::XSmall).color(Color::Muted))
-        .child(Icon::new(if delta < 0 { IconName::ArrowDown } else { IconName::ArrowUp }).size(IconSize::XSmall).color(if delta < 0 { Color::Error } else { Color::Success }))
 }

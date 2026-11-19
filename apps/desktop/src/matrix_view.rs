@@ -284,9 +284,11 @@ impl MatrixView {
         } else if self.menu_row.take().is_some() {
             cx.notify();
             return;
-        } else if self.menu.take().is_some() || std::mem::take(&mut self.header_menu) {
-            cx.notify();
-        } else if self.adding.take().is_some() || self.add_notice.take().is_some() {
+        } else if self.menu.take().is_some()
+            || std::mem::take(&mut self.header_menu)
+            || self.adding.take().is_some()
+            || self.add_notice.take().is_some()
+        {
             cx.notify();
         } else {
             cx.propagate();
@@ -391,7 +393,8 @@ impl MatrixView {
         let strings = i18n::t(cx);
         let view = self.views[quadrant];
         let group_label = |group: Option<GroupBy>| group.map_or(strings.filter_lists, |g| g.label(strings));
-        let rows: [(u8, IconName, &'static str, &'static str, Vec<(&'static str, QuadrantView)>); 3] = [
+        type ViewRow = (u8, IconName, &'static str, &'static str, Vec<(&'static str, QuadrantView)>);
+        let rows: [ViewRow; 3] = [
             (
                 0,
                 IconName::LayoutGrid,

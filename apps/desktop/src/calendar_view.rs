@@ -39,10 +39,10 @@ fn day_item_slots(height: Pixels) -> usize {
     (available / (DAY_ITEM_HEIGHT + DAY_ITEM_GAP)).floor().max(0.) as usize
 }
 
-/// The user clicked a task in the calendar.
-
 /// The week-number column of the month grid.
 const WEEK_NUMBER_WIDTH: f32 = 32.;
+
+/// The user clicked a task in the calendar.
 pub struct OpenTask(pub Id);
 
 /// A task's right-click menu asked for one of the details' pickers (`due`, `tags`,
@@ -1111,11 +1111,11 @@ impl CalendarView {
     }
 
     fn open_day_task_editor(&mut self, date: NaiveDate, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(editor) = &self.task_editor {
-            if editor.day == Some(date) || !editor.view.update(cx, |editor, cx| editor.close(cx)) {
-                window.focus(&editor.view.focus_handle(cx), cx);
-                return;
-            }
+        if let Some(editor) = &self.task_editor
+            && (editor.day == Some(date) || !editor.view.update(cx, |editor, cx| editor.close(cx)))
+        {
+            window.focus(&editor.view.focus_handle(cx), cx);
+            return;
         }
         self.selected_day = Some(date);
         self.anchor = date;

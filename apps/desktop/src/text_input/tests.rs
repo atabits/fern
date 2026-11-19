@@ -137,7 +137,7 @@ fn long_single_line_text_scrolls_without_losing_content_or_selection(cx: &mut Te
         cx.update(|window, cx| {
             input.update(cx, |input, cx| {
                 input.left(&Left, window, cx);
-                let last_grapheme = text.grapheme_indices(true).last().unwrap().0;
+                let last_grapheme = text.grapheme_indices(true).next_back().unwrap().0;
                 assert_eq!(input.selection(), last_grapheme..last_grapheme);
             })
         });
@@ -267,6 +267,7 @@ fn long_tokens_wrap_and_keep_the_caret_inside_multiline_inputs(cx: &mut TestAppC
 }
 
 #[gpui::test]
+#[allow(clippy::single_range_in_vec_init)]
 fn recognised_text_highlights_and_selection_share_the_input_clip(cx: &mut TestAppContext) {
     let (input, cx) = setup(cx, Mode::SingleLine);
     let text = "tomorrow ".repeat(40);

@@ -344,7 +344,7 @@ impl CalendarOptionsDialog {
         };
         let month = |shown: bool| {
             let cell = move |day: u32| {
-                let hot = shown && day % 3 != 0;
+                let hot = shown && !day.is_multiple_of(3);
                 div()
                     .size(px(16.))
                     .flex()

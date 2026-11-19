@@ -160,7 +160,7 @@ fn storage_and_validation() -> Result<()> {
     }
     {
         let store = Store::open(&path)?;
-        assert_eq!(store.filters()?, [f.clone()]);
+        assert_eq!(store.filters()?, std::slice::from_ref(&f));
         let replica = Store::open_in_memory()?;
         replica.apply_changes(&store.changes_since(0)?.0)?;
         assert_eq!(replica.filters()?, [f]);
@@ -242,7 +242,7 @@ fn malformed_sync_is_rejected_atomically_and_legacy_sync_is_readable() -> Result
             format!("lists! fern_rules_v1:{}", hex::encode(bad)).into(),
         );
         assert!(target.apply_changes(&[change]).is_err());
-        assert_eq!(target.filters()?, [original.clone()]);
+        assert_eq!(target.filters()?, std::slice::from_ref(&original));
     }
     let mut legacy = changes
         .iter()

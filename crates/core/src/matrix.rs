@@ -116,7 +116,7 @@ impl QuadrantRule {
         };
         Some(Self {
             name: value["name"].as_str().unwrap_or_default().to_owned(),
-            lists: strings("lists").iter().map(|l| if l == "inbox" { Some(None) } else { l.parse().ok().map(Some) }).flatten().collect(),
+            lists: strings("lists").iter().filter_map(|l| if l == "inbox" { Some(None) } else { l.parse().ok().map(Some) }).collect(),
             tags: strings("tags"),
             dates: strings("dates").iter().filter_map(|k| MatrixDate::ALL.into_iter().find(|d| d.key() == k)).collect(),
             priorities: strings("priorities").iter().filter_map(|p| p.parse().ok()).map(Priority::from_i64).collect(),

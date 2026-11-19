@@ -10,6 +10,8 @@ use crate::traits::ClickHandler;
 use crate::{Clickable, Color, Icon, IconSize, Toggleable};
 
 /// A square button with an icon and a hover background.
+type TooltipBuilder = Box<dyn Fn(&mut Window, &mut App) -> AnyView + 'static>;
+
 #[derive(IntoElement)]
 pub struct IconButton {
     id: ElementId,
@@ -21,7 +23,7 @@ pub struct IconButton {
     selected: bool,
     hover_color: Option<gpui::Hsla>,
     on_click: Option<ClickHandler>,
-    tooltip: Option<Box<dyn Fn(&mut Window, &mut App) -> AnyView + 'static>>,
+    tooltip: Option<TooltipBuilder>,
     tip: Option<(gpui::SharedString, crate::TipSide)>,
 }
 

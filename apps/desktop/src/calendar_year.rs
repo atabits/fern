@@ -646,14 +646,14 @@ impl CalendarView {
                             .map(|label| cell(label.to_owned(), secondary)),
                     ),
             )
-            .children(calendar::month_grid(month).chunks_exact(7).map(|week| {
+            .children(calendar::month_grid(month).as_chunks::<7>().0.iter().map(|week| {
                 h_flex()
                     .flex_1()
                     .min_h_0()
                     .items_stretch()
                     .when(week_numbers, |el| {
                         el.child(cell(
-                            calendar::week_number(week.try_into().unwrap()).to_string(),
+                            calendar::week_number(week).to_string(),
                             secondary,
                         ))
                     })

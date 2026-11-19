@@ -2208,12 +2208,12 @@ impl TaskDetail {
                     crate::calendar::format_time(custom.at, strings),
                     small("reminder-earlier", IconName::Minus)
                         .on_click(cx.listener(|this, _, _, cx| {
-                            this.update_custom_reminder(cx, |c| c.at = c.at - chrono::Duration::minutes(30))
+                            this.update_custom_reminder(cx, |c| c.at -= chrono::Duration::minutes(30))
                         }))
                         .into_any_element(),
                     small("reminder-later", IconName::Plus)
                         .on_click(cx.listener(|this, _, _, cx| {
-                            this.update_custom_reminder(cx, |c| c.at = c.at + chrono::Duration::minutes(30))
+                            this.update_custom_reminder(cx, |c| c.at += chrono::Duration::minutes(30))
                         }))
                         .into_any_element(),
                 ))
@@ -3450,24 +3450,6 @@ fn format_size(bytes: u64) -> String {
     }
 }
 
-#[cfg(test)]
-mod size_tests {
-    #[test]
-    fn sizes() {
-        assert_eq!(super::format_size(512), "512 B");
-        assert_eq!(super::format_size(12 * 1024 + 5), "12 KB");
-        assert_eq!(super::format_size(3_565_158), "3.4 MB");
-    }
-
-    #[test]
-    fn list_menu_search() {
-        assert!(super::list_matches("Work", ""));
-        assert!(super::list_matches("Work", " wo"));
-        assert!(super::list_matches("Входящие", "вх"));
-        assert!(!super::list_matches("Work", "home"));
-    }
-}
-
 /// A description drawn as the original shows it while it is not edited: headings, numbered items
 /// with their numbers in the accent color, bullets, check items, quotes and lines, with bold,
 /// italic, underlined, struck, highlighted, code and link runs.
@@ -3629,4 +3611,22 @@ fn render_markdown_blocks(
             }
         }))
         .into_any_element()
+}
+
+#[cfg(test)]
+mod size_tests {
+    #[test]
+    fn sizes() {
+        assert_eq!(super::format_size(512), "512 B");
+        assert_eq!(super::format_size(12 * 1024 + 5), "12 KB");
+        assert_eq!(super::format_size(3_565_158), "3.4 MB");
+    }
+
+    #[test]
+    fn list_menu_search() {
+        assert!(super::list_matches("Work", ""));
+        assert!(super::list_matches("Work", " wo"));
+        assert!(super::list_matches("Входящие", "вх"));
+        assert!(!super::list_matches("Work", "home"));
+    }
 }

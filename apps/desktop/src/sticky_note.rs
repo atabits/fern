@@ -644,8 +644,11 @@ fn win32_window_handle(window: &Window) -> Option<windows::Win32::Foundation::HW
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(debug_assertions)]
     use gpui::Focusable as _;
-    use gpui::{Modifiers, TestAppContext};
+    #[cfg(debug_assertions)]
+    use gpui::Modifiers;
+    use gpui::TestAppContext;
 
     fn new_note(store: Rc<Store>, id: Id, window: &mut Window, cx: &mut Context<StickyNote>) -> StickyNote {
         let bounds = window.window_bounds().get_bounds();

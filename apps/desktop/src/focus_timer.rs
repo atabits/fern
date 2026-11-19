@@ -98,7 +98,7 @@ impl FocusCycle {
     }
 
     pub fn start(&mut self, now: i64, stopwatch: bool, interval: usize) {
-        if stopwatch || self.idle_too_long(now) || (interval > 0 && self.count > 0 && self.count % interval == 0) {
+        if stopwatch || self.idle_too_long(now) || (interval > 0 && self.count > 0 && self.count.is_multiple_of(interval)) {
             self.count = 0;
         }
         self.count += 1;
@@ -109,7 +109,7 @@ impl FocusCycle {
     }
 
     pub fn break_kind(&self, now: i64, interval: usize) -> BreakKind {
-        if self.idle_too_long(now) || (interval > 0 && self.count > 0 && self.count % interval != 0) {
+        if self.idle_too_long(now) || (interval > 0 && self.count > 0 && !self.count.is_multiple_of(interval)) {
             BreakKind::Short
         } else {
             BreakKind::Long

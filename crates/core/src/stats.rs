@@ -119,7 +119,7 @@ pub fn completion_rate_in(tasks: &[Task], periods: &[(NaiveDate, NaiveDate)]) ->
                     day.is_some_and(|d| d >= *first && d <= *last)
                 })
                 .fold((0, 0), |(done, total), t| (done + t.is_completed() as u32, total + 1));
-            if total == 0 { 0 } else { done * 100 / total }
+            (done * 100).checked_div(total).unwrap_or(0)
         })
         .collect()
 }

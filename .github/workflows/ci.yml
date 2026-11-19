@@ -35,8 +35,13 @@ jobs:
         run: script/linux-deps
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
 
       - uses: Swatinem/rust-cache@v2
+
+      - name: Lint
+        run: cargo clippy --workspace --all-targets --locked
 
       - name: Build
         run: cargo build --workspace --locked

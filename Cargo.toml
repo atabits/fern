@@ -15,6 +15,12 @@ edition = "2024"
 version = "0.1.11"
 license = "AGPL-3.0-or-later"
 
+[workspace.lints.rust]
+warnings = "deny"
+
+[workspace.lints.clippy]
+all = "deny"
+
 [workspace.dependencies]
 assets = { path = "crates/assets" }
 fern_core = { path = "crates/core" }

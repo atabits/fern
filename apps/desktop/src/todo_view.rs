@@ -2622,7 +2622,7 @@ impl TodoView {
 
     /// The original's List Activities: the list's task events by day, newest first, each with
     /// its task, which a click opens.
-    fn render_list_activity(&self, entries: &[(fern_core::Activity, Id, String)], cx: &mut Context<Self>) -> AnyElement {
+    fn render_list_activity(&self, entries: &[(fern_core::Activity, Id, String)], top_inset: bool, cx: &mut Context<Self>) -> AnyElement {
         let strings = i18n::t(cx);
         let theme = cx.theme().clone();
         let today = Self::today();
@@ -2697,6 +2697,7 @@ impl TodoView {
             .border_color(theme.colors().border)
             .child(
                 h_flex()
+                    .when(top_inset, |el| el.mt(crate::title_bar::header_inset()))
                     .h(px(48.))
                     .px_5()
                     .border_b_1()
@@ -5746,6 +5747,7 @@ impl Render for TodoView {
             
             .child(
                 h_flex()
+                    .mt(crate::title_bar::header_inset())
                     .h(px(60.))
                     // The title sits 4 px above the row's middle, as the original's.
                     .pb(px(8.))
@@ -6040,6 +6042,7 @@ impl Render for TodoView {
                     return el.child(list);
                 }
                 // View Options' Pop-up: in a narrow window an opened task shows over the list.
+                self.detail.read(cx).set_top_inset(!popup_details);
                 if popup_details {
                     if self.selected.is_none() && self.list_activity.is_none() {
                         return el.child(list);
@@ -6071,7 +6074,7 @@ impl Render for TodoView {
                                     .shadow_lg()
                                     .on_click(|_, _, cx| cx.stop_propagation())
                                     .map(|el| match self.list_activity.clone() {
-                                        Some(entries) => el.child(self.render_list_activity(&entries, cx)),
+                                        Some(entries) => el.child(self.render_list_activity(&entries, false, cx)),
                                         None => el.child(self.detail.clone()),
                                     }),
                             ),
@@ -6084,7 +6087,7 @@ impl Render for TodoView {
                         .w(px(detail_width))
                         .h_full()
                         .map(|el| match self.list_activity.clone() {
-                            Some(entries) => el.child(self.render_list_activity(&entries, cx)),
+                            Some(entries) => el.child(self.render_list_activity(&entries, true, cx)),
                             None => el.child(self.detail.clone()),
                         })
                         .child(self.resize_handle(Panel::Detail, cx)),

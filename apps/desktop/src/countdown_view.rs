@@ -1546,6 +1546,7 @@ impl Render for CountdownView {
             .text_color(theme.colors().text)
             .child(
                 h_flex()
+                    .mt(crate::title_bar::header_inset())
                     .h(px(52.))
                     .flex_none()
                     .px(px(22.))

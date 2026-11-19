@@ -1696,6 +1696,7 @@ impl HabitView {
             .gap_2()
             .child(
                 h_flex()
+                    .mt(crate::title_bar::header_inset())
                     .h(px(52.))
                     .flex_none()
                     .gap_2()
@@ -2013,6 +2014,7 @@ impl Render for HabitView {
             .border_color(theme.colors().border)
             .child(
                 h_flex()
+                    .mt(crate::title_bar::header_inset())
                     .h(px(52.))
                     .flex_none()
                     .px(px(22.))

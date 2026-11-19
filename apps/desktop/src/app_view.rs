@@ -872,6 +872,7 @@ impl AppView {
             .shadow_lg()
             .child(
                 h_flex()
+                    .mt(title_bar::header_inset())
                     .h(px(48.))
                     .px_4()
                     .child(div().flex_1().child(Label::new(strings.shortcuts).size(LabelSize::Large)))
@@ -1263,7 +1264,9 @@ impl Render for AppView {
                         .occlude()
                         .bg(gpui::black().opacity(0.35))
                         .flex()
-                        .p_2()
+                        .pt(title_bar::height())
+                        .px_2()
+                        .pb_2()
                         .items_center()
                         .justify_center()
                         .child(settings),
@@ -1278,8 +1281,8 @@ impl Render for AppView {
             .on_action(cx.listener(Self::dismiss_transient))
             .bg(theme.colors().background)
             .text_color(theme.colors().text)
-            .child(self.title_bar.clone())
             .child(content)
+            .child(self.title_bar.clone())
             // A ring under a finger held long enough: lifting it opens the context menu.
             .when_some(crate::touch::held(), |el, at| {
                 let accent = theme.colors().accent;
@@ -1452,5 +1455,40 @@ mod tests {
             }));
         }
         assert_eq!(cx.debug_bounds("settings-language"), Some(language));
+    }
+
+    #[gpui::test]
+    fn title_bar_overlays_full_height_columns_above_header_controls(cx: &mut gpui::TestAppContext) {
+        cx.update(theme::init);
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let task = store.add_task("Check merged title bar").unwrap();
+        let (app, cx) = cx.add_window_view(|window, cx| AppView::new(store, true, window, cx));
+        cx.simulate_resize(gpui::size(px(1200.), px(700.)));
+        cx.update(|_, cx| {
+            let todo = app.read(cx).todo.clone();
+            todo.update(cx, |todo, cx| todo.select(task.id, cx));
+        });
+
+        let bar = cx.debug_bounds("title-bar").unwrap();
+        let sidebar = cx.debug_bounds("sidebar").unwrap();
+        let lists = cx.debug_bounds("lists-column").unwrap();
+        let sort = cx.debug_bounds("task-sort-menu-trigger").unwrap();
+        let priority = cx.debug_bounds("task-detail-priority").unwrap();
+        assert_eq!(bar.top(), px(0.));
+        assert_eq!(bar.bottom(), title_bar::height());
+        assert_eq!(sidebar.top(), px(0.));
+        assert_eq!(sidebar.bottom(), px(700.));
+        assert_eq!(lists.top(), px(0.));
+        assert_eq!(lists.bottom(), px(700.));
+        assert!(sort.top() >= bar.bottom());
+        assert!(priority.top() >= bar.bottom());
+
+        cx.update(|window, cx| app.update(cx, |app, cx| assert!(app.select(Section::Calendar, window, cx))));
+        let more = cx.debug_bounds("calendar-more-button").unwrap();
+        assert!(more.top() >= bar.bottom());
+
+        cx.update(|window, cx| app.update(cx, |app, cx| assert!(app.select(Section::Matrix, window, cx))));
+        let matrix_more = cx.debug_bounds("matrix-header-menu-trigger").unwrap();
+        assert!(matrix_more.top() >= bar.bottom());
     }
 }

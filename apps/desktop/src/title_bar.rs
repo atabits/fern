@@ -1,13 +1,13 @@
-//! Fern's own title bar and window frame, drawn in the app's theme on every platform instead of
-//! the system's: the window is opened without the system title bar (`window_options`), and this
-//! module draws the bar, the window buttons and, on Linux, the frame's border, shadow and resize
-//! edges. After Zed's `platform_title_bar` and `client_side_decorations`.
+//! Fern's integrated caption strip and window frame: the window is opened without the system title
+//! bar (`window_options`), every workspace column extends to the top edge, and this module overlays
+//! a transparent drag strip, the window buttons and, on Linux, the frame's border, shadow and
+//! resize edges. After Zed's `platform_title_bar` and `client_side_decorations`.
 //!
-//! - macOS keeps its traffic lights, which sit over the bar's left end.
-//! - Windows draws nothing itself: the bar's areas are tagged with [`WindowControlArea`], so the
+//! - macOS keeps its traffic lights over the top-left corner.
+//! - Windows draws nothing itself: the strip's areas are tagged with [`WindowControlArea`], so the
 //!   system handles dragging, double clicks, snap layouts and the buttons' clicks.
 //! - Linux asks the compositor for client-side decorations. When it draws its own (server-side),
-//!   the bar stays but without window buttons.
+//!   the drag strip stays without duplicate window buttons.
 
 use std::rc::Rc;
 
@@ -26,13 +26,17 @@ use crate::updater::Status;
 const ROUNDING: Pixels = px(10.);
 /// The room around the window for its shadow, which is also where it is grabbed to resize.
 const SHADOW: Pixels = px(10.);
-/// macOS traffic lights: their position, and the room the bar leaves for them.
+/// macOS traffic lights: their position at the top-left corner.
 const TRAFFIC_LIGHTS: Point<Pixels> = point(px(12.), px(11.));
-const TRAFFIC_LIGHT_PADDING: Pixels = px(80.);
 
-/// The bar's height: Windows' caption height there, a bit more elsewhere.
+/// The overlaid caption strip's height: Windows' standard 32 px caption button height.
 pub fn height() -> Pixels {
-    if cfg!(target_os = "windows") { px(32.) } else { px(36.) }
+    px(32.)
+}
+
+/// The top margin workspace headers leave so their controls clear the overlaid window buttons.
+pub fn header_inset() -> Pixels {
+    height() - px(8.)
 }
 
 pub fn frame_vertical_inset(window: &Window) -> Pixels {
@@ -80,15 +84,21 @@ impl TitleBar {
             Status::Available(notes) => (notes.clone(), strings.update_to.replace("{version}", &notes.version)),
             _ => return None,
         };
-        let accent = cx.theme().colors().accent;
+        let colors = cx.theme().colors();
+        let accent = colors.accent;
         Some(
             h_flex()
                 .flex_none()
-                .mr_2()
+                .mr_1p5()
                 .gap_1()
                 .child(
                     action_button("title-bar-update-notes", cx)
                         .debug_selector(|| "title-bar-update-notes".to_owned())
+                        .min_h(px(24.))
+                        .h(px(24.))
+                        .px_2()
+                        .bg(colors.elevated_surface_background)
+                        .border_color(colors.border)
                         .occlude()
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .child(Label::new(strings.whats_new).size(LabelSize::Small))
@@ -100,6 +110,9 @@ impl TitleBar {
                 .child(
                     action_button("update-button", cx)
                         .debug_selector(|| "title-bar-restart-update".to_owned())
+                        .min_h(px(24.))
+                        .h(px(24.))
+                        .px_2()
                         .bg(accent.opacity(0.12))
                         .border_color(accent.opacity(0.35))
                         .occlude()
@@ -118,7 +131,6 @@ impl TitleBar {
 impl Render for TitleBar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let update_buttons = self.update_buttons(cx);
-        let colors = cx.theme().colors();
         let decorations = window.window_decorations();
         let client_side = matches!(decorations, Decorations::Client { .. });
         let fullscreen = window.is_fullscreen();
@@ -137,23 +149,16 @@ impl Render for TitleBar {
         };
         let left_buttons = buttons.and_then(|b| side(b.left, "left-window-buttons")).filter(|_| !fullscreen);
         let right_buttons = buttons.and_then(|b| side(b.right, "right-window-buttons")).filter(|_| !fullscreen);
-        let background = if linux && !window.is_window_active() { colors.panel_background } else { colors.title_bar_background };
 
         h_flex()
             .id("title-bar")
+            .debug_selector(|| "title-bar".to_owned())
             .window_control_area(WindowControlArea::Drag)
-            .flex_none()
-            .w_full()
+            .absolute()
+            .top_0()
+            .left_0()
+            .right_0()
             .h(height())
-            .bg(background)
-            .border_b_1()
-            .border_color(colors.border)
-            .map(|bar| match decorations {
-                Decorations::Client { tiling } if !windows => bar
-                    .when(!(tiling.top || tiling.left), |bar| bar.rounded_tl(ROUNDING))
-                    .when(!(tiling.top || tiling.right), |bar| bar.rounded_tr(ROUNDING)),
-                _ => bar,
-            })
             .when(!windows, |bar| {
                 bar.on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, _| this.should_move = true))
                     .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, _| this.should_move = false))
@@ -179,16 +184,7 @@ impl Render for TitleBar {
                 bar.on_mouse_down(MouseButton::Right, |event, window, _| window.show_window_menu(event.position))
             })
             .children(left_buttons)
-            .child(
-                h_flex()
-                    .flex_1()
-                    .min_w_0()
-                    .h_full()
-                    .gap_2()
-                    .map(|title| if mac && !fullscreen { title.pl(TRAFFIC_LIGHT_PADDING) } else { title.pl_3() })
-                    .child(gpui::img("icon/icon-64.png").size(px(16.)).flex_none())
-                    .child(Label::new("Fern").size(LabelSize::Small).color(Color::Muted)),
-            )
+            .child(div().flex_1().min_w_0().h_full())
             .children(update_buttons)
             .children(right_buttons)
     }
@@ -219,46 +215,89 @@ impl RenderOnce for WindowButtons {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let controls = window.window_controls();
         let maximized = window.is_maximized();
+        let active = window.is_window_active();
         h_flex()
             .id(self.id)
             .h_full()
             .flex_none()
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .when(!cfg!(target_os = "windows"), |el| {
+                el.on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            })
             .children(self.buttons.into_iter().flatten().filter(|button| match button {
                 WindowButton::Minimize => controls.minimize && window.is_minimizable(),
                 WindowButton::Maximize => controls.maximize && window.is_resizable(),
                 WindowButton::Close => true,
-            }).map(|button| window_button(button, maximized, cx)))
+            }).map(|button| window_button(button, maximized, active, cx)))
     }
 }
 
-fn window_button(button: WindowButton, maximized: bool, cx: &App) -> impl IntoElement {
+/// Windows 11 ships "Segoe Fluent Icons" and Windows 10 "Segoe MDL2 Assets"; Zed renders caption
+/// buttons from those system fonts so DirectWrite hints them identically to native Windows chrome.
+#[cfg(target_os = "windows")]
+fn windows_caption_font(cx: &App) -> &'static str {
+    static FONT: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+    FONT.get_or_init(|| {
+        if cx.text_system().all_font_names().iter().any(|name| name == "Segoe Fluent Icons") {
+            "Segoe Fluent Icons"
+        } else {
+            "Segoe MDL2 Assets"
+        }
+    })
+}
+
+fn window_button(button: WindowButton, maximized: bool, active: bool, cx: &App) -> impl IntoElement {
     let colors = cx.theme().colors();
-    let (icon, area) = match button {
-        WindowButton::Minimize => (IconName::WindowMinimize, WindowControlArea::Min),
-        WindowButton::Maximize if maximized => (IconName::WindowRestore, WindowControlArea::Max),
-        WindowButton::Maximize => (IconName::WindowMaximize, WindowControlArea::Max),
-        WindowButton::Close => (IconName::WindowClose, WindowControlArea::Close),
+    let area = match button {
+        WindowButton::Minimize => WindowControlArea::Min,
+        WindowButton::Maximize => WindowControlArea::Max,
+        WindowButton::Close => WindowControlArea::Close,
     };
     let close = button == WindowButton::Close;
     let close_red: Hsla = rgb(0xe81123).into();
-    h_flex()
+    let resting = if active { colors.text } else { colors.icon_muted };
+    let hover_fg = if close { gpui::white() } else { colors.text };
+    let el = h_flex()
         .id(button.id())
         .group(button.id())
         .h_full()
-        .w(px(44.))
+        .w(px(46.))
         .justify_center()
+        .content_center()
         .occlude()
         .window_control_area(area)
-        .hover(|el| el.bg(if close { close_red } else { colors.ghost_element_hover }))
-        .active(|el| el.bg(if close { close_red.opacity(0.8) } else { colors.element_hover }))
-        .child(
+        .text_color(resting)
+        .hover(|el| el.bg(if close { close_red } else { colors.ghost_element_hover }).text_color(hover_fg))
+        .active(|el| el.bg(if close { close_red.opacity(0.8) } else { colors.element_hover }).text_color(hover_fg));
+    #[cfg(target_os = "windows")]
+    let el = {
+        let glyph = match button {
+            WindowButton::Minimize => "\u{e921}",
+            WindowButton::Maximize if maximized => "\u{e923}",
+            WindowButton::Maximize => "\u{e922}",
+            WindowButton::Close => "\u{e8bb}",
+        };
+        el.font_family(windows_caption_font(cx))
+            .text_size(px(10.))
+            .line_height(px(10.))
+            .child(glyph)
+    };
+    #[cfg(not(target_os = "windows"))]
+    let el = {
+        let icon = match button {
+            WindowButton::Minimize => IconName::WindowMinimize,
+            WindowButton::Maximize if maximized => IconName::WindowRestore,
+            WindowButton::Maximize => IconName::WindowMaximize,
+            WindowButton::Close => IconName::WindowClose,
+        };
+        el.child(
             gpui::svg()
                 .path(icon.path())
                 .size(px(14.))
-                .text_color(colors.icon_muted)
-                .group_hover(button.id(), |el| el.text_color(if close { gpui::white() } else { colors.icon })),
+                .text_color(resting)
+                .group_hover(button.id(), |svg| svg.text_color(hover_fg)),
         )
+    };
+    el
         // On Windows the system handles the click through the control area.
         .when(!cfg!(target_os = "windows"), |el| {
             el.on_mouse_move(|_, _, cx| cx.stop_propagation()).on_click(move |_, window, cx| {

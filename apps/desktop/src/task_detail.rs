@@ -112,6 +112,8 @@ pub struct TaskDetail {
     /// Shown as a task card (the calendar's or the board's), framed by the card instead of a
     /// left border.
     card: bool,
+    /// Leaves top clearance for the overlaid window buttons when docked at the window's right edge.
+    top_inset: std::cell::Cell<bool>,
     sticky_style: Option<crate::sticky_settings::StickySettings>,
     /// The calendar's card writes its date out with the weekday.
     calendar_card: bool,
@@ -218,6 +220,7 @@ impl TaskDetail {
             list_submenu: None,
             show_checklist: false,
             card: false,
+            top_inset: std::cell::Cell::new(false),
             sticky_style: None,
             calendar_card: false,
             subtask_open: false,
@@ -229,6 +232,11 @@ impl TaskDetail {
     pub fn set_card(&mut self, calendar: bool) {
         self.card = true;
         self.calendar_card = calendar;
+    }
+
+    /// Sets whether the header leaves top clearance for the overlaid window buttons.
+    pub fn set_top_inset(&self, inset: bool) {
+        self.top_inset.set(inset);
     }
 
     /// Whether one of the details' popovers is open, which a click outside the card closes first.
@@ -3013,6 +3021,7 @@ impl Render for TaskDetail {
             .when(!sticky, |panel| panel.child(
                 h_flex()
                     .debug_selector(|| "task-detail-header".into())
+                    .when(self.top_inset.get(), |el| el.mt(crate::title_bar::header_inset()))
                     .gap_2()
                     .h(px(48.))
                     .flex_none()

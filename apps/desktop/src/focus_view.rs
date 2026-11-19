@@ -1900,7 +1900,7 @@ impl FocusView {
             .w_full()
             .max_w(px(1024.))
             .px_8()
-            .pt(px(19.))
+            .pt(crate::title_bar::height() + px(6.))
             .pb_4()
             .flex_none()
             .child(div().flex_1().child(div().text_size(px(28.)).font_weight(FontWeight::MEDIUM).child(strings.statistics)))
@@ -3303,6 +3303,7 @@ impl FocusView {
             .border_color(theme.colors().border)
             .child(
                 h_flex()
+                    .mt(crate::title_bar::header_inset())
                     .h(px(52.))
                     .flex_none()
                     .px_4()
@@ -3425,6 +3426,7 @@ impl FocusView {
             .px_4()
             .child(
                 h_flex()
+                    .mt(crate::title_bar::header_inset())
                     .h(px(52.))
                     .gap_2()
                     .child(Icon::new(if stopwatch { IconName::Timer } else { IconName::FernFocus }).color(Color::Accent))
@@ -3539,6 +3541,7 @@ impl Render for FocusView {
             .child(
                 h_flex()
                     .relative()
+                    .mt(crate::title_bar::header_inset())
                     .h(px(52.))
                     .flex_none()
                     .px(px(22.))
@@ -3649,7 +3652,7 @@ impl Render for FocusView {
             .flex_none()
             .h_full()
             .px_5()
-            .child(h_flex().h(px(52.)).child(Label::new(strings.focus_overview).size(LabelSize::Large).weight(FontWeight::MEDIUM)))
+            .child(h_flex().mt(crate::title_bar::header_inset()).h(px(52.)).child(Label::new(strings.focus_overview).size(LabelSize::Large).weight(FontWeight::MEDIUM)))
             .child(self.render_overview(strings, cx))
             .child(self.render_record_header(true, cx))
             .when_some(self.message.clone(), |el, message| {

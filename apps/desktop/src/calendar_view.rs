@@ -577,7 +577,7 @@ impl CalendarView {
             .flex_none()
             .h_full()
             .px_3()
-            .pt_3()
+            .pt(crate::title_bar::height() + px(4.))
             .gap_2()
             .border_l_1()
             .border_color(theme.colors().border_variant)
@@ -1909,7 +1909,7 @@ impl CalendarView {
     fn render_month_grid(&self, today: NaiveDate, window: &Window, cx: &mut Context<Self>) -> Div {
         let colors = cx.theme().colors();
         let shown_weeks = self.month_grid_weeks();
-        let grid_height = window.viewport_size().height - crate::title_bar::height()
+        let grid_height = window.viewport_size().height - crate::title_bar::header_inset()
             - crate::title_bar::frame_vertical_inset(window)
             - px(CALENDAR_HEADER_HEIGHT + WEEKDAY_HEADER_HEIGHT + 1.);
         let slots = day_item_slots(grid_height / shown_weeks.len().max(1) as f32);
@@ -1958,6 +1958,7 @@ impl Render for CalendarView {
 
         let arrange = self.arrange.map(|tab| self.render_arrange(tab, cx));
         let toolbar = h_flex()
+            .mt(crate::title_bar::header_inset())
             .h(px(CALENDAR_HEADER_HEIGHT))
             .flex_none()
             .pl(px(16.))

@@ -121,11 +121,12 @@ pub fn render(
     };
 
     v_flex()
+        .debug_selector(|| "sidebar".to_owned())
         .flex_none()
         .w(px(WIDTH))
         .h_full()
         .items_center()
-        .pt_3()
+        .pt(crate::title_bar::height())
         .pb_3()
         .gap_1()
         .bg(colors.sidebar_background)

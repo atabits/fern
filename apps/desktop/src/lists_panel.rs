@@ -467,7 +467,7 @@ pub fn render(
         .min_h_0()
         .overflow_y_scroll()
         .px_2()
-        .py_2()
+        .pb_2()
         .when(shows(SmartList::Inbox, counts.inbox), |el| {
             el.child(smart(View::Inbox, strings.inbox, IconName::Inbox, Some(counts.inbox)))
         })
@@ -581,9 +581,11 @@ pub fn render(
         .when(shows(SmartList::Trash, 1), |el| el.child(smart(View::Trash, strings.trash, IconName::Trash, None)));
 
     v_flex()
+        .debug_selector(|| "lists-column".to_owned())
         .flex_none()
         .w(px(width))
         .h_full()
+        .pt(crate::title_bar::height())
         .bg(colors.lists_background)
         .border_r_1()
         .border_color(colors.lists_border)

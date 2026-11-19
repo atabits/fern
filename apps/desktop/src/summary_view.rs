@@ -779,7 +779,7 @@ impl SummaryView {
             .w(px(320.))
             .h_full()
             .px_4()
-            .pt_2()
+            .pt(crate::title_bar::height())
             .border_l_1()
             .border_color(colors.border_variant)
             .child(heading(strings.summary_template))
@@ -939,6 +939,7 @@ impl Render for SummaryView {
                     .h_full()
                     .child(
                         h_flex()
+                            .mt(crate::title_bar::header_inset())
                             .h(px(52.))
                             .px_4()
                             .gap_2()

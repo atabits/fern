@@ -729,34 +729,47 @@ impl CalendarView {
     }
 
     fn dismiss_transient(&mut self, _: &DismissTransient, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.try_dismiss_transient(window, cx) {
+            cx.propagate();
+        }
+    }
+
+    pub(crate) fn try_dismiss_transient(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         if self.context_menu.take().is_some() {
             self.context_side = None;
             cx.notify();
+            true
         } else if std::mem::take(&mut self.mode_menu_open)
             || std::mem::take(&mut self.more_menu)
             || self.month_picker_open.take().is_some()
         {
             cx.notify();
+            true
         } else if self.year_jump.is_some() {
             self.close_year_jump(window, cx);
+            true
         } else if let Some(editor) = &self.task_editor {
             editor.view.update(cx, |editor, cx| editor.dismiss(window, cx));
+            true
         } else if self.options_dialog.take().is_some() {
             window.focus(&self.focus_handle, cx);
             cx.notify();
+            true
         } else if self.card.is_some() {
             if self.detail.update(cx, |detail, cx| detail.dismiss_popup(window, cx)) {
-                return;
+                return true;
             }
             self.close_card(cx);
             window.focus(&self.focus_handle, cx);
+            true
         } else if self.open_event.take().is_some()
             || self.open_countdown.take().is_some()
             || self.year_day.take().is_some()
         {
             cx.notify();
+            true
         } else {
-            cx.propagate();
+            false
         }
     }
 

@@ -429,8 +429,11 @@ pub struct Strings {
     pub sticky_font_sizes: [&'static str; 4],
     pub sticky_save_failed: &'static str,
     pub shortcuts: &'static str,
+    pub edit_keymap: &'static str,
+    pub reload_keymap: &'static str,
+    pub keymap_errors: &'static str,
     /// Labels of `keymap::LISTED_ACTIONS`, in order.
-    pub shortcut_labels: [&'static str; 25],
+    pub shortcut_labels: [&'static str; 26],
     pub shortcut_groups: [&'static str; 4],
     /// Quick add syntax: (what, example).
     pub quick_add_help: [(&'static str, &'static str); 4],
@@ -964,6 +967,12 @@ pub struct Strings {
     pub color_by_options: [&'static str; 3],
     pub color_by_hints: [&'static str; 3],
     pub arrange_tabs: [&'static str; 3],
+    pub kanban_size: &'static str,
+    pub kanban_size_small: &'static str,
+    pub kanban_size_medium: &'static str,
+    pub kanban_size_large: &'static str,
+    pub kanban_column_color: &'static str,
+    pub kanban_show_input_box: &'static str,
 }
 
 pub static EN: Strings = Strings {
@@ -1268,9 +1277,12 @@ pub static EN: Strings = Strings {
     sticky_font_sizes: ["Small", "Normal", "Large", "Extra Large"],
     sticky_save_failed: "Could not save sticky note settings.",
     shortcuts: "Shortcuts",
+    edit_keymap: "Edit keymap.json",
+    reload_keymap: "Reload keymap",
+    keymap_errors: "keymap.json errors",
     shortcut_labels: [
         "Add task", "Search", "Toggle sidebar", "Go to Inbox", "Go to Today", "Go to Tomorrow", "Go to Next 7 Days",
-        "Shortcuts", "Settings", "Quit", "Dismiss the active menu or dialog", "Next task", "Previous task", "Complete task", "Delete task", "Pin task", "Set date",
+        "Shortcuts", "Settings", "Quit", "Dismiss the active menu or dialog", "Minimize window", "Next task", "Previous task", "Complete task", "Delete task", "Pin task", "Set date",
         "Clear date", "Set today", "Set tomorrow", "Set next week", "No priority", "Low priority",
         "Medium priority", "High priority",
     ],
@@ -1775,6 +1787,12 @@ pub static EN: Strings = Strings {
     color_by_options: ["List", "Tag", "Priority"],
     color_by_hints: ["Tasks are shown in their list color (to ensure text clarity, colors will be slightly toned down).", "Tasks are shown in the color of their first tag.", "Tasks are shown in the color of their priority."],
     arrange_tabs: ["Lists", "Tags", "Priority"],
+    kanban_size: "Kanban Size",
+    kanban_size_small: "Small",
+    kanban_size_medium: "Medium",
+    kanban_size_large: "Large",
+    kanban_column_color: "Column Color",
+    kanban_show_input_box: "Show Input Box",
 };
 
 pub static ZH_CN: Strings = Strings {
@@ -2078,9 +2096,12 @@ pub static ZH_CN: Strings = Strings {
     sticky_font_sizes: ["小", "普通", "大", "特大"],
     sticky_save_failed: "无法保存便签设置。",
     shortcuts: "快捷键",
+    edit_keymap: "编辑 keymap.json",
+    reload_keymap: "重新加载快捷键",
+    keymap_errors: "keymap.json 错误",
     shortcut_labels: [
         "新增任务", "搜索", "切换侧边栏", "跳转到收件箱", "跳转到今日", "跳转到明天", "跳转到未来7天",
-        "快捷键设置", "设置", "退出", "关闭当前菜单或对话框", "下一个任务", "上一个任务", "完成任务", "删除任务", "置顶任务", "设置日期",
+        "快捷键设置", "设置", "退出", "关闭当前菜单或对话框", "最小化窗口", "下一个任务", "上一个任务", "完成任务", "删除任务", "置顶任务", "设置日期",
         "清除日期", "设为今天", "设为明天", "设为下周", "无优先级", "低优先级",
         "中优先级", "高优先级",
     ],
@@ -2582,6 +2603,12 @@ pub static ZH_CN: Strings = Strings {
     color_by_options: ["清单", "标签", "优先级"],
     color_by_hints: ["任务使用所属清单颜色；为保证文字可读性，颜色会自动调淡。", "任务使用第一个标签的颜色。", "任务使用对应优先级颜色。"],
     arrange_tabs: ["清单", "标签", "优先级"],
+    kanban_size: "看板尺寸",
+    kanban_size_small: "小",
+    kanban_size_medium: "中",
+    kanban_size_large: "大",
+    kanban_column_color: "分组颜色",
+    kanban_show_input_box: "显示输入框",
 };
 
 pub static RU: Strings = Strings {
@@ -2888,9 +2915,12 @@ pub static RU: Strings = Strings {
     sticky_font_sizes: ["Маленький", "Обычный", "Крупный", "Очень крупный"],
     sticky_save_failed: "Не удалось сохранить настройки заметок.",
     shortcuts: "Горячие клавиши",
+    edit_keymap: "Редактировать keymap.json",
+    reload_keymap: "Обновить раскладку",
+    keymap_errors: "Ошибки в keymap.json",
     shortcut_labels: [
         "Новая задача", "Поиск", "Скрыть/показать панель", "Входящие", "Сегодня", "Завтра", "Следующие 7 дней",
-        "Горячие клавиши", "Настройки", "Выйти", "Закрыть открытое меню или диалог", "Следующая задача", "Предыдущая задача", "Выполнить задачу", "Удалить задачу",
+        "Горячие клавиши", "Настройки", "Выйти", "Закрыть открытое меню или диалог", "Свернуть окно", "Следующая задача", "Предыдущая задача", "Выполнить задачу", "Удалить задачу",
         "Закрепить задачу", "Выбрать дату", "Убрать дату", "На сегодня", "На завтра", "На следующую неделю",
         "Без приоритета", "Низкий приоритет", "Средний приоритет", "Высокий приоритет",
     ],
@@ -3397,6 +3427,12 @@ pub static RU: Strings = Strings {
     color_by_options: ["Списку", "Метке", "Приоритету"],
     color_by_hints: ["Задачи показаны цветом своего списка (чтобы текст читался, цвета немного приглушены).", "Задачи показаны цветом своего первой метки.", "Задачи показаны цветом своего приоритета."],
     arrange_tabs: ["Списки", "Метки", "Приоритет"],
+    kanban_size: "Размер колонок",
+    kanban_size_small: "Малый",
+    kanban_size_medium: "Средний",
+    kanban_size_large: "Большой",
+    kanban_column_color: "Цвет колонок",
+    kanban_show_input_box: "Поле ввода в колонках",
 };
 
 impl Strings {

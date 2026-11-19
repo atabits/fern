@@ -6,8 +6,8 @@ use ui::prelude::*;
 use ui::{Placement, PopoverAttachment, popover};
 
 use crate::actions::{
-    CloseWindow, DismissTransient, NewTask, OpenSettings, Quit, Search, ShowInbox, ShowNext7Days, ShowShortcuts,
-    ShowToday, ShowTomorrow, ToggleSidebar,
+    CloseWindow, DismissTransient, MinimizeWindow, NewTask, OpenSettings, Quit, Search, ShowInbox,
+    ShowNext7Days, ShowShortcuts, ShowToday, ShowTomorrow, ToggleSidebar,
 };
 use crate::calendar_view::{self, CalendarView};
 use crate::countdown_view::CountdownView;
@@ -51,6 +51,8 @@ pub struct AppView {
     statistics_open: bool,
     /// The sidebar icon under the pointer, whose name shows beside it.
     nav_hovered: Option<Section>,
+    #[cfg(test)]
+    minimized_count: usize,
 }
 
 impl AppView {
@@ -176,6 +178,8 @@ impl AppView {
             update_notice,
             statistics_open: false,
             nav_hovered: None,
+            #[cfg(test)]
+            minimized_count: 0,
         };
         reminders::start(this.store.clone(), window.window_handle(), cx);
         this.start_sync(cx);
@@ -738,27 +742,110 @@ impl AppView {
         cx.notify();
     }
 
-    fn dismiss_transient(&mut self, _: &DismissTransient, _: &mut Window, cx: &mut Context<Self>) {
+    fn open_user_keymap(&mut self, cx: &mut Context<Self>) {
+        match crate::keymap::ensure_user_keymap_file() {
+            Ok(path) => cx.open_with_system(&path),
+            Err(err) => {
+                let message = format!("{err:#}");
+                eprintln!("keymap: {message}");
+                crate::keymap::set_errors(vec![message], cx);
+                cx.notify();
+            }
+        }
+    }
+
+    fn reload_keymap(&mut self, cx: &mut Context<Self>) {
+        match crate::keymap::reload(&assets::Assets, cx) {
+            Ok(errors) => errors.iter().for_each(|err| eprintln!("keymap: {err}")),
+            Err(err) => eprintln!("failed to reload the keymap: {err:#}"),
+        }
+        cx.notify();
+    }
+
+    fn dismiss_any_transient(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         if self.account_menu_open {
             self.set_account_menu(false, cx);
-        } else if self.notices_open {
+            return true;
+        }
+        if self.notices_open {
             self.set_notices_open(false, cx);
-        } else if self.shortcuts_open {
-            self.toggle_shortcuts(cx);
-        } else {
+            return true;
+        }
+        if self.shortcuts_open {
+            if self.recording_hotkey.take().is_some() {
+                cx.notify();
+            } else {
+                self.toggle_shortcuts(cx);
+            }
+            return true;
+        }
+        if self.search.take().is_some() {
+            cx.notify();
+            return true;
+        }
+        if let Some(settings) = self.settings.clone() {
+            settings.update(cx, |settings, cx| settings.dismiss(window, cx));
+            return true;
+        }
+        if self.statistics_open {
+            if self.focus.update(cx, |focus, cx| focus.dismiss_transient(cx)) {
+                return true;
+            }
+            self.statistics_open = false;
+            self.focus.update(cx, |focus, cx| focus.close_stats(cx));
+            cx.notify();
+            return true;
+        }
+        match self.section {
+            Section::Tasks | Section::Search => {
+                self.todo.update(cx, |todo, cx| todo.dismiss_transient(window, cx))
+            }
+            Section::Calendar => {
+                self.calendar.update(cx, |cal, cx| cal.try_dismiss_transient(window, cx))
+            }
+            Section::Matrix => {
+                self.matrix.update(cx, |matrix, cx| matrix.try_dismiss_transient(window, cx))
+            }
+            Section::Habits => self.habits.update(cx, |habits, cx| habits.dismiss_transient(cx)),
+            Section::Pomodoro => self.focus.update(cx, |focus, cx| focus.dismiss_transient(cx)),
+            Section::Countdown => {
+                self.countdown.update(cx, |countdown, cx| countdown.dismiss_transient(cx))
+            }
+        }
+    }
+
+    fn dismiss_transient(&mut self, _: &DismissTransient, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.dismiss_any_transient(window, cx) {
             cx.propagate();
         }
+    }
+
+    fn minimize_window(&mut self, _: &MinimizeWindow, window: &mut Window, cx: &mut Context<Self>) {
+        if self.dismiss_any_transient(window, cx) {
+            return;
+        }
+        #[cfg(test)]
+        {
+            let _ = window;
+            self.minimized_count += 1;
+            cx.notify();
+        }
+        #[cfg(not(test))]
+        window.minimize_window();
     }
 
     /// The original's Shortcuts panel: the keymap's bindings by group, and quick add syntax.
     fn render_shortcuts(&self, cx: &mut Context<Self>) -> AnyElement {
         let strings = i18n::t(cx);
         let theme = cx.theme().clone();
+        let user_keymap = crate::data_dir()
+            .ok()
+            .and_then(|dir| std::fs::read_to_string(dir.join(crate::keymap::USER_KEYMAP_FILE)).ok());
         let list = std::str::from_utf8(
             &gpui::AssetSource::load(&assets::Assets, crate::keymap::DEFAULT_KEYMAP_PATH).ok().flatten().unwrap_or_default(),
         )
         .ok()
-        .and_then(|source| crate::keymap::shortcut_list(source).ok())
+        .and_then(|source| crate::keymap::shortcut_list_with_user(source, user_keymap.as_deref()).ok())
         .unwrap_or_default();
         let chip = |text: String| {
             div()
@@ -778,7 +865,31 @@ impl AppView {
                 .child(h_flex().gap_1().children(keys.into_iter().map(chip)))
         };
         let heading = |text: &'static str| div().pt_3().pb_1().child(Label::new(text).weight(gpui::FontWeight::SEMIBOLD));
-        let mut body = v_flex().child(heading(strings.shortcut_groups[0]));
+        let keymap_errors = crate::keymap::errors(cx).to_vec();
+        let mut body = v_flex()
+            .when(!keymap_errors.is_empty(), |el| {
+                el.child(
+                    v_flex()
+                        .debug_selector(|| "shortcuts-keymap-errors".to_owned())
+                        .mb_2()
+                        .p_2()
+                        .gap_1()
+                        .rounded(px(6.))
+                        .border_1()
+                        .border_color(theme.status().error.opacity(0.4))
+                        .bg(theme.status().error.opacity(0.08))
+                        .child(
+                            Label::new(strings.keymap_errors)
+                                .size(LabelSize::Small)
+                                .weight(gpui::FontWeight::SEMIBOLD)
+                                .color(Color::Error),
+                        )
+                        .children(keymap_errors.into_iter().map(|err| {
+                            Label::new(err).size(LabelSize::XSmall).color(Color::Error)
+                        })),
+                )
+            })
+            .child(heading(strings.shortcut_groups[0]));
         for (i, (action, keys)) in list.into_iter().enumerate() {
             if action.starts_with("task_list::") && i > 0 && list_group_start(i) {
                 body = body.child(heading(strings.shortcut_groups[1]));
@@ -874,7 +985,20 @@ impl AppView {
                     .mt(title_bar::header_inset())
                     .h(px(48.))
                     .px_4()
+                    .gap_1()
                     .child(div().flex_1().child(Label::new(strings.shortcuts).size(LabelSize::Large)))
+                    .child(
+                        IconButton::new("edit-keymap", IconName::FileText)
+                            .icon_color(Color::Muted)
+                            .tip(strings.edit_keymap, ui::TipSide::Below)
+                            .on_click(cx.listener(|this, _, _, cx| this.open_user_keymap(cx))),
+                    )
+                    .child(
+                        IconButton::new("reload-keymap", IconName::RefreshCw)
+                            .icon_color(Color::Muted)
+                            .tip(strings.reload_keymap, ui::TipSide::Below)
+                            .on_click(cx.listener(|this, _, _, cx| this.reload_keymap(cx))),
+                    )
                     .child(
                         IconButton::new("close-shortcuts", IconName::X)
                             .icon_color(Color::Muted)
@@ -1226,6 +1350,7 @@ impl Render for AppView {
             .min_h_0()
             .w_full()
             .key_context("Workspace")
+            .on_action(cx.listener(Self::minimize_window))
             .on_action(cx.listener(Self::new_task))
             .on_action(cx.listener(Self::search))
             .on_action(cx.listener(Self::toggle_sidebar))
@@ -1352,6 +1477,37 @@ mod tests {
             assert_eq!(app.read(cx).section, Section::Tasks);
             assert!(app.read(cx).settings.is_none());
         });
+    }
+
+    #[gpui::test]
+    fn user_escape_minimize_respects_text_inputs_and_transient_ui(cx: &mut gpui::TestAppContext) {
+        let user_keymap = r#"[{"context": "Workspace && !TextInput", "bindings": {"escape": "fern::MinimizeWindow"}}]"#;
+        cx.update(|cx| {
+            theme::init(cx);
+            let errors = crate::keymap::load_with_user(&assets::Assets, Some(user_keymap), cx).unwrap();
+            assert!(errors.is_empty(), "keymap errors: {errors:?}");
+        });
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let (app, cx) = cx.add_window_view(|window, cx| AppView::new(store, true, window, cx));
+
+        // 1. Focus is initially in quick-add TextInput: Esc blurs to task list without minimizing.
+        cx.simulate_keystrokes("escape");
+        cx.update(|window, cx| {
+            assert!(!app.read(cx).todo.focus_handle(cx).is_focused(window));
+            assert_eq!(app.read(cx).minimized_count, 0);
+        });
+
+        // 2. When an overlay (Shortcuts) is open, Esc closes it instead of minimizing.
+        cx.update(|_, cx| app.update(cx, |app, cx| app.toggle_shortcuts(cx)));
+        cx.simulate_keystrokes("escape");
+        cx.update(|_, cx| {
+            assert!(!app.read(cx).shortcuts_open);
+            assert_eq!(app.read(cx).minimized_count, 0);
+        });
+
+        // 3. When no TextInput or transient UI is active, Esc triggers MinimizeWindow.
+        cx.simulate_keystrokes("escape");
+        cx.update(|_, cx| assert_eq!(app.read(cx).minimized_count, 1));
     }
 
     #[gpui::test]

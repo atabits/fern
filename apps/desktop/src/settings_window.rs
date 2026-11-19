@@ -194,6 +194,16 @@ impl SettingsWindow {
         window.focus(&self.focus_handle, cx);
     }
 
+    pub fn dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.menu, Some(Menu::ChinaHolidays(_))) {
+            self.set_menu(None, cx);
+        } else if self.release_notes.is_some() {
+            self.back_to_about(window, cx);
+        } else {
+            cx.emit(SettingsEvent::Dismissed);
+        }
+    }
+
     fn set_menu(&mut self, menu: Option<Menu>, cx: &mut Context<Self>) {
         self.menu = menu;
         cx.notify();
@@ -1504,13 +1514,7 @@ impl Render for SettingsWindow {
             .tab_group()
             .key_context("Settings")
             .on_action(cx.listener(|this, _: &DismissSettings, window, cx| {
-                if matches!(this.menu, Some(Menu::ChinaHolidays(_))) {
-                    this.set_menu(None, cx);
-                } else if this.release_notes.is_some() {
-                    this.back_to_about(window, cx);
-                } else {
-                    cx.emit(SettingsEvent::Dismissed);
-                }
+                this.dismiss(window, cx);
             }))
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
                 if matches!(this.page, Page::About | Page::Appearance) && event.keystroke.key == "tab" {

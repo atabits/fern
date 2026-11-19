@@ -279,11 +279,17 @@ impl MatrixView {
     }
 
     fn dismiss_transient(&mut self, _: &DismissTransient, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.try_dismiss_transient(window, cx) {
+            cx.propagate();
+        }
+    }
+
+    pub(crate) fn try_dismiss_transient(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         if self.editing.is_some() {
             self.finish_edit(None, cx);
         } else if self.menu_row.take().is_some() {
             cx.notify();
-            return;
+            return true;
         } else if self.menu.take().is_some()
             || std::mem::take(&mut self.header_menu)
             || self.adding.take().is_some()
@@ -291,14 +297,14 @@ impl MatrixView {
         {
             cx.notify();
         } else {
-            cx.propagate();
-            return;
+            return false;
         }
         let focus = self.adding.as_ref().map_or_else(
             || self.focus.clone(),
             |(_, input)| input.focus_handle(cx),
         );
         window.focus(&focus, cx);
+        true
     }
 
     #[cfg(debug_assertions)]
@@ -854,6 +860,7 @@ impl Render for MatrixView {
         let [q1, q2, q3, q4] = [0, 1, 2, 3].map(|quadrant| self.render_quadrant(quadrant, cx));
         v_flex()
             .size_full()
+            .key_context("Matrix")
             .track_focus(&self.focus)
             .on_action(cx.listener(Self::dismiss_transient))
             .bg(theme.colors().background)

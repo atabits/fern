@@ -17,6 +17,7 @@ actions!(
         ShowShortcuts,
         OpenSettings,
         DismissTransient,
+        MinimizeWindow,
     ]
 );
 

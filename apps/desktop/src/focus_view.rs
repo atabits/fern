@@ -1636,6 +1636,45 @@ impl FocusView {
         self.update_stats(cx, |p| p.tab = 0);
     }
 
+    pub(crate) fn close_stats(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.stats.take().is_some() {
+            cx.emit(StatsClosed);
+            cx.notify();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn dismiss_transient(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.stats.as_mut().is_some_and(|stats| {
+            stats.curve_menu.take().is_some()
+                || std::mem::take(&mut stats.task_menu)
+                || std::mem::take(&mut stats.classify_menu)
+                || stats.details_menu.take().is_some()
+        }) {
+            cx.notify();
+            return true;
+        }
+        if self.record_menu.take().is_some()
+            || self.timer_menu.take().is_some()
+            || self.timer_draft.take().is_some()
+            || self.picker.take().is_some()
+            || self.open_record.take().is_some()
+            || self.batch_menu.take().is_some()
+            || self.batch_custom.take().is_some()
+            || std::mem::take(&mut self.finish_prompt)
+        {
+            self.delete_all_armed = false;
+            cx.notify();
+            true
+        } else if self.stats.is_some() {
+            self.close_stats(cx)
+        } else {
+            false
+        }
+    }
+
     fn update_stats(&mut self, cx: &mut Context<Self>, change: impl FnOnce(&mut StatsPage)) {
         if let Some(stats) = self.stats.as_mut() {
             let tab = stats.tab;
@@ -1986,6 +2025,12 @@ impl FocusView {
 
         v_flex()
             .size_full()
+            .key_context("Focus")
+            .on_action(cx.listener(|this, _: &crate::actions::DismissTransient, _, cx| {
+                if !this.dismiss_transient(cx) {
+                    cx.propagate();
+                }
+            }))
             .items_center()
             .bg(theme.colors().background)
             .text_color(theme.colors().text)
@@ -3449,6 +3494,12 @@ impl FocusView {
         h_flex()
             .relative()
             .size_full()
+            .key_context("Focus")
+            .on_action(cx.listener(|this, _: &crate::actions::DismissTransient, _, cx| {
+                if !this.dismiss_transient(cx) {
+                    cx.propagate();
+                }
+            }))
             .bg(theme.colors().background)
             .text_color(theme.colors().text)
             .child(left)
@@ -3676,6 +3727,12 @@ impl Render for FocusView {
         h_flex()
             .relative()
             .size_full()
+            .key_context("Focus")
+            .on_action(cx.listener(|this, _: &crate::actions::DismissTransient, _, cx| {
+                if !this.dismiss_transient(cx) {
+                    cx.propagate();
+                }
+            }))
             .items_start()
             .bg(theme.colors().background)
             .text_color(theme.colors().text)

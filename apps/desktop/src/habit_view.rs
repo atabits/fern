@@ -251,6 +251,23 @@ impl HabitView {
         cx.notify();
     }
 
+    pub(crate) fn dismiss_transient(&mut self, cx: &mut Context<Self>) -> bool {
+        if std::mem::take(&mut self.header_menu_open)
+            || self.header_more.take().is_some()
+            || std::mem::take(&mut self.detail_menu_open)
+            || self.section_menu.take().is_some()
+            || self.new_habit.take().is_some()
+            || self.editing.take().is_some()
+            || self.renaming_section.take().is_some()
+        {
+            self.detail_submenu = None;
+            cx.notify();
+            true
+        } else {
+            false
+        }
+    }
+
     fn start_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(habit) = self.selected.and_then(|id| self.habits.iter().find(|h| h.id == id)).cloned() else {
             return;
@@ -2135,6 +2152,12 @@ impl Render for HabitView {
         h_flex()
             .relative()
             .size_full()
+            .key_context("Habits")
+            .on_action(cx.listener(|this, _: &crate::actions::DismissTransient, _, cx| {
+                if !this.dismiss_transient(cx) {
+                    cx.propagate();
+                }
+            }))
             .items_start()
             .bg(theme.colors().background)
             .text_color(theme.colors().text)

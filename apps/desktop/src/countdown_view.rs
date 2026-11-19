@@ -1501,6 +1501,19 @@ impl CountdownView {
             .into_any_element()
     }
 
+    pub(crate) fn dismiss_transient(&mut self, cx: &mut Context<Self>) -> bool {
+        if std::mem::take(&mut self.title_menu)
+            || std::mem::take(&mut self.add_menu)
+            || std::mem::take(&mut self.header_menu)
+            || self.card_menu.take().is_some()
+            || self.draft.take().is_some()
+        {
+            cx.notify();
+            true
+        } else {
+            false
+        }
+    }
 }
 
 impl Render for CountdownView {
@@ -1542,6 +1555,12 @@ impl Render for CountdownView {
         v_flex()
             .relative()
             .size_full()
+            .key_context("Countdown")
+            .on_action(cx.listener(|this, _: &crate::actions::DismissTransient, _, cx| {
+                if !this.dismiss_transient(cx) {
+                    cx.propagate();
+                }
+            }))
             .bg(theme.colors().background)
             .text_color(theme.colors().text)
             .child(

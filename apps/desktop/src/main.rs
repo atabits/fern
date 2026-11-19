@@ -170,7 +170,7 @@ fn main() -> Result<()> {
             eprintln!("failed to load the fonts: {err:#}");
         }
         cx.set_global(CurrentLocale(locale));
-        match keymap::load_default(&Assets, cx) {
+        match keymap::reload(&Assets, cx) {
             Ok(errors) => errors.iter().for_each(|err| eprintln!("keymap: {err}")),
             Err(err) => eprintln!("failed to load the keymap: {err:#}"),
         }

@@ -6,7 +6,7 @@ use chrono::{Datelike, Duration, Local, NaiveDate, TimeZone as _};
 use gpui::{ElementId, Entity, FocusHandle, Focusable, FontWeight, ListAlignment, ListState, MouseButton, Pixels, Point, list};
 use ui::prelude::*;
 
-use crate::drag::DraggedTask;
+use crate::drag::{DraggedColumn, DraggedTask};
 use ui::{Placement, PopoverAttachment, SubmenuItem, popover};
 
 use crate::actions::{
@@ -172,6 +172,12 @@ pub struct TodoView {
     /// whether Move to's side menu is open), and a section being renamed.
     column_add: Option<(usize, DropTarget, Entity<TextInput>)>,
     column_menu: Option<(Id, bool)>,
+    /// Global kanban display options (from View Options, persisted in store settings).
+    kanban_column_size: u8,
+    kanban_column_color: bool,
+    kanban_quick_add: bool,
+    kanban_quick_adds: HashMap<String, Entity<TextInput>>,
+    kanban_section_colors: HashMap<Id, String>,
     /// The Timeline's groups folded up, by name.
     timeline_folded: HashSet<String>,
     /// Today's "Suggested Tasks" panel (the header's light bulb), and whether its Long Unfinished
@@ -382,6 +388,11 @@ impl TodoView {
             new_section_index: None,
             column_add: None,
             column_menu: None,
+            kanban_column_size: 1,
+            kanban_column_color: false,
+            kanban_quick_add: false,
+            kanban_quick_adds: HashMap::new(),
+            kanban_section_colors: HashMap::new(),
             timeline_folded: HashSet::new(),
             view_options: None,
             suggestions_open: None,
@@ -923,6 +934,13 @@ impl TodoView {
         self.show_details = self.view_flag("show_details", false);
         self.kanban = self.view_flag("kanban", false);
         self.timeline = self.view_flag("timeline", false);
+        self.kanban_column_size = match self.store.setting("kanban:column_size").ok().flatten().as_deref() {
+            Some("s") => 0,
+            Some("l") => 2,
+            _ => 1,
+        };
+        self.kanban_column_color = self.store.setting("kanban:column_color").ok().flatten().is_some_and(|v| v == "1");
+        self.kanban_quick_add = self.store.setting("kanban:quick_add").ok().flatten().is_some_and(|v| v == "1");
         self.timeline_scale = self
             .store
             .setting(&format!("timeline_scale:{}", self.view_key()))
@@ -935,6 +953,18 @@ impl TodoView {
             Some(list) => self.store.list_sections(list).unwrap_or_default(),
             None => Vec::new(),
         };
+        self.kanban_section_colors = self
+            .sections
+            .iter()
+            .filter_map(|s| {
+                self.store
+                    .setting(&format!("kanban:section_color:{}", s.id))
+                    .ok()
+                    .flatten()
+                    .filter(|c| !c.is_empty())
+                    .map(|c| (s.id, c))
+            })
+            .collect();
         self.folders = self.store.list_folders().unwrap_or_default();
         self.collapsed_folders = self
             .store
@@ -2368,11 +2398,13 @@ impl TodoView {
         task: &Task,
         subtasks: &[Task],
         tag_colors: &HashMap<String, Hsla>,
+        column_tint: Option<Hsla>,
         today: NaiveDate,
         strings: &Strings,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = cx.theme().clone();
+        let dark = theme.preset.is_dark();
         let selected = self.selected == Some(task.id) || self.card == Some(task.id);
         let root_done = task.is_completed() || self.completing.contains_key(&task.id);
         let has_note_mark = task.kind == fern_core::Kind::Note && !task.notes.trim().is_empty();
@@ -2427,15 +2459,34 @@ impl TodoView {
         };
         let id = task.id;
         let dragged = DraggedTask { id, title: task.title.clone().into() };
+        let card_border = if selected {
+            theme.colors().accent
+        } else if let Some(tint) = column_tint {
+            tint.opacity(if dark { 0.24 } else { 0.16 })
+        } else {
+            theme.colors().border
+        };
+        let card_bg = if selected {
+            theme.colors().element_selected
+        } else if let Some(tint) = column_tint {
+            if dark { tint.opacity(0.10) } else { theme.colors().background }
+        } else {
+            theme.colors().surface_background
+        };
+        let card_hover = if let Some(tint) = column_tint {
+            tint.opacity(if dark { 0.16 } else { 0.06 })
+        } else {
+            theme.colors().element_hover
+        };
         v_flex()
             .id(ElementId::Uuid(id))
             .on_drag(dragged, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
             .min_h(px(40.))
             .rounded(px(10.))
             .border_1()
-            .border_color(if selected { theme.colors().accent } else { theme.colors().border })
-            .bg(if selected { theme.colors().element_selected } else { theme.colors().surface_background })
-            .hover(|s| s.bg(theme.colors().element_hover))
+            .border_color(card_border)
+            .bg(card_bg)
+            .hover(move |s| s.bg(card_hover))
             .when(root_done, |el| el.opacity(0.6))
             .cursor_pointer()
             .on_click(cx.listener(move |this, _, _, cx| this.open_card(id, cx)))
@@ -3067,6 +3118,70 @@ impl TodoView {
                                     .children(menu),
                             ),
                     )
+                    .when(self.kanban, |el| {
+                        let size = self.kanban_column_size;
+                        let col_color = self.kanban_column_color;
+                        let quick_add = self.kanban_quick_add;
+                        let size_btn = |id: &'static str, label: &'static str, value: u8, cx: &mut Context<Self>| {
+                            let active = size == value;
+                            div()
+                                .id(id)
+                                .px_2p5()
+                                .h(px(26.))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(6.))
+                                .cursor_pointer()
+                                .when(active, |el| el.bg(theme.colors().element_selected))
+                                .hover(|s| s.bg(theme.colors().ghost_element_hover))
+                                .child(Label::new(label).size(LabelSize::Small).color(if active { Color::Accent } else { Color::Default }))
+                                .on_click(cx.listener(move |this, _, _, cx| this.set_kanban_column_size(value, cx)))
+                        };
+                        el.child(
+                            v_flex()
+                                .rounded(px(8.))
+                                .bg(theme.colors().surface_background)
+                                .child(
+                                    h_flex()
+                                        .h(px(48.))
+                                        .px_4()
+                                        .child(div().flex_1().child(Label::new(strings.kanban_size)))
+                                        .child(
+                                            h_flex()
+                                                .p(px(2.))
+                                                .gap_0p5()
+                                                .rounded(px(8.))
+                                                .bg(theme.colors().background)
+                                                .child(size_btn("kanban-size-s", strings.kanban_size_small, 0, cx))
+                                                .child(size_btn("kanban-size-m", strings.kanban_size_medium, 1, cx))
+                                                .child(size_btn("kanban-size-l", strings.kanban_size_large, 2, cx)),
+                                        ),
+                                )
+                                .child(div().px_4().child(Divider::horizontal()))
+                                .child(
+                                    h_flex()
+                                        .id("kanban-toggle-color")
+                                        .h(px(48.))
+                                        .px_4()
+                                        .cursor_pointer()
+                                        .child(div().flex_1().child(Label::new(strings.kanban_column_color)))
+                                        .child(ui::Switch::new().toggle_state(col_color))
+                                        .on_click(cx.listener(|this, _, _, cx| this.toggle_kanban_column_color(cx))),
+                                )
+                                .child(div().px_4().child(Divider::horizontal()))
+                                .child(
+                                    h_flex()
+                                        .id("kanban-toggle-quick-add")
+                                        .h(px(48.))
+                                        .px_4()
+                                        .cursor_pointer()
+                                        .child(div().flex_1().child(Label::new(strings.kanban_show_input_box)))
+                                        .child(ui::Switch::new().toggle_state(quick_add))
+                                        .on_click(cx.listener(|this, _, _, cx| this.toggle_kanban_quick_add(cx))),
+                                ),
+                        )
+                    })
                     .child(
                         section()
                             .child(Label::new(strings.task_detail_layout))
@@ -3081,6 +3196,159 @@ impl TodoView {
                     ),
             )
             .into_any_element()
+    }
+
+    /// The original's column widths: Small 242 px, Medium 282 px, Large 342 px.
+    fn kanban_column_width(&self) -> f32 {
+        [242., 282., 342.][self.kanban_column_size.min(2) as usize]
+    }
+
+    fn set_kanban_column_size(&mut self, size: u8, cx: &mut Context<Self>) {
+        let size = size.min(2);
+        let key = ["s", "m", "l"][size as usize];
+        let result = self.store.set_setting("kanban:column_size", key);
+        self.check(result);
+        self.kanban_column_size = size;
+        cx.notify();
+    }
+
+    fn toggle_kanban_column_color(&mut self, cx: &mut Context<Self>) {
+        let next = !self.kanban_column_color;
+        let result = self.store.set_setting("kanban:column_color", if next { "1" } else { "0" });
+        self.check(result);
+        self.kanban_column_color = next;
+        cx.notify();
+    }
+
+    fn toggle_kanban_quick_add(&mut self, cx: &mut Context<Self>) {
+        let next = !self.kanban_quick_add;
+        let result = self.store.set_setting("kanban:quick_add", if next { "1" } else { "0" });
+        self.check(result);
+        self.kanban_quick_add = next;
+        if next {
+            self.column_add = None;
+        } else {
+            self.kanban_quick_adds.clear();
+        }
+        cx.notify();
+    }
+
+    fn set_section_color(&mut self, section: Id, color: Option<&str>, cx: &mut Context<Self>) {
+        let value = color.unwrap_or("");
+        let result = self.store.set_setting(&format!("kanban:section_color:{section}"), value);
+        self.check(result);
+        if value.is_empty() {
+            self.kanban_section_colors.remove(&section);
+        } else {
+            self.kanban_section_colors.insert(section, value.to_owned());
+        }
+        self.column_menu = None;
+        cx.notify();
+    }
+
+    /// TickTick's column tint palette (used when Column Color is enabled).
+    const KANBAN_COLUMN_COLORS: [&'static str; 8] = [
+        "#6387F7", "#2FBFBC", "#52C41A", "#FAAD14", "#FF5C62", "#B069EE", "#F06292", "#8F8F8F",
+    ];
+
+    fn kanban_column_tint(
+        &self,
+        index: usize,
+        target: Option<&DropTarget>,
+        title: &str,
+        strings: &Strings,
+        tag_colors: &HashMap<String, Hsla>,
+        accent: Hsla,
+    ) -> Option<Hsla> {
+        if !self.kanban_column_color {
+            return None;
+        }
+        let hex = |s: &str| lists_panel::parse_color(Some(s));
+        match target {
+            Some(DropTarget::Complete) => hex("#A5A5A5"),
+            Some(DropTarget::Section(Some(id))) => self
+                .kanban_section_colors
+                .get(id)
+                .and_then(|c| hex(c))
+                .or_else(|| hex(Self::KANBAN_COLUMN_COLORS[index % Self::KANBAN_COLUMN_COLORS.len()])),
+            Some(DropTarget::Section(None)) => hex(Self::KANBAN_COLUMN_COLORS[index % Self::KANBAN_COLUMN_COLORS.len()]),
+            Some(DropTarget::List(Some(id))) => self
+                .lists
+                .iter()
+                .find(|l| l.id == *id)
+                .and_then(|l| lists_panel::parse_color(l.color.as_deref()))
+                .or(Some(accent)),
+            Some(DropTarget::List(None)) => Some(accent),
+            Some(DropTarget::Priority(p)) => match p {
+                Priority::High => hex("#F6252E"),
+                Priority::Medium => hex("#FFA300"),
+                Priority::Low => hex("#4772FA"),
+                Priority::None => hex("#8F8F8F"),
+            },
+            Some(DropTarget::Tag(Some(name))) => tag_colors.get(name).copied().or(Some(accent)),
+            Some(DropTarget::Tag(None)) => hex("#8F8F8F"),
+            Some(DropTarget::Due(Some(date))) => {
+                let today = Self::today();
+                let days = (*date - today).num_days();
+                if days < 0 {
+                    hex("#FF5C62")
+                } else if days == 0 {
+                    hex("#6387F7")
+                } else if days == 1 {
+                    hex("#FAAD14")
+                } else if days <= 7 {
+                    hex("#2FBFBC")
+                } else {
+                    hex("#52C41A")
+                }
+            }
+            Some(DropTarget::Due(None)) => hex("#8F8F8F"),
+            Some(DropTarget::Kind(_)) => hex("#A5A5A5"),
+            None => {
+                if title == strings.group_overdue {
+                    hex("#FF5C62")
+                } else if title == strings.group_completed {
+                    hex("#A5A5A5")
+                } else {
+                    hex(Self::KANBAN_COLUMN_COLORS[index % Self::KANBAN_COLUMN_COLORS.len()])
+                }
+            }
+        }
+    }
+
+    fn kanban_quick_add_key(target: &DropTarget) -> String {
+        format!("{target:?}")
+    }
+
+    fn sync_kanban_quick_adds(&mut self, columns: &[task_rows::KanbanColumn], strings: &'static Strings, cx: &mut Context<Self>) {
+        if !self.kanban_quick_add {
+            if !self.kanban_quick_adds.is_empty() {
+                self.kanban_quick_adds.clear();
+            }
+            return;
+        }
+        let mut active_keys = HashSet::new();
+        for (_, target, _) in columns {
+            let Some(target) = target.as_ref().filter(|t| !matches!(t, DropTarget::Complete)) else { continue };
+            let key = Self::kanban_quick_add_key(target);
+            active_keys.insert(key.clone());
+            self.kanban_quick_adds.entry(key).or_insert_with(|| {
+                let input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.add_task, cx));
+                let target_clone = target.clone();
+                cx.subscribe(&input, move |this, input, Submitted(text), cx| {
+                    if !text.trim().is_empty() {
+                        if let Some(task) = this.add_task(text, cx) {
+                            this.drop_on_column(task.id, target_clone.clone(), cx);
+                        }
+                        input.update(cx, |input, cx| input.set_text("", cx));
+                        this.reload(cx);
+                    }
+                })
+                .detach();
+                input
+            });
+        }
+        self.kanban_quick_adds.retain(|k, _| active_keys.contains(k));
     }
 
     /// A kanban column's "+": a field at the column's top; the task it adds takes the column's
@@ -3153,13 +3421,19 @@ impl TodoView {
         let renaming = self.section_rename.as_ref().filter(|(id, _)| Some(*id) == section).map(|(_, input)| input.clone());
         let menu_open = self.column_menu.is_some_and(|(id, _)| Some(id) == section);
         let show_count = count > 0 || section.is_some();
+        let drag_title: SharedString = title.clone().into();
         h_flex()
+            .id(SharedString::from(format!("kanban-header-{column}")))
             .h(px(38.))
             .pt(px(12.))
             .pb(px(6.))
             .pl(px(10.))
-            .pr(px(12.))
+            .pr(if self.kanban_column_color { px(10.) } else { px(12.) })
             .gap_1()
+            .when_some(section.filter(|_| renaming.is_none()), |el, id| {
+                let dragged = DraggedColumn { id, title: drag_title.clone() };
+                el.cursor_grab().on_drag(dragged, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
+            })
             .map(|el| match renaming {
                 Some(input) => el.child(div().flex_1().min_w_0().px(px(2.)).child(input)),
                 None => el
@@ -3216,7 +3490,7 @@ impl TodoView {
                         }),
                 )
             })
-            .when_some(target.filter(|t| !matches!(t, DropTarget::Complete)), |el, target| {
+            .when_some(target.filter(|t| !matches!(t, DropTarget::Complete) && !self.kanban_quick_add), |el, target| {
                 el.child(
                     IconButton::new(SharedString::from(format!("kanban-add-{column}")), IconName::Plus)
                         .icon_color(Color::Muted)
@@ -3267,6 +3541,8 @@ impl TodoView {
             })
             .collect();
         let view = cx.entity().downgrade();
+        let theme = cx.theme().clone();
+        let current_color = self.kanban_section_colors.get(&section).map(String::as_str);
         popover(cx)
             .min_w(px(220.))
             .on_mouse_down_out(cx.listener(|this, _, _, cx| {
@@ -3276,6 +3552,42 @@ impl TodoView {
             .child(item("section-rename", IconName::Pencil, strings.rename_section).on_click(cx.listener(move |this, _, window, cx| {
                 this.start_kanban_section_rename(section, window, cx);
             })))
+            .when(self.kanban_column_color, |el| {
+                let swatch = |id: SharedString, hex: Option<&'static str>, cx: &mut Context<Self>| {
+                    let active = current_color == hex;
+                    let fill = hex.and_then(|c| lists_panel::parse_color(Some(c)));
+                    div()
+                        .id(id)
+                        .size(px(18.))
+                        .rounded_full()
+                        .cursor_pointer()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .border_1()
+                        .border_color(if active { theme.colors().accent } else { theme.colors().border })
+                        .when_some(fill, |el, c| el.bg(c))
+                        .when(active, |el| {
+                            el.child(Icon::new(IconName::Check).size(IconSize::XSmall).color(if fill.is_some() { Color::IconOnAccent } else { Color::Accent }))
+                        })
+                        .on_click(cx.listener(move |this, _, _, cx| this.set_section_color(section, hex, cx)))
+                };
+                el.child(
+                    v_flex()
+                        .px_2()
+                        .py_1p5()
+                        .gap_1()
+                        .child(Label::new(strings.kanban_column_color).size(LabelSize::XSmall).color(Color::Muted))
+                        .child(
+                            h_flex()
+                                .gap_1p5()
+                                .child(swatch("section-color-default".into(), None, cx))
+                                .children(Self::KANBAN_COLUMN_COLORS.iter().map(|&hex| {
+                                    swatch(SharedString::from(format!("section-color-{hex}")), Some(hex), cx)
+                                })),
+                        ),
+                )
+            })
             .child(item("section-left", IconName::BetweenVerticalStart, strings.add_section_left).on_click(cx.listener(move |this, _, window, cx| {
                 this.column_menu = None;
                 this.start_new_section(window, cx);
@@ -3764,7 +4076,7 @@ impl TodoView {
         cx.notify();
     }
 
-    fn dismiss_transient(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+    pub(crate) fn dismiss_transient(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         if self.sort_menu.is_some() {
             self.close_sort_menu(window, cx);
             return true;
@@ -3785,6 +4097,12 @@ impl TodoView {
             self.column_menu.take().is_some(),
             self.section_menu.take().is_some(),
             self.view_options.take().is_some(),
+            self.filter_edit.take().is_some(),
+            self.list_dialog.take().is_some(),
+            self.folder_dialog.take().is_some(),
+            self.tag_dialog.take().is_some(),
+            self.merge_dialog.take().is_some(),
+            self.suggestions_open.take().is_some(),
             std::mem::take(&mut self.header_menu_open),
             std::mem::take(&mut self.postpone_menu),
             std::mem::take(&mut self.scale_menu_open),
@@ -5080,19 +5398,24 @@ impl TodoView {
                     .into_any_element()
             })
             .collect();
+        let col_width = self.kanban_column_width();
+        let dark = theme.preset.is_dark();
+        let tint = self.kanban_column_color.then(|| lists_panel::parse_color(Some("#A5A5A5"))).flatten();
+        let card_px = if self.kanban_column_color { px(10.) } else { px(12.) };
         Some(
             v_flex()
-                .w(px(282.))
+                .w(px(col_width))
                 .flex_none()
                 .max_h_full()
                 .rounded(px(14.))
+                .when_some(tint, |el, c| el.bg(c.opacity(if dark { 0.08 } else { 0.10 })))
                 .child(
                     h_flex()
                         .h(px(38.))
                         .pt(px(12.))
                         .pb(px(6.))
                         .pl(px(14.))
-                        .pr(px(12.))
+                        .pr(card_px)
                         .gap_1()
                         .child(Label::new(strings.section_habits).weight(FontWeight::SEMIBOLD))
                         .child(Label::new(count.to_string()).size(LabelSize::Small).color(Color::Muted)),
@@ -5101,7 +5424,7 @@ impl TodoView {
                     v_flex()
                         .id("kanban-habits")
                         .mt(px(2.))
-                        .px(px(12.))
+                        .px(card_px)
                         .pt(px(4.))
                         .pb(px(12.))
                         .gap_2()
@@ -5820,29 +6143,53 @@ impl Render for TodoView {
         };
         let board: Option<AnyElement> = board.or_else(|| kanban_view.then(|| {
             let columns = task_rows::kanban_columns(self.rows_with(strings, &HashSet::new(), &HashSet::new()), strings);
+            self.sync_kanban_quick_adds(&columns, strings, cx);
             let theme = cx.theme().clone();
+            let dark = theme.preset.is_dark();
+            let col_width = self.kanban_column_width();
+            let colored = self.kanban_column_color;
+            let card_px = if colored { px(10.) } else { px(12.) };
+            let owner = self.section_owner();
             h_flex()
                 .id("kanban")
                 .track_focus(&self.list_focus)
                 .flex_1()
                 .items_start()
                 // As the original's `#column-list-inner`: 12 px outer padding and 0 gap between
-                // columns; each column is 282 px wide with 12 px horizontal padding around its
-                // cards (258 px), giving 24 px between adjacent cards and 26 px to the first
-                // column title (12 + 10 + 4).
+                // columns (or 12 px gap when Column Color is enabled); each column is 242/282/342 px
+                // wide with 12 px (or 10 px when colored) horizontal padding around its cards.
+                .when(colored, |el| el.gap(px(12.)))
                 .px(px(12.))
                 .mt(px(-8.))
                 .pb(px(12.))
                 .overflow_x_scroll()
                 .children(columns.into_iter().enumerate().map(|(i, (title, drop, cards))| {
                     let drop_for_header = drop.clone();
+                    let section_id = match drop {
+                        Some(DropTarget::Section(Some(id))) => Some(id),
+                        _ => None,
+                    };
+                    let display_title = if title.is_empty() { strings.group_tasks.to_owned() } else { title };
                     let count = cards.len();
                     let accent = theme.colors().accent;
+                    let tint = self.kanban_column_tint(i, drop.as_ref(), &display_title, strings, &tag_colors, accent);
+                    let persistent_add = if self.kanban_quick_add {
+                        drop.as_ref()
+                            .filter(|t| !matches!(t, DropTarget::Complete))
+                            .and_then(|t| self.kanban_quick_adds.get(&Self::kanban_quick_add_key(t)).cloned())
+                    } else {
+                        None
+                    };
+                    let add_input = persistent_add.or_else(|| {
+                        self.column_add.as_ref().filter(|(at, _, _)| *at == i).map(|(_, _, input)| input.clone())
+                    });
+                    let temp_add = !self.kanban_quick_add;
                     v_flex()
                         .id(SharedString::from(format!("kanban-column-{i}")))
                         .rounded(px(14.))
                         .border_1()
                         .border_color(gpui::transparent_black())
+                        .when_some(tint, |el, c| el.bg(c.opacity(if dark { 0.08 } else { 0.10 })))
                         .when_some(drop, |el, drop| {
                             el.drag_over::<DraggedTask>(move |style, _, _, _| {
                                 style.bg(accent.opacity(0.08)).border_color(accent)
@@ -5851,62 +6198,76 @@ impl Render for TodoView {
                                 this.drop_on_column(dragged.id, drop.clone(), cx)
                             }))
                         })
-                        .w(px(282.))
+                        .when_some(section_id.zip(owner), |el, (target_section, list)| {
+                            el.drag_over::<DraggedColumn>(move |style, _, _, _| {
+                                style.bg(accent.opacity(0.08)).border_color(accent)
+                            })
+                            .on_drop(cx.listener(move |this, dragged: &DraggedColumn, _, cx| {
+                                if dragged.id != target_section {
+                                    let result = this.store.reorder_list_sections(list, dragged.id, target_section);
+                                    this.check(result);
+                                    this.reload(cx);
+                                }
+                            }))
+                        })
+                        .w(px(col_width))
                         .flex_none()
                         .max_h_full()
                         .child(self.render_column_header(
                             i,
-                            if title.is_empty() { strings.group_tasks.to_owned() } else { title },
+                            display_title,
                             count,
                             drop_for_header,
                             strings,
                             cx,
                         ))
-                        .children(self.column_add.as_ref().filter(|(at, _, _)| *at == i).map(|(_, _, input)| {
+                        .children(add_input.map(|input| {
                             h_flex()
-                                .mx(px(12.))
+                                .mx(card_px)
                                 .mt(px(6.))
                                 .mb(px(4.))
                                 .h(px(36.))
                                 .px_3()
                                 .rounded(px(10.))
                                 .border_1()
-                                .border_color(theme.colors().accent)
+                                .border_color(if temp_add { theme.colors().accent } else { theme.colors().border })
                                 .bg(theme.colors().surface_background)
-                                .child(input.clone())
+                                .child(input)
                         }))
                         .when(count > 0, |el| {
                             el.child(
                                 v_flex()
                                     .id(SharedString::from(format!("kanban-cards-{i}")))
                                     .mt(px(2.))
-                                    .px(px(12.))
+                                    .px(card_px)
                                     .pt(px(4.))
                                     .pb(px(12.))
                                     .gap_2()
                                     .overflow_y_scroll()
                                     .children(cards.iter().map(|(task, subtasks)| {
-                                        self.render_card(i, task, subtasks, &tag_colors, today, strings, cx)
+                                        self.render_card(i, task, subtasks, &tag_colors, tint, today, strings, cx)
                                     })),
                             )
                         })
                         // An empty column is a tinted panel down to the bottom, as the original's.
                         .when(count == 0, |el| {
-                            el.h_full().child(
-                                div()
-                                    .flex_1()
-                                    .mx(px(12.))
-                                    .mt(px(6.))
-                                    .mb(px(24.))
-                                    .rounded(px(8.))
-                                    .bg(theme.colors().ghost_element_hover),
-                            )
+                            el.h_full().when(tint.is_none(), |el| {
+                                el.child(
+                                    div()
+                                        .flex_1()
+                                        .mx(card_px)
+                                        .mt(px(6.))
+                                        .mb(px(24.))
+                                        .rounded(px(8.))
+                                        .bg(theme.colors().ghost_element_hover),
+                                )
+                            })
                         })
                 }))
                 .children(self.render_habit_column(strings, cx))
-                .when(self.section_owner().is_some(), |el| {
+                .when(owner.is_some(), |el| {
                     el.child(
-                        v_flex().w(px(282.)).flex_none().mt(px(6.)).px(px(10.)).map(|el| match self.new_section.clone() {
+                        v_flex().w(px(col_width)).flex_none().mt(px(6.)).px(px(10.)).map(|el| match self.new_section.clone() {
                             Some(input) => el.child(
                                 h_flex().h(px(32.)).px_2().rounded(px(6.)).bg(theme.colors().surface_background).child(input),
                             ),
@@ -6194,6 +6555,7 @@ impl Render for TodoView {
         h_flex()
             .relative()
             .size_full()
+            .key_context("Tasks")
             .items_start()
             .on_action(cx.listener(|this, _: &DismissTransient, window, cx| {
                 if !this.dismiss_transient(window, cx) {

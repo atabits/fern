@@ -27,6 +27,7 @@ pub fn active() -> bool {
 }
 
 /// Whether the mouse press being handled is a tap made here. The touch keyboard opens for it.
+#[cfg(windows)]
 pub fn tapping() -> bool {
     imp::tapping()
 }
@@ -570,10 +571,6 @@ mod imp {
     pub fn init(_: &Window, _: &mut App) {}
 
     pub fn active() -> bool {
-        false
-    }
-
-    pub fn tapping() -> bool {
         false
     }
 

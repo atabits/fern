@@ -238,7 +238,7 @@ impl SearchModal {
                     );
                 }
                 for tag in self.store.tags().unwrap_or_default() {
-                    let name = tag.name.clone();
+                    let name = tag.name;
                     let on = matches!(&draft.tags, TagRule::Any(tags) if tags.contains(&name));
                     items.push(
                         row(SharedString::from(format!("search-tag-{name}")), Some(Icon::new(IconName::Tag)), name.clone().into(), on)

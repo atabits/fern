@@ -182,12 +182,12 @@ pub(super) fn attach(
     }
 }
 
-fn fit_window(window: &mut Window, bounds: Bounds<Pixels>, _cx: &mut App) -> bool {
+fn fit_window(_window: &mut Window, _bounds: Bounds<Pixels>, _cx: &mut App) -> bool {
     #[cfg(windows)]
-    if let Some(hwnd) = win32_window_handle(window) {
+    if let Some(hwnd) = win32_window_handle(_window) {
         use windows::Win32::UI::WindowsAndMessaging::*;
-        let scale = window.scale_factor();
-        let bounds = bounds.to_device_pixels(scale);
+        let scale = _window.scale_factor();
+        let bounds = _bounds.to_device_pixels(scale);
         // SetWindowPos dispatches WM_SIZE synchronously. As in GPUI's WindowsWindow::resize,
         // run it outside App/Window updates so the resize callback can borrow them and
         // refresh the viewport and paint mask before drawing the enlarged menu.
@@ -464,9 +464,9 @@ impl Render for TooltipLifetime {
                 let native_owner = win32_window_handle(owner);
                 let text = this.text.clone();
                 let anchor = this.anchor;
-                this.popup = open(owner, anchor, measured, false, |anchored, window, cx| {
+                this.popup = open(owner, anchor, measured, false, |anchored, _window, cx| {
                     #[cfg(windows)]
-                    attach(native_owner, window, true);
+                    attach(native_owner, _window, true);
                     cx.new(|_| NoteTooltip { text, anchor, anchored })
                 }, cx).ok();
             });

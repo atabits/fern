@@ -2374,15 +2374,23 @@ impl TodoView {
     ) -> AnyElement {
         let theme = cx.theme().clone();
         let selected = self.selected == Some(task.id) || self.card == Some(task.id);
-        let line = |task: &Task, id: SharedString, cx: &mut Context<Self>| {
+        let root_done = task.is_completed() || self.completing.contains_key(&task.id);
+        let has_note_mark = task.kind == fern_core::Kind::Note && !task.notes.trim().is_empty();
+        let due = task.due_date.map(|date| task_rows::row_due_label(date, task.due_time, today, strings, self.preferences.countdown_dates));
+        let has_meta = !task.tags.is_empty() || due.is_some() || has_note_mark;
+        let line = |task: &Task, id: SharedString, pl: Pixels, py_top: Pixels, py_bottom: Pixels, cx: &mut Context<Self>| {
             let task_id = task.id;
             let done = task.is_completed() || self.completing.contains_key(&task.id);
             h_flex()
                 .items_start()
-                .gap_2()
+                .pl(pl)
+                .pr(px(12.))
+                .pt(py_top)
+                .pb(py_bottom)
+                .gap(px(9.))
                 // A note shows the note icon, as the original's cards, not a box.
                 .map(|el| if task.kind == Kind::Note {
-                    el.child(Icon::new(IconName::FileText).size(IconSize::Small).color(Color::Muted))
+                    el.child(div().pt(px(2.)).child(Icon::new(IconName::FileText).size(IconSize::Small).color(Color::Muted)))
                 } else {
                     let checkbox = Checkbox::new(id)
                         .toggle_state(done)
@@ -2393,34 +2401,42 @@ impl TodoView {
                             this.toggle(task_id, !done, cx);
                         }));
                     // A finger gets a wider target around the box, which does the same.
-                    el.child(div().id("card-box").debug_selector(|| format!("kanban-checkbox-{task_id}")).when(crate::touch::active(), |el| {
-                        el.p(px(8.)).m(px(-8.)).on_click(cx.listener(move |this, _, _, cx| {
-                            cx.stop_propagation();
-                            this.toggle(task_id, !done, cx);
-                        }))
-                    }).child(checkbox))
+                    el.child(
+                        div()
+                            .id("card-box")
+                            .pt(px(2.))
+                            .debug_selector(|| format!("kanban-checkbox-{task_id}"))
+                            .when(crate::touch::active(), |el| {
+                                el.p(px(8.)).m(px(-8.)).on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.toggle(task_id, !done, cx);
+                                }))
+                            })
+                            .child(checkbox),
+                    )
                 })
                 .child(
                     div()
                         .flex_1()
                         .min_w_0()
                         .text_size(px(14.))
+                        .line_height(px(20.))
                         .text_color(if done { theme.colors().text_muted } else { theme.colors().text })
                         .child(if task.title.is_empty() { strings.untitled.to_owned() } else { task.title.clone() }),
                 )
         };
         let id = task.id;
-        let due = task.due_date.map(|date| task_rows::row_due_label(date, task.due_time, today, strings, self.preferences.countdown_dates));
         let dragged = DraggedTask { id, title: task.title.clone().into() };
         v_flex()
             .id(ElementId::Uuid(id))
             .on_drag(dragged, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
-            .p_2()
-            .gap_1p5()
-            .rounded(px(8.))
+            .min_h(px(40.))
+            .rounded(px(10.))
             .border_1()
             .border_color(if selected { theme.colors().accent } else { theme.colors().border })
-            .bg(theme.colors().surface_background)
+            .bg(if selected { theme.colors().element_selected } else { theme.colors().surface_background })
+            .hover(|s| s.bg(theme.colors().element_hover))
+            .when(root_done, |el| el.opacity(0.6))
             .cursor_pointer()
             .on_click(cx.listener(move |this, _, _, cx| this.open_card(id, cx)))
             // As the original's, the card opens on the right of the first columns, on the left of
@@ -2429,29 +2445,44 @@ impl TodoView {
                 let placement = if column < 2 { Placement::RightOf } else { Placement::LeftOf };
                 el.relative().child(PopoverAttachment::new(placement, self.render_card_details(cx)))
             })
-            .child(line(task, SharedString::from(format!("card-check-{id}")), cx))
+            .child(line(
+                task,
+                SharedString::from(format!("card-check-{id}")),
+                px(16.),
+                px(10.),
+                if has_meta { px(4.) } else { px(10.) },
+                cx,
+            ))
             // As the original's cards: the tags on a line, the date under them with a repeating
-            // task's mark, and a note with text its small page.
-            .when(!task.tags.is_empty(), |el| {
-                el.child(h_flex().pl(px(24.)).gap_1().flex_wrap().children(task.tags.iter().map(|tag| {
-                    Chip::new(tag.clone(), tag_colors.get(tag).copied().unwrap_or(theme.colors().text_muted))
-                })))
-            })
-            .when_some(due, |el, (label, overdue)| {
-                let color = if overdue { Color::Error } else { Color::Accent };
+            // task's mark, and a note with text its small page (aligned at 41 px from left edge).
+            .when(has_meta, |el| {
                 el.child(
-                    h_flex()
-                        .pl(px(24.))
+                    v_flex()
+                        .pl(px(41.))
+                        .pr(px(12.))
+                        .pb(px(8.))
                         .gap_1()
-                        .child(Label::new(label).size(LabelSize::XSmall).color(color))
-                        .when(task.repeat.is_some(), |el| el.child(Icon::new(IconName::Repeat).size(IconSize::XSmall).color(Color::Muted))),
+                        .when(!task.tags.is_empty(), |el| {
+                            el.child(h_flex().gap_1().flex_wrap().children(task.tags.iter().map(|tag| {
+                                Chip::new(tag.clone(), tag_colors.get(tag).copied().unwrap_or(theme.colors().text_muted))
+                            })))
+                        })
+                        .when_some(due, |el, (label, overdue)| {
+                            let color = if overdue { Color::Error } else { Color::Accent };
+                            el.child(
+                                h_flex()
+                                    .gap_1()
+                                    .child(Label::new(label).size(LabelSize::XSmall).color(color))
+                                    .when(task.repeat.is_some(), |el| el.child(Icon::new(IconName::Repeat).size(IconSize::XSmall).color(Color::Muted))),
+                            )
+                        })
+                        .when(has_note_mark, |el| {
+                            el.child(Icon::new(IconName::FileText).size(IconSize::XSmall).color(Color::Muted))
+                        }),
                 )
             })
-            .when(task.kind == fern_core::Kind::Note && !task.notes.trim().is_empty(), |el| {
-                el.child(div().pl(px(24.)).child(Icon::new(IconName::FileText).size(IconSize::XSmall).color(Color::Muted)))
-            })
             .children(subtasks.iter().map(|sub| {
-                div().pl(px(16.)).child(line(sub, SharedString::from(format!("card-check-{}", sub.id)), cx))
+                line(sub, SharedString::from(format!("card-check-{}", sub.id)), px(34.), px(6.), px(8.), cx)
             }))
             .into_any_element()
     }
@@ -3079,6 +3110,29 @@ impl TodoView {
         cx.notify();
     }
 
+    fn start_kanban_section_rename(&mut self, section: Id, window: &mut Window, cx: &mut Context<Self>) {
+        self.column_menu = None;
+        let strings = i18n::t(cx);
+        let input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.section_name, cx));
+        let name = self.sections.iter().find(|s| s.id == section).map(|s| s.name.clone()).unwrap_or_default();
+        input.update(cx, |input, cx| input.set_text(name, cx));
+        cx.subscribe(&input, move |this, _, Submitted(name), cx| {
+            let result = this.store.rename_list_section(section, name);
+            this.check(result);
+            this.section_rename = None;
+            this.reload(cx);
+        })
+        .detach();
+        cx.subscribe(&input, |this, _, _: &Cancelled, cx| {
+            this.section_rename = None;
+            cx.notify();
+        })
+        .detach();
+        window.focus(&input.focus_handle(cx), cx);
+        self.section_rename = Some((section, input));
+        cx.notify();
+    }
+
     /// A column's header, as the original's: the name and count, then "+" and, for a section,
     /// "…" with Rename, Add Section to Left / Right, Move to › and Delete.
     fn render_column_header(
@@ -3090,21 +3144,77 @@ impl TodoView {
         strings: &'static Strings,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let theme = cx.theme().clone();
+        let overdue = target.is_none() && title == strings.group_overdue && count > 0;
         let section = match target {
             Some(DropTarget::Section(Some(id))) => Some(id),
             _ => None,
         };
         let renaming = self.section_rename.as_ref().filter(|(id, _)| Some(*id) == section).map(|(_, input)| input.clone());
         let menu_open = self.column_menu.is_some_and(|(id, _)| Some(id) == section);
+        let show_count = count > 0 || section.is_some();
         h_flex()
-            .h(px(30.))
+            .h(px(38.))
+            .pt(px(12.))
+            .pb(px(6.))
+            .pl(px(10.))
+            .pr(px(12.))
             .gap_1()
             .map(|el| match renaming {
-                Some(input) => el.child(div().flex_1().min_w_0().child(input)),
+                Some(input) => el.child(div().flex_1().min_w_0().px(px(2.)).child(input)),
                 None => el
-                    .child(Label::new(title).weight(FontWeight::SEMIBOLD).truncate())
-                    .child(Label::new(count.to_string()).size(LabelSize::Small).color(Color::Muted))
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("kanban-title-{column}")))
+                            .px(px(4.))
+                            .rounded(px(4.))
+                            .min_w_0()
+                            .when_some(section, |el, id| {
+                                el.cursor_pointer()
+                                    .hover(|s| s.bg(theme.colors().ghost_element_hover))
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.start_kanban_section_rename(id, window, cx);
+                                    }))
+                            })
+                            .child(Label::new(title).weight(FontWeight::SEMIBOLD).truncate()),
+                    )
+                    .when(show_count, |el| {
+                        el.child(div().ml(px(2.)).child(Label::new(count.to_string()).size(LabelSize::Small).color(Color::Muted)))
+                    })
                     .child(div().flex_1()),
+            })
+            .when(overdue, |el| {
+                el.child(
+                    div()
+                        .relative()
+                        .child(
+                            div()
+                                .id("kanban-postpone")
+                                .cursor_pointer()
+                                .child(Label::new(strings.postpone).size(LabelSize::Small).color(Color::Accent))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.postpone_menu = true;
+                                    cx.notify();
+                                })),
+                        )
+                        .when(self.postpone_menu, |el| {
+                            el.child(PopoverAttachment::new(
+                                Placement::BelowRight,
+                                popover(cx)
+                                    .min_w(px(180.))
+                                    .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                                        this.postpone_menu = false;
+                                        cx.notify();
+                                    }))
+                                    .children(fern_core::DefaultDate::ALL.iter().zip(strings.default_dates).map(|(&choice, name)| {
+                                        ListItem::new(SharedString::from(format!("kanban-postpone-{name}")))
+                                            .child(Label::new(name))
+                                            .on_click(cx.listener(move |this, _, _, cx| this.postpone_overdue(choice.date(Self::today()), cx)))
+                                    })),
+                            ))
+                        }),
+                )
             })
             .when_some(target.filter(|t| !matches!(t, DropTarget::Complete)), |el, target| {
                 el.child(
@@ -3164,26 +3274,7 @@ impl TodoView {
                 cx.notify();
             }))
             .child(item("section-rename", IconName::Pencil, strings.rename_section).on_click(cx.listener(move |this, _, window, cx| {
-                this.column_menu = None;
-                let strings = i18n::t(cx);
-                let input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.section_name, cx));
-                let name = this.sections.iter().find(|s| s.id == section).map(|s| s.name.clone()).unwrap_or_default();
-                input.update(cx, |input, cx| input.set_text(name, cx));
-                cx.subscribe(&input, move |this, _, Submitted(name), cx| {
-                    let result = this.store.rename_list_section(section, name);
-                    this.check(result);
-                    this.section_rename = None;
-                    this.reload(cx);
-                })
-                .detach();
-                cx.subscribe(&input, |this, _, _: &Cancelled, cx| {
-                    this.section_rename = None;
-                    cx.notify();
-                })
-                .detach();
-                window.focus(&input.focus_handle(cx), cx);
-                this.section_rename = Some((section, input));
-                cx.notify();
+                this.start_kanban_section_rename(section, window, cx);
             })))
             .child(item("section-left", IconName::BetweenVerticalStart, strings.add_section_left).on_click(cx.listener(move |this, _, window, cx| {
                 this.column_menu = None;
@@ -4953,22 +5044,25 @@ impl TodoView {
                 let (target, unit) = habit.goal.as_ref().map_or((1, String::new()), |g| (g.amount, g.unit.clone()));
                 v_flex()
                     .id(SharedString::from(format!("habit-card-{id}")))
-                    .p_2()
+                    .pl(px(14.))
+                    .pr(px(12.))
+                    .py(px(10.))
                     .gap_1()
-                    .rounded(px(8.))
+                    .rounded(px(10.))
                     .border_1()
                     .border_color(theme.colors().border)
                     .bg(theme.colors().surface_background)
+                    .hover(|s| s.bg(theme.colors().element_hover))
                     .cursor_pointer()
                     .child(
                         h_flex()
-                            .gap_2()
+                            .gap(px(7.))
                             .child(crate::habit_view::avatar(&habit, px(20.), cx))
                             .child(div().flex_1().min_w_0().child(Label::new(habit.name.clone()).truncate())),
                     )
                     .child(
                         h_flex()
-                            .pl(px(28.))
+                            .pl(px(27.))
                             .gap_1()
                             .child(Label::new(strings.today).size(LabelSize::Small).color(Color::Accent))
                             .child(Label::new(format!("{amount} / {target} {unit}").trim().to_owned()).size(LabelSize::Small).color(Color::Muted)),
@@ -4988,17 +5082,32 @@ impl TodoView {
             .collect();
         Some(
             v_flex()
-                .w(px(258.))
+                .w(px(282.))
                 .flex_none()
-                .gap_2()
+                .max_h_full()
+                .rounded(px(14.))
                 .child(
                     h_flex()
-                        .h(px(30.))
+                        .h(px(38.))
+                        .pt(px(12.))
+                        .pb(px(6.))
+                        .pl(px(14.))
+                        .pr(px(12.))
                         .gap_1()
                         .child(Label::new(strings.section_habits).weight(FontWeight::SEMIBOLD))
                         .child(Label::new(count.to_string()).size(LabelSize::Small).color(Color::Muted)),
                 )
-                .children(cards)
+                .child(
+                    v_flex()
+                        .id("kanban-habits")
+                        .mt(px(2.))
+                        .px(px(12.))
+                        .pt(px(4.))
+                        .pb(px(12.))
+                        .gap_2()
+                        .overflow_y_scroll()
+                        .children(cards),
+                )
                 .into_any_element(),
         )
     }
@@ -5717,12 +5826,13 @@ impl Render for TodoView {
                 .track_focus(&self.list_focus)
                 .flex_1()
                 .items_start()
-                .gap(px(24.))
-                // As the original's: the columns start under the header's sidebar button, 41 px
-                // under the title.
-                .px(px(26.))
+                // As the original's `#column-list-inner`: 12 px outer padding and 0 gap between
+                // columns; each column is 282 px wide with 12 px horizontal padding around its
+                // cards (258 px), giving 24 px between adjacent cards and 26 px to the first
+                // column title (12 + 10 + 4).
+                .px(px(12.))
                 .mt(px(-8.))
-                .pb_4()
+                .pb(px(12.))
                 .overflow_x_scroll()
                 .children(columns.into_iter().enumerate().map(|(i, (title, drop, cards))| {
                     let drop_for_header = drop.clone();
@@ -5730,17 +5840,20 @@ impl Render for TodoView {
                     let accent = theme.colors().accent;
                     v_flex()
                         .id(SharedString::from(format!("kanban-column-{i}")))
-                        .rounded(px(8.))
+                        .rounded(px(14.))
+                        .border_1()
+                        .border_color(gpui::transparent_black())
                         .when_some(drop, |el, drop| {
-                            el.drag_over::<DraggedTask>(move |style, _, _, _| style.bg(accent.opacity(0.08)))
-                                .on_drop(cx.listener(move |this, dragged: &DraggedTask, _, cx| {
-                                    this.drop_on_column(dragged.id, drop.clone(), cx)
-                                }))
+                            el.drag_over::<DraggedTask>(move |style, _, _, _| {
+                                style.bg(accent.opacity(0.08)).border_color(accent)
+                            })
+                            .on_drop(cx.listener(move |this, dragged: &DraggedTask, _, cx| {
+                                this.drop_on_column(dragged.id, drop.clone(), cx)
+                            }))
                         })
-                        .w(px(258.))
+                        .w(px(282.))
                         .flex_none()
                         .max_h_full()
-                        .gap_2()
                         .child(self.render_column_header(
                             i,
                             if title.is_empty() { strings.group_tasks.to_owned() } else { title },
@@ -5751,42 +5864,63 @@ impl Render for TodoView {
                         ))
                         .children(self.column_add.as_ref().filter(|(at, _, _)| *at == i).map(|(_, _, input)| {
                             h_flex()
+                                .mx(px(12.))
+                                .mt(px(6.))
+                                .mb(px(4.))
                                 .h(px(36.))
                                 .px_3()
-                                .rounded(px(8.))
+                                .rounded(px(10.))
                                 .border_1()
                                 .border_color(theme.colors().accent)
                                 .bg(theme.colors().surface_background)
                                 .child(input.clone())
                         }))
-                        .child(
-                            v_flex()
-                                .id(SharedString::from(format!("kanban-cards-{i}")))
-                                .gap_2()
-                                .overflow_y_scroll()
-                                .children(cards.iter().map(|(task, subtasks)| {
-                                    self.render_card(i, task, subtasks, &tag_colors, today, strings, cx)
-                                })),
-                        )
+                        .when(count > 0, |el| {
+                            el.child(
+                                v_flex()
+                                    .id(SharedString::from(format!("kanban-cards-{i}")))
+                                    .mt(px(2.))
+                                    .px(px(12.))
+                                    .pt(px(4.))
+                                    .pb(px(12.))
+                                    .gap_2()
+                                    .overflow_y_scroll()
+                                    .children(cards.iter().map(|(task, subtasks)| {
+                                        self.render_card(i, task, subtasks, &tag_colors, today, strings, cx)
+                                    })),
+                            )
+                        })
                         // An empty column is a tinted panel down to the bottom, as the original's.
                         .when(count == 0, |el| {
-                            el.h_full().child(div().flex_1().rounded(px(8.)).bg(theme.colors().ghost_element_hover))
+                            el.h_full().child(
+                                div()
+                                    .flex_1()
+                                    .mx(px(12.))
+                                    .mt(px(6.))
+                                    .mb(px(24.))
+                                    .rounded(px(8.))
+                                    .bg(theme.colors().ghost_element_hover),
+                            )
                         })
                 }))
                 .children(self.render_habit_column(strings, cx))
                 .when(self.section_owner().is_some(), |el| {
                     el.child(
-                        v_flex().w(px(220.)).flex_none().pt(px(6.)).map(|el| match self.new_section.clone() {
+                        v_flex().w(px(282.)).flex_none().mt(px(6.)).px(px(10.)).map(|el| match self.new_section.clone() {
                             Some(input) => el.child(
-                                h_flex().h(px(30.)).px_2().rounded(px(6.)).bg(theme.colors().surface_background).child(input),
+                                h_flex().h(px(32.)).px_2().rounded(px(6.)).bg(theme.colors().surface_background).child(input),
                             ),
                             None => el.child(
                                 h_flex()
                                     .id("kanban-new-section")
+                                    .h(px(32.))
+                                    .px(px(6.))
+                                    .rounded(px(6.))
                                     .gap_1()
+                                    .hover(|s| s.bg(theme.colors().ghost_element_hover))
                                     .cursor_pointer()
-                                    .child(Icon::new(IconName::Plus).size(IconSize::Small).color(Color::Accent))
-                                    .child(Label::new(strings.new_section).color(Color::Accent))
+                                    .child(Icon::new(IconName::Plus).size(IconSize::Small).color(Color::Muted))
+                                    .child(Label::new(strings.new_section).weight(FontWeight::SEMIBOLD).color(Color::Muted))
                                     .on_click(cx.listener(|this, _, window, cx| this.start_new_section(window, cx))),
                             ),
                         }),

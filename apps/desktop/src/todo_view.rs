@@ -56,6 +56,34 @@ enum SortMenu {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KanbanSub {
+    Pinned,
+    Unpinned,
+    Completed,
+}
+
+type BoardCard = (Task, Vec<Task>);
+
+struct BoardCol {
+    key: String,
+    title: String,
+    drop: Option<DropTarget>,
+    pinned_cards: Vec<BoardCard>,
+    open_cards: Vec<BoardCard>,
+    completed_cards: Vec<BoardCard>,
+}
+
+impl BoardCol {
+    fn open_count(&self) -> usize {
+        self.pinned_cards.len() + self.open_cards.len()
+    }
+
+    fn total_count(&self) -> usize {
+        self.open_count() + self.completed_cards.len()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RangeEnd {
     Start,
     End,
@@ -178,6 +206,10 @@ pub struct TodoView {
     kanban_quick_add: bool,
     kanban_quick_adds: HashMap<String, Entity<TextInput>>,
     kanban_section_colors: HashMap<Id, String>,
+    kanban_folded_sub: HashSet<String>,
+    kanban_scroll: gpui::ScrollHandle,
+    /// Horizontal pan-to-scroll on empty kanban space: `(start_pointer_x, start_scroll_offset_x)`.
+    kanban_pan: Option<(Pixels, Pixels)>,
     /// The Timeline's groups folded up, by name.
     timeline_folded: HashSet<String>,
     /// Today's "Suggested Tasks" panel (the header's light bulb), and whether its Long Unfinished
@@ -393,6 +425,9 @@ impl TodoView {
             kanban_quick_add: false,
             kanban_quick_adds: HashMap::new(),
             kanban_section_colors: HashMap::new(),
+            kanban_folded_sub: HashSet::new(),
+            kanban_scroll: gpui::ScrollHandle::new(),
+            kanban_pan: None,
             timeline_folded: HashSet::new(),
             view_options: None,
             suggestions_open: None,
@@ -560,12 +595,11 @@ impl TodoView {
                 Some(("kdrop", spec)) => {
                     // `kdrop=<task title part>><column number>`: drop a card on a kanban column.
                     let strings = i18n::t(cx);
-                    let columns = task_rows::kanban_columns(self.rows_with(strings, &HashSet::new(), &HashSet::new()), strings);
+                    let columns = self.board_columns(strings);
                     if let Some((needle, column)) = spec.split_once('>')
                         && let Some(id) = self.tasks.iter().find(|t| t.title.contains(needle)).map(|t| t.id)
-                        && let Some((_, Some(target), _)) = column.parse::<usize>().ok().and_then(|c| columns.get(c))
+                        && let Some(target) = column.parse::<usize>().ok().and_then(|c| columns.get(c)).and_then(|col| col.drop.clone())
                     {
-                        let target = target.clone();
                         self.drop_on_column(id, target, cx);
                     }
                 }
@@ -984,6 +1018,7 @@ impl TodoView {
         if let Some(tasks) = self.check(self.store.tasks_in_from_with_today_completed(all_tasks, &self.view, today, show_completed)) {
             self.tasks = tasks;
         }
+        self.ensure_kanban_sections(i18n::t(cx));
         if let Some(tags) = self.check(self.store.tags()) {
             self.tags = tags;
         }
@@ -2155,16 +2190,64 @@ impl TodoView {
             .into_any_element()
     }
 
-    /// Focuses the quick-add field.
+    /// Focuses the quick-add field (or, in kanban view, the first column's add input).
     pub fn focus_new_task(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.is_read_only_view() {
             self.set_view(View::Inbox, cx);
+        }
+        if self.kanban && !self.timeline {
+            let strings = i18n::t(cx);
+            let columns = self.board_columns(strings);
+            if self.kanban_quick_add {
+                self.sync_kanban_quick_adds(&columns, strings, cx);
+                if let Some(col) = columns.iter().find(|c| c.drop.as_ref().is_some_and(|t| !matches!(t, DropTarget::Complete)))
+                    && let Some(input) = self.kanban_quick_adds.get(&col.key)
+                {
+                    window.focus(&input.focus_handle(cx), cx);
+                    return;
+                }
+            } else if let Some((idx, col)) = columns
+                .into_iter()
+                .enumerate()
+                .find(|(_, c)| c.drop.as_ref().is_some_and(|t| !matches!(t, DropTarget::Complete)))
+                && let Some(target) = col.drop
+            {
+                self.start_column_add(idx, target, window, cx);
+                return;
+            }
         }
         window.focus(&self.input.focus_handle(cx), cx);
     }
 
     /// Task ids in the order they are shown, for keyboard navigation.
     fn visible_task_ids(&self, strings: &Strings) -> Vec<Id> {
+        if self.kanban && !self.timeline && !matches!(self.view, View::Trash | View::Completed | View::WontDo | View::Search(_)) {
+            let mut ids = Vec::new();
+            let push_cards = |cards: &[(Task, Vec<Task>)], ids: &mut Vec<Id>| {
+                for (root, subs) in cards {
+                    ids.push(root.id);
+                    if !self.collapsed_tasks.contains(&root.id) {
+                        ids.extend(subs.iter().map(|s| s.id));
+                    }
+                }
+            };
+            for col in self.board_columns(strings) {
+                if !col.pinned_cards.is_empty() {
+                    if !self.kanban_folded_sub.contains(&format!("{}:pinned", col.key)) {
+                        push_cards(&col.pinned_cards, &mut ids);
+                    }
+                    if !col.open_cards.is_empty() && !self.kanban_folded_sub.contains(&format!("{}:unpinned", col.key)) {
+                        push_cards(&col.open_cards, &mut ids);
+                    }
+                } else {
+                    push_cards(&col.open_cards, &mut ids);
+                }
+                if !col.completed_cards.is_empty() && !self.kanban_folded_sub.contains(&format!("{}:completed", col.key)) {
+                    push_cards(&col.completed_cards, &mut ids);
+                }
+            }
+            return ids;
+        }
         self.rows(strings)
             .into_iter()
             .filter_map(|row| match row {
@@ -2371,7 +2454,7 @@ impl TodoView {
             .id("board-task-card")
             .occlude()
             .w(px(402.))
-            .h(px(301.))
+            .h(px(440.))
             .rounded(px(10.))
             .overflow_hidden()
             .border_1()
@@ -2391,35 +2474,392 @@ impl TodoView {
             .into_any_element()
     }
 
+    fn ensure_kanban_sections(&mut self, strings: &Strings) {
+        if !self.kanban
+            || self.timeline
+            || matches!(self.view, View::Trash | View::Completed | View::WontDo | View::Search(_))
+        {
+            return;
+        }
+        let Some(owner) = self.section_owner() else { return };
+        if self.sections.is_empty()
+            && let Some(section) = self.check(self.store.add_list_section(owner, strings.not_sectioned))
+        {
+            self.sections.push(section);
+        }
+        let Some(first_id) = self.sections.first().map(|s| s.id) else { return };
+        if self.sort_settings().1 != GroupBy::Custom {
+            return;
+        }
+        let known: HashSet<Id> = self.sections.iter().map(|s| s.id).collect();
+        let unsectioned_roots: Vec<Id> = self
+            .tasks
+            .iter()
+            .filter(|t| t.list_id == owner && t.parent_id.is_none() && t.section_id.is_none_or(|s| !known.contains(&s)))
+            .map(|t| t.id)
+            .collect();
+        if unsectioned_roots.is_empty() {
+            return;
+        }
+        for root_id in &unsectioned_roots {
+            let result = self.store.set_section(*root_id, Some(first_id));
+            self.check(result);
+        }
+        let mut moved: HashSet<Id> = unsectioned_roots.into_iter().collect();
+        loop {
+            let mut added = false;
+            for t in &self.tasks {
+                if let Some(p) = t.parent_id
+                    && moved.contains(&p)
+                    && moved.insert(t.id)
+                {
+                    added = true;
+                }
+            }
+            if !added {
+                break;
+            }
+        }
+        for task in &mut self.tasks {
+            if moved.contains(&task.id) {
+                task.section_id = Some(first_id);
+            }
+        }
+    }
+
+    fn board_columns(&self, strings: &Strings) -> Vec<BoardCol> {
+        let (sort, group) = self.sort_settings();
+        let show_completed = self.view_flag("show_completed", true);
+        let descending = self.view_flag("descending", false);
+        let today = Self::today();
+
+        let mut tasks = self.tasks_for_rows();
+        if !show_completed {
+            tasks.retain(|t| !t.is_completed());
+        }
+        task_rows::order_tasks(&mut tasks, sort, descending);
+
+        let ids: HashSet<Id> = tasks.iter().map(|t| t.id).collect();
+        let mut children_map: HashMap<Id, Vec<&Task>> = HashMap::new();
+        let mut roots: Vec<&Task> = Vec::new();
+        for task in &tasks {
+            match task.parent_id.filter(|p| ids.contains(p)) {
+                Some(parent) => children_map.entry(parent).or_default().push(task),
+                None => roots.push(task),
+            }
+        }
+        fn collect_descendants(parent: Id, map: &HashMap<Id, Vec<&Task>>, out: &mut Vec<Task>) {
+            if let Some(kids) = map.get(&parent) {
+                for kid in kids {
+                    out.push((*kid).clone());
+                    collect_descendants(kid.id, map, out);
+                }
+            }
+        }
+        let all_cards: Vec<(Task, Vec<Task>)> = roots
+            .into_iter()
+            .map(|root| {
+                let mut subs = Vec::new();
+                collect_descendants(root.id, &children_map, &mut subs);
+                (root.clone(), subs)
+            })
+            .collect();
+
+        let make_col = |key: String, title: String, drop: Option<DropTarget>, cards: Vec<(Task, Vec<Task>)>| -> BoardCol {
+            let mut pinned_cards = Vec::new();
+            let mut open_cards = Vec::new();
+            let mut completed_cards = Vec::new();
+            for card in cards {
+                if card.0.is_completed() {
+                    completed_cards.push(card);
+                } else if card.0.pinned_at.is_some() {
+                    pinned_cards.push(card);
+                } else {
+                    open_cards.push(card);
+                }
+            }
+            if sort == SortBy::Custom {
+                pinned_cards.sort_by_key(|(t, _)| std::cmp::Reverse(t.pinned_at));
+            }
+            completed_cards.sort_by_key(|(t, _)| std::cmp::Reverse(t.completed_at.unwrap_or(0)));
+            BoardCol { key, title, drop, pinned_cards, open_cards, completed_cards }
+        };
+
+        match group {
+            GroupBy::Custom if self.view == View::Next7Days => {
+                let week_start = crate::calendar::week_start();
+                let mut cols = Vec::new();
+                let mut overdue = Vec::new();
+                let mut by_day: Vec<Vec<(Task, Vec<Task>)>> = (0..7).map(|_| Vec::new()).collect();
+                for card in all_cards {
+                    match card.0.due_date {
+                        Some(d) if d < today => overdue.push(card),
+                        Some(d) if (d - today).num_days() < 7 => by_day[(d - today).num_days().max(0) as usize].push(card),
+                        _ => by_day[0].push(card),
+                    }
+                }
+                if !overdue.is_empty() {
+                    cols.push(make_col("next7:overdue".into(), strings.group_overdue.to_owned(), None, overdue));
+                }
+                for (offset, cards) in by_day.into_iter().enumerate() {
+                    if !cards.is_empty() {
+                        let day = today + Duration::days(offset as i64);
+                        let label = task_rows::next_days_header(day, today, week_start, strings);
+                        cols.push(make_col(format!("next7:{day}"), label, Some(DropTarget::Due(Some(day))), cards));
+                    }
+                }
+                cols
+            }
+            GroupBy::Custom if self.section_owner().is_some() => {
+                if self.sections.is_empty() {
+                    return vec![make_col(
+                        "sec:none".into(),
+                        strings.not_sectioned.to_owned(),
+                        Some(DropTarget::Section(None)),
+                        all_cards,
+                    )];
+                }
+                let known: HashSet<Id> = self.sections.iter().map(|s| s.id).collect();
+                let first_id = self.sections[0].id;
+                let mut buckets: HashMap<Id, Vec<(Task, Vec<Task>)>> =
+                    self.sections.iter().map(|s| (s.id, Vec::new())).collect();
+                for card in all_cards {
+                    let target_sec = card.0.section_id.filter(|s| known.contains(s)).unwrap_or(first_id);
+                    if let Some(bucket) = buckets.get_mut(&target_sec) {
+                        bucket.push(card);
+                    }
+                }
+                self.sections
+                    .iter()
+                    .map(|sec| {
+                        let cards = buckets.remove(&sec.id).unwrap_or_default();
+                        make_col(format!("sec:{}", sec.id), sec.name.clone(), Some(DropTarget::Section(Some(sec.id))), cards)
+                    })
+                    .collect()
+            }
+            GroupBy::Custom => {
+                let mut task_cards = Vec::new();
+                let mut note_cards = Vec::new();
+                for card in all_cards {
+                    if card.0.kind == Kind::Note {
+                        note_cards.push(card);
+                    } else {
+                        task_cards.push(card);
+                    }
+                }
+                let mut cols = Vec::new();
+                if !task_cards.is_empty() {
+                    cols.push(make_col("kind:task".into(), strings.group_tasks.to_owned(), Some(DropTarget::Kind(Kind::Task)), task_cards));
+                }
+                if !note_cards.is_empty() {
+                    cols.push(make_col("kind:note".into(), strings.group_notes.to_owned(), Some(DropTarget::Kind(Kind::Note)), note_cards));
+                }
+                cols
+            }
+            GroupBy::List => {
+                let known: HashSet<Id> = self.lists.iter().map(|l| l.id).collect();
+                let mut inbox_cards = Vec::new();
+                let mut list_buckets: HashMap<Id, Vec<(Task, Vec<Task>)>> = HashMap::new();
+                for card in all_cards {
+                    match card.0.list_id.filter(|id| known.contains(id)) {
+                        Some(id) => list_buckets.entry(id).or_default().push(card),
+                        None => inbox_cards.push(card),
+                    }
+                }
+                let mut cols = Vec::new();
+                if !inbox_cards.is_empty() {
+                    cols.push(make_col("list:inbox".into(), strings.inbox.to_owned(), Some(DropTarget::List(None)), inbox_cards));
+                }
+                for list in &self.lists {
+                    if let Some(cards) = list_buckets.remove(&list.id)
+                        && !cards.is_empty()
+                    {
+                        cols.push(make_col(format!("list:{}", list.id), list.name.clone(), Some(DropTarget::List(Some(list.id))), cards));
+                    }
+                }
+                cols
+            }
+            GroupBy::Date => {
+                let overdue_last = self.preferences.task_defaults.overdue_last;
+                let mut buckets: [Vec<(Task, Vec<Task>)>; 6] = Default::default();
+                for card in all_cards {
+                    let slot = match card.0.due_date {
+                        Some(d) if d < today => 0,
+                        Some(d) if d == today => 1,
+                        Some(d) if d == today + Duration::days(1) => 2,
+                        Some(d) if d <= today + Duration::days(7) => 3,
+                        Some(_) => 4,
+                        None => 5,
+                    };
+                    buckets[slot].push(card);
+                }
+                let mut specs = vec![
+                    (if overdue_last { 6 } else { 0 }, 0usize, "date:overdue", strings.group_overdue, None),
+                    (1, 1, "date:today", strings.today, Some(DropTarget::Due(Some(today)))),
+                    (2, 2, "date:tomorrow", strings.tomorrow, Some(DropTarget::Due(Some(today + Duration::days(1))))),
+                    (3, 3, "date:next7", strings.next_7_days, Some(DropTarget::Due(Some(today + Duration::days(7))))),
+                    (4, 4, "date:later", strings.group_later, None),
+                    (5, 5, "date:none", strings.group_no_date, Some(DropTarget::Due(None))),
+                ];
+                specs.sort_by_key(|(ord, _, _, _, _)| *ord);
+                let mut cols = Vec::new();
+                for (_, slot, key, label, drop) in specs {
+                    let cards = std::mem::take(&mut buckets[slot]);
+                    if !cards.is_empty() {
+                        cols.push(make_col(key.into(), label.to_owned(), drop, cards));
+                    }
+                }
+                cols
+            }
+            GroupBy::Priority => {
+                let specs = [
+                    (Priority::High, "prio:high", strings.priority_high),
+                    (Priority::Medium, "prio:medium", strings.priority_medium),
+                    (Priority::Low, "prio:low", strings.priority_low),
+                    (Priority::None, "prio:none", strings.priority_none),
+                ];
+                let mut buckets: [Vec<(Task, Vec<Task>)>; 4] = Default::default();
+                for card in all_cards {
+                    let idx = match card.0.priority {
+                        Priority::High => 0,
+                        Priority::Medium => 1,
+                        Priority::Low => 2,
+                        Priority::None => 3,
+                    };
+                    buckets[idx].push(card);
+                }
+                specs
+                    .into_iter()
+                    .zip(buckets)
+                    .filter(|(_, cards)| !cards.is_empty())
+                    .map(|((prio, key, label), cards)| {
+                        make_col(key.into(), label.to_owned(), Some(DropTarget::Priority(prio)), cards)
+                    })
+                    .collect()
+            }
+            GroupBy::Tag => {
+                let mut tag_groups: Vec<(String, Vec<BoardCard>)> = Vec::new();
+                let mut untagged = Vec::new();
+                for card in all_cards {
+                    match card.0.tags.first().cloned() {
+                        Some(tag) => match tag_groups.iter_mut().find(|(t, _)| *t == tag) {
+                            Some((_, items)) => items.push(card),
+                            None => tag_groups.push((tag, vec![card])),
+                        },
+                        None => untagged.push(card),
+                    }
+                }
+                tag_groups.sort_by_key(|(a, _)| a.to_lowercase());
+                let mut cols: Vec<BoardCol> = tag_groups
+                    .into_iter()
+                    .map(|(tag, cards)| make_col(format!("tag:{tag}"), tag.clone(), Some(DropTarget::Tag(Some(tag))), cards))
+                    .collect();
+                if !untagged.is_empty() {
+                    cols.push(make_col("tag:none".into(), strings.group_no_tags.to_owned(), Some(DropTarget::Tag(None)), untagged));
+                }
+                cols
+            }
+            GroupBy::Created | GroupBy::None => {
+                let mut groups: Vec<(NaiveDate, Vec<BoardCard>)> = Vec::new();
+                for card in all_cards {
+                    let day = task_rows::local_day(card.0.created_at).unwrap_or(today);
+                    match groups.iter_mut().find(|(d, _)| *d == day) {
+                        Some((_, items)) => items.push(card),
+                        None => groups.push((day, vec![card])),
+                    }
+                }
+                groups.sort_by_key(|(d, _)| std::cmp::Reverse(*d));
+                groups
+                    .into_iter()
+                    .map(|(day, cards)| make_col(format!("created:{day}"), task_rows::day_header(day, today, strings), None, cards))
+                    .collect()
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn render_card(
         &self,
         column: usize,
+        column_drop: Option<DropTarget>,
         task: &Task,
         subtasks: &[Task],
         tag_colors: &HashMap<String, Hsla>,
         column_tint: Option<Hsla>,
+        show_list_name: bool,
         today: NaiveDate,
-        strings: &Strings,
+        strings: &'static Strings,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = cx.theme().clone();
         let dark = theme.preset.is_dark();
         let selected = self.selected == Some(task.id) || self.card == Some(task.id);
-        let root_done = task.is_completed() || self.completing.contains_key(&task.id);
-        let has_note_mark = task.kind == fern_core::Kind::Note && !task.notes.trim().is_empty();
+        let settled_done = task.is_completed();
+        let root_done = settled_done || self.completing.contains_key(&task.id);
+        let collapsed = self.collapsed_tasks.contains(&task.id);
+        let has_subtasks = !subtasks.is_empty();
+        let details_line = self
+            .show_details
+            .then(|| task.notes.lines().find(|l| !l.trim().is_empty()).map(|l| l.trim().to_owned()))
+            .flatten();
+        let has_note_icon = details_line.is_none() && !task.notes.trim().is_empty();
         let due = task.due_date.map(|date| task_rows::row_due_label(date, task.due_time, today, strings, self.preferences.countdown_dates));
-        let has_meta = !task.tags.is_empty() || due.is_some() || has_note_mark;
-        let line = |task: &Task, id: SharedString, pl: Pixels, py_top: Pixels, py_bottom: Pixels, cx: &mut Context<Self>| {
+        let has_reminders = !task.reminders.is_empty() && !settled_done;
+        let checklist = task.checklist.filter(|_| !settled_done);
+        let list_info = show_list_name.then(|| {
+            task.list_id
+                .and_then(|id| self.lists.iter().find(|l| l.id == id))
+                .map_or((SharedString::new_static(strings.inbox), None), |l| {
+                    (SharedString::from(l.name.clone()), lists_panel::parse_color(l.color.as_deref()))
+                })
+        });
+        let has_tips_row = due.is_some()
+            || has_note_icon
+            || task.repeat.is_some()
+            || has_reminders
+            || checklist.is_some()
+            || (collapsed && has_subtasks)
+            || list_info.is_some();
+        let has_meta = details_line.is_some() || !task.tags.is_empty() || has_tips_row;
+        let line = |task: &Task,
+                    id: SharedString,
+                    pl: Pixels,
+                    py_top: Pixels,
+                    py_bottom: Pixels,
+                    is_root: bool,
+                    cx: &mut Context<Self>| {
             let task_id = task.id;
             let done = task.is_completed() || self.completing.contains_key(&task.id);
             h_flex()
+                .relative()
                 .items_start()
                 .pl(pl)
                 .pr(px(12.))
                 .pt(py_top)
                 .pb(py_bottom)
                 .gap(px(9.))
+                .when(is_root && has_subtasks, |el| {
+                    el.child(
+                        div()
+                            .id(SharedString::from(format!("card-fold-{task_id}")))
+                            .absolute()
+                            .left(px(1.))
+                            .top(px(11.))
+                            .size(px(14.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .child(chevron(collapsed).color(Color::Muted))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                if !this.collapsed_tasks.remove(&task_id) {
+                                    this.collapsed_tasks.insert(task_id);
+                                }
+                                cx.notify();
+                            })),
+                    )
+                })
                 // A note shows the note icon, as the original's cards, not a box.
                 .map(|el| if task.kind == Kind::Note {
                     el.child(div().pt(px(2.)).child(Icon::new(IconName::FileText).size(IconSize::Small).color(Color::Muted)))
@@ -2447,52 +2887,136 @@ impl TodoView {
                             .child(checkbox),
                     )
                 })
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .text_size(px(14.))
-                        .line_height(px(20.))
-                        .text_color(if done { theme.colors().text_muted } else { theme.colors().text })
-                        .child(if task.title.is_empty() { strings.untitled.to_owned() } else { task.title.clone() }),
-                )
+                .child({
+                    let title_input = self
+                        .title_edit
+                        .as_ref()
+                        .filter(|(editing, _, _)| *editing == task_id)
+                        .map(|(_, input, _)| input.clone());
+                    if let Some(input) = title_input {
+                        div()
+                            .id(SharedString::from(format!("card-title-edit-{task_id}")))
+                            .flex_1()
+                            .min_w_0()
+                            .on_click(|_, _, cx| cx.stop_propagation())
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .child(input)
+                            .into_any_element()
+                    } else {
+                        div()
+                            .id(SharedString::from(format!("card-title-{task_id}")))
+                            .flex_1()
+                            .min_w_0()
+                            .text_size(px(14.))
+                            .line_height(px(20.))
+                            .text_color(if done { theme.colors().text_muted } else { theme.colors().text })
+                            .on_mouse_down(MouseButton::Left, cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                                if event.click_count > 1 {
+                                    cx.stop_propagation();
+                                    this.close_card(cx);
+                                    this.start_title_edit(task_id, window, cx);
+                                }
+                            }))
+                            .child(if task.title.is_empty() { strings.untitled.to_owned() } else { task.title.clone() })
+                            .into_any_element()
+                    }
+                })
         };
         let id = task.id;
+        let card_open_here = self.card == Some(id) || subtasks.iter().any(|s| self.card == Some(s.id));
         let dragged = DraggedTask { id, title: task.title.clone().into() };
-        let card_border = if selected {
-            theme.colors().accent
-        } else if let Some(tint) = column_tint {
+        // Match TickTick's `.kanban-bg-el`: `bg-main-background`, `border-grey-8 dark:border-[#363636]`,
+        // `bg-primary-10 dark:bg-grey-6` when selected (no accent border), and soft shadow in light mode.
+        let base_surface = theme.colors().elevated_surface_background;
+        let card_border = if let Some(tint) = column_tint {
             tint.opacity(if dark { 0.24 } else { 0.16 })
+        } else if dark {
+            gpui::rgb(0x363636).into()
         } else {
-            theme.colors().border
+            theme.colors().border_variant
         };
         let card_bg = if selected {
-            theme.colors().element_selected
+            if dark {
+                base_surface.blend(gpui::white().opacity(0.06))
+            } else {
+                base_surface.blend(theme.colors().accent.opacity(0.10))
+            }
         } else if let Some(tint) = column_tint {
-            if dark { tint.opacity(0.10) } else { theme.colors().background }
+            if dark { base_surface.blend(tint.opacity(0.12)) } else { base_surface }
         } else {
-            theme.colors().surface_background
+            base_surface
         };
-        let card_hover = if let Some(tint) = column_tint {
-            tint.opacity(if dark { 0.16 } else { 0.06 })
+        let card_hover = if selected {
+            card_bg
+        } else if let Some(tint) = column_tint {
+            base_surface.blend(tint.opacity(if dark { 0.16 } else { 0.04 }))
         } else {
-            theme.colors().element_hover
+            base_surface.blend(theme.colors().ghost_element_hover)
         };
+        let accent = theme.colors().accent;
+        let can_nest = task.kind == Kind::Task && !settled_done;
+        let drop_for_reorder = column_drop.clone();
+        let drop_for_nest = column_drop;
         v_flex()
             .id(ElementId::Uuid(id))
+            .relative()
             .on_drag(dragged, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
             .min_h(px(40.))
             .rounded(px(10.))
             .border_1()
             .border_color(card_border)
             .bg(card_bg)
+            .when(!dark && column_tint.is_none(), |el| el.shadow_xs())
             .hover(move |s| s.bg(card_hover))
-            .when(root_done, |el| el.opacity(0.6))
+            .when(settled_done, |el| el.opacity(0.6))
             .cursor_pointer()
-            .on_click(cx.listener(move |this, _, _, cx| this.open_card(id, cx)))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                if this.title_edit.as_ref().is_some_and(|(editing, _, _)| *editing == id) {
+                    return;
+                }
+                window.focus(&this.list_focus, cx);
+                this.open_card(id, cx);
+            }))
+            // Card-to-card drop zones: left zone reorders before this card, right zone nests as subtask.
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .h_full()
+                    .w(gpui::relative(if can_nest { NEST_ZONE } else { 1. }))
+                    .drag_over::<DraggedTask>(move |style, _, _, _| style.border_t_2().border_color(accent))
+                    .on_drop(cx.listener(move |this, dragged: &DraggedTask, _, cx| {
+                        this.drop_on_kanban_card(dragged.id, id, drop_for_reorder.clone(), false, cx);
+                    })),
+            )
+            .when(can_nest, |el| {
+                el.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .right_0()
+                        .h_full()
+                        .w(gpui::relative(1. - NEST_ZONE))
+                        .rounded(px(10.))
+                        .drag_over::<DraggedTask>(move |style, _, _, _| {
+                            style.border_1().border_color(accent).bg(accent.opacity(0.08))
+                        })
+                        .on_drop(cx.listener(move |this, dragged: &DraggedTask, _, cx| {
+                            this.drop_on_kanban_card(dragged.id, id, drop_for_nest.clone(), true, cx);
+                        })),
+                )
+            })
+            .on_mouse_down(MouseButton::Right, cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                cx.stop_propagation();
+                window.focus(&this.list_focus, cx);
+                this.context_menu = Some((id, event.position));
+                this.context_side = None;
+                cx.notify();
+            }))
             // As the original's, the card opens on the right of the first columns, on the left of
             // the others.
-            .when(self.card == Some(id), |el| {
+            .when(card_open_here, |el| {
                 let placement = if column < 2 { Placement::RightOf } else { Placement::LeftOf };
                 el.relative().child(PopoverAttachment::new(placement, self.render_card_details(cx)))
             })
@@ -2502,10 +3026,10 @@ impl TodoView {
                 px(16.),
                 px(10.),
                 if has_meta { px(4.) } else { px(10.) },
+                true,
                 cx,
             ))
-            // As the original's cards: the tags on a line, the date under them with a repeating
-            // task's mark, and a note with text its small page (aligned at 41 px from left edge).
+            // TickTick's `KanbanRow3` (tags) + `KanbanRow2` (`task-tips-more`: date, icons, progress, list).
             .when(has_meta, |el| {
                 el.child(
                     v_flex()
@@ -2513,28 +3037,103 @@ impl TodoView {
                         .pr(px(12.))
                         .pb(px(8.))
                         .gap_1()
+                        .when_some(details_line, |el, text| {
+                            el.child(Label::new(text).size(LabelSize::XSmall).color(Color::Muted).truncate())
+                        })
                         .when(!task.tags.is_empty(), |el| {
                             el.child(h_flex().gap_1().flex_wrap().children(task.tags.iter().map(|tag| {
                                 Chip::new(tag.clone(), tag_colors.get(tag).copied().unwrap_or(theme.colors().text_muted))
                             })))
                         })
-                        .when_some(due, |el, (label, overdue)| {
-                            let color = if overdue { Color::Error } else { Color::Accent };
+                        .when(has_tips_row, |el| {
                             el.child(
                                 h_flex()
-                                    .gap_1()
-                                    .child(Label::new(label).size(LabelSize::XSmall).color(color))
-                                    .when(task.repeat.is_some(), |el| el.child(Icon::new(IconName::Repeat).size(IconSize::XSmall).color(Color::Muted))),
+                                    .min_h(px(18.))
+                                    .gap_1p5()
+                                    .when_some(due, |el, (label, overdue)| {
+                                        let color = if root_done {
+                                            Color::Muted
+                                        } else if overdue {
+                                            Color::Error
+                                        } else {
+                                            Color::Accent
+                                        };
+                                        el.child(Label::new(label).size(LabelSize::XSmall).color(color))
+                                    })
+                                    .when(has_note_icon, |el| {
+                                        el.child(Icon::new(IconName::FileText).size(IconSize::XSmall).color(Color::Muted))
+                                    })
+                                    .when(task.repeat.is_some(), |el| {
+                                        el.child(Icon::new(IconName::Repeat).size(IconSize::XSmall).color(Color::Muted))
+                                    })
+                                    .when(has_reminders, |el| {
+                                        el.child(Icon::new(IconName::AlarmClock).size(IconSize::XSmall).color(Color::Muted))
+                                    })
+                                    .when_some(checklist, |el, (done_items, total)| {
+                                        el.child(
+                                            h_flex()
+                                                .gap_0p5()
+                                                .child(Icon::new(IconName::ListChecks).size(IconSize::XSmall).color(Color::Muted))
+                                                .child(Label::new(format!("{done_items}/{total}")).size(LabelSize::XSmall).color(Color::Muted)),
+                                        )
+                                    })
+                                    .when(collapsed && has_subtasks, |el| {
+                                        let done_subs = subtasks.iter().filter(|s| s.is_completed()).count();
+                                        el.child(
+                                            h_flex()
+                                                .gap_0p5()
+                                                .child(Icon::new(IconName::ListTree).size(IconSize::XSmall).color(Color::Muted))
+                                                .child(Label::new(format!("{done_subs}/{}", subtasks.len())).size(LabelSize::XSmall).color(Color::Muted)),
+                                        )
+                                    })
+                                    .when_some(list_info, |el, (name, dot)| {
+                                        el.child(div().flex_1()).child(
+                                            h_flex()
+                                                .min_w_0()
+                                                .gap_1()
+                                                .when_some(dot, |el, c| el.child(div().size(px(6.)).rounded_full().bg(c).flex_none()))
+                                                .child(Label::new(name).size(LabelSize::XSmall).color(Color::Muted).truncate()),
+                                        )
+                                    }),
                             )
-                        })
-                        .when(has_note_mark, |el| {
-                            el.child(Icon::new(IconName::FileText).size(IconSize::XSmall).color(Color::Muted))
                         }),
                 )
             })
-            .children(subtasks.iter().map(|sub| {
-                line(sub, SharedString::from(format!("card-check-{}", sub.id)), px(34.), px(6.), px(8.), cx)
-            }))
+            .when(!collapsed, |el| {
+                let sub_hover = theme.colors().ghost_element_hover;
+                let sub_selected_bg = if dark {
+                    gpui::white().opacity(0.06)
+                } else {
+                    theme.colors().accent.opacity(0.10)
+                };
+                el.children(subtasks.iter().enumerate().map(|(sub_idx, sub)| {
+                    let sub_id = sub.id;
+                    let is_last = sub_idx + 1 == subtasks.len();
+                    let sub_selected = self.card == Some(sub_id) || self.selected == Some(sub_id);
+                    v_flex()
+                        .id(SharedString::from(format!("card-sub-{sub_id}")))
+                        .when(is_last, |el| el.rounded_b(px(9.)))
+                        .when(sub_selected, |el| el.bg(sub_selected_bg))
+                        .when(!sub_selected, |el| el.hover(move |s| s.bg(sub_hover)))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            cx.stop_propagation();
+                            if this.title_edit.as_ref().is_some_and(|(editing, _, _)| *editing == sub_id) {
+                                return;
+                            }
+                            window.focus(&this.list_focus, cx);
+                            this.open_card(sub_id, cx);
+                        }))
+                        .on_mouse_down(MouseButton::Right, cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                            cx.stop_propagation();
+                            window.focus(&this.list_focus, cx);
+                            this.context_menu = Some((sub_id, event.position));
+                            this.context_side = None;
+                            cx.notify();
+                        }))
+                        .child(div().ml(px(41.)).mr(px(12.)).h(px(1.)).bg(theme.colors().border_variant))
+                        .child(line(sub, SharedString::from(format!("card-check-{sub_id}")), px(34.), px(8.), px(8.), false, cx))
+                }))
+            })
             .into_any_element()
     }
 
@@ -2834,6 +3433,7 @@ impl TodoView {
     }
 
     fn start_new_section(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let _ = self.store.set_setting(&format!("kanban:hide_new_section:{}", self.view_key()), "0");
         let strings = i18n::t(cx);
         let input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.section_name, cx));
         cx.subscribe(&input, |this, _, Submitted(name), cx| {
@@ -2847,12 +3447,52 @@ impl TodoView {
         .detach();
         cx.subscribe(&input, |this, _, _: &Cancelled, cx| {
             this.new_section = None;
+            this.new_section_index = None;
             cx.notify();
         })
         .detach();
         window.focus(&input.focus_handle(cx), cx);
         self.new_section = Some(input);
         self.header_menu_open = false;
+        cx.notify();
+    }
+
+    fn commit_new_section(&mut self, cx: &mut Context<Self>) {
+        let Some(input) = self.new_section.take() else { return };
+        let index = self.new_section_index.take();
+        let name = input.read(cx).text().trim().to_owned();
+        if !name.is_empty()
+            && let Some(list) = self.section_owner()
+        {
+            let result = self.store.insert_list_section(list, &name, index);
+            self.check(result);
+            self.reload(cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    fn commit_section_rename(&mut self, cx: &mut Context<Self>) {
+        let Some((section, input)) = self.section_rename.take() else { return };
+        let name = input.read(cx).text().trim().to_owned();
+        if !name.is_empty() {
+            let result = self.store.rename_list_section(section, &name);
+            self.check(result);
+            self.reload(cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    fn commit_column_add(&mut self, cx: &mut Context<Self>) {
+        let Some((_, target, input)) = self.column_add.take() else { return };
+        let text = input.read(cx).text().to_owned();
+        if !text.trim().is_empty()
+            && let Some(task) = self.add_task(&text, cx)
+        {
+            self.drop_on_column(task.id, target, cx);
+            return;
+        }
         cx.notify();
     }
 
@@ -3316,11 +3956,7 @@ impl TodoView {
         }
     }
 
-    fn kanban_quick_add_key(target: &DropTarget) -> String {
-        format!("{target:?}")
-    }
-
-    fn sync_kanban_quick_adds(&mut self, columns: &[task_rows::KanbanColumn], strings: &'static Strings, cx: &mut Context<Self>) {
+    fn sync_kanban_quick_adds(&mut self, columns: &[BoardCol], strings: &'static Strings, cx: &mut Context<Self>) {
         if !self.kanban_quick_add {
             if !self.kanban_quick_adds.is_empty() {
                 self.kanban_quick_adds.clear();
@@ -3328,9 +3964,9 @@ impl TodoView {
             return;
         }
         let mut active_keys = HashSet::new();
-        for (_, target, _) in columns {
-            let Some(target) = target.as_ref().filter(|t| !matches!(t, DropTarget::Complete)) else { continue };
-            let key = Self::kanban_quick_add_key(target);
+        for col in columns {
+            let Some(target) = col.drop.as_ref().filter(|t| !matches!(t, DropTarget::Complete)) else { continue };
+            let key = col.key.clone();
             active_keys.insert(key.clone());
             self.kanban_quick_adds.entry(key).or_insert_with(|| {
                 let input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.add_task, cx));
@@ -3379,6 +4015,7 @@ impl TodoView {
     }
 
     fn start_kanban_section_rename(&mut self, section: Id, window: &mut Window, cx: &mut Context<Self>) {
+        self.commit_section_rename(cx);
         self.column_menu = None;
         let strings = i18n::t(cx);
         let input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.section_name, cx));
@@ -3420,7 +4057,6 @@ impl TodoView {
         };
         let renaming = self.section_rename.as_ref().filter(|(id, _)| Some(*id) == section).map(|(_, input)| input.clone());
         let menu_open = self.column_menu.is_some_and(|(id, _)| Some(id) == section);
-        let show_count = count > 0 || section.is_some();
         let drag_title: SharedString = title.clone().into();
         h_flex()
             .id(SharedString::from(format!("kanban-header-{column}")))
@@ -3432,10 +4068,23 @@ impl TodoView {
             .gap_1()
             .when_some(section.filter(|_| renaming.is_none()), |el, id| {
                 let dragged = DraggedColumn { id, title: drag_title.clone() };
-                el.cursor_grab().on_drag(dragged, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
+                el.cursor_grab()
+                    .on_drag(dragged, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
+                    .on_mouse_down(MouseButton::Right, cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.column_menu = Some((id, false));
+                        cx.notify();
+                    }))
             })
             .map(|el| match renaming {
-                Some(input) => el.child(div().flex_1().min_w_0().px(px(2.)).child(input)),
+                Some(input) => el.child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .px(px(2.))
+                        .on_mouse_down_out(cx.listener(|this, _, _, cx| this.commit_section_rename(cx)))
+                        .child(input),
+                ),
                 None => el
                     .child(
                         div()
@@ -3452,9 +4101,7 @@ impl TodoView {
                             })
                             .child(Label::new(title).weight(FontWeight::SEMIBOLD).truncate()),
                     )
-                    .when(show_count, |el| {
-                        el.child(div().ml(px(2.)).child(Label::new(count.to_string()).size(LabelSize::Small).color(Color::Muted)))
-                    })
+                    .child(div().ml(px(2.)).child(Label::new(count.to_string()).size(LabelSize::Small).color(Color::Muted)))
                     .child(div().flex_1()),
             })
             .when(overdue, |el| {
@@ -3493,6 +4140,8 @@ impl TodoView {
             .when_some(target.filter(|t| !matches!(t, DropTarget::Complete) && !self.kanban_quick_add), |el, target| {
                 el.child(
                     IconButton::new(SharedString::from(format!("kanban-add-{column}")), IconName::Plus)
+                        .size(px(22.))
+                        .icon_size(IconSize::Small)
                         .icon_color(Color::Muted)
                         .tooltip(Tooltip::text(strings.add_task))
                         .on_click(cx.listener(move |this, _, window, cx| this.start_column_add(column, target.clone(), window, cx))),
@@ -3504,6 +4153,8 @@ impl TodoView {
                         .relative()
                         .child(
                             IconButton::new(SharedString::from(format!("kanban-menu-{column}")), IconName::Ellipsis)
+                                .size(px(22.))
+                                .icon_size(IconSize::Small)
                                 .icon_color(Color::Muted)
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.column_menu = if this.column_menu.is_some_and(|(open, _)| open == id) { None } else { Some((id, false)) };
@@ -3614,38 +4265,137 @@ impl TodoView {
                     })
                     .items(lists),
             )
-            .child(item("section-delete", IconName::Trash, strings.delete).on_click(cx.listener(move |this, _, _, cx| {
-                this.column_menu = None;
-                let result = this.store.delete_list_section(section);
-                this.check(result);
-                this.reload(cx);
-            })))
+            .when(self.sections.len() > 1, |el| {
+                el.child(item("section-delete", IconName::Trash, strings.delete).on_click(cx.listener(move |this, _, _, cx| {
+                    this.column_menu = None;
+                    let result = this.store.delete_list_section(section);
+                    this.check(result);
+                    this.reload(cx);
+                })))
+            })
             .into_any_element()
     }
 
-    /// A card dropped on a kanban column takes the column's value: its section, kind, date,
-    /// priority or tag, or completion. Leaving the Completed column reopens the task.
-    fn drop_on_column(&mut self, id: Id, target: DropTarget, cx: &mut Context<Self>) {
-        let Ok(Some(task)) = self.store.task(id) else { return };
+    fn apply_column_value(&self, id: Id, target: DropTarget) -> anyhow::Result<()> {
+        let Some(task) = self.store.task(id)? else { return Ok(()) };
         let store = &self.store;
+        if matches!(target, DropTarget::Priority(_)) && task.kind == Kind::Note {
+            return Ok(());
+        }
+        match target {
+            DropTarget::Section(section) => store.set_section(id, section),
+            DropTarget::Kind(kind) => store.set_kind(id, kind),
+            DropTarget::Complete => store.set_completed(id, true),
+            DropTarget::Due(date) => store.set_due(id, date, date.and(task.due_time)),
+            DropTarget::Priority(priority) => store.set_priority(id, priority),
+            DropTarget::Tag(Some(tag)) => {
+                let mut tags: Vec<String> = task.tags.iter().skip(1).filter(|t| **t != tag).cloned().collect();
+                tags.insert(0, tag);
+                store.set_tags(id, &tags)
+            }
+            DropTarget::Tag(None) => store.set_tags(id, &[]),
+            DropTarget::List(list) => store.set_list(id, list),
+        }
+    }
+
+    fn apply_column_drop(&self, id: Id, target: DropTarget, unparent: bool) -> anyhow::Result<()> {
+        let Some(task) = self.store.task(id)? else { return Ok(()) };
+        if matches!(target, DropTarget::Priority(_)) && task.kind == Kind::Note {
+            return Ok(());
+        }
+        if unparent && task.parent_id.is_some() {
+            self.store.set_parent(id, None)?;
+        }
+        if task.is_completed() && target != DropTarget::Complete {
+            self.store.set_completed(id, false)?;
+        }
+        self.apply_column_value(id, target)
+    }
+
+    /// A card dropped on a kanban column takes the column's value: its section, kind, date,
+    /// priority or tag, or completion. Leaving the Completed subsection reopens the task.
+    fn drop_on_column(&mut self, id: Id, target: DropTarget, cx: &mut Context<Self>) {
+        let result = self.apply_column_drop(id, target, true);
+        self.check(result);
+        self.reload(cx);
+    }
+
+    /// Drops a card onto an in-column subsection header (`Pinned`, `Others`, or `Completed`).
+    fn drop_on_kanban_subsection(&mut self, id: Id, column_drop: Option<DropTarget>, sub: KanbanSub, cx: &mut Context<Self>) {
         let result = (|| -> anyhow::Result<()> {
-            if task.is_completed() && target != DropTarget::Complete {
-                store.set_completed(id, false)?;
+            let Some(task) = self.store.task(id)? else { return Ok(()) };
+            if task.parent_id.is_some() {
+                self.store.set_parent(id, None)?;
             }
-            match target {
-                DropTarget::Section(section) => store.set_section(id, section),
-                DropTarget::Kind(kind) => store.set_kind(id, kind),
-                DropTarget::Complete => store.set_completed(id, true),
-                DropTarget::Due(date) => store.set_due(id, date, date.and(task.due_time)),
-                DropTarget::Priority(priority) => store.set_priority(id, priority),
-                DropTarget::Tag(Some(tag)) => {
-                    let mut tags: Vec<String> = task.tags.iter().skip(1).filter(|t| **t != tag).cloned().collect();
-                    tags.insert(0, tag);
-                    store.set_tags(id, &tags)
+            if let Some(col_target) = column_drop {
+                self.apply_column_value(id, col_target)?;
+            }
+            match sub {
+                KanbanSub::Pinned => {
+                    if task.is_completed() {
+                        self.store.set_completed(id, false)?;
+                    }
+                    if task.pinned_at.is_none() {
+                        self.store.set_pinned(id, true)?;
+                    }
                 }
-                DropTarget::Tag(None) => store.set_tags(id, &[]),
-                DropTarget::List(list) => store.set_list(id, list),
+                KanbanSub::Unpinned => {
+                    if task.is_completed() {
+                        self.store.set_completed(id, false)?;
+                    }
+                    if task.pinned_at.is_some() {
+                        self.store.set_pinned(id, false)?;
+                    }
+                }
+                KanbanSub::Completed => {
+                    if !task.is_completed() {
+                        self.store.set_completed(id, true)?;
+                    }
+                }
             }
+            Ok(())
+        })();
+        self.check(result);
+        self.reload(cx);
+    }
+
+    /// Drops a dragged card onto another card: either right before it (reordering within or across
+    /// columns and subsections) or nested inside it as a subtask.
+    fn drop_on_kanban_card(&mut self, dragged: Id, target: Id, column_drop: Option<DropTarget>, nest: bool, cx: &mut Context<Self>) {
+        if dragged == target {
+            return;
+        }
+        let result = (|| -> anyhow::Result<()> {
+            let (Some(dragged_task), Some(target_task)) = (self.store.task(dragged)?, self.store.task(target)?) else {
+                return Ok(());
+            };
+            if nest {
+                self.store.link_parent(dragged, target)?;
+                if let Some(sec) = target_task.section_id {
+                    self.store.set_section(dragged, Some(sec))?;
+                }
+            } else {
+                if dragged_task.parent_id.is_some() {
+                    self.store.set_parent(dragged, None)?;
+                }
+                if let Some(col_target) = column_drop {
+                    self.apply_column_value(dragged, col_target)?;
+                }
+                if target_task.is_completed() {
+                    if !dragged_task.is_completed() {
+                        self.store.set_completed(dragged, true)?;
+                    }
+                } else {
+                    if dragged_task.is_completed() {
+                        self.store.set_completed(dragged, false)?;
+                    }
+                    if target_task.pinned_at.is_some() != dragged_task.pinned_at.is_some() {
+                        self.store.set_pinned(dragged, target_task.pinned_at.is_some())?;
+                    }
+                }
+                self.store.move_task(dragged, target, false)?;
+            }
+            Ok(())
         })();
         self.check(result);
         self.reload(cx);
@@ -3690,6 +4440,10 @@ impl TodoView {
         self.timeline = timeline;
         self.timeline_from = Self::today();
         self.header_menu_open = false;
+        if kanban && !timeline {
+            let strings = i18n::t(cx);
+            self.ensure_kanban_sections(strings);
+        }
         if was_board != self.uses_board_layout() {
             self.sync_layout_selection(cx);
         }
@@ -4040,6 +4794,11 @@ impl TodoView {
             key if key.is_empty() && self.kanban && self.view.shows_list_names() => GroupBy::List,
             key => GroupBy::from_key(&key),
         };
+        let group = if self.kanban && !self.timeline && group == GroupBy::None {
+            if self.view.shows_list_names() { GroupBy::List } else { GroupBy::Custom }
+        } else {
+            group
+        };
         (SortBy::from_key(&get("sort")), group)
     }
 
@@ -4051,6 +4810,10 @@ impl TodoView {
             .chain(group.map(|g| self.store.set_setting(&format!("group:{key}"), g.key())))
             .collect::<anyhow::Result<Vec<()>>>();
         self.check(result);
+        if group == Some(GroupBy::Custom) {
+            let strings = i18n::t(cx);
+            self.ensure_kanban_sections(strings);
+        }
         self.close_sort_menu(window, cx);
     }
 
@@ -4163,10 +4926,16 @@ impl TodoView {
             .on_mouse_down_out(cx.listener(|this, _, window, cx| this.close_sort_menu(window, cx)))
             .child(row("group-by", IconName::Rows3, strings.group_by, group.label(strings), SortMenu::Group))
             .when(expanded == Some(SortMenu::Group), |el| {
-                el.children(GroupBy::ALL.into_iter().map(|g| {
-                    option(format!("group-{}", g.key()), g.label(strings), g == group)
-                        .on_click(cx.listener(move |this, _, window, cx| this.set_sort(None, Some(g), window, cx)))
-                }))
+                let kanban_board = self.kanban && !self.timeline;
+                el.children(
+                    GroupBy::ALL
+                        .into_iter()
+                        .filter(|g| !(kanban_board && *g == GroupBy::None))
+                        .map(|g| {
+                            option(format!("group-{}", g.key()), g.label(strings), g == group)
+                                .on_click(cx.listener(move |this, _, window, cx| this.set_sort(None, Some(g), window, cx)))
+                        }),
+                )
             })
             .child(row("sort-by", IconName::ArrowDownUp, strings.sort_by, sort.label(strings), SortMenu::Sort))
             .when(expanded == Some(SortMenu::Sort), |el| {
@@ -4191,18 +4960,30 @@ impl TodoView {
             .into_any_element()
     }
 
+    fn active_task_id(&self) -> Option<Id> {
+        self.selected.or(self.card)
+    }
+
+    fn select_in_current_layout(&mut self, id: Id, cx: &mut Context<Self>) {
+        if self.kanban && !self.timeline && self.selected.is_none() {
+            self.open_card(id, cx);
+        } else {
+            self.select(id, cx);
+        }
+    }
+
     fn move_selection(&mut self, step: isize, cx: &mut Context<Self>) {
         let ids = self.visible_task_ids(i18n::t(cx));
         if ids.is_empty() {
             return;
         }
-        let next = match self.selected.and_then(|id| ids.iter().position(|i| *i == id)) {
+        let next = match self.active_task_id().and_then(|id| ids.iter().position(|i| *i == id)) {
             Some(index) => (index as isize + step).clamp(0, ids.len() as isize - 1) as usize,
             None if step > 0 => 0,
             None => ids.len() - 1,
         };
-        self.select(ids[next], cx);
         let id = ids[next];
+        self.select_in_current_layout(id, cx);
         if let Some(ix) = self.list_entries.iter().position(|e| matches!(e, ListEntry::Row(Row::Task { task, .. }) if task.id == id)) {
             self.list_state.scroll_to_reveal_item(ix);
         }
@@ -4217,7 +4998,7 @@ impl TodoView {
     }
 
     fn toggle_selected(&mut self, _: &ToggleComplete, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(id) = self.selected {
+        if let Some(id) = self.active_task_id() {
             if self.completing.contains_key(&id) {
                 self.toggle(id, false, cx);
             } else if let Some(task) = self.tasks.iter().find(|task| task.id == id) {
@@ -4228,11 +5009,11 @@ impl TodoView {
 
     /// Applies a change to the selected task, for the task edit shortcuts.
     fn edit_selected(&mut self, cx: &mut Context<Self>, change: impl FnOnce(&Store, &Task) -> anyhow::Result<()>) {
-        let Some(task) = self.selected.and_then(|id| self.tasks.iter().find(|t| t.id == id)).cloned() else { return };
+        let Some(task) = self.active_task_id().and_then(|id| self.tasks.iter().find(|t| t.id == id)).cloned() else { return };
         let result = change(&self.store, &task);
         self.check(result);
         self.reload(cx);
-        self.select(task.id, cx);
+        self.select_in_current_layout(task.id, cx);
     }
 
     fn pin_selected(&mut self, _: &PinTask, _: &mut Window, cx: &mut Context<Self>) {
@@ -4242,6 +5023,8 @@ impl TodoView {
     fn date_selected(&mut self, _: &SetDate, _: &mut Window, cx: &mut Context<Self>) {
         if self.selected.is_some() {
             self.detail.update(cx, |detail, cx| detail.open_due(cx));
+        } else if self.card.is_some() {
+            self.card_detail.update(cx, |detail, cx| detail.open_due(cx));
         }
     }
 
@@ -4258,7 +5041,7 @@ impl TodoView {
     }
 
     fn delete_selected(&mut self, _: &DeleteTask, _: &mut Window, cx: &mut Context<Self>) {
-        let Some(id) = self.selected else { return };
+        let Some(id) = self.active_task_id() else { return };
         // Keep a selection so repeated presses keep working down the list.
         let ids = self.visible_task_ids(i18n::t(cx));
         let neighbor = ids
@@ -4268,7 +5051,7 @@ impl TodoView {
             .copied();
         self.delete(id, cx);
         if let Some(neighbor) = neighbor {
-            self.select(neighbor, cx);
+            self.select_in_current_layout(neighbor, cx);
         }
     }
 
@@ -4288,6 +5071,7 @@ impl TodoView {
         self.postpone_menu = false;
         self.column_menu = None;
         self.column_add = None;
+        self.kanban_folded_sub.clear();
         self.new_section = None;
         self.new_section_index = None;
         self.renaming_section = None;
@@ -5354,6 +6138,10 @@ impl TodoView {
             return None;
         }
         let count = habits.len();
+        let dark = theme.preset.is_dark();
+        let base_surface = theme.colors().elevated_surface_background;
+        let habit_border: Hsla = if dark { gpui::rgb(0x363636).into() } else { theme.colors().border_variant };
+        let habit_hover = base_surface.blend(theme.colors().ghost_element_hover);
         let cards: Vec<AnyElement> = habits
             .into_iter()
             .map(|(habit, amount)| {
@@ -5368,9 +6156,10 @@ impl TodoView {
                     .gap_1()
                     .rounded(px(10.))
                     .border_1()
-                    .border_color(theme.colors().border)
-                    .bg(theme.colors().surface_background)
-                    .hover(|s| s.bg(theme.colors().element_hover))
+                    .border_color(habit_border)
+                    .bg(base_surface)
+                    .when(!dark && !self.kanban_column_color, |el| el.shadow_xs())
+                    .hover(move |s| s.bg(habit_hover))
                     .cursor_pointer()
                     .child(
                         h_flex()
@@ -5552,8 +6341,13 @@ impl TodoView {
 
     /// The details' own picker for a task, for the right-click menu and the calendar's.
     pub fn start_detail(&mut self, id: Id, what: &str, window: &mut Window, cx: &mut Context<Self>) {
-        self.select(id, cx);
-        self.detail.update(cx, |detail, cx| detail.start(what, window, cx));
+        if self.kanban && !self.timeline && self.selected.is_none() {
+            self.open_card(id, cx);
+            self.card_detail.update(cx, |detail, cx| detail.start(what, window, cx));
+        } else {
+            self.select(id, cx);
+            self.detail.update(cx, |detail, cx| detail.start(what, window, cx));
+        }
     }
 
     /// A right-click menu choice (see `task_menu`).
@@ -6142,7 +6936,45 @@ impl Render for TodoView {
             None
         };
         let board: Option<AnyElement> = board.or_else(|| kanban_view.then(|| {
-            let columns = task_rows::kanban_columns(self.rows_with(strings, &HashSet::new(), &HashSet::new()), strings);
+            let columns = self.board_columns(strings);
+            let habit_col = self.render_habit_column(strings, cx);
+            if columns.is_empty() && habit_col.is_none() && self.section_owner().is_none() {
+                let theme = cx.theme().clone();
+                return v_flex()
+                    .id("kanban-empty")
+                    .track_focus(&self.list_focus)
+                    .flex_1()
+                    .when(matches!(self.view, View::Day(_)), |el| {
+                        el.pt(px(160.))
+                            .items_center()
+                            .gap_1()
+                            .child(Icon::new(IconName::CalendarCheck).size(IconSize::Medium).color(Color::Muted))
+                            .child(Label::new(strings.free_day))
+                            .child(Label::new(strings.free_day_hint).size(LabelSize::Small).color(Color::Muted))
+                    })
+                    .when(self.view == View::Tomorrow, |el| {
+                        el.pt(px(160.))
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .size(px(96.))
+                                    .mb_2()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded_full()
+                                    .bg(theme.colors().element_hover)
+                                    .child(Icon::new(IconName::Map).size(IconSize::XLarge).color(Color::Accent)),
+                            )
+                            .child(Label::new(strings.no_tasks_tomorrow))
+                            .child(Label::new(strings.plan_ahead).size(LabelSize::Small).color(Color::Muted))
+                    })
+                    .when(!matches!(self.view, View::Day(_) | View::Tomorrow), |el| {
+                        el.px_6().pt_8().child(Label::new(strings.no_tasks).color(Color::Muted))
+                    })
+                    .into_any_element();
+            }
             self.sync_kanban_quick_adds(&columns, strings, cx);
             let theme = cx.theme().clone();
             let dark = theme.preset.is_dark();
@@ -6150,46 +6982,248 @@ impl Render for TodoView {
             let colored = self.kanban_column_color;
             let card_px = if colored { px(10.) } else { px(12.) };
             let owner = self.section_owner();
-            h_flex()
-                .id("kanban")
-                .track_focus(&self.list_focus)
-                .flex_1()
-                .items_start()
-                // As the original's `#column-list-inner`: 12 px outer padding and 0 gap between
-                // columns (or 12 px gap when Column Color is enabled); each column is 242/282/342 px
-                // wide with 12 px (or 10 px when colored) horizontal padding around its cards.
-                .when(colored, |el| el.gap(px(12.)))
-                .px(px(12.))
-                .mt(px(-8.))
-                .pb(px(12.))
-                .overflow_x_scroll()
-                .children(columns.into_iter().enumerate().map(|(i, (title, drop, cards))| {
-                    let drop_for_header = drop.clone();
-                    let section_id = match drop {
-                        Some(DropTarget::Section(Some(id))) => Some(id),
-                        _ => None,
-                    };
-                    let display_title = if title.is_empty() { strings.group_tasks.to_owned() } else { title };
-                    let count = cards.len();
-                    let accent = theme.colors().accent;
-                    let tint = self.kanban_column_tint(i, drop.as_ref(), &display_title, strings, &tag_colors, accent);
-                    let persistent_add = if self.kanban_quick_add {
-                        drop.as_ref()
-                            .filter(|t| !matches!(t, DropTarget::Complete))
-                            .and_then(|t| self.kanban_quick_adds.get(&Self::kanban_quick_add_key(t)).cloned())
+            let show_list_name = self.view.shows_list_names() && self.sort_settings().1 != GroupBy::List;
+            let hide_new_section = self.view_flag("kanban:hide_new_section", false);
+            // Position where an inline "Add Section to Left / Right" input should appear among columns.
+            let inline_new_col_pos: Option<usize> = self.new_section.as_ref().and(self.new_section_index).map(|sec_idx| {
+                let mut seen_sections = 0usize;
+                for (col_i, col) in columns.iter().enumerate() {
+                    if matches!(col.drop, Some(DropTarget::Section(Some(_)))) {
+                        if seen_sections == sec_idx {
+                            return col_i;
+                        }
+                        seen_sections += 1;
+                    }
+                }
+                columns.len()
+            });
+            let render_new_sec_input = |input: Entity<TextInput>, cx: &mut Context<Self>| {
+                v_flex()
+                    .w(px(col_width))
+                    .flex_none()
+                    .mt(px(6.))
+                    .px(px(10.))
+                    .child(
+                        h_flex()
+                            .h(px(34.))
+                            .px_2p5()
+                            .rounded(px(10.))
+                            .border_1()
+                            .border_color(theme.colors().accent)
+                            .bg(theme.colors().elevated_surface_background)
+                            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.commit_new_section(cx)))
+                            .child(input),
+                    )
+                    .into_any_element()
+            };
+            let accent = theme.colors().accent;
+            let render_sub_header = |sub_id: String,
+                                     fold_key: String,
+                                     folded: bool,
+                                     pin_icon: bool,
+                                     label: &'static str,
+                                     sub_count: usize,
+                                     sub_kind: KanbanSub,
+                                     top_margin: Pixels,
+                                     col_drop: Option<DropTarget>,
+                                     cx: &mut Context<Self>| {
+                h_flex()
+                    .id(SharedString::from(sub_id))
+                    .mt(top_margin)
+                    .h(px(28.))
+                    .px(px(4.))
+                    .gap(px(5.))
+                    .rounded(px(6.))
+                    .border_1()
+                    .border_color(gpui::transparent_black())
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme.colors().ghost_element_hover))
+                    .drag_over::<DraggedTask>(move |style, _, _, _| {
+                        style.bg(accent.opacity(0.08)).border_color(accent)
+                    })
+                    .on_drop(cx.listener(move |this, dragged: &DraggedTask, _, cx| {
+                        this.drop_on_kanban_subsection(dragged.id, col_drop.clone(), sub_kind, cx);
+                    }))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        if !this.kanban_folded_sub.remove(&fold_key) {
+                            this.kanban_folded_sub.insert(fold_key.clone());
+                        }
+                        cx.notify();
+                    }))
+                    .child(chevron(folded).color(Color::Muted))
+                    .when(pin_icon, |el| {
+                        el.child(
+                            Icon::new(IconName::Pin)
+                                .size(IconSize::XSmall)
+                                .color(Color::Custom(Hsla::from(gpui::rgb(0xFAA80C)))),
+                        )
+                    })
+                    .child(Label::new(label).size(LabelSize::XSmall).weight(FontWeight::SEMIBOLD).color(Color::Muted))
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(theme.colors().text_muted.opacity(0.75))
+                            .child(sub_count.to_string()),
+                    )
+                    .into_any_element()
+            };
+            let mut rendered_cols: Vec<AnyElement> = Vec::with_capacity(columns.len() + 1);
+            for (i, col) in columns.into_iter().enumerate() {
+                if inline_new_col_pos == Some(i)
+                    && let Some(input) = self.new_section.clone()
+                {
+                    rendered_cols.push(render_new_sec_input(input, cx));
+                }
+                let open_count = col.open_count();
+                let has_cards = col.total_count() > 0;
+                let BoardCol { key: col_key, title, drop, pinned_cards, open_cards, completed_cards } = col;
+                let drop_for_header = drop.clone();
+                let drop_for_cards = drop.clone();
+                let section_id = match drop {
+                    Some(DropTarget::Section(Some(id))) => Some(id),
+                    _ => None,
+                };
+                let display_title = if title.is_empty() { strings.group_tasks.to_owned() } else { title };
+                let tint = self.kanban_column_tint(i, drop.as_ref(), &display_title, strings, &tag_colors, accent);
+                let persistent_add = if self.kanban_quick_add {
+                    self.kanban_quick_adds.get(&col_key).cloned()
+                } else {
+                    None
+                };
+                let is_temp_add = persistent_add.is_none() && self.column_add.as_ref().is_some_and(|(at, _, _)| *at == i);
+                let add_input = persistent_add.or_else(|| {
+                    self.column_add.as_ref().filter(|(at, _, _)| *at == i).map(|(_, _, input)| input.clone())
+                });
+                let mut col_items: Vec<AnyElement> = Vec::new();
+                if has_cards {
+                    if !pinned_cards.is_empty() {
+                        let pinned_key = format!("{col_key}:pinned");
+                        let pinned_folded = self.kanban_folded_sub.contains(&pinned_key);
+                        col_items.push(render_sub_header(
+                            format!("kanban-sub-pinned-{i}"),
+                            pinned_key,
+                            pinned_folded,
+                            true,
+                            strings.group_pinned,
+                            pinned_cards.len(),
+                            KanbanSub::Pinned,
+                            px(0.),
+                            drop_for_cards.clone(),
+                            cx,
+                        ));
+                        if !pinned_folded {
+                            for (task, subtasks) in &pinned_cards {
+                                col_items.push(self.render_card(
+                                    i,
+                                    drop_for_cards.clone(),
+                                    task,
+                                    subtasks,
+                                    &tag_colors,
+                                    tint,
+                                    show_list_name,
+                                    today,
+                                    strings,
+                                    cx,
+                                ));
+                            }
+                        }
+                        if !open_cards.is_empty() {
+                            let unpinned_key = format!("{col_key}:unpinned");
+                            let unpinned_folded = self.kanban_folded_sub.contains(&unpinned_key);
+                            col_items.push(render_sub_header(
+                                format!("kanban-sub-unpinned-{i}"),
+                                unpinned_key,
+                                unpinned_folded,
+                                false,
+                                strings.group_unpinned,
+                                open_cards.len(),
+                                KanbanSub::Unpinned,
+                                px(4.),
+                                drop_for_cards.clone(),
+                                cx,
+                            ));
+                            if !unpinned_folded {
+                                for (task, subtasks) in &open_cards {
+                                    col_items.push(self.render_card(
+                                        i,
+                                        drop_for_cards.clone(),
+                                        task,
+                                        subtasks,
+                                        &tag_colors,
+                                        tint,
+                                        show_list_name,
+                                        today,
+                                        strings,
+                                        cx,
+                                    ));
+                                }
+                            }
+                        }
                     } else {
-                        None
-                    };
-                    let add_input = persistent_add.or_else(|| {
-                        self.column_add.as_ref().filter(|(at, _, _)| *at == i).map(|(_, _, input)| input.clone())
-                    });
-                    let temp_add = !self.kanban_quick_add;
+                        for (task, subtasks) in &open_cards {
+                            col_items.push(self.render_card(
+                                i,
+                                drop_for_cards.clone(),
+                                task,
+                                subtasks,
+                                &tag_colors,
+                                tint,
+                                show_list_name,
+                                today,
+                                strings,
+                                cx,
+                            ));
+                        }
+                    }
+                    if !completed_cards.is_empty() {
+                        let completed_key = format!("{col_key}:completed");
+                        let completed_folded = self.kanban_folded_sub.contains(&completed_key);
+                        col_items.push(render_sub_header(
+                            format!("kanban-sub-completed-{i}"),
+                            completed_key,
+                            completed_folded,
+                            false,
+                            strings.group_completed,
+                            completed_cards.len(),
+                            KanbanSub::Completed,
+                            if open_count > 0 { px(6.) } else { px(0.) },
+                            drop_for_cards.clone(),
+                            cx,
+                        ));
+                        if !completed_folded {
+                            for (task, subtasks) in &completed_cards {
+                                col_items.push(self.render_card(
+                                    i,
+                                    drop_for_cards.clone(),
+                                    task,
+                                    subtasks,
+                                    &tag_colors,
+                                    tint,
+                                    show_list_name,
+                                    today,
+                                    strings,
+                                    cx,
+                                ));
+                            }
+                        }
+                    }
+                }
+                rendered_cols.push(
                     v_flex()
                         .id(SharedString::from(format!("kanban-column-{i}")))
                         .rounded(px(14.))
                         .border_1()
                         .border_color(gpui::transparent_black())
-                        .when_some(tint, |el, c| el.bg(c.opacity(if dark { 0.08 } else { 0.10 })))
+                        .map(|el| match (tint, !has_cards) {
+                            (Some(c), true) => el.bg(gpui::linear_gradient(
+                                180.,
+                                gpui::linear_color_stop(c.opacity(if dark { 0.08 } else { 0.10 }), 0.),
+                                gpui::linear_color_stop(gpui::transparent_black(), 1.),
+                            )),
+                            (Some(c), false) => el.bg(c.opacity(if dark { 0.08 } else { 0.10 })),
+                            (None, _) => el,
+                        })
                         .when_some(drop, |el, drop| {
                             el.drag_over::<DraggedTask>(move |style, _, _, _| {
                                 style.bg(accent.opacity(0.08)).border_color(accent)
@@ -6216,25 +7250,41 @@ impl Render for TodoView {
                         .child(self.render_column_header(
                             i,
                             display_title,
-                            count,
+                            open_count,
                             drop_for_header,
                             strings,
                             cx,
                         ))
                         .children(add_input.map(|input| {
+                            let focused = input.focus_handle(cx).is_focused(window);
+                            let input_focus = input.focus_handle(cx);
                             h_flex()
                                 .mx(card_px)
                                 .mt(px(6.))
                                 .mb(px(4.))
-                                .h(px(36.))
-                                .px_3()
+                                .h(px(38.))
+                                .px_2p5()
+                                .gap_1p5()
                                 .rounded(px(10.))
                                 .border_1()
-                                .border_color(if temp_add { theme.colors().accent } else { theme.colors().border })
-                                .bg(theme.colors().surface_background)
-                                .child(input)
+                                .border_color(if focused { theme.colors().accent } else { gpui::transparent_black() })
+                                .bg(if focused {
+                                    theme.colors().elevated_surface_background
+                                } else {
+                                    theme.colors().ghost_element_hover
+                                })
+                                .when(!focused, |el| el.hover(|s| s.border_color(theme.colors().border_variant)))
+                                .when(is_temp_add, |el| {
+                                    el.on_mouse_down_out(cx.listener(|this, _, _, cx| this.commit_column_add(cx)))
+                                })
+                                .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                                    cx.stop_propagation();
+                                    window.focus(&input_focus, cx);
+                                })
+                                .child(Icon::new(IconName::Plus).size(IconSize::Small).color(if focused { Color::Accent } else { Color::Muted }))
+                                .child(div().flex_1().min_w_0().child(input))
                         }))
-                        .when(count > 0, |el| {
+                        .when(has_cards, |el| {
                             el.child(
                                 v_flex()
                                     .id(SharedString::from(format!("kanban-cards-{i}")))
@@ -6244,14 +7294,16 @@ impl Render for TodoView {
                                     .pb(px(12.))
                                     .gap_2()
                                     .overflow_y_scroll()
-                                    .children(cards.iter().map(|(task, subtasks)| {
-                                        self.render_card(i, task, subtasks, &tag_colors, tint, today, strings, cx)
-                                    })),
+                                    .children(col_items),
                             )
                         })
-                        // An empty column is a tinted panel down to the bottom, as the original's.
-                        .when(count == 0, |el| {
+                        .when(!has_cards, |el| {
                             el.h_full().when(tint.is_none(), |el| {
+                                let top = if dark {
+                                    gpui::white().opacity(0.025)
+                                } else {
+                                    Hsla::from(gpui::rgb(0x191919)).opacity(0.03)
+                                };
                                 el.child(
                                     div()
                                         .flex_1()
@@ -6259,21 +7311,86 @@ impl Render for TodoView {
                                         .mt(px(6.))
                                         .mb(px(24.))
                                         .rounded(px(8.))
-                                        .bg(theme.colors().ghost_element_hover),
+                                        .bg(gpui::linear_gradient(
+                                            180.,
+                                            gpui::linear_color_stop(top, 0.),
+                                            gpui::linear_color_stop(gpui::transparent_black(), 1.),
+                                        )),
                                 )
                             })
                         })
+                        .into_any_element(),
+                );
+            }
+            if inline_new_col_pos.is_some_and(|pos| pos >= rendered_cols.len())
+                && let Some(input) = self.new_section.clone()
+            {
+                rendered_cols.push(render_new_sec_input(input, cx));
+            }
+            h_flex()
+                .id("kanban")
+                .track_focus(&self.list_focus)
+                .track_scroll(&self.kanban_scroll)
+                .key_context("TaskList")
+                .on_mouse_down(MouseButton::Left, cx.listener(|this, event: &gpui::MouseDownEvent, window, cx| {
+                    window.focus(&this.list_focus, cx);
+                    this.close_card(cx);
+                    if this.selected.take().is_some() {
+                        this.detail.update(cx, |detail, cx| detail.show(None, cx));
+                        cx.notify();
+                    }
+                    let offset = this.kanban_scroll.offset();
+                    this.kanban_pan = Some((event.position.x, offset.x));
                 }))
-                .children(self.render_habit_column(strings, cx))
-                .when(owner.is_some(), |el| {
-                    el.child(
-                        v_flex().w(px(col_width)).flex_none().mt(px(6.)).px(px(10.)).map(|el| match self.new_section.clone() {
-                            Some(input) => el.child(
-                                h_flex().h(px(32.)).px_2().rounded(px(6.)).bg(theme.colors().surface_background).child(input),
-                            ),
-                            None => el.child(
+                .on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, _, cx| {
+                    let Some((start_x, start_offset_x)) = this.kanban_pan else { return };
+                    if cx.has_active_drag() || event.pressed_button != Some(MouseButton::Left) {
+                        this.kanban_pan = None;
+                        return;
+                    }
+                    let delta = event.position.x - start_x;
+                    let offset = this.kanban_scroll.offset();
+                    this.kanban_scroll.set_offset(gpui::point((start_offset_x + delta).min(px(0.)), offset.y));
+                    cx.notify();
+                }))
+                .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, _| {
+                    this.kanban_pan = None;
+                }))
+                .on_mouse_up_out(MouseButton::Left, cx.listener(|this, _, _, _| {
+                    this.kanban_pan = None;
+                }))
+                .on_action(cx.listener(Self::select_next))
+                .on_action(cx.listener(Self::select_previous))
+                .on_action(cx.listener(Self::toggle_selected))
+                .on_action(cx.listener(Self::delete_selected))
+                .on_action(cx.listener(Self::pin_selected))
+                .on_action(cx.listener(Self::date_selected))
+                .on_action(cx.listener(|this, _: &ClearDate, _, cx| this.set_selected_due(None, cx)))
+                .on_action(cx.listener(|this, _: &SetToday, _, cx| this.set_selected_due(Some(0), cx)))
+                .on_action(cx.listener(|this, _: &SetTomorrow, _, cx| this.set_selected_due(Some(1), cx)))
+                .on_action(cx.listener(|this, _: &SetNextWeek, _, cx| this.set_selected_due(Some(7), cx)))
+                .on_action(cx.listener(|this, _: &PriorityNone, _, cx| this.set_selected_priority(Priority::None, cx)))
+                .on_action(cx.listener(|this, _: &PriorityLow, _, cx| this.set_selected_priority(Priority::Low, cx)))
+                .on_action(cx.listener(|this, _: &PriorityMedium, _, cx| this.set_selected_priority(Priority::Medium, cx)))
+                .on_action(cx.listener(|this, _: &PriorityHigh, _, cx| this.set_selected_priority(Priority::High, cx)))
+                .flex_1()
+                .items_start()
+                .when(colored, |el| el.gap(px(12.)))
+                .px(px(12.))
+                .mt(px(-8.))
+                .pb(px(12.))
+                .overflow_x_scroll()
+                .children(rendered_cols)
+                .children(habit_col)
+                .when(owner.is_some() && inline_new_col_pos.is_none(), |el| {
+                    let group_id = SharedString::from("kanban-new-section-group");
+                    el.map(|el| match self.new_section.clone() {
+                        Some(input) => el.child(render_new_sec_input(input, cx)),
+                        None if !hide_new_section => el.child(
+                            v_flex().w(px(col_width)).flex_none().mt(px(6.)).px(px(10.)).child(
                                 h_flex()
                                     .id("kanban-new-section")
+                                    .group(group_id.clone())
                                     .h(px(32.))
                                     .px(px(6.))
                                     .rounded(px(6.))
@@ -6281,11 +7398,29 @@ impl Render for TodoView {
                                     .hover(|s| s.bg(theme.colors().ghost_element_hover))
                                     .cursor_pointer()
                                     .child(Icon::new(IconName::Plus).size(IconSize::Small).color(Color::Muted))
-                                    .child(Label::new(strings.new_section).weight(FontWeight::SEMIBOLD).color(Color::Muted))
+                                    .child(div().flex_1().child(Label::new(strings.new_section).weight(FontWeight::SEMIBOLD).color(Color::Muted)))
+                                    .child(
+                                        div()
+                                            .id("kanban-hide-new-section")
+                                            .opacity(0.)
+                                            .group_hover(group_id, |s| s.opacity(1.))
+                                            .child(
+                                                IconButton::new("kanban-hide-new-section-btn", IconName::X)
+                                                    .size(px(20.))
+                                                    .icon_size(IconSize::XSmall)
+                                                    .icon_color(Color::Muted)
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        cx.stop_propagation();
+                                                        let _ = this.store.set_setting(&format!("kanban:hide_new_section:{}", this.view_key()), "1");
+                                                        cx.notify();
+                                                    })),
+                                            ),
+                                    )
                                     .on_click(cx.listener(|this, _, window, cx| this.start_new_section(window, cx))),
                             ),
-                        }),
-                    )
+                        ),
+                        None => el,
+                    })
                 })
                 .into_any_element()
         }));
@@ -7378,5 +8513,78 @@ mod tests {
         click_panel(&format!("lists-item-list-{}", l1.id), cx);
         assert_eq!(detail_state(cx), (None, None, None));
         assert!(cx.debug_bounds("detail-popup").is_none());
+    }
+
+    #[gpui::test]
+    fn kanban_keeps_pinned_completed_and_subtasks_inside_their_own_columns(cx: &mut TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let list = store.create_list("Project").unwrap();
+        let t_open = store.add_task("Open card").unwrap();
+        let t_pinned = store.add_task("Pinned card").unwrap();
+        let t_done = store.add_task("Completed card").unwrap();
+        let sub_done = store.add_task("Completed subtask").unwrap();
+        for t in [&t_open, &t_pinned, &t_done, &sub_done] {
+            store.set_list(t.id, Some(list.id)).unwrap();
+        }
+        store.link_parent(sub_done.id, t_open.id).unwrap();
+        store.set_priority(t_open.id, Priority::High).unwrap();
+        store.set_priority(sub_done.id, Priority::Low).unwrap();
+        store.set_completed(sub_done.id, true).unwrap();
+        store.set_pinned(t_pinned.id, true).unwrap();
+        store.set_completed(t_done.id, true).unwrap();
+
+        cx.update(|cx| {
+            theme::init(cx);
+            cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let mut view = TodoView::new(store.clone(), window, cx);
+            view.set_view(View::List(list.id), cx);
+            view.set_layout(true, false, cx);
+            view
+        });
+        cx.run_until_parked();
+
+        // Switching to Kanban auto-creates a real ListSection and assigns unsectioned root tasks to it.
+        let sections = store.list_sections(Some(list.id)).unwrap();
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].name, "Not Sectioned");
+        assert_eq!(store.task(t_open.id).unwrap().unwrap().section_id, Some(sections[0].id));
+        assert_eq!(store.task(t_done.id).unwrap().unwrap().section_id, Some(sections[0].id));
+
+        // Add a second section and move t_done into it: no separate rightmost Completed column is created.
+        let sec2 = store.add_list_section(Some(list.id), "Review").unwrap();
+        store.set_section(t_done.id, Some(sec2.id)).unwrap();
+        cx.update(|_, cx| view.update(cx, |view, cx| view.reload(cx)));
+        cx.run_until_parked();
+
+        cx.update(|_, cx| {
+            let v = view.read(cx);
+            let cols = v.board_columns(i18n::t(cx));
+            assert_eq!(cols.len(), 2, "only the two real sections exist, no separate Completed column");
+            assert_eq!(cols[0].title, "Not Sectioned");
+            assert_eq!(cols[0].open_count(), 2);
+            assert_eq!(cols[0].pinned_cards.len(), 1);
+            assert_eq!(cols[0].open_cards.len(), 1);
+            assert_eq!(cols[0].open_cards[0].1.len(), 1, "completed subtask stays nested inside its open parent card");
+            assert!(cols[0].completed_cards.is_empty());
+
+            assert_eq!(cols[1].title, "Review");
+            assert_eq!(cols[1].open_count(), 0, "header count counts only open tasks");
+            assert_eq!(cols[1].completed_cards.len(), 1, "completed task stays inside its own section column");
+            assert_eq!(cols[1].completed_cards[0].0.id, t_done.id);
+        });
+
+        // Grouping by Priority keeps subtasks nested under their root task's priority column.
+        cx.update(|window, cx| view.update(cx, |view, cx| view.set_sort(None, Some(GroupBy::Priority), window, cx)));
+        cx.update(|_, cx| {
+            let v = view.read(cx);
+            let cols = v.board_columns(i18n::t(cx));
+            let high = cols.iter().find(|c| c.title == "High").expect("High priority column");
+            assert_eq!(high.open_cards.len(), 1);
+            assert_eq!(high.open_cards[0].0.id, t_open.id);
+            assert_eq!(high.open_cards[0].1.len(), 1, "Low-priority subtask stays inside High-priority root card");
+            assert!(!cols.iter().any(|c| c.title == "Low"), "subtask does not split into its own Low column");
+        });
     }
 }

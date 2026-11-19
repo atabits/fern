@@ -973,6 +973,8 @@ pub struct Strings {
     pub kanban_size_large: &'static str,
     pub kanban_column_color: &'static str,
     pub kanban_show_input_box: &'static str,
+    pub group_pinned: &'static str,
+    pub group_unpinned: &'static str,
 }
 
 pub static EN: Strings = Strings {
@@ -1793,6 +1795,8 @@ pub static EN: Strings = Strings {
     kanban_size_large: "Large",
     kanban_column_color: "Column Color",
     kanban_show_input_box: "Show Input Box",
+    group_pinned: "Pinned",
+    group_unpinned: "Others",
 };
 
 pub static ZH_CN: Strings = Strings {
@@ -2609,6 +2613,8 @@ pub static ZH_CN: Strings = Strings {
     kanban_size_large: "大",
     kanban_column_color: "分组颜色",
     kanban_show_input_box: "显示输入框",
+    group_pinned: "已置顶",
+    group_unpinned: "其他",
 };
 
 pub static RU: Strings = Strings {
@@ -3433,6 +3439,8 @@ pub static RU: Strings = Strings {
     kanban_size_large: "Большой",
     kanban_column_color: "Цвет колонок",
     kanban_show_input_box: "Поле ввода в колонках",
+    group_pinned: "Закреплено",
+    group_unpinned: "Не закреплено",
 };
 
 impl Strings {

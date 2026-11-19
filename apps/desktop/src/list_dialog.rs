@@ -35,9 +35,23 @@ impl Layout {
         }
     }
 
-    fn save(self, store: &Store, list: Id) -> anyhow::Result<()> {
+    fn save(self, store: &Store, list: Id, strings: &Strings) -> anyhow::Result<()> {
         store.set_setting(&format!("kanban:list:{list}"), if self == Layout::Kanban { "1" } else { "0" })?;
-        store.set_setting(&format!("timeline:list:{list}"), if self == Layout::Timeline { "1" } else { "0" })
+        store.set_setting(&format!("timeline:list:{list}"), if self == Layout::Timeline { "1" } else { "0" })?;
+        if self == Layout::Kanban {
+            if store.setting(&format!("group:list:{list}"))?.as_deref() == Some("none") {
+                store.set_setting(&format!("group:list:{list}"), "custom")?;
+            }
+            if store.list_sections(Some(list))?.is_empty() {
+                let section = store.add_list_section(Some(list), strings.not_sectioned)?;
+                for task in store.tasks()? {
+                    if task.list_id == Some(list) && !task.is_deleted() && task.parent_id.is_none() && task.section_id.is_none() {
+                        store.set_section(task.id, Some(section.id))?;
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -126,11 +140,12 @@ impl ListDialog {
         if self.draft.name.is_empty() {
             return;
         }
+        let strings = i18n::t(cx);
         let result = match self.editing {
             Some(id) => self.store.update_list(id, &self.draft).map(|_| id),
             None => self.store.add_list(&self.draft).map(|list| list.id),
         }
-        .and_then(|id| self.layout.save(&self.store, id).map(|_| id));
+        .and_then(|id| self.layout.save(&self.store, id, strings).map(|_| id));
         match result {
             Ok(id) => cx.emit(DialogEvent::Saved(id)),
             Err(err) => {

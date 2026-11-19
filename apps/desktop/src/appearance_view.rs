@@ -186,17 +186,23 @@ impl SettingsWindow {
                     el.hoverable_tooltip(move |_, cx| cx.new(|_| NightPalette(owner.clone())).into())
                 })
                 .child(
-                    div().relative().size(px(52.)).rounded(px(8.)).border_1().border_color(colors.border)
-                        .bg(if dark { gpui::black().into() } else { preset.swatch() })
-                        .flex().items_center().justify_center()
-                        .when(dark, |el| el.child(h_flex().gap(px(5.)).children(
-                            (0..3).map(|_| div().size(px(7.)).rounded_full().bg(night.swatch())),
-                        )))
+                    div().relative().size(px(52.))
+                        .child(
+                            div().size_full().rounded(px(8.)).border_1().border_color(colors.border)
+                                .bg(if dark { gpui::black().into() } else { preset.swatch() })
+                                .flex().items_center().justify_center()
+                                .when(dark, |el| el.child(h_flex().gap(px(5.)).children(
+                                    (0..3).map(|_| div().size(px(7.)).rounded_full().bg(night.swatch())),
+                                ))),
+                        )
                         .when(selected, |el| el.child(
                             div().absolute().right(px(-6.)).bottom(px(-6.)).size(px(20.)).rounded_full()
-                                .border_2().border_color(colors.background)
-                                .flex().items_center().justify_center().bg(colors.accent)
-                                .child(Icon::new(IconName::Check).size(IconSize::XSmall).color(Color::IconOnAccent)),
+                                .bg(colors.background).p(px(2.))
+                                .child(
+                                    div().size_full().rounded_full().bg(colors.accent)
+                                        .flex().items_center().justify_center()
+                                        .child(Icon::new(IconName::Check).size(IconSize::XSmall).color(Color::IconOnAccent)),
+                                ),
                         )),
                 )
                 .child(Label::new(name).size(LabelSize::Small).color(if selected { Color::Default } else { Color::Muted }))

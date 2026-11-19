@@ -58,7 +58,7 @@ Every [release](https://github.com/atabits/fern/releases/latest) includes these 
 | Platform | File |
 |---|---|
 | macOS (Apple Silicon / Intel) | `fern-<version>-macos-arm64.dmg` / `-macos-x86_64.dmg` |
-| Windows (x86_64) | `fern-<version>-windows-x86_64-setup.exe` (installer) or `.zip` (portable) |
+| Windows (x86_64) | `fern-<version>-windows-x86_64-setup.exe` (installer) or `.zip` (standalone; add `.portable` beside `fern.exe` for portable data) |
 | Debian, Ubuntu (x86_64 / ARM64) | `fern-<version>-linux-<arch>.deb` |
 | Any Linux (x86_64 / ARM64) | `fern-<version>-linux-<arch>.AppImage` or `.tar.gz` |
 | Sync server (every platform) | `fern-server-<version>-<os>-<arch>.tar.gz` / `.zip` |

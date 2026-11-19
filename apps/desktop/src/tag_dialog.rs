@@ -224,7 +224,7 @@ impl Render for TagDialog {
         let parent_field = div()
             .relative()
             .child(
-                dropdown("tag-parent", current.clone().map_or(SharedString::new_static(strings.none_option), SharedString::from), parent_open, 259., cx)
+                dropdown("tag-parent", current.map_or(SharedString::new_static(strings.none_option), SharedString::from), parent_open, 259., cx)
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.parent_open = !this.parent_open;
                         cx.notify();

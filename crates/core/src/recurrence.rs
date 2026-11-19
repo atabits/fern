@@ -322,7 +322,7 @@ mod tests {
     #[test]
     fn roundtrip_and_ticktick_rules() {
         let rule = Recurrence::new(Frequency::Weekly, 2);
-        assert_eq!(rule.to_string().parse::<Recurrence>(), Ok(rule.clone()));
+        assert_eq!(rule.to_string().parse::<Recurrence>(), Ok(rule));
         assert_eq!(
             "RRULE:FREQ=MONTHLY;INTERVAL=1;BYMONTHDAY=13".parse::<Recurrence>(),
             Ok(Recurrence { month_days: 1 << 12, ..Recurrence::new(Frequency::Monthly, 1) })

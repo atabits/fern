@@ -737,7 +737,7 @@ mod tests {
         assert_eq!(shape(&rows), ["parent", "  child", "    grandchild"]);
 
         let rows = build_rows(
-            &[parent.clone(), child.clone()],
+            &[parent.clone(), child],
             &HashSet::from([parent.id]),
             &HashSet::new(),
             true,

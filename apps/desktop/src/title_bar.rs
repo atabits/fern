@@ -26,8 +26,8 @@ use crate::updater::Status;
 const ROUNDING: Pixels = px(10.);
 /// The room around the window for its shadow, which is also where it is grabbed to resize.
 const SHADOW: Pixels = px(10.);
-/// macOS traffic lights: their position at the top-left corner.
-const TRAFFIC_LIGHTS: Point<Pixels> = point(px(12.), px(11.));
+/// macOS traffic lights: centered inside the 72 px sections rail.
+const TRAFFIC_LIGHTS: Point<Pixels> = point(px(10.), px(11.));
 
 /// The overlaid caption strip's height: Windows' standard 32 px caption button height.
 pub fn height() -> Pixels {
@@ -262,7 +262,6 @@ fn window_button(button: WindowButton, maximized: bool, active: bool, cx: &App) 
         .h_full()
         .w(px(46.))
         .justify_center()
-        .content_center()
         .occlude()
         .window_control_area(area)
         .text_color(resting)

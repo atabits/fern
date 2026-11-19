@@ -4,14 +4,17 @@ use std::cell::Cell;
 use std::rc::Rc;
 use std::time::Duration;
 
-use gpui::{App, Task};
-use windows::Win32::Foundation::{E_FAIL, ERROR_SUCCESS, GetLastError, HWND, SetLastError};
+use gpui::{App, Bounds, Pixels, Task};
+use windows::Win32::Foundation::{E_FAIL, ERROR_SUCCESS, GetLastError, HWND, RECT, SetLastError};
+use windows::Win32::UI::Input::KeyboardAndMouse::{SetActiveWindow, SetFocus};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DestroyWindow, GW_OWNER, GWL_EXSTYLE, GWLP_HWNDPARENT, GetWindow,
-    GetWindowLongPtrW, IsIconic, IsWindowVisible, SET_WINDOW_POS_FLAGS, SW_SHOWMINNOACTIVE,
-    SW_SHOWNA, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSENDCHANGING,
-    SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    WINDOW_EX_STYLE, WINDOW_LONG_PTR_INDEX, WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW,
+    CreateWindowExW, DestroyWindow, GW_OWNER, GWL_EXSTYLE, GWLP_HWNDPARENT, GetClientRect,
+    GetWindow, GetWindowLongPtrW, GetWindowPlacement, GetWindowRect, IsIconic, IsWindowVisible,
+    SET_WINDOW_POS_FLAGS, SW_RESTORE, SW_SHOWMINNOACTIVE, SW_SHOWNA, SW_SHOWNOACTIVATE,
+    SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSENDCHANGING, SWP_NOSIZE,
+    SWP_NOZORDER, SWP_SHOWWINDOW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPlacement,
+    SetWindowPos, ShowWindow, WINDOW_EX_STYLE, WINDOW_LONG_PTR_INDEX, WINDOWPLACEMENT,
+    WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW,
 };
 use windows::core::{Error, PCWSTR, Result, w};
 
@@ -173,10 +176,63 @@ impl Drop for NoteHandle {
             && let Err(err) = set_window_long(self.note, GWLP_HWNDPARENT, 0)
         {
             eprintln!("failed to detach sticky note from its taskbar owner: {err}");
-            return;
         }
         let _ = unsafe { DestroyWindow(owner) };
     }
+}
+
+pub(super) fn show_inactive(note: HWND, bounds: Bounds<Pixels>, scale: f32, cx: &App) {
+    cx.foreground_executor()
+        .spawn(async move {
+            if let Err(err) = place_inactive(note, bounds, scale) {
+                eprintln!("failed to show restored sticky note: {err}");
+            }
+        })
+        .detach();
+}
+
+pub(super) fn activate(note: HWND, cx: &App) {
+    cx.foreground_executor()
+        .spawn(async move {
+            unsafe {
+                if IsIconic(note).as_bool() {
+                    let _ = ShowWindow(note, SW_RESTORE);
+                }
+                let _ = SetForegroundWindow(note);
+                let _ = SetActiveWindow(note);
+                let _ = SetFocus(Some(note));
+            }
+        })
+        .detach();
+}
+
+fn place_inactive(note: HWND, bounds: Bounds<Pixels>, scale: f32) -> Result<()> {
+    let mut window_rect = RECT::default();
+    let mut client_rect = RECT::default();
+    unsafe {
+        GetWindowRect(note, &mut window_rect)?;
+        GetClientRect(note, &mut client_rect)?;
+    }
+    let width_offset = (window_rect.right - window_rect.left) - (client_rect.right - client_rect.left);
+    let height_offset = (window_rect.bottom - window_rect.top) - (client_rect.bottom - client_rect.top);
+    let left_offset = width_offset / 2;
+    let top_offset = height_offset / 2;
+    let right_offset = width_offset - left_offset;
+    let bottom_offset = height_offset - top_offset;
+    let bounds = bounds.to_device_pixels(scale);
+    let mut placement = WINDOWPLACEMENT {
+        length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
+        ..Default::default()
+    };
+    unsafe { GetWindowPlacement(note, &mut placement)? };
+    placement.showCmd = SW_SHOWNOACTIVATE.0 as u32;
+    placement.rcNormalPosition = RECT {
+        left: bounds.left().0 - left_offset,
+        top: bounds.top().0 - top_offset,
+        right: bounds.right().0 + right_offset,
+        bottom: bounds.bottom().0 + bottom_offset,
+    };
+    unsafe { SetWindowPlacement(note, &placement) }
 }
 
 fn set_visibility(note: HWND, visibility: SET_WINDOW_POS_FLAGS) -> Result<()> {

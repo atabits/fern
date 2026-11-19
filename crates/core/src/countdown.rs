@@ -499,7 +499,7 @@ mod tests {
             background: None,
         };
         assert_eq!(once.next_date(d(2026, 10, 18)), d(2026, 9, 13), "without a repeat the date stays");
-        let monthly = Countdown { repeat: Some(Recurrence::new(Frequency::Monthly, 1)), ..once.clone() };
+        let monthly = Countdown { repeat: Some(Recurrence::new(Frequency::Monthly, 1)), ..once };
         assert_eq!(monthly.next_date(d(2026, 10, 18)), d(2026, 11, 13));
         assert_eq!(monthly.next_date(d(2026, 10, 13)), d(2026, 10, 13), "today counts");
         assert_eq!(monthly.next_date(d(2026, 8, 1)), d(2026, 9, 13), "before the first date, the first date");

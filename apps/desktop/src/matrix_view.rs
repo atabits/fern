@@ -1170,7 +1170,7 @@ mod tests {
         assert_eq!(titles(&by_list), ["now", "soon", "later"], "by time, oldest first");
         let newest = arrange(tasks.clone(), QuadrantView { newest_first: true, ..QuadrantView::default() }, &[], today, strings);
         assert_eq!(titles(&newest), ["later", "soon", "now"]);
-        let by_date = arrange(tasks.clone(), QuadrantView { group: Some(GroupBy::Date), ..QuadrantView::default() }, &[], today, strings);
+        let by_date = arrange(tasks, QuadrantView { group: Some(GroupBy::Date), ..QuadrantView::default() }, &[], today, strings);
         assert_eq!(by_date.iter().map(|(label, _)| label.as_str()).collect::<Vec<_>>(), ["Today", "Tomorrow", "Next 7 Days"]);
         let view = QuadrantView { group: Some(GroupBy::Tag), sort: SortBy::Title, newest_first: true };
         assert_eq!(QuadrantView::from_storage(&view.to_storage()), view);

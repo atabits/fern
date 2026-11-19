@@ -113,7 +113,7 @@ pub struct TaskDetail {
     /// left border.
     card: bool,
     /// Leaves top clearance for the overlaid window buttons when docked at the window's right edge.
-    top_inset: std::cell::Cell<bool>,
+    top_inset: bool,
     sticky_style: Option<crate::sticky_settings::StickySettings>,
     /// The calendar's card writes its date out with the weekday.
     calendar_card: bool,
@@ -220,7 +220,7 @@ impl TaskDetail {
             list_submenu: None,
             show_checklist: false,
             card: false,
-            top_inset: std::cell::Cell::new(false),
+            top_inset: false,
             sticky_style: None,
             calendar_card: false,
             subtask_open: false,
@@ -235,8 +235,11 @@ impl TaskDetail {
     }
 
     /// Sets whether the header leaves top clearance for the overlaid window buttons.
-    pub fn set_top_inset(&self, inset: bool) {
-        self.top_inset.set(inset);
+    pub fn set_top_inset(&mut self, inset: bool, cx: &mut Context<Self>) {
+        if self.top_inset != inset {
+            self.top_inset = inset;
+            cx.notify();
+        }
     }
 
     /// Whether one of the details' popovers is open, which a click outside the card closes first.
@@ -666,6 +669,9 @@ impl TaskDetail {
             let row = match old.iter().position(|row| row.item.id == item.id) {
                 Some(index) => {
                     let mut row = old.swap_remove(index);
+                    if row.item.title != item.title && row.input.read(cx).text() != item.title {
+                        row.input.update(cx, |input, cx| input.set_text(item.title.clone(), cx));
+                    }
                     row.item = item;
                     row
                 }
@@ -719,17 +725,24 @@ impl TaskDetail {
         cx.notify();
     }
 
-    /// Changes from another window can rename the task. Keep the caret for edits already in the input.
+    /// Changes from another window can edit the task's fields. Keep the caret for edits already in the inputs.
     pub fn refresh(&mut self, task: Option<Task>, cx: &mut Context<Self>) {
         match task {
             Some(task) if self.task_id() == Some(task.id) => {
                 if self.task_title() != Some(task.title.as_str()) && self.title.read(cx).text() != task.title {
                     self.title.update(cx, |input, cx| input.set_text(task.title.clone(), cx));
                 }
+                let old_notes = self.session.task.as_ref().map(|t| t.notes.as_str());
+                if old_notes != Some(task.notes.as_str()) && self.notes.read(cx).text() != task.notes {
+                    self.notes.update(cx, |input, cx| input.set_text(task.notes.clone(), cx));
+                }
                 self.session.task = Some(task);
                 self.sync_checklist(cx);
+                self.show_checklist |= !self.checklist.is_empty();
                 self.sync_subtasks();
                 self.sync_attachments();
+                self.sync_comments();
+                cx.notify();
             }
             other => self.show(other, cx),
         }
@@ -1167,7 +1180,7 @@ impl TaskDetail {
     /// A "…" menu entry; hovering it closes the Start Focus side menu.
     fn close_side_menu_on_hover(&self, item: ListItem, cx: &mut Context<Self>) -> impl IntoElement {
         let selector = format!("task-menu-{}", item.id());
-        div().id(item.id()).debug_selector(move || selector.clone()).child(item).on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+        div().id(item.id()).debug_selector(move || selector).child(item).on_hover(cx.listener(|this, hovered: &bool, _, cx| {
             if *hovered && this.focus_submenu {
                 this.focus_submenu = false;
                 cx.notify();
@@ -1522,7 +1535,7 @@ impl TaskDetail {
                     .map_or(strings.inbox.into(), |l| l.name.clone().into());
                 ListItem::new(SharedString::from(format!("link-{parent}")))
                     .start_slot(Icon::new(IconName::Circle).size(IconSize::Small).color(Color::Muted))
-                    .child(Label::new(candidate.title.clone()).truncate())
+                    .child(Label::new(candidate.title).truncate())
                     .end_slot(Label::new(list).size(LabelSize::XSmall).color(Color::Muted))
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.dismiss_popup(window, cx);
@@ -1569,6 +1582,7 @@ impl TaskDetail {
                 let done = row.item.completed;
                 h_flex()
                     .id(SharedString::from(format!("item-{id}")))
+                    .debug_selector(move || format!("checklist-item-{id}"))
                     .group("checklist-item")
                     .min_h(px(30.))
                     .items_start()
@@ -2698,7 +2712,7 @@ impl TaskDetail {
                 let row_id = format!("move-to-{}", list.map_or("inbox".to_owned(), |id| id.to_string()));
                 div()
                     .id(SharedString::from(row_id.clone()))
-                    .debug_selector(move || row_id.clone())
+                    .debug_selector(move || row_id)
                     .relative()
                     .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                         if *hovered && this.list_submenu != Some(list) {
@@ -2843,8 +2857,11 @@ impl TaskDetail {
                         Some(style) => div().h(px(18.)).px(px(6.)).rounded_full()
                             .bg(gpui::rgb(style.foreground()).opacity(0.12))
                             .text_color(gpui::rgb(style.foreground())).text_size(px(11.))
-                            .child(tag.clone()).into_any_element(),
-                        None => Chip::new(tag.clone(), self.tag_color(&tag, cx)).into_any_element(),
+                            .child(tag).into_any_element(),
+                        None => {
+                            let color = self.tag_color(&tag, cx);
+                            Chip::new(tag, color).into_any_element()
+                        }
                     })
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.open_tags(Popup::InlineTags, window, cx);
@@ -3021,7 +3038,7 @@ impl Render for TaskDetail {
             .when(!sticky, |panel| panel.child(
                 h_flex()
                     .debug_selector(|| "task-detail-header".into())
-                    .when(self.top_inset.get(), |el| el.mt(crate::title_bar::header_inset()))
+                    .when(self.top_inset, |el| el.mt(crate::title_bar::header_inset()))
                     .gap_2()
                     .h(px(48.))
                     .flex_none()
@@ -3147,10 +3164,7 @@ impl Render for TaskDetail {
                             .cursor_text()
                             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                             // On the release, so that a click on a link opens it instead.
-                            .on_click({
-                                let focus = notes_focus_click.clone();
-                                move |_, window, cx| window.focus(&focus, cx)
-                            })
+                            .on_click(move |_, window, cx| window.focus(&notes_focus_click, cx))
                             .child(render_markdown(&task.notes, self.sticky_style, cx))
                             .into_any_element()
                     } else {

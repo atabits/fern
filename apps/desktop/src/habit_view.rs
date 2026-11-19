@@ -444,7 +444,7 @@ impl HabitView {
             None => strings.habit_goal_all.to_owned(),
             Some(n) => format!("{n} {}{}", edit.unit.read(cx).text(), strings.habit_per_day),
         };
-        let section_text = self.section_label(edit.section, cx).to_string();
+        let section_text = self.section_label(edit.section, cx);
         // The original's rows: a label on the left and the value in a field that opens its choices.
         let row_with = |label: AnyElement, content: AnyElement| {
             // With the dialog's 8 px gap, a row every 40 px as in the original.
@@ -524,7 +524,7 @@ impl HabitView {
                                     .id("habit-icon-button")
                                     .cursor_pointer()
                                     .child(avatar(
-                                        &Habit { icon: edit.icon.clone(), color: edit.color.clone(), ..preview.clone() },
+                                        &Habit { icon: edit.icon.clone(), color: edit.color.clone(), ..preview },
                                         px(34.),
                                         cx,
                                     ))

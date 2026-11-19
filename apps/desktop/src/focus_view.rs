@@ -2402,7 +2402,7 @@ impl FocusView {
                                         ),
                                 ),
                         )
-                        .child(line_chart(&scores, day_labels.clone(), CHART_HEIGHT, false, cx)),
+                        .child(line_chart(&scores, day_labels, CHART_HEIGHT, false, cx)),
                 )
                 .into_any_element(),
             h_flex()

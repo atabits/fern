@@ -15,11 +15,12 @@ edition = "2024"
 version = "0.1.11"
 license = "AGPL-3.0-or-later"
 
-[workspace.lints.rust]
-warnings = "deny"
-
 [workspace.lints.clippy]
-all = "deny"
+dbg_macro = "deny"
+declare_interior_mutable_const = "deny"
+let_underscore_future = "deny"
+redundant_clone = "deny"
+todo = "deny"
 
 [workspace.dependencies]
 assets = { path = "crates/assets" }
@@ -33,6 +34,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 dirs = "6"
 futures = "0.3"
 notify-rust = "4"
+resvg = "0.46"
 rust-embed = { version = "8", features = ["include-exclude"] }
 rusqlite = { version = "0.37", features = ["bundled", "backup"] }
 serde = { version = "1", features = ["derive"] }
@@ -43,6 +45,7 @@ strum = { version = "0.27", features = ["derive"] }
 tiny_http = "0.12"
 ureq = "3"
 unicode-segmentation = "1"
+usvg = { version = "0.46", default-features = false }
 sys-locale = "0.3"
 uuid = { version = "1", features = ["v7", "serde"] }
 

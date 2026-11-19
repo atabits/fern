@@ -627,7 +627,7 @@ mod tests {
         store.save_preferences(&Preferences { date_format: Some(DateFormat::IsoYearMonthDay), ..preferences.clone() })?;
         assert_eq!(store.preferences()?.date_format, Some(DateFormat::IsoYearMonthDay));
 
-        store.save_preferences(&Preferences { default_list: None, ..preferences.clone() })?;
+        store.save_preferences(&Preferences { default_list: None, ..preferences })?;
         assert_eq!(store.preferences()?.default_list, None);
         Ok(())
     }

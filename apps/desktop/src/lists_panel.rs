@@ -668,10 +668,10 @@ fn mini_calendar(
         div().flex_1().min_w_0().flex().justify_center().child(Label::new(*day).size(LabelSize::Small).color(colors.list_text_muted))
     }));
     let toggle = on_mini.clone();
-    // The hover tab on the top border: "^" expands, "v" collapses.
+    // The hover tab hanging down from the top border: "^" expands, "v" collapses.
     let tab = div()
         .absolute()
-        .top(px(-8.))
+        .top_0()
         .left_0()
         .right_0()
         .flex()
@@ -682,12 +682,13 @@ fn mini_calendar(
             div()
                 .id("mini-calendar-toggle")
                 .group("mini-calendar-toggle")
-                .w(px(40.))
-                .h(px(16.))
+                .w(px(36.))
+                .h(px(12.))
                 .flex()
                 .items_center()
                 .justify_center()
-                .rounded(px(4.))
+                .rounded_bl(px(4.))
+                .rounded_br(px(4.))
                 .bg(colors.list_hover)
                 .cursor_pointer()
                 .child(

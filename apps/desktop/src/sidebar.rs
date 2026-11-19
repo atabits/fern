@@ -78,6 +78,9 @@ impl Section {
     }
 }
 
+#[cfg(target_os = "macos")]
+pub const WIDTH: f32 = 72.;
+#[cfg(not(target_os = "macos"))]
 pub const WIDTH: f32 = 50.;
 
 type ClickCallback = Box<dyn Fn(&ClickEvent, &mut Window, &mut App)>;

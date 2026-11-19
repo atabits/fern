@@ -280,9 +280,11 @@ impl TodoView {
         let search_input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.search_placeholder, cx));
         cx.subscribe(&search_input, |this, input, _: &Changed, cx| {
             let query = input.read(cx).text().to_owned();
-            this.set_view(View::Search(query), cx);
+            this.update_search_query(query, cx);
         })
         .detach();
+        cx.observe_window_bounds(window, |this, window, cx| this.sync_viewport(window, cx))
+            .detach();
 
         // A change made in a sticky note shows here.
         cx.observe_global::<crate::sticky_note::DataVersion>(|this, cx| {
@@ -418,7 +420,7 @@ impl TodoView {
             error: None,
             add_attachment_error: None,
         };
-        this.reload(cx);
+        this.reload_inner(false, false, cx);
         #[cfg(debug_assertions)]
         this.apply_dev_state(window, cx);
         this
@@ -825,6 +827,20 @@ impl TodoView {
         self.preferences.popup_details && self.narrow_viewport
     }
 
+    fn sync_detail_inset(&mut self, cx: &mut Context<Self>) {
+        let top_inset = !self.uses_popup_details();
+        self.detail.update(cx, |detail, cx| detail.set_top_inset(top_inset, cx));
+    }
+
+    fn sync_viewport(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let narrow = window.viewport_size().width < px(NARROW_WINDOW);
+        if self.narrow_viewport != narrow {
+            self.narrow_viewport = narrow;
+            self.sync_detail_inset(cx);
+            cx.notify();
+        }
+    }
+
     fn default_task_for_view(&self, cx: &App) -> Option<Task> {
         if self.view == View::Summary || self.uses_board_layout() || self.uses_popup_details() {
             return None;
@@ -846,13 +862,16 @@ impl TodoView {
     }
 
     pub fn reload(&mut self, cx: &mut Context<Self>) {
-        self.reload_inner(false, cx);
+        self.reload_inner(false, true, cx);
     }
 
-    pub(super) fn reload_inner(&mut self, mut switched: bool, cx: &mut Context<Self>) {
-        // Sticky notes show the change.
-        crate::sticky_note::data_changed(cx.entity_id(), cx);
+    pub(super) fn reload_inner(&mut self, mut switched: bool, notify_notes: bool, cx: &mut Context<Self>) {
+        // Sticky notes show data mutations, not view navigation.
+        if notify_notes {
+            crate::sticky_note::data_changed(cx.entity_id(), cx);
+        }
         self.preferences = self.store.preferences().unwrap_or_default();
+        self.sync_detail_inset(cx);
         // Loaded once: the views, counts and filters below are all selections of it.
         let all_tasks = self.store.tasks().unwrap_or_default();
         let today = Self::today();
@@ -1041,7 +1060,7 @@ impl TodoView {
                     .cursor_pointer()
                     .hover(|s| s.bg(theme.colors().element_hover))
                     .child(Icon::new(IconName::LayoutTemplate).size(IconSize::Small).color(Color::Muted))
-                    .child(div().flex_1().min_w_0().child(Label::new(template.title.clone()).truncate()))
+                    .child(div().flex_1().min_w_0().child(Label::new(template.title).truncate()))
                     .children(tags.map(|t| Label::new(t).size(LabelSize::XSmall).color(Color::Muted)))
                     .when(checklist > 0, |el| {
                         el.child(Icon::new(IconName::ListChecks).size(IconSize::XSmall).color(Color::Muted))
@@ -2867,6 +2886,7 @@ impl TodoView {
         let result = self.store.update_preferences(change);
         if let Some(preferences) = self.check(result) {
             self.preferences = preferences;
+            self.sync_detail_inset(cx);
         }
         cx.notify();
     }
@@ -3500,7 +3520,7 @@ impl TodoView {
                                         .rounded(px(8.))
                                         .bg(tint.opacity(if task.is_completed() { 0.3 } else { 0.75 }))
                                         .cursor_pointer()
-                                        .child(Label::new(task.title.clone()).truncate()),
+                                        .child(Label::new(task.title).truncate()),
                                 )
                                 .on_click(cx.listener(move |this, _, _, cx| this.select(id, cx)))
                         })),
@@ -3866,7 +3886,7 @@ impl TodoView {
     }
 
     pub fn select_view(&mut self, view: View, window: &mut Window, cx: &mut Context<Self>) {
-        self.narrow_viewport = window.viewport_size().width < px(NARROW_WINDOW);
+        self.sync_viewport(window, cx);
         let switching = self.view != view;
         self.set_view(view, cx);
         if switching && self.view != View::Summary {
@@ -3881,8 +3901,44 @@ impl TodoView {
             self.finish_title_edit(true, cx);
             self.reset_view_transients(cx);
             self.view = view;
-            self.reload_inner(true, cx);
+            self.reload_inner(true, false, cx);
         }
+    }
+
+    /// Switches to `View::All` and selects `id` directly without loading the first row's details twice.
+    pub fn open_task_in_all(&mut self, id: Id, cx: &mut Context<Self>) {
+        self.header_menu_open = false;
+        self.list_activity = None;
+        if self.view != View::All {
+            self.finish_title_edit(true, cx);
+            self.reset_view_transients(cx);
+            self.view = View::All;
+            self.list_state = ListState::new(0, ListAlignment::Top, px(400.));
+            self.list_entries.clear();
+            self.selected = Some(id);
+            self.reload_inner(false, false, cx);
+        } else {
+            self.select(id, cx);
+        }
+    }
+
+    fn update_search_query(&mut self, query: String, cx: &mut Context<Self>) {
+        if !matches!(self.view, View::Search(_)) {
+            self.set_view(View::Search(query), cx);
+            return;
+        }
+        if self.view == View::Search(query.clone()) {
+            return;
+        }
+        self.finish_title_edit(true, cx);
+        self.view = View::Search(query);
+        if let Some(tasks) = self.check(self.store.tasks_in(&self.view, Self::today())) {
+            self.tasks = tasks;
+        }
+        self.list_state = ListState::new(0, ListAlignment::Top, px(400.));
+        self.list_entries.clear();
+        self.sync_layout_selection(cx);
+        cx.notify();
     }
 
     /// Switches the list to search results and focuses the search field.
@@ -3923,6 +3979,7 @@ impl TodoView {
             if let DialogEvent::Saved(id) = event
                 && this.view != View::List(*id)
             {
+                crate::sticky_note::data_changed(cx.entity_id(), cx);
                 this.set_view(View::List(*id), cx);
                 return;
             }
@@ -4068,6 +4125,7 @@ impl TodoView {
                 self.check(result);
                 if self.view == View::Tag(tag) {
                     self.header_menu_open = false;
+                    crate::sticky_note::data_changed(cx.entity_id(), cx);
                     self.set_view(View::Inbox, cx);
                     return;
                 }
@@ -4087,6 +4145,7 @@ impl TodoView {
                     let result = self.store.duplicate_list(id, i18n::t(cx).list_copy_suffix);
                     if let Some(copy) = self.check(result) {
                         self.header_menu_open = false;
+                        crate::sticky_note::data_changed(cx.entity_id(), cx);
                         self.set_view(View::List(copy.id), cx);
                         return;
                     }
@@ -4106,6 +4165,7 @@ impl TodoView {
                     self.check(result);
                     if current == Some(id) {
                         self.header_menu_open = false;
+                        crate::sticky_note::data_changed(cx.entity_id(), cx);
                         self.set_view(View::Inbox, cx);
                         return;
                     }
@@ -5049,7 +5109,7 @@ impl TodoView {
                             Some(icon) => div().w(px(16.)).child(icon).into_any_element(),
                             None => Icon::new(crate::countdown_view::kind_icon(countdown.kind)).color(Color::Accent).into_any_element(),
                         })
-                        .child(div().flex_1().min_w_0().child(Label::new(countdown.name.clone()).truncate()))
+                        .child(div().flex_1().min_w_0().child(Label::new(countdown.name).truncate()))
                         .child(Label::new(when).size(LabelSize::Small).color(Color::Accent))
                         .border_b_1()
                         .border_color(theme.colors().border_variant)
@@ -5089,7 +5149,7 @@ impl TodoView {
             MenuAction::AddSubtask => self.start_detail(id, "subtask", window, cx),
             MenuAction::LinkParent => self.start_detail(id, "link-parent", window, cx),
             MenuAction::Tags => self.start_detail(id, "tags", window, cx),
-            MenuAction::Focus(stopwatch) => cx.emit(StartFocus(id, task.title.clone(), stopwatch)),
+            MenuAction::Focus(stopwatch) => cx.emit(StartFocus(id, task.title, stopwatch)),
             MenuAction::CopyLink => cx.write_to_clipboard(gpui::ClipboardItem::new_string(fern_core::link::task_link(id))),
             MenuAction::StickyNote => crate::sticky_note::open(self.store.clone(), id, cx),
             // Deleting goes the list's usual way, with its Undo.
@@ -5269,11 +5329,24 @@ impl TodoView {
                                 if let (Some(start), Some(end)) = (start, end) {
                                     this.closed_range = ClosedRange::custom(start, end);
                                     this.set_closed_menu(None, cx);
+                                    this.sync_closed_filter(cx);
                                 }
                             })),
                     ),
             )
             .into_any_element()
+    }
+
+    fn sync_closed_filter(&mut self, cx: &mut Context<Self>) {
+        let visible = self.selected.is_some_and(|selected| {
+            self.rows(i18n::t(cx)).into_iter().any(|row| matches!(row, Row::Task { task, .. } if task.id == selected))
+        });
+        self.list_state = ListState::new(0, ListAlignment::Top, px(400.));
+        self.list_entries.clear();
+        if !visible {
+            self.sync_layout_selection(cx);
+        }
+        cx.notify();
     }
 
     /// Toggles a list in the lists-filter draft; "All Lists" is `None`.
@@ -5334,6 +5407,7 @@ impl TodoView {
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.closed_range = range;
                         this.set_closed_menu(None, cx);
+                        this.sync_closed_filter(cx);
                     }))
             }))
             .child({
@@ -5414,7 +5488,7 @@ impl TodoView {
                                 if let Some(ClosedMenu::Lists(draft)) = this.closed_menu.take() {
                                     this.closed_lists = draft;
                                 }
-                                cx.notify();
+                                this.sync_closed_filter(cx);
                             })),
                     ),
             );
@@ -5618,7 +5692,6 @@ impl Render for TodoView {
             .map(|t| (t.name.clone(), lists_panel::color(t.color.as_deref(), cx)))
             .collect();
         // The original's "too narrow" window: the details then follow View Options' layout.
-        self.narrow_viewport = window.viewport_size().width < px(NARROW_WINDOW);
         let popup_details = self.uses_popup_details();
         // The dragged width, narrowed while the window leaves the task list too little room.
         let view_width = f32::from(window.viewport_size().width) - crate::sidebar::WIDTH;
@@ -5724,7 +5797,7 @@ impl Render for TodoView {
         let rows = if kanban_view { Vec::new() } else { self.rows(strings) };
         let rows_empty = rows.is_empty();
         if !kanban_view {
-            self.tag_colors = tag_colors.clone();
+            self.tag_colors = tag_colors;
             let mut entries = Vec::with_capacity(rows.len() + 3);
             if self.new_section.is_some() {
                 entries.push(ListEntry::NewSection);
@@ -6043,7 +6116,6 @@ impl Render for TodoView {
                     return el.child(list);
                 }
                 // View Options' Pop-up: in a narrow window an opened task shows over the list.
-                self.detail.read(cx).set_top_inset(!popup_details);
                 if popup_details {
                     if self.selected.is_none() && self.list_activity.is_none() {
                         return el.child(list);

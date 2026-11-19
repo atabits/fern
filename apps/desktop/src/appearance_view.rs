@@ -85,13 +85,14 @@ impl SettingsWindow {
     fn save_theme(&mut self, selection: ThemeSelection, temporary: Option<TemporaryTheme>, window: &mut Window, cx: &mut Context<Self>) {
         if let Err(error) = self.store.save_theme_selection(&selection) {
             let strings = i18n::t(cx);
-            drop(window.prompt(PromptLevel::Warning, strings.theme_save_failed, Some(&error.to_string()), &[strings.ok], cx));
+            let prompt = window.prompt(PromptLevel::Warning, strings.theme_save_failed, Some(&error.to_string()), &[strings.ok], cx);
+            cx.background_executor().spawn(async move { let _ = prompt.await; }).detach();
             return;
         }
         self.preferences.theme = selection;
         if let Some(choice) = temporary { cx.set_global(choice) } else { clear_temporary(cx) }
         apply_theme(&self.preferences.theme, window, cx);
-        cx.refresh_windows();
+        cx.notify();
     }
 
     fn pick_theme(&mut self, preset: &'static ThemePreset, window: &mut Window, cx: &mut Context<Self>) {
@@ -125,7 +126,7 @@ impl SettingsWindow {
             // "Just this time" leaves the saved opposite-appearance palette intact.
             cx.set_global(TemporaryTheme { system_dark, preset });
             apply_theme(&self.preferences.theme, window, cx);
-            cx.refresh_windows();
+            cx.notify();
             return;
         }
         if dark { selection.dark = Some(preset.id.into()) } else { selection.light = Some(preset.id.into()) }
@@ -208,27 +209,43 @@ impl SettingsWindow {
                 .child(Label::new(name).size(LabelSize::Small).color(if selected { Color::Default } else { Color::Muted }))
                 .on_click(cx.listener(move |this, _, window, cx| this.pick_theme(preset, window, cx)))
         };
+        let night_owner = owner.clone();
+        let night_picker = move |cx: &App| {
+            let night_owner = night_owner.clone();
+            night_swatches(night, true, move |preset, window, cx| {
+                night_owner.update(cx, |settings, cx| settings.pick_night_theme(preset, window, cx)).ok();
+            }, cx)
+        };
         v_flex().gap_4()
             .child(
-                h_flex().id("follow-system").tab_index(0).aria_label(strings.follow_system_dark_mode)
-                    .role(gpui::Role::Switch).aria_toggled(follow.into())
-                    .min_h(px(ROW_HEIGHT)).px_4().gap_2().rounded(px(8.))
-                    .bg(colors.surface_background).border_1().border_color(gpui::transparent_black())
-                    .cursor_pointer().focus_visible(|s| s.border_color(colors.accent))
-                    .child(div().flex_1().child(Label::new(strings.follow_system_dark_mode)))
-                    .child(Switch::new().toggle_state(follow))
-                    .on_click(cx.listener(|this, _, window, cx| this.toggle_system_theme(window, cx))),
+                v_flex().rounded(px(8.)).bg(colors.surface_background)
+                    .child(
+                        h_flex().id("follow-system").tab_index(0).aria_label(strings.follow_system_dark_mode)
+                            .role(gpui::Role::Switch).aria_toggled(follow.into())
+                            .min_h(px(ROW_HEIGHT)).px_4().gap_2().rounded(px(8.))
+                            .border_1().border_color(gpui::transparent_black())
+                            .cursor_pointer().focus_visible(|s| s.border_color(colors.accent))
+                            .child(div().flex_1().child(Label::new(strings.follow_system_dark_mode)))
+                            .child(Switch::new().toggle_state(follow))
+                            .on_click(cx.listener(|this, _, window, cx| this.toggle_system_theme(window, cx))),
+                    )
+                    .when(follow, |el| {
+                        el.child(div().px_4().child(Divider::horizontal()))
+                            .child(
+                                h_flex().min_h(px(ROW_HEIGHT)).px_4().py_2().gap_3()
+                                    .child(div().flex_1().child(Label::new(strings.night_theme)))
+                                    .child(night_picker(cx)),
+                            )
+                    }),
             )
             .child(v_flex().gap_2()
                 .child(Label::new(strings.color_series).weight(FontWeight::SEMIBOLD))
                 .child(h_flex().flex_wrap().gap_1()
                     .children(LIGHT_PRESETS.iter().zip(strings.light_theme_names).map(|(preset, name)| tile(preset, name)))
                     .child(tile(night, strings.dark_theme))))
-            .when(follow || active.is_dark(), |el| el.child(v_flex().gap_2()
+            .when(!follow && active.is_dark(), |el| el.child(v_flex().gap_2()
                 .child(Label::new(strings.night_theme).weight(FontWeight::SEMIBOLD))
-                .child(night_swatches(night, true, move |preset, window, cx| {
-                    owner.update(cx, |settings, cx| settings.pick_night_theme(preset, window, cx)).ok();
-                }, cx))))
+                .child(night_picker(cx))))
     }
 }
 

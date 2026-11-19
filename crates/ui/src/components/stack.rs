@@ -3,7 +3,7 @@ use std::panic::Location;
 use gpui::{
     A11ySubtreeBuilder, AnyElement, App, Bounds, Div, Element, ElementId, GlobalElementId,
     InspectorElementId, InteractiveElement, Interactivity, IntoElement, LayoutId, ParentElement,
-    Pixels, StyleRefinement, Styled, Window, accesskit, div,
+    Pixels, Stateful, StyleRefinement, Styled, Window, accesskit, div,
 };
 
 use super::{Icon, inline_icons::RowCaptions};
@@ -48,9 +48,66 @@ impl ParentElement for HorizontalStack {
                         .get_or_insert_with(RowCaptions::default)
                         .clone(),
                 );
+                child
+            } else if child.downcast_mut::<Stateful<Div>>().is_some() {
+                IsolatedControl(child).into_any_element()
+            } else {
+                child
             }
-            child
         }));
+    }
+}
+
+struct IsolatedControl(AnyElement);
+
+impl IntoElement for IsolatedControl {
+    type Element = Self;
+    fn into_element(self) -> Self {
+        self
+    }
+}
+
+impl Element for IsolatedControl {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+    fn source_location(&self) -> Option<&'static Location<'static>> {
+        None
+    }
+    fn request_layout(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, ()) {
+        (self.0.request_layout(window, cx), ())
+    }
+    fn prepaint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        _: Bounds<Pixels>,
+        _: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        RowCaptions::collect(None, cx, |cx| self.0.prepaint(window, cx));
+    }
+    fn paint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        _: Bounds<Pixels>,
+        _: &mut (),
+        _: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.0.paint(window, cx);
     }
 }
 
@@ -127,5 +184,67 @@ impl Element for HorizontalStack {
     ) {
         self.element
             .paint(id, inspector, bounds, layout, state, window, cx);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui::{TestAppContext, canvas, point, px, size};
+    use icons::IconName;
+
+    use super::*;
+    use crate::{Label, LabelSize};
+
+    #[gpui::test]
+    fn keyed_div_controls_isolate_captions_while_keeping_flex_layout(cx: &mut TestAppContext) {
+        cx.update(theme::init);
+        let cx = cx.add_empty_window();
+        cx.draw(point(px(0.), px(0.)), size(px(240.), px(40.)), |_, _| {
+            let mut row = h_flex().w(px(240.)).h(px(40.));
+            row.extend([
+                Icon::new(IconName::Check).into_any_element(),
+                div()
+                    .id("isolated-chip")
+                    .flex_1()
+                    .h_full()
+                    .debug_selector(|| "isolated-chip".into())
+                    .child(
+                        canvas(
+                            |bounds, _, cx| {
+                                RowCaptions::add(bounds, cx, || px(3.));
+                            },
+                            |_, _, _, _| {},
+                        )
+                        .size_full(),
+                    )
+                    .into_any_element(),
+                div()
+                    .w(px(60.))
+                    .h_full()
+                    .child(
+                        canvas(
+                            |bounds, _, cx| {
+                                RowCaptions::add(bounds, cx, || px(19.));
+                            },
+                            |_, _, _, _| {},
+                        )
+                        .size_full(),
+                    )
+                    .child(Label::new("Row").size(LabelSize::Small))
+                    .into_any_element(),
+            ]);
+            let captions = row.captions.clone().unwrap();
+            v_flex()
+                .child(row)
+                .child(canvas(
+                    move |_, window, _| {
+                        let icon_slot = Bounds::new(point(px(0.), px(12.)), size(px(16.), px(16.)));
+                        assert_eq!(captions.axis_for(icon_slot, window), Some(px(19.)));
+                    },
+                    |_, _, _, _| {},
+                ))
+        });
+        let chip = cx.debug_bounds("isolated-chip").unwrap();
+        assert_eq!(chip.size.width, px(240. - 16. - 60.));
     }
 }

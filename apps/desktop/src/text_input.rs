@@ -818,7 +818,7 @@ fn display_runs(
                 at = range.end;
             }
             if at < text.len() {
-                runs.push(TextRun { len: text.len() - at, ..run.clone() });
+                runs.push(TextRun { len: text.len() - at, ..run });
             }
             runs
         }

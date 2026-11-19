@@ -76,6 +76,13 @@ impl LabelMetrics {
         }
         ink
     }
+
+    fn cap_height(&self, line: &WrappedLineLayout) -> Pixels {
+        line.runs()
+            .first()
+            .map(|run| self.text_system.font_metrics(run.font_id).cap_height(line.font_size()))
+            .unwrap_or(Pixels::ZERO)
+    }
 }
 
 /// Text for a UI label that inherits its parent's style. GPUI still measures, wraps,
@@ -95,34 +102,42 @@ impl LabelText {
     }
 }
 
-/// Center of the main letter body above the baseline, ignoring descenders for cased
-/// scripts so neighboring labels on the same row share a stable baseline.
-fn body_center_y(text: &str, ink: Bounds<Pixels>) -> Pixels {
+/// Center of the main letter body above the baseline, ignoring descenders and using the
+/// font's capital height for cased scripts so neighboring labels share a stable baseline.
+fn body_center_y(text: &str, ink: Bounds<Pixels>, cap_height: Pixels) -> Pixels {
     if ink.top() < Pixels::ZERO
         && text
             .chars()
             .any(|ch| ch.is_uppercase() || ch.is_lowercase())
     {
-        (ink.top() + ink.bottom().min(Pixels::ZERO)) / 2.
+        let top = if cap_height > Pixels::ZERO {
+            -cap_height
+        } else {
+            ink.top()
+        };
+        (top + ink.bottom().min(Pixels::ZERO)) / 2.
     } else {
         ink.center().y
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn align_line(
     mut bounds: Bounds<Pixels>,
     text: &str,
     line: &WrappedLineLayout,
     line_height: Pixels,
     ink: Bounds<Pixels>,
+    cap_height: Pixels,
     align: TextAlign,
     window: &Window,
 ) -> Bounds<Pixels> {
     let baseline = baseline_offset(line, line_height);
-    let center_y = body_center_y(text, ink);
+    let center_y = body_center_y(text, ink, cap_height);
     bounds.origin.y = window.pixel_snap(bounds.center().y - center_y) - baseline;
     if align == TextAlign::Center {
-        bounds.origin.x += line.unwrapped_layout.width / 2. - ink.center().x;
+        bounds.origin.x =
+            window.pixel_snap(bounds.origin.x + line.unwrapped_layout.width / 2. - ink.center().x);
     }
     bounds
 }
@@ -198,18 +213,20 @@ impl Element for LabelText {
             && line.wrap_boundaries().is_empty()
             && let Some(ink) = metrics.ink_bounds(line, window.scale_factor(), style.color)
         {
+            let cap_height = metrics.cap_height(line);
             let aligned = align_line(
                 bounds,
                 &self.text,
                 line,
                 layout.line_height(),
                 ink,
+                cap_height,
                 style.text_align,
                 window,
             );
             RowCaptions::add(bounds, cx, || {
                 let baseline = aligned.top() + baseline_offset(line, layout.line_height());
-                baseline + body_center_y(&self.text, ink)
+                baseline + body_center_y(&self.text, ink, cap_height)
             });
             bounds = aligned;
         }
@@ -321,22 +338,23 @@ mod tests {
                         ..Default::default()
                     };
                     let bounds = Bounds::new(point(px(9.), px(17.)), size(px(90.), px(22.)));
-                    let painted = align_line(bounds, text, &line, px(22.), ink, align, window);
+                    let painted =
+                        align_line(bounds, text, &line, px(22.), ink, px(10.), align, window);
                     let baseline = painted.top()
                         + (px(22.) - line.ascent() - line.descent()) / 2.
                         + line.ascent();
-                    let center_y = baseline + body_center_y(text, ink);
+                    let center_y = baseline + body_center_y(text, ink, px(10.));
                     assert!((center_y - bounds.center().y).abs() <= px(0.51 / scale));
                     assert_eq!(painted.size, bounds.size);
                     if align == TextAlign::Center {
                         let start =
                             painted.left() + (bounds.size.width - line.unwrapped_layout.width) / 2.;
-                        assert!((start + ink.center().x - bounds.center().x).abs() < px(0.001));
+                        assert!((start + ink.center().x - bounds.center().x).abs() <= px(0.51 / scale));
                     } else {
                         assert_eq!(painted.left(), bounds.left());
                     }
                 }
-                // Words with and without descenders share the same baseline on a row.
+                // Words with/without descenders or ascenders share the same baseline on a row.
                 let plain_line = WrappedLineLayout {
                     unwrapped_layout: window.text_system().layout_line(
                         "Отмена",
@@ -355,12 +373,27 @@ mod tests {
                     ),
                     ..Default::default()
                 };
+                let lower_line = WrappedLineLayout {
+                    unwrapped_layout: window.text_system().layout_line(
+                        "дом",
+                        px(14.),
+                        &[style.to_run("дом".len())],
+                        None,
+                    ),
+                    ..Default::default()
+                };
                 let bounds = Bounds::new(point(px(9.), px(17.)), size(px(90.), px(22.)));
                 let plain_ink = Bounds::new(point(px(1.), px(-10.)), size(px(50.), px(10.)));
                 let desc_ink = Bounds::new(point(px(1.), px(-10.)), size(px(56.), px(13.)));
+                let lower_ink = Bounds::new(point(px(1.), px(-7.)), size(px(26.), px(7.)));
+                let plain_top = align_line(bounds, "Отмена", &plain_line, px(22.), plain_ink, px(10.), TextAlign::Left, window).top();
                 assert_eq!(
-                    align_line(bounds, "Отмена", &plain_line, px(22.), plain_ink, TextAlign::Left, window).top(),
-                    align_line(bounds, "Удалить", &desc_line, px(22.), desc_ink, TextAlign::Left, window).top(),
+                    plain_top,
+                    align_line(bounds, "Удалить", &desc_line, px(22.), desc_ink, px(10.), TextAlign::Left, window).top(),
+                );
+                assert_eq!(
+                    plain_top,
+                    align_line(bounds, "дом", &lower_line, px(22.), lower_ink, px(10.), TextAlign::Left, window).top(),
                 );
             }
         });

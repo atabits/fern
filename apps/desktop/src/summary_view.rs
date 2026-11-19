@@ -369,9 +369,7 @@ impl SummaryView {
         // `summary=image:<path>`: what "Save as → Image" writes, to a given file.
         if let Some(path) = menu.strip_prefix("image:") {
             let report = self.current_report(cx);
-            if path.ends_with(".svg") {
-                std::fs::write(path, crate::print::report_svg(&report.heading, &report.groups)).ok();
-            } else if let Ok(png) = crate::report_image::png(&report.heading, &report.groups) {
+            if let Ok(png) = crate::report_image::png(&report.heading, &report.groups) {
                 std::fs::write(path, png).ok();
             }
         }
@@ -597,7 +595,7 @@ impl SummaryView {
                     .into_any_element(),
             )
             .chain(tags.into_iter().map(|tag| {
-                let name = tag.name.clone();
+                let name = tag.name;
                 let selected = options.tags.as_ref().is_some_and(|t| t.contains(&name));
                 check(selected, ListItem::new(SharedString::from(format!("more-tag-{name}"))).child(Label::new(format!("#{name}"))))
                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -964,7 +962,7 @@ impl Render for SummaryView {
                         })).child({
                             let heading = report_heading.clone();
                             let groups = report_groups.clone();
-                            let mail = mailto.clone();
+                            let mail = mailto;
                             let menu = self.save_menu.then(|| {
                                 PopoverAttachment::new(
                                     Placement::AboveRight,

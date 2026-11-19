@@ -27,7 +27,7 @@ impl Global for OpenNotes {}
 pub fn restore(store: Rc<Store>, cx: &mut App) {
     for note in sticky_windows::load(&store).into_iter().filter(|n| n.open) {
         if store.task(note.task).ok().flatten().is_some_and(|task| !task.is_deleted()) {
-            open(store.clone(), note.task, cx);
+            open_note(store.clone(), note.task, false, cx);
         } else if let Err(err) = sticky_windows::close(&store, note.task) {
             eprintln!("failed to forget deleted note: {err:#}");
         }
@@ -68,6 +68,14 @@ fn display_title(text: &str, cx: &App) -> SharedString {
     text.replace("\r\n", " ").replace(['\r', '\n'], " ").into()
 }
 
+fn has_open_note(id: Id, cx: &App) -> bool {
+    cx.try_global::<OpenNotes>().is_some_and(|notes| {
+        notes.0.iter().any(|handle| {
+            handle.read_with(cx, |note, cx| note.detail.read(cx).task_id() == Some(id)).unwrap_or(false)
+        })
+    })
+}
+
 fn activate_existing(id: Id, cx: &mut App) -> bool {
     let handles = cx.default_global::<OpenNotes>().0.clone();
     handles.into_iter().any(|handle| {
@@ -75,9 +83,17 @@ fn activate_existing(id: Id, cx: &mut App) -> bool {
             let matches = note.detail.read(cx).task_id() == Some(id);
             if matches {
                 #[cfg(windows)]
-                if let Some(button) = &mut note.taskbar {
-                    button.set_hidden(note.settings.hide_from_taskbar, cx);
+                {
+                    if let Some(button) = &mut note.taskbar {
+                        button.set_hidden(note.settings.hide_from_taskbar, cx);
+                    }
+                    if let Some(hwnd) = win32_window_handle(window) {
+                        taskbar::activate(hwnd, cx);
+                    } else {
+                        window.activate_window();
+                    }
                 }
+                #[cfg(not(windows))]
                 window.activate_window();
             }
             matches
@@ -88,8 +104,16 @@ fn activate_existing(id: Id, cx: &mut App) -> bool {
 /// Opens a task as a sticky note: a window of its own, drawn by the app as the main one, which
 /// its pin keeps over the others.
 pub fn open(store: Rc<Store>, id: Id, cx: &mut App) {
+    open_note(store, id, true, cx);
+}
+
+fn open_note(store: Rc<Store>, id: Id, activate: bool, cx: &mut App) {
     let Some(task) = store.task(id).ok().flatten().filter(|task| !task.is_deleted()) else { return };
-    if activate_existing(id, cx) {
+    if activate {
+        if activate_existing(id, cx) {
+            return;
+        }
+    } else if has_open_note(id, cx) {
         return;
     }
     let settings = StickySettings::current(&store, cx);
@@ -101,6 +125,7 @@ pub fn open(store: Rc<Store>, id: Id, cx: &mut App) {
     // saved taskbar policy first, then let GPUI show it at its initial placement.
     let show = !(cfg!(windows) && settings.hide_from_taskbar);
     let options = WindowOptions {
+        focus: activate,
         show,
         window_bounds: Some(WindowBounds::Windowed(bounds)),
         titlebar: Some(TitlebarOptions { title: Some(display_title(&task.title, cx)), appears_transparent: true, traffic_light_position: None }),
@@ -111,9 +136,20 @@ pub fn open(store: Rc<Store>, id: Id, cx: &mut App) {
         ..Default::default()
     };
     match cx.open_window(options, |window, cx| {
+        #[cfg(windows)]
+        let scale = window.scale_factor();
         let initial_bounds = if show { window.window_bounds().get_bounds() } else { bounds };
         let view = cx.new(|cx| StickyNote::new(store, note, initial_bounds, settings, window, cx));
-        if !show { window.activate_window(); }
+        if !show {
+            if activate {
+                window.activate_window();
+            } else {
+                #[cfg(windows)]
+                if let Some(hwnd) = win32_window_handle(window) {
+                    taskbar::show_inactive(hwnd, bounds, scale, cx);
+                }
+            }
+        }
         view
     }) {
         Ok(handle) => {
@@ -410,7 +446,6 @@ impl StickyNote {
         let task = self.store.task(id).ok().flatten().filter(|task| !task.is_deleted());
         self.detail.update(cx, |detail, cx| {
             detail.refresh(task, cx);
-            cx.notify();
         });
         self.update_title(window, cx);
     }
@@ -1151,7 +1186,7 @@ mod tests {
             let first = store.add_task("First").unwrap().id;
             let second = store.add_task("Second").unwrap().id;
             open(store.clone(), first, cx);
-            open(store.clone(), second, cx);
+            open(store, second, cx);
             let [first_handle, second_handle] = cx.global::<OpenNotes>().0[..] else { panic!("expected two notes") };
             second_handle.update(cx, |note, window, cx| {
                 note.color = Some(10);
@@ -1204,5 +1239,41 @@ mod tests {
             restore(store.clone(), cx);
             assert!(!sticky_windows::load(&store)[0].open, "deleted tasks must not reopen");
         });
+    }
+
+    #[gpui::test]
+    #[cfg(debug_assertions)]
+    fn external_notes_and_checklist_changes_sync_into_open_note_editors(cx: &mut TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let task = store.add_task("Sync fields").unwrap();
+        store.set_notes(task.id, "Initial notes").unwrap();
+        let item = store.add_checklist_item(task.id, "Initial item", None).unwrap();
+        cx.update(|cx| {
+            theme::init(cx);
+            assert!(crate::keymap::load_default(&assets::Assets, cx).unwrap().is_empty());
+        });
+        let (note, cx) = cx.add_window_view(|window, cx| new_note(store.clone(), task.id, window, cx));
+        cx.simulate_resize(size(px(360.), px(600.)));
+
+        store.set_notes(task.id, "Updated elsewhere").unwrap();
+        store.set_checklist_item_title(item.id, "Renamed elsewhere").unwrap();
+        store.add_comment(task.id, "External comment").unwrap();
+        let other = cx.update(|_, cx| cx.new(|_| ()).entity_id());
+        cx.update(|_, cx| data_changed(other, cx));
+        cx.run_until_parked();
+
+        // Clicking into notes and typing appends to the updated text instead of overwriting it.
+        let preview = cx.debug_bounds("task-notes-preview").unwrap().center();
+        cx.simulate_click(preview, Modifiers::default());
+        cx.simulate_input("!");
+        assert_eq!(store.task(task.id).unwrap().unwrap().notes, "Updated elsewhere!");
+
+        // Clicking into the checklist row and typing appends to the renamed item title.
+        let selector: &'static str = format!("checklist-item-{}", item.id).leak();
+        let row = cx.debug_bounds(selector).unwrap().center();
+        cx.simulate_click(row, Modifiers::default());
+        cx.simulate_input("?");
+        assert_eq!(store.checklist(task.id).unwrap()[0].title, "Renamed elsewhere?");
+        let _ = note;
     }
 }

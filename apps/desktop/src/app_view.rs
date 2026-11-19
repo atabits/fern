@@ -100,7 +100,7 @@ impl AppView {
                 return;
             }
             this.todo.update(cx, |todo, cx| {
-                todo.set_view(fern_core::View::All, cx);
+                todo.open_task_in_all(id, cx);
                 todo.start_detail(id, what, window, cx);
             });
         })
@@ -725,8 +725,7 @@ impl AppView {
     pub fn open_task(&mut self, task: fern_core::Id, window: &mut Window, cx: &mut Context<Self>) {
         if self.select(Section::Tasks, window, cx) {
             self.todo.update(cx, |todo, cx| {
-                todo.set_view(fern_core::View::All, cx);
-                todo.select(task, cx);
+                todo.open_task_in_all(task, cx);
             });
         }
     }

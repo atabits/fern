@@ -172,7 +172,17 @@ impl CalendarView {
                 cx.notify();
             }).detach();
         }
-        cx.subscribe(&detail, |this, _, _: &TaskUpdated, cx| this.card_updated(cx)).detach();
+        cx.subscribe(&detail, |this, _, _: &TaskUpdated, cx| {
+            crate::sticky_note::data_changed(cx.entity_id(), cx);
+            this.card_updated(cx);
+        })
+        .detach();
+        cx.observe_global::<crate::sticky_note::DataVersion>(|this, cx| {
+            if crate::sticky_note::changed_elsewhere(cx.entity_id(), cx) {
+                this.card_updated(cx);
+            }
+        })
+        .detach();
         cx.subscribe(&detail, |_, _, StartFocus(id, title, stopwatch), cx| cx.emit(StartFocus(*id, title.clone(), *stopwatch))).detach();
         // A subtask clicked in the card opens in the card.
         cx.subscribe(&detail, |this, _, crate::task_detail::OpenTask(id), cx| {
@@ -645,6 +655,23 @@ impl CalendarView {
         }
     }
 
+    fn toggle_task_completed(&mut self, id: Id, completed: bool, cx: &mut Context<Self>) {
+        let Some(task) = self.store.task(id).ok().flatten() else { return };
+        let result = if completed && !task.is_wont_do() {
+            crate::undo::complete(&self.store, &task).map(|_| ())
+        } else if task.is_wont_do() {
+            self.store.set_wont_do(id, false)
+        } else {
+            self.store.set_completed(id, completed)
+        };
+        if let Err(err) = result {
+            eprintln!("failed to toggle calendar task: {err:#}");
+            return;
+        }
+        crate::sticky_note::data_changed(cx.entity_id(), cx);
+        self.card_updated(cx);
+    }
+
     /// The card's task changed: the calendar shows the change, and the card closes when the task
     /// is gone.
     fn card_updated(&mut self, cx: &mut Context<Self>) {
@@ -753,7 +780,8 @@ impl CalendarView {
             if let Err(err) = result {
                 eprintln!("failed to change the task: {err:#}");
             }
-            self.reload(cx);
+            crate::sticky_note::data_changed(cx.entity_id(), cx);
+            self.card_updated(cx);
             return;
         }
         match action {
@@ -761,14 +789,15 @@ impl CalendarView {
             MenuAction::LinkParent => cx.emit(OpenTaskPicker(id, "link-parent")),
             MenuAction::Tags => cx.emit(OpenTaskPicker(id, "tags")),
             MenuAction::AddSubtask => cx.emit(OpenTaskPicker(id, "subtask")),
-            MenuAction::Focus(stopwatch) => cx.emit(crate::task_detail::StartFocus(id, task.title.clone(), stopwatch)),
+            MenuAction::Focus(stopwatch) => cx.emit(crate::task_detail::StartFocus(id, task.title, stopwatch)),
             MenuAction::CopyLink => cx.write_to_clipboard(gpui::ClipboardItem::new_string(fern_core::link::task_link(id))),
             MenuAction::StickyNote => crate::sticky_note::open(self.store.clone(), id, cx),
             MenuAction::Delete => {
                 if let Err(err) = self.store.delete_task(id) {
                     eprintln!("failed to delete the task: {err:#}");
                 }
-                self.reload(cx);
+                crate::sticky_note::data_changed(cx.entity_id(), cx);
+                self.card_updated(cx);
             }
             _ => {}
         }
@@ -1313,11 +1342,38 @@ impl CalendarView {
     fn task_bar(&self, task: &Task, day: Option<NaiveDate>, cx: &mut Context<Self>) -> Stateful<ui::HorizontalStack> {
         let theme = cx.theme().clone();
         let id = task.id;
-        // Keep closed titles muted; the checkbox distinguishes completed and dismissed tasks.
+        // Keep closed titles muted; the checkbox distinguishes completed and dismissed tasks, while notes show their page icon.
         let done = task.is_closed();
+        let completed = task.is_completed();
+        let wont_do = task.is_wont_do();
         let tint = self.task_tint(task, &theme);
         let modern = self.options.modern;
         let dragged = DraggedTask { id, title: task.title.clone().into() };
+        let marker = if task.kind == fern_core::Kind::Note {
+            Icon::new(IconName::FileText)
+                .size(IconSize::XSmall)
+                .color(if done { Color::Muted } else { Color::IconMuted })
+                .into_any_element()
+        } else {
+            div()
+                .debug_selector(move || format!("calendar-task-checkbox-{id}"))
+                .flex_none()
+                .flex()
+                .items_center()
+                .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .child(
+                    Checkbox::new(SharedString::from(format!("calendar-task-checkbox-{id}")))
+                        .size(px(12.))
+                        .toggle_state(completed)
+                        .dismissed(wont_do)
+                        .lines(task.checklist.is_some())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.toggle_task_completed(id, !completed && !wont_do, cx);
+                        })),
+                )
+                .into_any_element()
+        };
         h_flex()
             .id(SharedString::from(format!("calendar-task-{id}")))
             .debug_selector(|| format!("calendar-task-{id}"))
@@ -1336,12 +1392,7 @@ impl CalendarView {
             }))
             .when(modern, |el| el.border_l_2().border_color(tint))
             .hover(|s| s.bg(tint.opacity(0.4)))
-            .child(
-                Checkbox::new("calendar-task-checkbox")
-                    .size(px(12.))
-                    .toggle_state(task.is_completed())
-                    .dismissed(task.is_wont_do()),
-            )
+            .child(marker)
             .child(
                 Label::new(if task.title.trim().is_empty() { i18n::t(cx).untitled.to_owned() } else { task.title.clone() })
                     .size(LabelSize::XSmall)
@@ -2775,5 +2826,39 @@ mod tests {
             assert_eq!(view.card, Some((task.id, today)));
             assert!(view.tasks_on(today).iter().any(|task| !task.is_closed()));
         });
+    }
+
+    #[gpui::test]
+    #[cfg(debug_assertions)]
+    fn calendar_row_checkbox_toggles_completion_without_opening_card_and_notes_skip_checkbox(cx: &mut TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let today = Local::now().date_naive();
+        let task = store.add_task("Bar task").unwrap();
+        store.set_due(task.id, Some(today), None).unwrap();
+        store.add_checklist_item(task.id, "Step 1", None).unwrap();
+        let note = store.add_task("Calendar note").unwrap();
+        store.set_due(note.id, Some(today), None).unwrap();
+        store.set_kind(note.id, fern_core::Kind::Note).unwrap();
+        cx.update(|cx| {
+            theme::init(cx);
+            cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| CalendarView::new(store.clone(), window, cx));
+        let note_task: &'static str = format!("calendar-task-{}", note.id).leak();
+        let note_checkbox: &'static str = format!("calendar-task-checkbox-{}", note.id).leak();
+        assert!(cx.debug_bounds(note_task).is_some());
+        assert!(cx.debug_bounds(note_checkbox).is_none(), "notes render a page icon rather than a checkbox");
+
+        let box_selector: &'static str = format!("calendar-task-checkbox-{}", task.id).leak();
+        let modifiers = Modifiers::default();
+        let box_pos = cx.debug_bounds(box_selector).expect("task checkbox is rendered").center();
+        cx.simulate_mouse_move(box_pos, None, modifiers);
+        cx.simulate_click(box_pos, modifiers);
+        assert!(store.task(task.id).unwrap().unwrap().is_completed());
+        cx.update(|_, cx| assert_eq!(view.read(cx).card, None, "clicking the checkbox must not open the task card"));
+
+        let box_pos = cx.debug_bounds(box_selector).expect("completed task checkbox remains rendered").center();
+        cx.simulate_click(box_pos, modifiers);
+        assert!(!store.task(task.id).unwrap().unwrap().is_closed());
     }
 }

@@ -21,7 +21,7 @@ computer. Sync between your devices through your own `fern-server` is optional.
 |---|---|
 | 🍏 macOS (Apple Silicon) | [fern-{version}-macos-arm64.dmg](https://github.com/{repo}/releases/download/v{version}/fern-{version}-macos-arm64.dmg) |
 | 🍏 macOS (Intel) | [fern-{version}-macos-x86_64.dmg](https://github.com/{repo}/releases/download/v{version}/fern-{version}-macos-x86_64.dmg) |
-| 🪟 Windows (x86_64) | [Installer](https://github.com/{repo}/releases/download/v{version}/fern-{version}-windows-x86_64-setup.exe) · [portable ZIP](https://github.com/{repo}/releases/download/v{version}/fern-{version}-windows-x86_64.zip) |
+| 🪟 Windows (x86_64) | [Installer](https://github.com/{repo}/releases/download/v{version}/fern-{version}-windows-x86_64-setup.exe) · [standalone ZIP](https://github.com/{repo}/releases/download/v{version}/fern-{version}-windows-x86_64.zip) |
 | 🐧 Linux (x86_64) | [.deb](https://github.com/{repo}/releases/download/v{version}/fern-{version}-linux-x86_64.deb) · [AppImage](https://github.com/{repo}/releases/download/v{version}/fern-{version}-linux-x86_64.AppImage) · [tar.gz](https://github.com/{repo}/releases/download/v{version}/fern-{version}-linux-x86_64.tar.gz) |
 | 🐧 Linux (ARM64) | [.deb](https://github.com/{repo}/releases/download/v{version}/fern-{version}-linux-arm64.deb) · [AppImage](https://github.com/{repo}/releases/download/v{version}/fern-{version}-linux-arm64.AppImage) · [tar.gz](https://github.com/{repo}/releases/download/v{version}/fern-{version}-linux-arm64.tar.gz) |
 

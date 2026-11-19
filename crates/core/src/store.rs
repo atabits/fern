@@ -1461,10 +1461,10 @@ impl Store {
         let checklist: Vec<String> = self.checklist(task.id)?.into_iter().map(|item| item.title).collect();
         let template = crate::model::Template {
             id: Uuid::now_v7(),
-            title: task.title.clone(),
-            notes: task.notes.clone(),
+            title: task.title,
+            notes: task.notes,
             priority: task.priority,
-            tags: task.tags.clone(),
+            tags: task.tags,
             checklist,
         };
         self.conn.execute(

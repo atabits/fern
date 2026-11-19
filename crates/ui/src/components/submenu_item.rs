@@ -92,7 +92,7 @@ impl RenderOnce for SubmenuItem {
             .when_some(self.height, |item, height| item.height(height));
         let menu_selector = format!("submenu-content-{}", self.id);
         let menu = self.open.then(|| PopoverAttachment::new(self.placement, popover(cx)
-            .debug_selector(move || menu_selector.clone())
+            .debug_selector(move || menu_selector)
             .relative()
             .min_w(gpui::px(180.))
             .children(self.items)
@@ -102,7 +102,7 @@ impl RenderOnce for SubmenuItem {
             ))));
         div()
             .id(self.id)
-            .debug_selector(move || debug_selector.clone())
+            .debug_selector(move || debug_selector)
             .relative()
             .when_some(self.on_hover, |el, handler| el.on_hover(handler))
             .child(item)

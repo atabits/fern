@@ -487,7 +487,7 @@ impl CalendarView {
         let measure = canvas(
             move |bounds, _, cx| {
                 if previous_size != Some(bounds.size) {
-                    let view = view.clone();
+                    let view = view;
                     cx.defer(move |cx| {
                         view.update(cx, |this, cx| {
                             if this.year_size != Some(bounds.size) {

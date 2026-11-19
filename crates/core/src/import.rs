@@ -427,7 +427,7 @@ mod tests {
         assert_eq!(rent.reminders, [0]);
         assert_eq!(rent.priority, Priority::High);
         assert!(rent.repeat.is_some());
-        let mut tags = rent.tags.clone();
+        let mut tags = rent.tags;
         tags.sort();
         assert_eq!(tags, ["home", "money"]);
 

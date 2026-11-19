@@ -28,7 +28,6 @@ pub struct ThemeColors {
     /// Neutral default avatar tile on the narrow sidebar.
     pub avatar_background: Hsla,
     pub avatar_icon: Hsla,
-    pub title_bar_background: Hsla,
     pub lists_background: Background,
     pub lists_border: Hsla,
     pub list_text: Hsla,
@@ -187,7 +186,6 @@ impl Theme {
                 sidebar_icon_bottom,
                 avatar_background,
                 avatar_icon,
-                title_bar_background: title_bar,
                 lists_background: lists,
                 lists_border,
                 list_text: list_ink.opacity(if dark { 0.90 } else { 1. }),

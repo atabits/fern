@@ -262,7 +262,7 @@ impl TodoView {
             if self.view != View::Filter(filter.id) {
                 self.set_view(View::Filter(filter.id), cx);
             } else {
-                self.reload_inner(true, cx);
+                self.reload_inner(true, false, cx);
             }
         }
     }

@@ -903,10 +903,13 @@ impl Element for TextElement {
         let input = self.input.read(cx);
         let line_height = window.line_height();
         let (text, runs, is_placeholder) =
-            display_runs(input, window, theme.colors().text_placeholder, theme.colors().accent);
+            display_runs(input, window, theme.colors().text_placeholder, theme.colors().text_accent);
         let font_size = window.text_style().font_size.to_pixels(window.rem_size());
         let wrap_width = input.mode.wraps().then_some(text_width(bounds.size.width));
         let lines = shape(text, &runs, font_size, wrap_width, window);
+        if !input.mode.wraps() && let [line] = lines.as_slice() {
+            ui::align_icons_to_input(bounds, line, line_height, window, cx);
+        }
 
         let mut paragraphs = Vec::with_capacity(lines.len());
         let (mut start, mut top) = (0, px(0.));

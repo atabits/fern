@@ -160,7 +160,10 @@ fn main() -> Result<()> {
         eprintln!("failed to back up the data: {err:#}");
     }
 
-    gpui_platform::application().with_assets(Assets).run(move |cx: &mut App| {
+    let platform = gpui_platform::current_platform(false);
+    let text_system = platform.text_system();
+    gpui::Application::with_platform(platform).with_assets(Assets).run(move |cx: &mut App| {
+        ui::init_label_metrics(text_system, cx);
         theme::init(cx);
         cx.set_http_client(http::UreqHttpClient::new());
         if let Err(err) = Assets.load_fonts(cx) {

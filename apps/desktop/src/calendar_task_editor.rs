@@ -120,6 +120,9 @@ pub(super) fn month_picker(
         IconButton::new(id, icon)
             .size(px(24.))
             .icon_size(IconSize::Small)
+            .icon_color(colors.list_text_muted)
+            .hover_icon_color(colors.list_text)
+            .hover_color(colors.list_hover)
             .on_click(move |_, window, cx| shift(&delta, window, cx))
     };
     v_flex()
@@ -131,7 +134,7 @@ pub(super) fn month_picker(
                     div()
                         .flex_1()
                         .min_w_0()
-                        .child(Label::new(calendar::month_title(month, strings)).truncate()),
+                        .child(Label::new(calendar::month_title(month, strings)).color(colors.list_text).truncate()),
                 )
                 .child(arrow("calendar-picker-prev", IconName::ChevronLeft, -1))
                 .child(arrow("calendar-picker-next", IconName::ChevronRight, 1)),
@@ -142,20 +145,20 @@ pub(super) fn month_picker(
                     .flex_1()
                     .flex()
                     .justify_center()
-                    .child(Label::new(day).size(LabelSize::XSmall).color(Color::Muted))
+                    .child(Label::new(day).size(LabelSize::XSmall).color(colors.list_text_muted))
             }),
         ))
         .children(calendar::month_grid(month).chunks(7).map(|week| {
             h_flex().children(week.iter().map(|&date| {
                 let pick = pick.clone();
                 let color = if date == selected {
-                    Color::Custom(gpui::white())
+                    Color::OnAccent
                 } else if date == today {
                     Color::Accent
                 } else if date.month() != month.month() {
-                    Color::Muted
+                    Color::Custom(colors.list_text_muted)
                 } else {
-                    Color::Default
+                    Color::Custom(colors.list_text)
                 };
                 div().flex_1().flex().justify_center().child(
                     div()
@@ -168,10 +171,11 @@ pub(super) fn month_picker(
                         .cursor_pointer()
                         .when(date == selected, |el| el.bg(colors.accent))
                         .when(date != selected, |el| {
-                            el.hover(|style| style.bg(colors.element_hover))
+                            el.hover(|style| style.bg(colors.list_hover))
                         })
                         .child(
                             Label::new(date.day().to_string())
+                                .centered()
                                 .size(LabelSize::Small)
                                 .color(color),
                         )

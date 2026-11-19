@@ -557,7 +557,7 @@ impl SummaryView {
                                     .rounded(px(6.))
                                     .bg(colors.accent)
                                     .cursor_pointer()
-                                    .child(Label::new(strings.save).size(LabelSize::Small).color(Color::Custom(gpui::white())))
+                                    .child(Label::new(strings.save).size(LabelSize::Small).color(Color::OnAccent))
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         let name = input.read(cx).text().to_owned();
                                         this.save_template(name, cx);
@@ -829,7 +829,7 @@ impl SummaryView {
                                             .rounded(px(6.))
                                             .bg(colors.accent)
                                             .cursor_pointer()
-                                            .child(Label::new(strings.confirm).size(LabelSize::Small).color(Color::Custom(gpui::white())))
+                                            .child(Label::new(strings.confirm).size(LabelSize::Small).color(Color::OnAccent))
                                             .on_click(cx.listener(|this, _, _, cx| this.confirm_custom(cx))),
                                     ),
                             )

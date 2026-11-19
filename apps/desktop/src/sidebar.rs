@@ -112,7 +112,12 @@ pub fn render(
     let colors = cx.theme().colors();
     let strings = i18n::t(cx);
     let button = |id: &'static str, icon: IconName| {
-        IconButton::new(id, icon).size(px(36.)).icon_size(IconSize::XLarge)
+        IconButton::new(id, icon)
+            .size(px(36.))
+            .icon_size(IconSize::XLarge)
+            .icon_color(colors.sidebar_icon_bottom)
+            .hover_icon_color(colors.sidebar_icon_hover)
+            .hover_color(gpui::transparent_black())
     };
 
     v_flex()
@@ -125,22 +130,22 @@ pub fn render(
         .gap_1()
         .bg(colors.sidebar_background)
         .border_r_1()
-        .border_color(colors.border)
+        .border_color(colors.sidebar_border)
         .child(
             div()
                 .id("avatar")
                 .relative()
                 .flex_none()
                 .mb_3()
-                .size(px(30.))
-                .rounded_full()
-                .bg(colors.accent)
+                .size(px(32.))
+                .rounded(px(6.))
+                .bg(colors.avatar_background)
                 .flex()
                 .items_center()
                 .justify_center()
                 .cursor_pointer()
                 .on_click(on_avatar)
-                .child(Icon::new(IconName::User).color(Color::Default))
+                .child(Icon::new(IconName::User).color(colors.avatar_icon))
                 .children(account_menu),
         )
         // Scroll the section icons in a short window so the controls below stay reachable.
@@ -167,14 +172,22 @@ pub fn render(
                         .items_center()
                         .justify_center()
                         .cursor_pointer()
-                        .child(Icon::new(section.icon()).size(IconSize::Custom(px(24.))).color(if section == active { Color::Default } else { Color::Muted }))
+                        .child(Icon::new(section.icon()).size(IconSize::Custom(px(24.))).color(
+                            if section == active {
+                                colors.sidebar_icon
+                            } else if hovered == Some(section) {
+                                colors.sidebar_icon_hover
+                            } else {
+                                colors.sidebar_icon_muted
+                            },
+                        ))
                         .on_click(move |_, window, cx| on_select(section, window, cx))
                         .when(hovered == Some(section), |el| el.child(side_tooltip(section.title(strings), cx)))
                 })),
         )
         .children(sync.map(|sync| {
             button("sync", IconName::RefreshCw)
-                .when(sync.failed, |b| b.icon_color(Color::Error))
+                .when(sync.failed, |b| b.icon_color(Color::Error).hover_icon_color(Color::Error))
                 .tooltip(Tooltip::text(sync.tooltip))
                 .on_click(sync.on_click)
         }))

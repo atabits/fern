@@ -138,7 +138,7 @@ fn changes<'a>(body: &'a str, version: &str) -> &'a str {
     body
 }
 
-pub fn action_button(id: &'static str, cx: &App) -> Stateful<Div> {
+pub fn action_button(id: &'static str, cx: &App) -> Stateful<ui::HorizontalStack> {
     let colors = cx.theme().colors();
     h_flex()
         .id(id)

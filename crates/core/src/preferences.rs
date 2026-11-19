@@ -11,9 +11,9 @@ use crate::store::Store;
 /// The color theme: fixed, or following the system's dark mode.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ThemeMode {
-    #[default]
     Dark,
     Light,
+    #[default]
     System,
 }
 
@@ -31,6 +31,22 @@ impl ThemeMode {
     pub fn from_code(code: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|mode| mode.code() == code)
     }
+
+    pub fn is_dark(self, system_dark: bool) -> bool {
+        match self {
+            Self::Dark => true,
+            Self::Light => false,
+            Self::System => system_dark,
+        }
+    }
+}
+
+/// The rendering layer resolves the stored preset IDs against its bundled catalog.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ThemeSelection {
+    pub mode: ThemeMode,
+    pub light: Option<String>,
+    pub dark: Option<String>,
 }
 
 /// An entry of the lists column that Settings → Smart List can show or hide.
@@ -227,7 +243,7 @@ pub const WEEK_STARTS: [Weekday; 3] = [Weekday::Mon, Weekday::Sun, Weekday::Sat]
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Preferences {
-    pub theme: ThemeMode,
+    pub theme: ThemeSelection,
     pub week_start: Weekday,
     /// Settings → Time Format: 12-hour ("1:00 PM") instead of 24-hour ("13:00").
     pub hour12: bool,
@@ -276,7 +292,7 @@ impl Preferences {
 impl Default for Preferences {
     fn default() -> Self {
         Self {
-            theme: ThemeMode::default(),
+            theme: ThemeSelection::default(),
             week_start: Weekday::Mon,
             hour12: false,
             date_format: None,
@@ -296,6 +312,8 @@ impl Default for Preferences {
 }
 
 const THEME: &str = "theme";
+const LIGHT_THEME: &str = "theme.light";
+const DARK_THEME: &str = "theme.dark";
 const WEEK_START: &str = "week_start";
 const TIME_FORMAT: &str = "time_format";
 const DATE_FORMAT: &str = "date_format";
@@ -395,7 +413,11 @@ impl Store {
     /// The saved preferences; unknown values and a deleted default list fall back to defaults.
     pub fn preferences(&self) -> Result<Preferences> {
         let defaults = Preferences::default();
-        let theme = self.setting(THEME)?.and_then(|c| ThemeMode::from_code(&c)).unwrap_or(defaults.theme);
+        let theme = ThemeSelection {
+            mode: self.setting(THEME)?.and_then(|c| ThemeMode::from_code(&c)).unwrap_or_default(),
+            light: self.setting(LIGHT_THEME)?.filter(|s| !s.is_empty()),
+            dark: self.setting(DARK_THEME)?.filter(|s| !s.is_empty()),
+        };
         let week_start = self
             .setting(WEEK_START)?
             .and_then(|c| c.parse::<Weekday>().ok())
@@ -481,8 +503,28 @@ impl Store {
         Ok(preferences)
     }
 
+    pub fn save_theme_selection(&self, selection: &ThemeSelection) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?1, ?2), (?3, ?4), (?5, ?6)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [THEME, selection.mode.code(), LIGHT_THEME, selection.light.as_deref().unwrap_or(""),
+             DARK_THEME, selection.dark.as_deref().unwrap_or("")],
+        )?;
+        Ok(())
+    }
+
+    /// Edit the current preferences even when another view still has an older snapshot.
+    pub fn update_preferences(&self, change: impl FnOnce(&mut Preferences)) -> Result<Preferences> {
+        let tx = self.conn.unchecked_transaction()?;
+        let mut preferences = self.preferences()?;
+        change(&mut preferences);
+        self.save_preferences(&preferences)?;
+        tx.commit()?;
+        Ok(preferences)
+    }
+
     pub fn save_preferences(&self, preferences: &Preferences) -> Result<()> {
-        self.set_setting(THEME, preferences.theme.code())?;
+        self.save_theme_selection(&preferences.theme)?;
         self.set_setting(WEEK_START, &preferences.week_start.to_string())?;
         self.set_setting(TIME_FORMAT, if preferences.hour12 { "12" } else { "24" })?;
         self.set_setting(DATE_FORMAT, preferences.date_format.map_or("", DateFormat::code))?;
@@ -534,12 +576,27 @@ mod tests {
     }
 
     #[test]
+    fn existing_theme_mode_and_new_palettes_survive_unrelated_settings_edits() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        store.set_setting(THEME, "light")?;
+        let mut selection = store.preferences()?.theme;
+        assert_eq!(selection, ThemeSelection { mode: ThemeMode::Light, ..Default::default() });
+        selection.light = Some("turquoise".into());
+        selection.dark = Some("darkpink".into());
+        selection.mode = ThemeMode::System;
+        store.save_theme_selection(&selection)?;
+        store.update_preferences(|p| p.detailed_input = true)?;
+        assert_eq!(store.preferences()?.theme, selection);
+        Ok(())
+    }
+
+    #[test]
     fn roundtrip() -> Result<()> {
         let store = Store::open_in_memory()?;
         let list = store.create_list("Work")?;
         let preferences =
             Preferences {
-            theme: ThemeMode::Light,
+            theme: ThemeSelection { mode: ThemeMode::System, light: Some("matcha".into()), dark: Some("darkgreen".into()) },
             week_start: Weekday::Sun,
             hour12: true,
             date_format: Some(DateFormat::YearMonthDay),

@@ -489,7 +489,7 @@ impl MatrixView {
                 .rounded(px(4.))
                 .cursor_pointer()
                 .bg(if on { theme.colors().accent } else { theme.colors().element_hover })
-                .child(Label::new(label).size(LabelSize::XSmall))
+                .child(Label::new(label).size(LabelSize::XSmall).when(on, |l| l.color(Color::OnAccent)))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     if let Some((_, rule)) = this.editing.as_mut() {
                         change(rule);
@@ -574,7 +574,7 @@ impl MatrixView {
                 .cursor_pointer()
                 .when(primary, |el| el.bg(theme.colors().accent))
                 .when(!primary, |el| el.border_1().border_color(theme.colors().border))
-                .child(Label::new(label).size(LabelSize::Small))
+                .child(Label::new(label).size(LabelSize::Small).when(primary, |label| label.color(Color::OnAccent)))
         };
         popover(cx)
             .w(px(420.))
@@ -732,7 +732,7 @@ impl MatrixView {
             .py_2()
             .gap_1()
             .rounded(px(8.))
-            .bg(theme.colors().panel_background)
+            .bg(theme.colors().matrix_background)
             .drag_over::<DraggedTask>(move |style, _, _, _| style.border_1().border_color(color))
             .on_drop(cx.listener(move |this, dragged: &DraggedTask, _, cx| this.drop_on(dragged.id, quadrant, cx)))
             .child(
@@ -760,9 +760,14 @@ impl MatrixView {
                         div()
                             .opacity(if crate::touch::active() { 1. } else { 0. })
                             .group_hover("quadrant-header", |s| s.opacity(1.))
-                            .child(IconButton::new("quadrant-add", IconName::Plus).size(px(22.)).icon_size(IconSize::Small).on_click(
-                                cx.listener(move |this, _, window, cx| this.start_add(quadrant, window, cx)),
-                            )),
+                            .child(
+                                IconButton::new("quadrant-add", IconName::Plus)
+                                    .size(px(22.))
+                                    .icon_size(IconSize::Small)
+                                    .icon_color(Color::Muted)
+                                    .hover_icon_color(Color::Icon)
+                                    .on_click(cx.listener(move |this, _, window, cx| this.start_add(quadrant, window, cx))),
+                            ),
                     )
                     // The original's "…" on a hovered header; its Edit opens "Edit Matrix".
                     .child(
@@ -770,14 +775,19 @@ impl MatrixView {
                             .relative()
                             .opacity(if self.menu == Some(quadrant) || crate::touch::active() { 1. } else { 0. })
                             .group_hover("quadrant-header", |s| s.opacity(1.))
-                            .child(IconButton::new("quadrant-more", IconName::Ellipsis).size(px(22.)).icon_size(IconSize::Small).on_click(
-                                cx.listener(move |this, _, window, cx| {
-                                    this.menu = if this.menu == Some(quadrant) { None } else { Some(quadrant) };
-                                    this.menu_row = None;
-                                    window.focus(&this.focus, cx);
-                                    cx.notify();
-                                }),
-                            ))
+                            .child(
+                                IconButton::new("quadrant-more", IconName::Ellipsis)
+                                    .size(px(22.))
+                                    .icon_size(IconSize::Small)
+                                    .icon_color(Color::Muted)
+                                    .hover_icon_color(Color::Icon)
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.menu = if this.menu == Some(quadrant) { None } else { Some(quadrant) };
+                                        this.menu_row = None;
+                                        window.focus(&this.focus, cx);
+                                        cx.notify();
+                                    })),
+                            )
                             .when(self.menu == Some(quadrant), |el| {
                                 el.child(PopoverAttachment::new(
                                     Placement::BelowRight,
@@ -790,7 +800,7 @@ impl MatrixView {
                                         }))
                                         .child(
                                             ListItem::new("quadrant-edit")
-                                                .start_slot(Icon::new(IconName::Pencil).color(Color::Muted))
+                                                .start_slot(Icon::new(IconName::Pencil).color(Color::Icon))
                                                 .child(Label::new(strings.edit))
                                                 .on_click(cx.listener(move |this, _, _, cx| this.start_edit(quadrant, cx))),
                                         )
@@ -873,7 +883,7 @@ impl Render for MatrixView {
                                         .child(
                                             ListItem::new("matrix-show-completed")
                                                 .height(px(34.))
-                                                .start_slot(Icon::new(IconName::SquareCheck).color(Color::Muted))
+                                                .start_slot(Icon::new(IconName::SquareCheck).color(Color::Icon))
                                                 .child(Label::new(if self.show_completed { strings.hide_completed } else { strings.show_completed }))
                                                 .on_click(cx.listener(|this, _, _, cx| {
                                                     this.header_menu = false;

@@ -601,8 +601,7 @@ impl TodoView {
                     self.add_date_month = Some(crate::calendar::month_start(Self::today()));
                 }
                 Some(("menu", "detailed-input")) => {
-                    self.preferences.detailed_input = true;
-                    self.store.save_preferences(&self.preferences).ok();
+                    self.save_preferences(|p| p.detailed_input = true, cx);
                     self.sync_input_placeholder(cx);
                 }
                 Some(("menu", "add-tags")) => {
@@ -1425,8 +1424,8 @@ impl TodoView {
                             .when(selected, |el| el.bg(theme.colors().accent))
                             .when(!selected && date == today, |el| el.bg(theme.colors().accent.opacity(0.18)))
                             .when(!selected, |el| el.hover(|s| s.bg(theme.colors().element_hover)))
-                            .child(Label::new(date.day().to_string()).size(LabelSize::Small).color(
-                                if selected || in_month { Color::Default } else { Color::Muted },
+                            .child(Label::new(date.day().to_string()).centered().size(LabelSize::Small).color(
+                                if selected { Color::OnAccent } else if in_month { Color::Default } else { Color::Muted },
                             ))
                             .on_click(cx.listener(pick(Some(date)))),
                     )
@@ -1445,7 +1444,7 @@ impl TodoView {
                 .cursor_pointer()
                 .when(primary, |el| el.bg(theme.colors().accent))
                 .when(!primary, |el| el.border_1().border_color(theme.colors().border))
-                .child(Label::new(label).size(LabelSize::Small))
+                .child(Label::new(label).size(LabelSize::Small).when(primary, |label| label.color(Color::OnAccent)))
         };
         popover(cx)
             .w(px(260.))
@@ -1496,7 +1495,7 @@ impl TodoView {
     fn render_add_range(
         &self,
         range: crate::due_picker::DueDraft,
-        tabs: gpui::Div,
+        tabs: impl IntoElement,
         strings: &'static Strings,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -1561,8 +1560,8 @@ impl TodoView {
                                         .cursor_pointer()
                                         .when(selected, |el| el.bg(theme.colors().accent))
                                         .when(!selected, |el| el.hover(|s| s.bg(theme.colors().element_hover)))
-                                        .child(Label::new(date.day().to_string()).size(LabelSize::Small).color(
-                                            if selected || date.month() == month.month() { Color::Default } else { Color::Muted },
+                                        .child(Label::new(date.day().to_string()).centered().size(LabelSize::Small).color(
+                                            if selected { Color::OnAccent } else if date.month() == month.month() { Color::Default } else { Color::Muted },
                                         ))
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             if let Some(range) = this.add_range.as_mut() {
@@ -1612,7 +1611,7 @@ impl TodoView {
                 .cursor_pointer()
                 .when(primary, |el| el.bg(theme.colors().accent))
                 .when(!primary, |el| el.border_1().border_color(theme.colors().border))
-                .child(Label::new(label).size(LabelSize::Small))
+                .child(Label::new(label).size(LabelSize::Small).when(primary, |label| label.color(Color::OnAccent)))
         };
         popover(cx)
             .w(px(260.))
@@ -1736,12 +1735,8 @@ impl TodoView {
                         .child(Label::new(label).size(LabelSize::Small)),
                 )
                 .on_click(cx.listener(move |this, _, _, cx| {
-                    this.preferences.detailed_input = value;
+                    this.save_preferences(|p| p.detailed_input = value, cx);
                     this.sync_input_placeholder(cx);
-                    if let Err(err) = this.store.save_preferences(&this.preferences) {
-                        eprintln!("failed to save the input box setting: {err:#}");
-                    }
-                    cx.notify();
                 }))
         };
         popover(cx)
@@ -1834,7 +1829,7 @@ impl TodoView {
                             .rounded(px(5.))
                             .cursor_pointer()
                             .bg(theme.colors().accent)
-                            .child(Label::new(strings.add).size(LabelSize::Small))
+                            .child(Label::new(strings.add).size(LabelSize::Small).color(Color::OnAccent))
                             .on_click(cx.listener(|this, _, window, cx| {
                                 let text = this.input.read(cx).text().to_owned();
                                 this.submit_new_task(&text, window, cx);
@@ -2024,7 +2019,7 @@ impl TodoView {
                 .cursor_pointer()
                 .when(primary, |el| el.bg(theme.colors().accent))
                 .when(!primary, |el| el.border_1().border_color(theme.colors().border))
-                .child(Label::new(label).size(LabelSize::Small))
+                .child(Label::new(label).size(LabelSize::Small).when(primary, |label| label.color(Color::OnAccent)))
         };
         popover(cx)
             .w(px(240.))
@@ -2818,9 +2813,10 @@ impl TodoView {
     }
 
     fn save_preferences(&mut self, change: impl FnOnce(&mut fern_core::Preferences), cx: &mut Context<Self>) {
-        change(&mut self.preferences);
-        let result = self.store.save_preferences(&self.preferences);
-        self.check(result);
+        let result = self.store.update_preferences(change);
+        if let Some(preferences) = self.check(result) {
+            self.preferences = preferences;
+        }
         cx.notify();
     }
 
@@ -2910,7 +2906,7 @@ impl TodoView {
                                 .rounded_full()
                                 .border_1()
                                 .border_color(if on { theme.colors().accent } else { theme.colors().border })
-                                .when(on, |el| el.bg(theme.colors().accent).flex().items_center().justify_center().child(Icon::new(IconName::Check).size(IconSize::XSmall).color(Color::Custom(gpui::white())))),
+                                .when(on, |el| el.bg(theme.colors().accent).flex().items_center().justify_center().child(Icon::new(IconName::Check).size(IconSize::XSmall).color(Color::IconOnAccent))),
                         )
                         .child(Label::new(label)),
                 )
@@ -3380,7 +3376,7 @@ impl TodoView {
                             .items_center()
                             .justify_center()
                             .when(weekend(date), |el| el.bg(theme.colors().element_hover.opacity(0.5)))
-                            .when(labelled || is_today, |el| el.child(Label::new(date.day().to_string()).weight(FontWeight::SEMIBOLD).color(color)))
+                            .when(labelled || is_today, |el| el.child(Label::new(date.day().to_string()).centered().weight(FontWeight::SEMIBOLD).color(color)))
                     })))
                     .child(IconButton::new("timeline-next", IconName::ChevronRight).size(px(20.)).icon_size(IconSize::XSmall).on_click(shift(step))),
             );
@@ -3486,13 +3482,11 @@ impl TodoView {
             let id = task.id;
             let color = tag_color(&task);
             let dragged = DraggedTask { id, title: task.title.clone().into() };
-            div()
+            h_flex()
                 .id(SharedString::from(format!("arrange-{id}")))
                 .ml(px(depth as f32 * 14.))
                 .h(px(22.))
                 .px_1p5()
-                .flex()
-                .items_center()
                 .rounded(px(3.))
                 .bg(color.opacity(0.7))
                 .cursor_grab()
@@ -3983,9 +3977,7 @@ impl TodoView {
                 }
             }
             (ListAction::ShowTags(visibility), _) => {
-                self.preferences.set_visibility(fern_core::SmartList::Tags, visibility);
-                let result = self.store.save_preferences(&self.preferences);
-                self.check(result);
+                self.save_preferences(|p| p.set_visibility(fern_core::SmartList::Tags, visibility), cx);
             }
             (ListAction::Edit, Some(ListMenuTarget::Folder(folder))) => return self.open_folder_dialog(Some(folder), window, cx),
             (ListAction::AddList, Some(ListMenuTarget::Folder(folder))) => return self.open_list_dialog(None, Some(folder), window, cx),
@@ -4031,7 +4023,7 @@ impl TodoView {
         let item = |id: &'static str, icon: IconName, label: &'static str, action: ListAction, cx: &mut Context<Self>| {
             ListItem::new(id)
                 .height(px(34.))
-                .start_slot(Icon::new(icon).color(if action == ListAction::Delete { Color::Error } else { Color::Muted }))
+                .start_slot(Icon::new(icon).color(if action == ListAction::Delete { Color::Error } else { Color::Icon }))
                 .child(Label::new(label).color(if action == ListAction::Delete { Color::Error } else { Color::Default }))
                 .on_click(cx.listener(move |this, _, window, cx| this.list_action(action, window, cx)))
                 .into_any_element()
@@ -4713,6 +4705,8 @@ impl TodoView {
                                     IconButton::new("restore-button", IconName::RotateCcw)
                                         .size(px(20.))
                                         .icon_size(IconSize::Small)
+                                        .icon_color(Color::Muted)
+                                        .hover_icon_color(Color::Icon)
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             cx.stop_propagation();
                                             this.restore(id, cx);
@@ -4722,9 +4716,11 @@ impl TodoView {
                     }),
             )
             // Keep the menu button inside the row, including in Trash and while editing.
-            .child(
+            .child({
+                let more_group = SharedString::from(format!("row-more-{id}"));
                 div()
                     .id("row-more")
+                    .group(more_group.clone())
                     .absolute()
                     .right(px(6.))
                     .top_0()
@@ -4735,7 +4731,12 @@ impl TodoView {
                     .justify_center()
                     .opacity(0.)
                     .group_hover(group.clone(), |s| s.opacity(1.))
-                    .child(Icon::new(IconName::Ellipsis).size(IconSize::XSmall).color(Color::Muted))
+                    .child(
+                        Icon::new(IconName::Ellipsis)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted)
+                            .group_hover_color(more_group, Color::Icon),
+                    )
                     .on_mouse_down(MouseButton::Left, cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
                         cx.stop_propagation();
                         window.focus(&this.list_focus, cx);
@@ -4743,12 +4744,14 @@ impl TodoView {
                         this.context_menu = Some((id, event.position));
                         this.context_side = None;
                         cx.notify();
-                    })),
-            )
+                    }))
+            })
             // And the drag handle left of a hovered row, as the original's.
             .when(draggable, |el| {
+                let drag_group = SharedString::from(format!("row-drag-{id}"));
                 el.child(
                     div()
+                        .group(drag_group.clone())
                         .absolute()
                         .left(px(-13.))
                         .top_0()
@@ -4757,7 +4760,12 @@ impl TodoView {
                         .items_center()
                         .opacity(0.)
                         .group_hover(group, |s| s.opacity(1.))
-                        .child(Icon::new(IconName::Menu).size(IconSize::XSmall).color(Color::Muted)),
+                        .child(
+                            Icon::new(IconName::Menu)
+                                .size(IconSize::XSmall)
+                                .color(Color::Muted)
+                                .group_hover_color(drag_group, Color::Icon),
+                        ),
                 )
             })
             .into_any_element()
@@ -5092,8 +5100,8 @@ impl TodoView {
                             .when(is_selected, |el| el.bg(theme.colors().accent))
                             .when(!is_selected, |el| el.hover(|s| s.bg(theme.colors().element_hover)))
                             .child(
-                                Label::new(date.day().to_string()).size(LabelSize::Small).color(if is_selected {
-                                    Color::Default
+                                Label::new(date.day().to_string()).centered().size(LabelSize::Small).color(if is_selected {
+                                    Color::OnAccent
                                 } else if date == today {
                                     Color::Accent
                                 } else if date.month() != month.month() {
@@ -5156,7 +5164,7 @@ impl TodoView {
                             .bg(theme.colors().accent)
                             .when(!ready, |el| el.opacity(0.5))
                             .when(ready, |el| el.cursor_pointer())
-                            .child(Label::new(strings.confirm).size(LabelSize::Small))
+                            .child(Label::new(strings.confirm).size(LabelSize::Small).color(Color::OnAccent))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 if let (Some(start), Some(end)) = (start, end) {
                                     this.closed_range = ClosedRange::custom(start, end);
@@ -5301,7 +5309,7 @@ impl TodoView {
                             .rounded(px(6.))
                             .bg(theme.colors().accent)
                             .cursor_pointer()
-                            .child(Label::new(strings.ok).size(LabelSize::Small))
+                            .child(Label::new(strings.ok).size(LabelSize::Small).color(Color::OnAccent))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 if let Some(ClosedMenu::Lists(draft)) = this.closed_menu.take() {
                                     this.closed_lists = draft;
@@ -5368,7 +5376,7 @@ impl TodoView {
             }, |el, filter| {
                 el.child(
                     ListItem::new("edit-filter")
-                        .start_slot(Icon::new(IconName::Pencil))
+                        .start_slot(Icon::new(IconName::Pencil).color(Color::Icon))
                         .child(Label::new(strings.edit_filter))
                         .on_click(cx.listener(move |this, _, window, cx| this.open_filter_edit(Some(filter.clone()), window, cx))),
                 )
@@ -5405,8 +5413,8 @@ impl TodoView {
                         .rounded(px(6.))
                         .cursor_pointer()
                         .when(on, |el| el.bg(theme.colors().element_selected))
-                        .hover(|s| s.bg(theme.colors().element_hover))
-                        .child(Icon::new(icon).color(if on { Color::Accent } else { Color::Muted }))
+                        .hover(|s| s.bg(theme.colors().ghost_element_hover))
+                        .child(Icon::new(icon).color(if on { Color::Accent } else { Color::Icon }))
                 };
                 el.when(in_list, |el| el.child(div().my_1().child(Divider::horizontal())))
                     .child(div().px_2().pt_1().child(Label::new(strings.view_label).size(LabelSize::Small).color(Color::Muted)))
@@ -5423,7 +5431,7 @@ impl TodoView {
                     .when(timeline, |el| {
                         el.child(
                             ListItem::new("arrange-tasks")
-                                .start_slot(Icon::new(IconName::CalendarPlus).color(Color::Muted))
+                                .start_slot(Icon::new(IconName::CalendarPlus).color(Color::Icon))
                                 .child(Label::new(strings.arrange_tasks))
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.arrange_open = true;
@@ -5434,19 +5442,19 @@ impl TodoView {
                     })
                     .child(
                         ListItem::new("toggle-completed")
-                            .start_slot(Icon::new(IconName::SquareCheck).color(Color::Muted))
+                            .start_slot(Icon::new(IconName::SquareCheck).color(Color::Icon))
                             .child(Label::new(if completed { strings.hide_completed } else { strings.show_completed }))
                             .on_click(cx.listener(|this, _, _, cx| this.toggle_view_flag("show_completed", true, cx))),
                     )
                     .child(
                         ListItem::new("toggle-details")
-                            .start_slot(Icon::new(IconName::FileText).color(Color::Muted))
+                            .start_slot(Icon::new(IconName::FileText).color(Color::Icon))
                             .child(Label::new(if details { strings.hide_details } else { strings.show_details }))
                             .on_click(cx.listener(|this, _, _, cx| this.toggle_view_flag("show_details", false, cx))),
                     )
                     .child(
                         ListItem::new("view-options")
-                            .start_slot(Icon::new(IconName::Settings2).color(Color::Muted))
+                            .start_slot(Icon::new(IconName::Settings2).color(Color::Icon))
                             .child(Label::new(strings.view_options))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.header_menu_open = false;
@@ -5458,7 +5466,7 @@ impl TodoView {
                     .when(self.section_owner().is_some(), |el| {
                         el.child(
                             ListItem::new("add-section")
-                                .start_slot(Icon::new(IconName::Plus).color(Color::Muted))
+                                .start_slot(Icon::new(IconName::Plus).color(Color::Icon))
                                 .child(Label::new(strings.add_section))
                                 .on_click(cx.listener(|this, _, window, cx| this.start_new_section(window, cx))),
                         )
@@ -5466,14 +5474,14 @@ impl TodoView {
                     .when(in_list || self.view == View::Inbox, |el| {
                         el.child(
                             ListItem::new("list-activities")
-                                .start_slot(Icon::new(IconName::ListTree).color(Color::Muted))
+                                .start_slot(Icon::new(IconName::ListTree).color(Color::Icon))
                                 .child(Label::new(strings.list_activities))
                                 .on_click(cx.listener(|this, _, _, cx| this.open_list_activity(cx))),
                         )
                     })
                     .child(
                         ListItem::new("print-list")
-                            .start_slot(Icon::new(IconName::Printer).color(Color::Muted))
+                            .start_slot(Icon::new(IconName::Printer).color(Color::Icon))
                             .child(Label::new(strings.print))
                             .on_click(cx.listener(|this, _, _, cx| this.print_list(cx))),
                     )
@@ -5766,6 +5774,7 @@ impl Render for TodoView {
                                 IconButton::new("add-options", IconName::ChevronDown)
                                     .size(px(24.))
                                     .icon_size(IconSize::Small)
+                                    .icon_color(Color::Muted)
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.add_menu_open = !this.add_menu_open;
                                         this.add_list_side = false;

@@ -37,6 +37,6 @@ impl RenderOnce for Switch {
             .flex()
             .when(self.on, |el| el.justify_end().bg(colors.accent))
             .when(!self.on, |el| el.bg(colors.element_hover))
-            .child(div().size(px(14.)).rounded_full().bg(gpui::white()))
+            .child(div().size(px(14.)).rounded_full().bg(if self.on { colors.icon_on_accent } else { gpui::white() }))
     }
 }

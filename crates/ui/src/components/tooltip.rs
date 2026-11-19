@@ -40,15 +40,15 @@ pub enum TipSide {
 /// A tooltip centered over or under its element while it is hovered, as the original's buttons
 /// show theirs (GPUI's own tooltips follow the pointer). `key` must be unique among the view's
 /// elements; `el` must have room to be `relative()`.
-pub fn with_tip(
-    el: gpui::Stateful<gpui::Div>,
+pub fn with_tip<E: gpui::StatefulInteractiveElement + Styled + ParentElement + IntoElement>(
+    el: E,
     key: impl Into<gpui::ElementId>,
     text: impl Into<SharedString>,
     side: TipSide,
     window: &mut Window,
     cx: &mut App,
-) -> gpui::Stateful<gpui::Div> {
-    use gpui::{StatefulInteractiveElement as _, prelude::FluentBuilder as _};
+) -> E {
+    use gpui::prelude::FluentBuilder as _;
     let hovered = window.use_keyed_state(key, cx, |_, _| false);
     let shown = *hovered.read(cx);
     let colors = cx.theme().colors();

@@ -104,7 +104,7 @@ pub fn render<V: 'static>(
         dated.then_some((IconName::CalendarX, strings.clear, MenuAction::ClearDate)),
     ];
     let date_row = h_flex().px_1().justify_between().children(dates.into_iter().flatten().enumerate().map(|(i, (icon, tip, action))| {
-        icon_button(SharedString::from(format!("task-menu-date-{i}")), icon, Color::Muted, false)
+        icon_button(SharedString::from(format!("task-menu-date-{i}")), icon, Color::Icon, false)
             .tooltip(ui::Tooltip::text(tip))
             .on_click(on_click(&act, action, cx))
     }));
@@ -121,7 +121,7 @@ pub fn render<V: 'static>(
         }
     };
     let item = |key: &'static str, icon: IconName, label: &'static str, action: MenuAction, cx: &mut Context<V>| {
-        let el = ListItem::new(key).height(px(34.)).start_slot(Icon::new(icon).color(Color::Muted)).child(Label::new(label)).on_click(on_click(&act, action, cx));
+        let el = ListItem::new(key).height(px(34.)).start_slot(Icon::new(icon).color(Color::Icon)).child(Label::new(label)).on_click(on_click(&act, action, cx));
         closes_side(key, el.into_any_element(), cx)
     };
     let pinned = task.pinned_at.is_some();

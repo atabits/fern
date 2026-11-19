@@ -26,7 +26,7 @@ pub type OnAction<V> = Rc<dyn Fn(&mut V, ToolbarAction, &mut Window, &mut Contex
 /// The toolbar row. `id` keeps two toolbars' buttons apart; `attach` makes it the description's:
 /// 19 px buttons close together, to fit the details' width in one row, and the paperclip at the end, as the
 /// original's.
-pub fn render<V: 'static>(id: &'static str, headings_open: bool, attach: bool, cx: &mut Context<V>, on_action: OnAction<V>) -> Div {
+pub fn render<V: 'static>(id: &'static str, headings_open: bool, attach: bool, cx: &mut Context<V>, on_action: OnAction<V>) -> ui::HorizontalStack {
     let size = if attach { px(19.) } else { px(28.) };
     let strings = i18n::t(cx);
     let colors = cx.theme().colors().clone();

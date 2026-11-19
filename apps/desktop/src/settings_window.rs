@@ -5,9 +5,8 @@ use std::rc::Rc;
 
 use chrono::Datelike as _;
 use fern_core::reminder::{ALL_DAY_OFFSETS, TIMED_OFFSETS};
-use fern_core::{DURATIONS, DefaultDate, Priority, format_minutes, DateFormat, Preferences, SmartList, Store, ThemeMode, Visibility, WEEK_STARTS};
-use gpui::{Entity, EventEmitter, FocusHandle, Focusable, FontWeight, ScrollHandle, WindowAppearance, point};
-use theme::Theme;
+use fern_core::{DURATIONS, DefaultDate, Priority, format_minutes, DateFormat, Preferences, SmartList, Store, Visibility, WEEK_STARTS};
+use gpui::{Entity, EventEmitter, FocusHandle, Focusable, FontWeight, ScrollHandle, point};
 use ui::prelude::*;
 use ui::{Placement, PopoverAttachment, popover};
 
@@ -16,6 +15,8 @@ use crate::calendar;
 use crate::i18n::{self, CurrentLocale, Locale};
 use crate::release_notes::{self, ReleaseNotes, action_button};
 use crate::subscriptions::{ChinaHolidaySource, ChinaHolidayStatus};
+#[path = "appearance_view.rs"]
+mod appearance_view;
 #[path = "sticky_settings_view.rs"]
 mod sticky_settings_view;
 
@@ -105,15 +106,7 @@ impl Focusable for SettingsWindow {
 
 /// Installs the theme and the first day of the week from `preferences`.
 pub fn apply(preferences: &Preferences, window: &Window, cx: &mut App) {
-    let dark = match preferences.theme {
-        ThemeMode::Dark => true,
-        ThemeMode::Light => false,
-        ThemeMode::System => matches!(window.appearance(), WindowAppearance::Dark | WindowAppearance::VibrantDark),
-    };
-    let theme = if dark { Theme::dark() } else { Theme::light() };
-    if theme.name != cx.theme().name {
-        theme::set(theme, cx);
-    }
+    appearance_view::apply_theme(&preferences.theme, window, cx);
     calendar::set_week_start(preferences.week_start);
     calendar::set_hour12(preferences.hour12);
     calendar::set_date_format(preferences.date_format);
@@ -204,12 +197,17 @@ impl SettingsWindow {
     }
 
     fn update(&mut self, window: &mut Window, cx: &mut Context<Self>, change: impl FnOnce(&mut Preferences)) {
-        change(&mut self.preferences);
         self.menu = None;
-        if let Err(err) = self.store.save_preferences(&self.preferences) {
-            eprintln!("failed to save the settings: {err:#}");
+        match self.store.update_preferences(change) {
+            Ok(preferences) => {
+                self.preferences = preferences;
+                apply(&self.preferences, window, cx);
+            }
+            Err(err) => {
+                eprintln!("failed to save the settings: {err:#}");
+                cx.notify();
+            }
         }
-        apply(&self.preferences, window, cx);
     }
 
     /// "Generate Backup": all data in one file, saved where the user chooses.
@@ -436,7 +434,7 @@ impl SettingsWindow {
             ListItem::new(id)
                 .height(px(37.))
                 .toggle_state(selected)
-                .start_slot(Icon::new(icon))
+                .start_slot(Icon::new(icon).color(Color::Icon))
                 .child(Label::new(label).truncate())
         };
         let page = |id, icon, index: usize, target: Page| {
@@ -939,7 +937,7 @@ impl SettingsWindow {
         page
     }
 
-    fn render_page(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+    fn render_page(&self, cx: &mut Context<Self>) -> AnyElement {
         let strings = i18n::t(cx);
         let colors = cx.theme().colors().clone();
         let group = || v_flex().py_1p5().rounded(px(8.)).bg(colors.surface_background);
@@ -1066,89 +1064,7 @@ impl SettingsWindow {
                 )
                 .into_any_element()
             }
-            Page::Appearance => {
-                let mode = self.preferences.theme;
-                let follow = mode == ThemeMode::System;
-                let dark_now = !cx.theme().is_light();
-                let swatch = |id: &'static str, label: &'static str, dark: bool| {
-                    let selected = dark == dark_now;
-                    let (fill, dots) = if dark { (Theme::dark(), true) } else { (Theme::light(), false) };
-                    v_flex()
-                        .id(id)
-                        .items_center()
-                        .gap_1p5()
-                        .cursor_pointer()
-                        .child(
-                            div()
-                                .relative()
-                                .size(px(48.))
-                                .rounded(px(8.))
-                                .border_1()
-                                .border_color(colors.border)
-                                .bg(fill.colors().background)
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .when(dots, |el| {
-                                    el.child(h_flex().gap(px(3.)).children((0..3).map(|_| {
-                                        div().size(px(5.)).rounded_full().bg(colors.accent)
-                                    })))
-                                })
-                                .when(selected, |el| {
-                                    el.child(
-                                        div()
-                                            .absolute()
-                                            .right(px(-5.))
-                                            .bottom(px(-5.))
-                                            .size(px(16.))
-                                            .rounded_full()
-                                            .bg(colors.accent)
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .child(Icon::new(IconName::Check).size(IconSize::XSmall).color(Color::Custom(gpui::white()))),
-                                    )
-                                }),
-                        )
-                        .child(Label::new(label).size(LabelSize::Small).color(Color::Muted))
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.update(window, cx, |p| p.theme = if dark { ThemeMode::Dark } else { ThemeMode::Light })
-                        }))
-                };
-                let system_dark = matches!(window.appearance(), WindowAppearance::Dark | WindowAppearance::VibrantDark);
-                body.child(
-                    group().child(
-                        h_flex()
-                            .id("follow-system")
-                            .h(px(ROW_HEIGHT))
-                            .px_4()
-                            .cursor_pointer()
-                            .child(div().flex_1().child(Label::new(strings.follow_system_dark_mode)))
-                            .child(Switch::new().toggle_state(follow))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.update(window, cx, |p| {
-                                    p.theme = match (follow, system_dark) {
-                                        (false, _) => ThemeMode::System,
-                                        (true, true) => ThemeMode::Dark,
-                                        (true, false) => ThemeMode::Light,
-                                    }
-                                })
-                            })),
-                    ),
-                )
-                .child(
-                    v_flex()
-                        .gap_3()
-                        .child(Label::new(strings.color_series).weight(FontWeight::SEMIBOLD))
-                        .child(
-                            h_flex()
-                                .gap_4()
-                                .child(swatch("theme-light", strings.theme_names[0], false))
-                                .child(swatch("theme-dark", strings.theme_names[1], true)),
-                        ),
-                )
-                .into_any_element()
-            }
+            Page::Appearance => body.child(self.render_appearance(cx)).into_any_element(),
             Page::More => {
                 let current = i18n::locale(cx);
                 let languages = Locale::available()
@@ -1570,13 +1486,13 @@ impl SettingsWindow {
 }
 
 impl Render for SettingsWindow {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors().clone();
         let notes_open = self.release_notes.is_some();
         let about = i18n::t(cx).settings_pages[5];
         let page = match &self.release_notes {
             Some(notes) => self.render_release_notes(notes, cx),
-            None => self.render_page(window, cx),
+            None => self.render_page(cx),
         };
         h_flex()
             .id("settings-window")
@@ -1593,7 +1509,7 @@ impl Render for SettingsWindow {
                 }
             }))
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
-                if this.page == Page::About && event.keystroke.key == "tab" {
+                if matches!(this.page, Page::About | Page::Appearance) && event.keystroke.key == "tab" {
                     if event.keystroke.modifiers.shift {
                         window.focus_prev(cx);
                     } else {
@@ -1638,6 +1554,7 @@ impl Render for SettingsWindow {
                                     .on_click(cx.listener(|this, _, window, cx| this.back_to_about(window, cx))),
                             ))
                             .child(IconButton::new("close-settings", IconName::X)
+                                .icon_color(Color::Muted)
                                 .on_click(cx.listener(|_, _, _, cx| cx.emit(SettingsEvent::Dismissed)))),
                     )
                     .child(page),
@@ -1683,7 +1600,7 @@ fn form_button(id: &'static str, label: &'static str, primary: bool, colors: &th
         .cursor_pointer()
         .when(primary, |el| el.bg(colors.accent))
         .when(!primary, |el| el.border_1().border_color(colors.border))
-        .child(Label::new(label).size(LabelSize::Small))
+        .child(Label::new(label).size(LabelSize::Small).when(primary, |label| label.color(Color::OnAccent)))
 }
 
 #[cfg(all(test, debug_assertions))]
@@ -1701,7 +1618,7 @@ mod tests {
         });
         cx.simulate_resize(gpui::size(px(900.), px(720.)));
 
-        for theme in [Theme::light(), Theme::dark()] {
+        for theme in [theme::Theme::light(), theme::Theme::dark()] {
             let surface = theme.colors().surface_background;
             cx.update(|_, cx| {
                 theme::set(theme, cx);

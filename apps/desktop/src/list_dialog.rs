@@ -334,7 +334,7 @@ impl ListDialog {
                 h_flex()
                     .gap_1()
                     .child(Icon::new(IconName::Menu).size(IconSize::XSmall).color(Color::Muted))
-                    .child(div().text_size(px(9.)).font_weight(FontWeight::MEDIUM).child(name)),
+                    .child(div().text_size(px(9.)).font_weight(FontWeight::MEDIUM).child(ui::LabelText::new(name))),
             )
             .child(body)
             .into_any_element()
@@ -488,7 +488,7 @@ impl Render for ListDialog {
                 .justify_center()
                 .rounded(px(6.))
                 .cursor_pointer()
-                .when(primary, |el| el.bg(theme.colors().accent).child(Label::new(label).color(Color::Custom(gpui::white()))))
+                .when(primary, |el| el.bg(theme.colors().accent).child(Label::new(label).color(Color::OnAccent)))
                 .when(!primary, |el| el.border_1().border_color(theme.colors().border).child(Label::new(label)))
         };
         let icon_cell = div()
@@ -673,7 +673,7 @@ impl Render for FolderDialog {
                 .cursor_pointer()
                 .when(primary, |el| {
                     el.bg(theme.colors().accent.opacity(if empty { 0.5 } else { 1. }))
-                        .child(Label::new(label).color(Color::Custom(gpui::white())))
+                        .child(Label::new(label).color(Color::OnAccent))
                 })
                 .when(!primary, |el| el.border_1().border_color(theme.colors().border).child(Label::new(label)))
         };

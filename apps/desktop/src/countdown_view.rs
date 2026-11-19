@@ -280,7 +280,7 @@ fn badge(countdown: &Countdown, color: gpui::Hsla, cx: &App) -> gpui::Div {
 /// The parts of a countdown card: its color, the "1M 1D" numbers and "Days until …".
 struct Face {
     color: gpui::Hsla,
-    numbers: gpui::Div,
+    numbers: ui::HorizontalStack,
     subtitle: String,
 }
 
@@ -749,14 +749,14 @@ impl CountdownView {
                                 }))
                                 .child(
                                     ListItem::new("countdown-edit")
-                                        .start_slot(Icon::new(IconName::Pencil).color(Color::Muted))
+                                        .start_slot(Icon::new(IconName::Pencil).color(Color::Icon))
                                         .child(Label::new(strings.edit))
                                         .on_click(cx.listener(move |this, _, window, cx| this.start_edit(id, window, cx))),
                                 )
                                 .child({
                                     let archived = countdown.archived;
                                     ListItem::new("countdown-archive")
-                                        .start_slot(Icon::new(if archived { IconName::ArchiveRestore } else { IconName::Archive }).color(Color::Muted))
+                                        .start_slot(Icon::new(if archived { IconName::ArchiveRestore } else { IconName::Archive }).color(Color::Icon))
                                         .child(Label::new(if archived { strings.habit_unarchive } else { strings.habit_archive }))
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             this.card_menu = None;
@@ -768,7 +768,7 @@ impl CountdownView {
                                 })
                                 .child(
                                     ListItem::new("countdown-delete")
-                                        .start_slot(Icon::new(IconName::Trash).color(Color::Muted))
+                                        .start_slot(Icon::new(IconName::Trash).color(Color::Icon))
                                         .child(Label::new(strings.delete))
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             this.card_menu = None;
@@ -1041,7 +1041,7 @@ impl CountdownView {
                     .cursor_pointer()
                     .when(primary, |el| el.bg(theme.colors().accent))
                     .when(!primary, |el| el.border_1().border_color(theme.colors().border))
-                    .child(Label::new(label).size(LabelSize::Small))
+                    .child(Label::new(label).size(LabelSize::Small).when(primary, |label| label.color(Color::OnAccent)))
             };
             v_flex()
                 .gap_2()
@@ -1143,7 +1143,7 @@ impl CountdownView {
                         .rounded(px(6.))
                         .cursor_pointer()
                         .bg(theme.colors().accent)
-                        .child(Label::new(strings.ok).size(LabelSize::Small))
+                        .child(Label::new(strings.ok).size(LabelSize::Small).color(Color::OnAccent))
                         .on_click(set(Box::new(|d| d.open = None))),
                 ),
             )
@@ -1348,7 +1348,7 @@ impl CountdownView {
                 .cursor_pointer()
                 .when(primary, |el| el.bg(theme.colors().accent))
                 .when(!primary, |el| el.border_1().border_color(theme.colors().border))
-                .child(Label::new(label).size(LabelSize::Small))
+                .child(Label::new(label).size(LabelSize::Small).when(primary, |label| label.color(Color::OnAccent)))
         };
         let show_age = draft.show_age;
         let presets = (open == Some(DraftRow::Presets)).then(|| {

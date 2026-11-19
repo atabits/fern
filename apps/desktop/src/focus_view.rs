@@ -764,7 +764,7 @@ impl FocusView {
                 .cursor_pointer()
                 .when(primary, |el| el.bg(theme.colors().accent))
                 .when(!primary, |el| el.border_1().border_color(theme.colors().border))
-                .child(Label::new(label).size(LabelSize::Small))
+                .child(Label::new(label).size(LabelSize::Small).when(primary, |label| label.color(Color::OnAccent)))
         };
         let fields = if which == 0 {
             v_flex().gap_2().child(field(first)).child(field(second))
@@ -1131,7 +1131,7 @@ impl FocusView {
                 .cursor_pointer()
                 .when(primary, |el| el.bg(theme.colors().accent))
                 .when(!primary, |el| el.border_1().border_color(theme.colors().border))
-                .child(Label::new(label).size(LabelSize::Small))
+                .child(Label::new(label).size(LabelSize::Small).when(primary, |label| label.color(Color::OnAccent)))
         };
         let close = cx.listener(|this, _, _, cx| {
             this.timer_draft = None;
@@ -1323,7 +1323,7 @@ impl FocusView {
                                             .justify_center()
                                             .rounded_full()
                                             .bg(theme.colors().accent)
-                                            .child(Icon::new(IconName::Check).size(IconSize::XSmall).color(Color::Default)),
+                                            .child(Icon::new(IconName::Check).size(IconSize::XSmall).color(Color::IconOnAccent)),
                                     )
                                 }),
                         )
@@ -1363,7 +1363,7 @@ impl FocusView {
                 .cursor_pointer()
                 .when(primary, |el| el.bg(theme.colors().accent))
                 .when(!primary, |el| el.border_1().border_color(theme.colors().border))
-                .child(Label::new(label).size(LabelSize::Small))
+                .child(Label::new(label).size(LabelSize::Small).when(primary, |label| label.color(Color::OnAccent)))
         };
         popover(cx)
             .w(px(404.))
@@ -1594,7 +1594,7 @@ impl FocusView {
                             .rounded(px(6.))
                             .bg(theme.colors().accent)
                             .cursor_pointer()
-                            .child(Label::new(strings.save).size(LabelSize::Small))
+                            .child(Label::new(strings.save).size(LabelSize::Small).color(Color::OnAccent))
                             .on_click(cx.listener(|this, _, _, cx| this.add_record(cx))),
                     )
                     .into_any_element()
@@ -1670,7 +1670,7 @@ impl FocusView {
                 .flex_1()
                 .items_center()
                 .gap_0p5()
-                .child(h_flex().items_end().text_color(theme.colors().accent).font_weight(FontWeight::SEMIBOLD).children(parts.into_iter().map(|(n, unit)| {
+                .child(h_flex().items_end().text_color(theme.colors().text_accent).font_weight(FontWeight::SEMIBOLD).children(parts.into_iter().map(|(n, unit)| {
                     h_flex()
                         .items_end()
                         .child(div().text_size(px(26.)).line_height(px(32.)).child(n.to_string()))
@@ -1932,7 +1932,7 @@ impl FocusView {
                     .rounded(px(8.))
                     .bg(theme.colors().accent)
                     .cursor_pointer()
-                    .child(Label::new(strings.done))
+                    .child(Label::new(strings.done).color(Color::OnAccent))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.stats = None;
                         cx.emit(StatsClosed);
@@ -2193,7 +2193,7 @@ impl FocusView {
                 .min_w_0()
                 .items_center()
                 .gap_1()
-                .child(h_flex().items_end().text_color(theme.colors().accent).font_weight(FontWeight::SEMIBOLD).children(parts.into_iter().map(|(n, unit)| {
+                .child(h_flex().items_end().text_color(theme.colors().text_accent).font_weight(FontWeight::SEMIBOLD).children(parts.into_iter().map(|(n, unit)| {
                     h_flex()
                         .items_end()
                         .child(div().text_size(px(30.)).line_height(px(36.)).child(n.to_string()))
@@ -2452,7 +2452,7 @@ impl FocusView {
             v_flex()
                 .flex_1()
                 .items_center()
-                .child(div().text_size(px(26.)).font_weight(FontWeight::SEMIBOLD).text_color(theme.colors().accent).child(v))
+                .child(div().text_size(px(26.)).font_weight(FontWeight::SEMIBOLD).text_color(theme.colors().text_accent).child(v))
                 .child(Label::new(label).size(LabelSize::XSmall).color(Color::Muted))
                 .child(change_line(from.replace("{n}", &change), delta))
         };
@@ -3274,7 +3274,7 @@ impl FocusView {
                 .cursor_pointer()
                 .when(primary, |el| el.bg(theme.colors().accent))
                 .when(!primary, |el| el.border_1().border_color(theme.colors().border))
-                .child(Label::new(text))
+                .child(Label::new(text).when(primary, |label| label.color(Color::OnAccent)))
         };
         // The picked task, timer or habit names the session until it starts.
         let label: SharedString = match (&self.next, running) {

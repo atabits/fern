@@ -263,7 +263,7 @@ impl Render for FocusReview {
                 .child(div().id("focus-review-save").px_3().py_2().rounded(px(6.)).bg(colors.accent)
                     .when(can_save, |el| el.cursor_pointer())
                     .when(!can_save, |el| el.opacity(0.5))
-                    .child(Label::new(strings.save).color(Color::Custom(gpui::rgb(0xffffff).into())))
+                    .child(Label::new(strings.save).color(Color::OnAccent))
                     .when(can_save, |el| el.on_click(cx.listener(|this, _, window, cx| this.save(window, cx))))))
     }
 }

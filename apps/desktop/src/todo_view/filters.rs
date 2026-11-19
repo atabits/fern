@@ -392,7 +392,7 @@ impl TodoView {
                 .when(!primary, |el| {
                     el.border_1().border_color(theme.colors().border)
                 })
-                .child(Label::new(label).size(LabelSize::Small))
+                .child(Label::new(label).size(LabelSize::Small).when(primary, |label| label.color(Color::OnAccent)))
         };
         div()
             .absolute()

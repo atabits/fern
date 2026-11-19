@@ -16,6 +16,8 @@ pub struct ListItem {
     id: ElementId,
     height: Pixels,
     selected: bool,
+    hover_color: Option<gpui::Hsla>,
+    selected_color: Option<gpui::Hsla>,
     start_slot: Option<AnyElement>,
     end_slot: Option<AnyElement>,
     children: SmallVec<[AnyElement; 2]>,
@@ -28,6 +30,8 @@ impl ListItem {
             id: id.into(),
             height: px(32.),
             selected: false,
+            hover_color: None,
+            selected_color: None,
             start_slot: None,
             end_slot: None,
             children: SmallVec::new(),
@@ -41,6 +45,16 @@ impl ListItem {
 
     pub fn height(mut self, height: Pixels) -> Self {
         self.height = height;
+        self
+    }
+
+    pub fn hover_color(mut self, color: gpui::Hsla) -> Self {
+        self.hover_color = Some(color);
+        self
+    }
+
+    pub fn selected_color(mut self, color: gpui::Hsla) -> Self {
+        self.selected_color = Some(color);
         self
     }
 
@@ -78,18 +92,18 @@ impl Toggleable for ListItem {
 impl RenderOnce for ListItem {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let colors = cx.theme().colors();
-        div()
+        let hover_color = self.hover_color.unwrap_or(colors.ghost_element_hover);
+        let selected_color = self.selected_color.unwrap_or(colors.ghost_element_selected);
+        crate::h_flex()
             .id(self.id)
             .h(self.height)
             .flex_none()
-            .flex()
-            .items_center()
             .gap_2()
             .px_2()
             .rounded(px(6.))
             .cursor_pointer()
-            .when(self.selected, |el| el.bg(colors.ghost_element_selected))
-            .when(!self.selected, |el| el.hover(|style| style.bg(colors.ghost_element_hover)))
+            .when(self.selected, |el| el.bg(selected_color))
+            .when(!self.selected, |el| el.hover(|style| style.bg(hover_color)))
             .when_some(self.on_click, |el, handler| el.on_click(handler))
             .children(self.start_slot)
             .child(div().flex_1().min_w_0().overflow_hidden().flex().items_center().children(self.children))

@@ -1168,7 +1168,7 @@ impl TaskDetail {
         let submenu_bounds = Rc::new(Cell::new(None::<gpui::Bounds<Pixels>>));
         let outside_submenu = submenu_bounds.clone();
         let item = |id: &'static str, icon: IconName, label: &'static str| {
-            ListItem::new(id).height(px(34.)).start_slot(Icon::new(icon).color(Color::Muted)).child(Label::new(label))
+            ListItem::new(id).height(px(34.)).start_slot(Icon::new(icon).color(Color::Icon)).child(Label::new(label))
         };
         // The original's menu: 178 px wide (wider when a label needs it), a row every 34 px.
         popover(cx)
@@ -1421,7 +1421,7 @@ impl TaskDetail {
                 .cursor_pointer()
                 .when(primary, |el| el.bg(theme.colors().accent))
                 .when(!primary, |el| el.border_1().border_color(theme.colors().border))
-                .child(Label::new(label).size(LabelSize::Small).when(primary, |l| l.color(Color::Custom(gpui::white()))))
+                .child(Label::new(label).size(LabelSize::Small).when(primary, |l| l.color(Color::OnAccent)))
         };
         popover(cx)
             .debug_selector(|| "task-estimate-popup".into())
@@ -1777,9 +1777,9 @@ impl TaskDetail {
                                 .when(is_selected, |el| el.bg(theme.colors().accent))
                                 .when(!is_selected && is_today, |el| el.bg(theme.colors().accent.opacity(0.18)))
                                 .when(!is_selected, |el| el.hover(|s| s.bg(theme.colors().element_hover)))
-                                .child(Label::new(date.day().to_string()).size(LabelSize::Small).color(
+                                .child(Label::new(date.day().to_string()).centered().size(LabelSize::Small).color(
                                     if is_selected {
-                                        Color::Default
+                                        Color::OnAccent
                                     } else if is_today {
                                         Color::Accent
                                     } else if in_month {
@@ -1984,7 +1984,7 @@ impl TaskDetail {
                 .cursor_pointer()
                 .when(primary, |el| el.bg(theme.colors().accent))
                 .when(!primary, |el| el.border_1().border_color(theme.colors().border))
-                .child(Label::new(label).size(LabelSize::Small))
+                .child(Label::new(label).size(LabelSize::Small).when(primary, |label| label.color(Color::OnAccent)))
         };
 
         let quick_row = h_flex()
@@ -2153,7 +2153,7 @@ impl TaskDetail {
                 .cursor_pointer()
                 .when(primary, |el| el.bg(theme.colors().accent))
                 .when(!primary, |el| el.border_1().border_color(theme.colors().border))
-                .child(Label::new(label).size(LabelSize::Small))
+                .child(Label::new(label).size(LabelSize::Small).when(primary, |label| label.color(Color::OnAccent)))
         };
         v_flex()
             .gap_2()
@@ -2267,7 +2267,7 @@ impl TaskDetail {
                 .cursor_pointer()
                 .when(on, |el| el.bg(theme.colors().accent))
                 .when(!on, |el| el.hover(|s| s.bg(theme.colors().element_hover)))
-                .child(Label::new(strings.weekdays_narrow[i as usize]).size(LabelSize::XSmall))
+                .child(Label::new(strings.weekdays_narrow[i as usize]).size(LabelSize::XSmall).when(on, |l| l.color(Color::OnAccent)))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.update_draft(cx, |d| {
                         if let Some(DueMenu::Custom(rule)) = d.menu.as_mut() {
@@ -2288,16 +2288,14 @@ impl TaskDetail {
                 .cursor_pointer()
                 .when(primary, |el| el.bg(theme.colors().accent))
                 .when(!primary, |el| el.border_1().border_color(theme.colors().border))
-                .child(Label::new(label).size(LabelSize::Small))
+                .child(Label::new(label).size(LabelSize::Small).when(primary, |label| label.color(Color::OnAccent)))
         };
         // The original's "By Due Dates" / "By Completion Date"; counting from completion drops
         // the weekdays and days of the month, as there.
-        let mode = div()
+        let mode = h_flex()
             .id("repeat-mode")
             .h(px(26.))
             .px_2()
-            .flex()
-            .items_center()
             .justify_between()
             .rounded(px(5.))
             .border_1()
@@ -2446,8 +2444,8 @@ impl TaskDetail {
                         .rounded_full()
                         .when(picked, |el| el.bg(theme.colors().accent))
                         .when(!picked && !past, |el| el.cursor_pointer().hover(|s| s.bg(theme.colors().element_hover)))
-                        .child(Label::new(date.day().to_string()).size(LabelSize::Small).color(
-                            if picked || (in_month && !past) { Color::Default } else { Color::Muted },
+                        .child(Label::new(date.day().to_string()).centered().size(LabelSize::Small).color(
+                            if picked { Color::OnAccent } else if in_month && !past { Color::Default } else { Color::Muted },
                         ))
                         .when(!past, |el| {
                             el.on_click(cx.listener(move |this, _, _, cx| {
@@ -2542,7 +2540,7 @@ impl TaskDetail {
                 .cursor_pointer()
                 .when(on, |el| el.bg(theme.colors().accent))
                 .when(!on, |el| el.hover(|s| s.bg(theme.colors().element_hover)))
-                .child(Label::new(label).size(LabelSize::XSmall))
+                .child(Label::new(label).centered().size(LabelSize::XSmall).when(on, |l| l.color(Color::OnAccent)))
                 .on_click(cx.listener(move |this, _, _, cx| update(this, cx, &|rule| rule.month_days ^= bit)))
         };
         let cycler = |id: &'static str, label: String, next: fn(&mut Recurrence)| {
@@ -2753,7 +2751,7 @@ impl TaskDetail {
                 .rounded(px(6.)).cursor_pointer()
                 .when(primary, |el| el.bg(theme.colors().accent))
                 .when(!primary, |el| el.border_1().border_color(theme.colors().border))
-                .child(Label::new(label).size(LabelSize::Small))
+                .child(Label::new(label).size(LabelSize::Small).when(primary, |label| label.color(Color::OnAccent)))
         };
         popover(cx)
             .debug_selector(|| "task-tag-picker".to_owned())
@@ -2888,7 +2886,7 @@ fn check_mark() -> impl IntoElement {
 }
 
 /// A text button with an icon, used for the due date and the list.
-fn label_button(id: &'static str, icon: IconName, label: SharedString, color: Color, hover: Hsla) -> Stateful<Div> {
+fn label_button(id: &'static str, icon: IconName, label: SharedString, color: Color, hover: Hsla) -> Stateful<ui::HorizontalStack> {
     h_flex()
         .id(id)
         .relative()
@@ -3023,6 +3021,7 @@ impl Render for TaskDetail {
                                 .animate_completion(crate::completion_mark::started(task.id, cx))
                                 .dismissed(task.is_wont_do())
                                 .lines(!self.checklist.is_empty())
+                                .tint(task_rows::priority_color(task.priority, &theme))
                                 .on_click(cx.listener(|this, _, _, cx| this.toggle_completed(cx))),
                         )
                         .child(div().w(px(1.)).h(px(14.)).bg(theme.colors().border))
@@ -3499,7 +3498,7 @@ fn render_markdown_blocks(
     use fern_core::markdown::BlockKind;
     let theme = cx.theme();
     let line_height = px(sticky.map_or(22., |style| style.font_px() + 8.));
-    let accent = sticky.map_or(theme.colors().accent, |s| gpui::rgb(if s.color >= 9 { 0x95b7ff } else { 0x254c9e }).into());
+    let accent = sticky.map_or(theme.colors().text_accent, |s| gpui::rgb(if s.color >= 9 { 0x95b7ff } else { 0x254c9e }).into());
     let muted = sticky.map_or(theme.colors().text_muted, |s| gpui::rgb(if s.color >= 9 { 0xbcc5d6 } else { 0x525566 }).into());
     let styled = |text: String, runs: Vec<(std::ops::Range<usize>, fern_core::markdown::Style)>| {
         let highlights = runs

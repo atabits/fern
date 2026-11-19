@@ -326,7 +326,7 @@ impl SearchModal {
                 .justify_center()
                 .rounded(px(6.))
                 .cursor_pointer()
-                .when(primary, |el| el.bg(theme.colors().accent).child(Label::new(label).size(LabelSize::Small).color(Color::Custom(gpui::white()))))
+                .when(primary, |el| el.bg(theme.colors().accent).child(Label::new(label).size(LabelSize::Small).color(Color::OnAccent)))
                 .when(!primary, |el| el.border_1().border_color(theme.colors().border).child(Label::new(label).size(LabelSize::Small)))
         };
         popover(cx)

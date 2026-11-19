@@ -5758,6 +5758,7 @@ dependencies = [
  "icons",
  "smallvec",
  "theme",
+ "usvg",
 ]
 
 [[package]]

@@ -12,6 +12,7 @@ gpui.workspace = true
 icons.workspace = true
 smallvec.workspace = true
 theme.workspace = true
+usvg = { version = "0.46", default-features = false }
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }

@@ -16,6 +16,7 @@ pub struct IconButton {
     icon: IconName,
     icon_size: IconSize,
     icon_color: Color,
+    hover_icon_color: Option<Color>,
     size: Pixels,
     selected: bool,
     hover_color: Option<gpui::Hsla>,
@@ -30,7 +31,8 @@ impl IconButton {
             id: id.into(),
             icon,
             icon_size: IconSize::Large,
-            icon_color: Color::Muted,
+            icon_color: Color::Icon,
+            hover_icon_color: None,
             size: px(26.),
             selected: false,
             hover_color: None,
@@ -47,6 +49,11 @@ impl IconButton {
 
     pub fn icon_color(mut self, color: impl Into<Color>) -> Self {
         self.icon_color = color.into();
+        self
+    }
+
+    pub fn hover_icon_color(mut self, color: impl Into<Color>) -> Self {
+        self.hover_icon_color = Some(color.into());
         self
     }
 
@@ -92,12 +99,20 @@ impl Toggleable for IconButton {
 impl RenderOnce for IconButton {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let colors = cx.theme().colors();
-        let icon_color = if self.selected { Color::Default } else { self.icon_color };
+        let icon_color = if self.selected { Color::Accent } else { self.icon_color };
         let tip = self.tip;
-        let hover_color = self.hover_color.unwrap_or(colors.element_hover);
+        let hover_color = self.hover_color.unwrap_or(colors.ghost_element_hover);
         let tip_key = gpui::ElementId::NamedChild(std::sync::Arc::new(self.id.clone()), "tip".into());
+        let hover_group = self.hover_icon_color.filter(|_| !self.selected).map(|color| {
+            (gpui::SharedString::from(format!("icon-button-{:?}", self.id)), color)
+        });
+        let icon = Icon::new(self.icon)
+            .size(self.icon_size)
+            .color(icon_color)
+            .when_some(hover_group.clone(), |icon, (group, color)| icon.group_hover_color(group, color));
         let button = div()
             .id(self.id)
+            .when_some(hover_group, |el, (group, _)| el.group(group))
             .flex_none()
             .size(self.size)
             .flex()
@@ -106,10 +121,10 @@ impl RenderOnce for IconButton {
             .rounded(px(6.))
             .cursor_pointer()
             .when(self.selected, |el| el.bg(colors.element_selected))
-            .hover(|style| style.bg(hover_color))
+            .when(!self.selected, |el| el.hover(|style| style.bg(hover_color)))
             .when_some(self.on_click, |el, handler| el.on_click(handler))
             .when_some(self.tooltip, |el, tooltip| el.tooltip(tooltip))
-            .child(Icon::new(self.icon).size(self.icon_size).color(icon_color));
+            .child(icon);
         match tip {
             Some((text, side)) => crate::with_tip(button, tip_key, text, side, window, cx),
             None => button,

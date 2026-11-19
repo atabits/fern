@@ -284,7 +284,7 @@ impl CalendarView {
 
     /// An event's bar: the calendar's color, its time when it has one, and a card with the rest
     /// on a click. Events cannot be changed here: they belong to the calendar they come from.
-    fn event_bar(&self, event: EventBar, date: NaiveDate, cx: &mut Context<Self>) -> Stateful<Div> {
+    fn event_bar(&self, event: EventBar, date: NaiveDate, cx: &mut Context<Self>) -> Stateful<ui::HorizontalStack> {
         let strings = i18n::t(cx);
         let open = self.open_event.as_ref() == Some(&(event.key.clone(), event.start));
         let key = (event.key.clone(), event.start);
@@ -1182,15 +1182,17 @@ impl CalendarView {
         let row = |filter, name: String, icon| {
             ListItem::new(SharedString::from(format!("calendar-filter-{filter:?}")))
                 .height(px(30.))
-                .start_slot(Icon::new(icon).size(IconSize::Small).color(Color::Muted))
-                .child(Label::new(name).truncate())
+                .hover_color(theme.colors().list_hover)
+                .selected_color(theme.colors().list_selected)
+                .start_slot(Icon::new(icon).size(IconSize::Small).color(theme.colors().list_text))
+                .child(Label::new(name).truncate().color(theme.colors().list_text))
                 .toggle_state(self.list_filter == filter)
                 .on_click(cx.listener(move |this, _, _, cx| this.set_list_filter(filter, cx)))
         };
         v_flex().id("calendar-sidebar").debug_selector(|| "calendar-sidebar".to_owned())
             .flex_none().w(px(CALENDAR_SIDEBAR_WIDTH)).h_full().overflow_y_scroll()
-            .border_r_1().border_color(theme.colors().border)
-            .bg(theme.colors().panel_background)
+            .border_r_1().border_color(theme.colors().lists_border)
+            .bg(theme.colors().lists_background)
             .p_3().gap_2()
             .child(month_picker(
                 self.sidebar_month.unwrap_or(self.month), self.selected_day.unwrap_or(self.anchor),
@@ -1202,7 +1204,7 @@ impl CalendarView {
                 cx,
             ))
             .child(Divider::horizontal())
-            .child(Label::new(strings.lists).size(LabelSize::Small).weight(FontWeight::SEMIBOLD))
+            .child(Label::new(strings.lists).size(LabelSize::Small).weight(FontWeight::SEMIBOLD).color(theme.colors().list_text))
             .child(row(None, strings.all_lists.to_owned(), IconName::Layers))
             .child(row(Some(None), strings.inbox.to_owned(), IconName::Inbox))
             .children(self.list_names.iter().map(|(id, name)| row(Some(Some(*id)), name.clone(), IconName::List)))
@@ -1273,8 +1275,10 @@ impl CalendarView {
                             this.select_day(date, cx);
                         }))
                         // As in the original, the days of the months around are muted.
-                        .child(Label::new(number).weight(FontWeight::SEMIBOLD).color(
-                            if self.mode == CalendarMode::Month && date.month() != self.month.month() && date != today {
+                        .child(Label::new(number).centered().weight(FontWeight::SEMIBOLD).color(
+                            if date == today {
+                                Color::OnAccent
+                            } else if self.mode == CalendarMode::Month && date.month() != self.month.month() {
                                 Color::Muted
                             } else {
                                 Color::Default
@@ -1306,7 +1310,7 @@ impl CalendarView {
 
     /// A task's bar on `day`; `None` in the Year view's day card, where a click opens the task in
     /// the list.
-    fn task_bar(&self, task: &Task, day: Option<NaiveDate>, cx: &mut Context<Self>) -> Stateful<Div> {
+    fn task_bar(&self, task: &Task, day: Option<NaiveDate>, cx: &mut Context<Self>) -> Stateful<ui::HorizontalStack> {
         let theme = cx.theme().clone();
         let id = task.id;
         // Keep closed titles muted; the checkbox distinguishes completed and dismissed tasks.
@@ -1417,7 +1421,8 @@ impl CalendarView {
                                     el.bg(theme.colors().element_selected)
                                 })
                                 .on_click(cx.listener(move |this, _, _, cx| this.select_day(date, cx)))
-                                .child(Label::new(date.day().to_string()).weight(FontWeight::SEMIBOLD)),
+                                .child(Label::new(date.day().to_string()).centered().weight(FontWeight::SEMIBOLD)
+                                    .when(date == today, |label| label.color(Color::OnAccent))),
                         ),
                     )
                     .children(tasks)
@@ -1623,7 +1628,7 @@ impl CalendarView {
                     div()
                         .text_size(px(22.))
                         .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(if is_today { theme.colors().accent } else { theme.colors().text })
+                        .text_color(if is_today { theme.colors().text_accent } else { theme.colors().text })
                         .child(date.day().to_string()),
                 )
                 .child(
@@ -2145,7 +2150,7 @@ impl Render for CalendarView {
             .on_action(cx.listener(|this, _: &PrintYear, _, cx| this.print_year(cx)))
             .on_action(cx.listener(Self::dismiss_transient))
             .size_full()
-            .bg(theme.colors().background)
+            .bg(theme.colors().calendar_background)
             .text_color(theme.colors().text)
             .child(
                 v_flex().flex_1().min_w_0().h_full()

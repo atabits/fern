@@ -86,7 +86,7 @@ impl RenderOnce for SubmenuItem {
         let debug_selector = format!("submenu-{}", self.id);
         let item = ListItem::new(self.id.clone())
             .toggle_state(self.open)
-            .when_some(self.icon, |item, icon| item.start_slot(Icon::new(icon).color(Color::Muted)))
+            .when_some(self.icon, |item, icon| item.start_slot(Icon::new(icon).color(Color::Icon)))
             .child(Label::new(self.label))
             .end_slot(Icon::new(IconName::ChevronRight).size(IconSize::Small).color(Color::Muted))
             .when_some(self.height, |item, height| item.height(height));

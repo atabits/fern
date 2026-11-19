@@ -673,7 +673,7 @@ impl CalendarView {
         counts: &BTreeMap<NaiveDate, usize>,
         layout: &YearLayout,
         cx: &mut Context<Self>,
-    ) -> Stateful<Div> {
+    ) -> Stateful<ui::HorizontalStack> {
         let colors = cx.theme().colors();
         let in_month = calendar::month_start(date) == month;
         let is_today = date == today && in_month;
@@ -745,14 +745,15 @@ impl CalendarView {
                 h_flex()
                     .justify_center()
                     .size(layout.marker_size)
+                    .text_center()
                     .rounded_full()
-                    .when(is_today, |el| el.text_color(gpui::white()))
+                    .when(is_today && !is_open, |el| el.text_color(colors.on_accent))
                     .when(!heatmap, |el| {
                         el.when(is_today || is_open, |el| el.bg(background))
                             .group_hover("year-date", move |style| style.bg(hovered))
                     })
                     .when(!in_month, |el| el.text_color(colors.text.opacity(0.65)))
-                    .child(date.day().to_string()),
+                    .child(ui::LabelText::new(date.day().to_string())),
             )
             .when(is_open, |el| {
                 let bounds = anchor_bounds.clone();

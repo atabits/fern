@@ -3,7 +3,7 @@ use gpui::{
     div, prelude::FluentBuilder as _, px,
 };
 
-use crate::Color;
+use crate::{Color, LabelText};
 
 #[derive(Debug, Default, PartialEq, Clone, Copy)]
 pub enum LabelSize {
@@ -38,6 +38,7 @@ pub struct Label {
     weight: Option<FontWeight>,
     strikethrough: bool,
     truncate: bool,
+    centered: bool,
 }
 
 impl Label {
@@ -49,6 +50,7 @@ impl Label {
             weight: None,
             strikethrough: false,
             truncate: false,
+            centered: false,
         }
     }
 
@@ -76,6 +78,12 @@ impl Label {
         self.truncate = true;
         self
     }
+
+    /// Center the visible text horizontally as well, for a badge or a date cell.
+    pub fn centered(mut self) -> Self {
+        self.centered = true;
+        self
+    }
 }
 
 impl RenderOnce for Label {
@@ -86,6 +94,7 @@ impl RenderOnce for Label {
             .when_some(self.weight, |el, weight| el.font_weight(weight))
             .when(self.strikethrough, |el| el.line_through())
             .when(self.truncate, |el| el.min_w_0().truncate())
-            .child(self.text)
+            .when(self.centered, |el| el.text_center())
+            .child(LabelText::new(self.text))
     }
 }

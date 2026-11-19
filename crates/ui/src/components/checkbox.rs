@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 use gpui::{
     App, Bounds, ClickEvent, ElementId, Hsla, InteractiveElement, IntoElement, ParentElement,
     PathBuilder, Pixels, RenderOnce, StatefulInteractiveElement, Styled, Window, canvas, div, fill,
-    point, prelude::FluentBuilder as _, px, rgb, size,
+    point, prelude::FluentBuilder as _, px, size,
 };
 use theme::ActiveTheme;
 
@@ -120,7 +120,7 @@ impl RenderOnce for Checkbox {
                 .overflow_hidden()
                 .cursor_pointer()
                 .when(self.checked, |el| {
-                    el.child(check_stroke(started, border, self.tint, colors.accent))
+                    el.child(check_stroke(started, border, self.tint, colors.accent, colors.icon_on_accent))
                 })
                 .when(!self.checked, |el| {
                     el.border_1()
@@ -152,7 +152,7 @@ impl RenderOnce for Checkbox {
             .when(self.checked, |el| el.bg(fill).child(
                 Icon::new(IconName::Check)
                     .size(IconSize::Custom(self.size - px(2.)))
-                    .color(colors.background),
+                    .color(if self.accent { colors.icon_on_accent } else { colors.background }),
             ))
             .when(self.lines && !self.checked, |el| {
                 el.child(
@@ -168,7 +168,7 @@ impl RenderOnce for Checkbox {
     }
 }
 
-fn check_stroke(started: Option<Instant>, border: Hsla, tint: Option<Hsla>, accent: Hsla) -> impl IntoElement {
+fn check_stroke(started: Option<Instant>, border: Hsla, tint: Option<Hsla>, accent: Hsla, ink: Hsla) -> impl IntoElement {
     canvas(
         |_, _, _| {},
         move |bounds, (), window, cx| {
@@ -214,7 +214,6 @@ fn check_stroke(started: Option<Instant>, border: Hsla, tint: Option<Hsla>, acce
             path.move_to(start);
             if stroke > 0.32 { path.line_to(bend); }
             path.line_to(tip);
-            let ink = rgb(0xffffff);
             if let Ok(path) = path.build() {
                 window.paint_path(path, ink);
             }

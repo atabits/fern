@@ -43,7 +43,7 @@ fn frame(
             .rounded(px(6.))
             .cursor_pointer()
             .when(primary, |el| {
-                el.bg(theme.colors().accent.opacity(if enabled { 1. } else { 0.5 })).child(Label::new(label).color(Color::Custom(gpui::white())))
+                el.bg(theme.colors().accent.opacity(if enabled { 1. } else { 0.5 })).child(Label::new(label).color(Color::OnAccent))
             })
             .when(!primary, |el| el.border_1().border_color(theme.colors().border).child(Label::new(label)))
     };
@@ -89,7 +89,7 @@ fn frame(
 }
 
 /// A dropdown field as the original's dialogs have: the value and a chevron, its choices under it.
-fn dropdown(id: &'static str, text: SharedString, open: bool, width: f32, cx: &App) -> Stateful<Div> {
+fn dropdown(id: &'static str, text: SharedString, open: bool, width: f32, cx: &App) -> Stateful<ui::HorizontalStack> {
     let theme = cx.theme();
     h_flex()
         .id(id)

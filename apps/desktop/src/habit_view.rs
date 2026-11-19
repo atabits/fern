@@ -371,7 +371,7 @@ impl HabitView {
                 .cursor_pointer()
                 .when(primary, |el| el.bg(theme.colors().accent))
                 .when(!primary, |el| el.border_1().border_color(theme.colors().border))
-                .child(Label::new(label).size(LabelSize::Small))
+                .child(Label::new(label).size(LabelSize::Small).when(primary, |label| label.color(Color::OnAccent)))
         };
         let picker = edit.icon_picker.map(|tab| self.render_icon_picker(edit, tab, cx));
         let frequency_menu = self.render_frequency(edit.frequency, cx);
@@ -654,8 +654,8 @@ impl HabitView {
                             .cursor_pointer()
                             .when(selected, |el| el.bg(theme.colors().accent))
                             .when(!selected, |el| el.hover(|s| s.bg(theme.colors().element_hover)))
-                            .child(Label::new(date.day().to_string()).size(LabelSize::XSmall).color(
-                                if selected || date.month() == month.month() { Color::Default } else { Color::Muted },
+                            .child(Label::new(date.day().to_string()).centered().size(LabelSize::XSmall).color(
+                                if selected { Color::OnAccent } else if date.month() == month.month() { Color::Default } else { Color::Muted },
                             ))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.update_edit(cx, |e| {
@@ -860,7 +860,7 @@ impl HabitView {
                 .cursor_pointer()
                 .when(on, |el| el.bg(theme.colors().accent))
                 .when(!on, |el| el.bg(theme.colors().element_hover))
-                .child(Label::new(label).size(LabelSize::XSmall))
+                .child(Label::new(label).size(LabelSize::XSmall).when(on, |l| l.color(Color::OnAccent)))
         };
         let tabs = h_flex().gap_1().children(strings.habit_frequency_kinds.iter().enumerate().map(|(i, label)| {
             div()
@@ -1133,7 +1133,7 @@ impl HabitView {
             .rounded_full()
             .bg(self.dot_color(habit, date, cx))
             .when(done, |el| {
-                el.child(Icon::new(IconName::Check).size(if size > px(20.) { IconSize::Small } else { IconSize::XSmall }).color(Color::Custom(gpui::white())))
+                el.child(Icon::new(IconName::Check).size(if size > px(20.) { IconSize::Small } else { IconSize::XSmall }).color(Color::IconOnAccent))
             })
     }
 
@@ -1877,7 +1877,7 @@ impl HabitView {
                                 .rounded(px(6.))
                                 .bg(theme.colors().accent)
                                 .cursor_pointer()
-                                .child(Label::new(strings.habit_record).size(LabelSize::Small).color(Color::Custom(gpui::white())))
+                                .child(Label::new(strings.habit_record).size(LabelSize::Small).color(Color::OnAccent))
                                 .on_click(cx.listener(|this, _, _, cx| this.record_amount(cx))),
                         ),
                 )

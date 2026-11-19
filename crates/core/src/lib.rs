@@ -34,7 +34,7 @@ pub use habit::{Checkin, Goal, Habit, HabitStats, MonthStats};
 pub use habit::Frequency as HabitFrequency;
 pub use habit::{CustomSection, HabitSection};
 pub use model::{Activity, Attachment, Comment, Estimate, ChecklistItem, ListSection, Template, Id, Kind, List, ListDraft, ListFolder, Priority, Tag, Task, TaskDraft, View, ViewCounts};
-pub use preferences::{DURATIONS, Features, Notifications, DateFormat, DefaultDate, Preferences, TaskDefaults, SmartList, ThemeMode, Visibility, WEEK_STARTS};
+pub use preferences::{DURATIONS, Features, Notifications, DateFormat, DefaultDate, Preferences, TaskDefaults, SmartList, ThemeMode, ThemeSelection, Visibility, WEEK_STARTS};
 pub use quick_add::{ParsedTask, Recognition, parse_quick_add, parse_quick_add_on_day, parse_quick_add_with};
 pub use recurrence::{Frequency, Recurrence};
 pub use store::Store;

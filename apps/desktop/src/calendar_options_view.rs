@@ -313,7 +313,7 @@ impl CalendarOptionsDialog {
                         .rounded_full()
                         .border_1()
                         .border_color(if on { accent } else { theme.colors().border })
-                        .when(on, |el| el.bg(accent).flex().items_center().justify_center().child(Icon::new(IconName::Check).size(IconSize::XSmall).color(Color::Custom(gpui::white())))),
+                        .when(on, |el| el.bg(accent).flex().items_center().justify_center().child(Icon::new(IconName::Check).size(IconSize::XSmall).color(Color::IconOnAccent))),
                 )
                 .child(Label::new(label))
         };
@@ -351,7 +351,7 @@ impl CalendarOptionsDialog {
                     .items_center()
                     .justify_center()
                     .when(hot, |el| el.bg(accent.opacity(0.45)))
-                    .child(Label::new(day.to_string()).size(LabelSize::XSmall))
+                    .child(Label::new(day.to_string()).centered().size(LabelSize::XSmall))
             };
             v_flex().children((0..4).map(move |week| h_flex().children((1..=7).map(move |d| cell(week * 7 + d)))))
         };

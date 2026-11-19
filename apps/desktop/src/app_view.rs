@@ -183,7 +183,7 @@ impl AppView {
         // "Follow System Dark Mode" tracks the system's appearance while the app runs.
         cx.observe_window_appearance(window, |this, window, cx| {
             let preferences = this.store.preferences().unwrap_or_default();
-            if preferences.theme == fern_core::ThemeMode::System {
+            if preferences.theme.mode == fern_core::ThemeMode::System {
                 settings_window::apply(&preferences, window, cx);
             }
         })
@@ -395,8 +395,9 @@ impl AppView {
             }
             // `theme=light|dark|system`, saved like a pick in the Settings.
             if let Some(mode) = state.split(';').find_map(|part| part.strip_prefix("theme=")).and_then(fern_core::ThemeMode::from_code) {
-                let preferences = fern_core::Preferences { theme: mode, ..this.store.preferences().unwrap_or_default() };
-                this.store.save_preferences(&preferences).ok();
+                let mut preferences = this.store.preferences().unwrap_or_default();
+                preferences.theme.mode = mode;
+                this.store.save_theme_selection(&preferences.theme).ok();
                 settings_window::apply(&preferences, window, cx);
             }
             // `visibility=<smart list>><show|if_not_empty|hide>`, repeatable: Settings → Smart List.
@@ -605,13 +606,13 @@ impl AppView {
             .on_mouse_down_out(cx.listener(|this, _, _, cx| this.set_account_menu(false, cx)))
             .child(
                 ListItem::new("account-settings")
-                    .start_slot(Icon::new(IconName::Settings))
+                    .start_slot(Icon::new(IconName::Settings).color(Color::Icon))
                     .child(Label::new(strings.settings))
                     .on_click(cx.listener(|this, _, window, cx| this.open_settings(None, window, cx))),
             )
             .child(
                 ListItem::new("account-statistics")
-                    .start_slot(Icon::new(IconName::ChartNoAxesColumn))
+                    .start_slot(Icon::new(IconName::ChartNoAxesColumn).color(Color::Icon))
                     .child(Label::new(strings.statistics))
                     .on_click(cx.listener(|this, _, _, cx| this.open_statistics(cx))),
             )
@@ -874,7 +875,11 @@ impl AppView {
                     .h(px(48.))
                     .px_4()
                     .child(div().flex_1().child(Label::new(strings.shortcuts).size(LabelSize::Large)))
-                    .child(IconButton::new("close-shortcuts", IconName::X).on_click(cx.listener(|this, _, _, cx| this.toggle_shortcuts(cx)))),
+                    .child(
+                        IconButton::new("close-shortcuts", IconName::X)
+                            .icon_color(Color::Muted)
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_shortcuts(cx))),
+                    ),
             )
             .child(v_flex().id("shortcut-list").flex_1().min_h_0().overflow_y_scroll().px_4().pb_4().child(body))
             .into_any_element()

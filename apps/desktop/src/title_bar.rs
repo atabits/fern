@@ -137,7 +137,7 @@ impl Render for TitleBar {
         };
         let left_buttons = buttons.and_then(|b| side(b.left, "left-window-buttons")).filter(|_| !fullscreen);
         let right_buttons = buttons.and_then(|b| side(b.right, "right-window-buttons")).filter(|_| !fullscreen);
-        let background = if linux && !window.is_window_active() { colors.panel_background } else { colors.sidebar_background };
+        let background = if linux && !window.is_window_active() { colors.panel_background } else { colors.title_bar_background };
 
         h_flex()
             .id("title-bar")

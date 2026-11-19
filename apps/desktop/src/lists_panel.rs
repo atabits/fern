@@ -132,9 +132,11 @@ pub fn render(
         // Every entry is also a drop target for dragged tasks.
         let item = ListItem::new(SharedString::from(id.clone()))
             .height(px(38.))
+            .hover_color(colors.list_hover)
+            .selected_color(colors.list_selected)
             .toggle_state(&view == active)
             .start_slot(icon)
-            .child(Label::new(label).truncate())
+            .child(Label::new(label).color(colors.list_text).truncate())
             .end_slot(
                 h_flex()
                     .gap_2()
@@ -146,19 +148,26 @@ pub fn render(
                                 .flex()
                                 .justify_end()
                                 .when(menu.is_some(), |el| el.group_hover(group.clone(), |s| s.invisible()))
-                                .child(Label::new(count.to_string()).size(LabelSize::Small).color(Color::Muted)),
+                                .child(Label::new(count.to_string()).size(LabelSize::Small).color(colors.list_count)),
                         )
                     })
                     // As the original's, a hovered smart list shows "…" where its count is.
                     .when_some(menu, |el, list| {
+                        let more_group = SharedString::from(format!("smart-more-{id}"));
                         el.child(
                             div()
                                 .id("smart-more")
+                                .group(more_group.clone())
                                 .absolute()
                                 .right(px(10.))
                                 .invisible()
                                 .group_hover(group.clone(), |s| s.visible())
-                                .child(Icon::new(IconName::Ellipsis).size(IconSize::Small).color(Color::Muted))
+                                .child(
+                                    Icon::new(IconName::Ellipsis)
+                                        .size(IconSize::Small)
+                                        .color(colors.list_text_muted)
+                                        .group_hover_color(more_group, colors.list_text),
+                                )
                                 .on_mouse_down(gpui::MouseButton::Left, move |event: &gpui::MouseDownEvent, window, cx| {
                                     cx.stop_propagation();
                                     on_panel(PanelEvent::SmartMenu(list, event.position), window, cx)
@@ -193,7 +202,7 @@ pub fn render(
             View::Summary => Some(SmartList::Summary),
             _ => None,
         };
-        item(format!("view-{label}"), view, label.into(), Icon::new(icon).into_any_element(), count, None, menu)
+        item(format!("view-{label}"), view, label.into(), Icon::new(icon).color(colors.list_text).into_any_element(), count, None, menu)
     };
     // As in the original: a row every 38 px, sections apart with a 12 px gap around their line,
     // and a section's "+" shown on hover.
@@ -205,7 +214,7 @@ pub fn render(
             .h(px(36.))
             .pt_1()
             .px_2()
-            .child(div().flex_1().child(Label::new(text).size(LabelSize::Small).color(Color::Muted)))
+            .child(div().flex_1().child(Label::new(text).size(LabelSize::Small).color(colors.list_text_muted)))
     };
     let on_hover_only = |text: &'static str, button: IconButton| {
         div().when(!crate::touch::active(), |el| el.invisible()).group_hover(SharedString::from(format!("heading-{text}")), |s| s.visible()).child(button)
@@ -221,7 +230,7 @@ pub fn render(
             list.name.clone().into(),
             match &list.icon {
                 Some(icon) => div().w(px(16.)).flex().justify_center().text_size(px(14.)).child(icon.clone()).into_any_element(),
-                None => Icon::new(IconName::List).into_any_element(),
+                None => Icon::new(IconName::List).color(colors.list_text).into_any_element(),
             },
             Some(list.open_count),
             parse_color(list.color.as_deref()),
@@ -270,13 +279,15 @@ pub fn render(
             .child(
                 ListItem::new(SharedString::from(format!("folder-item-{id}")))
                     .height(px(36.))
-                    .start_slot(Icon::new(if collapsed { IconName::Folder } else { IconName::FolderOpen }))
-                    .child(Label::new(folder.name.clone()).truncate())
+                    .hover_color(colors.list_hover)
+                    .selected_color(colors.list_selected)
+                    .start_slot(Icon::new(if collapsed { IconName::Folder } else { IconName::FolderOpen }).color(colors.list_text))
+                    .child(Label::new(folder.name.clone()).color(colors.list_text).truncate())
                     .end_slot(
                         h_flex()
                             .gap_1()
-                            .when(collapsed && count > 0, |el| el.child(Label::new(count.to_string()).size(LabelSize::Small).color(Color::Muted)))
-                            .child(Icon::new(if collapsed { IconName::ChevronRight } else { IconName::ChevronDown }).size(IconSize::XSmall).color(Color::Muted)),
+                            .when(collapsed && count > 0, |el| el.child(Label::new(count.to_string()).size(LabelSize::Small).color(colors.list_count)))
+                            .child(Icon::new(if collapsed { IconName::ChevronRight } else { IconName::ChevronDown }).size(IconSize::XSmall).color(colors.list_text_muted)),
                     )
                     .on_click(move |_, window, cx| on_panel(PanelEvent::ToggleFolder(id), window, cx)),
             )
@@ -307,9 +318,11 @@ pub fn render(
         list_entries.push(
             ListItem::new("archived-lists")
                 .height(px(36.))
-                .start_slot(Icon::new(IconName::Archive))
-                .child(Label::new(strings.archived_lists))
-                .end_slot(Icon::new(if archived_open { IconName::ChevronDown } else { IconName::ChevronRight }).size(IconSize::XSmall).color(Color::Muted))
+                .hover_color(colors.list_hover)
+                .selected_color(colors.list_selected)
+                .start_slot(Icon::new(IconName::Archive).color(colors.list_text))
+                .child(Label::new(strings.archived_lists).color(colors.list_text))
+                .end_slot(Icon::new(if archived_open { IconName::ChevronDown } else { IconName::ChevronRight }).size(IconSize::XSmall).color(colors.list_text_muted))
                 .on_click(move |_, window, cx| on_panel(PanelEvent::ToggleArchived, window, cx))
                 .into_any_element(),
         );
@@ -340,21 +353,28 @@ pub fn render(
                 format!("tag-{name}"),
                 View::Tag(name.clone()),
                 name.clone().into(),
-                Icon::new(IconName::Tag).into_any_element(),
+                Icon::new(IconName::Tag).color(colors.list_text).into_any_element(),
                 Some(count),
                 Some(color(tag.color.as_deref(), cx)),
                 None,
             ))
             .when_some(fold, |el, folded| {
                 // A parent's arrow at the left edge, as the original's folders of tags have.
+                let fold_group = SharedString::from(format!("tag-fold-{name}"));
                 el.child(
                     div()
-                        .id(SharedString::from(format!("tag-fold-{name}")))
+                        .id(fold_group.clone())
+                        .group(fold_group.clone())
                         .absolute()
                         .left(px(-6.))
                         .top(px(11.))
                         .cursor_pointer()
-                        .child(Icon::new(if folded { IconName::ChevronRight } else { IconName::ChevronDown }).size(IconSize::XSmall).color(Color::Muted))
+                        .child(
+                            Icon::new(if folded { IconName::ChevronRight } else { IconName::ChevronDown })
+                                .size(IconSize::XSmall)
+                                .color(colors.list_text_muted)
+                                .group_hover_color(fold_group, colors.list_text),
+                        )
                         .on_click(move |_, window, cx| on_fold(PanelEvent::ToggleTag(fold_name.clone()), window, cx)),
                 )
             })
@@ -394,16 +414,28 @@ pub fn render(
             .child(hover(
                 div()
                     .id("tags-fold")
+                    .group("tags-fold")
                     .absolute()
                     .left(px(-4.))
                     .top(px(7.))
-                    .child(Icon::new(if tags_collapsed { IconName::ChevronRight } else { IconName::ChevronDown }).size(IconSize::XSmall).color(Color::Muted)),
+                    .child(
+                        Icon::new(if tags_collapsed { IconName::ChevronRight } else { IconName::ChevronDown })
+                            .size(IconSize::XSmall)
+                            .color(colors.list_text_muted)
+                            .group_hover_color("tags-fold", colors.list_text),
+                    ),
             ))
-            .child(div().flex_1().child(Label::new(strings.tags).size(LabelSize::Small).color(Color::Muted)))
+            .child(div().flex_1().child(Label::new(strings.tags).size(LabelSize::Small).color(colors.list_text_muted)))
             .child(hover(
                 div()
                     .id("tags-menu")
-                    .child(Icon::new(IconName::Ellipsis).size(IconSize::Small).color(Color::Muted))
+                    .group("tags-menu")
+                    .child(
+                        Icon::new(IconName::Ellipsis)
+                            .size(IconSize::Small)
+                            .color(colors.list_text_muted)
+                            .group_hover_color("tags-menu", colors.list_text),
+                    )
                     .on_mouse_down(MouseButton::Left, move |event, window, cx| {
                         cx.stop_propagation();
                         on_menu(PanelEvent::TagsMenu(event.position), window, cx)
@@ -414,6 +446,9 @@ pub fn render(
                     IconButton::new("add-tag-button", IconName::Plus)
                         .size(px(20.))
                         .icon_size(IconSize::Small)
+                        .icon_color(colors.list_text_muted)
+                        .hover_icon_color(colors.list_text)
+                        .hover_color(colors.list_hover)
                         .tooltip(Tooltip::text(strings.add_tags))
                         .on_click(move |_, window, cx| {
                             cx.stop_propagation();
@@ -475,6 +510,9 @@ pub fn render(
                         IconButton::new("add-list", IconName::Plus)
                             .size(px(20.))
                             .icon_size(IconSize::Small)
+                            .icon_color(colors.list_text_muted)
+                            .hover_icon_color(colors.list_text)
+                            .hover_color(colors.list_hover)
                             .tooltip(Tooltip::text(strings.add_list))
                             .on_click(on_add_list),
                     )),
@@ -490,8 +528,8 @@ pub fn render(
                     .px(px(14.))
                     .py(px(10.))
                     .rounded(px(6.))
-                    .bg(colors.surface_background)
-                    .child(Label::new(strings.lists_hint).size(LabelSize::Small).color(Color::Muted)),
+                    .bg(colors.ghost_element_hover)
+                    .child(Label::new(strings.lists_hint).size(LabelSize::Small).color(colors.list_text_muted)),
             )
         })
         .children(list_entries)
@@ -503,6 +541,9 @@ pub fn render(
                 IconButton::new("add-filter", IconName::Plus)
                     .size(px(20.))
                     .icon_size(IconSize::Small)
+                    .icon_color(colors.list_text_muted)
+                    .hover_icon_color(colors.list_text)
+                    .hover_color(colors.list_hover)
                     .tooltip(Tooltip::text(strings.add_filter))
                     .on_click(on_add_filter),
             )),
@@ -515,8 +556,8 @@ pub fn render(
                     .px(px(14.))
                     .py(px(10.))
                     .rounded(px(6.))
-                    .bg(colors.surface_background)
-                    .child(Label::new(strings.filters_hint).size(LabelSize::Small).color(Color::Muted)),
+                    .bg(colors.ghost_element_hover)
+                    .child(Label::new(strings.filters_hint).size(LabelSize::Small).color(colors.list_text_muted)),
             )
         })
         .children(filters.iter().filter(|_| shows(SmartList::Filters, 1)).map(|(filter, count)| {
@@ -524,7 +565,7 @@ pub fn render(
                 format!("filter-{}", filter.id),
                 View::Filter(filter.id),
                 filter.name.clone().into(),
-                Icon::new(IconName::Funnel).into_any_element(),
+                Icon::new(IconName::Funnel).color(colors.list_text).into_any_element(),
                 Some(*count),
                 None,
                 None,
@@ -541,9 +582,9 @@ pub fn render(
         .flex_none()
         .w(px(width))
         .h_full()
-        .bg(colors.panel_background)
+        .bg(colors.lists_background)
         .border_r_1()
-        .border_color(colors.border)
+        .border_color(colors.lists_border)
         .child(lists_column)
         .when(preferences.mini_calendar, |el| el.child(mini_calendar(active, mini, on_select.clone(), on_mini, strings, cx)))
 }
@@ -590,34 +631,36 @@ fn mini_calendar(
         div().flex_1().min_w_0().flex().justify_center().child(
             v_flex()
                 .id(SharedString::from(format!("mini-day-{date}")))
+                .relative()
                 .flex_none()
                 .size(px(26.))
                 .cursor_pointer()
-                .hover(|s| s.bg(colors.ghost_element_hover))
+                .hover(|s| s.bg(colors.list_hover))
                 .when(selected, |el| el.bg(colors.accent))
                 .on_click(move |_, window, cx| on_select(View::Day(date), window, cx))
                 .items_center()
                 .justify_center()
                 .rounded_full()
-                .when(is_today && !selected, |el| el.bg(colors.element_hover))
+                .when(is_today && !selected, |el| el.bg(colors.list_hover))
                 .child(
                     Label::new(date.day().to_string())
+                        .centered()
                         .size(LabelSize::Small)
                         .color(if selected {
-                            Color::Custom(gpui::white())
+                            Color::OnAccent
                         } else if is_today {
                             Color::Accent
                         } else if faded {
-                            Color::Muted
+                            Color::Custom(colors.list_text_muted)
                         } else {
-                            Color::Default
+                            Color::Custom(colors.list_text)
                         }),
                 )
-                .child(div().size(px(3.)).rounded_full().when(busy, |el| el.bg(colors.accent))),
+                .when(busy, |el| el.child(div().absolute().bottom(px(2.)).size(px(3.)).rounded_full().bg(if selected { colors.icon_on_accent } else { colors.accent }))),
         )
     };
     let weekdays = h_flex().children(crate::calendar::weekday_labels(&strings.weekdays_narrow).iter().map(|day| {
-        div().flex_1().min_w_0().flex().justify_center().child(Label::new(*day).size(LabelSize::Small).color(Color::Muted))
+        div().flex_1().min_w_0().flex().justify_center().child(Label::new(*day).size(LabelSize::Small).color(colors.list_text_muted))
     }));
     let toggle = on_mini.clone();
     // The hover tab on the top border: "^" expands, "v" collapses.
@@ -633,27 +676,39 @@ fn mini_calendar(
         .child(
             div()
                 .id("mini-calendar-toggle")
+                .group("mini-calendar-toggle")
                 .w(px(40.))
                 .h(px(16.))
                 .flex()
                 .items_center()
                 .justify_center()
                 .rounded(px(4.))
-                .bg(colors.element_hover)
+                .bg(colors.list_hover)
                 .cursor_pointer()
-                .child(Icon::new(if mini.expanded { IconName::ChevronDown } else { IconName::ChevronUp }).size(IconSize::XSmall))
+                .child(
+                    Icon::new(if mini.expanded { IconName::ChevronDown } else { IconName::ChevronUp })
+                        .color(colors.list_text_muted)
+                        .group_hover_color("mini-calendar-toggle", colors.list_text)
+                        .size(IconSize::XSmall),
+                )
                 .on_click(move |_, window, cx| toggle(MiniAction::Toggle, window, cx)),
         );
     let body = if mini.expanded {
         let arrows = |id: &'static str, icon: IconName, action: MiniAction| {
             let on_mini = on_mini.clone();
-            IconButton::new(id, icon).size(px(20.)).icon_size(IconSize::XSmall).on_click(move |_, window, cx| on_mini(action, window, cx))
+            IconButton::new(id, icon)
+                .size(px(20.))
+                .icon_size(IconSize::XSmall)
+                .icon_color(colors.list_text_muted)
+                .hover_icon_color(colors.list_text)
+                .hover_color(colors.list_hover)
+                .on_click(move |_, window, cx| on_mini(action, window, cx))
         };
         v_flex()
             .gap_1()
             .child(
                 h_flex()
-                    .child(div().flex_1().child(Label::new(calendar::month_title(mini.month, strings)).size(LabelSize::Small)))
+                    .child(div().flex_1().child(Label::new(calendar::month_title(mini.month, strings)).color(colors.list_text).size(LabelSize::Small)))
                     .child(arrows("mini-back", IconName::ChevronLeft, MiniAction::Shift(-1)))
                     .child(arrows("mini-this-month", IconName::Circle, MiniAction::ThisMonth))
                     .child(arrows("mini-forward", IconName::ChevronRight, MiniAction::Shift(1))),
@@ -671,6 +726,6 @@ fn mini_calendar(
         .relative()
         .flex_none()
         // GPUI paints borders after children. Put the border on the body beneath the tab.
-        .child(body.py_2().px_2().border_t_1().border_color(colors.border))
+        .child(body.py_2().px_2().border_t_1().border_color(colors.border_variant))
         .child(tab)
 }

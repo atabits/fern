@@ -9,6 +9,8 @@ pub struct FocusSession {
     pub id: Id,
     /// The task the session was spent on, if any.
     pub task_id: Option<Id>,
+    /// The habit the session was spent on, if any.
+    pub habit_id: Option<Id>,
     pub title: String,
     /// Unix milliseconds.
     pub started_at: i64,
@@ -119,7 +121,7 @@ impl RecordFilter {
         };
         date_ok
             && length_ok
-            && self.linked.is_none_or(|linked| session.task_id.is_some() == linked)
+            && self.linked.is_none_or(|linked| (session.task_id.is_some() || session.habit_id.is_some()) == linked)
     }
 }
 
@@ -360,6 +362,7 @@ mod tests {
         FocusSession {
             id: Uuid::now_v7(),
             task_id: None,
+            habit_id: None,
             title: "x".into(),
             started_at,
             ended_at: started_at + minutes * 60_000,
@@ -437,7 +440,7 @@ mod tests {
         let at = |d: u32, h: u32, m: u32| {
             Local.from_local_datetime(&NaiveDate::from_ymd_opt(2026, 10, d).unwrap().and_hms_opt(h, m, 0).unwrap()).unwrap().timestamp_millis()
         };
-        let session = |start: i64, end: i64| FocusSession { id: uuid::Uuid::now_v7(), task_id: None, title: "x".into(), started_at: start, ended_at: end, stopwatch: false, note: String::new() };
+        let session = |start: i64, end: i64| FocusSession { id: uuid::Uuid::now_v7(), task_id: None, habit_id: None, title: "x".into(), started_at: start, ended_at: end, stopwatch: false, note: String::new() };
         let monday = NaiveDate::from_ymd_opt(2026, 10, 12).unwrap();
         let sessions = [session(at(15, 13, 30), at(15, 16, 0)), session(at(13, 23, 0), at(14, 1, 0)), session(at(20, 9, 0), at(20, 10, 0))];
         assert_eq!(timeline(&sessions, monday), [(3, 810, 960), (1, 1380, 1440), (2, 0, 60)]);
@@ -453,7 +456,7 @@ mod tests {
     #[test]
     fn day_blocks_of_a_day() {
         let at = |d: u32, h: u32, m: u32| Local.with_ymd_and_hms(2026, 10, d, h, m, 0).unwrap().timestamp_millis();
-        let session = |start: i64, end: i64| FocusSession { id: uuid::Uuid::now_v7(), task_id: None, title: "x".into(), started_at: start, ended_at: end, stopwatch: false, note: String::new() };
+        let session = |start: i64, end: i64| FocusSession { id: uuid::Uuid::now_v7(), task_id: None, habit_id: None, title: "x".into(), started_at: start, ended_at: end, stopwatch: false, note: String::new() };
         let sessions = [session(at(17, 23, 0), at(18, 1, 0)), session(at(18, 13, 30), at(18, 14, 0)), session(at(16, 9, 0), at(16, 10, 0))];
         let today = NaiveDate::from_ymd_opt(2026, 10, 18).unwrap();
         let blocks: Vec<(u32, u32)> = day_blocks(&sessions, today).into_iter().map(|(from, to, _)| (from, to)).collect();
@@ -484,6 +487,7 @@ mod tests {
             FocusSession {
                 id: uuid::Uuid::now_v7(),
                 task_id: task.then(uuid::Uuid::now_v7),
+                habit_id: None,
                 title: "x".into(),
                 started_at: start,
                 ended_at: start + minutes * 60_000,

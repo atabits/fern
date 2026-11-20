@@ -45,6 +45,20 @@ const KANBAN_GUTTER: f32 = 16.;
 
 impl gpui::EventEmitter<StartFocus> for TodoView {}
 
+/// Emitted when the user opens a habit from Today / Next 7 Days.
+pub struct OpenHabit(pub Id);
+
+impl gpui::EventEmitter<OpenHabit> for TodoView {}
+
+/// Emitted when the user starts a focus session directly from a habit row in Today / Next 7 Days.
+pub struct StartHabitFocus {
+    pub habit_id: Id,
+    pub title: String,
+    pub stopwatch: bool,
+}
+
+impl gpui::EventEmitter<StartHabitFocus> for TodoView {}
+
 mod filters;
 mod kanban;
 mod menus;
@@ -201,7 +215,9 @@ pub struct TodoView {
     busy_days: HashSet<NaiveDate>,
     /// Today and Next 7 Days: the habits due today, whether each is checked in and its amount;
     /// empty elsewhere or when the habit settings keep them out.
-    today_habits: Vec<(fern_core::Habit, bool, u32)>,
+    today_habits: Vec<(fern_core::Habit, bool, f64)>,
+    /// Right-click context menu on a habit row in Today / Next 7 Days.
+    habit_menu: Option<(Id, gpui::Point<Pixels>)>,
     /// The Summary smart list's report.
     summary: Entity<crate::summary_view::SummaryView>,
     /// The "Add Filter" / "Edit Filter" dialog, while it is open.
@@ -444,6 +460,7 @@ impl TodoView {
             mini_month: crate::calendar::month_start(Self::today()),
             busy_days: HashSet::new(),
             today_habits: Vec::new(),
+            habit_menu: None,
             summary,
             filter_edit: None,
             undo: None,
@@ -1038,8 +1055,7 @@ impl TodoView {
         cx.notify();
     }
 
-    /// Today and Next 7 Days list the habits due today, as in the original, unless turned off
-    /// in the habit settings.
+    /// Today and Next 7 Days list the habits due today, unless turned off in the habit settings.
     fn reload_today_habits(&mut self) {
         self.today_habits.clear();
         if !matches!(self.view, View::Today | View::Next7Days)
@@ -1048,14 +1064,23 @@ impl TodoView {
             return;
         }
         let today = Self::today();
+        let week_start = crate::calendar::week_start();
+        let sections = self.store.habit_sections().unwrap_or_default();
+        let section_order = fern_core::HabitSection::ordered(&sections);
+        let all_records = self.store.all_habit_checkins().unwrap_or_default();
+        let mut items: Vec<(usize, i64, fern_core::Habit, bool, f64)> = Vec::new();
         for habit in self.store.habits().unwrap_or_default().into_iter().filter(|h| !h.archived) {
-            let done = self.store.checkins(habit.id).unwrap_or_default();
-            if habit.is_due(today, &done) {
-                let amount = self.store.checkin_records(habit.id).unwrap_or_default().into_iter().find(|c| c.date == today).map_or(0, |c| c.value);
-                let checked = done.contains(&today);
-                self.today_habits.push((habit, checked, amount));
+            let recs = all_records.get(&habit.id).map(Vec::as_slice).unwrap_or(&[]);
+            if habit.is_active_on(today, recs, week_start) {
+                let today_rec = recs.iter().find(|c| c.date == today);
+                let amount = today_rec.map_or(0.0, |c| c.value);
+                let checked = today_rec.is_some_and(|c| c.is_done());
+                let sec_idx = section_order.iter().position(|s| *s == habit.section).unwrap_or(section_order.len());
+                items.push((sec_idx, habit.sort_order, habit, checked, amount));
             }
         }
+        items.sort_by_key(|(sec_idx, sort_order, _, _, _)| (*sec_idx, *sort_order));
+        self.today_habits = items.into_iter().map(|(_, _, h, c, a)| (h, c, a)).collect();
     }
 
 
@@ -1740,6 +1765,7 @@ impl TodoView {
         // These menus don't move keyboard focus when opened from the list.
         let dismissed_menu = [
             self.context_menu.take().is_some(),
+            self.habit_menu.take().is_some(),
             self.list_menu.take().is_some(),
             self.closed_menu.take().is_some(),
             self.column_menu.take().is_some(),
@@ -3102,7 +3128,15 @@ impl TodoView {
                 .children(habits.into_iter().map(|(habit, checked, amount)| {
                     let id = habit.id;
                     let has_goal = habit.goal.is_some();
-                    let (target, unit) = habit.goal.as_ref().map_or((1, String::new()), |g| (g.amount, g.unit.clone()));
+                    let (target, unit) = habit.goal.as_ref().map_or((1.0, String::new()), |g| (g.amount, g.unit.clone()));
+                    let progress_text = format!(
+                        "{} / {} {}",
+                        fern_core::habit::format_amount(amount),
+                        fern_core::habit::format_amount(target),
+                        unit
+                    )
+                    .trim()
+                    .to_owned();
                     h_flex()
                         .id(SharedString::from(format!("habit-row-{id}")))
                         .h(px(ROW_HEIGHT))
@@ -3111,7 +3145,24 @@ impl TodoView {
                         .gap(px(10.))
                         .cursor_pointer()
                         .hover(|s| s.bg(theme.colors().ghost_element_hover))
-                        .child(crate::habit_view::avatar(&habit, px(20.), cx))
+                        .child(
+                            div()
+                                .id(SharedString::from(format!("habit-check-{id}")))
+                                .cursor_pointer()
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    let result = if has_goal {
+                                        this.store.step_checkin(id, today).map(|_| ())
+                                    } else {
+                                        this.store.toggle_checkin(id, today).map(|_| ())
+                                    };
+                                    this.check(result);
+                                    desktop_common::data_version::data_changed(cx.entity_id(), cx);
+                                    this.reload_today_habits();
+                                    cx.notify();
+                                }))
+                                .child(crate::habit_view::avatar(&habit, px(20.), cx)),
+                        )
                         .child(
                             div().flex_1().min_w_0().child(
                                 Label::new(habit.name.clone())
@@ -3119,7 +3170,7 @@ impl TodoView {
                                     .truncate(),
                             ),
                         )
-                        .child(Label::new(format!("{amount} / {target} {unit}").trim().to_owned()).size(LabelSize::Small).color(Color::Muted))
+                        .child(Label::new(progress_text).size(LabelSize::Small).color(Color::Muted))
                         .child(Label::new(strings.today).size(LabelSize::Small).color(Color::Accent))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             let result = if has_goal {
@@ -3128,12 +3179,121 @@ impl TodoView {
                                 this.store.toggle_checkin(id, today).map(|_| ())
                             };
                             this.check(result);
+                            desktop_common::data_version::data_changed(cx.entity_id(), cx);
                             this.reload_today_habits();
                             cx.notify();
                         }))
+                        .on_mouse_down(
+                            gpui::MouseButton::Right,
+                            cx.listener(move |this, ev: &gpui::MouseDownEvent, _, cx| {
+                                cx.stop_propagation();
+                                this.habit_menu = Some((id, ev.position));
+                                cx.notify();
+                            }),
+                        )
                         .border_b_1()
                         .border_color(theme.colors().border_variant)
                 }))
+                .into_any_element(),
+        )
+    }
+
+    fn render_habit_context_menu(&self, strings: &Strings, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (id, pos) = self.habit_menu?;
+        let habit = self.today_habits.iter().find(|(h, _, _)| h.id == id)?.0.clone();
+        let today = Self::today();
+        let name = habit.name;
+        let name_sw = name.clone();
+        Some(
+            div()
+                .id("todo-habit-ctx")
+                .absolute()
+                .left(pos.x)
+                .top(pos.y)
+                .occlude()
+                .child(
+                    popover(cx)
+                        .min_w(px(176.))
+                        .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                            this.habit_menu = None;
+                            cx.notify();
+                        }))
+                        .child(
+                            ListItem::new("todo-habit-open")
+                                .height(px(32.))
+                                .start_slot(Icon::new(IconName::FernHabit).color(Color::Muted))
+                                .child(Label::new(strings.section_habits))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.habit_menu = None;
+                                    cx.emit(OpenHabit(id));
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            ListItem::new("todo-habit-pomo")
+                                .height(px(32.))
+                                .start_slot(Icon::new(IconName::Timer).color(Color::Muted))
+                                .child(Label::new(strings.habit_start_pomo))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.habit_menu = None;
+                                    cx.emit(StartHabitFocus { habit_id: id, title: name.clone(), stopwatch: false });
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            ListItem::new("todo-habit-sw")
+                                .height(px(32.))
+                                .start_slot(Icon::new(IconName::Clock).color(Color::Muted))
+                                .child(Label::new(strings.habit_start_stopwatch))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.habit_menu = None;
+                                    cx.emit(StartHabitFocus { habit_id: id, title: name_sw.clone(), stopwatch: true });
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            ListItem::new("todo-habit-skip")
+                                .height(px(32.))
+                                .start_slot(Icon::new(IconName::Minus).color(Color::Muted))
+                                .child(Label::new(strings.habit_skip))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.habit_menu = None;
+                                    let res = this.store.skip_habit_date(id, today);
+                                    this.check(res);
+                                    desktop_common::data_version::data_changed(cx.entity_id(), cx);
+                                    this.reload_today_habits();
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            ListItem::new("todo-habit-undone")
+                                .height(px(32.))
+                                .start_slot(Icon::new(IconName::Ban).color(Color::Muted))
+                                .child(Label::new(strings.habit_unachieved))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.habit_menu = None;
+                                    let res = this.store.mark_checkin_undone(id, today);
+                                    this.check(res);
+                                    desktop_common::data_version::data_changed(cx.entity_id(), cx);
+                                    this.reload_today_habits();
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            ListItem::new("todo-habit-reset")
+                                .height(px(32.))
+                                .start_slot(Icon::new(IconName::RotateCcw).color(Color::Muted))
+                                .child(Label::new(strings.habit_reset))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.habit_menu = None;
+                                    let res = this.store.reset_checkin(id, today, true);
+                                    this.check(res);
+                                    desktop_common::data_version::data_changed(cx.entity_id(), cx);
+                                    this.reload_today_habits();
+                                    cx.notify();
+                                })),
+                        ),
+                )
                 .into_any_element(),
         )
     }
@@ -3632,6 +3792,7 @@ impl Render for TodoView {
                 )
             })
             .children(self.render_context_menu(strings, cx))
+            .children(self.render_habit_context_menu(strings, cx))
             .children(self.render_list_menu(strings, cx))
             .children(self.view_options.map(|menu| self.render_view_options(menu, strings, cx)))
             .children(self.suggestions_open.filter(|_| self.view == View::Today).map(|all| self.render_suggestions(all, strings, cx)))

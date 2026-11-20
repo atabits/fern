@@ -118,7 +118,7 @@ pub fn fired(store: &Store, after: NaiveDateTime, until: NaiveDateTime) -> Vec<N
         .map(|(task, at)| Notice { target: Target::Task(task.id), title: task.title.clone(), at })
         .collect();
     let habits = store.habits().unwrap_or_default();
-    let done = habits.iter().map(|h| (h.id, store.checkins(h.id).unwrap_or_default())).collect();
+    let done = store.all_habit_done_dates().unwrap_or_default();
     notices.extend(
         fern_core::habit::reminders_between(&habits, &done, after, until)
             .into_iter()
@@ -351,7 +351,7 @@ mod tests {
         let read = store.add_habit("Read").unwrap();
         assert_eq!(actions(&store, Target::Habit(read.id)), [NoticeAction::Snooze, NoticeAction::CheckIn]);
         let water = store.add_habit("Water").unwrap();
-        store.update_habit(water.id, "Water", Some(&fern_core::Goal { amount: 8, unit: "glasses".into() })).unwrap();
+        store.update_habit(water.id, "Water", Some(&fern_core::Goal::new(8.0, "glasses"))).unwrap();
         assert_eq!(
             actions(&store, Target::Habit(water.id)),
             [NoticeAction::Snooze, NoticeAction::Record, NoticeAction::PlusOne]

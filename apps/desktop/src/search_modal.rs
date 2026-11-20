@@ -5,7 +5,7 @@ use std::rc::Rc;
 
 use chrono::Local;
 use fern_core::search::{DateRange, TagRule, TaskFilter};
-use fern_core::{Id, List, Priority, Store, Tag, Task, View};
+use fern_core::{Habit, Id, List, Priority, Store, Tag, Task, View};
 use gpui::{Entity, EventEmitter, FocusHandle, Focusable, FontWeight, HighlightStyle, StyledText};
 use ui::prelude::*;
 use ui::{Placement, PopoverAttachment, popover};
@@ -22,6 +22,7 @@ const TASK_LIMIT: usize = 5;
 enum Filter {
     All,
     Tasks,
+    Habits,
     Tags,
     Lists,
 }
@@ -37,6 +38,7 @@ enum Menu {
 
 pub enum SearchEvent {
     OpenTask(Id),
+    OpenHabit(Id),
     OpenView(View),
     Dismissed,
 }
@@ -46,6 +48,7 @@ pub struct SearchModal {
     input: Entity<TextInput>,
     filter: Filter,
     tasks: Vec<Task>,
+    habits: Vec<Habit>,
     tags: Vec<Tag>,
     lists: Vec<List>,
     all_lists: Vec<List>,
@@ -82,6 +85,7 @@ impl SearchModal {
             input,
             filter: Filter::All,
             tasks: Vec::new(),
+            habits: Vec::new(),
             tags: Vec::new(),
             lists: Vec::new(),
             all_lists,
@@ -114,6 +118,7 @@ impl SearchModal {
             self.tasks.retain(|task| self.task_filter.matches(task, today, week_start));
         }
         let matches = |name: &str| !task_rows::match_ranges(name, &query).is_empty();
+        self.habits = self.store.habits().unwrap_or_default().into_iter().filter(|h| matches(&h.name)).collect();
         self.tags = self.store.tags().unwrap_or_default().into_iter().filter(|t| matches(&t.name)).collect();
         self.lists = self.all_lists.iter().filter(|l| matches(&l.name)).cloned().collect();
         cx.notify();
@@ -383,6 +388,10 @@ impl SearchModal {
             && let Some(task) = self.tasks.first()
         {
             cx.emit(SearchEvent::OpenTask(task.id));
+        } else if self.shows(Filter::Habits)
+            && let Some(habit) = self.habits.first()
+        {
+            cx.emit(SearchEvent::OpenHabit(habit.id));
         } else if self.shows(Filter::Tags)
             && let Some(tag) = self.tags.first()
         {
@@ -561,7 +570,26 @@ impl Render for SearchModal {
         } else {
             Vec::new()
         };
-        let nothing = has_query && task_rows.is_empty() && tag_rows.is_empty() && list_rows.is_empty();
+        let habit_rows: Vec<AnyElement> = if self.shows(Filter::Habits) {
+            self.habits
+                .iter()
+                .map(|habit| {
+                    let id = habit.id;
+                    ListItem::new(SharedString::from(format!("search-habit-{id}")))
+                        .height(px(30.))
+                        .start_slot(desktop_common::habit_helpers::avatar(habit, px(18.), cx))
+                        .child(div().text_size(px(13.)).child(self.highlighted(&habit.name, &query, cx)))
+                        .when(habit.archived, |item| {
+                            item.end_slot(Label::new(strings.habit_archived).size(LabelSize::XSmall).color(Color::Muted))
+                        })
+                        .on_click(cx.listener(move |_, _, _, cx| cx.emit(SearchEvent::OpenHabit(id))))
+                        .into_any_element()
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let nothing = has_query && task_rows.is_empty() && habit_rows.is_empty() && tag_rows.is_empty() && list_rows.is_empty();
 
         v_flex()
             .w(px(560.))
@@ -615,6 +643,7 @@ impl Render for SearchModal {
                     .gap_1p5()
                     .when(self.filter == Filter::All || self.filter == Filter::Tasks, |el| el.child(chip(Filter::Tasks, strings.search_filter_task, cx)))
                     .children(task_dropdowns)
+                    .when(self.filter == Filter::All || self.filter == Filter::Habits, |el| el.child(chip(Filter::Habits, strings.section_habits, cx)))
                     .when(self.filter == Filter::All || self.filter == Filter::Tags, |el| el.child(chip(Filter::Tags, strings.search_filter_tag, cx)))
                     .when(self.filter == Filter::All || self.filter == Filter::Lists, |el| el.child(chip(Filter::Lists, strings.search_filter_list, cx))),
             )
@@ -628,11 +657,13 @@ impl Render for SearchModal {
                             let hint = match self.filter {
                                 Filter::All => strings.search_hint,
                                 Filter::Tasks => strings.search_hint_task,
+                                Filter::Habits => strings.section_habits,
                                 Filter::Tags => strings.search_hint_tag,
                                 Filter::Lists => strings.search_hint_list,
                             };
                             let icon = match self.filter {
                                 Filter::Tasks => IconName::SquareCheck,
+                                Filter::Habits => IconName::FernHabit,
                                 Filter::Tags => IconName::Tag,
                                 Filter::Lists => IconName::List,
                                 Filter::All => IconName::Search,
@@ -657,6 +688,7 @@ impl Render for SearchModal {
                                     })),
                             )
                         })
+                        .when(!habit_rows.is_empty(), |el| el.child(Self::group_heading(strings.section_habits)).children(habit_rows))
                         .when(!tag_rows.is_empty(), |el| el.child(Self::group_heading(strings.tags)).children(tag_rows))
                         .when(!list_rows.is_empty(), |el| el.child(Self::group_heading(strings.lists)).children(list_rows)),
                 )

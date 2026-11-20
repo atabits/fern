@@ -333,8 +333,19 @@ impl CalendarView {
                 }
             }
         }
-        if today.year() == year {
-            *counts.entry(today).or_default() += self.habits_today.len();
+        if self.options.show_habits {
+            let week_start = crate::calendar::week_start();
+            for habit in &self.habits {
+                let recs = self.habit_records.get(&habit.id).map(Vec::as_slice).unwrap_or(&[]);
+                for rec in recs {
+                    if rec.date < today && (first..=last).contains(&rec.date) && (rec.is_handled() || rec.is_partial()) {
+                        *counts.entry(rec.date).or_default() += 1;
+                    }
+                }
+                if today.year() == year && !habit.archived && habit.is_active_on(today, recs, week_start) {
+                    *counts.entry(today).or_default() += 1;
+                }
+            }
         }
         counts
     }

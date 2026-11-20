@@ -85,7 +85,7 @@ impl FocusView {
         let paused = running.timer.is_paused();
         running.timer.pause(now);
         if running.timer.is_stopwatch() && elapsed > STOPWATCH_DIRECT_SAVE_MS {
-            let title = running.task.as_ref().map(|(_, title)| title.clone()).unwrap_or_else(|| i18n::t(cx).focus.to_owned());
+            let title = running.task.as_ref().map(|t| t.title.clone()).unwrap_or_else(|| i18n::t(cx).focus.to_owned());
             self.open_stopwatch_review(title, elapsed, paused, limited, window, cx);
             return;
         }
@@ -345,7 +345,10 @@ mod tests {
                 complete_current(view, cx);
                 assert!(!view.running.as_ref().unwrap().timer.is_paused());
                 complete_current(view, cx);
-                assert_eq!(view.running.as_ref().unwrap().task, Some((Some(task.id), task.title)));
+                assert_eq!(
+                    view.running.as_ref().unwrap().task,
+                    Some(FocusTarget { task_id: Some(task.id), habit_id: None, title: task.title })
+                );
                 assert_eq!(view.running.as_ref().unwrap().on_break, None);
                 complete_current(view, cx);
                 assert_eq!(view.running.as_ref().unwrap().on_break, Some(BreakKind::Long));

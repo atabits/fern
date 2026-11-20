@@ -30,9 +30,11 @@ pub use calendar_options::{CalendarOptions, ColorBy, CountdownColor, HabitColor}
 pub use countdown::{Countdown, CountdownKind, Span, span};
 pub use filter::{Condition, ConditionValue, DateRule, Field, FilterRules, Join, SmartFilter};
 pub use focus::{FocusSession, FocusStats, focus_stats, format_minutes};
-pub use habit::{Checkin, Goal, Habit, HabitStats, MonthStats};
+pub use habit::{
+    Checkin, CheckinMode, CheckinStatus, CustomSection, CycleSummary, DayProgress, Goal, Habit, HabitCycle,
+    HabitDraft, HabitSection, HabitStats, MonthStats,
+};
 pub use habit::Frequency as HabitFrequency;
-pub use habit::{CustomSection, HabitSection};
 pub use model::{Activity, Attachment, Comment, Estimate, ChecklistItem, ListSection, Template, Id, Kind, List, ListDraft, ListFolder, Priority, Tag, Task, TaskDraft, View, ViewCounts};
 pub use preferences::{DURATIONS, Features, Notifications, DateFormat, DefaultDate, Preferences, RailSection, SidebarSection, TaskDefaults, SmartList, ThemeMode, ThemeSelection, Visibility, WEEK_STARTS};
 pub use quick_add::{ParsedTask, Recognition, parse_quick_add, parse_quick_add_on_day, parse_quick_add_with};

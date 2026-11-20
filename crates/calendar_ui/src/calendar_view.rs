@@ -117,6 +117,7 @@ pub struct CalendarView {
     card: Option<(Id, NaiveDate)>,
     /// A subscribed calendar's event whose card is open: its UID and the day it starts.
     open_event: Option<(String, NaiveDate)>,
+    open_habit: Option<(Id, NaiveDate)>,
     detail: gpui::Entity<TaskDetail>,
     /// View Options, the header's "…" menu and the dialog it opens.
     options: CalendarOptions,
@@ -132,8 +133,9 @@ pub struct CalendarView {
     list_names: Vec<(Id, String)>,
     tag_names: Vec<String>,
     sidebar_busy_days: HashSet<NaiveDate>,
-    /// With Show Habit, the habits due today; with Show Focus Records, the focus sessions.
-    habits_today: Vec<fern_core::Habit>,
+    /// With Show Habit, all habits and their check-ins; with Show Focus Records, the focus sessions.
+    habits: Vec<fern_core::Habit>,
+    habit_records: std::collections::HashMap<Id, Vec<fern_core::Checkin>>,
     focus_sessions: Vec<fern_core::FocusSession>,
 }
 
@@ -246,8 +248,11 @@ const CARD_HEIGHT: f32 = 301.;
 /// How far ahead the Agenda reaches.
 const AGENDA_DAYS: i64 = 366;
 
+pub struct OpenHabit(pub Id);
+
 impl EventEmitter<OpenTask> for CalendarView {}
 impl EventEmitter<OpenTaskPicker> for CalendarView {}
+impl EventEmitter<OpenHabit> for CalendarView {}
 impl EventEmitter<crate::task_detail::StartFocus> for CalendarView {}
 
 impl Focusable for CalendarView {
@@ -320,6 +325,7 @@ impl CalendarView {
             context_side: None,
             card: None,
             open_event: None,
+            open_habit: None,
             detail,
             options: CalendarOptions::default(),
             more_menu: false,
@@ -331,7 +337,8 @@ impl CalendarView {
             list_names: Vec::new(),
             tag_names: Vec::new(),
             sidebar_busy_days: HashSet::new(),
-            habits_today: Vec::new(),
+            habits: Vec::new(),
+            habit_records: std::collections::HashMap::new(),
             focus_sessions: Vec::new(),
         };
         this.reload(cx);
@@ -513,23 +520,202 @@ impl CalendarView {
             .into_any_element()
     }
 
-    fn day_extras(&self, date: NaiveDate, cx: &App) -> Vec<AnyElement> {
+    fn render_habit_popover(
+        &self,
+        habit: &fern_core::Habit,
+        date: NaiveDate,
+        cx: &mut Context<Self>,
+    ) -> Div {
         let strings = i18n::t(cx);
-        let theme = cx.theme();
+        let theme = cx.theme().clone();
+        let id = habit.id;
+        let rec = self
+            .habit_records
+            .get(&id)
+            .and_then(|recs| recs.iter().find(|r| r.date == date));
+        let done = rec.is_some_and(|r| r.is_done());
+        let value = rec.map_or(0.0, |r| r.value);
+        let goal_amt = habit.goal_amount();
+        let unit = habit.goal.as_ref().map(|g| g.unit.clone()).unwrap_or_default();
+        let pct = (value / goal_amt).clamp(0.0, 1.0) as f32;
+        let has_goal = habit.goal.is_some();
+        let step = habit.goal.as_ref().map_or(1.0, |g| g.step_amount());
+
+        popover(cx)
+            .w(px(236.))
+            .p_3()
+            .gap_2()
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.open_habit = None;
+                cx.notify();
+            }))
+            .child(
+                h_flex()
+                    .id(SharedString::from(format!("cal-habit-title-{id}")))
+                    .gap_2()
+                    .items_center()
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.open_habit = None;
+                        cx.emit(OpenHabit(id));
+                        cx.notify();
+                    }))
+                    .child(desktop_common::habit_helpers::avatar(habit, px(24.), cx))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(Label::new(habit.name.clone()).weight(FontWeight::SEMIBOLD).truncate()),
+                    )
+                    .child(Icon::new(IconName::ChevronRight).size(IconSize::XSmall).color(Color::Muted)),
+            )
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(
+                        Label::new(
+                            format!(
+                                "{} / {} {}",
+                                fern_core::habit::format_amount(value),
+                                fern_core::habit::format_amount(goal_amt),
+                                unit
+                            )
+                            .trim()
+                            .to_owned(),
+                        )
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                    )
+                    .child(
+                        div()
+                            .h(px(5.))
+                            .w_full()
+                            .rounded_full()
+                            .bg(theme.colors().border.opacity(0.5))
+                            .child(div().h_full().w(gpui::relative(pct)).rounded_full().bg(theme.colors().accent)),
+                    ),
+            )
+            .when(!habit.archived, |el| {
+                let btn_label = if done {
+                    strings.habit_reset.to_owned()
+                } else if has_goal {
+                    format!("+{}", fern_core::habit::format_amount(step))
+                } else {
+                    strings.habit_i_did_it.to_owned()
+                };
+                el.child(
+                    h_flex()
+                        .gap_2()
+                        .pt_1()
+                        .child(
+                            div()
+                                .id(SharedString::from(format!("cal-habit-act-{id}-{date}")))
+                                .flex_1()
+                                .h(px(28.))
+                                .rounded(px(6.))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .cursor_pointer()
+                                .bg(if done {
+                                    theme.colors().surface_background
+                                } else {
+                                    theme.colors().accent
+                                })
+                                .border_1()
+                                .border_color(if done {
+                                    theme.colors().border
+                                } else {
+                                    theme.colors().accent
+                                })
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    let res = if done {
+                                        this.store.reset_checkin(id, date, true)
+                                    } else if has_goal {
+                                        this.store.step_checkin(id, date).map(|_| ())
+                                    } else {
+                                        this.store.toggle_checkin(id, date).map(|_| ())
+                                    };
+                                    if let Err(err) = res {
+                                        eprintln!("failed to update habit from calendar: {err:#}");
+                                    }
+                                    desktop_common::data_version::data_changed(cx.entity_id(), cx);
+                                    this.reload(cx);
+                                }))
+                                .child(
+                                    Label::new(btn_label)
+                                        .size(LabelSize::Small)
+                                        .color(if done { Color::Default } else { Color::Custom(gpui::white()) }),
+                                ),
+                        ),
+                )
+            })
+    }
+
+    fn day_extras(&self, date: NaiveDate, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let strings = i18n::t(cx);
+        let theme = cx.theme().clone();
         let today = Local::now().date_naive();
+        let week_start = calendar::week_start();
         let bar = |tint: gpui::Hsla| h_flex().h(px(18.)).flex_none().gap_1().px_1().rounded(px(3.)).bg(tint.opacity(0.28));
         let mut items: Vec<AnyElement> = Vec::new();
-        if date == today {
-            for habit in &self.habits_today {
+        if self.options.show_habits && date <= today {
+            for habit in &self.habits {
+                let recs = self.habit_records.get(&habit.id).map(Vec::as_slice).unwrap_or(&[]);
+                let day_rec = recs.iter().find(|r| r.date == date);
+                let show = if date == today {
+                    !habit.archived && habit.is_active_on(today, recs, week_start)
+                } else {
+                    day_rec.is_some_and(|r| r.is_handled() || r.is_partial())
+                };
+                if !show {
+                    continue;
+                }
+                let done = day_rec.is_some_and(|r| r.is_done());
                 let tint = match self.options.habit_color {
                     fern_core::HabitColor::Theme => theme.colors().accent,
                     fern_core::HabitColor::Fixed => crate::calendar_options_view::palette(self.options.habit_fixed),
-                    fern_core::HabitColor::Habit => crate::lists_panel::parse_color(habit.color.as_deref()).unwrap_or(theme.colors().accent),
+                    fern_core::HabitColor::Habit => {
+                        crate::lists_panel::parse_color(habit.color.as_deref()).unwrap_or(theme.colors().accent)
+                    }
                 };
+                let id = habit.id;
+                let key = (id, date);
+                let open = self.open_habit == Some(key);
+                let time_badge = (date == today)
+                    .then(|| habit.reminders.first().copied())
+                    .flatten()
+                    .map(|t| calendar::format_time(t, strings));
                 items.push(
-                    bar(tint)
-                        .child(Icon::new(IconName::FernHabit).size(IconSize::XSmall).color(Color::Muted))
-                        .child(Label::new(habit.name.clone()).size(LabelSize::XSmall).truncate())
+                    div()
+                        .relative()
+                        .child(
+                            bar(tint)
+                                .id(SharedString::from(format!("cal-habit-{id}-{date}")))
+                                .cursor_pointer()
+                                .when(done, |el| el.opacity(0.65))
+                                .child(
+                                    Icon::new(if done { IconName::Check } else { IconName::FernHabit })
+                                        .size(IconSize::XSmall)
+                                        .color(if done { Color::Accent } else { Color::Muted }),
+                                )
+                                .child(div().flex_1().min_w_0().child(Label::new(habit.name.clone()).size(LabelSize::XSmall).truncate()))
+                                .when_some(time_badge, |el, t| {
+                                    el.child(Label::new(t).size(LabelSize::XSmall).color(Color::Muted))
+                                })
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.open_event = None;
+                                    this.open_habit = if this.open_habit == Some(key) { None } else { Some(key) };
+                                    cx.notify();
+                                })),
+                        )
+                        .when(open, |el| {
+                            el.child(PopoverAttachment::new(
+                                Placement::BelowLeft,
+                                self.render_habit_popover(habit, date, cx),
+                            ))
+                        })
                         .into_any_element(),
                 );
             }
@@ -773,6 +959,7 @@ impl CalendarView {
             window.focus(&self.focus_handle, cx);
             true
         } else if self.open_event.take().is_some()
+            || self.open_habit.take().is_some()
             || self.open_countdown.take().is_some()
             || self.year_day.take().is_some()
         {
@@ -1043,17 +1230,13 @@ impl CalendarView {
         self.tasks.sort_by_key(|task| (task.due_date, task.due_time.is_some(), task.due_time));
         self.tasks.extend(repeats_before_range);
         self.countdowns = self.store.countdowns().unwrap_or_default();
-        let today = Local::now().date_naive();
-        self.habits_today = if self.options.show_habits {
-            self.store
-                .habits()
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|h| !h.archived && h.is_due(today, &self.store.checkins(h.id).unwrap_or_default()))
-                .collect()
+        if self.options.show_habits {
+            self.habits = self.store.habits().unwrap_or_default();
+            self.habit_records = self.store.all_habit_checkins().unwrap_or_default();
         } else {
-            Vec::new()
-        };
+            self.habits.clear();
+            self.habit_records.clear();
+        }
         self.focus_sessions = if self.options.show_focus { self.store.focus_sessions().unwrap_or_default() } else { Vec::new() };
         cx.notify();
     }

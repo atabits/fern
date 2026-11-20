@@ -93,6 +93,17 @@
     }
   },
   {
+    "context": "Habits",
+    "bindings": {
+      "down": "habits::SelectNextHabit",
+      "j": "habits::SelectNextHabit",
+      "up": "habits::SelectPreviousHabit",
+      "k": "habits::SelectPreviousHabit",
+      "space": "habits::CheckInSelectedHabit",
+      "secondary-n": "habits::NewHabit"
+    }
+  },
+  {
     "context": "Settings",
     "bindings": {
       "escape": "settings::DismissSettings"

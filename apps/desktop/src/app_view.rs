@@ -156,11 +156,32 @@ impl AppView {
             }
         })
         .detach();
+        cx.subscribe_in(&calendar, window, |this, _, calendar_view::OpenHabit(id), window, cx| {
+            let id = *id;
+            if this.select(Section::Habits, window, cx) {
+                this.habits.update(cx, |habits, cx| habits.select(id, cx));
+            }
+        })
+        .detach();
         // "Start Focus" in a task's menu starts a Pomodoro for it in the Focus section.
         cx.subscribe_in(&todo, window, |this, _, crate::task_detail::StartFocus(id, title, stopwatch), window, cx| {
             let (target, stopwatch) = ((*id, title.clone()), *stopwatch);
             if this.select(Section::Pomodoro, window, cx) {
                 this.focus.update(cx, |focus, cx| focus.start_for(Some(target.0), target.1, stopwatch, cx));
+            }
+        })
+        .detach();
+        cx.subscribe_in(&todo, window, |this, _, crate::todo_view::OpenHabit(id), window, cx| {
+            let id = *id;
+            if this.select(Section::Habits, window, cx) {
+                this.habits.update(cx, |habits, cx| habits.select(id, cx));
+            }
+        })
+        .detach();
+        cx.subscribe_in(&todo, window, |this, _, event: &crate::todo_view::StartHabitFocus, window, cx| {
+            let (habit_id, title, stopwatch) = (event.habit_id, event.title.clone(), event.stopwatch);
+            if this.select(Section::Pomodoro, window, cx) {
+                this.focus.update(cx, |focus, cx| focus.start_for_habit(Some(habit_id), title, stopwatch, cx));
             }
         })
         .detach();
@@ -171,11 +192,11 @@ impl AppView {
         .detach();
         let countdown = cx.new(|cx| CountdownView::new(store.clone(), cx));
         let habits = cx.new(|cx| HabitView::new(store.clone(), cx));
-        // "Start Focus" in a habit's menu starts a Pomodoro or a stopwatch named after it.
+        // "Start Focus" in a habit's menu starts a Pomodoro or a stopwatch linked to it.
         cx.subscribe_in(&habits, window, |this, _, event: &crate::habit_view::StartFocus, window, cx| {
-            let (title, stopwatch) = (event.title.clone(), event.stopwatch);
+            let (habit_id, title, stopwatch) = (event.habit_id, event.title.clone(), event.stopwatch);
             if this.select(Section::Pomodoro, window, cx) {
-                this.focus.update(cx, |focus, cx| focus.start_named(title, stopwatch, cx));
+                this.focus.update(cx, |focus, cx| focus.start_for_habit(habit_id, title, stopwatch, cx));
             }
         })
         .detach();
@@ -687,6 +708,12 @@ impl AppView {
             match event {
                 SearchEvent::OpenTask(id) => {
                     this.open_task(*id, window, cx);
+                }
+                SearchEvent::OpenHabit(id) => {
+                    let id = *id;
+                    if this.select(Section::Habits, window, cx) {
+                        this.habits.update(cx, |habits, cx| habits.select(id, cx));
+                    }
                 }
                 SearchEvent::OpenView(fern_core::View::Search(query)) => {
                     let query = query.clone();
@@ -1401,7 +1428,17 @@ impl AppView {
                     self.store.toggle_checkin(habit, today).map(|_| ())
                 }
             }
-            NoticeAction::PlusOne => self.store.add_checkin_amount(habit, now.date(), 1).map(|_| ()),
+            NoticeAction::PlusOne => {
+                let step = self
+                    .store
+                    .habits()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .find(|h| h.id == habit)
+                    .and_then(|h| h.goal)
+                    .map_or(1.0, |g| g.step_amount());
+                self.store.add_checkin_amount(habit, now.date(), step).map(|_| ())
+            }
             NoticeAction::Record => {
                 window.activate_window();
                 self.set_notices_open(false, cx);
@@ -1416,6 +1453,7 @@ impl AppView {
             eprintln!("failed to answer the reminder: {err:#}");
         }
         self.notices.items.retain(|n| n != notice);
+        desktop_common::data_version::data_changed(cx.entity_id(), cx);
         self.habits.update(cx, |habits, cx| habits.reload(cx));
         cx.notify();
     }

@@ -199,12 +199,16 @@ impl FocusReview {
         };
         let result = self.focus.update(cx, |focus, cx| -> Result<(), &'static str> {
             let running = focus.running.as_ref().ok_or(strings.focus_session_unavailable)?;
-            let (task, title) = running.task.as_ref().map_or((None, strings.focus), |(id, title)| (*id, title.as_str()));
+            let (task, habit, title) = running
+                .task
+                .as_ref()
+                .map_or((None, None, strings.focus), |t| (t.task_id, t.habit_id, t.title.as_str()));
             let start = running.timer.started_at;
-            focus.store.add_focus_session_as(task, title, start, start + value, true).map_err(|error| {
+            focus.store.add_focus_session_for(task, habit, title, start, start + value, true).map_err(|error| {
                 eprintln!("failed to save the focus session: {error:#}");
                 strings.focus_save_failed
             })?;
+            focus.auto_checkin_habit(habit, value, cx);
             focus.running = None;
             focus.continuation = None;
             focus.cycle.reset();
@@ -464,7 +468,7 @@ mod tests {
                 assert!(focus.review_window.is_none());
                 let running = focus.running.as_ref().unwrap();
                 assert_eq!(running.timer.is_paused(), paused);
-                assert_eq!(running.task.as_ref().unwrap().1, "Keep this session");
+                assert_eq!(running.task.as_ref().unwrap().title, "Keep this session");
                 assert!(store.focus_sessions().unwrap().is_empty());
                 window.remove_window();
             }).unwrap();

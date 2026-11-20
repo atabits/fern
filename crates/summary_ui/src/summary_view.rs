@@ -419,7 +419,7 @@ impl SummaryView {
         summary_fields::decorate(&mut report, &groups, &self.options, &tasks, &sessions);
         // The Lists filter's "Habit": each habit's check-ins in the period.
         let habits = self.store.habits().unwrap_or_default();
-        let checkins = habits.iter().map(|h| (h.id, self.store.checkins(h.id).unwrap_or_default())).collect();
+        let checkins = self.store.all_habit_done_dates().unwrap_or_default();
         let rows = fern_core::summary::habit_checkins(&habits, &checkins, &self.options, today, calendar::week_start());
         if !rows.is_empty() {
             let lines = rows
@@ -744,14 +744,19 @@ impl SummaryView {
         let list_label = match &options.lists {
             None if options.habits => format!("{}, {}", strings.summary_all_lists, strings.summary_habits),
             None => strings.summary_all_lists.to_owned(),
-            Some(chosen) => chosen
-                .iter()
-                .map(|id| match id {
-                    None => strings.inbox.to_owned(),
-                    Some(id) => lists.iter().find(|l| l.id == *id).map(|l| l.name.clone()).unwrap_or_default(),
-                })
-                .collect::<Vec<_>>()
-                .join(", "),
+            Some(chosen) => {
+                let mut names: Vec<String> = chosen
+                    .iter()
+                    .map(|id| match id {
+                        None => strings.inbox.to_owned(),
+                        Some(id) => lists.iter().find(|l| l.id == *id).map(|l| l.name.clone()).unwrap_or_default(),
+                    })
+                    .collect();
+                if options.habits {
+                    names.push(strings.summary_habits.to_owned());
+                }
+                names.join(", ")
+            }
         };
         let mut list_options: Vec<(String, bool, Pick)> = vec![(
             strings.summary_all_lists.to_owned(),

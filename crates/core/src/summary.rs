@@ -416,7 +416,8 @@ pub fn summarize(tasks: &[Task], options: &SummaryOptions, today: NaiveDate, wee
     groups
 }
 
-/// The period's check-in days of each active habit, for the report's Habit section.
+/// The period's check-in days of each active habit (and archived habits that had check-ins in
+/// the period), for the report's Habit section.
 pub fn habit_checkins(
     habits: &[Habit],
     checkins: &HashMap<Id, HashSet<NaiveDate>>,
@@ -430,10 +431,9 @@ pub fn habit_checkins(
     let (first, last) = options.period.range(today, week_start);
     habits
         .iter()
-        .filter(|h| !h.archived)
-        .map(|h| {
+        .filter_map(|h| {
             let days = checkins.get(&h.id).map_or(0, |days| days.iter().filter(|d| **d >= first && **d <= last).count());
-            (h.clone(), days)
+            (!h.archived || days > 0).then(|| (h.clone(), days))
         })
         .collect()
 }

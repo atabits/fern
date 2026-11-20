@@ -266,6 +266,7 @@ mod tests {
         let session = |day: u32, hour: u32| FocusSession {
             id: uuid::Uuid::now_v7(),
             task_id: None,
+            habit_id: None,
             title: format!("{day} {hour}"),
             started_at: at(day, hour),
             ended_at: at(day, hour) + 25 * 60_000,

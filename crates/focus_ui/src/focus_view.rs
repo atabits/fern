@@ -34,10 +34,17 @@ fn now_ms() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct FocusTarget {
+    pub(super) task_id: Option<Id>,
+    pub(super) habit_id: Option<Id>,
+    pub(super) title: String,
+}
+
 struct Running {
     timer: FocusTimer,
-    /// What the session is for: a task, or a name alone (a habit).
-    task: Option<(Option<Id>, String)>,
+    /// What the session is for: a task, a habit, or a timer name.
+    task: Option<FocusTarget>,
     /// A break after a finished Pomodoro; breaks are not recorded.
     on_break: Option<BreakKind>,
     _ticker: GpuiTask<()>,
@@ -50,9 +57,10 @@ struct StatsData {
     lists: Vec<fern_core::List>,
     tags: Vec<fern_core::Tag>,
     habits: Vec<(fern_core::Habit, std::collections::HashSet<NaiveDate>)>,
+    habit_records: HashMap<Id, Vec<fern_core::Checkin>>,
 }
 
-type FocusTask = (Option<Id>, String);
+type FocusTask = FocusTarget;
 
 pub struct FocusView {
     store: Rc<Store>,
@@ -268,13 +276,13 @@ struct Picker {
 enum NextFocus {
     Task(Id, String),
     Timer(fern_core::focus::FocusTimer),
-    Habit(String),
+    Habit(Id, String),
 }
 
 impl NextFocus {
     fn title(&self) -> &str {
         match self {
-            Self::Task(_, title) | Self::Habit(title) => title,
+            Self::Task(_, title) | Self::Habit(_, title) => title,
             Self::Timer(timer) => &timer.name,
         }
     }
@@ -361,6 +369,7 @@ impl FocusView {
         self.tasks = self.store.tasks_in(&View::Today, today).unwrap_or_default();
         self.sessions = self.store.focus_sessions().unwrap_or_default();
         self.timers = self.store.focus_timers(self.archived_tab).unwrap_or_default();
+        let habit_records = self.store.all_habit_checkins().unwrap_or_default();
         self.stats_data = StatsData {
             tasks: self.store.tasks().unwrap_or_default(),
             lists: self.store.lists().unwrap_or_default(),
@@ -371,10 +380,14 @@ impl FocusView {
                 .unwrap_or_default()
                 .into_iter()
                 .map(|h| {
-                    let checkins = self.store.checkins(h.id).unwrap_or_default();
-                    (h, checkins)
+                    let done = habit_records
+                        .get(&h.id)
+                        .map(|recs| fern_core::habit::done_dates(recs))
+                        .unwrap_or_default();
+                    (h, done)
                 })
                 .collect(),
+            habit_records,
         };
         cx.notify();
     }
@@ -402,15 +415,35 @@ impl FocusView {
         } else {
             FocusTimer::start(now_ms(), pomo_length_ms(self.minutes(POMO_SETTING)))
         };
-        self.start_timer(task.map(|(id, title)| (Some(id), title)), None, timer, cx);
+        self.start_timer(
+            task.map(|(id, title)| FocusTarget { task_id: Some(id), habit_id: None, title }),
+            None,
+            timer,
+            cx,
+        );
     }
 
     /// "Start Focus" on a habit: a Pomodoro or a stopwatch named after it, in that mode.
     pub fn start_named(&mut self, title: String, stopwatch: bool, cx: &mut Context<Self>) {
-        self.start_for(None, title, stopwatch, cx);
+        self.start_for_habit(None, title, stopwatch, cx);
     }
 
-    /// "Start Focus → Start Pomo / Start Stopwatch" for a task or a habit, in that mode.
+    /// "Start Focus" on a specific habit, linking the recorded session so time-based goals auto check in.
+    pub fn start_for_habit(&mut self, habit_id: Option<Id>, title: String, stopwatch: bool, cx: &mut Context<Self>) {
+        if self.finish_prompt { return; }
+        self.finish(cx);
+        if self.running.is_some() { return; }
+        self.completed_in_chain = 0;
+        self.set_stopwatch_mode(stopwatch, cx);
+        let timer = if stopwatch {
+            FocusTimer::stopwatch(now_ms())
+        } else {
+            FocusTimer::start(now_ms(), pomo_length_ms(self.minutes(POMO_SETTING)))
+        };
+        self.start_timer(Some(FocusTarget { task_id: None, habit_id, title }), None, timer, cx);
+    }
+
+    /// "Start Focus → Start Pomo / Start Stopwatch" for a task, in that mode.
     pub fn start_for(&mut self, task: Option<Id>, title: String, stopwatch: bool, cx: &mut Context<Self>) {
         if self.finish_prompt { return; }
         self.finish(cx);
@@ -422,7 +455,7 @@ impl FocusView {
         } else {
             FocusTimer::start(now_ms(), pomo_length_ms(self.minutes(POMO_SETTING)))
         };
-        self.start_timer(Some((task, title)), None, timer, cx);
+        self.start_timer(Some(FocusTarget { task_id: task, habit_id: None, title }), None, timer, cx);
     }
 
     /// A timer's play button: a session named after it, with its own Pomo length or as a
@@ -438,7 +471,27 @@ impl FocusView {
             Some(length) => FocusTimer::start(now, length),
             None => FocusTimer::stopwatch(now),
         };
-        self.start_timer(Some((None, timer.name.clone())), None, clock, cx);
+        self.start_timer(
+            Some(FocusTarget { task_id: None, habit_id: None, title: timer.name.clone() }),
+            None,
+            clock,
+            cx,
+        );
+    }
+
+    pub(super) fn auto_checkin_habit(&self, habit_id: Option<Id>, elapsed_ms: i64, cx: &mut Context<Self>) {
+        let Some(habit_id) = habit_id else { return };
+        let focused_minutes = elapsed_ms as f64 / 60_000.0;
+        if let Ok(habits) = self.store.habits()
+            && let Some(habit) = habits.iter().find(|h| h.id == habit_id)
+            && let Some(delta) = fern_core::habit::focus_checkin_delta(habit, focused_minutes)
+        {
+            if let Err(err) = self.store.add_checkin_amount(habit_id, Local::now().date_naive(), delta) {
+                eprintln!("failed to auto check in habit from focus: {err:#}");
+            } else {
+                desktop_common::data_version::data_changed(cx.entity_id(), cx);
+            }
+        }
     }
 
     fn stopwatch_mode(&self) -> bool {
@@ -452,7 +505,7 @@ impl FocusView {
         cx.notify();
     }
 
-    fn start_timer(&mut self, task: Option<(Option<Id>, String)>, on_break: Option<BreakKind>, timer: FocusTimer, cx: &mut Context<Self>) {
+    fn start_timer(&mut self, task: Option<FocusTarget>, on_break: Option<BreakKind>, timer: FocusTimer, cx: &mut Context<Self>) {
         if on_break.is_none() {
             self.cycle.start(timer.started_at, timer.is_stopwatch(), self.interval());
         }
@@ -508,7 +561,7 @@ impl FocusView {
                 match r.on_break {
                     Some(BreakKind::Short) => SharedString::new_static(strings.focus_short_break),
                     Some(BreakKind::Long) => SharedString::new_static(strings.focus_long_break),
-                    None => r.task.as_ref().map_or(SharedString::new_static(strings.focus), |(_, t)| t.clone().into()),
+                    None => r.task.as_ref().map_or(SharedString::new_static(strings.focus), |t| t.title.clone().into()),
                 },
                 true,
                 r.timer.is_paused(),
@@ -546,10 +599,17 @@ impl FocusView {
         let elapsed = running.timer.elapsed(now);
         if running.on_break.is_none() && elapsed >= MIN_FOCUS_MS {
             let strings = i18n::t(cx);
-            let (task_id, title) = running.task.clone().unwrap_or((None, strings.focus.to_owned()));
+            let target = running.task.clone().unwrap_or(FocusTarget {
+                task_id: None,
+                habit_id: None,
+                title: strings.focus.to_owned(),
+            });
             let start = running.timer.started_at;
             let stopwatch = running.timer.is_stopwatch();
-            if let Err(err) = self.store.add_focus_session_as(task_id, &title, start, start + elapsed, stopwatch) {
+            if let Err(err) = self
+                .store
+                .add_focus_session_for(target.task_id, target.habit_id, &target.title, start, start + elapsed, stopwatch)
+            {
                 eprintln!("failed to save the focus session: {err:#}");
                 self.message = Some(strings.focus_save_failed.to_owned());
                 running.timer.pause(now);
@@ -557,6 +617,7 @@ impl FocusView {
                 cx.notify();
                 return;
             }
+            self.auto_checkin_habit(target.habit_id, elapsed, cx);
         }
         if running.on_break.is_none() {
             if completed && !running.timer.is_stopwatch() { self.cycle.complete(running.timer.completed_at()); }
@@ -2367,25 +2428,51 @@ impl FocusView {
                 })
         };
 
-        // The week's habits: the share of active habits done each day.
-        let habits: Vec<&fern_core::Habit> = self.stats_data.habits.iter().filter(|(h, _)| !h.archived).map(|(h, _)| h).collect();
-        let done: Vec<&std::collections::HashSet<NaiveDate>> =
-            self.stats_data.habits.iter().filter(|(h, _)| !h.archived).map(|(_, done)| done).collect();
+        // The week's habits: proportional daily progress respecting is_due and Undone.
+        let all_habits: Vec<fern_core::Habit> = self.stats_data.habits.iter().map(|(h, _)| h.clone()).collect();
+        let week_start = crate::calendar::week_start();
         let week = crate::calendar::week_of(today);
         let habit_week = h_flex().justify_between().children(week.iter().map(|date| {
-            let share = if habits.is_empty() { 0. } else { done.iter().filter(|d| d.contains(date)).count() as f32 / habits.len() as f32 };
+            let progress = fern_core::habit::day_progress(&all_habits, &self.stats_data.habit_records, *date, week_start);
+            let ring: AnyElement = match progress {
+                fern_core::DayProgress::Needless => div()
+                    .size(px(36.))
+                    .rounded_full()
+                    .border_2()
+                    .border_color(theme.colors().element_hover)
+                    .into_any_element(),
+                fern_core::DayProgress::AllUndone => div()
+                    .size(px(36.))
+                    .rounded_full()
+                    .border_2()
+                    .border_color(theme.status().error.opacity(0.6))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(Icon::new(IconName::X).size(IconSize::Small).color(Color::Error))
+                    .into_any_element(),
+                fern_core::DayProgress::Fraction(frac) if frac >= 0.999 => div()
+                    .size(px(36.))
+                    .rounded_full()
+                    .bg(theme.colors().accent)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(Icon::new(IconName::Check).size(IconSize::Small).color(Color::Custom(gpui::white())))
+                    .into_any_element(),
+                fern_core::DayProgress::Fraction(frac) => desktop_common::habit_helpers::progress_ring(
+                    px(36.),
+                    frac,
+                    theme.colors().accent,
+                    theme.colors().element_hover,
+                    px(3.),
+                )
+                .into_any_element(),
+            };
             v_flex()
                 .items_center()
                 .gap_1()
-                .child(
-                    div()
-                        .size(px(36.))
-                        .rounded_full()
-                        .border_2()
-                        .border_color(if share >= 1. { theme.colors().accent } else { theme.colors().element_hover })
-                        .when(share > 0. && share < 1., |el| el.bg(theme.colors().accent.opacity(0.3)))
-                        .when(share >= 1., |el| el.bg(theme.colors().accent.opacity(0.6))),
-                )
+                .child(ring)
                 .child(Label::new(strings.weekdays_short[date.weekday().num_days_from_monday() as usize]).size(LabelSize::XSmall).color(Color::Muted))
         }));
 
@@ -3133,9 +3220,9 @@ impl FocusView {
         match self.next.take() {
             Some(NextFocus::Task(id, title)) => self.start(Some((id, title)), cx),
             Some(NextFocus::Timer(timer)) => self.start_from_timer(&timer, cx),
-            Some(NextFocus::Habit(name)) => {
+            Some(NextFocus::Habit(id, name)) => {
                 let stopwatch = self.stopwatch_mode();
-                self.start_named(name, stopwatch, cx)
+                self.start_for_habit(Some(id), name, stopwatch, cx)
             }
             None => self.start(None, cx),
         }
@@ -3224,15 +3311,18 @@ impl FocusView {
                     items.push(item(format!("pick-task-{}", task.id).into(), task.title.clone(), NextFocus::Task(task.id, task.title.clone()), cx));
                 }
                 // As in the original, the habits due today follow Today's tasks.
+                let done_map = self.store.all_habit_done_dates().unwrap_or_default();
+                let empty_done = HashSet::new();
+                let week_start = crate::calendar::week_start();
                 let due: Vec<&fern_core::Habit> = habits
                     .iter()
-                    .filter(|h| self.picker_view == View::Today && h.is_due(today, &self.store.checkins(h.id).unwrap_or_default()))
+                    .filter(|h| self.picker_view == View::Today && h.is_due_on(today, done_map.get(&h.id).unwrap_or(&empty_done), week_start))
                     .collect();
                 if !due.is_empty() {
                     items.push(div().px_2().pt_1().child(Label::new(strings.focus_picker_tabs[2]).size(LabelSize::XSmall).color(Color::Muted)).into_any_element());
                 }
                 for habit in due {
-                    items.push(item(format!("pick-habit-{}", habit.id).into(), habit.name.clone(), NextFocus::Habit(habit.name.clone()), cx));
+                    items.push(item(format!("pick-habit-{}", habit.id).into(), habit.name.clone(), NextFocus::Habit(habit.id, habit.name.clone()), cx));
                 }
             }
             1 => {
@@ -3243,7 +3333,7 @@ impl FocusView {
             }
             _ => {
                 for habit in &habits {
-                    items.push(item(format!("pick-habit-{}", habit.id).into(), habit.name.clone(), NextFocus::Habit(habit.name.clone()), cx));
+                    items.push(item(format!("pick-habit-{}", habit.id).into(), habit.name.clone(), NextFocus::Habit(habit.id, habit.name.clone()), cx));
                 }
             }
         }

@@ -1518,8 +1518,7 @@ impl TodoView {
     pub(super) fn render_habit_column(&self, strings: &'static Strings, cx: &mut Context<Self>) -> Option<AnyElement> {
         let theme = cx.theme().clone();
         let today = Self::today();
-        let habits: Vec<(fern_core::Habit, u32)> =
-            self.today_habits.iter().map(|(habit, _, amount)| (habit.clone(), *amount)).collect();
+        let habits: Vec<(fern_core::Habit, bool, f64)> = self.today_habits.clone();
         if habits.is_empty() {
             return None;
         }
@@ -1530,10 +1529,18 @@ impl TodoView {
         let habit_hover = base_surface.blend(theme.colors().ghost_element_hover);
         let cards: Vec<AnyElement> = habits
             .into_iter()
-            .map(|(habit, amount)| {
+            .map(|(habit, checked, amount)| {
                 let id = habit.id;
                 let has_goal = habit.goal.is_some();
-                let (target, unit) = habit.goal.as_ref().map_or((1, String::new()), |g| (g.amount, g.unit.clone()));
+                let (target, unit) = habit.goal.as_ref().map_or((1.0, String::new()), |g| (g.amount, g.unit.clone()));
+                let progress_text = format!(
+                    "{} / {} {}",
+                    fern_core::habit::format_amount(amount),
+                    fern_core::habit::format_amount(target),
+                    unit
+                )
+                .trim()
+                .to_owned();
                 v_flex()
                     .id(SharedString::from(format!("habit-card-{id}")))
                     .pl(px(14.))
@@ -1544,6 +1551,7 @@ impl TodoView {
                     .border_1()
                     .border_color(habit_border)
                     .bg(base_surface)
+                    .when(checked, |el| el.opacity(0.62))
                     .when(!dark && !self.kanban_column_color, |el| el.shadow_xs())
                     .hover(move |s| s.bg(habit_hover))
                     .cursor_pointer()
@@ -1551,14 +1559,20 @@ impl TodoView {
                         h_flex()
                             .gap(px(7.))
                             .child(crate::habit_view::avatar(&habit, px(20.), cx))
-                            .child(div().flex_1().min_w_0().child(Label::new(habit.name.clone()).truncate())),
+                            .child(
+                                div().flex_1().min_w_0().child(
+                                    Label::new(habit.name.clone())
+                                        .color(if checked { Color::Muted } else { Color::Default })
+                                        .truncate(),
+                                ),
+                            ),
                     )
                     .child(
                         h_flex()
                             .pl(px(27.))
                             .gap_1()
                             .child(Label::new(strings.today).size(LabelSize::Small).color(Color::Accent))
-                            .child(Label::new(format!("{amount} / {target} {unit}").trim().to_owned()).size(LabelSize::Small).color(Color::Muted)),
+                            .child(Label::new(progress_text).size(LabelSize::Small).color(Color::Muted)),
                     )
                     .on_click(cx.listener(move |this, _, _, cx| {
                         let result = if has_goal {
@@ -1567,9 +1581,18 @@ impl TodoView {
                             this.store.toggle_checkin(id, today).map(|_| ())
                         };
                         this.check(result);
+                        desktop_common::data_version::data_changed(cx.entity_id(), cx);
                         this.reload_today_habits();
                         cx.notify();
                     }))
+                    .on_mouse_down(
+                        gpui::MouseButton::Right,
+                        cx.listener(move |this, ev: &gpui::MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            this.habit_menu = Some((id, ev.position));
+                            cx.notify();
+                        }),
+                    )
                     .into_any_element()
             })
             .collect();

@@ -8,6 +8,7 @@ use ui::prelude::*;
 fn drag_pill(label: SharedString, semibold: bool, radius: f32, cx: &App) -> Div {
     let colors = cx.theme().colors();
     div()
+        .max_w(px(280.))
         .px_3()
         .py_1p5()
         .rounded(px(radius))
@@ -16,9 +17,9 @@ fn drag_pill(label: SharedString, semibold: bool, radius: f32, cx: &App) -> Div 
         .border_color(colors.border)
         .shadow_lg()
         .child(if semibold {
-            Label::new(label).weight(FontWeight::SEMIBOLD)
+            Label::new(label).weight(FontWeight::SEMIBOLD).truncate()
         } else {
-            Label::new(label)
+            Label::new(label).truncate()
         })
 }
 
@@ -34,7 +35,7 @@ fn sidebar_drag_row(
     let colors = cx.theme().colors();
     h_flex()
         .w(px(196.))
-        .h(px(36.))
+        .h(px(38.))
         .px_2p5()
         .gap_2()
         .rounded(px(6.))

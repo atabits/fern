@@ -2,6 +2,7 @@
 //! Date and Priority rows of icons, then the task's actions. The views decide what the actions
 //! that open pickers do; the edits to the task itself are applied here.
 
+use std::cell::Cell;
 use std::rc::Rc;
 
 use chrono::{Duration, NaiveDate};
@@ -162,9 +163,15 @@ pub fn render<V: 'static>(
             ListItem::new(SharedString::from(format!("task-menu-focus-{stopwatch}"))).child(Label::new(label)).on_click(on_click(&act, MenuAction::Focus(stopwatch), cx))
         })
         .collect();
+    let submenu_bounds = Rc::new(Cell::new(None::<gpui::Bounds<Pixels>>));
+    let outside_submenu = submenu_bounds.clone();
     let close = {
         let act = act.clone();
-        cx.listener(move |this: &mut V, _: &gpui::MouseDownEvent, window: &mut Window, cx: &mut Context<V>| act(this, MenuAction::Close, window, cx))
+        cx.listener(move |this: &mut V, event: &gpui::MouseDownEvent, window: &mut Window, cx: &mut Context<V>| {
+            if !outside_submenu.get().is_some_and(|bounds| bounds.contains(&event.position)) {
+                act(this, MenuAction::Close, window, cx);
+            }
+        })
     };
     popover(cx)
         .min_w(px(196.))
@@ -192,6 +199,7 @@ pub fn render<V: 'static>(
                 .icon(IconName::Inbox)
                 .height(px(34.))
                 .open(side == Some(0))
+                .track_bounds(submenu_bounds.clone())
                 .on_hover(on_hover(&act, 0, side, cx))
                 .items(move_items),
         )
@@ -202,6 +210,7 @@ pub fn render<V: 'static>(
                 .icon(IconName::CircleDot)
                 .height(px(34.))
                 .open(side == Some(1))
+                .track_bounds(submenu_bounds)
                 .on_hover(on_hover(&act, 1, side, cx))
                 .items(focus_items),
         )

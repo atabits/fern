@@ -143,6 +143,51 @@ pub fn format_time(time: impl Timelike, strings: &Strings) -> String {
     format_time_as(time, HOUR12.with(Cell::get), strings)
 }
 
+/// Parses a typed time such as `"9"`, `"09:30"`, `"9.30pm"`, `"930"`, or `"下午3:15"`.
+pub fn parse_time(text: &str) -> Option<NaiveTime> {
+    let input = text.trim().to_ascii_lowercase();
+    let (text, meridiem) = [
+        (input.strip_prefix("上午"), false),
+        (input.strip_prefix("下午"), true),
+        (input.strip_suffix("am").or_else(|| input.strip_suffix("a")), false),
+        (input.strip_suffix("pm").or_else(|| input.strip_suffix("p")), true),
+    ]
+    .into_iter()
+    .find_map(|(text, pm)| text.map(|text| (text.trim(), Some(pm))))
+    .unwrap_or((&input, None));
+    let (hour, minute) = match text.split_once([':', '.', ' ']) {
+        Some((h, m)) => (h.trim().parse::<u32>().ok()?, m.trim().parse::<u32>().ok()?),
+        None if text.len() >= 3 && text.chars().all(|c| c.is_ascii_digit()) => {
+            let (h, m) = text.split_at(text.len() - 2);
+            (h.parse().ok()?, m.parse().ok()?)
+        }
+        None => (text.parse().ok()?, 0),
+    };
+    let hour = match meridiem {
+        Some(_) if !(1..=12).contains(&hour) => return None,
+        Some(false) => hour % 12,
+        Some(true) => hour % 12 + 12,
+        None => hour,
+    };
+    NaiveTime::from_hms_opt(hour, minute, 0)
+}
+
+/// Short localized date label (e.g. `"Oct 18"`).
+pub fn short_date(date: NaiveDate, strings: &Strings) -> String {
+    format_day(strings.short_date[0], date, strings)
+}
+
+/// The local calendar day of a Unix timestamp in milliseconds.
+pub fn local_day(ms: i64) -> Option<NaiveDate> {
+    use chrono::{Local, TimeZone};
+    Local.timestamp_millis_opt(ms).single().map(|time| time.date_naive())
+}
+
+/// Day header label including year when `day` is in a different year from `today`.
+pub fn day_header(day: NaiveDate, today: NaiveDate, strings: &Strings) -> String {
+    format_day(strings.day_header[usize::from(day.year() != today.year())], day, strings)
+}
+
 fn format_time_as(time: impl Timelike, hour12: bool, strings: &Strings) -> String {
     if hour12 {
         let (pm, hour) = time.hour12();

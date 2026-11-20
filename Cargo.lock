@@ -1146,14 +1146,12 @@ dependencies = [
 name = "countdown_ui"
 version = "0.1.12"
 dependencies = [
- "anyhow",
  "assets",
  "chrono",
  "desktop_common",
  "fern_core",
  "fern_i18n",
  "gpui",
- "task_ui",
  "theme",
  "ui",
 ]
@@ -1311,7 +1309,6 @@ dependencies = [
  "fern_server",
  "futures",
  "gpui",
- "icons",
  "raw-window-handle",
  "resvg",
  "serde",
@@ -1795,7 +1792,6 @@ dependencies = [
  "fern_core",
  "fern_i18n",
  "gpui",
- "task_ui",
  "theme",
  "ui",
 ]
@@ -2498,7 +2494,6 @@ dependencies = [
  "fern_core",
  "fern_i18n",
  "gpui",
- "task_ui",
  "theme",
  "ui",
 ]
@@ -5364,7 +5359,6 @@ dependencies = [
  "fern_core",
  "fern_i18n",
  "gpui",
- "raw-window-handle",
  "task_ui",
  "theme",
  "ui",

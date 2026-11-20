@@ -8,8 +8,8 @@ pub use presets::{DARK_PRESETS, LIGHT_PRESETS, ThemePreset};
 pub use registry::{ThemeRegistry, reload_user_themes};
 pub use schema::{
     BackgroundContent, EXAMPLE_THEME_TEMPLATE, SwatchContent, ThemeContent, ThemeFamilyContent,
-    ThemeStyleContent, load_theme_family_from_str, load_themes_from_dir, parse_theme_family,
-    try_parse_color,
+    ThemeStyleContent, is_theme_file, load_theme_family_from_str, load_themes_from_dir,
+    parse_theme_family, strip_jsonc, try_parse_color,
 };
 
 use std::sync::Arc;

@@ -119,6 +119,7 @@ pub struct TaskDetail {
     calendar_card: bool,
     /// The Add Subtask field shown while the task has no subtasks, from the "…" menu.
     subtask_open: bool,
+    body_scroll: gpui::ScrollHandle,
     _session_subscriptions: Vec<Subscription>,
 }
 
@@ -193,7 +194,9 @@ impl TaskDetail {
                 this.new_item.update(cx, |input, cx| input.set_placeholder(strings.add_item, cx));
                 this.subtask_input.update(cx, |input, cx| input.set_placeholder(strings.add_subtask, cx));
                 this.time_input.update(cx, |input, cx| input.set_placeholder(strings.time_placeholder, cx));
+                this.link_search.update(cx, |input, cx| input.set_placeholder(strings.search_placeholder, cx));
                 this.list_search.update(cx, |input, cx| input.set_placeholder(strings.section_search, cx));
+                this.comment_input.update(cx, |input, cx| input.set_placeholder(strings.write_comment, cx));
             }),
         ];
 
@@ -224,6 +227,7 @@ impl TaskDetail {
             sticky_style: None,
             calendar_card: false,
             subtask_open: false,
+            body_scroll: gpui::ScrollHandle::new(),
             _session_subscriptions: subscriptions,
         }
     }
@@ -279,15 +283,7 @@ impl TaskDetail {
         let strings = i18n::t(cx);
         match self.session.popup {
             Some(Popup::Due) => self.render_due_popup_in(available, strings, cx),
-            Some(Popup::More) => v_scroll(
-                "sticky-more-scroll-view",
-                div()
-                    .id("sticky-more-scroll")
-                    .child(self.render_more_popup(strings, cx)),
-            )
-            .max_h(available.height)
-            .compact()
-            .into_any_element(),
+            Some(Popup::More) => self.render_more_popup_in(Some(available.height), strings, cx),
             Some(Popup::Priority) => self.render_priority_popup(strings, cx),
             Some(Popup::List) => self.render_list_popup(strings, cx),
             Some(Popup::Tags | Popup::InlineTags) => self.render_tags_popup(cx),
@@ -322,6 +318,10 @@ impl TaskDetail {
 
     /// Shows a task, or the empty panel for `None`.
     pub fn show(&mut self, task: Option<Task>, cx: &mut Context<Self>) {
+        let task_changed = self.session.task.as_ref().map(|t| t.id) != task.as_ref().map(|t| t.id);
+        if task_changed {
+            self.body_scroll.set_offset(gpui::point(px(0.), px(0.)));
+        }
         self.session.draft = None;
         self.title.update(cx, |input, cx| input.set_placeholder(i18n::t(cx).untitled, cx));
         let (title, notes) = task
@@ -441,7 +441,9 @@ impl TaskDetail {
                                 .icon_color(Color::Muted)
                                 .tooltip(Tooltip::text(strings.delete))
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    let _ = this.session.store.delete_comment(id);
+                                    if this.session.store.delete_comment(id).is_ok() {
+                                        cx.emit(TaskUpdated);
+                                    }
                                     this.sync_comments();
                                     cx.notify();
                                 })),
@@ -551,8 +553,14 @@ impl TaskDetail {
             return;
         };
         let staging_dir = dir.clone();
-        let is_draft = self.session.draft.is_some() && self.task_id() == Some(task);
-        if is_draft { self.session.draft.as_mut().unwrap().pending_attachments += 1; }
+        let is_draft = if self.task_id() == Some(task)
+            && let Some(draft) = self.session.draft.as_mut()
+        {
+            draft.pending_attachments += 1;
+            true
+        } else {
+            false
+        };
         let copies = cx.background_spawn(async move {
             paths
                 .into_iter()
@@ -566,16 +574,26 @@ impl TaskDetail {
             let copies = copies.await;
             this.update(cx, |this, cx| {
                 // A file picker or copy can finish after its draft has been closed/replaced.
-                if is_draft && (this.task_id() != Some(task) || this.session.draft.is_none()) { return; }
-                if is_draft { this.session.draft.as_mut().unwrap().pending_attachments -= 1; }
+                if is_draft {
+                    if this.task_id() != Some(task) {
+                        return;
+                    }
+                    let Some(draft) = this.session.draft.as_mut() else { return };
+                    draft.pending_attachments = draft.pending_attachments.saturating_sub(1);
+                }
                 let strings = i18n::t(cx);
+                let mut saved_any = false;
                 for (path, prepared) in copies {
                     let result = prepared.and_then(|copy| {
                         if is_draft {
-                            this.session.draft.as_mut().unwrap().attachments.push(copy);
+                            if let Some(draft) = this.session.draft.as_mut() {
+                                draft.attachments.push(copy);
+                            }
                             Ok(())
                         } else {
-                            this.session.store.save_attachment(copy, &dir).map(|_| ())
+                            this.session.store.save_attachment(copy, &dir).map(|_| {
+                                saved_any = true;
+                            })
                         }
                     });
                     if let Err(err) = result {
@@ -589,6 +607,9 @@ impl TaskDetail {
                     }
                 }
                 this.sync_attachments();
+                if saved_any {
+                    cx.emit(TaskUpdated);
+                }
                 cx.notify();
             })
             .ok();
@@ -631,9 +652,9 @@ impl TaskDetail {
                                 return;
                             }
                             let Some(dir) = &this.session.attachments_dir else { return };
-                            let result = this.session.store.delete_attachment(&removed, dir);
-                            if let Err(err) = result {
-                                eprintln!("failed to remove the attachment: {err:#}");
+                            match this.session.store.delete_attachment(&removed, dir) {
+                                Ok(()) => cx.emit(TaskUpdated),
+                                Err(err) => eprintln!("failed to remove the attachment: {err:#}"),
                             }
                             this.sync_attachments();
                             cx.notify();
@@ -655,12 +676,14 @@ impl TaskDetail {
         };
         let parent_id = self.session.task.as_ref().and_then(|task| task.parent_id);
         self.session.parent = parent_id.and_then(|id| self.session.store.task(id).ok().flatten());
+        self.session.task_depth = self
+            .task_id()
+            .and_then(|id| self.session.store.task_depth(id).ok())
+            .unwrap_or(0);
     }
 
     fn task_depth(&self) -> usize {
-        self.task_id()
-            .and_then(|id| self.session.store.task_depth(id).ok())
-            .unwrap_or(0)
+        self.session.task_depth
     }
 
     fn can_add_subtask(&self) -> bool {
@@ -831,9 +854,57 @@ impl TaskDetail {
             Popup::List => {
                 self.list_search.update(cx, |input, cx| input.set_text("", cx));
                 self.list_submenu = None;
+                self.session.list_sections.clear();
+                for list_id in std::iter::once(None).chain(self.session.lists.iter().map(|l| Some(l.id))) {
+                    let sections = self.session.store.list_sections(list_id).unwrap_or_default();
+                    self.session.list_sections.insert(list_id, sections);
+                }
             }
-            Popup::Priority | Popup::More | Popup::Templates => {}
-            Popup::LinkParent => self.link_search.update(cx, |input, cx| input.set_text("", cx)),
+            Popup::Templates => {
+                self.session.draft_templates = self.session.store.templates().unwrap_or_default();
+            }
+            Popup::Priority | Popup::More => {}
+            Popup::LinkParent => {
+                self.link_search.update(cx, |input, cx| input.set_text("", cx));
+                self.session.link_parent_candidates = if let Some(task) = self.session.task.as_ref() {
+                    let excluded: std::collections::HashSet<Id> = self
+                        .session
+                        .store
+                        .descendants(task.id)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .chain([task.id])
+                        .collect();
+                    let all_tasks = self.session.store.tasks().unwrap_or_default();
+                    let parent_map: std::collections::HashMap<Id, Option<Id>> =
+                        all_tasks.iter().map(|t| (t.id, t.parent_id)).collect();
+                    let depth_of = |id: Id| -> usize {
+                        let mut depth = 0;
+                        let mut cur = id;
+                        while let Some(Some(p)) = parent_map.get(&cur) {
+                            depth += 1;
+                            cur = *p;
+                            if depth > fern_core::MAX_SUBTASK_DEPTH {
+                                break;
+                            }
+                        }
+                        depth
+                    };
+                    all_tasks
+                        .into_iter()
+                        .filter(|t| {
+                            !t.is_closed()
+                                && !t.is_deleted()
+                                && t.kind != Kind::Note
+                                && !excluded.contains(&t.id)
+                                && task.parent_id != Some(t.id)
+                                && depth_of(t.id) < fern_core::MAX_SUBTASK_DEPTH
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+            }
             Popup::Estimate => self.session.estimate_draft = EstimateDraft::from(self.session.task.as_ref().and_then(|t| t.estimate)),
         }
         self.session.popup = Some(popup);
@@ -1243,6 +1314,15 @@ impl TaskDetail {
     }
 
     fn render_more_popup(&self, strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {
+        self.render_more_popup_in(None, strings, cx)
+    }
+
+    fn render_more_popup_in(
+        &self,
+        max_height: Option<Pixels>,
+        strings: &'static Strings,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         if self.session.draft.is_some() { return self.render_draft_menu(strings, cx); }
         let Some(task) = self.session.task.as_ref() else { return div().into_any_element() };
         let wont_do = task.is_wont_do();
@@ -1252,15 +1332,8 @@ impl TaskDetail {
         let item = |id: &'static str, icon: IconName, label: &'static str| {
             ListItem::new(id).height(px(34.)).start_slot(Icon::new(icon).color(Color::Icon)).child(Label::new(label))
         };
-        // The original's menu: 178 px wide (wider when a label needs it), a row every 34 px.
-        popover(cx)
-            .debug_selector(|| "task-more-popup".into())
-            .min_w(px(178.))
-            .on_mouse_down_out(cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
-                if !outside_submenu.get().is_some_and(|bounds| bounds.contains(&event.position)) {
-                    this.close_popup(cx);
-                }
-            }))
+        let content = v_flex()
+            .id("task-more-popup-items")
             .when(self.sticky_style.is_some(), |menu| {
                 menu.when(!is_note, |menu| {
                     let label = if task.is_completed() { strings.reopen } else { strings.completed };
@@ -1417,7 +1490,22 @@ impl TaskDetail {
                     let label = i18n::t(cx).undo_deleted.replace("{title}", &title);
                     cx.emit(Undoable(crate::undo::UndoAction::Restore(id), label));
                 }
-            })), cx))
+            })), cx));
+        // The original's menu: 178 px wide (wider when a label needs it), a row every 34 px.
+        popover(cx)
+            .debug_selector(|| "task-more-popup".into())
+            .min_w(px(178.))
+            .on_mouse_down_out(cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                if !outside_submenu.get().is_some_and(|bounds| bounds.contains(&event.position)) {
+                    this.close_popup(cx);
+                }
+            }))
+            .map(|el| match max_height {
+                Some(h) => el
+                    .p_0()
+                    .child(v_scroll("sticky-more-scroll-view", content.p_1()).max_h(h).compact()),
+                None => el.child(content),
+            })
             .into_any_element()
     }
 
@@ -1569,40 +1657,19 @@ impl TaskDetail {
 
     fn render_link_parent(&self, strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
-        let Some(task) = self.session.task.as_ref() else { return div().into_any_element() };
+        if self.session.task.is_none() {
+            return div().into_any_element();
+        }
         let query = self.link_search.read(cx).text().trim().to_lowercase();
-        let excluded: std::collections::HashSet<Id> =
-            self.session.store.descendants(task.id).unwrap_or_default().into_iter().chain([task.id]).collect();
-        let all_tasks = self.session.store.tasks().unwrap_or_default();
-        let parent_map: std::collections::HashMap<Id, Option<Id>> =
-            all_tasks.iter().map(|t| (t.id, t.parent_id)).collect();
-        let depth_of = |id: Id| -> usize {
-            let mut depth = 0;
-            let mut cur = id;
-            while let Some(Some(p)) = parent_map.get(&cur) {
-                depth += 1;
-                cur = *p;
-                if depth > fern_core::MAX_SUBTASK_DEPTH {
-                    break;
-                }
-            }
-            depth
-        };
         let list_name = |list_id: Option<Id>| -> SharedString {
             list_id
                 .and_then(|id| self.session.lists.iter().find(|l| l.id == id))
                 .map_or(strings.inbox.into(), |l| l.name.clone().into())
         };
-        let candidates: Vec<Task> = all_tasks
-            .into_iter()
-            .filter(|t| {
-                !t.is_closed()
-                    && !t.is_deleted()
-                    && t.kind != Kind::Note
-                    && !excluded.contains(&t.id)
-                    && task.parent_id != Some(t.id)
-                    && depth_of(t.id) < fern_core::MAX_SUBTASK_DEPTH
-            })
+        let candidates: Vec<&Task> = self
+            .session
+            .link_parent_candidates
+            .iter()
             .filter(|t| query.is_empty() || t.title.to_lowercase().contains(&query))
             .take(30)
             .collect();
@@ -1682,7 +1749,7 @@ impl TaskDetail {
                         let list = list_name(candidate.list_id);
                         ListItem::new(SharedString::from(format!("link-{parent}")))
                             .start_slot(Icon::new(IconName::Circle).size(IconSize::Small).color(Color::Muted))
-                            .child(Label::new(candidate.title).truncate())
+                            .child(Label::new(candidate.title.clone()).truncate())
                             .end_slot(Label::new(list).size(LabelSize::XSmall).color(Color::Muted))
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.dismiss_popup(window, cx);
@@ -2899,7 +2966,12 @@ impl TaskDetail {
                     v_flex().id("list-menu-rows").p_1().children(rows.into_iter().map(|(list, name, icon)| {
                 let selected = current.is_some_and(|(l, _)| l == list);
                 let color = if selected { Color::Accent } else { Color::Default };
-                let sections = self.session.store.list_sections(list).unwrap_or_default();
+                let sections = self
+                    .session
+                    .list_sections
+                    .get(&list)
+                    .cloned()
+                    .unwrap_or_default();
                 let open = self.list_submenu == Some(list) && !sections.is_empty();
                 let has_sections = !sections.is_empty();
                 let row_id = format!("move-to-{}", list.map_or("inbox".to_owned(), |id| id.to_string()));
@@ -3448,6 +3520,7 @@ impl Render for TaskDetail {
                     })
                     .when(!self.session.comments.is_empty(), |el| el.child(self.render_comments(strings, cx))),
                 )
+                .track_scroll(&self.body_scroll)
                 .flex_1()
                 .min_h_0()
                 .when_some(self.sticky_style, |el, style| el.color(gpui::rgb(style.foreground()).into())),
@@ -3849,7 +3922,7 @@ fn render_markdown_blocks(
                 BlockKind::Check(done) => h_flex()
                     .items_start()
                     .gap_2()
-                    .child(div().pt(px(4.)).child(Checkbox::new("md-check").size(px(14.)).toggle_state(done)))
+                    .child(div().pt(px(4.)).child(Checkbox::new(("md-check", ix)).size(px(14.)).toggle_state(done)))
                     .child(body.when(done, |el| el.text_color(muted)))
                     .into_any_element(),
                 BlockKind::Quote => div().pl_3().border_l_2().border_color(accent).text_color(muted).child(body).into_any_element(),

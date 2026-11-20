@@ -12,6 +12,10 @@ pub struct ThemeRegistry {
     bundled_defaults: HashMap<SharedString, Arc<Theme>>,
     custom_ids: Vec<SharedString>,
     by_id: HashMap<SharedString, Arc<Theme>>,
+    cached_bundled_light: Vec<Arc<Theme>>,
+    cached_bundled_dark: Vec<Arc<Theme>>,
+    cached_custom_themes: Vec<Arc<Theme>>,
+    cached_custom_dark: Vec<Arc<Theme>>,
     errors: Vec<String>,
 }
 
@@ -40,22 +44,48 @@ impl ThemeRegistry {
             by_id.insert(id, theme);
         }
 
-        Self {
+        let mut registry = Self {
             bundled_light_ids,
             bundled_dark_ids,
             bundled_defaults,
             custom_ids: Vec::new(),
             by_id,
+            cached_bundled_light: Vec::new(),
+            cached_bundled_dark: Vec::new(),
+            cached_custom_themes: Vec::new(),
+            cached_custom_dark: Vec::new(),
             errors: Vec::new(),
-        }
+        };
+        registry.rebuild_caches();
+        registry
+    }
+
+    fn rebuild_caches(&mut self) {
+        self.cached_bundled_light = self
+            .bundled_light_ids
+            .iter()
+            .filter_map(|id| self.by_id.get(id).cloned())
+            .collect();
+        self.cached_bundled_dark = self
+            .bundled_dark_ids
+            .iter()
+            .filter_map(|id| self.by_id.get(id).cloned())
+            .collect();
+        self.cached_custom_themes = self
+            .custom_ids
+            .iter()
+            .filter_map(|id| self.by_id.get(id).cloned())
+            .collect();
+        self.cached_custom_dark = self
+            .cached_custom_themes
+            .iter()
+            .filter(|theme| theme.is_dark())
+            .cloned()
+            .collect();
     }
 
     pub fn global(cx: &App) -> &Self {
         cx.global::<Self>()
-    }
-
-    pub fn get(&self, id: &str) -> Option<Arc<Theme>> {
-        self.by_id.get(id).cloned()
     }
 
     /// Resolves `id` if present and matching `dark`; otherwise falls back to `"night"` or `"grey"`.
@@ -68,6 +98,8 @@ impl ThemeRegistry {
         let fallback_id = if dark { DARK_PRESETS[0].id } else { LIGHT_PRESETS[0].id };
         self.by_id
             .get(fallback_id)
+            .filter(|theme| theme.is_dark() == dark)
+            .or_else(|| self.bundled_defaults.get(fallback_id))
             .cloned()
             .expect("bundled fallback theme is always registered")
     }
@@ -76,38 +108,24 @@ impl ThemeRegistry {
         self.bundled_defaults.contains_key(id)
     }
 
-    pub fn bundled_light(&self) -> Vec<Arc<Theme>> {
-        self.bundled_light_ids
-            .iter()
-            .filter_map(|id| self.by_id.get(id).cloned())
-            .collect()
+    pub fn is_bundled_dark_id(&self, id: &str) -> bool {
+        self.bundled_defaults.get(id).is_some_and(|theme| theme.is_dark())
     }
 
-    pub fn bundled_dark(&self) -> Vec<Arc<Theme>> {
-        self.bundled_dark_ids
-            .iter()
-            .filter_map(|id| self.by_id.get(id).cloned())
-            .collect()
+    pub fn bundled_light(&self) -> &[Arc<Theme>] {
+        &self.cached_bundled_light
     }
 
-    pub fn custom_themes(&self) -> Vec<Arc<Theme>> {
-        self.custom_ids
-            .iter()
-            .filter_map(|id| self.by_id.get(id).cloned())
-            .collect()
+    pub fn bundled_dark(&self) -> &[Arc<Theme>] {
+        &self.cached_bundled_dark
     }
 
-    pub fn custom_dark(&self) -> Vec<Arc<Theme>> {
-        self.custom_themes()
-            .into_iter()
-            .filter(|theme| theme.is_dark())
-            .collect()
+    pub fn custom_themes(&self) -> &[Arc<Theme>] {
+        &self.cached_custom_themes
     }
 
-    pub fn all_dark(&self) -> Vec<Arc<Theme>> {
-        let mut dark = self.bundled_dark();
-        dark.extend(self.custom_dark());
-        dark
+    pub fn custom_dark(&self) -> &[Arc<Theme>] {
+        &self.cached_custom_dark
     }
 
     pub fn errors(&self) -> &[String] {
@@ -115,7 +133,8 @@ impl ThemeRegistry {
     }
 
     /// Replaces all user themes while preserving bundled defaults for un-overridden presets.
-    pub fn replace_user_themes(&mut self, themes: Vec<Theme>, errors: Vec<String>) {
+    /// Overrides targeting a bundled preset ID must match that preset's light/dark appearance.
+    pub fn replace_user_themes(&mut self, themes: Vec<Theme>, mut errors: Vec<String>) {
         self.by_id.clear();
         for (id, theme) in &self.bundled_defaults {
             self.by_id.insert(id.clone(), theme.clone());
@@ -124,15 +143,25 @@ impl ThemeRegistry {
 
         for theme in themes {
             let id = theme.id_shared();
-            let arc = Arc::new(theme);
-            if !self.is_bundled_id(id.as_ref()) {
+            if let Some(bundled) = self.bundled_defaults.get(id.as_ref()) {
+                if bundled.is_dark() != theme.is_dark() {
+                    errors.push(format!(
+                        "{}: cannot override bundled {} theme `{}` with opposite appearance",
+                        theme.name(),
+                        if bundled.is_dark() { "dark" } else { "light" },
+                        id,
+                    ));
+                    continue;
+                }
+            } else {
                 self.custom_ids.retain(|existing| existing != &id);
                 self.custom_ids.push(id.clone());
             }
-            self.by_id.insert(id, arc);
+            self.by_id.insert(id, Arc::new(theme));
         }
 
         self.errors = errors;
+        self.rebuild_caches();
     }
 }
 
@@ -197,10 +226,23 @@ mod tests {
         assert_eq!(registry.custom_themes().len(), 1);
         assert_eq!(registry.custom_themes()[0].id(), "ocean");
         assert_eq!(registry.custom_themes()[0].name(), "Ocean v2");
-        assert_eq!(registry.all_dark().len(), DARK_PRESETS.len() + 1);
+        assert_eq!(registry.bundled_dark().len() + registry.custom_dark().len(), DARK_PRESETS.len() + 1);
 
         // Wrong-appearance resolution falls back within requested appearance.
         assert_eq!(registry.resolve(false, Some("ocean")).id(), "grey");
+
+        // Overriding a bundled theme with the opposite appearance is rejected and logged.
+        let bad_override = r##"{
+            "id": "night",
+            "name": "Light Night",
+            "appearance": "light",
+            "style": { "background": "#ffffff" }
+        }"##;
+        let (bad_themes, _) = load_theme_family_from_str(bad_override).unwrap();
+        registry.replace_user_themes(bad_themes, Vec::new());
+        assert!(registry.resolve(true, Some("night")).is_dark());
+        assert!(!registry.resolve(true, Some("night")).is_custom());
+        assert_eq!(registry.errors().len(), 1);
 
         // Clearing user themes restores the original bundled preset.
         registry.replace_user_themes(Vec::new(), Vec::new());

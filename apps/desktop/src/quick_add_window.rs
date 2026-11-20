@@ -4,6 +4,7 @@
 use gpui::{AnyWindowHandle, Bounds, Entity, Focusable as _, Global, WindowBounds, WindowHandle, WindowKind, WindowOptions, point, size};
 use ui::prelude::*;
 
+use crate::actions::CloseWindow;
 use crate::app_view::AppView;
 use crate::i18n;
 use crate::text_input::{Cancelled, Mode, Submitted, TextInput};
@@ -85,6 +86,9 @@ impl Render for QuickAddWindow {
         let theme = cx.theme().clone();
         h_flex()
             .size_full()
+            .on_action(|_: &CloseWindow, window, cx| {
+                window.defer(cx, close);
+            })
             .px_4()
             .gap_3()
             .bg(theme.colors().elevated_surface_background)

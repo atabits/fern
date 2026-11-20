@@ -59,10 +59,14 @@ pub struct AppView {
     notices: Notices,
     notices_open: bool,
     sync: crate::sync::SyncStatus,
+    /// Cached `store.sync_config().is_some()` so `render` never queries SQLite every frame.
+    has_sync_config: bool,
     /// Settings → Features: the sections shown in the sidebar.
     features: fern_core::Features,
     /// Order of icons in the narrow left navigation rail.
     rail_order: Vec<fern_core::RailSection>,
+    /// Scroll handle for the left navigation rail (needed so drag slot calculation accounts for scroll).
+    rail_scroll: gpui::ScrollHandle,
     /// The rail icon currently being dragged, and the order before the drag started (for Escape).
     dragging_rail: Option<Section>,
     rail_drag_origin: Option<Vec<fern_core::RailSection>>,
@@ -83,15 +87,20 @@ pub struct AppView {
 
 impl AppView {
     pub fn register_window_actions(main_window: gpui::WindowHandle<Self>, cx: &mut App) {
-        // Action dispatch may be using the main window. Wait until GPUI has put it back.
+        // Action dispatch may be using the active window. Wait until GPUI has put it back.
         cx.on_action(move |_: &CloseWindow, cx| {
+            let target = cx.active_window().unwrap_or_else(|| main_window.into());
             cx.defer(move |cx| {
-                let _ = main_window.update(cx, |view, window, cx| {
-                    if view.prepare_to_leave_calendar(window, cx) {
-                        view.close_settings(cx);
-                        window.remove_window();
-                    }
-                });
+                if target == main_window.into() {
+                    let _ = main_window.update(cx, |view, window, cx| {
+                        if view.prepare_to_leave_calendar(window, cx) {
+                            view.close_settings(cx);
+                            window.remove_window();
+                        }
+                    });
+                } else {
+                    let _ = target.update(cx, |_, window, _| window.remove_window());
+                }
             });
         });
         cx.on_action(move |_: &Quit, cx| {
@@ -179,6 +188,7 @@ impl AppView {
         let initial_prefs = store.preferences().unwrap_or_default();
         let store_features = initial_prefs.features;
         let rail_order = initial_prefs.rail_order;
+        let has_sync_config = store.sync_config().ok().flatten().is_some();
         let update_notice = release_notes::take_update_notice(&store, first_start).unwrap_or_else(|err| {
             eprintln!("failed to read the update notification: {err:#}");
             None
@@ -205,8 +215,10 @@ impl AppView {
             notices: Notices::default(),
             notices_open: false,
             sync: crate::sync::SyncStatus::Off,
+            has_sync_config,
             features: store_features,
             rail_order,
+            rail_scroll: gpui::ScrollHandle::new(),
             dragging_rail: None,
             rail_drag_origin: None,
             shortcuts_open: false,
@@ -575,12 +587,15 @@ impl AppView {
         }
         if section == Section::Pomodoro {
             self.focus.update(cx, |focus, cx| focus.reload(cx));
+            window.focus(&self.focus.focus_handle(cx), cx);
         }
         if section == Section::Habits {
             self.habits.update(cx, |habits, cx| habits.reload(cx));
+            window.focus(&self.habits.focus_handle(cx), cx);
         }
         if section == Section::Countdown {
             self.countdown.update(cx, |countdown, cx| countdown.reload(cx));
+            window.focus(&self.countdown.focus_handle(cx), cx);
         }
         self.section = section;
         cx.notify();
@@ -648,7 +663,8 @@ impl AppView {
             return;
         }
         let top_y = title_bar::height() + px(sidebar::SECTIONS_TOP_OFFSET);
-        let slot = ((f32::from(event.event.position.y - top_y) / sidebar::SLOT_HEIGHT).floor() as isize)
+        let content_y = event.event.position.y - top_y - self.rail_scroll.offset().y;
+        let slot = ((f32::from(content_y) / sidebar::SLOT_HEIGHT).floor() as isize)
             .clamp(0, (enabled_count - 1) as isize) as usize;
         let current = self
             .rail_order
@@ -768,6 +784,7 @@ impl AppView {
         let prefs = self.store.preferences().unwrap_or_default();
         self.features = prefs.features;
         self.rail_order = prefs.rail_order;
+        self.has_sync_config = self.store.sync_config().ok().flatten().is_some();
         if !self.section.enabled(self.features) {
             self.select(Section::Tasks, window, cx);
         }
@@ -806,12 +823,12 @@ impl AppView {
                 SettingsEvent::Changed => this.apply_settings_changes(window, cx),
                 SettingsEvent::Dismissed => {
                     this.settings = None;
-                    this.apply_settings_changes(window, cx);
+                    cx.notify();
                 }
                 SettingsEvent::ShowShortcuts => {
                     this.settings = None;
                     this.shortcuts_open = true;
-                    this.apply_settings_changes(window, cx);
+                    cx.notify();
                     window.activate_window();
                 }
             })
@@ -987,15 +1004,7 @@ impl AppView {
     fn render_shortcuts(&self, cx: &mut Context<Self>) -> AnyElement {
         let strings = i18n::t(cx);
         let theme = cx.theme().clone();
-        let user_keymap = crate::data_dir()
-            .ok()
-            .and_then(|dir| std::fs::read_to_string(dir.join(crate::keymap::USER_KEYMAP_FILE)).ok());
-        let list = std::str::from_utf8(
-            &gpui::AssetSource::load(&assets::Assets, crate::keymap::DEFAULT_KEYMAP_PATH).ok().flatten().unwrap_or_default(),
-        )
-        .ok()
-        .and_then(|source| crate::keymap::shortcut_list_with_user(source, user_keymap.as_deref()).ok())
-        .unwrap_or_default();
+        let list = crate::keymap::cached_shortcuts(cx).to_vec();
         let chip = |text: String| {
             div()
                 .px_2()
@@ -1312,18 +1321,27 @@ impl AppView {
 
     /// Re-reads every view, after changes came from another device.
     fn reload_all(&mut self, cx: &mut Context<Self>) {
+        let prefs = self.store.preferences().unwrap_or_default();
+        self.features = prefs.features;
+        self.rail_order = prefs.rail_order;
+        self.has_sync_config = self.store.sync_config().ok().flatten().is_some();
+        crate::calendar::set_week_start(prefs.week_start);
+        crate::calendar::set_hour12(prefs.hour12);
+        crate::calendar::set_date_format(prefs.date_format);
+        crate::calendar::set_week_numbers(prefs.week_numbers);
         self.todo.update(cx, |view, cx| view.reload(cx));
         self.calendar.update(cx, |view, cx| view.reload(cx));
         self.matrix.update(cx, |view, cx| view.reload(cx));
         self.countdown.update(cx, |view, cx| view.reload(cx));
         self.habits.update(cx, |view, cx| view.reload(cx));
         self.focus.update(cx, |view, cx| view.reload(cx));
+        cx.notify();
     }
 
     /// The sync button's tooltip: "Sync" and how the last sync went.
     fn sync_tooltip(&self, strings: &'static i18n::Strings) -> String {
         let status = match &self.sync {
-            crate::sync::SyncStatus::Off if self.store.sync_config().ok().flatten().is_some() => strings.sync_never.to_owned(),
+            crate::sync::SyncStatus::Off if self.has_sync_config => strings.sync_never.to_owned(),
             crate::sync::SyncStatus::Off => strings.sync_off.to_owned(),
             crate::sync::SyncStatus::Running => strings.sync_running.to_owned(),
             crate::sync::SyncStatus::Done(at) => strings.sync_done.replace("{time}", &crate::calendar::format_time(at.time(), strings)),
@@ -1494,7 +1512,7 @@ impl Render for AppView {
             PopoverAttachment::new(Placement::RightTop, self.render_account_menu(cx)).into_any_element()
         });
         let features = self.features;
-        let sync_button = self.store.sync_config().ok().flatten().map(|_| sidebar::SyncButton {
+        let sync_button = self.has_sync_config.then(|| sidebar::SyncButton {
             tooltip: self.sync_tooltip(i18n::t(cx)),
             failed: matches!(self.sync, crate::sync::SyncStatus::Failed(_)),
             on_click: Box::new(cx.listener(|this, _, _, cx| this.sync_now(cx))),
@@ -1546,6 +1564,7 @@ impl Render for AppView {
                     self.nav_hovered,
                     &self.rail_order,
                     self.dragging_rail,
+                    &self.rail_scroll,
                     on_nav_hover,
                     on_select,
                     on_start_rail_drag,

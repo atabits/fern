@@ -211,7 +211,7 @@ fn normalize_order<T: Copy + PartialEq>(stored: &str, defaults: &[T], parse: fn(
 }
 
 fn reorder_relative<T: Copy + PartialEq>(order: &mut Vec<T>, defaults: &[T], dragged: T, target: T, after: bool) {
-    if dragged == target {
+    if dragged == target || !defaults.contains(&dragged) || !defaults.contains(&target) {
         return;
     }
     for &item in defaults {
@@ -222,7 +222,7 @@ fn reorder_relative<T: Copy + PartialEq>(order: &mut Vec<T>, defaults: &[T], dra
     let Some(from) = order.iter().position(|&item| item == dragged) else { return };
     order.remove(from);
     let Some(to) = order.iter().position(|&item| item == target) else {
-        order.push(dragged);
+        order.insert(from, dragged);
         return;
     };
     order.insert(to + usize::from(after), dragged);
@@ -554,18 +554,28 @@ const RAIL_ORDER: &str = "sidebar_rail_order";
 impl Store {
     /// The saved preferences; unknown values and a deleted default list fall back to defaults.
     pub fn preferences(&self) -> Result<Preferences> {
+        let mut settings: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        {
+            let mut stmt = self.conn.prepare_cached("SELECT key, value FROM settings")?;
+            let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+            for row in rows {
+                let (k, v) = row?;
+                settings.insert(k, v);
+            }
+        }
+        let get = |key: &str| -> Option<&str> { settings.get(key).map(String::as_str) };
+
         let defaults = Preferences::default();
         let theme = ThemeSelection {
-            mode: self.setting(THEME)?.and_then(|c| ThemeMode::from_code(&c)).unwrap_or_default(),
-            light: self.setting(LIGHT_THEME)?.filter(|s| !s.is_empty()),
-            dark: self.setting(DARK_THEME)?.filter(|s| !s.is_empty()),
+            mode: get(THEME).and_then(ThemeMode::from_code).unwrap_or_default(),
+            light: get(LIGHT_THEME).filter(|s| !s.is_empty()).map(str::to_owned),
+            dark: get(DARK_THEME).filter(|s| !s.is_empty()).map(str::to_owned),
         };
-        let week_start = self
-            .setting(WEEK_START)?
+        let week_start = get(WEEK_START)
             .and_then(|c| c.parse::<Weekday>().ok())
             .filter(|day| WEEK_STARTS.contains(day))
             .unwrap_or(defaults.week_start);
-        let default_list = match self.setting(DEFAULT_LIST)?.and_then(|c| c.parse::<Id>().ok()) {
+        let default_list = match get(DEFAULT_LIST).and_then(|c| c.parse::<Id>().ok()) {
             Some(id) => self
                 .conn
                 .query_row("SELECT 1 FROM lists WHERE id = ?1", [id.to_string()], |_| Ok(()))
@@ -573,64 +583,59 @@ impl Store {
                 .map(|_| id),
             None => None,
         };
-        let hour12 = self.setting(TIME_FORMAT)?.as_deref() == Some("12");
-        let date_format = self.setting(DATE_FORMAT)?.and_then(|c| DateFormat::from_code(&c));
-        let week_numbers = self.setting(WEEK_NUMBERS)?.as_deref() == Some("1");
-        let mini_calendar = self.setting(MINI_CALENDAR)?.as_deref() != Some("0");
-        let detailed_input = self.setting(INPUT_BOX)?.as_deref() == Some("detailed");
-        let countdown_dates = self.setting(SHOW_DATE_BY)?.as_deref() == Some("countdown");
-        let popup_details = self.setting(DETAIL_LAYOUT)?.as_deref() == Some("popup");
-        let features = self.setting(FEATURES)?.map(|t| Features::from_storage(&t)).unwrap_or_default();
+        let hour12 = get(TIME_FORMAT) == Some("12");
+        let date_format = get(DATE_FORMAT).and_then(DateFormat::from_code);
+        let week_numbers = get(WEEK_NUMBERS) == Some("1");
+        let mini_calendar = get(MINI_CALENDAR) != Some("0");
+        let detailed_input = get(INPUT_BOX) == Some("detailed");
+        let countdown_dates = get(SHOW_DATE_BY) == Some("countdown");
+        let popup_details = get(DETAIL_LAYOUT) == Some("popup");
+        let features = get(FEATURES).map(Features::from_storage).unwrap_or_default();
         let notifications = Notifications {
-            daily: self.setting(DAILY_NOTIFICATION)?.and_then(|t| chrono::NaiveTime::parse_from_str(&t, "%H:%M").ok()),
-            desktop: self.setting(DESKTOP_REMINDERS)?.as_deref() != Some("0"),
-            constant: self.setting(CONSTANT_REMINDERS)?.as_deref() == Some("1"),
+            daily: get(DAILY_NOTIFICATION).and_then(|t| chrono::NaiveTime::parse_from_str(t, "%H:%M").ok()),
+            desktop: get(DESKTOP_REMINDERS) != Some("0"),
+            constant: get(CONSTANT_REMINDERS) == Some("1"),
         };
-        let flag = |key: &str| -> Result<bool> { Ok(self.setting(key)?.as_deref() != Some("0")) };
+        let flag = |key: &str| -> bool { get(key) != Some("0") };
         let recognition = Recognition {
-            dates: flag(RECOGNITION[0])?,
-            remove_date_text: flag(RECOGNITION[1])?,
-            tags: flag(RECOGNITION[2])?,
-            remove_tag_text: flag(RECOGNITION[3])?,
+            dates: flag(RECOGNITION[0]),
+            remove_date_text: flag(RECOGNITION[1]),
+            tags: flag(RECOGNITION[2]),
+            remove_tag_text: flag(RECOGNITION[3]),
         };
         let defaults_of_tasks = TaskDefaults::default();
         // A stored offset, "none" for no reminder, or unset for the default.
-        let reminder = |key: &str, default: Option<i64>| -> Result<Option<i64>> {
-            Ok(match self.setting(key)?.as_deref() {
+        let reminder = |key: &str, default: Option<i64>| -> Option<i64> {
+            match get(key) {
                 None => default,
                 Some("none") => None,
                 Some(v) => v.parse().ok().or(default),
-            })
+            }
         };
         let task_defaults = TaskDefaults {
-            date: self.setting(DEFAULT_DATE)?.and_then(|c| DefaultDate::ALL.into_iter().find(|d| d.code() == c)),
-            duration: self
-                .setting(DEFAULT_DURATION)?
+            date: get(DEFAULT_DATE).and_then(|c| DefaultDate::ALL.into_iter().find(|d| d.code() == c)),
+            duration: get(DEFAULT_DURATION)
                 .and_then(|v| v.parse().ok())
                 .filter(|m| *m > 0)
                 .unwrap_or(defaults_of_tasks.duration),
-            timed_reminder: reminder(DEFAULT_TIMED_REMINDER, defaults_of_tasks.timed_reminder)?,
-            all_day_reminder: reminder(DEFAULT_ALL_DAY_REMINDER, defaults_of_tasks.all_day_reminder)?,
-            priority: self
-                .setting(DEFAULT_PRIORITY)?
+            timed_reminder: reminder(DEFAULT_TIMED_REMINDER, defaults_of_tasks.timed_reminder),
+            all_day_reminder: reminder(DEFAULT_ALL_DAY_REMINDER, defaults_of_tasks.all_day_reminder),
+            priority: get(DEFAULT_PRIORITY)
                 .and_then(|v| v.parse::<i64>().ok())
                 .map(Priority::from_i64)
                 .unwrap_or_default(),
-            tag: self.setting(DEFAULT_TAG)?.filter(|t| !t.is_empty()),
-            add_to_bottom: self.setting(DEFAULT_ADD_TO)?.as_deref() == Some("bottom"),
-            overdue_last: self.setting(OVERDUE_AT)?.as_deref() == Some("bottom"),
+            tag: get(DEFAULT_TAG).filter(|t| !t.is_empty()).map(str::to_owned),
+            add_to_bottom: get(DEFAULT_ADD_TO) == Some("bottom"),
+            overdue_last: get(OVERDUE_AT) == Some("bottom"),
         };
-        let smart_list_order = self
-            .setting(SMART_LIST_ORDER)?
-            .map(|s| normalize_order(&s, &SmartList::TOP_DRAGGABLE, SmartList::from_code))
+        let smart_list_order = get(SMART_LIST_ORDER)
+            .map(|s| normalize_order(s, &SmartList::TOP_DRAGGABLE, SmartList::from_code))
             .unwrap_or_else(|| defaults.smart_list_order.clone());
-        let sidebar_section_order = self
-            .setting(SIDEBAR_SECTION_ORDER)?
-            .map(|s| normalize_order(&s, &SidebarSection::ALL, SidebarSection::from_code))
+        let sidebar_section_order = get(SIDEBAR_SECTION_ORDER)
+            .map(|s| normalize_order(s, &SidebarSection::ALL, SidebarSection::from_code))
             .unwrap_or_else(|| defaults.sidebar_section_order.clone());
-        let rail_order = self
-            .setting(RAIL_ORDER)?
-            .map(|s| normalize_order(&s, &RailSection::ALL, RailSection::from_code))
+        let rail_order = get(RAIL_ORDER)
+            .map(|s| normalize_order(s, &RailSection::ALL, RailSection::from_code))
             .unwrap_or_else(|| defaults.rail_order.clone());
         let mut preferences = Preferences {
             theme,
@@ -653,7 +658,7 @@ impl Store {
             ..defaults
         };
         for list in SmartList::ALL {
-            if let Some(visibility) = self.setting(&smart_list_key(list))?.and_then(|c| Visibility::from_code(&c)) {
+            if let Some(visibility) = get(&smart_list_key(list)).and_then(Visibility::from_code) {
                 preferences.set_visibility(list, visibility);
             }
         }
@@ -672,54 +677,56 @@ impl Store {
 
     /// Edit the current preferences even when another view still has an older snapshot.
     pub fn update_preferences(&self, change: impl FnOnce(&mut Preferences)) -> Result<Preferences> {
-        let tx = self.conn.unchecked_transaction()?;
-        let mut preferences = self.preferences()?;
-        change(&mut preferences);
-        self.save_preferences(&preferences)?;
-        tx.commit()?;
-        Ok(preferences)
+        self.in_tx(|| {
+            let mut preferences = self.preferences()?;
+            change(&mut preferences);
+            self.save_preferences(&preferences)?;
+            Ok(preferences)
+        })
     }
 
     pub fn save_preferences(&self, preferences: &Preferences) -> Result<()> {
-        self.save_theme_selection(&preferences.theme)?;
-        self.set_setting(WEEK_START, &preferences.week_start.to_string())?;
-        self.set_setting(TIME_FORMAT, if preferences.hour12 { "12" } else { "24" })?;
-        self.set_setting(DATE_FORMAT, preferences.date_format.map_or("", DateFormat::code))?;
-        self.set_setting(WEEK_NUMBERS, if preferences.week_numbers { "1" } else { "0" })?;
-        self.set_setting(MINI_CALENDAR, if preferences.mini_calendar { "1" } else { "0" })?;
-        self.set_setting(FEATURES, &preferences.features.to_storage())?;
-        let n = &preferences.notifications;
-        self.set_setting(DAILY_NOTIFICATION, &n.daily.map_or(String::new(), |t| t.format("%H:%M").to_string()))?;
-        self.set_setting(DESKTOP_REMINDERS, if n.desktop { "1" } else { "0" })?;
-        self.set_setting(CONSTANT_REMINDERS, if n.constant { "1" } else { "0" })?;
-        self.set_setting(INPUT_BOX, if preferences.detailed_input { "detailed" } else { "simple" })?;
-        self.set_setting(SHOW_DATE_BY, if preferences.countdown_dates { "countdown" } else { "task_time" })?;
-        self.set_setting(DETAIL_LAYOUT, if preferences.popup_details { "popup" } else { "side" })?;
-        let t = &preferences.task_defaults;
-        let offset = |o: Option<i64>| o.map_or("none".to_owned(), |o| o.to_string());
-        self.set_setting(DEFAULT_DATE, t.date.map_or("", DefaultDate::code))?;
-        self.set_setting(DEFAULT_DURATION, &t.duration.to_string())?;
-        self.set_setting(DEFAULT_TIMED_REMINDER, &offset(t.timed_reminder))?;
-        self.set_setting(DEFAULT_ALL_DAY_REMINDER, &offset(t.all_day_reminder))?;
-        self.set_setting(DEFAULT_PRIORITY, &t.priority.to_i64().to_string())?;
-        self.set_setting(DEFAULT_TAG, t.tag.as_deref().unwrap_or(""))?;
-        self.set_setting(DEFAULT_ADD_TO, if t.add_to_bottom { "bottom" } else { "top" })?;
-        self.set_setting(OVERDUE_AT, if t.overdue_last { "bottom" } else { "top" })?;
-        let r = preferences.recognition;
-        for (key, on) in RECOGNITION.iter().zip([r.dates, r.remove_date_text, r.tags, r.remove_tag_text]) {
-            self.set_setting(key, if on { "1" } else { "0" })?;
-        }
-        self.set_setting(DEFAULT_LIST, &preferences.default_list.map(|id| id.to_string()).unwrap_or_default())?;
-        for list in SmartList::ALL {
-            self.set_setting(&smart_list_key(list), preferences.visibility(list).code())?;
-        }
-        let smart_order: Vec<&str> = preferences.smart_list_order.iter().map(|l| l.code()).collect();
-        self.set_setting(SMART_LIST_ORDER, &smart_order.join(","))?;
-        let section_order: Vec<&str> = preferences.sidebar_section_order.iter().map(|s| s.code()).collect();
-        self.set_setting(SIDEBAR_SECTION_ORDER, &section_order.join(","))?;
-        let rail_order: Vec<&str> = preferences.rail_order.iter().map(|r| r.code()).collect();
-        self.set_setting(RAIL_ORDER, &rail_order.join(","))?;
-        Ok(())
+        self.in_tx(|| {
+            self.save_theme_selection(&preferences.theme)?;
+            self.set_setting(WEEK_START, &preferences.week_start.to_string())?;
+            self.set_setting(TIME_FORMAT, if preferences.hour12 { "12" } else { "24" })?;
+            self.set_setting(DATE_FORMAT, preferences.date_format.map_or("", DateFormat::code))?;
+            self.set_setting(WEEK_NUMBERS, if preferences.week_numbers { "1" } else { "0" })?;
+            self.set_setting(MINI_CALENDAR, if preferences.mini_calendar { "1" } else { "0" })?;
+            self.set_setting(FEATURES, &preferences.features.to_storage())?;
+            let n = &preferences.notifications;
+            self.set_setting(DAILY_NOTIFICATION, &n.daily.map_or(String::new(), |t| t.format("%H:%M").to_string()))?;
+            self.set_setting(DESKTOP_REMINDERS, if n.desktop { "1" } else { "0" })?;
+            self.set_setting(CONSTANT_REMINDERS, if n.constant { "1" } else { "0" })?;
+            self.set_setting(INPUT_BOX, if preferences.detailed_input { "detailed" } else { "simple" })?;
+            self.set_setting(SHOW_DATE_BY, if preferences.countdown_dates { "countdown" } else { "task_time" })?;
+            self.set_setting(DETAIL_LAYOUT, if preferences.popup_details { "popup" } else { "side" })?;
+            let t = &preferences.task_defaults;
+            let offset = |o: Option<i64>| o.map_or("none".to_owned(), |o| o.to_string());
+            self.set_setting(DEFAULT_DATE, t.date.map_or("", DefaultDate::code))?;
+            self.set_setting(DEFAULT_DURATION, &t.duration.to_string())?;
+            self.set_setting(DEFAULT_TIMED_REMINDER, &offset(t.timed_reminder))?;
+            self.set_setting(DEFAULT_ALL_DAY_REMINDER, &offset(t.all_day_reminder))?;
+            self.set_setting(DEFAULT_PRIORITY, &t.priority.to_i64().to_string())?;
+            self.set_setting(DEFAULT_TAG, t.tag.as_deref().unwrap_or(""))?;
+            self.set_setting(DEFAULT_ADD_TO, if t.add_to_bottom { "bottom" } else { "top" })?;
+            self.set_setting(OVERDUE_AT, if t.overdue_last { "bottom" } else { "top" })?;
+            let r = preferences.recognition;
+            for (key, on) in RECOGNITION.iter().zip([r.dates, r.remove_date_text, r.tags, r.remove_tag_text]) {
+                self.set_setting(key, if on { "1" } else { "0" })?;
+            }
+            self.set_setting(DEFAULT_LIST, &preferences.default_list.map(|id| id.to_string()).unwrap_or_default())?;
+            for list in SmartList::ALL {
+                self.set_setting(&smart_list_key(list), preferences.visibility(list).code())?;
+            }
+            let smart_order: Vec<&str> = preferences.smart_list_order.iter().map(|l| l.code()).collect();
+            self.set_setting(SMART_LIST_ORDER, &smart_order.join(","))?;
+            let section_order: Vec<&str> = preferences.sidebar_section_order.iter().map(|s| s.code()).collect();
+            self.set_setting(SIDEBAR_SECTION_ORDER, &section_order.join(","))?;
+            let rail_order: Vec<&str> = preferences.rail_order.iter().map(|r| r.code()).collect();
+            self.set_setting(RAIL_ORDER, &rail_order.join(","))?;
+            Ok(())
+        })
     }
 }
 

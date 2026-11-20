@@ -9,11 +9,12 @@
 //! - Linux asks the compositor for client-side decorations. When it draws its own (server-side),
 //!   the drag strip stays without duplicate window buttons.
 
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use gpui::{
     Bounds, CursorStyle, Decorations, EventEmitter, Global, HitboxBehavior, MouseButton, Point, ResizeEdge, Size,
-    TitlebarOptions, Tiling, WindowButton, WindowButtonLayout, WindowControlArea, WindowDecorations,
+    TitlebarOptions, Tiling, WindowButton, WindowButtonLayout, WindowControlArea, WindowDecorations, WindowId,
     canvas, point, rgb, transparent_black,
 };
 use ui::prelude::*;
@@ -307,10 +308,12 @@ pub fn window_frame(content: impl IntoElement, window: &mut Window, cx: &mut App
         Decorations::Server => px(0.),
     });
 
-    /// The edge under the mouse, to repaint the cursor when it changes.
-    struct HoveredEdge(ResizeEdge);
-    impl Global for HoveredEdge {}
+    /// The edge under the mouse per window, to repaint the cursor when it changes.
+    #[derive(Default)]
+    struct HoveredEdges(HashMap<WindowId, ResizeEdge>);
+    impl Global for HoveredEdges {}
 
+    let window_id = window.window_handle().window_id();
     let client = matches!(decorations, Decorations::Client { .. });
     div()
         .id("window-frame")
@@ -326,7 +329,10 @@ pub fn window_frame(content: impl IntoElement, window: &mut Window, cx: &mut App
                     frame
                         .on_mouse_move(move |event, window, cx| {
                             let edge = resize_edge(event.position, window.window_bounds().get_bounds().size, tiling);
-                            if edge != cx.try_global::<HoveredEdge>().map(|edge| edge.0) {
+                            let previous = cx
+                                .try_global::<HoveredEdges>()
+                                .and_then(|edges| edges.0.get(&window_id).copied());
+                            if edge != previous {
                                 window.refresh();
                             }
                         })
@@ -367,10 +373,15 @@ pub fn window_frame(content: impl IntoElement, window: &mut Window, cx: &mut App
                         window.insert_hitbox(Bounds::new(point(px(0.), px(0.)), window.window_bounds().get_bounds().size), HitboxBehavior::Normal)
                     },
                     move |_, hitbox, window, cx| {
-                        let Some(edge) = resize_edge(window.mouse_position(), window.window_bounds().get_bounds().size, tiling) else {
+                        let edge = resize_edge(window.mouse_position(), window.window_bounds().get_bounds().size, tiling);
+                        if !cx.has_global::<HoveredEdges>() {
+                            cx.set_global(HoveredEdges::default());
+                        }
+                        let Some(edge) = edge else {
+                            cx.global_mut::<HoveredEdges>().0.remove(&window_id);
                             return;
                         };
-                        cx.set_global(HoveredEdge(edge));
+                        cx.global_mut::<HoveredEdges>().0.insert(window_id, edge);
                         let cursor = match edge {
                             ResizeEdge::Top | ResizeEdge::Bottom => CursorStyle::ResizeUpDown,
                             ResizeEdge::Left | ResizeEdge::Right => CursorStyle::ResizeLeftRight,

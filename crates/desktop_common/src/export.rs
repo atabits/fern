@@ -31,7 +31,16 @@ pub fn save_as<V: 'static>(
     let chosen = cx.prompt_for_new_path(&default_dir(), Some(&name));
     cx.spawn(async move |this, cx| {
         let path = chosen.await.ok().and_then(Result::ok).flatten();
-        let result = path.map(|path| std::fs::write(&path, &contents).map(|()| path));
+        let result = match path {
+            Some(path) => {
+                let written = cx
+                    .background_executor()
+                    .spawn(async move { std::fs::write(&path, &contents).map(|()| path) })
+                    .await;
+                Some(written)
+            }
+            None => None,
+        };
         this.update(cx, |view, cx| done(view, result, cx)).ok();
     })
     .detach();

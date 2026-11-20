@@ -79,12 +79,11 @@ pub(super) fn open<V: Render + 'static>(
     anchor: Anchor,
     measured: Size<Pixels>,
     focus: bool,
-    build: impl FnOnce(bool, &mut Window, &mut App) -> Entity<V>,
+    build: impl Fn(bool, &mut Window, &mut App) -> Entity<V>,
     cx: &mut App,
 ) -> anyhow::Result<WindowHandle<V>> {
     if !cfg!(windows) {
         use gpui::popup::{PopupAnchor, PopupConstraintAdjustment, PopupGravity, PopupNotSupportedError, PopupOptions};
-        let mut build = Some(build);
         let mut anchored = options(owner, anchor, measured, focus, cx);
         anchored.kind = WindowKind::AnchoredPopup(PopupOptions {
             parent: owner.window_handle(),
@@ -103,12 +102,12 @@ pub(super) fn open<V: Render + 'static>(
             // Their activation/outside-click handlers own dismissal instead.
             grab: false,
         });
-        match cx.open_window(anchored, |window, cx| build.take().unwrap()(true, window, cx)) {
+        match cx.open_window(anchored, |window, cx| build(true, window, cx)) {
             Err(error) if error.is::<PopupNotSupportedError>() => {},
             result => return result,
         }
         return cx.open_window(options(owner, anchor, measured, focus, cx), |window, cx| {
-            build.take().unwrap()(false, window, cx)
+            build(false, window, cx)
         });
     }
     cx.open_window(options(owner, anchor, measured, focus, cx), |window, cx| build(false, window, cx))
@@ -359,8 +358,8 @@ impl DetailPopup {
                 if note.detail_popup != Some(previous) || !detail.read(cx).has_popup() { return; }
                 match open(owner, anchor, bounds.size, true, |anchored, window, cx| {
                     window.set_window_title(i18n::t(cx).more);
-                    let popup = cx.new(|cx| Self::new(note_handle, detail, anchor, anchored, return_focus, window, cx));
-                    if let Some(focus) = focused { window.focus(&focus, cx); }
+                    let popup = cx.new(|cx| Self::new(note_handle, detail.clone(), anchor, anchored, return_focus.clone(), window, cx));
+                    if let Some(focus) = &focused { window.focus(focus, cx); }
                     popup
                 }, cx) {
                     Ok(replacement) => {
@@ -467,7 +466,7 @@ impl Render for TooltipLifetime {
                 this.popup = open(owner, anchor, measured, false, |anchored, _window, cx| {
                     #[cfg(windows)]
                     attach(native_owner, _window, true);
-                    cx.new(|_| NoteTooltip { text, anchor, anchored })
+                    cx.new(|_| NoteTooltip { text: text.clone(), anchor, anchored })
                 }, cx).ok();
             });
         }

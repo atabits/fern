@@ -1,10 +1,9 @@
-use std::{cell::Cell, rc::Rc};
-
 use gpui::{
-    App, Bounds, CursorStyle, ElementId, HitboxBehavior, Hsla, IntoElement, ListState,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement as _, Pixels,
-    RenderOnce, ScrollHandle, Size, StatefulInteractiveElement as _, StyleRefinement, Styled,
-    Window, canvas, div, fill, point, px, size,
+    App, AppContext as _, Bounds, Context, CursorStyle, ElementId, Entity, HitboxBehavior, Hsla,
+    IntoElement, ListState, MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent,
+    MouseUpEvent, ParentElement as _, Pixels, Render, RenderOnce, ScrollHandle, Size,
+    StatefulInteractiveElement as _, StyleRefinement, Styled, Subscription, Window, canvas, div,
+    fill, point, px, size,
 };
 use theme::ActiveTheme as _;
 
@@ -56,21 +55,22 @@ impl ScrollTarget {
         }
     }
 
-    fn set_axis_offset(&self, axis: Axis, fraction: f32, overflow: Pixels) {
+    /// Sets the scroll offset along `axis` and returns whether the offset changed.
+    fn set_axis_offset(&self, axis: Axis, fraction: f32, overflow: Pixels) -> bool {
+        let prev = self.offset();
         match self {
             Self::Handle(handle) => {
-                let current = handle.offset();
                 let next = match axis {
-                    Axis::Vertical => point(current.x, -overflow * fraction),
-                    Axis::Horizontal => point(-overflow * fraction, current.y),
+                    Axis::Vertical => point(prev.x, -overflow * fraction),
+                    Axis::Horizontal => point(-overflow * fraction, prev.y),
                 };
                 handle.set_offset(next);
             }
             Self::List(list) => {
                 // `ListState::max_offset_for_scrollbar` omits container padding (e.g. `.pb_4()`),
                 // whereas `set_offset_from_scrollbar` clamps against content + padding. Push past
-                // `overflow` at the end of the track so dragging to the bottom reveals the end.
-                let target_y = if fraction >= 0.995 {
+                // `overflow` only at the end of the track so dragging to the bottom reveals the end.
+                let target_y = if fraction >= 0.999 {
                     -(overflow + px(1000.))
                 } else {
                     -overflow * fraction
@@ -78,6 +78,7 @@ impl ScrollTarget {
                 list.set_offset_from_scrollbar(point(px(0.), target_y));
             }
         }
+        self.offset() != prev
     }
 
     fn drag_started(&self) {
@@ -93,152 +94,495 @@ impl ScrollTarget {
     }
 }
 
-#[derive(Clone, Default)]
-struct DragState {
-    grab_offset: Rc<Cell<Option<Pixels>>>,
-}
-
-/// A subtle overlay vertical scrollbar rendered at the right edge of a scrollable viewport.
-#[derive(Clone, IntoElement)]
-pub struct VerticalScrollbar {
-    id: Option<ElementId>,
+#[derive(Clone)]
+struct ScrollbarConfig {
+    axis: Axis,
     target: ScrollTarget,
-    drag: DragState,
     inset: Pixels,
     color: Option<Hsla>,
     compact: bool,
 }
 
-impl Default for VerticalScrollbar {
-    fn default() -> Self {
-        Self::new()
+impl ScrollbarConfig {
+    fn new(axis: Axis, target: ScrollTarget) -> Self {
+        Self {
+            axis,
+            target,
+            inset: px(0.),
+            color: None,
+            compact: false,
+        }
     }
 }
 
-impl VerticalScrollbar {
-    /// Creates an unkeyed vertical scrollbar with its own `ScrollHandle`.
-    pub fn new() -> Self {
+/// Isolated GPUI view holding a scrollbar's transient hover and drag state.
+///
+/// Storing state in a dedicated entity (not observed by the parent view) ensures hover
+/// enter/leave repaints only this scrollbar rather than refreshing the entire window.
+struct ScrollbarView {
+    config: ScrollbarConfig,
+    grab_offset: Option<Pixels>,
+    hovered: bool,
+    _activation: Subscription,
+}
+
+impl ScrollbarView {
+    fn new(config: ScrollbarConfig, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let activation = cx.observe_window_activation(window, |this, window, cx| {
+            if !window.is_window_active() {
+                let mut changed = false;
+                if this.grab_offset.take().is_some() {
+                    this.config.target.drag_ended();
+                    changed = true;
+                }
+                if std::mem::take(&mut this.hovered) {
+                    changed = true;
+                }
+                if changed {
+                    cx.notify();
+                }
+            }
+        });
         Self {
-            id: None,
-            target: ScrollTarget::Handle(ScrollHandle::new()),
-            drag: DragState::default(),
-            inset: px(0.),
-            color: None,
-            compact: false,
+            config,
+            grab_offset: None,
+            hovered: false,
+            _activation: activation,
         }
     }
+}
 
-    /// Creates a vertical scrollbar tracking a `ScrollHandle` with keyed drag state.
+impl Render for ScrollbarView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let axis = self.config.axis;
+        let target = self.config.target.clone();
+        let color = self.config.color;
+        let compact = self.config.compact;
+        let min_thumb = px(if compact {
+            COMPACT_MIN_THUMB_LENGTH
+        } else {
+            MIN_THUMB_LENGTH
+        });
+        let view = cx.entity().downgrade();
+        let view_for_paint = view;
+        let initial_dragging = self.grab_offset.is_some();
+
+        canvas(
+            {
+                let target = target.clone();
+                move |track, window, _| {
+                    let overflow = match axis {
+                        Axis::Vertical => target.max_offset().y,
+                        Axis::Horizontal => target.max_offset().x,
+                    };
+                    let viewport_len = match axis {
+                        Axis::Vertical => target.viewport_size().height,
+                        Axis::Horizontal => target.viewport_size().width,
+                    };
+                    let track_len = match axis {
+                        Axis::Vertical => track.size.height,
+                        Axis::Horizontal => track.size.width,
+                    };
+                    if !(f32::from(overflow).is_finite()
+                        && f32::from(viewport_len).is_finite()
+                        && f32::from(track_len).is_finite()
+                        && overflow > px(0.)
+                        && viewport_len > px(0.)
+                        && track_len > min_thumb)
+                    {
+                        return None;
+                    }
+
+                    let thumb_len =
+                        (track_len * (viewport_len / (viewport_len + overflow))).max(min_thumb);
+                    let travel = track_len - thumb_len;
+                    if !(f32::from(travel).is_finite() && travel > px(0.)) {
+                        return None;
+                    }
+
+                    let offset_along = match axis {
+                        Axis::Vertical => -target.offset().y,
+                        Axis::Horizontal => -target.offset().x,
+                    };
+                    let fraction = if f32::from(offset_along).is_finite() {
+                        (offset_along / overflow).clamp(0., 1.)
+                    } else {
+                        0.
+                    };
+
+                    let thumb = match axis {
+                        Axis::Vertical => Bounds::new(
+                            point(track.left(), track.top() + travel * fraction),
+                            size(track.size.width, thumb_len),
+                        ),
+                        Axis::Horizontal => Bounds::new(
+                            point(track.left() + travel * fraction, track.top()),
+                            size(thumb_len, track.size.height),
+                        ),
+                    };
+                    let hitbox = window.insert_hitbox(track, HitboxBehavior::BlockMouseExceptScroll);
+                    Some((hitbox, thumb, travel, overflow))
+                }
+            },
+            move |track, layout, window, cx| {
+                let Some((hitbox, thumb, travel, overflow)) = layout else {
+                    if initial_dragging {
+                        let _ = view_for_paint.update(cx, |this, _| {
+                            if this.grab_offset.take().is_some() {
+                                this.config.target.drag_ended();
+                            }
+                            this.hovered = false;
+                        });
+                    }
+                    return;
+                };
+
+                let hovered = hitbox.is_hovered(window);
+                let dragging = initial_dragging;
+                let active = hovered || dragging;
+                if dragging {
+                    window.set_window_cursor_style(CursorStyle::Arrow);
+                } else if hovered {
+                    window.set_cursor_style(CursorStyle::Arrow, &hitbox);
+                }
+
+                let base = color.unwrap_or_else(|| cx.theme().colors().text);
+                let thumb_thickness = px(if active {
+                    THUMB_ACTIVE_THICKNESS
+                } else {
+                    THUMB_REST_THICKNESS
+                });
+                let thumb_opacity = if dragging {
+                    THUMB_DRAG_OPACITY
+                } else if hovered {
+                    THUMB_HOVER_OPACITY
+                } else {
+                    THUMB_REST_OPACITY
+                };
+
+                if active {
+                    let lane_thickness = px(THUMB_ACTIVE_THICKNESS + 2.);
+                    let lane_edge = px((EDGE_INSET - 1.).max(0.));
+                    let lane = match axis {
+                        Axis::Vertical => Bounds::new(
+                            point(track.right() - lane_edge - lane_thickness, track.top()),
+                            size(lane_thickness, track.size.height),
+                        ),
+                        Axis::Horizontal => Bounds::new(
+                            point(track.left(), track.bottom() - lane_edge - lane_thickness),
+                            size(track.size.width, lane_thickness),
+                        ),
+                    };
+                    window.paint_quad(
+                        fill(lane, base.opacity(TRACK_ACTIVE_OPACITY))
+                            .corner_radii(lane_thickness / 2.),
+                    );
+                }
+
+                let edge = px(EDGE_INSET);
+                let grip = match axis {
+                    Axis::Vertical => Bounds::new(
+                        point(track.right() - edge - thumb_thickness, thumb.top()),
+                        size(thumb_thickness, thumb.size.height),
+                    ),
+                    Axis::Horizontal => Bounds::new(
+                        point(thumb.left(), track.bottom() - edge - thumb_thickness),
+                        size(thumb.size.width, thumb_thickness),
+                    ),
+                };
+                window.paint_quad(
+                    fill(grip, base.opacity(thumb_opacity)).corner_radii(thumb_thickness / 2.),
+                );
+
+                let track_start = match axis {
+                    Axis::Vertical => track.top(),
+                    Axis::Horizontal => track.left(),
+                };
+                let scroll_to = move |target: &ScrollTarget,
+                                      pointer: Pixels,
+                                      grab: Pixels,
+                                      window: &mut Window| {
+                    let fraction = ((pointer - track_start - grab) / travel).clamp(0., 1.);
+                    if target.set_axis_offset(axis, fraction, overflow) {
+                        window.refresh();
+                    }
+                };
+
+                window.on_mouse_event({
+                    let hitbox = hitbox.clone();
+                    let target = target.clone();
+                    let view = view_for_paint.clone();
+                    move |event: &MouseDownEvent, phase, window, cx| {
+                        if phase.bubble()
+                            && event.button == MouseButton::Left
+                            && hitbox.is_hovered(window)
+                        {
+                            let pointer = match axis {
+                                Axis::Vertical => event.position.y,
+                                Axis::Horizontal => event.position.x,
+                            };
+                            let grab = if thumb.contains(&event.position) {
+                                let thumb_start = match axis {
+                                    Axis::Vertical => thumb.top(),
+                                    Axis::Horizontal => thumb.left(),
+                                };
+                                pointer - thumb_start
+                            } else {
+                                let thumb_len = match axis {
+                                    Axis::Vertical => thumb.size.height,
+                                    Axis::Horizontal => thumb.size.width,
+                                };
+                                // Clamp the resulting thumb position first so track-clicks near
+                                // the top/bottom edge do not create a drag dead zone.
+                                let fraction =
+                                    ((pointer - track_start - thumb_len / 2.) / travel).clamp(0., 1.);
+                                (pointer - (track_start + travel * fraction))
+                                    .clamp(px(0.), thumb_len)
+                            };
+                            target.drag_started();
+                            let _ = view.update(cx, |this, cx| {
+                                this.grab_offset = Some(grab);
+                                this.hovered = true;
+                                cx.notify();
+                            });
+                            scroll_to(&target, pointer, grab, window);
+                            cx.stop_propagation();
+                        }
+                    }
+                });
+
+                window.on_mouse_event({
+                    let hitbox = hitbox.clone();
+                    let target = target.clone();
+                    let view = view_for_paint.clone();
+                    move |event: &MouseMoveEvent, phase, window, cx| {
+                        if !phase.capture() {
+                            return;
+                        }
+                        let mut drag_grab = None;
+                        let mut ended_drag = false;
+                        let _ = view.update(cx, |this, cx| {
+                            if event.pressed_button == Some(MouseButton::Left) {
+                                drag_grab = this.grab_offset;
+                            } else if this.grab_offset.take().is_some() {
+                                ended_drag = true;
+                                this.hovered = hitbox.is_hovered(window);
+                                cx.notify();
+                            }
+                        });
+                        if let Some(grab) = drag_grab {
+                            let pointer = match axis {
+                                Axis::Vertical => event.position.y,
+                                Axis::Horizontal => event.position.x,
+                            };
+                            scroll_to(&target, pointer, grab, window);
+                            cx.stop_propagation();
+                            return;
+                        }
+                        if ended_drag {
+                            target.drag_ended();
+                            return;
+                        }
+                        let next_hovered = hitbox.is_hovered(window);
+                        if hovered != next_hovered {
+                            let _ = view.update(cx, |this, cx| {
+                                if this.hovered != next_hovered {
+                                    this.hovered = next_hovered;
+                                    cx.notify();
+                                }
+                            });
+                        }
+                    }
+                });
+
+                window.on_mouse_event({
+                    let hitbox = hitbox.clone();
+                    let target = target.clone();
+                    let view = view_for_paint.clone();
+                    move |event: &MouseUpEvent, phase, window, cx| {
+                        if phase.capture() && event.button == MouseButton::Left {
+                            let mut ended = false;
+                            let _ = view.update(cx, |this, cx| {
+                                if this.grab_offset.take().is_some() {
+                                    ended = true;
+                                    this.hovered = hitbox.is_hovered(window);
+                                    cx.notify();
+                                }
+                            });
+                            if ended {
+                                target.drag_ended();
+                                cx.stop_propagation();
+                            }
+                        }
+                    }
+                });
+
+                window.on_mouse_event({
+                    let target = target.clone();
+                    let view = view_for_paint.clone();
+                    move |event: &MouseExitEvent, phase, _window, cx| {
+                        if !phase.capture() {
+                            return;
+                        }
+                        let mut ended = false;
+                        let _ = view.update(cx, |this, cx| {
+                            let mut changed = false;
+                            if event.pressed_button != Some(MouseButton::Left)
+                                && this.grab_offset.take().is_some()
+                            {
+                                ended = true;
+                                changed = true;
+                            }
+                            if std::mem::take(&mut this.hovered) {
+                                changed = true;
+                            }
+                            if changed {
+                                cx.notify();
+                            }
+                        });
+                        if ended {
+                            target.drag_ended();
+                        }
+                    }
+                });
+            },
+        )
+        .size_full()
+    }
+}
+
+fn render_scrollbar_view(
+    id: ElementId,
+    config: ScrollbarConfig,
+    window: &mut Window,
+    cx: &mut App,
+) -> impl IntoElement {
+    let axis = config.axis;
+    let inset = config.inset;
+    let margin = px(if config.compact {
+        COMPACT_END_MARGIN
+    } else {
+        END_MARGIN
+    });
+
+    let view: Entity<ScrollbarView> =
+        window.with_global_id((id, "scrollbar-view").into(), |global_id, window| {
+            window.with_element_state(global_id, |state: Option<Entity<ScrollbarView>>, window| {
+                let entity = match state {
+                    Some(existing) => {
+                        existing.update(cx, |this, _| {
+                            this.config = config.clone();
+                        });
+                        existing
+                    }
+                    None => cx.new(|cx| ScrollbarView::new(config.clone(), window, cx)),
+                };
+                (entity.clone(), entity)
+            })
+        });
+
+    let wrapper = div().absolute().child(view);
+    match axis {
+        Axis::Vertical => wrapper
+            .top(margin)
+            .bottom(margin)
+            .right(inset)
+            .w(px(TRACK_THICKNESS)),
+        Axis::Horizontal => wrapper
+            .left(margin)
+            .right(margin)
+            .bottom(inset)
+            .h(px(TRACK_THICKNESS)),
+    }
+}
+
+/// A subtle overlay vertical scrollbar rendered at the right edge of a scrollable viewport.
+#[derive(Clone, IntoElement)]
+pub struct VerticalScrollbar {
+    id: ElementId,
+    config: ScrollbarConfig,
+}
+
+impl VerticalScrollbar {
+    /// Creates a vertical scrollbar tracking a `ScrollHandle` with keyed state.
     pub fn for_handle(id: impl Into<ElementId>, handle: ScrollHandle) -> Self {
         Self {
-            id: Some(id.into()),
-            target: ScrollTarget::Handle(handle),
-            drag: DragState::default(),
-            inset: px(0.),
-            color: None,
-            compact: false,
+            id: id.into(),
+            config: ScrollbarConfig::new(Axis::Vertical, ScrollTarget::Handle(handle)),
         }
     }
 
-    /// Creates a vertical scrollbar tracking a virtualized `ListState` with keyed drag state.
+    /// Creates a vertical scrollbar tracking a virtualized `ListState` with keyed state.
     pub fn for_list(id: impl Into<ElementId>, list: ListState) -> Self {
         Self {
-            id: Some(id.into()),
-            target: ScrollTarget::List(list),
-            drag: DragState::default(),
-            inset: px(0.),
-            color: None,
-            compact: false,
+            id: id.into(),
+            config: ScrollbarConfig::new(Axis::Vertical, ScrollTarget::List(list)),
         }
     }
 
     /// Insets the scrollbar away from the right edge (e.g. to clear a panel resize handle).
     pub fn inset(mut self, inset: Pixels) -> Self {
-        self.inset = inset;
+        self.config.inset = inset;
         self
     }
 
     /// Overrides the base foreground color used for the thumb and hover track.
     pub fn color(mut self, color: Hsla) -> Self {
-        self.color = Some(color);
+        self.config.color = Some(color);
         self
     }
 
     /// Uses tighter end margins and a smaller minimum thumb size for compact popovers.
     pub fn compact(mut self) -> Self {
-        self.compact = true;
+        self.config.compact = true;
         self
     }
 }
 
 impl RenderOnce for VerticalScrollbar {
-    fn render(self, window: &mut Window, _cx: &mut App) -> impl IntoElement {
-        let drag = resolve_drag_state(self.id.as_ref(), &self.drag, window);
-        render_scrollbar(
-            Axis::Vertical,
-            self.target,
-            drag,
-            self.inset,
-            self.color,
-            self.compact,
-        )
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        render_scrollbar_view(self.id, self.config, window, cx)
     }
 }
 
 /// A subtle overlay horizontal scrollbar rendered at the bottom edge of a scrollable viewport.
 #[derive(Clone, IntoElement)]
 pub struct HorizontalScrollbar {
-    id: Option<ElementId>,
-    target: ScrollTarget,
-    drag: DragState,
-    inset: Pixels,
-    color: Option<Hsla>,
-    compact: bool,
+    id: ElementId,
+    config: ScrollbarConfig,
 }
 
 impl HorizontalScrollbar {
-    /// Creates a horizontal scrollbar tracking a `ScrollHandle` with keyed drag state.
+    /// Creates a horizontal scrollbar tracking a `ScrollHandle` with keyed state.
     pub fn for_handle(id: impl Into<ElementId>, handle: ScrollHandle) -> Self {
         Self {
-            id: Some(id.into()),
-            target: ScrollTarget::Handle(handle),
-            drag: DragState::default(),
-            inset: px(0.),
-            color: None,
-            compact: false,
+            id: id.into(),
+            config: ScrollbarConfig::new(Axis::Horizontal, ScrollTarget::Handle(handle)),
         }
     }
 
     /// Insets the scrollbar away from the bottom edge.
     pub fn inset(mut self, inset: Pixels) -> Self {
-        self.inset = inset;
+        self.config.inset = inset;
         self
     }
 
     /// Overrides the base foreground color used for the thumb and hover track.
     pub fn color(mut self, color: Hsla) -> Self {
-        self.color = Some(color);
+        self.config.color = Some(color);
         self
     }
 
     /// Uses tighter end margins and a smaller minimum thumb size for compact containers.
     pub fn compact(mut self) -> Self {
-        self.compact = true;
+        self.config.compact = true;
         self
     }
 }
 
 impl RenderOnce for HorizontalScrollbar {
-    fn render(self, window: &mut Window, _cx: &mut App) -> impl IntoElement {
-        let drag = resolve_drag_state(self.id.as_ref(), &self.drag, window);
-        render_scrollbar(
-            Axis::Horizontal,
-            self.target,
-            drag,
-            self.inset,
-            self.color,
-            self.compact,
-        )
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        render_scrollbar_view(self.id, self.config, window, cx)
     }
 }
 
@@ -321,8 +665,8 @@ impl RenderOnce for ScrollView {
             bar = bar.compact();
         }
 
-        // Propagate definite/max height bounds to the inner viewport so `max_h` containers
-        // shrink-wrap short content while constraining and scrolling overflowing content.
+        // Propagate outer `max_h` to the inner viewport only when specified on `outer`, so callers
+        // who set `max_h` directly on `viewport` are not clobbered.
         let mut viewport = self
             .viewport
             .flex_auto()
@@ -330,262 +674,18 @@ impl RenderOnce for ScrollView {
             .w_full()
             .overflow_y_scroll()
             .track_scroll(&handle);
-        viewport.style().max_size.height = self.outer.style().max_size.height;
+        if self.outer.style().max_size.height.is_some() {
+            viewport.style().max_size.height = self.outer.style().max_size.height;
+        }
 
         self.outer.child(viewport).child(bar)
     }
 }
 
-fn resolve_drag_state(
-    id: Option<&ElementId>,
-    fallback: &DragState,
-    window: &mut Window,
-) -> DragState {
-    let Some(id) = id else {
-        return fallback.clone();
-    };
-    window.with_global_id((id.clone(), "scrollbar-drag").into(), |global_id, window| {
-        window.with_element_state(global_id, |state: Option<DragState>, _| {
-            let state = state.unwrap_or_default();
-            (state.clone(), state)
-        })
-    })
-}
-
-fn render_scrollbar(
-    axis: Axis,
-    target: ScrollTarget,
-    drag: DragState,
-    inset: Pixels,
-    color: Option<Hsla>,
-    compact: bool,
-) -> impl IntoElement {
-    let margin = px(if compact { COMPACT_END_MARGIN } else { END_MARGIN });
-    let min_thumb = px(if compact {
-        COMPACT_MIN_THUMB_LENGTH
-    } else {
-        MIN_THUMB_LENGTH
-    });
-
-    let canvas_el = canvas(
-        {
-            let target = target.clone();
-            move |track, window, _| {
-                let overflow = match axis {
-                    Axis::Vertical => target.max_offset().y,
-                    Axis::Horizontal => target.max_offset().x,
-                };
-                let viewport_len = match axis {
-                    Axis::Vertical => target.viewport_size().height,
-                    Axis::Horizontal => target.viewport_size().width,
-                };
-                let track_len = match axis {
-                    Axis::Vertical => track.size.height,
-                    Axis::Horizontal => track.size.width,
-                };
-                if overflow <= px(0.) || viewport_len <= px(0.) || track_len <= min_thumb {
-                    return None;
-                }
-
-                let thumb_len =
-                    (track_len * (viewport_len / (viewport_len + overflow))).max(min_thumb);
-                let travel = track_len - thumb_len;
-                if travel <= px(0.) {
-                    return None;
-                }
-
-                let offset_along = match axis {
-                    Axis::Vertical => -target.offset().y,
-                    Axis::Horizontal => -target.offset().x,
-                };
-                let fraction = (offset_along / overflow).clamp(0., 1.);
-
-                let thumb = match axis {
-                    Axis::Vertical => Bounds::new(
-                        point(track.left(), track.top() + travel * fraction),
-                        size(track.size.width, thumb_len),
-                    ),
-                    Axis::Horizontal => Bounds::new(
-                        point(track.left() + travel * fraction, track.top()),
-                        size(thumb_len, track.size.height),
-                    ),
-                };
-                let hitbox = window.insert_hitbox(track, HitboxBehavior::BlockMouseExceptScroll);
-                Some((hitbox, thumb, travel, overflow))
-            }
-        },
-        move |track, layout, window, cx| {
-            let Some((hitbox, thumb, travel, overflow)) = layout else {
-                if drag.grab_offset.take().is_some() {
-                    target.drag_ended();
-                }
-                return;
-            };
-
-            let hovered = hitbox.is_hovered(window);
-            let dragging = drag.grab_offset.get().is_some();
-            let active = hovered || dragging;
-            if hovered {
-                window.set_cursor_style(CursorStyle::Arrow, &hitbox);
-            }
-
-            let base = color.unwrap_or_else(|| cx.theme().colors().text);
-            let thumb_thickness = px(if active {
-                THUMB_ACTIVE_THICKNESS
-            } else {
-                THUMB_REST_THICKNESS
-            });
-            let thumb_opacity = if dragging {
-                THUMB_DRAG_OPACITY
-            } else if hovered {
-                THUMB_HOVER_OPACITY
-            } else {
-                THUMB_REST_OPACITY
-            };
-
-            if active {
-                let lane_thickness = px(THUMB_ACTIVE_THICKNESS + 2.);
-                let lane_edge = px((EDGE_INSET - 1.).max(0.));
-                let lane = match axis {
-                    Axis::Vertical => Bounds::new(
-                        point(track.right() - lane_edge - lane_thickness, track.top()),
-                        size(lane_thickness, track.size.height),
-                    ),
-                    Axis::Horizontal => Bounds::new(
-                        point(track.left(), track.bottom() - lane_edge - lane_thickness),
-                        size(track.size.width, lane_thickness),
-                    ),
-                };
-                window.paint_quad(
-                    fill(lane, base.opacity(TRACK_ACTIVE_OPACITY))
-                        .corner_radii(lane_thickness / 2.),
-                );
-            }
-
-            let edge = px(EDGE_INSET);
-            let grip = match axis {
-                Axis::Vertical => Bounds::new(
-                    point(track.right() - edge - thumb_thickness, thumb.top()),
-                    size(thumb_thickness, thumb.size.height),
-                ),
-                Axis::Horizontal => Bounds::new(
-                    point(thumb.left(), track.bottom() - edge - thumb_thickness),
-                    size(thumb.size.width, thumb_thickness),
-                ),
-            };
-            window.paint_quad(
-                fill(grip, base.opacity(thumb_opacity)).corner_radii(thumb_thickness / 2.),
-            );
-
-            let scroll_to = move |target: &ScrollTarget,
-                                  pointer: Pixels,
-                                  grab: Pixels,
-                                  window: &mut Window| {
-                let track_start = match axis {
-                    Axis::Vertical => track.top(),
-                    Axis::Horizontal => track.left(),
-                };
-                let fraction = ((pointer - track_start - grab) / travel).clamp(0., 1.);
-                target.set_axis_offset(axis, fraction, overflow);
-                window.refresh();
-            };
-
-            window.on_mouse_event({
-                let hitbox = hitbox.clone();
-                let target = target.clone();
-                let drag = drag.clone();
-                move |event: &MouseDownEvent, phase, window, cx| {
-                    if phase.bubble()
-                        && event.button == MouseButton::Left
-                        && hitbox.is_hovered(window)
-                    {
-                        let pointer = match axis {
-                            Axis::Vertical => event.position.y,
-                            Axis::Horizontal => event.position.x,
-                        };
-                        let grab = if thumb.contains(&event.position) {
-                            let thumb_start = match axis {
-                                Axis::Vertical => thumb.top(),
-                                Axis::Horizontal => thumb.left(),
-                            };
-                            pointer - thumb_start
-                        } else {
-                            let thumb_len = match axis {
-                                Axis::Vertical => thumb.size.height,
-                                Axis::Horizontal => thumb.size.width,
-                            };
-                            thumb_len / 2.
-                        };
-                        target.drag_started();
-                        drag.grab_offset.set(Some(grab));
-                        scroll_to(&target, pointer, grab, window);
-                        cx.stop_propagation();
-                    }
-                }
-            });
-
-            window.on_mouse_event({
-                let hitbox = hitbox.clone();
-                let target = target.clone();
-                let drag = drag.clone();
-                move |event: &MouseMoveEvent, phase, window, cx| {
-                    if !phase.capture() {
-                        return;
-                    }
-                    if event.pressed_button == Some(MouseButton::Left) {
-                        if let Some(grab) = drag.grab_offset.get() {
-                            let pointer = match axis {
-                                Axis::Vertical => event.position.y,
-                                Axis::Horizontal => event.position.x,
-                            };
-                            scroll_to(&target, pointer, grab, window);
-                            cx.stop_propagation();
-                            return;
-                        }
-                    } else if drag.grab_offset.take().is_some() {
-                        target.drag_ended();
-                        window.refresh();
-                    }
-                    if hovered != hitbox.is_hovered(window) {
-                        window.refresh();
-                    }
-                }
-            });
-
-            window.on_mouse_event({
-                let target = target.clone();
-                let drag = drag.clone();
-                move |event: &MouseUpEvent, phase, window, cx| {
-                    if phase.capture()
-                        && event.button == MouseButton::Left
-                        && drag.grab_offset.take().is_some()
-                    {
-                        target.drag_ended();
-                        window.refresh();
-                        cx.stop_propagation();
-                    }
-                }
-            });
-        },
-    )
-    .absolute();
-
-    match axis {
-        Axis::Vertical => canvas_el
-            .top(margin)
-            .bottom(margin)
-            .right(inset)
-            .w(px(TRACK_THICKNESS)),
-        Axis::Horizontal => canvas_el
-            .left(margin)
-            .right(margin)
-            .bottom(inset)
-            .h(px(TRACK_THICKNESS)),
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use std::{cell::Cell, rc::Rc};
+
     use super::*;
     use gpui::{
         Context, InteractiveElement, ListAlignment, Modifiers, Render, TestAppContext, Window, list,

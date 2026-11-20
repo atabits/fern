@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result};
@@ -783,7 +784,22 @@ const MIGRATIONS: &[&str] = &[
     ",
     // Versioned, independent filter clauses. NULL rows retain their legacy representation.
     "ALTER TABLE filters ADD COLUMN rules TEXT;",
+    // Indexes for section lookups, manual task ordering, and list-folder membership.
+    "
+    CREATE INDEX IF NOT EXISTS tasks_section ON tasks(section_id);
+    CREATE INDEX IF NOT EXISTS tasks_sort_order ON tasks(sort_order);
+    CREATE INDEX IF NOT EXISTS list_sections_list_order ON list_sections(list_id, sort_order);
+    CREATE INDEX IF NOT EXISTS lists_folder ON lists(folder_id);
+    ",
 ];
+
+#[cfg(test)]
+pub(crate) fn pre_filter_rules_migration_version() -> u32 {
+    MIGRATIONS
+        .iter()
+        .position(|sql| sql.contains("ALTER TABLE filters ADD COLUMN rules TEXT"))
+        .expect("filter rules migration must exist") as u32
+}
 
 /// Drop target when dragging a list folder relative to another list or folder.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -814,6 +830,50 @@ impl Store {
 
     pub fn open_in_memory() -> Result<Self> {
         Self::init(Connection::open_in_memory()?)
+    }
+
+    /// Runs `f` inside a transaction, or a nested `SAVEPOINT` when already inside an outer
+    /// transaction. Automatically rolls back on error or panic.
+    pub(crate) fn in_tx<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        if self.conn.is_autocommit() {
+            let tx = self.conn.unchecked_transaction()?;
+            let result = f()?;
+            tx.commit()?;
+            Ok(result)
+        } else {
+            static NEXT_SP: AtomicU64 = AtomicU64::new(1);
+            let name = format!("sp_{}", NEXT_SP.fetch_add(1, Ordering::Relaxed));
+            self.conn.execute_batch(&format!("SAVEPOINT {name}"))?;
+            struct Guard<'a> {
+                conn: &'a Connection,
+                name: String,
+                committed: bool,
+            }
+            impl Drop for Guard<'_> {
+                fn drop(&mut self) {
+                    if !self.committed {
+                        let _ = self.conn.execute_batch(&format!(
+                            "ROLLBACK TO SAVEPOINT {0}; RELEASE SAVEPOINT {0}",
+                            self.name
+                        ));
+                    }
+                }
+            }
+            let mut guard = Guard { conn: &self.conn, name, committed: false };
+            let result = f()?;
+            self.conn.execute_batch(&format!("RELEASE SAVEPOINT {}", guard.name))?;
+            guard.committed = true;
+            Ok(result)
+        }
+    }
+
+    fn write_sort_order(&self, table: &'static str, ids: &[Id]) -> Result<()> {
+        let sql = format!("UPDATE {table} SET sort_order = ?2 WHERE id = ?1 AND sort_order != ?2");
+        let mut stmt = self.conn.prepare_cached(&sql)?;
+        for (i, id) in ids.iter().enumerate() {
+            stmt.execute(params![id.to_string(), i as i64])?;
+        }
+        Ok(())
     }
 
     fn init(conn: Connection) -> Result<Self> {
@@ -1043,12 +1103,10 @@ impl Store {
             read().map_err(|e| rusqlite::Error::FromSqlConversionFailure(10, rusqlite::types::Type::Text, e.into()))
         })?.collect::<Result<_, _>>()?;
         if let Some(saved) = self.setting(FILTER_ORDER_KEY)? {
-            let ranks: HashMap<Id, usize> = saved
-                .split(',')
-                .filter_map(|s| Uuid::parse_str(s.trim()).ok())
-                .enumerate()
-                .map(|(i, id)| (id, i))
-                .collect();
+            let mut ranks: HashMap<Id, usize> = HashMap::new();
+            for (i, id) in saved.split(',').filter_map(|s| Uuid::parse_str(s.trim()).ok()).enumerate() {
+                ranks.entry(id).or_insert(i);
+            }
             filters.sort_by_key(|f| ranks.get(&f.id).copied().unwrap_or(usize::MAX));
         }
         Ok(filters)
@@ -1099,8 +1157,19 @@ impl Store {
     }
 
     pub fn delete_filter(&self, id: Id) -> Result<()> {
-        self.conn.execute("DELETE FROM filters WHERE id = ?1", [id.to_string()])?;
-        Ok(())
+        self.in_tx(|| {
+            self.conn.execute("DELETE FROM filters WHERE id = ?1", [id.to_string()])?;
+            if let Some(saved) = self.setting(FILTER_ORDER_KEY)? {
+                let id_str = id.to_string();
+                let updated: Vec<&str> = saved
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty() && *s != id_str)
+                    .collect();
+                self.set_setting(FILTER_ORDER_KEY, &updated.join(","))?;
+            }
+            Ok(())
+        })
     }
 
     pub fn counts(&self, today: NaiveDate) -> Result<ViewCounts> {
@@ -1278,22 +1347,22 @@ impl Store {
         if id == target {
             return Ok(());
         }
-        let mut stmt = self.conn.prepare_cached("SELECT id FROM tasks ORDER BY sort_order, rowid DESC")?;
-        let mut order: Vec<String> = stmt.query_map([], |row| row.get(0))?.collect::<Result<_, _>>()?;
-        let (id, target) = (id.to_string(), target.to_string());
-        order.retain(|other| *other != id);
-        let index = order.iter().position(|other| *other == target).context("target task not found")?;
-        order.insert(if after { index + 1 } else { index }, id);
+        self.in_tx(|| {
+            let mut stmt = self.conn.prepare_cached("SELECT id FROM tasks ORDER BY sort_order, rowid DESC")?;
+            let mut order: Vec<String> = stmt.query_map([], |row| row.get(0))?.collect::<Result<_, _>>()?;
+            let (id, target) = (id.to_string(), target.to_string());
+            order.retain(|other| *other != id);
+            let index = order.iter().position(|other| *other == target).context("target task not found")?;
+            order.insert(if after { index + 1 } else { index }, id);
 
-        let tx = self.conn.unchecked_transaction()?;
-        for (position, task) in order.iter().enumerate() {
-            tx.execute(
-                "UPDATE tasks SET sort_order = ?2 WHERE id = ?1",
-                params![task, position as i64 * 1024],
-            )?;
-        }
-        tx.commit()?;
-        Ok(())
+            let mut update = self
+                .conn
+                .prepare_cached("UPDATE tasks SET sort_order = ?2 WHERE id = ?1 AND sort_order != ?2")?;
+            for (position, task) in order.iter().enumerate() {
+                update.execute(params![task, position as i64 * 1024])?;
+            }
+            Ok(())
+        })
     }
 
     /// Tasks (open and completed, not in the trash) due between `start` and `end`, inclusive,
@@ -1324,29 +1393,56 @@ impl Store {
         Ok(subtasks)
     }
 
-    /// Creates a subtask in the parent's list and section.
+    /// Creates a subtask in the parent's list and section (and inherits closed state if the parent is closed).
     pub fn add_subtask(&self, parent: Id, title: &str) -> Result<Task> {
-        let parent_task = self.task(parent)?.ok_or_else(|| anyhow::anyhow!("parent task not found"))?;
-        anyhow::ensure!(parent_task.kind != Kind::Note, "notes cannot have subtasks");
-        anyhow::ensure!(self.task_depth(parent)? < MAX_SUBTASK_DEPTH, "maximum subtask nesting depth reached");
-        let list = parent_task.list_id;
-        let section = parent_task.section_id;
-        let mut task = self.add_task(title)?;
-        let tx = self.conn.unchecked_transaction()?;
-        tx.execute(
-            "UPDATE tasks SET parent_id = ?2, list_id = ?3, section_id = ?4 WHERE id = ?1",
-            params![
-                task.id.to_string(),
-                parent.to_string(),
-                list.map(|l| l.to_string()),
-                section.map(|s| s.to_string()),
-            ],
-        )?;
-        tx.commit()?;
-        task.parent_id = Some(parent);
-        task.list_id = list;
-        task.section_id = section;
-        Ok(task)
+        self.in_tx(|| {
+            let parent_task = self.task(parent)?.ok_or_else(|| anyhow::anyhow!("parent task not found"))?;
+            anyhow::ensure!(!parent_task.is_deleted(), "trashed tasks cannot have subtasks");
+            anyhow::ensure!(parent_task.kind != Kind::Note, "notes cannot have subtasks");
+            anyhow::ensure!(self.task_depth(parent)? < MAX_SUBTASK_DEPTH, "maximum subtask nesting depth reached");
+            let task = Task {
+                id: Uuid::now_v7(),
+                list_id: parent_task.list_id,
+                parent_id: Some(parent),
+                kind: Kind::Task,
+                title: title.trim().to_owned(),
+                notes: String::new(),
+                priority: Priority::None,
+                due_date: None,
+                due_time: None,
+                repeat: None,
+                tags: Vec::new(),
+                checklist: None,
+                completed_at: parent_task.completed_at,
+                deleted_at: None,
+                wont_do_at: parent_task.wont_do_at,
+                end_date: None,
+                end_time: None,
+                modified_at: None,
+                pinned_at: None,
+                section_id: parent_task.section_id,
+                reminders: Vec::new(),
+                estimate: None,
+                created_at: now_ms(),
+            };
+            self.conn.execute(
+                "INSERT INTO tasks (id, parent_id, title, notes, list_id, section_id, kind, priority,
+                                    completed_at, wont_do_at, created_at, sort_order)
+                 VALUES (?1, ?2, ?3, '', ?4, ?5, 'task', 0, ?6, ?7, ?8,
+                         (SELECT COALESCE(MIN(sort_order), 0) - 1024 FROM tasks))",
+                params![
+                    task.id.to_string(),
+                    parent.to_string(),
+                    task.title,
+                    task.list_id.map(|l| l.to_string()),
+                    task.section_id.map(|s| s.to_string()),
+                    task.completed_at,
+                    task.wont_do_at,
+                    task.created_at,
+                ],
+            )?;
+            Ok(task)
+        })
     }
 
     pub fn set_completed(&self, id: Id, completed: bool) -> Result<()> {
@@ -1415,53 +1511,77 @@ impl Store {
             return Ok((Some(copy), Vec::new()));
         }
         if completed {
-            let now = now_ms();
-            let open_descendants: Vec<Id> = self
-                .descendants(id)?
-                .into_iter()
-                .filter(|&sub| {
-                    self.task(sub)
-                        .ok()
-                        .flatten()
-                        .is_some_and(|t| !t.is_deleted() && !t.is_closed())
-                })
-                .collect();
-            let tx = self.conn.unchecked_transaction()?;
-            tx.execute("UPDATE tasks SET completed_at = ?2 WHERE id = ?1", params![id.to_string(), now])?;
-            for &sub in &open_descendants {
-                tx.execute("UPDATE tasks SET completed_at = ?2 WHERE id = ?1", params![sub.to_string(), now])?;
-            }
-            tx.commit()?;
-            Ok((None, open_descendants))
+            let cascaded = self.close_with_descendants(id, true)?;
+            Ok((None, cascaded))
         } else {
-            let closed_ancestors: Vec<Id> = self
-                .ancestors(id)?
-                .into_iter()
-                .filter(|&anc| {
-                    self.task(anc)
-                        .ok()
-                        .flatten()
-                        .is_some_and(|t| !t.is_deleted() && t.is_closed())
-                })
-                .collect();
-            let tx = self.conn.unchecked_transaction()?;
-            tx.execute("UPDATE tasks SET completed_at = NULL, wont_do_at = NULL WHERE id = ?1", [id.to_string()])?;
-            for anc in closed_ancestors {
-                tx.execute("UPDATE tasks SET completed_at = NULL, wont_do_at = NULL WHERE id = ?1", [anc.to_string()])?;
-            }
-            tx.commit()?;
+            self.reopen_tasks(&[id])?;
             Ok((None, Vec::new()))
         }
     }
 
-    /// Reopens an explicit set of tasks (used by Undo after a cascading completion).
+    /// Marks `id` and all open non-deleted descendants completed (`completed = true`) or Won't Do
+    /// (`completed = false`) atomically, returning the newly cascaded descendant IDs.
+    fn close_with_descendants(&self, id: Id, completed: bool) -> Result<Vec<Id>> {
+        self.in_tx(|| {
+            let now = now_ms();
+            let mut stmt = self.conn.prepare_cached(
+                "WITH RECURSIVE sub(id) AS (
+                     SELECT id FROM tasks WHERE parent_id = ?1
+                     UNION
+                     SELECT t.id FROM tasks t JOIN sub ON t.parent_id = sub.id
+                 )
+                 SELECT t.id FROM tasks t JOIN sub ON t.id = sub.id
+                 WHERE t.deleted_at IS NULL AND t.completed_at IS NULL AND t.wont_do_at IS NULL",
+            )?;
+            let open_descendants: Vec<Id> = stmt
+                .query_map([id.to_string()], |row| {
+                    let raw: String = row.get(0)?;
+                    parse_uuid(&raw, 0)
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let sql = if completed {
+                "UPDATE tasks SET completed_at = ?2, wont_do_at = NULL WHERE id = ?1"
+            } else {
+                "UPDATE tasks SET wont_do_at = ?2, completed_at = NULL WHERE id = ?1"
+            };
+            let mut update = self.conn.prepare_cached(sql)?;
+            update.execute(params![id.to_string(), now])?;
+            for &sub in &open_descendants {
+                update.execute(params![sub.to_string(), now])?;
+            }
+            Ok(open_descendants)
+        })
+    }
+
+    /// Reopens an explicit set of tasks (used by Undo after a cascading completion) together with
+    /// any non-deleted closed ancestors so an open subtask is never left under a closed parent.
     pub fn reopen_tasks(&self, ids: &[Id]) -> Result<()> {
-        let tx = self.conn.unchecked_transaction()?;
-        for id in ids {
-            tx.execute("UPDATE tasks SET completed_at = NULL WHERE id = ?1", [id.to_string()])?;
-        }
-        tx.commit()?;
-        Ok(())
+        self.in_tx(|| {
+            let mut to_reopen: HashSet<Id> = ids.iter().copied().collect();
+            let mut anc_stmt = self.conn.prepare_cached(
+                "SELECT deleted_at IS NULL AND (completed_at IS NOT NULL OR wont_do_at IS NOT NULL)
+                 FROM tasks WHERE id = ?1",
+            )?;
+            for &id in ids {
+                for anc in self.ancestors(id)? {
+                    if !to_reopen.contains(&anc)
+                        && anc_stmt
+                            .query_row([anc.to_string()], |row| row.get::<_, bool>(0))
+                            .optional()?
+                            .unwrap_or(false)
+                    {
+                        to_reopen.insert(anc);
+                    }
+                }
+            }
+            let mut update = self
+                .conn
+                .prepare_cached("UPDATE tasks SET completed_at = NULL, wont_do_at = NULL WHERE id = ?1")?;
+            for id in to_reopen {
+                update.execute([id.to_string()])?;
+            }
+            Ok(())
+        })
     }
 
     /// Undoes completing a repeating task: removes the completed copy and puts the task back on
@@ -1502,64 +1622,34 @@ impl Store {
     /// Marks a task "Won't Do" (cascading to open descendants), or reopens it (and closed ancestors).
     pub fn set_wont_do(&self, id: Id, wont_do: bool) -> Result<()> {
         if wont_do {
-            let now = now_ms();
-            let open_descendants: Vec<Id> = self
-                .descendants(id)?
-                .into_iter()
-                .filter(|&sub| {
-                    self.task(sub)
-                        .ok()
-                        .flatten()
-                        .is_some_and(|t| !t.is_deleted() && !t.is_closed())
-                })
-                .collect();
-            let tx = self.conn.unchecked_transaction()?;
-            tx.execute("UPDATE tasks SET wont_do_at = ?2 WHERE id = ?1", params![id.to_string(), now])?;
-            for sub in open_descendants {
-                tx.execute("UPDATE tasks SET wont_do_at = ?2 WHERE id = ?1", params![sub.to_string(), now])?;
-            }
-            tx.commit()?;
-            Ok(())
+            self.close_with_descendants(id, false).map(|_| ())
         } else {
-            let closed_ancestors: Vec<Id> = self
-                .ancestors(id)?
-                .into_iter()
-                .filter(|&anc| {
-                    self.task(anc)
-                        .ok()
-                        .flatten()
-                        .is_some_and(|t| !t.is_deleted() && t.is_closed())
-                })
-                .collect();
-            let tx = self.conn.unchecked_transaction()?;
-            tx.execute("UPDATE tasks SET wont_do_at = NULL, completed_at = NULL WHERE id = ?1", [id.to_string()])?;
-            for anc in closed_ancestors {
-                tx.execute("UPDATE tasks SET wont_do_at = NULL, completed_at = NULL WHERE id = ?1", [anc.to_string()])?;
-            }
-            tx.commit()?;
-            Ok(())
+            self.reopen_tasks(&[id])
         }
     }
 
     /// Copies a task with its tags and checklist (not its subtasks) right below the original.
     pub fn duplicate_task(&self, id: Id) -> Result<Task> {
-        let original = self.task(id)?.context("task not found")?;
-        let copy = self.add_task(&original.title)?;
-        self.conn.execute(
-            "UPDATE tasks SET parent_id = o.parent_id, kind = o.kind, notes = o.notes,
-                 priority = o.priority, due_date = o.due_date, due_time = o.due_time,
-                 list_id = o.list_id, repeat = o.repeat, reminders = o.reminders,
-                 end_date = o.end_date, end_time = o.end_time
-             FROM (SELECT * FROM tasks WHERE id = ?2) AS o WHERE tasks.id = ?1",
-            params![copy.id.to_string(), id.to_string()],
-        )?;
-        self.set_tags(copy.id, &original.tags)?;
-        for item in self.checklist(id)? {
-            let new = self.add_checklist_item(copy.id, &item.title, None)?;
-            self.set_checklist_item_completed(new.id, item.completed)?;
-        }
-        self.move_task(copy.id, id, true)?;
-        self.task(copy.id)?.context("copy not found")
+        self.in_tx(|| {
+            let original = self.task(id)?.context("task not found")?;
+            let copy = self.insert_task(TaskDraft { title: original.title.clone(), ..Default::default() }, true)?;
+            self.conn.execute(
+                "UPDATE tasks SET parent_id = o.parent_id, kind = o.kind, notes = o.notes,
+                     priority = o.priority, due_date = o.due_date, due_time = o.due_time,
+                     list_id = o.list_id, section_id = o.section_id, repeat = o.repeat,
+                     reminders = o.reminders, end_date = o.end_date, end_time = o.end_time,
+                     estimate = o.estimate
+                 FROM (SELECT * FROM tasks WHERE id = ?2) AS o WHERE tasks.id = ?1",
+                params![copy.id.to_string(), id.to_string()],
+            )?;
+            self.replace_task_tags(copy.id, &original.tags)?;
+            for item in self.checklist(id)? {
+                let new = self.add_checklist_item(copy.id, &item.title, None)?;
+                self.set_checklist_item_completed(new.id, item.completed)?;
+            }
+            self.move_task(copy.id, id, true)?;
+            self.task(copy.id)?.context("copy not found")
+        })
     }
 
     pub fn set_title(&self, id: Id, title: &str) -> Result<()> {
@@ -1575,13 +1665,26 @@ impl Store {
     }
 
     pub fn set_kind(&self, id: Id, kind: Kind) -> Result<()> {
-        if kind == Kind::Note
-            && let Some(task) = self.task(id)?
-        {
-            anyhow::ensure!(
-                task.parent_id.is_none() && self.subtasks(id)?.is_empty(),
-                "nested tasks cannot be converted to notes"
-            );
+        if kind == Kind::Note {
+            return self.in_tx(|| {
+                if let Some(task) = self.task(id)? {
+                    let has_active_subtask: bool = self.conn.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM tasks WHERE parent_id = ?1 AND deleted_at IS NULL)",
+                        [id.to_string()],
+                        |row| row.get(0),
+                    )?;
+                    anyhow::ensure!(
+                        task.parent_id.is_none() && !has_active_subtask,
+                        "nested tasks cannot be converted to notes"
+                    );
+                    // Detach any trashed children so restoring them later cannot attach a subtask to a note.
+                    self.conn.execute(
+                        "UPDATE tasks SET parent_id = NULL WHERE parent_id = ?1 AND deleted_at IS NOT NULL",
+                        [id.to_string()],
+                    )?;
+                }
+                self.update(id, "kind", kind.as_str())
+            });
         }
         self.update(id, "kind", kind.as_str())
     }
@@ -1722,9 +1825,7 @@ impl Store {
             "INSERT INTO list_sections (id, list_id, name, created_at) VALUES (?1, ?2, ?3, ?4)",
             params![section.id.to_string(), list.map(|l| l.to_string()), section.name, now_ms()],
         )?;
-        for (i, id) in order.iter().enumerate() {
-            tx.execute("UPDATE list_sections SET sort_order = ?2 WHERE id = ?1 AND sort_order != ?2", params![id.to_string(), i as i64])?;
-        }
+        self.write_sort_order("list_sections", &order)?;
         tx.commit()?;
         Ok(section)
     }
@@ -1732,14 +1833,31 @@ impl Store {
     /// The kanban column menu's "Move to": the section and its tasks go to another list, after
     /// its sections.
     pub fn move_list_section(&self, id: Id, to: Option<Id>) -> Result<()> {
-        let tasks: Vec<Id> = self.tasks()?.into_iter().filter(|t| t.section_id == Some(id) && t.parent_id.is_none()).map(|t| t.id).collect();
-        let order = self.list_sections(to)?.len() as i64;
-        self.conn.execute("UPDATE list_sections SET list_id = ?2, sort_order = ?3 WHERE id = ?1", params![id.to_string(), to.map(|l| l.to_string()), order])?;
-        for task in tasks {
-            self.set_list(task, to)?;
-            self.set_section(task, Some(id))?;
-        }
-        Ok(())
+        self.in_tx(|| {
+            let mut stmt = self
+                .conn
+                .prepare_cached("SELECT id FROM tasks WHERE section_id = ?1 AND parent_id IS NULL")?;
+            let tasks: Vec<Id> = stmt
+                .query_map([id.to_string()], |row| {
+                    let raw: String = row.get(0)?;
+                    parse_uuid(&raw, 0)
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let order: i64 = self.conn.query_row(
+                "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM list_sections WHERE list_id IS ?1",
+                [to.map(|l| l.to_string())],
+                |row| row.get(0),
+            )?;
+            self.conn.execute(
+                "UPDATE list_sections SET list_id = ?2, sort_order = ?3 WHERE id = ?1",
+                params![id.to_string(), to.map(|l| l.to_string()), order],
+            )?;
+            for task in tasks {
+                self.set_list(task, to)?;
+                self.set_section(task, Some(id))?;
+            }
+            Ok(())
+        })
     }
 
     pub fn rename_list_section(&self, id: Id, name: &str) -> Result<()> {
@@ -1754,48 +1872,58 @@ impl Store {
         if dragged == target {
             return Ok(());
         }
-        let mut order: Vec<Id> = self.list_sections(list)?.into_iter().map(|s| s.id).collect();
-        let Some(from) = order.iter().position(|&id| id == dragged) else { return Ok(()) };
-        let Some(to) = order.iter().position(|&id| id == target) else { return Ok(()) };
-        let id = order.remove(from);
-        order.insert(to, id);
-        let tx = self.conn.unchecked_transaction()?;
-        for (i, id) in order.iter().enumerate() {
-            tx.execute("UPDATE list_sections SET sort_order = ?2 WHERE id = ?1 AND sort_order != ?2", params![id.to_string(), i as i64])?;
-        }
-        tx.commit()?;
-        Ok(())
+        self.in_tx(|| {
+            let mut order: Vec<Id> = self.list_sections(list)?.into_iter().map(|s| s.id).collect();
+            let Some(from) = order.iter().position(|&id| id == dragged) else { return Ok(()) };
+            let Some(to) = order.iter().position(|&id| id == target) else { return Ok(()) };
+            let id = order.remove(from);
+            order.insert(to, id);
+            self.write_sort_order("list_sections", &order)
+        })
     }
 
     /// Deletes a section; its tasks stay in the list without a section.
     pub fn delete_list_section(&self, id: Id) -> Result<()> {
-        self.conn.execute("UPDATE tasks SET section_id = NULL WHERE section_id = ?1", [id.to_string()])?;
-        self.conn.execute("DELETE FROM list_sections WHERE id = ?1", [id.to_string()])?;
-        Ok(())
+        self.in_tx(|| {
+            self.conn.execute("UPDATE tasks SET section_id = NULL WHERE section_id = ?1", [id.to_string()])?;
+            self.conn.execute("DELETE FROM list_sections WHERE id = ?1", [id.to_string()])?;
+            Ok(())
+        })
     }
 
     /// Puts a task (and its subtasks) into a section of its list, or out of any.
     pub fn set_section(&self, id: Id, section: Option<Id>) -> Result<()> {
-        let task = self.task(id)?.context("task not found")?;
-        if let Some(section) = section {
-            let list: Option<Option<String>> = self
-                .conn
-                .query_row("SELECT list_id FROM list_sections WHERE id = ?1", [section.to_string()], |row| row.get(0))
-                .optional()?;
-            let task_list = task.list_id.map(|l| l.to_string());
-            anyhow::ensure!(list == Some(task_list), "the section belongs to another list");
-        }
-        let unlink = task.parent_id.is_some_and(|parent_id| {
-            self.task(parent_id).ok().flatten().is_none_or(|parent| parent.section_id != section)
-        });
-        let section_str = section.map(|s| s.to_string());
-        if unlink {
-            self.conn.execute("UPDATE tasks SET parent_id = NULL WHERE id = ?1", [id.to_string()])?;
-        }
-        for sub in std::iter::once(id).chain(self.descendants(id)?) {
-            self.conn.execute("UPDATE tasks SET section_id = ?2 WHERE id = ?1", params![sub.to_string(), section_str])?;
-        }
-        Ok(())
+        self.in_tx(|| {
+            let task = self.task(id)?.context("task not found")?;
+            if let Some(section) = section {
+                let list: Option<Option<String>> = self
+                    .conn
+                    .query_row("SELECT list_id FROM list_sections WHERE id = ?1", [section.to_string()], |row| row.get(0))
+                    .optional()?;
+                let task_list = task.list_id.map(|l| l.to_string());
+                anyhow::ensure!(list == Some(task_list), "the section belongs to another list");
+            }
+            let section_str = section.map(|s| s.to_string());
+            let unlink = match task.parent_id {
+                Some(parent_id) => {
+                    let parent_section: Option<Option<String>> = self
+                        .conn
+                        .prepare_cached("SELECT section_id FROM tasks WHERE id = ?1")?
+                        .query_row([parent_id.to_string()], |row| row.get(0))
+                        .optional()?;
+                    parent_section.is_none_or(|ps| ps != section_str)
+                }
+                None => false,
+            };
+            if unlink {
+                self.conn.execute("UPDATE tasks SET parent_id = NULL WHERE id = ?1", [id.to_string()])?;
+            }
+            let mut stmt = self.conn.prepare_cached("UPDATE tasks SET section_id = ?2 WHERE id = ?1")?;
+            for sub in std::iter::once(id).chain(self.descendants(id)?) {
+                stmt.execute(params![sub.to_string(), section_str])?;
+            }
+            Ok(())
+        })
     }
 
     /// Pins a task to the top of its lists, or unpins it.
@@ -1895,61 +2023,67 @@ impl Store {
         self.set_parent(id, None)
     }
 
-    /// "Link Parent Task": makes a task a subtask of `parent`, moving it (and its descendants)
-    /// to the parent's list and section and clamping any descendants that exceed `MAX_SUBTASK_DEPTH`.
+    /// "Link Parent Task": makes a task a subtask of `parent`, moving it (and its descendants,
+    /// including any flattened onto `parent` at `MAX_SUBTASK_DEPTH`) to the parent's list and
+    /// section and clamping any descendants that exceed `MAX_SUBTASK_DEPTH`.
     pub fn link_parent(&self, id: Id, parent: Id) -> Result<()> {
-        let parent_task = self.task(parent)?.context("parent task not found")?;
-        self.set_parent(id, Some(parent))?;
-        let list = parent_task.list_id.map(|l| l.to_string());
-        let section = parent_task.section_id.map(|s| s.to_string());
-        let subtree: Vec<Id> = std::iter::once(id).chain(self.descendants(id)?).collect();
-        let tx = self.conn.unchecked_transaction()?;
-        for task_id in &subtree {
-            tx.execute(
-                "UPDATE tasks SET list_id = ?2, section_id = ?3 WHERE id = ?1",
-                params![task_id.to_string(), list, section],
-            )?;
-        }
-        if parent_task.is_completed() {
-            let now = parent_task.completed_at.unwrap_or_else(now_ms);
+        self.in_tx(|| {
+            let parent_task = self.task(parent)?.context("parent task not found")?;
+            // Capture the full subtree BEFORE `set_parent` flattens deep descendants onto `parent`.
+            let subtree: Vec<Id> = std::iter::once(id).chain(self.descendants(id)?).collect();
+            self.set_parent(id, Some(parent))?;
+            let list = parent_task.list_id.map(|l| l.to_string());
+            let section = parent_task.section_id.map(|s| s.to_string());
+            let mut move_stmt = self
+                .conn
+                .prepare_cached("UPDATE tasks SET list_id = ?2, section_id = ?3 WHERE id = ?1")?;
             for task_id in &subtree {
-                tx.execute(
+                move_stmt.execute(params![task_id.to_string(), list, section])?;
+            }
+            if parent_task.is_completed() {
+                let now = parent_task.completed_at.unwrap_or_else(now_ms);
+                let mut close_stmt = self.conn.prepare_cached(
                     "UPDATE tasks SET completed_at = COALESCE(completed_at, ?2) WHERE id = ?1 AND wont_do_at IS NULL AND deleted_at IS NULL",
-                    params![task_id.to_string(), now],
                 )?;
-            }
-        } else if parent_task.is_wont_do() {
-            let now = parent_task.wont_do_at.unwrap_or_else(now_ms);
-            for task_id in &subtree {
-                tx.execute(
+                for task_id in &subtree {
+                    close_stmt.execute(params![task_id.to_string(), now])?;
+                }
+            } else if parent_task.is_wont_do() {
+                let now = parent_task.wont_do_at.unwrap_or_else(now_ms);
+                let mut close_stmt = self.conn.prepare_cached(
                     "UPDATE tasks SET wont_do_at = COALESCE(wont_do_at, ?2) WHERE id = ?1 AND completed_at IS NULL AND deleted_at IS NULL",
-                    params![task_id.to_string(), now],
                 )?;
+                for task_id in &subtree {
+                    close_stmt.execute(params![task_id.to_string(), now])?;
+                }
             }
-        }
-        tx.commit()?;
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Makes the task a subtask of `parent`, or a top-level task for `None`.
     /// Notes cannot be nested or hold subtasks, and descendants beyond `MAX_SUBTASK_DEPTH`
     /// are flattened onto level `MAX_SUBTASK_DEPTH`.
     pub fn set_parent(&self, id: Id, parent: Option<Id>) -> Result<()> {
-        if let Some(parent) = parent {
-            anyhow::ensure!(
-                parent != id && !self.descendants(id)?.contains(&parent),
-                "a task cannot be nested inside itself"
-            );
-            let task = self.task(id)?.context("task not found")?;
-            let parent_task = self.task(parent)?.context("parent task not found")?;
-            anyhow::ensure!(task.kind != Kind::Note && parent_task.kind != Kind::Note, "notes cannot be nested");
-            let parent_depth = self.task_depth(parent)?;
-            anyhow::ensure!(parent_depth < MAX_SUBTASK_DEPTH, "maximum subtask nesting depth reached");
-            self.update(id, "parent_id", Some(parent.to_string()))?;
-            self.flatten_subtask_depth(id, parent_depth + 1, parent)?;
-            return Ok(());
-        }
-        self.update(id, "parent_id", None::<String>)
+        self.in_tx(|| {
+            if let Some(parent) = parent {
+                let task = self.task(id)?.context("task not found")?;
+                let parent_task = self.task(parent)?.context("parent task not found")?;
+                anyhow::ensure!(!parent_task.is_deleted(), "trashed tasks cannot be parents");
+                anyhow::ensure!(task.kind != Kind::Note && parent_task.kind != Kind::Note, "notes cannot be nested");
+                let ancestors = self.ancestors(parent)?;
+                anyhow::ensure!(
+                    parent != id && !ancestors.contains(&id),
+                    "a task cannot be nested inside itself"
+                );
+                let parent_depth = ancestors.len();
+                anyhow::ensure!(parent_depth < MAX_SUBTASK_DEPTH, "maximum subtask nesting depth reached");
+                self.update(id, "parent_id", Some(parent.to_string()))?;
+                self.flatten_subtask_depth(id, parent_depth + 1, parent)?;
+                return Ok(());
+            }
+            self.update(id, "parent_id", None::<String>)
+        })
     }
 
     /// Flattens any descendants of `root` (currently at `root_depth`, child of `root_parent`)
@@ -1971,9 +2105,11 @@ impl Store {
         while let Some((node, depth, cap_parent)) = stack.pop() {
             let mut stmt = self.conn.prepare_cached("SELECT id FROM tasks WHERE parent_id = ?1")?;
             let children: Vec<Id> = stmt
-                .query_map([node.to_string()], |row| row.get::<_, String>(0))?
-                .filter_map(|r| r.ok().and_then(|s| Uuid::parse_str(&s).ok()))
-                .collect();
+                .query_map([node.to_string()], |row| {
+                    let raw: String = row.get(0)?;
+                    parse_uuid(&raw, 0)
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
             for child in children {
                 if !seen.insert(child) {
                     continue;
@@ -1995,14 +2131,13 @@ impl Store {
             }
         }
         if !reparents.is_empty() {
-            let tx = self.conn.unchecked_transaction()?;
-            for (child, target_parent) in reparents {
-                tx.execute(
-                    "UPDATE tasks SET parent_id = ?2 WHERE id = ?1",
-                    params![child.to_string(), target_parent.to_string()],
-                )?;
-            }
-            tx.commit()?;
+            self.in_tx(|| {
+                let mut stmt = self.conn.prepare_cached("UPDATE tasks SET parent_id = ?2 WHERE id = ?1")?;
+                for (child, target_parent) in reparents {
+                    stmt.execute(params![child.to_string(), target_parent.to_string()])?;
+                }
+                Ok(())
+            })?;
         }
         Ok(())
     }
@@ -2011,28 +2146,30 @@ impl Store {
     /// `target` (`(target_id, after)`). When nesting directly after `new_parent`, places `id` as
     /// the first child of `new_parent`.
     pub fn move_task_in_tree(&self, id: Id, new_parent: Option<Id>, target: Option<(Id, bool)>) -> Result<()> {
-        match new_parent {
-            Some(parent) => self.link_parent(id, parent)?,
-            None => self.set_parent(id, None)?,
-        }
-        if let Some((target_id, after)) = target {
-            if new_parent == Some(target_id) && after {
-                let first_child: Option<Id> = self
-                    .conn
-                    .prepare_cached("SELECT id FROM tasks WHERE parent_id = ?1 AND id != ?2 AND deleted_at IS NULL ORDER BY sort_order, rowid DESC LIMIT 1")?
-                    .query_row(params![target_id.to_string(), id.to_string()], |row| row.get::<_, String>(0))
-                    .optional()?
-                    .and_then(|s| Uuid::parse_str(&s).ok());
-                if let Some(first_child) = first_child {
-                    self.move_task(id, first_child, false)?;
-                } else if target_id != id {
-                    self.move_task(id, target_id, true)?;
-                }
-            } else if target_id != id {
-                self.move_task(id, target_id, after)?;
+        self.in_tx(|| {
+            match new_parent {
+                Some(parent) => self.link_parent(id, parent)?,
+                None => self.set_parent(id, None)?,
             }
-        }
-        Ok(())
+            if let Some((target_id, after)) = target {
+                if new_parent == Some(target_id) && after {
+                    let first_child: Option<Id> = self
+                        .conn
+                        .prepare_cached("SELECT id FROM tasks WHERE parent_id = ?1 AND id != ?2 AND deleted_at IS NULL ORDER BY sort_order, rowid DESC LIMIT 1")?
+                        .query_row(params![target_id.to_string(), id.to_string()], |row| row.get::<_, String>(0))
+                        .optional()?
+                        .and_then(|s| Uuid::parse_str(&s).ok());
+                    if let Some(first_child) = first_child {
+                        self.move_task(id, first_child, false)?;
+                    } else if target_id != id {
+                        self.move_task(id, target_id, true)?;
+                    }
+                } else if target_id != id {
+                    self.move_task(id, target_id, after)?;
+                }
+            }
+            Ok(())
+        })
     }
 
     /// Replaces the task's tags; unknown tags are created.
@@ -2094,8 +2231,10 @@ impl Store {
             })?
             .collect::<Result<_, _>>()?;
         if let Some(saved) = self.setting(TAG_ORDER_KEY)? {
-            let ranks: HashMap<&str, usize> =
-                saved.lines().filter(|s| !s.is_empty()).enumerate().map(|(i, name)| (name, i)).collect();
+            let mut ranks: HashMap<&str, usize> = HashMap::new();
+            for (i, name) in saved.lines().filter(|s| !s.is_empty()).enumerate() {
+                ranks.entry(name).or_insert(i);
+            }
             tags.sort_by_key(|t| ranks.get(t.name.as_str()).copied().unwrap_or(usize::MAX));
         }
         Ok(tags)
@@ -2139,28 +2278,28 @@ impl Store {
         let new_name = new_name.trim().trim_start_matches('#').trim();
         anyhow::ensure!(!new_name.is_empty(), "a tag needs a name");
         self.check_parent(Some(name), parent)?;
-        if new_name != name {
-            anyhow::ensure!(
-                !self.tags()?.iter().any(|t| t.name != name && t.name.to_lowercase() == new_name.to_lowercase()),
-                "the tag already exists"
-            );
-            let tx = self.conn.unchecked_transaction()?;
-            tx.execute(
-                "INSERT INTO tags (name, color, parent, pinned_at, created_at) SELECT ?2, color, parent, pinned_at, created_at FROM tags WHERE name = ?1",
-                params![name, new_name],
-            )?;
-            tx.execute("INSERT OR IGNORE INTO task_tags (task_id, tag) SELECT task_id, ?2 FROM task_tags WHERE tag = ?1", params![name, new_name])?;
-            tx.execute("DELETE FROM task_tags WHERE tag = ?1", [name])?;
-            tx.execute("UPDATE tags SET parent = ?2 WHERE parent = ?1", params![name, new_name])?;
-            tx.execute("DELETE FROM tags WHERE name = ?1", [name])?;
-            tx.commit()?;
-            if let Some(saved) = self.setting(TAG_ORDER_KEY)? {
-                let updated: Vec<&str> = saved.lines().map(|n| if n == name { new_name } else { n }).collect();
-                self.set_setting(TAG_ORDER_KEY, &updated.join("\n"))?;
+        self.in_tx(|| {
+            if new_name != name {
+                anyhow::ensure!(
+                    !self.tags()?.iter().any(|t| t.name != name && t.name.to_lowercase() == new_name.to_lowercase()),
+                    "the tag already exists"
+                );
+                self.conn.execute(
+                    "INSERT INTO tags (name, color, parent, pinned_at, created_at) SELECT ?2, color, parent, pinned_at, created_at FROM tags WHERE name = ?1",
+                    params![name, new_name],
+                )?;
+                self.conn.execute("INSERT OR IGNORE INTO task_tags (task_id, tag) SELECT task_id, ?2 FROM task_tags WHERE tag = ?1", params![name, new_name])?;
+                self.conn.execute("DELETE FROM task_tags WHERE tag = ?1", [name])?;
+                self.conn.execute("UPDATE tags SET parent = ?2 WHERE parent = ?1", params![name, new_name])?;
+                self.conn.execute("DELETE FROM tags WHERE name = ?1", [name])?;
+                if let Some(saved) = self.setting(TAG_ORDER_KEY)? {
+                    let updated: Vec<&str> = saved.lines().map(|n| if n == name { new_name } else { n }).collect();
+                    self.set_setting(TAG_ORDER_KEY, &updated.join("\n"))?;
+                }
             }
-        }
-        self.conn.execute("UPDATE tags SET color = ?2, parent = ?3 WHERE name = ?1", params![new_name, color, parent])?;
-        Ok(())
+            self.conn.execute("UPDATE tags SET color = ?2, parent = ?3 WHERE name = ?1", params![new_name, color, parent])?;
+            Ok(())
+        })
     }
 
     pub fn set_tag_pinned(&self, name: &str, pinned: bool) -> Result<()> {
@@ -2178,127 +2317,146 @@ impl Store {
         if dragged == target {
             return Ok(());
         }
-        let tags = self.tags()?;
-        let Some(dragged_tag) = tags.iter().find(|t| t.name == dragged) else { return Ok(()) };
-        let Some(target_tag) = tags.iter().find(|t| t.name == target) else { return Ok(()) };
+        self.in_tx(|| {
+            let tags = self.tags()?;
+            let Some(dragged_tag) = tags.iter().find(|t| t.name == dragged) else { return Ok(()) };
+            let Some(target_tag) = tags.iter().find(|t| t.name == target) else { return Ok(()) };
 
-        let dragged_children: Vec<String> =
-            tags.iter().filter(|t| t.parent.as_deref() == Some(dragged)).map(|t| t.name.clone()).collect();
-        let dragged_is_parent = !dragged_children.is_empty();
-        let target_parent = target_tag.parent.clone();
+            let dragged_children: Vec<String> =
+                tags.iter().filter(|t| t.parent.as_deref() == Some(dragged)).map(|t| t.name.clone()).collect();
+            let dragged_is_parent = !dragged_children.is_empty();
+            let target_parent = target_tag.parent.clone();
 
-        if nest {
-            if dragged_is_parent || target_parent.is_some() {
+            if nest {
+                if dragged_is_parent || target_parent.is_some() {
+                    return Ok(());
+                }
+                let mut remaining: Vec<String> = tags.iter().filter(|t| t.name != dragged).map(|t| t.name.clone()).collect();
+                let last_child_pos = remaining.iter().rposition(|name| {
+                    tags.iter().any(|t| t.name == *name && t.parent.as_deref() == Some(target))
+                });
+                let insert_at = match last_child_pos {
+                    Some(idx) => idx + 1,
+                    None => remaining.iter().position(|name| name == target).map_or(remaining.len(), |idx| idx + 1),
+                };
+                remaining.insert(insert_at, dragged.to_owned());
+
+                self.conn.execute(
+                    "UPDATE tags SET parent = ?2, pinned_at = NULL WHERE name = ?1",
+                    params![dragged, target],
+                )?;
+                self.set_setting(TAG_ORDER_KEY, &remaining.join("\n"))?;
                 return Ok(());
             }
-            let mut remaining: Vec<String> = tags.iter().filter(|t| t.name != dragged).map(|t| t.name.clone()).collect();
-            let last_child_pos = remaining.iter().rposition(|name| {
-                tags.iter().any(|t| t.name == *name && t.parent.as_deref() == Some(target))
-            });
-            let insert_at = match last_child_pos {
-                Some(idx) => idx + 1,
-                None => remaining.iter().position(|name| name == target).map_or(remaining.len(), |idx| idx + 1),
+
+            if dragged_is_parent && target_parent.is_some() {
+                return Ok(());
+            }
+
+            let mut block = Vec::with_capacity(1 + dragged_children.len());
+            block.push(dragged.to_owned());
+            block.extend(dragged_children);
+
+            let mut remaining: Vec<String> =
+                tags.iter().filter(|t| !block.contains(&t.name)).map(|t| t.name.clone()).collect();
+            let Some(target_pos) = remaining.iter().position(|name| name == target) else {
+                return Ok(());
             };
-            remaining.insert(insert_at, dragged.to_owned());
+            let insert_at = if after && target_parent.is_none() {
+                remaining
+                    .iter()
+                    .rposition(|name| tags.iter().any(|t| t.name == *name && t.parent.as_deref() == Some(target)))
+                    .map_or(target_pos + 1, |idx| idx + 1)
+            } else {
+                target_pos + usize::from(after)
+            };
+            remaining.splice(insert_at..insert_at, block);
 
-            let tx = self.conn.unchecked_transaction()?;
-            tx.execute(
-                "UPDATE tags SET parent = ?2, pinned_at = NULL WHERE name = ?1",
-                params![dragged, target],
-            )?;
-            tx.commit()?;
+            if !dragged_is_parent && dragged_tag.parent != target_parent {
+                self.conn.execute(
+                    "UPDATE tags SET parent = ?2 WHERE name = ?1",
+                    params![dragged, target_parent.as_deref()],
+                )?;
+            }
+            if target_parent.is_some() {
+                self.conn.execute("UPDATE tags SET pinned_at = NULL WHERE name = ?1", [dragged])?;
+            } else if dragged_tag.pinned != target_tag.pinned {
+                self.conn.execute(
+                    "UPDATE tags SET pinned_at = ?2 WHERE name = ?1",
+                    params![dragged, target_tag.pinned.then(now_ms)],
+                )?;
+            }
             self.set_setting(TAG_ORDER_KEY, &remaining.join("\n"))?;
-            return Ok(());
-        }
-
-        if dragged_is_parent && target_parent.is_some() {
-            return Ok(());
-        }
-
-        let mut block = Vec::with_capacity(1 + dragged_children.len());
-        block.push(dragged.to_owned());
-        block.extend(dragged_children);
-
-        let mut remaining: Vec<String> =
-            tags.iter().filter(|t| !block.contains(&t.name)).map(|t| t.name.clone()).collect();
-        let Some(target_pos) = remaining.iter().position(|name| name == target) else {
-            return Ok(());
-        };
-        let insert_at = target_pos + usize::from(after);
-        remaining.splice(insert_at..insert_at, block);
-
-        let tx = self.conn.unchecked_transaction()?;
-        if !dragged_is_parent && dragged_tag.parent != target_parent {
-            tx.execute(
-                "UPDATE tags SET parent = ?2 WHERE name = ?1",
-                params![dragged, target_parent.as_deref()],
-            )?;
-        }
-        if target_parent.is_some() {
-            tx.execute("UPDATE tags SET pinned_at = NULL WHERE name = ?1", [dragged])?;
-        } else if dragged_tag.pinned != target_tag.pinned {
-            tx.execute(
-                "UPDATE tags SET pinned_at = ?2 WHERE name = ?1",
-                params![dragged, target_tag.pinned.then(now_ms)],
-            )?;
-        }
-        tx.commit()?;
-        self.set_setting(TAG_ORDER_KEY, &remaining.join("\n"))?;
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Moves a tag (and its children if any) to the top of the Tags section, out of any parent.
     pub fn move_tag_first(&self, dragged: &str) -> Result<()> {
-        let tags = self.tags()?;
-        if !tags.iter().any(|t| t.name == dragged) {
-            return Ok(());
-        }
-        let mut block = vec![dragged.to_owned()];
-        block.extend(tags.iter().filter(|t| t.parent.as_deref() == Some(dragged)).map(|t| t.name.clone()));
-        let mut remaining: Vec<String> =
-            tags.iter().filter(|t| !block.contains(&t.name)).map(|t| t.name.clone()).collect();
-        remaining.splice(0..0, block);
+        self.in_tx(|| {
+            let tags = self.tags()?;
+            if !tags.iter().any(|t| t.name == dragged) {
+                return Ok(());
+            }
+            let mut block = vec![dragged.to_owned()];
+            block.extend(tags.iter().filter(|t| t.parent.as_deref() == Some(dragged)).map(|t| t.name.clone()));
+            let mut remaining: Vec<String> =
+                tags.iter().filter(|t| !block.contains(&t.name)).map(|t| t.name.clone()).collect();
+            remaining.splice(0..0, block);
 
-        self.conn.execute("UPDATE tags SET parent = NULL WHERE name = ?1", [dragged])?;
-        self.set_setting(TAG_ORDER_KEY, &remaining.join("\n"))?;
-        Ok(())
+            self.conn.execute("UPDATE tags SET parent = NULL WHERE name = ?1", [dragged])?;
+            self.set_setting(TAG_ORDER_KEY, &remaining.join("\n"))?;
+            Ok(())
+        })
     }
 
     /// Commits a live-reordered tag slice (hierarchy, pinned state, and display order) atomically.
     pub fn save_tag_hierarchy_and_order(&self, tags: &[Tag]) -> Result<()> {
-        let existing = self.tags()?;
-        let by_name: HashMap<&str, &Tag> = existing.iter().map(|t| (t.name.as_str(), t)).collect();
-        let valid_roots: HashSet<&str> = tags
-            .iter()
-            .filter(|t| t.parent.is_none())
-            .map(|t| t.name.as_str())
-            .collect();
+        self.in_tx(|| {
+            let existing = self.tags()?;
+            let by_name: HashMap<&str, &Tag> = existing.iter().map(|t| (t.name.as_str(), t)).collect();
+            let valid_roots: HashSet<&str> = tags
+                .iter()
+                .filter(|t| t.parent.is_none() && by_name.contains_key(t.name.as_str()))
+                .map(|t| t.name.as_str())
+                .collect();
 
-        let tx = self.conn.unchecked_transaction()?;
-        for tag in tags {
-            let Some(prev) = by_name.get(tag.name.as_str()) else { continue };
-            let parent = tag
-                .parent
-                .as_deref()
-                .filter(|&p| p != tag.name.as_str() && valid_roots.contains(p));
-            let pinned = parent.is_none() && tag.pinned;
-            if prev.parent.as_deref() != parent {
-                tx.execute(
-                    "UPDATE tags SET parent = ?2 WHERE name = ?1",
-                    params![tag.name, parent],
-                )?;
+            for tag in tags {
+                let Some(prev) = by_name.get(tag.name.as_str()) else { continue };
+                let parent = tag
+                    .parent
+                    .as_deref()
+                    .filter(|&p| p != tag.name.as_str() && valid_roots.contains(p));
+                let pinned = parent.is_none() && tag.pinned;
+                if prev.parent.as_deref() != parent {
+                    self.conn.execute(
+                        "UPDATE tags SET parent = ?2 WHERE name = ?1",
+                        params![tag.name, parent],
+                    )?;
+                }
+                if prev.pinned != pinned {
+                    self.conn.execute(
+                        "UPDATE tags SET pinned_at = ?2 WHERE name = ?1",
+                        params![tag.name, pinned.then(now_ms)],
+                    )?;
+                }
             }
-            if prev.pinned != pinned {
-                tx.execute(
-                    "UPDATE tags SET pinned_at = ?2 WHERE name = ?1",
-                    params![tag.name, pinned.then(now_ms)],
-                )?;
-            }
+
+            let order: Vec<&str> = tags
+                .iter()
+                .filter(|t| by_name.contains_key(t.name.as_str()))
+                .map(|t| t.name.as_str())
+                .collect();
+            self.set_setting(TAG_ORDER_KEY, &order.join("\n"))?;
+            Ok(())
+        })
+    }
+
+    fn prune_tag_order(&self, removed: &str) -> Result<()> {
+        if let Some(saved) = self.setting(TAG_ORDER_KEY)? {
+            let updated: Vec<&str> = saved.lines().filter(|s| !s.is_empty() && *s != removed).collect();
+            self.set_setting(TAG_ORDER_KEY, &updated.join("\n"))?;
         }
-        tx.commit()?;
-
-        let order: Vec<&str> = tags.iter().map(|t| t.name.as_str()).collect();
-        self.set_setting(TAG_ORDER_KEY, &order.join("\n"))?;
         Ok(())
     }
 
@@ -2306,26 +2464,28 @@ impl Store {
     /// sub-tags go under `into` (or to the top when `into` is itself a sub-tag).
     pub fn merge_tag(&self, from: &str, into: &str) -> Result<()> {
         anyhow::ensure!(from != into, "a tag cannot be merged into itself");
-        let tags = self.tags()?;
-        let target = tags.iter().find(|t| t.name == into).context("no such tag")?;
-        let new_parent = if target.parent.is_none() { Some(into) } else { None };
-        let tx = self.conn.unchecked_transaction()?;
-        tx.execute("INSERT OR IGNORE INTO task_tags (task_id, tag) SELECT task_id, ?2 FROM task_tags WHERE tag = ?1", params![from, into])?;
-        tx.execute("DELETE FROM task_tags WHERE tag = ?1", [from])?;
-        tx.execute("UPDATE tags SET parent = ?2 WHERE parent = ?1 AND name != ?3", params![from, new_parent, into])?;
-        tx.execute("DELETE FROM tags WHERE name = ?1", [from])?;
-        tx.commit()?;
-        Ok(())
+        self.in_tx(|| {
+            let tags = self.tags()?;
+            let target = tags.iter().find(|t| t.name == into).context("no such tag")?;
+            let new_parent = if target.parent.is_none() { Some(into) } else { None };
+            self.conn.execute("INSERT OR IGNORE INTO task_tags (task_id, tag) SELECT task_id, ?2 FROM task_tags WHERE tag = ?1", params![from, into])?;
+            self.conn.execute("DELETE FROM task_tags WHERE tag = ?1", [from])?;
+            self.conn.execute("UPDATE tags SET parent = ?2 WHERE parent = ?1 AND name != ?3", params![from, new_parent, into])?;
+            self.conn.execute("DELETE FROM tags WHERE name = ?1", [from])?;
+            self.prune_tag_order(from)?;
+            Ok(())
+        })
     }
 
     /// Deletes a tag: its tasks keep everything else, its sub-tags move to the top.
     pub fn delete_tag(&self, name: &str) -> Result<()> {
-        let tx = self.conn.unchecked_transaction()?;
-        tx.execute("DELETE FROM task_tags WHERE tag = ?1", [name])?;
-        tx.execute("UPDATE tags SET parent = NULL WHERE parent = ?1", [name])?;
-        tx.execute("DELETE FROM tags WHERE name = ?1", [name])?;
-        tx.commit()?;
-        Ok(())
+        self.in_tx(|| {
+            self.conn.execute("DELETE FROM task_tags WHERE tag = ?1", [name])?;
+            self.conn.execute("UPDATE tags SET parent = NULL WHERE parent = ?1", [name])?;
+            self.conn.execute("DELETE FROM tags WHERE name = ?1", [name])?;
+            self.prune_tag_order(name)?;
+            Ok(())
+        })
     }
 
     /// A tag and its sub-tags, lowercased: a parent tag's view shows its sub-tags' tasks too.
@@ -2434,16 +2594,27 @@ impl Store {
 
     /// Moves a list right after `after` (first when `None`) and into `folder`.
     pub fn place_list(&self, id: Id, after: Option<Id>, folder: Option<Id>) -> Result<()> {
-        let mut order: Vec<Id> = self.lists()?.into_iter().map(|l| l.id).filter(|l| *l != id).collect();
-        let at = after.and_then(|a| order.iter().position(|l| *l == a)).map_or(0, |i| i + 1);
-        order.insert(at, id);
-        let tx = self.conn.unchecked_transaction()?;
-        for (i, list) in order.iter().enumerate() {
-            tx.execute("UPDATE lists SET sort_order = ?2 WHERE id = ?1 AND sort_order != ?2", params![list.to_string(), i as i64])?;
-        }
-        tx.execute("UPDATE lists SET folder_id = ?2 WHERE id = ?1", params![id.to_string(), folder.map(|f| f.to_string())])?;
-        tx.commit()?;
-        Ok(())
+        self.in_tx(|| {
+            let lists = self.lists()?;
+            if !lists.iter().any(|l| l.id == id) {
+                return Ok(());
+            }
+            if let Some(fid) = folder {
+                anyhow::ensure!(
+                    self.list_folders()?.iter().any(|f| f.id == fid),
+                    "target folder not found"
+                );
+            }
+            let mut order: Vec<Id> = lists.into_iter().map(|l| l.id).filter(|l| *l != id).collect();
+            let at = after.and_then(|a| order.iter().position(|l| *l == a)).map_or(0, |i| i + 1);
+            order.insert(at, id);
+            self.write_sort_order("lists", &order)?;
+            self.conn.execute(
+                "UPDATE lists SET folder_id = ?2 WHERE id = ?1",
+                params![id.to_string(), folder.map(|f| f.to_string())],
+            )?;
+            Ok(())
+        })
     }
 
     /// Groups active lists into visual order so each folder's active lists sit contiguously at
@@ -2468,60 +2639,65 @@ impl Store {
 
     /// Moves a list right before (`!after`) or right after (`after`) `target`, setting its `folder`.
     pub fn place_list_relative(&self, id: Id, target: Id, after: bool, folder: Option<Id>) -> Result<()> {
-        if id == target {
+        self.in_tx(|| {
+            let lists = self.lists()?;
+            if !lists.iter().any(|l| l.id == id) {
+                return Ok(());
+            }
+            let folders = self.list_folders()?;
+            if let Some(fid) = folder {
+                anyhow::ensure!(folders.iter().any(|f| f.id == fid), "target folder not found");
+            }
+            if id == target {
+                self.conn.execute(
+                    "UPDATE lists SET folder_id = ?2 WHERE id = ?1",
+                    params![id.to_string(), folder.map(|f| f.to_string())],
+                )?;
+                return Ok(());
+            }
+            let mut order: Vec<Id> =
+                Self::visual_list_order(&lists, &folders).into_iter().filter(|l| *l != id).collect();
+            let Some(pos) = order.iter().position(|l| *l == target) else {
+                return self.place_list(id, None, folder);
+            };
+            order.insert(pos + usize::from(after), id);
+            self.write_sort_order("lists", &order)?;
             self.conn.execute(
                 "UPDATE lists SET folder_id = ?2 WHERE id = ?1",
                 params![id.to_string(), folder.map(|f| f.to_string())],
             )?;
-            return Ok(());
-        }
-        let lists = self.lists()?;
-        let folders = self.list_folders()?;
-        let mut order: Vec<Id> =
-            Self::visual_list_order(&lists, &folders).into_iter().filter(|l| *l != id).collect();
-        let Some(pos) = order.iter().position(|l| *l == target) else {
-            return self.place_list(id, None, folder);
-        };
-        order.insert(pos + usize::from(after), id);
-        let tx = self.conn.unchecked_transaction()?;
-        for (i, list) in order.iter().enumerate() {
-            tx.execute("UPDATE lists SET sort_order = ?2 WHERE id = ?1 AND sort_order != ?2", params![list.to_string(), i as i64])?;
-        }
-        tx.execute("UPDATE lists SET folder_id = ?2 WHERE id = ?1", params![id.to_string(), folder.map(|f| f.to_string())])?;
-        tx.commit()?;
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Moves a list out of any folder and places it right before (`!after`) or right after (`after`)
     /// `folder`'s block of active lists.
     pub fn place_list_around_folder(&self, id: Id, folder: Id, after: bool) -> Result<()> {
-        let lists = self.lists()?;
-        let folders = self.list_folders()?;
-        let was_in_folder = lists.iter().find(|l| l.id == id).is_some_and(|l| l.folder == Some(folder));
-        let visual = Self::visual_list_order(&lists, &folders);
-        let active_by_id: HashMap<Id, &List> = lists.iter().map(|l| (l.id, l)).collect();
-        let mut remaining: Vec<Id> = visual.iter().copied().filter(|&lid| lid != id).collect();
-        let first = remaining.iter().position(|lid| active_by_id.get(lid).is_some_and(|l| !l.archived && l.folder == Some(folder)));
-        let last = remaining.iter().rposition(|lid| active_by_id.get(lid).is_some_and(|l| !l.archived && l.folder == Some(folder)));
-        let insert_at = match (first, last) {
-            (Some(f), Some(l)) => if !after { f } else { l + 1 },
-            _ if was_in_folder => visual.iter().position(|&lid| lid == id).unwrap_or(remaining.len()).min(remaining.len()),
-            _ => remaining
-                .iter()
-                .rposition(|lid| active_by_id.get(lid).is_some_and(|l| !l.archived))
-                .map_or(0, |p| p + 1),
-        };
-        remaining.insert(insert_at, id);
-        let tx = self.conn.unchecked_transaction()?;
-        for (i, list_id) in remaining.iter().enumerate() {
-            tx.execute(
-                "UPDATE lists SET sort_order = ?2 WHERE id = ?1 AND sort_order != ?2",
-                params![list_id.to_string(), i as i64],
-            )?;
-        }
-        tx.execute("UPDATE lists SET folder_id = NULL WHERE id = ?1", [id.to_string()])?;
-        tx.commit()?;
-        Ok(())
+        self.in_tx(|| {
+            let lists = self.lists()?;
+            let Some(dragged_list) = lists.iter().find(|l| l.id == id) else {
+                return Ok(());
+            };
+            let folders = self.list_folders()?;
+            let was_in_folder = dragged_list.folder == Some(folder);
+            let visual = Self::visual_list_order(&lists, &folders);
+            let active_by_id: HashMap<Id, &List> = lists.iter().map(|l| (l.id, l)).collect();
+            let mut remaining: Vec<Id> = visual.iter().copied().filter(|&lid| lid != id).collect();
+            let first = remaining.iter().position(|lid| active_by_id.get(lid).is_some_and(|l| !l.archived && l.folder == Some(folder)));
+            let last = remaining.iter().rposition(|lid| active_by_id.get(lid).is_some_and(|l| !l.archived && l.folder == Some(folder)));
+            let insert_at = match (first, last) {
+                (Some(f), Some(l)) => if !after { f } else { l + 1 },
+                _ if was_in_folder => visual.iter().position(|&lid| lid == id).unwrap_or(remaining.len()).min(remaining.len()),
+                _ => remaining
+                    .iter()
+                    .rposition(|lid| active_by_id.get(lid).is_some_and(|l| !l.archived))
+                    .map_or(0, |p| p + 1),
+            };
+            remaining.insert(insert_at, id);
+            self.write_sort_order("lists", &remaining)?;
+            self.conn.execute("UPDATE lists SET folder_id = NULL WHERE id = ?1", [id.to_string()])?;
+            Ok(())
+        })
     }
 
     /// Drops `dragged` list onto top-level `target` list, creating a new folder containing both
@@ -2530,36 +2706,32 @@ impl Store {
         anyhow::ensure!(dragged != target, "cannot group a list with itself");
         let name = folder_name.trim();
         anyhow::ensure!(!name.is_empty(), "a folder needs a name");
-        let lists = self.lists()?;
-        let folders = self.list_folders()?;
-        let target_list = lists.iter().find(|l| l.id == target).context("target list not found")?;
-        anyhow::ensure!(target_list.folder.is_none(), "target list is already inside a folder");
-        anyhow::ensure!(lists.iter().any(|l| l.id == dragged), "dragged list not found");
+        self.in_tx(|| {
+            let lists = self.lists()?;
+            let folders = self.list_folders()?;
+            let target_list = lists.iter().find(|l| l.id == target).context("target list not found")?;
+            let dragged_list = lists.iter().find(|l| l.id == dragged).context("dragged list not found")?;
+            anyhow::ensure!(!target_list.archived && !dragged_list.archived, "cannot group archived lists");
+            anyhow::ensure!(target_list.folder.is_none(), "target list is already inside a folder");
 
-        let mut order: Vec<Id> =
-            Self::visual_list_order(&lists, &folders).into_iter().filter(|&id| id != dragged).collect();
-        let target_pos = order.iter().position(|&id| id == target).context("target list not found")?;
-        order.insert(target_pos + 1, dragged);
+            let mut order: Vec<Id> =
+                Self::visual_list_order(&lists, &folders).into_iter().filter(|&id| id != dragged).collect();
+            let target_pos = order.iter().position(|&id| id == target).context("target list not found")?;
+            order.insert(target_pos + 1, dragged);
 
-        let folder = ListFolder { id: Uuid::now_v7(), name: name.to_owned() };
-        let tx = self.conn.unchecked_transaction()?;
-        tx.execute(
-            "INSERT INTO list_folders (id, name, created_at, sort_order) VALUES (?1, ?2, ?3, (SELECT COALESCE(MAX(sort_order), -1) + 1 FROM list_folders))",
-            params![folder.id.to_string(), folder.name, now_ms()],
-        )?;
-        for (i, list_id) in order.iter().enumerate() {
-            tx.execute(
-                "UPDATE lists SET sort_order = ?2 WHERE id = ?1 AND sort_order != ?2",
-                params![list_id.to_string(), i as i64],
+            let folder = ListFolder { id: Uuid::now_v7(), name: name.to_owned() };
+            self.conn.execute(
+                "INSERT INTO list_folders (id, name, created_at, sort_order) VALUES (?1, ?2, ?3, (SELECT COALESCE(MAX(sort_order), -1) + 1 FROM list_folders))",
+                params![folder.id.to_string(), folder.name, now_ms()],
             )?;
-        }
-        let folder_id_str = folder.id.to_string();
-        tx.execute(
-            "UPDATE lists SET folder_id = ?1 WHERE id IN (?2, ?3)",
-            params![folder_id_str, target.to_string(), dragged.to_string()],
-        )?;
-        tx.commit()?;
-        Ok(folder)
+            self.write_sort_order("lists", &order)?;
+            let folder_id_str = folder.id.to_string();
+            self.conn.execute(
+                "UPDATE lists SET folder_id = ?1 WHERE id IN (?2, ?3)",
+                params![folder_id_str, target.to_string(), dragged.to_string()],
+            )?;
+            Ok(folder)
+        })
     }
 
     /// Reorders an entire folder (and all its active lists together) before (`!after`) or after
@@ -2568,92 +2740,85 @@ impl Store {
         if target == FolderDropTarget::Folder(dragged) {
             return Ok(());
         }
-        let lists = self.lists()?;
-        let folders = self.list_folders()?;
-        if !folders.iter().any(|f| f.id == dragged) {
-            return Ok(());
-        }
-
-        let moving: Vec<Id> = lists.iter().filter(|l| !l.archived && l.folder == Some(dragged)).map(|l| l.id).collect();
-        let remaining_lists: Vec<List> = lists.into_iter().filter(|l| l.archived || l.folder != Some(dragged)).collect();
-
-        let tx = self.conn.unchecked_transaction()?;
-
-        if !moving.is_empty() {
-            let mut visual = Self::visual_list_order(&remaining_lists, &folders);
-            let by_id: HashMap<Id, &List> = remaining_lists.iter().map(|l| (l.id, l)).collect();
-            let insert_at = match target {
-                FolderDropTarget::List(target_list) => {
-                    let Some(pos) = visual.iter().position(|&id| id == target_list) else {
-                        return Ok(());
-                    };
-                    pos + usize::from(after)
-                }
-                FolderDropTarget::Folder(target_folder) => {
-                    let pos = if !after {
-                        visual.iter().position(|id| by_id.get(id).is_some_and(|l| !l.archived && l.folder == Some(target_folder)))
-                    } else {
-                        visual.iter().rposition(|id| by_id.get(id).is_some_and(|l| !l.archived && l.folder == Some(target_folder))).map(|p| p + 1)
-                    };
-                    pos.unwrap_or_else(|| {
-                        visual.iter().rposition(|id| by_id.get(id).is_some_and(|l| !l.archived)).map_or(0, |p| p + 1)
-                    })
-                }
-            };
-            visual.splice(insert_at..insert_at, moving);
-            for (i, list_id) in visual.iter().enumerate() {
-                tx.execute(
-                    "UPDATE lists SET sort_order = ?2 WHERE id = ?1 AND sort_order != ?2",
-                    params![list_id.to_string(), i as i64],
-                )?;
+        self.in_tx(|| {
+            let lists = self.lists()?;
+            let folders = self.list_folders()?;
+            if !folders.iter().any(|f| f.id == dragged) {
+                return Ok(());
             }
-        }
 
-        let mut folder_order: Vec<Id> = folders.iter().map(|f| f.id).filter(|&id| id != dragged).collect();
-        let folder_insert = match target {
-            FolderDropTarget::Folder(target_folder) => folder_order
-                .iter()
-                .position(|&id| id == target_folder)
-                .map_or(folder_order.len(), |pos| pos + usize::from(after)),
-            FolderDropTarget::List(_) => if after { folder_order.len() } else { 0 },
-        };
-        folder_order.insert(folder_insert, dragged);
-        for (i, folder_id) in folder_order.iter().enumerate() {
-            tx.execute(
-                "UPDATE list_folders SET sort_order = ?2 WHERE id = ?1 AND sort_order != ?2",
-                params![folder_id.to_string(), i as i64],
-            )?;
-        }
+            let moving: Vec<Id> = lists.iter().filter(|l| !l.archived && l.folder == Some(dragged)).map(|l| l.id).collect();
+            let remaining_lists: Vec<List> = lists.into_iter().filter(|l| l.archived || l.folder != Some(dragged)).collect();
 
-        tx.commit()?;
-        Ok(())
+            if let FolderDropTarget::List(target_list) = target {
+                let Some(tl) = remaining_lists.iter().find(|l| l.id == target_list) else {
+                    return Ok(());
+                };
+                if tl.archived || tl.folder.is_some() {
+                    return Ok(());
+                }
+            }
+
+            if !moving.is_empty() {
+                let mut visual = Self::visual_list_order(&remaining_lists, &folders);
+                let by_id: HashMap<Id, &List> = remaining_lists.iter().map(|l| (l.id, l)).collect();
+                let insert_at = match target {
+                    FolderDropTarget::List(target_list) => {
+                        let Some(pos) = visual.iter().position(|&id| id == target_list) else {
+                            return Ok(());
+                        };
+                        pos + usize::from(after)
+                    }
+                    FolderDropTarget::Folder(target_folder) => {
+                        let pos = if !after {
+                            visual.iter().position(|id| by_id.get(id).is_some_and(|l| !l.archived && l.folder == Some(target_folder)))
+                        } else {
+                            visual.iter().rposition(|id| by_id.get(id).is_some_and(|l| !l.archived && l.folder == Some(target_folder))).map(|p| p + 1)
+                        };
+                        pos.unwrap_or_else(|| {
+                            visual.iter().rposition(|id| by_id.get(id).is_some_and(|l| !l.archived)).map_or(0, |p| p + 1)
+                        })
+                    }
+                };
+                visual.splice(insert_at..insert_at, moving);
+                self.write_sort_order("lists", &visual)?;
+            }
+
+            let mut folder_order: Vec<Id> = folders.iter().map(|f| f.id).filter(|&id| id != dragged).collect();
+            let folder_insert = match target {
+                FolderDropTarget::Folder(target_folder) => folder_order
+                    .iter()
+                    .position(|&id| id == target_folder)
+                    .map_or(folder_order.len(), |pos| pos + usize::from(after)),
+                FolderDropTarget::List(_) => if after { folder_order.len() } else { 0 },
+            };
+            folder_order.insert(folder_insert, dragged);
+            self.write_sort_order("list_folders", &folder_order)?;
+            Ok(())
+        })
     }
 
     /// Commits live-reordered lists (including `folder` membership) and `list_folders` order in a
     /// single transaction.
     pub fn save_list_and_folder_order(&self, lists: &[List], folders: &[ListFolder]) -> Result<()> {
-        let visual = Self::visual_list_order(lists, folders);
-        let by_id: HashMap<Id, &List> = lists.iter().map(|l| (l.id, l)).collect();
-        let valid_folders: HashSet<Id> = folders.iter().map(|f| f.id).collect();
-        let tx = self.conn.unchecked_transaction()?;
-        for (i, list_id) in visual.iter().enumerate() {
-            if let Some(list) = by_id.get(list_id) {
-                let folder = list.folder.filter(|f| valid_folders.contains(f));
-                tx.execute(
-                    "UPDATE lists SET sort_order = ?2, folder_id = ?3
-                     WHERE id = ?1 AND (sort_order != ?2 OR folder_id IS NOT ?3)",
-                    params![list_id.to_string(), i as i64, folder.map(|f| f.to_string())],
-                )?;
+        self.in_tx(|| {
+            let visual = Self::visual_list_order(lists, folders);
+            let by_id: HashMap<Id, &List> = lists.iter().map(|l| (l.id, l)).collect();
+            let valid_folders: HashSet<Id> = folders.iter().map(|f| f.id).collect();
+            for (i, list_id) in visual.iter().enumerate() {
+                if let Some(list) = by_id.get(list_id) {
+                    let folder = list.folder.filter(|f| valid_folders.contains(f));
+                    self.conn.execute(
+                        "UPDATE lists SET sort_order = ?2, folder_id = ?3
+                         WHERE id = ?1 AND (sort_order != ?2 OR folder_id IS NOT ?3)",
+                        params![list_id.to_string(), i as i64, folder.map(|f| f.to_string())],
+                    )?;
+                }
             }
-        }
-        for (i, folder) in folders.iter().enumerate() {
-            tx.execute(
-                "UPDATE list_folders SET sort_order = ?2 WHERE id = ?1 AND sort_order != ?2",
-                params![folder.id.to_string(), i as i64],
-            )?;
-        }
-        tx.commit()?;
-        Ok(())
+            let folder_ids: Vec<Id> = folders.iter().map(|f| f.id).collect();
+            self.write_sort_order("list_folders", &folder_ids)?;
+            Ok(())
+        })
     }
 
     /// The folders of lists, in their order.
@@ -2719,26 +2884,39 @@ impl Store {
     /// Moves the task and its subtasks to a list (`None` means the Inbox).
     /// Moving a subtask to a different list than its parent unlinks it from that parent.
     pub fn set_list(&self, id: Id, list: Option<Id>) -> Result<()> {
-        let unlink = self
-            .task(id)?
-            .and_then(|t| t.parent_id)
-            .is_some_and(|parent_id| {
-                self.task(parent_id).ok().flatten().is_none_or(|parent| parent.list_id != list)
-            });
-        let tx = self.conn.unchecked_transaction()?;
-        if unlink {
-            tx.execute("UPDATE tasks SET parent_id = NULL WHERE id = ?1", [id.to_string()])?;
-        }
-        let list = list.map(|l| l.to_string());
-        for task in std::iter::once(id).chain(self.descendants(id)?) {
-            // A section belongs to its list, so moving to another list leaves it.
-            tx.execute(
-                "UPDATE tasks SET list_id = ?2, section_id = NULL WHERE id = ?1",
-                params![task.to_string(), list],
-            )?;
-        }
-        tx.commit()?;
-        Ok(())
+        self.in_tx(|| {
+            let Some(task) = self.task(id)? else { return Ok(()) };
+            let list_str = list.map(|l| l.to_string());
+            let unlink = match task.parent_id {
+                Some(parent_id) => {
+                    let parent_list: Option<Option<String>> = self
+                        .conn
+                        .prepare_cached("SELECT list_id FROM tasks WHERE id = ?1")?
+                        .query_row([parent_id.to_string()], |row| row.get(0))
+                        .optional()?;
+                    parent_list.is_none_or(|pl| pl != list_str)
+                }
+                None => false,
+            };
+            if task.list_id == list && !unlink {
+                return Ok(());
+            }
+            if unlink {
+                self.conn.execute("UPDATE tasks SET parent_id = NULL WHERE id = ?1", [id.to_string()])?;
+            }
+            let list_changed = task.list_id != list;
+            let sql = if list_changed {
+                // A section belongs to its list, so moving to another list leaves it.
+                "UPDATE tasks SET list_id = ?2, section_id = NULL WHERE id = ?1"
+            } else {
+                "UPDATE tasks SET list_id = ?2 WHERE id = ?1"
+            };
+            let mut stmt = self.conn.prepare_cached(sql)?;
+            for sub in std::iter::once(id).chain(self.descendants(id)?) {
+                stmt.execute(params![sub.to_string(), list_str])?;
+            }
+            Ok(())
+        })
     }
 
     /// The task's checklist in display order.
@@ -2762,35 +2940,35 @@ impl Store {
 
     /// Adds an item to the end of the checklist, or right after `after` when given.
     pub fn add_checklist_item(&self, task: Id, title: &str, after: Option<Id>) -> Result<ChecklistItem> {
-        let tx = self.conn.unchecked_transaction()?;
-        let position: i64 = match after {
-            Some(after) => {
-                let position: i64 = tx.query_row(
-                    "SELECT sort_order FROM checklist_items WHERE id = ?1",
-                    [after.to_string()],
+        self.in_tx(|| {
+            let position: i64 = match after {
+                Some(after) => {
+                    let position: i64 = self.conn.query_row(
+                        "SELECT sort_order FROM checklist_items WHERE id = ?1",
+                        [after.to_string()],
+                        |row| row.get(0),
+                    )?;
+                    self.conn.execute(
+                        "UPDATE checklist_items SET sort_order = sort_order + 1
+                         WHERE task_id = ?1 AND sort_order > ?2",
+                        params![task.to_string(), position],
+                    )?;
+                    position + 1
+                }
+                None => self.conn.query_row(
+                    "SELECT COALESCE(MAX(sort_order) + 1, 0) FROM checklist_items WHERE task_id = ?1",
+                    [task.to_string()],
                     |row| row.get(0),
-                )?;
-                tx.execute(
-                    "UPDATE checklist_items SET sort_order = sort_order + 1
-                     WHERE task_id = ?1 AND sort_order > ?2",
-                    params![task.to_string(), position],
-                )?;
-                position + 1
-            }
-            None => tx.query_row(
-                "SELECT COALESCE(MAX(sort_order) + 1, 0) FROM checklist_items WHERE task_id = ?1",
-                [task.to_string()],
-                |row| row.get(0),
-            )?,
-        };
-        let item = ChecklistItem { id: Uuid::now_v7(), task_id: task, title: title.trim().to_owned(), completed: false };
-        tx.execute(
-            "INSERT INTO checklist_items (id, task_id, title, sort_order, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![item.id.to_string(), task.to_string(), item.title, position, now_ms()],
-        )?;
-        tx.commit()?;
-        Ok(item)
+                )?,
+            };
+            let item = ChecklistItem { id: Uuid::now_v7(), task_id: task, title: title.trim().to_owned(), completed: false };
+            self.conn.execute(
+                "INSERT INTO checklist_items (id, task_id, title, sort_order, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![item.id.to_string(), task.to_string(), item.title, position, now_ms()],
+            )?;
+            Ok(item)
+        })
     }
 
     pub fn set_checklist_item_title(&self, id: Id, title: &str) -> Result<()> {
@@ -3640,9 +3818,21 @@ impl Store {
         self.set_deleted(id, Some(now_ms()))
     }
 
-    /// Brings the task and its subtasks back from the trash.
+    /// Brings the task and its subtasks back from the trash. If the task's parent is still in
+    /// the trash or is a note, detaches `id` to top-level so emptying trash cannot cascade-delete it.
     pub fn restore_task(&self, id: Id) -> Result<()> {
-        self.set_deleted(id, None)
+        self.in_tx(|| {
+            let parent_invalid = match self.task(id)?.and_then(|t| t.parent_id) {
+                Some(parent_id) => self
+                    .task(parent_id)?
+                    .is_none_or(|p| p.is_deleted() || p.kind == Kind::Note),
+                None => false,
+            };
+            if parent_invalid {
+                self.conn.execute("UPDATE tasks SET parent_id = NULL WHERE id = ?1", [id.to_string()])?;
+            }
+            self.set_deleted(id, None)
+        })
     }
 
     /// Deletes the task and its subtasks permanently.
@@ -3658,15 +3848,13 @@ impl Store {
     }
 
     fn set_deleted(&self, id: Id, deleted_at: Option<i64>) -> Result<()> {
-        let tx = self.conn.unchecked_transaction()?;
-        for task in std::iter::once(id).chain(self.descendants(id)?) {
-            tx.execute(
-                "UPDATE tasks SET deleted_at = ?2 WHERE id = ?1",
-                params![task.to_string(), deleted_at],
-            )?;
-        }
-        tx.commit()?;
-        Ok(())
+        self.in_tx(|| {
+            let mut stmt = self.conn.prepare_cached("UPDATE tasks SET deleted_at = ?2 WHERE id = ?1")?;
+            for task in std::iter::once(id).chain(self.descendants(id)?) {
+                stmt.execute(params![task.to_string(), deleted_at])?;
+            }
+            Ok(())
+        })
     }
 
     fn update(&self, id: Id, column: &'static str, value: impl rusqlite::ToSql) -> Result<()> {
@@ -3677,20 +3865,22 @@ impl Store {
         Ok(())
     }
 
-    /// Subtasks of a task, at any depth.
+    /// Subtasks of a task, at any depth (cycle-safe via `UNION` deduplication).
     pub fn descendants(&self, id: Id) -> Result<Vec<Id>> {
         let mut stmt = self.conn.prepare_cached(
             "WITH RECURSIVE sub(id) AS (
                  SELECT id FROM tasks WHERE parent_id = ?1
-                 UNION ALL
+                 UNION
                  SELECT t.id FROM tasks t JOIN sub ON t.parent_id = sub.id
              )
              SELECT id FROM sub",
         )?;
         let ids = stmt
-            .query_map([id.to_string()], |row| row.get::<_, String>(0))?
-            .filter_map(|r| r.ok().and_then(|s| Uuid::parse_str(&s).ok()))
-            .collect();
+            .query_map([id.to_string()], |row| {
+                let raw: String = row.get(0)?;
+                parse_uuid(&raw, 0)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(ids)
     }
 }
@@ -5442,6 +5632,112 @@ mod tests {
         let pos_b = ids.iter().position(|&id| id == b.id).unwrap();
         let pos_a = ids.iter().position(|&id| id == a.id).unwrap();
         assert!(pos_b < pos_a, "unnested B moved before A");
+        Ok(())
+    }
+
+    #[test]
+    fn link_parent_at_max_depth_syncs_flattened_descendants_list_section_and_completion() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let work = store.create_list("Work")?;
+        let sec = store.add_list_section(Some(work.id), "Active")?;
+        let l0 = store.add_task("L0")?;
+        store.set_list(l0.id, Some(work.id))?;
+        store.set_section(l0.id, Some(sec.id))?;
+        let l1 = store.add_subtask(l0.id, "L1")?;
+        let l2 = store.add_subtask(l1.id, "L2")?;
+        let l3 = store.add_subtask(l2.id, "L3")?; // depth 3 == MAX_SUBTASK_DEPTH - 1
+        store.set_completed(l3.id, true)?;
+
+        // Source subtree lives in Inbox (list = None, section = None), open.
+        let src_root = store.add_task("SR")?;
+        let src_child = store.add_subtask(src_root.id, "SC")?;
+        let src_grand = store.add_subtask(src_child.id, "SG")?;
+
+        store.link_parent(src_root.id, l3.id)?;
+        // Flattened children are reparented onto l3, and MUST also move into Work/sec and close.
+        for id in [src_root.id, src_child.id, src_grand.id] {
+            let t = store.task(id)?.unwrap();
+            assert_eq!(t.parent_id, Some(l3.id));
+            assert_eq!(t.list_id, Some(work.id));
+            assert_eq!(t.section_id, Some(sec.id));
+            assert!(t.is_completed());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn restore_subtask_detaches_from_trashed_parent_and_survives_empty_trash() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let parent = store.add_task("Parent")?;
+        let child = store.add_subtask(parent.id, "Child")?;
+        let grand = store.add_subtask(child.id, "Grand")?;
+
+        store.delete_task(parent.id)?;
+        // Restore only child; it must detach from trashed parent so empty_trash cannot CASCADE it.
+        store.restore_task(child.id)?;
+        assert_eq!(store.task(child.id)?.unwrap().parent_id, None);
+        assert_eq!(store.task(grand.id)?.unwrap().parent_id, Some(child.id));
+
+        store.empty_trash()?;
+        assert!(store.task(parent.id)?.is_none());
+        assert!(store.task(child.id)?.is_some());
+        assert!(store.task(grand.id)?.is_some());
+        // Cannot attach a subtask to a trashed parent.
+        let doomed = store.add_task("Doomed")?;
+        store.delete_task(doomed.id)?;
+        assert!(store.add_subtask(doomed.id, "Nope").is_err());
+        assert!(store.set_parent(child.id, Some(doomed.id)).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn reorder_list_sections_and_move_task_avoid_redundant_sync_log_writes() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let list = store.create_list("Board")?;
+        let s1 = store.add_list_section(Some(list.id), "S1")?;
+        let s2 = store.add_list_section(Some(list.id), "S2")?;
+        let s3 = store.add_list_section(Some(list.id), "S3")?;
+
+        store.reorder_list_sections(Some(list.id), s3.id, s1.id)?;
+        let order: Vec<Id> = store.list_sections(Some(list.id))?.into_iter().map(|s| s.id).collect();
+        assert_eq!(order, vec![s3.id, s1.id, s2.id]);
+
+        // Reordering two adjacent tasks in a 5-task DB should only dirty changed sort_orders.
+        let t1 = store.add_task("T1")?;
+        let t2 = store.add_task("T2")?;
+        let t3 = store.add_task("T3")?;
+        let t4 = store.add_task("T4")?;
+        store.move_task(t1.id, t2.id, true)?; // normalizes sort_orders to 0, 1024, 2048, 3072
+        store.conn.execute("DELETE FROM sync_log", [])?;
+        store.move_task(t3.id, t4.id, true)?; // swaps only last two (or first two), unchanged rows skipped
+        let dirty: i64 = store.conn.query_row("SELECT COUNT(*) FROM sync_log WHERE entity = 'tasks'", [], |r| r.get(0))?;
+        assert!(dirty <= 2, "expected at most 2 dirty sync_log rows, got {dirty}");
+        Ok(())
+    }
+
+    #[test]
+    fn descendants_terminates_on_synced_cycle_and_same_list_preserves_section() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let list = store.create_list("Proj")?;
+        let sec = store.add_list_section(Some(list.id), "Backlog")?;
+        let p = store.add_task("P")?;
+        store.set_list(p.id, Some(list.id))?;
+        store.set_section(p.id, Some(sec.id))?;
+        let c = store.add_subtask(p.id, "C")?;
+        // Calling set_list with the same list must preserve section_id and parent_id.
+        store.set_list(c.id, Some(list.id))?;
+        let c_after = store.task(c.id)?.unwrap();
+        assert_eq!(c_after.parent_id, Some(p.id));
+        assert_eq!(c_after.section_id, Some(sec.id));
+
+        // Simulate a corrupted cycle introduced by concurrent sync and verify descendants terminates.
+        store.conn.execute(
+            "UPDATE tasks SET parent_id = ?2 WHERE id = ?1",
+            params![p.id.to_string(), c.id.to_string()],
+        )?;
+        let desc = store.descendants(p.id)?;
+        assert!(desc.contains(&c.id));
+        assert!(desc.len() <= 2);
         Ok(())
     }
 }

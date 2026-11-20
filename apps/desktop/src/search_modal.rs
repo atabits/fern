@@ -294,9 +294,13 @@ impl SearchModal {
                     );
                 }
                 let custom = matches!(current, DateRange::Custom(..));
+                let custom_label = if custom {
+                    Self::range_label(current, strings)
+                } else {
+                    strings.custom_range.to_owned()
+                };
                 items.push(
-                    row("search-date-custom".into(), None, Self::range_label(current, strings).replace(strings.all_option, strings.custom_range).into(), custom)
-                        .when(!custom, |item| item.child(div()))
+                    row("search-date-custom".into(), None, custom_label.into(), custom)
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.custom_open = true;
                             cx.notify();
@@ -337,8 +341,8 @@ impl SearchModal {
             }))
             .child(
                 v_scroll(
-                    "search-menu-items-scroll",
-                    v_flex().id("search-menu-items").children(items),
+                    ("search-menu-items-scroll", menu as usize),
+                    v_flex().id(("search-menu-items", menu as usize)).children(items),
                 )
                 .max_h(px(260.))
                 .compact(),
@@ -489,7 +493,11 @@ impl Render for SearchModal {
                             h_flex()
                                 .h(px(24.))
                                 .gap_2()
-                                .child(Checkbox::new("search-checkbox").size(px(14.)).toggle_state(task.is_completed()))
+                                .child(
+                                    Checkbox::new(SharedString::from(format!("search-checkbox-{id}")))
+                                        .size(px(14.))
+                                        .toggle_state(task.is_completed()),
+                                )
                                 .child(
                                     div()
                                         .flex_1()
@@ -589,6 +597,7 @@ impl Render for SearchModal {
                                 .child(Icon::new(IconName::X).size(IconSize::Custom(px(10.))).color(Color::Custom(theme.colors().elevated_surface_background)))
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.input.update(cx, |input, cx| input.set_text("", cx));
+                                    this.refresh(cx);
                                     window.focus(&this.input.focus_handle(cx), cx);
                                 })),
                         )

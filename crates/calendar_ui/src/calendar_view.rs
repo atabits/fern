@@ -707,8 +707,8 @@ impl CalendarView {
             .child(tabs)
             .child(
                 v_scroll(
-                    "calendar-arrange-tasks-scroll",
-                    v_flex().id("arrange-tasks").gap(px(3.)).children(body),
+                    ("calendar-arrange-tasks-scroll", tab),
+                    v_flex().id(("arrange-tasks", tab)).gap(px(3.)).children(body),
                 )
                 .flex_1()
                 .min_h_0(),
@@ -1167,6 +1167,8 @@ impl CalendarView {
     fn drop_on_day(&mut self, id: Id, date: NaiveDate, cx: &mut Context<Self>) {
         if let Err(err) = self.store.move_dates(id, date) {
             eprintln!("failed to move the task: {err:#}");
+        } else {
+            crate::data_version::data_changed(cx.entity_id(), cx);
         }
         self.reload(cx);
     }
@@ -1408,6 +1410,7 @@ impl CalendarView {
             }
             if let EditorEvent::Saved(task) = event {
                 this.hint_if_outside_filter(*task, cx);
+                crate::data_version::data_changed(cx.entity_id(), cx);
                 this.reload(cx);
             } else {
                 cx.notify();

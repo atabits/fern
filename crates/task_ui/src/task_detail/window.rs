@@ -78,7 +78,10 @@ impl EditorWindow {
             subscribe(window, detail.clone(), comment, |this, input, Submitted(text), window, cx| {
                 if let Some(task) = this.task_id() && !text.trim().is_empty() {
                     match this.session.store.add_comment(task, text) {
-                        Ok(_) => input.update(cx, |input, cx| input.clear(window, cx)),
+                        Ok(_) => {
+                            input.update(cx, |input, cx| input.clear(window, cx));
+                            cx.emit(TaskUpdated);
+                        }
                         Err(err) => eprintln!("failed to add the comment: {err:#}"),
                     }
                     this.sync_comments();

@@ -44,12 +44,19 @@ fn night_swatches(
     let dark_names = i18n::t(cx).dark_theme_names;
     let bundled = registry
         .bundled_dark()
-        .into_iter()
+        .iter()
         .enumerate()
-        .map(|(idx, theme)| (theme, SharedString::from(dark_names[idx])));
-    let custom = registry.custom_dark().into_iter().map(|theme| {
+        .map(|(idx, theme)| {
+            let name = if theme.is_custom() {
+                SharedString::from(theme.name().to_owned())
+            } else {
+                SharedString::from(dark_names.get(idx).copied().unwrap_or_else(|| theme.name()).to_owned())
+            };
+            (theme.clone(), name)
+        });
+    let custom = registry.custom_dark().iter().map(|theme| {
         let name = SharedString::from(theme.name().to_owned());
-        (theme, name)
+        (theme.clone(), name)
     });
 
     h_flex().flex_wrap().gap_2().children(bundled.chain(custom).map(|(theme, name)| {
@@ -249,12 +256,12 @@ impl SettingsWindow {
     pub(super) fn render_appearance(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let strings = i18n::t(cx);
         let registry = ThemeRegistry::global(cx);
-        let bundled_light = registry.bundled_light();
-        let custom_themes = registry.custom_themes();
+        let bundled_light = registry.bundled_light().to_vec();
+        let custom_themes = registry.custom_themes().to_vec();
         let theme_errors: Vec<SharedString> =
             registry.errors().iter().cloned().map(SharedString::from).collect();
         let active = cx.theme().clone();
-        let is_bundled_dark = active.is_dark() && registry.is_bundled_id(active.id());
+        let is_bundled_dark = active.is_dark() && registry.is_bundled_dark_id(active.id());
         let night = if active.is_dark() {
             active.clone()
         } else {
@@ -263,7 +270,7 @@ impl SettingsWindow {
         let dark_tile_theme = if is_bundled_dark {
             active.clone()
         } else if let Some(saved_dark) =
-            self.preferences.theme.dark.as_deref().filter(|id| registry.is_bundled_id(id))
+            self.preferences.theme.dark.as_deref().filter(|id| registry.is_bundled_dark_id(id))
         {
             registry.resolve(true, Some(saved_dark))
         } else {
@@ -272,7 +279,7 @@ impl SettingsWindow {
         let follow = self.preferences.theme.mode == ThemeMode::System;
         let colors = active.colors();
         let owner = cx.weak_entity();
-        let night_dots = night.swatch();
+        let night_dots = dark_tile_theme.swatch();
 
         let tile = |id: SharedString,
                     theme: Arc<Theme>,
@@ -408,28 +415,25 @@ impl SettingsWindow {
                             .child(
                                 action_link("create-theme-template", strings.create_theme_template)
                                     .on_click(cx.listener(|this, _, window, cx| {
-                                        match user_themes::ensure_sample_theme_file() {
-                                            Ok(path) => {
-                                                user_themes::reload_and_apply(&this.store, window, cx);
-                                                cx.open_with_system(&path);
-                                                cx.notify();
-                                            }
-                                            Err(err) => eprintln!("theme: {err:#}"),
-                                        }
+                                        user_themes::create_and_open_sample_async(
+                                            this.store.clone(),
+                                            window.window_handle(),
+                                            cx,
+                                        );
                                     })),
                             )
                             .child(
                                 action_link("open-themes-folder", strings.open_themes_folder)
-                                    .on_click(|_, _, cx| match user_themes::ensure_themes_dir() {
-                                        Ok(dir) => cx.open_with_system(&dir),
-                                        Err(err) => eprintln!("theme: {err:#}"),
-                                    }),
+                                    .on_click(|_, _, cx| user_themes::open_themes_dir_async(cx)),
                             )
                             .child(
                                 action_link("reload-themes", strings.reload_themes)
                                     .on_click(cx.listener(|this, _, window, cx| {
-                                        user_themes::reload_and_apply(&this.store, window, cx);
-                                        cx.notify();
+                                        user_themes::reload_and_apply_async(
+                                            this.store.clone(),
+                                            window.window_handle(),
+                                            cx,
+                                        );
                                     })),
                             ),
                     ),
@@ -531,10 +535,21 @@ impl SettingsWindow {
                             .flex_wrap()
                             .items_start()
                             .gap_1()
-                            .children(bundled_light.into_iter().zip(strings.light_theme_names).map(
-                                |(theme, name)| {
+                            .children(bundled_light.into_iter().enumerate().map(
+                                |(idx, theme)| {
                                     let selected = active.id() == theme.id();
-                                    tile(theme.id_shared(), theme, name.into(), selected, false, None)
+                                    let label: SharedString = if theme.is_custom() {
+                                        theme.name().to_owned().into()
+                                    } else {
+                                        strings
+                                            .light_theme_names
+                                            .get(idx)
+                                            .copied()
+                                            .unwrap_or_else(|| theme.name())
+                                            .to_owned()
+                                            .into()
+                                    };
+                                    tile(theme.id_shared(), theme, label, selected, false, None)
                                 },
                             ))
                             .child(tile(

@@ -165,6 +165,12 @@ impl MatrixView {
             show_completed: false,
         };
         this.reload(cx);
+        cx.observe_global::<desktop_common::data_version::DataVersion>(|this, cx| {
+            if desktop_common::data_version::changed_elsewhere(cx.entity_id(), cx) {
+                this.reload(cx);
+            }
+        })
+        .detach();
         this
     }
 
@@ -210,6 +216,7 @@ impl MatrixView {
                 }
             };
             input.update(cx, |input, cx| input.clear(window, cx));
+            desktop_common::data_version::data_changed(cx.entity_id(), cx);
             this.reload(cx);
             this.add_notice = this.destination_notice(quadrant, &task, today, i18n::t(cx));
         })
@@ -323,6 +330,8 @@ impl MatrixView {
     fn set_priority(&mut self, id: Id, priority: Priority, cx: &mut Context<Self>) {
         if let Err(err) = self.store.set_priority(id, priority) {
             eprintln!("failed to change the priority: {err:#}");
+        } else {
+            desktop_common::data_version::data_changed(cx.entity_id(), cx);
         }
         self.reload(cx);
     }
@@ -330,6 +339,8 @@ impl MatrixView {
     fn complete(&mut self, id: Id, cx: &mut Context<Self>) {
         if let Err(err) = self.store.set_completed(id, true) {
             eprintln!("failed to complete the task: {err:#}");
+        } else {
+            desktop_common::data_version::data_changed(cx.entity_id(), cx);
         }
         self.reload(cx);
     }

@@ -1,7 +1,7 @@
 //! The narrow sidebar with app sections, modeled on TickTick's.
 
 use fern_core::RailSection;
-use gpui::{AnyElement, ClickEvent};
+use gpui::{AnyElement, ClickEvent, ScrollHandle};
 use ui::prelude::*;
 
 use crate::drag::DraggedRailSection;
@@ -142,6 +142,7 @@ pub fn render(
     hovered: Option<Section>,
     order: &[RailSection],
     dragging: Option<Section>,
+    rail_scroll: &ScrollHandle,
     on_hover: impl Fn(Section, bool, &mut App) + Clone + 'static,
     on_select: impl Fn(Section, &mut Window, &mut App) + Clone + 'static,
     on_start_drag: impl Fn(Section, &mut App) + Clone + 'static,
@@ -266,6 +267,7 @@ pub fn render(
             .flex_1()
             .min_h_0()
             .w_full()
+            .track_scroll(rail_scroll)
             .color(colors.sidebar_icon)
             .inset(px(1.))
             .compact(),

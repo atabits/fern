@@ -467,15 +467,7 @@ impl ClosedRange {
 }
 
 /// "Oct 18" / "18 окт".
-pub fn short_date(date: NaiveDate, strings: &Strings) -> String {
-    format_day(strings.short_date[0], date, strings)
-}
-
-/// The local day of a timestamp in milliseconds.
-pub fn local_day(ms: i64) -> Option<NaiveDate> {
-    use chrono::{Local, TimeZone};
-    Local.timestamp_millis_opt(ms).single().map(|time| time.date_naive())
-}
+pub use crate::calendar::{day_header, local_day, short_date};
 
 /// Rows for closed tasks grouped by the day they were closed (newest first), as in the original's
 /// Completed and Won't Do views. `closed_at` picks the timestamp (completion or "Won't Do").
@@ -549,10 +541,6 @@ pub fn relative_day(day: NaiveDate, name: &str, strings: &Strings) -> String {
 }
 
 /// "Sunday, September 27", with the year when it is not the current one.
-pub fn day_header(day: NaiveDate, today: NaiveDate, strings: &Strings) -> String {
-    format_day(strings.day_header[usize::from(day.year() != today.year())], day, strings)
-}
-
 /// A day's header in Next 7 Days, as the original's: "Sunday, Today", "Monday, Tomorrow",
 /// "Wednesday, October 21", and "Next Saturday, October 24" for a day in the next week.
 pub fn next_days_header(day: NaiveDate, today: NaiveDate, week_start: chrono::Weekday, strings: &Strings) -> String {
@@ -900,13 +888,30 @@ pub fn plan_task_drop(
 }
 
 /// Plans dropping a dragged task into empty space below the last task in the list:
-/// places it as a top-level root task at the end of the last visible group.
+/// places it as a top-level root task at the end of the last compatible visible group
+/// (avoiding accidentally completing an open task or converting a task into a note).
 pub fn plan_task_drop_at_end(rows: &[Row], dragged_id: Id) -> Option<TaskDropPlan> {
-    let last_idx = rows.iter().rposition(|r| matches!(r, Row::Task { .. }))?;
     let dragged_idx = rows.iter().position(|r| row_task(r).is_some_and(|(t, _, _)| t.id == dragged_id))?;
     let (dragged_task, dragged_depth, _) = row_task(&rows[dragged_idx])?;
+    let (_, dragged_group_end, dragged_group_drop) = group_bounds(rows, dragged_idx);
+    let last_idx = rows.iter().enumerate().rev().find_map(|(i, r)| {
+        if !matches!(r, Row::Task { .. }) {
+            return None;
+        }
+        let (_, _, candidate_drop) = group_bounds(rows, i);
+        // Never silently complete an open task or convert a task to a note on an empty-space drop.
+        if !dragged_task.is_completed() && candidate_drop == Some(DropTarget::Complete) {
+            return None;
+        }
+        if dragged_task.kind != Kind::Note
+            && candidate_drop == Some(DropTarget::Kind(Kind::Note))
+            && dragged_group_drop != Some(DropTarget::Kind(Kind::Note))
+        {
+            return None;
+        }
+        Some(i)
+    })?;
     let (group_start, group_end, group_drop) = group_bounds(rows, last_idx);
-    let (_, dragged_group_end, _) = group_bounds(rows, dragged_idx);
     let dragged_subtree_end = visible_subtree_end(rows, dragged_idx, dragged_depth, dragged_group_end);
 
     let same_group = dragged_idx >= group_start && dragged_idx < group_end;

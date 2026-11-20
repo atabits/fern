@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::{Context as _, Result};
 use fern_core::Store;
-use gpui::{AnyWindowHandle, App, Window};
+use gpui::{AnyWindowHandle, App};
 
 pub const THEMES_DIR: &str = "themes";
 pub const SAMPLE_THEME_FILE: &str = "custom-theme.json";
@@ -40,14 +40,6 @@ fn ensure_sample_theme_file_at(dir: &Path) -> Result<PathBuf> {
     Ok(path)
 }
 
-fn is_theme_file(path: &Path) -> bool {
-    path.is_file()
-        && path
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .is_some_and(|ext| matches!(ext.to_ascii_lowercase().as_str(), "json" | "jsonc"))
-}
-
 pub fn load(cx: &mut App) {
     let Ok(dir) = themes_dir() else { return };
     let (themes, errors) = theme::load_themes_from_dir(&dir);
@@ -57,10 +49,72 @@ pub fn load(cx: &mut App) {
     theme::reload_user_themes(themes, errors, cx);
 }
 
-pub fn reload_and_apply(store: &Store, window: &Window, cx: &mut App) {
-    load(cx);
+/// Reloads user themes off the UI thread and applies the active theme selection.
+pub fn reload_and_apply_async(store: Rc<Store>, window: AnyWindowHandle, cx: &mut App) {
+    let Ok(dir) = themes_dir() else { return };
+    let task = cx.background_executor().spawn(async move { theme::load_themes_from_dir(&dir) });
+    cx.spawn(async move |cx| {
+        let (themes, errors) = task.await;
+        cx.update(|cx| {
+            apply_loaded(&store, window, themes, errors, cx);
+        });
+    })
+    .detach();
+}
+
+/// Ensures the sample theme file exists off the UI thread, reloads themes, and opens the file.
+pub fn create_and_open_sample_async(store: Rc<Store>, window: AnyWindowHandle, cx: &mut App) {
+    let task = cx.background_executor().spawn(async move {
+        let path = ensure_sample_theme_file()?;
+        let loaded = themes_dir().map(|dir| theme::load_themes_from_dir(&dir)).unwrap_or_default();
+        Ok::<_, anyhow::Error>((path, loaded))
+    });
+    cx.spawn(async move |cx| match task.await {
+        Ok((path, (themes, errors))) => {
+            cx.update(|cx| {
+                apply_loaded(&store, window, themes, errors, cx);
+                cx.open_with_system(&path);
+            });
+        }
+        Err(err) => eprintln!("theme: {err:#}"),
+    })
+    .detach();
+}
+
+/// Ensures the themes directory exists off the UI thread and opens it in the system file manager.
+pub fn open_themes_dir_async(cx: &mut App) {
+    let task = cx.background_executor().spawn(async move { ensure_themes_dir() });
+    cx.spawn(async move |cx| match task.await {
+        Ok(dir) => {
+            cx.update(|cx| cx.open_with_system(&dir));
+        }
+        Err(err) => eprintln!("theme: {err:#}"),
+    })
+    .detach();
+}
+
+fn apply_loaded(
+    store: &Store,
+    window: AnyWindowHandle,
+    themes: Vec<theme::Theme>,
+    errors: Vec<String>,
+    cx: &mut App,
+) {
+    for error in &errors {
+        eprintln!("theme: {error}");
+    }
+    theme::reload_user_themes(themes, errors, cx);
     let selection = store.preferences().unwrap_or_default().theme;
-    crate::settings_window::apply_theme_only(&selection, window, cx);
+    let target = if cx.windows().contains(&window) {
+        Some(window)
+    } else {
+        cx.windows().into_iter().next()
+    };
+    if let Some(target) = target {
+        let _ = target.update(cx, |_, window, cx| {
+            crate::settings_window::apply_theme_only(&selection, window, cx);
+        });
+    }
     cx.refresh_windows();
 }
 
@@ -74,7 +128,7 @@ fn dir_fingerprint(dir: &Path) -> Vec<(OsString, u64, Option<SystemTime>)> {
     let mut items = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
-        if !is_theme_file(&path) {
+        if !theme::is_theme_file(&path) {
             continue;
         }
         if let Ok(meta) = entry.metadata() {
@@ -88,36 +142,40 @@ fn dir_fingerprint(dir: &Path) -> Vec<(OsString, u64, Option<SystemTime>)> {
 pub fn watch(store: Rc<Store>, window: AnyWindowHandle, cx: &mut App) {
     let Ok(dir) = themes_dir() else { return };
     cx.spawn(async move |cx| {
-        let scan_dir = dir.clone();
-        let mut last_fp = cx.background_executor().spawn(async move { dir_fingerprint(&scan_dir) }).await;
+        let bg = cx.background_executor().clone();
+        let initial_dir = dir.clone();
+        let mut last_fp = bg.spawn(async move { dir_fingerprint(&initial_dir) }).await;
 
         loop {
-            cx.background_executor().timer(POLL_INTERVAL).await;
-            let scan_dir = dir.clone();
-            let next_fp = cx.background_executor().spawn(async move { dir_fingerprint(&scan_dir) }).await;
-            if next_fp == last_fp {
-                continue;
-            }
-
-            cx.background_executor().timer(DEBOUNCE).await;
-            let load_dir = dir.clone();
-            let (final_fp, (themes, errors)) = cx
-                .background_executor()
-                .spawn(async move { (dir_fingerprint(&load_dir), theme::load_themes_from_dir(&load_dir)) })
+            let poll_dir = dir.clone();
+            let prev_fp = last_fp.clone();
+            let bg_for_poll = bg.clone();
+            let (final_fp, themes, errors) = bg
+                .spawn(async move {
+                    loop {
+                        bg_for_poll.timer(POLL_INTERVAL).await;
+                        let next_fp = dir_fingerprint(&poll_dir);
+                        if next_fp != prev_fp {
+                            bg_for_poll.timer(DEBOUNCE).await;
+                            let final_fp = dir_fingerprint(&poll_dir);
+                            let (themes, errors) = theme::load_themes_from_dir(&poll_dir);
+                            return (final_fp, themes, errors);
+                        }
+                    }
+                })
                 .await;
             last_fp = final_fp;
 
-            cx.update(|cx| {
-                for error in &errors {
-                    eprintln!("theme: {error}");
+            let alive = cx.update(|cx| {
+                if cx.windows().is_empty() {
+                    return false;
                 }
-                theme::reload_user_themes(themes, errors, cx);
-                let selection = store.preferences().unwrap_or_default().theme;
-                let _ = window.update(cx, |_, window, cx| {
-                    crate::settings_window::apply_theme_only(&selection, window, cx);
-                });
-                cx.refresh_windows();
+                apply_loaded(&store, window, themes, errors, cx);
+                true
             });
+            if !alive {
+                break;
+            }
         }
     })
     .detach();

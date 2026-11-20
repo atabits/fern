@@ -153,7 +153,7 @@ inherits = "dev"
 debug = "full"
 
 [profile.dbg.build-override]
-debug = "full"
+debug = 0
 
 [profile.release]
 lto = "thin"

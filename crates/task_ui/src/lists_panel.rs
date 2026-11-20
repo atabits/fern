@@ -264,6 +264,7 @@ pub fn render(
             )
             .on_click(move |_, window, cx| on_select(view.clone(), window, cx));
         let selector_id = id.clone();
+        let accepts_task_drop = !matches!(drop_view, View::All | View::Summary | View::Filter(_) | View::Search(_));
         div()
             .id(SharedString::from(format!("drop-{id}")))
             .debug_selector(move || format!("lists-item-{selector_id}"))
@@ -271,8 +272,10 @@ pub fn render(
             .relative()
             .rounded(px(6.))
             .when(highlighted, |el| el.bg(accent.opacity(0.18)).border_1().border_color(accent))
-            .drag_over::<DraggedTask>(move |style, _, _, _| style.bg(accent.opacity(0.18)))
-            .on_drop(move |dragged: &DraggedTask, window, cx| on_drop_task(drop_view.clone(), dragged.id, window, cx))
+            .when(accepts_task_drop, |el| {
+                el.drag_over::<DraggedTask>(move |style, _, _, _| style.bg(accent.opacity(0.18)))
+                    .on_drop(move |dragged: &DraggedTask, window, cx| on_drop_task(drop_view.clone(), dragged.id, window, cx))
+            })
             // The "…" menu on a right click too, and so on a finger's long press.
             .when_some(menu, |el, list| {
                 el.on_mouse_down(MouseButton::Right, move |event, window, cx| {

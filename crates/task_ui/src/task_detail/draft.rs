@@ -427,7 +427,7 @@ impl TaskDetail {
     }
 
     pub(super) fn render_draft_templates(&self, cx: &mut Context<Self>) -> AnyElement {
-        let templates = self.session.store.templates().unwrap_or_default();
+        let templates = &self.session.draft_templates;
         popover(cx)
             .w(px(260.))
             .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_popup(cx)))
@@ -439,7 +439,7 @@ impl TaskDetail {
                     "draft-templates-scroll",
                     v_flex()
                         .id("draft-templates")
-                        .children(templates.into_iter().map(|template| {
+                        .children(templates.iter().cloned().map(|template| {
                         ListItem::new(SharedString::from(format!(
                             "draft-template-{}",
                             template.id

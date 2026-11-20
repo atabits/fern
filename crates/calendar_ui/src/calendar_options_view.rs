@@ -269,10 +269,11 @@ impl CalendarOptionsDialog {
             )
             .when_some(hint, |el, hint| el.child(div().px_4().child(Label::new(hint).size(LabelSize::Small).color(Color::Muted))))
             .when(!rows.is_empty(), |el| {
+                let scroll_key = self.color_tab * 4 + chosen;
                 el.child(
                     v_scroll(
-                        "color-rows-scroll",
-                        v_flex().id("color-rows").py_1().children(rows),
+                        ("color-rows-scroll", scroll_key),
+                        v_flex().id(("color-rows", scroll_key)).py_1().children(rows),
                     )
                     .max_h(px(320.))
                     .rounded(px(8.))

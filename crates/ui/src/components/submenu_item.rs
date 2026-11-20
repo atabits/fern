@@ -6,7 +6,7 @@ use gpui::{
     SharedString, Styled, Window, div, prelude::FluentBuilder as _,
 };
 
-use crate::{Color, Icon, IconName, IconSize, Label, ListItem, Placement, PopoverAttachment, Toggleable, popover};
+use crate::{Color, Icon, IconName, IconSize, Label, ListItem, Placement, PopoverAttachment, Toggleable, popover, v_flex, v_scroll};
 
 type HoverHandler = Box<dyn Fn(&bool, &mut Window, &mut App)>;
 
@@ -95,7 +95,15 @@ impl RenderOnce for SubmenuItem {
             .debug_selector(move || menu_selector)
             .relative()
             .min_w(gpui::px(180.))
-            .children(self.items)
+            .p_0()
+            .child(
+                v_scroll(
+                    (self.id.clone(), "submenu-scroll"),
+                    v_flex().id((self.id.clone(), "submenu-items")).p_1().children(self.items),
+                )
+                .max_h(gpui::px(320.))
+                .compact(),
+            )
             .when_some(self.bounds, |menu, bounds| menu.child(
                 gpui::canvas(move |area, _, _| bounds.set(Some(area)), |_, _, _, _| {})
                     .absolute().inset_0(),

@@ -242,10 +242,20 @@ impl TextInput {
     /// Replaces the text as an edit — it emits [`Changed`] — and selects `selection`.
     pub fn edit(&mut self, text: String, selection: Range<usize>, window: &Window, cx: &mut Context<Self>) {
         let len = text.len();
+        let clamp_boundary = |offset: usize| {
+            let mut idx = offset.min(len);
+            while idx > 0 && !text.is_char_boundary(idx) {
+                idx -= 1;
+            }
+            idx
+        };
+        let start = clamp_boundary(selection.start);
+        let end = clamp_boundary(selection.end).max(start);
         self.content = text.into();
-        self.selected_range = selection.start.min(len)..selection.end.min(len);
+        self.selected_range = start..end;
         self.selection_reversed = false;
         self.marked_range = None;
+        self.pending_click = None;
         window.notify_text_input_changed(&self.focus_handle);
         cx.emit(Changed);
         cx.notify();
@@ -366,13 +376,9 @@ impl TextInput {
         self.replace_text_in_range(None, "", window, cx)
     }
 
-    fn on_mouse_down(
-        &mut self,
-        event: &MouseDownEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.is_selecting = true;
+    /// Requests the platform/touch virtual keyboard when an input is opened by a tap rather than
+    /// directly receiving `on_mouse_down` (for example, inline title editing).
+    pub fn open_touch_keyboard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         window.request_virtual_keyboard();
         if touch_keyboard::show_for_tap(window, &self.focus_handle) && self.keyboard_blur.is_none()
         {
@@ -382,6 +388,16 @@ impl TextInput {
                 window.defer(cx, move |_, _| touch_keyboard::release(&focus));
             }));
         }
+    }
+
+    fn on_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.is_selecting = true;
+        self.open_touch_keyboard(window, cx);
 
         if event.modifiers.shift {
             self.select_to(self.index_for_mouse_position(event.position), window, cx);
@@ -960,11 +976,13 @@ impl Element for TextElement {
             }
         });
         if let Some(offset) = pending_offset {
-            self.input.update(cx, |input, _| {
+            let focus_handle = self.input.update(cx, |input, _| {
                 input.pending_click = None;
                 input.selected_range = offset..offset;
                 input.selection_reversed = false;
+                input.focus_handle.clone()
             });
+            window.notify_text_selection_changed(&focus_handle);
         }
         let input = self.input.read(cx);
         if !input.mode.wraps() && !is_placeholder {
@@ -984,7 +1002,7 @@ impl Element for TextElement {
                     .clamp(px(0.), max_scroll);
             }
         }
-        let origin = layout.origin();
+        let origin = layout.origin() + point(px(0.), text_y_offset);
 
         let selected_range = input.selected_range.clone();
         let mut selection = Vec::new();
@@ -1063,7 +1081,7 @@ impl Element for TextElement {
             ElementInputHandler::new(bounds, self.input.clone()),
             cx,
         );
-        let layout = prepaint.layout.take().unwrap();
+        let Some(layout) = prepaint.layout.take() else { return };
         // WrappedLine's bounds control alignment, not clipping. Keep every text layer
         // inside the field, independently of whether its parent also clips overflow.
         window.with_content_mask(Some(ContentMask { bounds }), |window| {

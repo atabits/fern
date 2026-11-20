@@ -14,7 +14,6 @@ use ui::{Placement, PopoverAttachment, SubmenuItem, popover};
 use desktop_common::{actions, calendar, colors as lists_panel, export, layout, touch};
 use desktop_common::text_input::{Cancelled, Mode, Submitted, TextInput};
 use fern_i18n as i18n;
-use task_ui::{due_picker, task_rows};
 
 const CARD_WIDTH: f32 = 365.;
 
@@ -91,6 +90,7 @@ fn frequency_label(frequency: HabitFrequency, strings: &i18n::Strings) -> String
 
 pub struct HabitView {
     store: Rc<Store>,
+    focus_handle: gpui::FocusHandle,
     habits: Vec<Habit>,
     checkins: HashMap<Id, HashSet<NaiveDate>>,
     /// Check-ins with amounts and notes, for the details panel.
@@ -134,6 +134,12 @@ enum HeaderMore {
     Settings,
 }
 
+impl gpui::Focusable for HabitView {
+    fn focus_handle(&self, _: &App) -> gpui::FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
 impl HabitView {
     pub fn new(store: Rc<Store>, cx: &mut Context<Self>) -> Self {
         let strings = i18n::t(cx);
@@ -154,6 +160,7 @@ impl HabitView {
         cx.subscribe(&amount_input, |this, _, _: &Submitted, cx| this.record_amount(cx)).detach();
         let mut this = Self {
             store,
+            focus_handle: cx.focus_handle(),
             amount_input,
             habits: Vec::new(),
             checkins: HashMap::new(),
@@ -220,6 +227,16 @@ impl HabitView {
     }
 
     pub fn dismiss_transient(&mut self, cx: &mut Context<Self>) -> bool {
+        if let Some(edit) = self.editing.as_mut()
+            && (edit.icon_picker.take().is_some()
+                || edit.start_calendar.take().is_some()
+                || edit.new_section.take().is_some()
+                || std::mem::take(&mut edit.adding_reminder)
+                || edit.open.take().is_some())
+        {
+            cx.notify();
+            return true;
+        }
         if std::mem::take(&mut self.header_menu_open)
             || self.header_more.take().is_some()
             || std::mem::take(&mut self.detail_menu_open)
@@ -253,7 +270,7 @@ impl HabitView {
         });
         let reminder_input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.time_placeholder, cx));
         cx.subscribe(&reminder_input, |this, input, Submitted(text), cx| {
-            if let Some(time) = due_picker::parse_time(text) {
+            if let Some(time) = calendar::parse_time(text) {
                 this.update_edit(cx, |e| {
                     if !e.reminders.contains(&time) {
                         e.reminders.push(time);
@@ -669,7 +686,7 @@ impl HabitView {
         let start_label = if start == today {
             strings.today.to_owned()
         } else {
-            format!("{}, {}", task_rows::short_date(start, strings), start.year())
+            format!("{}, {}", calendar::short_date(start, strings), start.year())
         };
         let goal_menu = v_flex()
             .gap_2()
@@ -980,7 +997,7 @@ impl HabitView {
                 self.store.step_checkin(id, date).ok();
             }
         } else if let Some(times) = command.strip_prefix("remind=") {
-            let times: Vec<chrono::NaiveTime> = times.split(',').filter_map(due_picker::parse_time).collect();
+            let times: Vec<chrono::NaiveTime> = times.split(',').filter_map(calendar::parse_time).collect();
             self.store.set_habit_reminders(id, &times).ok();
         } else if let Some(frequency) = command.strip_prefix("freq=") {
             self.store.set_habit_frequency(id, HabitFrequency::from_storage(frequency)).ok();
@@ -1707,12 +1724,21 @@ impl HabitView {
                                 },
                             )))
                             .when(self.detail_menu_open, |el| {
+                                let focus_bounds = std::rc::Rc::new(std::cell::Cell::new(None::<gpui::Bounds<Pixels>>));
+                                let style_bounds = std::rc::Rc::new(std::cell::Cell::new(None::<gpui::Bounds<Pixels>>));
+                                let focus_bounds_out = focus_bounds.clone();
+                                let style_bounds_out = style_bounds.clone();
                                 el.child(PopoverAttachment::new(
                                     Placement::BelowRight,
                                     // The original's measures: 178 px wide (wider when a label needs it), a row every 34 px.
                                     popover(cx)
                                         .min_w(px(178.))
-                                        .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                                        .on_mouse_down_out(cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                                            if focus_bounds_out.get().is_some_and(|b| b.contains(&event.position))
+                                                || style_bounds_out.get().is_some_and(|b| b.contains(&event.position))
+                                            {
+                                                return;
+                                            }
                                             this.detail_submenu = None;
                                             this.detail_menu_open = false;
                                             cx.notify();
@@ -1730,6 +1756,7 @@ impl HabitView {
                                             let title = habit.name.clone();
                                             self.side_menu("habit-start-focus", IconName::CircleDot, strings.start_focus, DetailSubmenu::StartFocus, cx)
                                                 .height(px(34.))
+                                                .track_bounds(focus_bounds)
                                                 .items([(false, strings.start_pomo), (true, strings.start_stopwatch)].map(|(stopwatch, label)| {
                                                     let title = title.clone();
                                                     ListItem::new(SharedString::from(format!("habit-focus-{stopwatch}")))
@@ -1746,6 +1773,7 @@ impl HabitView {
                                             let current = habit.icon_checkins;
                                             self.side_menu("habit-checkin-style", IconName::SquareCheck, strings.checked_in_style, DetailSubmenu::CheckinStyle, cx)
                                                 .height(px(34.))
+                                                .track_bounds(style_bounds)
                                                 .items([(false, strings.checkin_style_checkmark), (true, strings.checkin_style_icon)].map(|(icon, label)| {
                                                     ListItem::new(SharedString::from(format!("habit-style-{icon}")))
                                                         .child(Label::new(label).color(if icon == current { Color::Accent } else { Color::Default }))
@@ -1888,7 +1916,7 @@ impl HabitView {
                     .children(notes.into_iter().map(|(date, note)| {
                         v_flex()
                             .child(
-                                Label::new(task_rows::day_header(date, today, strings))
+                                Label::new(calendar::day_header(date, today, strings))
                                     .size(LabelSize::XSmall)
                                     .color(Color::Muted),
                             )
@@ -2127,6 +2155,7 @@ impl Render for HabitView {
         h_flex()
             .relative()
             .size_full()
+            .track_focus(&self.focus_handle)
             .key_context("Habits")
             .on_action(cx.listener(|this, _: &actions::DismissTransient, _, cx| {
                 if !this.dismiss_transient(cx) {

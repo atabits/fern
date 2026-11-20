@@ -16,7 +16,6 @@ use desktop_common::text_input::{Cancelled, Changed, Mode, Submitted, TextInput}
 use fern_i18n::{self as i18n, Strings};
 #[cfg(test)]
 use desktop_common::keymap;
-use task_ui::due_picker;
 
 const CARD_WIDTH: f32 = 289.;
 const CARD_HEIGHT: f32 = 181.;
@@ -207,6 +206,7 @@ const COUNTDOWN_EMOJI: [&str; 14] = ["🎂", "🎉", "❤️", "💍", "✈️",
 
 pub struct CountdownView {
     store: Rc<Store>,
+    focus_handle: gpui::FocusHandle,
     countdowns: Vec<Countdown>,
     filter: Filter,
     /// Cards switched to the "days only" format.
@@ -239,9 +239,27 @@ fn kind_label(kind: CountdownKind, strings: &Strings) -> &'static str {
     }
 }
 
+impl gpui::Focusable for CountdownView {
+    fn focus_handle(&self, _: &App) -> gpui::FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
 impl CountdownView {
     pub fn new(store: Rc<Store>, cx: &mut Context<Self>) -> Self {
-        let mut this = Self { store, countdowns: Vec::new(), filter: Filter::All, days_only: HashSet::new(), draft: None, card_menu: None, add_menu: false, title_menu: false, header_menu: false, show_archived: false };
+        let mut this = Self {
+            store,
+            focus_handle: cx.focus_handle(),
+            countdowns: Vec::new(),
+            filter: Filter::All,
+            days_only: HashSet::new(),
+            draft: None,
+            card_menu: None,
+            add_menu: false,
+            title_menu: false,
+            header_menu: false,
+            show_archived: false,
+        };
         this.reload(cx);
         this
     }
@@ -393,7 +411,7 @@ impl CountdownView {
         let Some(draft) = self.draft.as_mut() else { return };
         let Some(custom) = draft.custom.as_ref() else { return };
         let count: Option<u32> = custom.count.read(cx).text().trim().parse().ok();
-        let time = due_picker::parse_time(custom.time.read(cx).text());
+        let time = calendar::parse_time(custom.time.read(cx).text());
         if let (Some(count), Some(time)) = (count, time) {
             let days = if custom.weeks { count * 7 } else { count };
             if !draft.custom_reminders.contains(&(days, time)) {
@@ -1391,6 +1409,12 @@ impl CountdownView {
     }
 
     pub fn dismiss_transient(&mut self, cx: &mut Context<Self>) -> bool {
+        if let Some(draft) = self.draft.as_mut()
+            && (draft.custom.take().is_some() || draft.open.take().is_some())
+        {
+            cx.notify();
+            return true;
+        }
         if std::mem::take(&mut self.title_menu)
             || std::mem::take(&mut self.add_menu)
             || std::mem::take(&mut self.header_menu)
@@ -1444,6 +1468,7 @@ impl Render for CountdownView {
         v_flex()
             .relative()
             .size_full()
+            .track_focus(&self.focus_handle)
             .key_context("Countdown")
             .on_action(cx.listener(|this, _: &actions::DismissTransient, _, cx| {
                 if !this.dismiss_transient(cx) {

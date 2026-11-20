@@ -89,6 +89,8 @@ pub struct SettingsWindow {
     page_scroll: ScrollHandle,
     menu: Option<Menu>,
     focus_handle: FocusHandle,
+    /// Guard against emitting `SettingsEvent::Dismissed` twice when close is triggered repeatedly.
+    closing: bool,
     /// Linux and macOS: a press on the drag strip turns into a window move once the mouse moves.
     should_move: bool,
     /// The outcome of the last backup or import.
@@ -141,6 +143,7 @@ pub fn open(
         ..Default::default()
     };
     let handle = cx.open_window(options, |window, cx| {
+        crate::touch::init(window, cx);
         cx.new(|cx| {
             let mut view = SettingsWindow::new(store, cx);
             view.attach_window(window, cx);
@@ -204,6 +207,7 @@ impl SettingsWindow {
             page_scroll: ScrollHandle::new(),
             menu: None,
             focus_handle: cx.focus_handle(),
+            closing: false,
             should_move: false,
             backup_message: None,
             installed_notes,
@@ -221,7 +225,13 @@ impl SettingsWindow {
     fn attach_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let weak = cx.weak_entity();
         window.on_window_should_close(cx, move |_, cx| {
-            weak.update(cx, |_, cx| cx.emit(SettingsEvent::Dismissed)).ok();
+            weak.update(cx, |this, cx| {
+                if !this.closing {
+                    this.closing = true;
+                    cx.emit(SettingsEvent::Dismissed);
+                }
+            })
+            .ok();
             true
         });
         cx.observe_global_in::<CurrentLocale>(window, |_, window, cx| {
@@ -231,6 +241,10 @@ impl SettingsWindow {
     }
 
     fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.closing {
+            return;
+        }
+        self.closing = true;
         cx.emit(SettingsEvent::Dismissed);
         window.defer(cx, |window, _| window.remove_window());
     }
@@ -240,8 +254,9 @@ impl SettingsWindow {
             server: self.sync_server.read(cx).text().to_owned(),
             token: self.sync_token.read(cx).text().to_owned(),
         };
-        if let Err(err) = self.store.set_sync_config(&config) {
-            eprintln!("failed to save the sync settings: {err:#}");
+        match self.store.set_sync_config(&config) {
+            Ok(()) => cx.emit(SettingsEvent::Changed),
+            Err(err) => eprintln!("failed to save the sync settings: {err:#}"),
         }
     }
 
@@ -298,24 +313,42 @@ impl SettingsWindow {
 
     /// "Generate Backup": all data in one file, saved where the user chooses.
     fn generate_backup(&mut self, cx: &mut Context<Self>) {
-        let contents = crate::scratch_dir().map_err(anyhow::Error::from).and_then(|dir| {
+        let temp = match crate::scratch_dir().map_err(anyhow::Error::from).and_then(|dir| {
             let temp = dir.join(format!("fern-backup-{}.db", std::process::id()));
             let attachments = crate::attachments_dir().ok();
-            let contents = self.store.backup_to(&temp, attachments.as_deref()).and_then(|()| Ok(std::fs::read(&temp)?));
-            std::fs::remove_file(&temp).ok();
-            contents
-        });
-        match contents {
-            Ok(bytes) => {
-                let name = format!("fern-backup-{}.db", chrono::Local::now().format("%Y-%m-%d"));
-                crate::export::save_as(name, bytes, cx, |this, result, cx| {
-                    this.backup_message = crate::export::outcome(result, i18n::t(cx));
-                    cx.notify();
-                });
+            self.store.backup_to(&temp, attachments.as_deref())?;
+            Ok(temp)
+        }) {
+            Ok(temp) => temp,
+            Err(err) => {
+                self.backup_message = Some(err.to_string());
+                cx.notify();
+                return;
             }
-            Err(err) => self.backup_message = Some(err.to_string()),
-        }
-        cx.notify();
+        };
+        let read = cx.background_spawn(async move {
+            let bytes = std::fs::read(&temp);
+            std::fs::remove_file(&temp).ok();
+            bytes
+        });
+        cx.spawn(async move |this, cx| {
+            let bytes = read.await;
+            this.update(cx, |this, cx| match bytes {
+                Ok(bytes) => {
+                    let name = format!("fern-backup-{}.db", chrono::Local::now().format("%Y-%m-%d"));
+                    crate::export::save_as(name, bytes, cx, |this, result, cx| {
+                        this.backup_message = crate::export::outcome(result, i18n::t(cx));
+                        cx.notify();
+                    });
+                }
+                Err(err) => {
+                    this.backup_message = Some(err.to_string());
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// "Import Backups": a Fern backup is checked now and restored on the next start; a TickTick
@@ -327,7 +360,7 @@ impl SettingsWindow {
                 return;
             };
             if path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("csv")) {
-                let text = std::fs::read_to_string(&path);
+                let text = cx.background_spawn(async move { std::fs::read_to_string(&path) }).await;
                 this.update(cx, |this, cx| {
                     let strings = i18n::t(cx);
                     let imported = text.map_err(anyhow::Error::from).and_then(|text| this.store.import_ticktick(&text));
@@ -344,9 +377,13 @@ impl SettingsWindow {
                 .ok();
                 return;
             }
-            let outcome = fern_core::Store::check_backup(&path)
-                .and_then(|()| Ok(std::fs::copy(&path, crate::pending_restore_path()?)?))
-                .map(|_| ());
+            let outcome = cx
+                .background_spawn(async move {
+                    fern_core::Store::check_backup(&path)
+                        .and_then(|()| Ok(std::fs::copy(&path, crate::pending_restore_path()?)?))
+                        .map(|_| ())
+                })
+                .await;
             this.update(cx, |this, cx| {
                 let strings = i18n::t(cx);
                 this.backup_message = Some(match outcome {
@@ -1696,12 +1733,14 @@ impl Render for SettingsWindow {
                                 )
                             })
                             .child(self.drag_area("settings-header-drag", window, cx).flex_1().min_w_0().h_full())
-                            .child(
-                                IconButton::new("close-settings", IconName::X)
-                                    .icon_color(Color::Muted)
-                                    .tooltip(Tooltip::text(strings.close))
-                                    .on_click(cx.listener(|this, _, window, cx| this.close(window, cx))),
-                            ),
+                            .when(!cfg!(target_os = "macos"), |el| {
+                                el.child(
+                                    IconButton::new("close-settings", IconName::X)
+                                        .icon_color(Color::Muted)
+                                        .tooltip(Tooltip::text(strings.close))
+                                        .on_click(cx.listener(|this, _, window, cx| this.close(window, cx))),
+                                )
+                            }),
                     )
                     .child(page),
             );

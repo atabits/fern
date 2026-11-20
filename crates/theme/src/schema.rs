@@ -141,6 +141,8 @@ pub struct ThemeContent {
     #[serde(default)]
     pub id: Option<String>,
     pub name: String,
+    #[serde(default)]
+    pub author: Option<String>,
     pub appearance: Appearance,
     #[serde(default)]
     pub base: Option<String>,
@@ -362,12 +364,14 @@ impl StatusColorsRefinement {
 }
 
 /// Strips `//` / `/* ... */` comments and trailing commas outside string literals, preserving newlines.
-fn strip_jsonc(source: &str) -> String {
-    let without_comments = strip_json_comments(source);
-    strip_trailing_commas(&without_comments)
+/// Strips an optional UTF-8 BOM, `//` and `/* ... */` JSONC comments, and valid trailing commas.
+pub fn strip_jsonc(source: &str) -> Result<String> {
+    let source = source.strip_prefix('\u{FEFF}').unwrap_or(source);
+    let without_comments = strip_json_comments(source)?;
+    Ok(strip_trailing_commas(&without_comments))
 }
 
-fn strip_json_comments(source: &str) -> String {
+fn strip_json_comments(source: &str) -> Result<String> {
     let mut out = String::with_capacity(source.len());
     let mut chars = source.chars().peekable();
     let mut in_string = false;
@@ -399,26 +403,32 @@ fn strip_json_comments(source: &str) -> String {
             }
         } else if ch == '/' && chars.peek() == Some(&'*') {
             chars.next();
+            let mut closed = false;
             while let Some(next) = chars.next() {
                 if next == '\n' {
                     out.push('\n');
                 } else if next == '*' && chars.peek() == Some(&'/') {
                     chars.next();
+                    closed = true;
                     break;
                 }
+            }
+            if !closed {
+                anyhow::bail!("unterminated block comment");
             }
         } else {
             out.push(ch);
         }
     }
 
-    out
+    Ok(out)
 }
 
 fn strip_trailing_commas(source: &str) -> String {
     let mut out = String::with_capacity(source.len());
     let mut in_string = false;
     let mut escaped = false;
+    let mut prev_non_ws: Option<char> = None;
 
     for (idx, ch) in source.char_indices() {
         if in_string {
@@ -429,6 +439,7 @@ fn strip_trailing_commas(source: &str) -> String {
                 escaped = true;
             } else if ch == '"' {
                 in_string = false;
+                prev_non_ws = Some('"');
             }
             continue;
         }
@@ -439,15 +450,29 @@ fn strip_trailing_commas(source: &str) -> String {
         } else if ch == ',' {
             let rest = &source[idx + ch.len_utf8()..];
             let next_non_ws = rest.chars().find(|c| !c.is_whitespace());
-            if !matches!(next_non_ws, Some('}' | ']')) {
-                out.push(ch);
+            // Only strip trailing commas that follow an actual element/property, not `[,]` or `{,}`.
+            let follows_container_open = matches!(prev_non_ws, None | Some('[' | '{' | ','));
+            if !follows_container_open && matches!(next_non_ws, Some('}' | ']')) {
+                continue;
             }
+            out.push(ch);
+            prev_non_ws = Some(ch);
         } else {
             out.push(ch);
+            if !ch.is_whitespace() {
+                prev_non_ws = Some(ch);
+            }
         }
     }
 
     out
+}
+
+/// Returns `true` when `path` has a `.json` or `.jsonc` extension.
+pub fn is_theme_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| matches!(ext.to_ascii_lowercase().as_str(), "json" | "jsonc"))
 }
 
 fn parse_opt_color(
@@ -515,7 +540,7 @@ fn parse_swatch(content: &SwatchContent) -> Result<[Hsla; 2]> {
 
 /// Parses either a [`ThemeFamilyContent`] (`"themes": [...]`) or a single [`ThemeContent`].
 pub fn parse_theme_family(source: &str) -> Result<ThemeFamilyContent> {
-    let cleaned = strip_jsonc(source);
+    let cleaned = strip_jsonc(source).context("invalid theme JSONC")?;
     let value: serde_json::Value = serde_json::from_str(&cleaned).context("invalid theme JSON")?;
     if value.as_object().is_some_and(|obj| obj.contains_key("themes")) {
         serde_json::from_value(value).context("invalid theme family schema")
@@ -524,7 +549,7 @@ pub fn parse_theme_family(source: &str) -> Result<ThemeFamilyContent> {
             serde_json::from_value(value).context("invalid single-theme schema")?;
         Ok(ThemeFamilyContent {
             name: theme.name.clone(),
-            author: String::new(),
+            author: theme.author.clone().unwrap_or_default(),
             themes: vec![theme],
         })
     }
@@ -533,10 +558,16 @@ pub fn parse_theme_family(source: &str) -> Result<ThemeFamilyContent> {
 /// Parses and refines all themes inside a JSON/JSONC theme document, returning themes and any non-fatal warnings.
 pub fn load_theme_family_from_str(source: &str) -> Result<(Vec<Theme>, Vec<String>)> {
     let family = parse_theme_family(source)?;
-    let author = (!family.author.trim().is_empty()).then_some(family.author.as_str());
+    let family_author = (!family.author.trim().is_empty()).then_some(family.author.as_str());
     let mut themes = Vec::with_capacity(family.themes.len());
     let mut warnings = Vec::new();
     for content in &family.themes {
+        let author = content
+            .author
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .or(family_author);
         let (theme, theme_warnings) = refine_theme(content, author);
         themes.push(theme);
         warnings.extend(theme_warnings);
@@ -558,13 +589,7 @@ pub fn load_themes_from_dir(dir: &Path) -> (Vec<Theme>, Vec<String>) {
 
     let mut paths: Vec<_> = entries
         .filter_map(|entry| entry.ok().map(|e| e.path()))
-        .filter(|path| {
-            path.is_file()
-                && path
-                    .extension()
-                    .and_then(|ext| ext.to_str())
-                    .is_some_and(|ext| matches!(ext.to_ascii_lowercase().as_str(), "json" | "jsonc"))
-        })
+        .filter(|path| path.is_file() && is_theme_file(path))
         .collect();
     paths.sort();
 
@@ -613,7 +638,11 @@ fn refine_theme(content: &ThemeContent, author: Option<&str>) -> (Theme, Vec<Str
 
     let base_preset = match content.base.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         Some(base_id) => match ThemePreset::find(base_id) {
-            Some(preset) => preset,
+            Some(preset) if preset.is_dark() == dark => preset,
+            Some(_) => {
+                warnings.push(format!("{label}: base preset `{base_id}` does not match theme appearance"));
+                ThemePreset::resolve(dark, None)
+            }
             None => {
                 warnings.push(format!("{label}: unknown base preset `{base_id}`"));
                 ThemePreset::resolve(dark, None)
@@ -641,23 +670,24 @@ fn refine_theme(content: &ThemeContent, author: Option<&str>) -> (Theme, Vec<Str
     let accent_direct = parse_opt_color(label, "accent", style.accent.as_deref(), &mut warnings);
     let mut first_accent_array = None;
     for (idx, item) in style.accents.iter().enumerate() {
-        if let Some(color) = parse_opt_color(label, &format!("accents[{idx}]"), item.as_deref(), &mut warnings)
-            && first_accent_array.is_none()
-        {
-            first_accent_array = Some(color);
+        let Some(raw) = item.as_deref() else { continue };
+        match try_parse_color(raw) {
+            Ok(color) => {
+                if first_accent_array.is_none() {
+                    first_accent_array = Some(color);
+                }
+            }
+            Err(err) => warnings.push(format!("{label}: invalid color for `accents[{idx}]`: {err}")),
         }
     }
 
     let mut first_player_selection = None;
     let mut first_player_background = None;
-    for (idx, player) in style.players.iter().enumerate() {
-        let _cursor = parse_opt_color(label, &format!("players[{idx}].cursor"), player.cursor.as_deref(), &mut warnings);
-        let bg = parse_opt_color(label, &format!("players[{idx}].background"), player.background.as_deref(), &mut warnings);
-        let sel = parse_opt_color(label, &format!("players[{idx}].selection"), player.selection.as_deref(), &mut warnings);
-        if idx == 0 {
-            first_player_background = bg;
-            first_player_selection = sel;
-        }
+    if let Some(player) = style.players.first() {
+        first_player_background =
+            parse_opt_color(label, "players[0].background", player.background.as_deref(), &mut warnings);
+        first_player_selection =
+            parse_opt_color(label, "players[0].selection", player.selection.as_deref(), &mut warnings);
     }
 
     let text_override = parse_opt_color(label, "text", style.text.as_deref(), &mut warnings);
@@ -819,10 +849,12 @@ fn refine_theme(content: &ThemeContent, author: Option<&str>) -> (Theme, Vec<Str
         if background_override.is_some() {
             theme.colors.background = background;
         }
+        if accent_override.is_some() || background_override.is_some() || text_override.is_some() {
+            theme.colors.text_accent = readable_accent(accent, theme.colors.background, ink);
+        }
         if accent_override.is_some() {
             let on_accent = foreground_on(&[accent], 3.);
             theme.colors.accent = accent;
-            theme.colors.text_accent = readable_accent(accent, theme.colors.background, ink);
             theme.colors.on_accent = on_accent;
             theme.colors.icon_on_accent = on_accent;
             theme.colors.element_selected =

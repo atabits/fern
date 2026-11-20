@@ -180,15 +180,12 @@ fn legacy_database_migrates_and_preserves_filters() -> Result<()> {
     {
         let store = Store::open(&path)?;
         store.conn.execute("INSERT INTO filters (id,name,lists,tags,date,priorities,keywords,kind,created_at,match_any,chain) VALUES (?1,'Legacy','','','overdue','','annual report',NULL,0,0,'include and:date unknown')", [id.to_string()])?;
-        let version: u32 = store
-            .conn
-            .pragma_query_value(None, "user_version", |r| r.get(0))?;
         store
             .conn
             .execute_batch("ALTER TABLE filters DROP COLUMN rules;")?;
         store
             .conn
-            .pragma_update(None, "user_version", version - 1)?;
+            .pragma_update(None, "user_version", crate::store::pre_filter_rules_migration_version())?;
     }
     {
         let store = Store::open(&path)?;

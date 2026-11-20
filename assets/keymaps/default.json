@@ -2,6 +2,12 @@
   {
     "bindings": {
       "secondary-q": "fern::Quit",
+      "escape": "fern::DismissTransient"
+    }
+  },
+  {
+    "context": "Workspace",
+    "bindings": {
       "secondary-n": "fern::NewTask",
       "secondary-f": "fern::Search",
       "secondary-\\": "fern::ToggleSidebar",
@@ -10,8 +16,7 @@
       "secondary-3": "fern::ShowTomorrow",
       "secondary-4": "fern::ShowNext7Days",
       "secondary-/": "fern::ShowShortcuts",
-      "secondary-,": "fern::OpenSettings",
-      "escape": "fern::DismissTransient"
+      "secondary-,": "fern::OpenSettings"
     }
   },
   {
@@ -41,6 +46,7 @@
   {
     "context": "Calendar",
     "bindings": {
+      "secondary-n": "fern::NewTask",
       "d": "calendar::DayView",
       "1": "calendar::DayView",
       "w": "calendar::WeekView",

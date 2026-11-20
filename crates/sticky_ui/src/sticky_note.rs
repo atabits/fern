@@ -327,7 +327,7 @@ impl StickyNote {
             window.set_window_title(i18n::t(cx).more);
             #[cfg(windows)]
             popup::attach(owner, window, false);
-            cx.new(|cx| popup::DetailPopup::new(note, detail, anchor, anchored, return_focus, window, cx))
+            cx.new(|cx| popup::DetailPopup::new(note, detail.clone(), anchor, anchored, return_focus.clone(), window, cx))
         }, cx) {
             Ok(popup) => self.detail_popup = Some(popup),
             Err(err) => eprintln!("failed to open sticky task menu: {err:#}"),
@@ -447,6 +447,10 @@ impl Render for StickyNote {
         v_flex()
             .id("sticky-window")
             .group("sticky-window")
+            .on_action(cx.listener(|this, _: &desktop_common::actions::CloseWindow, window, cx| {
+                this.forget(cx);
+                window.defer(cx, |window, _| window.remove_window());
+            }))
             .size_full()
             .overflow_hidden()
             .capture_any_mouse_down(cx.listener(|this, _, window, cx| {

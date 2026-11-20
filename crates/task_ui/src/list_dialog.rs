@@ -84,6 +84,7 @@ pub struct ListDialog {
     open: Option<Menu>,
     emoji_search: Entity<TextInput>,
     emoji_tab: usize,
+    emoji_scroll: gpui::ScrollHandle,
     /// The New Folder dialog over this one.
     new_folder: Option<Entity<FolderDialog>>,
     error: Option<String>,
@@ -129,6 +130,7 @@ impl ListDialog {
             open: None,
             emoji_search,
             emoji_tab: 0,
+            emoji_scroll: gpui::ScrollHandle::new(),
             new_folder: None,
             error: None,
             _subscriptions: subscriptions,
@@ -223,6 +225,7 @@ impl ListDialog {
                 .child(div().text_size(px(13.)).child(glyph))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.emoji_tab = i;
+                    this.emoji_scroll.set_offset(gpui::point(px(0.), px(0.)));
                     this.emoji_search.update(cx, |input, cx| input.set_text("", cx));
                     cx.notify();
                 }))
@@ -289,6 +292,7 @@ impl ListDialog {
                             }))
                     }))),
                 )
+                .track_scroll(&self.emoji_scroll)
                 .h(px(180.))
                 .compact(),
             )
@@ -397,8 +401,16 @@ impl Render for ListDialog {
                         Placement::BelowLeft,
                         popover(cx)
                             .min_w(px(213.))
+                            .p_0()
                             .on_mouse_down_out(cx.listener(|this, _, _, cx| this.update(cx, |this| this.open = None)))
-                            .children(items),
+                            .child(
+                                v_scroll(
+                                    ("list-dialog-dropdown-scroll", which as usize),
+                                    v_flex().id(("list-dialog-dropdown-items", which as usize)).p_1().children(items),
+                                )
+                                .max_h(px(240.))
+                                .compact(),
+                            ),
                     ))
                 })
                 .into_any_element()
@@ -636,6 +648,7 @@ pub struct FolderDialog {
     store: Rc<Store>,
     editing: Option<Id>,
     name: Entity<TextInput>,
+    error: Option<String>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -655,10 +668,13 @@ impl FolderDialog {
         let subscriptions = vec![
             cx.subscribe(&name, |this, _, _: &Submitted, cx| this.save(cx)),
             cx.subscribe(&name, |_, _, _: &Cancelled, cx| cx.emit(DialogEvent::Closed)),
-            cx.subscribe(&name, |_, _, _: &Changed, cx| cx.notify()),
+            cx.subscribe(&name, |this, _, _: &Changed, cx| {
+                this.error = None;
+                cx.notify();
+            }),
         ];
         window.focus(&name.focus_handle(cx), cx);
-        Self { store, editing, name, _subscriptions: subscriptions }
+        Self { store, editing, name, error: None, _subscriptions: subscriptions }
     }
 
     fn save(&mut self, cx: &mut Context<Self>) {
@@ -670,8 +686,12 @@ impl FolderDialog {
             Some(id) => self.store.rename_list_folder(id, &name).map(|_| id),
             None => self.store.add_list_folder(&name).map(|f| f.id),
         };
-        if let Ok(id) = result {
-            cx.emit(DialogEvent::FolderSaved(id));
+        match result {
+            Ok(id) => cx.emit(DialogEvent::FolderSaved(id)),
+            Err(err) => {
+                self.error = Some(err.to_string());
+                cx.notify();
+            }
         }
     }
 }
@@ -745,6 +765,9 @@ impl Render for FolderDialog {
                             .child(Icon::new(IconName::Folder).size(IconSize::Small).color(Color::Muted))
                             .child(div().flex_1().child(self.name.clone())),
                     )
+                    .when_some(self.error.clone(), |el, error| {
+                        el.child(div().pt_1().child(Label::new(error).size(LabelSize::XSmall).color(Color::Error)))
+                    })
                     .child(div().flex_1())
                     .child(
                         h_flex()

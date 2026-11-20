@@ -187,33 +187,7 @@ pub fn custom_start(repeat: Option<Recurrence>, date: NaiveDate) -> Recurrence {
 }
 
 /// A time typed by hand: "7", "7:45", "745", "19.30", "7pm", "7:45 am", "下午7:45".
-pub fn parse_time(text: &str) -> Option<NaiveTime> {
-    let input = text.trim().to_ascii_lowercase();
-    let (text, meridiem) = [
-        (input.strip_prefix("上午"), false),
-        (input.strip_prefix("下午"), true),
-        (input.strip_suffix("am").or_else(|| input.strip_suffix("a")), false),
-        (input.strip_suffix("pm").or_else(|| input.strip_suffix("p")), true),
-    ]
-    .into_iter()
-    .find_map(|(text, pm)| text.map(|text| (text.trim(), Some(pm))))
-    .unwrap_or((&input, None));
-    let (hour, minute) = match text.split_once([':', '.', ' ']) {
-        Some((h, m)) => (h.trim().parse::<u32>().ok()?, m.trim().parse::<u32>().ok()?),
-        None if text.len() >= 3 && text.chars().all(|c| c.is_ascii_digit()) => {
-            let (h, m) = text.split_at(text.len() - 2);
-            (h.parse().ok()?, m.parse().ok()?)
-        }
-        None => (text.parse().ok()?, 0),
-    };
-    let hour = match meridiem {
-        Some(_) if !(1..=12).contains(&hour) => return None,
-        Some(false) => hour % 12,
-        Some(true) => hour % 12 + 12,
-        None => hour,
-    };
-    NaiveTime::from_hms_opt(hour, minute, 0)
-}
+pub use crate::calendar::parse_time;
 
 /// Units of a custom reminder; all-day tasks use days and weeks, timed ones minutes to days.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

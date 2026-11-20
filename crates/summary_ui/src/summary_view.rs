@@ -1,6 +1,7 @@
 //! The Summary smart list, modeled on the original's: a report of the period's tasks on the left,
 //! its Filter and Display Options on the right, and "Copy" to take it as Markdown.
 
+use std::cell::Cell;
 use std::rc::Rc;
 
 use chrono::{Local, NaiveDate};
@@ -254,7 +255,28 @@ impl SummaryView {
 
     fn set_menu(&mut self, menu: Option<Menu>, cx: &mut Context<Self>) {
         self.menu = menu;
+        if menu != Some(Menu::More) {
+            self.more_side = None;
+        }
         cx.notify();
+    }
+
+    /// Closes the top-most open dropdown or inline prompt on Escape. Returns `true` if anything
+    /// was dismissed so callers can stop propagation.
+    pub fn dismiss_transient(&mut self, cx: &mut Context<Self>) -> bool {
+        let dismissed = if self.more_side.take().is_some() {
+            true
+        } else {
+            self.menu.take().is_some()
+                || std::mem::take(&mut self.save_menu)
+                || std::mem::take(&mut self.heading_menu)
+                || self.naming.take().is_some()
+                || self.custom.take().is_some()
+        };
+        if dismissed {
+            cx.notify();
+        }
+        dismissed
     }
 
     fn update(&mut self, cx: &mut Context<Self>, change: impl FnOnce(&mut SummaryOptions)) {
@@ -443,8 +465,8 @@ impl SummaryView {
                     .on_mouse_down_out(cx.listener(|this, _, _, cx| this.set_menu(None, cx)))
                     .child(
                         v_scroll(
-                            "summary-options-scroll-view",
-                            v_flex().id("summary-options-scroll").children(items),
+                            ("summary-options-scroll-view", menu as usize),
+                            v_flex().id(("summary-options-scroll", menu as usize)).children(items),
                         )
                         .max_h(px(280.))
                         .compact(),
@@ -641,26 +663,42 @@ impl SummaryView {
                     .into_any_element()
             }))
             .collect::<Vec<_>>();
-            let side = |index: u8, id: &'static str, label: &'static str, items: Vec<AnyElement>, cx: &mut Context<Self>| {
-                SubmenuItem::new(id, label).open(self.more_side == Some(index)).items(items).on_hover(cx.listener(
-                    move |this, hovered: &bool, _, cx| {
+            let tag_bounds = Rc::new(Cell::new(None::<gpui::Bounds<Pixels>>));
+            let priority_bounds = Rc::new(Cell::new(None::<gpui::Bounds<Pixels>>));
+            let tag_bounds_out = tag_bounds.clone();
+            let priority_bounds_out = priority_bounds.clone();
+            let side = |index: u8,
+                        id: &'static str,
+                        label: &'static str,
+                        items: Vec<AnyElement>,
+                        bounds: Rc<Cell<Option<gpui::Bounds<Pixels>>>>,
+                        cx: &mut Context<Self>| {
+                SubmenuItem::new(id, label)
+                    .open(self.more_side == Some(index))
+                    .track_bounds(bounds)
+                    .items(items)
+                    .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                         if *hovered && this.more_side != Some(index) {
                             this.more_side = Some(index);
                             cx.notify();
                         }
-                    },
-                ))
+                    }))
             };
             PopoverAttachment::new(
                 Placement::BelowRight,
                 popover(cx)
                     .min_w(px(200.))
-                    .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                    .on_mouse_down_out(cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                        if tag_bounds_out.get().is_some_and(|b| b.contains(&event.position))
+                            || priority_bounds_out.get().is_some_and(|b| b.contains(&event.position))
+                        {
+                            return;
+                        }
                         this.more_side = None;
                         this.set_menu(None, cx);
                     }))
-                    .child(side(0, "more-tag", strings.summary_tag, tag_items, cx))
-                    .child(side(1, "more-priority", strings.summary_priority, priority_items, cx)),
+                    .child(side(0, "more-tag", strings.summary_tag, tag_items, tag_bounds, cx))
+                    .child(side(1, "more-priority", strings.summary_priority, priority_items, priority_bounds, cx)),
             )
         });
         h_flex()
@@ -776,14 +814,10 @@ impl SummaryView {
         let status_index = StatusFilter::ALL.iter().position(|s| *s == options.status).unwrap_or(0);
         let grouping_index = Grouping::ALL.iter().position(|g| *g == options.grouping).unwrap_or(0);
 
-        v_flex()
-            .flex_none()
-            .w(px(320.))
-            .h_full()
+        let content = v_flex()
+            .id("summary-options-sidebar-content")
             .px_4()
-            .pt(crate::title_bar::height())
-            .border_l_1()
-            .border_color(colors.border_variant)
+            .pb_4()
             .child(heading(strings.summary_template))
             .child(self.render_templates(cx))
             .child(heading(strings.summary_filter))
@@ -861,7 +895,16 @@ impl SummaryView {
                     .child(div().flex_1().child(Label::new(strings.summary_next_period).weight(FontWeight::SEMIBOLD)))
                     .child(Switch::new().toggle_state(options.next_period))
                     .on_click(cx.listener(|this, _, _, cx| this.update(cx, |o| o.next_period = !o.next_period))),
-            )
+            );
+
+        v_flex()
+            .flex_none()
+            .w(px(320.))
+            .h_full()
+            .pt(crate::title_bar::height())
+            .border_l_1()
+            .border_color(colors.border_variant)
+            .child(v_scroll("summary-options-sidebar-scroll", content).flex_1().min_h_0())
     }
 }
 
@@ -931,6 +974,11 @@ impl Render for SummaryView {
         h_flex()
             .size_full()
             .items_start()
+            .on_action(cx.listener(|this, _: &md::DismissTransient, _, cx| {
+                if !this.dismiss_transient(cx) {
+                    cx.propagate();
+                }
+            }))
             .child(
                 v_flex()
                     .flex_1()
@@ -951,6 +999,7 @@ impl Render for SummaryView {
                             .min_h_0()
                             .mx_4()
                             .rounded(px(8.))
+                            .overflow_hidden()
                             .border_1()
                             .border_color(colors.border_variant)
                             .child(self.render_toolbar(cx))

@@ -19,7 +19,6 @@ fern_core.workspace = true
 fern_i18n.workspace = true
 futures.workspace = true
 gpui.workspace = true
-icons.workspace = true
 resvg.workspace = true
 serde.workspace = true
 serde_json.workspace = true

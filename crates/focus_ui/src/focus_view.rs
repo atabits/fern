@@ -10,7 +10,7 @@ use chrono::{Datelike, Local, NaiveDate};
 use fern_core::stats::{self, Bucket};
 use fern_core::{FocusSession, Id, Store, Task, View, focus_stats, format_minutes};
 use gpui::{Entity, Focusable as _, FontWeight, ScrollHandle, Task as GpuiTask};
-use ui::{Donut, Placement, PopoverAttachment, VerticalScrollbar, popover};
+use ui::{Donut, Placement, PopoverAttachment, popover};
 use ui::prelude::*;
 
 use crate::focus_timer::{BreakKind, DEFAULT_LONG_BREAK_EVERY, FocusCycle, FocusTimer, MIN_FOCUS_MS, format_clock, pomo_length_ms};
@@ -56,6 +56,7 @@ type FocusTask = (Option<Id>, String);
 
 pub struct FocusView {
     store: Rc<Store>,
+    focus_handle: gpui::FocusHandle,
     tasks: Vec<Task>,
     sessions: Vec<FocusSession>,
     /// What the Statistics page reads, loaded with the view rather than on every frame.
@@ -304,6 +305,12 @@ enum RecordMenu {
     Settings,
 }
 
+impl gpui::Focusable for FocusView {
+    fn focus_handle(&self, _: &App) -> gpui::FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
 impl FocusView {
     pub fn new(store: Rc<Store>, cx: &mut Context<Self>) -> Self {
         let strings = i18n::t(cx);
@@ -311,6 +318,7 @@ impl FocusView {
         let add_start = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.focus_record_start, cx));
         let mut this = Self {
             store,
+            focus_handle: cx.focus_handle(),
             tasks: Vec::new(),
             sessions: Vec::new(),
             stats_data: StatsData::default(),
@@ -1649,6 +1657,16 @@ impl FocusView {
         }
     }
 
+    fn bind_focus_root<E: InteractiveElement>(&self, el: E, cx: &mut Context<Self>) -> E {
+        el.track_focus(&self.focus_handle)
+            .key_context("Focus")
+            .on_action(cx.listener(|this, _: &crate::actions::DismissTransient, _, cx| {
+                if !this.dismiss_transient(cx) {
+                    cx.propagate();
+                }
+            }))
+    }
+
     pub fn dismiss_transient(&mut self, cx: &mut Context<Self>) -> bool {
         if self.stats.as_mut().is_some_and(|stats| {
             stats.curve_menu.take().is_some()
@@ -1666,10 +1684,12 @@ impl FocusView {
             || self.open_record.take().is_some()
             || self.batch_menu.take().is_some()
             || self.batch_custom.take().is_some()
-            || std::mem::take(&mut self.finish_prompt)
         {
             self.delete_all_armed = false;
             cx.notify();
+            true
+        } else if self.finish_prompt {
+            // Keep the unsaved session prompt open so Escape does not discard focus work.
             true
         } else if self.stats.is_some() {
             self.close_stats(cx)
@@ -2017,6 +2037,7 @@ impl FocusView {
                                             "stats-focus-record-scroll",
                                             v_flex()
                                                 .id("stats-focus-record")
+                                                .pr(px(14.))
                                                 .children(self.render_record(strings, cx)),
                                         )
                                         .max_h(px(200.))
@@ -2029,36 +2050,27 @@ impl FocusView {
                     .child(h_flex().items_start().gap_4().child(most_focused).child(year_grid)),
             });
 
-        v_flex()
-            .size_full()
-            .key_context("Focus")
-            .on_action(cx.listener(|this, _: &crate::actions::DismissTransient, _, cx| {
-                if !this.dismiss_transient(cx) {
-                    cx.propagate();
-                }
-            }))
+        self.bind_focus_root(v_flex().size_full(), cx)
             .items_center()
             .bg(theme.colors().background)
             .text_color(theme.colors().text)
             .child(header)
             .child(
-                div()
-                    .relative()
-                    .w_full()
-                    .flex_1()
-                    .min_h_0()
-                    .child(
-                        h_flex()
-                            .id(("focus-stats", page.tab))
-                            .debug_selector(|| "statistics-scroll".to_owned())
-                            .size_full()
-                            .items_start()
-                            .justify_center()
-                            .overflow_y_scroll()
-                            .track_scroll(&self.stats_scroll)
-                            .child(content),
-                    )
-                    .child(VerticalScrollbar::for_handle(("focus-stats-bar", page.tab), self.stats_scroll.clone())),
+                v_scroll(
+                    ("focus-stats-bar", page.tab),
+                    div()
+                        .id(("focus-stats", page.tab))
+                        .debug_selector(|| "statistics-scroll".to_owned())
+                        .w_full()
+                        .flex()
+                        .items_start()
+                        .justify_center()
+                        .child(content),
+                )
+                .track_scroll(&self.stats_scroll)
+                .w_full()
+                .flex_1()
+                .min_h_0(),
             )
             .into_any_element()
     }
@@ -3275,7 +3287,16 @@ impl FocusView {
                     .child(Icon::new(IconName::Search).size(IconSize::Small).color(Color::Muted))
                     .child(div().flex_1().child(picker.search.clone())),
             )
-            .child(v_scroll("focus-picker-items-scroll", v_flex().id("focus-picker-items").children(items)).flex_1().min_h_0())
+            .child(
+                v_scroll(
+                    ("focus-picker-items-scroll", self.picker_tab * 2 + usize::from(picker.views_open)),
+                    v_flex()
+                        .id(("focus-picker-items", self.picker_tab * 2 + usize::from(picker.views_open)))
+                        .children(items),
+                )
+                .flex_1()
+                .min_h_0(),
+            )
             .into_any_element()
     }
 
@@ -3497,15 +3518,7 @@ impl FocusView {
                     ),
             )
             .child(v_scroll("focus-page-hours-scroll", v_flex().id("focus-page-hours").pt_2().child(hours)).flex_1().min_h_0());
-        h_flex()
-            .relative()
-            .size_full()
-            .key_context("Focus")
-            .on_action(cx.listener(|this, _: &crate::actions::DismissTransient, _, cx| {
-                if !this.dismiss_transient(cx) {
-                    cx.propagate();
-                }
-            }))
+        self.bind_focus_root(h_flex().relative().size_full(), cx)
             .bg(theme.colors().background)
             .text_color(theme.colors().text)
             .child(left)
@@ -3725,6 +3738,7 @@ impl Render for FocusView {
                     "focus-record-scroll",
                     v_flex()
                         .id("focus-record")
+                        .pr(px(14.))
                         .when(record.is_empty(), |el| {
                             el.child(div().pt_4().child(Label::new(strings.focus_no_record).color(Color::Muted)))
                         })
@@ -3734,15 +3748,7 @@ impl Render for FocusView {
                 .min_h_0(),
             );
 
-        h_flex()
-            .relative()
-            .size_full()
-            .key_context("Focus")
-            .on_action(cx.listener(|this, _: &crate::actions::DismissTransient, _, cx| {
-                if !this.dismiss_transient(cx) {
-                    cx.propagate();
-                }
-            }))
+        self.bind_focus_root(h_flex().relative().size_full(), cx)
             .items_start()
             .bg(theme.colors().background)
             .text_color(theme.colors().text)

@@ -7,8 +7,15 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use anyhow::{Context as _, Result};
-use gpui::{Action as _, App, AssetSource, Global, KeyBinding, KeyBindingContextPredicate, NoAction};
+use gpui::{
+    Action as _, App, AssetSource, Global, KeyBinding, KeyBindingContextPredicate,
+    KeyBindingMetaIndex, Keystroke, NoAction,
+};
 use serde::Deserialize;
+
+/// Precedence layers matching GPUI's `KeyBindingMetaIndex` convention (lower index wins).
+const USER_META: KeyBindingMetaIndex = KeyBindingMetaIndex(0);
+const DEFAULT_META: KeyBindingMetaIndex = KeyBindingMetaIndex(1);
 
 pub const DEFAULT_KEYMAP_PATH: &str = "keymaps/default.json";
 pub const USER_KEYMAP_FILE: &str = "keymap.json";
@@ -43,6 +50,11 @@ struct KeymapErrors(Vec<String>);
 
 impl Global for KeymapErrors {}
 
+#[derive(Default)]
+struct CachedShortcuts(Vec<(&'static str, Vec<String>)>);
+
+impl Global for CachedShortcuts {}
+
 /// Any errors collected during the last keymap load or reload.
 pub fn errors(cx: &App) -> &[String] {
     cx.try_global::<KeymapErrors>().map_or(&[], |state| state.0.as_slice())
@@ -50,6 +62,12 @@ pub fn errors(cx: &App) -> &[String] {
 
 pub fn set_errors(errors: Vec<String>, cx: &mut App) {
     cx.set_global(KeymapErrors(errors));
+}
+
+/// Cached display list of active shortcuts from the last keymap load/reload (no disk I/O).
+pub fn cached_shortcuts(cx: &App) -> &[(&'static str, Vec<String>)] {
+    cx.try_global::<CachedShortcuts>()
+        .map_or(&[], |state| state.0.as_slice())
 }
 
 pub fn user_keymap_path() -> Result<PathBuf> {
@@ -76,19 +94,33 @@ fn ensure_user_keymap_file_at(path: &std::path::Path) -> Result<()> {
 }
 
 /// Clears active bindings and reloads `default.json` plus optional `<data_dir>/keymap.json`,
-/// storing any parse or action errors in app state for display in the Shortcuts panel.
+/// storing any parse or action errors and the resolved shortcut list in app state.
 pub fn reload(assets: &dyn AssetSource, cx: &mut App) -> Result<Vec<String>> {
-    let user_keymap = user_keymap_path()
-        .ok()
-        .and_then(|path| std::fs::read_to_string(path).ok());
+    let mut read_errors = Vec::new();
+    let user_keymap = match user_keymap_path() {
+        Ok(path) => match std::fs::read_to_string(&path) {
+            Ok(contents) => Some(contents),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) => {
+                read_errors.push(format!("{USER_KEYMAP_FILE}: {err}"));
+                None
+            }
+        },
+        Err(err) => {
+            read_errors.push(format!("{USER_KEYMAP_FILE}: {err}"));
+            None
+        }
+    };
     cx.clear_key_bindings();
     match load_with_user(assets, user_keymap.as_deref(), cx) {
-        Ok(errors) => {
-            set_errors(errors.clone(), cx);
-            Ok(errors)
+        Ok(mut errors) => {
+            read_errors.append(&mut errors);
+            set_errors(read_errors.clone(), cx);
+            Ok(read_errors)
         }
         Err(err) => {
-            set_errors(vec![err.to_string()], cx);
+            read_errors.push(err.to_string());
+            set_errors(read_errors, cx);
             Err(err)
         }
     }
@@ -133,64 +165,19 @@ pub fn shortcut_list(source: &str) -> Result<Vec<(&'static str, Vec<String>)>> {
     shortcut_list_with_user(source, None)
 }
 
-/// Strips `//` and `/* ... */` JSONC comments while preserving string literals and newlines
-/// (so line numbers in JSON parse errors stay accurate).
-fn strip_json_comments(source: &str) -> String {
-    let mut out = String::with_capacity(source.len());
-    let mut chars = source.chars().peekable();
-    let mut in_string = false;
-    let mut escaped = false;
-    while let Some(ch) = chars.next() {
-        if in_string {
-            out.push(ch);
-            if escaped {
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == '"' {
-                in_string = false;
-            }
-            continue;
-        }
-        if ch == '"' {
-            in_string = true;
-            out.push(ch);
-        } else if ch == '/' && chars.peek() == Some(&'/') {
-            chars.next();
-            for next in chars.by_ref() {
-                if next == '\n' {
-                    out.push('\n');
-                    break;
-                }
-            }
-        } else if ch == '/' && chars.peek() == Some(&'*') {
-            chars.next();
-            while let Some(next) = chars.next() {
-                if next == '\n' {
-                    out.push('\n');
-                } else if next == '*' && chars.peek() == Some(&'/') {
-                    chars.next();
-                    break;
-                }
-            }
-        } else {
-            out.push(ch);
-        }
-    }
-    out
-}
-
 /// The keys bound to each listed action after applying optional user `keymap.json` overrides and
 /// `null` unbindings on top of the default keymap.
 pub fn shortcut_list_with_user(
     default_source: &str,
     user_source: Option<&str>,
 ) -> Result<Vec<(&'static str, Vec<String>)>> {
+    let cleaned_default = theme::strip_jsonc(default_source).context("invalid keymap JSONC")?;
     let mut sections: Vec<KeymapSection> =
-        serde_json::from_str(&strip_json_comments(default_source)).context("invalid keymap JSON")?;
-    if let Some(user_source) = user_source.map(strip_json_comments)
-        && !user_source.trim().is_empty()
-        && let Ok(user_sections) = serde_json::from_str::<Vec<KeymapSection>>(&user_source)
+        serde_json::from_str(&cleaned_default).context("invalid keymap JSON")?;
+    if let Some(user_source) = user_source
+        && let Ok(cleaned_user) = theme::strip_jsonc(user_source)
+        && !cleaned_user.trim().is_empty()
+        && let Ok(user_sections) = serde_json::from_str::<Vec<KeymapSection>>(&cleaned_user)
     {
         sections.extend(user_sections);
     }
@@ -227,32 +214,70 @@ pub fn shortcut_list_with_user(
         .collect())
 }
 
-/// "secondary-n" → "Ctrl+N" (⌘N on macOS), "down" → "↓", "space" → "Space".
-pub fn display_keys(keystroke: &str) -> String {
-    // A sequence ("tab m") reads "Tab, M".
-    if keystroke.contains(' ') {
-        return keystroke.split(' ').map(display_keys).collect::<Vec<_>>().join(", ");
+fn format_key_name(key: &str) -> String {
+    match key {
+        "down" => "↓".to_owned(),
+        "up" => "↑".to_owned(),
+        "left" => "←".to_owned(),
+        "right" => "→".to_owned(),
+        "delete" => "Del".to_owned(),
+        "escape" => "Esc".to_owned(),
+        "space" => "Space".to_owned(),
+        "enter" => "Enter".to_owned(),
+        "tab" => "Tab".to_owned(),
+        "backspace" => "Backspace".to_owned(),
+        other => {
+            let mut chars = other.chars();
+            chars.next().map_or_else(String::new, |c| c.to_uppercase().chain(chars).collect())
+        }
     }
-    keystroke
-        .split('-')
-        .map(|part| match part {
-            "secondary" => if cfg!(target_os = "macos") { "⌘".to_owned() } else { "Ctrl".to_owned() },
-            "ctrl" => "Ctrl".to_owned(),
-            "shift" => "Shift".to_owned(),
-            "alt" => "Alt".to_owned(),
-            "down" => "↓".to_owned(),
-            "up" => "↑".to_owned(),
-            "left" => "←".to_owned(),
-            "right" => "→".to_owned(),
-            "delete" => "Del".to_owned(),
-            "escape" => "Esc".to_owned(),
-            other => {
-                let mut chars = other.chars();
-                chars.next().map_or_else(String::new, |c| c.to_uppercase().chain(chars).collect())
+}
+
+fn display_single_keystroke(raw: &str) -> String {
+    if let Ok(ks) = Keystroke::parse(raw) {
+        let mut parts: Vec<String> = Vec::new();
+        if cfg!(target_os = "macos") {
+            if ks.modifiers.control {
+                parts.push("⌃".to_owned());
             }
-        })
-        .collect::<Vec<_>>()
-        .join(if cfg!(target_os = "macos") { "" } else { "+" })
+            if ks.modifiers.alt {
+                parts.push("⌥".to_owned());
+            }
+            if ks.modifiers.shift {
+                parts.push("⇧".to_owned());
+            }
+            if ks.modifiers.platform {
+                parts.push("⌘".to_owned());
+            }
+            parts.push(format_key_name(&ks.key));
+            return parts.concat();
+        }
+        if ks.modifiers.control {
+            parts.push("Ctrl".to_owned());
+        }
+        if ks.modifiers.alt {
+            parts.push("Alt".to_owned());
+        }
+        if ks.modifiers.shift {
+            parts.push("Shift".to_owned());
+        }
+        if ks.modifiers.platform {
+            parts.push("Win".to_owned());
+        }
+        parts.push(format_key_name(&ks.key));
+        return parts.join("+");
+    }
+    // Fallback for any unparseable keystroke token.
+    format_key_name(raw)
+}
+
+/// "secondary-n" → "Ctrl+N" (`⌘N` on macOS), "down" → "↓", "space" → "Space".
+pub fn display_keys(keystroke: &str) -> String {
+    let chords: Vec<String> = keystroke
+        .split_whitespace()
+        .map(display_single_keystroke)
+        .collect();
+    chords.join(", ")
 }
 
 #[derive(Deserialize)]
@@ -280,18 +305,27 @@ pub fn load_with_user(
     let source = assets
         .load(DEFAULT_KEYMAP_PATH)?
         .with_context(|| format!("{DEFAULT_KEYMAP_PATH} is missing"))?;
-    let mut errors = load(std::str::from_utf8(&source)?, cx)?;
-    if let Some(user_source) = user_source.map(str::trim).filter(|s| !s.is_empty()) {
-        match load(user_source, cx) {
+    let default_str = std::str::from_utf8(&source)?;
+    let mut errors = load_with_meta(default_str, DEFAULT_META, cx)?;
+    let trimmed_user = user_source.map(str::trim).filter(|s| !s.is_empty());
+    if let Some(user_src) = trimmed_user {
+        match load_with_meta(user_src, USER_META, cx) {
             Ok(user_errors) => errors.extend(user_errors),
             Err(err) => errors.push(format!("{USER_KEYMAP_FILE}: {err}")),
         }
+    }
+    if let Ok(shortcuts) = shortcut_list_with_user(default_str, trimmed_user) {
+        cx.set_global(CachedShortcuts(shortcuts));
     }
     Ok(errors)
 }
 
 pub fn load(source: &str, cx: &mut App) -> Result<Vec<String>> {
-    let cleaned = strip_json_comments(source);
+    load_with_meta(source, USER_META, cx)
+}
+
+fn load_with_meta(source: &str, meta: KeyBindingMetaIndex, cx: &mut App) -> Result<Vec<String>> {
+    let cleaned = theme::strip_jsonc(source).context("invalid keymap JSONC")?;
     let sections: Vec<KeymapSection> = serde_json::from_str(&cleaned).context("invalid keymap JSON")?;
     let mut bindings = Vec::new();
     let mut errors = Vec::new();
@@ -323,7 +357,7 @@ pub fn load(source: &str, cx: &mut App) -> Result<Vec<String>> {
                 None,
                 cx.keyboard_mapper().as_ref(),
             ) {
-                Ok(binding) => bindings.push(binding),
+                Ok(binding) => bindings.push(binding.with_meta(meta)),
                 Err(err) => errors.push(format!("{keystrokes}: {err}")),
             }
         }
@@ -345,8 +379,14 @@ mod tests {
         next.sort();
         assert_eq!(next, ["J", "↓"]);
         assert_eq!(keys("task_list::PinTask"), ["Tab, P"]);
-        if !cfg!(target_os = "macos") {
+        if cfg!(target_os = "macos") {
+            assert_eq!(super::display_keys("secondary-shift-p"), "⇧⌘P");
+            assert_eq!(super::display_keys("ctrl-shift-m"), "⌃⇧M");
+            assert_eq!(super::display_keys("secondary--"), "⌘-");
+        } else {
             assert_eq!(super::display_keys("secondary-shift-p"), "Ctrl+Shift+P");
+            assert_eq!(super::display_keys("ctrl-shift-m"), "Ctrl+Shift+M");
+            assert_eq!(super::display_keys("secondary--"), "Ctrl+-");
         }
     }
 

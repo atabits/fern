@@ -1154,7 +1154,14 @@ impl AppView {
                             .on_click(cx.listener(|this, _, _, cx| this.toggle_shortcuts(cx))),
                     ),
             )
-            .child(v_flex().id("shortcut-list").flex_1().min_h_0().overflow_y_scroll().px_4().pb_4().child(body))
+            .child(
+                v_scroll(
+                    "shortcut-list-scroll",
+                    v_flex().id("shortcut-list").px_4().pb_4().child(body),
+                )
+                .flex_1()
+                .min_h_0(),
+            )
             .into_any_element()
     }
 
@@ -1408,39 +1415,44 @@ impl AppView {
                 el.child(div().px_2().py_3().child(Label::new(strings.no_notifications).color(Color::Muted)))
             })
             .child(
-                v_flex().id("notices").overflow_y_scroll().children(self.notices.items.iter().enumerate().map(|(i, notice)| {
-                    let target = notice.target;
-                    let (when, _) = crate::task_rows::due_label(notice.at.date(), Some(notice.at.time()), today, strings);
-                    let actions = reminders::actions(&self.store, target);
-                    let buttons = actions.iter().map(|&action| {
-                        let notice = notice.clone();
-                        div()
-                            .id(SharedString::from(format!("notice-{i}-{}", action.key())))
-                            .px_2()
-                            .py_0p5()
-                            .rounded(px(4.))
-                            .border_1().border_color(theme.colors().border)
-                            .hover(|s| s.bg(theme.colors().element_hover))
-                            .cursor_pointer()
-                            .child(Label::new(action.label(strings)).size(LabelSize::Small))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                cx.stop_propagation();
-                                this.answer_notice(&notice, Reply::Action(action), window, cx);
-                            }))
-                    });
-                    ListItem::new(SharedString::from(format!("notice-{i}")))
-                        .height(px(if actions.is_empty() { 44. } else { 72. }))
-                        .start_slot(Icon::new(IconName::AlarmClock).color(Color::Accent))
-                        .child(
-                            v_flex()
-                                .min_w_0()
-                                .py_1()
-                                .child(Label::new(notice.title.clone()).truncate())
-                                .child(Label::new(when).size(LabelSize::XSmall).color(Color::Muted))
-                                .child(h_flex().gap_1().children(buttons)),
-                        )
-                        .on_click(cx.listener(move |this, _, window, cx| this.open_notice(target, window, cx)))
-                })),
+                v_scroll(
+                    "notices-scroll",
+                    v_flex().id("notices").children(self.notices.items.iter().enumerate().map(|(i, notice)| {
+                        let target = notice.target;
+                        let (when, _) = crate::task_rows::due_label(notice.at.date(), Some(notice.at.time()), today, strings);
+                        let actions = reminders::actions(&self.store, target);
+                        let buttons = actions.iter().map(|&action| {
+                            let notice = notice.clone();
+                            div()
+                                .id(SharedString::from(format!("notice-{i}-{}", action.key())))
+                                .px_2()
+                                .py_0p5()
+                                .rounded(px(4.))
+                                .border_1().border_color(theme.colors().border)
+                                .hover(|s| s.bg(theme.colors().element_hover))
+                                .cursor_pointer()
+                                .child(Label::new(action.label(strings)).size(LabelSize::Small))
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    cx.stop_propagation();
+                                    this.answer_notice(&notice, Reply::Action(action), window, cx);
+                                }))
+                        });
+                        ListItem::new(SharedString::from(format!("notice-{i}")))
+                            .height(px(if actions.is_empty() { 44. } else { 72. }))
+                            .start_slot(Icon::new(IconName::AlarmClock).color(Color::Accent))
+                            .child(
+                                v_flex()
+                                    .min_w_0()
+                                    .py_1()
+                                    .child(Label::new(notice.title.clone()).truncate())
+                                    .child(Label::new(when).size(LabelSize::XSmall).color(Color::Muted))
+                                    .child(h_flex().gap_1().children(buttons)),
+                            )
+                            .on_click(cx.listener(move |this, _, window, cx| this.open_notice(target, window, cx)))
+                    })),
+                )
+                .min_h_0()
+                .compact(),
             )
             .into_any_element()
     }

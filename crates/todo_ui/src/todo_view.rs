@@ -11,7 +11,7 @@ use crate::drag::{
     DraggedColumn, DraggedFilter, DraggedFolder, DraggedList, DraggedParentTag,
     DraggedSidebarSection, DraggedSmartList, DraggedTag, DraggedTask,
 };
-use ui::{Placement, PopoverAttachment, SubmenuItem, popover};
+use ui::{HorizontalScrollbar, Placement, PopoverAttachment, SubmenuItem, VerticalScrollbar, popover};
 
 use crate::actions::{
     AddSubtask, ClearDate, DeleteTask, DismissTransient, PinTask, PriorityHigh, PriorityLow, PriorityMedium,
@@ -433,7 +433,7 @@ impl TodoView {
             collapsed_days: HashSet::new(),
             input,
             list_focus: cx.focus_handle(),
-            list_state: ListState::new(0, ListAlignment::Top, px(400.)),
+            list_state: Self::new_list_state(),
             list_entries: Vec::new(),
             list_entry_bounds: Rc::new(RefCell::new(HashMap::new())),
             task_drag_origin: None,
@@ -1079,7 +1079,7 @@ impl TodoView {
         let lists = self.active_lists();
         if switched {
             self.reset_view_transients(cx);
-            self.list_state = ListState::new(0, ListAlignment::Top, px(400.));
+            self.list_state = Self::new_list_state();
             self.list_entries.clear();
             let selected = self.default_task_for_view(cx);
             self.selected = selected.as_ref().map(|t| t.id);
@@ -1454,16 +1454,23 @@ impl TodoView {
         }
         if open == Some(0) && !duration {
             let times = std::iter::once(None).chain(crate::due_picker::time_options().into_iter().map(Some));
-            rows = rows.child(v_flex().id("add-date-times").max_h(px(150.)).overflow_y_scroll().children(times.map(|time| {
-                let label = time.map_or(strings.no_time.to_owned(), |time| crate::calendar::format_time(time, strings));
-                choice(SharedString::from(format!("add-time-{label}")), label, draft.time == time).on_click(cx.listener(move |this, _, _, cx| {
-                    this.add_draft.time = time;
-                    this.add_draft.date.get_or_insert_with(Self::today);
-                    this.add_draft.reminders = None;
-                    this.add_date_row = None;
-                    cx.notify();
-                }))
-            })));
+            rows = rows.child(
+                v_scroll(
+                    "add-date-times-scroll",
+                    v_flex().id("add-date-times").children(times.map(|time| {
+                        let label = time.map_or(strings.no_time.to_owned(), |time| crate::calendar::format_time(time, strings));
+                        choice(SharedString::from(format!("add-time-{label}")), label, draft.time == time).on_click(cx.listener(move |this, _, _, cx| {
+                            this.add_draft.time = time;
+                            this.add_draft.date.get_or_insert_with(Self::today);
+                            this.add_draft.reminders = None;
+                            this.add_date_row = None;
+                            cx.notify();
+                        }))
+                    })),
+                )
+                .max_h(px(150.))
+                .compact(),
+            );
         }
         rows = rows.child(row(1, IconName::AlarmClock, reminder_label, draft.reminders.as_ref().is_some_and(|r| !r.is_empty())));
         if open == Some(1) {
@@ -1765,23 +1772,26 @@ impl TodoView {
             Some(field @ (RangeField::StartTime | RangeField::EndTime)) => {
                 let current = if field == RangeField::EndTime { range.end_time } else { range.time };
                 Some(
-                    v_flex()
-                        .id("add-range-times")
-                        .max_h(px(180.))
-                        .overflow_y_scroll()
-                        .children(crate::due_picker::time_options().into_iter().map(|t| {
-                            ListItem::new(SharedString::from(format!("add-range-time-{t}")))
-                                .height(px(28.))
-                                .child(Label::new(crate::calendar::format_time(t, strings)).size(LabelSize::Small))
-                                .when(current == Some(t), |item| item.end_slot(Icon::new(IconName::Check).size(IconSize::Small).color(Color::Accent)))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    if let Some(range) = this.add_range.as_mut() {
-                                        range.pick_range_time(t);
-                                    }
-                                    cx.notify();
-                                }))
-                        }))
-                        .into_any_element(),
+                    v_scroll(
+                        "add-range-times-scroll",
+                        v_flex()
+                            .id("add-range-times")
+                            .children(crate::due_picker::time_options().into_iter().map(|t| {
+                                ListItem::new(SharedString::from(format!("add-range-time-{t}")))
+                                    .height(px(28.))
+                                    .child(Label::new(crate::calendar::format_time(t, strings)).size(LabelSize::Small))
+                                    .when(current == Some(t), |item| item.end_slot(Icon::new(IconName::Check).size(IconSize::Small).color(Color::Accent)))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        if let Some(range) = this.add_range.as_mut() {
+                                            range.pick_range_time(t);
+                                        }
+                                        cx.notify();
+                                    }))
+                            })),
+                    )
+                    .max_h(px(180.))
+                    .compact()
+                    .into_any_element(),
                 )
             }
             None => None,
@@ -2224,7 +2234,14 @@ impl TodoView {
                     .child(Icon::new(IconName::Search).size(IconSize::Small).color(Color::Muted))
                     .child(div().flex_1().child(self.add_tag_input.clone())),
             )
-            .child(v_flex().id("add-tag-list").max_h(px(240.)).overflow_y_scroll().py_1().children(rows))
+            .child(
+                v_scroll(
+                    "add-tag-list-scroll",
+                    v_flex().id("add-tag-list").py_1().children(rows),
+                )
+                .max_h(px(240.))
+                .compact(),
+            )
             .child(
                 h_flex()
                     .p_2()
@@ -2314,12 +2331,20 @@ impl TodoView {
     /// Tells the list which entries changed since it last drew: the ones between the unchanged
     /// start and end get measured again, and the scroll position stays put. Habits and
     /// countdowns are read elsewhere, so they are always measured again.
+    fn new_list_state() -> ListState {
+        ListState::new(0, ListAlignment::Top, px(400.)).measure_all()
+    }
+
     fn sync_list(&mut self, entries: Vec<ListEntry>) {
         let old = &self.list_entries;
         let start = old.iter().zip(&entries).take_while(|(a, b)| a == b).count();
         let end = old[start..].iter().rev().zip(entries[start..].iter().rev()).take_while(|(a, b)| a == b).count();
         if start < old.len() || old.len() != entries.len() {
-            self.list_state.splice(start..old.len() - end, entries.len() - start - end);
+            let inserted = entries.len() - start - end;
+            self.list_state.splice(start..old.len() - end, inserted);
+            if inserted > 0 {
+                self.list_state.remeasure_items(start..start + inserted);
+            }
         }
         for (ix, entry) in entries.iter().enumerate() {
             if !matches!(entry, ListEntry::Row(_)) {
@@ -3496,15 +3521,17 @@ impl TodoView {
                     }))),
             )
             .child(
-                v_flex()
-                    .id("list-activity")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .px_5()
-                    .pb_4()
-                    .when(entries.is_empty(), |el| el.child(div().pt_4().child(Label::new(strings.stats_no_data).color(Color::Muted))))
-                    .children(items),
+                v_scroll(
+                    "list-activity-scroll",
+                    v_flex()
+                        .id("list-activity")
+                        .px_5()
+                        .pb_4()
+                        .when(entries.is_empty(), |el| el.child(div().pt_4().child(Label::new(strings.stats_no_data).color(Color::Muted))))
+                        .children(items),
+                )
+                .flex_1()
+                .min_h_0(),
             )
             .into_any_element()
     }
@@ -3643,49 +3670,52 @@ impl TodoView {
             .right(px(12.))
             .bottom(px(12.))
             .child(
-                v_flex()
-                    .id("suggested-tasks")
-                    .w(px(370.))
-                    .max_h(px(560.))
-                    .overflow_y_scroll()
-                    .p_4()
-                    .gap_2()
-                    .rounded(px(10.))
-                    .bg(theme.colors().elevated_surface_background)
-                    .border_1()
-                    .border_color(theme.colors().border)
-                    .shadow_lg()
-                    .child(
-                        h_flex()
-                            .child(div().flex_1().text_size(px(16.)).font_weight(FontWeight::SEMIBOLD).child(strings.suggested_tasks))
-                            .child(IconButton::new("suggestions-x", IconName::X).icon_color(Color::Muted).on_click(cx.listener(|this, _, _, cx| {
-                                this.suggestions_open = None;
-                                cx.notify();
-                            }))),
-                    )
-                    .when(recent.is_empty() && long.is_empty(), |el| el.child(Label::new(strings.no_suggestions).color(Color::Muted)))
-                    .when(!recent.is_empty(), |el| el.child(heading(strings.recently_added)).children(recent))
-                    .when(!long.is_empty(), |el| {
-                        el.child(
+                v_scroll(
+                    "suggested-tasks-scroll",
+                    v_flex()
+                        .id("suggested-tasks")
+                        .p_4()
+                        .gap_2()
+                        .child(
                             h_flex()
-                                .pt_2()
-                                .child(div().flex_1().child(heading(strings.long_unfinished)))
-                                .when(more, |el| {
-                                    el.child(
-                                        h_flex()
-                                            .id("suggestions-more")
-                                            .cursor_pointer()
-                                            .child(Label::new(strings.more).size(LabelSize::Small).color(Color::Muted))
-                                            .child(Icon::new(IconName::ChevronRight).size(IconSize::XSmall).color(Color::Muted))
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.suggestions_open = Some(true);
-                                                cx.notify();
-                                            })),
-                                    )
-                                }),
+                                .child(div().flex_1().text_size(px(16.)).font_weight(FontWeight::SEMIBOLD).child(strings.suggested_tasks))
+                                .child(IconButton::new("suggestions-x", IconName::X).icon_color(Color::Muted).on_click(cx.listener(|this, _, _, cx| {
+                                    this.suggestions_open = None;
+                                    cx.notify();
+                                }))),
                         )
-                        .children(long)
-                    }),
+                        .when(recent.is_empty() && long.is_empty(), |el| el.child(Label::new(strings.no_suggestions).color(Color::Muted)))
+                        .when(!recent.is_empty(), |el| el.child(heading(strings.recently_added)).children(recent))
+                        .when(!long.is_empty(), |el| {
+                            el.child(
+                                h_flex()
+                                    .pt_2()
+                                    .child(div().flex_1().child(heading(strings.long_unfinished)))
+                                    .when(more, |el| {
+                                        el.child(
+                                            h_flex()
+                                                .id("suggestions-more")
+                                                .cursor_pointer()
+                                                .child(Label::new(strings.more).size(LabelSize::Small).color(Color::Muted))
+                                                .child(Icon::new(IconName::ChevronRight).size(IconSize::XSmall).color(Color::Muted))
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.suggestions_open = Some(true);
+                                                    cx.notify();
+                                                })),
+                                        )
+                                    }),
+                            )
+                            .children(long)
+                        }),
+                )
+                .w(px(370.))
+                .max_h(px(560.))
+                .rounded(px(10.))
+                .bg(theme.colors().elevated_surface_background)
+                .border_1()
+                .border_color(theme.colors().border)
+                .shadow_lg()
+                .overflow_hidden(),
             )
             .into_any_element()
     }
@@ -4774,7 +4804,10 @@ impl TodoView {
             .min_h(px(200.))
             .child(div().w(px(LABEL_WIDTH)).flex_none())
             .child(div().flex_1().h_full().mr(px(20.)).relative().overflow_hidden().child(backdrop(usize::MAX, px(4000.), cx)));
-        let timeline = v_flex().id("timeline").flex_1().min_w_0().h_full().overflow_y_scroll().child(header).children(rows).child(filler);
+        let timeline = v_scroll("timeline-scroll", v_flex().id("timeline").child(header).children(rows).child(filler))
+            .flex_1()
+            .min_w_0()
+            .h_full();
         h_flex()
             .flex_1()
             .min_h_0()
@@ -4846,27 +4879,29 @@ impl TodoView {
                 }
             }
         }
-        v_flex()
-            .id("arrange-tasks")
-            .w(px(220.))
-            .flex_none()
-            .h_full()
-            .px_2()
-            .pt_2()
-            .gap_1()
-            .border_l_1()
-            .border_color(theme.colors().border_variant)
-            .overflow_y_scroll()
-            .child(
-                h_flex()
-                    .child(div().flex_1().child(Label::new(strings.arrange_tasks).weight(FontWeight::SEMIBOLD)))
-                    .child(IconButton::new("arrange-close", IconName::X).size(px(22.)).icon_size(IconSize::Small).on_click(cx.listener(|this, _, _, cx| {
-                        this.arrange_open = false;
-                        cx.notify();
-                    }))),
-            )
-            .children(items)
-            .into_any_element()
+        v_scroll(
+            "todo-arrange-tasks-scroll",
+            v_flex()
+                .id("arrange-tasks")
+                .px_2()
+                .pt_2()
+                .gap_1()
+                .child(
+                    h_flex()
+                        .child(div().flex_1().child(Label::new(strings.arrange_tasks).weight(FontWeight::SEMIBOLD)))
+                        .child(IconButton::new("arrange-close", IconName::X).size(px(22.)).icon_size(IconSize::Small).on_click(cx.listener(|this, _, _, cx| {
+                            this.arrange_open = false;
+                            cx.notify();
+                        }))),
+                )
+                .children(items),
+        )
+        .w(px(220.))
+        .flex_none()
+        .h_full()
+        .border_l_1()
+        .border_color(theme.colors().border_variant)
+        .into_any_element()
     }
 
     fn sort_settings(&self) -> (SortBy, GroupBy) {
@@ -5194,7 +5229,7 @@ impl TodoView {
             self.finish_title_edit(true, cx);
             self.reset_view_transients(cx);
             self.view = View::All;
-            self.list_state = ListState::new(0, ListAlignment::Top, px(400.));
+            self.list_state = Self::new_list_state();
             self.list_entries.clear();
             self.selected = Some(id);
             self.reload_inner(false, false, cx);
@@ -5216,7 +5251,7 @@ impl TodoView {
         if let Some(tasks) = self.check(self.store.tasks_in(&self.view, Self::today())) {
             self.tasks = tasks;
         }
-        self.list_state = ListState::new(0, ListAlignment::Top, px(400.));
+        self.list_state = Self::new_list_state();
         self.list_entries.clear();
         self.sync_layout_selection(cx);
         cx.notify();
@@ -7626,15 +7661,18 @@ impl TodoView {
                         .child(Label::new(count.to_string()).size(LabelSize::Small).color(Color::Muted)),
                 )
                 .child(
-                    v_flex()
-                        .id("kanban-habits")
-                        .mt(px(2.))
-                        .px(card_px)
-                        .pt(px(4.))
-                        .pb(px(12.))
-                        .gap_2()
-                        .overflow_y_scroll()
-                        .children(cards),
+                    v_scroll(
+                        "kanban-habits-scroll",
+                        v_flex()
+                            .id("kanban-habits")
+                            .px(card_px)
+                            .pt(px(4.))
+                            .pb(px(12.))
+                            .gap_2()
+                            .children(cards),
+                    )
+                    .mt(px(2.))
+                    .min_h_0(),
                 )
                 .into_any_element(),
         )
@@ -7984,7 +8022,7 @@ impl TodoView {
         let visible = self.selected.is_some_and(|selected| {
             self.rows(i18n::t(cx)).into_iter().any(|row| matches!(row, Row::Task { task, .. } if task.id == selected))
         });
-        self.list_state = ListState::new(0, ListAlignment::Top, px(400.));
+        self.list_state = Self::new_list_state();
         self.list_entries.clear();
         if !visible {
             self.sync_layout_selection(cx);
@@ -8726,15 +8764,18 @@ impl Render for TodoView {
                         }))
                         .when(has_cards, |el| {
                             el.child(
-                                v_flex()
-                                    .id(SharedString::from(format!("kanban-cards-{i}")))
-                                    .mt(px(2.))
-                                    .px(card_px)
-                                    .pt(px(4.))
-                                    .pb(px(12.))
-                                    .gap_2()
-                                    .overflow_y_scroll()
-                                    .children(col_items),
+                                v_scroll(
+                                    SharedString::from(format!("kanban-cards-scroll-{i}")),
+                                    v_flex()
+                                        .id(SharedString::from(format!("kanban-cards-{i}")))
+                                        .px(card_px)
+                                        .pt(px(4.))
+                                        .pb(px(12.))
+                                        .gap_2()
+                                        .children(col_items),
+                                )
+                                .mt(px(2.))
+                                .min_h_0(),
                             )
                         })
                         .when(!has_cards, |el| {
@@ -8767,101 +8808,109 @@ impl Render for TodoView {
             {
                 rendered_cols.push(render_new_sec_input(input, cx));
             }
-            h_flex()
-                .id("kanban")
-                .track_focus(&self.list_focus)
-                .track_scroll(&self.kanban_scroll)
-                .key_context("TaskList")
-                .on_mouse_down(MouseButton::Left, cx.listener(|this, event: &gpui::MouseDownEvent, window, cx| {
-                    window.focus(&this.list_focus, cx);
-                    this.close_card(cx);
-                    if this.selected.take().is_some() {
-                        this.detail.update(cx, |detail, cx| detail.show(None, cx));
-                        cx.notify();
-                    }
-                    let offset = this.kanban_scroll.offset();
-                    this.kanban_pan = Some((event.position.x, offset.x));
-                }))
-                .on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, _, cx| {
-                    let Some((start_x, start_offset_x)) = this.kanban_pan else { return };
-                    if cx.has_active_drag() || event.pressed_button != Some(MouseButton::Left) {
-                        this.kanban_pan = None;
-                        return;
-                    }
-                    let delta = event.position.x - start_x;
-                    let offset = this.kanban_scroll.offset();
-                    this.kanban_scroll.set_offset(gpui::point((start_offset_x + delta).min(px(0.)), offset.y));
-                    cx.notify();
-                }))
-                .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, _| {
-                    this.kanban_pan = None;
-                }))
-                .on_mouse_up_out(MouseButton::Left, cx.listener(|this, _, _, _| {
-                    this.kanban_pan = None;
-                }))
-                .on_action(cx.listener(Self::select_next))
-                .on_action(cx.listener(Self::select_previous))
-                .on_action(cx.listener(Self::toggle_selected))
-                .on_action(cx.listener(Self::delete_selected))
-                .on_action(cx.listener(Self::pin_selected))
-                .on_action(cx.listener(Self::date_selected))
-                .on_action(cx.listener(|this, _: &ClearDate, _, cx| this.set_selected_due(None, cx)))
-                .on_action(cx.listener(|this, _: &SetToday, _, cx| this.set_selected_due(Some(0), cx)))
-                .on_action(cx.listener(|this, _: &SetTomorrow, _, cx| this.set_selected_due(Some(1), cx)))
-                .on_action(cx.listener(|this, _: &SetNextWeek, _, cx| this.set_selected_due(Some(7), cx)))
-                .on_action(cx.listener(|this, _: &PriorityNone, _, cx| this.set_selected_priority(Priority::None, cx)))
-                .on_action(cx.listener(|this, _: &PriorityLow, _, cx| this.set_selected_priority(Priority::Low, cx)))
-                .on_action(cx.listener(|this, _: &PriorityMedium, _, cx| this.set_selected_priority(Priority::Medium, cx)))
-                .on_action(cx.listener(|this, _: &PriorityHigh, _, cx| this.set_selected_priority(Priority::High, cx)))
+            div()
+                .relative()
                 .flex_1()
-                .items_start()
-                .when(colored, |el| el.gap(px(12.)))
-                .px(px(12.))
+                .min_h_0()
+                .w_full()
                 .mt(px(-8.))
-                .pb(px(12.))
-                .overflow_x_scroll()
-                .children(rendered_cols)
-                .children(habit_col)
-                .when(owner.is_some() && inline_new_col_pos.is_none(), |el| {
-                    let group_id = SharedString::from("kanban-new-section-group");
-                    el.map(|el| match self.new_section.clone() {
-                        Some(input) => el.child(render_new_sec_input(input, cx)),
-                        None if !hide_new_section => el.child(
-                            v_flex().w(px(col_width)).flex_none().mt(px(6.)).px(px(10.)).child(
-                                h_flex()
-                                    .id("kanban-new-section")
-                                    .group(group_id.clone())
-                                    .h(px(32.))
-                                    .px(px(6.))
-                                    .rounded(px(6.))
-                                    .gap_1()
-                                    .hover(|s| s.bg(theme.colors().ghost_element_hover))
-                                    .cursor_pointer()
-                                    .child(Icon::new(IconName::Plus).size(IconSize::Small).color(Color::Muted))
-                                    .child(div().flex_1().child(Label::new(strings.new_section).weight(FontWeight::SEMIBOLD).color(Color::Muted)))
-                                    .child(
-                                        div()
-                                            .id("kanban-hide-new-section")
-                                            .opacity(0.)
-                                            .group_hover(group_id, |s| s.opacity(1.))
+                .child(
+                    h_flex()
+                        .id("kanban")
+                        .track_focus(&self.list_focus)
+                        .track_scroll(&self.kanban_scroll)
+                        .key_context("TaskList")
+                        .on_mouse_down(MouseButton::Left, cx.listener(|this, event: &gpui::MouseDownEvent, window, cx| {
+                            window.focus(&this.list_focus, cx);
+                            this.close_card(cx);
+                            if this.selected.take().is_some() {
+                                this.detail.update(cx, |detail, cx| detail.show(None, cx));
+                                cx.notify();
+                            }
+                            let offset = this.kanban_scroll.offset();
+                            this.kanban_pan = Some((event.position.x, offset.x));
+                        }))
+                        .on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, _, cx| {
+                            let Some((start_x, start_offset_x)) = this.kanban_pan else { return };
+                            if cx.has_active_drag() || event.pressed_button != Some(MouseButton::Left) {
+                                this.kanban_pan = None;
+                                return;
+                            }
+                            let delta = event.position.x - start_x;
+                            let offset = this.kanban_scroll.offset();
+                            this.kanban_scroll.set_offset(gpui::point((start_offset_x + delta).min(px(0.)), offset.y));
+                            cx.notify();
+                        }))
+                        .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, _| {
+                            this.kanban_pan = None;
+                        }))
+                        .on_mouse_up_out(MouseButton::Left, cx.listener(|this, _, _, _| {
+                            this.kanban_pan = None;
+                        }))
+                        .on_action(cx.listener(Self::select_next))
+                        .on_action(cx.listener(Self::select_previous))
+                        .on_action(cx.listener(Self::toggle_selected))
+                        .on_action(cx.listener(Self::delete_selected))
+                        .on_action(cx.listener(Self::pin_selected))
+                        .on_action(cx.listener(Self::date_selected))
+                        .on_action(cx.listener(|this, _: &ClearDate, _, cx| this.set_selected_due(None, cx)))
+                        .on_action(cx.listener(|this, _: &SetToday, _, cx| this.set_selected_due(Some(0), cx)))
+                        .on_action(cx.listener(|this, _: &SetTomorrow, _, cx| this.set_selected_due(Some(1), cx)))
+                        .on_action(cx.listener(|this, _: &SetNextWeek, _, cx| this.set_selected_due(Some(7), cx)))
+                        .on_action(cx.listener(|this, _: &PriorityNone, _, cx| this.set_selected_priority(Priority::None, cx)))
+                        .on_action(cx.listener(|this, _: &PriorityLow, _, cx| this.set_selected_priority(Priority::Low, cx)))
+                        .on_action(cx.listener(|this, _: &PriorityMedium, _, cx| this.set_selected_priority(Priority::Medium, cx)))
+                        .on_action(cx.listener(|this, _: &PriorityHigh, _, cx| this.set_selected_priority(Priority::High, cx)))
+                        .size_full()
+                        .items_start()
+                        .when(colored, |el| el.gap(px(12.)))
+                        .px(px(12.))
+                        .pb(px(12.))
+                        .overflow_x_scroll()
+                        .children(rendered_cols)
+                        .children(habit_col)
+                        .when(owner.is_some() && inline_new_col_pos.is_none(), |el| {
+                            let group_id = SharedString::from("kanban-new-section-group");
+                            el.map(|el| match self.new_section.clone() {
+                                Some(input) => el.child(render_new_sec_input(input, cx)),
+                                None if !hide_new_section => el.child(
+                                    v_flex().w(px(col_width)).flex_none().mt(px(6.)).px(px(10.)).child(
+                                        h_flex()
+                                            .id("kanban-new-section")
+                                            .group(group_id.clone())
+                                            .h(px(32.))
+                                            .px(px(6.))
+                                            .rounded(px(6.))
+                                            .gap_1()
+                                            .hover(|s| s.bg(theme.colors().ghost_element_hover))
+                                            .cursor_pointer()
+                                            .child(Icon::new(IconName::Plus).size(IconSize::Small).color(Color::Muted))
+                                            .child(div().flex_1().child(Label::new(strings.new_section).weight(FontWeight::SEMIBOLD).color(Color::Muted)))
                                             .child(
-                                                IconButton::new("kanban-hide-new-section-btn", IconName::X)
-                                                    .size(px(20.))
-                                                    .icon_size(IconSize::XSmall)
-                                                    .icon_color(Color::Muted)
-                                                    .on_click(cx.listener(|this, _, _, cx| {
-                                                        cx.stop_propagation();
-                                                        let _ = this.store.set_setting(&format!("kanban:hide_new_section:{}", this.view_key()), "1");
-                                                        cx.notify();
-                                                    })),
-                                            ),
-                                    )
-                                    .on_click(cx.listener(|this, _, window, cx| this.start_new_section(window, cx))),
-                            ),
-                        ),
-                        None => el,
-                    })
-                })
+                                                div()
+                                                    .id("kanban-hide-new-section")
+                                                    .opacity(0.)
+                                                    .group_hover(group_id, |s| s.opacity(1.))
+                                                    .child(
+                                                        IconButton::new("kanban-hide-new-section-btn", IconName::X)
+                                                            .size(px(20.))
+                                                            .icon_size(IconSize::XSmall)
+                                                            .icon_color(Color::Muted)
+                                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                                cx.stop_propagation();
+                                                                let _ = this.store.set_setting(&format!("kanban:hide_new_section:{}", this.view_key()), "1");
+                                                                cx.notify();
+                                                            })),
+                                                    ),
+                                            )
+                                            .on_click(cx.listener(|this, _, window, cx| this.start_new_section(window, cx))),
+                                    ),
+                                ),
+                                None => el,
+                            })
+                        }),
+                )
+                .child(HorizontalScrollbar::for_handle("kanban-h-scroll", self.kanban_scroll.clone()))
                 .into_any_element()
         }));
         let rows = if kanban_view { Vec::new() } else { self.rows(strings) };
@@ -9111,9 +9160,17 @@ impl Render for TodoView {
                         ))
                     })
                     .child(
-                        list(self.list_state.clone(), cx.processor(|this, ix, _, cx| this.render_entry(ix, cx)))
+                        div()
+                            .relative()
                             .flex_1()
-                            .pb_4(),
+                            .min_h_0()
+                            .w_full()
+                            .child(
+                                list(self.list_state.clone(), cx.processor(|this, ix, _, cx| this.render_entry(ix, cx)))
+                                    .size_full()
+                                    .pb_4(),
+                            )
+                            .child(VerticalScrollbar::for_list("task-list-scroll", self.list_state.clone())),
                     ),
             ))
             .when_some(self.error.clone().or_else(|| self.add_attachment_error.clone()), |el, error| {
@@ -10863,5 +10920,99 @@ mod tests {
         // Drag the subtask to the top-left reorder zone of its own parent card (above the subtask row).
         drag(cx, sub_card_b.center(), point(sub_card_b.left() + px(24.), sub_card_b.top() - px(24.)));
         assert_eq!(store.task(child.id).unwrap().unwrap().parent_id, None, "kanban subtask drag unnests child");
+    }
+
+    #[gpui::test]
+    fn task_list_scrollbar_scrolls_and_lists_resize_edge_stays_unobstructed(cx: &mut TestAppContext) {
+        use gpui::{Modifiers, point, size};
+
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        for i in 0..30 {
+            store.add_task(&format!("Task {i:02}")).unwrap();
+        }
+        for i in 0..25 {
+            store.create_list(&format!("List {i:02}")).unwrap();
+        }
+
+        cx.update(|cx| {
+            theme::init(cx);
+            cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+            assert!(crate::keymap::load_default(&assets::Assets, cx).unwrap().is_empty());
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| TodoView::new(store.clone(), window, cx));
+        cx.simulate_resize(size(px(1100.), px(520.)));
+        cx.run_until_parked();
+
+        let (first_id, last_id) = cx.update(|_, cx| {
+            let entries = &view.read(cx).list_entries;
+            let mut ids = entries.iter().filter_map(|e| match e {
+                ListEntry::Row(Row::Task { task, .. }) => Some(task.id),
+                _ => None,
+            });
+            let first = ids.next().expect("at least one task row");
+            let last = ids.next_back().expect("multiple task rows");
+            (first, last)
+        });
+        let first_sel: &'static str = format!("task-row-{first_id}").leak();
+        let last_sel: &'static str = format!("task-row-{last_id}").leak();
+        assert!(cx.debug_bounds(first_sel).is_some());
+        assert!(cx.debug_bounds(last_sel).is_none());
+
+        let viewport = cx.update(|_, cx| view.read(cx).list_state.viewport_bounds());
+        let bar_bottom = point(viewport.right() - px(6.), viewport.bottom() - px(8.));
+        let modifiers = Modifiers::default();
+        cx.simulate_mouse_move(bar_bottom, None, modifiers);
+        cx.simulate_click(bar_bottom, modifiers);
+        assert!(
+            cx.debug_bounds(last_sel).is_some(),
+            "last task row should become visible after clicking task list scrollbar bottom"
+        );
+
+        let bar_top = point(bar_bottom.x, viewport.top() - px(10.));
+        cx.simulate_mouse_down(bar_bottom, MouseButton::Left, modifiers);
+        cx.simulate_mouse_move(bar_top, Some(MouseButton::Left), modifiers);
+        cx.simulate_mouse_up(bar_top, MouseButton::Left, modifiers);
+        assert!(
+            cx.debug_bounds(first_sel).is_some(),
+            "first task row should be visible again after dragging scrollbar to top"
+        );
+
+        // Verify lists_panel scrollbar scrolls at inset 6 px, and lists-resize at the right 6 px edge stays unobstructed.
+        let initial_lists_y = cx.update(|_, cx| view.read(cx).lists_scroll.offset().y);
+        let lists_bounds = cx.debug_bounds("lists-column").unwrap();
+        let lists_bar = point(lists_bounds.right() - px(10.), lists_bounds.top() + px(240.));
+        cx.simulate_mouse_move(lists_bar, None, modifiers);
+        cx.simulate_click(lists_bar, modifiers);
+        let scrolled_lists_y = cx.update(|_, cx| view.read(cx).lists_scroll.offset().y);
+        assert!(
+            scrolled_lists_y < initial_lists_y,
+            "lists-panel scrollbar should scroll when clicked inside inset track: {initial_lists_y:?} -> {scrolled_lists_y:?}"
+        );
+
+        let initial_width = cx.update(|_, cx| view.read(cx).lists_width);
+        let resize_start = point(lists_bounds.right() - px(3.), lists_bounds.top() + px(140.));
+        cx.simulate_mouse_move(resize_start, None, modifiers);
+        cx.simulate_mouse_down(resize_start, MouseButton::Left, modifiers);
+        cx.simulate_mouse_move(
+            point(resize_start.x + px(6.), resize_start.y),
+            Some(MouseButton::Left),
+            modifiers,
+        );
+        cx.simulate_mouse_move(
+            point(resize_start.x + px(40.), resize_start.y),
+            Some(MouseButton::Left),
+            modifiers,
+        );
+        cx.simulate_mouse_up(
+            point(resize_start.x + px(40.), resize_start.y),
+            MouseButton::Left,
+            modifiers,
+        );
+        cx.run_until_parked();
+        let resized_width = cx.update(|_, cx| view.read(cx).lists_width);
+        assert!(
+            resized_width > initial_width + 20.,
+            "lists-resize should remain unobstructed at the right 6 px edge: {initial_width:?} -> {resized_width:?}"
+        );
     }
 }

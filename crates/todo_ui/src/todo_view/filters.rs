@@ -303,8 +303,6 @@ impl TodoView {
                 .collect();
         let mut body = v_flex()
             .id("filter-preview-tasks")
-            .max_h(px(420.))
-            .overflow_y_scroll()
             .gap_0p5();
         if shown.is_empty() {
             body = body.child(
@@ -420,7 +418,7 @@ impl TodoView {
                             .justify_center()
                             .child(Label::new(strings.filter_preview).weight(FontWeight::SEMIBOLD)),
                     )
-                    .child(body)
+                    .child(v_scroll("filter-preview-tasks-scroll", body).max_h(px(420.)))
                     .child(
                         h_flex()
                             .gap_2()
@@ -814,9 +812,6 @@ impl TodoView {
         let advanced = edit.draft.rules.advanced;
         let mut body = v_flex()
             .id("filter-conditions")
-            .min_h_0()
-            .max_h((window.viewport_size().height - px(240.)).max(px(120.)))
-            .overflow_y_scroll()
             .gap_4();
         for i in 0..edit.draft.rules.conditions.len() {
             body = body.child(self.render_filter_condition(i, edit, cx));
@@ -919,7 +914,11 @@ impl TodoView {
                             })),
                     )
                     .child(input_field(edit.name.clone(), cx))
-                    .child(body)
+                    .child(
+                        v_scroll("filter-conditions-scroll", body)
+                            .min_h_0()
+                            .max_h((window.viewport_size().height - px(240.)).max(px(120.))),
+                    )
                     .when_some(edit.error, |el, error| {
                         el.child(Label::new(error).size(LabelSize::Small).color(Color::Error))
                     })

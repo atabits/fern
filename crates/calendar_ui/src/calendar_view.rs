@@ -464,12 +464,15 @@ impl CalendarView {
             })
             .when(!event.notes.trim().is_empty(), |el| {
                 el.child(
-                    div()
-                        .id("calendar-event-notes")
-                        .max_h(px(160.))
-                        .overflow_y_scroll()
-                        .text_size(px(12.))
-                        .child(event.notes.trim().to_owned()),
+                    v_scroll(
+                        "calendar-event-notes-scroll",
+                        div()
+                            .id("calendar-event-notes")
+                            .text_size(px(12.))
+                            .child(event.notes.trim().to_owned()),
+                    )
+                    .max_h(px(160.))
+                    .compact(),
                 )
             })
             .into_any_element()
@@ -702,7 +705,14 @@ impl CalendarView {
                     }))),
             )
             .child(tabs)
-            .child(v_flex().id("arrange-tasks").flex_1().min_h_0().overflow_y_scroll().gap(px(3.)).children(body))
+            .child(
+                v_scroll(
+                    "calendar-arrange-tasks-scroll",
+                    v_flex().id("arrange-tasks").gap(px(3.)).children(body),
+                )
+                .flex_1()
+                .min_h_0(),
+            )
             .into_any_element()
     }
 
@@ -1476,20 +1486,15 @@ impl CalendarView {
                 )
                 .child(Checkbox::new(box_id).size(px(15.)).accent().toggle_state(checked))
         };
-        v_flex()
-            .id("calendar-sidebar")
-            .debug_selector(|| "calendar-sidebar".to_owned())
-            .flex_none()
-            .w(px(CALENDAR_SIDEBAR_WIDTH))
-            .h_full()
-            .overflow_y_scroll()
-            .border_r_1()
-            .border_color(colors.lists_border)
-            .bg(colors.lists_background)
-            .pt(crate::title_bar::header_inset() + px(13.))
-            .px_3()
-            .pb_3()
-            .gap_3()
+        v_scroll(
+            "calendar-sidebar-scroll",
+            v_flex()
+                .id("calendar-sidebar")
+                .debug_selector(|| "calendar-sidebar".to_owned())
+                .pt(crate::title_bar::header_inset() + px(13.))
+                .px_3()
+                .pb_3()
+                .gap_3()
             .child(month_picker(
                 self.sidebar_month.unwrap_or(self.month),
                 self.selected_day,
@@ -1570,7 +1575,15 @@ impl CalendarView {
                         )
                         .on_click(cx.listener(move |this, _, _, cx| this.toggle_list_filter(Some(list_id), cx)))
                     })),
-            )
+            ),
+        )
+        .flex_none()
+        .w(px(CALENDAR_SIDEBAR_WIDTH))
+        .h_full()
+        .border_r_1()
+        .border_color(colors.lists_border)
+        .bg(colors.lists_background)
+        .color(colors.list_text)
     }
 
     fn render_month_picker_popover(
@@ -2035,35 +2048,37 @@ impl CalendarView {
             .border_color(line)
             .child(all_day)
             .child(
-                div()
-                    .id("week-scroll")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .child(
-                        h_flex()
-                            .items_start()
-                            .child(
-                                // The current time in red on the axis, as in the original.
-                                div().relative().child(axis).when(week.contains(&today) && week_axis::unfolded(Local::now().time()), |el| {
-                                    let now = Local::now().time();
-                                    el.child(
-                                        div()
-                                            .absolute()
-                                            .top(px(week_axis::offset(now) - 7.))
-                                            .right(px(4.))
-                                            .px_0p5()
-                                            .bg(theme.colors().background)
-                                            .child(
-                                                Label::new(calendar::format_time(now, strings))
-                                                    .size(LabelSize::XSmall)
-                                                    .color(Color::Custom(now_color)),
-                                            ),
-                                    )
-                                }),
-                            )
-                            .children(columns),
-                    ),
+                v_scroll(
+                    "week-scroll-bar",
+                    div()
+                        .id("week-scroll")
+                        .child(
+                            h_flex()
+                                .items_start()
+                                .child(
+                                    // The current time in red on the axis, as in the original.
+                                    div().relative().child(axis).when(week.contains(&today) && week_axis::unfolded(Local::now().time()), |el| {
+                                        let now = Local::now().time();
+                                        el.child(
+                                            div()
+                                                .absolute()
+                                                .top(px(week_axis::offset(now) - 7.))
+                                                .right(px(4.))
+                                                .px_0p5()
+                                                .bg(theme.colors().background)
+                                                .child(
+                                                    Label::new(calendar::format_time(now, strings))
+                                                        .size(LabelSize::XSmall)
+                                                        .color(Color::Custom(now_color)),
+                                                ),
+                                        )
+                                    }),
+                                )
+                                .children(columns),
+                        ),
+                )
+                .flex_1()
+                .min_h_0(),
             )
             .into_any_element()
     }
@@ -2275,18 +2290,20 @@ impl CalendarView {
                     .into_any_element(),
             );
         }
-        v_flex()
-            .id("agenda")
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .pl(px(185.))
-            .pr(px(60.))
-            .pb_6()
-            // The original's agenda: 185 px in from the left, up to 1030 px wide, each day 100 px
-            // apart.
-            .child(v_flex().pt(px(14.)).max_w(px(1030.)).children(rows))
-            .into_any_element()
+        v_scroll(
+            "agenda-scroll",
+            v_flex()
+                .id("agenda")
+                .pl(px(185.))
+                .pr(px(60.))
+                .pb_6()
+                // The original's agenda: 185 px in from the left, up to 1030 px wide, each day 100 px
+                // apart.
+                .child(v_flex().pt(px(14.)).max_w(px(1030.)).children(rows)),
+        )
+        .flex_1()
+        .min_h_0()
+        .into_any_element()
     }
 
     fn render_mode_menu(&self, cx: &mut Context<Self>) -> AnyElement {

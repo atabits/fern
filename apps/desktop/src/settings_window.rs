@@ -12,7 +12,7 @@ use gpui::{
     point, size,
 };
 use ui::prelude::*;
-use ui::{Placement, PopoverAttachment, popover};
+use ui::{Placement, PopoverAttachment, VerticalScrollbar, popover};
 
 use crate::actions::{CloseWindow, DismissSettings};
 use crate::calendar;
@@ -579,52 +579,54 @@ impl SettingsWindow {
                     .child(div().text_size(px(18.)).font_weight(FontWeight::SEMIBOLD).child(strings.settings)),
             )
             .child(
-                v_flex()
-                    .id("settings-navigation")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .px_2()
-                    .pb_2()
-                    .gap_0p5()
-                    .child(
-                        item("settings-features", IconName::LayoutGrid, strings.features, self.page == Page::Features)
-                            .on_click(cx.listener(|this, _, _, cx| this.set_page(Page::Features, cx))),
-                    )
-                    .child(page("settings-smart-list", IconName::Funnel, 0, Page::SmartList))
-                    .child(
-                        item("settings-notifications", IconName::Bell, strings.notifications_page, self.page == Page::Notifications)
-                            .on_click(cx.listener(|this, _, _, cx| this.set_page(Page::Notifications, cx))),
-                    )
-                    .child(page("settings-date-time", IconName::Clock, 1, Page::DateTime))
-                    .child(page("settings-appearance", IconName::PaintRoller, 2, Page::Appearance))
-                    .child(page("settings-more", IconName::ToggleRight, 3, Page::More))
-                    .child(
-                        item("settings-sticky", IconName::FileText, strings.sticky_notes, self.page == Page::Sticky)
-                            .on_click(cx.listener(|this, _, _, cx| this.set_page(Page::Sticky, cx))),
-                    )
-                    .child(
-                        item("settings-sync", IconName::RefreshCw, strings.data_and_sync, self.page == Page::Sync)
-                            .on_click(cx.listener(|this, _, _, cx| this.set_page(Page::Sync, cx))),
-                    )
-                    .child(
-                        item("settings-integrations", IconName::CalendarDays, strings.integrations, self.page == Page::Integrations)
-                            .on_click(cx.listener(|this, _, _, cx| this.set_page(Page::Integrations, cx))),
-                    )
-                    .child(div().h(px(12.)))
-                    .child(
-                        div()
-                            .debug_selector(|| "settings-shortcuts".to_owned())
-                            .child(
-                                item("settings-shortcuts", IconName::Keyboard, strings.settings_pages[4], false)
-                                    .on_click(cx.listener(|_, _, window, cx| {
-                                        cx.emit(SettingsEvent::ShowShortcuts);
-                                        window.defer(cx, |window, _| window.remove_window());
-                                    })),
-                            ),
-                    )
-                    .child(div().h(px(12.)))
-                    .child(page("settings-about", IconName::Info, 5, Page::About)),
+                v_scroll(
+                    "settings-navigation-scroll",
+                    v_flex()
+                        .id("settings-navigation")
+                        .px_2()
+                        .pb_2()
+                        .gap_0p5()
+                        .child(
+                            item("settings-features", IconName::LayoutGrid, strings.features, self.page == Page::Features)
+                                .on_click(cx.listener(|this, _, _, cx| this.set_page(Page::Features, cx))),
+                        )
+                        .child(page("settings-smart-list", IconName::Funnel, 0, Page::SmartList))
+                        .child(
+                            item("settings-notifications", IconName::Bell, strings.notifications_page, self.page == Page::Notifications)
+                                .on_click(cx.listener(|this, _, _, cx| this.set_page(Page::Notifications, cx))),
+                        )
+                        .child(page("settings-date-time", IconName::Clock, 1, Page::DateTime))
+                        .child(page("settings-appearance", IconName::PaintRoller, 2, Page::Appearance))
+                        .child(page("settings-more", IconName::ToggleRight, 3, Page::More))
+                        .child(
+                            item("settings-sticky", IconName::FileText, strings.sticky_notes, self.page == Page::Sticky)
+                                .on_click(cx.listener(|this, _, _, cx| this.set_page(Page::Sticky, cx))),
+                        )
+                        .child(
+                            item("settings-sync", IconName::RefreshCw, strings.data_and_sync, self.page == Page::Sync)
+                                .on_click(cx.listener(|this, _, _, cx| this.set_page(Page::Sync, cx))),
+                        )
+                        .child(
+                            item("settings-integrations", IconName::CalendarDays, strings.integrations, self.page == Page::Integrations)
+                                .on_click(cx.listener(|this, _, _, cx| this.set_page(Page::Integrations, cx))),
+                        )
+                        .child(div().h(px(12.)))
+                        .child(
+                            div()
+                                .debug_selector(|| "settings-shortcuts".to_owned())
+                                .child(
+                                    item("settings-shortcuts", IconName::Keyboard, strings.settings_pages[4], false)
+                                        .on_click(cx.listener(|_, _, window, cx| {
+                                            cx.emit(SettingsEvent::ShowShortcuts);
+                                            window.defer(cx, |window, _| window.remove_window());
+                                        })),
+                                ),
+                        )
+                        .child(div().h(px(12.)))
+                        .child(page("settings-about", IconName::Info, 5, Page::About)),
+                )
+                .flex_1()
+                .min_h_0(),
             )
     }
 
@@ -1085,15 +1087,14 @@ impl SettingsWindow {
         let body = v_flex()
             .id("settings-page")
             .debug_selector(|| "settings-page".to_owned())
-            .flex_1()
-            .min_h_0()
+            .size_full()
             .overflow_y_scroll()
             .track_scroll(&self.page_scroll)
             .pt_1()
             .px_6()
             .pb_6()
             .gap_4();
-        match self.page {
+        let page = match self.page {
             Page::SmartList => {
                 let row = |this: &Self, list: SmartList, cx: &mut Context<Self>| {
                     let (icon, label) = smart_list_label(list, strings);
@@ -1592,38 +1593,47 @@ impl SettingsWindow {
                 )
                 .into_any_element()
             }
-        }
+        };
+        div()
+            .relative()
+            .flex_1()
+            .min_h_0()
+            .child(page)
+            .child(VerticalScrollbar::for_handle("settings-page-scroll", self.page_scroll.clone()))
+            .into_any_element()
     }
 
     fn render_release_notes(&self, notes: &ReleaseNotes, cx: &App) -> AnyElement {
         let strings = i18n::t(cx);
         let title = strings.whats_new_in_version.replace("{version}", &notes.version);
         let url = notes.url.clone();
-        v_flex()
-            .id(SharedString::from(format!("release-notes-page-{}", notes.version)))
-            .debug_selector(|| "release-notes-page".to_owned())
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .px_6()
-            .pt_2()
-            .pb_6()
-            .gap_4()
-            .child(Label::new(title).size(LabelSize::Large).weight(FontWeight::SEMIBOLD))
-            .child(if notes.markdown.is_empty() {
-                div().text_size(px(14.)).child(strings.release_notes_missing).into_any_element()
-            } else {
-                crate::task_detail::render_release_markdown(&notes.markdown, cx)
-            })
-            .child(
-                action_button("release-notes-github", cx)
-                    .self_start()
-                    .border_color(cx.theme().colors().border)
-                    .child(Label::new(strings.release_on_github).size(LabelSize::Small))
-                    .child(Icon::new(IconName::SquareArrowOutUpRight).size(IconSize::Small).color(Color::Muted))
-                    .on_click(move |_, _, cx| cx.open_url(&url)),
-            )
-            .into_any_element()
+        v_scroll(
+            SharedString::from(format!("release-notes-scroll-{}", notes.version)),
+            v_flex()
+                .id(SharedString::from(format!("release-notes-page-{}", notes.version)))
+                .debug_selector(|| "release-notes-page".to_owned())
+                .px_6()
+                .pt_2()
+                .pb_6()
+                .gap_4()
+                .child(Label::new(title).size(LabelSize::Large).weight(FontWeight::SEMIBOLD))
+                .child(if notes.markdown.is_empty() {
+                    div().text_size(px(14.)).child(strings.release_notes_missing).into_any_element()
+                } else {
+                    crate::task_detail::render_release_markdown(&notes.markdown, cx)
+                })
+                .child(
+                    action_button("release-notes-github", cx)
+                        .self_start()
+                        .border_color(cx.theme().colors().border)
+                        .child(Label::new(strings.release_on_github).size(LabelSize::Small))
+                        .child(Icon::new(IconName::SquareArrowOutUpRight).size(IconSize::Small).color(Color::Muted))
+                        .on_click(move |_, _, cx| cx.open_url(&url)),
+                ),
+        )
+        .flex_1()
+        .min_h_0()
+        .into_any_element()
     }
 }
 

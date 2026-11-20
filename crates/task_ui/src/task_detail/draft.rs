@@ -435,11 +435,11 @@ impl TaskDetail {
                 el.child(Label::new(i18n::t(cx).no_templates).color(Color::Muted))
             })
             .child(
-                v_flex()
-                    .id("draft-templates")
-                    .max_h(px(240.))
-                    .overflow_y_scroll()
-                    .children(templates.into_iter().map(|template| {
+                v_scroll(
+                    "draft-templates-scroll",
+                    v_flex()
+                        .id("draft-templates")
+                        .children(templates.into_iter().map(|template| {
                         ListItem::new(SharedString::from(format!(
                             "draft-template-{}",
                             template.id
@@ -478,6 +478,9 @@ impl TaskDetail {
                             },
                         ))
                     })),
+                )
+                .max_h(px(240.))
+                .compact(),
             )
             .into_any_element()
     }

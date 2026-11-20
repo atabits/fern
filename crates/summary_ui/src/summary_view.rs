@@ -439,12 +439,16 @@ impl SummaryView {
             PopoverAttachment::new(
                 Placement::BelowRight,
                 popover(cx)
-                    .id("summary-options-scroll")
-                    .max_h(px(280.))
-                    .overflow_y_scroll()
                     .min_w(px(200.))
                     .on_mouse_down_out(cx.listener(|this, _, _, cx| this.set_menu(None, cx)))
-                    .children(items),
+                    .child(
+                        v_scroll(
+                            "summary-options-scroll-view",
+                            v_flex().id("summary-options-scroll").children(items),
+                        )
+                        .max_h(px(280.))
+                        .compact(),
+                    ),
             )
         });
         h_flex()
@@ -881,9 +885,6 @@ impl Render for SummaryView {
         let editor = self.editor.clone().filter(|_| self.editing);
         let body = v_flex()
             .id("summary-report")
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
             .px_4()
             .py_3()
             .gap_1()
@@ -953,7 +954,7 @@ impl Render for SummaryView {
                             .border_1()
                             .border_color(colors.border_variant)
                             .child(self.render_toolbar(cx))
-                            .child(body),
+                            .child(v_scroll("summary-report-scroll", body).flex_1().min_h_0()),
                     )
                     .child(
                         h_flex().h(px(44.)).px_4().gap_5().justify_end()

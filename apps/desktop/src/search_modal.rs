@@ -335,7 +335,14 @@ impl SearchModal {
                 this.menu = None;
                 cx.notify();
             }))
-            .child(v_flex().id("search-menu-items").max_h(px(260.)).overflow_y_scroll().children(items))
+            .child(
+                v_scroll(
+                    "search-menu-items-scroll",
+                    v_flex().id("search-menu-items").children(items),
+                )
+                .max_h(px(260.))
+                .compact(),
+            )
             .when(buttons, |el| {
                 el.child(
                     h_flex()
@@ -603,47 +610,49 @@ impl Render for SearchModal {
                     .when(self.filter == Filter::All || self.filter == Filter::Lists, |el| el.child(chip(Filter::Lists, strings.search_filter_list, cx))),
             )
             .child(
-                v_flex()
-                    .id("search-results")
-                    .flex_1()
-                    .min_h(px(180.))
-                    .overflow_y_scroll()
-                    .when(!has_query, |el| {
-                        // As in the original, the hint names what the chosen chip searches.
-                        let hint = match self.filter {
-                            Filter::All => strings.search_hint,
-                            Filter::Tasks => strings.search_hint_task,
-                            Filter::Tags => strings.search_hint_tag,
-                            Filter::Lists => strings.search_hint_list,
-                        };
-                        let icon = match self.filter {
-                            Filter::Tasks => IconName::SquareCheck,
-                            Filter::Tags => IconName::Tag,
-                            Filter::Lists => IconName::List,
-                            Filter::All => IconName::Search,
-                        };
-                        el.items_center().justify_center().gap_2().child(Icon::new(icon).size(IconSize::XLarge).color(Color::Muted)).child(Label::new(hint).color(Color::Muted))
-                    })
-                    .when(nothing, |el| {
-                        el.items_center().justify_center().child(Label::new(strings.nothing_found).color(Color::Muted))
-                    })
-                    .when(!task_rows.is_empty(), |el| el.child(Self::group_heading(strings.group_tasks)).children(task_rows))
-                    .when(more, |el| {
-                        el.child(
-                            div()
-                                .id("search-view-more")
-                                .px_2()
-                                .py_1()
-                                .cursor_pointer()
-                                .child(Label::new(strings.view_more).size(LabelSize::Small).color(Color::Accent))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    let query = this.query(cx);
-                                    cx.emit(SearchEvent::OpenView(View::Search(query)))
-                                })),
-                        )
-                    })
-                    .when(!tag_rows.is_empty(), |el| el.child(Self::group_heading(strings.tags)).children(tag_rows))
-                    .when(!list_rows.is_empty(), |el| el.child(Self::group_heading(strings.lists)).children(list_rows)),
+                v_scroll(
+                    "search-results-scroll",
+                    v_flex()
+                        .id("search-results")
+                        .when(!has_query, |el| {
+                            // As in the original, the hint names what the chosen chip searches.
+                            let hint = match self.filter {
+                                Filter::All => strings.search_hint,
+                                Filter::Tasks => strings.search_hint_task,
+                                Filter::Tags => strings.search_hint_tag,
+                                Filter::Lists => strings.search_hint_list,
+                            };
+                            let icon = match self.filter {
+                                Filter::Tasks => IconName::SquareCheck,
+                                Filter::Tags => IconName::Tag,
+                                Filter::Lists => IconName::List,
+                                Filter::All => IconName::Search,
+                            };
+                            el.items_center().justify_center().gap_2().child(Icon::new(icon).size(IconSize::XLarge).color(Color::Muted)).child(Label::new(hint).color(Color::Muted))
+                        })
+                        .when(nothing, |el| {
+                            el.items_center().justify_center().child(Label::new(strings.nothing_found).color(Color::Muted))
+                        })
+                        .when(!task_rows.is_empty(), |el| el.child(Self::group_heading(strings.group_tasks)).children(task_rows))
+                        .when(more, |el| {
+                            el.child(
+                                div()
+                                    .id("search-view-more")
+                                    .px_2()
+                                    .py_1()
+                                    .cursor_pointer()
+                                    .child(Label::new(strings.view_more).size(LabelSize::Small).color(Color::Accent))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        let query = this.query(cx);
+                                        cx.emit(SearchEvent::OpenView(View::Search(query)))
+                                    })),
+                            )
+                        })
+                        .when(!tag_rows.is_empty(), |el| el.child(Self::group_heading(strings.tags)).children(tag_rows))
+                        .when(!list_rows.is_empty(), |el| el.child(Self::group_heading(strings.lists)).children(list_rows)),
+                )
+                .flex_1()
+                .min_h(px(180.)),
             )
     }
 }

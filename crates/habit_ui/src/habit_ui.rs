@@ -750,11 +750,11 @@ impl HabitView {
                 .on_click(cx.listener(move |this, _, _, cx| this.update_edit(cx, |e| e.color = color.map(str::to_owned))))
         }));
         let body: AnyElement = match tab {
-            0 => div()
-                .id("habit-icon-grid")
-                .h(px(225.))
-                .overflow_y_scroll()
-                .child(div().flex().flex_wrap().gap_y(px(15.)).children(HABIT_EMOJI.iter().enumerate().map(|(i, emoji)| {
+            0 => v_scroll(
+                "habit-icon-grid-scroll",
+                div()
+                    .id("habit-icon-grid")
+                    .child(div().flex().flex_wrap().gap_y(px(15.)).children(HABIT_EMOJI.iter().enumerate().map(|(i, emoji)| {
                     let color = COLORS[i % COLORS.len()];
                     let selected = edit.icon.as_deref() == Some(*emoji) && edit.color.as_deref() == Some(color);
                     div()
@@ -782,8 +782,11 @@ impl HabitView {
                                 e.icon_picker = None;
                             })
                         }))
-                })))
-                .into_any_element(),
+                }))),
+            )
+            .h(px(225.))
+            .compact()
+            .into_any_element(),
             1 => v_flex()
                 .gap_2()
                 .child(div().flex().flex_wrap().gap_1().children(HABIT_EMOJI.iter().map(|emoji| {
@@ -1672,13 +1675,13 @@ impl HabitView {
             })
             .collect();
 
-        v_flex()
-            .id("habit-detail")
-            .size_full()
-            .overflow_y_scroll()
-            .px_4()
-            .pb_4()
-            .gap_2()
+        v_scroll(
+            "habit-detail-scroll",
+            v_flex()
+                .id("habit-detail")
+                .px_4()
+                .pb_4()
+                .gap_2()
             .child(
                 h_flex()
                     .mt(layout::header_inset())
@@ -1902,8 +1905,10 @@ impl HabitView {
                                 .child(self.note_input.clone()),
                         )
                     }),
-            )
-            .into_any_element()
+            ),
+        )
+        .size_full()
+        .into_any_element()
     }
 }
 
@@ -2090,18 +2095,20 @@ impl Render for HabitView {
             })
             .children(strip)
             .child(
-                div()
-                    .id("habit-grid")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .px(px(22.))
-                    .when(cards.is_empty(), |el| {
-                        el.child(div().pt_8().child(
-                            Label::new(if self.show_archived { strings.habit_no_archived } else { strings.habit_empty }).color(Color::Muted),
-                        ))
-                    })
-                    .child(v_flex().gap_2().children(cards)),
+                v_scroll(
+                    "habit-grid-scroll",
+                    div()
+                        .id("habit-grid")
+                        .px(px(22.))
+                        .when(cards.is_empty(), |el| {
+                            el.child(div().pt_8().child(
+                                Label::new(if self.show_archived { strings.habit_no_archived } else { strings.habit_empty }).color(Color::Muted),
+                            ))
+                        })
+                        .child(v_flex().gap_2().children(cards)),
+                )
+                .flex_1()
+                .min_h_0(),
             );
 
         // Edit Habit over a dimmed background, as the original shows it.

@@ -836,10 +836,6 @@ pub fn render(
     rows.clear();
     let mut lists_column = v_flex()
         .id("lists-panel")
-        .track_scroll(scroll_handle)
-        .flex_1()
-        .min_h_0()
-        .overflow_y_scroll()
         .px_2()
         .pb_2();
 
@@ -1014,7 +1010,14 @@ pub fn render(
         .bg(colors.lists_background)
         .border_r_1()
         .border_color(colors.lists_border)
-        .child(lists_column)
+        .child(
+            v_scroll("lists-panel-scroll", lists_column)
+                .track_scroll(scroll_handle)
+                .inset(px(6.))
+                .color(colors.list_text)
+                .flex_1()
+                .min_h_0(),
+        )
         .when(preferences.mini_calendar, |el| el.child(mini_calendar(active, mini, on_select.clone(), on_mini, strings, cx)))
 }
 

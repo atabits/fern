@@ -269,7 +269,17 @@ impl CalendarOptionsDialog {
             )
             .when_some(hint, |el, hint| el.child(div().px_4().child(Label::new(hint).size(LabelSize::Small).color(Color::Muted))))
             .when(!rows.is_empty(), |el| {
-                el.child(v_flex().id("color-rows").max_h(px(320.)).overflow_y_scroll().py_1().rounded(px(8.)).bg(theme.colors().element_selected).children(rows))
+                el.child(
+                    v_scroll(
+                        "color-rows-scroll",
+                        v_flex().id("color-rows").py_1().children(rows),
+                    )
+                    .max_h(px(320.))
+                    .rounded(px(8.))
+                    .bg(theme.colors().element_selected)
+                    .overflow_hidden()
+                    .compact(),
+                )
             })
     }
 

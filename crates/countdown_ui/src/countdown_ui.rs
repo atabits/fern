@@ -674,14 +674,12 @@ impl CountdownView {
         let selected = field.value(draft.date);
         let earlier = (selected < *options.start()).then_some(selected);
         let later = (selected > *options.end()).then_some(selected);
-        v_flex()
-            .id(("countdown-date-options", field as usize))
-            .debug_selector(|| "countdown-date-options".to_owned())
-            .max_h(px(272.))
-            .w_full()
-            .overflow_y_scroll()
-            .track_scroll(&draft.date_inputs.scroll)
-            .children(earlier.into_iter().chain(options).chain(later).enumerate().map(|(i, value)| {
+        v_scroll(
+            ("countdown-date-options-scroll", field as usize),
+            v_flex()
+                .id(("countdown-date-options", field as usize))
+                .debug_selector(|| "countdown-date-options".to_owned())
+                .children(earlier.into_iter().chain(options).chain(later).enumerate().map(|(i, value)| {
                 let on = value == selected;
                 let label = if field == DateField::Month {
                     strings.months_short[value as usize - 1].to_owned()
@@ -700,8 +698,13 @@ impl CountdownView {
                             cx.notify();
                         }
                     }))
-            }))
-            .into_any_element()
+            })),
+        )
+        .track_scroll(&draft.date_inputs.scroll)
+        .max_h(px(272.))
+        .w_full()
+        .compact()
+        .into_any_element()
     }
 
     fn render_date_fields(&self, draft: &Draft, window: &Window, cx: &Context<Self>) -> Div {
@@ -1581,16 +1584,18 @@ impl Render for CountdownView {
                     }))
             }))))
             .child(
-                div()
-                    .id("countdown-grid")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .px(px(22.))
-                    .when(cards.is_empty(), |el| {
-                        el.child(div().pt_8().child(Label::new(strings.countdown_empty).color(Color::Muted)))
-                    })
-                    .child(div().flex().flex_wrap().gap(px(20.)).children(cards)),
+                v_scroll(
+                    "countdown-grid-scroll",
+                    div()
+                        .id("countdown-grid")
+                        .px(px(22.))
+                        .when(cards.is_empty(), |el| {
+                            el.child(div().pt_8().child(Label::new(strings.countdown_empty).color(Color::Muted)))
+                        })
+                        .child(div().flex().flex_wrap().gap(px(20.)).children(cards)),
+                )
+                .flex_1()
+                .min_h_0(),
             )
             .children(modal)
     }

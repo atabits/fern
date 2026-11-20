@@ -652,6 +652,7 @@ impl MatrixView {
 
         h_flex()
             .id(ElementId::Uuid(id))
+            .debug_selector(move || format!("matrix-task-{id}"))
             .h(px(40.))
             .flex_none()
             .gap(px(10.))
@@ -826,31 +827,34 @@ impl MatrixView {
                     ),
             )
             .child(
-                v_flex()
-                    .id(SharedString::from(format!("quadrant-tasks-{numeral}")))
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .children(self.adding.as_ref().filter(|(q, _)| *q == quadrant).map(|(_, input)| {
-                        h_flex()
-                            .h(px(34.))
-                            .flex_none()
-                            .mx_1()
-                            .mb_1()
-                            .px_2()
-                            .gap_2()
-                            .rounded(px(6.))
-                            .border_1()
-                            .border_color(color)
-                            .child(Icon::new(IconName::Plus).size(IconSize::Small).color(Color::Muted))
-                            .child(div().flex_1().min_w_0().debug_selector(|| format!("matrix-add-input-{quadrant}")).child(input.clone()))
-                    }))
-                    .when(empty && self.adding.as_ref().is_none_or(|(q, _)| *q != quadrant), |el| {
-                        el.items_center()
-                            .justify_center()
-                            .child(Label::new(strings.no_tasks).color(Color::Muted))
-                    })
-                    .children(content),
+                v_scroll(
+                    SharedString::from(format!("quadrant-tasks-scroll-{numeral}")),
+                    v_flex()
+                        .id(SharedString::from(format!("quadrant-tasks-{numeral}")))
+                        .debug_selector(move || format!("matrix-quadrant-{numeral}"))
+                        .children(self.adding.as_ref().filter(|(q, _)| *q == quadrant).map(|(_, input)| {
+                            h_flex()
+                                .h(px(34.))
+                                .flex_none()
+                                .mx_1()
+                                .mb_1()
+                                .px_2()
+                                .gap_2()
+                                .rounded(px(6.))
+                                .border_1()
+                                .border_color(color)
+                                .child(Icon::new(IconName::Plus).size(IconSize::Small).color(Color::Muted))
+                                .child(div().flex_1().min_w_0().debug_selector(|| format!("matrix-add-input-{quadrant}")).child(input.clone()))
+                        }))
+                        .when(empty && self.adding.as_ref().is_none_or(|(q, _)| *q != quadrant), |el| {
+                            el.items_center()
+                                .justify_center()
+                                .child(Label::new(strings.no_tasks).color(Color::Muted))
+                        })
+                        .children(content),
+                )
+                .flex_1()
+                .min_h_0(),
             )
             .into_any_element()
     }
@@ -1185,5 +1189,47 @@ mod tests {
         let view = QuadrantView { group: Some(GroupBy::Tag), sort: SortBy::Title, newest_first: true };
         assert_eq!(QuadrantView::from_storage(&view.to_storage()), view);
         assert_eq!(QuadrantView::from_storage(""), QuadrantView::default());
+    }
+
+    #[gpui::test]
+    fn overflowing_quadrant_scrolls_when_clicking_scrollbar(cx: &mut gpui::TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let mut ids = Vec::new();
+        for i in 0..25 {
+            ids.push(store.add_task(&format!("Quadrant item {i:02}")).unwrap().id);
+        }
+
+        cx.update(|cx| {
+            theme::init(cx);
+            cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+            assert!(keymap::load_default(&assets::Assets, cx).unwrap().is_empty());
+        });
+        let (_, cx) = cx.add_window_view(|_, cx| MatrixView::new(store, cx));
+        cx.simulate_resize(gpui::size(gpui::px(900.), gpui::px(480.)));
+        cx.run_until_parked();
+
+        // Tasks without due date or priority land in quadrant IV ("Not Urgent & Not Important").
+        let quadrant = cx.debug_bounds("matrix-quadrant-IV").unwrap();
+        let (bottom_sel, bottom_row) = ids
+            .iter()
+            .filter_map(|id| {
+                let sel: &'static str = format!("matrix-task-{id}").leak();
+                cx.debug_bounds(sel).map(|b| (sel, b))
+            })
+            .max_by(|a, b| a.1.bottom().partial_cmp(&b.1.bottom()).unwrap())
+            .expect("quadrant renders task rows");
+        let initial_top = bottom_row.top();
+        assert!(bottom_row.bottom() > quadrant.bottom());
+
+        let bar_bottom = gpui::point(quadrant.right() - gpui::px(6.), quadrant.bottom() - gpui::px(8.));
+        let modifiers = gpui::Modifiers::default();
+        cx.simulate_mouse_move(bar_bottom, None, modifiers);
+        cx.simulate_click(bar_bottom, modifiers);
+        let scrolled_row = cx.debug_bounds(bottom_sel).unwrap();
+        assert!(
+            scrolled_row.top() < initial_top,
+            "clicking quadrant scrollbar should scroll rows upward: {initial_top:?} -> {:?}",
+            scrolled_row.top()
+        );
     }
 }

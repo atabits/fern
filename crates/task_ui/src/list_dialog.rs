@@ -267,25 +267,30 @@ impl ListDialog {
                     .child(Label::new(title).size(LabelSize::Small)),
             )
             .child(
-                div().id("emoji-grid").h(px(180.)).overflow_y_scroll().child(h_flex().flex_wrap().children(emoji.into_iter().map(|e| {
-                    div()
-                        .id(SharedString::from(format!("emoji-{e}")))
-                        .w(px(39.))
-                        .h(px(34.))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded(px(6.))
-                        .cursor_pointer()
-                        .hover(|s| s.bg(theme.colors().element_hover))
-                        .child(div().text_size(px(20.)).child(e))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.update(cx, |this| {
-                                this.draft.icon = Some(e.to_owned());
-                                this.open = None;
-                            })
-                        }))
-                }))),
+                v_scroll(
+                    "emoji-grid-scroll",
+                    div().id("emoji-grid").child(h_flex().flex_wrap().children(emoji.into_iter().map(|e| {
+                        div()
+                            .id(SharedString::from(format!("emoji-{e}")))
+                            .w(px(39.))
+                            .h(px(34.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(6.))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(theme.colors().element_hover))
+                            .child(div().text_size(px(20.)).child(e))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.update(cx, |this| {
+                                    this.draft.icon = Some(e.to_owned());
+                                    this.open = None;
+                                })
+                            }))
+                    }))),
+                )
+                .h(px(180.))
+                .compact(),
             )
             .into_any_element()
     }

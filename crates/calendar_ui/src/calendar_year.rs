@@ -810,22 +810,25 @@ impl CalendarView {
                 )
             })
             .child(
-                v_flex()
-                    .id("year-day-items")
-                    .max_h(px(220.))
-                    .overflow_y_scroll()
-                    .gap_0p5()
-                    .children(
-                        tasks
-                            .into_iter()
-                            .map(|task| self.task_bar(task, Some(date), cx).h(px(22.))),
-                    )
-                    .children(
-                        events
-                            .into_iter()
-                            .map(|event| self.event_bar(event, date, cx)),
-                    )
-                    .children(extras),
+                v_scroll(
+                    "year-day-items-scroll",
+                    v_flex()
+                        .id("year-day-items")
+                        .gap_0p5()
+                        .children(
+                            tasks
+                                .into_iter()
+                                .map(|task| self.task_bar(task, Some(date), cx).h(px(22.))),
+                        )
+                        .children(
+                            events
+                                .into_iter()
+                                .map(|event| self.event_bar(event, date, cx)),
+                        )
+                        .children(extras),
+                )
+                .max_h(px(220.))
+                .compact(),
             )
             .into_any_element()
     }

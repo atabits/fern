@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use chrono::{Datelike, Local, NaiveDate};
 use fern_core::stats::{self, Bucket};
 use fern_core::{FocusSession, Id, Store, Task, View, focus_stats, format_minutes};
-use gpui::{Entity, Focusable as _, FontWeight, Task as GpuiTask};
+use gpui::{Entity, Focusable as _, FontWeight, ScrollHandle, Task as GpuiTask};
 use ui::{Donut, Placement, PopoverAttachment, VerticalScrollbar, popover};
 use ui::prelude::*;
 
@@ -99,7 +99,7 @@ pub struct FocusView {
     message: Option<String>,
     /// The Statistics page, while it is open.
     stats: Option<StatsPage>,
-    stats_scrollbar: VerticalScrollbar,
+    stats_scroll: ScrollHandle,
     /// The focus record whose dialog is open, and its note field.
     open_record: Option<Id>,
     record_note: Entity<TextInput>,
@@ -340,7 +340,7 @@ impl FocusView {
             add_minutes: 25,
             message: None,
             stats: None,
-            stats_scrollbar: VerticalScrollbar::default(),
+            stats_scroll: ScrollHandle::new(),
             open_record: None,
             record_note: cx.new(|cx| TextInput::new(Mode::MultiLine, strings.focus_note_placeholder, cx)),
         };
@@ -1009,7 +1009,7 @@ impl FocusView {
                     )),
             )
             .child(filters)
-            .child(v_flex().id("batch-list").flex_1().min_h_0().overflow_y_scroll().children(rows))
+            .child(v_scroll("batch-list-scroll", v_flex().id("batch-list").children(rows)).flex_1().min_h_0())
             .child(
                 h_flex()
                     .child(
@@ -1289,11 +1289,11 @@ impl FocusView {
                     }))),
             );
         let body: AnyElement = if tab == 0 {
-            div()
-                .id("timer-icon-grid")
-                .h(px(158.))
-                .overflow_y_scroll()
-                .child(div().flex().flex_wrap().gap_y(px(16.)).children(HABIT_EMOJI.iter().enumerate().map(|(i, emoji)| {
+            v_scroll(
+                "timer-icon-grid-scroll",
+                div()
+                    .id("timer-icon-grid")
+                    .child(div().flex().flex_wrap().gap_y(px(16.)).children(HABIT_EMOJI.iter().enumerate().map(|(i, emoji)| {
                     let color = COLORS[i % COLORS.len()];
                     let selected = timer.icon.as_deref() == Some(*emoji);
                     div()
@@ -1333,8 +1333,11 @@ impl FocusView {
                             d.timer.icon = Some((*emoji).to_owned());
                             d.timer.color = Some(color.to_owned());
                         })))
-                })))
-                .into_any_element()
+                }))),
+            )
+            .h(px(158.))
+            .compact()
+            .into_any_element()
         } else {
             h_flex()
                 .h(px(40.))
@@ -1607,7 +1610,7 @@ impl FocusView {
     fn open_stats(&mut self, cx: &mut Context<Self>) {
         let today = Local::now().date_naive();
         self.record_menu = None;
-        self.stats_scrollbar = VerticalScrollbar::default();
+        self.stats_scroll = ScrollHandle::new();
         self.stats = Some(StatsPage {
             tab: 2,
             day: today,
@@ -1680,7 +1683,7 @@ impl FocusView {
             let tab = stats.tab;
             change(stats);
             if tab != stats.tab {
-                self.stats_scrollbar = VerticalScrollbar::default();
+                self.stats_scroll = ScrollHandle::new();
             }
         }
         cx.notify();
@@ -2010,11 +2013,14 @@ impl FocusView {
                                     .min_h(px(CARD_HEIGHT))
                                     .child(self.render_record_header(false, cx))
                                     .child(
-                                        v_flex()
-                                            .id("stats-focus-record")
-                                            .max_h(px(200.))
-                                            .overflow_y_scroll()
-                                            .children(self.render_record(strings, cx)),
+                                        v_scroll(
+                                            "stats-focus-record-scroll",
+                                            v_flex()
+                                                .id("stats-focus-record")
+                                                .children(self.render_record(strings, cx)),
+                                        )
+                                        .max_h(px(200.))
+                                        .compact(),
                                     ),
                             ),
                     )
@@ -2049,10 +2055,10 @@ impl FocusView {
                             .items_start()
                             .justify_center()
                             .overflow_y_scroll()
-                            .track_scroll(self.stats_scrollbar.scroll_handle())
+                            .track_scroll(&self.stats_scroll)
                             .child(content),
                     )
-                    .child(self.stats_scrollbar.clone()),
+                    .child(VerticalScrollbar::for_handle(("focus-stats-bar", page.tab), self.stats_scroll.clone())),
             )
             .into_any_element()
     }
@@ -3269,7 +3275,7 @@ impl FocusView {
                     .child(Icon::new(IconName::Search).size(IconSize::Small).color(Color::Muted))
                     .child(div().flex_1().child(picker.search.clone())),
             )
-            .child(v_flex().id("focus-picker-items").flex_1().min_h_0().overflow_y_scroll().children(items))
+            .child(v_scroll("focus-picker-items-scroll", v_flex().id("focus-picker-items").children(items)).flex_1().min_h_0())
             .into_any_element()
     }
 
@@ -3490,7 +3496,7 @@ impl FocusView {
                             .children(picker_eye),
                     ),
             )
-            .child(v_flex().id("focus-page-hours").flex_1().min_h_0().overflow_y_scroll().pt_2().child(hours));
+            .child(v_scroll("focus-page-hours-scroll", v_flex().id("focus-page-hours").pt_2().child(hours)).flex_1().min_h_0());
         h_flex()
             .relative()
             .size_full()
@@ -3635,18 +3641,20 @@ impl Render for FocusView {
                     ),
             )
             .child(
-                v_flex()
-                    .id("focus-tasks")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .px_3()
-                    .children(timer_rows)
-                    .when(!self.archived_tab && rows.is_empty() && self.timers.is_empty(), |el| {
-                        el.child(div().px_2().pt_4().child(Label::new(strings.focus_no_tasks).color(Color::Muted)))
-                    })
-                    .when(!self.archived_tab && !self.timers.is_empty() && !rows.is_empty(), |el| el.child(div().my_1().child(Divider::horizontal())))
-                    .when(!self.archived_tab, |el| el.children(rows)),
+                v_scroll(
+                    "focus-tasks-scroll",
+                    v_flex()
+                        .id("focus-tasks")
+                        .px_3()
+                        .children(timer_rows)
+                        .when(!self.archived_tab && rows.is_empty() && self.timers.is_empty(), |el| {
+                            el.child(div().px_2().pt_4().child(Label::new(strings.focus_no_tasks).color(Color::Muted)))
+                        })
+                        .when(!self.archived_tab && !self.timers.is_empty() && !rows.is_empty(), |el| el.child(div().my_1().child(Divider::horizontal())))
+                        .when(!self.archived_tab, |el| el.children(rows)),
+                )
+                .flex_1()
+                .min_h_0(),
             )
             .when(running, |el| {
                 el.child(
@@ -3713,15 +3721,17 @@ impl Render for FocusView {
                 el.child(Label::new(message).size(LabelSize::XSmall).color(Color::Muted))
             })
             .child(
-                v_flex()
-                    .id("focus-record")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .when(record.is_empty(), |el| {
-                        el.child(div().pt_4().child(Label::new(strings.focus_no_record).color(Color::Muted)))
-                    })
-                    .children(record),
+                v_scroll(
+                    "focus-record-scroll",
+                    v_flex()
+                        .id("focus-record")
+                        .when(record.is_empty(), |el| {
+                            el.child(div().pt_4().child(Label::new(strings.focus_no_record).color(Color::Muted)))
+                        })
+                        .children(record),
+                )
+                .flex_1()
+                .min_h_0(),
             );
 
         h_flex()

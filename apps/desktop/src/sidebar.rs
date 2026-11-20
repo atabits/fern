@@ -201,14 +201,12 @@ pub fn render(
         )
         // Scroll the section icons in a short window so the controls below stay reachable.
         .child(
-            v_flex()
-                .id("sidebar-sections")
-                .flex_1()
-                .min_h_0()
-                .w_full()
-                .items_center()
-                .overflow_y_scroll()
-                .children(ordered_sections.into_iter().filter(|s| s.enabled(features)).map(|section| {
+            v_scroll(
+                "sidebar-sections-scroll",
+                v_flex()
+                    .id("sidebar-sections")
+                    .items_center()
+                    .children(ordered_sections.into_iter().filter(|s| s.enabled(features)).map(|section| {
                     let on_select = on_select.clone();
                     let on_hover = on_hover.clone();
                     let on_start_drag = on_start_drag.clone();
@@ -264,6 +262,13 @@ pub fn render(
                             el.child(side_tooltip(section.title(strings), cx))
                         })
                 })),
+            )
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .color(colors.sidebar_icon)
+            .inset(px(1.))
+            .compact(),
         )
         .children(sync.map(|sync| {
             button("sync", IconName::RefreshCw)

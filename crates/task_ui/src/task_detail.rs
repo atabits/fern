@@ -279,8 +279,15 @@ impl TaskDetail {
         let strings = i18n::t(cx);
         match self.session.popup {
             Some(Popup::Due) => self.render_due_popup_in(available, strings, cx),
-            Some(Popup::More) => div().id("sticky-more-scroll").max_h(available.height)
-                .overflow_y_scroll().child(self.render_more_popup(strings, cx)).into_any_element(),
+            Some(Popup::More) => v_scroll(
+                "sticky-more-scroll-view",
+                div()
+                    .id("sticky-more-scroll")
+                    .child(self.render_more_popup(strings, cx)),
+            )
+            .max_h(available.height)
+            .compact()
+            .into_any_element(),
             Some(Popup::Priority) => self.render_priority_popup(strings, cx),
             Some(Popup::List) => self.render_list_popup(strings, cx),
             Some(Popup::Tags | Popup::InlineTags) => self.render_tags_popup(cx),
@@ -1429,41 +1436,43 @@ impl TaskDetail {
     fn render_activity(&self, activity: &[fern_core::Activity], strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
 
-        v_flex()
-            .id("task-activity")
-            .max_h(px(240.))
-            .overflow_y_scroll()
-            .px_5()
-            .py_3()
-            .gap_2()
-            .border_t_1()
-            .border_color(theme.colors().border)
-            .child(
-                h_flex()
-                    .child(div().flex_1().child(Label::new(strings.task_activities).weight(FontWeight::SEMIBOLD)))
-                    .child(IconButton::new("close-activity", IconName::X).on_click(cx.listener(|this, _, _, cx| {
-                        this.session.activity = None;
-                        cx.notify();
-                    }))),
-            )
-            .children(activity.iter().rev().map(|entry| {
-                let text = activity_text(&entry.kind, strings);
-                let when = chrono::Local
-                    .timestamp_millis_opt(entry.at)
-                    .single()
-                    .map(|t| format!("{} {}", calendar::format_day_month(t.date_naive(), strings), calendar::format_time(t, strings)))
-                    .unwrap_or_default();
-                h_flex()
-                    .items_start()
-                    .gap_2()
-                    .child(div().mt(px(5.)).size(px(8.)).flex_none().rounded_full().bg(theme.colors().accent))
-                    .child(
-                        v_flex()
-                            .child(Label::new(text).size(LabelSize::Small))
-                            .child(Label::new(when).size(LabelSize::XSmall).color(Color::Muted)),
-                    )
-            }))
-            .into_any_element()
+        v_scroll(
+            "task-activity-scroll",
+            v_flex()
+                .id("task-activity")
+                .px_5()
+                .py_3()
+                .gap_2()
+                .child(
+                    h_flex()
+                        .child(div().flex_1().child(Label::new(strings.task_activities).weight(FontWeight::SEMIBOLD)))
+                        .child(IconButton::new("close-activity", IconName::X).on_click(cx.listener(|this, _, _, cx| {
+                            this.session.activity = None;
+                            cx.notify();
+                        }))),
+                )
+                .children(activity.iter().rev().map(|entry| {
+                    let text = activity_text(&entry.kind, strings);
+                    let when = chrono::Local
+                        .timestamp_millis_opt(entry.at)
+                        .single()
+                        .map(|t| format!("{} {}", calendar::format_day_month(t.date_naive(), strings), calendar::format_time(t, strings)))
+                        .unwrap_or_default();
+                    h_flex()
+                        .items_start()
+                        .gap_2()
+                        .child(div().mt(px(5.)).size(px(8.)).flex_none().rounded_full().bg(theme.colors().accent))
+                        .child(
+                            v_flex()
+                                .child(Label::new(text).size(LabelSize::Small))
+                                .child(Label::new(when).size(LabelSize::XSmall).color(Color::Muted)),
+                        )
+                })),
+        )
+        .max_h(px(240.))
+        .border_t_1()
+        .border_color(theme.colors().border)
+        .into_any_element()
     }
 
     /// The "Link Parent Task" picker: open tasks other than this one and its subtasks, filtered by
@@ -1665,18 +1674,24 @@ impl TaskDetail {
                         ),
                 )
             })
-            .child(v_flex().id("link-parent-list").max_h(px(320.)).overflow_y_scroll().children(candidates.into_iter().map(|candidate| {
-                let parent = candidate.id;
-                let list = list_name(candidate.list_id);
-                ListItem::new(SharedString::from(format!("link-{parent}")))
-                    .start_slot(Icon::new(IconName::Circle).size(IconSize::Small).color(Color::Muted))
-                    .child(Label::new(candidate.title).truncate())
-                    .end_slot(Label::new(list).size(LabelSize::XSmall).color(Color::Muted))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.dismiss_popup(window, cx);
-                        this.link_current_parent(parent, cx);
-                    }))
-            })))
+            .child(
+                v_scroll(
+                    "link-parent-list-scroll",
+                    v_flex().id("link-parent-list").children(candidates.into_iter().map(|candidate| {
+                        let parent = candidate.id;
+                        let list = list_name(candidate.list_id);
+                        ListItem::new(SharedString::from(format!("link-{parent}")))
+                            .start_slot(Icon::new(IconName::Circle).size(IconSize::Small).color(Color::Muted))
+                            .child(Label::new(candidate.title).truncate())
+                            .end_slot(Label::new(list).size(LabelSize::XSmall).color(Color::Muted))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.dismiss_popup(window, cx);
+                                this.link_current_parent(parent, cx);
+                            }))
+                    })),
+                )
+                .max_h(px(320.)),
+            )
             .into_any_element()
     }
 
@@ -1888,18 +1903,21 @@ impl TaskDetail {
             Some(field @ (RangeField::StartTime | RangeField::EndTime)) => {
                 let current = if field == RangeField::EndTime { draft.end_time } else { draft.time };
                 Some(
-                    v_flex()
-                        .id("range-times")
-                        .max_h(px(180.))
-                        .overflow_y_scroll()
-                        .children(due_picker::time_options().into_iter().map(|t| {
-                            ListItem::new(SharedString::from(format!("range-time-{t}")))
-                                .height(px(28.))
-                                .child(Label::new(crate::calendar::format_time(t, strings)).size(LabelSize::Small))
-                                .when(current == Some(t), |item| item.end_slot(check_mark()))
-                                .on_click(cx.listener(move |this, _, _, cx| this.update_draft(cx, |d| d.pick_range_time(t))))
-                        }))
-                        .into_any_element(),
+                    v_scroll(
+                        "range-times-scroll",
+                        v_flex()
+                            .id("range-times")
+                            .children(due_picker::time_options().into_iter().map(|t| {
+                                ListItem::new(SharedString::from(format!("range-time-{t}")))
+                                    .height(px(28.))
+                                    .child(Label::new(crate::calendar::format_time(t, strings)).size(LabelSize::Small))
+                                    .when(current == Some(t), |item| item.end_slot(check_mark()))
+                                    .on_click(cx.listener(move |this, _, _, cx| this.update_draft(cx, |d| d.pick_range_time(t))))
+                            })),
+                    )
+                    .max_h(px(180.))
+                    .compact()
+                    .into_any_element(),
                 )
             }
             None => None,
@@ -2035,25 +2053,30 @@ impl TaskDetail {
                             .text_size(px(12.))
                             .child(self.time_input.clone()),
                     )
-                    .child(v_flex()
-                    .id("time-options")
-                    .max_h(px(180.))
-                    .overflow_y_scroll()
-                    .children(
-                        std::iter::once(None)
-                            .chain(due_picker::time_options().into_iter().map(Some))
-                            .map(|time| {
-                                let label: SharedString = time.map_or(strings.no_time.into(), |t| crate::calendar::format_time(t, strings).into());
-                                ListItem::new(SharedString::from(format!("time-{label}")))
-                                    .height(px(28.))
-                                    .child(Label::new(label).size(LabelSize::Small))
-                                    .when(draft.time == time, |item| item.end_slot(check_mark()))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.update_draft(cx, |d| d.pick_time(time, Local::now().date_naive()))
-                                    }))
-                            })
-                            .collect::<Vec<_>>(),
-                    ))
+                    .child(
+                        v_scroll(
+                            "time-options-scroll",
+                            v_flex()
+                                .id("time-options")
+                                .children(
+                                    std::iter::once(None)
+                                        .chain(due_picker::time_options().into_iter().map(Some))
+                                        .map(|time| {
+                                            let label: SharedString = time.map_or(strings.no_time.into(), |t| crate::calendar::format_time(t, strings).into());
+                                            ListItem::new(SharedString::from(format!("time-{label}")))
+                                                .height(px(28.))
+                                                .child(Label::new(label).size(LabelSize::Small))
+                                                .when(draft.time == time, |item| item.end_slot(check_mark()))
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.update_draft(cx, |d| d.pick_time(time, Local::now().date_naive()))
+                                                }))
+                                        })
+                                        .collect::<Vec<_>>(),
+                                ),
+                        )
+                        .max_h(px(180.))
+                        .compact(),
+                    )
                     .into_any_element(),
             ),
             Some(DueMenu::Custom(rule)) => Some(self.render_custom_repeat(rule.clone(), strings, cx)),
@@ -2276,11 +2299,12 @@ impl TaskDetail {
                 this.dismiss_popup(window, cx);
             }))
             .child(
-                v_flex()
-                    .id("due-popup-content")
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .child(content),
+                v_scroll(
+                    "due-popup-content-scroll",
+                    v_flex().id("due-popup-content").child(content),
+                )
+                .min_h_0()
+                .compact(),
             )
             .child(
                 h_flex()
@@ -2869,7 +2893,10 @@ impl TaskDetail {
                     .child(Icon::new(IconName::Search).color(Color::Muted))
                     .child(div().flex_1().child(self.list_search.clone())),
             )
-            .child(v_flex().id("list-menu-rows").flex_1().p_1().overflow_y_scroll().children(rows.into_iter().map(|(list, name, icon)| {
+            .child(
+                v_scroll(
+                    "list-menu-rows-scroll",
+                    v_flex().id("list-menu-rows").p_1().children(rows.into_iter().map(|(list, name, icon)| {
                 let selected = current.is_some_and(|(l, _)| l == list);
                 let color = if selected { Color::Accent } else { Color::Default };
                 let sections = self.session.store.list_sections(list).unwrap_or_default();
@@ -2924,7 +2951,12 @@ impl TaskDetail {
                             })),
                         ))
                     })
-            })))
+            })),
+                )
+                .flex_1()
+                .min_h_0()
+                .compact(),
+            )
             .into_any_element()
     }
 
@@ -2965,20 +2997,28 @@ impl TaskDetail {
                     .child(Icon::new(IconName::Search).size(IconSize::Small).color(Color::Muted))
                     .child(div().flex_1().min_w_0().child(self.tag_input.clone())),
             )
-            .child(v_flex().id("task-tag-options").max_h(px(200.)).overflow_y_scroll()
-                .children(names.into_iter().filter(|name| name.to_lowercase().contains(&folded)).map(|name| {
-                    let name = name.to_owned();
-                    let checked = draft.picked.iter().any(|picked| same_tag(picked, &name));
-                    ListItem::new(SharedString::from(format!("tag-option-{name}")))
-                        .start_slot(Icon::new(IconName::Tag).size(IconSize::Small).color(self.tag_color(&name, cx)))
-                        .child(Label::new(name.clone()).truncate())
-                        .when(checked, |item| item.end_slot(check_mark()))
-                        .on_click(cx.listener(move |this, _, _, cx| this.toggle_picked_tag(name.clone(), cx)))
-                }))
-                .when(offer_new, |el| el.child(ListItem::new("task-tag-create")
-                    .start_slot(Icon::new(IconName::Plus).size(IconSize::Small).color(Color::Accent))
-                    .child(Label::new(format!("{}: {query}", strings.new_tag)).truncate())
-                    .on_click(cx.listener(|this, _, window, cx| this.pick_typed_tag(window, cx))))))
+            .child(
+                v_scroll(
+                    "task-tag-options-scroll",
+                    v_flex()
+                        .id("task-tag-options")
+                        .children(names.into_iter().filter(|name| name.to_lowercase().contains(&folded)).map(|name| {
+                            let name = name.to_owned();
+                            let checked = draft.picked.iter().any(|picked| same_tag(picked, &name));
+                            ListItem::new(SharedString::from(format!("tag-option-{name}")))
+                                .start_slot(Icon::new(IconName::Tag).size(IconSize::Small).color(self.tag_color(&name, cx)))
+                                .child(Label::new(name.clone()).truncate())
+                                .when(checked, |item| item.end_slot(check_mark()))
+                                .on_click(cx.listener(move |this, _, _, cx| this.toggle_picked_tag(name.clone(), cx)))
+                        }))
+                        .when(offer_new, |el| el.child(ListItem::new("task-tag-create")
+                            .start_slot(Icon::new(IconName::Plus).size(IconSize::Small).color(Color::Accent))
+                            .child(Label::new(format!("{}: {query}", strings.new_tag)).truncate())
+                            .on_click(cx.listener(|this, _, window, cx| this.pick_typed_tag(window, cx))))),
+                )
+                .max_h(px(200.))
+                .compact(),
+            )
             .when(draft.save_failed, |el| el.child(Label::new(strings.task_save_failed).color(Color::Error)))
             .child(h_flex().gap_2().p_1()
                 .child(button("task-tags-cancel", strings.cancel, false).on_click(cx.listener(|this, _, window, cx| {
@@ -3259,24 +3299,23 @@ impl Render for TaskDetail {
             ))
             // Title, checklist, notes and tags; clicking empty space puts the caret into the notes.
             .child(
-                v_flex()
-                    .id("detail-body")
-                    .debug_selector(|| "task-detail-body".to_owned())
-                    .when_some(self.sticky_style, |el, style| el.text_size(px(style.font_px())))
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .px_5()
-                    .pt_4()
-                    .pb_6()
-                    .gap_3()
-                    .when(sticky, |el| el.px_3().pt_0p5().pb_2().gap_1())
-                    .on_mouse_down(MouseButton::Left, move |_, window, cx| {
-                        window.focus(&notes_focus, cx);
-                    })
-                    // A subtask names its parent over the title, as the original; a click opens it,
-                    // and hovering exposes Edit and Unlink Parent Task buttons.
-                    .when_some(self.session.parent.as_ref(), |el, parent| {
+                v_scroll(
+                    "detail-body-scroll",
+                    v_flex()
+                        .id("detail-body")
+                        .debug_selector(|| "task-detail-body".to_owned())
+                        .when_some(self.sticky_style, |el, style| el.text_size(px(style.font_px())))
+                        .px_5()
+                        .pt_4()
+                        .pb_6()
+                        .gap_3()
+                        .when(sticky, |el| el.px_3().pt_0p5().pb_2().gap_1())
+                        .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                            window.focus(&notes_focus, cx);
+                        })
+                        // A subtask names its parent over the title, as the original; a click opens it,
+                        // and hovering exposes Edit and Unlink Parent Task buttons.
+                        .when_some(self.session.parent.as_ref(), |el, parent| {
                         let parent_id = parent.id;
                         let parent_title: SharedString = if parent.title.is_empty() {
                             strings.untitled.into()
@@ -3408,6 +3447,10 @@ impl Render for TaskDetail {
                         el.child(div().pt_2().child(Divider::horizontal())).child(self.render_subtasks(strings, cx))
                     })
                     .when(!self.session.comments.is_empty(), |el| el.child(self.render_comments(strings, cx))),
+                )
+                .flex_1()
+                .min_h_0()
+                .when_some(self.sticky_style, |el, style| el.color(gpui::rgb(style.foreground()).into())),
             )
             .when(self.session.draft.as_ref().is_some_and(|draft| draft.save_failed), |el| {
                 el.child(div().px_5().py_1().child(Label::new(strings.task_save_failed).color(Color::Error)))

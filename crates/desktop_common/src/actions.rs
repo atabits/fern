@@ -31,7 +31,11 @@ actions!(
     [
         SelectNext,
         SelectPrevious,
+        SelectAllTasks,
+        ExtendSelectionNext,
+        ExtendSelectionPrevious,
         ToggleComplete,
+        ToggleInProgress,
         DeleteTask,
         PinTask,
         SetDate,

@@ -1,7 +1,7 @@
 //! State and labels of the due-date popover, matched to TickTick's: the user edits a draft
 //! (date, time, repeat) and nothing is saved until "OK".
 
-use chrono::{Datelike, Duration, Months, NaiveDate, NaiveDateTime, NaiveTime, Timelike};
+use chrono::{Datelike, Duration, Months, NaiveDate, NaiveDateTime, NaiveTime, Offset as _, TimeZone as _, Timelike, Utc};
 use fern_core::reminder::{ALL_DAY_OFFSETS, ALL_DAY_REMINDER_HOUR, TIMED_OFFSETS};
 use fern_core::{Frequency, Recurrence, Task};
 
@@ -12,6 +12,7 @@ use crate::i18n::{Locale, Strings};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DueMenu {
     Time,
+    TimeZone,
     Reminder,
     /// The custom reminder editor.
     CustomReminder(CustomReminder),
@@ -38,6 +39,9 @@ pub struct DueDraft {
     pub end_time: Option<NaiveTime>,
     /// The Duration tab's field being picked with the calendar or the time list.
     pub range_field: Option<RangeField>,
+    pub timezone: Option<String>,
+    pub is_floating: bool,
+    pub constant_reminder: bool,
 }
 
 /// The tabs of the due-date popover.
@@ -70,6 +74,9 @@ impl DueDraft {
             range_field: None,
             month: calendar::month_start(task.due_date.unwrap_or(today)),
             menu: None,
+            timezone: task.timezone.clone(),
+            is_floating: task.is_floating,
+            constant_reminder: task.constant_reminder,
         }
     }
 
@@ -362,13 +369,119 @@ pub fn repeat_options(date: NaiveDate, strings: &Strings, locale: Locale) -> Vec
     ]
 }
 
+/// Additional repeat presets (Ebbinghaus forgetting curve and Lunar calendar).
+pub fn extended_repeat_options(date: NaiveDate, strings: &Strings, locale: Locale) -> Vec<(Recurrence, String, String)> {
+    let mut out = vec![(
+        Recurrence::forgetting_curve(),
+        strings.repeat_forgetting_curve.to_owned(),
+        strings.repeat_forgetting_curve_hint.to_owned(),
+    )];
+    if let Some(lunar) = fern_core::lunar::gregorian_to_lunar(date) {
+        let hint = fern_core::lunar::format_short(lunar, locale == Locale::ZhCn);
+        out.push((Recurrence::lunar(Frequency::Yearly, 1), strings.repeat_lunar_yearly.to_owned(), hint.clone()));
+        out.push((Recurrence::lunar(Frequency::Monthly, 1), strings.repeat_lunar_monthly.to_owned(), hint));
+    }
+    out
+}
+
+const MAJOR_TIMEZONES: [&str; 29] = [
+    "UTC",
+    "America/New_York",
+    "America/Chicago",
+    "America/Denver",
+    "America/Los_Angeles",
+    "America/Toronto",
+    "America/Sao_Paulo",
+    "Europe/London",
+    "Europe/Paris",
+    "Europe/Berlin",
+    "Europe/Madrid",
+    "Europe/Rome",
+    "Europe/Amsterdam",
+    "Europe/Warsaw",
+    "Europe/Kyiv",
+    "Europe/Istanbul",
+    "Europe/Moscow",
+    "Asia/Dubai",
+    "Asia/Almaty",
+    "Asia/Kolkata",
+    "Asia/Bangkok",
+    "Asia/Singapore",
+    "Asia/Shanghai",
+    "Asia/Hong_Kong",
+    "Asia/Taipei",
+    "Asia/Tokyo",
+    "Asia/Seoul",
+    "Australia/Sydney",
+    "Pacific/Auckland",
+];
+
+fn format_tz_offset(tz: chrono_tz::Tz) -> String {
+    let now = Utc::now().naive_utc();
+    let offset_secs = tz.offset_from_utc_datetime(&now).fix().local_minus_utc();
+    let mins = offset_secs / 60;
+    let sign = if mins >= 0 { '+' } else { '-' };
+    let abs = mins.abs();
+    let (h, m) = (abs / 60, abs % 60);
+    if m == 0 {
+        format!("UTC{sign}{h}")
+    } else {
+        format!("UTC{sign}{h}:{m:02}")
+    }
+}
+
+/// Lists `(iana_name, utc_offset)` pairs matching `query` (curated major zones when empty).
+pub fn timezone_options(query: &str) -> Vec<(String, String)> {
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        return MAJOR_TIMEZONES
+            .iter()
+            .filter_map(|name| name.parse::<chrono_tz::Tz>().ok().map(|tz| ((*name).to_owned(), format_tz_offset(tz))))
+            .collect();
+    }
+    chrono_tz::TZ_VARIANTS
+        .iter()
+        .filter(|tz| tz.name().to_lowercase().contains(&q))
+        .take(40)
+        .map(|tz| (tz.name().to_owned(), format_tz_offset(*tz)))
+        .collect()
+}
+
+/// Compact badge text for a task's time zone or floating status; `None` for default local time.
+pub fn short_timezone_label(timezone: Option<&str>, is_floating: bool, strings: &Strings) -> Option<String> {
+    if is_floating {
+        return Some(strings.timezone_floating.to_owned());
+    }
+    let tz_name = timezone?;
+    let city = tz_name.rsplit('/').next().unwrap_or(tz_name).replace('_', " ");
+    match tz_name.parse::<chrono_tz::Tz>() {
+        Ok(tz) => Some(format!("{city} ({})", format_tz_offset(tz))),
+        Err(_) => Some(city),
+    }
+}
+
 /// The label of the current repeat rule for the Repeat row.
 pub fn repeat_label(repeat: &Recurrence, strings: &Strings) -> String {
+    if repeat.forgetting_curve {
+        return strings.repeat_forgetting_curve.to_owned();
+    }
     if repeat.is_specific_dates() {
         return strings.repeat_specific_dates.to_owned();
     }
     if repeat.is_weekdays() {
         return strings.repeat_weekdays.to_owned();
+    }
+    if repeat.lunar && repeat.interval == 1 {
+        let base = match repeat.frequency {
+            Frequency::Monthly => strings.repeat_lunar_monthly.to_owned(),
+            Frequency::Yearly => strings.repeat_lunar_yearly.to_owned(),
+            _ => format!("{} ({})", strings.repeat_daily, strings.repeat_lunar),
+        };
+        return if repeat.skip_holidays {
+            format!("{base}, {}", strings.repeat_skip_holidays)
+        } else {
+            base
+        };
     }
     let unit = unit_index(repeat.frequency);
     let mut label = if repeat.interval > 1 {
@@ -376,6 +489,9 @@ pub fn repeat_label(repeat: &Recurrence, strings: &Strings) -> String {
     } else {
         [strings.repeat_daily, strings.repeat_weekly, strings.repeat_monthly, strings.repeat_yearly][unit].to_owned()
     };
+    if repeat.lunar {
+        label.push_str(&format!(" ({})", strings.repeat_lunar));
+    }
     if repeat.frequency == Frequency::Weekly && repeat.weekdays != 0 {
         let days: Vec<&str> =
             (0..7).filter(|i| repeat.weekdays & (1 << i) != 0).map(|i| strings.weekdays_min[i]).collect();
@@ -403,6 +519,9 @@ pub fn repeat_label(repeat: &Recurrence, strings: &Strings) -> String {
         let nth = if nth < 0 { strings.repeat_nth[4] } else { strings.repeat_nth[0] };
         label.push_str(strings.repeat_on);
         label.push_str(&format!("{nth} {}", strings.repeat_workday_word));
+    }
+    if repeat.skip_holidays {
+        label.push_str(&format!(", {}", strings.repeat_skip_holidays));
     }
     label
 }
@@ -465,6 +584,7 @@ mod tests {
             end_time: None,
             range_field: None,
             menu: Some(DueMenu::Reminder),
+            ..Default::default()
         };
         draft.toggle_reminder(24 * 60, today);
         draft.toggle_reminder(0, today);
@@ -511,6 +631,7 @@ mod tests {
             end_time: None,
             range_field: None,
             menu: None,
+            ..Default::default()
         };
         assert_eq!(draft.end(), None);
         draft.start_duration(today.and_hms_opt(5, 30, 0).unwrap(), 60);
@@ -586,16 +707,25 @@ mod tests {
             end_time: None,
             range_field: None,
             menu: Some(DueMenu::Time),
+            ..Default::default()
         };
         draft.pick_time(NaiveTime::from_hms_opt(9, 30, 0), today);
         assert_eq!((draft.date, draft.menu), (Some(today), None));
 
-        let mut draft =
-            DueDraft { date: None, time: None, repeat: None, reminders: Vec::new(), reminders_changed: false, month: today,
+        let mut draft = DueDraft {
+            date: None,
+            time: None,
+            repeat: None,
+            reminders: Vec::new(),
+            reminders_changed: false,
+            month: today,
             tab: DueTab::Date,
             end_date: None,
             end_time: None,
-            range_field: None, menu: None };
+            range_field: None,
+            menu: None,
+            ..Default::default()
+        };
         draft.pick_repeat(Some(Recurrence::weekdays()), today);
         assert_eq!(draft.date, Some(today));
         assert_eq!(time_options().len(), 48);
@@ -609,5 +739,18 @@ mod tests {
         assert_eq!(repeat_label(&rule, &EN), "Monthly on 1, last day");
         let rule = Recurrence { nth_weekday: Some((1, chrono::Weekday::Sun)), ..Recurrence::new(Frequency::Monthly, 1) };
         assert_eq!(repeat_label(&rule, &EN), "Monthly on first Sunday");
+    }
+
+    #[test]
+    fn extended_repeats_and_timezones() {
+        assert_eq!(repeat_label(&Recurrence::forgetting_curve(), &EN), EN.repeat_forgetting_curve);
+        assert_eq!(repeat_label(&Recurrence::lunar(Frequency::Yearly, 1), &EN), EN.repeat_lunar_yearly);
+        let opts = extended_repeat_options(d(2026, 2, 17), &EN, Locale::ZhCn);
+        assert_eq!(opts.len(), 3);
+        assert_eq!(opts[1].2, "正月初一");
+        assert!(!timezone_options("").is_empty());
+        assert!(timezone_options("tokyo").iter().any(|(name, _)| name == "Asia/Tokyo"));
+        assert_eq!(short_timezone_label(None, true, &EN).as_deref(), Some(EN.timezone_floating));
+        assert!(short_timezone_label(Some("America/New_York"), false, &EN).unwrap().starts_with("New York (UTC"));
     }
 }

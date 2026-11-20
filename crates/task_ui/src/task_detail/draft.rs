@@ -128,8 +128,14 @@ impl TaskDetail {
             completed_at: None,
             deleted_at: None,
             wont_do_at: None,
+            in_progress_at: None,
             end_date: None,
             end_time: None,
+            location: None,
+            timezone: None,
+            is_floating: false,
+            snoozed_until: None,
+            constant_reminder: false,
             pinned_at: None,
             section_id: None,
             modified_at: None,
@@ -300,6 +306,7 @@ impl TaskDetail {
                 tags.push(tag);
             }
         }
+        let constant_reminder = due.constant_reminder && !due.reminders.is_empty();
         let fields = TaskDraft {
             title,
             notes: notes.to_owned(),
@@ -319,6 +326,13 @@ impl TaskDetail {
             end_time: task.end_time,
             section_id,
             checklist,
+            location: {
+                let loc = self.location_input.read(cx).text().trim();
+                (!loc.is_empty()).then(|| loc.to_owned())
+            },
+            timezone: due.timezone,
+            is_floating: due.is_floating,
+            constant_reminder,
         };
         let top = !preferences.task_defaults.add_to_bottom;
         let task = if draft.attachments.is_empty() {
@@ -391,6 +405,16 @@ impl TaskDetail {
             .child(item("draft-tags", IconName::Tag, strings.tags).on_click(
                 cx.listener(|this, _, window, cx| this.open_tags(Popup::Tags, window, cx)),
             ))
+            .child(
+                item("draft-location", IconName::MapPin, strings.add_location).on_click(cx.listener(
+                    |this, _, window, cx| {
+                        this.close_popup(cx);
+                        this.location_open = true;
+                        window.focus(&this.location_input.focus_handle(cx), cx);
+                        cx.notify();
+                    },
+                )),
+            )
             .child(
                 item(
                     "draft-attachment",

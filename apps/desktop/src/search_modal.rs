@@ -491,6 +491,12 @@ impl Render for SearchModal {
                         .map_or(SharedString::new_static(strings.inbox), |l| l.name.clone().into());
                     let title_matches = !task_rows::match_ranges(&task.title, &query).is_empty();
                     let note = (!title_matches).then(|| task_rows::snippet(&task.notes, &query, 30)).flatten();
+                    let location_match = task
+                        .location
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|loc| !loc.is_empty() && !task_rows::match_ranges(loc, &query).is_empty())
+                        .map(str::to_owned);
                     v_flex()
                         .id(SharedString::from(format!("search-task-{id}")))
                         .px_2()
@@ -505,7 +511,8 @@ impl Render for SearchModal {
                                 .child(
                                     Checkbox::new(SharedString::from(format!("search-checkbox-{id}")))
                                         .size(px(14.))
-                                        .toggle_state(task.is_completed()),
+                                        .toggle_state(task.is_completed())
+                                        .in_progress(task.is_in_progress()),
                                 )
                                 .child(
                                     div()
@@ -526,6 +533,23 @@ impl Render for SearchModal {
                                     .text_size(px(12.))
                                     .text_color(theme.colors().text_muted)
                                     .child(self.highlighted(&note, &query, cx)),
+                            )
+                        })
+                        .when_some(location_match, |el, loc| {
+                            el.child(
+                                h_flex()
+                                    .pl(px(22.))
+                                    .gap_1()
+                                    .child(Icon::new(IconName::MapPin).size(IconSize::XSmall).color(Color::Muted))
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .truncate()
+                                            .text_size(px(12.))
+                                            .text_color(theme.colors().text_muted)
+                                            .child(self.highlighted(&loc, &query, cx)),
+                                    ),
                             )
                         })
                         .on_click(cx.listener(move |_, _, _, cx| cx.emit(SearchEvent::OpenTask(id))))

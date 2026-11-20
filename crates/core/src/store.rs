@@ -1,10 +1,11 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result};
-use chrono::{Duration, NaiveDate, NaiveDateTime, NaiveTime, TimeZone as _};
+use chrono::{Duration, NaiveDate, NaiveDateTime, NaiveTime, TimeZone as _, Timelike as _};
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use uuid::Uuid;
 
@@ -818,6 +819,71 @@ const MIGRATIONS: &[&str] = &[
         END;
     ALTER TABLE focus_sessions ADD COLUMN habit_id TEXT;
     ",
+    // Task statuses, locations, timezones, snooze timestamps, and per-task constant reminders.
+    "
+    ALTER TABLE tasks ADD COLUMN in_progress_at INTEGER;
+    ALTER TABLE tasks ADD COLUMN location TEXT;
+    ALTER TABLE tasks ADD COLUMN timezone TEXT;
+    ALTER TABLE tasks ADD COLUMN is_floating INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE tasks ADD COLUMN snoozed_until TEXT;
+    ALTER TABLE tasks ADD COLUMN constant_reminder INTEGER NOT NULL DEFAULT 0;
+    DROP TRIGGER IF EXISTS tasks_modified;
+    CREATE TRIGGER tasks_modified AFTER UPDATE OF
+        title, notes, priority, kind, parent_id, list_id, due_date, due_time, end_date, end_time,
+        repeat, reminders, completed_at, deleted_at, wont_do_at,
+        in_progress_at, location, timezone, is_floating, snoozed_until, constant_reminder ON tasks
+    BEGIN
+        UPDATE tasks SET modified_at = CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) WHERE id = NEW.id;
+    END;
+    CREATE TRIGGER activity_in_progress AFTER UPDATE OF in_progress_at ON tasks
+    WHEN OLD.in_progress_at IS NOT NEW.in_progress_at AND NEW.in_progress_at IS NOT NULL
+    BEGIN
+        INSERT INTO task_activity (task_id, at, kind) VALUES (NEW.id, CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER), 'in_progress');
+    END;
+    ",
+    "
+    ALTER TABLE calendar_subscriptions ADD COLUMN kind TEXT NOT NULL DEFAULT 'ics';
+    ALTER TABLE calendar_subscriptions ADD COLUMN provider TEXT NOT NULL DEFAULT 'url';
+    ALTER TABLE calendar_subscriptions ADD COLUMN username TEXT NOT NULL DEFAULT '';
+    ALTER TABLE calendar_subscriptions ADD COLUMN password TEXT NOT NULL DEFAULT '';
+    ALTER TABLE calendar_subscriptions ADD COLUMN writable INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE calendar_subscriptions ADD COLUMN sync_token TEXT;
+
+    CREATE TABLE calendar_events (
+        subscription_id TEXT NOT NULL REFERENCES calendar_subscriptions(id) ON DELETE CASCADE,
+        uid TEXT NOT NULL,
+        href TEXT NOT NULL DEFAULT '',
+        etag TEXT,
+        ics TEXT NOT NULL,
+        dirty INTEGER NOT NULL DEFAULT 0,
+        updated_at INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (subscription_id, uid)
+    );
+
+    CREATE TABLE matrix_profiles (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        rules_json TEXT NOT NULL,
+        sort_order INTEGER NOT NULL DEFAULT 0,
+        updated_at INTEGER NOT NULL DEFAULT 0
+    );
+
+    CREATE TRIGGER sync_matrix_profiles_insert AFTER INSERT ON matrix_profiles
+    WHEN NOT EXISTS (SELECT 1 FROM sync_applying)
+    BEGIN
+        INSERT INTO sync_log (entity, key, at) VALUES ('matrix_profiles', NEW.id, CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER));
+    END;
+    CREATE TRIGGER sync_matrix_profiles_update AFTER UPDATE ON matrix_profiles
+    WHEN NOT EXISTS (SELECT 1 FROM sync_applying)
+    BEGIN
+        INSERT INTO sync_log (entity, key, at) VALUES ('matrix_profiles', NEW.id, CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER));
+    END;
+    CREATE TRIGGER sync_matrix_profiles_delete AFTER DELETE ON matrix_profiles
+    WHEN NOT EXISTS (SELECT 1 FROM sync_applying)
+    BEGIN
+        INSERT INTO sync_log (entity, key, at) VALUES ('matrix_profiles', OLD.id, CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER));
+    END;
+    ",
 ];
 
 #[cfg(test)]
@@ -854,7 +920,7 @@ const FILTER_ORDER_KEY: &str = "filter_order";
 
 const TASK_COLUMNS: &str = "id, parent_id, kind, title, notes, priority, due_date, due_time, \
                             completed_at, created_at, list_id, deleted_at, repeat, wont_do_at, reminders, end_date, end_time, modified_at, \
-                            pinned_at, section_id, estimate";
+                            pinned_at, section_id, estimate, in_progress_at, location, timezone, is_floating, snoozed_until, constant_reminder";
 
 const DATE_FORMAT: &str = "%Y-%m-%d";
 const TIME_FORMAT: &str = "%H:%M";
@@ -1330,6 +1396,13 @@ impl Store {
     }
 
     fn insert_task(&self, draft: TaskDraft, top: bool) -> Result<Task> {
+        let location = draft.location.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned);
+        let timezone = draft
+            .timezone
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && chrono_tz::Tz::from_str(s).is_ok())
+            .map(str::to_owned);
         let task = Task {
             id: Uuid::now_v7(),
             list_id: draft.list_id,
@@ -1346,8 +1419,14 @@ impl Store {
             completed_at: None,
             deleted_at: None,
             wont_do_at: None,
+            in_progress_at: None,
             end_date: draft.due_date.and(draft.end_date),
             end_time: draft.due_date.and(draft.end_date).and(draft.end_time),
+            location,
+            timezone,
+            is_floating: draft.is_floating,
+            snoozed_until: None,
+            constant_reminder: draft.constant_reminder,
             modified_at: None,
             pinned_at: None,
             section_id: None,
@@ -1360,21 +1439,44 @@ impl Store {
         } else {
             "(SELECT COALESCE(MAX(sort_order), 0) + 1024 FROM tasks)"
         };
-        self.conn.execute(
-            &format!("INSERT INTO tasks (id, title, notes, list_id, kind, priority, due_date, due_time,
-                      repeat, reminders, created_at, end_date, end_time, sort_order)
-                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, {order})"),
-            params![
-                task.id.to_string(), task.title, task.notes, task.list_id.map(|id| id.to_string()),
-                task.kind.as_str(), task.priority.to_i64(),
-                task.due_date.map(|date| date.format(DATE_FORMAT).to_string()),
-                task.due_time.map(|time| time.format(TIME_FORMAT).to_string()),
-                task.repeat.as_ref().map(ToString::to_string), crate::reminder::format(&task.reminders),
-                task.created_at,
-                task.end_date.map(|date| date.format(DATE_FORMAT).to_string()),
-                task.end_time.map(|time| time.format(TIME_FORMAT).to_string()),
-            ],
-        )?;
+        if task.location.is_some() || task.timezone.is_some() || task.is_floating || task.constant_reminder {
+            self.conn.execute(
+                &format!("INSERT INTO tasks (id, title, notes, list_id, kind, priority, due_date, due_time,
+                          repeat, reminders, created_at, end_date, end_time, location, timezone, is_floating,
+                          constant_reminder, sort_order)
+                          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, {order})"),
+                params![
+                    task.id.to_string(), task.title, task.notes, task.list_id.map(|id| id.to_string()),
+                    task.kind.as_str(), task.priority.to_i64(),
+                    task.due_date.map(|date| date.format(DATE_FORMAT).to_string()),
+                    task.due_time.map(|time| time.format(TIME_FORMAT).to_string()),
+                    task.repeat.as_ref().map(ToString::to_string), crate::reminder::format(&task.reminders),
+                    task.created_at,
+                    task.end_date.map(|date| date.format(DATE_FORMAT).to_string()),
+                    task.end_time.map(|time| time.format(TIME_FORMAT).to_string()),
+                    task.location,
+                    task.timezone,
+                    task.is_floating,
+                    task.constant_reminder,
+                ],
+            )?;
+        } else {
+            self.conn.execute(
+                &format!("INSERT INTO tasks (id, title, notes, list_id, kind, priority, due_date, due_time,
+                          repeat, reminders, created_at, end_date, end_time, sort_order)
+                          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, {order})"),
+                params![
+                    task.id.to_string(), task.title, task.notes, task.list_id.map(|id| id.to_string()),
+                    task.kind.as_str(), task.priority.to_i64(),
+                    task.due_date.map(|date| date.format(DATE_FORMAT).to_string()),
+                    task.due_time.map(|time| time.format(TIME_FORMAT).to_string()),
+                    task.repeat.as_ref().map(ToString::to_string), crate::reminder::format(&task.reminders),
+                    task.created_at,
+                    task.end_date.map(|date| date.format(DATE_FORMAT).to_string()),
+                    task.end_time.map(|time| time.format(TIME_FORMAT).to_string()),
+                ],
+            )?;
+        }
         Ok(task)
     }
 
@@ -1457,8 +1559,14 @@ impl Store {
                 completed_at: parent_task.completed_at,
                 deleted_at: None,
                 wont_do_at: parent_task.wont_do_at,
+                in_progress_at: None,
                 end_date: None,
                 end_time: None,
+                location: None,
+                timezone: None,
+                is_floating: false,
+                snoozed_until: None,
+                constant_reminder: false,
                 modified_at: None,
                 pinned_at: None,
                 section_id: parent_task.section_id,
@@ -1503,53 +1611,61 @@ impl Store {
         if completed
             && let Some(task) = self.task(id)?
             && let (Some(repeat), Some(due)) = (task.repeat.clone(), task.due_date)
-            && let Some(next) = repeat.next_for(due, chrono::Local::now().date_naive())
         {
-            let tx = self.conn.unchecked_transaction()?;
-            let copy = Uuid::now_v7();
-            tx.execute(
-                &format!(
-                    "INSERT INTO tasks ({TASK_COLUMNS})
-                     SELECT ?2, parent_id, kind, title, notes, priority, due_date, due_time,
-                            ?3, created_at, list_id, NULL, NULL, NULL, NULL, end_date, end_time, ?3, NULL,
-                            section_id, estimate
-                     FROM tasks WHERE id = ?1"
-                ),
-                params![id.to_string(), copy.to_string(), now_ms()],
-            )?;
-            tx.execute(
-                "INSERT INTO task_tags (task_id, tag) SELECT ?2, tag FROM task_tags WHERE task_id = ?1",
-                params![id.to_string(), copy.to_string()],
-            )?;
-            // The completed occurrence owns a snapshot of the checklist. Besides preserving
-            // its history, this lets Undo restore the exact checked state transactionally.
-            let items = {
-                let mut statement = tx.prepare("SELECT id, title, sort_order, completed_at, created_at FROM checklist_items WHERE task_id = ?1")?;
-                statement.query_map([id.to_string()], |row| Ok((
-                    row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?,
-                    row.get::<_, Option<i64>>(3)?, row.get::<_, i64>(4)?,
-                )))?
-                    .collect::<rusqlite::Result<Vec<_>>>()?
+            let holidays = if repeat.skip_holidays {
+                self.holiday_dates(due, due + Duration::days(400))?
+            } else {
+                HashSet::new()
             };
-            for (source_id, title, order, completed_at, created_at) in items {
-                let copy_id = Uuid::now_v7().to_string();
-                tx.execute("INSERT INTO checklist_items (id, task_id, title, sort_order, completed_at, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![copy_id, copy.to_string(), title, order, completed_at, created_at])?;
-                tx.execute("INSERT INTO repeat_checklist_copies (copy_id, source_id) VALUES (?1, ?2)",
-                    params![copy_id, source_id])?;
+            if let Some(next) = repeat.next_for_with_holidays(due, chrono::Local::now().date_naive(), |d| holidays.contains(&d)) {
+                let tx = self.conn.unchecked_transaction()?;
+                let copy = Uuid::now_v7();
+                tx.execute(
+                    &format!(
+                        "INSERT INTO tasks ({TASK_COLUMNS})
+                         SELECT ?2, parent_id, kind, title, notes, priority, due_date, due_time,
+                                ?3, created_at, list_id, NULL, NULL, NULL, NULL, end_date, end_time, ?3, NULL,
+                                section_id, estimate, NULL, location, timezone, is_floating, NULL, 0
+                         FROM tasks WHERE id = ?1"
+                    ),
+                    params![id.to_string(), copy.to_string(), now_ms()],
+                )?;
+                tx.execute(
+                    "INSERT INTO task_tags (task_id, tag) SELECT ?2, tag FROM task_tags WHERE task_id = ?1",
+                    params![id.to_string(), copy.to_string()],
+                )?;
+                // The completed occurrence owns a snapshot of the checklist. Besides preserving
+                // its history, this lets Undo restore the exact checked state transactionally.
+                let items = {
+                    let mut statement = tx.prepare("SELECT id, title, sort_order, completed_at, created_at FROM checklist_items WHERE task_id = ?1")?;
+                    statement.query_map([id.to_string()], |row| Ok((
+                        row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?,
+                        row.get::<_, Option<i64>>(3)?, row.get::<_, i64>(4)?,
+                    )))?
+                        .collect::<rusqlite::Result<Vec<_>>>()?
+                };
+                for (source_id, title, order, completed_at, created_at) in items {
+                    let copy_id = Uuid::now_v7().to_string();
+                    tx.execute("INSERT INTO checklist_items (id, task_id, title, sort_order, completed_at, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        params![copy_id, copy.to_string(), title, order, completed_at, created_at])?;
+                    tx.execute("INSERT INTO repeat_checklist_copies (copy_id, source_id) VALUES (?1, ?2)",
+                        params![copy_id, source_id])?;
+                }
+                // A duration moves with its start.
+                let end = task.end_date.map(|end| (end + (next - due)).format(DATE_FORMAT).to_string());
+                let next_repeat = repeat.forgetting_curve.then(|| repeat.advance().to_string());
+                tx.execute(
+                    "UPDATE tasks SET due_date = ?2, end_date = ?3, snoozed_until = NULL, in_progress_at = NULL,
+                            repeat = COALESCE(?4, repeat) WHERE id = ?1",
+                    params![id.to_string(), next.format(DATE_FORMAT).to_string(), end, next_repeat],
+                )?;
+                tx.execute(
+                    "UPDATE checklist_items SET completed_at = NULL WHERE task_id = ?1",
+                    [id.to_string()],
+                )?;
+                tx.commit()?;
+                return Ok((Some(copy), Vec::new()));
             }
-            // A duration moves with its start.
-            let end = task.end_date.map(|end| (end + (next - due)).format(DATE_FORMAT).to_string());
-            tx.execute(
-                "UPDATE tasks SET due_date = ?2, end_date = ?3 WHERE id = ?1",
-                params![id.to_string(), next.format(DATE_FORMAT).to_string(), end],
-            )?;
-            tx.execute(
-                "UPDATE checklist_items SET completed_at = NULL WHERE task_id = ?1",
-                [id.to_string()],
-            )?;
-            tx.commit()?;
-            return Ok((Some(copy), Vec::new()));
         }
         if completed {
             let cascaded = self.close_with_descendants(id, true)?;
@@ -1581,9 +1697,9 @@ impl Store {
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             let sql = if completed {
-                "UPDATE tasks SET completed_at = ?2, wont_do_at = NULL WHERE id = ?1"
+                "UPDATE tasks SET completed_at = ?2, wont_do_at = NULL, in_progress_at = NULL, snoozed_until = NULL WHERE id = ?1"
             } else {
-                "UPDATE tasks SET wont_do_at = ?2, completed_at = NULL WHERE id = ?1"
+                "UPDATE tasks SET wont_do_at = ?2, completed_at = NULL, in_progress_at = NULL, snoozed_until = NULL WHERE id = ?1"
             };
             let mut update = self.conn.prepare_cached(sql)?;
             update.execute(params![id.to_string(), now])?;
@@ -1626,8 +1742,15 @@ impl Store {
     }
 
     /// Undoes completing a repeating task: removes the completed copy and puts the task back on
-    /// its earlier dates.
-    pub fn undo_repeat(&self, id: Id, copy: Id, due: Option<NaiveDate>, end: Option<NaiveDate>) -> Result<()> {
+    /// its earlier dates (and repeat rule if stateful, e.g. forgetting curve).
+    pub fn undo_repeat(
+        &self,
+        id: Id,
+        copy: Id,
+        due: Option<NaiveDate>,
+        end: Option<NaiveDate>,
+        repeat: Option<&Recurrence>,
+    ) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
             "UPDATE checklist_items AS original SET completed_at = copied.completed_at
@@ -1637,11 +1760,12 @@ impl Store {
         )?;
         tx.execute("DELETE FROM tasks WHERE id = ?1", [copy.to_string()])?;
         tx.execute(
-            "UPDATE tasks SET due_date = ?2, end_date = ?3 WHERE id = ?1",
+            "UPDATE tasks SET due_date = ?2, end_date = ?3, repeat = COALESCE(?4, repeat) WHERE id = ?1",
             params![
                 id.to_string(),
                 due.map(|d| d.format(DATE_FORMAT).to_string()),
-                end.map(|d| d.format(DATE_FORMAT).to_string())
+                end.map(|d| d.format(DATE_FORMAT).to_string()),
+                repeat.map(ToString::to_string),
             ],
         )?;
         tx.commit()?;
@@ -1679,7 +1803,8 @@ impl Store {
                      priority = o.priority, due_date = o.due_date, due_time = o.due_time,
                      list_id = o.list_id, section_id = o.section_id, repeat = o.repeat,
                      reminders = o.reminders, end_date = o.end_date, end_time = o.end_time,
-                     estimate = o.estimate
+                     estimate = o.estimate, location = o.location, timezone = o.timezone,
+                     is_floating = o.is_floating, constant_reminder = o.constant_reminder
                  FROM (SELECT * FROM tasks WHERE id = ?2) AS o WHERE tasks.id = ?1",
                 params![copy.id.to_string(), id.to_string()],
             )?;
@@ -1758,6 +1883,51 @@ impl Store {
                 date.format(DATE_FORMAT).to_string(),
                 end.map(|date| date.format(DATE_FORMAT).to_string()),
                 end.and(task.end_time).map(|time| time.format(TIME_FORMAT).to_string()),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Resizes an all-day / date-span task to `[start, end]` inclusive.
+    pub fn resize_dates(&self, id: Id, start: NaiveDate, end: NaiveDate) -> Result<()> {
+        let task = self.task(id)?.context("task not found")?;
+        let end = end.max(start);
+        let stored_end_date = (end > start).then_some(end);
+        let stored_end_time = if stored_end_date.is_some() {
+            task.end_time
+        } else {
+            task.end_time.filter(|et| task.due_time.is_none_or(|st| *et > st))
+        };
+        self.conn.execute(
+            "UPDATE tasks SET due_date = ?2, end_date = ?3, end_time = ?4 WHERE id = ?1",
+            params![
+                id.to_string(),
+                start.format(DATE_FORMAT).to_string(),
+                stored_end_date.map(|d| d.format(DATE_FORMAT).to_string()),
+                stored_end_time.map(|t| t.format(TIME_FORMAT).to_string()),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Resizes a timed task block to `[date start .. end_date end]`.
+    pub fn resize_timed_range(&self, id: Id, date: NaiveDate, start: NaiveTime, end: NaiveTime, end_date: Option<NaiveDate>) -> Result<()> {
+        let _ = self.task(id)?.context("task not found")?;
+        let stored_end_date = end_date.filter(|d| *d > date);
+        let end = if stored_end_date.is_none() && end <= start {
+            let mins = (start.hour() * 60 + start.minute() + 15).min(23 * 60 + 59);
+            NaiveTime::from_hms_opt(mins / 60, mins % 60, 0).unwrap_or(start)
+        } else {
+            end
+        };
+        self.conn.execute(
+            "UPDATE tasks SET due_date = ?2, due_time = ?3, end_date = ?4, end_time = ?5 WHERE id = ?1",
+            params![
+                id.to_string(),
+                date.format(DATE_FORMAT).to_string(),
+                start.format(TIME_FORMAT).to_string(),
+                stored_end_date.map(|d| d.format(DATE_FORMAT).to_string()),
+                end.format(TIME_FORMAT).to_string(),
             ],
         )?;
         Ok(())
@@ -1985,10 +2155,118 @@ impl Store {
         let date_str = date.map(|d| d.format(DATE_FORMAT).to_string());
         let time_str = date.and(time).map(|t| t.format(TIME_FORMAT).to_string());
         self.conn.execute(
-            "UPDATE tasks SET due_date = ?2, due_time = ?3 WHERE id = ?1",
+            "UPDATE tasks SET due_date = ?2, due_time = ?3, snoozed_until = NULL WHERE id = ?1",
             params![id.to_string(), date_str, time_str],
         )?;
         Ok(())
+    }
+
+    /// Marks a task explicitly "In Progress" (reopening it if closed), or clears that status.
+    pub fn set_in_progress(&self, id: Id, in_progress: bool) -> Result<()> {
+        if in_progress {
+            self.conn.execute(
+                "UPDATE tasks SET in_progress_at = ?2, completed_at = NULL, wont_do_at = NULL WHERE id = ?1",
+                params![id.to_string(), now_ms()],
+            )?;
+        } else {
+            self.conn.execute("UPDATE tasks SET in_progress_at = NULL WHERE id = ?1", [id.to_string()])?;
+        }
+        Ok(())
+    }
+
+    pub fn set_location(&self, id: Id, location: Option<&str>) -> Result<()> {
+        let clean = location.map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned);
+        self.update(id, "location", clean)
+    }
+
+    pub fn set_timezone(&self, id: Id, timezone: Option<&str>, is_floating: bool) -> Result<()> {
+        let clean = match timezone.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(tz) => {
+                chrono_tz::Tz::from_str(tz).map_err(|e| anyhow::anyhow!("invalid time zone {tz}: {e}"))?;
+                Some(tz.to_owned())
+            }
+            None => None,
+        };
+        self.conn.execute(
+            "UPDATE tasks SET timezone = ?2, is_floating = ?3 WHERE id = ?1",
+            params![id.to_string(), clean, is_floating],
+        )?;
+        Ok(())
+    }
+
+    pub fn snooze_task(&self, id: Id, at: NaiveDateTime) -> Result<()> {
+        self.update(id, "snoozed_until", Some(at.format(SNOOZE_FORMAT).to_string()))
+    }
+
+    pub fn clear_task_snooze(&self, id: Id) -> Result<()> {
+        self.update(id, "snoozed_until", None::<String>)
+    }
+
+    pub fn set_task_constant_reminder(&self, id: Id, on: bool) -> Result<()> {
+        self.update(id, "constant_reminder", on)
+    }
+
+    /// Holiday dates collected from non-archived Holiday countdowns and non-hidden holiday ICS feeds.
+    pub fn holiday_dates(&self, from: NaiveDate, until: NaiveDate) -> Result<HashSet<NaiveDate>> {
+        use chrono::Datelike as _;
+        let mut dates = HashSet::new();
+        for countdown in self.countdowns()? {
+            if countdown.archived || countdown.kind != CountdownKind::Holiday {
+                continue;
+            }
+            if let Some(repeat) = &countdown.repeat {
+                let mut cur = countdown.date;
+                while cur <= until {
+                    if cur >= from {
+                        dates.insert(cur);
+                    }
+                    let next = repeat.next_after(cur);
+                    if next <= cur {
+                        break;
+                    }
+                    cur = next;
+                }
+            } else {
+                for year in from.year().max(countdown.date.year())..=until.year() {
+                    if let Some(date) = countdown.date.with_year(year).or_else(|| NaiveDate::from_ymd_opt(year, 2, 28))
+                        && date >= from
+                        && date <= until
+                    {
+                        dates.insert(date);
+                    }
+                }
+            }
+        }
+        for sub in self.subscriptions()? {
+            if sub.hidden || sub.feed.trim().is_empty() {
+                continue;
+            }
+            let title_lower = sub.name.to_lowercase();
+            let url_lower = sub.url.to_lowercase();
+            let is_holiday_feed = title_lower.contains("holiday")
+                || title_lower.contains("праздник")
+                || title_lower.contains("节假日")
+                || title_lower.contains("假日")
+                || url_lower.contains("holiday");
+            if !is_holiday_feed {
+                continue;
+            }
+            for event in crate::ical::parse(&sub.feed) {
+                if !event.all_day() {
+                    continue;
+                }
+                for occ in event.occurrences_in(from, until) {
+                    let mut d = occ.start.max(from);
+                    let end = occ.end.min(until);
+                    while d <= end {
+                        dates.insert(d);
+                        let Some(next) = d.succ_opt() else { break };
+                        d = next;
+                    }
+                }
+            }
+        }
+        Ok(dates)
     }
 
     /// The task's comments, oldest first.
@@ -2021,15 +2299,25 @@ impl Store {
     /// The original's "Skip the Recurrence": a repeating task moves on to its next date without
     /// being completed; its time stays, and a range keeps its length.
     pub fn skip_recurrence(&self, id: Id) -> Result<()> {
-        let task = self.task(id)?.context("task not found")?;
-        let (Some(repeat), Some(due)) = (&task.repeat, task.due_date) else { anyhow::bail!("the task does not repeat") };
-        let next = repeat.next_after(due);
-        anyhow::ensure!(next > due, "the task has no later date");
-        self.set_due(id, Some(next), task.due_time)?;
-        if let Some(end) = task.end_date {
-            self.update(id, "end_date", (end + (next - due)).format(DATE_FORMAT).to_string())?;
-        }
-        Ok(())
+        self.in_tx(|| {
+            let task = self.task(id)?.context("task not found")?;
+            let (Some(repeat), Some(due)) = (&task.repeat, task.due_date) else { anyhow::bail!("the task does not repeat") };
+            let holidays = if repeat.skip_holidays {
+                self.holiday_dates(due, due + Duration::days(400))?
+            } else {
+                HashSet::new()
+            };
+            let next = repeat.next_after_with_holidays(due, |d| holidays.contains(&d));
+            anyhow::ensure!(next > due, "the task has no later date");
+            self.set_due(id, Some(next), task.due_time)?;
+            if let Some(end) = task.end_date {
+                self.update(id, "end_date", (end + (next - due)).format(DATE_FORMAT).to_string())?;
+            }
+            if repeat.forgetting_curve {
+                self.update(id, "repeat", repeat.advance().to_string())?;
+            }
+            Ok(())
+        })
     }
 
     /// Ancestor IDs of `id`, from its immediate parent up to the root (cycle-safe).
@@ -3056,10 +3344,13 @@ impl Store {
     /// The subscribed calendars, in the order they were added.
     pub fn subscriptions(&self) -> Result<Vec<crate::ical::Subscription>> {
         let mut stmt = self.conn.prepare_cached(
-            "SELECT id, name, url, color, hidden, feed, fetched_at, error FROM calendar_subscriptions ORDER BY created_at, rowid",
+            "SELECT id, name, url, color, hidden, feed, fetched_at, error, kind, provider, username, password, writable, sync_token
+             FROM calendar_subscriptions ORDER BY created_at, rowid",
         )?;
         let rows = stmt
             .query_map([], |row| {
+                let kind_str: String = row.get(8)?;
+                let provider_str: String = row.get(9)?;
                 Ok(crate::ical::Subscription {
                     id: parse_uuid(&row.get::<_, String>(0)?, 0)?,
                     name: row.get(1)?,
@@ -3069,6 +3360,12 @@ impl Store {
                     feed: row.get(5)?,
                     fetched_at: row.get(6)?,
                     error: row.get(7)?,
+                    kind: crate::ical::CalendarKind::from_code(&kind_str),
+                    provider: crate::ical::CalendarProvider::from_code(&provider_str),
+                    username: row.get(10)?,
+                    password: row.get(11)?,
+                    writable: row.get::<_, i64>(12)? != 0,
+                    sync_token: row.get(13)?,
                 })
             })?
             .collect::<Result<_, _>>()?;
@@ -3096,6 +3393,39 @@ impl Store {
         Ok(id)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_caldav_subscription(
+        &self,
+        name: &str,
+        url: &str,
+        color: Option<&str>,
+        provider: crate::ical::CalendarProvider,
+        username: &str,
+        password: &str,
+        writable: bool,
+    ) -> Result<Id> {
+        let url = url.trim();
+        anyhow::ensure!(!url.is_empty(), "a CalDAV calendar needs an address");
+        let id = Uuid::now_v7();
+        let now = now_ms();
+        self.conn.execute(
+            "INSERT INTO calendar_subscriptions (id, name, url, color, created_at, feed, fetched_at, kind, provider, username, password, writable)
+             VALUES (?1, ?2, ?3, ?4, ?5, '', NULL, 'caldav', ?6, ?7, ?8, ?9)",
+            params![
+                id.to_string(),
+                name.trim(),
+                url,
+                color,
+                now,
+                provider.code(),
+                username.trim(),
+                password,
+                i64::from(writable),
+            ],
+        )?;
+        Ok(id)
+    }
+
     /// Changes a subscription; a new address drops the feed read from the old one.
     pub fn update_subscription(&self, id: Id, name: &str, url: &str, color: Option<&str>, hidden: bool) -> Result<()> {
         self.conn.execute(
@@ -3106,6 +3436,55 @@ impl Store {
              WHERE id = ?1",
             params![id.to_string(), name.trim(), url.trim(), color, hidden],
         )?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_caldav_subscription(
+        &self,
+        id: Id,
+        name: &str,
+        url: &str,
+        color: Option<&str>,
+        hidden: bool,
+        provider: crate::ical::CalendarProvider,
+        username: &str,
+        password: &str,
+        writable: bool,
+    ) -> Result<()> {
+        let url = url.trim();
+        let prev_url: Option<String> = self
+            .conn
+            .query_row("SELECT url FROM calendar_subscriptions WHERE id = ?1", params![id.to_string()], |r| r.get(0))
+            .optional()?;
+        let url_changed = prev_url.as_deref() != Some(url);
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "UPDATE calendar_subscriptions
+             SET name = ?2, color = ?4, hidden = ?5, kind = 'caldav',
+                 provider = ?6, username = ?7, password = ?8, writable = ?9,
+                 feed = CASE WHEN url = ?3 THEN feed ELSE '' END,
+                 fetched_at = CASE WHEN url = ?3 THEN fetched_at ELSE NULL END,
+                 sync_token = CASE WHEN url = ?3 THEN sync_token ELSE NULL END,
+                 error = CASE WHEN url = ?3 THEN error ELSE NULL END,
+                 url = ?3
+             WHERE id = ?1",
+            params![
+                id.to_string(),
+                name.trim(),
+                url,
+                color,
+                hidden,
+                provider.code(),
+                username.trim(),
+                password,
+                i64::from(writable),
+            ],
+        )?;
+        if url_changed {
+            tx.execute("DELETE FROM calendar_events WHERE subscription_id = ?1", params![id.to_string()])?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -3140,6 +3519,143 @@ impl Store {
             )?,
         };
         Ok(changed == 1)
+    }
+
+    /// Cached CalDAV events for a subscription, including locally queued deletions.
+    pub fn calendar_events(&self, subscription_id: Id) -> Result<Vec<crate::ical::StoredEvent>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT subscription_id, uid, href, etag, ics, dirty FROM calendar_events
+             WHERE subscription_id = ?1 ORDER BY updated_at, uid",
+        )?;
+        let rows = stmt
+            .query_map(params![subscription_id.to_string()], |row| {
+                Ok(crate::ical::StoredEvent {
+                    subscription_id: parse_uuid(&row.get::<_, String>(0)?, 0)?,
+                    uid: row.get(1)?,
+                    href: row.get(2)?,
+                    etag: row.get(3)?,
+                    ics: row.get(4)?,
+                    dirty: crate::ical::EventDirty::from_i64(row.get(5)?),
+                })
+            })?
+            .collect::<Result<_, _>>()?;
+        Ok(rows)
+    }
+
+    /// Queues or updates a local CalDAV event edit (`dirty = Upsert`) and refreshes the combined feed.
+    pub fn upsert_local_calendar_event(&self, subscription_id: Id, uid: &str, href: &str, ics: &str) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO calendar_events (subscription_id, uid, href, etag, ics, dirty, updated_at)
+             VALUES (?1, ?2, ?3, NULL, ?4, 1, ?5)
+             ON CONFLICT(subscription_id, uid) DO UPDATE SET
+                 href = CASE WHEN excluded.href != '' THEN excluded.href ELSE calendar_events.href END,
+                 ics = excluded.ics,
+                 dirty = 1,
+                 updated_at = excluded.updated_at",
+            params![subscription_id.to_string(), uid, href, ics, now_ms()],
+        )?;
+        rebuild_caldav_feed(&tx, subscription_id)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Marks a CalDAV event for remote deletion (or drops it immediately if never pushed).
+    pub fn mark_calendar_event_deleted(&self, subscription_id: Id, uid: &str) -> Result<bool> {
+        let existing: Option<(Option<String>, i64)> = self
+            .conn
+            .query_row(
+                "SELECT etag, dirty FROM calendar_events WHERE subscription_id = ?1 AND uid = ?2",
+                params![subscription_id.to_string(), uid],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((etag, dirty)) = existing else {
+            return Ok(false);
+        };
+        let tx = self.conn.unchecked_transaction()?;
+        if etag.is_none() && dirty == crate::ical::EventDirty::Upsert.to_i64() {
+            tx.execute(
+                "DELETE FROM calendar_events WHERE subscription_id = ?1 AND uid = ?2",
+                params![subscription_id.to_string(), uid],
+            )?;
+        } else {
+            tx.execute(
+                "UPDATE calendar_events SET dirty = 2, updated_at = ?3 WHERE subscription_id = ?1 AND uid = ?2",
+                params![subscription_id.to_string(), uid, now_ms()],
+            )?;
+        }
+        rebuild_caldav_feed(&tx, subscription_id)?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Marks a dirty local event as synced cleanly after `PUT`.
+    pub fn mark_caldav_event_clean(&self, subscription_id: Id, uid: &str, href: &str, etag: Option<&str>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE calendar_events SET href = ?3, etag = ?4, dirty = 0, updated_at = ?5
+             WHERE subscription_id = ?1 AND uid = ?2 AND dirty = 1",
+            params![subscription_id.to_string(), uid, href, etag, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    /// Removes a deleted event record after remote `DELETE` succeeds.
+    pub fn remove_caldav_event(&self, subscription_id: Id, uid: &str) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM calendar_events WHERE subscription_id = ?1 AND uid = ?2 AND dirty = 2",
+            params![subscription_id.to_string(), uid],
+        )?;
+        rebuild_caldav_feed(&tx, subscription_id)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Replaces clean remote CalDAV events from a remote fetch while keeping any still-dirty local edits.
+    pub fn replace_caldav_snapshot(
+        &self,
+        subscription_id: Id,
+        url: &str,
+        remote: &[crate::ical::StoredEvent],
+        sync_token: Option<&str>,
+    ) -> Result<bool> {
+        let still_matches: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT url FROM calendar_subscriptions WHERE id = ?1",
+                params![subscription_id.to_string()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if still_matches.as_deref() != Some(url) {
+            return Ok(false);
+        }
+
+        let tx = self.conn.unchecked_transaction()?;
+        let now = now_ms();
+        tx.execute("DELETE FROM calendar_events WHERE subscription_id = ?1 AND dirty = 0", params![subscription_id.to_string()])?;
+        for ev in remote {
+            tx.execute(
+                "INSERT INTO calendar_events (subscription_id, uid, href, etag, ics, dirty, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)
+                 ON CONFLICT(subscription_id, uid) DO UPDATE SET
+                     href = excluded.href,
+                     etag = excluded.etag,
+                     ics = excluded.ics,
+                     dirty = 0,
+                     updated_at = excluded.updated_at
+                 WHERE calendar_events.dirty = 0",
+                params![subscription_id.to_string(), ev.uid, ev.href, ev.etag, ev.ics, now],
+            )?;
+        }
+        rebuild_caldav_feed(&tx, subscription_id)?;
+        tx.execute(
+            "UPDATE calendar_subscriptions SET fetched_at = ?2, error = NULL, sync_token = ?3 WHERE id = ?1 AND url = ?4",
+            params![subscription_id.to_string(), now, sync_token, url],
+        )?;
+        tx.commit()?;
+        Ok(true)
     }
 
     pub fn countdowns(&self) -> Result<Vec<Countdown>> {
@@ -4448,6 +4964,134 @@ impl Store {
         Ok(())
     }
 
+    /// Completes or reopens all given tasks inside one transaction.
+    pub fn batch_complete(&self, ids: &[Id], completed: bool) -> Result<()> {
+        self.in_tx(|| {
+            for &id in ids {
+                self.set_completed(id, completed)?;
+            }
+            Ok(())
+        })
+    }
+
+    pub fn batch_set_wont_do(&self, ids: &[Id], wont_do: bool) -> Result<()> {
+        self.in_tx(|| {
+            for &id in ids {
+                self.set_wont_do(id, wont_do)?;
+            }
+            Ok(())
+        })
+    }
+
+    pub fn batch_set_in_progress(&self, ids: &[Id], in_progress: bool) -> Result<()> {
+        self.in_tx(|| {
+            for &id in ids {
+                self.set_in_progress(id, in_progress)?;
+            }
+            Ok(())
+        })
+    }
+
+    pub fn batch_set_due(&self, ids: &[Id], date: Option<NaiveDate>, time: Option<NaiveTime>) -> Result<()> {
+        self.in_tx(|| {
+            for &id in ids {
+                self.set_due(id, date, time)?;
+            }
+            Ok(())
+        })
+    }
+
+    pub fn batch_set_priority(&self, ids: &[Id], priority: Priority) -> Result<()> {
+        self.in_tx(|| {
+            for &id in ids {
+                self.set_priority(id, priority)?;
+            }
+            Ok(())
+        })
+    }
+
+    pub fn batch_set_list(&self, ids: &[Id], list_id: Option<Id>) -> Result<()> {
+        self.in_tx(|| {
+            for &id in ids {
+                self.set_list(id, list_id)?;
+            }
+            Ok(())
+        })
+    }
+
+    pub fn batch_add_tag(&self, ids: &[Id], tag: &str) -> Result<()> {
+        let tag = tag.trim();
+        if tag.is_empty() {
+            return Ok(());
+        }
+        self.in_tx(|| {
+            for &id in ids {
+                let Some(task) = self.task(id)? else { continue };
+                if !task.tags.iter().any(|existing| existing.to_lowercase() == tag.to_lowercase()) {
+                    let mut next = task.tags;
+                    next.push(tag.to_owned());
+                    self.replace_task_tags(id, &next)?;
+                }
+            }
+            Ok(())
+        })
+    }
+
+    pub fn batch_remove_tag(&self, ids: &[Id], tag: &str) -> Result<()> {
+        let tag = tag.trim();
+        if tag.is_empty() {
+            return Ok(());
+        }
+        self.in_tx(|| {
+            for &id in ids {
+                let Some(task) = self.task(id)? else { continue };
+                let filtered: Vec<String> = task
+                    .tags
+                    .into_iter()
+                    .filter(|existing| existing.to_lowercase() != tag.to_lowercase())
+                    .collect();
+                self.replace_task_tags(id, &filtered)?;
+            }
+            Ok(())
+        })
+    }
+
+    pub fn batch_set_pinned(&self, ids: &[Id], pinned: bool) -> Result<()> {
+        self.in_tx(|| {
+            for &id in ids {
+                self.set_pinned(id, pinned)?;
+            }
+            Ok(())
+        })
+    }
+
+    pub fn batch_delete(&self, ids: &[Id]) -> Result<()> {
+        self.in_tx(|| {
+            for &id in ids {
+                self.delete_task(id)?;
+            }
+            Ok(())
+        })
+    }
+
+    pub fn batch_restore(&self, ids: &[Id]) -> Result<()> {
+        self.in_tx(|| {
+            for &id in ids {
+                self.restore_task(id)?;
+            }
+            Ok(())
+        })
+    }
+
+    pub fn batch_purge(&self, ids: &[Id]) -> Result<()> {
+        self.in_tx(|| {
+            for &id in ids {
+                self.purge_task(id)?;
+            }
+            Ok(())
+        })
+    }
+
     fn set_deleted(&self, id: Id, deleted_at: Option<i64>) -> Result<()> {
         self.in_tx(|| {
             let mut stmt = self.conn.prepare_cached("UPDATE tasks SET deleted_at = ?2 WHERE id = ?1")?;
@@ -4521,6 +5165,7 @@ fn matches_view(task: &Task, view: &View, today: NaiveDate) -> bool {
             !query.is_empty()
                 && (task.title.to_lowercase().contains(&query)
                     || task.notes.to_lowercase().contains(&query)
+                    || task.location.as_deref().is_some_and(|loc| loc.to_lowercase().contains(&query))
                     || task.tags.iter().any(|t| t.to_lowercase().contains(&query)))
         }
     }
@@ -4560,7 +5205,50 @@ fn task_from_row(row: &Row) -> rusqlite::Result<Task> {
         pinned_at: row.get(18)?,
         section_id: row.get::<_, Option<String>>(19)?.map(|s| parse_uuid(&s, 19)).transpose()?,
         estimate: row.get::<_, Option<String>>(20)?.and_then(|e| crate::model::Estimate::from_storage(&e)),
+        in_progress_at: row.get(21)?,
+        location: row.get(22)?,
+        timezone: row.get(23)?,
+        is_floating: row.get::<_, i64>(24)? != 0,
+        snoozed_until: row.get::<_, Option<String>>(25)?.and_then(|s| NaiveDateTime::parse_from_str(&s, SNOOZE_FORMAT).ok()),
+        constant_reminder: row.get::<_, i64>(26)? != 0,
     })
+}
+
+fn rebuild_caldav_feed(tx: &rusqlite::Transaction<'_>, subscription_id: Id) -> Result<()> {
+    let mut stmt = tx.prepare(
+        "SELECT ics FROM calendar_events WHERE subscription_id = ?1 AND dirty != 2 ORDER BY uid",
+    )?;
+    let entries: Vec<String> = stmt.query_map(params![subscription_id.to_string()], |r| r.get(0))?.collect::<Result<_, _>>()?;
+    drop(stmt);
+
+    let mut combined = String::from("BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Fern//Calendar//EN\r\n");
+    for ics in &entries {
+        let normalized = ics.replace("\r\n", "\n");
+        let mut inside_component = 0usize;
+        for line in normalized.lines() {
+            let upper = line.to_ascii_uppercase();
+            if upper == "BEGIN:VCALENDAR" || upper == "END:VCALENDAR" {
+                continue;
+            }
+            if upper.starts_with("BEGIN:") {
+                inside_component += 1;
+            }
+            if inside_component > 0 {
+                combined.push_str(line);
+                combined.push_str("\r\n");
+            }
+            if upper.starts_with("END:") {
+                inside_component = inside_component.saturating_sub(1);
+            }
+        }
+    }
+    combined.push_str("END:VCALENDAR\r\n");
+
+    tx.execute(
+        "UPDATE calendar_subscriptions SET feed = ?2 WHERE id = ?1",
+        params![subscription_id.to_string(), combined],
+    )?;
+    Ok(())
 }
 
 pub(crate) fn now_ms() -> i64 {
@@ -5184,7 +5872,7 @@ mod tests {
         store.set_repeat(task.id, Some(crate::Recurrence::new(crate::Frequency::Daily, 1)), d(2026, 10, 18))?;
         let copy = store.complete(task.id, true)?.expect("a repeating task leaves a completed copy");
         assert_eq!(store.task(task.id)?.unwrap().due_date, Some(d(2026, 10, 19)));
-        store.undo_repeat(task.id, copy, Some(d(2026, 10, 18)), None)?;
+        store.undo_repeat(task.id, copy, Some(d(2026, 10, 18)), None, None)?;
         assert_eq!(store.task(task.id)?.unwrap().due_date, Some(d(2026, 10, 18)));
         assert!(store.task(copy)?.is_none());
         assert_eq!(store.complete(store.add_task("once")?.id, true)?, None);
@@ -6426,6 +7114,162 @@ mod tests {
         let desc = store.descendants(p.id)?;
         assert!(desc.contains(&c.id));
         assert!(desc.len() <= 2);
+        Ok(())
+    }
+
+    #[test]
+    fn in_progress_location_timezone_snooze_and_batch_operations() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let a = store.add_task("Read paper")?;
+        let b = store.add_task("Draft notes")?;
+        let c = store.add_task("Review PR")?;
+
+        // Explicit InProgress + activity trigger + cleared on close.
+        store.set_in_progress(a.id, true)?;
+        assert!(store.task(a.id)?.unwrap().is_in_progress());
+        assert!(store.task_activity(a.id)?.iter().any(|entry| entry.kind == "in_progress"));
+        store.set_completed(a.id, true)?;
+        assert!(!store.task(a.id)?.unwrap().is_in_progress());
+        store.set_completed(a.id, false)?;
+
+        // Location + Search matching location.
+        store.set_location(a.id, Some("  Library Desk 4  "))?;
+        assert_eq!(store.task(a.id)?.unwrap().location.as_deref(), Some("Library Desk 4"));
+        let hits = store.tasks_in(&View::Search("library".into()), d(2026, 10, 18))?;
+        assert_eq!(hits.iter().map(|t| t.id).collect::<Vec<_>>(), vec![a.id]);
+
+        // Timezone validation & floating flag.
+        assert!(store.set_timezone(a.id, Some("Not/A_Zone"), false).is_err());
+        store.set_timezone(a.id, Some("America/New_York"), true)?;
+        let loaded = store.task(a.id)?.unwrap();
+        assert_eq!(loaded.timezone.as_deref(), Some("America/New_York"));
+        assert!(loaded.is_floating);
+
+        // Snooze + constant reminder.
+        let snooze_at = d(2026, 10, 18).and_hms_opt(10, 15, 0).unwrap();
+        store.snooze_task(a.id, snooze_at)?;
+        store.set_task_constant_reminder(a.id, true)?;
+        let loaded = store.task(a.id)?.unwrap();
+        assert_eq!(loaded.snoozed_until, Some(snooze_at));
+        assert!(loaded.constant_reminder);
+        store.clear_task_snooze(a.id)?;
+        assert_eq!(store.task(a.id)?.unwrap().snoozed_until, None);
+
+        // Batch operations.
+        let ids = [a.id, b.id];
+        store.batch_set_priority(&ids, Priority::High)?;
+        store.batch_add_tag(&ids, "urgent")?;
+        store.batch_set_in_progress(&ids, true)?;
+        assert_eq!(store.task(a.id)?.unwrap().priority, Priority::High);
+        assert_eq!(store.task(b.id)?.unwrap().tags, vec!["urgent"]);
+        assert!(store.task(b.id)?.unwrap().is_in_progress());
+        assert!(!store.task(c.id)?.unwrap().is_in_progress());
+        store.batch_remove_tag(&ids, "urgent")?;
+        assert!(store.task(a.id)?.unwrap().tags.is_empty());
+
+        let work = store.create_list("Work")?;
+        store.batch_set_list(&ids, Some(work.id))?;
+        assert_eq!(store.task(b.id)?.unwrap().list_id, Some(work.id));
+        store.batch_delete(&ids)?;
+        assert!(store.task(a.id)?.unwrap().is_deleted());
+        store.batch_restore(&ids)?;
+        assert!(!store.task(a.id)?.unwrap().is_deleted());
+        store.batch_purge(&[b.id])?;
+        assert!(store.task(b.id)?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn holiday_skip_and_forgetting_curve_advance() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        store.add_countdown("Holiday", d(2026, 10, 19), CountdownKind::Holiday)?;
+        let task = store.add_task("Vocab")?;
+        store.set_due(task.id, Some(d(2026, 10, 16)), None)?;
+        let mut fc = crate::Recurrence::forgetting_curve();
+        fc.skip_holidays = true;
+        fc.skip_weekends = true;
+        store.set_repeat(task.id, Some(fc.clone()), d(2026, 10, 16))?;
+        let copy = store.complete(task.id, true)?.unwrap();
+        let after = store.task(task.id)?.unwrap();
+        // +1 day = Sat Oct 17 -> skips weekend to Mon Oct 19 -> skips holiday to Tue Oct 20.
+        assert_eq!(after.due_date, Some(d(2026, 10, 20)));
+        assert_eq!(after.repeat.as_ref().map(|r| r.cycle), Some(1));
+        store.undo_repeat(task.id, copy, Some(d(2026, 10, 16)), None, Some(&fc))?;
+        let reverted = store.task(task.id)?.unwrap();
+        assert_eq!(reverted.due_date, Some(d(2026, 10, 16)));
+        assert_eq!(reverted.repeat.as_ref().map(|r| r.cycle), Some(0));
+        Ok(())
+    }
+
+    #[test]
+    fn resize_dates_and_timed_range_update_span() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let t = store.add_task("Workshop")?;
+        store.set_due(t.id, Some(d(2026, 11, 10)), None)?;
+
+        // Expand all-day span to 3 days, then shrink back to single day.
+        store.resize_dates(t.id, d(2026, 11, 10), d(2026, 11, 12))?;
+        let loaded = store.task(t.id)?.unwrap();
+        assert_eq!(loaded.due_date, Some(d(2026, 11, 10)));
+        assert_eq!(loaded.end_date, Some(d(2026, 11, 12)));
+
+        store.resize_dates(t.id, d(2026, 11, 11), d(2026, 11, 11))?;
+        let single = store.task(t.id)?.unwrap();
+        assert_eq!(single.due_date, Some(d(2026, 11, 11)));
+        assert_eq!(single.end_date, None);
+
+        // Resize timed range on a day.
+        let s = NaiveTime::from_hms_opt(9, 0, 0).unwrap();
+        let e = NaiveTime::from_hms_opt(11, 30, 0).unwrap();
+        store.resize_timed_range(t.id, d(2026, 11, 11), s, e, None)?;
+        let timed = store.task(t.id)?.unwrap();
+        assert_eq!(timed.due_date, Some(d(2026, 11, 11)));
+        assert_eq!(timed.due_time, Some(s));
+        assert_eq!(timed.end_time, Some(e));
+        assert_eq!(timed.end_date, None);
+        Ok(())
+    }
+
+    #[test]
+    fn caldav_event_queue_and_snapshot_preserve_dirty_edits() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let sub_id = store.add_caldav_subscription(
+            "Work CalDAV",
+            "https://dav.example.com/cal/",
+            Some("#3B82F6"),
+            crate::ical::CalendarProvider::CalDav,
+            "alice",
+            "pw",
+            true,
+        )?;
+        let remote_ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:r1\r\nSUMMARY:Remote\r\nDTSTART:20261110T090000\r\nDTEND:20261110T100000\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let local_ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:l1\r\nSUMMARY:Offline Draft\r\nDTSTART:20261111T100000\r\nDTEND:20261111T110000\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+
+        assert!(store.replace_caldav_snapshot(
+            sub_id,
+            "https://dav.example.com/cal/",
+            &[crate::ical::StoredEvent {
+                subscription_id: sub_id,
+                uid: "r1".into(),
+                href: "/cal/r1.ics".into(),
+                etag: Some("\"e1\"".into()),
+                ics: remote_ics.into(),
+                dirty: crate::ical::EventDirty::Clean,
+            }],
+            Some("tok-1"),
+        )?);
+
+        store.upsert_local_calendar_event(sub_id, "l1", "/cal/l1.ics", local_ics)?;
+        // Concurrent snapshot must keep dirty local edit l1 intact.
+        store.replace_caldav_snapshot(sub_id, "https://dav.example.com/cal/", &[], Some("tok-2"))?;
+        let events = store.calendar_events(sub_id)?;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].uid, "l1");
+        assert_eq!(events[0].dirty, crate::ical::EventDirty::Upsert);
+
+        // Marking an unpushed draft deleted drops it immediately.
+        assert!(store.mark_calendar_event_deleted(sub_id, "l1")?);
+        assert!(store.calendar_events(sub_id)?.is_empty());
         Ok(())
     }
 }

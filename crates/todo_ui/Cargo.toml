@@ -13,6 +13,7 @@ path = "src/todo_ui.rs"
 [dependencies]
 anyhow.workspace = true
 chrono.workspace = true
+chrono-tz.workspace = true
 desktop_common.workspace = true
 fern_core.workspace = true
 fern_i18n.workspace = true

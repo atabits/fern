@@ -303,6 +303,38 @@ pub mod week_axis {
                 + (minutes - last) / (24. * 60. - last) * FOLDED_HEIGHT
         }
     }
+
+    /// Converts a vertical pixel offset on the week grid back into a 15-minute snapped time.
+    pub fn time_at_offset(y: f32) -> NaiveTime {
+        let first = (FIRST_HOUR * 60) as f32;
+        let last = (LAST_HOUR * 60) as f32;
+        let unfolded_end = FOLDED_HEIGHT + (LAST_HOUR - FIRST_HOUR) as f32 * HOUR_HEIGHT;
+        let minutes = if y <= 0. {
+            0.
+        } else if y < FOLDED_HEIGHT {
+            (y / FOLDED_HEIGHT) * first
+        } else if y <= unfolded_end {
+            first + (y - FOLDED_HEIGHT) / HOUR_HEIGHT * 60.
+        } else {
+            last + ((y - unfolded_end) / FOLDED_HEIGHT).min(1.) * (24. * 60. - last)
+        };
+        let snapped = ((minutes / 15.).round() as i64 * 15).clamp(0, 23 * 60 + 45) as u32;
+        NaiveTime::from_hms_opt(snapped / 60, snapped % 60, 0).unwrap_or(NaiveTime::MIN)
+    }
+
+    /// Maps `date` at `local_hour:00` (system `Local`) into `(hour, minute, day_delta)` in `tz`.
+    pub fn hour_in_timezone(date: NaiveDate, local_hour: u32, tz: chrono_tz::Tz) -> (u32, u32, i8) {
+        use chrono::TimeZone as _;
+        let Some(naive) = date.and_hms_opt(local_hour.min(23), 0, 0) else {
+            return (local_hour.min(23), 0, 0);
+        };
+        let Some(local_dt) = chrono::Local.from_local_datetime(&naive).earliest() else {
+            return (local_hour.min(23), 0, 0);
+        };
+        let target = local_dt.with_timezone(&tz);
+        let delta = (target.date_naive() - date).num_days().clamp(-2, 2) as i8;
+        (target.hour(), target.minute(), delta)
+    }
 }
 
 /// The part of a timed task on `date` in the week view: from its start (or midnight) to its end
@@ -505,5 +537,16 @@ mod tests {
         assert_eq!(weeks.len(), 5);
         assert_eq!(weeks[0], week_of(day));
         assert_eq!(weeks[4][0], weeks[0][0] + Duration::weeks(4));
+    }
+
+    #[test]
+    fn week_axis_offset_round_trips_and_formats_secondary_tz() {
+        let t930 = NaiveTime::from_hms_opt(9, 30, 0).unwrap();
+        assert_eq!(week_axis::time_at_offset(week_axis::offset(t930)), t930);
+        let t2145 = NaiveTime::from_hms_opt(21, 45, 0).unwrap();
+        assert_eq!(week_axis::time_at_offset(week_axis::offset(t2145)), t2145);
+
+        let (h, m, _delta) = week_axis::hour_in_timezone(d(2026, 10, 18), 12, chrono_tz::UTC);
+        assert!(h < 24 && m == 0);
     }
 }

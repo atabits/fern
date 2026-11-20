@@ -487,6 +487,74 @@ impl TodoView {
                                         .child(div().flex_1().child(Label::new(strings.kanban_show_input_box)))
                                         .child(ui::Switch::new().toggle_state(quick_add))
                                         .on_click(cx.listener(|this, _, _, cx| this.toggle_kanban_quick_add(cx))),
+                                )
+                                .child(div().px_4().child(Divider::horizontal()))
+                                .child(
+                                    h_flex()
+                                        .id("kanban-toggle-workflow")
+                                        .h(px(48.))
+                                        .px_4()
+                                        .cursor_pointer()
+                                        .child(
+                                            v_flex()
+                                                .flex_1()
+                                                .child(Label::new(strings.kanban_workflow))
+                                                .child(Label::new(strings.kanban_workflow_hint).size(LabelSize::XSmall).color(Color::Muted)),
+                                        )
+                                        .child(ui::Switch::new().toggle_state(self.kanban_workflow))
+                                        .on_click(cx.listener(|this, _, _, cx| this.toggle_kanban_workflow(cx))),
+                                ),
+                        )
+                    })
+                    .when(self.timeline && !self.kanban, |el| {
+                        let show_weekends = self.timeline_show_weekends;
+                        let color_by = self.timeline_color_by;
+                        let color_btn = |id: &'static str, label: &'static str, choice: ColorBy, cx: &mut Context<Self>| {
+                            let active = color_by == choice;
+                            div()
+                                .id(id)
+                                .px_2()
+                                .h(px(26.))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(6.))
+                                .cursor_pointer()
+                                .when(active, |el| el.bg(theme.colors().element_selected))
+                                .hover(|s| s.bg(theme.colors().ghost_element_hover))
+                                .child(Label::new(label).size(LabelSize::Small).color(if active { Color::Accent } else { Color::Default }))
+                                .on_click(cx.listener(move |this, _, _, cx| this.set_timeline_color_by(choice, cx)))
+                        };
+                        el.child(
+                            v_flex()
+                                .rounded(px(8.))
+                                .bg(theme.colors().surface_background)
+                                .child(
+                                    h_flex()
+                                        .id("timeline-toggle-weekends")
+                                        .h(px(48.))
+                                        .px_4()
+                                        .cursor_pointer()
+                                        .child(div().flex_1().child(Label::new(strings.timeline_show_weekends)))
+                                        .child(ui::Switch::new().toggle_state(show_weekends))
+                                        .on_click(cx.listener(|this, _, _, cx| this.toggle_timeline_weekends(cx))),
+                                )
+                                .child(div().px_4().child(Divider::horizontal()))
+                                .child(
+                                    h_flex()
+                                        .h(px(48.))
+                                        .px_4()
+                                        .child(div().flex_1().child(Label::new(strings.color_by)))
+                                        .child(
+                                            h_flex()
+                                                .p(px(2.))
+                                                .gap_0p5()
+                                                .rounded(px(8.))
+                                                .bg(theme.colors().background)
+                                                .child(color_btn("timeline-color-list", strings.color_by_options[0], ColorBy::List, cx))
+                                                .child(color_btn("timeline-color-tag", strings.color_by_options[1], ColorBy::Tag, cx))
+                                                .child(color_btn("timeline-color-prio", strings.color_by_options[2], ColorBy::Priority, cx)),
+                                        ),
                                 ),
                         )
                     })

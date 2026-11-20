@@ -58,6 +58,7 @@ pub struct AppView {
     account_menu_open: bool,
     notices: Notices,
     notices_open: bool,
+    active_alerts: Vec<Notice>,
     sync: crate::sync::SyncStatus,
     /// Cached `store.sync_config().is_some()` so `render` never queries SQLite every frame.
     has_sync_config: bool,
@@ -242,6 +243,7 @@ impl AppView {
             account_menu_open: false,
             notices: Notices::default(),
             notices_open: false,
+            active_alerts: Vec::new(),
             sync: crate::sync::SyncStatus::Off,
             has_sync_config,
             features: store_features,
@@ -476,9 +478,9 @@ impl AppView {
                 let (needle, ago) = spec.split_once('>').unwrap_or((spec, "0"));
                 let at = chrono::Local::now().naive_local() - chrono::Duration::hours(ago.parse().unwrap_or(0));
                 if let Some(task) = this.store.tasks().unwrap_or_default().into_iter().find(|t| t.title.contains(needle)) {
-                    this.add_notices(vec![Notice { target: Target::Task(task.id), title: task.title, at }], cx);
+                    this.add_notices(vec![Notice { target: Target::Task(task.id), title: task.title, at, constant: task.constant_reminder }], cx);
                 } else if let Some(habit) = this.store.habits().unwrap_or_default().into_iter().find(|h| h.name.contains(needle)) {
-                    this.add_notices(vec![Notice { target: Target::Habit(habit.id), title: habit.name, at }], cx);
+                    this.add_notices(vec![Notice { target: Target::Habit(habit.id), title: habit.name, at, constant: habit.constant_reminder }], cx);
                 }
             }
             // `theme=light|dark|system`, saved like a pick in the Settings.
@@ -1391,6 +1393,23 @@ impl AppView {
         }
     }
 
+    pub fn push_active_alerts(&mut self, mut notices: Vec<Notice>, cx: &mut Context<Self>) {
+        if notices.is_empty() {
+            return;
+        }
+        notices.sort_by_key(|n| std::cmp::Reverse(n.at));
+        for notice in notices.into_iter().rev() {
+            self.active_alerts.retain(|existing| existing.target != notice.target);
+            self.active_alerts.insert(0, notice);
+        }
+        self.active_alerts.truncate(5);
+        cx.notify();
+    }
+
+    pub fn has_active_alert(&self, target: Target) -> bool {
+        self.active_alerts.iter().any(|n| n.target == target)
+    }
+
     /// Opening the list marks the notifications read, which clears the badge.
     fn set_notices_open(&mut self, open: bool, cx: &mut Context<Self>) {
         self.notices_open = open;
@@ -1401,6 +1420,7 @@ impl AppView {
     }
 
     fn open_notice(&mut self, target: Target, window: &mut Window, cx: &mut Context<Self>) {
+        self.active_alerts.retain(|n| n.target != target);
         self.set_notices_open(false, cx);
         match target {
             Target::Task(task) => self.open_task(task, window, cx),
@@ -1415,54 +1435,180 @@ impl AppView {
         }
     }
 
-    /// A click on a reminder, in the bell or on the desktop notification. Answering a habit's
-    /// reminder takes it off the bell.
+    /// A click on a reminder, in the bell, floating banner, or desktop notification.
     pub fn answer_notice(&mut self, notice: &Notice, reply: Reply, window: &mut Window, cx: &mut Context<Self>) {
+        self.active_alerts.retain(|n| n.target != notice.target);
         let Reply::Action(action) = reply else {
             window.activate_window();
             self.open_notice(notice.target, window, cx);
             return;
         };
-        let Target::Habit(habit) = notice.target else { return };
         let now = chrono::Local::now().naive_local();
-        let done = match action {
-            NoticeAction::Snooze => self.store.snooze_habit(habit, now + chrono::Duration::minutes(reminders::SNOOZE_MINUTES)),
-            NoticeAction::CheckIn => {
-                let today = now.date();
-                if self.store.checkins(habit).unwrap_or_default().contains(&today) {
-                    Ok(())
+        let snooze_minutes = match action {
+            NoticeAction::Snooze5m => Some(5),
+            NoticeAction::Snooze | NoticeAction::Snooze15m => Some(reminders::SNOOZE_MINUTES),
+            NoticeAction::Snooze1h => Some(60),
+            _ => None,
+        };
+        let mut touched_tasks = false;
+        let mut touched_habits = false;
+        let done = match notice.target {
+            Target::Task(id) => {
+                touched_tasks = true;
+                if let Some(mins) = snooze_minutes {
+                    self.store.snooze_task(id, now + chrono::Duration::minutes(mins))
                 } else {
-                    self.store.toggle_checkin(habit, today).map(|_| ())
+                    match action {
+                        NoticeAction::Complete => self.store.complete(id, true).map(|_| ()),
+                        NoticeAction::Dismiss => self.store.clear_task_snooze(id),
+                        _ => Ok(()),
+                    }
                 }
             }
-            NoticeAction::PlusOne => {
-                let step = self
-                    .store
-                    .habits()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .find(|h| h.id == habit)
-                    .and_then(|h| h.goal)
-                    .map_or(1.0, |g| g.step_amount());
-                self.store.add_checkin_amount(habit, now.date(), step).map(|_| ())
-            }
-            NoticeAction::Record => {
-                window.activate_window();
-                self.set_notices_open(false, cx);
-                if !self.select(Section::Habits, window, cx) {
-                    return;
+            Target::Habit(habit) => {
+                touched_habits = true;
+                if let Some(mins) = snooze_minutes {
+                    self.store.snooze_habit(habit, now + chrono::Duration::minutes(mins))
+                } else {
+                    match action {
+                        NoticeAction::CheckIn => {
+                            let today = now.date();
+                            if self.store.checkins(habit).unwrap_or_default().contains(&today) {
+                                Ok(())
+                            } else {
+                                self.store.toggle_checkin(habit, today).map(|_| ())
+                            }
+                        }
+                        NoticeAction::PlusOne => {
+                            let step = self
+                                .store
+                                .habits()
+                                .unwrap_or_default()
+                                .into_iter()
+                                .find(|h| h.id == habit)
+                                .and_then(|h| h.goal)
+                                .map_or(1.0, |g| g.step_amount());
+                            self.store.add_checkin_amount(habit, now.date(), step).map(|_| ())
+                        }
+                        NoticeAction::Record => {
+                            window.activate_window();
+                            self.set_notices_open(false, cx);
+                            if !self.select(Section::Habits, window, cx) {
+                                return;
+                            }
+                            self.habits.update(cx, |habits, cx| habits.record(habit, window, cx));
+                            Ok(())
+                        }
+                        _ => Ok(()),
+                    }
                 }
-                self.habits.update(cx, |habits, cx| habits.record(habit, window, cx));
-                Ok(())
             }
+            Target::Countdown(_) => Ok(()),
         };
         if let Err(err) = done {
             eprintln!("failed to answer the reminder: {err:#}");
         }
         self.notices.items.retain(|n| n != notice);
         desktop_common::data_version::data_changed(cx.entity_id(), cx);
-        self.habits.update(cx, |habits, cx| habits.reload(cx));
+        if touched_tasks {
+            self.todo.update(cx, |todo, cx| todo.reload(cx));
+            self.calendar.update(cx, |calendar, cx| calendar.reload(cx));
+            self.matrix.update(cx, |matrix, cx| matrix.reload(cx));
+        }
+        if touched_habits {
+            self.habits.update(cx, |habits, cx| habits.reload(cx));
+        }
         cx.notify();
+    }
+
+    fn render_active_alerts(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.active_alerts.is_empty() {
+            return None;
+        }
+        let strings = i18n::t(cx);
+        let today = chrono::Local::now().date_naive();
+        let theme = cx.theme().clone();
+        Some(
+            v_flex()
+                .id("active-reminder-alerts")
+                .debug_selector(|| "active-reminder-alerts".to_owned())
+                .absolute()
+                .bottom(px(16.))
+                .right(px(16.))
+                .w(px(320.))
+                .gap_2()
+                .children(self.active_alerts.iter().enumerate().map(|(i, notice)| {
+                    let target = notice.target;
+                    let (when, _) = crate::task_rows::due_label(notice.at.date(), Some(notice.at.time()), today, strings);
+                    let actions = reminders::actions(&self.store, target);
+                    let dismiss_notice = notice.clone();
+                    v_flex()
+                        .id(SharedString::from(format!("alert-{i}")))
+                        .p_3()
+                        .gap_2()
+                        .rounded(px(10.))
+                        .bg(theme.colors().elevated_surface_background)
+                        .border_1()
+                        .border_color(if notice.constant { theme.colors().accent } else { theme.colors().border })
+                        .shadow_md()
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .items_center()
+                                .child(Icon::new(IconName::AlarmClock).size(IconSize::Small).color(Color::Accent))
+                                .child(
+                                    div()
+                                        .id(SharedString::from(format!("alert-{i}-open")))
+                                        .flex_1()
+                                        .min_w_0()
+                                        .cursor_pointer()
+                                        .child(Label::new(notice.title.clone()).truncate())
+                                        .on_click(cx.listener(move |this, _, window, cx| this.open_notice(target, window, cx))),
+                                )
+                                .child(
+                                    div()
+                                        .id(SharedString::from(format!("alert-{i}-dismiss")))
+                                        .debug_selector(move || format!("alert-{i}-dismiss"))
+                                        .child(
+                                            IconButton::new(SharedString::from(format!("alert-{i}-dismiss-btn")), IconName::X)
+                                                .size(px(22.))
+                                                .icon_size(IconSize::XSmall)
+                                                .icon_color(Color::Muted)
+                                                .hover_icon_color(Color::Icon)
+                                                .on_click(cx.listener(move |this, _, window, cx| {
+                                                    cx.stop_propagation();
+                                                    this.answer_notice(&dismiss_notice, Reply::Action(NoticeAction::Dismiss), window, cx);
+                                                })),
+                                        ),
+                                ),
+                        )
+                        .child(Label::new(when).size(LabelSize::XSmall).color(Color::Muted))
+                        .when(!actions.is_empty(), |el| {
+                            el.child(
+                                h_flex().flex_wrap().gap_1().children(actions.iter().map(|&action| {
+                                    let notice = notice.clone();
+                                    let key = action.key();
+                                    div()
+                                        .id(SharedString::from(format!("alert-{i}-{key}")))
+                                        .debug_selector(move || format!("alert-{i}-{key}"))
+                                        .px_2()
+                                        .py_0p5()
+                                        .rounded(px(4.))
+                                        .border_1()
+                                        .border_color(theme.colors().border)
+                                        .hover(|s| s.bg(theme.colors().element_hover))
+                                        .cursor_pointer()
+                                        .child(Label::new(action.label(strings)).size(LabelSize::Small))
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            cx.stop_propagation();
+                                            this.answer_notice(&notice, Reply::Action(action), window, cx);
+                                        }))
+                                })),
+                            )
+                        })
+                }))
+                .into_any_element(),
+        )
     }
 
     fn render_notices(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -1500,16 +1646,24 @@ impl AppView {
                                     this.answer_notice(&notice, Reply::Action(action), window, cx);
                                 }))
                         });
+                        let item_height = if actions.is_empty() {
+                            44.
+                        } else if actions.len() > 3 {
+                            92.
+                        } else {
+                            72.
+                        };
                         ListItem::new(SharedString::from(format!("notice-{i}")))
-                            .height(px(if actions.is_empty() { 44. } else { 72. }))
+                            .height(px(item_height))
                             .start_slot(Icon::new(IconName::AlarmClock).color(Color::Accent))
                             .child(
                                 v_flex()
                                     .min_w_0()
                                     .py_1()
+                                    .gap_0p5()
                                     .child(Label::new(notice.title.clone()).truncate())
                                     .child(Label::new(when).size(LabelSize::XSmall).color(Color::Muted))
-                                    .child(h_flex().gap_1().children(buttons)),
+                                    .child(h_flex().flex_wrap().gap_1().children(buttons)),
                             )
                             .on_click(cx.listener(move |this, _, window, cx| this.open_notice(target, window, cx)))
                     })),
@@ -1644,6 +1798,7 @@ impl Render for AppView {
             .text_color(theme.colors().text)
             .child(content)
             .child(self.title_bar.clone())
+            .children(self.render_active_alerts(cx))
             // A ring under a finger held long enough: lifting it opens the context menu.
             .when_some(crate::touch::held(), |el, at| {
                 let accent = theme.colors().accent;
@@ -2046,5 +2201,51 @@ mod tests {
             assert!(app.read(cx).dragging_rail.is_none());
             assert_eq!(app.read(cx).rail_order[0], RailSection::Calendar);
         });
+    }
+
+    #[gpui::test]
+    fn active_alert_banner_snoozes_and_completes_task(cx: &mut gpui::TestAppContext) {
+        cx.update(theme::init);
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let t1 = store.add_task("Call bank").unwrap();
+        let t2 = store.add_task("Pay rent").unwrap();
+        let (app, cx) = cx.add_window_view(|window, cx| AppView::new(store.clone(), true, window, cx));
+        cx.simulate_resize(gpui::size(px(1200.), px(700.)));
+        cx.run_until_parked();
+
+        let at = chrono::Local::now().naive_local();
+        cx.update(|_, cx| {
+            app.update(cx, |app, cx| {
+                app.push_active_alerts(
+                    vec![Notice { target: Target::Task(t1.id), title: t1.title.clone(), at, constant: true }],
+                    cx,
+                );
+            });
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("active-reminder-alerts").is_some());
+
+        // Click "Snooze 5m" on active alert card -> sets snoozed_until and removes card.
+        let snooze_5m = cx.debug_bounds("alert-0-snooze-5m").unwrap().center();
+        cx.simulate_click(snooze_5m, gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert!(store.task(t1.id).unwrap().unwrap().snoozed_until.is_some());
+        assert!(cx.debug_bounds("active-reminder-alerts").is_none());
+
+        // Push second alert -> click "Done" -> marks task completed and removes card.
+        cx.update(|_, cx| {
+            app.update(cx, |app, cx| {
+                app.push_active_alerts(
+                    vec![Notice { target: Target::Task(t2.id), title: t2.title.clone(), at, constant: false }],
+                    cx,
+                );
+            });
+        });
+        cx.run_until_parked();
+        let complete = cx.debug_bounds("alert-0-complete").unwrap().center();
+        cx.simulate_click(complete, gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert!(store.task(t2.id).unwrap().unwrap().is_completed());
+        assert!(cx.debug_bounds("active-reminder-alerts").is_none());
     }
 }

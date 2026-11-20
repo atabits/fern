@@ -1,4 +1,4 @@
-use chrono::{NaiveDate, NaiveTime};
+use chrono::{Local, NaiveDate, NaiveDateTime, NaiveTime, TimeZone as _};
 use uuid::Uuid;
 
 use crate::recurrence::Recurrence;
@@ -78,6 +78,10 @@ pub struct TaskDraft {
     pub end_time: Option<NaiveTime>,
     pub section_id: Option<Id>,
     pub checklist: Vec<(String, bool)>,
+    pub location: Option<String>,
+    pub timezone: Option<String>,
+    pub is_floating: bool,
+    pub constant_reminder: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -103,9 +107,21 @@ pub struct Task {
     pub deleted_at: Option<i64>,
     /// When the task was marked "Won't Do".
     pub wont_do_at: Option<i64>,
+    /// When the task was explicitly marked "In Progress".
+    pub in_progress_at: Option<i64>,
     /// The end of a duration ("Duration" tab): the task spans from the due date and time to here.
     pub end_date: Option<NaiveDate>,
     pub end_time: Option<NaiveTime>,
+    /// Optional place / location associated with the task.
+    pub location: Option<String>,
+    /// Optional IANA time zone (e.g. "America/New_York"); `None` uses local time.
+    pub timezone: Option<String>,
+    /// Floating tasks keep their wall-clock time regardless of `timezone`.
+    pub is_floating: bool,
+    /// Snoozed reminder timestamp in local time, if snoozed.
+    pub snoozed_until: Option<NaiveDateTime>,
+    /// Whether this task's reminders repeat persistently until dismissed/snoozed/completed.
+    pub constant_reminder: bool,
     /// When the task was pinned to the top of its lists.
     pub pinned_at: Option<i64>,
     /// The section of its list ("Add Section"), if any.
@@ -194,6 +210,33 @@ impl Task {
 
     pub fn is_wont_do(&self) -> bool {
         self.wont_do_at.is_some()
+    }
+
+    pub fn is_in_progress(&self) -> bool {
+        !self.is_closed() && self.in_progress_at.is_some()
+    }
+
+    /// Due timestamp converted into the local time zone when a timed task specifies an IANA zone
+    /// and is not floating; all-day tasks anchor at `ALL_DAY_REMINDER_HOUR` local time.
+    pub fn effective_due_local(&self) -> Option<NaiveDateTime> {
+        self.effective_due_in(&Local)
+    }
+
+    /// Due timestamp converted into `target` time zone (useful for deterministic timezone tests).
+    pub fn effective_due_in<T: chrono::TimeZone>(&self, target: &T) -> Option<NaiveDateTime> {
+        let date = self.due_date?;
+        let Some(time) = self.due_time else {
+            return NaiveTime::from_hms_opt(crate::reminder::ALL_DAY_REMINDER_HOUR, 0, 0).map(|t| date.and_time(t));
+        };
+        let wall = date.and_time(time);
+        if !self.is_floating
+            && let Some(tz_name) = self.timezone.as_deref()
+            && let Ok(tz) = tz_name.parse::<chrono_tz::Tz>()
+            && let Some(dt) = tz.from_local_datetime(&wall).earliest()
+        {
+            return Some(dt.with_timezone(target).naive_local());
+        }
+        Some(wall)
     }
 
     /// Completed or marked "Won't Do": no longer something to do.

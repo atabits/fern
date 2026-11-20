@@ -35,19 +35,22 @@ pub struct BackupTask {
     pub repeat: Option<Recurrence>,
     pub priority: Priority,
     pub status: Status,
+    pub timezone: Option<String>,
+    pub location: Option<String>,
     pub created: Option<DateTime<FixedOffset>>,
     pub completed: Option<DateTime<FixedOffset>>,
     pub id: String,
     pub parent_id: String,
 }
 
-/// The backup's "Status": 0 normal, 1 and 2 completed (2 archived), -1 won't do.
+/// The backup's "Status": 0 normal, 1 and 2 completed (2 archived), -1 won't do, 3 in progress.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Status {
     #[default]
     Open,
     Completed,
     WontDo,
+    InProgress,
 }
 
 /// What an import added.
@@ -137,7 +140,17 @@ pub fn parse_backup(text: &str) -> Result<Vec<BackupTask>> {
             status: match get("Status").trim() {
                 "1" | "2" => Status::Completed,
                 "-1" => Status::WontDo,
+                "3" | "inProgress" => Status::InProgress,
                 _ => Status::Open,
+            },
+            timezone: {
+                let tz = get("Timezone").trim();
+                let tz = if tz.is_empty() { get("TimeZone").trim() } else { tz };
+                (!tz.is_empty()).then(|| tz.to_owned())
+            },
+            location: {
+                let loc = get("Location").trim();
+                (!loc.is_empty()).then(|| loc.to_owned())
             },
             created: parse_time(get("Created Time")),
             completed: parse_time(get("Completed Time")),
@@ -328,15 +341,24 @@ impl Store {
                     self.set_reminders(task.id, &reminders)?;
                 }
             }
+            if let Some(tz) = item.timezone.as_deref() {
+                self.set_timezone(task.id, Some(tz), item.floating).ok();
+            } else if item.floating {
+                self.set_timezone(task.id, None, true).ok();
+            }
+            if let Some(loc) = item.location.as_deref() {
+                self.set_location(task.id, Some(loc))?;
+            }
             let created = item.created.map(|t| t.timestamp_millis());
             let closed = item.completed.map(|t| t.timestamp_millis()).or(created).unwrap_or_else(|| Local::now().timestamp_millis());
             self.conn.execute(
-                "UPDATE tasks SET created_at = COALESCE(?2, created_at), completed_at = ?3, wont_do_at = ?4 WHERE id = ?1",
+                "UPDATE tasks SET created_at = COALESCE(?2, created_at), completed_at = ?3, wont_do_at = ?4, in_progress_at = ?5 WHERE id = ?1",
                 params![
                     task.id.to_string(),
                     created,
                     (item.status == Status::Completed).then_some(closed),
                     (item.status == Status::WontDo).then_some(closed),
+                    (item.status == Status::InProgress).then_some(closed),
                 ],
             )?;
             summary.tasks += 1;

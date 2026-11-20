@@ -11,7 +11,7 @@ pub enum UndoAction {
     /// The task went to the trash.
     Restore(Id),
     /// A repeating task was completed: its completed copy goes and its dates come back.
-    ReopenRepeat { id: Id, copy: Id, due: Option<NaiveDate>, end: Option<NaiveDate> },
+    ReopenRepeat { id: Id, copy: Id, due: Option<NaiveDate>, end: Option<NaiveDate>, repeat: Option<fern_core::Recurrence> },
 }
 
 impl UndoAction {
@@ -24,7 +24,7 @@ impl UndoAction {
                 store.reopen_tasks(&ids)
             }
             Self::Restore(id) => store.restore_task(*id),
-            Self::ReopenRepeat { id, copy, due, end } => store.undo_repeat(*id, *copy, *due, *end),
+            Self::ReopenRepeat { id, copy, due, end, repeat } => store.undo_repeat(*id, *copy, *due, *end, repeat.as_ref()),
         }
     }
 }
@@ -33,7 +33,7 @@ impl UndoAction {
 pub fn complete(store: &Store, task: &Task) -> Result<UndoAction> {
     let (copy, cascaded) = store.complete_with_cascaded(task.id, true)?;
     Ok(match copy {
-        Some(copy) => UndoAction::ReopenRepeat { id: task.id, copy, due: task.due_date, end: task.end_date },
+        Some(copy) => UndoAction::ReopenRepeat { id: task.id, copy, due: task.due_date, end: task.end_date, repeat: task.repeat.clone() },
         None => UndoAction::Reopen { id: task.id, cascaded },
     })
 }

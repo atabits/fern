@@ -1302,3 +1302,164 @@ fn task_list_scrollbar_scrolls_and_lists_resize_edge_stays_unobstructed(cx: &mut
         "lists-resize should remain unobstructed at the right 6 px edge: {initial_width:?} -> {resized_width:?}"
     );
 }
+
+#[gpui::test]
+fn multi_select_and_batch_edit_actions(cx: &mut TestAppContext) {
+    let store = Rc::new(Store::open_in_memory().unwrap());
+    let t1 = store.add_task("First task").unwrap();
+    let t2 = store.add_task("Second task").unwrap();
+    let t3 = store.add_task("Third task").unwrap();
+    cx.update(|cx| {
+        theme::init(cx);
+        cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+        crate::keymap::load_default(&assets::Assets, cx).unwrap();
+    });
+    let (view, cx) = cx.add_window_view(|window, cx| TodoView::new(store.clone(), window, cx));
+    cx.simulate_resize(gpui::size(px(1300.), px(720.)));
+    cx.run_until_parked();
+
+    // Select all visible tasks via SelectAllTasks action -> opens batch edit panel.
+    cx.update(|window, cx| {
+        view.update(cx, |v, cx| window.focus(&v.list_focus, cx));
+        window.dispatch_action(Box::new(SelectAllTasks), cx);
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| assert_eq!(view.read(cx).selected_task_ids().len(), 3));
+    assert!(cx.debug_bounds("batch-edit-panel").is_some());
+
+    // Escape clears multi-selection.
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    cx.update(|_, cx| assert!(!view.read(cx).is_multi_selecting()));
+    assert!(cx.debug_bounds("batch-edit-panel").is_none());
+
+    // Shift+Click from first row to second row selects only those two tasks.
+    let s1: &'static str = Box::leak(format!("task-row-{}", t1.id).into_boxed_str());
+    let s2: &'static str = Box::leak(format!("task-row-{}", t2.id).into_boxed_str());
+    let r1 = cx.debug_bounds(s1).unwrap();
+    let r2 = cx.debug_bounds(s2).unwrap();
+    let no_mod = Modifiers::default();
+    let shift = Modifiers { shift: true, ..Default::default() };
+    cx.simulate_click(point(r1.right() - px(60.), r1.center().y), no_mod);
+    cx.simulate_click(point(r2.right() - px(60.), r2.center().y), shift);
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let ids = view.read(cx).selected_task_ids();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&t1.id) && ids.contains(&t2.id));
+    });
+    assert!(cx.debug_bounds("batch-edit-panel").is_some());
+
+    // Batch set high priority, in-progress, and complete on the two selected tasks.
+    let prio_high = cx.debug_bounds("batch-prio-high").unwrap().center();
+    cx.simulate_click(prio_high, no_mod);
+    cx.run_until_parked();
+    let in_prog = cx.debug_bounds("batch-in-progress").unwrap().center();
+    cx.simulate_click(in_prog, no_mod);
+    cx.run_until_parked();
+
+    assert_eq!(store.task(t1.id).unwrap().unwrap().priority, Priority::High);
+    assert_eq!(store.task(t2.id).unwrap().unwrap().priority, Priority::High);
+    assert_eq!(store.task(t3.id).unwrap().unwrap().priority, Priority::None);
+    assert!(store.task(t1.id).unwrap().unwrap().is_in_progress());
+    assert!(store.task(t2.id).unwrap().unwrap().is_in_progress());
+    assert!(!store.task(t3.id).unwrap().unwrap().is_in_progress());
+
+    let batch_done = cx.debug_bounds("batch-complete").unwrap().center();
+    cx.simulate_click(batch_done, no_mod);
+    cx.run_until_parked();
+    assert!(store.task(t1.id).unwrap().unwrap().is_completed());
+    assert!(store.task(t2.id).unwrap().unwrap().is_completed());
+    assert!(!store.task(t3.id).unwrap().unwrap().is_completed());
+
+    // Clear selection restores single-task detail view.
+    let clear = cx.debug_bounds("batch-clear").unwrap().center();
+    cx.simulate_click(clear, no_mod);
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("batch-edit-panel").is_none());
+}
+
+#[gpui::test]
+fn workflow_kanban_partitions_and_transitions_task_status(cx: &mut TestAppContext) {
+    let store = Rc::new(Store::open_in_memory().unwrap());
+    let t_todo = store.add_task("Backlog task").unwrap();
+    let t_prog = store.add_task("Active work").unwrap();
+    store.set_in_progress(t_prog.id, true).unwrap();
+    let t_done = store.add_task("Finished").unwrap();
+    store.set_completed(t_done.id, true).unwrap();
+
+    cx.update(|cx| {
+        theme::init(cx);
+        cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+        crate::keymap::load_default(&assets::Assets, cx).unwrap();
+    });
+    let (view, cx) = cx.add_window_view(|window, cx| TodoView::new(store.clone(), window, cx));
+    view.update(cx, |v, cx| {
+        v.set_layout(true, false, cx);
+        v.toggle_kanban_workflow(cx);
+    });
+    cx.run_until_parked();
+
+    cx.update(|_, cx| {
+        let cols = view.read(cx).board_columns(&i18n::EN);
+        assert_eq!(cols.len(), 3);
+        assert_eq!(cols[0].key, "workflow:todo");
+        assert_eq!(cols[0].open_cards.iter().map(|(t, _)| t.id).collect::<Vec<_>>(), vec![t_todo.id]);
+        assert_eq!(cols[1].key, "workflow:in_progress");
+        assert_eq!(cols[1].open_cards.iter().map(|(t, _)| t.id).collect::<Vec<_>>(), vec![t_prog.id]);
+        assert_eq!(cols[2].key, "workflow:completed");
+        assert_eq!(cols[2].completed_cards.iter().map(|(t, _)| t.id).collect::<Vec<_>>(), vec![t_done.id]);
+    });
+
+    // Drop Backlog task onto In Progress, then Completed, then back to To Do.
+    view.update(cx, |v, cx| v.drop_on_column(t_todo.id, DropTarget::InProgress, cx));
+    assert!(store.task(t_todo.id).unwrap().unwrap().is_in_progress());
+    view.update(cx, |v, cx| v.drop_on_column(t_todo.id, DropTarget::Complete, cx));
+    assert!(store.task(t_todo.id).unwrap().unwrap().is_completed());
+    view.update(cx, |v, cx| v.drop_on_column(t_todo.id, DropTarget::Todo, cx));
+    let reopened = store.task(t_todo.id).unwrap().unwrap();
+    assert!(!reopened.is_completed() && !reopened.is_in_progress());
+}
+
+#[gpui::test]
+fn timeline_resize_weekends_and_secondary_timezone(cx: &mut TestAppContext) {
+    let store = Rc::new(Store::open_in_memory().unwrap());
+    let day = TodoView::today();
+    let t = store.add_task("Timeline Bar").unwrap();
+    store.set_due(t.id, Some(day), chrono::NaiveTime::from_hms_opt(10, 0, 0)).unwrap();
+
+    cx.update(|cx| {
+        theme::init(cx);
+        cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+        crate::keymap::load_default(&assets::Assets, cx).unwrap();
+    });
+    let (view, cx) = cx.add_window_view(|window, cx| TodoView::new(store.clone(), window, cx));
+    view.update(cx, |v, cx| {
+        v.set_layout(false, true, cx);
+        v.set_timeline_color_by(ColorBy::Priority, cx);
+        v.set_timeline_secondary_tz(Some("UTC".into()), cx);
+        v.toggle_timeline_weekends(cx);
+    });
+    cx.run_until_parked();
+
+    let target_end = day + Duration::days(3);
+    let target_start = day - Duration::days(1);
+    view.update(cx, |v, cx| {
+        assert!(!v.timeline_show_weekends);
+        assert_eq!(v.timeline_color_by, ColorBy::Priority);
+        assert_eq!(v.timeline_secondary_tz.as_deref(), Some("UTC"));
+        v.resize_timeline_task(
+            &ResizedTask { id: t.id, title: "Timeline Bar".into(), start: day, end: day, edge: ResizeEdge::End },
+            target_end,
+            cx,
+        );
+        v.resize_timeline_task(
+            &ResizedTask { id: t.id, title: "Timeline Bar".into(), start: day, end: target_end, edge: ResizeEdge::Start },
+            target_start,
+            cx,
+        );
+    });
+    let updated = store.task(t.id).unwrap().unwrap();
+    assert_eq!(updated.due_date, Some(target_start));
+    assert_eq!(updated.end_date, Some(target_end));
+}

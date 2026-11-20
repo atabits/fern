@@ -177,6 +177,26 @@ impl TodoView {
             BoardCol { key, title, drop, pinned_cards, open_cards, completed_cards }
         };
 
+        if self.kanban_workflow {
+            let mut todo_cards = Vec::new();
+            let mut in_progress_cards = Vec::new();
+            let mut completed_cards = Vec::new();
+            for card in all_cards {
+                if card.0.is_completed() {
+                    completed_cards.push(card);
+                } else if card.0.is_in_progress() {
+                    in_progress_cards.push(card);
+                } else {
+                    todo_cards.push(card);
+                }
+            }
+            return vec![
+                make_col("workflow:todo".into(), strings.col_todo.to_owned(), Some(DropTarget::Todo), todo_cards),
+                make_col("workflow:in_progress".into(), strings.in_progress.to_owned(), Some(DropTarget::InProgress), in_progress_cards),
+                make_col("workflow:completed".into(), strings.completed.to_owned(), Some(DropTarget::Complete), completed_cards),
+            ];
+        }
+
         match group {
             GroupBy::Custom if self.view == View::Next7Days => {
                 let week_start = crate::calendar::week_start();
@@ -604,6 +624,7 @@ impl TodoView {
                     let checkbox = Checkbox::new(SharedString::from(format!("card-check-{id}")))
                         .toggle_state(done)
                         .animate_completion(crate::completion_mark::started(id, cx))
+                        .in_progress(task.is_in_progress())
                         .tint(task_rows::priority_color(task.priority, &theme))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             if cx.has_active_drag() {
@@ -867,6 +888,15 @@ impl TodoView {
         cx.notify();
     }
 
+    pub(super) fn toggle_kanban_workflow(&mut self, cx: &mut Context<Self>) {
+        let next = !self.kanban_workflow;
+        let key = format!("kanban_workflow:{}", self.view_key());
+        let result = self.store.set_setting(&key, if next { "1" } else { "0" });
+        self.check(result);
+        self.kanban_workflow = next;
+        cx.notify();
+    }
+
     pub(super) fn set_section_color(&mut self, section: Id, color: Option<&str>, cx: &mut Context<Self>) {
         let value = color.unwrap_or("");
         let result = self.store.set_setting(&format!("kanban:section_color:{section}"), value);
@@ -899,6 +929,8 @@ impl TodoView {
         }
         let hex = |s: &str| lists_panel::parse_color(Some(s));
         match target {
+            Some(DropTarget::Todo) => hex("#6387F7"),
+            Some(DropTarget::InProgress) => hex("#FAAD14"),
             Some(DropTarget::Complete) => hex("#A5A5A5"),
             Some(DropTarget::Section(Some(id))) => self
                 .kanban_section_colors
@@ -1270,6 +1302,24 @@ impl TodoView {
         match target {
             DropTarget::Section(section) => store.set_section(id, section),
             DropTarget::Kind(kind) => store.set_kind(id, kind),
+            DropTarget::Todo => {
+                if task.is_completed() {
+                    store.set_completed(id, false)?;
+                }
+                if task.is_in_progress() {
+                    store.set_in_progress(id, false)?;
+                }
+                Ok(())
+            }
+            DropTarget::InProgress => {
+                if task.is_completed() {
+                    store.set_completed(id, false)?;
+                }
+                if !task.is_in_progress() {
+                    store.set_in_progress(id, true)?;
+                }
+                Ok(())
+            }
             DropTarget::Complete => store.set_completed(id, true),
             DropTarget::Due(date) => store.set_due(id, date, date.and(task.due_time)),
             DropTarget::Priority(priority) => store.set_priority(id, priority),

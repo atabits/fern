@@ -408,7 +408,7 @@ impl Condition {
             }
             ConditionValue::Priority(v) => v.is_empty() || v.contains(&task.priority),
             ConditionValue::Include(s) => {
-                let text = format!("{}\n{}", task.title, task.notes).to_lowercase();
+                let text = format!("{}\n{}\n{}", task.title, task.notes, task.location.as_deref().unwrap_or("")).to_lowercase();
                 let matches = |word: &str| text.contains(&word.to_lowercase());
                 if self.legacy_matching {
                     s.split_whitespace().all(matches)

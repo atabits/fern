@@ -3,6 +3,7 @@
 
 pub mod agenda;
 pub mod attachment;
+pub mod caldav;
 pub mod calendar_options;
 pub mod countdown;
 pub mod filter;
@@ -11,6 +12,7 @@ pub mod habit;
 pub mod ical;
 pub mod import;
 pub mod link;
+pub mod lunar;
 pub mod markdown;
 pub mod matrix;
 pub mod model;
@@ -35,6 +37,7 @@ pub use habit::{
     HabitDraft, HabitSection, HabitStats, MonthStats,
 };
 pub use habit::Frequency as HabitFrequency;
+pub use matrix::MatrixProfile;
 pub use model::{Activity, Attachment, Comment, Estimate, ChecklistItem, ListSection, Template, Id, Kind, List, ListDraft, ListFolder, Priority, Tag, Task, TaskDraft, View, ViewCounts};
 pub use preferences::{DURATIONS, Features, Notifications, DateFormat, DefaultDate, Preferences, RailSection, SidebarSection, TaskDefaults, SmartList, ThemeMode, ThemeSelection, Visibility, WEEK_STARTS};
 pub use quick_add::{ParsedTask, Recognition, parse_quick_add, parse_quick_add_on_day, parse_quick_add_with};

@@ -3,8 +3,9 @@
 
 use std::rc::Rc;
 
+use desktop_common::text_input::{Changed, Mode, TextInput};
 use fern_core::{CalendarOptions, ColorBy, CountdownColor, HabitColor, Priority, Store};
-use gpui::{EventEmitter, FontWeight, Hsla};
+use gpui::{Entity, EventEmitter, Focusable as _, FontWeight, Hsla};
 use ui::prelude::*;
 use ui::{Placement, PopoverAttachment, Switch, popover};
 
@@ -40,6 +41,8 @@ pub struct CalendarOptionsDialog {
     options: CalendarOptions,
     page: Page,
     color_menu: bool,
+    tz_menu: bool,
+    tz_input: Entity<TextInput>,
     /// The Color page's tab: Task, Habit or Countdown.
     color_tab: usize,
 }
@@ -47,9 +50,11 @@ pub struct CalendarOptionsDialog {
 impl EventEmitter<OptionsEvent> for CalendarOptionsDialog {}
 
 impl CalendarOptionsDialog {
-    pub fn new(store: Rc<Store>, page: Page) -> Self {
+    pub fn new(store: Rc<Store>, page: Page, cx: &mut Context<Self>) -> Self {
         let options = store.calendar_options().unwrap_or_default();
-        Self { store, options, page, color_menu: false, color_tab: 0 }
+        let tz_input = cx.new(|cx| TextInput::new(Mode::SingleLine, "", cx).without_cancel());
+        cx.subscribe(&tz_input, |_, _, _: &Changed, cx| cx.notify()).detach();
+        Self { store, options, page, color_menu: false, tz_menu: false, tz_input, color_tab: 0 }
     }
 
     /// Opens the Color By dropdown, for the debug-build dev state.
@@ -68,7 +73,7 @@ impl CalendarOptionsDialog {
         if let Err(err) = self.store.save_calendar_options(&self.options) {
             eprintln!("failed to save the calendar options: {err:#}");
         }
-        cx.emit(OptionsEvent::Changed(self.options));
+        cx.emit(OptionsEvent::Changed(self.options.clone()));
         cx.notify();
     }
 
@@ -104,7 +109,82 @@ impl CalendarOptionsDialog {
                 .child(Switch::new().toggle_state(on))
                 .on_click(cx.listener(move |this, _, _, cx| this.change(cx, flip)))
         };
-        let o = self.options;
+        let o = &self.options;
+        let current_tz = o.secondary_timezone.as_deref().unwrap_or(strings.secondary_timezone_none).to_owned();
+        let tz_query = self.tz_input.read(cx).text().trim().to_lowercase();
+        let tz_choices: Vec<&'static str> = if tz_query.is_empty() {
+            vec![
+                "UTC",
+                "America/New_York",
+                "America/Los_Angeles",
+                "America/Chicago",
+                "Europe/London",
+                "Europe/Berlin",
+                "Europe/Moscow",
+                "Asia/Dubai",
+                "Asia/Kolkata",
+                "Asia/Shanghai",
+                "Asia/Tokyo",
+                "Australia/Sydney",
+            ]
+        } else {
+            chrono_tz::TZ_VARIANTS
+                .iter()
+                .map(|z| z.name())
+                .filter(|name| name.to_lowercase().contains(&tz_query))
+                .take(40)
+                .collect()
+        };
+        let tz_menu = self.tz_menu.then(|| {
+            popover(cx)
+                .w(px(280.))
+                .p_2()
+                .gap_1p5()
+                .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                    this.tz_menu = false;
+                    cx.notify();
+                }))
+                .child(
+                    h_flex()
+                        .h(px(30.))
+                        .px_2()
+                        .rounded(px(6.))
+                        .border_1()
+                        .border_color(theme.colors().border)
+                        .child(self.tz_input.clone())
+                        .child(Label::new(if self.tz_input.read(cx).text().is_empty() { strings.timezone_search } else { "" }).size(LabelSize::Small).color(Color::Muted)),
+                )
+                .child(
+                    v_scroll(
+                        "calendar-secondary-tz-scroll",
+                        v_flex()
+                            .id("calendar-secondary-tz-list")
+                            .child(
+                                ListItem::new("secondary-tz-none")
+                                    .height(px(30.))
+                                    .toggle_state(o.secondary_timezone.is_none())
+                                    .child(Label::new(strings.secondary_timezone_none).size(LabelSize::Small))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.tz_menu = false;
+                                        this.change(cx, |o| o.secondary_timezone = None);
+                                    })),
+                            )
+                            .children(tz_choices.into_iter().map(|zone| {
+                                let selected = o.secondary_timezone.as_deref() == Some(zone);
+                                ListItem::new(SharedString::from(format!("secondary-tz-{zone}")))
+                                    .height(px(30.))
+                                    .toggle_state(selected)
+                                    .child(Label::new(zone).size(LabelSize::Small).truncate())
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.tz_menu = false;
+                                        this.change(cx, |o| o.secondary_timezone = Some(zone.to_owned()));
+                                    }))
+                            })),
+                    )
+                    .max_h(px(210.))
+                    .compact(),
+                )
+        });
         v_flex()
             .gap_3()
             .child(self.header(strings.view_options, cx))
@@ -125,6 +205,31 @@ impl CalendarOptionsDialog {
                     .child(switch("calendar-focus", strings.show_focus, o.show_focus, |o| o.show_focus = !o.show_focus, cx))
                     .child(switch("calendar-countdowns", strings.show_countdowns, o.show_countdowns, |o| o.show_countdowns = !o.show_countdowns, cx)),
             )
+            .child(
+                group().child(
+                    h_flex()
+                        .id("calendar-secondary-tz")
+                        .relative()
+                        .h(px(40.))
+                        .px_4()
+                        .cursor_pointer()
+                        .child(div().flex_1().child(Label::new(strings.secondary_timezone)))
+                        .child(
+                            h_flex()
+                                .gap_1()
+                                .child(Label::new(current_tz).size(LabelSize::Small).color(Color::Muted))
+                                .child(Icon::new(IconName::ChevronsUpDown).size(IconSize::XSmall).color(Color::Muted)),
+                        )
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.tz_menu = !this.tz_menu;
+                            if this.tz_menu {
+                                window.focus(&this.tz_input.focus_handle(cx), cx);
+                            }
+                            cx.notify();
+                        }))
+                        .when_some(tz_menu, |el, menu| el.child(PopoverAttachment::new(Placement::AboveRight, menu))),
+                ),
+            )
     }
 
     /// The Color page, as the original's: Task, Habit and Countdown tabs, each with its "Color By",
@@ -132,7 +237,7 @@ impl CalendarOptionsDialog {
     fn render_color(&self, strings: &'static Strings, cx: &mut Context<Self>) -> Div {
         let theme = cx.theme().clone();
         let accent = theme.colors().accent;
-        let o = self.options;
+        let o = &self.options;
         let swatch = |color: Hsla| div().size(px(14.)).rounded_full().bg(color);
         let row = |icon: IconName, label: SharedString, color: Hsla| {
             h_flex()

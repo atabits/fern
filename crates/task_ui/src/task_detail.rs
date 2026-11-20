@@ -101,6 +101,11 @@ pub struct TaskDetail {
     subtask_input: Entity<TextInput>,
     /// The due-date popover's field for typing a time.
     time_input: Entity<TextInput>,
+    /// The due-date popover's time-zone search input.
+    tz_input: Entity<TextInput>,
+    /// The task's location field and whether it is expanded when empty.
+    location_input: Entity<TextInput>,
+    location_open: bool,
     /// The "Link Parent Task" search field.
     link_search: Entity<TextInput>,
     /// The list menu's search field, and the list (`Some(None)` for the Inbox) whose sections
@@ -161,6 +166,8 @@ impl TaskDetail {
         let new_item = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.add_item, cx).without_cancel());
         let subtask_input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.add_subtask, cx).without_cancel());
         let time_input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.time_placeholder, cx).without_cancel());
+        let tz_input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.timezone_search, cx).without_cancel());
+        let location_input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.location_placeholder, cx).without_cancel());
         let link_search = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.search_placeholder, cx).without_cancel());
         let list_search = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.section_search, cx).without_cancel());
         let comment_input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.write_comment, cx));
@@ -179,7 +186,16 @@ impl TaskDetail {
                 if this.edit_draft(cx, |task, _| task.notes = text.clone()) { return; }
                 this.save(cx, |store, id| store.set_notes(id, &text));
             }),
+            cx.subscribe(&location_input, |this, input, _: &Changed, cx| {
+                let text = input.read(cx).text().trim().to_owned();
+                let value = (!text.is_empty()).then_some(text);
+                if this.edit_draft(cx, |task, _| task.location = value.clone()) {
+                    return;
+                }
+                this.save(cx, |store, id| store.set_location(id, value.as_deref()));
+            }),
             cx.subscribe(&tag_input, |_, _, _: &Changed, cx| cx.notify()),
+            cx.subscribe(&tz_input, |_, _, _: &Changed, cx| cx.notify()),
             cx.subscribe(&link_search, |_, _, _: &Changed, cx| cx.notify()),
             cx.subscribe(&list_search, |this, _, _: &Changed, cx| {
                 this.list_submenu = None;
@@ -194,6 +210,8 @@ impl TaskDetail {
                 this.new_item.update(cx, |input, cx| input.set_placeholder(strings.add_item, cx));
                 this.subtask_input.update(cx, |input, cx| input.set_placeholder(strings.add_subtask, cx));
                 this.time_input.update(cx, |input, cx| input.set_placeholder(strings.time_placeholder, cx));
+                this.tz_input.update(cx, |input, cx| input.set_placeholder(strings.timezone_search, cx));
+                this.location_input.update(cx, |input, cx| input.set_placeholder(strings.location_placeholder, cx));
                 this.link_search.update(cx, |input, cx| input.set_placeholder(strings.search_placeholder, cx));
                 this.list_search.update(cx, |input, cx| input.set_placeholder(strings.section_search, cx));
                 this.comment_input.update(cx, |input, cx| input.set_placeholder(strings.write_comment, cx));
@@ -218,6 +236,9 @@ impl TaskDetail {
             new_item,
             subtask_input,
             time_input,
+            tz_input,
+            location_input,
+            location_open: false,
             link_search,
             list_search,
             list_submenu: None,
@@ -324,11 +345,15 @@ impl TaskDetail {
         }
         self.session.draft = None;
         self.title.update(cx, |input, cx| input.set_placeholder(i18n::t(cx).untitled, cx));
-        let (title, notes) = task
+        let (title, notes, location) = task
             .as_ref()
-            .map_or((String::new(), String::new()), |t| (t.title.clone(), t.notes.clone()));
+            .map_or((String::new(), String::new(), String::new()), |t| {
+                (t.title.clone(), t.notes.clone(), t.location.clone().unwrap_or_default())
+            });
         self.title.update(cx, |input, cx| input.set_text(title, cx));
         self.notes.update(cx, |input, cx| input.set_text(notes, cx));
+        self.location_open = !location.is_empty();
+        self.location_input.update(cx, |input, cx| input.set_text(location, cx));
         self.new_item.update(cx, |input, cx| input.set_text("", cx));
         self.subtask_input.update(cx, |input, cx| input.set_text("", cx));
         self.comment_input.update(cx, |input, cx| input.set_text("", cx));
@@ -813,6 +838,12 @@ impl TaskDetail {
                 if old_notes != Some(task.notes.as_str()) && self.notes.read(cx).text() != task.notes {
                     self.notes.update(cx, |input, cx| input.set_text(task.notes.clone(), cx));
                 }
+                let old_loc = self.session.task.as_ref().and_then(|t| t.location.as_deref());
+                let new_loc = task.location.as_deref().unwrap_or("");
+                if old_loc != task.location.as_deref() && self.location_input.read(cx).text() != new_loc {
+                    self.location_input.update(cx, |input, cx| input.set_text(new_loc.to_owned(), cx));
+                }
+                self.location_open |= task.location.is_some();
                 self.session.task = Some(task);
                 self.sync_checklist(cx);
                 self.show_checklist |= !self.checklist.is_empty();
@@ -843,6 +874,7 @@ impl TaskDetail {
         match popup {
             Popup::Due => {
                 let today = Local::now().date_naive();
+                self.tz_input.update(cx, |input, cx| input.set_text("", cx));
                 self.session.due_draft = self.session.task.as_ref().map(|task| self.due_preview(task, today));
             }
             Popup::Tags | Popup::InlineTags => {
@@ -1062,14 +1094,16 @@ impl TaskDetail {
     }
 
     fn popup_input_focused(&self, window: &Window, cx: &App) -> bool {
-        let input = match self.session.popup {
-            Some(Popup::Tags | Popup::InlineTags) => &self.tag_input,
-            Some(Popup::LinkParent) => &self.link_search,
-            Some(Popup::Due) => &self.time_input,
-            Some(Popup::List) => &self.list_search,
-            _ => return false,
-        };
-        input.focus_handle(cx).is_focused(window)
+        match self.session.popup {
+            Some(Popup::Tags | Popup::InlineTags) => self.tag_input.focus_handle(cx).is_focused(window),
+            Some(Popup::LinkParent) => self.link_search.focus_handle(cx).is_focused(window),
+            Some(Popup::Due) => {
+                self.time_input.focus_handle(cx).is_focused(window)
+                    || self.tz_input.focus_handle(cx).is_focused(window)
+            }
+            Some(Popup::List) => self.list_search.focus_handle(cx).is_focused(window),
+            _ => false,
+        }
     }
 
     /// Dismisses a popover even if focus is still in the task list or calendar.
@@ -1106,7 +1140,7 @@ impl TaskDetail {
         }
     }
 
-    /// "OK": saves the draft's date, time and repeat.
+    /// "OK": saves the draft's date, time, timezone, reminders, and repeat.
     fn apply_due(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(draft) = self.session.due_draft.take() {
             let today = Local::now().date_naive();
@@ -1114,7 +1148,11 @@ impl TaskDetail {
                 let before = self.due_preview(task, today);
                 draft.date != before.date || draft.time != before.time
                     || draft.end() != before.end() || draft.repeat != before.repeat
+                    || draft.timezone != before.timezone || draft.is_floating != before.is_floating
+                    || draft.constant_reminder != before.constant_reminder
             });
+            let reminders: Vec<i64> = if draft.date.is_some() { draft.reminders.clone() } else { Vec::new() };
+            let constant = draft.constant_reminder && !reminders.is_empty();
             if !self.edit_draft(cx, |task, state| {
                 if changed {
                     task.due_date = draft.date;
@@ -1122,15 +1160,20 @@ impl TaskDetail {
                     task.end_date = draft.end().map(|(date, _)| date);
                     task.end_time = draft.end().and_then(|(_, time)| time);
                     task.repeat = draft.repeat.clone();
+                    task.timezone = draft.timezone.clone();
+                    task.is_floating = draft.is_floating;
                     state.date_changed = true;
                 }
-                task.reminders = if draft.date.is_some() { draft.reminders.clone() } else { Vec::new() };
+                task.reminders = reminders.clone();
+                task.constant_reminder = constant;
                 state.reminders_changed = draft.reminders_changed;
             }) {
                 self.save(cx, |store, id| {
                     store.set_due(id, draft.date, draft.time)?;
                     store.set_due_end(id, draft.end())?;
-                    store.set_reminders(id, if draft.date.is_some() { &draft.reminders } else { &[] })?;
+                    store.set_timezone(id, draft.timezone.as_deref(), draft.is_floating)?;
+                    store.set_reminders(id, &reminders)?;
+                    store.set_task_constant_reminder(id, constant)?;
                     store.set_repeat(id, draft.repeat, today)
                 });
             } else {
@@ -1140,18 +1183,21 @@ impl TaskDetail {
         self.dismiss_popup(window, cx);
     }
 
-    /// "Clear": removes the due date, time and repeat.
+    /// "Clear": removes the due date, time, timezone, reminders, and repeat.
     fn clear_due(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.session.due_draft = None;
         let today = Local::now().date_naive();
         if !self.edit_draft(cx, |task, state| {
             task.due_date = None; task.due_time = None; task.end_date = None; task.end_time = None;
+            task.timezone = None; task.is_floating = false; task.constant_reminder = false;
             task.reminders.clear(); task.repeat = None; state.date_changed = true;
             state.reminders_changed = false;
         }) { self.save(cx, |store, id| {
             store.set_due(id, None, None)?;
             store.set_due_end(id, None)?;
+            store.set_timezone(id, None, false)?;
             store.set_reminders(id, &[])?;
+            store.set_task_constant_reminder(id, false)?;
             store.set_repeat(id, None, today)
         }); } else {
             self.refresh_draft_title(cx);
@@ -1286,6 +1332,12 @@ impl TaskDetail {
         self.menu_action(cx, |store, id| store.set_wont_do(id, !wont_do));
     }
 
+    fn toggle_in_progress(&mut self, cx: &mut Context<Self>) {
+        let in_progress = self.session.task.as_ref().is_some_and(|t| t.is_in_progress());
+        self.menu_action(cx, |store, id| store.set_in_progress(id, !in_progress));
+        self.reload_current_task();
+    }
+
     fn toggle_kind(&mut self, cx: &mut Context<Self>) {
         let kind = match self.session.task.as_ref().map(|task| self.kind_preview(task)) {
             Some(Kind::Note) => Kind::Task,
@@ -1397,6 +1449,14 @@ impl TaskDetail {
                 item("more-pin", if pinned { IconName::PinOff } else { IconName::Pin }, if pinned { strings.unpin } else { strings.pin })
                     .on_click(cx.listener(move |this, _, _, cx| this.menu_action(cx, move |store, id| store.set_pinned(id, !pinned))))
             }, cx))
+            .when(!is_note, |el| {
+                let active = task.is_in_progress();
+                el.child(self.close_side_menu_on_hover(
+                    item("more-in-progress", IconName::Hourglass, if active { strings.clear_in_progress } else { strings.mark_in_progress })
+                        .on_click(cx.listener(|this, _, _, cx| this.toggle_in_progress(cx))),
+                    cx,
+                ))
+            })
             .child(self.close_side_menu_on_hover(
                 item("more-wont-do", if wont_do { IconName::RotateCcw } else { IconName::SquareX }, if wont_do {
                     strings.reopen
@@ -1406,6 +1466,12 @@ impl TaskDetail {
                 .on_click(cx.listener(|this, _, _, cx| this.toggle_wont_do(cx))),
             cx,
             ))
+            .child(self.close_side_menu_on_hover(item("more-location", IconName::MapPin, strings.add_location).on_click(cx.listener(|this, _, window, cx| {
+                this.close_popup(cx);
+                this.location_open = true;
+                window.focus(&this.location_input.focus_handle(cx), cx);
+                cx.notify();
+            })), cx))
             .child(self.close_side_menu_on_hover(item("more-tags", IconName::Tag, strings.tags).on_click(cx.listener(|this, _, window, cx| {
                 this.open_tags(Popup::Tags, window, cx);
             })), cx))
@@ -1861,6 +1927,7 @@ impl TaskDetail {
                             Checkbox::new("subtask-checkbox")
                                 .size(px(14.))
                                 .toggle_state(done)
+                                .in_progress(subtask.is_in_progress())
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     cx.stop_propagation();
                                     this.toggle_subtask(id, !done, cx);
@@ -2146,6 +2213,85 @@ impl TaskDetail {
                     )
                     .into_any_element(),
             ),
+            Some(DueMenu::TimeZone) => {
+                let query = self.tz_input.read(cx).text().to_owned();
+                let options = due_picker::timezone_options(&query);
+                Some(
+                    v_flex()
+                        .gap_1()
+                        .child(
+                            ListItem::new("tz-local")
+                                .height(px(28.))
+                                .child(Label::new(strings.timezone_local).size(LabelSize::Small))
+                                .when(draft.timezone.is_none() && !draft.is_floating, |item| item.end_slot(check_mark()))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.update_draft(cx, |d| {
+                                        d.timezone = None;
+                                        d.is_floating = false;
+                                        d.menu = None;
+                                    })
+                                })),
+                        )
+                        .child(
+                            div()
+                                .id("tz-floating-tip")
+                                .tooltip(Tooltip::text(strings.timezone_floating_hint))
+                                .child(
+                                    ListItem::new("tz-floating")
+                                        .height(px(28.))
+                                        .child(Label::new(strings.timezone_floating).size(LabelSize::Small))
+                                        .when(draft.is_floating, |item| item.end_slot(check_mark()))
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.update_draft(cx, |d| {
+                                                d.is_floating = true;
+                                                d.menu = None;
+                                            })
+                                        })),
+                                ),
+                        )
+                        .child(div().py_0p5().child(Divider::horizontal()))
+                        .child(
+                            h_flex()
+                                .h(px(28.))
+                                .px_2()
+                                .rounded(px(6.))
+                                .bg(theme.colors().background)
+                                .text_size(px(12.))
+                                .child(self.tz_input.clone()),
+                        )
+                        .child(
+                            v_scroll(
+                                "tz-options-scroll",
+                                v_flex().id("tz-options").children(options.into_iter().map(|(name, offset)| {
+                                    let selected = !draft.is_floating && draft.timezone.as_deref() == Some(name.as_str());
+                                    let pick_name = name.clone();
+                                    ListItem::new(SharedString::from(format!("tz-{name}")))
+                                        .height(px(28.))
+                                        .child(
+                                            h_flex()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .gap_1()
+                                                .child(div().flex_1().min_w_0().child(Label::new(name).size(LabelSize::Small).truncate()))
+                                                .child(Label::new(offset).size(LabelSize::XSmall).color(Color::Muted)),
+                                        )
+                                        .when(selected, |item| item.end_slot(check_mark()))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            let pick_name = pick_name.clone();
+                                            this.update_draft(cx, move |d| {
+                                                d.timezone = Some(pick_name);
+                                                d.is_floating = false;
+                                                d.menu = None;
+                                            })
+                                        }))
+                                })),
+                            )
+                            .max_h(px(160.))
+                            .compact(),
+                        )
+                        .into_any_element(),
+                )
+            }
             Some(DueMenu::Custom(rule)) => Some(self.render_custom_repeat(rule.clone(), strings, cx)),
             Some(DueMenu::Reminder) => Some(
                 v_flex()
@@ -2189,6 +2335,29 @@ impl TaskDetail {
                     )
                     .child(div().py_1().child(Divider::horizontal()))
                     .child(
+                        h_flex()
+                            .id("reminder-constant")
+                            .h(px(28.))
+                            .px_2()
+                            .gap_2()
+                            .rounded(px(4.))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(theme.colors().element_hover))
+                            .tooltip(Tooltip::text(strings.annoying_alert_hint))
+                            .child(Checkbox::new("reminder-constant-box").size(px(14.)).toggle_state(draft.constant_reminder))
+                            .child(Label::new(strings.annoying_alert).size(LabelSize::Small))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                let today = Local::now().date_naive();
+                                this.update_draft(cx, |d| {
+                                    d.constant_reminder = !d.constant_reminder;
+                                    if d.constant_reminder && d.reminders.is_empty() {
+                                        d.toggle_reminder(0, today);
+                                    }
+                                })
+                            })),
+                    )
+                    .child(div().py_1().child(Divider::horizontal()))
+                    .child(
                         ListItem::new("reminder-custom")
                             .height(px(28.))
                             .child(Label::new(strings.repeat_custom).size(LabelSize::Small))
@@ -2204,6 +2373,7 @@ impl TaskDetail {
             Some(DueMenu::Repeat) => {
                 let base = draft.date.unwrap_or(today);
                 let options = due_picker::repeat_options(base, strings, locale);
+                let extended = due_picker::extended_repeat_options(base, strings, locale);
                 Some(
                     v_flex()
                         .child(
@@ -2217,6 +2387,23 @@ impl TaskDetail {
                         )
                         .children(options.into_iter().map(|(rule, label, hint)| {
                             ListItem::new(SharedString::from(format!("repeat-{rule}")))
+                                .height(px(28.))
+                                .child(
+                                    h_flex()
+                                        .gap_1()
+                                        .child(Label::new(label).size(LabelSize::Small))
+                                        .when(!hint.is_empty(), |el| {
+                                            el.child(Label::new(format!("({hint})")).size(LabelSize::Small).color(Color::Muted))
+                                        }),
+                                )
+                                .when(draft.repeat.as_ref() == Some(&rule), |item| item.end_slot(check_mark()))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.update_draft(cx, |d| d.pick_repeat(Some(rule.clone()), Local::now().date_naive()))
+                                }))
+                        }))
+                        .child(div().py_1().child(Divider::horizontal()))
+                        .children(extended.into_iter().map(|(rule, label, hint)| {
+                            ListItem::new(SharedString::from(format!("repeat-ext-{rule}")))
                                 .height(px(28.))
                                 .child(
                                     h_flex()
@@ -2248,12 +2435,16 @@ impl TaskDetail {
             }
             None => None,
         };
-        let (time_menu, reminder_menu, repeat_menu) = match &draft.menu {
-            Some(DueMenu::Time) => (menu, None, None),
-            Some(DueMenu::Reminder | DueMenu::CustomReminder(_)) => (None, menu, None),
-            Some(DueMenu::Repeat | DueMenu::Custom(_)) => (None, None, menu),
-            None => (None, None, None),
+        let (time_menu, tz_menu, reminder_menu, repeat_menu) = match &draft.menu {
+            Some(DueMenu::Time) => (menu, None, None, None),
+            Some(DueMenu::TimeZone) => (None, menu, None, None),
+            Some(DueMenu::Reminder | DueMenu::CustomReminder(_)) => (None, None, menu, None),
+            Some(DueMenu::Repeat | DueMenu::Custom(_)) => (None, None, None, menu),
+            None => (None, None, None, None),
         };
+        let tz_label: SharedString = due_picker::short_timezone_label(draft.timezone.as_deref(), draft.is_floating, strings)
+            .unwrap_or_else(|| strings.timezone_local.to_owned())
+            .into();
         let reminder_label: SharedString = due_picker::reminder_label(&draft.reminders, draft.time.is_some(), strings)
             .map_or(strings.reminder.into(), Into::into);
 
@@ -2343,7 +2534,18 @@ impl TaskDetail {
                     .child(calendar_block)
                     .child(Divider::horizontal())
                     .child(row("due-time-row", IconName::Clock, time_label, draft.time.is_some(), DueMenu::Time, cx))
-                    .children(time_menu),
+                    .children(time_menu)
+                    .when(draft.time.is_some(), |el| {
+                        el.child(row(
+                            "due-timezone-row",
+                            IconName::Map,
+                            tz_label,
+                            draft.timezone.is_some() || draft.is_floating,
+                            DueMenu::TimeZone,
+                            cx,
+                        ))
+                        .children(tz_menu)
+                    }),
                 DueTab::Duration => el.child(self.render_duration(&draft, calendar_block, strings, cx)),
             })
             .child(row(
@@ -2534,6 +2736,9 @@ impl TaskDetail {
                                 rule.nth_weekday = None;
                                 rule.nth_workday = None;
                             }
+                            if !matches!(frequency, Frequency::Monthly | Frequency::Yearly) {
+                                rule.lunar = false;
+                            }
                             if frequency != Frequency::Daily {
                                 rule.skip_weekends = false;
                             }
@@ -2576,8 +2781,7 @@ impl TaskDetail {
                 .when(!primary, |el| el.border_1().border_color(theme.colors().border))
                 .child(Label::new(label).size(LabelSize::Small).when(primary, |label| label.color(Color::OnAccent)))
         };
-        // The original's "By Due Dates" / "By Completion Date"; counting from completion drops
-        // the weekdays and days of the month, as there.
+        // The original's repeat modes: Due Dates, Completion Date, Specific Dates, Forgetting Curve.
         let mode = h_flex()
             .id("repeat-mode")
             .h(px(26.))
@@ -2588,7 +2792,9 @@ impl TaskDetail {
             .border_color(theme.colors().border)
             .cursor_pointer()
             .child(
-                Label::new(if rule.is_specific_dates() {
+                Label::new(if rule.forgetting_curve {
+                    strings.repeat_forgetting_curve
+                } else if rule.is_specific_dates() {
                     strings.repeat_by_specific
                 } else if rule.from_completion {
                     strings.repeat_by_completion
@@ -2598,17 +2804,23 @@ impl TaskDetail {
                 .size(LabelSize::Small),
             )
             .child(Icon::new(IconName::ChevronsUpDown).size(IconSize::XSmall).color(Color::Muted))
-            // Goes through the original's three modes: due dates, completion date, specific dates.
             .on_click(cx.listener(|this, _, _, cx| {
                 let today = Local::now().date_naive();
                 this.update_draft(cx, |d| {
                     let start = d.date.unwrap_or(today);
                     if let Some(DueMenu::Custom(rule)) = d.menu.as_mut() {
-                        if rule.is_specific_dates() {
+                        if rule.forgetting_curve {
+                            rule.forgetting_curve = false;
+                            rule.cycle = 0;
+                        } else if rule.is_specific_dates() {
                             rule.dates.clear();
+                            rule.forgetting_curve = true;
+                            rule.cycle = 0;
+                            rule.lunar = false;
                         } else if rule.from_completion {
                             rule.from_completion = false;
                             rule.dates = vec![start];
+                            rule.lunar = false;
                         } else {
                             rule.from_completion = true;
                             rule.weekdays = 0;
@@ -2616,6 +2828,7 @@ impl TaskDetail {
                             rule.nth_weekday = None;
                             rule.nth_workday = None;
                             rule.skip_weekends = false;
+                            rule.lunar = false;
                         }
                     }
                 })
@@ -2633,6 +2846,37 @@ impl TaskDetail {
                     }
                 })
             }));
+        let skip_holidays = h_flex()
+            .id("repeat-skip-holidays")
+            .gap_2()
+            .cursor_pointer()
+            .child(Checkbox::new("repeat-skip-holidays-box").size(px(14.)).toggle_state(rule.skip_holidays))
+            .child(Label::new(strings.repeat_skip_holidays).size(LabelSize::Small))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.update_draft(cx, |d| {
+                    if let Some(DueMenu::Custom(rule)) = d.menu.as_mut() {
+                        rule.skip_holidays = !rule.skip_holidays;
+                    }
+                })
+            }));
+        let lunar_toggle = h_flex()
+            .id("repeat-lunar")
+            .gap_2()
+            .cursor_pointer()
+            .child(Checkbox::new("repeat-lunar-box").size(px(14.)).toggle_state(rule.lunar))
+            .child(Label::new(strings.repeat_lunar).size(LabelSize::Small))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.update_draft(cx, |d| {
+                    if let Some(DueMenu::Custom(rule)) = d.menu.as_mut() {
+                        rule.lunar = !rule.lunar;
+                        if rule.lunar {
+                            rule.month_days = 0;
+                            rule.nth_weekday = None;
+                            rule.nth_workday = None;
+                        }
+                    }
+                })
+            }));
         let by_due = !rule.from_completion;
         let actions = h_flex()
             .gap_2()
@@ -2643,6 +2887,25 @@ impl TaskDetail {
                 let rule = rule.clone();
                 move |this, _, _, cx| this.update_draft(cx, |d| d.pick_repeat(Some(rule.clone()), Local::now().date_naive()))
             })));
+        if rule.forgetting_curve {
+            return v_flex()
+                .gap_2()
+                .p_2()
+                .rounded(px(6.))
+                .border_1()
+                .border_color(theme.colors().border)
+                .child(mode)
+                .child(Label::new(strings.repeat_forgetting_curve_hint).size(LabelSize::XSmall).color(Color::Muted))
+                .child(
+                    Label::new(strings.repeat_forgetting_step.replace("{n}", &(rule.cycle + 1).to_string()))
+                        .size(LabelSize::XSmall)
+                        .color(Color::Accent),
+                )
+                .child(skip_weekends)
+                .child(skip_holidays)
+                .child(actions)
+                .into_any_element();
+        }
         if rule.is_specific_dates() {
             return v_flex()
                 .gap_2()
@@ -2695,8 +2958,10 @@ impl TaskDetail {
             )
             .child(units)
             .when(by_due && rule.frequency == Frequency::Daily, |el| el.child(skip_weekends))
+            .when(by_due, |el| el.child(skip_holidays))
+            .when(by_due && matches!(rule.frequency, Frequency::Monthly | Frequency::Yearly), |el| el.child(lunar_toggle))
             .when(by_due && rule.frequency == Frequency::Weekly, |el| el.child(weekdays))
-            .when(by_due && rule.frequency == Frequency::Monthly, |el| el.child(self.render_monthly_rule(rule.clone(), strings, cx)))
+            .when(by_due && rule.frequency == Frequency::Monthly && !rule.lunar, |el| el.child(self.render_monthly_rule(rule.clone(), strings, cx)))
             .child(actions)
             .into_any_element()
     }
@@ -3171,9 +3436,9 @@ impl TaskDetail {
 }
 
 /// The activity log's kinds, in the order of `Strings::activity_kinds`.
-const ACTIVITY_KINDS: [&str; 11] = [
+const ACTIVITY_KINDS: [&str; 12] = [
     "created", "renamed", "completed", "reopened", "date", "date_cleared", "priority", "moved", "deleted", "restored",
-    "wont_do",
+    "wont_do", "in_progress",
 ];
 
 /// What the activity log says for a kind: "created the task".
@@ -3272,10 +3537,15 @@ impl Render for TaskDetail {
         let notes_focus_click = notes_focus.clone();
         let today = Local::now().date_naive();
         let preview = self.session.draft.as_ref().map(|_| self.due_preview(task, today));
-        let (date, time, repeats) = preview.as_ref().map_or(
-            (task.due_date, task.due_time, task.repeat.is_some()),
-            |due| (due.date, due.time, due.repeat.is_some()),
+        let (date, time, repeats, tz_name, is_floating) = preview.as_ref().map_or(
+            (task.due_date, task.due_time, task.repeat.is_some(), task.timezone.as_deref(), task.is_floating),
+            |due| (due.date, due.time, due.repeat.is_some(), due.timezone.as_deref(), due.is_floating),
         );
+        let tz_suffix = if time.is_some() {
+            due_picker::short_timezone_label(tz_name, is_floating, strings)
+        } else {
+            None
+        };
         let kind = self.kind_preview(task);
         let (due_text, due_color): (SharedString, Color) = match date {
             Some(date) => {
@@ -3285,16 +3555,21 @@ impl Render for TaskDetail {
                     None => label,
                 };
                 // The calendar's card writes the date out, as the original's.
-                let label = if self.calendar_card && task.end_date.is_none() {
+                let mut label = if self.calendar_card && task.end_date.is_none() {
                     task_rows::card_due_label(date, time, today, strings)
                 } else {
                     task_rows::detail_due_label(label, date, today, strings)
                 };
+                if let Some(tz) = tz_suffix {
+                    label = format!("{label} · {tz}");
+                }
                 (label.into(), if overdue && !done { Color::Error } else { Color::Accent })
             }
             // A note, as the original's, offers a reminder rather than a due date.
             None => ((if kind == Kind::Note { strings.set_reminder } else { strings.due_date }).into(), muted),
         };
+        let in_progress = task.is_in_progress();
+        let show_location = self.location_open || task.location.is_some();
         let priority_color = task_rows::priority_color(task.priority, &theme).map_or(Color::Muted, Color::Custom);
         let list_id = self.list_preview(task);
         let list_name: SharedString = list_id
@@ -3331,6 +3606,7 @@ impl Render for TaskDetail {
                                 .toggle_state(done)
                                 .animate_completion(crate::completion_mark::started(task.id, cx))
                                 .dismissed(task.is_wont_do())
+                                .in_progress(in_progress)
                                 .lines(!self.checklist.is_empty())
                                 .tint(task_rows::priority_color(task.priority, &theme))
                                 .on_click(cx.listener(|this, _, _, cx| this.toggle_completed(cx))),
@@ -3349,6 +3625,22 @@ impl Render for TaskDetail {
                                 ))
                             }),
                     )
+                    .when(in_progress, |el| {
+                        el.child(
+                            h_flex()
+                                .id("detail-in-progress-badge")
+                                .px_1p5()
+                                .py_0p5()
+                                .gap_1()
+                                .rounded(px(5.))
+                                .bg(theme.colors().accent.opacity(0.14))
+                                .cursor_pointer()
+                                .tooltip(Tooltip::text(strings.clear_in_progress))
+                                .child(Icon::new(IconName::Hourglass).size(IconSize::XSmall).color(Color::Accent))
+                                .child(Label::new(strings.in_progress).size(LabelSize::XSmall).color(Color::Accent))
+                                .on_click(cx.listener(|this, _, _, cx| this.toggle_in_progress(cx))),
+                        )
+                    })
                     .child(div().flex_1())
                     .child(
                         div()
@@ -3508,6 +3800,35 @@ impl Render for TaskDetail {
                     .when(self.show_checklist, |el| el.child(self.render_checklist(cx)))
                     .when(!self.session.attachments.is_empty(), |el| el.child(self.render_attachments(cx)))
                     .children(self.session.attachment_errors.iter().map(|error| Label::new(error.clone()).color(Color::Error)))
+                    .when(show_location && !sticky, |el| {
+                        el.child(
+                            h_flex()
+                                .id("detail-location-row")
+                                .h(px(30.))
+                                .px_2()
+                                .gap_2()
+                                .rounded(px(6.))
+                                .border_1()
+                                .border_color(theme.colors().border_variant)
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .child(Icon::new(IconName::MapPin).size(IconSize::Small).color(Color::Muted))
+                                .child(div().flex_1().min_w_0().text_size(px(13.)).child(self.location_input.clone()))
+                                .child(
+                                    IconButton::new("detail-location-clear", IconName::X)
+                                        .size(px(20.))
+                                        .icon_size(IconSize::XSmall)
+                                        .icon_color(Color::Muted)
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.location_open = false;
+                                            this.location_input.update(cx, |input, cx| input.clear(window, cx));
+                                            if !this.edit_draft(cx, |task, _| task.location = None) {
+                                                this.save(cx, |store, id| store.set_location(id, None));
+                                            }
+                                            cx.notify();
+                                        })),
+                                ),
+                        )
+                    })
                     // Tags sit under the notes, as in the original.
                     // The calendar's card leaves out the empty tags and subtasks, as the original's.
                     // As the original's, the tags row only once there are tags (the "…" menu's Tags

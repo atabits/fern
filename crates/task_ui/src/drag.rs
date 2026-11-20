@@ -219,3 +219,40 @@ impl Render for DraggedColumn {
         drag_pill(self.title.clone(), true, 8., cx)
     }
 }
+
+/// Which edge of a timed or multi-day span is being resized.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResizeEdge {
+    Start,
+    End,
+}
+
+/// Drag payload when resizing a task's date span from its start or end edge.
+#[derive(Clone)]
+pub struct ResizedTask {
+    pub id: Id,
+    pub title: SharedString,
+    pub start: chrono::NaiveDate,
+    pub end: chrono::NaiveDate,
+    pub edge: ResizeEdge,
+}
+
+impl Render for ResizedTask {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        drag_pill(self.title.clone(), false, 6., cx)
+    }
+}
+
+/// Drag payload when moving a writable CalDAV calendar event to another day.
+#[derive(Clone)]
+pub struct DraggedEvent {
+    pub subscription_id: Id,
+    pub uid: String,
+    pub title: SharedString,
+}
+
+impl Render for DraggedEvent {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        drag_pill(self.title.clone(), false, 6., cx)
+    }
+}

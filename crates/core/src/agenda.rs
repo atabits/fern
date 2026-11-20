@@ -34,6 +34,17 @@ pub fn agenda(
     from: NaiveDate,
     until: NaiveDate,
 ) -> Vec<(NaiveDate, Vec<AgendaItem>)> {
+    let empty = std::collections::HashSet::new();
+    agenda_with_holidays(tasks, countdowns, &empty, from, until)
+}
+
+pub fn agenda_with_holidays(
+    tasks: &[Task],
+    countdowns: &[Countdown],
+    holidays: &std::collections::HashSet<NaiveDate>,
+    from: NaiveDate,
+    until: NaiveDate,
+) -> Vec<(NaiveDate, Vec<AgendaItem>)> {
     let mut entries: Vec<(NaiveDate, AgendaItem)> = Vec::new();
     for task in tasks.iter().filter(|t| !t.is_closed() && !t.is_deleted()) {
         let Some(mut date) = task.due_date else { continue };
@@ -48,6 +59,7 @@ pub fn agenda(
             icon: None,
             kind: None,
         };
+        let mut current_repeat = task.repeat.clone();
         loop {
             if date > until {
                 break;
@@ -55,13 +67,14 @@ pub fn agenda(
             if date >= from {
                 entries.push((date, item.clone()));
             }
-            match &task.repeat {
+            match &current_repeat {
                 Some(repeat) => {
-                    let next = repeat.next_after(date);
+                    let next = repeat.next_after_with_holidays(date, |d| holidays.contains(&d));
                     if next <= date {
                         break;
                     }
                     date = next;
+                    current_repeat = Some(repeat.advance());
                 }
                 None => break,
             }

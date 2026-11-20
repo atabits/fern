@@ -78,6 +78,9 @@ walkdir = "2"
 winresource = "0.1"
 zip = { version = "9.5", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 windows = { version = "0.62", features = [
+    "Data_Xml_Dom",
+    "Foundation",
+    "UI_Notifications",
     "UI_ViewManagement",
     "Win32_Graphics_Gdi",
     "Win32_Graphics_Dwm",

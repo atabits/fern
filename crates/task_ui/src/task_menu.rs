@@ -26,6 +26,7 @@ pub enum MenuAction {
     LinkParent,
     UnlinkParent,
     Pin,
+    InProgress,
     WontDo,
     Move(Option<Id>),
     Tags,
@@ -77,6 +78,7 @@ pub fn apply(store: &Store, task: &Task, action: MenuAction, today: NaiveDate) -
         MenuAction::Priority(priority) => store.set_priority(id, priority),
         MenuAction::UnlinkParent => store.unlink_parent(id),
         MenuAction::Pin => store.set_pinned(id, task.pinned_at.is_none()),
+        MenuAction::InProgress => store.set_in_progress(id, !task.is_in_progress()),
         MenuAction::WontDo => store.set_wont_do(id, !task.is_wont_do()),
         MenuAction::Move(list) => store.set_list(id, list),
         MenuAction::Duplicate => store.duplicate_task(id).map(|_| ()),
@@ -193,6 +195,16 @@ pub fn render<V: 'static>(
                 cx,
             ))
         })
+        .when(!note, |el| {
+            let active = task.is_in_progress();
+            el.child(item(
+                "task-menu-in-progress",
+                IconName::Hourglass,
+                if active { strings.clear_in_progress } else { strings.mark_in_progress },
+                MenuAction::InProgress,
+                cx,
+            ))
+        })
         .child(item("task-menu-wont-do", IconName::SquareX, strings.mark_wont_do, MenuAction::WontDo, cx))
         .child(
             SubmenuItem::new("task-menu-move", strings.move_to)
@@ -278,6 +290,10 @@ mod tests {
         assert_eq!(reload(&store).priority, Priority::High);
         apply(&store, &reload(&store), MenuAction::Pin, today).unwrap()?;
         assert!(reload(&store).pinned_at.is_some());
+        apply(&store, &reload(&store), MenuAction::InProgress, today).unwrap()?;
+        assert!(reload(&store).is_in_progress());
+        apply(&store, &reload(&store), MenuAction::InProgress, today).unwrap()?;
+        assert!(!reload(&store).is_in_progress());
         apply(&store, &reload(&store), MenuAction::Convert, today).unwrap()?;
         assert_eq!(reload(&store).kind, Kind::Note);
         apply(&store, &reload(&store), MenuAction::Duplicate, today).unwrap()?;

@@ -24,7 +24,7 @@ pub enum ColorBy {
 impl ColorBy {
     pub const ALL: [ColorBy; 3] = [ColorBy::List, ColorBy::Tag, ColorBy::Priority];
 
-    fn code(self) -> &'static str {
+    pub fn code(self) -> &'static str {
         match self {
             Self::List => "list",
             Self::Tag => "tag",
@@ -32,7 +32,7 @@ impl ColorBy {
         }
     }
 
-    fn from_code(code: &str) -> Option<Self> {
+    pub fn from_code(code: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|c| c.code() == code)
     }
 }
@@ -54,7 +54,7 @@ pub enum CountdownColor {
     Countdown,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CalendarOptions {
     pub color_by: ColorBy,
     /// Style → Item Style: Modern (a colored edge on a light tint) rather than Classic (filled).
@@ -74,6 +74,8 @@ pub struct CalendarOptions {
     /// The fixed colors, as indexes into the palette the Color page offers.
     pub habit_fixed: u8,
     pub countdown_fixed: u8,
+    /// Optional second timezone (IANA name, e.g. `"America/New_York"`) shown alongside local hours.
+    pub secondary_timezone: Option<String>,
 }
 
 impl Default for CalendarOptions {
@@ -93,6 +95,7 @@ impl Default for CalendarOptions {
             countdown_color: CountdownColor::Fixed,
             habit_fixed: 0,
             countdown_fixed: 0,
+            secondary_timezone: None,
         }
     }
 }
@@ -100,6 +103,7 @@ impl Default for CalendarOptions {
 const COLOR_BY: &str = "calendar_color_by";
 const HABIT_COLOR: &str = "calendar_habit_color";
 const COUNTDOWN_COLOR: &str = "calendar_countdown_color";
+const SECONDARY_TIMEZONE: &str = "calendar_secondary_timezone";
 /// The switches, in the order of `CalendarOptions::flags`.
 const FLAGS: [&str; 8] = [
     "calendar_modern",
@@ -157,12 +161,14 @@ impl CalendarOptions {
         if !self.show_repeats || task.is_closed() || date < due {
             return false;
         }
+        let mut current = repeat.clone();
         while due < date {
-            let next = repeat.next_after(due);
+            let next = current.next_after(due);
             if next <= due {
                 return false;
             }
             due = next;
+            current = current.advance();
         }
         due == date
     }
@@ -206,6 +212,10 @@ impl Store {
                 }
             }
         }
+        options.secondary_timezone = self
+            .setting(SECONDARY_TIMEZONE)?
+            .map(|tz| tz.trim().to_owned())
+            .filter(|tz| !tz.is_empty() && tz.parse::<chrono_tz::Tz>().is_ok());
         Ok(options)
     }
 
@@ -222,7 +232,14 @@ impl Store {
             CountdownColor::Fixed => format!("fixed:{}", options.countdown_fixed),
         };
         self.set_setting(COUNTDOWN_COLOR, &countdown)?;
-        let mut options = *options;
+        let tz = options
+            .secondary_timezone
+            .as_deref()
+            .map(str::trim)
+            .filter(|z| !z.is_empty() && z.parse::<chrono_tz::Tz>().is_ok())
+            .unwrap_or("");
+        self.set_setting(SECONDARY_TIMEZONE, tz)?;
+        let mut options = options.clone();
         for (key, flag) in FLAGS.iter().zip(options.flags()) {
             self.set_setting(key, if *flag { "1" } else { "0" })?;
         }
@@ -243,9 +260,21 @@ mod tests {
     fn options_are_saved() -> Result<()> {
         let store = Store::open_in_memory()?;
         assert_eq!(store.calendar_options()?, CalendarOptions::default());
-        let options = CalendarOptions { color_by: ColorBy::Priority, modern: true, heatmap: false, show_weekends: false, ..Default::default() };
+        let options = CalendarOptions {
+            color_by: ColorBy::Priority,
+            modern: true,
+            heatmap: false,
+            show_weekends: false,
+            secondary_timezone: Some("America/New_York".into()),
+            ..Default::default()
+        };
         store.save_calendar_options(&options)?;
         assert_eq!(store.calendar_options()?, options);
+
+        let invalid = CalendarOptions { secondary_timezone: Some("Invalid/Zone".into()), ..options };
+        store.save_calendar_options(&invalid)?;
+        assert_eq!(store.calendar_options()?.secondary_timezone, None);
+
         let colors = CalendarOptions {
             show_habits: true,
             habit_color: HabitColor::Fixed,

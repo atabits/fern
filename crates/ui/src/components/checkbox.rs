@@ -19,6 +19,7 @@ pub struct Checkbox {
     id: ElementId,
     checked: bool,
     dismissed: bool,
+    in_progress: bool,
     lines: bool,
     tint: Option<Hsla>,
     size: Pixels,
@@ -34,7 +35,7 @@ enum CheckMark {
 
 impl Checkbox {
     pub fn new(id: impl Into<ElementId>) -> Self {
-        Self { id: id.into(), checked: false, dismissed: false, lines: false, tint: None, size: px(16.), on_click: None, accent: false, check_mark: CheckMark::Icon }
+        Self { id: id.into(), checked: false, dismissed: false, in_progress: false, lines: false, tint: None, size: px(16.), on_click: None, accent: false, check_mark: CheckMark::Icon }
     }
 
     pub fn tint(mut self, tint: Option<Hsla>) -> Self {
@@ -45,6 +46,12 @@ impl Checkbox {
     /// A muted box with a cross, for tasks closed as "Won't Do".
     pub fn dismissed(mut self, dismissed: bool) -> Self {
         self.dismissed = dismissed;
+        self
+    }
+
+    /// An active "In Progress" task: half-filled indicator inside the box.
+    pub fn in_progress(mut self, in_progress: bool) -> Self {
+        self.in_progress = in_progress;
         self
     }
 
@@ -108,7 +115,8 @@ impl RenderOnce for Checkbox {
                 .when_some(self.on_click, |el, handler| el.on_click(handler));
         }
         if let CheckMark::Stroke(started) = self.check_mark {
-            let border = self.tint.unwrap_or(colors.checkbox_border);
+            let progress_color = self.tint.unwrap_or(colors.accent);
+            let border = if !self.checked && self.in_progress { progress_color } else { self.tint.unwrap_or(colors.checkbox_border) };
             return div()
                 .id(self.id)
                 .size(self.size)
@@ -126,8 +134,12 @@ impl RenderOnce for Checkbox {
                     el.border_1()
                         .border_color(border)
                         .when_some(self.tint, |el, tint| el.bg(tint.opacity(0.12)))
+                        .when(self.in_progress && self.tint.is_none(), |el| el.bg(progress_color.opacity(0.12)))
                         .hover(|style| style.border_color(colors.accent).bg(colors.accent.opacity(0.08)))
                         .active(|style| style.bg(colors.accent.opacity(0.18)))
+                        .when(self.in_progress && !self.lines, |el| {
+                            el.items_end().child(div().w_full().h(self.size * 0.44).bg(progress_color.opacity(0.75)))
+                        })
                         .when(self.lines, |el| {
                             el.child(div().flex().flex_col().gap(px(2.)).children(
                                 (0..3).map(|_| div().w(self.size * 0.45).h(px(1.)).bg(border)),
@@ -137,7 +149,8 @@ impl RenderOnce for Checkbox {
                 .when_some(self.on_click, |el, handler| el.on_click(handler));
         }
         let fill = if self.accent { colors.accent } else { colors.text_muted.opacity(0.6) };
-        let border = if self.checked { fill } else { self.tint.unwrap_or(colors.checkbox_border) };
+        let progress_color = self.tint.unwrap_or(colors.accent);
+        let border = if self.checked { fill } else if self.in_progress { progress_color } else { self.tint.unwrap_or(colors.checkbox_border) };
         div()
             .id(self.id)
             .size(self.size)
@@ -146,6 +159,7 @@ impl RenderOnce for Checkbox {
             .items_center()
             .justify_center()
             .rounded(px(3.))
+            .overflow_hidden()
             .border_1()
             .border_color(border)
             .cursor_pointer()
@@ -154,6 +168,11 @@ impl RenderOnce for Checkbox {
                     .size(IconSize::Custom(self.size - px(2.)))
                     .color(if self.accent { colors.icon_on_accent } else { colors.background }),
             ))
+            .when(!self.checked && self.in_progress && !self.lines, |el| {
+                el.bg(progress_color.opacity(0.14))
+                    .items_end()
+                    .child(div().w_full().h(self.size * 0.44).bg(progress_color.opacity(0.75)))
+            })
             .when(self.lines && !self.checked, |el| {
                 el.child(
                     div()
@@ -163,7 +182,7 @@ impl RenderOnce for Checkbox {
                         .children((0..3).map(|_| div().w(self.size * 0.45).h(px(1.)).bg(border))),
                 )
             })
-            .when_some(self.tint.filter(|_| !self.checked), |el, tint| el.bg(tint.opacity(0.15)))
+            .when_some(self.tint.filter(|_| !self.checked && !self.in_progress), |el, tint| el.bg(tint.opacity(0.15)))
             .when_some(self.on_click, |el, handler| el.on_click(handler))
     }
 }

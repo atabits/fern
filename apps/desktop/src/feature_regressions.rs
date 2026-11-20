@@ -54,7 +54,7 @@ fn repeating_occurrences_keep_history_and_undo_restores_checklist() {
     assert_eq!(store.task(copy).unwrap().unwrap().checklist, Some((1, 2)));
     assert_eq!(store.task(task.id).unwrap().unwrap().checklist, Some((0, 2)));
     let inserted = store.add_checklist_item(task.id, "Inserted", Some(first.id)).unwrap();
-    store.undo_repeat(task.id, copy, Some(day), None).unwrap();
+    store.undo_repeat(task.id, copy, Some(day), None, None).unwrap();
     let checklist = store.checklist(task.id).unwrap();
     assert_eq!(
         checklist.iter().map(|item| (item.id, item.completed)).collect::<Vec<_>>(),
@@ -80,6 +80,13 @@ fn summary_in_progress_excludes_unstarted_completed_and_trash() {
     let groups = summarize(&store.tasks().unwrap(), &options, today, Weekday::Mon);
     let names: Vec<_> = groups.iter().flat_map(|g| &g.tasks).map(|t| t.title.as_str()).collect();
     assert_eq!(names, ["Started"]);
+    let explicit = store.add_task("Explicit in progress").unwrap();
+    store.set_due(explicit.id, Some(today), None).unwrap();
+    store.set_in_progress(explicit.id, true).unwrap();
+    let groups_with_explicit = summarize(&store.tasks().unwrap(), &options, today, Weekday::Mon);
+    let mut explicit_names: Vec<_> = groups_with_explicit.iter().flat_map(|g| &g.tasks).map(|t| t.title.as_str()).collect();
+    explicit_names.sort();
+    assert_eq!(explicit_names, ["Explicit in progress", "Started"]);
     let legacy = SummaryOptions::from_storage("fields=status,list;period=this_week");
     assert!(legacy.fields.contains(&SummaryField::Title));
     let mut new = SummaryOptions::default();

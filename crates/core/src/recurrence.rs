@@ -5,6 +5,8 @@
 //! "Skip Weekends" and repeating from the completion date have no RRULE part, so they are kept
 //! as the extension parts `X-SKIP=WEEKEND` and `X-FROM=COMPLETION`; "By Specific Dates" keeps
 //! its dates as `X-DATES=20261018,20261031`.
+//! Extended rules also support `TT_SKIP=HOLIDAY[,WEEKEND]`, `LUNAR:FREQ=...`, and
+//! `ERULE:NAME=FORGETTINGCURVE;CYCLE=N`.
 
 use std::fmt;
 use std::str::FromStr;
@@ -36,6 +38,14 @@ pub struct Recurrence {
     /// For daily rules, the original's "Skip Weekends": a date falling on a weekend moves to the
     /// Monday after.
     pub skip_weekends: bool,
+    /// Skip holiday dates (from Holiday countdowns and holiday calendar feeds).
+    pub skip_holidays: bool,
+    /// Repeat according to the Chinese lunar calendar (`LUNAR:`).
+    pub lunar: bool,
+    /// Spaced repetition following the Ebbinghaus forgetting curve (`ERULE:NAME=FORGETTINGCURVE`).
+    pub forgetting_curve: bool,
+    /// Current 0-based review step for `forgetting_curve`.
+    pub cycle: u32,
     /// The original's "By Completion Date": the next date counts from the day the task was
     /// completed rather than from its due date.
     pub from_completion: bool,
@@ -46,6 +56,9 @@ pub struct Recurrence {
 
 /// `month_days`' bit for the last day of the month.
 pub const LAST_DAY: u32 = 1 << 31;
+
+/// Cumulative day offsets for the Ebbinghaus forgetting curve (matching TickTick).
+const FORGETTING_CURVE_DAYS: [i64; 6] = [0, 1, 2, 4, 7, 15];
 
 const BYDAY_CODES: [&str; 7] = ["MO", "TU", "WE", "TH", "FR", "SA", "SU"];
 
@@ -66,9 +79,32 @@ impl Recurrence {
             nth_weekday: None,
             nth_workday: None,
             skip_weekends: false,
+            skip_holidays: false,
+            lunar: false,
+            forgetting_curve: false,
+            cycle: 0,
             from_completion: false,
             dates: Vec::new(),
         }
+    }
+
+    /// Ebbinghaus spaced-repetition rule starting at step 0 (`+1d, +1d, +2d, +3d, +8d, +15d...`).
+    pub fn forgetting_curve() -> Self {
+        Self { forgetting_curve: true, cycle: 0, ..Self::new(Frequency::Daily, 1) }
+    }
+
+    /// Lunar calendar repeat rule (`LUNAR:FREQ=...`).
+    pub fn lunar(frequency: Frequency, interval: u32) -> Self {
+        Self { lunar: true, ..Self::new(frequency, interval) }
+    }
+
+    /// Advances stateful rules (currently `forgetting_curve` cycle) to the next occurrence step.
+    pub fn advance(&self) -> Self {
+        let mut next = self.clone();
+        if next.forgetting_curve {
+            next.cycle = next.cycle.saturating_add(1);
+        }
+        next
     }
 
     /// Monday to Friday, every week.
@@ -77,7 +113,15 @@ impl Recurrence {
     }
 
     pub fn is_weekdays(&self) -> bool {
-        self.frequency == Frequency::Weekly && self.interval == 1 && self.weekdays == WORKDAYS && !self.from_completion
+        self.frequency == Frequency::Weekly
+            && self.interval == 1
+            && self.weekdays == WORKDAYS
+            && !self.from_completion
+            && !self.forgetting_curve
+            && !self.lunar
+            && !self.skip_holidays
+            && !self.skip_weekends
+            && self.dates.is_empty()
     }
 
     /// The days of the month starting on `month` that a monthly "Each" or "On the" rule picks,
@@ -112,8 +156,17 @@ impl Recurrence {
     /// completion day for "By Completion Date" rules, from the due date otherwise.
     /// `None` once a "By Specific Dates" rule has no dates left.
     pub fn next_for(&self, due: NaiveDate, completed: NaiveDate) -> Option<NaiveDate> {
+        self.next_for_with_holidays(due, completed, |_| false)
+    }
+
+    pub fn next_for_with_holidays(
+        &self,
+        due: NaiveDate,
+        completed: NaiveDate,
+        is_holiday: impl Fn(NaiveDate) -> bool,
+    ) -> Option<NaiveDate> {
         let from = if self.from_completion { completed } else { due };
-        let next = self.next_after(from);
+        let next = self.next_after_with_holidays(from, is_holiday);
         (next > from).then_some(next)
     }
 
@@ -125,53 +178,100 @@ impl Recurrence {
     /// The next occurrence after `from`. Months clamp to the last day: Jan 31 → Feb 28. A "By
     /// Specific Dates" rule with no later date returns `from` itself: it has ended.
     pub fn next_after(&self, from: NaiveDate) -> NaiveDate {
+        self.next_after_with_holidays(from, |_| false)
+    }
+
+    pub fn next_after_with_holidays(&self, from: NaiveDate, is_holiday: impl Fn(NaiveDate) -> bool) -> NaiveDate {
         if self.is_specific_dates() {
             return self.dates.iter().copied().filter(|d| *d > from).min().unwrap_or(from);
         }
         let n = self.interval.max(1);
-        match self.frequency {
-            Frequency::Daily if self.skip_weekends => {
-                let next = from + Duration::days(n as i64);
-                match next.weekday() {
-                    Weekday::Sat => next + Duration::days(2),
-                    Weekday::Sun => next + Duration::days(1),
-                    _ => next,
+        let mut next = if self.forgetting_curve {
+            let last = FORGETTING_CURVE_DAYS.len() - 1;
+            let idx = self.cycle as usize;
+            let add = if idx >= last {
+                FORGETTING_CURVE_DAYS[last]
+            } else {
+                FORGETTING_CURVE_DAYS[idx + 1] - FORGETTING_CURVE_DAYS[idx]
+            };
+            from + Duration::days(add)
+        } else if self.lunar {
+            match self.frequency {
+                Frequency::Monthly => crate::lunar::next_lunar_monthly(from, n)
+                    .unwrap_or_else(|| from.checked_add_months(Months::new(n)).unwrap_or(from)),
+                Frequency::Yearly => crate::lunar::next_lunar_yearly(from, n)
+                    .unwrap_or_else(|| from.checked_add_months(Months::new(12 * n)).unwrap_or(from)),
+                Frequency::Daily => from + Duration::days(n as i64),
+                Frequency::Weekly => from + Duration::weeks(n as i64),
+            }
+        } else {
+            match self.frequency {
+                Frequency::Daily => from + Duration::days(n as i64),
+                // With BYDAY: the next listed weekday later in the same week, otherwise the first
+                // listed weekday `interval` weeks on (weeks start on Monday).
+                Frequency::Weekly if self.weekdays != 0 => {
+                    let monday = from - Duration::days(from.weekday().num_days_from_monday() as i64);
+                    let later_this_week = (from.weekday().num_days_from_monday() as i64 + 1..7)
+                        .map(|offset| monday + Duration::days(offset))
+                        .find(|day| self.falls_on(day.weekday()));
+                    later_this_week.unwrap_or_else(|| {
+                        let next = monday + Duration::weeks(n as i64);
+                        (0..7)
+                            .map(|offset| next + Duration::days(offset))
+                            .find(|day| self.falls_on(day.weekday()))
+                            .unwrap_or(next)
+                    })
                 }
+                Frequency::Weekly => from + Duration::weeks(n as i64),
+                Frequency::Monthly if self.month_days != 0 || self.nth_weekday.is_some() || self.nth_workday.is_some() => {
+                    // The next matching day later this month, otherwise in the month `interval` on.
+                    let month = from.with_day(1).expect("every month has a first day");
+                    let later = self.days_in(month).into_iter().find(|day| *day > from);
+                    later.unwrap_or_else(|| {
+                        let next = month.checked_add_months(Months::new(n)).unwrap_or(month);
+                        self.days_in(next).into_iter().next().unwrap_or(next)
+                    })
+                }
+                Frequency::Monthly => from.checked_add_months(Months::new(n)).unwrap_or(from),
+                Frequency::Yearly => from.checked_add_months(Months::new(12 * n)).unwrap_or(from),
             }
-            Frequency::Daily => from + Duration::days(n as i64),
-            // With BYDAY: the next listed weekday later in the same week, otherwise the first
-            // listed weekday `interval` weeks on (weeks start on Monday).
-            Frequency::Weekly if self.weekdays != 0 => {
-                let monday = from - Duration::days(from.weekday().num_days_from_monday() as i64);
-                let later_this_week = (from.weekday().num_days_from_monday() as i64 + 1..7)
-                    .map(|offset| monday + Duration::days(offset))
-                    .find(|day| self.falls_on(day.weekday()));
-                later_this_week.unwrap_or_else(|| {
-                    let next = monday + Duration::weeks(n as i64);
-                    (0..7)
-                        .map(|offset| next + Duration::days(offset))
-                        .find(|day| self.falls_on(day.weekday()))
-                        .unwrap_or(next)
-                })
+        };
+        if self.skip_weekends || self.skip_holidays {
+            for _ in 0..366 {
+                let blocked_weekend = self.skip_weekends && !is_workday(next);
+                let blocked_holiday = self.skip_holidays && is_holiday(next);
+                if !blocked_weekend && !blocked_holiday {
+                    break;
+                }
+                next += Duration::days(1);
             }
-            Frequency::Weekly => from + Duration::weeks(n as i64),
-            Frequency::Monthly if self.month_days != 0 || self.nth_weekday.is_some() || self.nth_workday.is_some() => {
-                // The next matching day later this month, otherwise in the month `interval` on.
-                let month = from.with_day(1).expect("every month has a first day");
-                let later = self.days_in(month).into_iter().find(|day| *day > from);
-                later.unwrap_or_else(|| {
-                    let next = month.checked_add_months(Months::new(n)).unwrap_or(month);
-                    self.days_in(next).into_iter().next().unwrap_or(next)
-                })
-            }
-            Frequency::Monthly => from.checked_add_months(Months::new(n)).unwrap_or(from),
-            Frequency::Yearly => from.checked_add_months(Months::new(12 * n)).unwrap_or(from),
         }
+        next
+    }
+}
+
+fn write_skip(f: &mut fmt::Formatter<'_>, skip_weekends: bool, skip_holidays: bool) -> fmt::Result {
+    match (skip_weekends, skip_holidays) {
+        (true, true) => write!(f, ";TT_SKIP=HOLIDAY,WEEKEND"),
+        (false, true) => write!(f, ";TT_SKIP=HOLIDAY"),
+        (true, false) => write!(f, ";X-SKIP=WEEKEND"),
+        (false, false) => Ok(()),
     }
 }
 
 impl fmt::Display for Recurrence {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.forgetting_curve {
+            write!(f, "ERULE:NAME=FORGETTINGCURVE;CYCLE={}", self.cycle)?;
+            write_skip(f, self.skip_weekends, self.skip_holidays)?;
+            if self.from_completion {
+                write!(f, ";X-FROM=COMPLETION")?;
+            }
+            return Ok(());
+        }
+        if self.lunar {
+            write!(f, "LUNAR:")?;
+        }
         let frequency = match self.frequency {
             Frequency::Daily => "DAILY",
             Frequency::Weekly => "WEEKLY",
@@ -198,9 +298,7 @@ impl fmt::Display for Recurrence {
         if let Some(nth) = self.nth_workday {
             write!(f, ";BYDAY=MO,TU,WE,TH,FR;BYSETPOS={nth}")?;
         }
-        if self.skip_weekends {
-            write!(f, ";X-SKIP=WEEKEND")?;
-        }
+        write_skip(f, self.skip_weekends, self.skip_holidays)?;
         if self.from_completion {
             write!(f, ";X-FROM=COMPLETION")?;
         }
@@ -223,12 +321,73 @@ impl fmt::Display for ParseRecurrenceError {
 
 impl std::error::Error for ParseRecurrenceError {}
 
+fn parse_skip_tokens(value: &str, skip_weekends: &mut bool, skip_holidays: &mut bool) {
+    for token in value.split(',').map(str::trim) {
+        match token {
+            "WEEKEND" => *skip_weekends = true,
+            "HOLIDAY" => *skip_holidays = true,
+            _ => {}
+        }
+    }
+}
+
 impl FromStr for Recurrence {
     type Err = ParseRecurrenceError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let rule = s.trim().trim_start_matches("RRULE:");
-        let error = || ParseRecurrenceError(rule.to_owned());
+        let trimmed = s.trim();
+        let error = || ParseRecurrenceError(trimmed.to_owned());
+        if let Some(erule) = trimmed.strip_prefix("ERULE:") {
+            let mut name = None;
+            let mut cycle = 0u32;
+            let mut dates = Vec::new();
+            let mut skip_weekends = false;
+            let mut skip_holidays = false;
+            let mut from_completion = false;
+            for part in erule.split(';').filter(|p| !p.is_empty()) {
+                let (key, value) = part.split_once('=').ok_or_else(error)?;
+                match key {
+                    "NAME" => name = Some(value),
+                    "CYCLE" => cycle = value.parse().map_err(|_| error())?,
+                    "BYDATE" => {
+                        for date in value.split(',').filter(|d| !d.is_empty()) {
+                            dates.push(NaiveDate::parse_from_str(date, "%Y%m%d").map_err(|_| error())?);
+                        }
+                    }
+                    "X-SKIP" | "TT_SKIP" => parse_skip_tokens(value, &mut skip_weekends, &mut skip_holidays),
+                    "X-FROM" => from_completion = value == "COMPLETION",
+                    _ => {}
+                }
+            }
+            return match name {
+                Some("FORGETTINGCURVE") => Ok(Recurrence {
+                    forgetting_curve: true,
+                    cycle,
+                    skip_weekends,
+                    skip_holidays,
+                    from_completion,
+                    ..Recurrence::new(Frequency::Daily, 1)
+                }),
+                Some("CUSTOM") if !dates.is_empty() => {
+                    dates.sort();
+                    dates.dedup();
+                    Ok(Recurrence {
+                        dates,
+                        skip_weekends,
+                        skip_holidays,
+                        from_completion,
+                        ..Recurrence::new(Frequency::Daily, 1)
+                    })
+                }
+                _ => Err(error()),
+            };
+        }
+
+        let (lunar, rule) = if let Some(rest) = trimmed.strip_prefix("LUNAR:") {
+            (true, rest)
+        } else {
+            (false, trimmed.strip_prefix("RRULE:").unwrap_or(trimmed))
+        };
         let mut frequency = None;
         let mut interval = 1;
         let mut weekdays = 0u8;
@@ -236,6 +395,7 @@ impl FromStr for Recurrence {
         let mut nth_weekday = None;
         let mut setpos = None;
         let mut skip_weekends = false;
+        let mut skip_holidays = false;
         let mut from_completion = false;
         let mut dates = Vec::new();
         for part in rule.split(';').filter(|p| !p.is_empty()) {
@@ -276,7 +436,7 @@ impl FromStr for Recurrence {
                     }
                 }
                 "BYSETPOS" => setpos = Some(value.parse::<i8>().map_err(|_| error())?),
-                "X-SKIP" => skip_weekends = value == "WEEKEND",
+                "X-SKIP" | "TT_SKIP" => parse_skip_tokens(value, &mut skip_weekends, &mut skip_holidays),
                 "X-FROM" => from_completion = value == "COMPLETION",
                 "X-DATES" => {
                     for date in value.split(',').filter(|d| !d.is_empty()) {
@@ -289,12 +449,12 @@ impl FromStr for Recurrence {
         }
         let mut rule = Recurrence::new(frequency.ok_or_else(error)?, interval);
         rule.from_completion = from_completion;
+        rule.lunar = lunar;
+        rule.skip_holidays = skip_holidays;
+        rule.skip_weekends = skip_weekends;
         dates.sort();
         dates.dedup();
         rule.dates = dates;
-        if rule.frequency == Frequency::Daily {
-            rule.skip_weekends = skip_weekends;
-        }
         if rule.frequency == Frequency::Weekly {
             rule.weekdays = weekdays;
         }
@@ -418,5 +578,48 @@ mod tests {
         assert_eq!(rule.next_for(d(2026, 12, 1), d(2026, 12, 1)), None, "the last date ends the repeat");
         assert_eq!(rule.to_string(), "FREQ=DAILY;INTERVAL=1;X-DATES=20261018,20261031,20261201");
         assert_eq!(rule.to_string().parse::<Recurrence>().unwrap(), rule);
+    }
+
+    #[test]
+    fn forgetting_curve_lunar_and_skip_holidays() {
+        let mut curve = Recurrence::forgetting_curve();
+        let start = d(2026, 10, 1);
+        let deltas: Vec<i64> = (0..7)
+            .map(|_| {
+                let next = curve.next_after(start);
+                curve = curve.advance();
+                (next - start).num_days()
+            })
+            .collect();
+        assert_eq!(deltas, [1, 1, 2, 3, 8, 15, 15]);
+        let parsed: Recurrence = "ERULE:NAME=FORGETTINGCURVE;CYCLE=2;TT_SKIP=HOLIDAY".parse().unwrap();
+        assert!(parsed.forgetting_curve);
+        assert_eq!(parsed.cycle, 2);
+        assert!(parsed.skip_holidays);
+        assert_eq!(parsed.to_string(), "ERULE:NAME=FORGETTINGCURVE;CYCLE=2;TT_SKIP=HOLIDAY");
+        assert_eq!(parsed.to_string().parse::<Recurrence>().unwrap(), parsed);
+
+        let custom: Recurrence = "ERULE:NAME=CUSTOM;BYDATE=20261018,20261031".parse().unwrap();
+        assert_eq!(custom.dates, vec![d(2026, 10, 18), d(2026, 10, 31)]);
+
+        let lunar_y = Recurrence::lunar(Frequency::Yearly, 1);
+        assert_eq!(lunar_y.to_string(), "LUNAR:FREQ=YEARLY;INTERVAL=1");
+        assert_eq!(lunar_y.to_string().parse::<Recurrence>().unwrap(), lunar_y);
+        assert_eq!(lunar_y.next_after(d(2026, 2, 17)), d(2027, 2, 6));
+
+        let lunar_m = Recurrence::lunar(Frequency::Monthly, 1);
+        assert_eq!(lunar_m.to_string(), "LUNAR:FREQ=MONTHLY;INTERVAL=1");
+        assert_eq!(lunar_m.to_string().parse::<Recurrence>().unwrap(), lunar_m);
+
+        let holiday_skip = Recurrence {
+            skip_weekends: true,
+            skip_holidays: true,
+            ..Recurrence::new(Frequency::Daily, 1)
+        };
+        assert_eq!(holiday_skip.to_string(), "FREQ=DAILY;INTERVAL=1;TT_SKIP=HOLIDAY,WEEKEND");
+        assert_eq!(holiday_skip.to_string().parse::<Recurrence>().unwrap(), holiday_skip);
+        // Friday 2026-10-16 -> Sat/Sun skipped -> Mon 2026-10-19 is a holiday -> Tue 2026-10-20.
+        let next = holiday_skip.next_after_with_holidays(d(2026, 10, 16), |day| day == d(2026, 10, 19));
+        assert_eq!(next, d(2026, 10, 20));
     }
 }

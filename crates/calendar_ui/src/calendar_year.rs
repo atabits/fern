@@ -265,6 +265,7 @@ impl CalendarView {
     fn year_counts(&self, year: i32, today: NaiveDate, cx: &App) -> BTreeMap<NaiveDate, usize> {
         let first = NaiveDate::from_ymd_opt(year, 1, 1).unwrap();
         let last = NaiveDate::from_ymd_opt(year, 12, 31).unwrap();
+        let holidays = self.store.holiday_dates(first, last).unwrap_or_default();
         let mut counts: BTreeMap<_, _> = if self.options.show_countdowns {
             fern_core::agenda::agenda(&[], &self.countdowns, first, last)
                 .into_iter()
@@ -292,10 +293,14 @@ impl CalendarView {
             {
                 use fern_core::Frequency;
                 let interval = i64::from(repeat.interval.max(1));
-                let step = match repeat.frequency {
-                    Frequency::Daily if !repeat.skip_weekends => Some(interval),
-                    Frequency::Weekly if repeat.weekdays == 0 => Some(7 * interval),
-                    _ => None,
+                let step = if !repeat.skip_weekends && !repeat.skip_holidays && !repeat.lunar && !repeat.forgetting_curve {
+                    match repeat.frequency {
+                        Frequency::Daily => Some(interval),
+                        Frequency::Weekly if repeat.weekdays == 0 => Some(7 * interval),
+                        _ => None,
+                    }
+                } else {
+                    None
                 };
                 // Simple daily and weekly rules have a fixed stride. Advance directly to
                 // just before the year instead of counting years of earlier occurrences.
@@ -308,8 +313,9 @@ impl CalendarView {
                 } else {
                     start
                 };
+                let mut current = repeat.clone();
                 loop {
-                    let next = repeat.next_after(date);
+                    let next = current.next_after_with_holidays(date, |d| holidays.contains(&d));
                     if next <= date || next > last {
                         break;
                     }
@@ -317,6 +323,7 @@ impl CalendarView {
                         *counts.entry(next).or_default() += 1;
                     }
                     date = next;
+                    current = current.advance();
                 }
             }
         }

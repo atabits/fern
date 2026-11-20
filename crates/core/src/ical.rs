@@ -17,6 +17,157 @@ use crate::recurrence::Recurrence;
 mod time;
 use time::{DurationValue, Identity, Time};
 
+/// How a calendar subscription syncs with its remote source.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CalendarKind {
+    #[default]
+    Ics,
+    CalDav,
+}
+
+impl CalendarKind {
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Ics => "ics",
+            Self::CalDav => "caldav",
+        }
+    }
+
+    pub fn from_code(code: &str) -> Self {
+        match code {
+            "caldav" => Self::CalDav,
+            _ => Self::Ics,
+        }
+    }
+}
+
+/// Known calendar provider presets for setup & sync UX.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CalendarProvider {
+    #[default]
+    Url,
+    CalDav,
+    ICloud,
+    Google,
+    Outlook,
+    Nextcloud,
+    Fastmail,
+}
+
+impl CalendarProvider {
+    pub const ALL: [Self; 7] = [
+        Self::Url,
+        Self::CalDav,
+        Self::ICloud,
+        Self::Google,
+        Self::Outlook,
+        Self::Nextcloud,
+        Self::Fastmail,
+    ];
+
+    pub const CALDAV_PRESETS: [Self; 6] = [
+        Self::CalDav,
+        Self::ICloud,
+        Self::Google,
+        Self::Outlook,
+        Self::Nextcloud,
+        Self::Fastmail,
+    ];
+
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Url => "url",
+            Self::CalDav => "caldav",
+            Self::ICloud => "icloud",
+            Self::Google => "google",
+            Self::Outlook => "outlook",
+            Self::Nextcloud => "nextcloud",
+            Self::Fastmail => "fastmail",
+        }
+    }
+
+    pub fn from_code(code: &str) -> Self {
+        match code {
+            "caldav" => Self::CalDav,
+            "icloud" => Self::ICloud,
+            "google" => Self::Google,
+            "outlook" => Self::Outlook,
+            "nextcloud" => Self::Nextcloud,
+            "fastmail" => Self::Fastmail,
+            _ => Self::Url,
+        }
+    }
+
+    /// Suggested CalDAV discovery endpoint (empty when the user supplies a server URL).
+    pub fn default_discovery_url(self) -> &'static str {
+        match self {
+            Self::ICloud => "https://caldav.icloud.com/",
+            Self::Google => "https://apidata.googleusercontent.com/caldav/v2/",
+            Self::Fastmail => "https://caldav.fastmail.com/dav/principals",
+            _ => "",
+        }
+    }
+
+    pub fn kind(self) -> CalendarKind {
+        match self {
+            Self::Url => CalendarKind::Ics,
+            Self::CalDav | Self::ICloud | Self::Google | Self::Outlook | Self::Nextcloud | Self::Fastmail => {
+                CalendarKind::CalDav
+            }
+        }
+    }
+}
+
+/// Local mutation queue state for a cached CalDAV event.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EventDirty {
+    #[default]
+    Clean = 0,
+    Upsert = 1,
+    Delete = 2,
+}
+
+impl EventDirty {
+    pub fn to_i64(self) -> i64 {
+        self as i64
+    }
+
+    pub fn from_i64(value: i64) -> Self {
+        match value {
+            1 => Self::Upsert,
+            2 => Self::Delete,
+            _ => Self::Clean,
+        }
+    }
+}
+
+/// A locally cached remote/CalDAV event resource keyed by `(subscription_id, uid)`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredEvent {
+    pub subscription_id: crate::model::Id,
+    pub uid: String,
+    pub href: String,
+    pub etag: Option<String>,
+    pub ics: String,
+    pub dirty: EventDirty,
+}
+
+/// Editable fields for creating or updating a writable CalDAV `VEVENT`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EventDraft {
+    pub uid: String,
+    pub title: String,
+    pub location: String,
+    pub notes: String,
+    pub start_date: NaiveDate,
+    pub start_time: Option<NaiveTime>,
+    /// Inclusive end date.
+    pub end_date: NaiveDate,
+    pub end_time: Option<NaiveTime>,
+    pub all_day: bool,
+    pub timezone: Option<String>,
+}
+
 /// A subscribed calendar and the last feed read from its address.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Subscription {
@@ -28,6 +179,12 @@ pub struct Subscription {
     pub feed: String,
     pub fetched_at: Option<i64>,
     pub error: Option<String>,
+    pub kind: CalendarKind,
+    pub provider: CalendarProvider,
+    pub username: String,
+    pub password: String,
+    pub writable: bool,
+    pub sync_token: Option<String>,
 }
 
 impl Subscription {
@@ -402,6 +559,97 @@ fn unescape(value: &str) -> String {
     out
 }
 
+impl Subscription {
+    pub fn is_caldav(&self) -> bool {
+        self.kind == CalendarKind::CalDav
+    }
+}
+
+/// Serializes an [`EventDraft`] into a standalone RFC 5545 `VCALENDAR` containing one `VEVENT`.
+pub fn serialize_event(draft: &EventDraft) -> String {
+    use std::fmt::Write as _;
+
+    let mut raw_lines = Vec::new();
+    raw_lines.push("BEGIN:VCALENDAR".to_owned());
+    raw_lines.push("VERSION:2.0".to_owned());
+    raw_lines.push("PRODID:-//Fern//Calendar//EN".to_owned());
+    raw_lines.push("BEGIN:VEVENT".to_owned());
+    raw_lines.push(format!("UID:{}", escape_text(&draft.uid)));
+    raw_lines.push(format!("DTSTAMP:{}", chrono::Utc::now().format("%Y%m%dT%H%M%SZ")));
+    raw_lines.push(format!("SUMMARY:{}", escape_text(&draft.title)));
+    if !draft.location.trim().is_empty() {
+        raw_lines.push(format!("LOCATION:{}", escape_text(draft.location.trim())));
+    }
+    if !draft.notes.trim().is_empty() {
+        raw_lines.push(format!("DESCRIPTION:{}", escape_text(draft.notes.trim())));
+    }
+
+    if draft.all_day || draft.start_time.is_none() {
+        let start = draft.start_date;
+        // RFC 5545 all-day DTEND is exclusive.
+        let end_excl = draft.end_date.max(start) + chrono::Duration::days(1);
+        raw_lines.push(format!("DTSTART;VALUE=DATE:{}", start.format("%Y%m%d")));
+        raw_lines.push(format!("DTEND;VALUE=DATE:{}", end_excl.format("%Y%m%d")));
+    } else if let Some(st) = draft.start_time {
+        let end_date = draft.end_date.max(draft.start_date);
+        let et = draft.end_time.unwrap_or_else(|| st + chrono::Duration::hours(1));
+        let (final_end_date, final_end_time) = if end_date == draft.start_date && et <= st {
+            (draft.start_date + chrono::Duration::days(1), et)
+        } else {
+            (end_date, et)
+        };
+        let tz = draft.timezone.as_deref().and_then(|z| z.parse::<Tz>().ok());
+        match tz {
+            Some(zone) => {
+                raw_lines.push(format!("DTSTART;TZID={}:{}T{}", zone.name(), draft.start_date.format("%Y%m%d"), st.format("%H%M%S")));
+                raw_lines.push(format!("DTEND;TZID={}:{}T{}", zone.name(), final_end_date.format("%Y%m%d"), final_end_time.format("%H%M%S")));
+            }
+            None => {
+                raw_lines.push(format!("DTSTART:{}T{}", draft.start_date.format("%Y%m%d"), st.format("%H%M%S")));
+                raw_lines.push(format!("DTEND:{}T{}", final_end_date.format("%Y%m%d"), final_end_time.format("%H%M%S")));
+            }
+        }
+    }
+
+    raw_lines.push("END:VEVENT".to_owned());
+    raw_lines.push("END:VCALENDAR".to_owned());
+
+    let mut out = String::new();
+    for line in raw_lines {
+        fold_ics_line(&line, &mut out);
+        let _ = write!(out, "\r\n");
+    }
+    out
+}
+
+fn escape_text(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            ',' => out.push_str("\\,"),
+            ';' => out.push_str("\\;"),
+            '\n' => out.push_str("\\n"),
+            '\r' => {}
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+fn fold_ics_line(line: &str, out: &mut String) {
+    let mut bytes = 0usize;
+    for ch in line.chars() {
+        let len = ch.len_utf8();
+        if bytes > 0 && bytes + len > 74 {
+            out.push_str("\r\n ");
+            bytes = 1;
+        }
+        out.push(ch);
+        bytes += len;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -426,6 +674,48 @@ BEGIN:VEVENT\r\nUID:b\r\nSUMMARY:Trip to the\r\n  mountains\r\nDTSTART;VALUE=DAT
         let first = trip.occurrences_in(d(2026, 10, 30), d(2026, 10, 30))[0];
         assert_eq!((trip.title.as_str(), trip.all_day(), first.end), ("Trip to the mountains", true, d(2026, 11, 1)));
         assert_eq!(trip.starts_in(d(2026, 11, 1), d(2026, 11, 1)), [d(2026, 10, 30)], "a day it spans");
+    }
+
+    #[test]
+    fn serialize_event_round_trips_timed_and_all_day() {
+        let timed = EventDraft {
+            uid: "ev-timed-1".into(),
+            title: "Design, Review; Q4\nPlanning".into(),
+            location: "Room 4A, Bldg B".into(),
+            notes: "Agenda:\n1. Roadmap".into(),
+            start_date: d(2026, 11, 10),
+            start_time: NaiveTime::from_hms_opt(14, 0, 0),
+            end_date: d(2026, 11, 10),
+            end_time: NaiveTime::from_hms_opt(15, 30, 0),
+            all_day: false,
+            timezone: None,
+        };
+        let ics = serialize_event(&timed);
+        let parsed = parse(&ics);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].uid, "ev-timed-1");
+        assert_eq!(parsed[0].title, "Design, Review; Q4\nPlanning");
+        assert_eq!(parsed[0].location, "Room 4A, Bldg B");
+        let occ = parsed[0].occurrences_in(d(2026, 11, 10), d(2026, 11, 10))[0];
+        assert_eq!(occ.start_time, NaiveTime::from_hms_opt(14, 0, 0));
+
+        let all_day = EventDraft {
+            uid: "ev-all-1".into(),
+            title: "Offsite".into(),
+            location: String::new(),
+            notes: String::new(),
+            start_date: d(2026, 11, 12),
+            start_time: None,
+            end_date: d(2026, 11, 14),
+            end_time: None,
+            all_day: true,
+            timezone: None,
+        };
+        let parsed_all = parse(&serialize_event(&all_day));
+        assert_eq!(parsed_all.len(), 1);
+        assert!(parsed_all[0].all_day());
+        let occ = parsed_all[0].occurrences_in(d(2026, 11, 12), d(2026, 11, 14))[0];
+        assert_eq!(occ.end, d(2026, 11, 14));
     }
 }
 

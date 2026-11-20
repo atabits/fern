@@ -123,6 +123,10 @@ pub enum DropTarget {
     /// A list section, or none.
     Section(Option<Id>),
     Kind(Kind),
+    /// Moves a task back to open/to-do status (clears completed and in-progress).
+    Todo,
+    /// Marks a task explicitly In Progress.
+    InProgress,
     Complete,
     /// A due date, or none.
     Due(Option<NaiveDate>),
@@ -961,8 +965,14 @@ mod tests {
             completed_at: None,
             deleted_at: None,
             wont_do_at: None,
+            in_progress_at: None,
             end_date: None,
             end_time: None,
+            location: None,
+            timezone: None,
+            is_floating: false,
+            snoozed_until: None,
+            constant_reminder: false,
             modified_at: None,
             pinned_at: None,
             section_id: None,

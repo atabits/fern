@@ -1,7 +1,7 @@
 //! Task reminders, as in the original: offsets before the due time. All-day tasks are reminded
 //! relative to 09:00 on their due day ("On the day (09:00)", "1 day early (09:00)").
 
-use chrono::{Duration, NaiveDateTime, NaiveTime};
+use chrono::{Duration, NaiveDateTime};
 
 use crate::model::Task;
 
@@ -17,10 +17,7 @@ pub const ALL_DAY_OFFSETS: [i64; 5] = [0, 24 * 60, 2 * 24 * 60, 3 * 24 * 60, 7 *
 
 /// When a task's reminders fire, earliest first. Tasks without a due date have none.
 pub fn fire_times(task: &Task) -> Vec<NaiveDateTime> {
-    let Some(date) = task.due_date else { return Vec::new() };
-    let base = date.and_time(
-        task.due_time.unwrap_or_else(|| NaiveTime::from_hms_opt(ALL_DAY_REMINDER_HOUR, 0, 0).unwrap_or_default()),
-    );
+    let Some(base) = task.effective_due_local() else { return Vec::new() };
     let mut times: Vec<NaiveDateTime> =
         task.reminders.iter().map(|minutes| base - Duration::minutes(*minutes)).collect();
     times.sort();
@@ -28,12 +25,20 @@ pub fn fire_times(task: &Task) -> Vec<NaiveDateTime> {
     times
 }
 
-/// Open tasks with a reminder firing in `(after, until]`, with the time it fires.
+/// Open tasks with a reminder (or active snooze) firing in `(after, until]`, with the time it fires.
 pub fn due_between(tasks: &[Task], after: NaiveDateTime, until: NaiveDateTime) -> Vec<(&Task, NaiveDateTime)> {
     tasks
         .iter()
         .filter(|task| !task.is_closed() && !task.is_deleted())
-        .filter_map(|task| fire_times(task).into_iter().find(|at| *at > after && *at <= until).map(|at| (task, at)))
+        .filter_map(|task| {
+            let mut due_times = fire_times(task);
+            if let Some(snoozed) = task.snoozed_until {
+                due_times.push(snoozed);
+                due_times.sort();
+                due_times.dedup();
+            }
+            due_times.into_iter().find(|at| *at > after && *at <= until).map(|at| (task, at))
+        })
         .collect()
 }
 
@@ -48,7 +53,7 @@ pub fn parse(text: &str) -> Vec<i64> {
 
 #[cfg(test)]
 mod tests {
-    use chrono::NaiveDate;
+    use chrono::{NaiveDate, NaiveTime};
 
     use super::*;
 
@@ -89,5 +94,25 @@ mod tests {
         assert_eq!(format(&[0, 1440]).as_deref(), Some("0,1440"));
         assert_eq!(format(&[]), None);
         assert_eq!(parse("0, 1440,x"), [0, 1440]);
+    }
+
+    #[test]
+    fn timezone_and_snoozed_reminders() {
+        let mut t = task(Some((20, Some((12, 0)))), &[0]);
+        t.timezone = Some("UTC".into());
+        let utc_target = chrono_tz::UTC;
+        assert_eq!(t.effective_due_in(&utc_target), Some(at(20, 12, 0)));
+        let ny_target = chrono_tz::America::New_York;
+        // 2026-10-20 is EDT (UTC-4).
+        assert_eq!(t.effective_due_in(&ny_target), Some(at(20, 8, 0)));
+        t.is_floating = true;
+        assert_eq!(t.effective_due_in(&ny_target), Some(at(20, 12, 0)));
+
+        let mut snoozed = task(None, &[]);
+        snoozed.snoozed_until = Some(at(20, 14, 15));
+        let snoozed_list = [snoozed];
+        let due = due_between(&snoozed_list, at(20, 14, 0), at(20, 14, 20));
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].1, at(20, 14, 15));
     }
 }

@@ -14,6 +14,7 @@ path = "src/desktop_common.rs"
 anyhow.workspace = true
 assets.workspace = true
 chrono.workspace = true
+chrono-tz.workspace = true
 dirs.workspace = true
 fern_core.workspace = true
 fern_i18n.workspace = true

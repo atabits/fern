@@ -227,6 +227,10 @@ pub struct MatrixView {
     header_menu: bool,
     show_completed: bool,
     show_subtasks: bool,
+    profiles: Vec<fern_core::MatrixProfile>,
+    active_profile_id: Option<Id>,
+    profile_menu: bool,
+    profile_editor: Option<(Option<Id>, Entity<TextInput>)>,
 }
 
 impl EventEmitter<OpenTask> for MatrixView {}
@@ -275,6 +279,10 @@ impl MatrixView {
             header_menu: false,
             show_completed: false,
             show_subtasks: false,
+            profiles: Vec::new(),
+            active_profile_id: None,
+            profile_menu: false,
+            profile_editor: None,
         };
         this.reload(cx);
         cx.observe_global::<desktop_common::data_version::DataVersion>(|this, cx| {
@@ -284,6 +292,71 @@ impl MatrixView {
         })
         .detach();
         this
+    }
+
+    fn profile_setting_key(&self, base: &str) -> String {
+        let first_id = self.profiles.first().map(|p| p.id);
+        match self.active_profile_id {
+            Some(id) if Some(id) != first_id => format!("{base}_{id}"),
+            _ => base.to_owned(),
+        }
+    }
+
+    fn switch_profile(&mut self, id: Id, cx: &mut Context<Self>) {
+        self.profile_menu = false;
+        if let Err(err) = self.store.set_active_matrix_profile(id) {
+            eprintln!("failed to switch matrix profile: {err:#}");
+            return;
+        }
+        self.reload(cx);
+    }
+
+    fn open_profile_editor(&mut self, editing: Option<Id>, initial: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.profile_menu = false;
+        let input = cx.new(|cx| TextInput::new(Mode::SingleLine, initial, cx).without_cancel());
+        cx.subscribe(&input, |this, _, _: &Submitted, cx| {
+            this.save_profile_editor(cx);
+        })
+        .detach();
+        window.focus(&input.focus_handle(cx), cx);
+        self.profile_editor = Some((editing, input));
+        cx.notify();
+    }
+
+    fn save_profile_editor(&mut self, cx: &mut Context<Self>) {
+        let Some((editing, input)) = self.profile_editor.take() else { return };
+        let name = input.read(cx).text().trim().to_owned();
+        if name.is_empty() {
+            cx.notify();
+            return;
+        }
+        match editing {
+            Some(id) => {
+                if let Err(err) = self.store.rename_matrix_profile(id, &name) {
+                    eprintln!("failed to rename matrix profile: {err:#}");
+                } else {
+                    desktop_common::data_version::data_changed(cx.entity_id(), cx);
+                }
+            }
+            None => match self.store.create_matrix_profile(&name, None) {
+                Ok(profile) => {
+                    let _ = self.store.set_active_matrix_profile(profile.id);
+                    desktop_common::data_version::data_changed(cx.entity_id(), cx);
+                }
+                Err(err) => eprintln!("failed to create matrix profile: {err:#}"),
+            },
+        }
+        self.reload(cx);
+    }
+
+    fn delete_profile(&mut self, id: Id, cx: &mut Context<Self>) {
+        self.profile_menu = false;
+        match self.store.delete_matrix_profile(id) {
+            Ok(true) => desktop_common::data_version::data_changed(cx.entity_id(), cx),
+            Ok(false) => {}
+            Err(err) => eprintln!("failed to delete matrix profile: {err:#}"),
+        }
+        self.reload(cx);
     }
 
     pub fn reload(&mut self, cx: &mut Context<Self>) {
@@ -299,7 +372,14 @@ impl MatrixView {
             .ok()
             .flatten()
             .is_some_and(|v| v == "1");
-        self.rules = self.store.matrix_rules().unwrap_or_else(|_| QuadrantRule::defaults());
+        self.profiles = self.store.matrix_profiles().unwrap_or_default();
+        self.active_profile_id = self.store.active_matrix_profile_id().ok();
+        self.rules = self
+            .active_profile_id
+            .and_then(|id| self.profiles.iter().find(|p| p.id == id))
+            .or_else(|| self.profiles.first())
+            .map(|p| p.rules.clone())
+            .unwrap_or_else(QuadrantRule::defaults);
         self.tasks = self
             .store
             .matrix_tasks(&self.rules, self.show_completed, COMPLETED_HISTORY_LIMIT)
@@ -308,25 +388,28 @@ impl MatrixView {
         self.tags = self.store.tags().unwrap_or_default();
         self.tag_families = build_tag_families(&self.tags);
 
-        for (i, view) in self.views.iter_mut().enumerate() {
-            *view = self
+        for i in 0..4 {
+            let key = self.profile_setting_key(&format!("matrix_view_{i}"));
+            self.views[i] = self
                 .store
-                .setting(&format!("matrix_view_{i}"))
+                .setting(&key)
                 .ok()
                 .flatten()
                 .map(|s| QuadrantView::from_storage(&s))
                 .unwrap_or_default();
         }
-        if let Some(order_str) = self.store.setting("matrix_quadrant_order").ok().flatten() {
+        self.quadrant_order = [0, 1, 2, 3];
+        if let Some(order_str) = self.store.setting(&self.profile_setting_key("matrix_quadrant_order")).ok().flatten() {
             let parsed: Vec<usize> = order_str.split(',').filter_map(|s| s.parse().ok()).filter(|&n| n < 4).collect();
             if parsed.len() == 4 && (0..4).all(|i| parsed.contains(&i)) {
                 self.quadrant_order = [parsed[0], parsed[1], parsed[2], parsed[3]];
             }
         }
-        for (i, slot) in self.manual_order.iter_mut().enumerate() {
-            *slot = self
+        for i in 0..4 {
+            let key = self.profile_setting_key(&format!("matrix_manual_order_{i}"));
+            self.manual_order[i] = self
                 .store
-                .setting(&format!("matrix_manual_order_{i}"))
+                .setting(&key)
                 .ok()
                 .flatten()
                 .map(|s| s.split(',').filter_map(|id| id.parse().ok()).collect())
@@ -541,6 +624,10 @@ impl MatrixView {
     }
 
     pub fn try_dismiss_transient(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.profile_editor.take().is_some() || std::mem::take(&mut self.profile_menu) {
+            cx.notify();
+            return true;
+        }
         if self.emoji_picker_open {
             self.emoji_picker_open = false;
             cx.notify();
@@ -730,7 +817,7 @@ impl MatrixView {
             order.insert(to, dragged_id);
             let encoded = order.iter().map(ToString::to_string).collect::<Vec<_>>().join(",");
             self.manual_order[quadrant] = order;
-            let _ = self.store.set_setting(&format!("matrix_manual_order_{quadrant}"), &encoded);
+            let _ = self.store.set_setting(&self.profile_setting_key(&format!("matrix_manual_order_{quadrant}")), &encoded);
             self.rebuild_cache(cx);
             cx.notify();
         }
@@ -738,7 +825,7 @@ impl MatrixView {
 
     fn reset_manual_order(&mut self, quadrant: usize, cx: &mut Context<Self>) {
         self.manual_order[quadrant].clear();
-        let _ = self.store.delete_setting(&format!("matrix_manual_order_{quadrant}"));
+        let _ = self.store.delete_setting(&self.profile_setting_key(&format!("matrix_manual_order_{quadrant}")));
         self.menu = None;
         self.rebuild_cache(cx);
         cx.notify();
@@ -754,7 +841,7 @@ impl MatrixView {
         ) {
             self.quadrant_order.swap(a, b);
             let encoded = self.quadrant_order.map(|q| q.to_string()).join(",");
-            let _ = self.store.set_setting("matrix_quadrant_order", &encoded);
+            let _ = self.store.set_setting(&self.profile_setting_key("matrix_quadrant_order"), &encoded);
             cx.notify();
         }
     }
@@ -784,9 +871,15 @@ impl MatrixView {
                 } else {
                     typed
                 };
-                self.store.save_matrix_rule(quadrant, Some(&rule))
+                match self.active_profile_id {
+                    Some(pid) => self.store.save_matrix_profile_rule(pid, quadrant, Some(&rule)),
+                    None => self.store.save_matrix_rule(quadrant, Some(&rule)),
+                }
             } else {
-                self.store.save_matrix_rule(quadrant, None)
+                match self.active_profile_id {
+                    Some(pid) => self.store.save_matrix_profile_rule(pid, quadrant, None),
+                    None => self.store.save_matrix_rule(quadrant, None),
+                }
             };
             if let Err(err) = result {
                 eprintln!("failed to save the quadrant: {err:#}");
@@ -911,10 +1004,8 @@ impl MatrixView {
                             })
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.views[quadrant] = next;
-                                if let Err(err) = this
-                                    .store
-                                    .set_setting(&format!("matrix_view_{quadrant}"), &next.to_storage())
-                                {
+                                let key = this.profile_setting_key(&format!("matrix_view_{quadrant}"));
+                                if let Err(err) = this.store.set_setting(&key, &next.to_storage()) {
                                     eprintln!("failed to save the quadrant's view: {err:#}");
                                 }
                                 this.menu_row = None;
@@ -1010,6 +1101,7 @@ impl MatrixView {
             } else {
                 Checkbox::new(SharedString::from(format!("matrix-cb-{quadrant}-{id}")))
                     .toggle_state(completed)
+                    .in_progress(task.is_in_progress())
                     .tint(task_rows::priority_color(task.priority, &theme))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
@@ -1513,13 +1605,113 @@ impl Render for MatrixView {
                     .h(px(56.))
                     .flex_none()
                     .px(px(22.))
+                    .gap_3()
                     .child(
-                        div().flex_1().child(
-                            Label::new(strings.section_matrix)
-                                .size(LabelSize::Large)
-                                .weight(FontWeight::SEMIBOLD),
-                        ),
+                        Label::new(strings.section_matrix)
+                            .size(LabelSize::Large)
+                            .weight(FontWeight::SEMIBOLD),
                     )
+                    .child({
+                        let active_name = self
+                            .active_profile_id
+                            .and_then(|id| self.profiles.iter().find(|p| p.id == id))
+                            .or_else(|| self.profiles.first())
+                            .map(|p| if p.name == "Default" { strings.matrix_default_profile.to_owned() } else { p.name.clone() })
+                            .unwrap_or_else(|| strings.matrix_default_profile.to_owned());
+                        let can_delete = self.profiles.len() > 1;
+                        let menu = self.profile_menu.then(|| {
+                            PopoverAttachment::new(
+                                Placement::BelowLeft,
+                                popover(cx)
+                                    .min_w(px(220.))
+                                    .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                                        this.profile_menu = false;
+                                        cx.notify();
+                                    }))
+                                    .children(self.profiles.iter().map(|profile| {
+                                        let id = profile.id;
+                                        let active = self.active_profile_id == Some(id);
+                                        let display_name = if profile.name == "Default" {
+                                            strings.matrix_default_profile.to_owned()
+                                        } else {
+                                            profile.name.clone()
+                                        };
+                                        let raw_name = profile.name.clone();
+                                        ListItem::new(SharedString::from(format!("matrix-profile-{id}")))
+                                            .height(px(34.))
+                                            .start_slot(Icon::new(IconName::LayoutGrid).size(IconSize::XSmall).color(if active { Color::Accent } else { Color::Muted }))
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .min_w_0()
+                                                    .child(Label::new(display_name).color(if active { Color::Accent } else { Color::Default }).truncate()),
+                                            )
+                                            .end_slot(
+                                                h_flex()
+                                                    .gap_1()
+                                                    .when(active, |el| el.child(Icon::new(IconName::Check).size(IconSize::XSmall).color(Color::Accent)))
+                                                    .child(
+                                                        IconButton::new(SharedString::from(format!("matrix-profile-rename-{id}")), IconName::Pencil)
+                                                            .size(px(20.))
+                                                            .icon_size(IconSize::XSmall)
+                                                            .icon_color(Color::Muted)
+                                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                                cx.stop_propagation();
+                                                                this.open_profile_editor(Some(id), &raw_name, window, cx);
+                                                            })),
+                                                    )
+                                                    .when(can_delete, |el| {
+                                                        el.child(
+                                                            IconButton::new(SharedString::from(format!("matrix-profile-delete-{id}")), IconName::Trash)
+                                                                .size(px(20.))
+                                                                .icon_size(IconSize::XSmall)
+                                                                .icon_color(Color::Muted)
+                                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                                    cx.stop_propagation();
+                                                                    this.delete_profile(id, cx);
+                                                                })),
+                                                        )
+                                                    }),
+                                            )
+                                            .on_click(cx.listener(move |this, _, _, cx| this.switch_profile(id, cx)))
+                                    }))
+                                    .child(div().my_1().child(Divider::horizontal()))
+                                    .child(
+                                        ListItem::new("matrix-profile-new")
+                                            .height(px(34.))
+                                            .start_slot(Icon::new(IconName::Plus).color(Color::Accent))
+                                            .child(Label::new(strings.matrix_new_profile).color(Color::Accent))
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.open_profile_editor(None, "", window, cx);
+                                            })),
+                                    ),
+                            )
+                        });
+                        div()
+                            .relative()
+                            .child(
+                                h_flex()
+                                    .id("matrix-profile-switcher")
+                                    .h(px(28.))
+                                    .px_2p5()
+                                    .gap_1()
+                                    .rounded(px(6.))
+                                    .border_1()
+                                    .border_color(theme.colors().border)
+                                    .bg(theme.colors().surface_background)
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(theme.colors().ghost_element_hover))
+                                    .child(Icon::new(IconName::LayoutGrid).size(IconSize::XSmall).color(Color::Muted))
+                                    .child(Label::new(active_name).size(LabelSize::Small))
+                                    .child(Icon::new(IconName::ChevronDown).size(IconSize::XSmall).color(Color::Muted))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.profile_menu = !this.profile_menu;
+                                        cx.notify();
+                                    })),
+                            )
+                            .children(menu)
+                    })
+                    .child(div().flex_1())
                     .child(
                         div()
                             .debug_selector(|| "matrix-header-menu-trigger".to_owned())
@@ -1583,7 +1775,11 @@ impl Render for MatrixView {
                                                 .child(Label::new(strings.matrix_apply_date_template))
                                                 .on_click(cx.listener(|this, _, _, cx| {
                                                     this.header_menu = false;
-                                                    if let Err(err) = this.store.apply_matrix_date_template() {
+                                                    let res = match this.active_profile_id {
+                                                        Some(pid) => this.store.apply_matrix_profile_date_template(pid).map(|_| ()),
+                                                        None => this.store.apply_matrix_date_template().map(|_| ()),
+                                                    };
+                                                    if let Err(err) = res {
                                                         eprintln!("failed to apply date template: {err:#}");
                                                     } else {
                                                         desktop_common::data_version::data_changed(cx.entity_id(), cx);
@@ -1639,6 +1835,88 @@ impl Render for MatrixView {
             .children(task_ctx)
             .children(floating_detail)
             .children(edit_modal)
+            .when_some(self.profile_editor.as_ref(), |el, (editing, input)| {
+                let heading = if editing.is_some() { strings.matrix_rename_profile } else { strings.matrix_new_profile };
+                el.child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .bg(gpui::black().opacity(0.35))
+                        .occlude()
+                        .id("matrix-profile-editor-backdrop")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.profile_editor = None;
+                            window.focus(&this.focus, cx);
+                            cx.notify();
+                        }))
+                        .child(
+                            v_flex()
+                                .id("matrix-profile-editor")
+                                .w(px(320.))
+                                .p_4()
+                                .gap_3()
+                                .rounded(px(10.))
+                                .bg(theme.colors().elevated_surface_background)
+                                .border_1()
+                                .border_color(theme.colors().border)
+                                .shadow_lg()
+                                .on_click(|_, _, cx| cx.stop_propagation())
+                                .child(Label::new(heading).weight(FontWeight::SEMIBOLD))
+                                .child(Label::new(strings.matrix_profile_name).size(LabelSize::XSmall).color(Color::Muted))
+                                .child(
+                                    div()
+                                        .h(px(32.))
+                                        .px_2p5()
+                                        .flex()
+                                        .items_center()
+                                        .rounded(px(6.))
+                                        .border_1()
+                                        .border_color(theme.colors().border)
+                                        .bg(theme.colors().background)
+                                        .child(input.clone()),
+                                )
+                                .child(
+                                    h_flex()
+                                        .justify_end()
+                                        .gap_2()
+                                        .child(
+                                            div()
+                                                .id("matrix-profile-cancel")
+                                                .h(px(30.))
+                                                .px_3()
+                                                .flex()
+                                                .items_center()
+                                                .rounded(px(6.))
+                                                .border_1()
+                                                .border_color(theme.colors().border)
+                                                .cursor_pointer()
+                                                .child(Label::new(strings.cancel).size(LabelSize::Small))
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    this.profile_editor = None;
+                                                    window.focus(&this.focus, cx);
+                                                    cx.notify();
+                                                })),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("matrix-profile-save")
+                                                .h(px(30.))
+                                                .px_3p5()
+                                                .flex()
+                                                .items_center()
+                                                .rounded(px(6.))
+                                                .bg(theme.colors().accent)
+                                                .cursor_pointer()
+                                                .child(Label::new(strings.save).size(LabelSize::Small).color(Color::OnAccent))
+                                                .on_click(cx.listener(|this, _, _, cx| this.save_profile_editor(cx))),
+                                        ),
+                                ),
+                        ),
+                )
+            })
     }
 }
 
@@ -2037,6 +2315,50 @@ mod tests {
                 matrix.read(cx).cache[0].groups[0].1.iter().map(|t| t.id).collect();
             assert_eq!(reset, vec![a.id, b.id, c.id]);
             assert!(matrix.read(cx).manual_order[0].is_empty());
+        });
+    }
+
+    #[gpui::test]
+    fn multiple_matrix_profiles_keep_independent_rules_and_settings(cx: &mut gpui::TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let p2 = store.create_matrix_profile("Focus Profile", None).unwrap();
+
+        cx.update(|cx| {
+            let matrix = cx.new(|cx| MatrixView::new(store.clone(), cx));
+            assert_eq!(matrix.read(cx).profiles.len(), 2);
+
+            // Rename Q1 on profile 1.
+            matrix.update(cx, |m, cx| {
+                m.start_edit(0, cx);
+                m.name_input.update(cx, |i, cx| i.set_text("Profile 1 Q1", cx));
+                m.finish_edit(Some(true), cx);
+            });
+            assert_eq!(matrix.read(cx).rules[0].name, "Profile 1 Q1");
+
+            // Switch to profile 2 -> independent rules and view settings.
+            matrix.update(cx, |m, cx| m.switch_profile(p2.id, cx));
+            assert_eq!(matrix.read(cx).active_profile_id, Some(p2.id));
+            assert_ne!(matrix.read(cx).rules[0].name, "Profile 1 Q1");
+
+            matrix.update(cx, |m, cx| {
+                m.start_edit(0, cx);
+                m.name_input.update(cx, |i, cx| i.set_text("Profile 2 Q1", cx));
+                m.finish_edit(Some(true), cx);
+                m.swap_quadrants(0, 3, cx);
+            });
+            assert_eq!(matrix.read(cx).rules[0].name, "Profile 2 Q1");
+            assert_eq!(matrix.read(cx).quadrant_order, [3, 1, 2, 0]);
+
+            // Switch back -> profile 1 keeps its original order & rules.
+            let p1_id = matrix.read(cx).profiles[0].id;
+            matrix.update(cx, |m, cx| m.switch_profile(p1_id, cx));
+            assert_eq!(matrix.read(cx).rules[0].name, "Profile 1 Q1");
+            assert_eq!(matrix.read(cx).quadrant_order, [0, 1, 2, 3]);
+
+            // Delete profile 2 -> only default remains.
+            matrix.update(cx, |m, cx| m.delete_profile(p2.id, cx));
+            assert_eq!(matrix.read(cx).profiles.len(), 1);
+            assert_eq!(matrix.read(cx).active_profile_id, Some(p1_id));
         });
     }
 }

@@ -360,7 +360,7 @@ pub fn summarize(tasks: &[Task], options: &SummaryOptions, today: NaiveDate, wee
             StatusFilter::Completed => t.is_completed(),
             StatusFilter::Uncompleted => !t.is_closed(),
             StatusFilter::WontDo => t.is_wont_do(),
-            StatusFilter::InProgress => !t.is_closed() && t.checklist.is_some_and(|(done, total)| done > 0 && done < total),
+            StatusFilter::InProgress => !t.is_closed() && (t.is_in_progress() || t.checklist.is_some_and(|(done, total)| done > 0 && done < total)),
         })
         .collect();
     // Newest first within a group, as in the original.

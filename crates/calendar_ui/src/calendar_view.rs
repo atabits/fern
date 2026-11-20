@@ -3,15 +3,16 @@
 
 use std::{collections::{BTreeMap, HashSet}, rc::Rc, time::Duration};
 
-use chrono::{Datelike, Local, NaiveDate};
+use chrono::{Datelike, Local, NaiveDate, NaiveTime};
+use desktop_common::text_input::{Mode, TextInput};
 use fern_core::{CalendarOptions, ColorBy, Id, Priority, Store, Task};
 use gpui::{EventEmitter, Focusable, FontWeight};
 use ui::prelude::*;
-use ui::{Placement, PopoverAttachment, popover};
+use ui::{Placement, PopoverAttachment, Switch, popover};
 
 use crate::actions::{AgendaView, CalendarToday, DayView, DismissTransient, MonthView, NewTask, NextYear, PreviousYear, PrintYear, WeekView, YearView};
 use crate::calendar::{self, week_axis};
-use crate::drag::DraggedTask;
+use crate::drag::{DraggedEvent, DraggedTask, ResizeEdge, ResizedTask};
 use crate::i18n;
 use crate::calendar_options_view::{CalendarOptionsDialog, OptionsEvent, Page};
 use crate::task_detail::{StartFocus, TaskDetail, TaskUpdated};
@@ -137,6 +138,54 @@ pub struct CalendarView {
     habits: Vec<fern_core::Habit>,
     habit_records: std::collections::HashMap<Id, Vec<fern_core::Checkin>>,
     focus_sessions: Vec<fern_core::FocusSession>,
+    timed_resize: Option<TimedResize>,
+    event_editor: Option<EventEditor>,
+}
+
+#[derive(Clone, Debug)]
+struct TimedResize {
+    id: Id,
+    date: NaiveDate,
+    edge: ResizeEdge,
+    orig_start: NaiveTime,
+    orig_end: NaiveTime,
+    end_date: Option<NaiveDate>,
+    start_y: Pixels,
+    current_time: NaiveTime,
+}
+
+impl TimedResize {
+    fn snapped_range(&self) -> (NaiveTime, NaiveTime) {
+        let min_span = chrono::Duration::minutes(15);
+        let max_t = NaiveTime::from_hms_opt(23, 45, 0).unwrap_or_default();
+        match self.edge {
+            ResizeEdge::Start => {
+                let limit = if self.end_date.is_some_and(|d| d > self.date) {
+                    max_t
+                } else {
+                    self.orig_end - min_span
+                };
+                (self.current_time.min(limit), self.orig_end)
+            }
+            ResizeEdge::End => {
+                let min_end = self.orig_start + min_span;
+                (self.orig_start, self.current_time.max(min_end.min(max_t)))
+            }
+        }
+    }
+}
+
+struct EventEditor {
+    subscription_id: Id,
+    uid: Option<String>,
+    span_days: i64,
+    title: gpui::Entity<TextInput>,
+    location: gpui::Entity<TextInput>,
+    notes: gpui::Entity<TextInput>,
+    date: gpui::Entity<TextInput>,
+    start_time: gpui::Entity<TextInput>,
+    end_time: gpui::Entity<TextInput>,
+    all_day: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -340,6 +389,8 @@ impl CalendarView {
             habits: Vec::new(),
             habit_records: std::collections::HashMap::new(),
             focus_sessions: Vec::new(),
+            timed_resize: None,
+            event_editor: None,
         };
         this.reload(cx);
         this
@@ -386,6 +437,8 @@ impl CalendarView {
             .into_iter()
             .map(|occurrence| EventBar {
                 key: occurrence.event.uid.clone(),
+                subscription_id: occurrence.calendar.id,
+                writable: occurrence.calendar.is_caldav() && occurrence.calendar.writable,
                 title: occurrence.event.title.clone(),
                 start: occurrence.times.start,
                 end: occurrence.times.end,
@@ -402,14 +455,24 @@ impl CalendarView {
     }
 
     /// An event's bar: the calendar's color, its time when it has one, and a card with the rest
-    /// on a click. Events cannot be changed here: they belong to the calendar they come from.
+    /// on a click. Writable CalDAV events can also be dragged to another day.
     fn event_bar(&self, event: EventBar, date: NaiveDate, cx: &mut Context<Self>) -> Stateful<ui::HorizontalStack> {
         let strings = i18n::t(cx);
         let open = self.open_event.as_ref() == Some(&(event.key.clone(), event.start));
         let key = (event.key.clone(), event.start);
         let column = calendar::week_of(date).iter().position(|d| *d == date).unwrap_or(0);
+        let card = event.clone();
+        let writable = event.writable;
+        let dragged = DraggedEvent {
+            subscription_id: event.subscription_id,
+            uid: event.key.clone(),
+            title: event.title.clone().into(),
+        };
         h_flex()
             .id(SharedString::from(format!("calendar-event-{}-{}-{date}", event.key, event.start)))
+            .when(writable, |el| {
+                el.on_drag(dragged, |d, _, _, cx| cx.new(|_| d.clone()))
+            })
             .h(px(18.))
             .flex_none()
             .gap_1()
@@ -422,7 +485,7 @@ impl CalendarView {
             .when_some(event.start_time.filter(|_| event.start == date), |el, time| {
                 el.child(Label::new(calendar::format_time(time, strings)).size(LabelSize::XSmall).color(Color::Muted))
             })
-            .child(div().flex_1().min_w_0().child(Label::new(event.title.clone()).size(LabelSize::XSmall).truncate()))
+            .child(div().flex_1().min_w_0().child(Label::new(event.title).size(LabelSize::XSmall).truncate()))
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.open_event = if this.open_event.as_ref() == Some(&key) { None } else { Some(key.clone()) };
                 window.focus(&this.focus_handle, cx);
@@ -430,13 +493,14 @@ impl CalendarView {
             }))
             .when(open, |el| {
                 let placement = if column < 3 { Placement::RightOf } else { Placement::LeftOf };
-                el.relative().child(PopoverAttachment::new(placement, self.render_event_card(&event, cx)))
+                el.relative().child(PopoverAttachment::new(placement, self.render_event_card(&card, cx)))
             })
     }
 
     /// An event's card: its title, when it is, its calendar, place and description.
     fn render_event_card(&self, event: &EventBar, cx: &mut Context<Self>) -> AnyElement {
         let strings = i18n::t(cx);
+        let theme = cx.theme().clone();
         let day = |date: NaiveDate| task_rows::format_day(strings.closed_date[0], date, strings);
         let when = match (event.start_time, event.end_time) {
             (Some(from), Some(to)) if event.start == event.end => format!("{}, {} – {}", day(event.start), calendar::format_time(from, strings), calendar::format_time(to, strings)),
@@ -445,6 +509,9 @@ impl CalendarView {
             (None, _) if event.start == event.end => format!("{}, {}", day(event.start), strings.range_all_day),
             (None, _) => format!("{} – {}", day(event.start), day(event.end)),
         };
+        let sub_id = event.subscription_id;
+        let uid = event.key.clone();
+        let edit_snapshot = event.clone();
         popover(cx)
             .w(px(300.))
             .p_3()
@@ -480,6 +547,28 @@ impl CalendarView {
                     )
                     .max_h(px(160.))
                     .compact(),
+                )
+            })
+            .when(event.writable, |el| {
+                el.child(div().h(px(1.)).bg(theme.colors().border_variant)).child(
+                    h_flex()
+                        .justify_end()
+                        .gap_1p5()
+                        .child(
+                            IconButton::new("calendar-event-edit", IconName::Pencil)
+                                .tip(strings.cal_edit_event, ui::TipSide::Above)
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.open_edit_event_editor(&edit_snapshot, window, cx);
+                                })),
+                        )
+                        .child(
+                            IconButton::new("calendar-event-delete", IconName::Trash)
+                                .icon_color(Color::Error)
+                                .tip(strings.delete, ui::TipSide::Above)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.delete_caldav_event(sub_id, &uid, cx);
+                                })),
+                        ),
                 )
             })
             .into_any_element()
@@ -755,10 +844,10 @@ impl CalendarView {
 
     fn open_options(&mut self, page: Page, cx: &mut Context<Self>) {
         let store = self.store.clone();
-        let dialog = cx.new(|_| CalendarOptionsDialog::new(store, page));
+        let dialog = cx.new(|cx| CalendarOptionsDialog::new(store, page, cx));
         cx.subscribe(&dialog, |this, _, event: &OptionsEvent, cx| {
             match event {
-                OptionsEvent::Changed(options) => this.options = *options,
+                OptionsEvent::Changed(options) => this.options = options.clone(),
                 OptionsEvent::Closed => this.options_dialog = None,
             }
             this.reload(cx);
@@ -931,7 +1020,14 @@ impl CalendarView {
     }
 
     pub fn try_dismiss_transient(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        if self.context_menu.take().is_some() {
+        if self.timed_resize.take().is_some() {
+            cx.notify();
+            true
+        } else if self.event_editor.take().is_some() {
+            window.focus(&self.focus_handle, cx);
+            cx.notify();
+            true
+        } else if self.context_menu.take().is_some() {
             self.context_side = None;
             cx.notify();
             true
@@ -1178,7 +1274,9 @@ impl CalendarView {
                         .filter_map(|t| t.due_date)
                         .collect();
                     let countdowns: &[fern_core::Countdown] = if self.options.show_countdowns { &self.countdowns } else { &[] };
-                    self.agenda = fern_core::agenda::agenda(&tasks, countdowns, from, from + chrono::Duration::days(AGENDA_DAYS))
+                    let until = from + chrono::Duration::days(AGENDA_DAYS);
+                    let holidays = self.store.holiday_dates(from, until).unwrap_or_default();
+                    self.agenda = fern_core::agenda::agenda_with_holidays(&tasks, countdowns, &holidays, from, until)
                 }
                 Err(err) => eprintln!("failed to load the agenda: {err:#}"),
             }
@@ -1354,6 +1452,345 @@ impl CalendarView {
             crate::data_version::data_changed(cx.entity_id(), cx);
         }
         self.reload(cx);
+    }
+
+    /// Resizes a task's start or end date to `day`.
+    fn resize_task_to_day(&mut self, resized: &ResizedTask, day: NaiveDate, cx: &mut Context<Self>) {
+        let (start, end) = match resized.edge {
+            ResizeEdge::Start => (day.min(resized.end), resized.end),
+            ResizeEdge::End => (resized.start, day.max(resized.start)),
+        };
+        if let Err(err) = self.store.resize_dates(resized.id, start, end) {
+            eprintln!("failed to resize task dates: {err:#}");
+        } else {
+            crate::data_version::data_changed(cx.entity_id(), cx);
+        }
+        self.reload(cx);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start_timed_resize(
+        &mut self,
+        id: Id,
+        date: NaiveDate,
+        edge: ResizeEdge,
+        orig_start: NaiveTime,
+        orig_end: NaiveTime,
+        end_date: Option<NaiveDate>,
+        start_y: Pixels,
+        cx: &mut Context<Self>,
+    ) {
+        let current_time = match edge {
+            ResizeEdge::Start => orig_start,
+            ResizeEdge::End => orig_end,
+        };
+        self.timed_resize = Some(TimedResize { id, date, edge, orig_start, orig_end, end_date, start_y, current_time });
+        cx.notify();
+    }
+
+    fn update_timed_resize(&mut self, mouse_y: Pixels, cx: &mut Context<Self>) {
+        let Some(resize) = &mut self.timed_resize else { return };
+        let base_time = match resize.edge {
+            ResizeEdge::Start => resize.orig_start,
+            ResizeEdge::End => resize.orig_end,
+        };
+        let next = week_axis::time_at_offset(week_axis::offset(base_time) + f32::from(mouse_y - resize.start_y));
+        if resize.current_time != next {
+            resize.current_time = next;
+            cx.notify();
+        }
+    }
+
+    fn finish_timed_resize(&mut self, cx: &mut Context<Self>) {
+        let Some(resize) = self.timed_resize.take() else { return };
+        let (start, end) = resize.snapped_range();
+        let existing_task = self.tasks.iter().find(|t| t.id == resize.id);
+        let save_date = existing_task.and_then(|t| t.due_date).unwrap_or(resize.date);
+        let save_start = if resize.edge == ResizeEdge::Start && save_date == resize.date {
+            start
+        } else {
+            existing_task.and_then(|t| t.due_time).unwrap_or(start)
+        };
+        let save_end_date = existing_task.and_then(|t| t.end_date);
+        let save_end = if resize.edge == ResizeEdge::End && save_end_date.unwrap_or(save_date) == resize.date {
+            end
+        } else {
+            existing_task.and_then(|t| t.end_time).unwrap_or(end)
+        };
+        if let Err(err) = self.store.resize_timed_range(resize.id, save_date, save_start, save_end, save_end_date) {
+            eprintln!("failed to resize timed task: {err:#}");
+        } else {
+            crate::data_version::data_changed(cx.entity_id(), cx);
+        }
+        self.reload(cx);
+    }
+
+    fn open_new_event_editor(&mut self, date: NaiveDate, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(sub_id) = crate::subscriptions::feeds(cx)
+            .and_then(|feeds| feeds.read(cx).writable_calendars().first().map(|c| c.id))
+        else {
+            return;
+        };
+        let date_str = date.format("%Y-%m-%d").to_string();
+        let title = cx.new(|cx| TextInput::new(Mode::SingleLine, "", cx).without_cancel());
+        let location = cx.new(|cx| TextInput::new(Mode::SingleLine, "", cx).without_cancel());
+        let notes = cx.new(|cx| TextInput::new(Mode::MultiLine, "", cx).without_cancel());
+        let date_in = cx.new(|cx| TextInput::new(Mode::SingleLine, &date_str, cx).without_cancel());
+        let start_in = cx.new(|cx| TextInput::new(Mode::SingleLine, "09:00", cx).without_cancel());
+        let end_in = cx.new(|cx| TextInput::new(Mode::SingleLine, "10:00", cx).without_cancel());
+        window.focus(&title.focus_handle(cx), cx);
+        self.open_event = None;
+        self.event_editor = Some(EventEditor {
+            subscription_id: sub_id,
+            uid: None,
+            span_days: 0,
+            title,
+            location,
+            notes,
+            date: date_in,
+            start_time: start_in,
+            end_time: end_in,
+            all_day: false,
+        });
+        cx.notify();
+    }
+
+    fn open_edit_event_editor(&mut self, event: &EventBar, window: &mut Window, cx: &mut Context<Self>) {
+        let date_str = event.start.format("%Y-%m-%d").to_string();
+        let start_str = event.start_time.map(|t| t.format("%H:%M").to_string()).unwrap_or_default();
+        let end_str = event.end_time.map(|t| t.format("%H:%M").to_string()).unwrap_or_default();
+        let title = cx.new(|cx| TextInput::new(Mode::SingleLine, &event.title, cx).without_cancel());
+        let location = cx.new(|cx| TextInput::new(Mode::SingleLine, &event.location, cx).without_cancel());
+        let notes = cx.new(|cx| TextInput::new(Mode::MultiLine, &event.notes, cx).without_cancel());
+        let date_in = cx.new(|cx| TextInput::new(Mode::SingleLine, &date_str, cx).without_cancel());
+        let start_in = cx.new(|cx| TextInput::new(Mode::SingleLine, &start_str, cx).without_cancel());
+        let end_in = cx.new(|cx| TextInput::new(Mode::SingleLine, &end_str, cx).without_cancel());
+        window.focus(&title.focus_handle(cx), cx);
+        self.open_event = None;
+        self.event_editor = Some(EventEditor {
+            subscription_id: event.subscription_id,
+            uid: Some(event.key.clone()),
+            span_days: (event.end - event.start).num_days().max(0),
+            title,
+            location,
+            notes,
+            date: date_in,
+            start_time: start_in,
+            end_time: end_in,
+            all_day: event.start_time.is_none(),
+        });
+        cx.notify();
+    }
+
+    fn save_event_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editor) = self.event_editor.take() else { return };
+        let title = editor.title.read(cx).text().trim().to_owned();
+        if title.is_empty() {
+            window.focus(&self.focus_handle, cx);
+            cx.notify();
+            return;
+        }
+        let date = NaiveDate::parse_from_str(editor.date.read(cx).text().trim(), "%Y-%m-%d")
+            .unwrap_or_else(|_| Local::now().date_naive());
+        let parse_hhmm = |s: &str| {
+            let s = s.trim();
+            NaiveTime::parse_from_str(s, "%H:%M")
+                .or_else(|_| NaiveTime::parse_from_str(s, "%H:%M:%S"))
+                .ok()
+        };
+        let (start_time, end_time) = if editor.all_day {
+            (None, None)
+        } else {
+            let st = parse_hhmm(editor.start_time.read(cx).text());
+            let et = st.map(|from| parse_hhmm(editor.end_time.read(cx).text()).unwrap_or_else(|| from + chrono::Duration::hours(1)));
+            (st, et)
+        };
+        let draft = fern_core::ical::EventDraft {
+            uid: editor.uid.unwrap_or_else(|| Id::now_v7().to_string()),
+            title,
+            location: editor.location.read(cx).text().trim().to_owned(),
+            notes: editor.notes.read(cx).text().trim().to_owned(),
+            start_date: date,
+            start_time,
+            end_date: date + chrono::Duration::days(editor.span_days.max(0)),
+            end_time,
+            all_day: editor.all_day || start_time.is_none(),
+            timezone: None,
+        };
+        if let Some(feeds) = crate::subscriptions::feeds(cx) {
+            feeds.update(cx, |feeds, cx| {
+                if let Err(err) = feeds.save_event(editor.subscription_id, &draft, cx) {
+                    eprintln!("failed to save CalDAV event: {err:#}");
+                }
+            });
+        }
+        window.focus(&self.focus_handle, cx);
+        cx.notify();
+    }
+
+    fn delete_caldav_event(&mut self, subscription_id: Id, uid: &str, cx: &mut Context<Self>) {
+        self.open_event = None;
+        if let Some(feeds) = crate::subscriptions::feeds(cx) {
+            feeds.update(cx, |feeds, cx| {
+                if let Err(err) = feeds.delete_event(subscription_id, uid, cx) {
+                    eprintln!("failed to delete CalDAV event: {err:#}");
+                }
+            });
+        }
+        cx.notify();
+    }
+
+    fn move_event_to_day(&mut self, dragged: &DraggedEvent, target_day: NaiveDate, cx: &mut Context<Self>) {
+        let range = self.events_between(self.anchor - chrono::Duration::days(365), self.anchor + chrono::Duration::days(365), cx);
+        let Some(existing) = range.into_iter().find(|e| e.subscription_id == dragged.subscription_id && e.key == dragged.uid) else {
+            return;
+        };
+        let span = (existing.end - existing.start).num_days().max(0);
+        let draft = fern_core::ical::EventDraft {
+            uid: existing.key,
+            title: existing.title,
+            location: existing.location,
+            notes: existing.notes,
+            start_date: target_day,
+            start_time: existing.start_time,
+            end_date: target_day + chrono::Duration::days(span),
+            end_time: existing.end_time,
+            all_day: existing.start_time.is_none(),
+            timezone: None,
+        };
+        if let Some(feeds) = crate::subscriptions::feeds(cx) {
+            feeds.update(cx, |feeds, cx| {
+                if let Err(err) = feeds.save_event(dragged.subscription_id, &draft, cx) {
+                    eprintln!("failed to move CalDAV event: {err:#}");
+                }
+            });
+        }
+        cx.notify();
+    }
+
+    fn render_event_editor_modal(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let editor = self.event_editor.as_ref()?;
+        let strings = i18n::t(cx);
+        let theme = cx.theme().clone();
+        let title_label = if editor.uid.is_some() { strings.cal_edit_event } else { strings.cal_new_event };
+        let field = |label: &'static str, input: gpui::Entity<TextInput>, height: f32| {
+            v_flex()
+                .gap_1()
+                .child(Label::new(label).size(LabelSize::XSmall).color(Color::Muted))
+                .child(
+                    div()
+                        .min_h(px(height))
+                        .px_2p5()
+                        .py_1()
+                        .rounded(px(6.))
+                        .border_1()
+                        .border_color(theme.colors().border)
+                        .bg(theme.colors().background)
+                        .child(input),
+                )
+        };
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(gpui::black().opacity(0.35))
+                .occlude()
+                .id("calendar-event-editor-backdrop")
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.event_editor = None;
+                    window.focus(&this.focus_handle, cx);
+                    cx.notify();
+                }))
+                .child(
+                    v_flex()
+                        .id("calendar-event-editor")
+                        .w(px(380.))
+                        .p_4()
+                        .gap_3()
+                        .rounded(px(10.))
+                        .bg(theme.colors().elevated_surface_background)
+                        .border_1()
+                        .border_color(theme.colors().border)
+                        .shadow_lg()
+                        .on_click(|_, _, cx| cx.stop_propagation())
+                        .child(
+                            h_flex()
+                                .child(div().flex_1().child(Label::new(title_label).weight(FontWeight::SEMIBOLD)))
+                                .child(IconButton::new("event-editor-close", IconName::X).on_click(cx.listener(|this, _, window, cx| {
+                                    this.event_editor = None;
+                                    window.focus(&this.focus_handle, cx);
+                                    cx.notify();
+                                }))),
+                        )
+                        .child(field(strings.cal_event_title, editor.title.clone(), 30.))
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .child(div().flex_1().child(field(strings.filter_date, editor.date.clone(), 30.)))
+                                .when(!editor.all_day, |el| {
+                                    el.child(div().w(px(76.)).child(field(strings.range_start, editor.start_time.clone(), 30.)))
+                                        .child(div().w(px(76.)).child(field(strings.range_end, editor.end_time.clone(), 30.)))
+                                }),
+                        )
+                        .child(
+                            h_flex()
+                                .id("event-editor-all-day")
+                                .cursor_pointer()
+                                .child(div().flex_1().child(Label::new(strings.cal_all_day).size(LabelSize::Small)))
+                                .child(Switch::new().toggle_state(editor.all_day))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if let Some(ed) = &mut this.event_editor {
+                                        ed.all_day = !ed.all_day;
+                                        cx.notify();
+                                    }
+                                })),
+                        )
+                        .child(field(strings.location, editor.location.clone(), 30.))
+                        .child(field(strings.notes_placeholder, editor.notes.clone(), 68.))
+                        .child(
+                            h_flex()
+                                .justify_end()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .id("event-editor-cancel")
+                                        .h(px(30.))
+                                        .px_3()
+                                        .flex()
+                                        .items_center()
+                                        .rounded(px(6.))
+                                        .border_1()
+                                        .border_color(theme.colors().border)
+                                        .cursor_pointer()
+                                        .hover(|s| s.bg(theme.colors().ghost_element_hover))
+                                        .child(Label::new(strings.cancel).size(LabelSize::Small))
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.event_editor = None;
+                                            window.focus(&this.focus_handle, cx);
+                                            cx.notify();
+                                        })),
+                                )
+                                .child(
+                                    div()
+                                        .id("event-editor-save")
+                                        .h(px(30.))
+                                        .px_3p5()
+                                        .flex()
+                                        .items_center()
+                                        .rounded(px(6.))
+                                        .bg(theme.colors().accent)
+                                        .cursor_pointer()
+                                        .hover(|s| s.opacity(0.9))
+                                        .child(Label::new(strings.save).size(LabelSize::Small).color(Color::OnAccent))
+                                        .on_click(cx.listener(|this, _, window, cx| this.save_event_editor(window, cx))),
+                                ),
+                        ),
+                )
+                .into_any_element(),
+        )
     }
 
     fn go_to_today(&mut self, cx: &mut Context<Self>) {
@@ -1911,6 +2348,10 @@ impl CalendarView {
             .overflow_hidden()
             .drag_over::<DraggedTask>(move |style, _, _, _| style.bg(accent.opacity(0.12)))
             .on_drop(cx.listener(move |this, dragged: &DraggedTask, _, cx| this.drop_on_day(dragged.id, date, cx)))
+            .drag_over::<ResizedTask>(move |style, _, _, _| style.bg(accent.opacity(0.14)))
+            .on_drop(cx.listener(move |this, resized: &ResizedTask, _, cx| this.resize_task_to_day(resized, date, cx)))
+            .drag_over::<DraggedEvent>(move |style, _, _, _| style.bg(accent.opacity(0.12)))
+            .on_drop(cx.listener(move |this, event: &DraggedEvent, _, cx| this.move_event_to_day(event, date, cx)))
             .gap(px(DAY_ITEM_GAP))
             .px(px(2.))
             .pt(px(DAY_TOP_PADDING))
@@ -1957,7 +2398,7 @@ impl CalendarView {
                     // Items and their popovers have their own actions. Only empty calendar
                     // space creates a task, including for non-task items and the more row.
                     .on_click(|_, _, cx| cx.stop_propagation())
-                    .children(tasks.iter().take(visible).map(|task| self.task_bar(task, Some(date), cx)))
+                    .children(tasks.iter().take(visible).map(|task| self.task_bar_with_resize(task, Some(date), true, cx)))
                     .children(events.into_iter().take(event_room).map(|event| self.event_bar(event, date, cx)))
                     .children(extras.into_iter().take(room))
                     .when(hidden > 0 && slots > 0, |el| {
@@ -1977,6 +2418,10 @@ impl CalendarView {
     /// A task's bar on `day`; `None` in the Year view's day card, where a click opens the task in
     /// the list.
     fn task_bar(&self, task: &Task, day: Option<NaiveDate>, cx: &mut Context<Self>) -> Stateful<ui::HorizontalStack> {
+        self.task_bar_with_resize(task, day, false, cx)
+    }
+
+    fn task_bar_with_resize(&self, task: &Task, day: Option<NaiveDate>, horizontal_resize: bool, cx: &mut Context<Self>) -> Stateful<ui::HorizontalStack> {
         let theme = cx.theme().clone();
         let id = task.id;
         // Keep closed titles muted; the checkbox distinguishes completed and dismissed tasks, while notes show their page icon.
@@ -2002,6 +2447,7 @@ impl CalendarView {
                     Checkbox::new(SharedString::from(format!("calendar-task-checkbox-{id}")))
                         .size(px(12.))
                         .toggle_state(completed)
+                        .in_progress(task.is_in_progress())
                         .dismissed(wont_do)
                         .lines(task.checklist.is_some())
                         .on_click(cx.listener(move |this, _, _, cx| {
@@ -2011,14 +2457,56 @@ impl CalendarView {
                 )
                 .into_any_element()
         };
+        let title = if task.title.trim().is_empty() { i18n::t(cx).untitled.to_owned() } else { task.title.clone() };
+        let handle_title: SharedString = title.clone().into();
+        let span_start = task.due_date.unwrap_or_else(|| Local::now().date_naive());
+        let span_end = task.end_date.unwrap_or(span_start).max(span_start);
+        let resize_handle = |edge: ResizeEdge| {
+            let tag = if edge == ResizeEdge::Start { "start" } else { "end" };
+            let payload = ResizedTask {
+                id,
+                title: handle_title.clone(),
+                start: span_start,
+                end: span_end,
+                edge,
+            };
+            div()
+                .id(SharedString::from(format!("calendar-task-resize-{tag}-{id}")))
+                .flex_none()
+                .w(px(5.))
+                .h_full()
+                .cursor_ew_resize()
+                .on_drag(payload, |d, _, _, cx| cx.new(|_| d.clone()))
+                .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(|_, _, cx| cx.stop_propagation())
+        };
+        let body = h_flex()
+            .id(SharedString::from(format!("calendar-task-body-{id}")))
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .items_center()
+            .gap_1()
+            .when(horizontal_resize, |el| {
+                el.on_drag(dragged.clone(), |d, _, _, cx| cx.new(|_| d.clone()))
+            })
+            .child(marker)
+            .child(
+                Label::new(title)
+                    .size(LabelSize::XSmall)
+                    .color(if done { Color::Muted } else { Color::Default })
+                    .truncate(),
+            );
         h_flex()
             .id(SharedString::from(format!("calendar-task-{id}")))
             .debug_selector(|| format!("calendar-task-{id}"))
-            .on_drag(dragged, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
+            .when(!horizontal_resize, |el| {
+                el.on_drag(dragged, |d, _, _, cx| cx.new(|_| d.clone()))
+            })
             .h(px(18.))
             .flex_none()
-            .gap_1()
-            .px_1()
+            .gap_0p5()
+            .px(if horizontal_resize { px(0.) } else { px(4.) })
             .rounded(px(3.))
             .cursor_pointer()
             // Style → Item Style: Classic fills the bar, Modern tints it lighter with a colored edge.
@@ -2029,13 +2517,9 @@ impl CalendarView {
             }))
             .when(modern, |el| el.border_l_2().border_color(tint))
             .hover(|s| s.bg(tint.opacity(0.4)))
-            .child(marker)
-            .child(
-                Label::new(if task.title.trim().is_empty() { i18n::t(cx).untitled.to_owned() } else { task.title.clone() })
-                    .size(LabelSize::XSmall)
-                    .color(if done { Color::Muted } else { Color::Default })
-                    .truncate(),
-            )
+            .when(horizontal_resize, |el| el.child(resize_handle(ResizeEdge::Start)))
+            .child(body)
+            .when(horizontal_resize, |el| el.child(resize_handle(ResizeEdge::End)))
             .on_click(cx.listener(move |this, _, _, cx| match day {
                 Some(day) => this.open_card(id, day, cx),
                 None => cx.emit(OpenTask(id)),
@@ -2057,7 +2541,13 @@ impl CalendarView {
         let strings = i18n::t(cx);
         let theme = cx.theme().clone();
         let week = self.shown_days();
-        let gutter = px(56.);
+        let secondary_tz = self
+            .options
+            .secondary_timezone
+            .as_deref()
+            .and_then(|z| z.parse::<chrono_tz::Tz>().ok());
+        let axis_ref_day = week.first().copied().unwrap_or(today);
+        let gutter = if secondary_tz.is_some() { px(108.) } else { px(56.) };
         let line = theme.colors().border_variant;
 
         // All-day strip: day numbers and tasks without a time.
@@ -2067,14 +2557,23 @@ impl CalendarView {
             .min_h(px(64.))
             .border_b_1()
             .border_color(line)
-            .child(div().w(gutter).flex_none())
+            .child(
+                div().w(gutter).flex_none().when_some(secondary_tz, |el, tz| {
+                    let tz_short = tz.name().rsplit('/').next().unwrap_or(tz.name()).replace('_', " ");
+                    el.flex().items_end().h(px(26.)).px_1().gap_1().child(
+                        div().w(px(50.)).child(Label::new(tz_short).size(LabelSize::XSmall).color(Color::Muted).truncate()),
+                    ).child(
+                        div().flex_1().flex().justify_end().child(Label::new(strings.timezone_local).size(LabelSize::XSmall).color(Color::Muted).truncate()),
+                    )
+                }),
+            )
             .children(week.iter().copied().map(|date| {
                 let accent = theme.colors().accent;
                 let tasks: Vec<AnyElement> = self
                     .tasks
                     .iter()
                     .filter(|t| self.options.shows_task(t, date) && t.due_time.is_none())
-                    .map(|t| self.task_bar(t, Some(date), cx).into_any_element())
+                    .map(|t| self.task_bar_with_resize(t, Some(date), true, cx).into_any_element())
                     .collect::<Vec<_>>()
                     .into_iter()
                     .chain(self.events_on(date, cx).into_iter().filter(|e| e.start_time.is_none()).map(|e| self.event_bar(e, date, cx).into_any_element()).collect::<Vec<_>>())
@@ -2092,6 +2591,10 @@ impl CalendarView {
                     .border_color(line)
                     .drag_over::<DraggedTask>(move |style, _, _, _| style.bg(accent.opacity(0.12)))
                     .on_drop(cx.listener(move |this, dragged: &DraggedTask, _, cx| this.drop_on_day(dragged.id, date, cx)))
+                    .drag_over::<ResizedTask>(move |style, _, _, _| style.bg(accent.opacity(0.14)))
+                    .on_drop(cx.listener(move |this, resized: &ResizedTask, _, cx| this.resize_task_to_day(resized, date, cx)))
+                    .drag_over::<DraggedEvent>(move |style, _, _, _| style.bg(accent.opacity(0.12)))
+                    .on_drop(cx.listener(move |this, event: &DraggedEvent, _, cx| this.move_event_to_day(event, date, cx)))
                     .child(
                         h_flex().h(px(26.)).px_1().child(
                             div()
@@ -2120,6 +2623,20 @@ impl CalendarView {
         let hour_label = |hour: u32| -> SharedString {
             if hour == 12 { strings.noon.into() } else { calendar::format_hour(hour, strings).into() }
         };
+        let tz_hour_label = |hour: u32, tz: chrono_tz::Tz| -> String {
+            let (h, m, delta) = week_axis::hour_in_timezone(axis_ref_day, hour, tz);
+            let mut label = if m == 0 {
+                calendar::format_hour(h, strings)
+            } else {
+                calendar::format_time(NaiveTime::from_hms_opt(h, m, 0).unwrap_or_default(), strings)
+            };
+            if delta > 0 {
+                label.push_str("+1");
+            } else if delta < 0 {
+                label.push_str("-1");
+            }
+            label
+        };
         let now_color = theme.status().error;
         let mut axis = v_flex().w(gutter).flex_none().child(
             div()
@@ -2134,12 +2651,21 @@ impl CalendarView {
         );
         for hour in week_axis::FIRST_HOUR..week_axis::LAST_HOUR {
             axis = axis.child(
-                div()
+                h_flex()
                     .h(px(week_axis::HOUR_HEIGHT))
                     .px_1()
-                    .flex()
-                    .justify_end()
-                    .child(Label::new(hour_label(hour)).size(LabelSize::XSmall).color(Color::Muted)),
+                    .items_start()
+                    .when_some(secondary_tz, |el, tz| {
+                        el.child(
+                            div()
+                                .w(px(50.))
+                                .flex()
+                                .justify_end()
+                                .pr_1()
+                                .child(Label::new(tz_hour_label(hour, tz)).size(LabelSize::XSmall).color(Color::Muted)),
+                        )
+                    })
+                    .child(div().flex_1().flex().justify_end().child(Label::new(hour_label(hour)).size(LabelSize::XSmall).color(Color::Muted))),
             );
         }
         axis = axis.child(
@@ -2161,7 +2687,11 @@ impl CalendarView {
                 .iter()
                 .filter(|t| self.options.show_completed || !t.is_completed())
                 .filter_map(|t| calendar::timed_segment(t, date).map(|segment| (t, segment)))
-                .map(|(t, (from, to))| {
+                .map(|(t, (orig_from, orig_to))| {
+                    let preview = self.timed_resize.as_ref().filter(|r| r.id == t.id && r.date == date);
+                    let (from, to) = preview.map_or((orig_from, orig_to), TimedResize::snapped_range);
+                    let id = t.id;
+                    let end_date = t.end_date;
                     // A span is drawn as a block from its start to its end; a point in time as a bar.
                     let height = (week_axis::offset(to) - week_axis::offset(from)).max(18.);
                     div()
@@ -2170,7 +2700,40 @@ impl CalendarView {
                         .left(px(2.))
                         .right(px(2.))
                         .h(px(height))
-                        .child(self.task_bar(t, Some(date), cx).h(px(height)).items_start().pt(px(1.)))
+                        .child(
+                            div()
+                                .relative()
+                                .size_full()
+                                .child(self.task_bar(t, Some(date), cx).size_full().items_start().pt(px(1.)))
+                                .child(
+                                    div()
+                                        .id(SharedString::from(format!("timed-resize-top-{id}-{date}")))
+                                        .absolute()
+                                        .top_0()
+                                        .left_0()
+                                        .right_0()
+                                        .h(px(5.))
+                                        .cursor_ns_resize()
+                                        .on_mouse_down(gpui::MouseButton::Left, cx.listener(move |this, ev: &gpui::MouseDownEvent, _, cx| {
+                                            cx.stop_propagation();
+                                            this.start_timed_resize(id, date, ResizeEdge::Start, orig_from, orig_to, end_date, ev.position.y, cx);
+                                        })),
+                                )
+                                .child(
+                                    div()
+                                        .id(SharedString::from(format!("timed-resize-bot-{id}-{date}")))
+                                        .absolute()
+                                        .bottom_0()
+                                        .left_0()
+                                        .right_0()
+                                        .h(px(5.))
+                                        .cursor_ns_resize()
+                                        .on_mouse_down(gpui::MouseButton::Left, cx.listener(move |this, ev: &gpui::MouseDownEvent, _, cx| {
+                                            cx.stop_propagation();
+                                            this.start_timed_resize(id, date, ResizeEdge::End, orig_from, orig_to, end_date, ev.position.y, cx);
+                                        })),
+                                ),
+                        )
                         .into_any_element()
                 })
                 .collect();
@@ -2215,6 +2778,8 @@ impl CalendarView {
                 .border_color(line)
                 .drag_over::<DraggedTask>(move |style, _, _, _| style.bg(accent.opacity(0.08)))
                 .on_drop(cx.listener(move |this, dragged: &DraggedTask, _, cx| this.drop_on_day(dragged.id, date, cx)))
+                .drag_over::<DraggedEvent>(move |style, _, _, _| style.bg(accent.opacity(0.08)))
+                .on_drop(cx.listener(move |this, event: &DraggedEvent, _, cx| this.move_event_to_day(event, date, cx)))
                 .children(hour_lines)
                 .children(timed)
                 .children(timed_events)
@@ -2744,6 +3309,22 @@ impl Render for CalendarView {
                     el.child(PopoverAttachment::new(Placement::BelowRight, editor.view.clone()))
                 }),
             )
+            .when(
+                crate::subscriptions::feeds(cx).is_some_and(|f| !f.read(cx).writable_calendars().is_empty()),
+                |el| {
+                    el.child(
+                        bordered("calendar-add-event-frame").child(
+                            IconButton::new("calendar-add-event", IconName::CalendarPlus)
+                                .size(px(28.))
+                                .icon_size(IconSize::Small)
+                                .tip(strings.cal_new_event, ui::TipSide::Below)
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.open_new_event_editor(this.selected_day.unwrap_or(today), window, cx);
+                                })),
+                        ),
+                    )
+                },
+            )
             .child(
                 div()
                     .relative()
@@ -2887,6 +3468,10 @@ impl Render for CalendarView {
             .on_action(cx.listener(|this, _: &CalendarToday, _, cx| this.go_to_today(cx)))
             .on_action(cx.listener(|this, _: &PrintYear, _, cx| this.print_year(cx)))
             .on_action(cx.listener(Self::dismiss_transient))
+            .when(self.timed_resize.is_some(), |el| {
+                el.on_mouse_move(cx.listener(|this, ev: &gpui::MouseMoveEvent, _, cx| this.update_timed_resize(ev.position.y, cx)))
+                    .on_mouse_up(gpui::MouseButton::Left, cx.listener(|this, _, _, cx| this.finish_timed_resize(cx)))
+            })
             .size_full()
             .bg(theme.colors().calendar_background)
             .text_color(theme.colors().text)
@@ -2909,6 +3494,7 @@ impl Render for CalendarView {
             }))
             .children(self.options_dialog.clone())
             .children(self.render_context_menu(cx))
+            .children(self.render_event_editor_modal(cx))
     }
 }
 
@@ -2916,6 +3502,8 @@ impl Render for CalendarView {
 #[derive(Clone)]
 struct EventBar {
     key: String,
+    subscription_id: Id,
+    writable: bool,
     title: String,
     start: NaiveDate,
     end: NaiveDate,
@@ -3595,5 +4183,124 @@ mod tests {
         cx.simulate_click(march, modifiers);
         assert!(cx.debug_bounds("calendar-month-picker").is_none());
         cx.update(|_, cx| assert_eq!(view.read(cx).month, NaiveDate::from_ymd_opt(2026, 3, 1).unwrap()));
+    }
+
+    #[gpui::test]
+    fn drag_resize_span_and_timed_range_and_dual_tz_options(cx: &mut TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let day = NaiveDate::from_ymd_opt(2026, 11, 18).unwrap();
+        let t_span = store.add_task("Multi-day sprint").unwrap();
+        store.set_due(t_span.id, Some(day), None).unwrap();
+
+        let t_timed = store.add_task("Deep block").unwrap();
+        let t_start = NaiveTime::from_hms_opt(10, 0, 0).unwrap();
+        let t_end = NaiveTime::from_hms_opt(11, 0, 0).unwrap();
+        store.set_due(t_timed.id, Some(day), Some(t_start)).unwrap();
+        store.set_due_end(t_timed.id, Some((day, Some(t_end)))).unwrap();
+
+        cx.update(|cx| {
+            theme::init(cx);
+            cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+            assert!(crate::keymap::load_default(&assets::Assets, cx).unwrap().is_empty());
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let mut calendar = CalendarView::new(store.clone(), window, cx);
+            calendar.mode = CalendarMode::Week;
+            calendar.anchor = day;
+            calendar.options.secondary_timezone = Some("UTC".into());
+            store.save_calendar_options(&calendar.options).unwrap();
+            calendar.reload(cx);
+            calendar
+        });
+
+        // Horizontal date-span resize from end edge and start edge.
+        let end_day = day + chrono::Duration::days(2);
+        let earlier_day = day - chrono::Duration::days(1);
+        view.update(cx, |cal, cx| {
+            let r_end = ResizedTask {
+                id: t_span.id,
+                title: "Multi-day sprint".into(),
+                start: day,
+                end: day,
+                edge: ResizeEdge::End,
+            };
+            cal.resize_task_to_day(&r_end, end_day, cx);
+            let after_end = store.task(t_span.id).unwrap().unwrap();
+            assert_eq!((after_end.due_date, after_end.end_date), (Some(day), Some(end_day)));
+
+            let r_start = ResizedTask {
+                id: t_span.id,
+                title: "Multi-day sprint".into(),
+                start: day,
+                end: end_day,
+                edge: ResizeEdge::Start,
+            };
+            cal.resize_task_to_day(&r_start, earlier_day, cx);
+            let after_start = store.task(t_span.id).unwrap().unwrap();
+            assert_eq!((after_start.due_date, after_start.end_date), (Some(earlier_day), Some(end_day)));
+        });
+
+        // Vertical timed resize: drag bottom +60px (1h) and commit, then Escape cancels a second drag.
+        view.update(cx, |cal, cx| {
+            cal.start_timed_resize(t_timed.id, day, ResizeEdge::End, t_start, t_end, None, px(100.), cx);
+            cal.update_timed_resize(px(100. + week_axis::HOUR_HEIGHT), cx);
+            cal.finish_timed_resize(cx);
+            let saved = store.task(t_timed.id).unwrap().unwrap();
+            assert_eq!(saved.due_time, Some(NaiveTime::from_hms_opt(10, 0, 0).unwrap()));
+            assert_eq!(saved.end_time, Some(NaiveTime::from_hms_opt(12, 0, 0).unwrap()));
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |cal, cx| {
+                cal.start_timed_resize(t_timed.id, day, ResizeEdge::End, t_start, NaiveTime::from_hms_opt(12, 0, 0).unwrap(), None, px(100.), cx);
+                cal.update_timed_resize(px(220.), cx);
+                assert!(cal.try_dismiss_transient(window, cx));
+                assert!(cal.timed_resize.is_none());
+            });
+            let unchanged = store.task(t_timed.id).unwrap().unwrap();
+            assert_eq!(unchanged.end_time, Some(NaiveTime::from_hms_opt(12, 0, 0).unwrap()));
+        });
+    }
+
+    #[gpui::test]
+    fn writable_caldav_event_crud_and_drag_move(cx: &mut TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let sub_id = store
+            .add_caldav_subscription(
+                "Team",
+                "http://127.0.0.1:9/dav/cal/",
+                Some("#3B82F6"),
+                fern_core::ical::CalendarProvider::CalDav,
+                "alice",
+                "pw",
+                true,
+            )
+            .unwrap();
+        let day = NaiveDate::from_ymd_opt(2026, 11, 18).unwrap();
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:cal-ev-1\r\nSUMMARY:Design Sync\r\nDTSTART:20261118T100000\r\nDTEND:20261118T110000\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        store.upsert_local_calendar_event(sub_id, "cal-ev-1", "http://127.0.0.1:9/dav/cal/cal-ev-1.ics", ics).unwrap();
+
+        cx.update(|cx| {
+            theme::init(cx);
+            crate::subscriptions::init(store.clone(), cx);
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| CalendarView::new(store.clone(), window, cx));
+        let next_day = day + chrono::Duration::days(1);
+        cx.update(|_, cx| {
+            let bars = view.read(cx).events_on(day, cx);
+            assert_eq!(bars.len(), 1);
+            assert!(bars[0].writable);
+            assert_eq!(bars[0].subscription_id, sub_id);
+
+            view.update(cx, |cal, cx| {
+                cal.move_event_to_day(&DraggedEvent { subscription_id: sub_id, uid: "cal-ev-1".into(), title: "Design Sync".into() }, next_day, cx);
+            });
+            assert_eq!(view.read(cx).events_on(next_day, cx).len(), 1);
+            assert!(view.read(cx).events_on(day, cx).is_empty());
+
+            view.update(cx, |cal, cx| {
+                cal.delete_caldav_event(sub_id, "cal-ev-1", cx);
+            });
+            assert!(view.read(cx).events_on(next_day, cx).is_empty());
+        });
     }
 }

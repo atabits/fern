@@ -2,21 +2,21 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
-use fern_core::{Id, Kind, List, ListFolder, Priority, Store, Tag, Task, View, ViewCounts};
+use fern_core::{ColorBy, Id, Kind, List, ListFolder, Priority, Store, Tag, Task, View, ViewCounts};
 use chrono::{Datelike, Duration, Local, NaiveDate, TimeZone as _};
 use gpui::{ElementId, Entity, FocusHandle, Focusable, FontWeight, ListAlignment, ListState, MouseButton, Pixels, Point, list};
 use ui::prelude::*;
 
 use crate::drag::{
     DraggedColumn, DraggedFilter, DraggedFolder, DraggedList, DraggedParentTag,
-    DraggedSidebarSection, DraggedSmartList, DraggedTag, DraggedTask,
+    DraggedSidebarSection, DraggedSmartList, DraggedTag, DraggedTask, ResizeEdge, ResizedTask,
 };
 use ui::{HorizontalScrollbar, Placement, PopoverAttachment, SubmenuItem, VerticalScrollbar, popover};
 
 use crate::actions::{
-    AddSubtask, ClearDate, DeleteTask, DismissTransient, PinTask, PriorityHigh, PriorityLow, PriorityMedium,
-    PriorityNone, SelectNext, SelectPrevious, SetDate, SetNextWeek, SetToday, SetTomorrow, ToggleAllSubtasks,
-    ToggleComplete,
+    AddSubtask, ClearDate, DeleteTask, DismissTransient, ExtendSelectionNext, ExtendSelectionPrevious, PinTask,
+    PriorityHigh, PriorityLow, PriorityMedium, PriorityNone, SelectAllTasks, SelectNext, SelectPrevious, SetDate,
+    SetNextWeek, SetToday, SetTomorrow, ToggleAllSubtasks, ToggleComplete, ToggleInProgress,
 };
 use crate::i18n::{self, CurrentLocale, Strings};
 use crate::list_dialog::{DialogEvent, FolderDialog, ListDialog};
@@ -59,6 +59,7 @@ pub struct StartHabitFocus {
 
 impl gpui::EventEmitter<StartHabitFocus> for TodoView {}
 
+mod batch;
 mod filters;
 mod kanban;
 mod menus;
@@ -68,6 +69,7 @@ mod timeline;
 #[cfg(all(test, debug_assertions))]
 mod tests;
 
+use batch::BatchMenu;
 use filters::FilterEdit;
 use kanban::{BoardCard, KanbanColRows};
 use menus::{ClosedMenu, ListMenuTarget, SortMenu};
@@ -179,7 +181,13 @@ pub struct TodoView {
     kanban_column_size: u8,
     kanban_column_color: bool,
     kanban_quick_add: bool,
+    kanban_workflow: bool,
     kanban_quick_adds: HashMap<String, (DropTarget, Entity<TextInput>)>,
+    timeline_secondary_tz: Option<String>,
+    timeline_tz_menu: bool,
+    timeline_tz_input: Entity<TextInput>,
+    timeline_color_by: ColorBy,
+    timeline_show_weekends: bool,
     kanban_section_colors: HashMap<Id, String>,
     kanban_folded_sub: HashSet<String>,
     kanban_scroll: gpui::ScrollHandle,
@@ -250,6 +258,9 @@ pub struct TodoView {
     card_detail: Entity<TaskDetail>,
     card: Option<Id>,
     selected: Option<Id>,
+    multi_selected: HashSet<Id>,
+    selection_anchor: Option<Id>,
+    batch_menu: Option<BatchMenu>,
     /// A task row's right-click menu: the task, pointer window coordinates, and precomputed nesting.
     context_menu: Option<(Id, gpui::Point<Pixels>, task_menu::TaskNesting)>,
     /// Its side menu open: 0 Move to, 1 Start Focus.
@@ -303,6 +314,8 @@ impl TodoView {
             this.update_search_query(query, cx);
         })
         .detach();
+        let timeline_tz_input = cx.new(|cx| TextInput::new(Mode::SingleLine, "", cx).without_cancel());
+        cx.subscribe(&timeline_tz_input, |_, _, _: &Changed, cx| cx.notify()).detach();
         cx.observe_window_bounds(window, |this, window, cx| this.sync_viewport(window, cx))
             .detach();
 
@@ -426,7 +439,13 @@ impl TodoView {
             kanban_column_size: 1,
             kanban_column_color: false,
             kanban_quick_add: false,
+            kanban_workflow: false,
             kanban_quick_adds: HashMap::new(),
+            timeline_secondary_tz: None,
+            timeline_tz_menu: false,
+            timeline_tz_input,
+            timeline_color_by: ColorBy::List,
+            timeline_show_weekends: true,
             kanban_section_colors: HashMap::new(),
             kanban_folded_sub: HashSet::new(),
             kanban_scroll: gpui::ScrollHandle::new(),
@@ -468,6 +487,9 @@ impl TodoView {
             card_detail,
             card: None,
             selected: None,
+            multi_selected: HashSet::new(),
+            selection_anchor: None,
+            batch_menu: None,
             context_menu: None,
             context_side: None,
             error: None,
@@ -974,6 +996,7 @@ impl TodoView {
         self.show_details = self.view_flag("show_details", false);
         self.kanban = self.view_flag("kanban", false);
         self.timeline = self.view_flag("timeline", false);
+        self.kanban_workflow = self.view_flag("kanban_workflow", false);
         self.kanban_column_size = match self.store.setting("kanban:column_size").ok().flatten().as_deref() {
             Some("s") => 0,
             Some("l") => 2,
@@ -981,6 +1004,27 @@ impl TodoView {
         };
         self.kanban_column_color = self.store.setting("kanban:column_color").ok().flatten().is_some_and(|v| v == "1");
         self.kanban_quick_add = self.store.setting("kanban:quick_add").ok().flatten().is_some_and(|v| v == "1");
+        self.timeline_secondary_tz = self
+            .store
+            .setting("timeline_secondary_tz")
+            .ok()
+            .flatten()
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty() && s.parse::<chrono_tz::Tz>().is_ok());
+        self.timeline_color_by = self
+            .store
+            .setting("timeline_color_by")
+            .ok()
+            .flatten()
+            .and_then(|c| ColorBy::from_code(&c))
+            .unwrap_or(ColorBy::List);
+        self.timeline_show_weekends = self
+            .store
+            .setting("timeline_show_weekends")
+            .ok()
+            .flatten()
+            .as_deref()
+            != Some("0");
         self.timeline_scale = self
             .store
             .setting(&format!("timeline_scale:{}", self.view_key()))
@@ -1042,6 +1086,11 @@ impl TodoView {
                 detail.show(selected, cx);
             });
         } else {
+            self.multi_selected.retain(|id| self.tasks.iter().any(|t| t.id == *id));
+            if self.multi_selected.len() <= 1 {
+                self.multi_selected.clear();
+                self.batch_menu = None;
+            }
             // Keep completed tasks open after they leave a view like Today. A deleted task is only
             // shown in Trash; otherwise the detail panel returns to its empty state.
             let selected = self.selected.and_then(|id| self.store.task(id).ok().flatten())
@@ -1650,6 +1699,7 @@ impl TodoView {
         self.show_details = self.view_flag("show_details", false);
         self.kanban = self.view_flag("kanban", false);
         self.timeline = self.view_flag("timeline", false);
+        self.kanban_workflow = self.view_flag("kanban_workflow", false);
         self.header_menu_open = false;
         if name == "show_completed" && self.view == View::Today {
             if value {
@@ -1768,6 +1818,7 @@ impl TodoView {
             self.habit_menu.take().is_some(),
             self.list_menu.take().is_some(),
             self.closed_menu.take().is_some(),
+            self.batch_menu.take().is_some(),
             self.column_menu.take().is_some(),
             self.section_menu.take().is_some(),
             self.view_options.take().is_some(),
@@ -1808,6 +1859,10 @@ impl TodoView {
             self.dismiss_card(window, cx);
             return true;
         }
+        if !self.multi_selected.is_empty() {
+            self.clear_multi_selection(cx);
+            return true;
+        }
         self.detail.read(cx).has_popup()
             && self.detail.update(cx, |detail, cx| detail.dismiss_popup(window, cx))
     }
@@ -1830,12 +1885,15 @@ impl TodoView {
         if ids.is_empty() {
             return;
         }
+        self.multi_selected.clear();
+        self.batch_menu = None;
         let next = match self.active_task_id().and_then(|id| ids.iter().position(|i| *i == id)) {
             Some(index) => (index as isize + step).clamp(0, ids.len() as isize - 1) as usize,
             None if step > 0 => 0,
             None => ids.len() - 1,
         };
         let id = ids[next];
+        self.selection_anchor = Some(id);
         self.select_in_current_layout(id, cx);
         if let Some(ix) = self.list_entries.iter().position(|e| matches!(e, ListEntry::Row(Row::Task { task, .. }) if task.id == id)) {
             self.list_state.scroll_to_reveal_item(ix);
@@ -1851,6 +1909,16 @@ impl TodoView {
     }
 
     fn toggle_selected(&mut self, _: &ToggleComplete, _: &mut Window, cx: &mut Context<Self>) {
+        if self.is_multi_selecting() {
+            let ids = self.selected_task_ids();
+            let all_completed = !ids.is_empty()
+                && ids
+                    .iter()
+                    .filter_map(|id| self.tasks.iter().find(|t| t.id == *id))
+                    .all(Task::is_completed);
+            self.run_batch(false, cx, move |store, ids| store.batch_complete(ids, !all_completed));
+            return;
+        }
         if let Some(id) = self.active_task_id() {
             if self.completing.contains_key(&id) {
                 self.toggle(id, false, cx);
@@ -1870,6 +1938,16 @@ impl TodoView {
     }
 
     fn pin_selected(&mut self, _: &PinTask, _: &mut Window, cx: &mut Context<Self>) {
+        if self.is_multi_selecting() {
+            let ids = self.selected_task_ids();
+            let all_pinned = !ids.is_empty()
+                && ids
+                    .iter()
+                    .filter_map(|id| self.tasks.iter().find(|t| t.id == *id))
+                    .all(|t| t.pinned_at.is_some());
+            self.run_batch(false, cx, move |store, ids| store.batch_set_pinned(ids, !all_pinned));
+            return;
+        }
         self.edit_selected(cx, |store, task| store.set_pinned(task.id, task.pinned_at.is_none()));
     }
 
@@ -1883,6 +1961,11 @@ impl TodoView {
 
     fn set_selected_due(&mut self, days: Option<i64>, cx: &mut Context<Self>) {
         let today = Self::today();
+        if self.is_multi_selecting() {
+            let date = days.map(|d| today + Duration::days(d));
+            self.run_batch(false, cx, move |store, ids| store.batch_set_due(ids, date, None));
+            return;
+        }
         self.edit_selected(cx, move |store, task| {
             let date = days.map(|d| today + Duration::days(d));
             store.set_due(task.id, date, date.and(task.due_time))
@@ -1890,10 +1973,18 @@ impl TodoView {
     }
 
     fn set_selected_priority(&mut self, priority: Priority, cx: &mut Context<Self>) {
+        if self.is_multi_selecting() {
+            self.run_batch(false, cx, move |store, ids| store.batch_set_priority(ids, priority));
+            return;
+        }
         self.edit_selected(cx, move |store, task| store.set_priority(task.id, priority));
     }
 
     fn delete_selected(&mut self, _: &DeleteTask, _: &mut Window, cx: &mut Context<Self>) {
+        if self.is_multi_selecting() {
+            self.run_batch(true, cx, |store, ids| store.batch_delete(ids));
+            return;
+        }
         let Some(id) = self.active_task_id() else { return };
         // Keep a selection so repeated presses keep working down the list.
         let ids = self.visible_task_ids(i18n::t(cx));
@@ -1909,6 +2000,9 @@ impl TodoView {
     }
 
     fn reset_view_transients(&mut self, cx: &mut Context<Self>) {
+        self.multi_selected.clear();
+        self.selection_anchor = None;
+        self.batch_menu = None;
         self.header_menu_open = false;
         self.list_activity = None;
         self.close_card(cx);
@@ -2173,7 +2267,11 @@ impl TodoView {
         el.key_context("TaskList")
             .on_action(cx.listener(Self::select_next))
             .on_action(cx.listener(Self::select_previous))
+            .on_action(cx.listener(Self::select_all_visible))
+            .on_action(cx.listener(|this, _: &ExtendSelectionNext, _, cx| this.extend_selection(1, cx)))
+            .on_action(cx.listener(|this, _: &ExtendSelectionPrevious, _, cx| this.extend_selection(-1, cx)))
             .on_action(cx.listener(Self::toggle_selected))
+            .on_action(cx.listener(Self::toggle_in_progress_selected))
             .on_action(cx.listener(Self::delete_selected))
             .on_action(cx.listener(Self::pin_selected))
             .on_action(cx.listener(Self::date_selected))
@@ -2351,6 +2449,9 @@ impl TodoView {
     }
 
     pub fn select(&mut self, id: Id, cx: &mut Context<Self>) {
+        self.multi_selected.clear();
+        self.batch_menu = None;
+        self.selection_anchor = Some(id);
         if self.selected == Some(id) {
             return;
         }
@@ -2599,6 +2700,22 @@ impl TodoView {
                             self.store.set_section(dragged, sec)?;
                         }
                     }
+                    DropTarget::Todo => {
+                        if dragged_task.is_completed() {
+                            self.store.set_completed(dragged, false)?;
+                        }
+                        if dragged_task.is_in_progress() {
+                            self.store.set_in_progress(dragged, false)?;
+                        }
+                    }
+                    DropTarget::InProgress => {
+                        if dragged_task.is_completed() {
+                            self.store.set_completed(dragged, false)?;
+                        }
+                        if !dragged_task.is_in_progress() {
+                            self.store.set_in_progress(dragged, true)?;
+                        }
+                    }
                     DropTarget::Complete => {
                         if !dragged_task.is_completed() {
                             self.store.set_completed(dragged, true)?;
@@ -2798,7 +2915,7 @@ impl TodoView {
         let details = self.show_details && !task.notes.trim().is_empty();
         let wont_do = task.is_wont_do();
         let closed_view = matches!(self.view, View::Completed | View::WontDo);
-        let selected = self.selected == Some(id);
+        let selected = self.is_task_selected(id);
         let group = format!("task-{id}");
 
         let marker = if task.kind == Kind::Note {
@@ -2807,6 +2924,7 @@ impl TodoView {
             Checkbox::new("marker")
                 .toggle_state(done)
                 .animate_completion(crate::completion_mark::started(id, cx))
+                .in_progress(task.is_in_progress())
                 .dismissed(wont_do)
                 .lines(task.checklist.is_some())
                 .tint(task_rows::priority_color(task.priority, &theme))
@@ -2892,14 +3010,13 @@ impl TodoView {
             .cursor_pointer()
             .when(selected, |el| el.bg(theme.colors().ghost_element_selected))
             .when(!selected, |el| el.hover(|s| s.bg(theme.colors().ghost_element_hover)))
-            .on_click(cx.listener(move |this, _, window, cx| {
+            .on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
                 if cx.has_active_drag()
                     || this.title_edit.as_ref().is_some_and(|(editing, _, _)| *editing == id)
                 {
                     return;
                 }
-                window.focus(&this.list_focus, cx);
-                this.select(id, cx);
+                this.handle_row_click(id, event.modifiers(), window, cx);
             }))
             // The original's right-click menu, at the pointer; the task is selected too.
             .on_mouse_down(MouseButton::Right, cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
@@ -2963,6 +3080,10 @@ impl TodoView {
                                                 return;
                                             }
                                             cx.stop_propagation();
+                                            if event.modifiers().shift || event.modifiers().secondary() {
+                                                this.handle_row_click(id, event.modifiers(), window, cx);
+                                                return;
+                                            }
                                             this.start_title_edit(id, Some(event.position()), window, cx);
                                         },
                                     ))
@@ -2987,6 +3108,16 @@ impl TodoView {
                             .map_or(SharedString::new_static(strings.inbox), |l| l.name.clone().into());
                         el.child(div().flex_none().child(Label::new(list).size(LabelSize::Small).color(Color::Muted)))
                     })
+                    .when_some(task.location.as_deref().filter(|s| !s.trim().is_empty()), |el, loc| {
+                        el.child(
+                            h_flex()
+                                .flex_none()
+                                .max_w(px(120.))
+                                .gap_1()
+                                .child(Icon::new(IconName::MapPin).size(IconSize::XSmall).color(Color::Muted))
+                                .child(Label::new(loc.trim().to_owned()).size(LabelSize::XSmall).color(Color::Muted).truncate()),
+                        )
+                    })
                     .when_some(task.checklist, |el, (done_items, total)| {
                         el.child(
                             h_flex()
@@ -3002,10 +3133,20 @@ impl TodoView {
                     })
                     .when_some(due, |el, (label, overdue)| {
                         el.when(!task.reminders.is_empty() && !closed_view, |el| {
-                            el.child(Icon::new(IconName::AlarmClock).size(IconSize::XSmall).color(Color::Muted))
+                            el.child(
+                                Icon::new(IconName::AlarmClock)
+                                    .size(IconSize::XSmall)
+                                    .color(if task.constant_reminder { Color::Accent } else { Color::Muted }),
+                            )
                         })
                         .when(task.repeat.is_some(), |el| {
                             el.child(Icon::new(IconName::Repeat).size(IconSize::XSmall).color(Color::Accent))
+                        })
+                        .when(!closed_view, |el| {
+                            el.when_some(
+                                crate::due_picker::short_timezone_label(task.timezone.as_deref(), task.is_floating, strings),
+                                |el, tz| el.child(Label::new(tz).size(LabelSize::XSmall).color(Color::Muted)),
+                            )
                         })
                         .child(
                             Label::new(label)
@@ -3492,6 +3633,31 @@ impl Render for TodoView {
                     })
                     // The Completed and Won't Do views have only Print, as the original's.
                     .when(closed_header, |el| el.child(IconButton::new("print-closed", IconName::Printer).tooltip(Tooltip::text(strings.print)).on_click(cx.listener(|this, _, _, cx| this.print_list(cx)))))
+                    .when(kanban_only, |el| {
+                        let workflow_on = self.kanban_workflow;
+                        el.child(
+                            h_flex()
+                                .id("kanban-workflow-toggle")
+                                .h(px(26.))
+                                .px_2()
+                                .gap_1()
+                                .rounded(px(6.))
+                                .cursor_pointer()
+                                .when(workflow_on, |el| el.bg(theme.colors().element_selected))
+                                .hover(|s| s.bg(theme.colors().ghost_element_hover))
+                                .child(
+                                    Icon::new(IconName::Kanban)
+                                        .size(IconSize::XSmall)
+                                        .color(if workflow_on { Color::Accent } else { Color::Muted }),
+                                )
+                                .child(
+                                    Label::new(strings.kanban_workflow)
+                                        .size(LabelSize::Small)
+                                        .color(if workflow_on { Color::Accent } else { Color::Muted }),
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| this.toggle_kanban_workflow(cx))),
+                        )
+                    })
                     .when(self.view != View::Trash && !closed_header, |el| {
                         el.child(
                             div()
@@ -3711,13 +3877,14 @@ impl Render for TodoView {
                 if self.view == View::Summary {
                     return el.child(div().flex_1().min_w_0().h_full().child(self.summary.clone()));
                 }
+                let multi = self.is_multi_selecting();
                 // As in the original, the Timeline takes the whole width until a task is opened.
-                if (timeline_view || kanban_only) && self.selected.is_none() && self.list_activity.is_none() {
+                if (timeline_view || kanban_only) && (self.selected.is_none() || multi) && self.list_activity.is_none() {
                     return el.child(list);
                 }
                 // View Options' Pop-up: in a narrow window an opened task shows over the list.
                 if popup_details {
-                    if self.selected.is_none() && self.list_activity.is_none() {
+                    if multi || (self.selected.is_none() && self.list_activity.is_none()) {
                         return el.child(list);
                     }
                     return el.child(list).child(
@@ -3761,11 +3928,30 @@ impl Render for TodoView {
                         .h_full()
                         .map(|el| match self.list_activity.clone() {
                             Some(entries) => el.child(self.render_list_activity(&entries, true, cx)),
+                            None if multi => el.child(self.render_batch_panel(strings, cx)),
                             None => el.child(self.detail.clone()),
                         })
                         .child(self.resize_handle(Panel::Detail, cx)),
                 )
             })
+            .when(
+                self.view != View::Summary
+                    && self.is_multi_selecting()
+                    && (popup_details || ((timeline_view || kanban_only) && self.list_activity.is_none())),
+                |el| {
+                    let bottom = if self.undo.is_some() { px(72.) } else { px(24.) };
+                    el.child(
+                        div()
+                            .absolute()
+                            .bottom(bottom)
+                            .left_0()
+                            .right_0()
+                            .flex()
+                            .justify_center()
+                            .child(self.render_batch_bar(strings, cx)),
+                    )
+                },
+            )
             .when_some(self.filter_edit.as_ref().map(|edit| self.render_filter_edit(edit, window, cx)), |el, dialog| el.child(dialog))
             .when_some(self.undo.as_ref().map(|(_, label, _)| label.clone()), |el, label| {
                 el.child(

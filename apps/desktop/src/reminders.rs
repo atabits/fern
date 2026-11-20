@@ -14,6 +14,9 @@ use crate::task_rows;
 
 /// How often reminders are checked.
 const CHECK_EVERY: Duration = Duration::from_secs(20);
+/// How often constant reminders ("annoying alerts") re-notify while unacknowledged.
+pub const ANNOYING_REPEAT_SECS: u64 = 60;
+const ANNOYING_MAX_REPEATS: usize = 15;
 /// The setting with the last time reminders were checked, to find the ones missed in between.
 const CHECKED_AT: &str = "reminders_checked_at";
 const STAMP_FORMAT: &str = "%Y-%m-%dT%H:%M:%S";
@@ -26,20 +29,37 @@ pub enum Target {
     Countdown(Id),
 }
 
-/// What a habit's reminder offers besides opening it, as in the original: "Snooze", and "Check
-/// In" for a habit without a goal, or "Record" (type the amount) and "+1" for one with a goal.
+/// Actions offered on a reminder notification (both OS toast and in-app banner/bell).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NoticeAction {
     Snooze,
+    Snooze5m,
+    Snooze15m,
+    Snooze1h,
+    Complete,
+    Dismiss,
     CheckIn,
     Record,
     PlusOne,
 }
 
-/// How long "Snooze" puts a reminder off.
+/// How long default "Snooze" puts a habit reminder off.
 pub const SNOOZE_MINUTES: i64 = 15;
 
 impl NoticeAction {
+    pub fn for_task() -> &'static [NoticeAction] {
+        &[
+            NoticeAction::Snooze5m,
+            NoticeAction::Snooze15m,
+            NoticeAction::Snooze1h,
+            NoticeAction::Complete,
+        ]
+    }
+
+    pub fn for_countdown() -> &'static [NoticeAction] {
+        &[NoticeAction::Dismiss]
+    }
+
     pub fn for_habit(has_goal: bool) -> &'static [NoticeAction] {
         if has_goal {
             &[NoticeAction::Snooze, NoticeAction::Record, NoticeAction::PlusOne]
@@ -51,22 +71,42 @@ impl NoticeAction {
     pub fn key(self) -> &'static str {
         match self {
             NoticeAction::Snooze => "snooze",
+            NoticeAction::Snooze5m => "snooze-5m",
+            NoticeAction::Snooze15m => "snooze-15m",
+            NoticeAction::Snooze1h => "snooze-1h",
+            NoticeAction::Complete => "complete",
+            NoticeAction::Dismiss => "dismiss",
             NoticeAction::CheckIn => "check-in",
             NoticeAction::Record => "record",
             NoticeAction::PlusOne => "plus-one",
         }
     }
 
-    #[cfg(any(test, all(unix, not(target_os = "macos"))))]
-    fn from_key(key: &str) -> Option<Self> {
-        [NoticeAction::Snooze, NoticeAction::CheckIn, NoticeAction::Record, NoticeAction::PlusOne]
-            .into_iter()
-            .find(|action| action.key() == key)
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    pub fn from_key(key: &str) -> Option<Self> {
+        [
+            NoticeAction::Snooze,
+            NoticeAction::Snooze5m,
+            NoticeAction::Snooze15m,
+            NoticeAction::Snooze1h,
+            NoticeAction::Complete,
+            NoticeAction::Dismiss,
+            NoticeAction::CheckIn,
+            NoticeAction::Record,
+            NoticeAction::PlusOne,
+        ]
+        .into_iter()
+        .find(|action| action.key() == key)
     }
 
     pub fn label(self, strings: &'static i18n::Strings) -> &'static str {
         match self {
             NoticeAction::Snooze => strings.snooze,
+            NoticeAction::Snooze5m => strings.snooze_5m,
+            NoticeAction::Snooze15m => strings.snooze_15m,
+            NoticeAction::Snooze1h => strings.snooze_1h,
+            NoticeAction::Complete => strings.mark_done,
+            NoticeAction::Dismiss => strings.dismiss,
             NoticeAction::CheckIn => strings.check_in,
             NoticeAction::Record => strings.habit_record,
             NoticeAction::PlusOne => "+1",
@@ -77,7 +117,7 @@ impl NoticeAction {
 /// What a click on a desktop notification asks for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reply {
-    #[cfg_attr(not(all(unix, not(target_os = "macos"))), allow(dead_code))]
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     Open,
     Action(NoticeAction),
 }
@@ -88,6 +128,7 @@ pub struct Notice {
     pub target: Target,
     pub title: String,
     pub at: NaiveDateTime,
+    pub constant: bool,
 }
 
 /// The bell's notifications, newest first, and how many are unread.
@@ -115,34 +156,55 @@ pub fn fired(store: &Store, after: NaiveDateTime, until: NaiveDateTime) -> Vec<N
     let tasks = store.tasks().unwrap_or_default();
     let mut notices: Vec<Notice> = reminder::due_between(&tasks, after, until)
         .into_iter()
-        .map(|(task, at)| Notice { target: Target::Task(task.id), title: task.title.clone(), at })
+        .map(|(task, at)| Notice {
+            target: Target::Task(task.id),
+            title: task.title.clone(),
+            at,
+            constant: task.constant_reminder,
+        })
         .collect();
     let habits = store.habits().unwrap_or_default();
     let done = store.all_habit_done_dates().unwrap_or_default();
     notices.extend(
         fern_core::habit::reminders_between(&habits, &done, after, until)
             .into_iter()
-            .map(|(habit, at)| Notice { target: Target::Habit(habit.id), title: habit.name.clone(), at }),
+            .map(|(habit, at)| Notice {
+                target: Target::Habit(habit.id),
+                title: habit.name.clone(),
+                at,
+                constant: habit.constant_reminder,
+            }),
     );
     let countdowns = store.countdowns().unwrap_or_default();
     notices.extend(
         fern_core::countdown::reminders_between(&countdowns, after, until)
             .into_iter()
-            .map(|(countdown, at)| Notice { target: Target::Countdown(countdown.id), title: countdown.name.clone(), at }),
+            .map(|(countdown, at)| Notice {
+                target: Target::Countdown(countdown.id),
+                title: countdown.name.clone(),
+                at,
+                constant: countdown.constant_reminder,
+            }),
     );
     let snoozes = store.habit_snoozes().unwrap_or_default();
     notices.extend(
         fern_core::habit::snoozed_between(&habits, &done, &snoozes, after, until)
             .into_iter()
-            .map(|(habit, at)| Notice { target: Target::Habit(habit.id), title: habit.name.clone(), at }),
+            .map(|(habit, at)| Notice {
+                target: Target::Habit(habit.id),
+                title: habit.name.clone(),
+                at,
+                constant: habit.constant_reminder,
+            }),
     );
     notices
 }
 
-/// The actions a notice offers: none for tasks.
+/// The actions a notice offers.
 pub fn actions(store: &Store, target: Target) -> &'static [NoticeAction] {
     match target {
-        Target::Task(_) | Target::Countdown(_) => &[],
+        Target::Task(_) => NoticeAction::for_task(),
+        Target::Countdown(_) => NoticeAction::for_countdown(),
         Target::Habit(id) => {
             let has_goal = store.habits().unwrap_or_default().iter().any(|h| h.id == id && h.goal.is_some());
             NoticeAction::for_habit(has_goal)
@@ -150,9 +212,162 @@ pub fn actions(store: &Store, target: Target) -> &'static [NoticeAction] {
     }
 }
 
+#[cfg_attr(not(any(test, windows)), allow(dead_code))]
+pub(crate) fn escape_xml(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+#[cfg_attr(not(any(test, windows)), allow(dead_code))]
+pub(crate) fn build_toast_xml(title: &str, body: &str, actions: &[(&str, &str)], constant: bool) -> String {
+    let scenario = if constant { r#" scenario="reminder""# } else { "" };
+    let title = escape_xml(title);
+    let body = escape_xml(body);
+    let mut xml = format!(
+        r#"<toast launch="default"{scenario}><visual><binding template="ToastGeneric"><text>{title}</text><text>{body}</text></binding></visual>"#
+    );
+    if !actions.is_empty() {
+        xml.push_str("<actions>");
+        for &(key, label) in actions {
+            let key = escape_xml(key);
+            let label = escape_xml(label);
+            xml.push_str(&format!(
+                r#"<action content="{label}" arguments="{key}" activationType="foreground"/>"#
+            ));
+        }
+        xml.push_str("</actions>");
+    }
+    xml.push_str("</toast>");
+    xml
+}
+
+#[cfg(windows)]
+fn show_windows_toast(
+    title: &str,
+    body: &str,
+    actions: &[(&str, &str)],
+    constant: bool,
+    tx: futures::channel::oneshot::Sender<Reply>,
+) -> windows::core::Result<()> {
+    use std::sync::{Arc, Mutex, mpsc};
+    use windows::Data::Xml::Dom::XmlDocument;
+    use windows::Foundation::TypedEventHandler;
+    use windows::UI::Notifications::{
+        ToastActivatedEventArgs, ToastDismissedEventArgs, ToastFailedEventArgs, ToastNotification,
+        ToastNotificationManager,
+    };
+    use windows::Win32::System::WinRT::{RO_INIT_MULTITHREADED, RoInitialize, RoUninitialize};
+    use windows::core::{HSTRING, IInspectable, Interface as _};
+
+    struct ComGuard(bool);
+    impl Drop for ComGuard {
+        fn drop(&mut self) {
+            if self.0 {
+                unsafe { RoUninitialize() };
+            }
+        }
+    }
+
+    let _com = ComGuard(unsafe { RoInitialize(RO_INIT_MULTITHREADED).is_ok() });
+    let doc = XmlDocument::new()?;
+    let xml = build_toast_xml(title, body, actions, constant);
+    doc.LoadXml(&HSTRING::from(xml))?;
+    let toast = ToastNotification::CreateToastNotification(&doc)?;
+
+    let (done_tx, done_rx) = mpsc::channel::<Option<Reply>>();
+    let done_tx = Arc::new(Mutex::new(Some(done_tx)));
+    let send_once = |slot: &Arc<Mutex<Option<mpsc::Sender<Option<Reply>>>>>, reply: Option<Reply>| {
+        if let Ok(mut guard) = slot.lock()
+            && let Some(sender) = guard.take()
+        {
+            sender.send(reply).ok();
+        }
+    };
+
+    let act_slot = Arc::clone(&done_tx);
+    let act_token = toast.Activated(&TypedEventHandler::<ToastNotification, IInspectable>::new(
+        move |_, args| {
+            let key = args
+                .as_ref()
+                .and_then(|insp| insp.cast::<ToastActivatedEventArgs>().ok())
+                .and_then(|act| act.Arguments().ok())
+                .map(|s| s.to_string_lossy())
+                .unwrap_or_default();
+            let reply = if key.is_empty() || key == "default" {
+                Some(Reply::Open)
+            } else {
+                NoticeAction::from_key(&key).map(Reply::Action)
+            };
+            send_once(&act_slot, reply);
+            Ok(())
+        },
+    ))?;
+
+    let dis_slot = Arc::clone(&done_tx);
+    let dis_token = toast.Dismissed(&TypedEventHandler::<ToastNotification, ToastDismissedEventArgs>::new(
+        move |_, _| {
+            send_once(&dis_slot, None);
+            Ok(())
+        },
+    ))?;
+
+    let fail_slot = Arc::clone(&done_tx);
+    let fail_token = toast.Failed(&TypedEventHandler::<ToastNotification, ToastFailedEventArgs>::new(
+        move |_, _| {
+            send_once(&fail_slot, None);
+            Ok(())
+        },
+    ))?;
+
+    let notifier = ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(
+        r"{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe",
+    ))?;
+    notifier.Show(&toast)?;
+
+    if let Ok(Some(reply)) = done_rx.recv_timeout(Duration::from_secs(600)) {
+        tx.send(reply).ok();
+    }
+    toast.RemoveActivated(act_token).ok();
+    toast.RemoveDismissed(dis_token).ok();
+    toast.RemoveFailed(fail_token).ok();
+    Ok(())
+}
+
 /// Shows a desktop notification with its actions as buttons, and waits on a thread of its own for
 /// the one clicked, if any.
-fn show(title: String, body: String, actions: Vec<(&'static str, &'static str)>, constant: bool) -> futures::channel::oneshot::Receiver<Reply> {
+#[cfg(windows)]
+fn show(
+    title: String,
+    body: String,
+    actions: Vec<(&'static str, &'static str)>,
+    constant: bool,
+) -> futures::channel::oneshot::Receiver<Reply> {
+    let (tx, rx) = futures::channel::oneshot::channel();
+    std::thread::spawn(move || {
+        if let Err(err) = show_windows_toast(&title, &body, &actions, constant, tx) {
+            eprintln!("failed to show a reminder: {err:#}");
+        }
+    });
+    rx
+}
+
+#[cfg(not(windows))]
+fn show(
+    title: String,
+    body: String,
+    actions: Vec<(&'static str, &'static str)>,
+    constant: bool,
+) -> futures::channel::oneshot::Receiver<Reply> {
     let (tx, rx) = futures::channel::oneshot::channel();
     std::thread::spawn(move || {
         let mut notification = notify_rust::Notification::new();
@@ -168,12 +383,16 @@ fn show(title: String, body: String, actions: Vec<(&'static str, &'static str)>,
         match notification.show() {
             #[cfg(all(unix, not(target_os = "macos")))]
             Ok(handle) => handle.wait_for_action(|key| {
-                let reply = if key == "default" { Some(Reply::Open) } else { NoticeAction::from_key(key).map(Reply::Action) };
+                let reply = if key == "default" {
+                    Some(Reply::Open)
+                } else {
+                    NoticeAction::from_key(key).map(Reply::Action)
+                };
                 if let Some(reply) = reply {
                     tx.send(reply).ok();
                 }
             }),
-            #[cfg(not(all(unix, not(target_os = "macos"))))]
+            #[cfg(target_os = "macos")]
             Ok(_) => drop(tx),
             Err(err) => eprintln!("failed to show a reminder: {err}"),
         }
@@ -210,6 +429,26 @@ fn daily_text(titles: &[String], strings: &i18n::Strings) -> (String, String) {
         body.push(strings.daily_empty.to_owned());
     }
     (title, body.join("\n"))
+}
+
+fn spawn_reply_listener(
+    reply: futures::channel::oneshot::Receiver<Reply>,
+    notice: Notice,
+    window: AnyWindowHandle,
+    this: gpui::WeakEntity<AppView>,
+    cx: &gpui::AsyncApp,
+) {
+    cx.spawn(async move |cx| {
+        let Ok(reply) = reply.await else { return };
+        cx.update(|cx| {
+            window
+                .update(cx, |_, window, cx| {
+                    this.update(cx, |this, cx| this.answer_notice(&notice, reply, window, cx)).ok();
+                })
+                .ok();
+        });
+    })
+    .detach();
 }
 
 /// Starts checking for reminders: collects the ones missed since the last run, then shows new
@@ -251,41 +490,62 @@ pub fn start(store: Rc<Store>, window: AnyWindowHandle, cx: &mut Context<AppView
                 }
                 continue;
             }
-            let shown: Vec<_> = cx.update(|cx| {
+            type ShownNotice = (Notice, String, Vec<(&'static str, &'static str)>);
+            let shown: Vec<ShownNotice> = cx.update(|cx| {
                 let strings = i18n::t(cx);
                 notices
-                    .iter()
-                    .map(|n| {
+                    .into_iter()
+                    .map(|mut n| {
+                        n.constant = settings.constant || n.constant;
                         let due = task_rows::due_label(n.at.date(), Some(n.at.time()), now.date(), strings).0;
                         let buttons = actions(&store, n.target).iter().map(|a| (a.key(), a.label(strings))).collect();
-                        (n.clone(), due, buttons)
+                        (n, due, buttons)
                     })
                     .collect()
             });
-            for (notice, due, buttons) in shown {
-                // Constant everywhere, or for a habit set to "Constant Reminder".
-                let constant = settings.constant
-                    || match notice.target {
-                        Target::Habit(id) => store.habits().unwrap_or_default().iter().any(|h| h.id == id && h.constant_reminder),
-                        Target::Countdown(id) => store.countdowns().unwrap_or_default().iter().any(|c| c.id == id && c.constant_reminder),
-                        Target::Task(_) => false,
-                    };
-                let reply = show(notice.title.clone(), due, buttons, constant);
-                let this = this.clone();
-                cx.spawn(async move |cx| {
-                    let Ok(reply) = reply.await else { return };
-                    cx.update(|cx| {
-                        window
-                            .update(cx, |_, window, cx| {
-                                this.update(cx, |this, cx| this.answer_notice(&notice, reply, window, cx)).ok();
-                            })
-                            .ok();
-                    });
+            let live_notices: Vec<Notice> = shown.iter().map(|(n, _, _)| n.clone()).collect();
+            if this
+                .update(cx, |this, cx| {
+                    this.add_notices(live_notices.clone(), cx);
+                    this.push_active_alerts(live_notices, cx);
                 })
-                .detach();
-            }
-            if this.update(cx, |this, cx| this.add_notices(notices, cx)).is_err() {
+                .is_err()
+            {
                 break;
+            }
+            for (notice, due, buttons) in shown {
+                let constant = notice.constant;
+                let reply = show(notice.title.clone(), due.clone(), buttons.clone(), constant);
+                spawn_reply_listener(reply, notice.clone(), window, this.clone(), cx);
+                if constant {
+                    let store = Rc::clone(&store);
+                    let this = this.clone();
+                    cx.spawn(async move |cx| {
+                        for _ in 0..ANNOYING_MAX_REPEATS {
+                            cx.background_executor().timer(Duration::from_secs(ANNOYING_REPEAT_SECS)).await;
+                            let active = matches!(
+                                this.read_with(cx, |this, _| this.has_active_alert(notice.target)),
+                                Ok(true)
+                            );
+                            if !active {
+                                break;
+                            }
+                            if let Target::Task(id) = notice.target {
+                                let still_open = store
+                                    .task(id)
+                                    .ok()
+                                    .flatten()
+                                    .is_some_and(|t| !t.is_closed() && !t.is_deleted() && t.snoozed_until.is_none());
+                                if !still_open {
+                                    break;
+                                }
+                            }
+                            let repeat_reply = show(notice.title.clone(), due.clone(), buttons.clone(), true);
+                            spawn_reply_listener(repeat_reply, notice.clone(), window, this.clone(), cx);
+                        }
+                    })
+                    .detach();
+                }
             }
         }
     })
@@ -300,7 +560,7 @@ mod tests {
 
     fn notice(title: &str, hour: u32) -> Notice {
         let at = NaiveDate::from_ymd_opt(2026, 10, 18).unwrap().and_hms_opt(hour, 0, 0).unwrap();
-        Notice { target: Target::Task(uuid::Uuid::now_v7()), title: title.into(), at }
+        Notice { target: Target::Task(uuid::Uuid::now_v7()), title: title.into(), at, constant: false }
     }
 
     #[test]
@@ -344,10 +604,10 @@ mod tests {
     }
 
     #[test]
-    fn habit_reminder_actions_and_snooze() {
+    fn habit_and_task_reminder_actions_and_snooze() {
         let store = Store::open_in_memory().unwrap();
         let task = store.add_task("water the plants").unwrap();
-        assert!(actions(&store, Target::Task(task.id)).is_empty());
+        assert_eq!(actions(&store, Target::Task(task.id)), NoticeAction::for_task());
         let read = store.add_habit("Read").unwrap();
         assert_eq!(actions(&store, Target::Habit(read.id)), [NoticeAction::Snooze, NoticeAction::CheckIn]);
         let water = store.add_habit("Water").unwrap();
@@ -356,14 +616,33 @@ mod tests {
             actions(&store, Target::Habit(water.id)),
             [NoticeAction::Snooze, NoticeAction::Record, NoticeAction::PlusOne]
         );
-        for action in actions(&store, Target::Habit(water.id)) {
+        for action in actions(&store, Target::Habit(water.id))
+            .iter()
+            .chain(actions(&store, Target::Task(task.id)))
+            .chain(NoticeAction::for_countdown())
+        {
             assert_eq!(NoticeAction::from_key(action.key()), Some(*action));
         }
 
-        // A snoozed reminder fires again when its time comes.
+        // A snoozed habit reminder and a snoozed task reminder both fire again when their time comes.
         let at = NaiveDate::from_ymd_opt(2026, 10, 18).unwrap().and_hms_opt(9, 0, 0).unwrap();
         store.snooze_habit(read.id, at + chrono::Duration::minutes(SNOOZE_MINUTES)).unwrap();
+        store.snooze_task(task.id, at + chrono::Duration::minutes(5)).unwrap();
+        store.set_task_constant_reminder(task.id, true).unwrap();
         let notices = fired(&store, at, at + chrono::Duration::minutes(20));
-        assert_eq!(notices.iter().map(|n| n.target).collect::<Vec<_>>(), [Target::Habit(read.id)]);
+        assert!(notices.iter().any(|n| n.target == Target::Task(task.id) && n.constant));
+        assert!(notices.iter().any(|n| n.target == Target::Habit(read.id)));
+    }
+
+    #[test]
+    fn windows_toast_xml_escapes_text_and_adds_reminder_scenario() {
+        let normal = build_toast_xml("Call <Bob> & Co", "At \"5\"", &[("snooze-5m", "5m"), ("complete", "Done")], false);
+        assert!(normal.contains("Call &lt;Bob&gt; &amp; Co"));
+        assert!(normal.contains("At &quot;5&quot;"));
+        assert!(!normal.contains("scenario=\"reminder\""));
+        assert!(normal.contains(r#"<action content="5m" arguments="snooze-5m" activationType="foreground"/>"#));
+
+        let urgent = build_toast_xml("Pay rent", "Now", &[("complete", "Done")], true);
+        assert!(urgent.contains(r#"scenario="reminder""#));
     }
 }

@@ -105,6 +105,14 @@ pub struct SettingsWindow {
     subscription_form: Option<(Option<fern_core::Id>, Option<String>)>,
     subscription_name: Entity<crate::text_input::TextInput>,
     subscription_url: Entity<crate::text_input::TextInput>,
+    subscription_kind: fern_core::ical::CalendarKind,
+    subscription_provider: fern_core::ical::CalendarProvider,
+    subscription_username: Entity<crate::text_input::TextInput>,
+    subscription_password: Entity<crate::text_input::TextInput>,
+    subscription_writable: bool,
+    subscription_discovering: bool,
+    subscription_discovered: Vec<crate::subscriptions::DiscoveredCalendar>,
+    subscription_discover_error: Option<String>,
     _updates: Option<gpui::Subscription>,
     _feeds: Option<gpui::Subscription>,
 }
@@ -199,6 +207,10 @@ impl SettingsWindow {
         };
         let subscription_name = plain(i18n::t(cx).subscription_name_placeholder, cx);
         let subscription_url = plain("https://…/calendar.ics", cx);
+        let subscription_username = plain("", cx);
+        let subscription_password = cx.new(|cx| {
+            crate::text_input::TextInput::new(crate::text_input::Mode::SingleLine, "", cx).masked()
+        });
         let installed_notes = release_notes::installed(&store).map(Rc::new);
         Self {
             store,
@@ -217,6 +229,14 @@ impl SettingsWindow {
             subscription_form: None,
             subscription_name,
             subscription_url,
+            subscription_kind: fern_core::ical::CalendarKind::Ics,
+            subscription_provider: fern_core::ical::CalendarProvider::Url,
+            subscription_username,
+            subscription_password,
+            subscription_writable: true,
+            subscription_discovering: false,
+            subscription_discovered: Vec::new(),
+            subscription_discover_error: None,
             _updates: updates,
             _feeds: feeds,
         }
@@ -818,9 +838,29 @@ impl SettingsWindow {
             let feeds = feeds.read(cx);
             feeds.calendars().iter().find(|c| c.subscription.id == id).map(|c| c.subscription.clone())
         });
-        let (name, url, color) = current.map_or((String::new(), String::new(), None), |s| (s.name, s.url, s.color));
+        let (name, url, color, kind, provider, username, password, writable) = match current {
+            Some(s) => (s.name, s.url, s.color, s.kind, s.provider, s.username, s.password, s.writable),
+            None => (
+                String::new(),
+                String::new(),
+                None,
+                fern_core::ical::CalendarKind::Ics,
+                fern_core::ical::CalendarProvider::Url,
+                String::new(),
+                String::new(),
+                true,
+            ),
+        };
+        self.subscription_kind = kind;
+        self.subscription_provider = provider;
+        self.subscription_writable = writable;
+        self.subscription_discovering = false;
+        self.subscription_discovered.clear();
+        self.subscription_discover_error = None;
         self.subscription_name.update(cx, |input, cx| input.set_text(name, cx));
         self.subscription_url.update(cx, |input, cx| input.set_text(url, cx));
+        self.subscription_username.update(cx, |input, cx| input.set_text(username, cx));
+        self.subscription_password.update(cx, |input, cx| input.set_text(password, cx));
         self.subscription_form = Some((id, color));
         window.focus(&self.subscription_url.focus_handle(cx), cx);
         cx.notify();
@@ -830,18 +870,66 @@ impl SettingsWindow {
         let Some((id, color)) = self.subscription_form.take() else { return };
         let name = self.subscription_name.read(cx).text().to_owned();
         let url = self.subscription_url.read(cx).text().to_owned();
+        let kind = self.subscription_kind;
+        let provider = self.subscription_provider;
+        let username = self.subscription_username.read(cx).text().to_owned();
+        let password = self.subscription_password.read(cx).text().to_owned();
+        let writable = self.subscription_writable;
         if let Some(feeds) = crate::subscriptions::feeds(cx)
             && !url.trim().is_empty()
         {
-            feeds.update(cx, |feeds, cx| match id {
-                Some(id) => {
+            feeds.update(cx, |feeds, cx| match (id, kind) {
+                (Some(id), fern_core::ical::CalendarKind::CalDav) => {
+                    let hidden = feeds.calendars().iter().find(|c| c.subscription.id == id).is_some_and(|c| c.subscription.hidden);
+                    feeds.update_caldav(id, &name, &url, color.as_deref(), hidden, provider, &username, &password, writable, cx);
+                }
+                (None, fern_core::ical::CalendarKind::CalDav) => {
+                    feeds.add_caldav(&name, &url, color.as_deref(), provider, &username, &password, writable, cx);
+                }
+                (Some(id), fern_core::ical::CalendarKind::Ics) => {
                     let hidden = feeds.calendars().iter().find(|c| c.subscription.id == id).is_some_and(|c| c.subscription.hidden);
                     feeds.update_subscription(id, &name, &url, color.as_deref(), hidden, cx);
                 }
-                None => feeds.add(&name, &url, color.as_deref(), cx),
+                (None, fern_core::ical::CalendarKind::Ics) => feeds.add(&name, &url, color.as_deref(), cx),
             });
         }
         cx.notify();
+    }
+
+    fn discover_caldav(&mut self, cx: &mut Context<Self>) {
+        if self.subscription_discovering {
+            return;
+        }
+        let url = self.subscription_url.read(cx).text().trim().to_owned();
+        let username = self.subscription_username.read(cx).text().to_owned();
+        let password = self.subscription_password.read(cx).text().to_owned();
+        if url.is_empty() {
+            return;
+        }
+        self.subscription_discovering = true;
+        self.subscription_discover_error = None;
+        self.subscription_discovered.clear();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { crate::subscriptions::discover_caldav_calendars(&url, &username, &password) })
+                .await;
+            this.update(cx, |this, cx| {
+                this.subscription_discovering = false;
+                match result {
+                    Ok(cals) => {
+                        this.subscription_discovered = cals;
+                    }
+                    Err(err) => {
+                        this.subscription_discover_error = Some(format!("{err:#}"));
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn render_china_holiday_source(
@@ -963,23 +1051,45 @@ impl SettingsWindow {
                         v_flex()
                             .flex_1()
                             .min_w_0()
-                            .child(Label::new(subscription.title().to_owned()).truncate().color(if hidden { Color::Muted } else { Color::Default }))
+                            .child(
+                                h_flex()
+                                    .gap_1p5()
+                                    .child(Label::new(subscription.title().to_owned()).truncate().color(if hidden { Color::Muted } else { Color::Default }))
+                                    .when(subscription.is_caldav(), |el| {
+                                        el.child(
+                                            div()
+                                                .px_1p5()
+                                                .py(px(1.))
+                                                .rounded(px(4.))
+                                                .bg(colors.accent.opacity(0.14))
+                                                .child(Label::new(strings.cal_badge_caldav).size(LabelSize::XSmall).color(Color::Accent)),
+                                        )
+                                    }),
+                            )
                             .child(Label::new(status.0).size(LabelSize::XSmall).color(status.1).truncate()),
                     )
                     .children(china_source.map(|source| self.render_china_holiday_source(Some((id, source)), can_choose_source, cx)))
                     .child(
-                        IconButton::new(SharedString::from(format!("subscription-show-{id}")), if hidden { IconName::EyeOff } else { IconName::Eye })
-                            .icon_color(Color::Muted)
-                            .tooltip(Tooltip::text(if hidden { strings.subscription_show } else { strings.subscription_hide }))
-                            .on_click(cx.listener(move |_, _, _, cx| {
-                                if let Some(feeds) = crate::subscriptions::feeds(cx) {
-                                    feeds.update(cx, |feeds, cx| {
-                                        if let Some(s) = feeds.calendars().iter().find(|c| c.subscription.id == id).map(|c| c.subscription.clone()) {
-                                            feeds.update_subscription(id, &s.name, &s.url, s.color.as_deref(), !hidden, cx);
+                        div()
+                            .debug_selector(move || format!("subscription-show-{id}"))
+                            .child(
+                                IconButton::new(SharedString::from(format!("subscription-show-{id}")), if hidden { IconName::EyeOff } else { IconName::Eye })
+                                    .icon_color(Color::Muted)
+                                    .tooltip(Tooltip::text(if hidden { strings.subscription_show } else { strings.subscription_hide }))
+                                    .on_click(cx.listener(move |_, _, _, cx| {
+                                        if let Some(feeds) = crate::subscriptions::feeds(cx) {
+                                            feeds.update(cx, |feeds, cx| {
+                                                if let Some(s) = feeds.calendars().iter().find(|c| c.subscription.id == id).map(|c| c.subscription.clone()) {
+                                                    if s.is_caldav() {
+                                                        feeds.update_caldav(id, &s.name, &s.url, s.color.as_deref(), !hidden, s.provider, &s.username, &s.password, s.writable, cx);
+                                                    } else {
+                                                        feeds.update_subscription(id, &s.name, &s.url, s.color.as_deref(), !hidden, cx);
+                                                    }
+                                                }
+                                            });
                                         }
-                                    });
-                                }
-                            })),
+                                    })),
+                            ),
                     )
                     .child(
                         IconButton::new(SharedString::from(format!("subscription-read-{id}")), IconName::RefreshCw)
@@ -1037,9 +1147,167 @@ impl SettingsWindow {
                         cx.notify();
                     }))
             }));
+            let is_caldav = self.subscription_kind == fern_core::ical::CalendarKind::CalDav;
+            let mode_btn = |id: &'static str, label: &'static str, kind: fern_core::ical::CalendarKind| {
+                let active = self.subscription_kind == kind;
+                div()
+                    .id(id)
+                    .debug_selector(move || id.to_owned())
+                    .px_2p5()
+                    .h(px(26.))
+                    .flex()
+                    .items_center()
+                    .rounded(px(6.))
+                    .cursor_pointer()
+                    .when(active, |el| el.bg(colors.element_selected))
+                    .when(!active, |el| el.hover(|s| s.bg(colors.ghost_element_hover)))
+                    .child(Label::new(label).size(LabelSize::Small).color(if active { Color::Accent } else { Color::Default }))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.subscription_kind = kind;
+                        if kind == fern_core::ical::CalendarKind::CalDav && this.subscription_provider == fern_core::ical::CalendarProvider::Url {
+                            this.subscription_provider = fern_core::ical::CalendarProvider::CalDav;
+                        }
+                        cx.notify();
+                    }))
+            };
+            let provider_label = |p: fern_core::ical::CalendarProvider| match p {
+                fern_core::ical::CalendarProvider::Url => strings.cal_provider_url,
+                fern_core::ical::CalendarProvider::CalDav => strings.cal_provider_caldav,
+                fern_core::ical::CalendarProvider::ICloud => strings.cal_provider_icloud,
+                fern_core::ical::CalendarProvider::Google => strings.cal_provider_google,
+                fern_core::ical::CalendarProvider::Outlook => strings.cal_provider_outlook,
+                fern_core::ical::CalendarProvider::Nextcloud => strings.cal_provider_nextcloud,
+                fern_core::ical::CalendarProvider::Fastmail => strings.cal_provider_fastmail,
+            };
             group()
+                .child(
+                    h_flex()
+                        .px_4()
+                        .py_2()
+                        .gap_1()
+                        .child(mode_btn("subscription-kind-ics", strings.cal_source_ics, fern_core::ical::CalendarKind::Ics))
+                        .child(mode_btn("subscription-kind-caldav", strings.cal_source_caldav, fern_core::ical::CalendarKind::CalDav)),
+                )
+                .when(is_caldav, |el| {
+                    el.child(
+                        h_flex()
+                            .min_h(px(36.))
+                            .px_4()
+                            .gap_4()
+                            .child(div().w(px(80.)).child(Label::new(strings.cal_provider)))
+                            .child(
+                                h_flex()
+                                    .flex_1()
+                                    .flex_wrap()
+                                    .gap_1()
+                                    .children(fern_core::ical::CalendarProvider::CALDAV_PRESETS.into_iter().map(|preset| {
+                                        let active = self.subscription_provider == preset;
+                                        let label = provider_label(preset);
+                                        div()
+                                            .id(SharedString::from(format!("caldav-provider-{}", preset.code())))
+                                            .debug_selector(move || format!("caldav-provider-{}", preset.code()))
+                                            .px_2()
+                                            .h(px(24.))
+                                            .flex()
+                                            .items_center()
+                                            .rounded(px(5.))
+                                            .border_1()
+                                            .border_color(if active { colors.accent } else { colors.border })
+                                            .when(active, |el| el.bg(colors.accent.opacity(0.14)))
+                                            .cursor_pointer()
+                                            .child(Label::new(label).size(LabelSize::XSmall).color(if active { Color::Accent } else { Color::Default }))
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.subscription_provider = preset;
+                                                let suggested = preset.default_discovery_url();
+                                                if !suggested.is_empty() {
+                                                    let cur = this.subscription_url.read(cx).text().trim().to_owned();
+                                                    let is_preset_url = cur.is_empty()
+                                                        || fern_core::ical::CalendarProvider::CALDAV_PRESETS
+                                                            .iter()
+                                                            .any(|p| p.default_discovery_url() == cur);
+                                                    if is_preset_url {
+                                                        this.subscription_url.update(cx, |input, cx| input.set_text(suggested, cx));
+                                                    }
+                                                }
+                                                cx.notify();
+                                            }))
+                                    })),
+                            ),
+                    )
+                })
                 .child(field(strings.subscription_name, self.subscription_name.clone()))
                 .child(field("URL", self.subscription_url.clone()))
+                .when(is_caldav, |el| {
+                    el.child(field(strings.cal_username, self.subscription_username.clone()))
+                        .child(field(strings.cal_password, self.subscription_password.clone()))
+                        .child(
+                            h_flex()
+                                .id("caldav-writable-toggle")
+                                .h(px(36.))
+                                .px_4()
+                                .gap_4()
+                                .cursor_pointer()
+                                .child(div().flex_1().child(Label::new(strings.cal_writable).size(LabelSize::Small)))
+                                .child(ui::Switch::new().toggle_state(self.subscription_writable))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.subscription_writable = !this.subscription_writable;
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            h_flex()
+                                .px_4()
+                                .py_1()
+                                .gap_2()
+                                .child(
+                                    form_button(
+                                        "caldav-discover",
+                                        if self.subscription_discovering { "…" } else { strings.cal_discover },
+                                        false,
+                                        &colors,
+                                    )
+                                    .on_click(cx.listener(|this, _, _, cx| this.discover_caldav(cx))),
+                                )
+                                .when_some(self.subscription_discover_error.as_ref(), |el, err| {
+                                    el.child(div().flex_1().min_w_0().child(Label::new(err.clone()).size(LabelSize::XSmall).color(Color::Error).truncate()))
+                                }),
+                        )
+                        .when(!self.subscription_discovered.is_empty(), |el| {
+                            el.child(
+                                h_flex()
+                                    .px_4()
+                                    .py_1()
+                                    .flex_wrap()
+                                    .gap_1p5()
+                                    .children(self.subscription_discovered.iter().enumerate().map(|(i, cal)| {
+                                        let cal = cal.clone();
+                                        let selected = self.subscription_url.read(cx).text().trim() == cal.url;
+                                        div()
+                                            .id(SharedString::from(format!("caldav-discovered-{i}")))
+                                            .px_2p5()
+                                            .h(px(26.))
+                                            .flex()
+                                            .items_center()
+                                            .gap_1()
+                                            .rounded(px(6.))
+                                            .border_1()
+                                            .border_color(if selected { colors.accent } else { colors.border })
+                                            .when(selected, |el| el.bg(colors.accent.opacity(0.12)))
+                                            .cursor_pointer()
+                                            .child(Icon::new(IconName::CalendarPlus).size(IconSize::XSmall).color(Color::Muted))
+                                            .child(Label::new(cal.name.clone()).size(LabelSize::XSmall))
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                let name = cal.name.clone();
+                                                let url = cal.url.clone();
+                                                this.subscription_name.update(cx, |input, cx| input.set_text(name, cx));
+                                                this.subscription_url.update(cx, |input, cx| input.set_text(url, cx));
+                                                this.subscription_writable = cal.writable;
+                                                cx.notify();
+                                            }))
+                                    })),
+                            )
+                        })
+                })
                 .child(h_flex().h(px(40.)).px_4().gap_4().child(div().w(px(80.)).child(Label::new(strings.color))).child(swatches))
                 .child(
                     h_flex()
@@ -1854,5 +2122,59 @@ mod tests {
         cx.simulate_keystrokes("escape");
         assert!(cx.debug_bounds("china-holiday-source-menu").is_none());
         cx.update(|_, cx| assert_eq!(settings.read(cx).page, Page::Integrations));
+    }
+
+    #[gpui::test]
+    fn caldav_form_saves_and_preserves_credentials_on_visibility_toggle(cx: &mut gpui::TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        cx.update(|cx| {
+            theme::init(cx);
+            assert!(crate::keymap::load_default(&assets::Assets, cx).unwrap().is_empty());
+            cx.set_global(CurrentLocale(Locale::En));
+            crate::subscriptions::init(store.clone(), cx);
+        });
+        let (settings, cx) = cx.add_window_view(|window, cx| {
+            let mut settings = SettingsWindow::new(store.clone(), cx);
+            settings.set_page(Page::Integrations, cx);
+            window.focus(&settings.focus_handle, cx);
+            settings
+        });
+        cx.simulate_resize(gpui::size(px(900.), px(720.)));
+
+        // Open add form, switch to CalDAV + Fastmail preset, fill credentials, save.
+        cx.update(|window, cx| {
+            settings.update(cx, |s, cx| s.open_subscription_form(None, window, cx));
+        });
+        let caldav_btn = cx.debug_bounds("subscription-kind-caldav").unwrap().center();
+        cx.simulate_click(caldav_btn, gpui::Modifiers::default());
+        let fastmail_btn = cx.debug_bounds("caldav-provider-fastmail").unwrap().center();
+        cx.simulate_click(fastmail_btn, gpui::Modifiers::default());
+        settings.update(cx, |s, cx| {
+            s.subscription_name.update(cx, |i, cx| i.set_text("Fastmail Work", cx));
+            s.subscription_username.update(cx, |i, cx| i.set_text("alice@fastmail.com", cx));
+            s.subscription_password.update(cx, |i, cx| i.set_text("app-secret", cx));
+            s.save_subscription_form(cx);
+        });
+        cx.run_until_parked();
+
+        let subs = store.subscriptions().unwrap();
+        assert_eq!(subs.len(), 1);
+        let id = subs[0].id;
+        assert_eq!(subs[0].kind, fern_core::ical::CalendarKind::CalDav);
+        assert_eq!(subs[0].provider, fern_core::ical::CalendarProvider::Fastmail);
+        assert_eq!(subs[0].username, "alice@fastmail.com");
+        assert_eq!(subs[0].password, "app-secret");
+        assert!(subs[0].writable);
+
+        // Toggle visibility -> CalDAV credentials/provider remain intact.
+        let show_sel: &'static str = Box::leak(format!("subscription-show-{id}").into_boxed_str());
+        let show_btn = cx.debug_bounds(show_sel).unwrap().center();
+        cx.simulate_click(show_btn, gpui::Modifiers::default());
+        cx.run_until_parked();
+        let after = store.subscriptions().unwrap();
+        assert!(after[0].hidden);
+        assert_eq!(after[0].kind, fern_core::ical::CalendarKind::CalDav);
+        assert_eq!(after[0].provider, fern_core::ical::CalendarProvider::Fastmail);
+        assert_eq!(after[0].password, "app-secret");
     }
 }

@@ -38,6 +38,7 @@ pub const SYNCED: &[(&str, &[&str])] = &[
     ("task_comments", &["id"]),
     ("focus_timers", &["id"]),
     ("matrix_rules", &["quadrant"]),
+    ("matrix_profiles", &["id"]),
 ];
 
 /// Key parts are joined with this character, as the triggers do.

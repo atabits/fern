@@ -1,6 +1,192 @@
 use super::*;
 
+fn visible_timeline_bar(task: &Task, days: &[NaiveDate]) -> Option<(usize, usize)> {
+    let start = task.due_date?;
+    let end = task.end_date.unwrap_or(start).max(start);
+    let first_day = *days.first()?;
+    let last_day = *days.last()?;
+    if end < first_day || start > last_day {
+        return None;
+    }
+    let first = days.iter().position(|d| *d >= start)?;
+    let last = days.iter().rposition(|d| *d <= end)?;
+    (last >= first).then_some((first, last - first + 1))
+}
+
 impl TodoView {
+    pub(super) fn toggle_timeline_weekends(&mut self, cx: &mut Context<Self>) {
+        let next = !self.timeline_show_weekends;
+        let result = self.store.set_setting("timeline_show_weekends", if next { "1" } else { "0" });
+        self.check(result);
+        self.timeline_show_weekends = next;
+        cx.notify();
+    }
+
+    pub(super) fn set_timeline_color_by(&mut self, choice: ColorBy, cx: &mut Context<Self>) {
+        let result = self.store.set_setting("timeline_color_by", choice.code());
+        self.check(result);
+        self.timeline_color_by = choice;
+        cx.notify();
+    }
+
+    pub(super) fn set_timeline_secondary_tz(&mut self, tz: Option<String>, cx: &mut Context<Self>) {
+        let cleaned = tz
+            .as_deref()
+            .map(str::trim)
+            .filter(|z| !z.is_empty() && z.parse::<chrono_tz::Tz>().is_ok())
+            .map(str::to_owned);
+        let result = self.store.set_setting("timeline_secondary_tz", cleaned.as_deref().unwrap_or(""));
+        self.check(result);
+        self.timeline_secondary_tz = cleaned;
+        self.timeline_tz_menu = false;
+        cx.notify();
+    }
+
+    pub(super) fn resize_timeline_task(&mut self, resized: &ResizedTask, day: NaiveDate, cx: &mut Context<Self>) {
+        let (start, end) = match resized.edge {
+            ResizeEdge::Start => (day.min(resized.end), resized.end),
+            ResizeEdge::End => (resized.start, day.max(resized.start)),
+        };
+        let result = self.store.resize_dates(resized.id, start, end);
+        self.check(result);
+        crate::data_version::data_changed(cx.entity_id(), cx);
+        self.reload(cx);
+    }
+
+    fn timeline_bar_color(&self, task: &Task, theme: &theme::Theme) -> Hsla {
+        let accent = theme.colors().accent;
+        match self.timeline_color_by {
+            ColorBy::List => task
+                .list_id
+                .and_then(|id| self.lists.iter().find(|l| l.id == id))
+                .and_then(|l| lists_panel::parse_color(l.color.as_deref()))
+                .unwrap_or(accent),
+            ColorBy::Tag => task
+                .tags
+                .first()
+                .and_then(|name| self.tags.iter().find(|t| t.name.eq_ignore_ascii_case(name)))
+                .and_then(|t| lists_panel::parse_color(t.color.as_deref()))
+                .unwrap_or(accent),
+            ColorBy::Priority => task_rows::priority_color(task.priority, theme).unwrap_or(accent),
+        }
+    }
+
+    fn render_timeline_tz_button(&self, strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let label = self
+            .timeline_secondary_tz
+            .as_deref()
+            .map(|z| z.rsplit('/').next().unwrap_or(z).replace('_', " "))
+            .unwrap_or_else(|| strings.secondary_timezone_none.to_owned());
+        let query = self.timeline_tz_input.read(cx).text().trim().to_lowercase();
+        let tz_choices: Vec<&'static str> = if query.is_empty() {
+            vec![
+                "UTC",
+                "America/New_York",
+                "America/Los_Angeles",
+                "America/Chicago",
+                "Europe/London",
+                "Europe/Berlin",
+                "Europe/Moscow",
+                "Asia/Dubai",
+                "Asia/Kolkata",
+                "Asia/Shanghai",
+                "Asia/Tokyo",
+                "Australia/Sydney",
+            ]
+        } else {
+            chrono_tz::TZ_VARIANTS
+                .iter()
+                .map(|z| z.name())
+                .filter(|name| name.to_lowercase().contains(&query))
+                .take(40)
+                .collect()
+        };
+        div()
+            .relative()
+            .ml_1p5()
+            .child(
+                h_flex()
+                    .id("timeline-secondary-tz")
+                    .px_2()
+                    .h(px(22.))
+                    .gap_1()
+                    .rounded(px(11.))
+                    .border_1()
+                    .border_color(theme.colors().border)
+                    .cursor_pointer()
+                    .child(Icon::new(IconName::Clock).size(IconSize::XSmall).color(Color::Muted))
+                    .child(Label::new(label).size(LabelSize::Small))
+                    .child(Icon::new(IconName::ChevronDown).size(IconSize::XSmall).color(Color::Muted))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.timeline_tz_menu = !this.timeline_tz_menu;
+                        if this.timeline_tz_menu {
+                            window.focus(&this.timeline_tz_input.focus_handle(cx), cx);
+                        }
+                        cx.notify();
+                    })),
+            )
+            .when(self.timeline_tz_menu, |el| {
+                el.child(PopoverAttachment::new(
+                    Placement::BelowRight,
+                    popover(cx)
+                        .w(px(260.))
+                        .p_2()
+                        .gap_1p5()
+                        .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                            this.timeline_tz_menu = false;
+                            cx.notify();
+                        }))
+                        .child(
+                            h_flex()
+                                .h(px(28.))
+                                .px_2()
+                                .rounded(px(6.))
+                                .border_1()
+                                .border_color(theme.colors().border)
+                                .child(self.timeline_tz_input.clone())
+                                .child(
+                                    Label::new(if self.timeline_tz_input.read(cx).text().is_empty() {
+                                        strings.timezone_search
+                                    } else {
+                                        ""
+                                    })
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                                ),
+                        )
+                        .child(
+                            v_scroll(
+                                "timeline-tz-scroll",
+                                v_flex()
+                                    .id("timeline-tz-list")
+                                    .child(
+                                        ListItem::new("timeline-tz-none")
+                                            .height(px(28.))
+                                            .toggle_state(self.timeline_secondary_tz.is_none())
+                                            .child(Label::new(strings.secondary_timezone_none).size(LabelSize::Small))
+                                            .on_click(cx.listener(|this, _, _, cx| this.set_timeline_secondary_tz(None, cx))),
+                                    )
+                                    .children(tz_choices.into_iter().map(|zone| {
+                                        let active = self.timeline_secondary_tz.as_deref() == Some(zone);
+                                        ListItem::new(SharedString::from(format!("timeline-tz-{zone}")))
+                                            .height(px(28.))
+                                            .toggle_state(active)
+                                            .child(Label::new(zone).size(LabelSize::Small).truncate())
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.set_timeline_secondary_tz(Some(zone.to_owned()), cx);
+                                            }))
+                                    })),
+                            )
+                            .max_h(px(200.))
+                            .compact(),
+                        )
+                        .into_any_element(),
+                ))
+            })
+            .into_any_element()
+    }
+
     /// The Timeline's scale button, "Day ▾", and its menu: Day, Week, Month.
     pub(super) fn render_scale_button(&self, strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
@@ -66,10 +252,31 @@ impl TodoView {
         let today = Self::today();
         let from = self.timeline_from;
         let today_line = theme.status().error;
-        let days: Vec<NaiveDate> = (0..days_shown as i64).map(|i| from + chrono::Duration::days(i)).collect();
+        let weekend = |date: &NaiveDate| matches!(date.weekday(), chrono::Weekday::Sat | chrono::Weekday::Sun);
+        let days: Vec<NaiveDate> = (0..days_shown as i64)
+            .map(|i| from + chrono::Duration::days(i))
+            .filter(|d| self.timeline_show_weekends || !weekend(d))
+            .collect();
+        let visible_cols = days.len().max(1);
+        let secondary_tz = self
+            .timeline_secondary_tz
+            .as_deref()
+            .and_then(|z| z.parse::<chrono_tz::Tz>().ok());
         let groups = task_rows::kanban_columns(self.rows_with(strings, &HashSet::new(), &HashSet::new()), strings);
         let scale_button = self.render_scale_button(strings, cx);
-        let weekend = |date: &NaiveDate| matches!(date.weekday(), chrono::Weekday::Sat | chrono::Weekday::Sun);
+        let tz_button = self.render_timeline_tz_button(strings, cx);
+        let dual_clock = secondary_tz.map(|tz| {
+            let now_local = Local::now();
+            let now_sec = now_local.with_timezone(&tz);
+            let city = tz.name().rsplit('/').next().unwrap_or(tz.name()).replace('_', " ");
+            format!(
+                "{} {} · {} {}",
+                strings.timezone_local,
+                crate::calendar::format_time(now_local.time(), strings),
+                city,
+                crate::calendar::format_time(now_sec.time(), strings)
+            )
+        });
         let shift = |delta: i64| {
             cx.listener(move |this: &mut Self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>| {
                 this.timeline_from += chrono::Duration::days(delta);
@@ -77,7 +284,7 @@ impl TodoView {
             })
         };
         // The day columns behind each row, so that weekends stay shaded all the way down; a bar
-        // dropped on one moves its task there, keeping its duration.
+        // dropped on one moves or resizes its task there.
         let accent = theme.colors().accent;
         let backdrop = |row: usize, height: Pixels, cx: &mut Context<Self>| {
             h_flex().absolute().top_0().left_0().w_full().h(height).children(days.iter().map(|&date| {
@@ -94,6 +301,10 @@ impl TodoView {
                         this.check(result);
                         this.reload(cx);
                     }))
+                    .drag_over::<ResizedTask>(move |style, _, _, _| style.bg(accent.opacity(0.18)))
+                    .on_drop(cx.listener(move |this, resized: &ResizedTask, _, cx| {
+                        this.resize_timeline_task(resized, date, cx);
+                    }))
             }))
         };
         let header = v_flex()
@@ -109,6 +320,9 @@ impl TodoView {
                             el.child(Label::new(strings.months_short[date.month0() as usize]).size(LabelSize::Small).color(Color::Muted))
                         })
                     })))
+                    .when_some(dual_clock, |el, text| {
+                        el.child(div().mr_2().child(Label::new(text).size(LabelSize::XSmall).color(Color::Muted)))
+                    })
                     .child(
                         div()
                             .id("timeline-today")
@@ -126,7 +340,8 @@ impl TodoView {
                                 cx.notify();
                             })),
                     )
-                    .child(scale_button),
+                    .child(scale_button)
+                    .child(tz_button),
             )
             .child(
                 h_flex()
@@ -168,7 +383,7 @@ impl TodoView {
             let bars: Vec<(Task, usize, usize)> = cards
                 .into_iter()
                 .flat_map(|(task, subtasks)| std::iter::once(task).chain(subtasks))
-                .filter_map(|task| fern_core::timeline::bar(&task, from, days_shown).map(|(first, span)| (task, first, span)))
+                .filter_map(|task| visible_timeline_bar(&task, &days).map(|(first, span)| (task, first, span)))
                 .collect();
             // A group folds up with the arrow before its name, as in the original.
             let folded = self.timeline_folded.contains(&label);
@@ -208,29 +423,75 @@ impl TodoView {
                         .child(backdrop(i, height, cx))
                         .children(bars.into_iter().enumerate().map(|(n, (task, first, span))| {
                             let id = task.id;
-                            let tint = task_rows::priority_color(task.priority, &theme).unwrap_or(theme.colors().accent);
-                            let dragged = DraggedTask { id, title: task.title.clone().into() };
-                            div()
-                                .id(SharedString::from(format!("timeline-{i}-{id}")))
+                            let completed = task.is_completed();
+                            let tint = self.timeline_bar_color(&task, &theme);
+                            let handle_title: SharedString = task.title.clone().into();
+                            let dragged = DraggedTask { id, title: handle_title.clone() };
+                            let span_start = task.due_date.unwrap_or(today);
+                            let span_end = task.end_date.unwrap_or(span_start).max(span_start);
+                            let sec_time_label = secondary_tz.and_then(|tz| {
+                                let d = task.due_date?;
+                                let t = task.due_time?;
+                                let naive = d.and_time(t);
+                                let local_dt = Local.from_local_datetime(&naive).earliest()?;
+                                let sec_dt = local_dt.with_timezone(&tz);
+                                Some(format!(
+                                    "{} ({})",
+                                    crate::calendar::format_time(t, strings),
+                                    crate::calendar::format_time(sec_dt.time(), strings)
+                                ))
+                            });
+                            let resize_handle = |edge: ResizeEdge| {
+                                let tag = if edge == ResizeEdge::Start { "start" } else { "end" };
+                                let payload = ResizedTask {
+                                    id,
+                                    title: handle_title.clone(),
+                                    start: span_start,
+                                    end: span_end,
+                                    edge,
+                                };
+                                div()
+                                    .id(SharedString::from(format!("timeline-resize-{tag}-{i}-{id}")))
+                                    .flex_none()
+                                    .w(px(6.))
+                                    .h_full()
+                                    .cursor_ew_resize()
+                                    .on_drag(payload, |p, _, _, cx| cx.new(|_| p.clone()))
+                                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                    .on_click(|_, _, cx| cx.stop_propagation())
+                            };
+                            let middle = h_flex()
+                                .id(SharedString::from(format!("timeline-body-{i}-{id}")))
+                                .flex_1()
+                                .min_w_0()
+                                .h_full()
+                                .px_1()
+                                .gap_1()
+                                .items_center()
+                                .cursor_grab()
                                 .on_drag(dragged, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
+                                .on_click(cx.listener(move |this, _, _, cx| this.select(id, cx)))
+                                .when_some(sec_time_label, |el, tz_txt| {
+                                    el.child(Label::new(tz_txt).size(LabelSize::XSmall).color(Color::Muted))
+                                })
+                                .child(Label::new(task.title).truncate());
+                            h_flex()
+                                .id(SharedString::from(format!("timeline-{i}-{id}")))
                                 .absolute()
                                 .top(px(8. + 40. * n as f32))
-                                .left(gpui::relative(first as f32 / days_shown as f32))
-                                .w(gpui::relative(span as f32 / days_shown as f32))
+                                .left(gpui::relative(first as f32 / visible_cols as f32))
+                                .w(gpui::relative(span as f32 / visible_cols as f32))
                                 .h(px(32.))
                                 .px_0p5()
                                 .child(
-                                    div()
+                                    h_flex()
                                         .size_full()
-                                        .px_2()
-                                        .flex()
-                                        .items_center()
                                         .rounded(px(8.))
-                                        .bg(tint.opacity(if task.is_completed() { 0.3 } else { 0.75 }))
-                                        .cursor_pointer()
-                                        .child(Label::new(task.title).truncate()),
+                                        .bg(tint.opacity(if completed { 0.3 } else { 0.75 }))
+                                        .child(resize_handle(ResizeEdge::Start))
+                                        .child(middle)
+                                        .child(resize_handle(ResizeEdge::End)),
                                 )
-                                .on_click(cx.listener(move |this, _, _, cx| this.select(id, cx)))
                         })),
                 )
         }).collect::<Vec<_>>();

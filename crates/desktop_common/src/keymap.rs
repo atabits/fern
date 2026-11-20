@@ -408,7 +408,7 @@ mod tests {
         assert_eq!(keys("fern::MinimizeWindow"), ["Esc"]);
         assert_eq!(keys("fern::DismissTransient"), ["Esc"]);
         assert!(keys("fern::Quit").is_empty());
-        assert!(keys("fern::NewTask").contains(&"Ctrl+Shift+M".to_owned()));
+        assert!(keys("fern::NewTask").contains(&display_keys("ctrl-shift-m")));
         assert_eq!(keys("task_list::ToggleComplete"), ["Tab, M"]);
     }
 

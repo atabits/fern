@@ -620,7 +620,8 @@ impl SettingsWindow {
                     "settings-navigation-scroll",
                     v_flex()
                         .id("settings-navigation")
-                        .px_2()
+                        .pl_2()
+                        .pr(px(12.))
                         .pb_2()
                         .gap_0p5()
                         .child(

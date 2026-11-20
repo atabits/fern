@@ -1256,9 +1256,17 @@ fn task_list_scrollbar_scrolls_and_lists_resize_edge_stays_unobstructed(cx: &mut
         "first task row should be visible again after dragging scrollbar to top"
     );
 
-    // Verify lists_panel scrollbar scrolls at inset 6 px, and lists-resize at the right 6 px edge stays unobstructed.
+    // Verify lists_panel rows stay clear of the inset scrollbar thumb (8..14 px from the inner right edge)
+    // and lists-resize at the right 6 px edge stays unobstructed.
     let initial_lists_y = cx.update(|_, cx| view.read(cx).lists_scroll.offset().y);
     let lists_bounds = cx.debug_bounds("lists-column").unwrap();
+    let inbox_bounds = cx.debug_bounds("lists-item-view-Inbox").unwrap();
+    assert!(
+        inbox_bounds.right() <= lists_bounds.right() - px(16.),
+        "sidebar rows must not extend under the inset scrollbar thumb: row right {:?}, panel right {:?}",
+        inbox_bounds.right(),
+        lists_bounds.right()
+    );
     let lists_bar = point(lists_bounds.right() - px(10.), lists_bounds.top() + px(240.));
     cx.simulate_mouse_move(lists_bar, None, modifiers);
     cx.simulate_click(lists_bar, modifiers);

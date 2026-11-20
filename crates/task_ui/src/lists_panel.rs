@@ -839,7 +839,9 @@ pub fn render(
     rows.clear();
     let mut lists_column = v_flex()
         .id("lists-panel")
-        .px_2()
+        .pl_2()
+        // Reserve room for the 6 px resize strip + inset overlay scrollbar so rows stay clear of the thumb.
+        .pr(px(16.))
         .pb_2();
 
     let mut push_row = |col: Stateful<Div>, kind: PanelChild, el: AnyElement| -> Stateful<Div> {

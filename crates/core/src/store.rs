@@ -2337,6 +2337,7 @@ impl Store {
                     let updated: Vec<&str> = saved.lines().map(|n| if n == name { new_name } else { n }).collect();
                     self.set_setting(TAG_ORDER_KEY, &updated.join("\n"))?;
                 }
+                self.update_matrix_rules_for_tag_rename(name, new_name)?;
             }
             self.conn.execute("UPDATE tags SET color = ?2, parent = ?3 WHERE name = ?1", params![new_name, color, parent])?;
             Ok(())
@@ -2514,6 +2515,7 @@ impl Store {
             self.conn.execute("UPDATE tags SET parent = ?2 WHERE parent = ?1 AND name != ?3", params![from, new_parent, into])?;
             self.conn.execute("DELETE FROM tags WHERE name = ?1", [from])?;
             self.prune_tag_order(from)?;
+            self.update_matrix_rules_for_tag_rename(from, into)?;
             Ok(())
         })
     }
@@ -2525,6 +2527,7 @@ impl Store {
             self.conn.execute("UPDATE tags SET parent = NULL WHERE parent = ?1", [name])?;
             self.conn.execute("DELETE FROM tags WHERE name = ?1", [name])?;
             self.prune_tag_order(name)?;
+            self.prune_matrix_rules_for_tag_delete(name)?;
             Ok(())
         })
     }

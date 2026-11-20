@@ -104,6 +104,18 @@
     }
   },
   {
+    "context": "Matrix",
+    "bindings": {
+      "down": "matrix::SelectNextMatrixTask",
+      "j": "matrix::SelectNextMatrixTask",
+      "up": "matrix::SelectPreviousMatrixTask",
+      "k": "matrix::SelectPreviousMatrixTask",
+      "space": "matrix::ToggleMatrixTask",
+      "enter": "matrix::OpenMatrixTask",
+      "delete": "matrix::DeleteMatrixTask"
+    }
+  },
+  {
     "context": "Settings",
     "bindings": {
       "escape": "settings::DismissSettings"

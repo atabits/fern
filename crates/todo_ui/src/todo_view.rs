@@ -28,9 +28,6 @@ use crate::task_menu;
 use crate::task_rows::{self, ClosedRange, DropTarget, GroupBy, Row, Section, SortBy};
 use crate::text_input::{Cancelled, Changed, Mode, Submitted, TextInput};
 
-/// The share of a task row, from the left, where a dropped task goes before it; the rest of the
-/// row nests it.
-const NEST_ZONE: f32 = 0.6;
 /// The details' width by default and the narrowest its edge drags to; the task list keeps at
 /// least `LIST_MIN_WIDTH`, which also bounds how wide the details get.
 const DETAIL_WIDTH: f32 = 419.;
@@ -42,6 +39,8 @@ const NARROW_WINDOW: f32 = 1200.;
 /// Space left of the checkbox for the subtask chevron.
 const GUTTER: f32 = 20.;
 const INDENT: f32 = 24.;
+/// Left padding before a root kanban card's checkbox (chevron sits inside this gutter).
+const KANBAN_GUTTER: f32 = 16.;
 
 /// An open filter dropdown of the Completed and Won't Do views. The lists filter is edited as a
 /// draft until "OK", as in the original.
@@ -65,6 +64,33 @@ enum KanbanSub {
     Pinned,
     Unpinned,
     Completed,
+}
+
+/// Visual card-slice role of a visible kanban row:
+/// a root card and its expanded descendants share one continuous outer border and radius.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KanbanItemUi {
+    Root,
+    RootHasChildren,
+    Child,
+    LastChild,
+}
+
+struct KanbanVisibleRow {
+    task: Task,
+    depth: usize,
+    has_children: bool,
+    collapsed: bool,
+    descendant_done: usize,
+    descendant_total: usize,
+    ui: KanbanItemUi,
+}
+
+struct KanbanColRows {
+    key: String,
+    drop: Option<DropTarget>,
+    rows: Vec<Row>,
+    row_subs: HashMap<Id, KanbanSub>,
 }
 
 type BoardCard = (Task, Vec<Task>);
@@ -249,6 +275,13 @@ pub struct TodoView {
     kanban_scroll: gpui::ScrollHandle,
     /// Horizontal pan-to-scroll on empty kanban space: `(start_pointer_x, start_scroll_offset_x)`.
     kanban_pan: Option<(Pixels, Pixels)>,
+    /// Window bounds of currently painted kanban task rows and columns, for drag-and-drop.
+    kanban_row_bounds: Rc<RefCell<HashMap<Id, gpui::Bounds<Pixels>>>>,
+    kanban_col_bounds: Rc<RefCell<HashMap<String, gpui::Bounds<Pixels>>>>,
+    /// Cached per-column visible rows from the last kanban render frame, for drag planning.
+    kanban_drag_rows: Vec<KanbanColRows>,
+    /// Target column key highlighted during a cross-column task drag.
+    kanban_hover_col: Option<String>,
     /// The Timeline's groups folded up, by name.
     timeline_folded: HashSet<String>,
     /// Today's "Suggested Tasks" panel (the header's light bulb), and whether its Long Unfinished
@@ -481,6 +514,10 @@ impl TodoView {
             kanban_folded_sub: HashSet::new(),
             kanban_scroll: gpui::ScrollHandle::new(),
             kanban_pan: None,
+            kanban_row_bounds: Rc::new(RefCell::new(HashMap::new())),
+            kanban_col_bounds: Rc::new(RefCell::new(HashMap::new())),
+            kanban_drag_rows: Vec::new(),
+            kanban_hover_col: None,
             timeline_folded: HashSet::new(),
             view_options: None,
             suggestions_open: None,
@@ -2293,13 +2330,8 @@ impl TodoView {
     fn visible_task_ids(&self, strings: &Strings) -> Vec<Id> {
         if self.kanban && !self.timeline && !matches!(self.view, View::Trash | View::Completed | View::WontDo | View::Search(_)) {
             let mut ids = Vec::new();
-            let push_cards = |cards: &[(Task, Vec<Task>)], ids: &mut Vec<Id>| {
-                for (root, subs) in cards {
-                    ids.push(root.id);
-                    if !self.collapsed_tasks.contains(&root.id) {
-                        ids.extend(subs.iter().map(|s| s.id));
-                    }
-                }
+            let push_cards = |cards: &[BoardCard], ids: &mut Vec<Id>| {
+                ids.extend(self.kanban_visible_rows(cards).into_iter().map(|r| r.task.id));
             };
             for col in self.board_columns(strings) {
                 if !col.pinned_cards.is_empty() {
@@ -2880,13 +2912,89 @@ impl TodoView {
         }
     }
 
+    /// Flattens a kanban subsection's cards into visible rows preserving real multi-level
+    /// nesting depth, per-parent collapse state, and `KanbanItemUi` card-slice role.
+    fn kanban_visible_rows(&self, cards: &[BoardCard]) -> Vec<KanbanVisibleRow> {
+        fn count_descendants(id: Id, children: &HashMap<Id, Vec<&Task>>) -> (usize, usize) {
+            let mut done = 0;
+            let mut total = 0;
+            if let Some(kids) = children.get(&id) {
+                for kid in kids {
+                    total += 1;
+                    if kid.is_completed() {
+                        done += 1;
+                    }
+                    let (d, t) = count_descendants(kid.id, children);
+                    done += d;
+                    total += t;
+                }
+            }
+            (done, total)
+        }
+        fn push_tree(
+            task: &Task,
+            depth: usize,
+            children: &HashMap<Id, Vec<&Task>>,
+            collapsed_tasks: &HashSet<Id>,
+            out: &mut Vec<KanbanVisibleRow>,
+        ) {
+            let kids = children.get(&task.id);
+            let has_children = kids.is_some_and(|k| !k.is_empty());
+            let collapsed = has_children && collapsed_tasks.contains(&task.id);
+            let (descendant_done, descendant_total) = if collapsed {
+                count_descendants(task.id, children)
+            } else {
+                (0, 0)
+            };
+            out.push(KanbanVisibleRow {
+                task: task.clone(),
+                depth,
+                has_children,
+                collapsed,
+                descendant_done,
+                descendant_total,
+                ui: KanbanItemUi::Root,
+            });
+            if !collapsed {
+                for kid in kids.into_iter().flatten() {
+                    push_tree(kid, depth + 1, children, collapsed_tasks, out);
+                }
+            }
+        }
+
+        let mut out = Vec::new();
+        for (root, subs) in cards {
+            let mut card_ids: HashSet<Id> = HashSet::with_capacity(subs.len() + 1);
+            card_ids.insert(root.id);
+            for sub in subs {
+                card_ids.insert(sub.id);
+            }
+            let mut children: HashMap<Id, Vec<&Task>> = HashMap::new();
+            for sub in subs {
+                let parent = sub.parent_id.filter(|p| card_ids.contains(p)).unwrap_or(root.id);
+                children.entry(parent).or_default().push(sub);
+            }
+            push_tree(root, 0, &children, &self.collapsed_tasks, &mut out);
+        }
+
+        for i in 0..out.len() {
+            let next_is_child = out.get(i + 1).is_some_and(|n| n.depth > 0);
+            out[i].ui = if out[i].depth == 0 {
+                if next_is_child { KanbanItemUi::RootHasChildren } else { KanbanItemUi::Root }
+            } else if next_is_child {
+                KanbanItemUi::Child
+            } else {
+                KanbanItemUi::LastChild
+            };
+        }
+        out
+    }
+
     #[allow(clippy::too_many_arguments)]
-    fn render_card(
+    fn render_kanban_row(
         &self,
         column: usize,
-        column_drop: Option<DropTarget>,
-        task: &Task,
-        subtasks: &[Task],
+        row: &KanbanVisibleRow,
         tag_colors: &HashMap<String, Hsla>,
         column_tint: Option<Hsla>,
         show_list_name: bool,
@@ -2894,13 +3002,18 @@ impl TodoView {
         strings: &'static Strings,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let task = &row.task;
+        let id = task.id;
+        let depth = row.depth;
+        let has_children = row.has_children;
+        let collapsed = row.collapsed;
+        let ui = row.ui;
+
         let theme = cx.theme().clone();
         let dark = theme.is_dark();
-        let selected = self.selected == Some(task.id) || self.card == Some(task.id);
+        let selected = self.selected == Some(id) || self.card == Some(id);
         let settled_done = task.is_completed();
-        let root_done = settled_done || self.completing.contains_key(&task.id);
-        let collapsed = self.collapsed_tasks.contains(&task.id);
-        let has_subtasks = !subtasks.is_empty();
+        let done = settled_done || self.completing.contains_key(&id);
         let details_line = self
             .show_details
             .then(|| task.notes.lines().find(|l| !l.trim().is_empty()).map(|l| l.trim().to_owned()))
@@ -2909,9 +3022,9 @@ impl TodoView {
         let due = task.due_date.map(|date| task_rows::row_due_label(date, task.due_time, today, strings, self.preferences.countdown_dates));
         let has_reminders = !task.reminders.is_empty() && !settled_done;
         let checklist = task.checklist.filter(|_| !settled_done);
-        let list_info = show_list_name.then(|| {
+        let list_info = (depth == 0 && show_list_name).then(|| {
             task.list_id
-                .and_then(|id| self.lists.iter().find(|l| l.id == id))
+                .and_then(|lid| self.lists.iter().find(|l| l.id == lid))
                 .map_or((SharedString::new_static(strings.inbox), None), |l| {
                     (SharedString::from(l.name.clone()), lists_panel::parse_color(l.color.as_deref()))
                 })
@@ -2921,113 +3034,31 @@ impl TodoView {
             || task.repeat.is_some()
             || has_reminders
             || checklist.is_some()
-            || (collapsed && has_subtasks)
+            || (collapsed && has_children)
             || list_info.is_some();
         let has_meta = details_line.is_some() || !task.tags.is_empty() || has_tips_row;
-        let line = |task: &Task,
-                    id: SharedString,
-                    pl: Pixels,
-                    py_top: Pixels,
-                    py_bottom: Pixels,
-                    is_root: bool,
-                    cx: &mut Context<Self>| {
-            let task_id = task.id;
-            let done = task.is_completed() || self.completing.contains_key(&task.id);
-            h_flex()
-                .relative()
-                .items_start()
-                .pl(pl)
-                .pr(px(12.))
-                .pt(py_top)
-                .pb(py_bottom)
-                .gap(px(9.))
-                .when(is_root && has_subtasks, |el| {
-                    el.child(
-                        div()
-                            .id(SharedString::from(format!("card-fold-{task_id}")))
-                            .absolute()
-                            .left(px(1.))
-                            .top(px(11.))
-                            .size(px(14.))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .cursor_pointer()
-                            .child(chevron(collapsed).color(Color::Muted))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                cx.stop_propagation();
-                                if !this.collapsed_tasks.remove(&task_id) {
-                                    this.collapsed_tasks.insert(task_id);
-                                }
-                                cx.notify();
-                            })),
-                    )
-                })
-                // A note shows the note icon, as the original's cards, not a box.
-                .map(|el| if task.kind == Kind::Note {
-                    el.child(div().pt(px(2.)).child(Icon::new(IconName::FileText).size(IconSize::Small).color(Color::Muted)))
-                } else {
-                    let checkbox = Checkbox::new(id)
-                        .toggle_state(done)
-                        .animate_completion(crate::completion_mark::started(task_id, cx))
-                        .tint(task_rows::priority_color(task.priority, &theme))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            cx.stop_propagation();
-                            this.toggle(task_id, !done, cx);
-                        }));
-                    // A finger gets a wider target around the box, which does the same.
-                    el.child(
-                        div()
-                            .id("card-box")
-                            .pt(px(2.))
-                            .debug_selector(|| format!("kanban-checkbox-{task_id}"))
-                            .when(crate::touch::active(), |el| {
-                                el.p(px(8.)).m(px(-8.)).on_click(cx.listener(move |this, _, _, cx| {
-                                    cx.stop_propagation();
-                                    this.toggle(task_id, !done, cx);
-                                }))
-                            })
-                            .child(checkbox),
-                    )
-                })
-                .child({
-                    let title_input = self
-                        .title_edit
-                        .as_ref()
-                        .filter(|(editing, _, _)| *editing == task_id)
-                        .map(|(_, input, _)| input.clone());
-                    if let Some(input) = title_input {
-                        div()
-                            .id(SharedString::from(format!("card-title-edit-{task_id}")))
-                            .flex_1()
-                            .min_w_0()
-                            .on_click(|_, _, cx| cx.stop_propagation())
-                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                            .child(input)
-                            .into_any_element()
-                    } else {
-                        div()
-                            .id(SharedString::from(format!("card-title-{task_id}")))
-                            .flex_1()
-                            .min_w_0()
-                            .text_size(px(14.))
-                            .line_height(px(20.))
-                            .text_color(if done { theme.colors().text_muted } else { theme.colors().text })
-                            .on_mouse_down(MouseButton::Left, cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
-                                if event.click_count > 1 {
-                                    cx.stop_propagation();
-                                    this.close_card(cx);
-                                    this.start_title_edit(task_id, Some(event.position), window, cx);
-                                }
-                            }))
-                            .child(if task.title.is_empty() { strings.untitled.to_owned() } else { task.title.clone() })
-                            .into_any_element()
-                    }
-                })
+
+        let indent_px = depth as f32 * INDENT;
+        let row_pl = px(KANBAN_GUTTER + indent_px);
+        let py_top = if depth == 0 { px(10.) } else { px(8.) };
+        let py_bottom = if has_meta {
+            px(4.)
+        } else if depth == 0 {
+            px(10.)
+        } else {
+            px(8.)
         };
-        let id = task.id;
-        let card_open_here = self.card == Some(id) || subtasks.iter().any(|s| self.card == Some(s.id));
+
+        let title_input = self
+            .title_edit
+            .as_ref()
+            .filter(|(editing, _, _)| *editing == id)
+            .map(|(_, input, _)| input.clone());
+        let draggable = self.view != View::Trash && title_input.is_none();
         let dragged = DraggedTask { id, title: task.title.clone().into() };
+        let is_being_dragged = self.task_drag_origin.is_some_and(|(d, _)| d == id);
+        let drop_indicator = self.task_drop.as_ref().filter(|plan| plan.target_id == id).cloned();
+
         // Match TickTick's `.kanban-bg-el`: `bg-main-background`, `border-grey-8 dark:border-[#363636]`,
         // `bg-primary-10 dark:bg-grey-6` when selected (no accent border), and soft shadow in light mode.
         let base_surface = theme.colors().elevated_surface_background;
@@ -3057,86 +3088,124 @@ impl TodoView {
             base_surface.blend(theme.colors().ghost_element_hover)
         };
         let accent = theme.colors().accent;
-        let can_nest = task.kind == Kind::Task && !settled_done;
-        let drop_for_reorder = column_drop.clone();
-        let drop_for_nest = column_drop;
-        v_flex()
-            .id(ElementId::Uuid(id))
+        let row_bounds = self.kanban_row_bounds.clone();
+        let card_open_here = self.card == Some(id);
+
+        let content_line = h_flex()
             .relative()
-            .on_drag(dragged, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
-            .min_h(px(40.))
-            .rounded(px(10.))
-            .border_1()
-            .border_color(card_border)
-            .bg(card_bg)
-            .when(!dark && column_tint.is_none(), |el| el.shadow_xs())
-            .hover(move |s| s.bg(card_hover))
-            .when(settled_done, |el| el.opacity(0.6))
-            .cursor_pointer()
-            .on_click(cx.listener(move |this, _, window, cx| {
-                if this.title_edit.as_ref().is_some_and(|(editing, _, _)| *editing == id) {
-                    return;
-                }
-                window.focus(&this.list_focus, cx);
-                this.open_card(id, cx);
-            }))
-            // Card-to-card drop zones: left zone reorders before this card, right zone nests as subtask.
-            .child(
-                div()
-                    .absolute()
-                    .top_0()
-                    .left_0()
-                    .h_full()
-                    .w(gpui::relative(if can_nest { NEST_ZONE } else { 1. }))
-                    .drag_over::<DraggedTask>(move |style, _, _, _| style.border_t_2().border_color(accent))
-                    .on_drop(cx.listener(move |this, dragged: &DraggedTask, _, cx| {
-                        this.drop_on_kanban_card(dragged.id, id, drop_for_reorder.clone(), false, cx);
-                    })),
-            )
-            .when(can_nest, |el| {
+            .items_start()
+            .pl(row_pl)
+            .pr(px(12.))
+            .pt(py_top)
+            .pb(py_bottom)
+            .gap(px(9.))
+            .when(has_children, |el| {
                 el.child(
                     div()
+                        .id(SharedString::from(format!("card-fold-{id}")))
                         .absolute()
-                        .top_0()
-                        .right_0()
-                        .h_full()
-                        .w(gpui::relative(1. - NEST_ZONE))
-                        .rounded(px(10.))
-                        .drag_over::<DraggedTask>(move |style, _, _, _| {
-                            style.border_1().border_color(accent).bg(accent.opacity(0.08))
-                        })
-                        .on_drop(cx.listener(move |this, dragged: &DraggedTask, _, cx| {
-                            this.drop_on_kanban_card(dragged.id, id, drop_for_nest.clone(), true, cx);
+                        .left(px(1. + indent_px))
+                        .top(if depth == 0 { px(11.) } else { px(9.) })
+                        .size(px(14.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .child(chevron(collapsed).color(Color::Muted))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            if !this.collapsed_tasks.remove(&id) {
+                                this.collapsed_tasks.insert(id);
+                            }
+                            cx.notify();
                         })),
                 )
             })
-            .on_mouse_down(MouseButton::Right, cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
-                cx.stop_propagation();
-                window.focus(&this.list_focus, cx);
-                this.context_menu = Some((id, event.position));
-                this.context_side = None;
-                cx.notify();
-            }))
-            // As the original's, the card opens on the right of the first columns, on the left of
-            // the others.
-            .when(card_open_here, |el| {
-                let placement = if column < 2 { Placement::RightOf } else { Placement::LeftOf };
-                el.relative().child(PopoverAttachment::new(placement, self.render_card_details(cx)))
+            // A note shows the note icon, as the original's cards, not a box.
+            .map(|el| {
+                if task.kind == Kind::Note {
+                    el.child(div().pt(px(2.)).child(Icon::new(IconName::FileText).size(IconSize::Small).color(Color::Muted)))
+                } else {
+                    let checkbox = Checkbox::new(SharedString::from(format!("card-check-{id}")))
+                        .toggle_state(done)
+                        .animate_completion(crate::completion_mark::started(id, cx))
+                        .tint(task_rows::priority_color(task.priority, &theme))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.toggle(id, !done, cx);
+                        }));
+                    // A finger gets a wider target around the box, which does the same.
+                    el.child(
+                        div()
+                            .id("card-box")
+                            .pt(px(2.))
+                            .debug_selector(move || format!("kanban-checkbox-{id}"))
+                            .when(crate::touch::active(), |el| {
+                                el.p(px(8.)).m(px(-8.)).on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.toggle(id, !done, cx);
+                                }))
+                            })
+                            .child(checkbox),
+                    )
+                }
             })
-            .child(line(
-                task,
-                SharedString::from(format!("card-check-{id}")),
-                px(16.),
-                px(10.),
-                if has_meta { px(4.) } else { px(10.) },
-                true,
-                cx,
-            ))
+            .child(if let Some(input) = title_input {
+                div()
+                    .id(SharedString::from(format!("card-title-edit-{id}")))
+                    .flex_1()
+                    .min_w_0()
+                    .on_click(|_, _, cx| cx.stop_propagation())
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(input)
+                    .into_any_element()
+            } else {
+                div()
+                    .id(SharedString::from(format!("card-title-{id}")))
+                    .flex_1()
+                    .min_w_0()
+                    .text_size(px(14.))
+                    .line_height(px(20.))
+                    .text_color(if done { theme.colors().text_muted } else { theme.colors().text })
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                            if event.click_count > 1 {
+                                cx.stop_propagation();
+                                this.close_card(cx);
+                                this.start_title_edit(id, Some(event.position), window, cx);
+                            }
+                        }),
+                    )
+                    .child(if task.title.is_empty() { strings.untitled.to_owned() } else { task.title.clone() })
+                    .into_any_element()
+            });
+
+        let inner = v_flex()
+            .relative()
+            .min_h(px(if depth == 0 { 40. } else { 36. }))
+            .border_color(card_border)
+            .map(|el| match ui {
+                KanbanItemUi::Root => el.rounded(px(10.)).border_1(),
+                KanbanItemUi::RootHasChildren => el.rounded_t(px(10.)).border_t_1().border_l_1().border_r_1(),
+                KanbanItemUi::Child => el.border_l_1().border_r_1(),
+                KanbanItemUi::LastChild => el.rounded_b(px(10.)).border_l_1().border_r_1().border_b_1(),
+            })
+            .bg(card_bg)
+            .when(!dark && column_tint.is_none() && matches!(ui, KanbanItemUi::Root), |el| el.shadow_xs())
+            .hover(move |s| s.bg(card_hover))
+            .when(settled_done, |el| el.opacity(0.6))
+            .when(depth > 0, |el| {
+                el.child(div().ml(px(KANBAN_GUTTER + indent_px + 25.)).mr(px(12.)).h(px(1.)).bg(theme.colors().border_variant))
+            })
+            .child(content_line)
             // TickTick's `KanbanRow3` (tags) + `KanbanRow2` (`task-tips-more`: date, icons, progress, list).
             .when(has_meta, |el| {
+                let done_subs = row.descendant_done;
+                let total_subs = row.descendant_total;
                 el.child(
                     v_flex()
-                        .pl(px(41.))
+                        .pl(px(KANBAN_GUTTER + indent_px + 25.))
                         .pr(px(12.))
                         .pb(px(8.))
                         .gap_1()
@@ -3154,7 +3223,7 @@ impl TodoView {
                                     .min_h(px(18.))
                                     .gap_1p5()
                                     .when_some(due, |el, (label, overdue)| {
-                                        let color = if root_done {
+                                        let color = if done {
                                             Color::Muted
                                         } else if overdue {
                                             Color::Error
@@ -3180,13 +3249,12 @@ impl TodoView {
                                                 .child(Label::new(format!("{done_items}/{total}")).size(LabelSize::XSmall).color(Color::Muted)),
                                         )
                                     })
-                                    .when(collapsed && has_subtasks, |el| {
-                                        let done_subs = subtasks.iter().filter(|s| s.is_completed()).count();
+                                    .when(collapsed && has_children, |el| {
                                         el.child(
                                             h_flex()
                                                 .gap_0p5()
                                                 .child(Icon::new(IconName::ListTree).size(IconSize::XSmall).color(Color::Muted))
-                                                .child(Label::new(format!("{done_subs}/{}", subtasks.len())).size(LabelSize::XSmall).color(Color::Muted)),
+                                                .child(Label::new(format!("{done_subs}/{total_subs}")).size(LabelSize::XSmall).color(Color::Muted)),
                                         )
                                     })
                                     .when_some(list_info, |el, (name, dot)| {
@@ -3201,49 +3269,105 @@ impl TodoView {
                             )
                         }),
                 )
-            })
-            .when(!collapsed, |el| {
-                let sub_hover = theme.colors().ghost_element_hover;
-                let sub_selected_bg = if dark {
-                    gpui::white().opacity(0.06)
+            });
+
+        div()
+            .id(ElementId::Uuid(id))
+            .debug_selector(move || {
+                if depth > 0 {
+                    format!("card-sub-{id}")
                 } else {
-                    theme.colors().accent.opacity(0.10)
-                };
-                el.children(subtasks.iter().enumerate().map(|(sub_idx, sub)| {
-                    let sub_id = sub.id;
-                    let is_last = sub_idx + 1 == subtasks.len();
-                    let sub_selected = self.card == Some(sub_id) || self.selected == Some(sub_id);
-                    let sub_draggable = self.view != View::Trash
-                        && self.title_edit.as_ref().is_none_or(|(editing, _, _)| *editing != sub_id);
-                    let dragged_sub = DraggedTask { id: sub_id, title: sub.title.clone().into() };
-                    v_flex()
-                        .id(SharedString::from(format!("card-sub-{sub_id}")))
-                        .debug_selector(move || format!("card-sub-{sub_id}"))
-                        .when(sub_draggable, |el| {
-                            el.on_drag(dragged_sub, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
-                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        })
-                        .when(is_last, |el| el.rounded_b(px(9.)))
-                        .when(sub_selected, |el| el.bg(sub_selected_bg))
-                        .when(!sub_selected, |el| el.hover(move |s| s.bg(sub_hover)))
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            cx.stop_propagation();
-                            if this.title_edit.as_ref().is_some_and(|(editing, _, _)| *editing == sub_id) {
-                                return;
-                            }
-                            window.focus(&this.list_focus, cx);
-                            this.open_card(sub_id, cx);
-                        }))
-                        .on_mouse_down(MouseButton::Right, cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
-                            cx.stop_propagation();
-                            window.focus(&this.list_focus, cx);
-                            this.context_menu = Some((sub_id, event.position));
-                            this.context_side = None;
-                            cx.notify();
-                        }))
-                        .child(div().ml(px(41.)).mr(px(12.)).h(px(1.)).bg(theme.colors().border_variant))
-                        .child(line(sub, SharedString::from(format!("card-check-{sub_id}")), px(34.), px(8.), px(8.), false, cx))
-                }))
+                    format!("kanban-card-{id}")
+                }
+            })
+            .relative()
+            // Outer vertical padding: 8 px between distinct cards with zero dead gaps between row hit-boxes.
+            .map(|el| match ui {
+                KanbanItemUi::Root => el.py(px(4.)),
+                KanbanItemUi::RootHasChildren => el.pt(px(4.)),
+                KanbanItemUi::Child => el,
+                KanbanItemUi::LastChild => el.pb(px(4.)),
+            })
+            .cursor_pointer()
+            .when(draggable, |el| {
+                let view = cx.entity().downgrade();
+                el.on_drag(dragged, move |dragged, cursor_offset, window, cx| {
+                    let dragged_id = dragged.id;
+                    let fallback_x = window.mouse_position().x;
+                    view.update(cx, |this, cx| {
+                        let start_x = this
+                            .kanban_row_bounds
+                            .borrow()
+                            .get(&dragged_id)
+                            .copied()
+                            .map_or(fallback_x, |area| area.left() + cursor_offset.x);
+                        this.task_drag_origin = Some((dragged_id, start_x));
+                        this.task_drop = None;
+                        this.kanban_hover_col = None;
+                        cx.notify();
+                    })
+                    .ok();
+                    cx.new(|_| dragged.clone())
+                })
+            })
+            .when(is_being_dragged, |el| el.opacity(0.45))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                if this.title_edit.as_ref().is_some_and(|(editing, _, _)| *editing == id) {
+                    return;
+                }
+                window.focus(&this.list_focus, cx);
+                this.open_card(id, cx);
+            }))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    window.focus(&this.list_focus, cx);
+                    this.context_menu = Some((id, event.position));
+                    this.context_side = None;
+                    cx.notify();
+                }),
+            )
+            // As the original's, the card opens on the right of the first columns, on the left of
+            // the others.
+            .when(card_open_here, |el| {
+                let placement = if column < 2 { Placement::RightOf } else { Placement::LeftOf };
+                el.child(PopoverAttachment::new(placement, self.render_card_details(cx)))
+            })
+            .child(
+                gpui::canvas(
+                    move |area, _, _| {
+                        row_bounds.borrow_mut().insert(id, area);
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full(),
+            )
+            .child(inner)
+            .when_some(drop_indicator, |el, plan| {
+                let left = px(plan.target_level as f32 * INDENT + KANBAN_GUTTER);
+                el.child(
+                    div()
+                        .absolute()
+                        .left(left)
+                        .right_0()
+                        .when(!plan.after, |s| s.top(px(-1.)))
+                        .when(plan.after, |s| s.bottom(px(-1.)))
+                        .h(px(2.))
+                        .bg(accent)
+                        .child(
+                            div()
+                                .absolute()
+                                .left(px(-3.))
+                                .top(px(-2.))
+                                .size(px(6.))
+                                .rounded_full()
+                                .border_2()
+                                .border_color(accent)
+                                .bg(theme.colors().background),
+                        ),
+                )
             })
             .into_any_element()
     }
@@ -4475,43 +4599,169 @@ impl TodoView {
         self.reload(cx);
     }
 
-    /// Drops a dragged card onto another card: either right before it (reordering within or across
-    /// columns and subsections) or nested inside it as a subtask.
-    fn drop_on_kanban_card(&mut self, dragged: Id, target: Id, column_drop: Option<DropTarget>, nest: bool, cx: &mut Context<Self>) {
-        if dragged == target {
+    /// Tracks a dragged task across the kanban board:
+    /// - within the source column: vertical reorder + horizontal indent/outdent via `plan_task_drop`
+    /// - over another column: highlight the whole target column (no row insertion line)
+    fn move_kanban_task_drag(&mut self, event: &gpui::DragMoveEvent<DraggedTask>, _: &mut Window, cx: &mut Context<Self>) {
+        if self.view == View::Trash || !self.kanban || self.timeline {
             return;
         }
+        let pos = event.event.position;
+        if !event.bounds.contains(&pos) {
+            if self.task_drop.take().is_some() | self.kanban_hover_col.take().is_some() {
+                cx.notify();
+            }
+            return;
+        }
+        let dragged_id = event.drag(cx).id;
+        let start_x = match self.task_drag_origin {
+            Some((id, x)) if id == dragged_id => x,
+            _ => {
+                self.task_drag_origin = Some((dragged_id, pos.x));
+                pos.x
+            }
+        };
+
+        let source_col_idx = self.kanban_drag_rows.iter().position(|c| c.row_subs.contains_key(&dragged_id));
+        // A column's visual card panel shrinks to content height (`max_h_full`), while its drop
+        // lane extends down to the bottom of the board.
+        let hovered_col_key = {
+            let cols = self.kanban_col_bounds.borrow();
+            cols.iter()
+                .find_map(|(k, b)| (pos.x >= b.left() && pos.x <= b.right() && pos.y >= b.top()).then(|| k.clone()))
+        };
+
+        let mut new_plan = None;
+        let mut new_hover_col = None;
+
+        if let Some(target_key) = hovered_col_key {
+            let source_key = source_col_idx.map(|i| self.kanban_drag_rows[i].key.as_str());
+            if source_key != Some(target_key.as_str()) {
+                // Cross-column drag: reject row drop line and highlight target column if it accepts drops.
+                if let Some(target_col) = self.kanban_drag_rows.iter().find(|c| c.key == target_key)
+                    && let Some(drop_target) = &target_col.drop
+                {
+                    let dragged_is_note = self.tasks.iter().any(|t| t.id == dragged_id && t.kind == Kind::Note);
+                    if !(dragged_is_note && matches!(drop_target, DropTarget::Priority(_))) {
+                        new_hover_col = Some(target_key);
+                    }
+                }
+            } else if let Some(src_idx) = source_col_idx {
+                // Same-column drag: use the exact same tree drop planner as List view.
+                let col = &self.kanban_drag_rows[src_idx];
+                let row_bounds = self.kanban_row_bounds.borrow();
+                let mut hit: Option<(Id, gpui::Bounds<Pixels>)> = None;
+                let mut bottommost_y: Option<Pixels> = None;
+                for &task_id in col.row_subs.keys() {
+                    if let Some(&bounds) = row_bounds.get(&task_id) {
+                        bottommost_y = Some(bottommost_y.map_or(bounds.bottom(), |b| b.max(bounds.bottom())));
+                        if pos.y >= bounds.top() && pos.y <= bounds.bottom() {
+                            hit = Some((task_id, bounds));
+                        }
+                    }
+                }
+                drop(row_bounds);
+
+                let allow_nesting = !matches!(self.view, View::Completed | View::WontDo | View::Trash);
+                new_plan = if let Some((hovered_id, bounds)) = hit {
+                    let mid_y = bounds.top() + bounds.size.height / 2.;
+                    let after = pos.y >= mid_y;
+                    let dx = f32::from(pos.x - start_x);
+                    let rel_x = f32::from(pos.x - bounds.left());
+                    task_rows::plan_task_drop(
+                        &col.rows,
+                        dragged_id,
+                        hovered_id,
+                        after,
+                        dx,
+                        rel_x,
+                        INDENT,
+                        KANBAN_GUTTER,
+                        allow_nesting,
+                    )
+                } else if bottommost_y.is_some_and(|bottom| pos.y > bottom) {
+                    let dragged_completed = col.row_subs.get(&dragged_id) == Some(&KanbanSub::Completed);
+                    let end_slice = if !dragged_completed {
+                        let cutoff = col
+                            .rows
+                            .iter()
+                            .position(|r| matches!(r, Row::Day { drop: Some(DropTarget::Complete), .. }))
+                            .unwrap_or(col.rows.len());
+                        &col.rows[..cutoff]
+                    } else {
+                        &col.rows[..]
+                    };
+                    task_rows::plan_task_drop_at_end(end_slice, dragged_id)
+                } else {
+                    None
+                };
+            }
+        }
+
+        if self.task_drop != new_plan || self.kanban_hover_col != new_hover_col {
+            self.task_drop = new_plan;
+            self.kanban_hover_col = new_hover_col;
+            cx.notify();
+        }
+    }
+
+    fn drop_task_in_kanban(&mut self, dragged: &DraggedTask, _: &mut Window, cx: &mut Context<Self>) {
+        let plan = self.task_drop.take();
+        let hover_col = self.kanban_hover_col.take();
+        self.task_drag_origin = None;
+        if let Some(plan) = plan {
+            cx.stop_propagation();
+            self.apply_kanban_task_drop(dragged.id, plan, cx);
+        } else if let Some(col_key) = hover_col {
+            cx.stop_propagation();
+            if let Some(drop_target) =
+                self.kanban_drag_rows.iter().find(|c| c.key == col_key).and_then(|c| c.drop.clone())
+            {
+                self.drop_on_column(dragged.id, drop_target, cx);
+            }
+        } else {
+            cx.notify();
+        }
+    }
+
+    fn apply_kanban_task_drop(&mut self, dragged: Id, plan: task_rows::TaskDropPlan, cx: &mut Context<Self>) {
+        let target_sub = self
+            .kanban_drag_rows
+            .iter()
+            .find_map(|c| c.row_subs.get(&plan.target_id).copied());
         let result = (|| -> anyhow::Result<()> {
-            let (Some(dragged_task), Some(target_task)) = (self.store.task(dragged)?, self.store.task(target)?) else {
-                return Ok(());
-            };
-            if nest {
-                self.store.link_parent(dragged, target)?;
-            } else {
-                if dragged_task.parent_id.is_some() {
-                    self.store.set_parent(dragged, None)?;
-                }
-                if let Some(col_target) = column_drop {
-                    self.apply_column_value(dragged, col_target)?;
-                }
-                if target_task.is_completed() {
+            let Some(dragged_task) = self.store.task(dragged)? else { return Ok(()) };
+            match target_sub {
+                Some(KanbanSub::Completed) => {
                     if !dragged_task.is_completed() {
                         self.store.set_completed(dragged, true)?;
                     }
-                } else {
+                }
+                Some(KanbanSub::Pinned) => {
                     if dragged_task.is_completed() {
                         self.store.set_completed(dragged, false)?;
                     }
-                    if target_task.pinned_at.is_some() != dragged_task.pinned_at.is_some() {
-                        self.store.set_pinned(dragged, target_task.pinned_at.is_some())?;
+                    if plan.new_parent.is_none() && dragged_task.pinned_at.is_none() {
+                        self.store.set_pinned(dragged, true)?;
                     }
                 }
-                self.store.move_task(dragged, target, false)?;
+                Some(KanbanSub::Unpinned) => {
+                    if dragged_task.is_completed() {
+                        self.store.set_completed(dragged, false)?;
+                    }
+                    if plan.new_parent.is_none() && dragged_task.pinned_at.is_some() {
+                        self.store.set_pinned(dragged, false)?;
+                    }
+                }
+                None => {}
             }
+            self.store.move_task_in_tree(dragged, plan.new_parent, plan.order_target)?;
             Ok(())
         })();
-        if self.check(result).is_some() && nest {
-            self.collapsed_tasks.remove(&target);
+        if self.check(result).is_some()
+            && let Some(parent_id) = plan.expand_parent
+        {
+            self.collapsed_tasks.remove(&parent_id);
         }
         self.reload(cx);
     }
@@ -8520,6 +8770,10 @@ impl Render for TodoView {
                         style.bg(accent.opacity(0.08)).border_color(accent)
                     })
                     .on_drop(cx.listener(move |this, dragged: &DraggedTask, _, cx| {
+                        cx.stop_propagation();
+                        this.task_drop = None;
+                        this.task_drag_origin = None;
+                        this.kanban_hover_col = None;
                         this.drop_on_kanban_subsection(dragged.id, col_drop.clone(), sub_kind, cx);
                     }))
                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -8547,6 +8801,7 @@ impl Render for TodoView {
                     .into_any_element()
             };
             let mut rendered_cols: Vec<AnyElement> = Vec::with_capacity(columns.len() + 1);
+            let mut drag_cols: Vec<KanbanColRows> = Vec::with_capacity(columns.len());
             for (i, col) in columns.into_iter().enumerate() {
                 if inline_new_col_pos == Some(i)
                     && let Some(input) = self.new_section.clone()
@@ -8574,6 +8829,44 @@ impl Render for TodoView {
                     self.column_add.as_ref().filter(|(at, _, _)| *at == i).map(|(_, _, input)| input.clone())
                 });
                 let mut col_items: Vec<AnyElement> = Vec::new();
+                let mut col_plan_rows: Vec<Row> = Vec::new();
+                let mut col_row_subs: HashMap<Id, KanbanSub> = HashMap::new();
+                let push_sub_rows = |rows: &[KanbanVisibleRow],
+                                         sub: KanbanSub,
+                                         sub_label: &str,
+                                         sub_drop: Option<DropTarget>,
+                                         col_items: &mut Vec<AnyElement>,
+                                         col_plan_rows: &mut Vec<Row>,
+                                         col_row_subs: &mut HashMap<Id, KanbanSub>,
+                                         cx: &mut Context<Self>| {
+                    if rows.is_empty() {
+                        return;
+                    }
+                    col_plan_rows.push(Row::Day {
+                        label: sub_label.to_owned(),
+                        count: rows.len(),
+                        drop: sub_drop,
+                    });
+                    for vrow in rows {
+                        col_row_subs.insert(vrow.task.id, sub);
+                        col_plan_rows.push(Row::Task {
+                            task: vrow.task.clone(),
+                            depth: vrow.depth,
+                            has_children: vrow.has_children,
+                            collapsed: vrow.collapsed,
+                        });
+                        col_items.push(self.render_kanban_row(
+                            i,
+                            vrow,
+                            &tag_colors,
+                            tint,
+                            show_list_name,
+                            today,
+                            strings,
+                            cx,
+                        ));
+                    }
+                };
                 if has_cards {
                     if !pinned_cards.is_empty() {
                         let pinned_key = format!("{col_key}:pinned");
@@ -8591,20 +8884,17 @@ impl Render for TodoView {
                             cx,
                         ));
                         if !pinned_folded {
-                            for (task, subtasks) in &pinned_cards {
-                                col_items.push(self.render_card(
-                                    i,
-                                    drop_for_cards.clone(),
-                                    task,
-                                    subtasks,
-                                    &tag_colors,
-                                    tint,
-                                    show_list_name,
-                                    today,
-                                    strings,
-                                    cx,
-                                ));
-                            }
+                            let rows = self.kanban_visible_rows(&pinned_cards);
+                            push_sub_rows(
+                                &rows,
+                                KanbanSub::Pinned,
+                                strings.group_pinned,
+                                drop_for_cards.clone(),
+                                &mut col_items,
+                                &mut col_plan_rows,
+                                &mut col_row_subs,
+                                cx,
+                            );
                         }
                         if !open_cards.is_empty() {
                             let unpinned_key = format!("{col_key}:unpinned");
@@ -8622,37 +8912,31 @@ impl Render for TodoView {
                                 cx,
                             ));
                             if !unpinned_folded {
-                                for (task, subtasks) in &open_cards {
-                                    col_items.push(self.render_card(
-                                        i,
-                                        drop_for_cards.clone(),
-                                        task,
-                                        subtasks,
-                                        &tag_colors,
-                                        tint,
-                                        show_list_name,
-                                        today,
-                                        strings,
-                                        cx,
-                                    ));
-                                }
+                                let rows = self.kanban_visible_rows(&open_cards);
+                                push_sub_rows(
+                                    &rows,
+                                    KanbanSub::Unpinned,
+                                    strings.group_unpinned,
+                                    drop_for_cards.clone(),
+                                    &mut col_items,
+                                    &mut col_plan_rows,
+                                    &mut col_row_subs,
+                                    cx,
+                                );
                             }
                         }
                     } else {
-                        for (task, subtasks) in &open_cards {
-                            col_items.push(self.render_card(
-                                i,
-                                drop_for_cards.clone(),
-                                task,
-                                subtasks,
-                                &tag_colors,
-                                tint,
-                                show_list_name,
-                                today,
-                                strings,
-                                cx,
-                            ));
-                        }
+                        let rows = self.kanban_visible_rows(&open_cards);
+                        push_sub_rows(
+                            &rows,
+                            KanbanSub::Unpinned,
+                            strings.group_unpinned,
+                            drop_for_cards.clone(),
+                            &mut col_items,
+                            &mut col_plan_rows,
+                            &mut col_row_subs,
+                            cx,
+                        );
                     }
                     if !completed_cards.is_empty() {
                         let completed_key = format!("{col_key}:completed");
@@ -8670,45 +8954,51 @@ impl Render for TodoView {
                             cx,
                         ));
                         if !completed_folded {
-                            for (task, subtasks) in &completed_cards {
-                                col_items.push(self.render_card(
-                                    i,
-                                    drop_for_cards.clone(),
-                                    task,
-                                    subtasks,
-                                    &tag_colors,
-                                    tint,
-                                    show_list_name,
-                                    today,
-                                    strings,
-                                    cx,
-                                ));
-                            }
+                            let rows = self.kanban_visible_rows(&completed_cards);
+                            push_sub_rows(
+                                &rows,
+                                KanbanSub::Completed,
+                                strings.group_completed,
+                                Some(DropTarget::Complete),
+                                &mut col_items,
+                                &mut col_plan_rows,
+                                &mut col_row_subs,
+                                cx,
+                            );
                         }
                     }
                 }
+                let is_hover_target = self.kanban_hover_col.as_deref() == Some(col_key.as_str());
+                let col_bounds = self.kanban_col_bounds.clone();
+                let col_key_for_bounds = col_key.clone();
+                drag_cols.push(KanbanColRows {
+                    key: col_key,
+                    drop,
+                    rows: col_plan_rows,
+                    row_subs: col_row_subs,
+                });
                 rendered_cols.push(
                     v_flex()
                         .id(SharedString::from(format!("kanban-column-{i}")))
+                        .debug_selector(move || format!("kanban-column-{i}"))
+                        .relative()
                         .rounded(px(14.))
                         .border_1()
-                        .border_color(gpui::transparent_black())
-                        .map(|el| match (tint, !has_cards) {
-                            (Some(c), true) => el.bg(gpui::linear_gradient(
-                                180.,
-                                gpui::linear_color_stop(c.opacity(if dark { 0.08 } else { 0.10 }), 0.),
-                                gpui::linear_color_stop(gpui::transparent_black(), 1.),
-                            )),
-                            (Some(c), false) => el.bg(c.opacity(if dark { 0.08 } else { 0.10 })),
-                            (None, _) => el,
-                        })
-                        .when_some(drop, |el, drop| {
-                            el.drag_over::<DraggedTask>(move |style, _, _, _| {
-                                style.bg(accent.opacity(0.08)).border_color(accent)
-                            })
-                            .on_drop(cx.listener(move |this, dragged: &DraggedTask, _, cx| {
-                                this.drop_on_column(dragged.id, drop.clone(), cx)
-                            }))
+                        .border_color(if is_hover_target { accent } else { gpui::transparent_black() })
+                        .map(|el| {
+                            if is_hover_target {
+                                el.bg(accent.opacity(0.08))
+                            } else {
+                                match (tint, !has_cards) {
+                                    (Some(c), true) => el.bg(gpui::linear_gradient(
+                                        180.,
+                                        gpui::linear_color_stop(c.opacity(if dark { 0.08 } else { 0.10 }), 0.),
+                                        gpui::linear_color_stop(gpui::transparent_black(), 1.),
+                                    )),
+                                    (Some(c), false) => el.bg(c.opacity(if dark { 0.08 } else { 0.10 })),
+                                    (None, _) => el,
+                                }
+                            }
                         })
                         .when_some(section_id.zip(owner), |el, (target_section, list)| {
                             el.drag_over::<DraggedColumn>(move |style, _, _, _| {
@@ -8725,6 +9015,16 @@ impl Render for TodoView {
                         .w(px(col_width))
                         .flex_none()
                         .max_h_full()
+                        .child(
+                            gpui::canvas(
+                                move |area, _, _| {
+                                    col_bounds.borrow_mut().insert(col_key_for_bounds.clone(), area);
+                                },
+                                |_, _, _, _| {},
+                            )
+                            .absolute()
+                            .size_full(),
+                        )
                         .child(self.render_column_header(
                             i,
                             display_title,
@@ -8769,9 +9069,8 @@ impl Render for TodoView {
                                     v_flex()
                                         .id(SharedString::from(format!("kanban-cards-{i}")))
                                         .px(card_px)
-                                        .pt(px(4.))
+                                        .pt(px(2.))
                                         .pb(px(12.))
-                                        .gap_2()
                                         .children(col_items),
                                 )
                                 .mt(px(2.))
@@ -8803,11 +9102,14 @@ impl Render for TodoView {
                         .into_any_element(),
                 );
             }
+            self.kanban_drag_rows = drag_cols;
             if inline_new_col_pos.is_some_and(|pos| pos >= rendered_cols.len())
                 && let Some(input) = self.new_section.clone()
             {
                 rendered_cols.push(render_new_sec_input(input, cx));
             }
+            let row_bounds_clear = self.kanban_row_bounds.clone();
+            let col_bounds_clear = self.kanban_col_bounds.clone();
             div()
                 .relative()
                 .flex_1()
@@ -8815,10 +9117,23 @@ impl Render for TodoView {
                 .w_full()
                 .mt(px(-8.))
                 .child(
+                    gpui::canvas(
+                        move |_, _, _| {
+                            row_bounds_clear.borrow_mut().clear();
+                            col_bounds_clear.borrow_mut().clear();
+                        },
+                        |_, _, _, _| {},
+                    )
+                    .absolute()
+                    .size_0(),
+                )
+                .child(
                     h_flex()
                         .id("kanban")
                         .track_focus(&self.list_focus)
                         .track_scroll(&self.kanban_scroll)
+                        .on_drag_move(cx.listener(Self::move_kanban_task_drag))
+                        .on_drop(cx.listener(Self::drop_task_in_kanban))
                         .key_context("TaskList")
                         .on_mouse_down(MouseButton::Left, cx.listener(|this, event: &gpui::MouseDownEvent, window, cx| {
                             window.focus(&this.list_focus, cx);
@@ -9217,12 +9532,18 @@ impl Render for TodoView {
             .on_drag_move(cx.listener(Self::move_filter_drag))
             .capture_any_mouse_up(cx.listener(Self::finish_panel_drag_up))
             .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                if this.task_drop.take().is_some() | this.task_drag_origin.take().is_some() {
+                if this.task_drop.take().is_some()
+                    | this.task_drag_origin.take().is_some()
+                    | this.kanban_hover_col.take().is_some()
+                {
                     cx.notify();
                 }
             }))
             .on_mouse_up_out(MouseButton::Left, cx.listener(|this, event, window, cx| {
-                if this.task_drop.take().is_some() | this.task_drag_origin.take().is_some() {
+                if this.task_drop.take().is_some()
+                    | this.task_drag_origin.take().is_some()
+                    | this.kanban_hover_col.take().is_some()
+                {
                     cx.notify();
                 }
                 this.finish_panel_drag_up(event, window, cx);
@@ -10917,9 +11238,123 @@ mod tests {
         cx.update(|_, cx| view.update(cx, |v, cx| v.set_layout(true, false, cx)));
         cx.run_until_parked();
         let sub_card_b = bounds(cx, format!("card-sub-{}", child.id));
-        // Drag the subtask to the top-left reorder zone of its own parent card (above the subtask row).
+        // Drag the subtask above its own parent card to unnest it.
         drag(cx, sub_card_b.center(), point(sub_card_b.left() + px(24.), sub_card_b.top() - px(24.)));
         assert_eq!(store.task(child.id).unwrap().unwrap().parent_id, None, "kanban subtask drag unnests child");
+    }
+
+    #[gpui::test]
+    fn kanban_nested_tasks_drag_nest_outdent_reorder_and_cross_column(cx: &mut TestAppContext) {
+        use gpui::{Modifiers, point, size};
+
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let list = store.create_list("Board").unwrap();
+        let sec1 = store.add_list_section(Some(list.id), "Todo").unwrap();
+        let sec2 = store.add_list_section(Some(list.id), "Doing").unwrap();
+        let parent = store.add_task("Parent").unwrap();
+        let child = store.add_subtask(parent.id, "Child").unwrap();
+        let sibling = store.add_task("Sibling").unwrap();
+        let other = store.add_task("Other").unwrap();
+        for t in [&parent, &child, &sibling, &other] {
+            store.set_list(t.id, Some(list.id)).unwrap();
+        }
+        store.set_section(parent.id, Some(sec1.id)).unwrap();
+        store.set_section(sibling.id, Some(sec1.id)).unwrap();
+        store.set_section(other.id, Some(sec2.id)).unwrap();
+
+        cx.update(|cx| {
+            theme::init(cx);
+            cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+            assert!(crate::keymap::load_default(&assets::Assets, cx).unwrap().is_empty());
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let mut view = TodoView::new(store.clone(), window, cx);
+            view.set_view(View::List(list.id), cx);
+            view.set_layout(true, false, cx);
+            view
+        });
+        cx.simulate_resize(size(px(1100.), px(700.)));
+        cx.run_until_parked();
+
+        let bounds = |cx: &mut gpui::VisualTestContext, selector: String| {
+            let selector: &'static str = selector.leak();
+            cx.debug_bounds(selector).unwrap_or_else(|| panic!("missing {selector}"))
+        };
+        let drag = |cx: &mut gpui::VisualTestContext, from: gpui::Point<Pixels>, to: gpui::Point<Pixels>| {
+            let modifiers = Modifiers::default();
+            cx.simulate_mouse_move(from, None, modifiers);
+            cx.simulate_mouse_down(from, MouseButton::Left, modifiers);
+            let step = if to.x < from.x { -6. } else { 6. };
+            cx.simulate_mouse_move(point(from.x + px(step), from.y), Some(MouseButton::Left), modifiers);
+            cx.simulate_mouse_move(to, Some(MouseButton::Left), modifiers);
+            cx.run_until_parked();
+            cx.simulate_mouse_up(to, MouseButton::Left, modifiers);
+            cx.run_until_parked();
+        };
+        let visible_ids = |cx: &mut gpui::VisualTestContext| -> Vec<Id> {
+            cx.update(|_, cx| view.read(cx).visible_task_ids(i18n::t(cx)))
+        };
+
+        // 1. Nest Sibling under Child (depth 2) by dragging right onto Child's bottom half.
+        let sib_b = bounds(cx, format!("kanban-card-{}", sibling.id));
+        let child_b = bounds(cx, format!("card-sub-{}", child.id));
+        drag(cx, sib_b.center(), point(sib_b.center().x + px(56.), child_b.bottom() - px(6.)));
+        assert_eq!(store.task(sibling.id).unwrap().unwrap().parent_id, Some(child.id), "nests at depth 2 under child");
+        assert_eq!(visible_ids(cx), vec![parent.id, child.id, sibling.id, other.id]);
+
+        // 2. Per-level collapse: collapsing Child hides Sibling while keeping Child visible.
+        cx.update(|_, cx| {
+            view.update(cx, |v, cx| {
+                v.collapsed_tasks.insert(child.id);
+                cx.notify();
+            });
+        });
+        cx.run_until_parked();
+        assert_eq!(visible_ids(cx), vec![parent.id, child.id, other.id], "collapsing depth-1 parent hides depth-2 child");
+        cx.update(|_, cx| {
+            view.update(cx, |v, cx| {
+                v.collapsed_tasks.remove(&child.id);
+                cx.notify();
+            });
+        });
+        cx.run_until_parked();
+
+        // 3. Outdent Sibling from depth 2 -> depth 1 (sibling of Child under Parent) by dragging left 24 px.
+        let sib_b = bounds(cx, format!("card-sub-{}", sibling.id));
+        drag(cx, sib_b.center(), point(sib_b.center().x - px(24.), sib_b.center().y));
+        assert_eq!(store.task(sibling.id).unwrap().unwrap().parent_id, Some(parent.id), "outdents depth 2 -> depth 1");
+
+        // 4. Reorder subtasks within Parent: drag Sibling onto top half of Child -> [Parent, Sibling, Child].
+        let sib_b = bounds(cx, format!("card-sub-{}", sibling.id));
+        let child_b = bounds(cx, format!("card-sub-{}", child.id));
+        drag(cx, sib_b.center(), point(sib_b.center().x, child_b.top() + px(6.)));
+        assert_eq!(store.task(sibling.id).unwrap().unwrap().parent_id, Some(parent.id), "stays under same parent");
+        assert_eq!(visible_ids(cx), vec![parent.id, sibling.id, child.id, other.id], "reordered subtasks within card");
+
+        // 5. Drag Child into empty space below column 0 -> unnests to root at bottom of column 0.
+        let child_b = bounds(cx, format!("card-sub-{}", child.id));
+        drag(cx, child_b.center(), point(child_b.center().x, child_b.bottom() + px(90.)));
+        assert_eq!(store.task(child.id).unwrap().unwrap().parent_id, None, "drag below column unnests child");
+        assert_eq!(store.task(child.id).unwrap().unwrap().section_id, Some(sec1.id), "stays in same section");
+
+        // 6. Cross-column drag of a subtask (Sibling) onto column 1: unlinks from Parent and moves to sec2.
+        let sib_b = bounds(cx, format!("card-sub-{}", sibling.id));
+        let col1_b = bounds(cx, "kanban-column-1".into());
+        drag(cx, sib_b.center(), point(col1_b.center().x, col1_b.top() + px(80.)));
+        let sib_after = store.task(sibling.id).unwrap().unwrap();
+        assert_eq!(sib_after.parent_id, None, "cross-column subtask drag unlinks from old parent");
+        assert_eq!(sib_after.section_id, Some(sec2.id), "cross-column subtask drag moves to target section");
+
+        // 7. Re-nest Child under Parent, then drag Parent across to column 1 -> Parent AND Child move together!
+        store.link_parent(child.id, parent.id).unwrap();
+        cx.update(|_, cx| view.update(cx, |v, cx| v.reload(cx)));
+        cx.run_until_parked();
+        let parent_b = bounds(cx, format!("kanban-card-{}", parent.id));
+        let col1_b = bounds(cx, "kanban-column-1".into());
+        drag(cx, parent_b.center(), point(col1_b.center().x, col1_b.top() + px(80.)));
+        assert_eq!(store.task(parent.id).unwrap().unwrap().section_id, Some(sec2.id));
+        assert_eq!(store.task(child.id).unwrap().unwrap().parent_id, Some(parent.id), "subtree stays attached");
+        assert_eq!(store.task(child.id).unwrap().unwrap().section_id, Some(sec2.id), "subtask moves with parent");
     }
 
     #[gpui::test]

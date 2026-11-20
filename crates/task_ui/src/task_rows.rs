@@ -772,8 +772,9 @@ pub fn plan_task_drop(
 
     let dragged_is_note = dragged_task.kind == Kind::Note;
     let target_is_notes = matches!(group_drop, Some(DropTarget::Kind(Kind::Note)));
-    // Notes cannot be nested or hold subtasks, nor be dropped inside an expanded subtask block.
-    let can_nest = allow_nesting && !dragged_is_note && !target_is_notes;
+    let target_is_completed = matches!(group_drop, Some(DropTarget::Complete));
+    // Notes and completed sections cannot be nested or hold subtasks, nor be dropped inside an expanded subtask block.
+    let can_nest = allow_nesting && !dragged_is_note && !target_is_notes && !target_is_completed;
 
     let min_level = if allow_nesting {
         next_idx.and_then(|i| row_task(&rows[i]).map(|(_, d, _)| d)).unwrap_or(0)

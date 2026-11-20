@@ -1,0 +1,21 @@
+[package]
+name = "summary_ui"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/summary_ui.rs"
+
+[dependencies]
+chrono.workspace = true
+desktop_common.workspace = true
+fern_core.workspace = true
+fern_i18n.workspace = true
+gpui.workspace = true
+task_ui.workspace = true
+theme.workspace = true
+ui.workspace = true

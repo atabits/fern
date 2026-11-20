@@ -1,5 +1,5 @@
 use super::*;
-use crate::sticky_settings::{PALETTE, StickySettings};
+use desktop_common::sticky_settings::{PALETTE, StickySettings};
 
 impl SettingsWindow {
     pub(super) fn render_sticky(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -66,7 +66,7 @@ mod tests {
             let saved = StickySettings::load(&store);
             assert_eq!(saved.font, 3);
             assert_eq!(*cx.global::<StickySettings>(), saved);
-            assert!(cx.try_global::<crate::sticky_note::DataVersion>().is_none());
+            assert!(cx.try_global::<desktop_common::data_version::DataVersion>().is_none());
         });
     }
 }

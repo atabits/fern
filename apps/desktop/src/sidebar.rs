@@ -108,10 +108,7 @@ impl Section {
     }
 }
 
-#[cfg(target_os = "macos")]
-pub const WIDTH: f32 = 72.;
-#[cfg(not(target_os = "macos"))]
-pub const WIDTH: f32 = 50.;
+pub use desktop_common::layout::SIDEBAR_WIDTH as WIDTH;
 
 /// Height of one rail icon slot (`40 px` icon + `5 px` vertical padding on each side, zero dead gap),
 /// matching TickTick's `px-[4px] py-[5px]` + `w-[40px] h-[40px]` rail entries.

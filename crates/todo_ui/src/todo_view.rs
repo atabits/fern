@@ -1,0 +1,10867 @@
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
+
+use fern_core::{Id, Kind, List, ListFolder, Priority, Store, Tag, Task, View, ViewCounts};
+use chrono::{Datelike, Duration, Local, NaiveDate, TimeZone as _};
+use gpui::{ElementId, Entity, FocusHandle, Focusable, FontWeight, ListAlignment, ListState, MouseButton, Pixels, Point, list};
+use ui::prelude::*;
+
+use crate::drag::{
+    DraggedColumn, DraggedFilter, DraggedFolder, DraggedList, DraggedParentTag,
+    DraggedSidebarSection, DraggedSmartList, DraggedTag, DraggedTask,
+};
+use ui::{Placement, PopoverAttachment, SubmenuItem, popover};
+
+use crate::actions::{
+    AddSubtask, ClearDate, DeleteTask, DismissTransient, PinTask, PriorityHigh, PriorityLow, PriorityMedium,
+    PriorityNone, SelectNext, SelectPrevious, SetDate, SetNextWeek, SetToday, SetTomorrow, ToggleAllSubtasks,
+    ToggleComplete,
+};
+use crate::i18n::{self, CurrentLocale, Strings};
+use crate::list_dialog::{DialogEvent, FolderDialog, ListDialog};
+use crate::tag_dialog::{MergeDialog, TagDialog, TagEvent};
+use crate::lists_panel;
+use crate::resize::{self, DraggedEdge, Panel};
+use crate::task_detail::{OpenTask, StartFocus, TaskDetail, TaskUpdated};
+use crate::task_menu;
+use crate::task_rows::{self, ClosedRange, DropTarget, GroupBy, Row, Section, SortBy};
+use crate::text_input::{Cancelled, Changed, Mode, Submitted, TextInput};
+
+/// The share of a task row, from the left, where a dropped task goes before it; the rest of the
+/// row nests it.
+const NEST_ZONE: f32 = 0.6;
+/// The details' width by default and the narrowest its edge drags to; the task list keeps at
+/// least `LIST_MIN_WIDTH`, which also bounds how wide the details get.
+const DETAIL_WIDTH: f32 = 419.;
+const DETAIL_MIN_WIDTH: f32 = 340.;
+const LIST_MIN_WIDTH: f32 = 360.;
+const ROW_HEIGHT: f32 = 40.;
+/// Below this width the window is narrow, for View Options' Task Detail Layout.
+const NARROW_WINDOW: f32 = 1200.;
+/// Space left of the checkbox for the subtask chevron.
+const GUTTER: f32 = 20.;
+const INDENT: f32 = 24.;
+
+/// An open filter dropdown of the Completed and Won't Do views. The lists filter is edited as a
+/// draft until "OK", as in the original.
+#[derive(Clone, Debug, PartialEq)]
+enum ClosedMenu {
+    Dates,
+    /// "Other Date": the range being picked and the calendar shown for one of its ends.
+    OtherDate { start: Option<NaiveDate>, end: Option<NaiveDate>, picking: Option<RangeEnd>, month: NaiveDate },
+    Lists(Option<Vec<Option<Id>>>),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SortMenu {
+    Group,
+    Sort,
+    Order,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KanbanSub {
+    Pinned,
+    Unpinned,
+    Completed,
+}
+
+type BoardCard = (Task, Vec<Task>);
+
+struct BoardCol {
+    key: String,
+    title: String,
+    drop: Option<DropTarget>,
+    pinned_cards: Vec<BoardCard>,
+    open_cards: Vec<BoardCard>,
+    completed_cards: Vec<BoardCard>,
+}
+
+impl BoardCol {
+    fn open_count(&self) -> usize {
+        self.pinned_cards.len() + self.open_cards.len()
+    }
+
+    fn total_count(&self) -> usize {
+        self.open_count() + self.completed_cards.len()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RangeEnd {
+    Start,
+    End,
+}
+
+impl gpui::EventEmitter<StartFocus> for TodoView {}
+
+mod filters;
+use filters::FilterEdit;
+
+/// What the add field's "▾" menu set for the next task.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct AddDraft {
+    priority: Option<Priority>,
+    /// `Some(None)` is the Inbox.
+    list: Option<Option<Id>>,
+    note: bool,
+    tags: Vec<String>,
+    /// The date picked with the field's calendar button, with its time, reminders and repeat;
+    /// a typed date wins.
+    date: Option<NaiveDate>,
+    time: Option<chrono::NaiveTime>,
+    /// `None` keeps the default reminder from the settings.
+    reminders: Option<Vec<i64>>,
+    repeat: Option<fern_core::Recurrence>,
+    /// Files picked with the menu's Attachment, attached once the task is added.
+    files: Vec<std::path::PathBuf>,
+    /// The end the picker's Duration tab set, with the start in `date` and `time`.
+    end: Option<(NaiveDate, Option<chrono::NaiveTime>)>,
+}
+
+/// The saved task stays in its original group briefly while its checkbox settles.
+/// Only presentation is held; the store and the details already have the committed state.
+struct CompletingTask {
+    before: Task,
+    index: usize,
+    view: View,
+    undo: crate::undo::UndoAction,
+    _timer: gpui::Task<()>,
+}
+
+/// A collapsed folder or parent tag being hovered during a drag so it auto-expands after a brief pause.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DragExpandTarget {
+    Folder(Id),
+    Tag(String),
+}
+
+struct PanelDragState {
+    item: lists_panel::ActiveDragItem,
+    grab_offset_y: f32,
+    highlight: Option<lists_panel::HighlightTarget>,
+    /// Pre-drag heights of the non-dragged variable-height blocks in the group, keeping midpoint
+    /// thresholds invariant while blocks swap.
+    block_spans: Vec<f32>,
+    orig_tag_pinned: bool,
+    orig_preferences: fern_core::Preferences,
+    orig_lists: Vec<List>,
+    orig_folders: Vec<ListFolder>,
+    orig_tags: Vec<Tag>,
+    orig_filters: Vec<(fern_core::SmartFilter, usize)>,
+    orig_collapsed_folders: HashSet<Id>,
+    orig_collapsed_tags: HashSet<String>,
+}
+
+pub struct TodoView {
+    store: Rc<Store>,
+    view: View,
+    tasks: Vec<Task>,
+    completing: HashMap<Id, CompletingTask>,
+    counts: ViewCounts,
+    lists: Vec<List>,
+    tags: Vec<Tag>,
+    show_lists: bool,
+    /// The lists column's and the details' widths, as their edges were dragged.
+    lists_width: f32,
+    detail_width: f32,
+    narrow_viewport: bool,
+    /// The edge being dragged, if any.
+    resizing: Option<Panel>,
+    /// Saves the widths once the drag has rested a moment.
+    save_widths: Option<gpui::Task<()>>,
+    collapsed_tasks: HashSet<Id>,
+    collapsed_sections: HashSet<Section>,
+    /// Day and section groups folded by their header's arrow, by their title.
+    collapsed_days: HashSet<String>,
+    input: Entity<TextInput>,
+    /// Focus of the task list itself, for keyboard navigation (the `TaskList` key context).
+    list_focus: FocusHandle,
+    /// The task list, drawn as Zed's lists: only the rows in view are built. `list_entries` are
+    /// what it showed last, to tell it which rows changed.
+    list_state: ListState,
+    list_entries: Vec<ListEntry>,
+    /// Window bounds of currently painted `list_entries` rows, keyed by entry index.
+    list_entry_bounds: Rc<RefCell<HashMap<usize, gpui::Bounds<Pixels>>>>,
+    /// Active task-list drag origin: `(dragged_task_id, start_mouse_x)`.
+    task_drag_origin: Option<(Id, Pixels)>,
+    /// Live drop plan while dragging a task over `#tasks`.
+    task_drop: Option<task_rows::TaskDropPlan>,
+    tag_colors: HashMap<String, Hsla>,
+    /// The Add List / Edit List dialog and the folder dialog, while open.
+    list_dialog: Option<Entity<ListDialog>>,
+    folder_dialog: Option<Entity<FolderDialog>>,
+    folders: Vec<ListFolder>,
+    collapsed_folders: HashSet<Id>,
+    archived_open: bool,
+    /// A right-clicked list, folder or tag in the lists column, with the point its menu opens at.
+    list_menu: Option<(ListMenuTarget, Point<Pixels>)>,
+    /// The tag dialogs, folded parent tags and whether the Tags section is folded.
+    tag_dialog: Option<Entity<TagDialog>>,
+    merge_dialog: Option<Entity<MergeDialog>>,
+    collapsed_tags: HashSet<String>,
+    tags_collapsed: bool,
+    drag_expand: Option<(DragExpandTarget, gpui::Task<()>)>,
+    lists_scroll: gpui::ScrollHandle,
+    lists_rows: Rc<RefCell<Vec<lists_panel::PanelChild>>>,
+    panel_drag: Option<PanelDragState>,
+    search_input: Entity<TextInput>,
+    header_menu_open: bool,
+    /// Filters of the Completed and Won't Do views; `None` lists means all lists.
+    closed_range: ClosedRange,
+    closed_lists: Option<Vec<Option<Id>>>,
+    closed_menu: Option<ClosedMenu>,
+    /// The header's sort menu: `Some(None)` when open, with the expanded submenu otherwise.
+    sort_menu: Option<Option<SortMenu>>,
+    sort_menu_focus: FocusHandle,
+    sort_menu_return_focus: Option<FocusHandle>,
+    /// The current list's "Show Details", read when the list loads.
+    show_details: bool,
+    /// The current list's layout: cards in columns instead of rows (the menu's View).
+    kanban: bool,
+    /// The original's Timeline view, and the first day it shows.
+    timeline: bool,
+    timeline_from: NaiveDate,
+    /// The Timeline's scale: 0 Day, 1 Week, 2 Month; and whether its menu is open.
+    timeline_scale: usize,
+    scale_menu_open: bool,
+    /// The Timeline's "Arrange Tasks" panel: the undated tasks, to drag onto days.
+    arrange_open: bool,
+    /// The current list's sections.
+    sections: Vec<fern_core::ListSection>,
+    /// The "Add Section" field, while it is shown.
+    new_section: Option<Entity<TextInput>>,
+    /// Where the new section goes among the list's sections (the column menu's Add Section to
+    /// Left / Right); `None` puts it last.
+    new_section_index: Option<usize>,
+    /// The kanban: a column's "+" field (its index and value), its "…" menu (the section and
+    /// whether Move to's side menu is open), and a section being renamed.
+    column_add: Option<(usize, DropTarget, Entity<TextInput>)>,
+    column_menu: Option<(Id, bool)>,
+    /// Global kanban display options (from View Options, persisted in store settings).
+    kanban_column_size: u8,
+    kanban_column_color: bool,
+    kanban_quick_add: bool,
+    kanban_quick_adds: HashMap<String, Entity<TextInput>>,
+    kanban_section_colors: HashMap<Id, String>,
+    kanban_folded_sub: HashSet<String>,
+    kanban_scroll: gpui::ScrollHandle,
+    /// Horizontal pan-to-scroll on empty kanban space: `(start_pointer_x, start_scroll_offset_x)`.
+    kanban_pan: Option<(Pixels, Pixels)>,
+    /// The Timeline's groups folded up, by name.
+    timeline_folded: HashSet<String>,
+    /// Today's "Suggested Tasks" panel (the header's light bulb), and whether its Long Unfinished
+    /// list is shown in full.
+    suggestions_open: Option<bool>,
+    /// The header menu's View Options dialog and its Show Date by dropdown, while open.
+    view_options: Option<bool>,
+    section_rename: Option<(Id, Entity<TextInput>)>,
+    title_edit: Option<(Id, Entity<TextInput>, gpui::Subscription)>,
+    /// The "Undo" toast after completing or deleting a task, with its timer.
+    undo: Option<(crate::undo::UndoAction, String, gpui::Task<()>)>,
+    /// Saved filters with their task counts, for the lists column.
+    filters: Vec<(fern_core::SmartFilter, usize)>,
+    /// Settings → Smart List, read on reload.
+    preferences: fern_core::Preferences,
+    /// The date quick add recognized in the field so far, shown at its end.
+    quick_add_due: Option<(NaiveDate, Option<chrono::NaiveTime>)>,
+    /// The mini calendar: expanded to a month, which month, and the days with open tasks.
+    mini_expanded: bool,
+    mini_month: NaiveDate,
+    busy_days: HashSet<NaiveDate>,
+    /// Today and Next 7 Days: the habits due today, whether each is checked in and its amount;
+    /// empty elsewhere or when the habit settings keep them out.
+    today_habits: Vec<(fern_core::Habit, bool, u32)>,
+    /// The Summary smart list's report.
+    summary: Entity<crate::summary_view::SummaryView>,
+    /// The "Add Filter" / "Edit Filter" dialog, while it is open.
+    filter_edit: Option<FilterEdit>,
+    /// The "List Activities" panel, shown in place of the details while open.
+    list_activity: Option<Vec<(fern_core::Activity, Id, String)>>,
+    /// The "Add task" field's template picker, while it is open.
+    templates_open: bool,
+    /// The add field's "▾" menu, its list side menu, and what it set for the next task.
+    add_menu_open: bool,
+    add_list_side: bool,
+    add_draft: AddDraft,
+    /// The "▾" menu's Tags picker while open, with the tags ticked so far, and its search field.
+    add_tags: Option<Vec<String>>,
+    add_tag_input: Entity<TextInput>,
+    /// The "▾" menu's "Input Box Setting" chooser, while open.
+    input_box_open: bool,
+    /// The field's date picker, while open, with the month it shows, and its expanded row
+    /// (0 Time, 1 Reminder, 2 Repeat).
+    add_date_month: Option<NaiveDate>,
+    /// The add field's date picker on its Duration tab: the start and end being picked.
+    add_range: Option<crate::due_picker::DueDraft>,
+    add_date_row: Option<u8>,
+    /// The section whose "…" menu is open.
+    section_menu: Option<Id>,
+    /// The overdue group's "Postpone" menu is open.
+    postpone_menu: bool,
+    /// A section being renamed, with its field.
+    renaming_section: Option<(Id, Entity<TextInput>)>,
+    detail: Entity<TaskDetail>,
+    /// The board's task card, opened beside a clicked card as the original's, and its task.
+    card_detail: Entity<TaskDetail>,
+    card: Option<Id>,
+    selected: Option<Id>,
+    /// A task row's right-click menu: the task and where the click was (window coordinates).
+    context_menu: Option<(Id, gpui::Point<Pixels>)>,
+    /// Its side menu open: 0 Move to, 1 Start Focus.
+    context_side: Option<u8>,
+    error: Option<String>,
+    add_attachment_error: Option<String>,
+}
+
+impl TodoView {
+    pub fn new(store: Rc<Store>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let strings = i18n::t(cx);
+        let summary = cx.new(|_| crate::summary_view::SummaryView::new(store.clone()));
+        let mini_expanded = store.setting("mini_expanded").ok().flatten().as_deref() == Some("1");
+        let input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.add_task, cx));
+        cx.subscribe_in(&input, window, |this, _, Submitted(text), window, cx| this.submit_new_task(text, window, cx))
+            .detach();
+        // As the user types, the recognized date, tags and list are highlighted and the date is
+        // shown at the end of the field, as in the original.
+        cx.subscribe(&input, |this, _, _: &Changed, cx| this.update_quick_add_hint(cx)).detach();
+        window.focus(&input.focus_handle(cx), cx);
+        // Escape in the quick-add field hands the keyboard to the list.
+        cx.subscribe_in(&input, window, |this, _, _: &Cancelled, window, cx| {
+            if !this.dismiss_transient(window, cx) {
+                window.focus(&this.list_focus, cx);
+            }
+        })
+        .detach();
+
+        let add_tag_input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.type_in_tag, cx));
+        cx.subscribe(&add_tag_input, |_, _, _: &Changed, cx| cx.notify()).detach();
+        cx.subscribe_in(&add_tag_input, window, |this, _, _: &Cancelled, window, cx| {
+            this.dismiss_transient(window, cx);
+        })
+        .detach();
+        // Enter ticks the typed tag, a new one too.
+        cx.subscribe(&add_tag_input, |this, input, Submitted(text), cx| {
+            let tag = text.trim().trim_start_matches('#').to_owned();
+            if let Some(picked) = this.add_tags.as_mut()
+                && !tag.is_empty()
+                && !picked.iter().any(|t| t.to_lowercase() == tag.to_lowercase())
+            {
+                picked.push(tag);
+            }
+            input.update(cx, |input, cx| input.set_text("", cx));
+            cx.notify();
+        })
+        .detach();
+        let search_input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.search_placeholder, cx));
+        cx.subscribe(&search_input, |this, input, _: &Changed, cx| {
+            let query = input.read(cx).text().to_owned();
+            this.update_search_query(query, cx);
+        })
+        .detach();
+        cx.observe_window_bounds(window, |this, window, cx| this.sync_viewport(window, cx))
+            .detach();
+
+        // A change made in a sticky note shows here.
+        cx.observe_global::<crate::data_version::DataVersion>(|this, cx| {
+            if crate::data_version::changed_elsewhere(cx.entity_id(), cx) {
+                this.reload(cx);
+            }
+        })
+        .detach();
+
+        // Placeholders live inside the inputs, so they are updated when the language changes.
+        cx.observe_global::<CurrentLocale>(|this, cx| {
+            let strings = i18n::t(cx);
+            this.sync_input_placeholder(cx);
+            this.search_input.update(cx, |input, cx| input.set_placeholder(strings.search_placeholder, cx));
+        })
+        .detach();
+
+        cx.observe_keystrokes(|this, event, window, cx| {
+            if event.keystroke.key == "escape" && this.cancel_panel_drag(window, cx) {
+                cx.notify();
+            }
+        })
+        .detach();
+
+        let detail = cx.new(|cx| TaskDetail::new(store.clone(), window, cx));
+        cx.subscribe(&detail, |this, _, _: &TaskUpdated, cx| this.reload(cx)).detach();
+        cx.subscribe(&detail, |this, _, OpenTask(id), cx| this.select(*id, cx)).detach();
+        cx.subscribe(&detail, |_, _, StartFocus(id, title, stopwatch), cx| cx.emit(StartFocus(*id, title.clone(), *stopwatch))).detach();
+        cx.subscribe(&detail, |this, _, crate::task_detail::Undoable(action, label), cx| {
+            this.offer_undo(action.clone(), label.clone(), cx);
+        })
+        .detach();
+
+        let card_detail = cx.new(|cx| {
+            let mut detail = TaskDetail::new(store.clone(), window, cx);
+            detail.set_card(false);
+            detail
+        });
+        cx.subscribe(&card_detail, |this, _, _: &TaskUpdated, cx| this.card_updated(cx)).detach();
+        // A subtask or parent clicked in the card opens in the card.
+        cx.subscribe(&card_detail, |this, _, OpenTask(id), cx| this.open_card(*id, cx)).detach();
+        cx.subscribe(&card_detail, |_, _, StartFocus(id, title, stopwatch), cx| cx.emit(StartFocus(*id, title.clone(), *stopwatch))).detach();
+        cx.subscribe(&card_detail, |this, _, crate::task_detail::Undoable(action, label), cx| {
+            this.offer_undo(action.clone(), label.clone(), cx);
+        })
+        .detach();
+
+        let width = |key: &str, default: f32| store.setting(key).ok().flatten().and_then(|value| value.parse().ok()).unwrap_or(default);
+        let lists_width = width("lists_width", lists_panel::WIDTH).clamp(lists_panel::MIN_WIDTH, lists_panel::MAX_WIDTH);
+        let detail_width = width("detail_width", DETAIL_WIDTH).max(DETAIL_MIN_WIDTH);
+        let narrow_viewport = window.viewport_size().width < px(NARROW_WINDOW);
+        let mut this = Self {
+            store,
+            view: View::Inbox,
+            tasks: Vec::new(),
+            completing: HashMap::new(),
+            counts: ViewCounts::default(),
+            lists: Vec::new(),
+            tags: Vec::new(),
+            show_lists: true,
+            lists_width,
+            detail_width,
+            narrow_viewport,
+            resizing: None,
+            save_widths: None,
+            collapsed_tasks: HashSet::new(),
+            // As in TickTick, completed tasks sit collapsed at the bottom of the list.
+            collapsed_sections: HashSet::from([Section::Completed]),
+            collapsed_days: HashSet::new(),
+            input,
+            list_focus: cx.focus_handle(),
+            list_state: ListState::new(0, ListAlignment::Top, px(400.)),
+            list_entries: Vec::new(),
+            list_entry_bounds: Rc::new(RefCell::new(HashMap::new())),
+            task_drag_origin: None,
+            task_drop: None,
+            tag_colors: HashMap::new(),
+            list_dialog: None,
+            folder_dialog: None,
+            folders: Vec::new(),
+            collapsed_folders: HashSet::new(),
+            archived_open: false,
+            list_menu: None,
+            tag_dialog: None,
+            merge_dialog: None,
+            collapsed_tags: HashSet::new(),
+            tags_collapsed: false,
+            drag_expand: None,
+            lists_scroll: gpui::ScrollHandle::new(),
+            lists_rows: Rc::new(RefCell::new(Vec::new())),
+            panel_drag: None,
+            search_input,
+            header_menu_open: false,
+            closed_range: ClosedRange::All,
+            closed_lists: None,
+            closed_menu: None,
+            sort_menu: None,
+            sort_menu_focus: cx.focus_handle(),
+            sort_menu_return_focus: None,
+            show_details: false,
+            kanban: false,
+            timeline: false,
+            timeline_from: Self::today(),
+            timeline_scale: 0,
+            scale_menu_open: false,
+            arrange_open: false,
+            sections: Vec::new(),
+            new_section: None,
+            new_section_index: None,
+            column_add: None,
+            column_menu: None,
+            kanban_column_size: 1,
+            kanban_column_color: false,
+            kanban_quick_add: false,
+            kanban_quick_adds: HashMap::new(),
+            kanban_section_colors: HashMap::new(),
+            kanban_folded_sub: HashSet::new(),
+            kanban_scroll: gpui::ScrollHandle::new(),
+            kanban_pan: None,
+            timeline_folded: HashSet::new(),
+            view_options: None,
+            suggestions_open: None,
+            section_rename: None,
+            title_edit: None,
+            section_menu: None,
+            postpone_menu: false,
+            templates_open: false,
+            add_menu_open: false,
+            add_list_side: false,
+            add_draft: AddDraft::default(),
+            add_tags: None,
+            add_tag_input,
+            input_box_open: false,
+            add_date_month: None,
+            add_range: None,
+            add_date_row: None,
+            list_activity: None,
+            filters: Vec::new(),
+            preferences: Default::default(),
+            quick_add_due: None,
+            mini_expanded,
+            mini_month: crate::calendar::month_start(Self::today()),
+            busy_days: HashSet::new(),
+            today_habits: Vec::new(),
+            summary,
+            filter_edit: None,
+            undo: None,
+            renaming_section: None,
+            detail,
+            card_detail,
+            card: None,
+            selected: None,
+            context_menu: None,
+            context_side: None,
+            error: None,
+            add_attachment_error: None,
+        };
+        this.reload_inner(false, false, cx);
+        #[cfg(debug_assertions)]
+        this.apply_dev_state(window, cx);
+        this
+    }
+
+    /// Debug builds only: puts the UI into a given state without clicks, for screenshots.
+    /// `FERN_DEV_STATE="add=<quick-add text>;list=<new list>;view=<list name>;select=<title part>;
+    /// popup=due|priority|tags|list;menu=header;new-list=1"`
+    #[cfg(debug_assertions)]
+    fn apply_dev_state(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Ok(state) = std::env::var("FERN_DEV_STATE") else { return };
+        for part in state.split(';') {
+            match part.split_once('=') {
+                Some(("add", text)) => {
+                    self.add_task(text, cx);
+                    self.reload(cx);
+                }
+                Some(("list", name)) => {
+                    let result = self.store.create_list(name);
+                    if let Some(list) = self.check(result) {
+                        self.set_view(View::List(list.id), cx);
+                    } else {
+                        self.reload(cx);
+                    }
+                }
+                Some(("view", "trash")) => self.set_view(View::Trash, cx),
+                Some(("view", "wontdo")) => self.set_view(View::WontDo, cx),
+                Some(("view", "today")) => self.set_view(View::Today, cx),
+                Some(("view", "summary")) => self.set_view(View::Summary, cx),
+                Some(("view", "next7")) => self.set_view(View::Next7Days, cx),
+                Some(("view", "completed")) => self.set_view(View::Completed, cx),
+                Some(("view", name)) if name.starts_with('#') => self.set_view(View::Tag(name[1..].to_owned()), cx),
+                Some(("view", "tomorrow")) => self.set_view(View::Tomorrow, cx),
+                // `type=<text>`: text in the quick-add field, as if typed (not added).
+                Some(("type", text)) => {
+                    self.input.update(cx, |input, cx| input.set_text(text.to_owned(), cx));
+                    self.update_quick_add_hint(cx);
+                }
+                // `mini=month`: the mini calendar expanded to the month.
+                Some(("mini", "month")) => self.mini_expanded = true,
+                // `view=day+N`: the mini calendar's day N days from today.
+                Some(("view", day)) if day.starts_with("day") => {
+                    let offset: i64 = day.trim_start_matches("day").trim_start_matches('+').parse().unwrap_or(0);
+                    self.set_view(View::Day(Self::today() + Duration::days(offset)), cx);
+                }
+                // `summary=<period|status|grouping|fields>` opens a Summary dropdown.
+                Some(("summary", menu)) => self.summary.update(cx, |summary, cx| summary.dev_open(menu, window, cx)),
+                Some(("drop", spec)) => {
+                    // `drop=<title part>><today|tomorrow|inbox|completed|trash|list:Name|tag:Name>`:
+                    // the same path as dropping a task on the lists column.
+                    let all = self.store.tasks().unwrap_or_default();
+                    if let Some((needle, target)) = spec.split_once('>')
+                        && let Some(id) = all.iter().find(|t| t.title.contains(needle)).map(|t| t.id)
+                    {
+                        let view = match target {
+                            "today" => Some(View::Today),
+                            "tomorrow" => Some(View::Tomorrow),
+                            "inbox" => Some(View::Inbox),
+                            "completed" => Some(View::Completed),
+                            "wontdo" => Some(View::WontDo),
+                            "trash" => Some(View::Trash),
+                            other => other
+                                .strip_prefix("tag:")
+                                .map(|t| View::Tag(t.to_owned()))
+                                .or_else(|| {
+                                    let name = other.strip_prefix("list:")?;
+                                    self.lists.iter().find(|l| l.name == name).map(|l| View::List(l.id))
+                                }),
+                        };
+                        if let Some(view) = view {
+                            self.drop_on_view(view, id, cx);
+                        }
+                    }
+                }
+                Some(("move", spec)) => {
+                    // `move=<dragged title part>><target title part>`: same path as a mouse drop.
+                    let find = |needle: &str| self.tasks.iter().find(|t| t.title.contains(needle)).map(|t| t.id);
+                    if let Some((dragged, target)) = spec.split_once('>')
+                        && let (Some(dragged), Some(target)) = (find(dragged), find(target))
+                    {
+                        self.drop_task(dragged, target, cx);
+                    }
+                }
+                Some(("span", spec)) => {
+                    // `span=<title part>><days from today> [HH:MM]><days from today> [HH:MM]`.
+                    let at = |part: &str| {
+                        let mut words = part.split_whitespace();
+                        let days: i64 = words.next()?.parse().ok()?;
+                        let time = words.next().and_then(crate::due_picker::parse_time);
+                        Some((Self::today() + Duration::days(days), time))
+                    };
+                    let parts: Vec<&str> = spec.split('>').collect();
+                    if let [needle, start, end] = parts[..]
+                        && let (Some((start, start_time)), Some(end)) = (at(start), at(end))
+                        && let Some(id) = self.store.tasks().unwrap_or_default().iter().find(|t| t.title.contains(needle)).map(|t| t.id)
+                    {
+                        self.store.set_due(id, Some(start), start_time).ok();
+                        self.store.set_due_end(id, Some(end)).ok();
+                        self.reload(cx);
+                    }
+                }
+                Some(("search", query)) => {
+                    let query = query.to_owned();
+                    self.search_input.update(cx, |input, cx| input.set_text(query, cx));
+                    self.start_search(window, cx);
+                }
+                Some(("view", name)) => {
+                    if let Some(id) = self.lists.iter().find(|l| l.name == name).map(|l| l.id) {
+                        self.set_view(View::List(id), cx);
+                    }
+                }
+                Some(("list-section", spec)) => {
+                    // `list-section=<name>` adds a section to the current list; `list-section=<name>><task>` also files a task.
+                    let (name, task) = spec.split_once('>').map_or((spec, None), |(n, t)| (n, Some(t)));
+                    if let Some(list) = self.section_owner() {
+                        let existing = self.store.list_sections(list).unwrap_or_default().into_iter().find(|s| s.name == name);
+                        let section = existing.or_else(|| self.store.add_list_section(list, name).ok());
+                        if let (Some(section), Some(task)) = (section, task)
+                            && let Some(id) = self.tasks.iter().find(|t| t.title.contains(task)).map(|t| t.id)
+                        {
+                            self.store.set_section(id, Some(section.id)).ok();
+                        }
+                        self.reload(cx);
+                    }
+                }
+                Some(("kdrop", spec)) => {
+                    // `kdrop=<task title part>><column number>`: drop a card on a kanban column.
+                    let strings = i18n::t(cx);
+                    let columns = self.board_columns(strings);
+                    if let Some((needle, column)) = spec.split_once('>')
+                        && let Some(id) = self.tasks.iter().find(|t| t.title.contains(needle)).map(|t| t.id)
+                        && let Some(target) = column.parse::<usize>().ok().and_then(|c| columns.get(c)).and_then(|col| col.drop.clone())
+                    {
+                        self.drop_on_column(id, target, cx);
+                    }
+                }
+                Some(("column-menu", name)) => {
+                    self.column_menu = self.sections.iter().find(|s| s.name == name).map(|s| (s.id, false));
+                }
+                Some(("section-menu", name)) => {
+                    self.section_menu = self.sections.iter().find(|s| s.name == name).map(|s| s.id);
+                }
+                Some(("template", needle)) => {
+                    if let Some(id) = self.tasks.iter().find(|t| t.title.contains(needle)).map(|t| t.id) {
+                        self.store.save_template(id).ok();
+                    }
+                }
+                Some(("menu", "templates")) => self.templates_open = true,
+                Some(("menu", "input-box")) => self.input_box_open = true,
+                Some(("menu", "timeline")) => self.set_layout(false, true, cx),
+                Some(("menu", "kanban")) => self.set_layout(true, false, cx),
+                Some(("menu", "view-options")) => self.view_options = Some(false),
+                Some(("menu", "suggestions")) => self.suggestions_open = Some(false),
+                Some(("menu", "view-options-date")) => self.view_options = Some(true),
+                Some(("show-date", "countdown")) => self.save_preferences(|p| p.countdown_dates = true, cx),
+                Some(("menu", "arrange")) => {
+                    self.set_layout(false, true, cx);
+                    self.arrange_open = true;
+                }
+                Some(("menu", "timeline-week")) => {
+                    self.set_layout(false, true, cx);
+                    self.timeline_scale = 1;
+                }
+                // `menu=add-date-repeat`: the picker with a time and a weekly repeat, Repeat open.
+                Some(("menu", "add-date-repeat")) => {
+                    self.add_draft.date = Some(Self::today() + chrono::Duration::days(1));
+                    self.add_draft.time = chrono::NaiveTime::from_hms_opt(9, 0, 0);
+                    self.add_draft.repeat = Some(fern_core::Recurrence::new(fern_core::Frequency::Weekly, 1));
+                    self.add_date_month = Some(crate::calendar::month_start(Self::today()));
+                    self.add_date_row = Some(2);
+                }
+                // `menu=add-date`: the field's date picker open, with tomorrow picked.
+                // The add field's picker on its Duration tab, from the next full hour.
+                Some(("menu", "add-duration")) => {
+                    self.add_date_month = Some(crate::calendar::month_start(Self::today()));
+                    let mut range = crate::due_picker::DueDraft { month: crate::calendar::month_start(Self::today()), ..Default::default() };
+                    range.start_duration(Local::now().naive_local(), self.preferences.task_defaults.duration);
+                    self.add_range = Some(range);
+                }
+                Some(("menu", "add-date")) => {
+                    self.add_draft.date = Some(Self::today() + chrono::Duration::days(1));
+                    self.add_date_month = Some(crate::calendar::month_start(Self::today()));
+                }
+                Some(("menu", "detailed-input")) => {
+                    self.save_preferences(|p| p.detailed_input = true, cx);
+                    self.sync_input_placeholder(cx);
+                }
+                Some(("menu", "add-tags")) => {
+                    self.add_tags = Some(vec!["home".to_owned()]);
+                }
+                Some(("menu", "add")) => {
+                    self.add_menu_open = true;
+                    self.add_list_side = true;
+                }
+                Some(("menu", "activity")) => self.open_list_activity(cx),
+                // `context=<title part>`: that task's right-click menu, opened beside its row.
+                Some(("context", needle)) => {
+                    if let Some(task) = self.tasks.iter().find(|t| t.title.contains(needle)).cloned() {
+                        self.select(task.id, cx);
+                        self.context_menu = Some((task.id, gpui::point(px(420.), px(200.))));
+                    }
+                }
+                // `filter-new=normal|advanced`, `filter-new=chain` (an Advanced chain with a
+                // condition's menu open), `filter-new=preview` or `filter-new=examples`.
+                Some(("filter-new", mode)) => {
+                    self.open_filter_edit(None, window, cx);
+                    if mode != "normal" {
+                        self.set_filter_advanced(true, cx);
+                    }
+                    if let Some(edit) = self.filter_edit.as_mut() {
+                        edit.preview = mode == "preview";
+                        edit.examples_open = mode == "examples";
+                    }
+                    if mode == "chain"
+                        && let Some(edit) = self.filter_edit.as_mut()
+                    {
+                        edit.draft.rules = fern_core::filter::examples()[2].rules.clone();
+                        edit.inputs = Self::filter_inputs(&edit.draft, cx);
+                        edit.chain_menu = Some(1);
+                    }
+                }
+                Some(("filter", spec)) => {
+                    // `filter=<name>><tag>`: a saved filter of one tag, opened.
+                    let (name, tag) = spec.split_once('>').unwrap_or((spec, ""));
+                    let names = if tag.is_empty() { Vec::new() } else { vec![tag.to_owned()] };
+                    let filter = fern_core::SmartFilter {
+                        name: name.to_owned(),
+                        rules: fern_core::FilterRules { conditions: vec![fern_core::Condition::new(fern_core::ConditionValue::Tags { names, untagged: false })], ..Default::default() },
+                        ..fern_core::SmartFilter::new()
+                    };
+                    if self.store.save_filter(&filter).is_ok() {
+                        self.set_view(View::Filter(filter.id), cx);
+                    }
+                }
+                Some(("flag", name)) => {
+                    let default = name == "show_completed";
+                    self.toggle_view_flag(name, default, cx);
+                }
+                Some(("pin", needle)) => {
+                    if let Some(id) = self.tasks.iter().find(|t| t.title.contains(needle)).map(|t| t.id) {
+                        let result = self.store.set_pinned(id, true);
+                        self.check(result);
+                        self.reload(cx);
+                    }
+                }
+                // `estimate=<title part>>p3|m90`: an Estimation, as Start Focus → Estimation sets it.
+                Some(("estimate", spec)) => {
+                    let all = self.store.tasks().unwrap_or_default();
+                    if let Some((needle, value)) = spec.split_once('>')
+                        && let Some(task) = all.iter().find(|t| t.title.contains(needle))
+                    {
+                        let estimate = fern_core::Estimate::from_storage(&value.replacen(['p', 'm'], &format!("{}:", &value[..1]), 1));
+                        self.store.set_estimate(task.id, estimate).ok();
+                        self.reload(cx);
+                    }
+                }
+                Some(("select", needle)) => {
+                    if let Some(id) = self.tasks.iter().find(|t| t.title.contains(needle)).map(|t| t.id) {
+                        self.select(id, cx);
+                    }
+                }
+                Some(("popup", popup)) => {
+                    let popup = popup.to_owned();
+                    self.detail.update(cx, |detail, cx| detail.dev_open_popup(&popup, cx));
+                }
+                Some(("menu", "header")) => self.header_menu_open = true,
+                Some(("menu", "sort")) => self.sort_menu = Some(Some(SortMenu::Sort)),
+                Some(("menu", "sort-root")) => self.sort_menu = Some(None),
+                Some(("menu", "group")) => self.sort_menu = Some(Some(SortMenu::Group)),
+                Some(("group", key)) => self.set_sort(None, Some(GroupBy::from_key(key)), window, cx),
+                Some(("sort", key)) => self.set_sort(Some(SortBy::from_key(key)), None, window, cx),
+                Some(("menu", "dates")) => self.closed_menu = Some(ClosedMenu::Dates),
+                Some(("menu", "other-date")) => {
+                    self.open_other_date(cx);
+                    self.update_other_date(cx, |start, _, picking, _| {
+                        *start = Some(Self::today() - Duration::days(7));
+                        *picking = Some(RangeEnd::End);
+                    });
+                }
+                Some(("menu", "lists")) => self.closed_menu = Some(ClosedMenu::Lists(self.closed_lists.clone())),
+                Some(("range", "this-week")) => self.closed_range = ClosedRange::ThisWeek,
+                Some(("complete", needle)) => {
+                    if let Some(id) = self.tasks.iter().find(|t| t.title.contains(needle)).map(|t| t.id) {
+                        self.toggle(id, true, cx);
+                    }
+                }
+                Some(("delete", needle)) => {
+                    if let Some(id) = self.tasks.iter().find(|t| t.title.contains(needle)).map(|t| t.id) {
+                        self.delete(id, cx);
+                    }
+                }
+                Some(("new-list", _)) => self.start_new_list(window, cx),
+                // `detail-bar=format|format-headings|comment|comment-emoji|comment:<text>`.
+                Some(("detail-bar", what)) => self.detail.update(cx, |detail, cx| detail.dev_bar(what, window, cx)),
+                // `list-dialog=new|<list name>[>icon|folder|type|smart|new-folder|kanban|timeline]`.
+                Some(("list-dialog", spec)) => {
+                    let (which, menu) = spec.split_once('>').unwrap_or((spec, ""));
+                    let list = self.lists.iter().find(|l| l.name == which).map(|l| l.id);
+                    self.open_list_dialog(list, None, window, cx);
+                    if let Some(dialog) = &self.list_dialog {
+                        dialog.update(cx, |dialog, cx| dialog.dev_open(menu, window, cx));
+                    }
+                }
+                // `folder=<name>><list>,<list>`: a folder with these lists in it (dev data only).
+                Some(("folder", spec)) => {
+                    let (name, lists) = spec.split_once('>').unwrap_or((spec, ""));
+                    if let Ok(folder) = self.store.add_list_folder(name) {
+                        for list in self.lists.clone().iter().filter(|l| lists.split(',').any(|n| n == l.name)) {
+                            let draft = fern_core::ListDraft { folder: Some(folder.id), ..fern_core::ListDraft::of(list) };
+                            let result = self.store.update_list(list.id, &draft);
+                            self.check(result);
+                        }
+                    }
+                    self.reload(cx);
+                }
+                // `list-icon=<list>><emoji>`, `archive-list=<list>`: dev data only.
+                Some(("list-icon", spec)) => {
+                    let (name, icon) = spec.split_once('>').unwrap_or((spec, ""));
+                    if let Some(list) = self.lists.iter().find(|l| l.name == name).cloned() {
+                        let result = self.store.update_list(list.id, &fern_core::ListDraft { icon: Some(icon.to_owned()), ..fern_core::ListDraft::of(&list) });
+                        self.check(result);
+                    }
+                    self.reload(cx);
+                }
+                Some(("archive-list", name)) => {
+                    if let Some(id) = self.lists.iter().find(|l| l.name == name).map(|l| l.id) {
+                        let result = self.store.set_list_archived(id, true);
+                        self.check(result);
+                        self.archived_open = true;
+                    }
+                    self.reload(cx);
+                }
+                // `tag-dialog=new|<tag>[>parent]`, `merge-dialog=<tag>[>open]`, `tag-menu=<tag>`,
+                // `tags-menu`, `sub-tag=<tag>><parent>` (dev data only).
+                Some(("tag-dialog", spec)) => {
+                    let (which, menu) = spec.split_once('>').unwrap_or((spec, ""));
+                    let tag = (which != "new").then(|| which.to_owned());
+                    self.open_tag_dialog(tag, None, window, cx);
+                    if menu == "parent"
+                        && let Some(dialog) = &self.tag_dialog
+                    {
+                        dialog.update(cx, |dialog, cx| dialog.dev_open_parent(cx));
+                    }
+                }
+                Some(("merge-dialog", spec)) => {
+                    let (tag, menu) = spec.split_once('>').unwrap_or((spec, ""));
+                    self.open_merge_dialog(tag.to_owned(), window, cx);
+                    if menu == "open"
+                        && let Some(dialog) = &self.merge_dialog
+                    {
+                        dialog.update(cx, |dialog, cx| dialog.dev_open(cx));
+                    }
+                }
+                Some(("tag-menu", tag)) => self.list_menu = Some((ListMenuTarget::Tag(tag.to_owned()), gpui::point(px(150.), px(420.)))),
+                Some(("tags-menu", _)) => self.list_menu = Some((ListMenuTarget::TagsHeading, gpui::point(px(170.), px(330.)))),
+                Some(("sub-tag", spec)) => {
+                    let (tag, parent) = spec.split_once('>').unwrap_or((spec, ""));
+                    let result = self.store.update_tag(tag, tag, None, Some(parent));
+                    self.check(result);
+                    self.reload(cx);
+                }
+                // `list-menu=<list>` and `folder-menu=<folder>` open their right-click menus.
+                Some(("list-menu", name)) => {
+                    if let Some(id) = self.lists.iter().find(|l| l.name == name).map(|l| l.id) {
+                        self.list_menu = Some((ListMenuTarget::List(id), gpui::point(px(180.), px(260.))));
+                    }
+                }
+                Some(("folder-menu", name)) => {
+                    if let Some(id) = self.folders.iter().find(|f| f.name == name).map(|f| f.id) {
+                        self.list_menu = Some((ListMenuTarget::Folder(id), gpui::point(px(180.), px(260.))));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn today() -> NaiveDate {
+        Local::now().date_naive()
+    }
+
+    /// The mini calendar's tab and arrows; whether it is expanded is remembered.
+    fn mini_action(&mut self, action: lists_panel::MiniAction, cx: &mut Context<Self>) {
+        match action {
+            lists_panel::MiniAction::Toggle => {
+                self.mini_expanded = !self.mini_expanded;
+                let value = if self.mini_expanded { "1" } else { "0" };
+                let result = self.store.set_setting("mini_expanded", value);
+                self.check(result);
+            }
+            lists_panel::MiniAction::Shift(delta) => self.mini_month = crate::calendar::add_months(self.mini_month, delta),
+            lists_panel::MiniAction::ThisMonth => self.mini_month = crate::calendar::month_start(Self::today()),
+        }
+        cx.notify();
+    }
+
+    fn uses_board_layout(&self) -> bool {
+        (self.kanban || self.timeline)
+            && !matches!(self.view, View::Trash | View::Completed | View::WontDo | View::Search(_))
+    }
+
+    fn uses_popup_details(&self) -> bool {
+        self.preferences.popup_details && self.narrow_viewport
+    }
+
+    fn sync_detail_inset(&mut self, cx: &mut Context<Self>) {
+        let top_inset = !self.uses_popup_details();
+        self.detail.update(cx, |detail, cx| detail.set_top_inset(top_inset, cx));
+    }
+
+    fn sync_viewport(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let narrow = window.viewport_size().width < px(NARROW_WINDOW);
+        if self.narrow_viewport != narrow {
+            self.narrow_viewport = narrow;
+            self.sync_detail_inset(cx);
+            cx.notify();
+        }
+    }
+
+    fn default_task_for_view(&self, cx: &App) -> Option<Task> {
+        if self.view == View::Summary || self.uses_board_layout() || self.uses_popup_details() {
+            return None;
+        }
+        self.rows(i18n::t(cx)).into_iter().find_map(|row| match row {
+            Row::Task { task, .. } => Some(task),
+            Row::Section { .. } | Row::Day { .. } => None,
+        })
+    }
+
+    fn sync_layout_selection(&mut self, cx: &mut Context<Self>) {
+        let selected = self.default_task_for_view(cx);
+        self.selected = selected.as_ref().map(|t| t.id);
+        let lists = self.active_lists();
+        self.detail.update(cx, |detail, cx| {
+            detail.set_lists(lists);
+            detail.show(selected, cx);
+        });
+    }
+
+    pub fn reload(&mut self, cx: &mut Context<Self>) {
+        self.reload_inner(false, true, cx);
+    }
+
+    pub(super) fn reload_inner(&mut self, mut switched: bool, notify_notes: bool, cx: &mut Context<Self>) {
+        // Sticky notes show data mutations, not view navigation.
+        if notify_notes {
+            crate::data_version::data_changed(cx.entity_id(), cx);
+        }
+        self.preferences = self.store.preferences().unwrap_or_default();
+        self.sync_detail_inset(cx);
+        // Loaded once: the views, counts and filters below are all selections of it.
+        let all_tasks = self.store.tasks().unwrap_or_default();
+        let today = Self::today();
+        let week_start = self.preferences.week_start;
+        if let Some(filters) = self.check(self.store.filters()) {
+            self.filters = filters
+                .into_iter()
+                .map(|filter| {
+                    let count = all_tasks.iter().filter(|t| filter.matches(t, today, week_start)).count();
+                    (filter, count)
+                })
+                .collect();
+            if let View::Filter(id) = self.view
+                && !self.filters.iter().any(|(filter, _)| filter.id == id)
+            {
+                self.view = View::Inbox;
+                switched = true;
+            }
+        }
+        if let Some(lists) = self.check(self.store.lists()) {
+            self.lists = lists;
+        }
+        // The current list may have been deleted.
+        if let View::List(id) = self.view
+            && !self.lists.iter().any(|l| l.id == id)
+        {
+            self.view = View::Inbox;
+            switched = true;
+        }
+        self.sync_input_placeholder(cx);
+        self.completing.retain(|id, pending| {
+            pending.view == self.view && !cx.reduce_motion()
+                && all_tasks.iter().any(|task| {
+                    task.id == *id && !task.is_deleted() && !task.is_wont_do()
+                        && task.list_id == pending.before.list_id
+                        && match &pending.undo {
+                            crate::undo::UndoAction::Reopen { .. } => task.is_completed(),
+                            crate::undo::UndoAction::ReopenRepeat { copy, .. } => all_tasks.iter()
+                                .any(|copy_task| copy_task.id == *copy && copy_task.is_completed() && !copy_task.is_deleted()),
+                            _ => false,
+                        }
+                })
+        });
+        self.busy_days = all_tasks
+            .iter()
+            .filter(|t| !t.is_closed() && !t.is_deleted())
+            .filter_map(|t| t.due_date)
+            .collect();
+        self.show_details = self.view_flag("show_details", false);
+        self.kanban = self.view_flag("kanban", false);
+        self.timeline = self.view_flag("timeline", false);
+        self.kanban_column_size = match self.store.setting("kanban:column_size").ok().flatten().as_deref() {
+            Some("s") => 0,
+            Some("l") => 2,
+            _ => 1,
+        };
+        self.kanban_column_color = self.store.setting("kanban:column_color").ok().flatten().is_some_and(|v| v == "1");
+        self.kanban_quick_add = self.store.setting("kanban:quick_add").ok().flatten().is_some_and(|v| v == "1");
+        self.timeline_scale = self
+            .store
+            .setting(&format!("timeline_scale:{}", self.view_key()))
+            .ok()
+            .flatten()
+            .and_then(|s| s.parse().ok())
+            .filter(|s| *s < 3)
+            .unwrap_or(0);
+        self.sections = match self.section_owner() {
+            Some(list) => self.store.list_sections(list).unwrap_or_default(),
+            None => Vec::new(),
+        };
+        self.kanban_section_colors = self
+            .sections
+            .iter()
+            .filter_map(|s| {
+                self.store
+                    .setting(&format!("kanban:section_color:{}", s.id))
+                    .ok()
+                    .flatten()
+                    .filter(|c| !c.is_empty())
+                    .map(|c| (s.id, c))
+            })
+            .collect();
+        self.folders = self.store.list_folders().unwrap_or_default();
+        self.collapsed_folders = self
+            .store
+            .setting("collapsed_folders")
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|id| Id::parse_str(id).ok())
+            .collect();
+        self.collapsed_tags = self.store.setting("collapsed_tags").ok().flatten().unwrap_or_default().lines().map(str::to_owned).collect();
+        self.tags_collapsed = self.store.setting("tags_collapsed").ok().flatten().is_some_and(|v| v == "1");
+        if let Some(counts) = self.check(self.store.counts_from(&all_tasks, today)) {
+            self.counts = counts;
+        }
+        let show_completed = self.view == View::Today && self.view_flag("show_completed", true);
+        if let Some(tasks) = self.check(self.store.tasks_in_from_with_today_completed(all_tasks, &self.view, today, show_completed)) {
+            self.tasks = tasks;
+        }
+        self.ensure_kanban_sections(i18n::t(cx));
+        if let Some(tags) = self.check(self.store.tags()) {
+            self.tags = tags;
+        }
+        self.reload_today_habits();
+        let lists = self.active_lists();
+        if switched {
+            self.reset_view_transients(cx);
+            self.list_state = ListState::new(0, ListAlignment::Top, px(400.));
+            self.list_entries.clear();
+            let selected = self.default_task_for_view(cx);
+            self.selected = selected.as_ref().map(|t| t.id);
+            self.detail.update(cx, |detail, cx| {
+                detail.set_lists(lists);
+                detail.show(selected, cx);
+            });
+        } else {
+            // Keep completed tasks open after they leave a view like Today. A deleted task is only
+            // shown in Trash; otherwise the detail panel returns to its empty state.
+            let selected = self.selected.and_then(|id| self.store.task(id).ok().flatten())
+                .filter(|task| task.is_deleted() == (self.view == View::Trash));
+            self.selected = selected.as_ref().map(|t| t.id);
+            self.detail.update(cx, |detail, cx| {
+                detail.set_lists(lists);
+                detail.refresh(selected, cx);
+            });
+        }
+        cx.notify();
+    }
+
+    /// Today and Next 7 Days list the habits due today, as in the original, unless turned off
+    /// in the habit settings.
+    fn reload_today_habits(&mut self) {
+        self.today_habits.clear();
+        if !matches!(self.view, View::Today | View::Next7Days)
+            || self.store.setting(crate::habit_view::IN_TODAY_SETTING).ok().flatten().as_deref() == Some("0")
+        {
+            return;
+        }
+        let today = Self::today();
+        for habit in self.store.habits().unwrap_or_default().into_iter().filter(|h| !h.archived) {
+            let done = self.store.checkins(habit.id).unwrap_or_default();
+            if habit.is_due(today, &done) {
+                let amount = self.store.checkin_records(habit.id).unwrap_or_default().into_iter().find(|c| c.date == today).map_or(0, |c| c.value);
+                let checked = done.contains(&today);
+                self.today_habits.push((habit, checked, amount));
+            }
+        }
+    }
+
+    /// Creates a task from the quick-add line: due date, time, tags, priority and list come from
+    /// the text ("tomorrow 6pm #home !1 ^work"); anything missing comes from the current view —
+    /// a due date in Today/Tomorrow, the tag in a tag view, the list in a list view.
+    /// A task from a template, placed like a typed one: in the current list, tag or day.
+    fn add_from_template(&mut self, template: Id, cx: &mut Context<Self>) {
+        self.templates_open = false;
+        let today = Self::today();
+        let result = (|| -> anyhow::Result<Task> {
+            let task = self.store.add_from_template(template)?;
+            match &self.view {
+                View::Today | View::Next7Days => self.store.set_due(task.id, Some(today), None)?,
+                View::Tomorrow => self.store.set_due(task.id, Some(today + Duration::days(1)), None)?,
+                View::List(list) => self.store.set_list(task.id, Some(*list))?,
+                View::Tag(tag) if !task.tags.iter().any(|t| t.to_lowercase() == tag.to_lowercase()) => {
+                    let mut tags = task.tags.clone();
+                    tags.push(tag.clone());
+                    self.store.set_tags(task.id, &tags)?;
+                }
+                _ => {}
+            }
+            Ok(task)
+        })();
+        if let Some(task) = self.check(result) {
+            self.reload(cx);
+            self.select(task.id, cx);
+        }
+    }
+
+    fn render_templates(&self, strings: &Strings, cx: &mut Context<Self>) -> AnyElement {
+        let templates = self.store.templates().unwrap_or_default();
+        let theme = cx.theme().clone();
+        popover(cx)
+            .w(px(280.))
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.templates_open = false;
+                cx.notify();
+            }))
+            .child(div().px_2().py_1().child(Label::new(strings.templates).weight(FontWeight::SEMIBOLD)))
+            .when(templates.is_empty(), |el| {
+                el.child(div().px_2().py_2().child(Label::new(strings.no_templates).size(LabelSize::Small).color(Color::Muted)))
+            })
+            .children(templates.into_iter().map(|template| {
+                let id = template.id;
+                let group = SharedString::from(format!("template-{id}"));
+                let tags = (!template.tags.is_empty())
+                    .then(|| template.tags.iter().map(|t| format!("#{t}")).collect::<Vec<_>>().join(" "));
+                let checklist = template.checklist.len();
+                h_flex()
+                    .id(group.clone())
+                    .group(group.clone())
+                    .h(px(34.))
+                    .px_2()
+                    .gap_2()
+                    .rounded(px(5.))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme.colors().element_hover))
+                    .child(Icon::new(IconName::LayoutTemplate).size(IconSize::Small).color(Color::Muted))
+                    .child(div().flex_1().min_w_0().child(Label::new(template.title).truncate()))
+                    .children(tags.map(|t| Label::new(t).size(LabelSize::XSmall).color(Color::Muted)))
+                    .when(checklist > 0, |el| {
+                        el.child(Icon::new(IconName::ListChecks).size(IconSize::XSmall).color(Color::Muted))
+                            .child(Label::new(checklist.to_string()).size(LabelSize::XSmall).color(Color::Muted))
+                    })
+                    .child(
+                        div().opacity(if crate::touch::active() { 1. } else { 0. }).group_hover(group, |s| s.opacity(1.)).child(
+                            IconButton::new(SharedString::from(format!("delete-template-{id}")), IconName::X)
+                                .size(px(20.))
+                                .icon_size(IconSize::XSmall)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    let result = this.store.delete_template(id);
+                                    this.check(result);
+                                    cx.notify();
+                                })),
+                        ),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| this.add_from_template(id, cx)))
+            }))
+            .into_any_element()
+    }
+
+    /// The system-wide Quick Add's task: added as from All, so that it takes the Settings'
+    /// defaults (the default list among them) and nothing from the view or the add field's menu.
+    pub fn add_quick(&mut self, text: &str, cx: &mut Context<Self>) {
+        let result = self.add_task_as(text, &View::All, &AddDraft::default());
+        self.check(result);
+        self.reload(cx);
+    }
+
+    fn add_task(&mut self, input: &str, cx: &App) -> Option<Task> {
+        let result = self.add_task_as(input, &self.view, &self.add_draft);
+        let task = self.check(result)?;
+        let strings = i18n::t(cx);
+        let errors: Vec<_> = std::mem::take(&mut self.add_draft.files).into_iter().filter_map(|file| {
+            let result = crate::attachments_dir().and_then(|dir| self.store.add_attachment(task.id, &file, &dir));
+            let error = result.err()?;
+            let name = file.file_name().unwrap_or(file.as_os_str()).to_string_lossy();
+            Some(strings.attachment_failed.replace("{file}", &name)
+                .replace("{error}", &crate::sync::attachment_error(&error, strings)))
+        }).collect();
+        self.add_attachment_error = (!errors.is_empty()).then(|| errors.join("\n"));
+        Some(task)
+    }
+
+    /// Adds a task from the add field's text as if typed in `view` with `draft`'s choices.
+    fn add_task_as(&self, input: &str, view: &View, draft: &AddDraft) -> anyhow::Result<Task> {
+        let today = Self::today();
+        let list_names: Vec<String> = self.lists.iter().map(|l| l.name.clone()).collect();
+        let parsed = fern_core::parse_quick_add_with(input, today, &list_names, self.preferences.recognition);
+        let title = if parsed.title.is_empty() { input.trim() } else { parsed.title.as_str() };
+        let task = self.store.add_task_at(title, !self.preferences.task_defaults.add_to_bottom)?;
+
+        let view_due = match view {
+            View::Today | View::Next7Days => Some(today),
+            View::Tomorrow => Some(today + Duration::days(1)),
+            View::Day(day) => Some(*day),
+            _ => None,
+        };
+        // Settings → More → Task Default fills in what neither the text nor the view gives.
+        let defaults = &self.preferences.task_defaults;
+        // The date picker's time and reminders go with its date, not with a typed one.
+        let from_picker = parsed.due_date.is_none() && draft.date.is_some();
+        let due_time = if from_picker { draft.time } else { parsed.due_time };
+        if let Some(date) = parsed.due_date.or(draft.date).or(view_due).or(defaults.date.map(|d| d.date(today))) {
+            self.store.set_due(task.id, Some(date), due_time)?;
+            if from_picker && draft.end.is_some() {
+                self.store.set_due_end(task.id, draft.end)?;
+            }
+            match draft.reminders.as_ref().filter(|_| from_picker) {
+                Some(reminders) => self.store.set_reminders(task.id, reminders)?,
+                None => {
+                    let reminder = if due_time.is_some() { defaults.timed_reminder } else { defaults.all_day_reminder };
+                    if let Some(offset) = reminder {
+                        self.store.set_reminders(task.id, &[offset])?;
+                    }
+                }
+            }
+        }
+
+        let mut tags = parsed.tags;
+        if let Some(tag) = &defaults.tag
+            && !tags.iter().any(|t| t.to_lowercase() == tag.to_lowercase())
+        {
+            tags.push(tag.clone());
+        }
+        if let View::Tag(tag) = view
+            && !tags.iter().any(|t| t.to_lowercase() == tag.to_lowercase())
+        {
+            tags.push(tag.clone());
+        }
+        for tag in &draft.tags {
+            if !tags.iter().any(|t| t.to_lowercase() == tag.to_lowercase()) {
+                tags.push(tag.clone());
+            }
+        }
+        if !tags.is_empty() {
+            self.store.set_tags(task.id, &tags)?;
+        }
+        if let Some(repeat) = parsed.repeat.or_else(|| draft.repeat.clone().filter(|_| draft.date.is_some())) {
+            self.store.set_repeat(task.id, Some(repeat), today)?;
+        }
+        let draft_priority = draft.priority.filter(|p| *p != fern_core::Priority::None);
+        if let Some(priority) = parsed
+            .priority
+            .or(draft_priority)
+            .or((defaults.priority != fern_core::Priority::None).then_some(defaults.priority))
+        {
+            self.store.set_priority(task.id, priority)?;
+        }
+
+        let parsed_list =
+            parsed.list.and_then(|name| self.lists.iter().find(|l| l.name == name)).map(|l| l.id);
+        let view_list = match view {
+            View::List(id) => Some(*id),
+            _ => None,
+        };
+        // Outside the Inbox and lists, new tasks go to the default list from the Settings.
+        let default_list = match view {
+            View::Inbox | View::List(_) => None,
+            _ => self.store.preferences().ok().and_then(|p| p.default_list),
+        };
+        // The "▾" menu's list goes before the view's and the default one.
+        let draft_list = draft.list;
+        if let Some(Some(list)) = parsed_list.map(Some).or(draft_list).or(view_list.map(Some)).or(default_list.map(Some)) {
+            self.store.set_list(task.id, Some(list))?;
+        }
+        // In a note list (the original's List Type), new entries are notes.
+        let note_list = self.store.task(task.id)?.and_then(|t| t.list_id).is_some_and(|id| self.lists.iter().any(|l| l.id == id && l.kind == fern_core::Kind::Note));
+        if draft.note || note_list {
+            self.store.set_kind(task.id, fern_core::Kind::Note)?;
+        }
+        Ok(task)
+    }
+
+    /// Highlights what quick add recognizes in the field and shows the recognized date.
+    fn update_quick_add_hint(&mut self, cx: &mut Context<Self>) {
+        let text = self.input.read(cx).text().to_owned();
+        let list_names: Vec<String> = self.lists.iter().map(|l| l.name.clone()).collect();
+        let parsed = fern_core::parse_quick_add_with(&text, Self::today(), &list_names, self.preferences.recognition);
+        let spans = parsed.spans.clone();
+        self.input.update(cx, |input, cx| input.set_highlights(spans, cx));
+        self.quick_add_due = parsed.due_date.map(|date| (date, parsed.due_time));
+        cx.notify();
+    }
+
+    /// The add field's placeholder: the Detailed box asks "What would you like to do?".
+    fn sync_input_placeholder(&mut self, cx: &mut Context<Self>) {
+        let strings = i18n::t(cx);
+        // In the smart lists, as the original: 'Add task to "Inbox"', naming where new tasks go.
+        let smart = matches!(self.view, View::All | View::Today | View::Tomorrow | View::Next7Days);
+        let placeholder: SharedString = if self.preferences.detailed_input {
+            strings.input_box_placeholder.into()
+        } else if let View::Tag(tag) = &self.view {
+            // As the original: the tag the new task gets, "#work".
+            format!("#{tag}").into()
+        } else if smart {
+            let list = self.preferences.default_list.and_then(|id| self.lists.iter().find(|l| l.id == id)).map_or(strings.inbox.to_owned(), |l| l.name.clone());
+            strings.add_task_to.replace("{list}", &list).into()
+        } else {
+            strings.add_task.into()
+        };
+        self.input.update(cx, |input, cx| input.set_placeholder(placeholder, cx));
+    }
+
+    /// Adds the typed task, as Enter in the add field or its "Add" button does.
+    fn submit_new_task(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if text.trim().is_empty() {
+            return;
+        }
+        if self.add_task(text, cx).is_some() {
+            self.input.update(cx, |input, cx| input.clear(window, cx));
+            self.quick_add_due = None;
+            self.add_draft = AddDraft::default();
+            self.reload(cx);
+        }
+    }
+
+    /// The popovers the add field's buttons open: the "▾" menu, its Tags and Input Box Setting,
+    /// and the templates.
+    fn add_field_popovers(&self, el: Div, strings: &'static Strings, cx: &mut Context<Self>) -> Div {
+        el.when(self.add_menu_open, |el| {
+            // As the original's, the menu hangs from the field's calendar button, opening rightwards.
+            el.child(PopoverAttachment::new(Placement::BelowLeft, self.render_add_menu(strings, cx)))
+        })
+        .when_some(self.add_tags.clone(), |el, picked| {
+            el.child(PopoverAttachment::new(Placement::BelowRight, self.render_add_tags(&picked, strings, cx)))
+        })
+        .when(self.input_box_open, |el| {
+            el.child(PopoverAttachment::new(Placement::BelowRight, self.render_input_box_setting(strings, cx)))
+        })
+        .when(self.templates_open, |el| {
+            el.child(PopoverAttachment::new(Placement::BelowRight, self.render_templates(strings, cx)))
+        })
+    }
+
+    /// The date the field shows: the typed one, or the one picked with its calendar button.
+    fn shown_add_due(&self) -> Option<(NaiveDate, Option<chrono::NaiveTime>)> {
+        self.quick_add_due.or(self.add_draft.date.map(|date| (date, self.add_draft.time)))
+    }
+
+    /// The field's calendar button, as in the original: it opens a date picker for the next task,
+    /// placed under the button.
+    fn add_date_button(&self, placement: Placement, strings: &'static Strings, cx: &mut Context<Self>) -> Div {
+        let picked = self.add_draft.date.is_some();
+        let button = IconButton::new("add-date", IconName::CalendarDays)
+            .size(px(24.))
+            .icon_size(IconSize::Small)
+            .icon_color(if picked { Color::Accent } else { Color::Muted })
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.add_date_month = match this.add_date_month {
+                    Some(_) => None,
+                    None => Some(crate::calendar::month_start(this.add_draft.date.unwrap_or_else(Self::today))),
+                };
+                cx.notify();
+            }));
+        div().relative().child(button).when_some(self.add_date_month, |el, month| {
+            el.child(PopoverAttachment::new(placement, self.render_add_date(month, strings, cx)))
+        })
+    }
+
+    /// The date picker's Time, Reminder and Repeat rows, as in the task's date popover: a click
+    /// opens the row's choices under it.
+    fn render_add_date_rows(&self, strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let draft = &self.add_draft;
+        let date = draft.date.unwrap_or_else(Self::today);
+        let has_time = draft.time.is_some();
+        let open = self.add_date_row;
+        let row = |i: u8, icon: IconName, label: String, set: bool| {
+            h_flex()
+                .id(SharedString::from(format!("add-date-row-{i}")))
+                .h(px(36.))
+                .px_1()
+                .gap_2()
+                .rounded(px(5.))
+                .cursor_pointer()
+                .hover(|s| s.bg(theme.colors().element_hover))
+                .child(Icon::new(icon).size(IconSize::Small).color(if set { Color::Accent } else { Color::Muted }))
+                .child(div().flex_1().min_w_0().child(Label::new(label).size(LabelSize::Small).color(if set { Color::Accent } else { Color::Default }).truncate()))
+                .child(Icon::new(if open == Some(i) { IconName::ChevronDown } else { IconName::ChevronRight }).size(IconSize::XSmall).color(Color::Muted))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.add_date_row = if this.add_date_row == Some(i) { None } else { Some(i) };
+                    cx.notify();
+                }))
+        };
+        let choice = |id: SharedString, label: String, selected: bool| {
+            h_flex()
+                .id(id)
+                .h(px(26.))
+                .px_2()
+                .gap_2()
+                .rounded(px(5.))
+                .cursor_pointer()
+                .hover(|s| s.bg(theme.colors().element_hover))
+                .child(div().flex_1().child(Label::new(label).size(LabelSize::Small).color(if selected { Color::Accent } else { Color::Default })))
+                .when(selected, |el| el.child(Icon::new(IconName::Check).size(IconSize::XSmall).color(Color::Accent)))
+        };
+        let time_label = draft.time.map_or(strings.time.to_owned(), |time| crate::calendar::format_time(time, strings));
+        let reminder_label = draft
+            .reminders
+            .as_ref()
+            .and_then(|r| crate::due_picker::reminder_label(r, has_time, strings))
+            .unwrap_or_else(|| strings.reminder.to_owned());
+        let repeat_label =
+            draft.repeat.as_ref().map_or(strings.repeat.to_owned(), |r| crate::due_picker::repeat_label(r, strings));
+        let mut rows = v_flex().gap_0p5();
+        // On the Duration tab the times are the Start and End fields, as in the original.
+        let duration = self.add_range.is_some();
+        if !duration {
+            rows = rows.child(row(0, IconName::Clock, time_label, has_time));
+        }
+        if open == Some(0) && !duration {
+            let times = std::iter::once(None).chain(crate::due_picker::time_options().into_iter().map(Some));
+            rows = rows.child(v_flex().id("add-date-times").max_h(px(150.)).overflow_y_scroll().children(times.map(|time| {
+                let label = time.map_or(strings.no_time.to_owned(), |time| crate::calendar::format_time(time, strings));
+                choice(SharedString::from(format!("add-time-{label}")), label, draft.time == time).on_click(cx.listener(move |this, _, _, cx| {
+                    this.add_draft.time = time;
+                    this.add_draft.date.get_or_insert_with(Self::today);
+                    this.add_draft.reminders = None;
+                    this.add_date_row = None;
+                    cx.notify();
+                }))
+            })));
+        }
+        rows = rows.child(row(1, IconName::AlarmClock, reminder_label, draft.reminders.as_ref().is_some_and(|r| !r.is_empty())));
+        if open == Some(1) {
+            let chosen = draft.reminders.clone().unwrap_or_default();
+            rows = rows.child(v_flex().children(crate::due_picker::reminder_options(has_time, strings).into_iter().map(|(offset, label, hint)| {
+                let selected = chosen.contains(&offset);
+                let label = if hint.is_empty() { label.to_owned() } else { format!("{label} ({hint})") };
+                choice(SharedString::from(format!("add-reminder-{offset}")), label, selected).on_click(cx.listener(move |this, _, _, cx| {
+                    let reminders = this.add_draft.reminders.get_or_insert_with(Vec::new);
+                    if let Some(i) = reminders.iter().position(|r| *r == offset) {
+                        reminders.remove(i);
+                    } else {
+                        reminders.push(offset);
+                    }
+                    this.add_draft.date.get_or_insert_with(Self::today);
+                    cx.notify();
+                }))
+            })));
+        }
+        rows = rows.child(row(2, IconName::Repeat, repeat_label, draft.repeat.is_some()));
+        if open == Some(2) {
+            let options = crate::due_picker::repeat_options(date, strings, i18n::locale(cx));
+            rows = rows.child(
+                v_flex()
+                    .child(choice("add-repeat-none".into(), strings.none_option.to_owned(), draft.repeat.is_none()).on_click(cx.listener(|this, _, _, cx| {
+                        this.add_draft.repeat = None;
+                        this.add_date_row = None;
+                        cx.notify();
+                    })))
+                    .children(options.into_iter().enumerate().map(|(i, (rule, label, hint))| {
+                        let selected = draft.repeat.as_ref() == Some(&rule);
+                        let label = if hint.is_empty() { label } else { format!("{label} ({hint})") };
+                        choice(SharedString::from(format!("add-repeat-{i}")), label, selected).on_click(cx.listener(move |this, _, _, cx| {
+                            this.add_draft.repeat = Some(rule.clone());
+                            this.add_draft.date.get_or_insert_with(Self::today);
+                            this.add_date_row = None;
+                            cx.notify();
+                        }))
+                    })),
+            );
+        }
+        rows.into_any_element()
+    }
+
+    /// The add field's date picker: the original's quick picks (today, tomorrow, next week, next
+    /// month) and the month; a pick applies to the next task added. Clear drops it.
+    fn render_add_date(&self, month: NaiveDate, strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let today = Self::today();
+        let picked = self.add_draft.date;
+        // A pick stays in the picker, as in the original; OK closes it and Clear drops it all.
+        let pick = |date: Option<NaiveDate>| {
+            move |this: &mut Self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>| {
+                this.add_draft.date = date;
+                if date.is_none() {
+                    this.add_draft.time = None;
+                    this.add_draft.reminders = None;
+                    this.add_draft.repeat = None;
+                    this.add_date_month = None;
+                }
+                cx.notify();
+            }
+        };
+        // The original's Date and Duration tabs on top.
+        let on_duration = self.add_range.is_some();
+        let tab = |id: &'static str, label: &'static str, duration: bool, cx: &mut Context<Self>| {
+            let on = on_duration == duration;
+            div()
+                .id(id)
+                .flex_1()
+                .h(px(26.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(5.))
+                .cursor_pointer()
+                .when(on, |el| el.bg(theme.colors().element_selected))
+                .child(Label::new(label).size(LabelSize::Small).color(if on { Color::Default } else { Color::Muted }))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.add_range = duration.then(|| {
+                        let mut draft = crate::due_picker::DueDraft {
+                            date: this.add_draft.date,
+                            time: this.add_draft.time,
+                            month: crate::calendar::month_start(this.add_draft.date.unwrap_or_else(Self::today)),
+                            ..Default::default()
+                        };
+                        if let Some((end, end_time)) = this.add_draft.end {
+                            (draft.end_date, draft.end_time) = (Some(end), end_time);
+                        }
+                        draft.start_duration(Local::now().naive_local(), this.preferences.task_defaults.duration);
+                        draft
+                    });
+                    cx.notify();
+                }))
+        };
+        let tabs = h_flex()
+            .p(px(2.))
+            .rounded(px(7.))
+            .bg(theme.colors().element_hover)
+            .child(tab("add-tab-date", strings.date_tab, false, cx))
+            .child(tab("add-tab-duration", strings.duration_tab, true, cx));
+        if let Some(range) = self.add_range.clone() {
+            return self.render_add_range(range, tabs, strings, cx);
+        }
+        let [d_today, d_tomorrow, d_week, d_month] = crate::due_picker::quick_dates(today);
+        let quick = |id: &'static str, icon: IconName, tip: &'static str, date: NaiveDate| {
+            div()
+                .id(id)
+                .flex_1()
+                .h(px(30.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(6.))
+                .cursor_pointer()
+                .hover(|s| s.bg(theme.colors().element_hover))
+                .tooltip(Tooltip::text(tip))
+                .child(Icon::new(icon).size(IconSize::Large))
+                .on_click(cx.listener(pick(Some(date))))
+        };
+        let shift = |delta: i32| {
+            cx.listener(move |this: &mut Self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>| {
+                if let Some(month) = this.add_date_month.as_mut() {
+                    *month = crate::calendar::add_months(*month, delta);
+                }
+                cx.notify();
+            })
+        };
+        let days = crate::calendar::month_grid(month);
+        let weeks: Vec<_> = days
+            .chunks(7)
+            .map(|week| {
+                h_flex().children(week.iter().map(|&date| {
+                    let selected = picked == Some(date);
+                    let in_month = date.month() == month.month();
+                    div().flex_1().flex().justify_center().child(
+                        div()
+                            .id(SharedString::from(format!("add-day-{date}")))
+                            .size(px(26.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_full()
+                            .cursor_pointer()
+                            .when(selected, |el| el.bg(theme.colors().accent))
+                            .when(!selected && date == today, |el| el.bg(theme.colors().accent.opacity(0.18)))
+                            .when(!selected, |el| el.hover(|s| s.bg(theme.colors().element_hover)))
+                            .child(Label::new(date.day().to_string()).centered().size(LabelSize::Small).color(
+                                if selected { Color::OnAccent } else if in_month { Color::Default } else { Color::Muted },
+                            ))
+                            .on_click(cx.listener(pick(Some(date)))),
+                    )
+                }))
+            })
+            .collect();
+        let button = |id: &'static str, label: &'static str, primary: bool| {
+            div()
+                .id(id)
+                .flex_1()
+                .h(px(28.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(6.))
+                .cursor_pointer()
+                .when(primary, |el| el.bg(theme.colors().accent))
+                .when(!primary, |el| el.border_1().border_color(theme.colors().border))
+                .child(Label::new(label).size(LabelSize::Small).when(primary, |label| label.color(Color::OnAccent)))
+        };
+        popover(cx)
+            .w(px(260.))
+            .p_2()
+            .gap_1()
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.add_date_month = None;
+                this.add_range = None;
+                cx.notify();
+            }))
+            .child(tabs)
+            .child(
+                h_flex()
+                    .child(quick("add-date-today", IconName::Sun, strings.today, d_today))
+                    .child(quick("add-date-tomorrow", IconName::Sunrise, strings.tomorrow, d_tomorrow))
+                    .child(quick("add-date-week", IconName::CalendarPlus, strings.next_week, d_week))
+                    .child(quick("add-date-month", IconName::Moon, strings.next_month, d_month)),
+            )
+            .child(
+                h_flex()
+                    .px_1()
+                    .child(div().flex_1().child(Label::new(crate::calendar::month_title(month, strings)).size(LabelSize::Small)))
+                    .child(IconButton::new("add-date-prev", IconName::ChevronLeft).size(px(22.)).icon_size(IconSize::XSmall).on_click(shift(-1)))
+                    .child(IconButton::new("add-date-next", IconName::ChevronRight).size(px(22.)).icon_size(IconSize::XSmall).on_click(shift(1))),
+            )
+            .child(h_flex().children(crate::calendar::weekday_labels(&strings.weekdays_narrow).map(|day| {
+                div().flex_1().flex().justify_center().child(Label::new(day).size(LabelSize::XSmall).color(Color::Muted))
+            })))
+            .children(weeks)
+            // As the original's, no line between the month and the Time, Reminder and Repeat rows.
+            .child(div().h(px(8.)))
+            .child(self.render_add_date_rows(strings, cx))
+            .child(
+                h_flex()
+                    .pt_1()
+                    .gap_2()
+                    .child(button("add-date-clear", strings.clear, false).on_click(cx.listener(pick(None))))
+                    .child(button("add-date-ok", strings.ok, true).on_click(cx.listener(|this, _, _, cx| {
+                        this.add_date_month = None;
+                        cx.notify();
+                    }))),
+            )
+            .into_any_element()
+    }
+
+    /// The add field's date picker on the original's Duration tab: Start and End, each a date and
+    /// a time picked from a month or a list, All Day, the reminder and repeat rows, Clear and OK.
+    fn render_add_range(
+        &self,
+        range: crate::due_picker::DueDraft,
+        tabs: impl IntoElement,
+        strings: &'static Strings,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        use crate::due_picker::RangeField;
+        let theme = cx.theme().clone();
+        let today = Self::today();
+        let all_day = range.is_all_day();
+        let chip = |id: &'static str, label: SharedString, field: RangeField, cx: &mut Context<Self>| {
+            let active = range.range_field == Some(field);
+            div()
+                .id(id)
+                .flex_1()
+                .h(px(28.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(6.))
+                .border_1()
+                .border_color(if active { theme.colors().accent } else { theme.colors().border })
+                .cursor_pointer()
+                .child(Label::new(label).size(LabelSize::Small))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if let Some(range) = this.add_range.as_mut() {
+                        range.range_field = if range.range_field == Some(field) { None } else { Some(field) };
+                    }
+                    cx.notify();
+                }))
+        };
+        let day = |date: Option<NaiveDate>| -> SharedString { date.map_or(SharedString::default(), |d| task_rows::short_date(d, strings).into()) };
+        let time = |t: Option<chrono::NaiveTime>| -> SharedString { t.map_or(SharedString::default(), |t| crate::calendar::format_time(t, strings).into()) };
+        let line = |label: &'static str, date_chip: AnyElement, time_chip: Option<AnyElement>| {
+            h_flex().gap_2().child(div().w(px(40.)).child(Label::new(label).size(LabelSize::Small))).child(date_chip).children(time_chip)
+        };
+        let start = line(
+            strings.range_start,
+            chip("add-range-start-date", day(range.date), RangeField::StartDate, cx).into_any_element(),
+            (!all_day).then(|| chip("add-range-start-time", time(range.time), RangeField::StartTime, cx).into_any_element()),
+        );
+        let end = line(
+            strings.range_end,
+            chip("add-range-end-date", day(range.end_date), RangeField::EndDate, cx).into_any_element(),
+            (!all_day).then(|| chip("add-range-end-time", time(range.end_time), RangeField::EndTime, cx).into_any_element()),
+        );
+        // The field being picked: a month for a date, a list for a time.
+        let picker: Option<AnyElement> = match range.range_field {
+            Some(field @ (RangeField::StartDate | RangeField::EndDate)) => {
+                let shown = if field == RangeField::EndDate { range.end_date } else { range.date };
+                let month = crate::calendar::month_start(shown.unwrap_or(today));
+                Some(
+                    v_flex()
+                        .children(crate::calendar::month_grid(month).chunks(7).map(|week| {
+                            h_flex().children(week.iter().map(|&date| {
+                                let selected = shown == Some(date);
+                                div().flex_1().flex().justify_center().child(
+                                    div()
+                                        .id(SharedString::from(format!("add-range-day-{date}")))
+                                        .size(px(26.))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded_full()
+                                        .cursor_pointer()
+                                        .when(selected, |el| el.bg(theme.colors().accent))
+                                        .when(!selected, |el| el.hover(|s| s.bg(theme.colors().element_hover)))
+                                        .child(Label::new(date.day().to_string()).centered().size(LabelSize::Small).color(
+                                            if selected { Color::OnAccent } else if date.month() == month.month() { Color::Default } else { Color::Muted },
+                                        ))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            if let Some(range) = this.add_range.as_mut() {
+                                                range.pick_range_date(date);
+                                            }
+                                            cx.notify();
+                                        })),
+                                )
+                            }))
+                        }))
+                        .into_any_element(),
+                )
+            }
+            Some(field @ (RangeField::StartTime | RangeField::EndTime)) => {
+                let current = if field == RangeField::EndTime { range.end_time } else { range.time };
+                Some(
+                    v_flex()
+                        .id("add-range-times")
+                        .max_h(px(180.))
+                        .overflow_y_scroll()
+                        .children(crate::due_picker::time_options().into_iter().map(|t| {
+                            ListItem::new(SharedString::from(format!("add-range-time-{t}")))
+                                .height(px(28.))
+                                .child(Label::new(crate::calendar::format_time(t, strings)).size(LabelSize::Small))
+                                .when(current == Some(t), |item| item.end_slot(Icon::new(IconName::Check).size(IconSize::Small).color(Color::Accent)))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if let Some(range) = this.add_range.as_mut() {
+                                        range.pick_range_time(t);
+                                    }
+                                    cx.notify();
+                                }))
+                        }))
+                        .into_any_element(),
+                )
+            }
+            None => None,
+        };
+        let button = |id: &'static str, label: &'static str, primary: bool| {
+            div()
+                .id(id)
+                .flex_1()
+                .h(px(28.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(6.))
+                .cursor_pointer()
+                .when(primary, |el| el.bg(theme.colors().accent))
+                .when(!primary, |el| el.border_1().border_color(theme.colors().border))
+                .child(Label::new(label).size(LabelSize::Small).when(primary, |label| label.color(Color::OnAccent)))
+        };
+        popover(cx)
+            .w(px(260.))
+            .p_2()
+            .gap_2()
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.add_date_month = None;
+                this.add_range = None;
+                cx.notify();
+            }))
+            .child(tabs)
+            .child(start)
+            .child(end)
+            .children(picker)
+            .child(
+                h_flex()
+                    .id("add-range-all-day")
+                    .h(px(30.))
+                    .px_1()
+                    .cursor_pointer()
+                    .child(div().flex_1().child(Label::new(strings.range_all_day).size(LabelSize::Small)))
+                    .child(ui::Switch::new().toggle_state(all_day))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(range) = this.add_range.as_mut() {
+                            range.set_all_day(!all_day);
+                        }
+                        cx.notify();
+                    })),
+            )
+            .child(self.render_add_date_rows(strings, cx))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(button("add-range-clear", strings.clear, false).on_click(cx.listener(|this, _, _, cx| {
+                        this.add_draft.date = None;
+                        this.add_draft.time = None;
+                        this.add_draft.end = None;
+                        this.add_draft.reminders = None;
+                        this.add_draft.repeat = None;
+                        this.add_range = None;
+                        this.add_date_month = None;
+                        cx.notify();
+                    })))
+                    .child(button("add-range-ok", strings.ok, true).on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(range) = this.add_range.take() {
+                            this.add_draft.date = range.date;
+                            this.add_draft.time = range.time;
+                            this.add_draft.end = range.end();
+                        }
+                        this.add_date_month = None;
+                        cx.notify();
+                    }))),
+            )
+            .into_any_element()
+    }
+
+    /// The original's "Input Box Setting": a preview of the Simple and the Detailed add field;
+    /// a click picks one.
+    fn render_input_box_setting(&self, strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let detailed = self.preferences.detailed_input;
+        let line = |w: f32| div().w(px(w)).h(px(6.)).rounded(px(3.)).bg(theme.colors().text_muted.opacity(0.4));
+        let simple_preview = h_flex()
+            .h(px(28.))
+            .px_2()
+            .gap_1()
+            .rounded(px(5.))
+            .border_1()
+            .border_color(theme.colors().accent)
+            .child(Icon::new(IconName::Plus).size(IconSize::XSmall).color(Color::Muted))
+            .child(line(70.))
+            .child(div().flex_1())
+            .child(Icon::new(IconName::ChevronDown).size(IconSize::XSmall).color(Color::Muted));
+        let detailed_preview = v_flex()
+            .p_1p5()
+            .gap_1p5()
+            .rounded(px(5.))
+            .border_1()
+            .border_color(theme.colors().accent)
+            .child(line(90.))
+            .child(
+                h_flex()
+                    .gap_1()
+                    .child(Icon::new(IconName::Flag).size(IconSize::XSmall).color(Color::Muted))
+                    .child(Icon::new(IconName::Inbox).size(IconSize::XSmall).color(Color::Muted))
+                    .child(Icon::new(IconName::Ellipsis).size(IconSize::XSmall).color(Color::Muted))
+                    .child(div().flex_1())
+                    .child(div().w(px(22.)).h(px(12.)).rounded(px(3.)).bg(theme.colors().accent)),
+            );
+        let option = |id: &'static str, preview: AnyElement, label: &'static str, value: bool| {
+            let selected = detailed == value;
+            v_flex()
+                .id(id)
+                .flex_1()
+                .gap_2()
+                .items_center()
+                .cursor_pointer()
+                .child(
+                    div()
+                        .w_full()
+                        .h(px(76.))
+                        .px_2()
+                        .flex()
+                        .flex_col()
+                        .justify_center()
+                        .rounded(px(6.))
+                        .bg(theme.colors().background)
+                        .child(preview),
+                )
+                .child(
+                    h_flex()
+                        .gap_1p5()
+                        .child(
+                            div()
+                                .size(px(14.))
+                                .rounded_full()
+                                .border_1()
+                                .border_color(if selected { theme.colors().accent } else { theme.colors().text_muted })
+                                .when(selected, |el| el.bg(theme.colors().accent)),
+                        )
+                        .child(Label::new(label).size(LabelSize::Small)),
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.save_preferences(|p| p.detailed_input = value, cx);
+                    this.sync_input_placeholder(cx);
+                }))
+        };
+        popover(cx)
+            .w(px(380.))
+            .p_3()
+            .gap_3()
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.input_box_open = false;
+                cx.notify();
+            }))
+            .child(
+                h_flex()
+                    .child(div().flex_1().child(Label::new(strings.input_box_setting).weight(FontWeight::SEMIBOLD)))
+                    .child(IconButton::new("input-box-close", IconName::X).size(px(22.)).icon_size(IconSize::Small).on_click(
+                        cx.listener(|this, _, _, cx| {
+                            this.input_box_open = false;
+                            cx.notify();
+                        }),
+                    )),
+            )
+            .child(
+                h_flex()
+                    .gap_3()
+                    .child(option("input-box-simple", simple_preview.into_any_element(), strings.input_box_simple, false))
+                    .child(option("input-box-detailed", detailed_preview.into_any_element(), strings.input_box_detailed, true)),
+            )
+            .into_any_element()
+    }
+
+    /// The original's "Detailed" add field: the text on top, a toolbar under it — priority, list
+    /// and "…" open the options menu — and an "Add" button.
+    fn render_detailed_add(&self, strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let input_focus = self.input.read(cx).focus_handle(cx);
+        let date_button = self.add_date_button(Placement::BelowLeft, strings, cx);
+        let open_menu = |side: bool| {
+            cx.listener(move |this: &mut Self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>| {
+                this.add_menu_open = !this.add_menu_open;
+                this.add_list_side = side;
+                cx.notify();
+            })
+        };
+        let priority_color = self
+            .add_draft
+            .priority
+            .and_then(|p| task_rows::priority_color(p, &theme))
+            .map_or(Color::Muted, Color::Custom);
+        v_flex()
+            .mx(px(20.))
+            .mb_2()
+            .flex_none()
+            .gap_1()
+            .px_3()
+            .py_2()
+            .rounded(px(6.))
+            .border_1()
+            .border_color(theme.colors().border)
+            .bg(theme.colors().surface_background)
+            .on_mouse_down(MouseButton::Left, move |_, window, cx| window.focus(&input_focus, cx))
+            .child(h_flex().gap_2().child(div().flex_1().min_w_0().debug_selector(|| "quick-add-input".to_owned()).child(self.input.clone())).children(
+                self.shown_add_due().map(|(date, time)| {
+                    let (label, _) = task_rows::due_label(date, time, Self::today(), strings);
+                    let label = match self.add_draft.end.filter(|_| self.quick_add_due.is_none()) {
+                        Some((end, end_time)) => crate::due_picker::range_label(date, time, end, end_time, strings),
+                        None => label,
+                    };
+                    Label::new(label).size(LabelSize::Small).color(Color::Accent)
+                }),
+            ))
+            .child(
+                h_flex()
+                    .gap_1()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(date_button)
+                    .child(IconButton::new("add-priority", IconName::Flag).size(px(24.)).icon_size(IconSize::Small).icon_color(priority_color).on_click(open_menu(false)))
+                    .child(IconButton::new("add-list", IconName::Inbox).size(px(24.)).icon_size(IconSize::Small).on_click(open_menu(true)))
+                    .child(self.add_field_popovers(
+                        div().relative().child(IconButton::new("add-more", IconName::Ellipsis).size(px(24.)).icon_size(IconSize::Small).on_click(open_menu(false))),
+                        strings,
+                        cx,
+                    ))
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .id("add-submit")
+                            .h(px(24.))
+                            .px_3()
+                            .flex()
+                            .items_center()
+                            .rounded(px(5.))
+                            .cursor_pointer()
+                            .bg(theme.colors().accent)
+                            .child(Label::new(strings.add).size(LabelSize::Small).color(Color::OnAccent))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                let text = this.input.read(cx).text().to_owned();
+                                this.submit_new_task(&text, window, cx);
+                            })),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// The add field's "▾" menu, as in the original.
+    fn render_add_menu(&self, strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let draft = self.add_draft.clone();
+        let flags = [Priority::High, Priority::Medium, Priority::Low, Priority::None].map(|priority| {
+            let selected = draft.priority == Some(priority);
+            let color = task_rows::priority_color(priority, &theme).unwrap_or(theme.colors().text_muted);
+            div()
+                .id(SharedString::from(format!("add-priority-{}", priority.to_i64())))
+                .size(px(30.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(6.))
+                .cursor_pointer()
+                .when(selected, |el| el.bg(theme.colors().element_selected))
+                .hover(|s| s.bg(theme.colors().element_hover))
+                .child(Icon::new(if priority == Priority::None { IconName::Flag } else { IconName::FlagFilled }).color(Color::Custom(color)))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.add_draft.priority = if selected { None } else { Some(priority) };
+                    cx.notify();
+                }))
+        });
+        let list_name = match draft.list {
+            Some(Some(id)) => self.lists.iter().find(|l| l.id == id).map_or(strings.inbox.to_owned(), |l| l.name.clone()),
+            _ => strings.inbox.to_owned(),
+        };
+        let list_items = std::iter::once((None, strings.inbox.to_owned()))
+            .chain(self.lists.iter().filter(|l| !l.archived).map(|l| (Some(l.id), l.name.clone())))
+            .map(|(id, name)| {
+                let selected = draft.list.unwrap_or(None) == id && (draft.list.is_some() || id.is_none());
+                ListItem::new(SharedString::from(format!("add-list-{}", id.map_or("inbox".to_owned(), |i| i.to_string()))))
+                    .child(Label::new(name).color(if selected { Color::Accent } else { Color::Default }).truncate())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.add_draft.list = Some(id);
+                        this.add_menu_open = false;
+                        cx.notify();
+                    }))
+            })
+            .collect::<Vec<_>>();
+        // As the original's: 181 px wide (wider when a label needs it), a row every 34 px, no line under the flags.
+        popover(cx)
+            .min_w(px(181.))
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.add_menu_open = false;
+                cx.notify();
+            }))
+            .child(div().px_2().pt_1().child(Label::new(strings.filter_priority).size(LabelSize::XSmall).color(Color::Muted)))
+            .child(h_flex().px_1().py_1().justify_between().children(flags))
+            .child(
+                SubmenuItem::new("add-list", list_name)
+                    .icon(IconName::Inbox)
+                    .height(px(34.))
+                    .open(self.add_list_side)
+                    .placement(Placement::RightSide)
+                    .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                        if *hovered && !this.add_list_side {
+                            this.add_list_side = true;
+                            cx.notify();
+                        }
+                    }))
+                    .items(list_items),
+            )
+            .child(
+                ListItem::new("add-tags").height(px(34.))
+                    .start_slot(Icon::new(IconName::Tag).color(Color::Muted))
+                    .child(Label::new(strings.tags))
+                    .when(!draft.tags.is_empty(), |item| {
+                        item.end_slot(Label::new(draft.tags.len().to_string()).size(LabelSize::XSmall).color(Color::Accent))
+                    })
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.add_menu_open = false;
+                        this.add_tags = Some(this.add_draft.tags.clone());
+                        this.add_tag_input.update(cx, |input, cx| input.set_text("", cx));
+                        let focus = this.add_tag_input.read(cx).focus_handle(cx);
+                        window.focus(&focus, cx);
+                        cx.notify();
+                    })),
+            )
+            .child(
+                ListItem::new("add-attachment").height(px(34.))
+                    .start_slot(Icon::new(IconName::Paperclip).color(Color::Muted))
+                    .child(Label::new(strings.attachment))
+                    .when(!draft.files.is_empty(), |item| {
+                        item.end_slot(Label::new(draft.files.len().to_string()).size(LabelSize::XSmall).color(Color::Accent))
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.add_menu_open = false;
+                        let chosen = cx.prompt_for_paths(gpui::PathPromptOptions {
+                            files: true,
+                            directories: false,
+                            multiple: true,
+                            prompt: None,
+                        });
+                        cx.spawn(async move |this, cx| {
+                            let Some(paths) = chosen.await.ok().and_then(Result::ok).flatten() else { return };
+                            this.update(cx, |this, cx| {
+                                this.add_draft.files.extend(paths);
+                                cx.notify();
+                            })
+                            .ok();
+                        })
+                        .detach();
+                        cx.notify();
+                    })),
+            )
+            .child(
+                ListItem::new("add-from-template").height(px(34.))
+                    .start_slot(Icon::new(IconName::LayoutTemplate).color(Color::Muted))
+                    .child(Label::new(strings.add_from_template))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.add_menu_open = false;
+                        this.templates_open = true;
+                        cx.notify();
+                    })),
+            )
+            .child(
+                ListItem::new("add-as-note").height(px(34.))
+                    .start_slot(Icon::new(IconName::FileText).color(Color::Muted))
+                    .child(Label::new(if draft.note { strings.convert_to_task } else { strings.convert_to_note }))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.add_draft.note = !this.add_draft.note;
+                        this.add_menu_open = false;
+                        cx.notify();
+                    })),
+            )
+            .child(div().py_1().child(Divider::horizontal()))
+            .child(
+                ListItem::new("add-input-box").height(px(34.))
+                    .start_slot(Icon::new(IconName::Settings).color(Color::Muted))
+                    .child(Label::new(strings.input_box_setting))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.add_menu_open = false;
+                        this.input_box_open = true;
+                        cx.notify();
+                    })),
+            )
+            .into_any_element()
+    }
+
+    /// The "▾" menu's Tags, as in the original: a search field over the tags, ticked by a click
+    /// (Enter ticks a typed one, new tags too), then Cancel or OK; they go on the next task added.
+    fn render_add_tags(&self, picked: &[String], strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let query = self.add_tag_input.read(cx).text().trim().to_lowercase();
+        let mut names: Vec<String> = self.tags.iter().map(|t| t.name.clone()).collect();
+        for tag in picked {
+            if !names.iter().any(|n| n.to_lowercase() == tag.to_lowercase()) {
+                names.push(tag.clone());
+            }
+        }
+        let rows = names.into_iter().filter(|name| name.to_lowercase().contains(&query)).map(|name| {
+            let ticked = picked.iter().any(|t| t.to_lowercase() == name.to_lowercase());
+            ListItem::new(SharedString::from(format!("add-tag-{name}")))
+                .start_slot(Icon::new(IconName::Tag).color(Color::Muted))
+                .child(Label::new(name.clone()).truncate())
+                .when(ticked, |item| item.end_slot(Icon::new(IconName::Check).size(IconSize::Small).color(Color::Accent)))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if let Some(picked) = this.add_tags.as_mut() {
+                        if let Some(i) = picked.iter().position(|t| t.to_lowercase() == name.to_lowercase()) {
+                            picked.remove(i);
+                        } else {
+                            picked.push(name.clone());
+                        }
+                    }
+                    cx.notify();
+                }))
+        });
+        let button = |id: &'static str, label: &'static str, primary: bool| {
+            div()
+                .id(id)
+                .flex_1()
+                .h(px(28.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(6.))
+                .cursor_pointer()
+                .when(primary, |el| el.bg(theme.colors().accent))
+                .when(!primary, |el| el.border_1().border_color(theme.colors().border))
+                .child(Label::new(label).size(LabelSize::Small).when(primary, |label| label.color(Color::OnAccent)))
+        };
+        popover(cx)
+            .w(px(240.))
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.add_tags = None;
+                cx.notify();
+            }))
+            .child(
+                h_flex()
+                    .px_2()
+                    .pb_1()
+                    .gap_2()
+                    .border_b_1()
+                    .border_color(theme.colors().border_variant)
+                    .child(Icon::new(IconName::Search).size(IconSize::Small).color(Color::Muted))
+                    .child(div().flex_1().child(self.add_tag_input.clone())),
+            )
+            .child(v_flex().id("add-tag-list").max_h(px(240.)).overflow_y_scroll().py_1().children(rows))
+            .child(
+                h_flex()
+                    .p_2()
+                    .gap_2()
+                    .child(button("add-tags-cancel", strings.cancel, false).on_click(cx.listener(|this, _, _, cx| {
+                        this.add_tags = None;
+                        cx.notify();
+                    })))
+                    .child(button("add-tags-ok", strings.ok, true).on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(picked) = this.add_tags.take() {
+                            this.add_draft.tags = picked;
+                        }
+                        cx.notify();
+                    }))),
+            )
+            .into_any_element()
+    }
+
+    /// Focuses the quick-add field (or, in kanban view, the first column's add input).
+    pub fn focus_new_task(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_read_only_view() {
+            self.set_view(View::Inbox, cx);
+        }
+        if self.kanban && !self.timeline {
+            let strings = i18n::t(cx);
+            let columns = self.board_columns(strings);
+            if self.kanban_quick_add {
+                self.sync_kanban_quick_adds(&columns, strings, cx);
+                if let Some(col) = columns.iter().find(|c| c.drop.as_ref().is_some_and(|t| !matches!(t, DropTarget::Complete)))
+                    && let Some(input) = self.kanban_quick_adds.get(&col.key)
+                {
+                    window.focus(&input.focus_handle(cx), cx);
+                    return;
+                }
+            } else if let Some((idx, col)) = columns
+                .into_iter()
+                .enumerate()
+                .find(|(_, c)| c.drop.as_ref().is_some_and(|t| !matches!(t, DropTarget::Complete)))
+                && let Some(target) = col.drop
+            {
+                self.start_column_add(idx, target, window, cx);
+                return;
+            }
+        }
+        window.focus(&self.input.focus_handle(cx), cx);
+    }
+
+    /// Task ids in the order they are shown, for keyboard navigation.
+    fn visible_task_ids(&self, strings: &Strings) -> Vec<Id> {
+        if self.kanban && !self.timeline && !matches!(self.view, View::Trash | View::Completed | View::WontDo | View::Search(_)) {
+            let mut ids = Vec::new();
+            let push_cards = |cards: &[(Task, Vec<Task>)], ids: &mut Vec<Id>| {
+                for (root, subs) in cards {
+                    ids.push(root.id);
+                    if !self.collapsed_tasks.contains(&root.id) {
+                        ids.extend(subs.iter().map(|s| s.id));
+                    }
+                }
+            };
+            for col in self.board_columns(strings) {
+                if !col.pinned_cards.is_empty() {
+                    if !self.kanban_folded_sub.contains(&format!("{}:pinned", col.key)) {
+                        push_cards(&col.pinned_cards, &mut ids);
+                    }
+                    if !col.open_cards.is_empty() && !self.kanban_folded_sub.contains(&format!("{}:unpinned", col.key)) {
+                        push_cards(&col.open_cards, &mut ids);
+                    }
+                } else {
+                    push_cards(&col.open_cards, &mut ids);
+                }
+                if !col.completed_cards.is_empty() && !self.kanban_folded_sub.contains(&format!("{}:completed", col.key)) {
+                    push_cards(&col.completed_cards, &mut ids);
+                }
+            }
+            return ids;
+        }
+        self.rows(strings)
+            .into_iter()
+            .filter_map(|row| match row {
+                Row::Task { task, .. } => Some(task.id),
+                Row::Section { .. } | Row::Day { .. } => None,
+            })
+            .collect()
+    }
+
+    /// The rows of the current view: closed tasks by day, the trash flat, everything else grouped.
+    /// Tells the list which entries changed since it last drew: the ones between the unchanged
+    /// start and end get measured again, and the scroll position stays put. Habits and
+    /// countdowns are read elsewhere, so they are always measured again.
+    fn sync_list(&mut self, entries: Vec<ListEntry>) {
+        let old = &self.list_entries;
+        let start = old.iter().zip(&entries).take_while(|(a, b)| a == b).count();
+        let end = old[start..].iter().rev().zip(entries[start..].iter().rev()).take_while(|(a, b)| a == b).count();
+        if start < old.len() || old.len() != entries.len() {
+            self.list_state.splice(start..old.len() - end, entries.len() - start - end);
+        }
+        for (ix, entry) in entries.iter().enumerate() {
+            if !matches!(entry, ListEntry::Row(_)) {
+                self.list_state.remeasure_items(ix..ix + 1);
+            }
+        }
+        self.list_entries = entries;
+    }
+
+    fn render_entry(&mut self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
+        // Each entry spans the list's width, as in the column the list replaced.
+        let entry_bounds = self.list_entry_bounds.clone();
+        div()
+            .relative()
+            .w_full()
+            .px(px(14.))
+            .child(
+                gpui::canvas(move |area, _, _| {
+                    entry_bounds.borrow_mut().insert(ix, area);
+                }, |_, _, _, _| {})
+                .absolute()
+                .size_full(),
+            )
+            .child(self.render_entry_content(ix, cx))
+            .into_any_element()
+    }
+
+    fn render_entry_content(&mut self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
+        let strings = i18n::t(cx);
+        let empty = || div().into_any_element();
+        match self.list_entries.get(ix).cloned() {
+            Some(ListEntry::NewSection) => match self.new_section.clone() {
+                Some(input) => h_flex()
+                    .h(px(32.))
+                    .mx(px(GUTTER))
+                    .px_2()
+                    .rounded(px(6.))
+                    .bg(cx.theme().colors().surface_background)
+                    .child(input)
+                    .into_any_element(),
+                None => empty(),
+            },
+            Some(ListEntry::Habits) => self.render_habits(strings, cx).unwrap_or_else(empty),
+            Some(ListEntry::Countdowns) => self.render_countdowns(strings, cx).unwrap_or_else(empty),
+            Some(ListEntry::Row(Row::Section { section, count, collapsed })) => {
+                self.render_section(section, count, collapsed, strings, cx)
+            }
+            // As the original's, a group folds by its header, the arrow in the gutter.
+            Some(ListEntry::Row(Row::Day { label, count, drop })) => {
+                let collapsed = self.collapsed_days.contains(&label);
+                let key = label.clone();
+                let accent = cx.theme().colors().accent;
+                let drop_on_header = drop.clone();
+                h_flex()
+                    .id(SharedString::from(format!("day-{label}")))
+                    .rounded(px(6.))
+                    .cursor_pointer()
+                    .when_some(drop_on_header, |el, target| {
+                        el.drag_over::<DraggedTask>(move |style, _, _, _| style.bg(accent.opacity(0.10)))
+                            .on_drop(cx.listener(move |this, dragged: &DraggedTask, _, cx| {
+                                cx.stop_propagation();
+                                this.task_drop = None;
+                                this.task_drag_origin = None;
+                                this.drop_on_column(dragged.id, target.clone(), cx);
+                            }))
+                    })
+                    .child(div().w(px(GUTTER)).flex_none().pl(px(4.)).child(chevron(collapsed)))
+                    .child(div().flex_1().min_w_0().child(self.render_group_header(label, count, drop.as_ref(), 36., cx)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if this.renaming_section.is_none() {
+                            this.toggle_day(key.clone(), cx);
+                        }
+                    }))
+                    .into_any_element()
+            }
+            Some(ListEntry::Row(Row::Task { task, depth, has_children, collapsed })) => {
+                let tag_colors = std::mem::take(&mut self.tag_colors);
+                let row = self.render_task(&task, depth, has_children, collapsed, &tag_colors, Self::today(), strings, cx);
+                self.tag_colors = tag_colors;
+                row
+            }
+            None => empty(),
+        }
+    }
+
+    fn rows(&self, strings: &Strings) -> Vec<Row> {
+        task_rows::fold_days(self.rows_with(strings, &self.collapsed_tasks, &self.collapsed_sections), &self.collapsed_days)
+    }
+
+    fn tasks_for_rows(&self) -> Vec<Task> {
+        let mut tasks = self.tasks.clone();
+        let mut pending: Vec<_> = self.completing.values().collect();
+        pending.sort_by_key(|pending| pending.index);
+        for pending in pending {
+            if let crate::undo::UndoAction::ReopenRepeat { copy, .. } = &pending.undo {
+                tasks.retain(|task| task.id != *copy);
+            }
+            if let Some(task) = tasks.iter_mut().find(|task| task.id == pending.before.id) {
+                *task = pending.before.clone();
+            } else {
+                tasks.insert(pending.index.min(tasks.len()), pending.before.clone());
+            }
+        }
+        tasks
+    }
+
+    /// Rows with the given collapsed tasks and groups; the kanban board shows everything.
+    fn rows_with(&self, strings: &Strings, collapsed_tasks: &HashSet<Id>, collapsed_sections: &HashSet<Section>) -> Vec<Row> {
+        let tasks = self.tasks_for_rows();
+        let closed = |closed_at: fn(&Task) -> Option<i64>| {
+            let today = Self::today();
+            let tasks: Vec<Task> = tasks
+                .iter()
+                .filter(|t| {
+                    let day = closed_at(t).and_then(task_rows::local_day).unwrap_or(today);
+                    self.closed_range.contains(day, today)
+                        && self.closed_lists.as_ref().is_none_or(|lists| lists.contains(&t.list_id))
+                })
+                .cloned()
+                .collect();
+            task_rows::rows_by_day(&tasks, closed_at, today, strings)
+        };
+        match self.view {
+            View::Completed => closed(|t| t.completed_at),
+            View::WontDo => closed(|t| t.wont_do_at),
+            View::Trash | View::Search(_) => task_rows::build_rows(
+                &tasks,
+                collapsed_tasks,
+                collapsed_sections,
+                self.view != View::Trash,
+            ),
+            _ => {
+                let (sort, group) = self.sort_settings();
+                let mut tasks = tasks;
+                if !self.view_flag("show_completed", true) {
+                    tasks.retain(|t| !t.is_completed());
+                }
+                task_rows::order_tasks(&mut tasks, sort, self.view_flag("descending", false));
+                task_rows::pinned_first(&mut tasks);
+                match group {
+                    // As the original's Next 7 Days: a group for each day.
+                    GroupBy::Custom if self.view == View::Next7Days => {
+                        task_rows::next_days_rows(&tasks, Self::today(), crate::calendar::week_start(), strings)
+                    }
+                    GroupBy::Custom if !self.sections.is_empty() => {
+                        task_rows::section_rows(&tasks, &self.sections, collapsed_tasks, strings)
+                    }
+                    GroupBy::Custom => {
+                        task_rows::build_rows(&tasks, collapsed_tasks, collapsed_sections, true)
+                    }
+                    group => {
+                        let lists: Vec<(Id, String)> = self.lists.iter().map(|l| (l.id, l.name.clone())).collect();
+                        task_rows::grouped_rows_in(&tasks, group, Self::today(), self.preferences.task_defaults.overdue_last, &lists, strings)
+                    }
+                }
+            }
+        }
+    }
+
+    /// The settings key of the current view's sort and grouping: each list keeps its own.
+    fn view_key(&self) -> String {
+        match &self.view {
+            View::List(id) => format!("list:{id}"),
+            View::Tag(tag) => format!("tag:{tag}"),
+            other => format!("{other:?}").to_lowercase(),
+        }
+    }
+
+    /// A kanban card: the task with its tags and date, and its subtasks under it.
+    /// Opens a board card's details beside it, as the original's board does.
+    fn open_card(&mut self, id: Id, cx: &mut Context<Self>) {
+        let Ok(Some(task)) = self.store.task(id) else { return };
+        let lists = self.lists.clone();
+        self.card_detail.update(cx, |detail, cx| {
+            detail.set_lists(lists);
+            detail.show(Some(task), cx);
+        });
+        self.card = Some(id);
+        cx.notify();
+    }
+
+    fn close_card(&mut self, cx: &mut Context<Self>) {
+        if self.card.take().is_some() {
+            self.card_detail.update(cx, |detail, cx| detail.show(None, cx));
+            cx.notify();
+        }
+    }
+
+    fn dismiss_card(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.card_detail.update(cx, |detail, cx| detail.dismiss_popup(window, cx)) {
+            self.close_card(cx);
+            window.focus(&self.list_focus, cx);
+        }
+    }
+
+    /// The card's task changed: the board shows it, and the card closes when the task is gone.
+    fn card_updated(&mut self, cx: &mut Context<Self>) {
+        self.reload(cx);
+        let Some(id) = self.card else { return };
+        match self.store.task(id) {
+            Ok(Some(task)) if !task.is_deleted() => self.card_detail.update(cx, |detail, cx| detail.refresh(Some(task), cx)),
+            _ => self.close_card(cx),
+        }
+    }
+
+    /// The board's task card: the details, framed, closed by a click elsewhere or Escape.
+    fn render_card_details(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        div()
+            .id("board-task-card")
+            .occlude()
+            .w(px(402.))
+            .h(px(440.))
+            .rounded(px(10.))
+            .overflow_hidden()
+            .border_1()
+            .border_color(theme.colors().border)
+            .bg(theme.colors().background)
+            .shadow_lg()
+            // The details' own popovers lie outside the card; a click in them keeps it open.
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                if !this.card_detail.read(cx).has_popup() {
+                    this.close_card(cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &DismissTransient, window, cx| {
+                this.dismiss_card(window, cx);
+            }))
+            .child(self.card_detail.clone())
+            .into_any_element()
+    }
+
+    fn ensure_kanban_sections(&mut self, strings: &Strings) {
+        if !self.kanban
+            || self.timeline
+            || matches!(self.view, View::Trash | View::Completed | View::WontDo | View::Search(_))
+        {
+            return;
+        }
+        let Some(owner) = self.section_owner() else { return };
+        if self.sections.is_empty()
+            && let Some(section) = self.check(self.store.add_list_section(owner, strings.not_sectioned))
+        {
+            self.sections.push(section);
+        }
+        let Some(first_id) = self.sections.first().map(|s| s.id) else { return };
+        if self.sort_settings().1 != GroupBy::Custom {
+            return;
+        }
+        let known: HashSet<Id> = self.sections.iter().map(|s| s.id).collect();
+        let unsectioned_roots: Vec<Id> = self
+            .tasks
+            .iter()
+            .filter(|t| t.list_id == owner && t.parent_id.is_none() && t.section_id.is_none_or(|s| !known.contains(&s)))
+            .map(|t| t.id)
+            .collect();
+        if unsectioned_roots.is_empty() {
+            return;
+        }
+        for root_id in &unsectioned_roots {
+            let result = self.store.set_section(*root_id, Some(first_id));
+            self.check(result);
+        }
+        let mut moved: HashSet<Id> = unsectioned_roots.into_iter().collect();
+        loop {
+            let mut added = false;
+            for t in &self.tasks {
+                if let Some(p) = t.parent_id
+                    && moved.contains(&p)
+                    && moved.insert(t.id)
+                {
+                    added = true;
+                }
+            }
+            if !added {
+                break;
+            }
+        }
+        for task in &mut self.tasks {
+            if moved.contains(&task.id) {
+                task.section_id = Some(first_id);
+            }
+        }
+    }
+
+    fn board_columns(&self, strings: &Strings) -> Vec<BoardCol> {
+        let (sort, group) = self.sort_settings();
+        let show_completed = self.view_flag("show_completed", true);
+        let descending = self.view_flag("descending", false);
+        let today = Self::today();
+
+        let mut tasks = self.tasks_for_rows();
+        if !show_completed {
+            tasks.retain(|t| !t.is_completed());
+        }
+        task_rows::order_tasks(&mut tasks, sort, descending);
+
+        let ids: HashSet<Id> = tasks.iter().map(|t| t.id).collect();
+        let mut children_map: HashMap<Id, Vec<&Task>> = HashMap::new();
+        let mut roots: Vec<&Task> = Vec::new();
+        for task in &tasks {
+            match task.parent_id.filter(|p| ids.contains(p)) {
+                Some(parent) => children_map.entry(parent).or_default().push(task),
+                None => roots.push(task),
+            }
+        }
+        fn collect_descendants(parent: Id, map: &HashMap<Id, Vec<&Task>>, out: &mut Vec<Task>) {
+            if let Some(kids) = map.get(&parent) {
+                for kid in kids {
+                    out.push((*kid).clone());
+                    collect_descendants(kid.id, map, out);
+                }
+            }
+        }
+        let all_cards: Vec<(Task, Vec<Task>)> = roots
+            .into_iter()
+            .map(|root| {
+                let mut subs = Vec::new();
+                collect_descendants(root.id, &children_map, &mut subs);
+                (root.clone(), subs)
+            })
+            .collect();
+
+        let make_col = |key: String, title: String, drop: Option<DropTarget>, cards: Vec<(Task, Vec<Task>)>| -> BoardCol {
+            let mut pinned_cards = Vec::new();
+            let mut open_cards = Vec::new();
+            let mut completed_cards = Vec::new();
+            for card in cards {
+                if card.0.is_completed() {
+                    completed_cards.push(card);
+                } else if card.0.pinned_at.is_some() {
+                    pinned_cards.push(card);
+                } else {
+                    open_cards.push(card);
+                }
+            }
+            if sort == SortBy::Custom {
+                pinned_cards.sort_by_key(|(t, _)| std::cmp::Reverse(t.pinned_at));
+            }
+            completed_cards.sort_by_key(|(t, _)| std::cmp::Reverse(t.completed_at.unwrap_or(0)));
+            BoardCol { key, title, drop, pinned_cards, open_cards, completed_cards }
+        };
+
+        match group {
+            GroupBy::Custom if self.view == View::Next7Days => {
+                let week_start = crate::calendar::week_start();
+                let mut cols = Vec::new();
+                let mut overdue = Vec::new();
+                let mut by_day: Vec<Vec<(Task, Vec<Task>)>> = (0..7).map(|_| Vec::new()).collect();
+                for card in all_cards {
+                    match card.0.due_date {
+                        Some(d) if d < today => overdue.push(card),
+                        Some(d) if (d - today).num_days() < 7 => by_day[(d - today).num_days().max(0) as usize].push(card),
+                        _ => by_day[0].push(card),
+                    }
+                }
+                if !overdue.is_empty() {
+                    cols.push(make_col("next7:overdue".into(), strings.group_overdue.to_owned(), None, overdue));
+                }
+                for (offset, cards) in by_day.into_iter().enumerate() {
+                    if !cards.is_empty() {
+                        let day = today + Duration::days(offset as i64);
+                        let label = task_rows::next_days_header(day, today, week_start, strings);
+                        cols.push(make_col(format!("next7:{day}"), label, Some(DropTarget::Due(Some(day))), cards));
+                    }
+                }
+                cols
+            }
+            GroupBy::Custom if self.section_owner().is_some() => {
+                if self.sections.is_empty() {
+                    return vec![make_col(
+                        "sec:none".into(),
+                        strings.not_sectioned.to_owned(),
+                        Some(DropTarget::Section(None)),
+                        all_cards,
+                    )];
+                }
+                let known: HashSet<Id> = self.sections.iter().map(|s| s.id).collect();
+                let first_id = self.sections[0].id;
+                let mut buckets: HashMap<Id, Vec<(Task, Vec<Task>)>> =
+                    self.sections.iter().map(|s| (s.id, Vec::new())).collect();
+                for card in all_cards {
+                    let target_sec = card.0.section_id.filter(|s| known.contains(s)).unwrap_or(first_id);
+                    if let Some(bucket) = buckets.get_mut(&target_sec) {
+                        bucket.push(card);
+                    }
+                }
+                self.sections
+                    .iter()
+                    .map(|sec| {
+                        let cards = buckets.remove(&sec.id).unwrap_or_default();
+                        make_col(format!("sec:{}", sec.id), sec.name.clone(), Some(DropTarget::Section(Some(sec.id))), cards)
+                    })
+                    .collect()
+            }
+            GroupBy::Custom => {
+                let mut task_cards = Vec::new();
+                let mut note_cards = Vec::new();
+                for card in all_cards {
+                    if card.0.kind == Kind::Note {
+                        note_cards.push(card);
+                    } else {
+                        task_cards.push(card);
+                    }
+                }
+                let mut cols = Vec::new();
+                if !task_cards.is_empty() {
+                    cols.push(make_col("kind:task".into(), strings.group_tasks.to_owned(), Some(DropTarget::Kind(Kind::Task)), task_cards));
+                }
+                if !note_cards.is_empty() {
+                    cols.push(make_col("kind:note".into(), strings.group_notes.to_owned(), Some(DropTarget::Kind(Kind::Note)), note_cards));
+                }
+                cols
+            }
+            GroupBy::List => {
+                let known: HashSet<Id> = self.lists.iter().map(|l| l.id).collect();
+                let mut inbox_cards = Vec::new();
+                let mut list_buckets: HashMap<Id, Vec<(Task, Vec<Task>)>> = HashMap::new();
+                for card in all_cards {
+                    match card.0.list_id.filter(|id| known.contains(id)) {
+                        Some(id) => list_buckets.entry(id).or_default().push(card),
+                        None => inbox_cards.push(card),
+                    }
+                }
+                let mut cols = Vec::new();
+                if !inbox_cards.is_empty() {
+                    cols.push(make_col("list:inbox".into(), strings.inbox.to_owned(), Some(DropTarget::List(None)), inbox_cards));
+                }
+                for list in &self.lists {
+                    if let Some(cards) = list_buckets.remove(&list.id)
+                        && !cards.is_empty()
+                    {
+                        cols.push(make_col(format!("list:{}", list.id), list.name.clone(), Some(DropTarget::List(Some(list.id))), cards));
+                    }
+                }
+                cols
+            }
+            GroupBy::Date => {
+                let overdue_last = self.preferences.task_defaults.overdue_last;
+                let mut buckets: [Vec<(Task, Vec<Task>)>; 6] = Default::default();
+                for card in all_cards {
+                    let slot = match card.0.due_date {
+                        Some(d) if d < today => 0,
+                        Some(d) if d == today => 1,
+                        Some(d) if d == today + Duration::days(1) => 2,
+                        Some(d) if d <= today + Duration::days(7) => 3,
+                        Some(_) => 4,
+                        None => 5,
+                    };
+                    buckets[slot].push(card);
+                }
+                let mut specs = vec![
+                    (if overdue_last { 6 } else { 0 }, 0usize, "date:overdue", strings.group_overdue, None),
+                    (1, 1, "date:today", strings.today, Some(DropTarget::Due(Some(today)))),
+                    (2, 2, "date:tomorrow", strings.tomorrow, Some(DropTarget::Due(Some(today + Duration::days(1))))),
+                    (3, 3, "date:next7", strings.next_7_days, Some(DropTarget::Due(Some(today + Duration::days(7))))),
+                    (4, 4, "date:later", strings.group_later, None),
+                    (5, 5, "date:none", strings.group_no_date, Some(DropTarget::Due(None))),
+                ];
+                specs.sort_by_key(|(ord, _, _, _, _)| *ord);
+                let mut cols = Vec::new();
+                for (_, slot, key, label, drop) in specs {
+                    let cards = std::mem::take(&mut buckets[slot]);
+                    if !cards.is_empty() {
+                        cols.push(make_col(key.into(), label.to_owned(), drop, cards));
+                    }
+                }
+                cols
+            }
+            GroupBy::Priority => {
+                let specs = [
+                    (Priority::High, "prio:high", strings.priority_high),
+                    (Priority::Medium, "prio:medium", strings.priority_medium),
+                    (Priority::Low, "prio:low", strings.priority_low),
+                    (Priority::None, "prio:none", strings.priority_none),
+                ];
+                let mut buckets: [Vec<(Task, Vec<Task>)>; 4] = Default::default();
+                for card in all_cards {
+                    let idx = match card.0.priority {
+                        Priority::High => 0,
+                        Priority::Medium => 1,
+                        Priority::Low => 2,
+                        Priority::None => 3,
+                    };
+                    buckets[idx].push(card);
+                }
+                specs
+                    .into_iter()
+                    .zip(buckets)
+                    .filter(|(_, cards)| !cards.is_empty())
+                    .map(|((prio, key, label), cards)| {
+                        make_col(key.into(), label.to_owned(), Some(DropTarget::Priority(prio)), cards)
+                    })
+                    .collect()
+            }
+            GroupBy::Tag => {
+                let mut tag_groups: Vec<(String, Vec<BoardCard>)> = Vec::new();
+                let mut untagged = Vec::new();
+                for card in all_cards {
+                    match card.0.tags.first().cloned() {
+                        Some(tag) => match tag_groups.iter_mut().find(|(t, _)| *t == tag) {
+                            Some((_, items)) => items.push(card),
+                            None => tag_groups.push((tag, vec![card])),
+                        },
+                        None => untagged.push(card),
+                    }
+                }
+                tag_groups.sort_by_key(|(a, _)| a.to_lowercase());
+                let mut cols: Vec<BoardCol> = tag_groups
+                    .into_iter()
+                    .map(|(tag, cards)| make_col(format!("tag:{tag}"), tag.clone(), Some(DropTarget::Tag(Some(tag))), cards))
+                    .collect();
+                if !untagged.is_empty() {
+                    cols.push(make_col("tag:none".into(), strings.group_no_tags.to_owned(), Some(DropTarget::Tag(None)), untagged));
+                }
+                cols
+            }
+            GroupBy::Created | GroupBy::None => {
+                let mut groups: Vec<(NaiveDate, Vec<BoardCard>)> = Vec::new();
+                for card in all_cards {
+                    let day = task_rows::local_day(card.0.created_at).unwrap_or(today);
+                    match groups.iter_mut().find(|(d, _)| *d == day) {
+                        Some((_, items)) => items.push(card),
+                        None => groups.push((day, vec![card])),
+                    }
+                }
+                groups.sort_by_key(|(d, _)| std::cmp::Reverse(*d));
+                groups
+                    .into_iter()
+                    .map(|(day, cards)| make_col(format!("created:{day}"), task_rows::day_header(day, today, strings), None, cards))
+                    .collect()
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_card(
+        &self,
+        column: usize,
+        column_drop: Option<DropTarget>,
+        task: &Task,
+        subtasks: &[Task],
+        tag_colors: &HashMap<String, Hsla>,
+        column_tint: Option<Hsla>,
+        show_list_name: bool,
+        today: NaiveDate,
+        strings: &'static Strings,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = cx.theme().clone();
+        let dark = theme.is_dark();
+        let selected = self.selected == Some(task.id) || self.card == Some(task.id);
+        let settled_done = task.is_completed();
+        let root_done = settled_done || self.completing.contains_key(&task.id);
+        let collapsed = self.collapsed_tasks.contains(&task.id);
+        let has_subtasks = !subtasks.is_empty();
+        let details_line = self
+            .show_details
+            .then(|| task.notes.lines().find(|l| !l.trim().is_empty()).map(|l| l.trim().to_owned()))
+            .flatten();
+        let has_note_icon = details_line.is_none() && !task.notes.trim().is_empty();
+        let due = task.due_date.map(|date| task_rows::row_due_label(date, task.due_time, today, strings, self.preferences.countdown_dates));
+        let has_reminders = !task.reminders.is_empty() && !settled_done;
+        let checklist = task.checklist.filter(|_| !settled_done);
+        let list_info = show_list_name.then(|| {
+            task.list_id
+                .and_then(|id| self.lists.iter().find(|l| l.id == id))
+                .map_or((SharedString::new_static(strings.inbox), None), |l| {
+                    (SharedString::from(l.name.clone()), lists_panel::parse_color(l.color.as_deref()))
+                })
+        });
+        let has_tips_row = due.is_some()
+            || has_note_icon
+            || task.repeat.is_some()
+            || has_reminders
+            || checklist.is_some()
+            || (collapsed && has_subtasks)
+            || list_info.is_some();
+        let has_meta = details_line.is_some() || !task.tags.is_empty() || has_tips_row;
+        let line = |task: &Task,
+                    id: SharedString,
+                    pl: Pixels,
+                    py_top: Pixels,
+                    py_bottom: Pixels,
+                    is_root: bool,
+                    cx: &mut Context<Self>| {
+            let task_id = task.id;
+            let done = task.is_completed() || self.completing.contains_key(&task.id);
+            h_flex()
+                .relative()
+                .items_start()
+                .pl(pl)
+                .pr(px(12.))
+                .pt(py_top)
+                .pb(py_bottom)
+                .gap(px(9.))
+                .when(is_root && has_subtasks, |el| {
+                    el.child(
+                        div()
+                            .id(SharedString::from(format!("card-fold-{task_id}")))
+                            .absolute()
+                            .left(px(1.))
+                            .top(px(11.))
+                            .size(px(14.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .child(chevron(collapsed).color(Color::Muted))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                if !this.collapsed_tasks.remove(&task_id) {
+                                    this.collapsed_tasks.insert(task_id);
+                                }
+                                cx.notify();
+                            })),
+                    )
+                })
+                // A note shows the note icon, as the original's cards, not a box.
+                .map(|el| if task.kind == Kind::Note {
+                    el.child(div().pt(px(2.)).child(Icon::new(IconName::FileText).size(IconSize::Small).color(Color::Muted)))
+                } else {
+                    let checkbox = Checkbox::new(id)
+                        .toggle_state(done)
+                        .animate_completion(crate::completion_mark::started(task_id, cx))
+                        .tint(task_rows::priority_color(task.priority, &theme))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.toggle(task_id, !done, cx);
+                        }));
+                    // A finger gets a wider target around the box, which does the same.
+                    el.child(
+                        div()
+                            .id("card-box")
+                            .pt(px(2.))
+                            .debug_selector(|| format!("kanban-checkbox-{task_id}"))
+                            .when(crate::touch::active(), |el| {
+                                el.p(px(8.)).m(px(-8.)).on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.toggle(task_id, !done, cx);
+                                }))
+                            })
+                            .child(checkbox),
+                    )
+                })
+                .child({
+                    let title_input = self
+                        .title_edit
+                        .as_ref()
+                        .filter(|(editing, _, _)| *editing == task_id)
+                        .map(|(_, input, _)| input.clone());
+                    if let Some(input) = title_input {
+                        div()
+                            .id(SharedString::from(format!("card-title-edit-{task_id}")))
+                            .flex_1()
+                            .min_w_0()
+                            .on_click(|_, _, cx| cx.stop_propagation())
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .child(input)
+                            .into_any_element()
+                    } else {
+                        div()
+                            .id(SharedString::from(format!("card-title-{task_id}")))
+                            .flex_1()
+                            .min_w_0()
+                            .text_size(px(14.))
+                            .line_height(px(20.))
+                            .text_color(if done { theme.colors().text_muted } else { theme.colors().text })
+                            .on_mouse_down(MouseButton::Left, cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                                if event.click_count > 1 {
+                                    cx.stop_propagation();
+                                    this.close_card(cx);
+                                    this.start_title_edit(task_id, Some(event.position), window, cx);
+                                }
+                            }))
+                            .child(if task.title.is_empty() { strings.untitled.to_owned() } else { task.title.clone() })
+                            .into_any_element()
+                    }
+                })
+        };
+        let id = task.id;
+        let card_open_here = self.card == Some(id) || subtasks.iter().any(|s| self.card == Some(s.id));
+        let dragged = DraggedTask { id, title: task.title.clone().into() };
+        // Match TickTick's `.kanban-bg-el`: `bg-main-background`, `border-grey-8 dark:border-[#363636]`,
+        // `bg-primary-10 dark:bg-grey-6` when selected (no accent border), and soft shadow in light mode.
+        let base_surface = theme.colors().elevated_surface_background;
+        let card_border = if let Some(tint) = column_tint {
+            tint.opacity(if dark { 0.24 } else { 0.16 })
+        } else if dark {
+            gpui::rgb(0x363636).into()
+        } else {
+            theme.colors().border_variant
+        };
+        let card_bg = if selected {
+            if dark {
+                base_surface.blend(gpui::white().opacity(0.06))
+            } else {
+                base_surface.blend(theme.colors().accent.opacity(0.10))
+            }
+        } else if let Some(tint) = column_tint {
+            if dark { base_surface.blend(tint.opacity(0.12)) } else { base_surface }
+        } else {
+            base_surface
+        };
+        let card_hover = if selected {
+            card_bg
+        } else if let Some(tint) = column_tint {
+            base_surface.blend(tint.opacity(if dark { 0.16 } else { 0.04 }))
+        } else {
+            base_surface.blend(theme.colors().ghost_element_hover)
+        };
+        let accent = theme.colors().accent;
+        let can_nest = task.kind == Kind::Task && !settled_done;
+        let drop_for_reorder = column_drop.clone();
+        let drop_for_nest = column_drop;
+        v_flex()
+            .id(ElementId::Uuid(id))
+            .relative()
+            .on_drag(dragged, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
+            .min_h(px(40.))
+            .rounded(px(10.))
+            .border_1()
+            .border_color(card_border)
+            .bg(card_bg)
+            .when(!dark && column_tint.is_none(), |el| el.shadow_xs())
+            .hover(move |s| s.bg(card_hover))
+            .when(settled_done, |el| el.opacity(0.6))
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, window, cx| {
+                if this.title_edit.as_ref().is_some_and(|(editing, _, _)| *editing == id) {
+                    return;
+                }
+                window.focus(&this.list_focus, cx);
+                this.open_card(id, cx);
+            }))
+            // Card-to-card drop zones: left zone reorders before this card, right zone nests as subtask.
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .h_full()
+                    .w(gpui::relative(if can_nest { NEST_ZONE } else { 1. }))
+                    .drag_over::<DraggedTask>(move |style, _, _, _| style.border_t_2().border_color(accent))
+                    .on_drop(cx.listener(move |this, dragged: &DraggedTask, _, cx| {
+                        this.drop_on_kanban_card(dragged.id, id, drop_for_reorder.clone(), false, cx);
+                    })),
+            )
+            .when(can_nest, |el| {
+                el.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .right_0()
+                        .h_full()
+                        .w(gpui::relative(1. - NEST_ZONE))
+                        .rounded(px(10.))
+                        .drag_over::<DraggedTask>(move |style, _, _, _| {
+                            style.border_1().border_color(accent).bg(accent.opacity(0.08))
+                        })
+                        .on_drop(cx.listener(move |this, dragged: &DraggedTask, _, cx| {
+                            this.drop_on_kanban_card(dragged.id, id, drop_for_nest.clone(), true, cx);
+                        })),
+                )
+            })
+            .on_mouse_down(MouseButton::Right, cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                cx.stop_propagation();
+                window.focus(&this.list_focus, cx);
+                this.context_menu = Some((id, event.position));
+                this.context_side = None;
+                cx.notify();
+            }))
+            // As the original's, the card opens on the right of the first columns, on the left of
+            // the others.
+            .when(card_open_here, |el| {
+                let placement = if column < 2 { Placement::RightOf } else { Placement::LeftOf };
+                el.relative().child(PopoverAttachment::new(placement, self.render_card_details(cx)))
+            })
+            .child(line(
+                task,
+                SharedString::from(format!("card-check-{id}")),
+                px(16.),
+                px(10.),
+                if has_meta { px(4.) } else { px(10.) },
+                true,
+                cx,
+            ))
+            // TickTick's `KanbanRow3` (tags) + `KanbanRow2` (`task-tips-more`: date, icons, progress, list).
+            .when(has_meta, |el| {
+                el.child(
+                    v_flex()
+                        .pl(px(41.))
+                        .pr(px(12.))
+                        .pb(px(8.))
+                        .gap_1()
+                        .when_some(details_line, |el, text| {
+                            el.child(Label::new(text).size(LabelSize::XSmall).color(Color::Muted).truncate())
+                        })
+                        .when(!task.tags.is_empty(), |el| {
+                            el.child(h_flex().gap_1().flex_wrap().children(task.tags.iter().map(|tag| {
+                                Chip::new(tag.clone(), tag_colors.get(tag).copied().unwrap_or(theme.colors().text_muted))
+                            })))
+                        })
+                        .when(has_tips_row, |el| {
+                            el.child(
+                                h_flex()
+                                    .min_h(px(18.))
+                                    .gap_1p5()
+                                    .when_some(due, |el, (label, overdue)| {
+                                        let color = if root_done {
+                                            Color::Muted
+                                        } else if overdue {
+                                            Color::Error
+                                        } else {
+                                            Color::Accent
+                                        };
+                                        el.child(Label::new(label).size(LabelSize::XSmall).color(color))
+                                    })
+                                    .when(has_note_icon, |el| {
+                                        el.child(Icon::new(IconName::FileText).size(IconSize::XSmall).color(Color::Muted))
+                                    })
+                                    .when(task.repeat.is_some(), |el| {
+                                        el.child(Icon::new(IconName::Repeat).size(IconSize::XSmall).color(Color::Muted))
+                                    })
+                                    .when(has_reminders, |el| {
+                                        el.child(Icon::new(IconName::AlarmClock).size(IconSize::XSmall).color(Color::Muted))
+                                    })
+                                    .when_some(checklist, |el, (done_items, total)| {
+                                        el.child(
+                                            h_flex()
+                                                .gap_0p5()
+                                                .child(Icon::new(IconName::ListChecks).size(IconSize::XSmall).color(Color::Muted))
+                                                .child(Label::new(format!("{done_items}/{total}")).size(LabelSize::XSmall).color(Color::Muted)),
+                                        )
+                                    })
+                                    .when(collapsed && has_subtasks, |el| {
+                                        let done_subs = subtasks.iter().filter(|s| s.is_completed()).count();
+                                        el.child(
+                                            h_flex()
+                                                .gap_0p5()
+                                                .child(Icon::new(IconName::ListTree).size(IconSize::XSmall).color(Color::Muted))
+                                                .child(Label::new(format!("{done_subs}/{}", subtasks.len())).size(LabelSize::XSmall).color(Color::Muted)),
+                                        )
+                                    })
+                                    .when_some(list_info, |el, (name, dot)| {
+                                        el.child(div().flex_1()).child(
+                                            h_flex()
+                                                .min_w_0()
+                                                .gap_1()
+                                                .when_some(dot, |el, c| el.child(div().size(px(6.)).rounded_full().bg(c).flex_none()))
+                                                .child(Label::new(name).size(LabelSize::XSmall).color(Color::Muted).truncate()),
+                                        )
+                                    }),
+                            )
+                        }),
+                )
+            })
+            .when(!collapsed, |el| {
+                let sub_hover = theme.colors().ghost_element_hover;
+                let sub_selected_bg = if dark {
+                    gpui::white().opacity(0.06)
+                } else {
+                    theme.colors().accent.opacity(0.10)
+                };
+                el.children(subtasks.iter().enumerate().map(|(sub_idx, sub)| {
+                    let sub_id = sub.id;
+                    let is_last = sub_idx + 1 == subtasks.len();
+                    let sub_selected = self.card == Some(sub_id) || self.selected == Some(sub_id);
+                    let sub_draggable = self.view != View::Trash
+                        && self.title_edit.as_ref().is_none_or(|(editing, _, _)| *editing != sub_id);
+                    let dragged_sub = DraggedTask { id: sub_id, title: sub.title.clone().into() };
+                    v_flex()
+                        .id(SharedString::from(format!("card-sub-{sub_id}")))
+                        .debug_selector(move || format!("card-sub-{sub_id}"))
+                        .when(sub_draggable, |el| {
+                            el.on_drag(dragged_sub, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        })
+                        .when(is_last, |el| el.rounded_b(px(9.)))
+                        .when(sub_selected, |el| el.bg(sub_selected_bg))
+                        .when(!sub_selected, |el| el.hover(move |s| s.bg(sub_hover)))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            cx.stop_propagation();
+                            if this.title_edit.as_ref().is_some_and(|(editing, _, _)| *editing == sub_id) {
+                                return;
+                            }
+                            window.focus(&this.list_focus, cx);
+                            this.open_card(sub_id, cx);
+                        }))
+                        .on_mouse_down(MouseButton::Right, cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                            cx.stop_propagation();
+                            window.focus(&this.list_focus, cx);
+                            this.context_menu = Some((sub_id, event.position));
+                            this.context_side = None;
+                            cx.notify();
+                        }))
+                        .child(div().ml(px(41.)).mr(px(12.)).h(px(1.)).bg(theme.colors().border_variant))
+                        .child(line(sub, SharedString::from(format!("card-check-{sub_id}")), px(34.), px(8.), px(8.), false, cx))
+                }))
+            })
+            .into_any_element()
+    }
+
+    /// A group header: its label and count; a list section also gets a "…" menu with Rename and
+    /// Delete, and is replaced by a field while it is renamed.
+    fn render_group_header(
+        &self,
+        label: String,
+        count: usize,
+        drop: Option<&DropTarget>,
+        height: f32,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let strings = i18n::t(cx);
+        // Matched by name: the overdue group is the one header of a date view with this title.
+        let overdue = drop.is_none() && label == strings.group_overdue;
+        let section = match drop {
+            Some(DropTarget::Section(Some(id))) => Some(*id),
+            _ => None,
+        };
+        let renaming = section.and_then(|id| self.renaming_section.as_ref().filter(|(s, _)| *s == id)).map(|(_, input)| input.clone());
+        let group = SharedString::from(format!("group-header-{label}"));
+        h_flex()
+            .id(group.clone())
+            .group(group.clone())
+            .h(px(height))
+            .gap_2()
+            .map(|el| match renaming {
+                Some(input) => el.child(
+                    h_flex().flex_1().min_w_0().h(px(28.)).px_2().rounded(px(6.)).bg(cx.theme().colors().surface_background).child(input),
+                ),
+                None => el
+                    .child(Label::new(label).weight(FontWeight::BOLD).truncate())
+                    .child(Label::new(count.to_string()).size(LabelSize::Small).color(Color::Muted)),
+            })
+            .when_some(section, |el, id| {
+                el.child(div().flex_1()).child(
+                    div()
+                        .relative()
+                        .opacity(if self.section_menu == Some(id) || crate::touch::active() { 1. } else { 0. })
+                        .group_hover(group, |s| s.opacity(1.))
+                        .child(
+                            IconButton::new(SharedString::from(format!("section-more-{id}")), IconName::Ellipsis)
+                                .size(px(22.))
+                                .icon_size(IconSize::Small)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.section_menu = Some(id);
+                                    cx.notify();
+                                })),
+                        )
+                        .when(self.section_menu == Some(id), |el| {
+                            el.child(PopoverAttachment::new(
+                                Placement::BelowRight,
+                                popover(cx)
+                                    .min_w(px(200.))
+                                    .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                                        this.section_menu = None;
+                                        cx.notify();
+                                    }))
+                                    .child(
+                                        ListItem::new("rename-section")
+                                            .start_slot(Icon::new(IconName::Pencil).color(Color::Muted))
+                                            .child(Label::new(strings.rename_section))
+                                            .on_click(cx.listener(move |this, _, window, cx| this.start_rename_section(id, window, cx))),
+                                    )
+                                    .child(
+                                        ListItem::new("delete-section")
+                                            .start_slot(Icon::new(IconName::Trash).color(Color::Error))
+                                            .child(Label::new(strings.delete_section).color(Color::Error))
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.section_menu = None;
+                                                let result = this.store.delete_list_section(id);
+                                                this.check(result);
+                                                this.reload(cx);
+                                            })),
+                                    ),
+                            ))
+                        }),
+                )
+            })
+            // The overdue group's "Postpone" moves its tasks to a later day, as the original's.
+            .when(overdue, |el| {
+                el.child(div().flex_1()).child(
+                    div()
+                        .relative()
+                        .child(
+                            div()
+                                .id("postpone")
+                                .cursor_pointer()
+                                .child(Label::new(strings.postpone).size(LabelSize::Small).color(Color::Accent))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.postpone_menu = true;
+                                    cx.notify();
+                                })),
+                        )
+                        .when(self.postpone_menu, |el| {
+                            el.child(PopoverAttachment::new(
+                                Placement::BelowRight,
+                                popover(cx)
+                                    .min_w(px(180.))
+                                    .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                                        this.postpone_menu = false;
+                                        cx.notify();
+                                    }))
+                                    .children(fern_core::DefaultDate::ALL.iter().zip(strings.default_dates).map(|(&choice, name)| {
+                                        ListItem::new(SharedString::from(format!("postpone-{name}")))
+                                            .child(Label::new(name))
+                                            .on_click(cx.listener(move |this, _, _, cx| this.postpone_overdue(choice.date(Self::today()), cx)))
+                                    })),
+                            ))
+                        }),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// Moves every overdue task in view to `day`, keeping its time.
+    fn postpone_overdue(&mut self, day: NaiveDate, cx: &mut Context<Self>) {
+        self.postpone_menu = false;
+        let today = Self::today();
+        let overdue: Vec<_> = self
+            .tasks
+            .iter()
+            .filter(|t| !t.is_closed() && t.due_date.is_some_and(|d| d < today))
+            .map(|t| (t.id, t.due_time))
+            .collect();
+        for (id, time) in overdue {
+            let result = self.store.set_due(id, Some(day), time);
+            self.check(result);
+        }
+        self.reload(cx);
+    }
+
+    fn start_rename_section(&mut self, id: Id, window: &mut Window, cx: &mut Context<Self>) {
+        let strings = i18n::t(cx);
+        let name = self.sections.iter().find(|s| s.id == id).map(|s| s.name.clone()).unwrap_or_default();
+        let input = cx.new(|cx| {
+            let mut input = TextInput::new(Mode::SingleLine, strings.section_name, cx);
+            input.set_text(name, cx);
+            input
+        });
+        cx.subscribe(&input, move |this, _, Submitted(name), cx| {
+            let result = this.store.rename_list_section(id, name);
+            this.check(result);
+            this.renaming_section = None;
+            this.reload(cx);
+        })
+        .detach();
+        cx.subscribe(&input, |this, _, _: &Cancelled, cx| {
+            this.renaming_section = None;
+            cx.notify();
+        })
+        .detach();
+        window.focus(&input.focus_handle(cx), cx);
+        self.section_menu = None;
+        self.renaming_section = Some((id, input));
+        cx.notify();
+    }
+
+    fn print_list(&mut self, cx: &mut Context<Self>) {
+        self.header_menu_open = false;
+        let strings = i18n::t(cx);
+        let title = self.view_title(strings);
+        let html = crate::print::list_html(&title, &self.tasks, Self::today(), strings);
+        if let Err(err) = crate::print::open("list", &html) {
+            self.error = Some(err.to_string());
+        }
+        cx.notify();
+    }
+
+    fn view_title(&self, strings: &Strings) -> SharedString {
+        let filters: Vec<fern_core::SmartFilter> = self.filters.iter().map(|(f, _)| f.clone()).collect();
+        lists_panel::title(&self.view, &self.lists, &filters, strings)
+    }
+
+    fn open_list_activity(&mut self, cx: &mut Context<Self>) {
+        let list = match self.view {
+            View::List(id) => Some(id),
+            _ => None,
+        };
+        self.list_activity = Some(self.store.list_activity(list, 300).unwrap_or_default());
+        self.header_menu_open = false;
+        cx.notify();
+    }
+
+    /// The original's List Activities: the list's task events by day, newest first, each with
+    /// its task, which a click opens.
+    fn render_list_activity(&self, entries: &[(fern_core::Activity, Id, String)], top_inset: bool, cx: &mut Context<Self>) -> AnyElement {
+        let strings = i18n::t(cx);
+        let theme = cx.theme().clone();
+        let today = Self::today();
+        let mut items: Vec<AnyElement> = Vec::new();
+        let mut current_day = None;
+        for (activity, task, title) in entries {
+            let Some(when) = Local.timestamp_millis_opt(activity.at).single() else { continue };
+            let day = when.date_naive();
+            if current_day != Some(day) {
+                current_day = Some(day);
+                items.push(
+                    div()
+                        .pt_3()
+                        .pb_1()
+                        .child(Label::new(task_rows::day_header(day, today, strings)).size(LabelSize::XSmall).color(Color::Muted))
+                        .into_any_element(),
+                );
+            }
+            let (icon, color) = match activity.kind.as_str() {
+                "created" => (IconName::Plus, theme.colors().accent),
+                "completed" => (IconName::Check, theme.status().success),
+                "deleted" => (IconName::Trash, theme.status().error),
+                _ => (IconName::Pencil, theme.colors().text_muted),
+            };
+            let task = *task;
+            items.push(
+                h_flex()
+                    .items_start()
+                    .gap_2()
+                    .py_1()
+                    .child(
+                        div()
+                            .mt(px(2.))
+                            .size(px(18.))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_full()
+                            .bg(color)
+                            .child(Icon::new(icon).size(IconSize::XSmall).color(Color::Custom(theme.colors().background))),
+                    )
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .child(
+                                h_flex()
+                                    .gap_1()
+                                    .child(Label::new(crate::task_detail::activity_text(&activity.kind, strings).to_owned()).size(LabelSize::Small).color(Color::Muted))
+                                    .child(
+                                        div()
+                                            .id(SharedString::from(format!("activity-{task}-{}", activity.at)))
+                                            .min_w_0()
+                                            .cursor_pointer()
+                                            .child(Label::new(title.clone()).size(LabelSize::Small).color(Color::Accent).truncate())
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.list_activity = None;
+                                                this.select(task, cx);
+                                            })),
+                                    ),
+                            )
+                            .child(Label::new(format!("{} {}", crate::calendar::format_day_month(when.date_naive(), strings), crate::calendar::format_time(when, strings))).size(LabelSize::XSmall).color(Color::Muted)),
+                    )
+                    .into_any_element(),
+            );
+        }
+        v_flex()
+            .size_full()
+            .bg(theme.colors().background)
+            .border_l_1()
+            .border_color(theme.colors().border)
+            .child(
+                h_flex()
+                    .when(top_inset, |el| el.mt(crate::title_bar::header_inset()))
+                    .h(px(48.))
+                    .px_5()
+                    .border_b_1()
+                    .border_color(theme.colors().border)
+                    .child(div().flex_1().child(Label::new(strings.list_activities).size(LabelSize::Large)))
+                    .child(IconButton::new("close-list-activity", IconName::X).on_click(cx.listener(|this, _, _, cx| {
+                        this.list_activity = None;
+                        cx.notify();
+                    }))),
+            )
+            .child(
+                v_flex()
+                    .id("list-activity")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .px_5()
+                    .pb_4()
+                    .when(entries.is_empty(), |el| el.child(div().pt_4().child(Label::new(strings.stats_no_data).color(Color::Muted))))
+                    .children(items),
+            )
+            .into_any_element()
+    }
+
+    /// Whose sections the view shows: a list's, the Inbox's (`Some(None)`), or none.
+    fn section_owner(&self) -> Option<Option<Id>> {
+        match self.view {
+            View::List(id) => Some(Some(id)),
+            View::Inbox => Some(None),
+            _ => None,
+        }
+    }
+
+    fn start_new_section(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let _ = self.store.set_setting(&format!("kanban:hide_new_section:{}", self.view_key()), "0");
+        let strings = i18n::t(cx);
+        let input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.section_name, cx));
+        cx.subscribe(&input, |this, _, Submitted(name), cx| {
+            if let Some(list) = this.section_owner() {
+                let result = this.store.insert_list_section(list, name, this.new_section_index.take());
+                this.check(result);
+            }
+            this.new_section = None;
+            this.reload(cx);
+        })
+        .detach();
+        cx.subscribe(&input, |this, _, _: &Cancelled, cx| {
+            this.new_section = None;
+            this.new_section_index = None;
+            cx.notify();
+        })
+        .detach();
+        window.focus(&input.focus_handle(cx), cx);
+        self.new_section = Some(input);
+        self.header_menu_open = false;
+        cx.notify();
+    }
+
+    fn commit_new_section(&mut self, cx: &mut Context<Self>) {
+        let Some(input) = self.new_section.take() else { return };
+        let index = self.new_section_index.take();
+        let name = input.read(cx).text().trim().to_owned();
+        if !name.is_empty()
+            && let Some(list) = self.section_owner()
+        {
+            let result = self.store.insert_list_section(list, &name, index);
+            self.check(result);
+            self.reload(cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    fn commit_section_rename(&mut self, cx: &mut Context<Self>) {
+        let Some((section, input)) = self.section_rename.take() else { return };
+        let name = input.read(cx).text().trim().to_owned();
+        if !name.is_empty() {
+            let result = self.store.rename_list_section(section, &name);
+            self.check(result);
+            self.reload(cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    fn commit_column_add(&mut self, cx: &mut Context<Self>) {
+        let Some((_, target, input)) = self.column_add.take() else { return };
+        let text = input.read(cx).text().to_owned();
+        if !text.trim().is_empty()
+            && let Some(task) = self.add_task(&text, cx)
+        {
+            self.drop_on_column(task.id, target, cx);
+            return;
+        }
+        cx.notify();
+    }
+
+    /// The original's Suggested Tasks: Recently Added and Long Unfinished, each with "+" to plan
+    /// the task for today; four of the long unfinished ones until "More".
+    fn render_suggestions(&self, all: bool, strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let today = Self::today();
+        let found = fern_core::suggest::suggestions(&self.store.tasks().unwrap_or_default(), today);
+        let row = |task: &Task, note: String, cx: &mut Context<Self>| {
+            let id = task.id;
+            h_flex()
+                .id(SharedString::from(format!("suggestion-{id}")))
+                .py_1p5()
+                .gap_2()
+                .items_start()
+                .border_b_1()
+                .border_color(theme.colors().border_variant)
+                .child(div().pt(px(3.)).child(Checkbox::new(SharedString::from(format!("suggestion-box-{id}"))).size(px(14.))))
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .child(Label::new(task.title.clone()).truncate())
+                        .child(Label::new(note).size(LabelSize::XSmall).color(Color::Muted)),
+                )
+                .child(
+                    IconButton::new(SharedString::from(format!("suggestion-add-{id}")), IconName::Plus)
+                        .icon_color(Color::Accent)
+                        .tooltip(Tooltip::text(strings.add_to_today))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let result = this.store.set_due(id, Some(Self::today()), None);
+                            this.check(result);
+                            this.reload(cx);
+                        })),
+                )
+                .into_any_element()
+        };
+        let recent: Vec<AnyElement> = found
+            .recent
+            .iter()
+            .map(|task| {
+                let when = fern_core::suggest::created_day(task)
+                    .zip(chrono::DateTime::from_timestamp_millis(task.created_at))
+                    .map(|(day, at)| task_rows::due_label(day, Some(at.with_timezone(&Local).time()), today, strings).0)
+                    .unwrap_or_default();
+                row(task, strings.added_on.replace("{when}", &when), cx)
+            })
+            .collect();
+        let shown = if all { found.long_unfinished.len() } else { found.long_unfinished.len().min(4) };
+        let long: Vec<AnyElement> = found.long_unfinished[..shown]
+            .iter()
+            .map(|task| {
+                let days = fern_core::suggest::created_day(task).map_or(0, |d| (today - d).num_days());
+                row(task, strings.created_days_ago.replace("{n}", &days.to_string()), cx)
+            })
+            .collect();
+        let more = !all && found.long_unfinished.len() > 4;
+        let heading = |text: &'static str| Label::new(text).size(LabelSize::Small).weight(FontWeight::SEMIBOLD);
+        div()
+            .absolute()
+            .right(px(12.))
+            .bottom(px(12.))
+            .child(
+                v_flex()
+                    .id("suggested-tasks")
+                    .w(px(370.))
+                    .max_h(px(560.))
+                    .overflow_y_scroll()
+                    .p_4()
+                    .gap_2()
+                    .rounded(px(10.))
+                    .bg(theme.colors().elevated_surface_background)
+                    .border_1()
+                    .border_color(theme.colors().border)
+                    .shadow_lg()
+                    .child(
+                        h_flex()
+                            .child(div().flex_1().text_size(px(16.)).font_weight(FontWeight::SEMIBOLD).child(strings.suggested_tasks))
+                            .child(IconButton::new("suggestions-x", IconName::X).icon_color(Color::Muted).on_click(cx.listener(|this, _, _, cx| {
+                                this.suggestions_open = None;
+                                cx.notify();
+                            }))),
+                    )
+                    .when(recent.is_empty() && long.is_empty(), |el| el.child(Label::new(strings.no_suggestions).color(Color::Muted)))
+                    .when(!recent.is_empty(), |el| el.child(heading(strings.recently_added)).children(recent))
+                    .when(!long.is_empty(), |el| {
+                        el.child(
+                            h_flex()
+                                .pt_2()
+                                .child(div().flex_1().child(heading(strings.long_unfinished)))
+                                .when(more, |el| {
+                                    el.child(
+                                        h_flex()
+                                            .id("suggestions-more")
+                                            .cursor_pointer()
+                                            .child(Label::new(strings.more).size(LabelSize::Small).color(Color::Muted))
+                                            .child(Icon::new(IconName::ChevronRight).size(IconSize::XSmall).color(Color::Muted))
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.suggestions_open = Some(true);
+                                                cx.notify();
+                                            })),
+                                    )
+                                }),
+                        )
+                        .children(long)
+                    }),
+            )
+            .into_any_element()
+    }
+
+    fn save_preferences(&mut self, change: impl FnOnce(&mut fern_core::Preferences), cx: &mut Context<Self>) {
+        let result = self.store.update_preferences(change);
+        if let Some(preferences) = self.check(result) {
+            self.preferences = preferences;
+            self.sync_detail_inset(cx);
+        }
+        cx.notify();
+    }
+
+    /// The original's View Options: Show Date by (Task Time or Countdown) and the Task Detail
+    /// Layout for a narrow window (Side peek or Pop-up), each drawn as the original's sketches.
+    fn render_view_options(&self, menu_open: bool, strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let countdown = self.preferences.countdown_dates;
+        let popup = self.preferences.popup_details;
+        let choice = |id: &'static str, label: &'static str, on: bool| {
+            ListItem::new(id)
+                .height(px(34.))
+                .child(Label::new(label).color(if on { Color::Accent } else { Color::Default }))
+                .when(on, |item| item.end_slot(Icon::new(IconName::Check).size(IconSize::Small).color(Color::Accent)))
+        };
+        let menu = menu_open.then(|| {
+            PopoverAttachment::new(
+                Placement::BelowRight,
+                popover(cx)
+                    .min_w(px(196.))
+                    .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                        this.view_options = Some(false);
+                        cx.notify();
+                    }))
+                    .child(choice("show-date-time", strings.task_time, !countdown).on_click(cx.listener(|this, _, _, cx| {
+                        this.view_options = Some(false);
+                        this.save_preferences(|p| p.countdown_dates = false, cx);
+                    })))
+                    .child(choice("show-date-countdown", strings.date_countdown, countdown).on_click(cx.listener(|this, _, _, cx| {
+                        this.view_options = Some(false);
+                        this.save_preferences(|p| p.countdown_dates = true, cx);
+                    }))),
+            )
+        });
+        // A small sketch of the window: the details beside the list, or over it.
+        let sketch = |over: bool| {
+            let line = |w: f32| div().w(px(w)).h(px(3.)).rounded(px(1.)).bg(theme.colors().text_muted.opacity(0.3));
+            div()
+                .relative()
+                .w(px(140.))
+                .h(px(92.))
+                .rounded(px(6.))
+                .border_1()
+                .border_color(theme.colors().border)
+                .bg(theme.colors().background)
+                .child(div().absolute().left(px(6.)).top(px(8.)).child(v_flex().gap_1().children([40., 30., 36., 28.].map(line))))
+                .child(if over {
+                    div()
+                        .absolute()
+                        .left(px(40.))
+                        .top(px(18.))
+                        .w(px(80.))
+                        .h(px(58.))
+                        .rounded(px(4.))
+                        .border_1()
+                        .border_color(theme.colors().border)
+                        .bg(theme.colors().elevated_surface_background)
+                        .p_1p5()
+                        .child(v_flex().gap_1().children([50., 60., 40.].map(line)))
+                } else {
+                    div()
+                        .absolute()
+                        .right_0()
+                        .top_0()
+                        .w(px(64.))
+                        .h_full()
+                        .border_l_1()
+                        .border_color(theme.colors().border)
+                        .p_1p5()
+                        .child(v_flex().gap_1().children([40., 50., 30.].map(line)))
+                })
+        };
+        let layout = |id: &'static str, label: &'static str, over: bool, cx: &mut Context<Self>| {
+            let on = popup == over;
+            v_flex()
+                .id(id)
+                .items_center()
+                .gap_2()
+                .cursor_pointer()
+                .child(sketch(over))
+                .child(
+                    h_flex()
+                        .gap_1p5()
+                        .child(
+                            div()
+                                .size(px(16.))
+                                .rounded_full()
+                                .border_1()
+                                .border_color(if on { theme.colors().accent } else { theme.colors().border })
+                                .when(on, |el| el.bg(theme.colors().accent).flex().items_center().justify_center().child(Icon::new(IconName::Check).size(IconSize::XSmall).color(Color::IconOnAccent))),
+                        )
+                        .child(Label::new(label)),
+                )
+                .on_click(cx.listener(move |this, _, _, cx| this.save_preferences(|p| p.popup_details = over, cx)))
+        };
+        let section = || v_flex().p_4().gap_1().rounded(px(8.)).bg(theme.colors().surface_background);
+        div()
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(gpui::black().opacity(0.35))
+            .occlude()
+            .child(
+                v_flex()
+                    .id("view-options")
+                    .w(px(440.))
+                    .p_5()
+                    .gap_3()
+                    .rounded(px(10.))
+                    .bg(theme.colors().elevated_surface_background)
+                    .border_1()
+                    .border_color(theme.colors().border)
+                    .shadow_lg()
+                    .child(
+                        h_flex()
+                            .child(div().flex_1().text_size(px(16.)).font_weight(FontWeight::SEMIBOLD).child(strings.view_options))
+                            .child(IconButton::new("view-options-x", IconName::X).icon_color(Color::Muted).on_click(cx.listener(|this, _, _, cx| {
+                                this.view_options = None;
+                                cx.notify();
+                            }))),
+                    )
+                    .child(
+                        h_flex()
+                            .h(px(48.))
+                            .px_4()
+                            .rounded(px(8.))
+                            .bg(theme.colors().surface_background)
+                            .child(div().flex_1().child(Label::new(strings.show_date_by)))
+                            .child(
+                                div()
+                                    .relative()
+                                    .child(
+                                        h_flex()
+                                            .id("show-date-by")
+                                            .gap_1()
+                                            .cursor_pointer()
+                                            .child(Label::new(if countdown { strings.date_countdown } else { strings.task_time }).color(Color::Muted))
+                                            .child(Icon::new(IconName::ChevronsUpDown).size(IconSize::XSmall).color(Color::Muted))
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.view_options = Some(!this.view_options.unwrap_or(false));
+                                                cx.notify();
+                                            })),
+                                    )
+                                    .children(menu),
+                            ),
+                    )
+                    .when(self.kanban, |el| {
+                        let size = self.kanban_column_size;
+                        let col_color = self.kanban_column_color;
+                        let quick_add = self.kanban_quick_add;
+                        let size_btn = |id: &'static str, label: &'static str, value: u8, cx: &mut Context<Self>| {
+                            let active = size == value;
+                            div()
+                                .id(id)
+                                .px_2p5()
+                                .h(px(26.))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(6.))
+                                .cursor_pointer()
+                                .when(active, |el| el.bg(theme.colors().element_selected))
+                                .hover(|s| s.bg(theme.colors().ghost_element_hover))
+                                .child(Label::new(label).size(LabelSize::Small).color(if active { Color::Accent } else { Color::Default }))
+                                .on_click(cx.listener(move |this, _, _, cx| this.set_kanban_column_size(value, cx)))
+                        };
+                        el.child(
+                            v_flex()
+                                .rounded(px(8.))
+                                .bg(theme.colors().surface_background)
+                                .child(
+                                    h_flex()
+                                        .h(px(48.))
+                                        .px_4()
+                                        .child(div().flex_1().child(Label::new(strings.kanban_size)))
+                                        .child(
+                                            h_flex()
+                                                .p(px(2.))
+                                                .gap_0p5()
+                                                .rounded(px(8.))
+                                                .bg(theme.colors().background)
+                                                .child(size_btn("kanban-size-s", strings.kanban_size_small, 0, cx))
+                                                .child(size_btn("kanban-size-m", strings.kanban_size_medium, 1, cx))
+                                                .child(size_btn("kanban-size-l", strings.kanban_size_large, 2, cx)),
+                                        ),
+                                )
+                                .child(div().px_4().child(Divider::horizontal()))
+                                .child(
+                                    h_flex()
+                                        .id("kanban-toggle-color")
+                                        .h(px(48.))
+                                        .px_4()
+                                        .cursor_pointer()
+                                        .child(div().flex_1().child(Label::new(strings.kanban_column_color)))
+                                        .child(ui::Switch::new().toggle_state(col_color))
+                                        .on_click(cx.listener(|this, _, _, cx| this.toggle_kanban_column_color(cx))),
+                                )
+                                .child(div().px_4().child(Divider::horizontal()))
+                                .child(
+                                    h_flex()
+                                        .id("kanban-toggle-quick-add")
+                                        .h(px(48.))
+                                        .px_4()
+                                        .cursor_pointer()
+                                        .child(div().flex_1().child(Label::new(strings.kanban_show_input_box)))
+                                        .child(ui::Switch::new().toggle_state(quick_add))
+                                        .on_click(cx.listener(|this, _, _, cx| this.toggle_kanban_quick_add(cx))),
+                                ),
+                        )
+                    })
+                    .child(
+                        section()
+                            .child(Label::new(strings.task_detail_layout))
+                            .child(Label::new(strings.task_detail_layout_hint).size(LabelSize::Small).color(Color::Muted))
+                            .child(
+                                h_flex()
+                                    .pt_3()
+                                    .justify_around()
+                                    .child(layout("layout-side", strings.side_peek, false, cx))
+                                    .child(layout("layout-popup", strings.pop_up, true, cx)),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// The original's column widths: Small 242 px, Medium 282 px, Large 342 px.
+    fn kanban_column_width(&self) -> f32 {
+        [242., 282., 342.][self.kanban_column_size.min(2) as usize]
+    }
+
+    fn set_kanban_column_size(&mut self, size: u8, cx: &mut Context<Self>) {
+        let size = size.min(2);
+        let key = ["s", "m", "l"][size as usize];
+        let result = self.store.set_setting("kanban:column_size", key);
+        self.check(result);
+        self.kanban_column_size = size;
+        cx.notify();
+    }
+
+    fn toggle_kanban_column_color(&mut self, cx: &mut Context<Self>) {
+        let next = !self.kanban_column_color;
+        let result = self.store.set_setting("kanban:column_color", if next { "1" } else { "0" });
+        self.check(result);
+        self.kanban_column_color = next;
+        cx.notify();
+    }
+
+    fn toggle_kanban_quick_add(&mut self, cx: &mut Context<Self>) {
+        let next = !self.kanban_quick_add;
+        let result = self.store.set_setting("kanban:quick_add", if next { "1" } else { "0" });
+        self.check(result);
+        self.kanban_quick_add = next;
+        if next {
+            self.column_add = None;
+        } else {
+            self.kanban_quick_adds.clear();
+        }
+        cx.notify();
+    }
+
+    fn set_section_color(&mut self, section: Id, color: Option<&str>, cx: &mut Context<Self>) {
+        let value = color.unwrap_or("");
+        let result = self.store.set_setting(&format!("kanban:section_color:{section}"), value);
+        self.check(result);
+        if value.is_empty() {
+            self.kanban_section_colors.remove(&section);
+        } else {
+            self.kanban_section_colors.insert(section, value.to_owned());
+        }
+        self.column_menu = None;
+        cx.notify();
+    }
+
+    /// TickTick's column tint palette (used when Column Color is enabled).
+    const KANBAN_COLUMN_COLORS: [&'static str; 8] = [
+        "#6387F7", "#2FBFBC", "#52C41A", "#FAAD14", "#FF5C62", "#B069EE", "#F06292", "#8F8F8F",
+    ];
+
+    fn kanban_column_tint(
+        &self,
+        index: usize,
+        target: Option<&DropTarget>,
+        title: &str,
+        strings: &Strings,
+        tag_colors: &HashMap<String, Hsla>,
+        accent: Hsla,
+    ) -> Option<Hsla> {
+        if !self.kanban_column_color {
+            return None;
+        }
+        let hex = |s: &str| lists_panel::parse_color(Some(s));
+        match target {
+            Some(DropTarget::Complete) => hex("#A5A5A5"),
+            Some(DropTarget::Section(Some(id))) => self
+                .kanban_section_colors
+                .get(id)
+                .and_then(|c| hex(c))
+                .or_else(|| hex(Self::KANBAN_COLUMN_COLORS[index % Self::KANBAN_COLUMN_COLORS.len()])),
+            Some(DropTarget::Section(None)) => hex(Self::KANBAN_COLUMN_COLORS[index % Self::KANBAN_COLUMN_COLORS.len()]),
+            Some(DropTarget::List(Some(id))) => self
+                .lists
+                .iter()
+                .find(|l| l.id == *id)
+                .and_then(|l| lists_panel::parse_color(l.color.as_deref()))
+                .or(Some(accent)),
+            Some(DropTarget::List(None)) => Some(accent),
+            Some(DropTarget::Priority(p)) => match p {
+                Priority::High => hex("#F6252E"),
+                Priority::Medium => hex("#FFA300"),
+                Priority::Low => hex("#4772FA"),
+                Priority::None => hex("#8F8F8F"),
+            },
+            Some(DropTarget::Tag(Some(name))) => tag_colors.get(name).copied().or(Some(accent)),
+            Some(DropTarget::Tag(None)) => hex("#8F8F8F"),
+            Some(DropTarget::Due(Some(date))) => {
+                let today = Self::today();
+                let days = (*date - today).num_days();
+                if days < 0 {
+                    hex("#FF5C62")
+                } else if days == 0 {
+                    hex("#6387F7")
+                } else if days == 1 {
+                    hex("#FAAD14")
+                } else if days <= 7 {
+                    hex("#2FBFBC")
+                } else {
+                    hex("#52C41A")
+                }
+            }
+            Some(DropTarget::Due(None)) => hex("#8F8F8F"),
+            Some(DropTarget::Kind(_)) => hex("#A5A5A5"),
+            None => {
+                if title == strings.group_overdue {
+                    hex("#FF5C62")
+                } else if title == strings.group_completed {
+                    hex("#A5A5A5")
+                } else {
+                    hex(Self::KANBAN_COLUMN_COLORS[index % Self::KANBAN_COLUMN_COLORS.len()])
+                }
+            }
+        }
+    }
+
+    fn sync_kanban_quick_adds(&mut self, columns: &[BoardCol], strings: &'static Strings, cx: &mut Context<Self>) {
+        if !self.kanban_quick_add {
+            if !self.kanban_quick_adds.is_empty() {
+                self.kanban_quick_adds.clear();
+            }
+            return;
+        }
+        let mut active_keys = HashSet::new();
+        for col in columns {
+            let Some(target) = col.drop.as_ref().filter(|t| !matches!(t, DropTarget::Complete)) else { continue };
+            let key = col.key.clone();
+            active_keys.insert(key.clone());
+            self.kanban_quick_adds.entry(key).or_insert_with(|| {
+                let input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.add_task, cx));
+                let target_clone = target.clone();
+                cx.subscribe(&input, move |this, input, Submitted(text), cx| {
+                    if !text.trim().is_empty() {
+                        if let Some(task) = this.add_task(text, cx) {
+                            this.drop_on_column(task.id, target_clone.clone(), cx);
+                        }
+                        input.update(cx, |input, cx| input.set_text("", cx));
+                        this.reload(cx);
+                    }
+                })
+                .detach();
+                input
+            });
+        }
+        self.kanban_quick_adds.retain(|k, _| active_keys.contains(k));
+    }
+
+    /// A kanban column's "+": a field at the column's top; the task it adds takes the column's
+    /// value, as one dropped there.
+    fn start_column_add(&mut self, column: usize, target: DropTarget, window: &mut Window, cx: &mut Context<Self>) {
+        let strings = i18n::t(cx);
+        let input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.add_task, cx));
+        cx.subscribe_in(&input, window, move |this, input, Submitted(text), window, cx| {
+            if !text.trim().is_empty() {
+                if let Some(task) = this.add_task(text, cx)
+                    && let Some((_, target, _)) = this.column_add.clone()
+                {
+                    this.drop_on_column(task.id, target, cx);
+                }
+                input.update(cx, |input, cx| input.clear(window, cx));
+                this.reload(cx);
+            }
+        })
+        .detach();
+        cx.subscribe(&input, |this, _, _: &Cancelled, cx| {
+            this.column_add = None;
+            cx.notify();
+        })
+        .detach();
+        window.focus(&input.focus_handle(cx), cx);
+        self.column_add = Some((column, target, input));
+        cx.notify();
+    }
+
+    fn start_kanban_section_rename(&mut self, section: Id, window: &mut Window, cx: &mut Context<Self>) {
+        self.commit_section_rename(cx);
+        self.column_menu = None;
+        let strings = i18n::t(cx);
+        let input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.section_name, cx));
+        let name = self.sections.iter().find(|s| s.id == section).map(|s| s.name.clone()).unwrap_or_default();
+        input.update(cx, |input, cx| input.set_text(name, cx));
+        cx.subscribe(&input, move |this, _, Submitted(name), cx| {
+            let result = this.store.rename_list_section(section, name);
+            this.check(result);
+            this.section_rename = None;
+            this.reload(cx);
+        })
+        .detach();
+        cx.subscribe(&input, |this, _, _: &Cancelled, cx| {
+            this.section_rename = None;
+            cx.notify();
+        })
+        .detach();
+        window.focus(&input.focus_handle(cx), cx);
+        self.section_rename = Some((section, input));
+        cx.notify();
+    }
+
+    /// A column's header, as the original's: the name and count, then "+" and, for a section,
+    /// "…" with Rename, Add Section to Left / Right, Move to › and Delete.
+    fn render_column_header(
+        &self,
+        column: usize,
+        title: String,
+        count: usize,
+        target: Option<DropTarget>,
+        strings: &'static Strings,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = cx.theme().clone();
+        let overdue = target.is_none() && title == strings.group_overdue && count > 0;
+        let section = match target {
+            Some(DropTarget::Section(Some(id))) => Some(id),
+            _ => None,
+        };
+        let renaming = self.section_rename.as_ref().filter(|(id, _)| Some(*id) == section).map(|(_, input)| input.clone());
+        let menu_open = self.column_menu.is_some_and(|(id, _)| Some(id) == section);
+        let drag_title: SharedString = title.clone().into();
+        h_flex()
+            .id(SharedString::from(format!("kanban-header-{column}")))
+            .h(px(38.))
+            .pt(px(12.))
+            .pb(px(6.))
+            .pl(px(10.))
+            .pr(if self.kanban_column_color { px(10.) } else { px(12.) })
+            .gap_1()
+            .when_some(section.filter(|_| renaming.is_none()), |el, id| {
+                let dragged = DraggedColumn { id, title: drag_title.clone() };
+                el.cursor_grab()
+                    .on_drag(dragged, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
+                    .on_mouse_down(MouseButton::Right, cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.column_menu = Some((id, false));
+                        cx.notify();
+                    }))
+            })
+            .map(|el| match renaming {
+                Some(input) => el.child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .px(px(2.))
+                        .on_mouse_down_out(cx.listener(|this, _, _, cx| this.commit_section_rename(cx)))
+                        .child(input),
+                ),
+                None => el
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("kanban-title-{column}")))
+                            .px(px(4.))
+                            .rounded(px(4.))
+                            .min_w_0()
+                            .when_some(section, |el, id| {
+                                el.cursor_pointer()
+                                    .hover(|s| s.bg(theme.colors().ghost_element_hover))
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.start_kanban_section_rename(id, window, cx);
+                                    }))
+                            })
+                            .child(Label::new(title).weight(FontWeight::SEMIBOLD).truncate()),
+                    )
+                    .child(div().ml(px(2.)).child(Label::new(count.to_string()).size(LabelSize::Small).color(Color::Muted)))
+                    .child(div().flex_1()),
+            })
+            .when(overdue, |el| {
+                el.child(
+                    div()
+                        .relative()
+                        .child(
+                            div()
+                                .id("kanban-postpone")
+                                .cursor_pointer()
+                                .child(Label::new(strings.postpone).size(LabelSize::Small).color(Color::Accent))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.postpone_menu = true;
+                                    cx.notify();
+                                })),
+                        )
+                        .when(self.postpone_menu, |el| {
+                            el.child(PopoverAttachment::new(
+                                Placement::BelowRight,
+                                popover(cx)
+                                    .min_w(px(180.))
+                                    .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                                        this.postpone_menu = false;
+                                        cx.notify();
+                                    }))
+                                    .children(fern_core::DefaultDate::ALL.iter().zip(strings.default_dates).map(|(&choice, name)| {
+                                        ListItem::new(SharedString::from(format!("kanban-postpone-{name}")))
+                                            .child(Label::new(name))
+                                            .on_click(cx.listener(move |this, _, _, cx| this.postpone_overdue(choice.date(Self::today()), cx)))
+                                    })),
+                            ))
+                        }),
+                )
+            })
+            .when_some(target.filter(|t| !matches!(t, DropTarget::Complete) && !self.kanban_quick_add), |el, target| {
+                el.child(
+                    IconButton::new(SharedString::from(format!("kanban-add-{column}")), IconName::Plus)
+                        .size(px(22.))
+                        .icon_size(IconSize::Small)
+                        .icon_color(Color::Muted)
+                        .tooltip(Tooltip::text(strings.add_task))
+                        .on_click(cx.listener(move |this, _, window, cx| this.start_column_add(column, target.clone(), window, cx))),
+                )
+            })
+            .when_some(section, |el, id| {
+                el.child(
+                    div()
+                        .relative()
+                        .child(
+                            IconButton::new(SharedString::from(format!("kanban-menu-{column}")), IconName::Ellipsis)
+                                .size(px(22.))
+                                .icon_size(IconSize::Small)
+                                .icon_color(Color::Muted)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.column_menu = if this.column_menu.is_some_and(|(open, _)| open == id) { None } else { Some((id, false)) };
+                                    cx.notify();
+                                })),
+                        )
+                        .when(menu_open, |el| el.child(PopoverAttachment::new(Placement::BelowRight, self.render_column_menu(id, column, strings, cx)))),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn render_column_menu(&self, section: Id, column: usize, strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {
+        let item = |key: &'static str, icon: IconName, label: &'static str| {
+            ListItem::new(key).height(px(34.)).start_slot(Icon::new(icon).color(Color::Muted)).child(Label::new(label))
+        };
+        // The section's place among the list's sections, for Add Section to Left / Right.
+        let index = self.sections.iter().position(|s| s.id == section).unwrap_or(column);
+        let side = self.column_menu.is_some_and(|(_, side)| side);
+        // Move to: the Inbox and the lists, but not where the section already is.
+        let owner = self.section_owner();
+        let lists: Vec<ListItem> = std::iter::once((None, SharedString::new_static(strings.inbox), IconName::Inbox))
+            .chain(self.active_lists().into_iter().map(|l| (Some(l.id), SharedString::from(l.name), IconName::List)))
+            .filter(|(to, _, _)| owner != Some(*to))
+            .map(|(to, name, icon)| {
+                ListItem::new(SharedString::from(format!("section-move-{to:?}")))
+                    .start_slot(Icon::new(icon).color(Color::Muted))
+                    .child(Label::new(name))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.column_menu = None;
+                        let result = this.store.move_list_section(section, to);
+                        this.check(result);
+                        this.reload(cx);
+                    }))
+            })
+            .collect();
+        let view = cx.entity().downgrade();
+        let theme = cx.theme().clone();
+        let current_color = self.kanban_section_colors.get(&section).map(String::as_str);
+        popover(cx)
+            .min_w(px(220.))
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.column_menu = None;
+                cx.notify();
+            }))
+            .child(item("section-rename", IconName::Pencil, strings.rename_section).on_click(cx.listener(move |this, _, window, cx| {
+                this.start_kanban_section_rename(section, window, cx);
+            })))
+            .when(self.kanban_column_color, |el| {
+                let swatch = |id: SharedString, hex: Option<&'static str>, cx: &mut Context<Self>| {
+                    let active = current_color == hex;
+                    let fill = hex.and_then(|c| lists_panel::parse_color(Some(c)));
+                    div()
+                        .id(id)
+                        .size(px(18.))
+                        .rounded_full()
+                        .cursor_pointer()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .border_1()
+                        .border_color(if active { theme.colors().accent } else { theme.colors().border })
+                        .when_some(fill, |el, c| el.bg(c))
+                        .when(active, |el| {
+                            el.child(Icon::new(IconName::Check).size(IconSize::XSmall).color(if fill.is_some() { Color::IconOnAccent } else { Color::Accent }))
+                        })
+                        .on_click(cx.listener(move |this, _, _, cx| this.set_section_color(section, hex, cx)))
+                };
+                el.child(
+                    v_flex()
+                        .px_2()
+                        .py_1p5()
+                        .gap_1()
+                        .child(Label::new(strings.kanban_column_color).size(LabelSize::XSmall).color(Color::Muted))
+                        .child(
+                            h_flex()
+                                .gap_1p5()
+                                .child(swatch("section-color-default".into(), None, cx))
+                                .children(Self::KANBAN_COLUMN_COLORS.iter().map(|&hex| {
+                                    swatch(SharedString::from(format!("section-color-{hex}")), Some(hex), cx)
+                                })),
+                        ),
+                )
+            })
+            .child(item("section-left", IconName::BetweenVerticalStart, strings.add_section_left).on_click(cx.listener(move |this, _, window, cx| {
+                this.column_menu = None;
+                this.start_new_section(window, cx);
+                this.new_section_index = Some(index);
+            })))
+            .child(item("section-right", IconName::BetweenVerticalEnd, strings.add_section_right).on_click(cx.listener(move |this, _, window, cx| {
+                this.column_menu = None;
+                this.start_new_section(window, cx);
+                this.new_section_index = Some(index + 1);
+            })))
+            .child(
+                SubmenuItem::new("section-move", strings.move_to)
+                    .icon(IconName::Inbox)
+                    .height(px(34.))
+                    .open(side)
+                    .on_hover(move |hovered: &bool, _, cx: &mut App| {
+                        if *hovered && !side {
+                            view.update(cx, |this, cx| {
+                                this.column_menu = Some((section, true));
+                                cx.notify();
+                            })
+                            .ok();
+                        }
+                    })
+                    .items(lists),
+            )
+            .when(self.sections.len() > 1, |el| {
+                el.child(item("section-delete", IconName::Trash, strings.delete).on_click(cx.listener(move |this, _, _, cx| {
+                    this.column_menu = None;
+                    let result = this.store.delete_list_section(section);
+                    this.check(result);
+                    this.reload(cx);
+                })))
+            })
+            .into_any_element()
+    }
+
+    fn apply_column_value(&self, id: Id, target: DropTarget) -> anyhow::Result<()> {
+        let Some(task) = self.store.task(id)? else { return Ok(()) };
+        let store = &self.store;
+        if matches!(target, DropTarget::Priority(_)) && task.kind == Kind::Note {
+            return Ok(());
+        }
+        match target {
+            DropTarget::Section(section) => store.set_section(id, section),
+            DropTarget::Kind(kind) => store.set_kind(id, kind),
+            DropTarget::Complete => store.set_completed(id, true),
+            DropTarget::Due(date) => store.set_due(id, date, date.and(task.due_time)),
+            DropTarget::Priority(priority) => store.set_priority(id, priority),
+            DropTarget::Tag(Some(tag)) => {
+                let mut tags: Vec<String> = task.tags.iter().skip(1).filter(|t| **t != tag).cloned().collect();
+                tags.insert(0, tag);
+                store.set_tags(id, &tags)
+            }
+            DropTarget::Tag(None) => store.set_tags(id, &[]),
+            DropTarget::List(list) => store.set_list(id, list),
+        }
+    }
+
+    fn apply_column_drop(&self, id: Id, target: DropTarget, unparent: bool) -> anyhow::Result<()> {
+        let Some(task) = self.store.task(id)? else { return Ok(()) };
+        if matches!(target, DropTarget::Priority(_)) && task.kind == Kind::Note {
+            return Ok(());
+        }
+        if unparent && task.parent_id.is_some() {
+            self.store.set_parent(id, None)?;
+        }
+        if task.is_completed() && target != DropTarget::Complete {
+            self.store.set_completed(id, false)?;
+        }
+        self.apply_column_value(id, target)
+    }
+
+    /// A card dropped on a kanban column takes the column's value: its section, kind, date,
+    /// priority or tag, or completion. Leaving the Completed subsection reopens the task.
+    fn drop_on_column(&mut self, id: Id, target: DropTarget, cx: &mut Context<Self>) {
+        let result = self.apply_column_drop(id, target, true);
+        self.check(result);
+        self.reload(cx);
+    }
+
+    /// Drops a card onto an in-column subsection header (`Pinned`, `Others`, or `Completed`).
+    fn drop_on_kanban_subsection(&mut self, id: Id, column_drop: Option<DropTarget>, sub: KanbanSub, cx: &mut Context<Self>) {
+        let result = (|| -> anyhow::Result<()> {
+            let Some(task) = self.store.task(id)? else { return Ok(()) };
+            if task.parent_id.is_some() {
+                self.store.set_parent(id, None)?;
+            }
+            if let Some(col_target) = column_drop {
+                self.apply_column_value(id, col_target)?;
+            }
+            match sub {
+                KanbanSub::Pinned => {
+                    if task.is_completed() {
+                        self.store.set_completed(id, false)?;
+                    }
+                    if task.pinned_at.is_none() {
+                        self.store.set_pinned(id, true)?;
+                    }
+                }
+                KanbanSub::Unpinned => {
+                    if task.is_completed() {
+                        self.store.set_completed(id, false)?;
+                    }
+                    if task.pinned_at.is_some() {
+                        self.store.set_pinned(id, false)?;
+                    }
+                }
+                KanbanSub::Completed => {
+                    if !task.is_completed() {
+                        self.store.set_completed(id, true)?;
+                    }
+                }
+            }
+            Ok(())
+        })();
+        self.check(result);
+        self.reload(cx);
+    }
+
+    /// Drops a dragged card onto another card: either right before it (reordering within or across
+    /// columns and subsections) or nested inside it as a subtask.
+    fn drop_on_kanban_card(&mut self, dragged: Id, target: Id, column_drop: Option<DropTarget>, nest: bool, cx: &mut Context<Self>) {
+        if dragged == target {
+            return;
+        }
+        let result = (|| -> anyhow::Result<()> {
+            let (Some(dragged_task), Some(target_task)) = (self.store.task(dragged)?, self.store.task(target)?) else {
+                return Ok(());
+            };
+            if nest {
+                self.store.link_parent(dragged, target)?;
+            } else {
+                if dragged_task.parent_id.is_some() {
+                    self.store.set_parent(dragged, None)?;
+                }
+                if let Some(col_target) = column_drop {
+                    self.apply_column_value(dragged, col_target)?;
+                }
+                if target_task.is_completed() {
+                    if !dragged_task.is_completed() {
+                        self.store.set_completed(dragged, true)?;
+                    }
+                } else {
+                    if dragged_task.is_completed() {
+                        self.store.set_completed(dragged, false)?;
+                    }
+                    if target_task.pinned_at.is_some() != dragged_task.pinned_at.is_some() {
+                        self.store.set_pinned(dragged, target_task.pinned_at.is_some())?;
+                    }
+                }
+                self.store.move_task(dragged, target, false)?;
+            }
+            Ok(())
+        })();
+        if self.check(result).is_some() && nest {
+            self.collapsed_tasks.remove(&target);
+        }
+        self.reload(cx);
+    }
+
+    /// A per-list switch of the header's "…" menu ("Show Completed", "Show Details").
+    fn view_flag(&self, name: &str, default: bool) -> bool {
+        let key = format!("{name}:{}", self.view_key());
+        self.store.setting(&key).ok().flatten().map_or(default, |v| v == "1")
+    }
+
+    fn toggle_view_flag(&mut self, name: &str, default: bool, cx: &mut Context<Self>) {
+        let key = format!("{name}:{}", self.view_key());
+        let value = !self.view_flag(name, default);
+        let result = self.store.set_setting(&key, if value { "1" } else { "0" });
+        self.check(result);
+        self.show_details = self.view_flag("show_details", false);
+        self.kanban = self.view_flag("kanban", false);
+        self.timeline = self.view_flag("timeline", false);
+        self.header_menu_open = false;
+        if name == "show_completed" && self.view == View::Today {
+            if value {
+                self.collapsed_sections.remove(&Section::Completed);
+            }
+            self.reload(cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    /// The header menu's View: list, kanban or timeline, one at a time.
+    fn set_layout(&mut self, kanban: bool, timeline: bool, cx: &mut Context<Self>) {
+        let was_board = self.uses_board_layout();
+        self.completing.clear();
+        self.close_card(cx);
+        let key = self.view_key();
+        for (name, on) in [("kanban", kanban), ("timeline", timeline)] {
+            let result = self.store.set_setting(&format!("{name}:{key}"), if on { "1" } else { "0" });
+            self.check(result);
+        }
+        self.kanban = kanban;
+        self.timeline = timeline;
+        self.timeline_from = Self::today();
+        self.header_menu_open = false;
+        if kanban && !timeline {
+            let strings = i18n::t(cx);
+            self.ensure_kanban_sections(strings);
+        }
+        if was_board != self.uses_board_layout() {
+            self.sync_layout_selection(cx);
+        }
+        cx.notify();
+    }
+
+    /// The Timeline's scale button, "Day ▾", and its menu: Day, Week, Month.
+    fn render_scale_button(&self, strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let labels = [strings.day, strings.week, strings.month];
+        div()
+            .relative()
+            .ml_2()
+            .child(
+                h_flex()
+                    .id("timeline-scale")
+                    .px_2()
+                    .h(px(22.))
+                    .gap_1()
+                    .rounded(px(11.))
+                    .border_1()
+                    .border_color(theme.colors().border)
+                    .cursor_pointer()
+                    .child(Label::new(labels[self.timeline_scale]).size(LabelSize::Small))
+                    .child(Icon::new(IconName::ChevronDown).size(IconSize::XSmall).color(Color::Muted))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.scale_menu_open = !this.scale_menu_open;
+                        cx.notify();
+                    })),
+            )
+            .when(self.scale_menu_open, |el| {
+                el.child(PopoverAttachment::new(
+                    Placement::BelowRight,
+                    popover(cx)
+                        .min_w(px(150.))
+                        .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                            this.scale_menu_open = false;
+                            cx.notify();
+                        }))
+                        .children(labels.into_iter().enumerate().map(|(i, label)| {
+                            let selected = i == self.timeline_scale;
+                            ListItem::new(SharedString::from(format!("timeline-scale-{i}")))
+                                .child(Label::new(label).color(if selected { Color::Accent } else { Color::Default }))
+                                .when(selected, |item| item.end_slot(Icon::new(IconName::Check).size(IconSize::Small).color(Color::Accent)))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.timeline_scale = i;
+                                    this.scale_menu_open = false;
+                                    let result = this.store.set_setting(&format!("timeline_scale:{}", this.view_key()), &i.to_string());
+                                    this.check(result);
+                                    cx.notify();
+                                }))
+                        }))
+                        .into_any_element(),
+                ))
+            })
+            .into_any_element()
+    }
+
+    /// The original's Timeline: the groups as rows, the coming days as columns (weekends shaded),
+    /// and each dated task as a bar from its date to the end of its duration; a click opens it.
+    fn render_timeline(&self, strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {
+        // The original's scales: Day shows ten days, Week three weeks, Month six; the arrows move
+        // by a week, two weeks or a month.
+        let scale = self.timeline_scale;
+        let days_shown = [10usize, 22, 45][scale];
+        let step = [7i64, 14, 30][scale];
+        const LABEL_WIDTH: f32 = 108.;
+        let theme = cx.theme().clone();
+        let today = Self::today();
+        let from = self.timeline_from;
+        let today_line = theme.status().error;
+        let days: Vec<NaiveDate> = (0..days_shown as i64).map(|i| from + chrono::Duration::days(i)).collect();
+        let groups = task_rows::kanban_columns(self.rows_with(strings, &HashSet::new(), &HashSet::new()), strings);
+        let scale_button = self.render_scale_button(strings, cx);
+        let weekend = |date: &NaiveDate| matches!(date.weekday(), chrono::Weekday::Sat | chrono::Weekday::Sun);
+        let shift = |delta: i64| {
+            cx.listener(move |this: &mut Self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>| {
+                this.timeline_from += chrono::Duration::days(delta);
+                cx.notify();
+            })
+        };
+        // The day columns behind each row, so that weekends stay shaded all the way down; a bar
+        // dropped on one moves its task there, keeping its duration.
+        let accent = theme.colors().accent;
+        let backdrop = |row: usize, height: Pixels, cx: &mut Context<Self>| {
+            h_flex().absolute().top_0().left_0().w_full().h(height).children(days.iter().map(|&date| {
+                div()
+                    .id(SharedString::from(format!("timeline-day-{row}-{date}")))
+                    .flex_1()
+                    .h_full()
+                    .when(weekend(&date), |el| el.bg(theme.colors().element_hover.opacity(0.5)))
+                    // Week and Month mark today with a red line, as the original does.
+                    .when(scale > 0 && date == today, |el| el.border_l_2().border_color(today_line))
+                    .drag_over::<DraggedTask>(move |style, _, _, _| style.bg(accent.opacity(0.15)))
+                    .on_drop(cx.listener(move |this, dragged: &DraggedTask, _, cx| {
+                        let result = this.store.move_dates(dragged.id, date);
+                        this.check(result);
+                        this.reload(cx);
+                    }))
+            }))
+        };
+        let header = v_flex()
+            .flex_none()
+            .child(
+                h_flex()
+                    .h(px(30.))
+                    .px_3()
+                    .child(div().w(px(LABEL_WIDTH - 12.)).flex_none().child(Label::new(strings.months_short[from.month0() as usize]).size(LabelSize::Small).color(Color::Muted)))
+                    // A month's name above its first day, for the scales that cross months.
+                    .child(h_flex().flex_1().mr(px(8.)).children(days.iter().map(|date| {
+                        div().flex_1().when(scale > 0 && date.day() == 1 && *date != from, |el| {
+                            el.child(Label::new(strings.months_short[date.month0() as usize]).size(LabelSize::Small).color(Color::Muted))
+                        })
+                    })))
+                    .child(
+                        div()
+                            .id("timeline-today")
+                            .px_2()
+                            .h(px(22.))
+                            .flex()
+                            .items_center()
+                            .rounded(px(11.))
+                            .border_1()
+                            .border_color(theme.colors().border)
+                            .cursor_pointer()
+                            .child(Label::new(strings.today).size(LabelSize::Small))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.timeline_from = Self::today();
+                                cx.notify();
+                            })),
+                    )
+                    .child(scale_button),
+            )
+            .child(
+                h_flex()
+                    .h(px(34.))
+                    .border_b_1()
+                    .border_color(theme.colors().border_variant)
+                    .child(
+                        h_flex()
+                            .w(px(LABEL_WIDTH))
+                            .flex_none()
+                            .px_1()
+                            .child(IconButton::new("timeline-prev", IconName::ChevronLeft).size(px(20.)).icon_size(IconSize::XSmall).on_click(shift(-step))),
+                    )
+                    .child(h_flex().flex_1().children(days.iter().map(|date| {
+                        let is_today = *date == today;
+                        // Month shows every seventh day's number, so that they fit.
+                        let labelled = scale < 2 || (date.day() - 1) % 7 == 0;
+                        // As in the original: the numbers centered over their days, semibold, and
+                        // the weekend's muted.
+                        let color = match (is_today, scale) {
+                            (true, 0) => Color::Accent,
+                            (true, _) => Color::Custom(today_line),
+                            _ if weekend(date) => Color::Muted,
+                            _ => Color::Default,
+                        };
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .when(weekend(date), |el| el.bg(theme.colors().element_hover.opacity(0.5)))
+                            .when(labelled || is_today, |el| el.child(Label::new(date.day().to_string()).centered().weight(FontWeight::SEMIBOLD).color(color)))
+                    })))
+                    .child(IconButton::new("timeline-next", IconName::ChevronRight).size(px(20.)).icon_size(IconSize::XSmall).on_click(shift(step))),
+            );
+        let rows = groups.into_iter().enumerate().map(|(i, (label, _, cards))| {
+            let bars: Vec<(Task, usize, usize)> = cards
+                .into_iter()
+                .flat_map(|(task, subtasks)| std::iter::once(task).chain(subtasks))
+                .filter_map(|task| fern_core::timeline::bar(&task, from, days_shown).map(|(first, span)| (task, first, span)))
+                .collect();
+            // A group folds up with the arrow before its name, as in the original.
+            let folded = self.timeline_folded.contains(&label);
+            let bars = if folded { Vec::new() } else { bars };
+            let height = px(if folded { 40. } else { 20. + 40. * bars.len().max(1) as f32 });
+            let fold_label = label.clone();
+            h_flex()
+                .h(height)
+                .border_b_1()
+                .border_color(theme.colors().border_variant)
+                .child(
+                    h_flex()
+                        .id(SharedString::from(format!("timeline-group-{i}")))
+                        .w(px(LABEL_WIDTH))
+                        .flex_none()
+                        .h_full()
+                        .items_start()
+                        .gap_1()
+                        .pl_2()
+                        .pt(px(14.))
+                        .cursor_pointer()
+                        .child(Icon::new(if folded { IconName::ChevronRight } else { IconName::ChevronDown }).size(IconSize::XSmall).color(Color::Muted))
+                        .child(Label::new(label).size(LabelSize::Small).weight(FontWeight::SEMIBOLD))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if !this.timeline_folded.remove(&fold_label) {
+                                this.timeline_folded.insert(fold_label.clone());
+                            }
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .h_full()
+                        .mr(px(20.))
+                        .relative()
+                        .child(backdrop(i, height, cx))
+                        .children(bars.into_iter().enumerate().map(|(n, (task, first, span))| {
+                            let id = task.id;
+                            let tint = task_rows::priority_color(task.priority, &theme).unwrap_or(theme.colors().accent);
+                            let dragged = DraggedTask { id, title: task.title.clone().into() };
+                            div()
+                                .id(SharedString::from(format!("timeline-{i}-{id}")))
+                                .on_drag(dragged, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
+                                .absolute()
+                                .top(px(8. + 40. * n as f32))
+                                .left(gpui::relative(first as f32 / days_shown as f32))
+                                .w(gpui::relative(span as f32 / days_shown as f32))
+                                .h(px(32.))
+                                .px_0p5()
+                                .child(
+                                    div()
+                                        .size_full()
+                                        .px_2()
+                                        .flex()
+                                        .items_center()
+                                        .rounded(px(8.))
+                                        .bg(tint.opacity(if task.is_completed() { 0.3 } else { 0.75 }))
+                                        .cursor_pointer()
+                                        .child(Label::new(task.title).truncate()),
+                                )
+                                .on_click(cx.listener(move |this, _, _, cx| this.select(id, cx)))
+                        })),
+                )
+        }).collect::<Vec<_>>();
+        // Under the groups the weekends stay shaded down to the bottom, as in the original.
+        let filler = h_flex()
+            .flex_1()
+            .min_h(px(200.))
+            .child(div().w(px(LABEL_WIDTH)).flex_none())
+            .child(div().flex_1().h_full().mr(px(20.)).relative().overflow_hidden().child(backdrop(usize::MAX, px(4000.), cx)));
+        let timeline = v_flex().id("timeline").flex_1().min_w_0().h_full().overflow_y_scroll().child(header).children(rows).child(filler);
+        h_flex()
+            .flex_1()
+            .min_h_0()
+            .items_start()
+            .child(timeline)
+            .when(self.arrange_open, |el| el.child(self.render_arrange(strings, cx)))
+            .into_any_element()
+    }
+
+    /// The original's "Arrange Tasks": the list's undated open tasks by group, as bars in their
+    /// first tag's color, to drag onto a day of the Timeline.
+    fn render_arrange(&self, strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let groups = task_rows::kanban_columns(self.rows_with(strings, &HashSet::new(), &HashSet::new()), strings);
+        let tag_color = |task: &Task| {
+            task.tags
+                .first()
+                .and_then(|name| self.tags.iter().find(|t| t.name.to_lowercase() == name.to_lowercase()))
+                .and_then(|t| lists_panel::parse_color(t.color.as_deref()))
+                .unwrap_or(theme.colors().accent)
+        };
+        let bar = |task: Task, depth: usize, cx: &mut Context<Self>| {
+            let id = task.id;
+            let color = tag_color(&task);
+            let dragged = DraggedTask { id, title: task.title.clone().into() };
+            h_flex()
+                .id(SharedString::from(format!("arrange-{id}")))
+                .ml(px(depth as f32 * 14.))
+                .h(px(22.))
+                .px_1p5()
+                .rounded(px(3.))
+                .bg(color.opacity(0.7))
+                .cursor_grab()
+                .on_drag(dragged, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
+                .gap_1()
+                .when(task.kind == Kind::Note, |el| el.child(Icon::new(IconName::FileText).size(IconSize::XSmall)))
+                .child(Label::new(task.title).size(LabelSize::XSmall).truncate())
+                .on_click(cx.listener(move |this, _, _, cx| this.select(id, cx)))
+                .into_any_element()
+        };
+        let mut items: Vec<AnyElement> = Vec::new();
+        for (label, _, cards) in groups {
+            let undated: Vec<(Task, Vec<Task>)> = cards
+                .into_iter()
+                .filter(|(task, _)| !task.is_closed())
+                .map(|(task, subtasks)| (task, subtasks.into_iter().filter(|t| t.due_date.is_none() && !t.is_closed()).collect::<Vec<_>>()))
+                .filter(|(task, subtasks)| task.due_date.is_none() || !subtasks.is_empty())
+                .collect();
+            let count: usize = undated.iter().map(|(t, s)| usize::from(t.due_date.is_none()) + s.len()).sum();
+            if count == 0 {
+                continue;
+            }
+            items.push(
+                h_flex()
+                    .pt_2()
+                    .pb_1()
+                    .gap_1()
+                    .child(Icon::new(IconName::ChevronDown).size(IconSize::XSmall).color(Color::Muted))
+                    .child(Label::new(label).size(LabelSize::Small).weight(FontWeight::SEMIBOLD))
+                    .child(Label::new(count.to_string()).size(LabelSize::XSmall).color(Color::Muted))
+                    .into_any_element(),
+            );
+            for (task, subtasks) in undated {
+                if task.due_date.is_none() {
+                    items.push(bar(task, 0, cx));
+                }
+                for subtask in subtasks {
+                    items.push(bar(subtask, 1, cx));
+                }
+            }
+        }
+        v_flex()
+            .id("arrange-tasks")
+            .w(px(220.))
+            .flex_none()
+            .h_full()
+            .px_2()
+            .pt_2()
+            .gap_1()
+            .border_l_1()
+            .border_color(theme.colors().border_variant)
+            .overflow_y_scroll()
+            .child(
+                h_flex()
+                    .child(div().flex_1().child(Label::new(strings.arrange_tasks).weight(FontWeight::SEMIBOLD)))
+                    .child(IconButton::new("arrange-close", IconName::X).size(px(22.)).icon_size(IconSize::Small).on_click(cx.listener(|this, _, _, cx| {
+                        this.arrange_open = false;
+                        cx.notify();
+                    }))),
+            )
+            .children(items)
+            .into_any_element()
+    }
+
+    fn sort_settings(&self) -> (SortBy, GroupBy) {
+        let key = self.view_key();
+        let get = |what: &str| self.store.setting(&format!("{what}:{key}")).ok().flatten().unwrap_or_default();
+        // A tag's view is grouped by list until chosen otherwise, as the original's.
+        let group = match get("group") {
+            key if key.is_empty() && matches!(self.view, View::Tag(_)) => GroupBy::List,
+            // The original's board of a smart list has a column per list.
+            key if key.is_empty() && self.kanban && self.view.shows_list_names() => GroupBy::List,
+            key => GroupBy::from_key(&key),
+        };
+        let group = if self.kanban && !self.timeline && group == GroupBy::None {
+            if self.view.shows_list_names() { GroupBy::List } else { GroupBy::Custom }
+        } else {
+            group
+        };
+        (SortBy::from_key(&get("sort")), group)
+    }
+
+    fn set_sort(&mut self, sort: Option<SortBy>, group: Option<GroupBy>, window: &mut Window, cx: &mut Context<Self>) {
+        let key = self.view_key();
+        let result = sort
+            .map(|s| self.store.set_setting(&format!("sort:{key}"), s.key()))
+            .into_iter()
+            .chain(group.map(|g| self.store.set_setting(&format!("group:{key}"), g.key())))
+            .collect::<anyhow::Result<Vec<()>>>();
+        self.check(result);
+        if group == Some(GroupBy::Custom) {
+            let strings = i18n::t(cx);
+            self.ensure_kanban_sections(strings);
+        }
+        self.close_sort_menu(window, cx);
+    }
+
+    fn open_sort_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.sort_menu.is_none() {
+            self.sort_menu_return_focus = window.focused(cx);
+            window.focus(&self.sort_menu_focus, cx);
+        }
+        self.sort_menu = Some(None);
+        cx.notify();
+    }
+
+    fn close_sort_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.sort_menu = None;
+        let previous = self.sort_menu_return_focus.take();
+        if self.sort_menu_focus.is_focused(window) {
+            if let Some(previous) = previous {
+                window.focus(&previous, cx);
+            } else {
+                window.blur(cx);
+            }
+        }
+        cx.notify();
+    }
+
+    pub fn dismiss_transient(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.cancel_panel_drag(window, cx) {
+            return true;
+        }
+        if self.sort_menu.is_some() {
+            self.close_sort_menu(window, cx);
+            return true;
+        }
+        if self.add_tags.take().is_some() {
+            if self.add_tag_input.focus_handle(cx).is_focused(window) {
+                window.focus(&self.input.focus_handle(cx), cx);
+            }
+            cx.notify();
+            return true;
+        }
+
+        // These menus don't move keyboard focus when opened from the list.
+        let dismissed_menu = [
+            self.context_menu.take().is_some(),
+            self.list_menu.take().is_some(),
+            self.closed_menu.take().is_some(),
+            self.column_menu.take().is_some(),
+            self.section_menu.take().is_some(),
+            self.view_options.take().is_some(),
+            self.filter_edit.take().is_some(),
+            self.list_dialog.take().is_some(),
+            self.folder_dialog.take().is_some(),
+            self.tag_dialog.take().is_some(),
+            self.merge_dialog.take().is_some(),
+            self.suggestions_open.take().is_some(),
+            std::mem::take(&mut self.header_menu_open),
+            std::mem::take(&mut self.postpone_menu),
+            std::mem::take(&mut self.scale_menu_open),
+            std::mem::take(&mut self.templates_open),
+            std::mem::take(&mut self.input_box_open),
+            std::mem::take(&mut self.add_menu_open),
+            self.add_date_month.take().is_some(),
+        ].into_iter().any(|was_open| was_open);
+        if dismissed_menu {
+            self.context_side = None;
+            self.add_list_side = false;
+            self.add_date_row = None;
+            self.add_range = None;
+            cx.notify();
+            return true;
+        }
+
+        if self.card.is_some() {
+            self.dismiss_card(window, cx);
+            return true;
+        }
+        self.detail.read(cx).has_popup()
+            && self.detail.update(cx, |detail, cx| detail.dismiss_popup(window, cx))
+    }
+
+    /// The original's sort menu: "Group by" and "Sort by", each opening its options in place.
+    fn render_sort_menu(&self, expanded: Option<SortMenu>, strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {
+        let (sort, group) = self.sort_settings();
+        let descending = self.view_flag("descending", false);
+        let row = |id: &'static str, icon: IconName, label: &'static str, value: &'static str, which: SortMenu| {
+            ListItem::new(id)
+                .start_slot(Icon::new(icon).color(Color::Muted))
+                .child(
+                    h_flex()
+                        .w_full()
+                        .gap_2()
+                        .child(div().flex_1().child(Label::new(label)))
+                        .child(Label::new(value).color(Color::Muted))
+                        .child(
+                            Icon::new(if expanded == Some(which) { IconName::ChevronDown } else { IconName::ChevronRight })
+                                .size(IconSize::XSmall)
+                                .color(Color::Muted),
+                        ),
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.sort_menu = Some(if expanded == Some(which) { None } else { Some(which) });
+                    cx.notify();
+                }))
+        };
+        let option = |id: String, label: &'static str, selected: bool| {
+            ListItem::new(SharedString::from(id))
+                .child(div().pl_6().child(Label::new(label).color(if selected { Color::Accent } else { Color::Default })))
+                .when(selected, |item| item.end_slot(Label::new("✓").color(Color::Accent)))
+        };
+        popover(cx)
+            .min_w(px(250.))
+            .track_focus(&self.sort_menu_focus)
+            .on_mouse_down_out(cx.listener(|this, _, window, cx| this.close_sort_menu(window, cx)))
+            .child(row("group-by", IconName::Rows3, strings.group_by, group.label(strings), SortMenu::Group))
+            .when(expanded == Some(SortMenu::Group), |el| {
+                let kanban_board = self.kanban && !self.timeline;
+                el.children(
+                    GroupBy::ALL
+                        .into_iter()
+                        .filter(|g| !(kanban_board && *g == GroupBy::None))
+                        .map(|g| {
+                            option(format!("group-{}", g.key()), g.label(strings), g == group)
+                                .on_click(cx.listener(move |this, _, window, cx| this.set_sort(None, Some(g), window, cx)))
+                        }),
+                )
+            })
+            .child(row("sort-by", IconName::ArrowDownUp, strings.sort_by, sort.label(strings), SortMenu::Sort))
+            .when(expanded == Some(SortMenu::Sort), |el| {
+                el.children(SortBy::ALL.into_iter().map(|s| {
+                    option(format!("sort-{}", s.key()), s.label(strings), s == sort)
+                        .on_click(cx.listener(move |this, _, window, cx| this.set_sort(Some(s), None, window, cx)))
+                }))
+            })
+            // The original's Order: Ascending or Descending, kept per list; with the manual
+            // (Custom) sort, as there, no Order.
+            .when(sort != SortBy::Custom, |el| el.child(row("order-by", IconName::ArrowDownUp, strings.order, strings.order_directions[descending as usize], SortMenu::Order)))
+            .when(sort != SortBy::Custom && expanded == Some(SortMenu::Order), |el| {
+                el.children([false, true].map(|value| {
+                    option(format!("order-{value}"), strings.order_directions[value as usize], value == descending).on_click(cx.listener(move |this, _, window, cx| {
+                        if this.view_flag("descending", false) != value {
+                            this.toggle_view_flag("descending", false, cx);
+                        }
+                        this.close_sort_menu(window, cx);
+                    }))
+                }))
+            })
+            .into_any_element()
+    }
+
+    fn active_task_id(&self) -> Option<Id> {
+        self.selected.or(self.card)
+    }
+
+    fn select_in_current_layout(&mut self, id: Id, cx: &mut Context<Self>) {
+        if self.kanban && !self.timeline && self.selected.is_none() {
+            self.open_card(id, cx);
+        } else {
+            self.select(id, cx);
+        }
+    }
+
+    fn move_selection(&mut self, step: isize, cx: &mut Context<Self>) {
+        let ids = self.visible_task_ids(i18n::t(cx));
+        if ids.is_empty() {
+            return;
+        }
+        let next = match self.active_task_id().and_then(|id| ids.iter().position(|i| *i == id)) {
+            Some(index) => (index as isize + step).clamp(0, ids.len() as isize - 1) as usize,
+            None if step > 0 => 0,
+            None => ids.len() - 1,
+        };
+        let id = ids[next];
+        self.select_in_current_layout(id, cx);
+        if let Some(ix) = self.list_entries.iter().position(|e| matches!(e, ListEntry::Row(Row::Task { task, .. }) if task.id == id)) {
+            self.list_state.scroll_to_reveal_item(ix);
+        }
+    }
+
+    fn select_next(&mut self, _: &SelectNext, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_selection(1, cx);
+    }
+
+    fn select_previous(&mut self, _: &SelectPrevious, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_selection(-1, cx);
+    }
+
+    fn toggle_selected(&mut self, _: &ToggleComplete, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(id) = self.active_task_id() {
+            if self.completing.contains_key(&id) {
+                self.toggle(id, false, cx);
+            } else if let Some(task) = self.tasks.iter().find(|task| task.id == id) {
+                self.toggle(id, !task.is_completed(), cx);
+            }
+        }
+    }
+
+    /// Applies a change to the selected task, for the task edit shortcuts.
+    fn edit_selected(&mut self, cx: &mut Context<Self>, change: impl FnOnce(&Store, &Task) -> anyhow::Result<()>) {
+        let Some(task) = self.active_task_id().and_then(|id| self.tasks.iter().find(|t| t.id == id)).cloned() else { return };
+        let result = change(&self.store, &task);
+        self.check(result);
+        self.reload(cx);
+        self.select_in_current_layout(task.id, cx);
+    }
+
+    fn pin_selected(&mut self, _: &PinTask, _: &mut Window, cx: &mut Context<Self>) {
+        self.edit_selected(cx, |store, task| store.set_pinned(task.id, task.pinned_at.is_none()));
+    }
+
+    fn date_selected(&mut self, _: &SetDate, _: &mut Window, cx: &mut Context<Self>) {
+        if self.selected.is_some() {
+            self.detail.update(cx, |detail, cx| detail.open_due(cx));
+        } else if self.card.is_some() {
+            self.card_detail.update(cx, |detail, cx| detail.open_due(cx));
+        }
+    }
+
+    fn set_selected_due(&mut self, days: Option<i64>, cx: &mut Context<Self>) {
+        let today = Self::today();
+        self.edit_selected(cx, move |store, task| {
+            let date = days.map(|d| today + Duration::days(d));
+            store.set_due(task.id, date, date.and(task.due_time))
+        });
+    }
+
+    fn set_selected_priority(&mut self, priority: Priority, cx: &mut Context<Self>) {
+        self.edit_selected(cx, move |store, task| store.set_priority(task.id, priority));
+    }
+
+    fn delete_selected(&mut self, _: &DeleteTask, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.active_task_id() else { return };
+        // Keep a selection so repeated presses keep working down the list.
+        let ids = self.visible_task_ids(i18n::t(cx));
+        let neighbor = ids
+            .iter()
+            .position(|i| *i == id)
+            .and_then(|index| ids.get(index + 1).or_else(|| index.checked_sub(1).and_then(|i| ids.get(i))))
+            .copied();
+        self.delete(id, cx);
+        if let Some(neighbor) = neighbor {
+            self.select_in_current_layout(neighbor, cx);
+        }
+    }
+
+    fn reset_view_transients(&mut self, cx: &mut Context<Self>) {
+        self.header_menu_open = false;
+        self.list_activity = None;
+        self.close_card(cx);
+        self.context_menu = None;
+        self.context_side = None;
+        self.closed_menu = None;
+        self.sort_menu = None;
+        self.sort_menu_return_focus = None;
+        self.scale_menu_open = false;
+        self.arrange_open = false;
+        self.suggestions_open = None;
+        self.section_menu = None;
+        self.postpone_menu = false;
+        self.column_menu = None;
+        self.column_add = None;
+        self.kanban_folded_sub.clear();
+        self.new_section = None;
+        self.new_section_index = None;
+        self.renaming_section = None;
+        self.completing.clear();
+    }
+
+    pub fn select_view(&mut self, view: View, window: &mut Window, cx: &mut Context<Self>) {
+        self.sync_viewport(window, cx);
+        let switching = self.view != view;
+        self.set_view(view, cx);
+        if switching && self.view != View::Summary {
+            window.focus(&self.list_focus, cx);
+        }
+    }
+
+    pub fn set_view(&mut self, view: View, cx: &mut Context<Self>) {
+        self.header_menu_open = false;
+        self.list_activity = None;
+        if self.view != view {
+            self.finish_title_edit(true, cx);
+            self.reset_view_transients(cx);
+            self.view = view;
+            self.reload_inner(true, false, cx);
+        }
+    }
+
+    /// Switches to `View::All` and selects `id` directly without loading the first row's details twice.
+    pub fn open_task_in_all(&mut self, id: Id, cx: &mut Context<Self>) {
+        self.header_menu_open = false;
+        self.list_activity = None;
+        if self.view != View::All {
+            self.finish_title_edit(true, cx);
+            self.reset_view_transients(cx);
+            self.view = View::All;
+            self.list_state = ListState::new(0, ListAlignment::Top, px(400.));
+            self.list_entries.clear();
+            self.selected = Some(id);
+            self.reload_inner(false, false, cx);
+        } else {
+            self.select(id, cx);
+        }
+    }
+
+    fn update_search_query(&mut self, query: String, cx: &mut Context<Self>) {
+        if !matches!(self.view, View::Search(_)) {
+            self.set_view(View::Search(query), cx);
+            return;
+        }
+        if self.view == View::Search(query.clone()) {
+            return;
+        }
+        self.finish_title_edit(true, cx);
+        self.view = View::Search(query);
+        if let Some(tasks) = self.check(self.store.tasks_in(&self.view, Self::today())) {
+            self.tasks = tasks;
+        }
+        self.list_state = ListState::new(0, ListAlignment::Top, px(400.));
+        self.list_entries.clear();
+        self.sync_layout_selection(cx);
+        cx.notify();
+    }
+
+    /// Switches the list to search results and focuses the search field.
+    #[cfg(debug_assertions)]
+    pub fn start_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let query = self.search_input.read(cx).text().to_owned();
+        self.set_view(View::Search(query), cx);
+        window.focus(&self.search_input.focus_handle(cx), cx);
+        cx.notify();
+    }
+
+    /// Shows the full results for `query` in the list (the popover's "View more").
+    pub fn show_search_results(&mut self, query: String, cx: &mut Context<Self>) {
+        self.search_input.update(cx, |input, cx| input.set_text(query.clone(), cx));
+        self.set_view(View::Search(query), cx);
+    }
+
+    /// Leaves search results for the Inbox.
+    pub fn stop_search(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.view, View::Search(_)) {
+            self.set_view(View::Inbox, cx);
+        }
+    }
+
+    fn start_new_list(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_lists = true;
+        self.open_list_dialog(None, None, window, cx);
+    }
+
+    /// Opens the original's Add List dialog (in a folder when given), or Edit List for `list`.
+    fn open_list_dialog(&mut self, list: Option<Id>, folder: Option<Id>, window: &mut Window, cx: &mut Context<Self>) {
+        self.list_menu = None;
+        self.header_menu_open = false;
+        let dialog = cx.new(|cx| ListDialog::new(self.store.clone(), list, folder, window, cx));
+        cx.subscribe_in(&dialog, window, |this, _, event: &DialogEvent, window, cx| {
+            this.list_dialog = None;
+            window.focus(&this.list_focus, cx);
+            if let DialogEvent::Saved(id) = event
+                && this.view != View::List(*id)
+            {
+                crate::data_version::data_changed(cx.entity_id(), cx);
+                this.set_view(View::List(*id), cx);
+                return;
+            }
+            let was_board = this.uses_board_layout();
+            this.reload(cx);
+            if was_board != this.uses_board_layout() {
+                this.sync_layout_selection(cx);
+            }
+        })
+        .detach();
+        self.list_dialog = Some(dialog);
+        cx.notify();
+    }
+
+    /// The New Folder dialog, or Edit Folder for `folder`.
+    fn open_folder_dialog(&mut self, folder: Option<Id>, window: &mut Window, cx: &mut Context<Self>) {
+        self.list_menu = None;
+        let dialog = cx.new(|cx| FolderDialog::new(self.store.clone(), folder, window, cx));
+        cx.subscribe_in(&dialog, window, |this, _, _: &DialogEvent, window, cx| {
+            this.folder_dialog = None;
+            window.focus(&this.list_focus, cx);
+            this.reload(cx);
+        })
+        .detach();
+        self.folder_dialog = Some(dialog);
+        cx.notify();
+    }
+
+    /// The lists not archived, for choosing a list.
+    fn active_lists(&self) -> Vec<List> {
+        self.lists.iter().filter(|l| !l.archived).cloned().collect()
+    }
+
+    /// The original's Add Tags (under `parent` for Add Sub-tag), or Edit Tag for `tag`.
+    fn open_tag_dialog(&mut self, tag: Option<String>, parent: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        self.list_menu = None;
+        let editing = tag.clone();
+        let dialog = cx.new(|cx| TagDialog::new(self.store.clone(), tag, parent, window, cx));
+        cx.subscribe_in(&dialog, window, move |this, _, event: &TagEvent, window, cx| {
+            if let TagEvent::Saved(name) = event
+                && editing.as_ref().is_some_and(|old| this.view == View::Tag(old.clone()))
+            {
+                this.view = View::Tag(name.clone());
+            }
+            this.tag_dialog = None;
+            window.focus(&this.list_focus, cx);
+            this.reload(cx);
+        })
+        .detach();
+        self.tag_dialog = Some(dialog);
+        cx.notify();
+    }
+
+    fn open_merge_dialog(&mut self, tag: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.list_menu = None;
+        let from = tag.clone();
+        let dialog = cx.new(|_| MergeDialog::new(self.store.clone(), tag));
+        cx.subscribe_in(&dialog, window, move |this, _, event: &TagEvent, window, cx| {
+            if let TagEvent::Saved(into) = event
+                && this.view == View::Tag(from.clone())
+            {
+                this.view = View::Tag(into.clone());
+            }
+            this.merge_dialog = None;
+            window.focus(&this.list_focus, cx);
+            this.reload(cx);
+        })
+        .detach();
+        self.merge_dialog = Some(dialog);
+        cx.notify();
+    }
+
+    fn schedule_drag_expand(&mut self, target: DragExpandTarget, cx: &mut Context<Self>) {
+        if self.drag_expand.as_ref().is_some_and(|(cur, _)| *cur == target) {
+            return;
+        }
+        let scheduled = target.clone();
+        let task = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(std::time::Duration::from_millis(900)).await;
+            let _ = this.update(cx, |this, cx| {
+                if !cx.has_active_drag() {
+                    this.drag_expand = None;
+                    return;
+                }
+                if !this.drag_expand.as_ref().is_some_and(|(cur, _)| *cur == scheduled) {
+                    return;
+                }
+                this.drag_expand = None;
+                match scheduled {
+                    DragExpandTarget::Folder(id) => {
+                        if this.collapsed_folders.remove(&id) {
+                            if let Some(drag) = this.panel_drag.as_mut()
+                                && let lists_panel::ActiveDragItem::List(dragged_id) = drag.item
+                            {
+                                drag.highlight = None;
+                                move_list_into_folder_start(&mut this.lists, &this.folders, dragged_id, id);
+                            }
+                            cx.notify();
+                        }
+                    }
+                    DragExpandTarget::Tag(tag) => {
+                        if this.collapsed_tags.remove(&tag) {
+                            if let Some(drag) = this.panel_drag.as_mut()
+                                && let lists_panel::ActiveDragItem::Tag(dragged_name) = drag.item.clone()
+                            {
+                                drag.highlight = None;
+                                move_tag_into_parent_start(&mut this.tags, &dragged_name, &tag);
+                            }
+                            cx.notify();
+                        }
+                    }
+                }
+            });
+        });
+        self.drag_expand = Some((target, task));
+    }
+
+    fn persist_collapsed_sidebar_sets(&mut self) {
+        let folders: Vec<String> = self.collapsed_folders.iter().map(Id::to_string).collect();
+        let res = self.store.set_setting("collapsed_folders", &folders.join(","));
+        self.check(res);
+        let tags: Vec<&str> = self.collapsed_tags.iter().map(String::as_str).collect();
+        let res = self.store.set_setting("collapsed_tags", &tags.join("\n"));
+        self.check(res);
+    }
+
+    fn panel_event(&mut self, event: lists_panel::PanelEvent, window: &mut Window, cx: &mut Context<Self>) {
+        use lists_panel::PanelEvent;
+        match event {
+            PanelEvent::ToggleFolder(id) => {
+                if !self.collapsed_folders.remove(&id) {
+                    self.collapsed_folders.insert(id);
+                }
+                let value: Vec<String> = self.collapsed_folders.iter().map(Id::to_string).collect();
+                let result = self.store.set_setting("collapsed_folders", &value.join(","));
+                self.check(result);
+            }
+            PanelEvent::ToggleArchived => self.archived_open = !self.archived_open,
+            PanelEvent::AddTag => return self.open_tag_dialog(None, None, window, cx),
+            PanelEvent::TagsMenu(at) => self.list_menu = Some((ListMenuTarget::TagsHeading, at)),
+            PanelEvent::SmartMenu(list, at) => self.list_menu = Some((ListMenuTarget::Smart(list), at)),
+            PanelEvent::ToggleTags => {
+                self.tags_collapsed = !self.tags_collapsed;
+                let result = self.store.set_setting("tags_collapsed", if self.tags_collapsed { "1" } else { "0" });
+                self.check(result);
+            }
+            PanelEvent::ToggleTag(tag) => {
+                if !self.collapsed_tags.remove(&tag) {
+                    self.collapsed_tags.insert(tag);
+                }
+                let value: Vec<&str> = self.collapsed_tags.iter().map(String::as_str).collect();
+                let result = self.store.set_setting("collapsed_tags", &value.join("\n"));
+                self.check(result);
+            }
+            PanelEvent::TagMenu(tag, at) => self.list_menu = Some((ListMenuTarget::Tag(tag), at)),
+            PanelEvent::ListMenu(id, at) => self.list_menu = Some((ListMenuTarget::List(id), at)),
+            PanelEvent::FolderMenu(id, at) => self.list_menu = Some((ListMenuTarget::Folder(id), at)),
+            PanelEvent::StartDrag { item, grab_offset_y } => {
+                self.start_panel_drag(item, grab_offset_y, cx);
+                return;
+            }
+        }
+        self.reload(cx);
+    }
+
+    fn measure_non_dragged_block_spans(&self, item: &lists_panel::ActiveDragItem) -> Vec<f32> {
+        use lists_panel::{ActiveDragItem, PanelChild};
+        let rows = self.lists_rows.borrow();
+        let item_top = |ix: usize| self.lists_scroll.bounds_for_item(ix).map_or(0., |b| f32::from(b.top()));
+        let item_bot = |ix: usize| self.lists_scroll.bounds_for_item(ix).map_or(0., |b| f32::from(b.bottom()));
+
+        match item {
+            ActiveDragItem::SidebarSection(dragged_sec) => {
+                let headings: Vec<(usize, fern_core::SidebarSection)> = rows
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(ix, r)| match r {
+                        PanelChild::SectionHeading(sec) => Some((ix, *sec)),
+                        _ => None,
+                    })
+                    .collect();
+                let Some(&(last_h, _)) = headings.last() else { return Vec::new() };
+                let end_ix = rows
+                    .iter()
+                    .enumerate()
+                    .skip(last_h + 1)
+                    .find_map(|(ix, r)| {
+                        matches!(r, PanelChild::Separator | PanelChild::BottomSmart(_)).then_some(ix)
+                    })
+                    .unwrap_or(rows.len());
+                let mut spans = Vec::new();
+                for (m, &(start_ix, sec)) in headings.iter().enumerate() {
+                    if sec == *dragged_sec {
+                        continue;
+                    }
+                    let top_y = item_top(start_ix);
+                    let bot_y = if let Some(&(next_ix, _)) = headings.get(m + 1) {
+                        item_top(next_ix)
+                    } else {
+                        item_bot(end_ix.saturating_sub(1).max(start_ix))
+                    };
+                    spans.push((bot_y - top_y).max(36.));
+                }
+                spans
+            }
+            ActiveDragItem::Folder(dragged_fid) => {
+                let has_lists = self.lists.iter().any(|l| !l.archived && l.folder == Some(*dragged_fid));
+                if !has_lists {
+                    return Vec::new();
+                }
+                let blocks: Vec<(usize, bool)> = rows
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(ix, r)| match r {
+                        PanelChild::TopList(_) => Some((ix, false)),
+                        PanelChild::FolderHeader { id, empty: false, .. } => Some((ix, *id == *dragged_fid)),
+                        _ => None,
+                    })
+                    .collect();
+                let Some(&(last_start, _)) = blocks.last() else { return Vec::new() };
+                let end_ix = rows
+                    .iter()
+                    .enumerate()
+                    .skip(last_start + 1)
+                    .find_map(|(ix, r)| {
+                        (!matches!(r, PanelChild::SubList { .. })).then_some(ix)
+                    })
+                    .unwrap_or(rows.len());
+                let mut spans = Vec::new();
+                for (m, &(start_ix, is_dragged)) in blocks.iter().enumerate() {
+                    if is_dragged {
+                        continue;
+                    }
+                    let next_ix = blocks.get(m + 1).map_or(end_ix, |&(ix, _)| ix);
+                    let last_ix = next_ix.saturating_sub(1).max(start_ix);
+                    spans.push((item_bot(last_ix) - item_top(start_ix)).max(36.));
+                }
+                spans
+            }
+            ActiveDragItem::Tag(dragged_name) => {
+                let is_parent = self.tags.iter().any(|t| t.parent.as_deref() == Some(dragged_name.as_str()));
+                if !is_parent {
+                    return Vec::new();
+                }
+                let roots: Vec<(usize, bool)> = rows
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(ix, r)| match r {
+                        PanelChild::TopTag { name, .. } => Some((ix, name == dragged_name)),
+                        _ => None,
+                    })
+                    .collect();
+                let Some(&(last_start, _)) = roots.last() else { return Vec::new() };
+                let end_ix = rows
+                    .iter()
+                    .enumerate()
+                    .skip(last_start + 1)
+                    .find_map(|(ix, r)| (!matches!(r, PanelChild::SubTag { .. })).then_some(ix))
+                    .unwrap_or(rows.len());
+                let mut spans = Vec::new();
+                for (m, &(start_ix, is_dragged)) in roots.iter().enumerate() {
+                    if is_dragged {
+                        continue;
+                    }
+                    let next_ix = roots.get(m + 1).map_or(end_ix, |&(ix, _)| ix);
+                    let last_ix = next_ix.saturating_sub(1).max(start_ix);
+                    spans.push((item_bot(last_ix) - item_top(start_ix)).max(38.));
+                }
+                spans
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn start_panel_drag(&mut self, item: lists_panel::ActiveDragItem, grab_offset_y: f32, cx: &mut Context<Self>) {
+        self.drag_expand = None;
+        self.list_menu = None;
+        let block_spans = self.measure_non_dragged_block_spans(&item);
+        let orig_tag_pinned = match &item {
+            lists_panel::ActiveDragItem::Tag(name) => {
+                self.tags.iter().find(|t| t.name == *name).is_some_and(|t| t.pinned)
+            }
+            _ => false,
+        };
+        let orig_preferences = self.preferences.clone();
+        let orig_lists = self.lists.clone();
+        let orig_folders = self.folders.clone();
+        let orig_tags = self.tags.clone();
+        let orig_filters = self.filters.clone();
+        let orig_collapsed_folders = self.collapsed_folders.clone();
+        let orig_collapsed_tags = self.collapsed_tags.clone();
+
+        normalize_lists_in_memory(&mut self.lists, &self.folders);
+        normalize_tags_in_memory(&mut self.tags);
+
+        self.panel_drag = Some(PanelDragState {
+            item,
+            grab_offset_y,
+            highlight: None,
+            block_spans,
+            orig_tag_pinned,
+            orig_preferences,
+            orig_lists,
+            orig_folders,
+            orig_tags,
+            orig_filters,
+            orig_collapsed_folders,
+            orig_collapsed_tags,
+        });
+        cx.notify();
+    }
+
+    fn restore_panel_drag_snapshot(&mut self) -> bool {
+        self.drag_expand = None;
+        let Some(drag) = self.panel_drag.take() else { return false };
+        self.preferences = drag.orig_preferences;
+        self.lists = drag.orig_lists;
+        self.folders = drag.orig_folders;
+        self.tags = drag.orig_tags;
+        self.filters = drag.orig_filters;
+        self.collapsed_folders = drag.orig_collapsed_folders;
+        self.collapsed_tags = drag.orig_collapsed_tags;
+        true
+    }
+
+    fn cancel_panel_drag(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.restore_panel_drag_snapshot() {
+            cx.stop_active_drag(window);
+            cx.notify();
+            return true;
+        }
+        false
+    }
+
+    fn finish_panel_drag_up(
+        &mut self,
+        event: &gpui::MouseUpEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if event.button == MouseButton::Left {
+            self.finish_panel_drag(window, cx);
+        }
+    }
+
+    fn finish_panel_drag(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use lists_panel::{ActiveDragItem, HighlightTarget};
+        self.drag_expand = None;
+        let Some(drag) = self.panel_drag.take() else { return };
+        cx.stop_active_drag(window);
+
+        let collapsed_changed = self.collapsed_folders != drag.orig_collapsed_folders
+            || self.collapsed_tags != drag.orig_collapsed_tags;
+        if collapsed_changed {
+            self.persist_collapsed_sidebar_sets();
+        }
+
+        let mut persisted = collapsed_changed;
+        match drag.item {
+            ActiveDragItem::SmartList(_) => {
+                if self.preferences.smart_list_order != drag.orig_preferences.smart_list_order {
+                    let order = self.preferences.smart_list_order.clone();
+                    self.save_preferences(|p| p.smart_list_order = order, cx);
+                    return;
+                }
+            }
+            ActiveDragItem::SidebarSection(_) => {
+                if self.preferences.sidebar_section_order != drag.orig_preferences.sidebar_section_order {
+                    let order = self.preferences.sidebar_section_order.clone();
+                    self.save_preferences(|p| p.sidebar_section_order = order, cx);
+                    return;
+                }
+            }
+            ActiveDragItem::Filter(_) => {
+                let order: Vec<Id> = self.filters.iter().map(|(f, _)| f.id).collect();
+                let orig_order: Vec<Id> = drag.orig_filters.iter().map(|(f, _)| f.id).collect();
+                if order != orig_order {
+                    let result = self.store.set_filter_order(&order);
+                    self.check(result);
+                    persisted = true;
+                }
+            }
+            ActiveDragItem::Folder(_) => {
+                if self.lists != drag.orig_lists || self.folders != drag.orig_folders {
+                    let result = self.store.save_list_and_folder_order(&self.lists, &self.folders);
+                    self.check(result);
+                    persisted = true;
+                }
+            }
+            ActiveDragItem::List(dragged_id) => match drag.highlight {
+                Some(HighlightTarget::List(target_id)) if target_id != dragged_id => {
+                    let name = i18n::t(cx).new_folder;
+                    let result = self.store.group_lists_into_folder(dragged_id, target_id, name);
+                    if let Some(folder) = self.check(result) {
+                        self.reload(cx);
+                        self.open_folder_dialog(Some(folder.id), window, cx);
+                        return;
+                    }
+                    persisted = true;
+                }
+                Some(HighlightTarget::Folder(folder_id)) => {
+                    move_list_into_folder_end(&mut self.lists, &self.folders, dragged_id, folder_id);
+                    if self.lists != drag.orig_lists || self.folders != drag.orig_folders {
+                        let result = self.store.save_list_and_folder_order(&self.lists, &self.folders);
+                        self.check(result);
+                        persisted = true;
+                    }
+                }
+                _ => {
+                    if self.lists != drag.orig_lists || self.folders != drag.orig_folders {
+                        let result = self.store.save_list_and_folder_order(&self.lists, &self.folders);
+                        self.check(result);
+                        persisted = true;
+                    }
+                }
+            },
+            ActiveDragItem::Tag(dragged_name) => {
+                if let Some(HighlightTarget::Tag(target_name)) = drag.highlight
+                    && target_name != dragged_name
+                {
+                    move_tag_into_parent_end(&mut self.tags, &dragged_name, &target_name);
+                    if self.collapsed_tags.remove(&target_name) {
+                        self.persist_collapsed_sidebar_sets();
+                        persisted = true;
+                    }
+                }
+                if self.tags != drag.orig_tags {
+                    let result = self.store.save_tag_hierarchy_and_order(&self.tags);
+                    self.check(result);
+                    persisted = true;
+                }
+            }
+        }
+        if persisted {
+            self.reload(cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    fn lists_panel_content_y(&self, mouse_pos: Point<Pixels>, cx: &mut Context<Self>) -> f32 {
+        let viewport = self.lists_scroll.bounds();
+        let max_y = self.lists_scroll.max_offset().y;
+        if max_y > px(0.)
+            && viewport.size.height > px(64.)
+            && mouse_pos.x >= viewport.left() - px(24.)
+            && mouse_pos.x <= viewport.right() + px(80.)
+        {
+            let cur = self.lists_scroll.offset();
+            let edge = px(28.);
+            let next_y = if mouse_pos.y < viewport.top() + edge && cur.y < px(0.) {
+                (cur.y + px(8.)).min(px(0.))
+            } else if mouse_pos.y > viewport.bottom() - edge && -cur.y < max_y {
+                (cur.y - px(8.)).max(-max_y)
+            } else {
+                cur.y
+            };
+            if next_y != cur.y {
+                self.lists_scroll.set_offset(gpui::point(cur.x, next_y));
+                cx.notify();
+            }
+        }
+        f32::from(mouse_pos.y - self.lists_scroll.offset().y)
+    }
+
+    fn move_smart_list_drag(
+        &mut self,
+        event: &gpui::DragMoveEvent<DraggedSmartList>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use fern_core::SmartList;
+        use lists_panel::{ActiveDragItem, PanelChild};
+        let dragged = event.drag(cx).list;
+        if !self.panel_drag.as_ref().is_some_and(|d| d.item == ActiveDragItem::SmartList(dragged)) {
+            return;
+        }
+        let content_y = self.lists_panel_content_y(event.event.position, cx);
+        let visible: Vec<(SmartList, f32)> = {
+            let rows = self.lists_rows.borrow();
+            rows.iter()
+                .enumerate()
+                .filter_map(|(ix, r)| match r {
+                    PanelChild::SmartList(s) => {
+                        let b = self.lists_scroll.bounds_for_item(ix)?;
+                        Some((*s, f32::from(b.center().y)))
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        let Some(cur_pos) = visible.iter().position(|(s, _)| *s == dragged) else { return };
+        let mut pos = cur_pos;
+        while pos > 0 && content_y < visible[pos - 1].1 - 4. {
+            pos -= 1;
+        }
+        while pos + 1 < visible.len() && content_y > visible[pos + 1].1 + 4. {
+            pos += 1;
+        }
+        if pos != cur_pos {
+            if self.preferences.smart_list_order.is_empty() {
+                self.preferences.smart_list_order = SmartList::TOP_DRAGGABLE.to_vec();
+            }
+            let vis_set: HashSet<SmartList> = visible.iter().map(|(s, _)| *s).collect();
+            let mut reordered: Vec<SmartList> = visible.into_iter().map(|(s, _)| s).collect();
+            let item = reordered.remove(cur_pos);
+            reordered.insert(pos, item);
+            let mut it = reordered.into_iter();
+            for slot in &mut self.preferences.smart_list_order {
+                if vis_set.contains(slot)
+                    && let Some(next) = it.next()
+                {
+                    *slot = next;
+                }
+            }
+            cx.notify();
+        }
+    }
+
+    fn move_sidebar_section_drag(
+        &mut self,
+        event: &gpui::DragMoveEvent<DraggedSidebarSection>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use fern_core::SidebarSection;
+        use lists_panel::{ActiveDragItem, PanelChild};
+        let dragged = event.drag(cx).section;
+        let Some((grab_offset_y, spans)) = self
+            .panel_drag
+            .as_ref()
+            .filter(|d| d.item == ActiveDragItem::SidebarSection(dragged))
+            .map(|d| (d.grab_offset_y, d.block_spans.clone()))
+        else {
+            return;
+        };
+        let content_y = self.lists_panel_content_y(event.event.position, cx);
+        let visible: Vec<(usize, SidebarSection)> = {
+            let rows = self.lists_rows.borrow();
+            rows.iter()
+                .enumerate()
+                .filter_map(|(ix, r)| match r {
+                    PanelChild::SectionHeading(s) => Some((ix, *s)),
+                    _ => None,
+                })
+                .collect()
+        };
+        let Some(&(first_ix, _)) = visible.first() else { return };
+        let Some(cur_pos) = visible.iter().position(|(_, s)| *s == dragged) else { return };
+        let Some(first_b) = self.lists_scroll.bounds_for_item(first_ix) else { return };
+        let first_top = f32::from(first_b.top());
+        let drag_top_y = content_y - grab_offset_y;
+        let new_pos = invariant_block_slot(first_top, &spans, cur_pos, drag_top_y);
+        if new_pos != cur_pos {
+            if self.preferences.sidebar_section_order.is_empty() {
+                self.preferences.sidebar_section_order = SidebarSection::ALL.to_vec();
+            }
+            let vis_set: HashSet<SidebarSection> = visible.iter().map(|(_, s)| *s).collect();
+            let mut reordered: Vec<SidebarSection> = visible.into_iter().map(|(_, s)| s).collect();
+            let item = reordered.remove(cur_pos);
+            reordered.insert(new_pos.min(reordered.len()), item);
+            let mut it = reordered.into_iter();
+            for slot in &mut self.preferences.sidebar_section_order {
+                if vis_set.contains(slot)
+                    && let Some(next) = it.next()
+                {
+                    *slot = next;
+                }
+            }
+            cx.notify();
+        }
+    }
+
+    fn move_filter_drag(
+        &mut self,
+        event: &gpui::DragMoveEvent<DraggedFilter>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use lists_panel::{ActiveDragItem, PanelChild};
+        let dragged = event.drag(cx).id;
+        if !self.panel_drag.as_ref().is_some_and(|d| d.item == ActiveDragItem::Filter(dragged)) {
+            return;
+        }
+        let content_y = self.lists_panel_content_y(event.event.position, cx);
+        let (heading_bounds, visible): (Option<gpui::Bounds<Pixels>>, Vec<(Id, f32)>) = {
+            let rows = self.lists_rows.borrow();
+            let h = rows
+                .iter()
+                .position(|r| *r == PanelChild::SectionHeading(fern_core::SidebarSection::Filters))
+                .and_then(|ix| self.lists_scroll.bounds_for_item(ix));
+            let vis = rows
+                .iter()
+                .enumerate()
+                .filter_map(|(ix, r)| match r {
+                    PanelChild::Filter(id) => {
+                        let b = self.lists_scroll.bounds_for_item(ix)?;
+                        Some((*id, f32::from(b.center().y)))
+                    }
+                    _ => None,
+                })
+                .collect();
+            (h, vis)
+        };
+        let Some(cur_pos) = visible.iter().position(|(id, _)| *id == dragged) else { return };
+        let mut pos = cur_pos;
+        if heading_bounds.is_some_and(|hb| content_y >= f32::from(hb.top()) && content_y <= f32::from(hb.bottom())) {
+            pos = 0;
+        } else {
+            while pos > 0 && content_y < visible[pos - 1].1 - 4. {
+                pos -= 1;
+            }
+            while pos + 1 < visible.len() && content_y > visible[pos + 1].1 + 4. {
+                pos += 1;
+            }
+        }
+        if pos != cur_pos
+            && let Some(from) = self.filters.iter().position(|(f, _)| f.id == dragged)
+        {
+            let entry = self.filters.remove(from);
+            let insert_at = pos.min(self.filters.len());
+            self.filters.insert(insert_at, entry);
+            cx.notify();
+        }
+    }
+
+    fn move_folder_drag(
+        &mut self,
+        event: &gpui::DragMoveEvent<DraggedFolder>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use lists_panel::{ActiveDragItem, PanelChild};
+        let dragged_fid = event.drag(cx).id;
+        let has_lists = event.drag(cx).has_lists;
+        let Some((grab_offset_y, spans)) = self
+            .panel_drag
+            .as_ref()
+            .filter(|d| d.item == ActiveDragItem::Folder(dragged_fid))
+            .map(|d| (d.grab_offset_y, d.block_spans.clone()))
+        else {
+            return;
+        };
+        let content_y = self.lists_panel_content_y(event.event.position, cx);
+
+        if !has_lists {
+            // Empty folders reorder among empty folders at the bottom of Lists.
+            let empty_vis: Vec<(Id, f32)> = {
+                let rows = self.lists_rows.borrow();
+                rows.iter()
+                    .enumerate()
+                    .filter_map(|(ix, r)| match r {
+                        PanelChild::FolderHeader { id, empty: true, .. } => {
+                            let b = self.lists_scroll.bounds_for_item(ix)?;
+                            Some((*id, f32::from(b.center().y)))
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            };
+            let Some(cur_pos) = empty_vis.iter().position(|(id, _)| *id == dragged_fid) else { return };
+            let mut pos = cur_pos;
+            while pos > 0 && content_y < empty_vis[pos - 1].1 - 4. {
+                pos -= 1;
+            }
+            while pos + 1 < empty_vis.len() && content_y > empty_vis[pos + 1].1 + 4. {
+                pos += 1;
+            }
+            if pos != cur_pos {
+                let empty_set: HashSet<Id> = empty_vis.iter().map(|(id, _)| *id).collect();
+                let mut reordered: Vec<Id> = empty_vis.into_iter().map(|(id, _)| id).collect();
+                let item = reordered.remove(cur_pos);
+                reordered.insert(pos, item);
+                let by_id: HashMap<Id, ListFolder> =
+                    self.folders.iter().cloned().map(|f| (f.id, f)).collect();
+                let mut it = reordered.into_iter();
+                for slot in &mut self.folders {
+                    if empty_set.contains(&slot.id)
+                        && let Some(next_id) = it.next()
+                        && let Some(next_folder) = by_id.get(&next_id)
+                    {
+                        *slot = next_folder.clone();
+                    }
+                }
+                cx.notify();
+            }
+            return;
+        }
+
+        let (first_ix, cur_pos) = {
+            let rows = self.lists_rows.borrow();
+            let blocks: Vec<(usize, bool)> = rows
+                .iter()
+                .enumerate()
+                .filter_map(|(ix, r)| match r {
+                    PanelChild::TopList(_) => Some((ix, false)),
+                    PanelChild::FolderHeader { id, empty: false, .. } => Some((ix, *id == dragged_fid)),
+                    _ => None,
+                })
+                .collect();
+            let Some(&(first_ix, _)) = blocks.first() else { return };
+            let Some(cur_pos) = blocks.iter().position(|&(_, is_d)| is_d) else { return };
+            (first_ix, cur_pos)
+        };
+        let Some(first_b) = self.lists_scroll.bounds_for_item(first_ix) else { return };
+        let first_top = f32::from(first_b.top());
+        let new_pos = invariant_block_slot(first_top, &spans, cur_pos, content_y - grab_offset_y);
+        if new_pos != cur_pos {
+            reorder_non_empty_folder_in_memory(&mut self.lists, &mut self.folders, dragged_fid, new_pos);
+            cx.notify();
+        }
+    }
+
+    fn move_parent_tag_drag(
+        &mut self,
+        event: &gpui::DragMoveEvent<DraggedParentTag>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use lists_panel::{ActiveDragItem, PanelChild};
+        let dragged_name = event.drag(cx).name.to_string();
+        let Some((grab_offset_y, spans, orig_pinned)) = self
+            .panel_drag
+            .as_ref()
+            .filter(|d| d.item == ActiveDragItem::Tag(dragged_name.clone()))
+            .map(|d| (d.grab_offset_y, d.block_spans.clone(), d.orig_tag_pinned))
+        else {
+            return;
+        };
+        let content_y = self.lists_panel_content_y(event.event.position, cx);
+        let (heading_bounds, roots) = {
+            let rows = self.lists_rows.borrow();
+            let h = rows
+                .iter()
+                .position(|r| *r == PanelChild::SectionHeading(fern_core::SidebarSection::Tags))
+                .and_then(|ix| self.lists_scroll.bounds_for_item(ix));
+            let vis: Vec<(usize, String, bool)> = rows
+                .iter()
+                .enumerate()
+                .filter_map(|(ix, r)| match r {
+                    PanelChild::TopTag { name, pinned, .. } => Some((ix, name.clone(), *pinned)),
+                    _ => None,
+                })
+                .collect();
+            (h, vis)
+        };
+        let Some(&(first_ix, _, _)) = roots.first() else { return };
+        let Some(cur_pos) = roots.iter().position(|(_, n, _)| *n == dragged_name) else { return };
+        let Some(first_b) = self.lists_scroll.bounds_for_item(first_ix) else { return };
+        let new_pos = if heading_bounds.is_some_and(|hb| {
+            content_y >= f32::from(hb.top()) && content_y <= f32::from(hb.bottom())
+        }) {
+            0
+        } else {
+            invariant_block_slot(f32::from(first_b.top()), &spans, cur_pos, content_y - grab_offset_y)
+        };
+        if new_pos != cur_pos {
+            let visible_others: Vec<(String, bool)> = roots
+                .into_iter()
+                .filter(|(_, n, _)| *n != dragged_name)
+                .map(|(_, n, p)| (n, p))
+                .collect();
+            reorder_parent_tag_in_memory(&mut self.tags, &dragged_name, &visible_others, new_pos, orig_pinned);
+            cx.notify();
+        }
+    }
+
+    fn move_list_drag(
+        &mut self,
+        event: &gpui::DragMoveEvent<DraggedList>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use lists_panel::{ActiveDragItem, HighlightTarget, PanelChild};
+        let dragged_id = event.drag(cx).id;
+        if !self.panel_drag.as_ref().is_some_and(|d| d.item == ActiveDragItem::List(dragged_id)) {
+            return;
+        }
+        let content_y = self.lists_panel_content_y(event.event.position, cx);
+        let rows_snapshot: Vec<PanelChild> = self.lists_rows.borrow().clone();
+
+        let vacant_ix = rows_snapshot.iter().position(|r| {
+            matches!(r, PanelChild::TopList(id) | PanelChild::SubList { id, .. } if *id == dragged_id)
+        });
+        if let Some(v_ix) = vacant_ix
+            && let Some(vb) = self.lists_scroll.bounds_for_item(v_ix)
+            && content_y >= f32::from(vb.top()) - 3.
+            && content_y <= f32::from(vb.bottom()) + 3.
+        {
+            self.drag_expand = None;
+            if let Some(drag) = self.panel_drag.as_mut()
+                && drag.highlight.take().is_some()
+            {
+                cx.notify();
+            }
+            return;
+        }
+
+        let Some(heading_ix) = rows_snapshot
+            .iter()
+            .position(|r| *r == PanelChild::SectionHeading(fern_core::SidebarSection::Lists))
+        else {
+            return;
+        };
+        let active_end_ix = rows_snapshot
+            .iter()
+            .enumerate()
+            .skip(heading_ix + 1)
+            .find_map(|(ix, r)| {
+                matches!(
+                    r,
+                    PanelChild::ArchivedHeader
+                        | PanelChild::SectionHeading(_)
+                        | PanelChild::Separator
+                        | PanelChild::BottomSmart(_)
+                )
+                .then_some(ix)
+            })
+            .unwrap_or(rows_snapshot.len());
+
+        let mut next_highlight: Option<HighlightTarget> = None;
+        let mut keep_expand = false;
+        let mut lists_changed = false;
+
+        let cur_folder = self.lists.iter().find(|l| l.id == dragged_id).and_then(|l| l.folder);
+        let can_slide_adjacent = cur_folder.is_none_or(|fid| {
+            self.lists.iter().any(|l| l.id != dragged_id && !l.archived && l.folder == Some(fid))
+        });
+
+        if let Some(hb) = self.lists_scroll.bounds_for_item(heading_ix)
+            && content_y <= f32::from(hb.bottom())
+        {
+            lists_changed = move_list_first_in_memory(&mut self.lists, &self.folders, dragged_id);
+        } else if active_end_ix > heading_ix + 1
+            && let Some(last_b) = self.lists_scroll.bounds_for_item(active_end_ix - 1)
+            && content_y > f32::from(last_b.bottom())
+        {
+            lists_changed = move_list_last_top_in_memory(&mut self.lists, &self.folders, dragged_id);
+        } else {
+            for (r_ix, child) in rows_snapshot
+                .iter()
+                .enumerate()
+                .take(active_end_ix)
+                .skip(heading_ix + 1)
+            {
+                let Some(rb) = self.lists_scroll.bounds_for_item(r_ix) else { continue };
+                let top = f32::from(rb.top());
+                let bot = f32::from(rb.bottom());
+                if content_y < top || content_y > bot {
+                    continue;
+                }
+                let h = bot - top;
+                let mid = (top + bot) * 0.5;
+                let rel_y = content_y - top;
+                let vacant_above = vacant_ix.is_none_or(|v| v < r_ix);
+
+                match *child {
+                    PanelChild::TopList(target_id) if target_id != dragged_id => {
+                        if rel_y < 9.5 {
+                            lists_changed = move_list_relative_in_memory(
+                                &mut self.lists,
+                                &self.folders,
+                                dragged_id,
+                                target_id,
+                                false,
+                                None,
+                            );
+                        } else if rel_y <= h - 9.5 {
+                            next_highlight = Some(HighlightTarget::List(target_id));
+                            if can_slide_adjacent {
+                                lists_changed = move_list_relative_in_memory(
+                                    &mut self.lists,
+                                    &self.folders,
+                                    dragged_id,
+                                    target_id,
+                                    !vacant_above,
+                                    None,
+                                );
+                            }
+                        } else {
+                            lists_changed = move_list_relative_in_memory(
+                                &mut self.lists,
+                                &self.folders,
+                                dragged_id,
+                                target_id,
+                                true,
+                                None,
+                            );
+                        }
+                    }
+                    PanelChild::FolderHeader { id: folder_id, collapsed, empty } => {
+                        if collapsed {
+                            if rel_y < 9. {
+                                lists_changed = move_list_around_folder_in_memory(
+                                    &mut self.lists,
+                                    &self.folders,
+                                    dragged_id,
+                                    folder_id,
+                                    false,
+                                );
+                            } else if rel_y <= h - 9. {
+                                next_highlight = Some(HighlightTarget::Folder(folder_id));
+                                keep_expand = true;
+                                self.schedule_drag_expand(DragExpandTarget::Folder(folder_id), cx);
+                                if !empty && can_slide_adjacent {
+                                    lists_changed = move_list_around_folder_in_memory(
+                                        &mut self.lists,
+                                        &self.folders,
+                                        dragged_id,
+                                        folder_id,
+                                        !vacant_above,
+                                    );
+                                }
+                            } else {
+                                lists_changed = move_list_around_folder_in_memory(
+                                    &mut self.lists,
+                                    &self.folders,
+                                    dragged_id,
+                                    folder_id,
+                                    true,
+                                );
+                            }
+                        } else if rel_y < 9. {
+                            lists_changed = move_list_around_folder_in_memory(
+                                &mut self.lists,
+                                &self.folders,
+                                dragged_id,
+                                folder_id,
+                                false,
+                            );
+                        } else {
+                            lists_changed = move_list_into_folder_start(
+                                &mut self.lists,
+                                &self.folders,
+                                dragged_id,
+                                folder_id,
+                            );
+                        }
+                    }
+                    PanelChild::SubList { id: sub_id, folder: folder_id } if sub_id != dragged_id => {
+                        let adj_before = vacant_ix == Some(r_ix.saturating_sub(1))
+                            && matches!(
+                                rows_snapshot.get(r_ix.saturating_sub(1)),
+                                Some(PanelChild::SubList { folder, .. }) if *folder == folder_id
+                            );
+                        let adj_after = vacant_ix == Some(r_ix + 1)
+                            && matches!(
+                                rows_snapshot.get(r_ix + 1),
+                                Some(PanelChild::SubList { folder, .. }) if *folder == folder_id
+                            );
+                        if adj_before {
+                            if content_y > mid + 4. {
+                                lists_changed = move_list_relative_in_memory(
+                                    &mut self.lists,
+                                    &self.folders,
+                                    dragged_id,
+                                    sub_id,
+                                    true,
+                                    Some(folder_id),
+                                );
+                            }
+                        } else if adj_after {
+                            if content_y < mid - 4. {
+                                lists_changed = move_list_relative_in_memory(
+                                    &mut self.lists,
+                                    &self.folders,
+                                    dragged_id,
+                                    sub_id,
+                                    false,
+                                    Some(folder_id),
+                                );
+                            }
+                        } else {
+                            lists_changed = move_list_relative_in_memory(
+                                &mut self.lists,
+                                &self.folders,
+                                dragged_id,
+                                sub_id,
+                                content_y >= mid,
+                                Some(folder_id),
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+                break;
+            }
+        }
+
+        if !keep_expand {
+            self.drag_expand = None;
+        }
+        let highlight_changed = self
+            .panel_drag
+            .as_mut()
+            .is_some_and(|d| std::mem::replace(&mut d.highlight, next_highlight) != d.highlight);
+        if lists_changed || highlight_changed {
+            cx.notify();
+        }
+    }
+
+    fn move_tag_drag(
+        &mut self,
+        event: &gpui::DragMoveEvent<DraggedTag>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use lists_panel::{ActiveDragItem, HighlightTarget, PanelChild};
+        let dragged_name = event.drag(cx).name.to_string();
+        if !self.panel_drag.as_ref().is_some_and(|d| d.item == ActiveDragItem::Tag(dragged_name.clone())) {
+            return;
+        }
+        let content_y = self.lists_panel_content_y(event.event.position, cx);
+        let rows_snapshot: Vec<PanelChild> = self.lists_rows.borrow().clone();
+
+        let vacant_ix = rows_snapshot.iter().position(|r| match r {
+            PanelChild::TopTag { name, .. } | PanelChild::SubTag { name, .. } => *name == dragged_name,
+            _ => false,
+        });
+        if let Some(v_ix) = vacant_ix
+            && let Some(vb) = self.lists_scroll.bounds_for_item(v_ix)
+            && content_y >= f32::from(vb.top()) - 3.
+            && content_y <= f32::from(vb.bottom()) + 3.
+        {
+            self.drag_expand = None;
+            if let Some(drag) = self.panel_drag.as_mut()
+                && drag.highlight.take().is_some()
+            {
+                cx.notify();
+            }
+            return;
+        }
+
+        let Some(heading_ix) = rows_snapshot
+            .iter()
+            .position(|r| *r == PanelChild::SectionHeading(fern_core::SidebarSection::Tags))
+        else {
+            return;
+        };
+        let tags_end_ix = rows_snapshot
+            .iter()
+            .enumerate()
+            .skip(heading_ix + 1)
+            .find_map(|(ix, r)| {
+                matches!(
+                    r,
+                    PanelChild::SectionHeading(_) | PanelChild::Separator | PanelChild::BottomSmart(_)
+                )
+                .then_some(ix)
+            })
+            .unwrap_or(rows_snapshot.len());
+
+        let mut next_highlight: Option<HighlightTarget> = None;
+        let mut keep_expand = false;
+        let mut tags_changed = false;
+
+        let cur_parent = self.tags.iter().find(|t| t.name == dragged_name).and_then(|t| t.parent.clone());
+        let can_slide_adjacent = cur_parent.is_none()
+            || self.preferences.visibility(fern_core::SmartList::Tags)
+                != fern_core::Visibility::IfNotEmpty;
+
+        if let Some(hb) = self.lists_scroll.bounds_for_item(heading_ix)
+            && content_y <= f32::from(hb.bottom())
+        {
+            tags_changed = move_tag_first_in_memory(&mut self.tags, &dragged_name);
+        } else if !self.tags_collapsed
+            && tags_end_ix > heading_ix + 1
+            && let Some(last_b) = self.lists_scroll.bounds_for_item(tags_end_ix - 1)
+            && content_y > f32::from(last_b.bottom())
+        {
+            tags_changed = move_tag_last_top_in_memory(&mut self.tags, &dragged_name);
+        } else {
+            for (r_ix, child) in rows_snapshot
+                .iter()
+                .enumerate()
+                .take(tags_end_ix)
+                .skip(heading_ix + 1)
+            {
+                let Some(rb) = self.lists_scroll.bounds_for_item(r_ix) else { continue };
+                let top = f32::from(rb.top());
+                let bot = f32::from(rb.bottom());
+                if content_y < top || content_y > bot {
+                    continue;
+                }
+                let h = bot - top;
+                let mid = (top + bot) * 0.5;
+                let rel_y = content_y - top;
+                let vacant_above = vacant_ix.is_none_or(|v| v < r_ix);
+
+                match child {
+                    PanelChild::TopTag { name: target_name, is_parent: false, .. }
+                        if *target_name != dragged_name =>
+                    {
+                        if rel_y < 9.5 {
+                            tags_changed = move_tag_around_root_in_memory(
+                                &mut self.tags,
+                                &dragged_name,
+                                target_name,
+                                false,
+                            );
+                        } else if rel_y <= h - 9.5 {
+                            next_highlight = Some(HighlightTarget::Tag(target_name.clone()));
+                            if can_slide_adjacent {
+                                tags_changed = move_tag_around_root_in_memory(
+                                    &mut self.tags,
+                                    &dragged_name,
+                                    target_name,
+                                    !vacant_above,
+                                );
+                            }
+                        } else {
+                            tags_changed = move_tag_around_root_in_memory(
+                                &mut self.tags,
+                                &dragged_name,
+                                target_name,
+                                true,
+                            );
+                        }
+                    }
+                    PanelChild::TopTag { name: target_name, is_parent: true, collapsed, .. }
+                        if *target_name != dragged_name =>
+                    {
+                        if *collapsed {
+                            if rel_y < 9.5 {
+                                tags_changed = move_tag_around_root_in_memory(
+                                    &mut self.tags,
+                                    &dragged_name,
+                                    target_name,
+                                    false,
+                                );
+                            } else if rel_y <= h - 9.5 {
+                                next_highlight = Some(HighlightTarget::Tag(target_name.clone()));
+                                keep_expand = true;
+                                self.schedule_drag_expand(DragExpandTarget::Tag(target_name.clone()), cx);
+                                if can_slide_adjacent {
+                                    tags_changed = move_tag_around_root_in_memory(
+                                        &mut self.tags,
+                                        &dragged_name,
+                                        target_name,
+                                        !vacant_above,
+                                    );
+                                }
+                            } else {
+                                tags_changed = move_tag_around_root_in_memory(
+                                    &mut self.tags,
+                                    &dragged_name,
+                                    target_name,
+                                    true,
+                                );
+                            }
+                        } else if rel_y < 9.5 {
+                            tags_changed = move_tag_around_root_in_memory(
+                                &mut self.tags,
+                                &dragged_name,
+                                target_name,
+                                false,
+                            );
+                        } else {
+                            tags_changed = move_tag_into_parent_start(
+                                &mut self.tags,
+                                &dragged_name,
+                                target_name,
+                            );
+                        }
+                    }
+                    PanelChild::SubTag { name: sub_name, parent: parent_name }
+                        if *sub_name != dragged_name =>
+                    {
+                        let adj_before = vacant_ix == Some(r_ix.saturating_sub(1))
+                            && matches!(
+                                rows_snapshot.get(r_ix.saturating_sub(1)),
+                                Some(PanelChild::SubTag { parent, .. }) if parent == parent_name
+                            );
+                        let adj_after = vacant_ix == Some(r_ix + 1)
+                            && matches!(
+                                rows_snapshot.get(r_ix + 1),
+                                Some(PanelChild::SubTag { parent, .. }) if parent == parent_name
+                            );
+                        if adj_before {
+                            if content_y > mid + 4. {
+                                tags_changed = move_subtag_relative_in_memory(
+                                    &mut self.tags,
+                                    &dragged_name,
+                                    sub_name,
+                                    parent_name,
+                                    true,
+                                );
+                            }
+                        } else if adj_after {
+                            if content_y < mid - 4. {
+                                tags_changed = move_subtag_relative_in_memory(
+                                    &mut self.tags,
+                                    &dragged_name,
+                                    sub_name,
+                                    parent_name,
+                                    false,
+                                );
+                            }
+                        } else {
+                            tags_changed = move_subtag_relative_in_memory(
+                                &mut self.tags,
+                                &dragged_name,
+                                sub_name,
+                                parent_name,
+                                content_y >= mid,
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+                break;
+            }
+        }
+
+        if !keep_expand {
+            self.drag_expand = None;
+        }
+        let highlight_changed = self
+            .panel_drag
+            .as_mut()
+            .is_some_and(|d| std::mem::replace(&mut d.highlight, next_highlight) != d.highlight);
+        if tags_changed || highlight_changed {
+            cx.notify();
+        }
+    }
+
+    fn list_action(&mut self, action: ListAction, window: &mut Window, cx: &mut Context<Self>) {
+        let target = self.list_menu.take().map(|(t, _)| t);
+        let current = match self.view {
+            View::List(id) => Some(id),
+            _ => None,
+        };
+        let list = match target {
+            Some(ListMenuTarget::List(id)) => Some(id),
+            _ => current,
+        };
+        match (action, target) {
+            (ListAction::Edit, Some(ListMenuTarget::Tag(tag))) => return self.open_tag_dialog(Some(tag), None, window, cx),
+            (ListAction::AddSubtag, Some(ListMenuTarget::Tag(tag))) => return self.open_tag_dialog(None, Some(tag), window, cx),
+            (ListAction::Merge, Some(ListMenuTarget::Tag(tag))) => return self.open_merge_dialog(tag, window, cx),
+            (ListAction::Pin, Some(ListMenuTarget::Tag(tag))) => {
+                let pinned = self.tags.iter().any(|t| t.name == tag && t.pinned);
+                let result = self.store.set_tag_pinned(&tag, !pinned);
+                self.check(result);
+            }
+            (ListAction::Delete, Some(ListMenuTarget::Tag(tag))) => {
+                let result = self.store.delete_tag(&tag);
+                self.check(result);
+                if self.view == View::Tag(tag) {
+                    self.header_menu_open = false;
+                    crate::data_version::data_changed(cx.entity_id(), cx);
+                    self.set_view(View::Inbox, cx);
+                    return;
+                }
+            }
+            (ListAction::ShowTags(visibility), _) => {
+                self.save_preferences(|p| p.set_visibility(fern_core::SmartList::Tags, visibility), cx);
+            }
+            (ListAction::Edit, Some(ListMenuTarget::Folder(folder))) => return self.open_folder_dialog(Some(folder), window, cx),
+            (ListAction::AddList, Some(ListMenuTarget::Folder(folder))) => return self.open_list_dialog(None, Some(folder), window, cx),
+            (ListAction::Ungroup, Some(ListMenuTarget::Folder(folder))) => {
+                let result = self.store.ungroup_list_folder(folder);
+                self.check(result);
+            }
+            (ListAction::Edit, _) => return self.open_list_dialog(list, None, window, cx),
+            (ListAction::Duplicate, _) => {
+                if let Some(id) = list {
+                    let result = self.store.duplicate_list(id, i18n::t(cx).list_copy_suffix);
+                    if let Some(copy) = self.check(result) {
+                        self.header_menu_open = false;
+                        crate::data_version::data_changed(cx.entity_id(), cx);
+                        self.set_view(View::List(copy.id), cx);
+                        return;
+                    }
+                }
+            }
+            (ListAction::Archive, _) => {
+                if let Some(list) = list.and_then(|id| self.lists.iter().find(|l| l.id == id)) {
+                    let (id, archived) = (list.id, !list.archived);
+                    let result = self.store.set_list_archived(id, archived);
+                    self.check(result);
+                    self.archived_open |= archived;
+                }
+            }
+            (ListAction::Delete, _) => {
+                if let Some(id) = list {
+                    let result = self.store.delete_list(id);
+                    self.check(result);
+                    if current == Some(id) {
+                        self.header_menu_open = false;
+                        crate::data_version::data_changed(cx.entity_id(), cx);
+                        self.set_view(View::Inbox, cx);
+                        return;
+                    }
+                }
+            }
+            _ => {}
+        }
+        self.header_menu_open = false;
+        self.reload(cx);
+    }
+
+    /// The menu of a list (Edit, Duplicate, Archive or Unarchive, Delete) or of a folder (Edit,
+    /// Add List, Ungroup), from the list header's "…" or a right click in the lists column.
+    fn render_list_items(&self, target: ListMenuTarget, strings: &'static Strings, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let item = |id: &'static str, icon: IconName, label: &'static str, action: ListAction, cx: &mut Context<Self>| {
+            ListItem::new(id)
+                .height(px(34.))
+                .start_slot(Icon::new(icon).color(if action == ListAction::Delete { Color::Error } else { Color::Icon }))
+                .child(Label::new(label).color(if action == ListAction::Delete { Color::Error } else { Color::Default }))
+                .on_click(cx.listener(move |this, _, window, cx| this.list_action(action, window, cx)))
+                .into_any_element()
+        };
+        match target {
+            ListMenuTarget::List(id) => {
+                let archived = self.lists.iter().any(|l| l.id == id && l.archived);
+                vec![
+                    item("list-menu-edit", IconName::Pencil, strings.edit, ListAction::Edit, cx),
+                    item("list-menu-duplicate", IconName::Copy, strings.duplicate, ListAction::Duplicate, cx),
+                    item(
+                        "list-menu-archive",
+                        if archived { IconName::ArchiveRestore } else { IconName::Archive },
+                        if archived { strings.unarchive_list } else { strings.archive_list },
+                        ListAction::Archive,
+                        cx,
+                    ),
+                    div().my_1().child(Divider::horizontal()).into_any_element(),
+                    item("list-menu-delete", IconName::Trash, strings.delete, ListAction::Delete, cx),
+                ]
+            }
+            ListMenuTarget::Tag(tag) => {
+                // As in the original: words only. "Move to Shared Tags" needs shared lists.
+                let tag = self.tags.iter().find(|t| t.name == tag);
+                let pinned = tag.is_some_and(|t| t.pinned);
+                let top = tag.is_some_and(|t| t.parent.is_none());
+                let text = |id: &'static str, label: &'static str, action: ListAction, cx: &mut Context<Self>| {
+                    ListItem::new(id)
+                        .height(px(34.))
+                        .child(Label::new(label))
+                        .on_click(cx.listener(move |this, _, window, cx| this.list_action(action, window, cx)))
+                        .into_any_element()
+                };
+                let mut items = vec![
+                    text("tag-menu-edit", strings.edit, ListAction::Edit, cx),
+                    text("tag-menu-pin", if pinned { strings.unpin } else { strings.pin }, ListAction::Pin, cx),
+                ];
+                if top {
+                    items.push(text("tag-menu-subtag", strings.add_subtag, ListAction::AddSubtag, cx));
+                }
+                items.push(text("tag-menu-merge", strings.merge_tags, ListAction::Merge, cx));
+                items.push(text("tag-menu-delete", strings.delete, ListAction::Delete, cx));
+                items
+            }
+            ListMenuTarget::TagsHeading => {
+                use fern_core::Visibility;
+                let current = self.preferences.visibility(fern_core::SmartList::Tags);
+                [(Visibility::IfNotEmpty, strings.visibility_names[1]), (Visibility::Show, strings.visibility_names[0]), (Visibility::Hide, strings.visibility_names[2])]
+                    .into_iter()
+                    .map(|(visibility, label)| {
+                        let on = current == visibility;
+                        ListItem::new(SharedString::from(format!("tags-show-{label}")))
+                            .height(px(34.))
+                            .child(Label::new(label).color(if on { Color::Accent } else { Color::Default }))
+                            .when(on, |item| item.end_slot(Icon::new(IconName::Check).size(IconSize::Small).color(Color::Accent)))
+                            .on_click(cx.listener(move |this, _, window, cx| this.list_action(ListAction::ShowTags(visibility), window, cx)))
+                            .into_any_element()
+                    })
+                    .collect()
+            }
+            ListMenuTarget::Smart(list) => vec![
+                ListItem::new("smart-hide")
+                    .height(px(34.))
+                    .child(Label::new(strings.visibility_names[2]))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.list_menu = None;
+                        this.save_preferences(|p| p.set_visibility(list, fern_core::Visibility::Hide), cx);
+                    }))
+                    .into_any_element(),
+            ],
+            ListMenuTarget::Folder(_) => vec![
+                item("folder-menu-edit", IconName::Pencil, strings.edit, ListAction::Edit, cx),
+                item("folder-menu-add", IconName::Plus, strings.add_list, ListAction::AddList, cx),
+                item("folder-menu-ungroup", IconName::FolderOpen, strings.ungroup, ListAction::Ungroup, cx),
+            ],
+        }
+    }
+
+    fn render_list_menu(&self, strings: &'static Strings, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (target, at) = self.list_menu.clone()?;
+        // The tag menu is the original's 163 px; the others as the task menu.
+        let width = match target {
+            ListMenuTarget::Tag(_) | ListMenuTarget::TagsHeading => 163.,
+            // The original's smart-list menu, with its one Hide.
+            ListMenuTarget::Smart(_) => 163.,
+            _ => 196.,
+        };
+        let items = self.render_list_items(target, strings, cx);
+        let menu = popover(cx)
+            .min_w(px(width))
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.list_menu = None;
+                cx.notify();
+            }))
+            .children(items)
+            .into_any_element();
+        Some(task_menu::place(at, menu))
+    }
+
+
+    fn toggle_task_collapsed(&mut self, id: Id, cx: &mut Context<Self>) {
+        if !self.collapsed_tasks.remove(&id) {
+            self.collapsed_tasks.insert(id);
+        }
+        cx.notify();
+    }
+
+    fn toggle_day(&mut self, label: String, cx: &mut Context<Self>) {
+        if !self.collapsed_days.remove(&label) {
+            self.collapsed_days.insert(label);
+        }
+        cx.notify();
+    }
+
+    fn toggle_section(&mut self, section: Section, cx: &mut Context<Self>) {
+        if !self.collapsed_sections.remove(&section) {
+            self.collapsed_sections.insert(section);
+        }
+        cx.notify();
+    }
+
+    pub fn toggle_lists(&mut self, cx: &mut Context<Self>) {
+        self.show_lists = !self.show_lists;
+        cx.notify();
+    }
+
+    /// Follows a dragged panel edge. `event.bounds` is this view's.
+    fn resize_panel(&mut self, event: &gpui::DragMoveEvent<DraggedEdge>, _: &mut Window, cx: &mut Context<Self>) {
+        let panel = event.drag(cx).0;
+        let bounds = event.bounds;
+        let x = event.event.position.x;
+        self.resizing = Some(panel);
+        match panel {
+            Panel::Lists => {
+                let width = f32::from(x - bounds.left());
+                // Dragged almost shut, the column hides; dragged back out, it shows again.
+                self.show_lists = width >= lists_panel::COLLAPSE_BELOW;
+                if self.show_lists {
+                    self.lists_width = width.clamp(lists_panel::MIN_WIDTH, lists_panel::MAX_WIDTH);
+                }
+            }
+            Panel::Detail => {
+                let width = f32::from(bounds.right() - x);
+                self.detail_width = width.clamp(DETAIL_MIN_WIDTH, self.max_detail_width(f32::from(bounds.size.width)).max(DETAIL_MIN_WIDTH));
+            }
+        }
+        self.schedule_save_widths(cx);
+        cx.notify();
+    }
+
+    /// The widest the details may be in a view `view_width` wide, leaving the task list its room.
+    fn max_detail_width(&self, view_width: f32) -> f32 {
+        let lists = if self.show_lists { self.lists_width } else { 0. };
+        view_width - lists - LIST_MIN_WIDTH
+    }
+
+    /// A double click on an edge: the panel's default width.
+    fn reset_panel_width(&mut self, panel: Panel, cx: &mut Context<Self>) {
+        match panel {
+            Panel::Lists => self.lists_width = lists_panel::WIDTH,
+            Panel::Detail => self.detail_width = DETAIL_WIDTH,
+        }
+        self.schedule_save_widths(cx);
+        cx.notify();
+    }
+
+    fn schedule_save_widths(&mut self, cx: &mut Context<Self>) {
+        self.save_widths = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(std::time::Duration::from_millis(300)).await;
+            this.update(cx, |this, _| {
+                for (key, width) in [("lists_width", this.lists_width), ("detail_width", this.detail_width)] {
+                    if let Err(err) = this.store.set_setting(key, &width.round().to_string()) {
+                        eprintln!("failed to save the panel width: {err:#}");
+                    }
+                }
+            })
+            .ok();
+        }));
+    }
+
+    /// An edge's handle; `panel` takes its width from where the edge is dropped.
+    fn resize_handle(&self, panel: Panel, cx: &mut Context<Self>) -> impl IntoElement {
+        let this = cx.entity().downgrade();
+        let dragged = self.resizing == Some(panel) && cx.has_active_drag();
+        resize::handle(
+            panel,
+            dragged,
+            move |_, cx| {
+                this.update(cx, |this, cx| this.reset_panel_width(panel, cx)).ok();
+            },
+            cx,
+        )
+    }
+
+    /// Database errors are shown in a line at the bottom of the window instead of crashing.
+    fn check<T>(&mut self, result: anyhow::Result<T>) -> Option<T> {
+        match result {
+            Ok(value) => {
+                self.error = None;
+                Some(value)
+            }
+            Err(err) => {
+                self.error = Some(format!("{err:#}"));
+                None
+            }
+        }
+    }
+
+    pub fn select(&mut self, id: Id, cx: &mut Context<Self>) {
+        if self.selected == Some(id) {
+            return;
+        }
+        self.selected = Some(id);
+        // The task may be outside the current view, for example a subtask opened from the panel.
+        let task = self
+            .tasks
+            .iter()
+            .find(|t| t.id == id)
+            .cloned()
+            .or_else(|| self.store.task(id).ok().flatten());
+        self.detail.update(cx, |detail, cx| detail.show(task, cx));
+        cx.notify();
+    }
+
+    fn toggle(&mut self, id: Id, completed: bool, cx: &mut Context<Self>) {
+        if let Some(pending) = self.completing.get(&id) {
+            // A second click cancels this completion, including a repeating occurrence.
+            // Repeated complete commands must not advance the recurrence again.
+            if completed { return; }
+            let action = pending.undo.clone();
+            if self.check(action.apply(&self.store)).is_some() {
+                self.completing.remove(&id);
+                if self.undo.as_ref().is_some_and(|(undo, _, _)| *undo == action) {
+                    self.undo = None;
+                }
+            }
+            self.reload(cx);
+            return;
+        }
+        // Unchecking a "Won't Do" task reopens it, as in the original.
+        let wont_do = self.tasks.iter().any(|t| t.id == id && t.is_wont_do());
+        let task = self.tasks.iter().find(|t| t.id == id).cloned();
+        match task {
+            // Completing offers Undo, also for a repeating task, which moves to its next date.
+            Some(task) if completed && !wont_do => {
+                let result = crate::undo::complete(&self.store, &task);
+                if let Some(action) = self.check(result) {
+                    let label = i18n::t(cx).undo_completed.replace("{title}", &task.title);
+                    self.offer_undo(action, label, cx);
+                    crate::completion_mark::record(id, cx);
+                }
+            }
+            _ => {
+                let result =
+                    if wont_do { self.store.set_wont_do(id, false) } else { self.store.set_completed(id, completed) };
+                self.check(result);
+            }
+        }
+        self.reload(cx);
+    }
+
+    /// Shows the "Undo" toast for a few seconds.
+    fn offer_undo(&mut self, action: crate::undo::UndoAction, label: String, cx: &mut Context<Self>) {
+        let completed = match &action {
+            crate::undo::UndoAction::Reopen { id, .. } | crate::undo::UndoAction::ReopenRepeat { id, .. } => Some(*id),
+            _ => None,
+        };
+        if !cx.reduce_motion()
+            && let Some(id) = completed
+            && let Some((index, before)) = self.tasks_for_rows().into_iter().enumerate()
+                .find(|(_, task)| task.id == id && !task.is_closed())
+        {
+            let timer = cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(crate::completion_mark::SETTLE_DURATION).await;
+                this.update(cx, |this, cx| {
+                    this.completing.remove(&id);
+                    cx.notify();
+                }).ok();
+            });
+            self.completing.insert(id, CompletingTask {
+                before, index, view: self.view.clone(), undo: action.clone(), _timer: timer,
+            });
+        }
+        let expected = action.clone();
+        let timer = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(std::time::Duration::from_secs(5)).await;
+            this.update(cx, |this, cx| {
+                if this.undo.as_ref().is_some_and(|(a, _, _)| *a == expected) {
+                    this.undo = None;
+                    cx.notify();
+                }
+            })
+            .ok();
+        });
+        self.undo = Some((action, label, timer));
+        cx.notify();
+    }
+
+    fn apply_undo(&mut self, cx: &mut Context<Self>) {
+        if let Some((action, _, _)) = self.undo.take() {
+            let result = action.apply(&self.store);
+            if self.check(result).is_some() {
+                self.completing.retain(|_, pending| pending.undo != action);
+            }
+            self.reload(cx);
+        }
+    }
+
+    /// Moves a task to the trash, or deletes it for good when it is already there.
+    fn delete(&mut self, id: Id, cx: &mut Context<Self>) {
+        let in_trash = self.view == View::Trash;
+        let title = self.tasks.iter().find(|t| t.id == id).map(|t| t.title.clone()).unwrap_or_default();
+        let result = if in_trash { self.store.purge_task(id) } else { self.store.delete_task(id) };
+        if self.check(result).is_some() && !in_trash {
+            let label = i18n::t(cx).undo_deleted.replace("{title}", &title);
+            self.offer_undo(crate::undo::UndoAction::Restore(id), label, cx);
+        }
+        self.reload(cx);
+    }
+
+    /// A task dropped on an entry of the lists column takes that entry's meaning: a list moves it,
+    /// a tag tags it, Today/Tomorrow set its date, Completed completes it, Trash deletes it.
+    fn drop_on_view(&mut self, view: View, id: Id, cx: &mut Context<Self>) {
+        let today = Self::today();
+        let time = self.store.task(id).ok().flatten().and_then(|t| t.due_time);
+        let result = match &view {
+            View::Inbox => self.store.set_list(id, None),
+            View::List(list) => self.store.set_list(id, Some(*list)),
+            View::Tag(tag) => match self.store.task(id) {
+                Ok(Some(task)) if !task.tags.iter().any(|t| t.to_lowercase() == tag.to_lowercase()) => {
+                    let mut tags = task.tags;
+                    tags.push(tag.clone());
+                    self.store.set_tags(id, &tags)
+                }
+                other => other.map(|_| ()),
+            },
+            View::Today | View::Next7Days => self.store.set_due(id, Some(today), time),
+            View::Tomorrow => self.store.set_due(id, Some(today + Duration::days(1)), time),
+            View::Completed => self.store.set_completed(id, true),
+            View::WontDo => self.store.set_wont_do(id, true),
+            View::Trash => self.store.delete_task(id),
+            View::Day(day) => self.store.set_due(id, Some(*day), time),
+            View::All | View::Search(_) | View::Filter(_) | View::Summary => Ok(()),
+        };
+        self.check(result);
+        self.reload(cx);
+    }
+
+    /// Drops a dragged task right before `target`, inheriting `target`'s parent (used by dev-state `move=A>B`).
+    #[cfg(debug_assertions)]
+    fn drop_task(&mut self, dragged: Id, target: Id, cx: &mut Context<Self>) {
+        let parent = self.store.task(target).ok().flatten().and_then(|t| t.parent_id);
+        let result = self.store.move_task_in_tree(dragged, parent, Some((target, false)));
+        self.check(result);
+        self.reload(cx);
+    }
+
+    /// Whether the active list view renders subtasks nested under their parents.
+    fn allows_tree_nesting(&self) -> bool {
+        !matches!(self.view, View::Completed | View::WontDo | View::Trash | View::Next7Days)
+            && self.sort_settings().1 == GroupBy::Custom
+    }
+
+    fn move_task_drag(&mut self, event: &gpui::DragMoveEvent<DraggedTask>, _: &mut Window, cx: &mut Context<Self>) {
+        if self.view == View::Trash || self.kanban || self.timeline {
+            return;
+        }
+        let pos = event.event.position;
+        if !event.bounds.contains(&pos) {
+            if self.task_drop.take().is_some() {
+                cx.notify();
+            }
+            return;
+        }
+        let dragged_id = event.drag(cx).id;
+        let start_x = match self.task_drag_origin {
+            Some((id, x)) if id == dragged_id => x,
+            _ => {
+                self.task_drag_origin = Some((dragged_id, pos.x));
+                pos.x
+            }
+        };
+        let rows: Vec<Row> = self
+            .list_entries
+            .iter()
+            .filter_map(|e| match e {
+                ListEntry::Row(row) => Some(row.clone()),
+                _ => None,
+            })
+            .collect();
+        let allow_nesting = self.allows_tree_nesting();
+        let bounds_map = self.list_entry_bounds.borrow();
+
+        let mut hit: Option<(usize, gpui::Bounds<Pixels>)> = None;
+        let mut bottommost_row_y: Option<Pixels> = None;
+        for (&ix, &bounds) in bounds_map.iter() {
+            if !matches!(self.list_entries.get(ix), Some(ListEntry::Row(_))) {
+                continue;
+            }
+            bottommost_row_y = Some(bottommost_row_y.map_or(bounds.bottom(), |b| b.max(bounds.bottom())));
+            if pos.y >= bounds.top() && pos.y <= bounds.bottom() {
+                hit = Some((ix, bounds));
+            }
+        }
+        drop(bounds_map);
+
+        let plan = if let Some((ix, bounds)) = hit {
+            match self.list_entries.get(ix) {
+                Some(ListEntry::Row(Row::Task { task, .. })) => {
+                    let mid_y = bounds.top() + bounds.size.height / 2.;
+                    let after = pos.y >= mid_y;
+                    let dx = f32::from(pos.x - start_x);
+                    // Subtract `render_entry`'s 14 px horizontal padding so `rel_x = 0` is the row's left edge.
+                    let rel_x = f32::from(pos.x - bounds.left()) - 14.0;
+                    task_rows::plan_task_drop(
+                        &rows,
+                        dragged_id,
+                        task.id,
+                        after,
+                        dx,
+                        rel_x,
+                        INDENT,
+                        GUTTER,
+                        allow_nesting,
+                    )
+                }
+                _ => None,
+            }
+        } else if bottommost_row_y.is_some_and(|bottom| pos.y > bottom) {
+            task_rows::plan_task_drop_at_end(&rows, dragged_id)
+        } else {
+            None
+        };
+
+        if self.task_drop != plan {
+            self.task_drop = plan;
+            cx.notify();
+        }
+    }
+
+    fn drop_task_in_list(&mut self, dragged: &DraggedTask, _: &mut Window, cx: &mut Context<Self>) {
+        let plan = self.task_drop.take();
+        self.task_drag_origin = None;
+        if let Some(plan) = plan {
+            cx.stop_propagation();
+            self.apply_task_drop(dragged.id, plan, cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    fn apply_task_drop(&mut self, dragged: Id, plan: task_rows::TaskDropPlan, cx: &mut Context<Self>) {
+        let result = (|| -> anyhow::Result<()> {
+            let Some(dragged_task) = self.store.task(dragged)? else { return Ok(()) };
+            if let Some(group_drop) = plan.group_drop {
+                match group_drop {
+                    DropTarget::Section(sec) => {
+                        if dragged_task.is_completed() {
+                            self.store.set_completed(dragged, false)?;
+                        }
+                        if dragged_task.section_id != sec {
+                            self.store.set_section(dragged, sec)?;
+                        }
+                    }
+                    DropTarget::Complete => {
+                        if !dragged_task.is_completed() {
+                            self.store.set_completed(dragged, true)?;
+                        }
+                    }
+                    DropTarget::Kind(kind) => {
+                        if dragged_task.is_completed() {
+                            self.store.set_completed(dragged, false)?;
+                        }
+                        if dragged_task.kind != kind {
+                            self.store.set_kind(dragged, kind)?;
+                        }
+                    }
+                    other => {
+                        if dragged_task.is_completed() {
+                            self.store.set_completed(dragged, false)?;
+                        }
+                        self.apply_column_value(dragged, other)?;
+                    }
+                }
+            } else if dragged_task.is_completed()
+                && self.store.task(plan.target_id)?.is_some_and(|t| !t.is_completed())
+            {
+                self.store.set_completed(dragged, false)?;
+            }
+            self.store.move_task_in_tree(dragged, plan.new_parent, plan.order_target)?;
+            Ok(())
+        })();
+        if self.check(result).is_some()
+            && let Some(parent_id) = plan.expand_parent
+        {
+            self.collapsed_tasks.remove(&parent_id);
+        }
+        self.reload(cx);
+    }
+
+    /// Parents in the current view that have at least one visible subtask.
+    fn parent_task_ids(&self, strings: &Strings) -> Vec<Id> {
+        self.rows_with(strings, &HashSet::new(), &HashSet::new())
+            .into_iter()
+            .filter_map(|row| match row {
+                Row::Task { task, has_children: true, .. } => Some(task.id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn toggle_all_subtasks_now(&mut self, cx: &mut Context<Self>) {
+        let parents = self.parent_task_ids(i18n::t(cx));
+        if parents.is_empty() {
+            return;
+        }
+        let any_expanded = parents.iter().any(|id| !self.collapsed_tasks.contains(id));
+        if any_expanded {
+            self.collapsed_tasks.extend(parents);
+        } else {
+            for id in parents {
+                self.collapsed_tasks.remove(&id);
+            }
+        }
+        cx.notify();
+    }
+
+    fn toggle_all_subtasks(&mut self, _: &ToggleAllSubtasks, _: &mut Window, cx: &mut Context<Self>) {
+        if self.title_edit.is_some() {
+            return;
+        }
+        self.toggle_all_subtasks_now(cx);
+    }
+
+    fn add_subtask_selected(&mut self, _: &AddSubtask, window: &mut Window, cx: &mut Context<Self>) {
+        if self.title_edit.is_some() {
+            return;
+        }
+        if let Some(id) = self.selected {
+            self.start_detail(id, "subtask", window, cx);
+        }
+    }
+
+    fn restore(&mut self, id: Id, cx: &mut Context<Self>) {
+        let result = self.store.restore_task(id);
+        self.check(result);
+        self.reload(cx);
+    }
+
+    fn empty_trash(&mut self, cx: &mut Context<Self>) {
+        self.header_menu_open = false;
+        let result = self.store.empty_trash();
+        self.check(result);
+        self.reload(cx);
+    }
+
+    /// Views where new tasks cannot be added.
+    fn is_read_only_view(&self) -> bool {
+        matches!(self.view, View::Completed | View::WontDo | View::Trash | View::Search(_))
+    }
+
+    fn render_section(
+        &self,
+        section: Section,
+        count: usize,
+        collapsed: bool,
+        strings: &Strings,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let accent = cx.theme().colors().accent;
+        let drop_target = match section {
+            Section::Tasks => DropTarget::Kind(Kind::Task),
+            Section::Notes => DropTarget::Kind(Kind::Note),
+            Section::Completed => DropTarget::Complete,
+        };
+        h_flex()
+            .id(SharedString::from(format!("group-{section:?}")))
+            .h(px(36.))
+            // As the original's, the arrow sits 7 px in from the rows' edge.
+            .pl(px(7.))
+            .gap_1()
+            .rounded(px(6.))
+            .cursor_pointer()
+            .when(self.view != View::Trash, |el| {
+                el.drag_over::<DraggedTask>(move |style, _, _, _| style.bg(accent.opacity(0.10)))
+                    .on_drop(cx.listener(move |this, dragged: &DraggedTask, _, cx| {
+                        cx.stop_propagation();
+                        this.task_drop = None;
+                        this.task_drag_origin = None;
+                        this.drop_on_column(dragged.id, drop_target.clone(), cx);
+                    }))
+            })
+            .on_click(cx.listener(move |this, _, _, cx| this.toggle_section(section, cx)))
+            .child(chevron(collapsed))
+            .child(Label::new(section.title(strings)).weight(FontWeight::BOLD))
+            .child(div().pl_1().child(Label::new(count.to_string()).size(LabelSize::Small).color(Color::Muted)))
+            .into_any_element()
+    }
+
+    fn start_title_edit(&mut self, id: Id, click: Option<gpui::Point<Pixels>>, window: &mut Window, cx: &mut Context<Self>) {
+        self.finish_title_edit(true, cx);
+        let Some(task) = self.tasks.iter().find(|task| task.id == id && !task.is_deleted()) else { return };
+        let title = task.title.clone();
+        self.select(id, cx);
+        let input = cx.new(|cx| {
+            let mut input = TextInput::new(Mode::SingleLine, "", cx);
+            input.set_text(title, cx);
+            if let Some(position) = click {
+                input.place_cursor_at(position, cx);
+            }
+            input
+        });
+        cx.subscribe_in(&input, window, |this, _, _: &Submitted, window, cx| {
+            this.finish_title_edit(true, cx);
+            window.focus(&this.list_focus, cx);
+        }).detach();
+        cx.subscribe_in(&input, window, |this, _, _: &Cancelled, window, cx| {
+            this.finish_title_edit(false, cx);
+            window.focus(&this.list_focus, cx);
+        }).detach();
+        let focus = input.focus_handle(cx);
+        let blur = cx.on_blur(&focus, window, |this, _, cx| this.finish_title_edit(true, cx));
+        self.title_edit = Some((id, input, blur));
+        window.focus(&focus, cx);
+        cx.notify();
+    }
+
+    fn finish_title_edit(&mut self, save: bool, cx: &mut Context<Self>) {
+        let Some((id, input, _blur)) = self.title_edit.take() else { return };
+        let title = input.read(cx).text().trim();
+        if save && !title.is_empty() && self.tasks.iter().any(|task| task.id == id && task.title != title) {
+            let result = self.store.set_title(id, title);
+            if self.check(result).is_some() {
+                self.reload(cx);
+            }
+        }
+        cx.notify();
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_task(
+        &self,
+        task: &Task,
+        depth: usize,
+        has_children: bool,
+        collapsed: bool,
+        tag_colors: &HashMap<String, Hsla>,
+        today: NaiveDate,
+        strings: &Strings,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = cx.theme().clone();
+        let id = task.id;
+        let title_input = self.title_edit.as_ref().filter(|(editing, _, _)| *editing == id).map(|(_, input, _)| input.clone());
+        let done = task.is_completed() || self.completing.contains_key(&id);
+        let details = self.show_details && !task.notes.trim().is_empty();
+        let wont_do = task.is_wont_do();
+        let closed_view = matches!(self.view, View::Completed | View::WontDo);
+        let selected = self.selected == Some(id);
+        let group = format!("task-{id}");
+
+        let marker = if task.kind == Kind::Note {
+            Icon::new(IconName::FileText).into_any_element()
+        } else {
+            Checkbox::new("marker")
+                .toggle_state(done)
+                .animate_completion(crate::completion_mark::started(id, cx))
+                .dismissed(wont_do)
+                .lines(task.checklist.is_some())
+                .tint(task_rows::priority_color(task.priority, &theme))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.toggle(id, !done && !wont_do, cx);
+                }))
+                .into_any_element()
+        };
+        // A finger gets a wider target around the box, which does the same.
+        let marker = if crate::touch::active() && task.kind != Kind::Note {
+            div()
+                .id("marker-target")
+                .p(px(8.))
+                .m(px(-8.))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.toggle(id, !done && !wont_do, cx);
+                }))
+                .child(marker)
+                .into_any_element()
+        } else {
+            marker
+        };
+
+        let due = task.due_date.map(|date| {
+            if matches!(self.view, View::Completed | View::WontDo) {
+                (task_rows::closed_due_label(date, today, strings), false)
+            } else {
+                task_rows::row_due_label(date, task.due_time, today, strings, self.preferences.countdown_dates)
+            }
+        });
+
+        let draggable = self.view != View::Trash && title_input.is_none();
+        let dragged = DraggedTask { id, title: task.title.clone().into() };
+        let accent = theme.colors().accent;
+        let is_being_dragged = self.task_drag_origin.is_some_and(|(d, _)| d == id);
+        let drop_indicator = self.task_drop.as_ref().filter(|plan| plan.target_id == id).cloned();
+
+        // The separator starts at the checkbox; the gutter to its left holds the chevron.
+        div()
+            .id(ElementId::Uuid(id))
+            .debug_selector(move || format!("task-row-{id}"))
+            .group(group.clone())
+            .relative()
+            .when(draggable, |el| {
+                let view = cx.entity().downgrade();
+                el.on_drag(dragged, move |dragged, cursor_offset, window, cx| {
+                    let dragged_id = dragged.id;
+                    let fallback_x = window.mouse_position().x;
+                    view.update(cx, |this, cx| {
+                        let start_x = this
+                            .list_entries
+                            .iter()
+                            .position(|e| matches!(e, ListEntry::Row(Row::Task { task, .. }) if task.id == dragged_id))
+                            .and_then(|ix| this.list_entry_bounds.borrow().get(&ix).copied())
+                            .map_or(fallback_x, |area| area.left() + px(14.) + cursor_offset.x);
+                        this.task_drag_origin = Some((dragged_id, start_x));
+                        this.task_drop = None;
+                        cx.notify();
+                    })
+                    .ok();
+                    cx.new(|_| dragged.clone())
+                })
+            })
+            .when(is_being_dragged, |el| el.opacity(0.45))
+            .when_some(drop_indicator, |el, plan| {
+                let left = px(plan.target_level as f32 * INDENT + GUTTER);
+                el.child(
+                    div()
+                        .absolute()
+                        .left(left)
+                        .right_0()
+                        .when(!plan.after, |s| s.top(px(-1.)))
+                        .when(plan.after, |s| s.bottom(px(-1.)))
+                        .h(px(2.))
+                        .bg(accent)
+                        .child(
+                            div()
+                                .absolute()
+                                .left(px(-3.))
+                                .top(px(-2.))
+                                .size(px(6.))
+                                .rounded_full()
+                                .border_2()
+                                .border_color(accent)
+                                .bg(theme.colors().background),
+                        ),
+                )
+            })
+            .h(px(if details { ROW_HEIGHT + 14. } else { ROW_HEIGHT }))
+            .flex()
+            .pl(px(depth as f32 * INDENT))
+            .rounded(px(6.))
+            .cursor_pointer()
+            .when(selected, |el| el.bg(theme.colors().ghost_element_selected))
+            .when(!selected, |el| el.hover(|s| s.bg(theme.colors().ghost_element_hover)))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                if this.title_edit.as_ref().is_some_and(|(editing, _, _)| *editing == id) {
+                    return;
+                }
+                window.focus(&this.list_focus, cx);
+                this.select(id, cx);
+            }))
+            // The original's right-click menu, at the pointer; the task is selected too.
+            .on_mouse_down(MouseButton::Right, cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                window.focus(&this.list_focus, cx);
+                this.select(id, cx);
+                this.context_menu = Some((id, event.position));
+                this.context_side = None;
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .id("toggle-children")
+                    .w(px(GUTTER))
+                    .h_full()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .when(has_children, |el| {
+                        el.child(chevron(collapsed)).on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.toggle_task_collapsed(id, cx);
+                        }))
+                    }),
+            )
+            .child(
+                h_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .gap(px(10.))
+                    // Reserve the menu button's width and gap even when it is hidden.
+                    .pr(px(36.))
+                    .border_b_1()
+                    .border_color(theme.colors().border_variant)
+                    .child(marker)
+                    .when(task.pinned_at.is_some() && !closed_view, |el| {
+                        el.child(Icon::new(IconName::Pin).size(IconSize::XSmall).color(Color::Accent))
+                    })
+                    .child(
+                        v_flex().flex_1().min_w_0().debug_selector(|| format!("task-title-field-{id}")).child(if let Some(input) = title_input {
+                            input.into_any_element()
+                        } else {
+                            div()
+                                .id("task-title")
+                                .max_w_full()
+                                .min_w_0()
+                                .self_start()
+                                .child(Label::new(if task.title.is_empty() {
+                                    SharedString::new_static(strings.untitled)
+                                } else {
+                                    task.title.clone().into()
+                                })
+                                // As the original: closed tasks are muted, not struck through.
+                                .color(if done || wont_do || task.title.is_empty() { Color::Muted } else { Color::Default })
+                                .truncate())
+                                .debug_selector(|| format!("task-title-{id}"))
+                                .when(!task.is_deleted(), |el| {
+                                    el.cursor(gpui::CursorStyle::IBeam).on_click(cx.listener(
+                                        move |this, event: &gpui::ClickEvent, window, cx| {
+                                            cx.stop_propagation();
+                                            this.start_title_edit(id, Some(event.position()), window, cx);
+                                        },
+                                    ))
+                                })
+                                .into_any_element()
+                        })
+                        // "Show Details": the first line of the notes under the title.
+                        .when_some(details.then(|| task.notes.lines().find(|l| !l.trim().is_empty())).flatten(), |el, line| {
+                            el.child(Label::new(line.trim().to_owned()).size(LabelSize::XSmall).color(Color::Muted).truncate())
+                        }),
+                    )
+                    // A closed task's tags are muted with it, as the original's.
+                    .children(task.tags.iter().map(|tag| {
+                        let color = tag_colors.get(tag).copied().unwrap_or(theme.colors().text_muted);
+                        div().flex_none().when(closed_view, |el| el.opacity(0.45)).child(Chip::new(tag.clone(), color))
+                    }))
+                    // As the original's, a view across lists names each task's list after its tags.
+                    .when(self.view.shows_list_names(), |el| {
+                        let list = task
+                            .list_id
+                            .and_then(|id| self.lists.iter().find(|l| l.id == id))
+                            .map_or(SharedString::new_static(strings.inbox), |l| l.name.clone().into());
+                        el.child(div().flex_none().child(Label::new(list).size(LabelSize::Small).color(Color::Muted)))
+                    })
+                    .when_some(task.checklist, |el, (done_items, total)| {
+                        el.child(
+                            h_flex()
+                                .flex_none()
+                                .gap_1()
+                                .child(Icon::new(IconName::ListChecks).size(IconSize::XSmall))
+                                .child(
+                                    Label::new(format!("{done_items}/{total}"))
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted),
+                                ),
+                        )
+                    })
+                    .when_some(due, |el, (label, overdue)| {
+                        el.when(!task.reminders.is_empty() && !closed_view, |el| {
+                            el.child(Icon::new(IconName::AlarmClock).size(IconSize::XSmall).color(Color::Muted))
+                        })
+                        .when(task.repeat.is_some(), |el| {
+                            el.child(Icon::new(IconName::Repeat).size(IconSize::XSmall).color(Color::Accent))
+                        })
+                        .child(
+                            Label::new(label)
+                                .size(LabelSize::Small)
+                                .color(if closed_view {
+                                    Color::Muted
+                                } else if overdue && !done {
+                                    Color::Error
+                                } else {
+                                    Color::Accent
+                                }),
+                        )
+                    })
+                    // As the original's, a note with text shows a small page at the row's end.
+                    .when(task.kind == fern_core::Kind::Note && !task.notes.trim().is_empty(), |el| {
+                        el.child(Icon::new(IconName::FileText).size(IconSize::XSmall).color(Color::Muted))
+                    })
+                    // And a task with subtasks a small tree, open or folded.
+                    .when(has_children, |el| el.child(Icon::new(IconName::ListTree).size(IconSize::XSmall).color(Color::Muted)))
+                    .when(self.view == View::Trash, |el| {
+                        el.child(
+                            div()
+                                .id("restore")
+                                .flex_none()
+                                .opacity(if crate::touch::active() { 1. } else { 0. })
+                                .group_hover(group.clone(), |s| s.opacity(1.))
+                                .child(
+                                    IconButton::new("restore-button", IconName::RotateCcw)
+                                        .size(px(20.))
+                                        .icon_size(IconSize::Small)
+                                        .icon_color(Color::Muted)
+                                        .hover_icon_color(Color::Icon)
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.restore(id, cx);
+                                        })),
+                                ),
+                        )
+                    }),
+            )
+            // Keep the menu button inside the row, including in Trash and while editing.
+            .child({
+                let more_group = SharedString::from(format!("row-more-{id}"));
+                div()
+                    .id("row-more")
+                    .group(more_group.clone())
+                    .absolute()
+                    .right(px(6.))
+                    .top_0()
+                    .w(px(20.))
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .opacity(0.)
+                    .group_hover(group.clone(), |s| s.opacity(1.))
+                    .child(
+                        Icon::new(IconName::Ellipsis)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted)
+                            .group_hover_color(more_group, Color::Icon),
+                    )
+                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                        cx.stop_propagation();
+                        window.focus(&this.list_focus, cx);
+                        this.select(id, cx);
+                        this.context_menu = Some((id, event.position));
+                        this.context_side = None;
+                        cx.notify();
+                    }))
+            })
+            // And the drag handle left of a hovered row, as the original's.
+            .when(draggable, |el| {
+                let drag_group = SharedString::from(format!("row-drag-{id}"));
+                el.child(
+                    div()
+                        .group(drag_group.clone())
+                        .absolute()
+                        .left(px(-13.))
+                        .top_0()
+                        .h_full()
+                        .flex()
+                        .items_center()
+                        .opacity(0.)
+                        .group_hover(group, |s| s.opacity(1.))
+                        .child(
+                            Icon::new(IconName::Menu)
+                                .size(IconSize::XSmall)
+                                .color(Color::Muted)
+                                .group_hover_color(drag_group, Color::Icon),
+                        ),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// As in the original, Today and Next 7 Days list the habits due today, unless turned off in
+    /// the habit settings. Checking one checks the habit in (one unit for amount goals).
+    /// The kanban's Habit column in Today and Next 7 Days, as the original's: a card per habit
+    /// due today with its icon and name and "Today 0 / 2 unit" (or "0 / 1" without a goal); a
+    /// click checks it in or adds a step.
+    fn render_habit_column(&self, strings: &'static Strings, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let theme = cx.theme().clone();
+        let today = Self::today();
+        let habits: Vec<(fern_core::Habit, u32)> =
+            self.today_habits.iter().map(|(habit, _, amount)| (habit.clone(), *amount)).collect();
+        if habits.is_empty() {
+            return None;
+        }
+        let count = habits.len();
+        let dark = theme.is_dark();
+        let base_surface = theme.colors().elevated_surface_background;
+        let habit_border: Hsla = if dark { gpui::rgb(0x363636).into() } else { theme.colors().border_variant };
+        let habit_hover = base_surface.blend(theme.colors().ghost_element_hover);
+        let cards: Vec<AnyElement> = habits
+            .into_iter()
+            .map(|(habit, amount)| {
+                let id = habit.id;
+                let has_goal = habit.goal.is_some();
+                let (target, unit) = habit.goal.as_ref().map_or((1, String::new()), |g| (g.amount, g.unit.clone()));
+                v_flex()
+                    .id(SharedString::from(format!("habit-card-{id}")))
+                    .pl(px(14.))
+                    .pr(px(12.))
+                    .py(px(10.))
+                    .gap_1()
+                    .rounded(px(10.))
+                    .border_1()
+                    .border_color(habit_border)
+                    .bg(base_surface)
+                    .when(!dark && !self.kanban_column_color, |el| el.shadow_xs())
+                    .hover(move |s| s.bg(habit_hover))
+                    .cursor_pointer()
+                    .child(
+                        h_flex()
+                            .gap(px(7.))
+                            .child(crate::habit_view::avatar(&habit, px(20.), cx))
+                            .child(div().flex_1().min_w_0().child(Label::new(habit.name.clone()).truncate())),
+                    )
+                    .child(
+                        h_flex()
+                            .pl(px(27.))
+                            .gap_1()
+                            .child(Label::new(strings.today).size(LabelSize::Small).color(Color::Accent))
+                            .child(Label::new(format!("{amount} / {target} {unit}").trim().to_owned()).size(LabelSize::Small).color(Color::Muted)),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let result = if has_goal {
+                            this.store.step_checkin(id, today).map(|_| ())
+                        } else {
+                            this.store.toggle_checkin(id, today).map(|_| ())
+                        };
+                        this.check(result);
+                        this.reload_today_habits();
+                        cx.notify();
+                    }))
+                    .into_any_element()
+            })
+            .collect();
+        let col_width = self.kanban_column_width();
+        let dark = theme.is_dark();
+        let tint = self.kanban_column_color.then(|| lists_panel::parse_color(Some("#A5A5A5"))).flatten();
+        let card_px = if self.kanban_column_color { px(10.) } else { px(12.) };
+        Some(
+            v_flex()
+                .w(px(col_width))
+                .flex_none()
+                .max_h_full()
+                .rounded(px(14.))
+                .when_some(tint, |el, c| el.bg(c.opacity(if dark { 0.08 } else { 0.10 })))
+                .child(
+                    h_flex()
+                        .h(px(38.))
+                        .pt(px(12.))
+                        .pb(px(6.))
+                        .pl(px(14.))
+                        .pr(card_px)
+                        .gap_1()
+                        .child(Label::new(strings.section_habits).weight(FontWeight::SEMIBOLD))
+                        .child(Label::new(count.to_string()).size(LabelSize::Small).color(Color::Muted)),
+                )
+                .child(
+                    v_flex()
+                        .id("kanban-habits")
+                        .mt(px(2.))
+                        .px(card_px)
+                        .pt(px(4.))
+                        .pb(px(12.))
+                        .gap_2()
+                        .overflow_y_scroll()
+                        .children(cards),
+                )
+                .into_any_element(),
+        )
+    }
+
+    fn render_habits(&self, strings: &Strings, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let theme = cx.theme().clone();
+        let today = Self::today();
+        let habits = self.today_habits.clone();
+        if habits.is_empty() {
+            return None;
+        }
+        let count = habits.len();
+        Some(
+            v_flex()
+                .child(
+                    h_flex()
+                        .h(px(36.))
+                        .gap_1()
+                        .pl(px(GUTTER))
+                        // Next 7 Days names today's habits by the day, as the original: "Sunday, Today's Habit".
+                        .child(Label::new(if self.view == View::Next7Days {
+                            task_rows::relative_day(today, strings.todays_habit, strings)
+                        } else {
+                            strings.section_habits.to_owned()
+                        }).weight(FontWeight::BOLD))
+                        .child(div().pl_1().child(Label::new(count.to_string()).size(LabelSize::Small).color(Color::Muted))),
+                )
+                // As the original's rows: the icon and name, then "0 / 2 unit" and "Today" on
+                // the right, no box; a click checks the habit in or adds a step.
+                .children(habits.into_iter().map(|(habit, checked, amount)| {
+                    let id = habit.id;
+                    let has_goal = habit.goal.is_some();
+                    let (target, unit) = habit.goal.as_ref().map_or((1, String::new()), |g| (g.amount, g.unit.clone()));
+                    h_flex()
+                        .id(SharedString::from(format!("habit-row-{id}")))
+                        .h(px(ROW_HEIGHT))
+                        .pl(px(GUTTER))
+                        .pr_3()
+                        .gap(px(10.))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(theme.colors().ghost_element_hover))
+                        .child(crate::habit_view::avatar(&habit, px(20.), cx))
+                        .child(
+                            div().flex_1().min_w_0().child(
+                                Label::new(habit.name.clone())
+                                    .color(if checked { Color::Muted } else { Color::Default })
+                                    .truncate(),
+                            ),
+                        )
+                        .child(Label::new(format!("{amount} / {target} {unit}").trim().to_owned()).size(LabelSize::Small).color(Color::Muted))
+                        .child(Label::new(strings.today).size(LabelSize::Small).color(Color::Accent))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let result = if has_goal {
+                                this.store.step_checkin(id, today).map(|_| ())
+                            } else {
+                                this.store.toggle_checkin(id, today).map(|_| ())
+                            };
+                            this.check(result);
+                            this.reload_today_habits();
+                            cx.notify();
+                        }))
+                        .border_b_1()
+                        .border_color(theme.colors().border_variant)
+                }))
+                .into_any_element(),
+        )
+    }
+
+    /// The countdowns whose Show puts them in Today (on the day by default, as in the original),
+    /// each with its icon, name and the days left.
+    fn render_countdowns(&self, strings: &Strings, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.view != View::Today {
+            return None;
+        }
+        let theme = cx.theme().clone();
+        let today = Self::today();
+        let countdowns: Vec<fern_core::Countdown> = self
+            .store
+            .countdowns()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|c| !c.archived && c.show_in_list.shows(c.next_date(today), today))
+            .collect();
+        if countdowns.is_empty() {
+            return None;
+        }
+        let count = countdowns.len();
+        Some(
+            v_flex()
+                .child(
+                    h_flex()
+                        .h(px(36.))
+                        .gap_1()
+                        .pl(px(GUTTER))
+                        .child(Label::new(strings.section_countdown).weight(FontWeight::BOLD))
+                        .child(div().pl_1().child(Label::new(count.to_string()).size(LabelSize::Small).color(Color::Muted))),
+                )
+                .children(countdowns.into_iter().map(|countdown| {
+                    let date = countdown.next_date(today);
+                    let days = countdown.span(today).total_days;
+                    let when = if date == today { strings.today.to_owned() } else { format!("{days} {}", strings.habit_days) };
+                    h_flex()
+                        .h(px(ROW_HEIGHT))
+                        .pl(px(GUTTER))
+                        .pr_3()
+                        .gap(px(10.))
+                        .child(match countdown.icon.clone() {
+                            Some(icon) => div().w(px(16.)).child(icon).into_any_element(),
+                            None => Icon::new(crate::countdown_view::kind_icon(countdown.kind)).color(Color::Accent).into_any_element(),
+                        })
+                        .child(div().flex_1().min_w_0().child(Label::new(countdown.name).truncate()))
+                        .child(Label::new(when).size(LabelSize::Small).color(Color::Accent))
+                        .border_b_1()
+                        .border_color(theme.colors().border_variant)
+                }))
+                .into_any_element(),
+        )
+    }
+
+    /// The details' own picker for a task, for the right-click menu and the calendar's.
+    pub fn start_detail(&mut self, id: Id, what: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.kanban && !self.timeline && self.selected.is_none() {
+            self.open_card(id, cx);
+            self.card_detail.update(cx, |detail, cx| detail.start(what, window, cx));
+        } else {
+            self.select(id, cx);
+            self.detail.update(cx, |detail, cx| detail.start(what, window, cx));
+        }
+    }
+
+    /// A right-click menu choice (see `task_menu`).
+    fn context_action(&mut self, action: task_menu::MenuAction, window: &mut Window, cx: &mut Context<Self>) {
+        use task_menu::MenuAction;
+        let Some((id, _)) = self.context_menu else { return };
+        if let MenuAction::Side(side) = action {
+            self.context_side = side;
+            cx.notify();
+            return;
+        }
+        self.context_menu = None;
+        self.context_side = None;
+        let Some(task) = self.tasks.iter().find(|t| t.id == id).cloned().or_else(|| self.store.task(id).ok().flatten()) else {
+            cx.notify();
+            return;
+        };
+        if let Some(result) = task_menu::apply(&self.store, &task, action, Self::today()) {
+            self.check(result);
+            self.reload(cx);
+            return;
+        }
+        match action {
+            MenuAction::Due(None) => self.start_detail(id, "due", window, cx),
+            MenuAction::AddSubtask => self.start_detail(id, "subtask", window, cx),
+            MenuAction::LinkParent => self.start_detail(id, "link-parent", window, cx),
+            MenuAction::Tags => self.start_detail(id, "tags", window, cx),
+            MenuAction::Focus(stopwatch) => cx.emit(StartFocus(id, task.title, stopwatch)),
+            MenuAction::CopyLink => cx.write_to_clipboard(gpui::ClipboardItem::new_string(fern_core::link::task_link(id))),
+            MenuAction::StickyNote => crate::sticky_opener::open_sticky_note(self.store.clone(), id, cx),
+            // Deleting goes the list's usual way, with its Undo.
+            MenuAction::Delete => self.delete(id, cx),
+            _ => {}
+        }
+        cx.notify();
+    }
+
+    /// The task's right-click menu, as the original's, at the pointer.
+    fn render_context_menu(&self, strings: &'static Strings, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (id, position) = self.context_menu?;
+        let task = self.tasks.iter().find(|t| t.id == id).cloned().or_else(|| self.store.task(id).ok().flatten())?;
+        let menu = task_menu::render(
+            &task,
+            &self.active_lists(),
+            task_menu::MenuKind::List,
+            task_menu::TaskNesting::of(&self.store, task.id),
+            self.context_side,
+            strings,
+            cx,
+            std::rc::Rc::new(|this: &mut Self, action, window, cx| this.context_action(action, window, cx)),
+        );
+        Some(task_menu::place(position, menu))
+    }
+
+    fn set_closed_menu(&mut self, menu: Option<ClosedMenu>, cx: &mut Context<Self>) {
+        self.closed_menu = menu;
+        cx.notify();
+    }
+
+    fn open_other_date(&mut self, cx: &mut Context<Self>) {
+        let (start, end) = match self.closed_range {
+            ClosedRange::Custom(start, end) => (Some(start), Some(end)),
+            _ => (None, None),
+        };
+        let month = crate::calendar::month_start(start.unwrap_or_else(Self::today));
+        self.set_closed_menu(Some(ClosedMenu::OtherDate { start, end, picking: None, month }), cx);
+    }
+
+    fn update_other_date(
+        &mut self,
+        cx: &mut Context<Self>,
+        change: impl FnOnce(&mut Option<NaiveDate>, &mut Option<NaiveDate>, &mut Option<RangeEnd>, &mut NaiveDate),
+    ) {
+        if let Some(ClosedMenu::OtherDate { start, end, picking, month }) = self.closed_menu.as_mut() {
+            change(start, end, picking, month);
+        }
+        cx.notify();
+    }
+
+    /// The "Other Date" popover: Start and End fields, a calendar for the one being picked.
+    fn render_other_date(
+        &self,
+        start: Option<NaiveDate>,
+        end: Option<NaiveDate>,
+        picking: Option<RangeEnd>,
+        month: NaiveDate,
+        strings: &'static Strings,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = cx.theme().clone();
+        let today = Self::today();
+        let field = |which: RangeEnd, value: Option<NaiveDate>, placeholder: &'static str| {
+            let label: SharedString =
+                value.map_or(placeholder.into(), |date| task_rows::short_date(date, strings).into());
+            h_flex()
+                .id(if which == RangeEnd::Start { "range-start" } else { "range-end" })
+                .h(px(30.))
+                .px_2()
+                .rounded(px(6.))
+                .border_1()
+                .border_color(if picking == Some(which) { theme.colors().accent } else { theme.colors().border })
+                .cursor_pointer()
+                .child(Label::new(label).color(if value.is_some() { Color::Default } else { Color::Muted }))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.update_other_date(cx, |_, _, picking, _| *picking = Some(which))
+                }))
+        };
+        let calendar = picking.map(|which| {
+            let selected = if which == RangeEnd::Start { start } else { end };
+            v_flex()
+                .gap_1()
+                .child(
+                    h_flex()
+                        .child(div().flex_1().child(Label::new(crate::calendar::month_title(month, strings)).weight(FontWeight::SEMIBOLD)))
+                        .child(IconButton::new("range-prev", IconName::ChevronLeft).size(px(22.)).on_click(cx.listener(
+                            |this, _, _, cx| this.update_other_date(cx, |_, _, _, month| *month = crate::calendar::add_months(*month, -1)),
+                        )))
+                        .child(IconButton::new("range-next", IconName::ChevronRight).size(px(22.)).on_click(cx.listener(
+                            |this, _, _, cx| this.update_other_date(cx, |_, _, _, month| *month = crate::calendar::add_months(*month, 1)),
+                        ))),
+                )
+                .child(h_flex().children(crate::calendar::weekday_labels(&strings.weekdays_narrow).iter().map(|day| {
+                    div().flex_1().flex().justify_center().child(Label::new(*day).size(LabelSize::XSmall).color(Color::Muted))
+                })))
+                .children(crate::calendar::month_grid(month).chunks(7).map(|week| {
+                    h_flex().children(week.iter().map(|&date| {
+                        let is_selected = selected == Some(date);
+                        div()
+                            .id(SharedString::from(format!("range-day-{date}")))
+                            .flex_1()
+                            .h(px(26.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_full()
+                            .cursor_pointer()
+                            .when(is_selected, |el| el.bg(theme.colors().accent))
+                            .when(!is_selected, |el| el.hover(|s| s.bg(theme.colors().element_hover)))
+                            .child(
+                                Label::new(date.day().to_string()).centered().size(LabelSize::Small).color(if is_selected {
+                                    Color::OnAccent
+                                } else if date == today {
+                                    Color::Accent
+                                } else if date.month() != month.month() {
+                                    Color::Muted
+                                } else {
+                                    Color::Default
+                                }),
+                            )
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.update_other_date(cx, |start, end, picking, _| {
+                                    match which {
+                                        RangeEnd::Start => *start = Some(date),
+                                        RangeEnd::End => *end = Some(date),
+                                    }
+                                    *picking = None;
+                                })
+                            }))
+                    }))
+                }))
+        });
+        let (start_calendar, end_calendar) =
+            if picking == Some(RangeEnd::Start) { (calendar, None) } else { (None, calendar) };
+        let ready = start.is_some() && end.is_some();
+        popover(cx)
+            .w(px(240.))
+            .p_2()
+            .gap_2()
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.set_closed_menu(None, cx)))
+            .child(field(RangeEnd::Start, start, strings.range_start))
+            .children(start_calendar)
+            .child(field(RangeEnd::End, end, strings.range_end))
+            .children(end_calendar)
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        div()
+                            .id("range-cancel")
+                            .flex_1()
+                            .h(px(26.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(6.))
+                            .border_1()
+                            .border_color(theme.colors().border)
+                            .cursor_pointer()
+                            .child(Label::new(strings.cancel).size(LabelSize::Small))
+                            .on_click(cx.listener(|this, _, _, cx| this.set_closed_menu(None, cx))),
+                    )
+                    .child(
+                        div()
+                            .id("range-confirm")
+                            .flex_1()
+                            .h(px(26.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(6.))
+                            .bg(theme.colors().accent)
+                            .when(!ready, |el| el.opacity(0.5))
+                            .when(ready, |el| el.cursor_pointer())
+                            .child(Label::new(strings.confirm).size(LabelSize::Small).color(Color::OnAccent))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if let (Some(start), Some(end)) = (start, end) {
+                                    this.closed_range = ClosedRange::custom(start, end);
+                                    this.set_closed_menu(None, cx);
+                                    this.sync_closed_filter(cx);
+                                }
+                            })),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn sync_closed_filter(&mut self, cx: &mut Context<Self>) {
+        let visible = self.selected.is_some_and(|selected| {
+            self.rows(i18n::t(cx)).into_iter().any(|row| matches!(row, Row::Task { task, .. } if task.id == selected))
+        });
+        self.list_state = ListState::new(0, ListAlignment::Top, px(400.));
+        self.list_entries.clear();
+        if !visible {
+            self.sync_layout_selection(cx);
+        }
+        cx.notify();
+    }
+
+    /// Toggles a list in the lists-filter draft; "All Lists" is `None`.
+    fn toggle_closed_list(&mut self, list: Option<Option<Id>>, cx: &mut Context<Self>) {
+        if let Some(ClosedMenu::Lists(draft)) = self.closed_menu.as_mut() {
+            *draft = match (list, draft.take()) {
+                (None, _) => None,
+                (Some(list), None) => Some(vec![list]),
+                (Some(list), Some(mut lists)) => {
+                    if let Some(at) = lists.iter().position(|l| *l == list) {
+                        lists.remove(at);
+                    } else {
+                        lists.push(list);
+                    }
+                    (!lists.is_empty()).then_some(lists)
+                }
+            };
+        }
+        cx.notify();
+    }
+
+    /// The "All Dates" / "All Lists" filter buttons of the Completed and Won't Do views.
+    fn render_closed_filters(&self, strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let list_name = |list: Option<Id>| -> SharedString {
+            list.and_then(|id| self.lists.iter().find(|l| l.id == id))
+                .map_or(SharedString::new_static(strings.inbox), |l| l.name.clone().into())
+        };
+        let lists_label: SharedString = match &self.closed_lists {
+            None => strings.all_lists.into(),
+            Some(lists) if lists.len() == 1 => list_name(lists[0]),
+            Some(lists) => format!("{} ({})", strings.all_lists, lists.len()).into(),
+        };
+        let open = self.closed_menu.clone();
+        let filter_button = |id: &'static str, label: SharedString, active: bool| {
+            h_flex()
+                .id(id)
+                .h(px(24.))
+                .px_2()
+                .gap_1()
+                .rounded(px(5.))
+                .border_1()
+                .border_color(if active { theme.colors().accent } else { theme.colors().border })
+                .cursor_pointer()
+                .child(Label::new(label).size(LabelSize::XSmall))
+                .child(Icon::new(IconName::ChevronDown).size(IconSize::XSmall).color(Color::Muted))
+        };
+        let check = || Label::new("✓").color(Color::Accent);
+
+        let dates_menu = popover(cx)
+            .min_w(px(180.))
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.set_closed_menu(None, cx)))
+            .children(ClosedRange::PRESETS.into_iter().map(|range| {
+                let selected = range == self.closed_range;
+                ListItem::new(SharedString::from(format!("closed-range-{range:?}")))
+                    .child(Label::new(range.label(strings)).color(if selected { Color::Accent } else { Color::Default }))
+                    .when(selected, |item| item.end_slot(check()))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.closed_range = range;
+                        this.set_closed_menu(None, cx);
+                        this.sync_closed_filter(cx);
+                    }))
+            }))
+            .child({
+                let custom = matches!(self.closed_range, ClosedRange::Custom(..));
+                ListItem::new("closed-range-other")
+                    .child(Label::new(strings.other_date).color(if custom { Color::Accent } else { Color::Default }))
+                    .when(custom, |item| item.end_slot(check()))
+                    .on_click(cx.listener(|this, _, _, cx| this.open_other_date(cx)))
+            });
+        let other_menu = match &open {
+            Some(ClosedMenu::OtherDate { start, end, picking, month }) => {
+                Some(self.render_other_date(*start, *end, *picking, *month, strings, cx))
+            }
+            _ => None,
+        };
+
+        let draft = match &open {
+            Some(ClosedMenu::Lists(draft)) => draft.clone(),
+            _ => None,
+        };
+        let entries: Vec<(Option<Option<Id>>, SharedString, IconName)> = std::iter::once((None, strings.all_lists.into(), IconName::Layers))
+            .chain(std::iter::once((Some(None), strings.inbox.into(), IconName::Inbox)))
+            .chain(self.lists.iter().map(|l| (Some(Some(l.id)), l.name.clone().into(), IconName::List)))
+            .collect();
+        let lists_menu = popover(cx)
+            .min_w(px(240.))
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.set_closed_menu(None, cx)))
+            .children(entries.into_iter().map(|(list, label, icon)| {
+                let selected = match (&list, &draft) {
+                    (None, None) => true,
+                    (Some(list), Some(lists)) => lists.contains(list),
+                    _ => false,
+                };
+                let id = match list {
+                    None => "closed-list-all".to_owned(),
+                    Some(None) => "closed-list-inbox".to_owned(),
+                    Some(Some(id)) => format!("closed-list-{id}"),
+                };
+                ListItem::new(SharedString::from(id))
+                    .start_slot(Icon::new(icon).color(if selected { Color::Accent } else { Color::Muted }))
+                    .child(Label::new(label).color(if selected { Color::Accent } else { Color::Default }))
+                    .when(selected, |item| item.end_slot(check()))
+                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_closed_list(list, cx)))
+            }))
+            .child(div().py_1().child(Divider::horizontal()))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .p_1()
+                    .child(
+                        div()
+                            .id("closed-lists-cancel")
+                            .flex_1()
+                            .h(px(26.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(6.))
+                            .border_1()
+                            .border_color(theme.colors().border)
+                            .cursor_pointer()
+                            .child(Label::new(strings.cancel).size(LabelSize::Small))
+                            .on_click(cx.listener(|this, _, _, cx| this.set_closed_menu(None, cx))),
+                    )
+                    .child(
+                        div()
+                            .id("closed-lists-ok")
+                            .flex_1()
+                            .h(px(26.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(6.))
+                            .bg(theme.colors().accent)
+                            .cursor_pointer()
+                            .child(Label::new(strings.ok).size(LabelSize::Small).color(Color::OnAccent))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(ClosedMenu::Lists(draft)) = this.closed_menu.take() {
+                                    this.closed_lists = draft;
+                                }
+                                this.sync_closed_filter(cx);
+                            })),
+                    ),
+            );
+
+        h_flex()
+            .h(px(30.))
+            .flex_none()
+            .px(px(24.))
+            .gap_2()
+            .child(
+                div()
+                    .relative()
+                    .child(
+                        filter_button(
+                            "closed-dates",
+                            self.closed_range.label(strings).into(),
+                            matches!(open, Some(ClosedMenu::Dates | ClosedMenu::OtherDate { .. })),
+                        )
+                            .on_click(cx.listener(|this, _, _, cx| this.set_closed_menu(Some(ClosedMenu::Dates), cx))),
+                    )
+                    .when(open == Some(ClosedMenu::Dates), |el| {
+                        el.child(PopoverAttachment::new(Placement::BelowLeft, dates_menu))
+                    })
+                    .when_some(other_menu, |el, menu| el.child(PopoverAttachment::new(Placement::BelowLeft, menu))),
+            )
+            .child(
+                div()
+                    .relative()
+                    .child(
+                        filter_button("closed-lists", lists_label, matches!(open, Some(ClosedMenu::Lists(_))))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                let draft = this.closed_lists.clone();
+                                this.set_closed_menu(Some(ClosedMenu::Lists(draft)), cx)
+                            })),
+                    )
+                    .when(matches!(open, Some(ClosedMenu::Lists(_))), |el| {
+                        el.child(PopoverAttachment::new(Placement::BelowLeft, lists_menu))
+                    }),
+            )
+            .into_any_element()
+    }
+
+    fn render_header_menu(&self, strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {
+        let in_list = matches!(self.view, View::List(_));
+        let in_trash = self.view == View::Trash;
+        popover(cx)
+            .min_w(px(236.))
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.header_menu_open = false;
+                cx.notify();
+            }))
+            .when_some(match self.view {
+                View::List(id) => Some(id),
+                _ => None,
+            }, |el, id| el.children(self.render_list_items(ListMenuTarget::List(id), strings, cx)).child(div().my_1().child(Divider::horizontal())))
+            .when_some(match self.view {
+                View::Filter(id) => self.filters.iter().find(|(f, _)| f.id == id).map(|(f, _)| f.clone()),
+                _ => None,
+            }, |el, filter| {
+                el.child(
+                    ListItem::new("edit-filter")
+                        .start_slot(Icon::new(IconName::Pencil).color(Color::Icon))
+                        .child(Label::new(strings.edit_filter))
+                        .on_click(cx.listener(move |this, _, window, cx| this.open_filter_edit(Some(filter.clone()), window, cx))),
+                )
+                .child(
+                    ListItem::new("delete-filter")
+                        .start_slot(Icon::new(IconName::Trash).color(Color::Error))
+                        .child(Label::new(strings.delete_filter).color(Color::Error))
+                        .on_click(cx.listener(|this, _, _, cx| this.delete_current_filter(cx))),
+                )
+                .child(div().my_1().child(Divider::horizontal()))
+            })
+            .when(in_trash, |el| {
+                el.child(
+                    ListItem::new("empty-trash")
+                        .start_slot(Icon::new(IconName::Trash).color(Color::Error))
+                        .child(Label::new(strings.empty_trash).color(Color::Error))
+                        .on_click(cx.listener(|this, _, _, cx| this.empty_trash(cx))),
+                )
+            })
+            .when(!in_trash && !matches!(self.view, View::Completed | View::WontDo | View::Search(_)), |el| {
+                let completed = self.view_flag("show_completed", true);
+                let details = self.view_flag("show_details", false);
+                let kanban = self.kanban;
+                let timeline = self.timeline && !kanban;
+                let theme = cx.theme().clone();
+                let layout = |id: &'static str, icon: IconName, on: bool| {
+                    div()
+                        .id(id)
+                        .flex_1()
+                        .h(px(30.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(6.))
+                        .cursor_pointer()
+                        .when(on, |el| el.bg(theme.colors().element_selected))
+                        .hover(|s| s.bg(theme.colors().ghost_element_hover))
+                        .child(Icon::new(icon).color(if on { Color::Accent } else { Color::Icon }))
+                };
+                el.when(in_list, |el| el.child(div().my_1().child(Divider::horizontal())))
+                    .child(div().px_2().pt_1().child(Label::new(strings.view_label).size(LabelSize::Small).color(Color::Muted)))
+                    .child(
+                        h_flex()
+                            .px_2()
+                            .py_1()
+                            .gap_1()
+                            .child(layout("layout-list", IconName::List, !kanban && !timeline).on_click(cx.listener(|this, _, _, cx| this.set_layout(false, false, cx))))
+                            .child(layout("layout-kanban", IconName::Kanban, kanban).on_click(cx.listener(|this, _, _, cx| this.set_layout(true, false, cx))))
+                            .child(layout("layout-timeline", IconName::ChartGantt, timeline).on_click(cx.listener(|this, _, _, cx| this.set_layout(false, true, cx)))),
+                    )
+                    .child(div().my_1().child(Divider::horizontal()))
+                    .when(timeline, |el| {
+                        el.child(
+                            ListItem::new("arrange-tasks")
+                                .start_slot(Icon::new(IconName::CalendarPlus).color(Color::Icon))
+                                .child(Label::new(strings.arrange_tasks))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.arrange_open = true;
+                                    this.header_menu_open = false;
+                                    cx.notify();
+                                })),
+                        )
+                    })
+                    .child(
+                        ListItem::new("toggle-completed")
+                            .start_slot(Icon::new(IconName::SquareCheck).color(Color::Icon))
+                            .child(Label::new(if completed { strings.hide_completed } else { strings.show_completed }))
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_view_flag("show_completed", true, cx))),
+                    )
+                    .child(
+                        ListItem::new("toggle-details")
+                            .start_slot(Icon::new(IconName::FileText).color(Color::Icon))
+                            .child(Label::new(if details { strings.hide_details } else { strings.show_details }))
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_view_flag("show_details", false, cx))),
+                    )
+                    .when(!timeline, |el| {
+                        let parents = self.parent_task_ids(strings);
+                        if parents.is_empty() {
+                            return el;
+                        }
+                        let any_expanded = parents.iter().any(|id| !self.collapsed_tasks.contains(id));
+                        el.child(
+                            ListItem::new("toggle-all-subtasks")
+                                .start_slot(Icon::new(IconName::ChevronsUpDown).color(Color::Icon))
+                                .child(Label::new(if any_expanded {
+                                    strings.collapse_all_subtasks
+                                } else {
+                                    strings.expand_all_subtasks
+                                }))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.header_menu_open = false;
+                                    this.toggle_all_subtasks_now(cx);
+                                })),
+                        )
+                    })
+                    .child(
+                        ListItem::new("view-options")
+                            .start_slot(Icon::new(IconName::Settings2).color(Color::Icon))
+                            .child(Label::new(strings.view_options))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.header_menu_open = false;
+                                this.view_options = Some(false);
+                                cx.notify();
+                            })),
+                    )
+                    .child(div().my_1().child(Divider::horizontal()))
+                    .when(self.section_owner().is_some(), |el| {
+                        el.child(
+                            ListItem::new("add-section")
+                                .start_slot(Icon::new(IconName::Plus).color(Color::Icon))
+                                .child(Label::new(strings.add_section))
+                                .on_click(cx.listener(|this, _, window, cx| this.start_new_section(window, cx))),
+                        )
+                    })
+                    .when(in_list || self.view == View::Inbox, |el| {
+                        el.child(
+                            ListItem::new("list-activities")
+                                .start_slot(Icon::new(IconName::ListTree).color(Color::Icon))
+                                .child(Label::new(strings.list_activities))
+                                .on_click(cx.listener(|this, _, _, cx| this.open_list_activity(cx))),
+                        )
+                    })
+                    .child(
+                        ListItem::new("print-list")
+                            .start_slot(Icon::new(IconName::Printer).color(Color::Icon))
+                            .child(Label::new(strings.print))
+                            .on_click(cx.listener(|this, _, _, cx| this.print_list(cx))),
+                    )
+            })
+            .when(!in_list && !in_trash && matches!(self.view, View::Completed | View::WontDo | View::Search(_)), |el| {
+                el.child(div().px_2().py_1().child(Label::new(strings.no_actions).color(Color::Muted)))
+            })
+            .into_any_element()
+    }
+}
+
+/// A round color option; `None` is "no color", drawn as an outlined circle.
+fn chevron(collapsed: bool) -> Icon {
+    Icon::new(if collapsed { IconName::ChevronRight } else { IconName::ChevronDown }).size(IconSize::XSmall)
+}
+
+impl Focusable for TodoView {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.input.focus_handle(cx)
+    }
+}
+
+impl Render for TodoView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if !cx.has_active_drag() && self.panel_drag.is_some() {
+            self.restore_panel_drag_snapshot();
+        }
+        let strings = i18n::t(cx);
+        let theme = cx.theme().clone();
+        let closed_header = matches!(self.view, View::Completed | View::WontDo);
+        let add_focused = self.input.focus_handle(cx).is_focused(window);
+        let input_focus = self.input.focus_handle(cx);
+        let today = Self::today();
+        let tag_colors: HashMap<String, Hsla> = self
+            .tags
+            .iter()
+            .map(|t| (t.name.clone(), lists_panel::color(t.color.as_deref(), cx)))
+            .collect();
+        // The original's "too narrow" window: the details then follow View Options' layout.
+        let popup_details = self.uses_popup_details();
+        // The dragged width, narrowed while the window leaves the task list too little room.
+        let view_width = f32::from(window.viewport_size().width) - crate::sidebar::WIDTH;
+        let detail_width = self.detail_width.min(self.max_detail_width(view_width)).max(DETAIL_MIN_WIDTH);
+        let timeline_view = self.timeline
+            && !self.kanban
+            && !matches!(self.view, View::Trash | View::Completed | View::WontDo | View::Search(_));
+        let kanban_view = (self.kanban || timeline_view)
+            && !matches!(self.view, View::Trash | View::Completed | View::WontDo | View::Search(_));
+        // The original's kanban and timeline have no add field on top: a kanban column has its
+        // own "+".
+        let kanban_only = kanban_view && !timeline_view;
+        let board: Option<AnyElement> = if timeline_view {
+            Some(self.render_timeline(strings, cx))
+        } else {
+            None
+        };
+        let board: Option<AnyElement> = board.or_else(|| kanban_view.then(|| {
+            let columns = self.board_columns(strings);
+            let habit_col = self.render_habit_column(strings, cx);
+            if columns.is_empty() && habit_col.is_none() && self.section_owner().is_none() {
+                let theme = cx.theme().clone();
+                return v_flex()
+                    .id("kanban-empty")
+                    .track_focus(&self.list_focus)
+                    .flex_1()
+                    .when(matches!(self.view, View::Day(_)), |el| {
+                        el.pt(px(160.))
+                            .items_center()
+                            .gap_1()
+                            .child(Icon::new(IconName::CalendarCheck).size(IconSize::Medium).color(Color::Muted))
+                            .child(Label::new(strings.free_day))
+                            .child(Label::new(strings.free_day_hint).size(LabelSize::Small).color(Color::Muted))
+                    })
+                    .when(self.view == View::Tomorrow, |el| {
+                        el.pt(px(160.))
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .size(px(96.))
+                                    .mb_2()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded_full()
+                                    .bg(theme.colors().element_hover)
+                                    .child(Icon::new(IconName::Map).size(IconSize::XLarge).color(Color::Accent)),
+                            )
+                            .child(Label::new(strings.no_tasks_tomorrow))
+                            .child(Label::new(strings.plan_ahead).size(LabelSize::Small).color(Color::Muted))
+                    })
+                    .when(!matches!(self.view, View::Day(_) | View::Tomorrow), |el| {
+                        el.px_6().pt_8().child(Label::new(strings.no_tasks).color(Color::Muted))
+                    })
+                    .into_any_element();
+            }
+            self.sync_kanban_quick_adds(&columns, strings, cx);
+            let theme = cx.theme().clone();
+            let dark = theme.is_dark();
+            let col_width = self.kanban_column_width();
+            let colored = self.kanban_column_color;
+            let card_px = if colored { px(10.) } else { px(12.) };
+            let owner = self.section_owner();
+            let show_list_name = self.view.shows_list_names() && self.sort_settings().1 != GroupBy::List;
+            let hide_new_section = self.view_flag("kanban:hide_new_section", false);
+            // Position where an inline "Add Section to Left / Right" input should appear among columns.
+            let inline_new_col_pos: Option<usize> = self.new_section.as_ref().and(self.new_section_index).map(|sec_idx| {
+                let mut seen_sections = 0usize;
+                for (col_i, col) in columns.iter().enumerate() {
+                    if matches!(col.drop, Some(DropTarget::Section(Some(_)))) {
+                        if seen_sections == sec_idx {
+                            return col_i;
+                        }
+                        seen_sections += 1;
+                    }
+                }
+                columns.len()
+            });
+            let render_new_sec_input = |input: Entity<TextInput>, cx: &mut Context<Self>| {
+                v_flex()
+                    .w(px(col_width))
+                    .flex_none()
+                    .mt(px(6.))
+                    .px(px(10.))
+                    .child(
+                        h_flex()
+                            .h(px(34.))
+                            .px_2p5()
+                            .rounded(px(10.))
+                            .border_1()
+                            .border_color(theme.colors().accent)
+                            .bg(theme.colors().elevated_surface_background)
+                            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.commit_new_section(cx)))
+                            .child(input),
+                    )
+                    .into_any_element()
+            };
+            let accent = theme.colors().accent;
+            let render_sub_header = |sub_id: String,
+                                     fold_key: String,
+                                     folded: bool,
+                                     pin_icon: bool,
+                                     label: &'static str,
+                                     sub_count: usize,
+                                     sub_kind: KanbanSub,
+                                     top_margin: Pixels,
+                                     col_drop: Option<DropTarget>,
+                                     cx: &mut Context<Self>| {
+                h_flex()
+                    .id(SharedString::from(sub_id))
+                    .mt(top_margin)
+                    .h(px(28.))
+                    .px(px(4.))
+                    .gap(px(5.))
+                    .rounded(px(6.))
+                    .border_1()
+                    .border_color(gpui::transparent_black())
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme.colors().ghost_element_hover))
+                    .drag_over::<DraggedTask>(move |style, _, _, _| {
+                        style.bg(accent.opacity(0.08)).border_color(accent)
+                    })
+                    .on_drop(cx.listener(move |this, dragged: &DraggedTask, _, cx| {
+                        this.drop_on_kanban_subsection(dragged.id, col_drop.clone(), sub_kind, cx);
+                    }))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        if !this.kanban_folded_sub.remove(&fold_key) {
+                            this.kanban_folded_sub.insert(fold_key.clone());
+                        }
+                        cx.notify();
+                    }))
+                    .child(chevron(folded).color(Color::Muted))
+                    .when(pin_icon, |el| {
+                        el.child(
+                            Icon::new(IconName::Pin)
+                                .size(IconSize::XSmall)
+                                .color(Color::Custom(Hsla::from(gpui::rgb(0xFAA80C)))),
+                        )
+                    })
+                    .child(Label::new(label).size(LabelSize::XSmall).weight(FontWeight::SEMIBOLD).color(Color::Muted))
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(theme.colors().text_muted.opacity(0.75))
+                            .child(sub_count.to_string()),
+                    )
+                    .into_any_element()
+            };
+            let mut rendered_cols: Vec<AnyElement> = Vec::with_capacity(columns.len() + 1);
+            for (i, col) in columns.into_iter().enumerate() {
+                if inline_new_col_pos == Some(i)
+                    && let Some(input) = self.new_section.clone()
+                {
+                    rendered_cols.push(render_new_sec_input(input, cx));
+                }
+                let open_count = col.open_count();
+                let has_cards = col.total_count() > 0;
+                let BoardCol { key: col_key, title, drop, pinned_cards, open_cards, completed_cards } = col;
+                let drop_for_header = drop.clone();
+                let drop_for_cards = drop.clone();
+                let section_id = match drop {
+                    Some(DropTarget::Section(Some(id))) => Some(id),
+                    _ => None,
+                };
+                let display_title = if title.is_empty() { strings.group_tasks.to_owned() } else { title };
+                let tint = self.kanban_column_tint(i, drop.as_ref(), &display_title, strings, &tag_colors, accent);
+                let persistent_add = if self.kanban_quick_add {
+                    self.kanban_quick_adds.get(&col_key).cloned()
+                } else {
+                    None
+                };
+                let is_temp_add = persistent_add.is_none() && self.column_add.as_ref().is_some_and(|(at, _, _)| *at == i);
+                let add_input = persistent_add.or_else(|| {
+                    self.column_add.as_ref().filter(|(at, _, _)| *at == i).map(|(_, _, input)| input.clone())
+                });
+                let mut col_items: Vec<AnyElement> = Vec::new();
+                if has_cards {
+                    if !pinned_cards.is_empty() {
+                        let pinned_key = format!("{col_key}:pinned");
+                        let pinned_folded = self.kanban_folded_sub.contains(&pinned_key);
+                        col_items.push(render_sub_header(
+                            format!("kanban-sub-pinned-{i}"),
+                            pinned_key,
+                            pinned_folded,
+                            true,
+                            strings.group_pinned,
+                            pinned_cards.len(),
+                            KanbanSub::Pinned,
+                            px(0.),
+                            drop_for_cards.clone(),
+                            cx,
+                        ));
+                        if !pinned_folded {
+                            for (task, subtasks) in &pinned_cards {
+                                col_items.push(self.render_card(
+                                    i,
+                                    drop_for_cards.clone(),
+                                    task,
+                                    subtasks,
+                                    &tag_colors,
+                                    tint,
+                                    show_list_name,
+                                    today,
+                                    strings,
+                                    cx,
+                                ));
+                            }
+                        }
+                        if !open_cards.is_empty() {
+                            let unpinned_key = format!("{col_key}:unpinned");
+                            let unpinned_folded = self.kanban_folded_sub.contains(&unpinned_key);
+                            col_items.push(render_sub_header(
+                                format!("kanban-sub-unpinned-{i}"),
+                                unpinned_key,
+                                unpinned_folded,
+                                false,
+                                strings.group_unpinned,
+                                open_cards.len(),
+                                KanbanSub::Unpinned,
+                                px(4.),
+                                drop_for_cards.clone(),
+                                cx,
+                            ));
+                            if !unpinned_folded {
+                                for (task, subtasks) in &open_cards {
+                                    col_items.push(self.render_card(
+                                        i,
+                                        drop_for_cards.clone(),
+                                        task,
+                                        subtasks,
+                                        &tag_colors,
+                                        tint,
+                                        show_list_name,
+                                        today,
+                                        strings,
+                                        cx,
+                                    ));
+                                }
+                            }
+                        }
+                    } else {
+                        for (task, subtasks) in &open_cards {
+                            col_items.push(self.render_card(
+                                i,
+                                drop_for_cards.clone(),
+                                task,
+                                subtasks,
+                                &tag_colors,
+                                tint,
+                                show_list_name,
+                                today,
+                                strings,
+                                cx,
+                            ));
+                        }
+                    }
+                    if !completed_cards.is_empty() {
+                        let completed_key = format!("{col_key}:completed");
+                        let completed_folded = self.kanban_folded_sub.contains(&completed_key);
+                        col_items.push(render_sub_header(
+                            format!("kanban-sub-completed-{i}"),
+                            completed_key,
+                            completed_folded,
+                            false,
+                            strings.group_completed,
+                            completed_cards.len(),
+                            KanbanSub::Completed,
+                            if open_count > 0 { px(6.) } else { px(0.) },
+                            drop_for_cards.clone(),
+                            cx,
+                        ));
+                        if !completed_folded {
+                            for (task, subtasks) in &completed_cards {
+                                col_items.push(self.render_card(
+                                    i,
+                                    drop_for_cards.clone(),
+                                    task,
+                                    subtasks,
+                                    &tag_colors,
+                                    tint,
+                                    show_list_name,
+                                    today,
+                                    strings,
+                                    cx,
+                                ));
+                            }
+                        }
+                    }
+                }
+                rendered_cols.push(
+                    v_flex()
+                        .id(SharedString::from(format!("kanban-column-{i}")))
+                        .rounded(px(14.))
+                        .border_1()
+                        .border_color(gpui::transparent_black())
+                        .map(|el| match (tint, !has_cards) {
+                            (Some(c), true) => el.bg(gpui::linear_gradient(
+                                180.,
+                                gpui::linear_color_stop(c.opacity(if dark { 0.08 } else { 0.10 }), 0.),
+                                gpui::linear_color_stop(gpui::transparent_black(), 1.),
+                            )),
+                            (Some(c), false) => el.bg(c.opacity(if dark { 0.08 } else { 0.10 })),
+                            (None, _) => el,
+                        })
+                        .when_some(drop, |el, drop| {
+                            el.drag_over::<DraggedTask>(move |style, _, _, _| {
+                                style.bg(accent.opacity(0.08)).border_color(accent)
+                            })
+                            .on_drop(cx.listener(move |this, dragged: &DraggedTask, _, cx| {
+                                this.drop_on_column(dragged.id, drop.clone(), cx)
+                            }))
+                        })
+                        .when_some(section_id.zip(owner), |el, (target_section, list)| {
+                            el.drag_over::<DraggedColumn>(move |style, _, _, _| {
+                                style.bg(accent.opacity(0.08)).border_color(accent)
+                            })
+                            .on_drop(cx.listener(move |this, dragged: &DraggedColumn, _, cx| {
+                                if dragged.id != target_section {
+                                    let result = this.store.reorder_list_sections(list, dragged.id, target_section);
+                                    this.check(result);
+                                    this.reload(cx);
+                                }
+                            }))
+                        })
+                        .w(px(col_width))
+                        .flex_none()
+                        .max_h_full()
+                        .child(self.render_column_header(
+                            i,
+                            display_title,
+                            open_count,
+                            drop_for_header,
+                            strings,
+                            cx,
+                        ))
+                        .children(add_input.map(|input| {
+                            let focused = input.focus_handle(cx).is_focused(window);
+                            let input_focus = input.focus_handle(cx);
+                            h_flex()
+                                .mx(card_px)
+                                .mt(px(6.))
+                                .mb(px(4.))
+                                .h(px(38.))
+                                .px_2p5()
+                                .gap_1p5()
+                                .rounded(px(10.))
+                                .border_1()
+                                .border_color(if focused { theme.colors().accent } else { gpui::transparent_black() })
+                                .bg(if focused {
+                                    theme.colors().elevated_surface_background
+                                } else {
+                                    theme.colors().ghost_element_hover
+                                })
+                                .when(!focused, |el| el.hover(|s| s.border_color(theme.colors().border_variant)))
+                                .when(is_temp_add, |el| {
+                                    el.on_mouse_down_out(cx.listener(|this, _, _, cx| this.commit_column_add(cx)))
+                                })
+                                .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                                    cx.stop_propagation();
+                                    window.focus(&input_focus, cx);
+                                })
+                                .child(Icon::new(IconName::Plus).size(IconSize::Small).color(if focused { Color::Accent } else { Color::Muted }))
+                                .child(div().flex_1().min_w_0().child(input))
+                        }))
+                        .when(has_cards, |el| {
+                            el.child(
+                                v_flex()
+                                    .id(SharedString::from(format!("kanban-cards-{i}")))
+                                    .mt(px(2.))
+                                    .px(card_px)
+                                    .pt(px(4.))
+                                    .pb(px(12.))
+                                    .gap_2()
+                                    .overflow_y_scroll()
+                                    .children(col_items),
+                            )
+                        })
+                        .when(!has_cards, |el| {
+                            el.h_full().when(tint.is_none(), |el| {
+                                let top = if dark {
+                                    gpui::white().opacity(0.025)
+                                } else {
+                                    Hsla::from(gpui::rgb(0x191919)).opacity(0.03)
+                                };
+                                el.child(
+                                    div()
+                                        .flex_1()
+                                        .mx(card_px)
+                                        .mt(px(6.))
+                                        .mb(px(24.))
+                                        .rounded(px(8.))
+                                        .bg(gpui::linear_gradient(
+                                            180.,
+                                            gpui::linear_color_stop(top, 0.),
+                                            gpui::linear_color_stop(gpui::transparent_black(), 1.),
+                                        )),
+                                )
+                            })
+                        })
+                        .into_any_element(),
+                );
+            }
+            if inline_new_col_pos.is_some_and(|pos| pos >= rendered_cols.len())
+                && let Some(input) = self.new_section.clone()
+            {
+                rendered_cols.push(render_new_sec_input(input, cx));
+            }
+            h_flex()
+                .id("kanban")
+                .track_focus(&self.list_focus)
+                .track_scroll(&self.kanban_scroll)
+                .key_context("TaskList")
+                .on_mouse_down(MouseButton::Left, cx.listener(|this, event: &gpui::MouseDownEvent, window, cx| {
+                    window.focus(&this.list_focus, cx);
+                    this.close_card(cx);
+                    if this.selected.take().is_some() {
+                        this.detail.update(cx, |detail, cx| detail.show(None, cx));
+                        cx.notify();
+                    }
+                    let offset = this.kanban_scroll.offset();
+                    this.kanban_pan = Some((event.position.x, offset.x));
+                }))
+                .on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, _, cx| {
+                    let Some((start_x, start_offset_x)) = this.kanban_pan else { return };
+                    if cx.has_active_drag() || event.pressed_button != Some(MouseButton::Left) {
+                        this.kanban_pan = None;
+                        return;
+                    }
+                    let delta = event.position.x - start_x;
+                    let offset = this.kanban_scroll.offset();
+                    this.kanban_scroll.set_offset(gpui::point((start_offset_x + delta).min(px(0.)), offset.y));
+                    cx.notify();
+                }))
+                .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, _| {
+                    this.kanban_pan = None;
+                }))
+                .on_mouse_up_out(MouseButton::Left, cx.listener(|this, _, _, _| {
+                    this.kanban_pan = None;
+                }))
+                .on_action(cx.listener(Self::select_next))
+                .on_action(cx.listener(Self::select_previous))
+                .on_action(cx.listener(Self::toggle_selected))
+                .on_action(cx.listener(Self::delete_selected))
+                .on_action(cx.listener(Self::pin_selected))
+                .on_action(cx.listener(Self::date_selected))
+                .on_action(cx.listener(|this, _: &ClearDate, _, cx| this.set_selected_due(None, cx)))
+                .on_action(cx.listener(|this, _: &SetToday, _, cx| this.set_selected_due(Some(0), cx)))
+                .on_action(cx.listener(|this, _: &SetTomorrow, _, cx| this.set_selected_due(Some(1), cx)))
+                .on_action(cx.listener(|this, _: &SetNextWeek, _, cx| this.set_selected_due(Some(7), cx)))
+                .on_action(cx.listener(|this, _: &PriorityNone, _, cx| this.set_selected_priority(Priority::None, cx)))
+                .on_action(cx.listener(|this, _: &PriorityLow, _, cx| this.set_selected_priority(Priority::Low, cx)))
+                .on_action(cx.listener(|this, _: &PriorityMedium, _, cx| this.set_selected_priority(Priority::Medium, cx)))
+                .on_action(cx.listener(|this, _: &PriorityHigh, _, cx| this.set_selected_priority(Priority::High, cx)))
+                .flex_1()
+                .items_start()
+                .when(colored, |el| el.gap(px(12.)))
+                .px(px(12.))
+                .mt(px(-8.))
+                .pb(px(12.))
+                .overflow_x_scroll()
+                .children(rendered_cols)
+                .children(habit_col)
+                .when(owner.is_some() && inline_new_col_pos.is_none(), |el| {
+                    let group_id = SharedString::from("kanban-new-section-group");
+                    el.map(|el| match self.new_section.clone() {
+                        Some(input) => el.child(render_new_sec_input(input, cx)),
+                        None if !hide_new_section => el.child(
+                            v_flex().w(px(col_width)).flex_none().mt(px(6.)).px(px(10.)).child(
+                                h_flex()
+                                    .id("kanban-new-section")
+                                    .group(group_id.clone())
+                                    .h(px(32.))
+                                    .px(px(6.))
+                                    .rounded(px(6.))
+                                    .gap_1()
+                                    .hover(|s| s.bg(theme.colors().ghost_element_hover))
+                                    .cursor_pointer()
+                                    .child(Icon::new(IconName::Plus).size(IconSize::Small).color(Color::Muted))
+                                    .child(div().flex_1().child(Label::new(strings.new_section).weight(FontWeight::SEMIBOLD).color(Color::Muted)))
+                                    .child(
+                                        div()
+                                            .id("kanban-hide-new-section")
+                                            .opacity(0.)
+                                            .group_hover(group_id, |s| s.opacity(1.))
+                                            .child(
+                                                IconButton::new("kanban-hide-new-section-btn", IconName::X)
+                                                    .size(px(20.))
+                                                    .icon_size(IconSize::XSmall)
+                                                    .icon_color(Color::Muted)
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        cx.stop_propagation();
+                                                        let _ = this.store.set_setting(&format!("kanban:hide_new_section:{}", this.view_key()), "1");
+                                                        cx.notify();
+                                                    })),
+                                            ),
+                                    )
+                                    .on_click(cx.listener(|this, _, window, cx| this.start_new_section(window, cx))),
+                            ),
+                        ),
+                        None => el,
+                    })
+                })
+                .into_any_element()
+        }));
+        let rows = if kanban_view { Vec::new() } else { self.rows(strings) };
+        let rows_empty = rows.is_empty();
+        if !kanban_view {
+            self.tag_colors = tag_colors;
+            let mut entries = Vec::with_capacity(rows.len() + 3);
+            if self.new_section.is_some() {
+                entries.push(ListEntry::NewSection);
+            }
+            // In Next 7 Days today's habits come first, as the original's.
+            if self.view == View::Next7Days {
+                entries.push(ListEntry::Habits);
+            }
+            entries.extend(rows.into_iter().map(ListEntry::Row));
+            if self.view != View::Next7Days {
+                entries.push(ListEntry::Habits);
+            }
+            entries.push(ListEntry::Countdowns);
+            self.sync_list(entries);
+        }
+
+        let list = v_flex()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            
+            .child(
+                h_flex()
+                    .mt(crate::title_bar::header_inset())
+                    .h(px(60.))
+                    // The title sits 4 px above the row's middle, as the original's.
+                    .pb(px(8.))
+                    .flex_none()
+                    .gap_2()
+                    .pl(px(24.))
+                    .pr(px(16.))
+                    .child(
+                        IconButton::new("toggle-sidebar", IconName::PanelLeft)
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_lists(cx))),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_size(px(20.))
+                            .font_weight(FontWeight::BOLD)
+                            .map(|el| {
+                                if matches!(self.view, View::Search(_)) {
+                                    el.child(
+                                        h_flex()
+                                            .gap_2()
+                                            .text_size(px(16.))
+                                            .font_weight(FontWeight::NORMAL)
+                                            .child(Icon::new(IconName::Search).size(IconSize::Large))
+                                            .child(self.search_input.clone()),
+                                    )
+                                } else {
+                                    el.truncate().child(self.view_title(strings))
+                                }
+                            }),
+                    )
+                    .when(self.view == View::Trash, |el| {
+                        el.child(
+                            IconButton::new("empty-trash-button", IconName::BrushCleaning)
+                                .on_click(cx.listener(|this, _, _, cx| this.empty_trash(cx))),
+                        )
+                    })
+                    // The original's light bulb in Today: Suggested Tasks.
+                    .when(self.view == View::Today, |el| {
+                        el.child(
+                            IconButton::new("suggestions", IconName::Lightbulb)
+                                .toggle_state(self.suggestions_open.is_some())
+                                .tooltip(Tooltip::text(strings.suggested_tasks))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.suggestions_open = if this.suggestions_open.is_some() { None } else { Some(false) };
+                                    cx.notify();
+                                })),
+                        )
+                    })
+                    // The Completed and Won't Do views have only Print, as the original's.
+                    .when(closed_header, |el| el.child(IconButton::new("print-closed", IconName::Printer).tooltip(Tooltip::text(strings.print)).on_click(cx.listener(|this, _, _, cx| this.print_list(cx)))))
+                    .when(self.view != View::Trash && !closed_header, |el| {
+                        el.child(
+                            div()
+                                .relative()
+                                .debug_selector(|| "task-sort-menu-trigger".to_owned())
+                                .child(IconButton::new("sort", IconName::ArrowDownUp).tip(strings.group_and_sort, ui::TipSide::Below).on_click(cx.listener(|this, _, window, cx| this.open_sort_menu(window, cx))))
+                                .when_some(self.sort_menu, |el, expanded| {
+                                    el.child(PopoverAttachment::new(Placement::BelowRight, self.render_sort_menu(expanded, strings, cx)))
+                                }),
+                        )
+                    })
+                    .when(self.view != View::Trash && !closed_header, |el| el.child(
+                        div()
+                            .relative()
+                            .child(IconButton::new("more", IconName::Ellipsis).tip(strings.more, ui::TipSide::Below).on_click(cx.listener(
+                                |this, _, _, cx| {
+                                    this.header_menu_open = true;
+                                    cx.notify();
+                                },
+                            )))
+                            .when(self.header_menu_open, |el| {
+                                el.child(PopoverAttachment::new(
+                                    Placement::BelowRight,
+                                    self.render_header_menu(strings, cx),
+                                ))
+                            }),
+                    )),
+            )
+            .when(matches!(self.view, View::Completed | View::WontDo), |el| {
+                el.child(self.render_closed_filters(strings, cx))
+            })
+            .when(!self.is_read_only_view() && !kanban_view && self.preferences.detailed_input, |el| el.child(self.render_detailed_add(strings, cx)))
+            .when(!self.is_read_only_view() && !kanban_view && !self.preferences.detailed_input, |el| el.child(
+                // As in the original: 20 px in from the column's edge, lined up with the rows,
+                // and outlined in the accent while focused.
+                h_flex()
+                    .mx(px(20.))
+                    .mb_2()
+                    .h(px(38.))
+                    .flex_none()
+                    .gap_2()
+                    .px_3()
+                    .rounded(px(6.))
+                    .border_1()
+                    .border_color(if add_focused { theme.colors().accent } else { gpui::transparent_black() })
+                    .bg(theme.colors().surface_background)
+                    .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                        window.focus(&input_focus, cx);
+                    })
+                    .child(Icon::new(IconName::Plus))
+                    .child(div().flex_1().min_w_0().debug_selector(|| "quick-add-input".to_owned()).child(self.input.clone()))
+                    .children(self.shown_add_due().map(|(date, time)| {
+                        let (label, _) = task_rows::due_label(date, time, Self::today(), strings);
+                        // A picked duration shows its span, as the original's "Today, 22:00 - 23:00".
+                        let label = match self.add_draft.end.filter(|_| self.quick_add_due.is_none()) {
+                            Some((end, end_time)) => crate::due_picker::range_label(date, time, end, end_time, strings),
+                            None => label,
+                        };
+                        h_flex()
+                            .flex_none()
+                            .gap_1()
+                            .child(Icon::new(IconName::CalendarDays).size(IconSize::Small).color(Color::Accent))
+                            .child(Label::new(label).size(LabelSize::Small).color(Color::Accent))
+                    }))
+                    .child(
+                        div()
+                            .relative()
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .child(
+                                h_flex().child(self.add_date_button(Placement::BelowCenter, strings, cx)).child(
+                                // The original's "▾": priority, list, template and note for the
+                                // next task; its flag takes the chosen priority's color.
+                                IconButton::new("add-options", IconName::ChevronDown)
+                                    .size(px(24.))
+                                    .icon_size(IconSize::Small)
+                                    .icon_color(Color::Muted)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.add_menu_open = !this.add_menu_open;
+                                        this.add_list_side = false;
+                                        cx.notify();
+                                    })),
+                            ))
+                            .map(|el| self.add_field_popovers(el, strings, cx)),
+                    ),
+            ))
+            .children(board)
+            .when(!kanban_view, |el| el.child(
+                div()
+                    .id("tasks")
+                    .track_focus(&self.list_focus)
+                    .key_context("TaskList")
+                    .on_action(cx.listener(Self::select_next))
+                    .on_action(cx.listener(Self::select_previous))
+                    .on_action(cx.listener(Self::toggle_selected))
+                    .on_action(cx.listener(Self::delete_selected))
+                    .on_action(cx.listener(Self::pin_selected))
+                    .on_action(cx.listener(Self::date_selected))
+                    .on_action(cx.listener(|this, _: &ClearDate, _, cx| this.set_selected_due(None, cx)))
+                    .on_action(cx.listener(|this, _: &SetToday, _, cx| this.set_selected_due(Some(0), cx)))
+                    .on_action(cx.listener(|this, _: &SetTomorrow, _, cx| this.set_selected_due(Some(1), cx)))
+                    .on_action(cx.listener(|this, _: &SetNextWeek, _, cx| this.set_selected_due(Some(7), cx)))
+                    .on_action(cx.listener(|this, _: &PriorityNone, _, cx| this.set_selected_priority(Priority::None, cx)))
+                    .on_action(cx.listener(|this, _: &PriorityLow, _, cx| this.set_selected_priority(Priority::Low, cx)))
+                    .on_action(cx.listener(|this, _: &PriorityMedium, _, cx| this.set_selected_priority(Priority::Medium, cx)))
+                    .on_action(cx.listener(|this, _: &PriorityHigh, _, cx| this.set_selected_priority(Priority::High, cx)))
+                    .on_action(cx.listener(Self::toggle_all_subtasks))
+                    .on_action(cx.listener(Self::add_subtask_selected))
+                    .on_drag_move(cx.listener(Self::move_task_drag))
+                    .on_drop(cx.listener(Self::drop_task_in_list))
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .flex_col()
+                    .child({
+                        let bounds = self.list_entry_bounds.clone();
+                        gpui::canvas(move |_, _, _| bounds.borrow_mut().clear(), |_, _, _, _| {})
+                            .absolute()
+                            .size_0()
+                    })
+                    // A free day in the mini calendar, as in the original.
+                    .when(rows_empty && matches!(self.view, View::Day(_)), |el| {
+                        el.child(
+                            v_flex()
+                                .pt(px(160.))
+                                .items_center()
+                                .gap_1()
+                                .child(Icon::new(IconName::CalendarCheck).size(IconSize::Medium).color(Color::Muted))
+                                .child(Label::new(strings.free_day))
+                                .child(Label::new(strings.free_day_hint).size(LabelSize::Small).color(Color::Muted)),
+                        )
+                    })
+                    // An empty Tomorrow, as the original's: a map in a soft patch and its words.
+                    .when(rows_empty && self.view == View::Tomorrow, |el| {
+                        el.child(
+                            v_flex()
+                                .pt(px(160.))
+                                .items_center()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .size(px(96.))
+                                        .mb_2()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded_full()
+                                        .bg(theme.colors().element_hover)
+                                        .child(Icon::new(IconName::Map).size(IconSize::XLarge).color(Color::Accent)),
+                                )
+                                .child(Label::new(strings.no_tasks_tomorrow))
+                                .child(Label::new(strings.plan_ahead).size(LabelSize::Small).color(Color::Muted)),
+                        )
+                    })
+                    .when(rows_empty && !matches!(self.view, View::Day(_) | View::Tomorrow), |el| {
+                        el.child(div().px_3().pt_8().child(
+                            Label::new(match &self.view {
+                                View::Completed => strings.no_completed_tasks,
+                                View::WontDo => strings.no_wont_do,
+                                View::Trash => strings.trash_is_empty,
+                                View::Search(query) if query.trim().is_empty() => strings.search_hint,
+                                View::Search(_) => strings.nothing_found,
+                                _ => strings.no_tasks,
+                            })
+                            .color(Color::Muted),
+                        ))
+                    })
+                    .child(
+                        list(self.list_state.clone(), cx.processor(|this, ix, _, cx| this.render_entry(ix, cx)))
+                            .flex_1()
+                            .pb_4(),
+                    ),
+            ))
+            .when_some(self.error.clone().or_else(|| self.add_attachment_error.clone()), |el, error| {
+                el.child(
+                    div()
+                        .px_6()
+                        .py_2()
+                        .border_t_1()
+                        .border_color(theme.colors().border)
+                        .child(Label::new(error).color(Color::Error)),
+                )
+            });
+
+        let this = cx.entity().downgrade();
+        let on_select = move |view, window: &mut Window, cx: &mut App| {
+            this.update(cx, |this, cx| this.select_view(view, window, cx)).ok();
+        };
+        let on_add_list = cx.listener(|this, _, window, cx| this.start_new_list(window, cx));
+        let this = cx.entity().downgrade();
+        let on_drop_task = move |view, id, _: &mut Window, cx: &mut App| {
+            this.update(cx, |this, cx| this.drop_on_view(view, id, cx)).ok();
+        };
+
+        h_flex()
+            .relative()
+            .size_full()
+            .key_context("Tasks")
+            .items_start()
+            .on_action(cx.listener(|this, _: &DismissTransient, window, cx| {
+                if !this.dismiss_transient(window, cx) {
+                    cx.propagate();
+                }
+            }))
+            .bg(theme.colors().background)
+            .text_color(theme.colors().text)
+            .text_size(px(14.))
+            .on_drag_move(cx.listener(Self::resize_panel))
+            .on_drag_move(cx.listener(Self::move_smart_list_drag))
+            .on_drag_move(cx.listener(Self::move_sidebar_section_drag))
+            .on_drag_move(cx.listener(Self::move_list_drag))
+            .on_drag_move(cx.listener(Self::move_folder_drag))
+            .on_drag_move(cx.listener(Self::move_tag_drag))
+            .on_drag_move(cx.listener(Self::move_parent_tag_drag))
+            .on_drag_move(cx.listener(Self::move_filter_drag))
+            .capture_any_mouse_up(cx.listener(Self::finish_panel_drag_up))
+            .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                if this.task_drop.take().is_some() | this.task_drag_origin.take().is_some() {
+                    cx.notify();
+                }
+            }))
+            .on_mouse_up_out(MouseButton::Left, cx.listener(|this, event, window, cx| {
+                if this.task_drop.take().is_some() | this.task_drag_origin.take().is_some() {
+                    cx.notify();
+                }
+                this.finish_panel_drag_up(event, window, cx);
+            }))
+            .when(self.show_lists, |el| {
+                let active_drag = self.panel_drag.as_ref().map(|d| &d.item);
+                let highlight_target = self.panel_drag.as_ref().and_then(|d| d.highlight.as_ref());
+                el.child(div().relative().flex_none().h_full().child(lists_panel::render(
+                    lists_panel::Props {
+                        filters: &self.filters,
+                        preferences: &self.preferences,
+                        active: &self.view,
+                        counts: &self.counts,
+                        lists: &self.lists,
+                        tags: &self.tags,
+                        strings,
+                        folders: &self.folders,
+                        collapsed_folders: &self.collapsed_folders,
+                        archived_open: self.archived_open,
+                        collapsed_tags: &self.collapsed_tags,
+                        tags_collapsed: self.tags_collapsed,
+                        mini: lists_panel::MiniCalendar { expanded: self.mini_expanded, month: self.mini_month, busy: &self.busy_days },
+                        width: self.lists_width,
+                        scroll_handle: &self.lists_scroll,
+                        rows_out: &self.lists_rows,
+                        active_drag,
+                        highlight_target,
+                    },
+                    on_select,
+                    {
+                        let this = cx.entity().downgrade();
+                        move |event, window: &mut Window, cx: &mut App| {
+                            this.update(cx, |this, cx| this.panel_event(event, window, cx)).ok();
+                        }
+                    },
+                    on_add_list,
+                    on_drop_task,
+                    cx.listener(|this, _, window, cx| this.open_filter_edit(None, window, cx)),
+                    {
+                        let this = cx.entity().downgrade();
+                        move |action, _: &mut Window, cx: &mut App| {
+                            this.update(cx, |this, cx| this.mini_action(action, cx)).ok();
+                        }
+                    },
+                    cx,
+                )).child(self.resize_handle(Panel::Lists, cx)))
+            })
+            .map(|el| {
+                if self.view == View::Summary {
+                    return el.child(div().flex_1().min_w_0().h_full().child(self.summary.clone()));
+                }
+                // As in the original, the Timeline takes the whole width until a task is opened.
+                if (timeline_view || kanban_only) && self.selected.is_none() && self.list_activity.is_none() {
+                    return el.child(list);
+                }
+                // View Options' Pop-up: in a narrow window an opened task shows over the list.
+                if popup_details {
+                    if self.selected.is_none() && self.list_activity.is_none() {
+                        return el.child(list);
+                    }
+                    return el.child(list).child(
+                        div()
+                            .id("detail-popup")
+                            .absolute()
+                            .inset_0()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .bg(gpui::black().opacity(0.35))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.selected = None;
+                                this.list_activity = None;
+                                cx.notify();
+                            }))
+                            .child(
+                                div()
+                                    .id("detail-popup-card")
+                                    .w(px(detail_width))
+                                    .h(gpui::relative(0.8))
+                                    .rounded(px(10.))
+                                    .overflow_hidden()
+                                    .border_1()
+                                    .border_color(theme.colors().border)
+                                    .bg(theme.colors().background)
+                                    .shadow_lg()
+                                    .on_click(|_, _, cx| cx.stop_propagation())
+                                    .map(|el| match self.list_activity.clone() {
+                                        Some(entries) => el.child(self.render_list_activity(&entries, false, cx)),
+                                        None => el.child(self.detail.clone()),
+                                    }),
+                            ),
+                    );
+                }
+                el.child(list).child(
+                    div()
+                        .relative()
+                        .flex_none()
+                        .w(px(detail_width))
+                        .h_full()
+                        .map(|el| match self.list_activity.clone() {
+                            Some(entries) => el.child(self.render_list_activity(&entries, true, cx)),
+                            None => el.child(self.detail.clone()),
+                        })
+                        .child(self.resize_handle(Panel::Detail, cx)),
+                )
+            })
+            .when_some(self.filter_edit.as_ref().map(|edit| self.render_filter_edit(edit, window, cx)), |el, dialog| el.child(dialog))
+            .when_some(self.undo.as_ref().map(|(_, label, _)| label.clone()), |el, label| {
+                el.child(
+                    div().absolute().bottom(px(24.)).left_0().right_0().flex().justify_center().child(
+                        h_flex()
+                            .id("undo-toast")
+                            .h(px(40.))
+                            .px_4()
+                            .gap_4()
+                            .rounded(px(8.))
+                            .bg(theme.colors().elevated_surface_background)
+                            .border_1()
+                            .border_color(theme.colors().border)
+                            .shadow_md()
+                            .child(Label::new(label).size(LabelSize::Small).truncate())
+                            .child(
+                                div()
+                                    .id("undo-button")
+                                    .cursor_pointer()
+                                    .child(Label::new(strings.undo).size(LabelSize::Small).color(Color::Accent))
+                                    .on_click(cx.listener(|this, _, _, cx| this.apply_undo(cx))),
+                            ),
+                    ),
+                )
+            })
+            .children(self.render_context_menu(strings, cx))
+            .children(self.render_list_menu(strings, cx))
+            .children(self.view_options.map(|menu| self.render_view_options(menu, strings, cx)))
+            .children(self.suggestions_open.filter(|_| self.view == View::Today).map(|all| self.render_suggestions(all, strings, cx)))
+            .children(self.list_dialog.clone())
+            .children(self.folder_dialog.clone())
+            .children(self.tag_dialog.clone())
+            .children(self.merge_dialog.clone())
+    }
+}
+
+/// What a list menu acts on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ListMenuTarget {
+    List(Id),
+    Folder(Id),
+    Tag(String),
+    /// The Tags heading's "…": whether tags show.
+    TagsHeading,
+    /// A smart list's "…": Hide.
+    Smart(fern_core::SmartList),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ListAction {
+    Edit,
+    Duplicate,
+    Archive,
+    Delete,
+    AddList,
+    Ungroup,
+    Pin,
+    AddSubtag,
+    Merge,
+    ShowTags(fern_core::Visibility),
+}
+
+/// An entry of the task list: a row, or what the list shows around the rows.
+#[allow(clippy::large_enum_variant)]
+#[derive(Clone, PartialEq)]
+enum ListEntry {
+    /// The field for a new section's name.
+    NewSection,
+    /// Today's habits.
+    Habits,
+    /// The countdowns shown in Today.
+    Countdowns,
+    Row(Row),
+}
+
+fn invariant_block_slot(first_top: f32, spans: &[f32], cur_slot: usize, drag_top_y: f32) -> usize {
+    let mut thresholds = Vec::with_capacity(spans.len());
+    let mut acc = first_top;
+    for &span in spans {
+        thresholds.push(acc + span * 0.5);
+        acc += span;
+    }
+    let mut slot = cur_slot.min(spans.len());
+    while slot > 0 && drag_top_y < thresholds[slot - 1] - 5. {
+        slot -= 1;
+    }
+    while slot < thresholds.len() && drag_top_y > thresholds[slot] + 5. {
+        slot += 1;
+    }
+    slot
+}
+
+fn normalize_lists_in_memory(lists: &mut Vec<List>, folders: &[ListFolder]) {
+    let valid_folders: HashSet<Id> = folders.iter().map(|f| f.id).collect();
+    let mut out = Vec::with_capacity(lists.len());
+    let mut shown_folders: HashSet<Id> = HashSet::new();
+    for list in lists.iter().filter(|l| !l.archived) {
+        match list.folder.filter(|f| valid_folders.contains(f)) {
+            None => {
+                let mut item = list.clone();
+                item.folder = None;
+                out.push(item);
+            }
+            Some(fid) if shown_folders.insert(fid) => {
+                out.extend(
+                    lists
+                        .iter()
+                        .filter(|l| !l.archived && l.folder == Some(fid))
+                        .cloned(),
+                );
+            }
+            Some(_) => {}
+        }
+    }
+    out.extend(lists.iter().filter(|l| l.archived).cloned());
+    *lists = out;
+}
+
+fn move_list_first_in_memory(lists: &mut Vec<List>, folders: &[ListFolder], dragged_id: Id) -> bool {
+    let before = lists.clone();
+    normalize_lists_in_memory(lists, folders);
+    let Some(pos) = lists.iter().position(|l| l.id == dragged_id) else { return false };
+    let mut dragged = lists.remove(pos);
+    dragged.folder = None;
+    lists.insert(0, dragged);
+    normalize_lists_in_memory(lists, folders);
+    *lists != before
+}
+
+fn move_list_last_top_in_memory(lists: &mut Vec<List>, folders: &[ListFolder], dragged_id: Id) -> bool {
+    let before = lists.clone();
+    normalize_lists_in_memory(lists, folders);
+    let Some(pos) = lists.iter().position(|l| l.id == dragged_id) else { return false };
+    let mut dragged = lists.remove(pos);
+    dragged.folder = None;
+    let at = lists.iter().rposition(|l| !l.archived).map_or(0, |p| p + 1);
+    lists.insert(at, dragged);
+    normalize_lists_in_memory(lists, folders);
+    *lists != before
+}
+
+fn move_list_relative_in_memory(
+    lists: &mut Vec<List>,
+    folders: &[ListFolder],
+    dragged_id: Id,
+    target_id: Id,
+    after: bool,
+    folder: Option<Id>,
+) -> bool {
+    if dragged_id == target_id {
+        return false;
+    }
+    let before = lists.clone();
+    normalize_lists_in_memory(lists, folders);
+    let Some(from) = lists.iter().position(|l| l.id == dragged_id) else { return false };
+    let mut dragged = lists.remove(from);
+    dragged.folder = folder;
+    let Some(to) = lists.iter().position(|l| l.id == target_id) else {
+        lists.insert(from.min(lists.len()), dragged);
+        return false;
+    };
+    lists.insert(to + usize::from(after), dragged);
+    normalize_lists_in_memory(lists, folders);
+    *lists != before
+}
+
+fn move_list_around_folder_in_memory(
+    lists: &mut Vec<List>,
+    folders: &[ListFolder],
+    dragged_id: Id,
+    folder_id: Id,
+    after: bool,
+) -> bool {
+    let before = lists.clone();
+    normalize_lists_in_memory(lists, folders);
+    let Some(from) = lists.iter().position(|l| l.id == dragged_id) else { return false };
+    let was_in_folder = lists[from].folder == Some(folder_id);
+    let mut dragged = lists.remove(from);
+    dragged.folder = None;
+    let first = lists.iter().position(|l| !l.archived && l.folder == Some(folder_id));
+    let last = lists.iter().rposition(|l| !l.archived && l.folder == Some(folder_id));
+    let at = match (first, last) {
+        (Some(f), Some(l)) => if !after { f } else { l + 1 },
+        _ if was_in_folder => from.min(lists.len()),
+        _ => lists.iter().rposition(|l| !l.archived).map_or(0, |p| p + 1),
+    };
+    lists.insert(at, dragged);
+    normalize_lists_in_memory(lists, folders);
+    *lists != before
+}
+
+fn move_list_into_folder_start(
+    lists: &mut Vec<List>,
+    folders: &[ListFolder],
+    dragged_id: Id,
+    folder_id: Id,
+) -> bool {
+    let before = lists.clone();
+    normalize_lists_in_memory(lists, folders);
+    if let Some(first_other) = lists
+        .iter()
+        .find(|l| l.id != dragged_id && !l.archived && l.folder == Some(folder_id))
+        .map(|l| l.id)
+    {
+        return move_list_relative_in_memory(lists, folders, dragged_id, first_other, false, Some(folder_id));
+    }
+    let Some(from) = lists.iter().position(|l| l.id == dragged_id) else { return false };
+    if lists[from].folder == Some(folder_id) {
+        return false;
+    }
+    let mut dragged = lists.remove(from);
+    dragged.folder = Some(folder_id);
+    let at = lists.iter().rposition(|l| !l.archived).map_or(0, |p| p + 1);
+    lists.insert(at, dragged);
+    normalize_lists_in_memory(lists, folders);
+    *lists != before
+}
+
+fn move_list_into_folder_end(
+    lists: &mut Vec<List>,
+    folders: &[ListFolder],
+    dragged_id: Id,
+    folder_id: Id,
+) -> bool {
+    let before = lists.clone();
+    normalize_lists_in_memory(lists, folders);
+    if let Some(last_other) = lists
+        .iter()
+        .rev()
+        .find(|l| l.id != dragged_id && !l.archived && l.folder == Some(folder_id))
+        .map(|l| l.id)
+    {
+        return move_list_relative_in_memory(lists, folders, dragged_id, last_other, true, Some(folder_id));
+    }
+    let Some(from) = lists.iter().position(|l| l.id == dragged_id) else { return false };
+    let mut dragged = lists.remove(from);
+    dragged.folder = Some(folder_id);
+    let at = lists.iter().rposition(|l| !l.archived).map_or(0, |p| p + 1);
+    lists.insert(at, dragged);
+    normalize_lists_in_memory(lists, folders);
+    *lists != before
+}
+
+fn reorder_non_empty_folder_in_memory(
+    lists: &mut Vec<List>,
+    folders: &mut [ListFolder],
+    dragged_fid: Id,
+    new_pos: usize,
+) {
+    normalize_lists_in_memory(lists, folders);
+    let valid_folders: HashSet<Id> = folders.iter().map(|f| f.id).collect();
+    let moving: Vec<List> = lists
+        .iter()
+        .filter(|l| !l.archived && l.folder == Some(dragged_fid))
+        .cloned()
+        .collect();
+    if moving.is_empty() {
+        return;
+    }
+
+    let mut blocks: Vec<(Option<Id>, Vec<List>)> = Vec::new();
+    let mut seen_folders: HashSet<Id> = HashSet::new();
+    for list in lists.iter().filter(|l| !l.archived && l.folder != Some(dragged_fid)) {
+        match list.folder.filter(|f| valid_folders.contains(f)) {
+            None => blocks.push((None, vec![list.clone()])),
+            Some(fid) if seen_folders.insert(fid) => {
+                let members: Vec<List> = lists
+                    .iter()
+                    .filter(|l| !l.archived && l.folder == Some(fid))
+                    .cloned()
+                    .collect();
+                blocks.push((Some(fid), members));
+            }
+            Some(_) => {}
+        }
+    }
+    let at = new_pos.min(blocks.len());
+    blocks.insert(at, (Some(dragged_fid), moving));
+
+    let archived: Vec<List> = lists.iter().filter(|l| l.archived).cloned().collect();
+    let mut rebuilt = Vec::with_capacity(lists.len());
+    let mut non_empty_folder_order = Vec::new();
+    for (fid_opt, members) in blocks {
+        if let Some(fid) = fid_opt {
+            non_empty_folder_order.push(fid);
+        }
+        rebuilt.extend(members);
+    }
+    rebuilt.extend(archived);
+    *lists = rebuilt;
+
+    let non_empty_set: HashSet<Id> = non_empty_folder_order.iter().copied().collect();
+    let by_id: HashMap<Id, ListFolder> = folders.iter().cloned().map(|f| (f.id, f)).collect();
+    let mut it = non_empty_folder_order.into_iter();
+    for slot in folders.iter_mut() {
+        if non_empty_set.contains(&slot.id)
+            && let Some(next_id) = it.next()
+            && let Some(next_f) = by_id.get(&next_id)
+        {
+            *slot = next_f.clone();
+        }
+    }
+}
+
+fn normalize_tags_in_memory(tags: &mut Vec<Tag>) {
+    let raw_roots: HashSet<String> = tags
+        .iter()
+        .filter(|t| t.parent.is_none() || !tags.iter().any(|p| Some(&p.name) == t.parent.as_ref()))
+        .map(|t| t.name.clone())
+        .collect();
+    for tag in tags.iter_mut() {
+        if tag.parent.as_ref().is_some_and(|p| p == &tag.name || !raw_roots.contains(p)) {
+            tag.parent = None;
+        }
+        if tag.parent.is_some() {
+            tag.pinned = false;
+        }
+    }
+    let pinned_roots: Vec<Tag> = tags.iter().filter(|t| t.parent.is_none() && t.pinned).cloned().collect();
+    let unpinned_roots: Vec<Tag> = tags.iter().filter(|t| t.parent.is_none() && !t.pinned).cloned().collect();
+    let mut out = Vec::with_capacity(tags.len());
+    for root in pinned_roots.into_iter().chain(unpinned_roots) {
+        let root_name = root.name.clone();
+        out.push(root);
+        out.extend(tags.iter().filter(|c| c.parent.as_deref() == Some(root_name.as_str())).cloned());
+    }
+    *tags = out;
+}
+
+fn move_tag_first_in_memory(tags: &mut Vec<Tag>, dragged_name: &str) -> bool {
+    let before = tags.clone();
+    normalize_tags_in_memory(tags);
+    let first_pinned = tags
+        .iter()
+        .find(|t| t.name != dragged_name && t.parent.is_none())
+        .is_some_and(|t| t.pinned);
+    let Some(pos) = tags.iter().position(|t| t.name == dragged_name) else { return false };
+    let mut dragged = tags.remove(pos);
+    dragged.parent = None;
+    dragged.pinned = first_pinned;
+    tags.insert(0, dragged);
+    normalize_tags_in_memory(tags);
+    *tags != before
+}
+
+fn move_tag_last_top_in_memory(tags: &mut Vec<Tag>, dragged_name: &str) -> bool {
+    let before = tags.clone();
+    normalize_tags_in_memory(tags);
+    let last_pinned = tags
+        .iter()
+        .rev()
+        .find(|t| t.name != dragged_name && t.parent.is_none())
+        .is_some_and(|t| t.pinned);
+    let Some(pos) = tags.iter().position(|t| t.name == dragged_name) else { return false };
+    let mut dragged = tags.remove(pos);
+    dragged.parent = None;
+    dragged.pinned = last_pinned;
+    tags.push(dragged);
+    normalize_tags_in_memory(tags);
+    *tags != before
+}
+
+fn move_tag_around_root_in_memory(
+    tags: &mut Vec<Tag>,
+    dragged_name: &str,
+    target_root: &str,
+    after: bool,
+) -> bool {
+    if dragged_name == target_root {
+        return false;
+    }
+    let before = tags.clone();
+    normalize_tags_in_memory(tags);
+    let Some(target_pinned) = tags.iter().find(|t| t.name == target_root).map(|t| t.pinned) else {
+        return false;
+    };
+    let Some(from) = tags.iter().position(|t| t.name == dragged_name) else { return false };
+    let mut dragged = tags.remove(from);
+    dragged.parent = None;
+    dragged.pinned = target_pinned;
+    let insert_at = if !after {
+        tags.iter().position(|t| t.name == target_root).unwrap_or(tags.len())
+    } else {
+        tags.iter()
+            .rposition(|t| t.name == target_root || t.parent.as_deref() == Some(target_root))
+            .map_or(tags.len(), |p| p + 1)
+    };
+    tags.insert(insert_at, dragged);
+    normalize_tags_in_memory(tags);
+    *tags != before
+}
+
+fn move_tag_into_parent_start(tags: &mut Vec<Tag>, dragged_name: &str, parent_name: &str) -> bool {
+    if dragged_name == parent_name {
+        return false;
+    }
+    let before = tags.clone();
+    normalize_tags_in_memory(tags);
+    if tags.iter().any(|t| t.parent.as_deref() == Some(dragged_name)) {
+        return false;
+    }
+    let Some(from) = tags.iter().position(|t| t.name == dragged_name) else { return false };
+    let mut dragged = tags.remove(from);
+    dragged.parent = Some(parent_name.to_owned());
+    dragged.pinned = false;
+    let at = tags.iter().position(|t| t.name == parent_name).map_or(tags.len(), |p| p + 1);
+    tags.insert(at, dragged);
+    normalize_tags_in_memory(tags);
+    *tags != before
+}
+
+fn move_tag_into_parent_end(tags: &mut Vec<Tag>, dragged_name: &str, parent_name: &str) -> bool {
+    if dragged_name == parent_name {
+        return false;
+    }
+    let before = tags.clone();
+    normalize_tags_in_memory(tags);
+    if tags.iter().any(|t| t.parent.as_deref() == Some(dragged_name)) {
+        return false;
+    }
+    let Some(from) = tags.iter().position(|t| t.name == dragged_name) else { return false };
+    let mut dragged = tags.remove(from);
+    dragged.parent = Some(parent_name.to_owned());
+    dragged.pinned = false;
+    let at = tags
+        .iter()
+        .rposition(|t| t.name == parent_name || t.parent.as_deref() == Some(parent_name))
+        .map_or(tags.len(), |p| p + 1);
+    tags.insert(at, dragged);
+    normalize_tags_in_memory(tags);
+    *tags != before
+}
+
+fn move_subtag_relative_in_memory(
+    tags: &mut Vec<Tag>,
+    dragged_name: &str,
+    target_sub: &str,
+    parent_name: &str,
+    after: bool,
+) -> bool {
+    if dragged_name == target_sub || dragged_name == parent_name {
+        return false;
+    }
+    let before = tags.clone();
+    normalize_tags_in_memory(tags);
+    if tags.iter().any(|t| t.parent.as_deref() == Some(dragged_name)) {
+        return false;
+    }
+    let Some(from) = tags.iter().position(|t| t.name == dragged_name) else { return false };
+    let mut dragged = tags.remove(from);
+    dragged.parent = Some(parent_name.to_owned());
+    dragged.pinned = false;
+    let Some(to) = tags.iter().position(|t| t.name == target_sub) else {
+        tags.insert(from.min(tags.len()), dragged);
+        return false;
+    };
+    tags.insert(to + usize::from(after), dragged);
+    normalize_tags_in_memory(tags);
+    *tags != before
+}
+
+fn reorder_parent_tag_in_memory(
+    tags: &mut Vec<Tag>,
+    dragged_name: &str,
+    visible_others: &[(String, bool)],
+    new_pos: usize,
+    orig_pinned: bool,
+) {
+    normalize_tags_in_memory(tags);
+    let pinned_count = visible_others.iter().filter(|(_, p)| *p).count();
+    let new_pinned = if orig_pinned {
+        new_pos <= pinned_count
+    } else {
+        new_pos < pinned_count
+    };
+
+    let mut dragged_family: Vec<Tag> = tags
+        .iter()
+        .filter(|t| t.name == dragged_name || t.parent.as_deref() == Some(dragged_name))
+        .cloned()
+        .collect();
+    let Some(root) = dragged_family.first_mut() else { return };
+    root.parent = None;
+    root.pinned = new_pinned;
+
+    tags.retain(|t| t.name != dragged_name && t.parent.as_deref() != Some(dragged_name));
+
+    let clamped = new_pos.min(visible_others.len());
+    let insert_at = if clamped < visible_others.len() {
+        let target_name = &visible_others[clamped].0;
+        tags.iter().position(|t| t.name == *target_name).unwrap_or(tags.len())
+    } else if let Some((last_vis, _)) = visible_others.last() {
+        tags.iter()
+            .rposition(|t| t.name == *last_vis || t.parent.as_deref() == Some(last_vis.as_str()))
+            .map_or(tags.len(), |p| p + 1)
+    } else {
+        0
+    };
+    tags.splice(insert_at..insert_at, dragged_family);
+    normalize_tags_in_memory(tags);
+}
+
+#[cfg(all(test, debug_assertions))]
+mod tests {
+    use super::*;
+    use gpui::{EntityInputHandler, Modifiers, TestAppContext, point};
+
+    #[gpui::test]
+    fn long_quick_add_keeps_the_caret_inside_both_input_layouts(cx: &mut TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        cx.update(|cx| {
+            theme::init(cx);
+            cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+            crate::keymap::load_default(&assets::Assets, cx).unwrap();
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| TodoView::new(store.clone(), window, cx));
+        let title = format!("{}конец", "Длинное название 日本語 🧑‍💻 ".repeat(80));
+        for detailed in [false, true] {
+            cx.update(|window, cx| view.update(cx, |view, cx| {
+                view.preferences.detailed_input = detailed;
+                window.focus(&view.input.focus_handle(cx), cx);
+                cx.notify();
+            }));
+            cx.simulate_resize(gpui::size(px(540.), px(480.)));
+            let empty_bounds = cx.debug_bounds("quick-add-input").unwrap();
+            cx.simulate_input(&title);
+            cx.run_until_parked();
+            assert_eq!(cx.debug_bounds("quick-add-input").unwrap(), empty_bounds);
+            for width in [540., 340.] {
+                cx.simulate_resize(gpui::size(px(width), px(480.)));
+                let field = cx.debug_bounds("quick-add-input").unwrap();
+                let end = title.encode_utf16().count();
+                for (key, offset) in [("home", 0), ("end", end)] {
+                    cx.simulate_keystrokes(key);
+                    cx.run_until_parked();
+                    cx.update(|window, cx| {
+                        let input = view.read(cx).input.clone();
+                        let caret = input.update(cx, |input, cx| {
+                            input.bounds_for_range(offset..offset, gpui::Bounds::default(), window, cx).unwrap()
+                        });
+                        assert!(caret.left() >= field.left() && caret.right() <= field.right(), "{detailed}: {caret:?} outside {field:?}");
+                    });
+                }
+            }
+            cx.simulate_keystrokes("enter");
+            cx.update(|_, cx| assert!(view.read(cx).input.read(cx).text().is_empty()));
+        }
+        let tasks = store.tasks().unwrap();
+        assert_eq!(tasks.len(), 2);
+        assert!(tasks.iter().all(|task| task.title == title));
+    }
+
+    #[gpui::test]
+    fn long_inline_title_stays_inside_its_column_and_saves_in_full(cx: &mut TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let title = "Long task title 日本語 🧑‍💻 ".repeat(80).trim().to_owned();
+        let task = store.add_task(&title).unwrap();
+        store.set_completed(task.id, true).unwrap();
+        cx.update(|cx| {
+            theme::init(cx);
+            cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+            crate::keymap::load_default(&assets::Assets, cx).unwrap();
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let mut view = TodoView::new(store.clone(), window, cx);
+            view.set_view(View::Completed, cx);
+            view
+        });
+        cx.simulate_resize(gpui::size(px(900.), px(480.)));
+        let selector = format!("task-title-field-{}", task.id).leak();
+        let original_field = cx.debug_bounds(selector).unwrap();
+        assert!(original_field.size.width > px(50.));
+        cx.update(|window, cx| view.update(cx, |view, cx| view.start_title_edit(task.id, None, window, cx)));
+        cx.run_until_parked();
+        let field = cx.debug_bounds(selector).unwrap();
+        assert_eq!(field.left(), original_field.left());
+        assert_eq!(field.right(), original_field.right());
+        cx.simulate_input("!");
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let (_, input, _) = view.read(cx).title_edit.as_ref().unwrap();
+            let input = input.clone();
+            let end = title.encode_utf16().count() + 1;
+            let caret = input.update(cx, |input, cx| {
+                input.bounds_for_range(end..end, gpui::Bounds::default(), window, cx).unwrap()
+            });
+            assert!(caret.left() >= original_field.left() && caret.right() <= original_field.right(), "{caret:?} outside {original_field:?}");
+        });
+        cx.simulate_keystrokes("enter");
+        assert_eq!(store.task(task.id).unwrap().unwrap().title, format!("{title}!"));
+    }
+
+    #[gpui::test]
+    fn completion_stays_in_place_until_the_check_settles(cx: &mut TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let second = store.add_task("Finish two").unwrap();
+        let first = store.add_task("Finish one").unwrap();
+        store.set_setting("show_completed:today", "0").unwrap();
+        for task in [&first, &second] {
+            store.set_due(task.id, Some(TodoView::today()), None).unwrap();
+        }
+        cx.update(|cx| {
+            theme::init(cx);
+            cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| TodoView::new(store.clone(), window, cx));
+        // Exercise the virtual list and the board, also with completed tasks filtered out.
+        for kanban in [false, true] {
+            for task in [&first, &second] { store.set_completed(task.id, false).unwrap(); }
+            cx.update(|_, cx| view.update(cx, |view, cx| {
+                view.set_view(View::Today, cx);
+                view.set_layout(kanban, false, cx);
+                view.reload(cx);
+            }));
+            cx.run_until_parked();
+            let selector = |id| -> &'static str {
+                format!("{}-{id}", if kanban { "kanban-checkbox" } else { "task-title" }).leak()
+            };
+            let first_selector = selector(first.id);
+            let second_selector = selector(second.id);
+            let first_bounds = cx.debug_bounds(first_selector).unwrap();
+            let second_bounds = cx.debug_bounds(second_selector).unwrap();
+            assert!(first_bounds.top() < second_bounds.top());
+            let at = |bounds: gpui::Bounds<Pixels>| {
+                if kanban { bounds.center() } else { point(bounds.left() - px(18.), bounds.center().y) }
+            };
+            cx.simulate_click(at(first_bounds), Modifiers::default());
+            assert!(store.task(first.id).unwrap().unwrap().is_completed());
+            assert_eq!(cx.debug_bounds(first_selector), Some(first_bounds));
+            assert_eq!(cx.debug_bounds(second_selector), Some(second_bounds));
+            cx.simulate_click(at(second_bounds), Modifiers::default());
+            assert!(store.task(second.id).unwrap().unwrap().is_completed());
+            cx.update(|_, cx| {
+                let view = view.read(cx);
+                assert!(view.completing[&first.id].index < view.completing[&second.id].index);
+                assert!(crate::completion_mark::started(first.id, cx).is_some());
+                assert!(crate::completion_mark::started(second.id, cx).is_some());
+            });
+            cx.executor().advance_clock(std::time::Duration::from_millis(200));
+            cx.run_until_parked();
+            assert_eq!(cx.debug_bounds(first_selector), Some(first_bounds));
+            assert_eq!(cx.debug_bounds(second_selector), Some(second_bounds));
+            cx.executor().advance_clock(std::time::Duration::from_millis(80));
+            cx.run_until_parked();
+            assert!(cx.debug_bounds(first_selector).is_none());
+            assert!(cx.debug_bounds(second_selector).is_none());
+        }
+    }
+
+    #[gpui::test]
+    fn a_second_click_reverts_a_repeating_completion_during_the_animation(cx: &mut TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let task = store.add_task("Daily task").unwrap();
+        let today = TodoView::today();
+        store.set_repeat(task.id, Some(fern_core::Recurrence::new(fern_core::Frequency::Daily, 1)), today).unwrap();
+        cx.update(|cx| {
+            theme::init(cx);
+            cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| TodoView::new(store.clone(), window, cx));
+        let selector = format!("task-title-{}", task.id).leak();
+        let bounds = cx.debug_bounds(selector).unwrap();
+        let position = point(bounds.left() - px(18.), bounds.center().y);
+        cx.simulate_click(position, Modifiers::default());
+        assert_eq!(store.task(task.id).unwrap().unwrap().due_date, Some(today + Duration::days(1)));
+        cx.executor().advance_clock(std::time::Duration::from_millis(100));
+        cx.simulate_click(position, Modifiers::default());
+        assert_eq!(store.task(task.id).unwrap().unwrap().due_date, Some(today));
+        assert_eq!(store.tasks().unwrap().len(), 1);
+        cx.update(|_, cx| assert!(view.read(cx).completing.is_empty()));
+        // Completing again must survive the cancelled transition's original deadline.
+        cx.simulate_click(position, Modifiers::default());
+        cx.executor().advance_clock(std::time::Duration::from_millis(180));
+        cx.run_until_parked();
+        cx.update(|_, cx| assert!(view.read(cx).completing.contains_key(&task.id)));
+        cx.update(|_, cx| view.update(cx, |view, cx| view.apply_undo(cx)));
+        cx.executor().advance_clock(std::time::Duration::from_millis(100));
+        cx.run_until_parked();
+        assert_eq!(store.task(task.id).unwrap().unwrap().due_date, Some(today));
+        assert_eq!(store.tasks().unwrap().len(), 1);
+    }
+
+    #[gpui::test]
+    fn completion_respects_navigation_and_reduced_motion(cx: &mut TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let task = store.add_task("Complete immediately").unwrap();
+        cx.update(|cx| {
+            theme::init(cx);
+            cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| TodoView::new(store.clone(), window, cx));
+        cx.update(|_, cx| view.update(cx, |view, cx| {
+            view.toggle(task.id, true, cx);
+            assert!(view.completing.contains_key(&task.id));
+            view.set_view(View::Completed, cx);
+            assert!(view.completing.is_empty());
+            view.toggle(task.id, false, cx);
+            view.set_view(View::Inbox, cx);
+            cx.set_reduce_motion(true);
+            view.toggle(task.id, true, cx);
+            assert!(view.completing.is_empty());
+            assert!(view.tasks[0].is_completed());
+        }));
+    }
+
+    #[gpui::test]
+    fn unchecking_a_kanban_card_reopens_the_task(cx: &mut TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let task = store.add_task("Reopen on board").unwrap();
+        store.set_completed(task.id, true).unwrap();
+        cx.update(|cx| {
+            theme::init(cx);
+            cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let mut view = TodoView::new(store.clone(), window, cx);
+            view.set_layout(true, false, cx);
+            view
+        });
+        let selector = format!("kanban-checkbox-{}", task.id).leak();
+        let position = cx.debug_bounds(selector).expect("completed kanban card is rendered").center();
+        let modifiers = Modifiers::default();
+        cx.simulate_mouse_move(position, None, modifiers);
+        cx.simulate_click(position, modifiers);
+        assert!(!store.task(task.id).unwrap().unwrap().is_closed());
+        cx.update(|_, cx| {
+            assert!(view.read(cx).tasks.iter().any(|task| !task.is_closed()));
+        });
+    }
+
+    #[gpui::test]
+    fn unchecking_a_completed_row_reopens_the_task(cx: &mut TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let task = store.add_task("Reopen me").unwrap();
+        let today = TodoView::today();
+        store.set_due(task.id, Some(today), None).unwrap();
+        store.set_completed(task.id, true).unwrap();
+        cx.update(|cx| {
+            theme::init(cx);
+            cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let mut view = TodoView::new(store.clone(), window, cx);
+            view.set_view(View::Completed, cx);
+            view
+        });
+        let selector = format!("task-title-{}", task.id).leak();
+        let click_checkbox = |cx: &mut gpui::VisualTestContext| {
+            let title = cx.debug_bounds(selector).expect("completed task is rendered");
+            // The 16px checkbox is immediately before the title, with a 10px gap.
+            let position = point(title.left() - px(18.), title.center().y);
+            let modifiers = Modifiers::default();
+            cx.simulate_mouse_move(position, None, modifiers);
+            cx.simulate_click(position, modifiers);
+        };
+        click_checkbox(cx);
+        assert!(!store.task(task.id).unwrap().unwrap().is_closed());
+        cx.update(|_, cx| assert!(view.read(cx).tasks.is_empty()));
+        cx.update(|_, cx| view.update(cx, |view, cx| view.set_view(View::Today, cx)));
+        cx.update(|_, cx| {
+            let tasks = &view.read(cx).tasks;
+            assert_eq!(tasks.len(), 1);
+            assert_eq!(tasks[0].id, task.id);
+            assert_eq!(tasks[0].due_date, Some(today));
+            assert!(!tasks[0].is_closed());
+        });
+
+        store.set_completed(task.id, true).unwrap();
+        cx.update(|_, cx| view.update(cx, |view, cx| {
+            view.toggle_view_flag("show_completed", true, cx);
+            assert!(view.tasks.is_empty());
+            view.toggle_view_flag("show_completed", true, cx);
+            assert!(view.tasks[0].is_completed());
+        }));
+        cx.run_until_parked();
+        click_checkbox(cx);
+        cx.update(|_, cx| {
+            let view = view.read(cx);
+            assert_eq!(view.tasks[0].id, task.id);
+            assert!(!view.tasks[0].is_closed());
+            assert!(!view.rows(i18n::t(cx)).iter().any(|row| {
+                matches!(row, Row::Section { section: Section::Completed, .. })
+            }));
+        });
+
+        let list = store.create_list("Reopen test").unwrap();
+        for (page, list_id) in [
+            (View::Inbox, None),
+            (View::All, None),
+            (View::Search("Reopen me".into()), None),
+            (View::List(list.id), Some(list.id)),
+        ] {
+            store.set_list(task.id, list_id).unwrap();
+            store.set_completed(task.id, true).unwrap();
+            cx.update(|_, cx| view.update(cx, |view, cx| view.set_view(page.clone(), cx)));
+            cx.run_until_parked();
+            click_checkbox(cx);
+            cx.update(|_, cx| {
+                let tasks = &view.read(cx).tasks;
+                assert_eq!(tasks.len(), 1, "{page:?}");
+                assert_eq!(tasks[0].id, task.id, "{page:?}");
+                assert!(!tasks[0].is_closed(), "{page:?}");
+                assert_eq!(tasks[0].list_id, list_id, "{page:?}");
+            });
+        }
+    }
+
+    #[gpui::test]
+    fn clicking_the_selected_title_edits_and_saves_it_in_the_list(cx: &mut TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let task = store.add_task("Original").unwrap();
+        cx.update(|cx| {
+            theme::init(cx);
+            cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+            crate::keymap::load_default(&assets::Assets, cx).unwrap();
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| TodoView::new(store.clone(), window, cx));
+        let selector = format!("task-title-{}", task.id).leak();
+        let bounds = cx.debug_bounds(selector).expect("task title is rendered");
+        // Single click in the middle of the title immediately starts editing at the clicked offset.
+        let position = bounds.center();
+        let modifiers = Modifiers::default();
+        cx.simulate_mouse_move(position, None, modifiers);
+        cx.simulate_click(position, modifiers);
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            assert_eq!(view.read(cx).selected, Some(task.id));
+            let (_, input, _) = view.read(cx).title_edit.as_ref().expect("inline editor opens on first click");
+            assert!(input.focus_handle(cx).is_focused(window));
+            let selection = input.read(cx).selection();
+            assert!(selection.is_empty());
+            assert!(
+                selection.start > 0 && selection.start < "Original".len(),
+                "caret should land inside the clicked word, got {selection:?}"
+            );
+        });
+        cx.simulate_input("!");
+        cx.simulate_keystrokes("enter");
+        let saved = store.task(task.id).unwrap().unwrap().title;
+        assert!(saved.contains('!') && !saved.starts_with('!') && !saved.ends_with('!'), "saved title: {saved}");
+        cx.update(|_, cx| assert!(view.read(cx).title_edit.is_none()));
+    }
+
+    #[gpui::test]
+    fn escape_closes_the_sort_menu_and_restores_focus(cx: &mut TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        cx.update(|cx| {
+            theme::init(cx);
+            cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+            assert!(crate::keymap::load_default(&assets::Assets, cx).unwrap().is_empty());
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| TodoView::new(store.clone(), window, cx));
+        let sort = cx.debug_bounds("task-sort-menu-trigger").unwrap().center();
+        let modifiers = Modifiers::default();
+
+        let previous = cx.update(|window, cx| window.focused(cx).expect("quick-add field has focus"));
+        cx.simulate_mouse_move(sort, None, modifiers);
+        cx.simulate_click(sort, modifiers);
+        cx.update(|window, cx| {
+            let view = view.read(cx);
+            assert_eq!(view.sort_menu, Some(None));
+            assert!(view.sort_menu_focus.is_focused(window));
+        });
+
+        cx.simulate_keystrokes("escape");
+        cx.update(|window, cx| {
+            assert!(view.read(cx).sort_menu.is_none());
+            assert!(previous.is_focused(window));
+        });
+    }
+
+    #[gpui::test]
+    fn escape_returns_focus_to_the_board_when_it_closes_a_card(cx: &mut TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let task = store.add_task("Board task").unwrap();
+        cx.update(|cx| {
+            theme::init(cx);
+            cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+            assert!(crate::keymap::load_default(&assets::Assets, cx).unwrap().is_empty());
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let mut view = TodoView::new(store.clone(), window, cx);
+            view.set_layout(true, false, cx);
+            view.open_card(task.id, cx);
+            view
+        });
+        let body = cx.debug_bounds("task-detail-body").expect("board card is rendered").center();
+        let modifiers = Modifiers::default();
+        cx.simulate_mouse_move(body, None, modifiers);
+        cx.simulate_click(body, modifiers);
+        cx.update(|window, cx| {
+            let view = view.read(cx);
+            assert_eq!(view.card, Some(task.id));
+            assert!(view.list_focus.contains_focused(window, cx));
+            assert!(!view.list_focus.is_focused(window));
+        });
+
+        cx.simulate_keystrokes("escape");
+        cx.update(|window, cx| {
+            let view = view.read(cx);
+            assert!(view.card.is_none());
+            assert!(view.list_focus.is_focused(window));
+        });
+    }
+
+    #[gpui::test]
+    fn a_rejected_quick_add_attachment_does_not_repeat_the_saved_task(cx: &mut TestAppContext) {
+        use fern_core::attachment::MAX_ATTACHMENT_BYTES;
+
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let file = std::env::temp_dir().join(format!("fern-oversized-{}.bin", Id::now_v7()));
+        std::fs::File::create(&file).unwrap().set_len(MAX_ATTACHMENT_BYTES + 1).unwrap();
+        cx.update(|cx| {
+            theme::init(cx);
+            cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+            assert!(crate::keymap::load_default(&assets::Assets, cx).unwrap().is_empty());
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let mut view = TodoView::new(store.clone(), window, cx);
+            view.add_draft.files.push(file.clone());
+            window.focus(&view.input.focus_handle(cx), cx);
+            view
+        });
+        cx.simulate_input("One task");
+        cx.simulate_keystrokes("enter enter");
+        std::fs::remove_file(file).unwrap();
+        let tasks = store.tasks().unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert!(store.attachments(tasks[0].id).unwrap().is_empty());
+        cx.update(|_, cx| {
+            assert!(view.read(cx).input.read(cx).text().is_empty());
+            assert!(view.read(cx).add_attachment_error.as_deref().is_some_and(|error| error.contains("32 MiB")));
+        });
+    }
+
+    #[gpui::test]
+    fn a_task_without_tags_can_open_the_picker_and_save_its_first_tag(cx: &mut TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let task = store.add_task("No tags yet").unwrap();
+        cx.update(|cx| {
+            theme::init(cx);
+            cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+            crate::keymap::load_default(&assets::Assets, cx).unwrap();
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| TodoView::new(store.clone(), window, cx));
+        cx.update(|window, cx| view.update(cx, |view, cx| {
+            window.focus(&view.list_focus, cx);
+            view.start_detail(task.id, "tags", window, cx);
+        }));
+        assert!(cx.debug_bounds("task-tag-picker").is_some());
+        cx.simulate_input("work");
+        cx.simulate_keystrokes("enter");
+        assert!(store.task(task.id).unwrap().unwrap().tags.is_empty());
+        assert!(cx.debug_bounds("task-tag-picker").is_some());
+        cx.simulate_keystrokes("escape");
+        assert!(cx.debug_bounds("task-tag-picker").is_none());
+        assert!(store.tags().unwrap().is_empty(), "Esc discards new tags too");
+        cx.update(|window, cx| {
+            assert!(view.read(cx).list_focus.is_focused(window));
+            view.update(cx, |view, cx| view.start_detail(task.id, "tags", window, cx));
+        });
+        cx.simulate_input("work");
+        cx.simulate_keystrokes("enter");
+        let ok = cx.debug_bounds("task-tags-ok").unwrap().center();
+        cx.simulate_mouse_move(ok, None, Modifiers::default());
+        cx.simulate_click(ok, Modifiers::default());
+        assert_eq!(store.task(task.id).unwrap().unwrap().tags, ["work"]);
+        assert!(cx.debug_bounds("task-tag-picker").is_none());
+        cx.update(|window, cx| assert!(view.read(cx).list_focus.is_focused(window)));
+    }
+
+    #[gpui::test]
+    fn backspace_edits_text_but_only_delete_trashes_the_selected_task(cx: &mut TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let task = store.add_task("Original").unwrap();
+        cx.update(|cx| {
+            theme::init(cx);
+            cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+            let errors = crate::keymap::load_default(&assets::Assets, cx).unwrap();
+            assert!(errors.is_empty(), "{errors:?}");
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| TodoView::new(store.clone(), window, cx));
+        let selector = format!("task-title-{}", task.id).leak();
+        let bounds = cx.debug_bounds(selector).expect("task title is rendered");
+        let row_empty_space = point(bounds.right() + px(24.), bounds.center().y);
+        let title_click = point(bounds.left() + px(8.), bounds.center().y);
+        let modifiers = Modifiers::default();
+
+        cx.simulate_mouse_move(row_empty_space, None, modifiers);
+        cx.simulate_click(row_empty_space, modifiers);
+        cx.update(|window, cx| {
+            let view = view.read(cx);
+            assert_eq!(view.selected, Some(task.id));
+            assert!(view.title_edit.is_none());
+            assert!(view.list_focus.is_focused(window));
+        });
+        cx.simulate_keystrokes("backspace");
+        assert!(!store.task(task.id).unwrap().unwrap().is_deleted());
+
+        cx.simulate_mouse_move(title_click, None, modifiers);
+        cx.simulate_click(title_click, modifiers);
+        cx.simulate_keystrokes("end backspace enter");
+        let edited = store.task(task.id).unwrap().unwrap();
+        assert_eq!(edited.title, "Origina");
+        assert!(!edited.is_deleted());
+
+        cx.simulate_keystrokes("delete");
+        assert!(store.task(task.id).unwrap().unwrap().is_deleted());
+        cx.update(|_, cx| {
+            assert!(view.read(cx).tasks.is_empty());
+            assert_eq!(view.read(cx).selected, None);
+        });
+
+        cx.update(|_, cx| view.update(cx, |view, cx| {
+            view.set_view(View::Trash, cx);
+            view.select(task.id, cx);
+            view.reload(cx);
+            assert_eq!(view.selected, Some(task.id), "Trash still shows the selected deleted task");
+        }));
+    }
+
+    #[gpui::test]
+    fn switching_views_selects_the_first_visible_row_and_syncs_details(cx: &mut TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let l1 = store.create_list("L1").unwrap();
+        let l2 = store.create_list("L2").unwrap();
+        let empty_list = store.create_list("EmptyList").unwrap();
+        let kanban_list = store.create_list("BoardList").unwrap();
+        store.set_setting(&format!("kanban:list:{}", kanban_list.id), "1").unwrap();
+
+        let a2 = store.add_task("A2").unwrap();
+        let a1 = store.add_task("A1").unwrap();
+        for task in [&a1, &a2] {
+            store.set_list(task.id, Some(l1.id)).unwrap();
+            store.set_tags(task.id, &["AAA".to_owned()]).unwrap();
+        }
+        let b2 = store.add_task("B2").unwrap();
+        let b1 = store.add_task("B1").unwrap();
+        for task in [&b1, &b2] {
+            store.set_list(task.id, Some(l2.id)).unwrap();
+            store.set_tags(task.id, &["BBB".to_owned()]).unwrap();
+        }
+        let board_task = store.add_task("Board1").unwrap();
+        store.set_list(board_task.id, Some(kanban_list.id)).unwrap();
+        store.add_tag("EmptyTag", None, None).unwrap();
+
+        let filter_aaa = fern_core::SmartFilter {
+            name: "FilterAAA".to_owned(),
+            rules: fern_core::FilterRules {
+                conditions: vec![fern_core::Condition::new(fern_core::ConditionValue::Tags {
+                    names: vec!["AAA".to_owned()],
+                    untagged: false,
+                })],
+                ..Default::default()
+            },
+            ..fern_core::SmartFilter::new()
+        };
+        store.save_filter(&filter_aaa).unwrap();
+        let empty_filter = fern_core::SmartFilter {
+            name: "EmptyFilter".to_owned(),
+            rules: fern_core::FilterRules {
+                conditions: vec![fern_core::Condition::new(fern_core::ConditionValue::Tags {
+                    names: vec!["EmptyTag".to_owned()],
+                    untagged: false,
+                })],
+                ..Default::default()
+            },
+            ..fern_core::SmartFilter::new()
+        };
+        store.save_filter(&empty_filter).unwrap();
+
+        cx.update(|cx| {
+            theme::init(cx);
+            cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+            let errors = crate::keymap::load_default(&assets::Assets, cx).unwrap();
+            assert!(errors.is_empty(), "{errors:?}");
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| TodoView::new(store.clone(), window, cx));
+        cx.simulate_resize(gpui::size(px(1280.), px(960.)));
+        cx.run_until_parked();
+
+        let click_panel = |selector: &str, cx: &mut gpui::VisualTestContext| {
+            let selector: &'static str = selector.to_owned().leak();
+            let center = cx.debug_bounds(selector).unwrap_or_else(|| panic!("missing {selector}")).center();
+            let modifiers = Modifiers::default();
+            cx.simulate_mouse_move(center, None, modifiers);
+            cx.simulate_click(center, modifiers);
+            cx.run_until_parked();
+        };
+        let detail_state = |cx: &mut gpui::VisualTestContext| {
+            cx.update(|_, cx| {
+                let view = view.read(cx);
+                let detail = view.detail.read(cx);
+                (view.selected, detail.task_id(), detail.task_title().map(str::to_owned))
+            })
+        };
+
+        // Switch to tag BBB, then manually select the second row B2 (matching issue #17).
+        click_panel("lists-item-tag-BBB", cx);
+        assert_eq!(detail_state(cx), (Some(b1.id), Some(b1.id), Some("B1".to_owned())));
+        assert!(cx.debug_bounds("task-detail-header").is_some());
+
+        cx.update(|_, cx| view.update(cx, |view, cx| view.select(b2.id, cx)));
+        cx.run_until_parked();
+        assert_eq!(detail_state(cx), (Some(b2.id), Some(b2.id), Some("B2".to_owned())));
+
+        // Switch to list L1: first visible row A1 is selected and Region C updates to A1.
+        click_panel(&format!("lists-item-list-{}", l1.id), cx);
+        assert_eq!(detail_state(cx), (Some(a1.id), Some(a1.id), Some("A1".to_owned())));
+        cx.update(|window, cx| assert!(view.read(cx).list_focus.is_focused(window)));
+
+        // Keyboard navigation immediately advances from the auto-selected first row to A2.
+        cx.simulate_keystrokes("down");
+        assert_eq!(detail_state(cx), (Some(a2.id), Some(a2.id), Some("A2".to_owned())));
+
+        // Switch to an empty list: selection and Region C are cleared.
+        click_panel(&format!("lists-item-list-{}", empty_list.id), cx);
+        assert_eq!(detail_state(cx), (None, None, None));
+        assert!(cx.debug_bounds("task-detail-header").is_none());
+
+        // Switch to a saved filter with records, then an empty filter, then an empty tag.
+        click_panel(&format!("lists-item-filter-{}", filter_aaa.id), cx);
+        assert_eq!(detail_state(cx), (Some(a1.id), Some(a1.id), Some("A1".to_owned())));
+
+        click_panel(&format!("lists-item-filter-{}", empty_filter.id), cx);
+        assert_eq!(detail_state(cx), (None, None, None));
+        assert!(cx.debug_bounds("task-detail-header").is_none());
+
+        click_panel("lists-item-tag-AAA", cx);
+        assert_eq!(detail_state(cx), (Some(a1.id), Some(a1.id), Some("A1".to_owned())));
+
+        click_panel("lists-item-tag-EmptyTag", cx);
+        assert_eq!(detail_state(cx), (None, None, None));
+
+        // Pinned/sorted order determines the first row in Region B.
+        store.set_pinned(b2.id, true).unwrap();
+        click_panel(&format!("lists-item-list-{}", l2.id), cx);
+        assert_eq!(detail_state(cx), (Some(b2.id), Some(b2.id), Some("B2".to_owned())));
+
+        // Switching to a kanban list clears the side-panel selection so the board takes full width.
+        click_panel(&format!("lists-item-list-{}", kanban_list.id), cx);
+        assert_eq!(detail_state(cx), (None, None, None));
+        assert!(cx.debug_bounds("task-detail-header").is_none());
+
+        // Narrow window with pop-up detail layout does not cover the list with a modal on view switch.
+        cx.update(|_, cx| view.update(cx, |view, cx| view.save_preferences(|p| p.popup_details = true, cx)));
+        cx.simulate_resize(gpui::size(px(900.), px(960.)));
+        cx.run_until_parked();
+        click_panel(&format!("lists-item-list-{}", l1.id), cx);
+        assert_eq!(detail_state(cx), (None, None, None));
+        assert!(cx.debug_bounds("detail-popup").is_none());
+    }
+
+    #[gpui::test]
+    fn kanban_keeps_pinned_completed_and_subtasks_inside_their_own_columns(cx: &mut TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let list = store.create_list("Project").unwrap();
+        let t_open = store.add_task("Open card").unwrap();
+        let t_pinned = store.add_task("Pinned card").unwrap();
+        let t_done = store.add_task("Completed card").unwrap();
+        let sub_done = store.add_task("Completed subtask").unwrap();
+        for t in [&t_open, &t_pinned, &t_done, &sub_done] {
+            store.set_list(t.id, Some(list.id)).unwrap();
+        }
+        store.link_parent(sub_done.id, t_open.id).unwrap();
+        store.set_priority(t_open.id, Priority::High).unwrap();
+        store.set_priority(sub_done.id, Priority::Low).unwrap();
+        store.set_completed(sub_done.id, true).unwrap();
+        store.set_pinned(t_pinned.id, true).unwrap();
+        store.set_completed(t_done.id, true).unwrap();
+
+        cx.update(|cx| {
+            theme::init(cx);
+            cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let mut view = TodoView::new(store.clone(), window, cx);
+            view.set_view(View::List(list.id), cx);
+            view.set_layout(true, false, cx);
+            view
+        });
+        cx.run_until_parked();
+
+        // Switching to Kanban auto-creates a real ListSection and assigns unsectioned root tasks to it.
+        let sections = store.list_sections(Some(list.id)).unwrap();
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].name, "Not Sectioned");
+        assert_eq!(store.task(t_open.id).unwrap().unwrap().section_id, Some(sections[0].id));
+        assert_eq!(store.task(t_done.id).unwrap().unwrap().section_id, Some(sections[0].id));
+
+        // Add a second section and move t_done into it: no separate rightmost Completed column is created.
+        let sec2 = store.add_list_section(Some(list.id), "Review").unwrap();
+        store.set_section(t_done.id, Some(sec2.id)).unwrap();
+        cx.update(|_, cx| view.update(cx, |view, cx| view.reload(cx)));
+        cx.run_until_parked();
+
+        cx.update(|_, cx| {
+            let v = view.read(cx);
+            let cols = v.board_columns(i18n::t(cx));
+            assert_eq!(cols.len(), 2, "only the two real sections exist, no separate Completed column");
+            assert_eq!(cols[0].title, "Not Sectioned");
+            assert_eq!(cols[0].open_count(), 2);
+            assert_eq!(cols[0].pinned_cards.len(), 1);
+            assert_eq!(cols[0].open_cards.len(), 1);
+            assert_eq!(cols[0].open_cards[0].1.len(), 1, "completed subtask stays nested inside its open parent card");
+            assert!(cols[0].completed_cards.is_empty());
+
+            assert_eq!(cols[1].title, "Review");
+            assert_eq!(cols[1].open_count(), 0, "header count counts only open tasks");
+            assert_eq!(cols[1].completed_cards.len(), 1, "completed task stays inside its own section column");
+            assert_eq!(cols[1].completed_cards[0].0.id, t_done.id);
+        });
+
+        // Grouping by Priority keeps subtasks nested under their root task's priority column.
+        cx.update(|window, cx| view.update(cx, |view, cx| view.set_sort(None, Some(GroupBy::Priority), window, cx)));
+        cx.update(|_, cx| {
+            let v = view.read(cx);
+            let cols = v.board_columns(i18n::t(cx));
+            let high = cols.iter().find(|c| c.title == "High").expect("High priority column");
+            assert_eq!(high.open_cards.len(), 1);
+            assert_eq!(high.open_cards[0].0.id, t_open.id);
+            assert_eq!(high.open_cards[0].1.len(), 1, "Low-priority subtask stays inside High-priority root card");
+            assert!(!cols.iter().any(|c| c.title == "Low"), "subtask does not split into its own Low column");
+        });
+    }
+
+    #[gpui::test]
+    fn sidebar_drag_and_drop_reorders_smart_lists_sections_lists_folders_tags_and_filters(
+        cx: &mut TestAppContext,
+    ) {
+        use fern_core::{
+            FilterRules, SidebarSection, SmartFilter, SmartList,
+        };
+        use gpui::{Modifiers, MouseButton, point, size};
+
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let l1 = store.create_list("Alpha").unwrap();
+        let l2 = store.create_list("Beta").unwrap();
+        let l3 = store.create_list("Gamma").unwrap();
+        let task = store.add_task("Draggable task").unwrap();
+        store.add_tag("work", None, None).unwrap();
+        store.add_tag("home", None, None).unwrap();
+        store.add_tag("errands", None, None).unwrap();
+        let f1 = SmartFilter { id: Id::now_v7(), name: "Filter One".into(), rules: FilterRules::default() };
+        let f2 = SmartFilter { id: Id::now_v7(), name: "Filter Two".into(), rules: FilterRules::default() };
+        store.save_filter(&f1).unwrap();
+        store.save_filter(&f2).unwrap();
+
+        cx.update(|cx| {
+            theme::init(cx);
+            cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+            assert!(crate::keymap::load_default(&assets::Assets, cx).unwrap().is_empty());
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| TodoView::new(store.clone(), window, cx));
+        // Tall window so smart lists, lists, tags, and filters are all visible without scrolling.
+        cx.simulate_resize(size(px(1200.), px(1400.)));
+        cx.run_until_parked();
+
+        let drag = |cx: &mut gpui::VisualTestContext, from: gpui::Point<Pixels>, to: gpui::Point<Pixels>| {
+            let modifiers = Modifiers::default();
+            cx.simulate_mouse_move(from, None, modifiers);
+            cx.simulate_mouse_down(from, MouseButton::Left, modifiers);
+            cx.simulate_mouse_move(point(from.x + px(6.), from.y), Some(MouseButton::Left), modifiers);
+            cx.simulate_mouse_move(to, Some(MouseButton::Left), modifiers);
+            cx.simulate_mouse_up(to, MouseButton::Left, modifiers);
+            cx.run_until_parked();
+        };
+
+        let bounds = |cx: &mut gpui::VisualTestContext, selector: String| {
+            let selector: &'static str = selector.leak();
+            cx.debug_bounds(selector).unwrap_or_else(|| panic!("missing {selector}"))
+        };
+
+        // 1. Reorder top smart lists with live-sliding BEFORE MouseUp + monotonic 2px sweep.
+        let today_b = bounds(cx, "lists-item-view-Today".into());
+        let inbox_b = bounds(cx, "lists-item-view-Inbox".into());
+        let modifiers = Modifiers::default();
+        cx.simulate_mouse_move(today_b.center(), None, modifiers);
+        cx.simulate_mouse_down(today_b.center(), MouseButton::Left, modifiers);
+        cx.simulate_mouse_move(point(today_b.center().x + px(6.), today_b.center().y), Some(MouseButton::Left), modifiers);
+        cx.run_until_parked();
+        let mut prev_pos = 2usize;
+        let mut y = f32::from(today_b.center().y);
+        let target_y = f32::from(inbox_b.top()) + 5.;
+        while y > target_y {
+            y = (y - 2.).max(target_y);
+            cx.simulate_mouse_move(point(inbox_b.center().x, px(y)), Some(MouseButton::Left), modifiers);
+            cx.run_until_parked();
+            let cur_pos = cx.update(|_, cx| {
+                view.read(cx).preferences.smart_list_order.iter().position(|&s| s == SmartList::Today).unwrap_or(2)
+            });
+            assert!(cur_pos <= prev_pos, "smart list drag must never oscillate: {cur_pos} > {prev_pos}");
+            prev_pos = cur_pos;
+        }
+        // Assert Inbox physically slid down BEFORE MouseUp!
+        let inbox_live = bounds(cx, "lists-item-view-Inbox".into());
+        assert!(inbox_live.top() > inbox_b.top() + px(20.), "Inbox slid down live before MouseUp");
+        cx.simulate_mouse_up(point(inbox_b.center().x, px(target_y)), MouseButton::Left, modifiers);
+        cx.run_until_parked();
+        assert_eq!(store.preferences().unwrap().smart_list_order[0], SmartList::Today);
+        assert_eq!(store.preferences().unwrap().smart_list_order[1], SmartList::Inbox);
+
+        // 2. Reorder variable-height middle sections with 2px incremental sweep (zero jitter!).
+        let filters_h = bounds(cx, "filters-heading".into());
+        let lists_h = bounds(cx, "lists-heading".into());
+        cx.simulate_mouse_move(filters_h.center(), None, modifiers);
+        cx.simulate_mouse_down(filters_h.center(), MouseButton::Left, modifiers);
+        cx.simulate_mouse_move(point(filters_h.center().x + px(6.), filters_h.center().y), Some(MouseButton::Left), modifiers);
+        cx.run_until_parked();
+        let mut prev_sec_pos = 2usize;
+        let mut y = f32::from(filters_h.center().y);
+        let sec_target_y = f32::from(lists_h.top()) + 5.;
+        while y > sec_target_y {
+            y = (y - 4.).max(sec_target_y);
+            cx.simulate_mouse_move(point(lists_h.center().x, px(y)), Some(MouseButton::Left), modifiers);
+            cx.run_until_parked();
+            let cur_pos = cx.update(|_, cx| {
+                view.read(cx).preferences.sidebar_section_order.iter().position(|&s| s == SidebarSection::Filters).unwrap_or(2)
+            });
+            assert!(cur_pos <= prev_sec_pos, "section block drag must never oscillate: {cur_pos} > {prev_sec_pos}");
+            prev_sec_pos = cur_pos;
+        }
+        let lists_h_live = bounds(cx, "lists-heading".into());
+        assert!(lists_h_live.top() > lists_h.top() + px(20.), "Lists section slid down live before MouseUp");
+        cx.simulate_mouse_up(point(lists_h.center().x, px(sec_target_y)), MouseButton::Left, modifiers);
+        cx.run_until_parked();
+        assert_eq!(
+            store.preferences().unwrap().sidebar_section_order,
+            vec![SidebarSection::Filters, SidebarSection::Lists, SidebarSection::Tags]
+        );
+
+        // 3. Reorder filters (live-sliding before MouseUp).
+        let f2_b = bounds(cx, format!("lists-item-filter-{}", f2.id));
+        let f1_b = bounds(cx, format!("lists-item-filter-{}", f1.id));
+        cx.simulate_mouse_move(f2_b.center(), None, modifiers);
+        cx.simulate_mouse_down(f2_b.center(), MouseButton::Left, modifiers);
+        cx.simulate_mouse_move(point(f2_b.center().x + px(6.), f2_b.center().y), Some(MouseButton::Left), modifiers);
+        cx.simulate_mouse_move(point(f1_b.center().x, f1_b.top() + px(5.)), Some(MouseButton::Left), modifiers);
+        cx.run_until_parked();
+        assert!(bounds(cx, format!("lists-item-filter-{}", f1.id)).top() > f1_b.top() + px(20.));
+        cx.simulate_mouse_up(point(f1_b.center().x, f1_b.top() + px(5.)), MouseButton::Left, modifiers);
+        cx.run_until_parked();
+        let filter_names: Vec<String> = store.filters().unwrap().into_iter().map(|f| f.name).collect();
+        assert_eq!(filter_names, vec!["Filter Two", "Filter One"]);
+
+        // 4a. Escape cancels an in-progress list drag and restores pre-drag order cleanly.
+        let list_names = |s: &Store| -> Vec<String> { s.lists().unwrap().into_iter().map(|l| l.name).collect() };
+        let l3_b = bounds(cx, format!("lists-item-list-{}", l3.id));
+        let l1_b = bounds(cx, format!("lists-item-list-{}", l1.id));
+        cx.simulate_mouse_move(l3_b.center(), None, modifiers);
+        cx.simulate_mouse_down(l3_b.center(), MouseButton::Left, modifiers);
+        cx.simulate_mouse_move(point(l3_b.center().x + px(6.), l3_b.center().y), Some(MouseButton::Left), modifiers);
+        cx.simulate_mouse_move(point(l1_b.center().x, l1_b.top() + px(4.)), Some(MouseButton::Left), modifiers);
+        cx.run_until_parked();
+        assert!(bounds(cx, format!("lists-item-list-{}", l1.id)).top() > l1_b.top() + px(20.));
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        cx.simulate_mouse_up(point(l1_b.center().x, l1_b.top() + px(4.)), MouseButton::Left, modifiers);
+        cx.run_until_parked();
+        assert_eq!(list_names(&store), vec!["Alpha", "Beta", "Gamma"]);
+
+        // 4b. List 3-zone drag with 2px sweep: reorder Gamma before Alpha (zero oscillation!).
+        let l3_b = bounds(cx, format!("lists-item-list-{}", l3.id));
+        let l1_b = bounds(cx, format!("lists-item-list-{}", l1.id));
+        cx.simulate_mouse_move(l3_b.center(), None, modifiers);
+        cx.simulate_mouse_down(l3_b.center(), MouseButton::Left, modifiers);
+        cx.simulate_mouse_move(point(l3_b.center().x + px(6.), l3_b.center().y), Some(MouseButton::Left), modifiers);
+        cx.run_until_parked();
+        let mut prev_idx = 2usize;
+        let mut y = f32::from(l3_b.center().y);
+        let list_target_y = f32::from(l1_b.top()) + 4.;
+        while y > list_target_y {
+            y = (y - 2.).max(list_target_y);
+            cx.simulate_mouse_move(point(l1_b.center().x, px(y)), Some(MouseButton::Left), modifiers);
+            cx.run_until_parked();
+            let cur_idx = cx.update(|_, cx| {
+                view.read(cx).lists.iter().position(|l| l.id == l3.id).unwrap_or(2)
+            });
+            assert!(cur_idx <= prev_idx, "list drag must never oscillate: {cur_idx} > {prev_idx}");
+            prev_idx = cur_idx;
+        }
+        cx.simulate_mouse_up(point(l1_b.center().x, px(list_target_y)), MouseButton::Left, modifiers);
+        cx.run_until_parked();
+        assert_eq!(list_names(&store), vec!["Gamma", "Alpha", "Beta"]);
+
+        // 5. List middle-zone drag: hovering center of Alpha shifts Alpha by 0.0 px, highlights it,
+        //    and releasing creates a folder & opens the rename dialog.
+        let l2_b = bounds(cx, format!("lists-item-list-{}", l2.id));
+        let l1_b = bounds(cx, format!("lists-item-list-{}", l1.id));
+        cx.simulate_mouse_move(l2_b.center(), None, modifiers);
+        cx.simulate_mouse_down(l2_b.center(), MouseButton::Left, modifiers);
+        cx.simulate_mouse_move(point(l2_b.center().x + px(6.), l2_b.center().y), Some(MouseButton::Left), modifiers);
+        cx.simulate_mouse_move(l1_b.center(), Some(MouseButton::Left), modifiers);
+        cx.run_until_parked();
+        assert_eq!(bounds(cx, format!("lists-item-list-{}", l1.id)).top(), l1_b.top(), "highlighted row does not jump");
+        cx.simulate_mouse_up(l1_b.center(), MouseButton::Left, modifiers);
+        cx.run_until_parked();
+        let folders = store.list_folders().unwrap();
+        assert_eq!(folders.len(), 1);
+        let folder = folders[0].clone();
+        cx.update(|_, cx| assert!(view.read(cx).folder_dialog.is_some(), "grouping opens folder rename dialog"));
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        cx.update(|_, cx| assert!(view.read(cx).folder_dialog.is_none(), "escape closes folder rename dialog"));
+        let grouped: Vec<(String, Option<Id>)> = store.lists().unwrap().into_iter().map(|l| (l.name, l.folder)).collect();
+        assert_eq!(
+            grouped,
+            vec![
+                ("Gamma".into(), None),
+                ("Alpha".into(), Some(folder.id)),
+                ("Beta".into(), Some(folder.id)),
+            ]
+        );
+
+        // 6. Folder drag-reorder: drag folder above Gamma.
+        let folder_b = bounds(cx, format!("lists-folder-{}", folder.id));
+        let l3_b = bounds(cx, format!("lists-item-list-{}", l3.id));
+        drag(cx, folder_b.center(), point(l3_b.center().x, l3_b.top() + px(5.)));
+        assert_eq!(list_names(&store), vec!["Alpha", "Beta", "Gamma"]);
+
+        // 7. Collapse folder, hover dragged Gamma over its middle zone for 900ms -> auto-expands!
+        cx.update(|window, cx| {
+            view.update(cx, |v, cx| v.panel_event(lists_panel::PanelEvent::ToggleFolder(folder.id), window, cx));
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| assert!(view.read(cx).collapsed_folders.contains(&folder.id)));
+        let l3_b = bounds(cx, format!("lists-item-list-{}", l3.id));
+        let folder_b = bounds(cx, format!("lists-folder-{}", folder.id));
+        let modifiers = Modifiers::default();
+        cx.simulate_mouse_move(l3_b.center(), None, modifiers);
+        cx.simulate_mouse_down(l3_b.center(), MouseButton::Left, modifiers);
+        cx.simulate_mouse_move(point(l3_b.center().x + px(6.), l3_b.center().y), Some(MouseButton::Left), modifiers);
+        cx.simulate_mouse_move(folder_b.center(), Some(MouseButton::Left), modifiers);
+        cx.background_executor.advance_clock(std::time::Duration::from_millis(950));
+        cx.run_until_parked();
+        cx.update(|_, cx| assert!(!view.read(cx).collapsed_folders.contains(&folder.id), "folder auto-expanded on drag hover"));
+        // Drop Gamma into the folder.
+        let folder_b = bounds(cx, format!("lists-folder-{}", folder.id));
+        cx.simulate_mouse_up(folder_b.center(), MouseButton::Left, modifiers);
+        cx.run_until_parked();
+        assert_eq!(store.lists().unwrap().iter().find(|l| l.id == l3.id).unwrap().folder, Some(folder.id));
+
+        // 8. Tag drag: nest `errands` into `work` (middle zone), then drag parent `work` after `home`.
+        let errands_b = bounds(cx, "lists-item-tag-errands".into());
+        let work_b = bounds(cx, "lists-item-tag-work".into());
+        drag(cx, errands_b.center(), work_b.center());
+        assert_eq!(
+            store.tags().unwrap().into_iter().find(|t| t.name == "errands").unwrap().parent.as_deref(),
+            Some("work")
+        );
+
+        let work_b = bounds(cx, "lists-item-tag-work".into());
+        let home_b = bounds(cx, "lists-item-tag-home".into());
+        drag(cx, work_b.center(), point(home_b.center().x, home_b.bottom() - px(5.)));
+        let top_tags: Vec<String> = store.tags().unwrap().into_iter().filter(|t| t.parent.is_none()).map(|t| t.name).collect();
+        assert_eq!(top_tags, vec!["home", "work"]);
+
+        // 9. Promote sub-tag `errands` to top-level by dropping on Tags heading.
+        let errands_b = bounds(cx, "lists-item-tag-errands".into());
+        let tags_h = bounds(cx, "tags-heading".into());
+        drag(cx, errands_b.center(), tags_h.center());
+        let top_tags: Vec<String> = store.tags().unwrap().into_iter().filter(|t| t.parent.is_none()).map(|t| t.name).collect();
+        assert_eq!(top_tags, vec!["errands", "home", "work"]);
+
+        // 10. Existing task drop onto a list still works cleanly.
+        assert_eq!(store.task(task.id).unwrap().unwrap().list_id, None);
+        cx.update(|_, cx| {
+            view.update(cx, |v, cx| v.drop_on_view(View::List(l1.id), task.id, cx));
+        });
+        assert_eq!(store.task(task.id).unwrap().unwrap().list_id, Some(l1.id));
+    }
+
+    #[gpui::test]
+    fn nested_tasks_drag_unnest_unlink_and_toggle_all(cx: &mut TestAppContext) {
+        use gpui::{Modifiers, point, size};
+
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let parent = store.add_task("Parent").unwrap();
+        let child = store.add_subtask(parent.id, "Child").unwrap();
+
+        cx.update(|cx| {
+            theme::init(cx);
+            cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+            assert!(crate::keymap::load_default(&assets::Assets, cx).unwrap().is_empty());
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| TodoView::new(store.clone(), window, cx));
+        cx.simulate_resize(size(px(1100.), px(700.)));
+        cx.run_until_parked();
+
+        let bounds = |cx: &mut gpui::VisualTestContext, selector: String| {
+            let selector: &'static str = selector.leak();
+            cx.debug_bounds(selector).unwrap_or_else(|| panic!("missing {selector}"))
+        };
+        let drag = |cx: &mut gpui::VisualTestContext, from: gpui::Point<Pixels>, to: gpui::Point<Pixels>| {
+            let modifiers = Modifiers::default();
+            cx.simulate_mouse_move(from, None, modifiers);
+            cx.simulate_mouse_down(from, MouseButton::Left, modifiers);
+            let step = if to.x < from.x { -6. } else { 6. };
+            cx.simulate_mouse_move(point(from.x + px(step), from.y), Some(MouseButton::Left), modifiers);
+            cx.simulate_mouse_move(to, Some(MouseButton::Left), modifiers);
+            cx.run_until_parked();
+            cx.simulate_mouse_up(to, MouseButton::Left, modifiers);
+            cx.run_until_parked();
+        };
+        let visible_ids = |cx: &mut gpui::VisualTestContext| -> Vec<Id> {
+            cx.update(|_, cx| view.read(cx).visible_task_ids(i18n::t(cx)))
+        };
+
+        // 1. Two-task list: drag Child left by grabbing directly on its title text -> unnested without opening title edit.
+        let child_title_b = bounds(cx, format!("task-title-{}", child.id));
+        let grab_title = child_title_b.center();
+        drag(cx, grab_title, point(grab_title.x - px(48.), grab_title.y));
+        assert_eq!(store.task(child.id).unwrap().unwrap().parent_id, None, "drag left from title unnests child");
+        cx.update(|_, cx| assert!(view.read(cx).title_edit.is_none(), "dragging title does not enter inline edit"));
+        assert_eq!(visible_ids(cx), vec![parent.id, child.id]);
+
+        // 2. Drag Child right on its own row -> nests back under Parent.
+        let child_b = bounds(cx, format!("task-row-{}", child.id));
+        let grab = point(child_b.left() + px(160.), child_b.center().y);
+        drag(cx, grab, point(grab.x + px(48.), grab.y));
+        assert_eq!(store.task(child.id).unwrap().unwrap().parent_id, Some(parent.id), "drag right nests child");
+
+        // 3. Drag Child down into empty whitespace below the list -> unnested at bottom.
+        let child_b = bounds(cx, format!("task-row-{}", child.id));
+        let grab = point(child_b.left() + px(160.), child_b.center().y);
+        drag(cx, grab, point(grab.x, child_b.bottom() + px(80.)));
+        assert_eq!(store.task(child.id).unwrap().unwrap().parent_id, None, "drag below list unnests child");
+
+        // 4. Drag Child onto bottom half of Parent moved right -> nests; then above Parent -> unnested first.
+        let child_b = bounds(cx, format!("task-row-{}", child.id));
+        let parent_b = bounds(cx, format!("task-row-{}", parent.id));
+        let grab = point(child_b.left() + px(160.), child_b.center().y);
+        drag(cx, grab, point(grab.x + px(48.), parent_b.bottom() - px(6.)));
+        assert_eq!(store.task(child.id).unwrap().unwrap().parent_id, Some(parent.id));
+
+        let child_b = bounds(cx, format!("task-row-{}", child.id));
+        let parent_b = bounds(cx, format!("task-row-{}", parent.id));
+        let grab = point(child_b.left() + px(160.), child_b.center().y);
+        drag(cx, grab, point(grab.x, parent_b.top() + px(6.)));
+        assert_eq!(store.task(child.id).unwrap().unwrap().parent_id, None, "drag above parent unnests");
+        assert_eq!(visible_ids(cx), vec![child.id, parent.id], "moved before parent");
+
+        // 5. Unlink parent via TaskDetail parent breadcrumb X button.
+        store.link_parent(child.id, parent.id).unwrap();
+        cx.update(|_, cx| view.update(cx, |v, cx| { v.reload(cx); v.select(child.id, cx); }));
+        cx.run_until_parked();
+        let unlink_b = bounds(cx, "detail-unlink-parent".into());
+        cx.simulate_click(unlink_b.center(), Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(store.task(child.id).unwrap().unwrap().parent_id, None, "breadcrumb unlink clears parent");
+
+        // 6. Unlink parent via Link Parent popover X button.
+        store.link_parent(child.id, parent.id).unwrap();
+        cx.update(|window, cx| view.update(cx, |v, cx| {
+            v.reload(cx);
+            v.start_detail(child.id, "link-parent", window, cx);
+        }));
+        cx.run_until_parked();
+        let pop_unlink_b = bounds(cx, "link-parent-unlink".into());
+        cx.simulate_click(pop_unlink_b.center(), Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(store.task(child.id).unwrap().unwrap().parent_id, None, "popover unlink clears parent");
+
+        // 7. Unlink subtask from Parent's subtask list in TaskDetail.
+        store.link_parent(child.id, parent.id).unwrap();
+        cx.update(|_, cx| view.update(cx, |v, cx| { v.reload(cx); v.select(parent.id, cx); }));
+        cx.run_until_parked();
+        let sub_unlink_b = bounds(cx, format!("subtask-unlink-{}", child.id));
+        cx.simulate_click(sub_unlink_b.center(), Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(store.task(child.id).unwrap().unwrap().parent_id, None, "subtask list unlink clears parent");
+
+        // 8. ToggleAllSubtasks collapses and re-expands all parents.
+        store.link_parent(child.id, parent.id).unwrap();
+        cx.update(|_, cx| view.update(cx, |v, cx| v.reload(cx)));
+        cx.run_until_parked();
+        assert_eq!(visible_ids(cx), vec![parent.id, child.id]);
+        cx.update(|_, cx| view.update(cx, |v, cx| v.toggle_all_subtasks_now(cx)));
+        cx.run_until_parked();
+        assert_eq!(visible_ids(cx), vec![parent.id], "all subtasks collapsed");
+        cx.update(|_, cx| view.update(cx, |v, cx| v.toggle_all_subtasks_now(cx)));
+        cx.run_until_parked();
+        assert_eq!(visible_ids(cx), vec![parent.id, child.id], "all subtasks expanded again");
+
+        // 9. Kanban: dragging a subtask row out of its parent card unnests it.
+        cx.update(|_, cx| view.update(cx, |v, cx| v.set_layout(true, false, cx)));
+        cx.run_until_parked();
+        let sub_card_b = bounds(cx, format!("card-sub-{}", child.id));
+        // Drag the subtask to the top-left reorder zone of its own parent card (above the subtask row).
+        drag(cx, sub_card_b.center(), point(sub_card_b.left() + px(24.), sub_card_b.top() - px(24.)));
+        assert_eq!(store.task(child.id).unwrap().unwrap().parent_id, None, "kanban subtask drag unnests child");
+    }
+}

@@ -10,12 +10,12 @@ workspace = true
 [dependencies]
 anyhow.workspace = true
 chrono.workspace = true
-chrono-tz = "0.10.4"
-hex = "0.4"
+chrono-tz.workspace = true
+hex.workspace = true
 rusqlite.workspace = true
 serde_json.workspace = true
 serde.workspace = true
-tempfile = "3"
+tempfile.workspace = true
 uuid.workspace = true
-walkdir = "2"
-zip = { version = "9.5", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+walkdir.workspace = true
+zip.workspace = true

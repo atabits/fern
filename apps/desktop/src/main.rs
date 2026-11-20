@@ -1,63 +1,40 @@
 // A release build on Windows opens no console window next to the app.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
-mod actions;
 #[cfg(test)]
 mod feature_regressions;
 mod app_view;
 
-mod calendar;
-mod completion_mark;
-mod calendar_options_view;
-mod calendar_view;
-mod countdown_view;
-mod drag;
-mod emoji;
-mod export;
-mod due_picker;
-mod filter_draft;
-mod focus_timer;
-mod focus_mini;
-mod focus_view;
+pub(crate) use desktop_common::{
+    actions, calendar, export, keymap, portable, subscriptions, sync, text_input, touch,
+};
+pub(crate) use desktop_common::paths::{
+    DAILY_BACKUPS, attachments_dir, backups_dir, data_dir, pending_restore_path, scratch_dir,
+};
+pub(crate) use task_ui::{
+    drag, lists_panel, task_detail, task_rows,
+};
+pub(crate) use calendar_ui as calendar_view;
+pub(crate) use countdown_ui as countdown_view;
+pub(crate) use focus_ui as focus_view;
+pub(crate) use habit_ui as habit_view;
+pub(crate) use matrix_ui as matrix_view;
+pub(crate) use sticky_ui as sticky_note;
+pub(crate) use todo_ui as todo_view;
 mod hotkeys;
 mod http;
-mod habit_view;
-mod i18n;
-mod keymap;
+pub(crate) use fern_i18n as i18n;
 mod release_notes;
-mod list_dialog;
-mod lists_panel;
-mod markdown_toolbar;
-mod matrix_view;
-mod print;
-mod portable;
 mod quick_add_window;
 mod reminders;
-mod report_image;
-mod resize;
 mod search_modal;
 mod settings_window;
 mod sidebar;
-mod sticky_note;
-mod sticky_settings;
-mod sticky_windows;
-mod subscriptions;
-mod summary_view;
-mod sync;
-mod tag_dialog;
-mod task_detail;
-mod task_menu;
-mod task_rows;
-mod text_input;
 mod title_bar;
-mod touch;
-mod touch_keyboard;
 #[cfg(windows)]
 mod tray;
-mod undo;
 mod updater;
 mod user_themes;
-mod todo_view;
 
 use std::rc::Rc;
 
@@ -68,49 +45,6 @@ use gpui::{App, Bounds, WindowBounds, WindowOptions, prelude::*, px, size};
 use crate::app_view::AppView;
 use assets::Assets;
 use crate::i18n::{CurrentLocale, Locale};
-
-
-/// Where Fern keeps its data.
-pub fn data_dir() -> Result<std::path::PathBuf> {
-    // Debug builds can be pointed at throwaway data, so that checking a change leaves the real
-    // data alone.
-    #[cfg(debug_assertions)]
-    if let Some(dir) = std::env::var_os("FERN_DATA_DIR") {
-        return Ok(dir.into());
-    }
-    if let Some(dir) = portable::data_dir() {
-        return Ok(dir.to_owned());
-    }
-    Ok(dirs::data_dir().context("cannot determine the user data directory")?.join("fern-tasks"))
-}
-
-/// Where temporary files for printing and backup exports are written.
-fn scratch_dir() -> std::io::Result<std::path::PathBuf> {
-    let Some(dir) = portable::data_dir() else {
-        return Ok(std::env::temp_dir());
-    };
-    let cache = dir.join("cache");
-    std::fs::create_dir_all(&cache)?;
-    Ok(cache)
-}
-
-/// Where attached files are kept, as copies.
-pub fn attachments_dir() -> Result<std::path::PathBuf> {
-    Ok(data_dir()?.join("attachments"))
-}
-
-/// A backup chosen with "Import Backups", restored on the next start before anything opens.
-pub fn pending_restore_path() -> Result<std::path::PathBuf> {
-    Ok(data_dir()?.join("restore.db"))
-}
-
-/// Where the daily copies of the data are kept.
-pub fn backups_dir() -> Result<std::path::PathBuf> {
-    Ok(data_dir()?.join("backups"))
-}
-
-/// How many daily copies are kept.
-const DAILY_BACKUPS: usize = 7;
 
 /// Opens the data, and whether it was just created: the first start.
 fn open_store() -> Result<(Store, bool)> {
@@ -213,6 +147,7 @@ fn main() -> Result<()> {
         .expect("failed to open the main window");
         AppView::register_window_actions(main_window, cx);
         user_themes::watch(store_for_themes, main_window.into(), cx);
+        cx.set_global(desktop_common::StickyOpener(Rc::new(sticky_note::open)));
         sticky_note::restore(store_for_hotkeys.clone(), cx);
         hotkeys::init(main_window, store_for_hotkeys, cx);
         cx.activate(true);

@@ -1,0 +1,18 @@
+[target.'cfg(all())']
+# More compact mangling with better backtraces for GPUI closures.
+rustflags = ["-C", "symbol-mangling-version=v0"]
+
+[target.'cfg(target_os = "windows")']
+# Shrinks windows::core::Error from 16 bytes to 4 bytes.
+rustflags = ["--cfg", "windows_slim_errors"]
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-fuse-ld=lld"]
+
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-fuse-ld=lld"]
+
+[alias]
+c = "check -p fern_desktop"
+t = "test --workspace"
+run-fast = "run --profile release-fast -p fern_desktop"

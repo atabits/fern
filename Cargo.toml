@@ -2,9 +2,20 @@
 resolver = "3"
 members = [
     "crates/assets",
+    "crates/calendar_ui",
     "crates/core",
+    "crates/countdown_ui",
+    "crates/desktop_common",
+    "crates/focus_ui",
+    "crates/habit_ui",
+    "crates/i18n",
     "crates/icons",
+    "crates/matrix_ui",
+    "crates/sticky_ui",
+    "crates/summary_ui",
+    "crates/task_ui",
     "crates/theme",
+    "crates/todo_ui",
     "crates/ui",
     "apps/desktop",
     "apps/server",
@@ -24,16 +35,30 @@ todo = "deny"
 
 [workspace.dependencies]
 assets = { path = "crates/assets" }
+calendar_ui = { path = "crates/calendar_ui" }
+countdown_ui = { path = "crates/countdown_ui" }
+desktop_common = { path = "crates/desktop_common" }
 fern_core = { path = "crates/core" }
+fern_i18n = { path = "crates/i18n" }
+focus_ui = { path = "crates/focus_ui" }
+habit_ui = { path = "crates/habit_ui" }
 icons = { path = "crates/icons" }
+matrix_ui = { path = "crates/matrix_ui" }
+sticky_ui = { path = "crates/sticky_ui" }
+summary_ui = { path = "crates/summary_ui" }
+task_ui = { path = "crates/task_ui" }
 theme = { path = "crates/theme" }
+todo_ui = { path = "crates/todo_ui" }
 ui = { path = "crates/ui" }
 
 anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+chrono-tz = "0.10.4"
 dirs = "6"
 futures = "0.3"
+hex = "0.4"
 notify-rust = "4"
+raw-window-handle = "0.6"
 resvg = "0.46"
 rust-embed = { version = "8", features = ["include-exclude"] }
 rusqlite = { version = "0.37", features = ["bundled", "backup"] }
@@ -42,12 +67,29 @@ serde_json = "1"
 sha2 = "0.10"
 smallvec = "1"
 strum = { version = "0.27", features = ["derive"] }
+tempfile = "3"
 tiny_http = "0.12"
 ureq = "3"
 unicode-segmentation = "1"
 usvg = { version = "0.46", default-features = false }
 sys-locale = "0.3"
 uuid = { version = "1", features = ["v7", "serde"] }
+walkdir = "2"
+winresource = "0.1"
+zip = { version = "9.5", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+windows = { version = "0.62", features = [
+    "UI_ViewManagement",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Dwm",
+    "Win32_System_WinRT",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Input_Pointer",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 gpui = { git = "https://github.com/zed-industries/zed", default-features = false, features = ["font-kit", "wayland", "x11"] }
 gpui_platform = { git = "https://github.com/zed-industries/zed", default-features = false, features = ["font-kit", "wayland", "x11"] }
@@ -59,11 +101,69 @@ calloop = { git = "https://github.com/zed-industries/calloop", rev = "3759371fee
 khronos-egl = { git = "https://github.com/zed-industries/khronos-egl", rev = "42214b36347b108fd9630ca6254b96dde59e04fe" }
 
 [profile.dev]
-# Optimize dependencies (GPUI) even in debug builds, otherwise the UI is noticeably slow.
+split-debuginfo = "unpacked"
+incremental = true
+codegen-units = 16
+debug = "limited"
+
+# Mirror external dependency settings for build scripts & proc-macros to avoid compiling shared crates twice.
+[profile.dev.build-override]
+split-debuginfo = "unpacked"
+codegen-units = 16
+debug = 0
+
+# Strip debug symbols from external dependencies (gpui, windows, etc.) to drastically shrink PDBs & link time.
 [profile.dev.package."*"]
-opt-level = 2
+debug = 0
+
+[profile.dev.package]
+# Compile proc-macros and their parsers with -O3 once so macro expansion is fast on every edit.
+syn = { opt-level = 3 }
+quote = { opt-level = 3 }
+proc-macro2 = { opt-level = 3 }
+gpui_macros = { opt-level = 3 }
+derive_refineable = { opt-level = 3 }
+strum_macros = { opt-level = 3 }
+serde_derive = { opt-level = 3 }
+rust-embed-impl = { opt-level = 3 }
+thiserror-impl = { opt-level = 3 }
+futures-macro = { opt-level = 3 }
+async-trait = { opt-level = 3 }
+windows-implement = { opt-level = 3 }
+windows-interface = { opt-level = 3 }
+zerocopy-derive = { opt-level = 3 }
+bytemuck_derive = { opt-level = 3 }
+
+# Hot runtime UI/rendering dependencies stay smooth in debug builds without optimizing all 400+ crates.
+taffy = { opt-level = 3 }
+resvg = { opt-level = 3 }
+usvg = { opt-level = 3 }
+tiny-skia = { opt-level = 3 }
+cosmic-text = { opt-level = 3 }
+serde_json = { opt-level = 3 }
+
+# Small single-file internal crates compile faster as a single codegen unit.
+assets = { codegen-units = 1 }
+fern_i18n = { codegen-units = 1 }
+icons = { codegen-units = 1 }
+
+# Full debug info profile when attaching a debugger: `cargo build --profile dbg`
+[profile.dbg]
+inherits = "dev"
+debug = "full"
+
+[profile.dbg.build-override]
+debug = "full"
 
 [profile.release]
 lto = "thin"
 codegen-units = 1
 strip = true
+
+[profile.release.package]
+fern_desktop = { codegen-units = 16 }
+
+[profile.release-fast]
+inherits = "release"
+lto = false
+codegen-units = 16

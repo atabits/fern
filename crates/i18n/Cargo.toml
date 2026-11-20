@@ -1,0 +1,20 @@
+[package]
+name = "fern_i18n"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/i18n.rs"
+
+[dependencies]
+fern_core.workspace = true
+gpui.workspace = true
+sys-locale.workspace = true
+theme.workspace = true
+
+[dev-dependencies]
+chrono.workspace = true

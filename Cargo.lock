@@ -715,6 +715,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
+name = "calendar_ui"
+version = "0.1.12"
+dependencies = [
+ "assets",
+ "chrono",
+ "desktop_common",
+ "fern_core",
+ "fern_i18n",
+ "gpui",
+ "serde_json",
+ "task_ui",
+ "theme",
+ "ui",
+]
+
+[[package]]
 name = "calloop"
 version = "0.14.3"
 source = "git+https://github.com/zed-industries/calloop?rev=3759371fee14c40066d64777e2a36b6ffcc22590#3759371fee14c40066d64777e2a36b6ffcc22590"
@@ -1127,6 +1143,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "countdown_ui"
+version = "0.1.12"
+dependencies = [
+ "anyhow",
+ "assets",
+ "chrono",
+ "desktop_common",
+ "fern_core",
+ "fern_i18n",
+ "gpui",
+ "task_ui",
+ "theme",
+ "ui",
+]
+
+[[package]]
 name = "cpufeatures"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1264,6 +1296,34 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "desktop_common"
+version = "0.1.12"
+dependencies = [
+ "anyhow",
+ "assets",
+ "chrono",
+ "dirs",
+ "fern_core",
+ "fern_i18n",
+ "fern_server",
+ "futures",
+ "gpui",
+ "icons",
+ "raw-window-handle",
+ "resvg",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "theme",
+ "tiny_http",
+ "ui",
+ "unicode-segmentation",
+ "ureq",
+ "uuid",
+ "windows 0.62.2",
 ]
 
 [[package]]
@@ -1605,29 +1665,44 @@ version = "0.1.12"
 dependencies = [
  "anyhow",
  "assets",
+ "calendar_ui",
  "chrono",
- "dirs",
+ "countdown_ui",
+ "desktop_common",
  "fern_core",
- "fern_server",
+ "fern_i18n",
+ "focus_ui",
  "futures",
  "gpui",
  "gpui_platform",
+ "habit_ui",
  "icons",
+ "matrix_ui",
  "notify-rust",
  "raw-window-handle",
- "resvg",
  "serde",
  "serde_json",
  "sha2 0.10.9",
- "sys-locale",
+ "sticky_ui",
+ "task_ui",
  "theme",
- "tiny_http",
+ "todo_ui",
  "ui",
- "unicode-segmentation",
  "ureq",
  "uuid",
  "windows 0.62.2",
  "winresource",
+]
+
+[[package]]
+name = "fern_i18n"
+version = "0.1.12"
+dependencies = [
+ "chrono",
+ "fern_core",
+ "gpui",
+ "sys-locale",
+ "theme",
 ]
 
 [[package]]
@@ -1710,6 +1785,20 @@ name = "fnv"
 version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
+
+[[package]]
+name = "focus_ui"
+version = "0.1.12"
+dependencies = [
+ "chrono",
+ "desktop_common",
+ "fern_core",
+ "fern_i18n",
+ "gpui",
+ "task_ui",
+ "theme",
+ "ui",
+]
 
 [[package]]
 name = "foldhash"
@@ -2398,6 +2487,20 @@ dependencies = [
  "windows-core 0.62.2",
  "windows-numerics 0.3.1",
  "windows-registry",
+]
+
+[[package]]
+name = "habit_ui"
+version = "0.1.12"
+dependencies = [
+ "chrono",
+ "desktop_common",
+ "fern_core",
+ "fern_i18n",
+ "gpui",
+ "task_ui",
+ "theme",
+ "ui",
 ]
 
 [[package]]
@@ -3144,6 +3247,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "62bb907fe88d54d8d9ce32a3cceab4218ed2f6b7d35617cafe9adf84e43919cb"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "matrix_ui"
+version = "0.1.12"
+dependencies = [
+ "anyhow",
+ "assets",
+ "chrono",
+ "desktop_common",
+ "fern_core",
+ "fern_i18n",
+ "gpui",
+ "task_ui",
+ "theme",
+ "ui",
 ]
 
 [[package]]
@@ -5235,6 +5354,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
+name = "sticky_ui"
+version = "0.1.12"
+dependencies = [
+ "anyhow",
+ "assets",
+ "chrono",
+ "desktop_common",
+ "fern_core",
+ "fern_i18n",
+ "gpui",
+ "raw-window-handle",
+ "task_ui",
+ "theme",
+ "ui",
+ "windows 0.62.2",
+]
+
+[[package]]
 name = "strict-num"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5300,6 +5437,20 @@ dependencies = [
  "rayon",
  "tracing",
  "ztracing",
+]
+
+[[package]]
+name = "summary_ui"
+version = "0.1.12"
+dependencies = [
+ "chrono",
+ "desktop_common",
+ "fern_core",
+ "fern_i18n",
+ "gpui",
+ "task_ui",
+ "theme",
+ "ui",
 ]
 
 [[package]]
@@ -5407,6 +5558,24 @@ dependencies = [
  "core-foundation-sys",
  "libc",
  "objc",
+]
+
+[[package]]
+name = "task_ui"
+version = "0.1.12"
+dependencies = [
+ "anyhow",
+ "assets",
+ "chrono",
+ "desktop_common",
+ "fern_core",
+ "fern_i18n",
+ "gpui",
+ "icons",
+ "theme",
+ "ui",
+ "uuid",
+ "windows 0.62.2",
 ]
 
 [[package]]
@@ -5587,6 +5756,23 @@ name = "tinyvec"
 version = "1.13.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
+
+[[package]]
+name = "todo_ui"
+version = "0.1.12"
+dependencies = [
+ "anyhow",
+ "assets",
+ "chrono",
+ "desktop_common",
+ "fern_core",
+ "fern_i18n",
+ "gpui",
+ "summary_ui",
+ "task_ui",
+ "theme",
+ "ui",
+]
 
 [[package]]
 name = "tokio"

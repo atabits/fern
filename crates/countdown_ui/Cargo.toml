@@ -1,0 +1,26 @@
+[package]
+name = "countdown_ui"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/countdown_ui.rs"
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+desktop_common.workspace = true
+fern_core.workspace = true
+fern_i18n.workspace = true
+gpui.workspace = true
+task_ui.workspace = true
+theme.workspace = true
+ui.workspace = true
+
+[dev-dependencies]
+assets.workspace = true
+gpui = { workspace = true, features = ["test-support"] }

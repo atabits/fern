@@ -22,31 +22,13 @@ use crate::actions::CloseWindow;
 use crate::release_notes::{ReleaseNotes, action_button};
 use crate::updater::Status;
 
+use desktop_common::layout::TITLE_BAR_SHADOW as SHADOW;
+pub use desktop_common::layout::{header_inset, title_bar_height as height};
+
 /// The radius of the window's corners with client-side decorations.
 const ROUNDING: Pixels = px(10.);
-/// The room around the window for its shadow, which is also where it is grabbed to resize.
-const SHADOW: Pixels = px(10.);
 /// macOS traffic lights: centered inside the 72 px sections rail.
 const TRAFFIC_LIGHTS: Point<Pixels> = point(px(10.), px(11.));
-
-/// The overlaid caption strip's height: Windows' standard 32 px caption button height.
-pub fn height() -> Pixels {
-    px(32.)
-}
-
-/// The top margin workspace headers leave so their controls clear the overlaid window buttons.
-pub fn header_inset() -> Pixels {
-    height() - px(8.)
-}
-
-pub fn frame_vertical_inset(window: &Window) -> Pixels {
-    if cfg!(any(target_os = "linux", target_os = "freebsd"))
-        && let Decorations::Client { tiling } = window.window_decorations()
-    {
-        return (SHADOW + px(1.)) * (u8::from(!tiling.top) + u8::from(!tiling.bottom)) as f32;
-    }
-    px(0.)
-}
 
 /// The window options that hide the system title bar.
 pub fn window_options() -> (TitlebarOptions, WindowDecorations) {

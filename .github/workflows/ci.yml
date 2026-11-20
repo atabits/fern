@@ -44,8 +44,8 @@ jobs:
       - name: Lint
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
-      - name: Build
-        run: cargo build --workspace --locked
+      - name: Check binaries
+        run: cargo check --workspace --bins --locked
 
       - name: Test
         run: cargo test --workspace --locked

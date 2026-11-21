@@ -947,28 +947,60 @@ impl HabitView {
             .and_then(|r| r.iter().find(|c| c.date == target_single_day));
         let single_day_handled = single_day_rec.is_some_and(|c| c.is_handled());
 
-        let subtitle = if let Some(date) = self.selected_date {
-            if let Some(goal) = habit.goal.as_ref() {
-                let current = self
-                    .records
-                    .get(&id)
-                    .and_then(|r| r.iter().find(|c| c.date == date))
-                    .map_or(0.0, |c| c.value);
-                format!("{}/{} {}", format_amount(current), format_amount(goal.amount), goal.unit)
-            } else {
-                format!("{} {} · {} {}", stats.total_days, strings.habit_days, stats.streak, strings.habit_streak)
-            }
-        } else if habit.archived {
-            format!(
-                "{} {} · {} {}",
-                stats.total_days, strings.habit_days, stats.best_streak, strings.habit_best_streak
-            )
+        let subtitle_el: AnyElement = if let Some(date) = self.selected_date
+            && let Some(goal) = habit.goal.as_ref()
+        {
+            let current = self
+                .records
+                .get(&id)
+                .and_then(|r| r.iter().find(|c| c.date == date))
+                .map_or(0.0, |c| c.value);
+            Label::new(format!("{}/{} {}", format_amount(current), format_amount(goal.amount), goal.unit))
+                .size(LabelSize::XSmall)
+                .color(Color::Muted)
+                .truncate()
+                .into_any_element()
         } else {
-            let total_text = match habit.goal_days {
-                Some(goal) => format!("{}/{goal} {}", stats.total_days, strings.habit_days),
-                None => format!("{} {}", stats.total_days, strings.habit_days),
+            let total_text = if self.selected_date.is_none() && !habit.archived {
+                match habit.goal_days {
+                    Some(goal) => format!("{}/{goal} {}", stats.total_days, strings.habit_days),
+                    None => format!("{} {}", stats.total_days, strings.habit_days),
+                }
+            } else {
+                format!("{} {}", stats.total_days, strings.habit_days)
             };
-            format!("{total_text} · {} {}", stats.streak, strings.habit_streak)
+            let (streak_count, streak_label) = if habit.archived && self.selected_date.is_none() {
+                (stats.best_streak, strings.habit_best_streak)
+            } else {
+                (stats.streak, strings.habit_streak)
+            };
+            h_flex()
+                .gap_2()
+                .items_center()
+                .overflow_hidden()
+                .child(
+                    h_flex()
+                        .gap_0p5()
+                        .items_center()
+                        .child(
+                            Icon::new(IconName::Zap)
+                                .size(IconSize::XSmall)
+                                .color(if stats.total_days > 0 { Color::Accent } else { Color::Muted }),
+                        )
+                        .child(Label::new(total_text).size(LabelSize::XSmall).color(Color::Muted)),
+                )
+                .child(
+                    h_flex()
+                        .gap_0p5()
+                        .items_center()
+                        .child(
+                            Icon::new(IconName::Flame)
+                                .size(IconSize::XSmall)
+                                .color(if streak_count > 0 { Color::Warning } else { Color::Muted }),
+                        )
+                        .child(Label::new(format!("{streak_count} {streak_label}")).size(LabelSize::XSmall).color(Color::Muted)),
+                )
+                .into_any_element()
         };
 
         let habit_section = habit.section;
@@ -1012,7 +1044,7 @@ impl HabitView {
                             .truncate()
                             .when(self.selected_date.is_some() && single_day_handled, |l| l.color(Color::Muted)),
                     )
-                    .child(Label::new(subtitle).size(LabelSize::XSmall).color(Color::Muted).truncate()),
+                    .child(subtitle_el),
             );
 
         let dots_el: AnyElement = if let Some(single_day) = self.selected_date {

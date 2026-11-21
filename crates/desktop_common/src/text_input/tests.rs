@@ -316,3 +316,17 @@ fn scrolled_masked_text_hit_testing_keeps_unicode_graphemes_intact(cx: &mut Test
         assert_caret_visible(&input, cx);
     }
 }
+
+#[test]
+fn markdown_list_continuation_handles_bullets_checklists_quotes_and_numbers() {
+    assert_eq!(markdown_list_continuation("- [ ] Buy milk"), Some(ListEnter::Continue("- [ ] ".into())));
+    assert_eq!(markdown_list_continuation("- [x] Done item"), Some(ListEnter::Continue("- [ ] ".into())));
+    assert_eq!(markdown_list_continuation("- [ ] "), Some(ListEnter::ClearLine));
+    assert_eq!(markdown_list_continuation("  - Nested"), Some(ListEnter::Continue("  - ".into())));
+    assert_eq!(markdown_list_continuation("* Bullet"), Some(ListEnter::Continue("* ".into())));
+    assert_eq!(markdown_list_continuation("- "), Some(ListEnter::ClearLine));
+    assert_eq!(markdown_list_continuation("> Quote"), Some(ListEnter::Continue("> ".into())));
+    assert_eq!(markdown_list_continuation("1. First"), Some(ListEnter::Continue("2. ".into())));
+    assert_eq!(markdown_list_continuation("9. "), Some(ListEnter::ClearLine));
+    assert_eq!(markdown_list_continuation("Plain text"), None);
+}

@@ -363,6 +363,23 @@ impl TextInput {
 
     fn enter(&mut self, _: &Enter, window: &mut Window, cx: &mut Context<Self>) {
         if self.mode == Mode::MultiLine {
+            if self.selected_range.is_empty() {
+                let cursor = self.selected_range.end;
+                let line_start = self.content[..cursor].rfind('\n').map_or(0, |i| i + 1);
+                let before_cursor = &self.content[line_start..cursor];
+                match markdown_list_continuation(before_cursor) {
+                    Some(ListEnter::Continue(prefix)) => {
+                        self.replace_text_in_range(None, &format!("\n{prefix}"), window, cx);
+                        return;
+                    }
+                    Some(ListEnter::ClearLine) => {
+                        self.selected_range = line_start..cursor;
+                        self.replace_text_in_range(None, "", window, cx);
+                        return;
+                    }
+                    None => {}
+                }
+            }
             self.replace_text_in_range(None, "\n", window, cx);
         } else {
             cx.emit(Submitted(self.content.to_string()));
@@ -1381,6 +1398,48 @@ impl Focusable for TextInput {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus_handle.clone()
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ListEnter {
+    Continue(String),
+    ClearLine,
+}
+
+fn markdown_list_continuation(line: &str) -> Option<ListEnter> {
+    let indent_len = line.len() - line.trim_start_matches([' ', '\t']).len();
+    let indent = &line[..indent_len];
+    let rest = &line[indent_len..];
+    for prefix in ["- [ ] ", "- [x] ", "- [X] "] {
+        if let Some(after) = rest.strip_prefix(prefix) {
+            return Some(if after.trim().is_empty() {
+                ListEnter::ClearLine
+            } else {
+                ListEnter::Continue(format!("{indent}- [ ] "))
+            });
+        }
+    }
+    for prefix in ["- ", "* ", "> "] {
+        if let Some(after) = rest.strip_prefix(prefix) {
+            return Some(if after.trim().is_empty() {
+                ListEnter::ClearLine
+            } else {
+                ListEnter::Continue(format!("{indent}{prefix}"))
+            });
+        }
+    }
+    let digits_len = rest.bytes().take_while(|b| b.is_ascii_digit()).count();
+    if digits_len > 0
+        && let Some(after) = rest[digits_len..].strip_prefix(". ")
+        && let Ok(n) = rest[..digits_len].parse::<u64>()
+    {
+        return Some(if after.trim().is_empty() {
+            ListEnter::ClearLine
+        } else {
+            ListEnter::Continue(format!("{indent}{}. ", n.saturating_add(1)))
+        });
+    }
+    None
 }
 
 #[cfg(test)]

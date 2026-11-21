@@ -477,6 +477,28 @@ pub fn count_words(text: &str) -> usize {
     count
 }
 
+/// Toggles a Markdown checklist line (`- [ ] ` ↔ `- [x] `) at `line_index`, returning the updated
+/// text and the new checked state (`true` if now checked).
+pub fn toggle_check_line(text: &str, line_index: usize) -> Option<(String, bool)> {
+    let mut lines: Vec<String> = text.lines().map(ToOwned::to_owned).collect();
+    let line = lines.get_mut(line_index)?;
+    let indent_len = line.len() - line.trim_start().len();
+    let indent = &line[..indent_len];
+    let trimmed = &line[indent_len..];
+    let (new_line, checked) = if let Some(rest) = trimmed.strip_prefix("- [ ] ") {
+        (format!("{indent}- [x] {rest}"), true)
+    } else {
+        let rest = trimmed.strip_prefix("- [x] ").or_else(|| trimmed.strip_prefix("- [X] "))?;
+        (format!("{indent}- [ ] {rest}"), false)
+    };
+    *line = new_line;
+    let mut out = lines.join("\n");
+    if text.ends_with('\n') {
+        out.push('\n');
+    }
+    Some((out, checked))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -516,6 +538,18 @@ mod tests {
             blocks.iter().map(|b| &b.kind).collect::<Vec<_>>(),
             [&BlockKind::Bullet, &BlockKind::BlankLine, &BlockKind::BlankLine, &BlockKind::Bullet]
         );
+    }
+
+    #[test]
+    fn toggle_check_line_flips_markdown_checkboxes() {
+        let src = "# Notes\n- [ ] buy milk\n  - [x] call mom\n";
+        let (toggled, checked) = toggle_check_line(src, 1).unwrap();
+        assert!(checked);
+        assert_eq!(toggled, "# Notes\n- [x] buy milk\n  - [x] call mom\n");
+        let (untoggled, checked) = toggle_check_line(&toggled, 2).unwrap();
+        assert!(!checked);
+        assert_eq!(untoggled, "# Notes\n- [x] buy milk\n  - [ ] call mom\n");
+        assert!(toggle_check_line(src, 0).is_none());
     }
 
     fn run(text: &str, selection: Range<usize>, format: Format) -> (String, String) {

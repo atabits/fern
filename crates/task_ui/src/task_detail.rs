@@ -431,6 +431,22 @@ impl TaskDetail {
 
     /// The task's comments, as the original lists them under the task: the text, when it was
     /// written, and × on hover to delete it.
+    fn toggle_markdown_check(&mut self, line_index: usize, cx: &mut Context<Self>) {
+        let current = self.session.task.as_ref().map(|t| t.notes.clone()).unwrap_or_default();
+        let Some((updated, checked)) = fern_core::markdown::toggle_check_line(&current, line_index) else {
+            return;
+        };
+        if checked {
+            desktop_common::sound::play_complete(&self.session.store);
+        }
+        self.notes.update(cx, |input, cx| input.set_text(updated.clone(), cx));
+        if self.edit_draft(cx, |task, _| task.notes = updated.clone()) {
+            return;
+        }
+        self.save(cx, |store, id| store.set_notes(id, &updated));
+    }
+
+    /// Formats a task's comments section.
     fn render_comments(&self, strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
         v_flex()
@@ -3916,7 +3932,17 @@ impl Render for TaskDetail {
                             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                             // On the release, so that a click on a link opens it instead.
                             .on_click(move |_, window, cx| window.focus(&notes_focus_click, cx))
-                            .child(render_markdown(&task.notes, self.sticky_style, cx))
+                            .child(render_markdown_interactive(
+                                &task.notes,
+                                self.sticky_style,
+                                {
+                                    let view = cx.entity().downgrade();
+                                    Rc::new(move |line_index, _, cx| {
+                                        view.update(cx, |this, cx| this.toggle_markdown_check(line_index, cx)).ok();
+                                    })
+                                },
+                                cx,
+                            ))
                             .into_any_element()
                     } else {
                         div()
@@ -4262,8 +4288,19 @@ fn format_size(bytes: u64) -> String {
 /// A description drawn as the original shows it while it is not edited: headings, numbered items
 /// with their numbers in the accent color, bullets, check items, quotes and lines, with bold,
 /// italic, underlined, struck, highlighted, code and link runs.
+type MarkdownCheckToggle = Rc<dyn Fn(usize, &mut Window, &mut App)>;
+
 pub fn render_markdown(text: &str, sticky: Option<crate::sticky_settings::StickySettings>, cx: &App) -> AnyElement {
-    render_markdown_blocks(fern_core::markdown::blocks(text), sticky, true, cx)
+    render_markdown_blocks(fern_core::markdown::blocks(text), sticky, true, None, cx)
+}
+
+fn render_markdown_interactive(
+    text: &str,
+    sticky: Option<crate::sticky_settings::StickySettings>,
+    on_toggle_check: MarkdownCheckToggle,
+    cx: &App,
+) -> AnyElement {
+    render_markdown_blocks(fern_core::markdown::blocks(text), sticky, true, Some(on_toggle_check), cx)
 }
 
 pub fn render_release_markdown(text: &str, cx: &App) -> AnyElement {
@@ -4293,13 +4330,14 @@ pub fn render_release_markdown(text: &str, cx: &App) -> AnyElement {
             reflowed.push(block);
         }
     }
-    render_markdown_blocks(reflowed, None, false, cx)
+    render_markdown_blocks(reflowed, None, false, None, cx)
 }
 
 fn render_markdown_blocks(
     blocks: Vec<fern_core::markdown::Block>,
     sticky: Option<crate::sticky_settings::StickySettings>,
     show_images: bool,
+    on_toggle_check: Option<MarkdownCheckToggle>,
     cx: &App,
 ) -> AnyElement {
     use fern_core::markdown::BlockKind;
@@ -4382,12 +4420,23 @@ fn render_markdown_blocks(
                     .child(div().w(px(22.)).flex_none().text_color(accent).child("•"))
                     .child(body)
                     .into_any_element(),
-                BlockKind::Check(done) => h_flex()
-                    .items_start()
-                    .gap_2()
-                    .child(div().pt(px(4.)).child(Checkbox::new(("md-check", ix)).size(px(14.)).toggle_state(done)))
-                    .child(body.when(done, |el| el.text_color(muted)))
-                    .into_any_element(),
+                BlockKind::Check(done) => {
+                    let cb = Checkbox::new(("md-check", ix)).size(px(14.)).toggle_state(done);
+                    let cb = if let Some(toggle) = on_toggle_check.clone() {
+                        cb.on_click(move |_, window, cx| {
+                            cx.stop_propagation();
+                            toggle(ix, window, cx);
+                        })
+                    } else {
+                        cb
+                    };
+                    h_flex()
+                        .items_start()
+                        .gap_2()
+                        .child(div().pt(px(4.)).child(cb))
+                        .child(body.when(done, |el| el.line_through().text_color(muted)))
+                        .into_any_element()
+                }
                 BlockKind::Quote => div().pl_3().border_l_2().border_color(accent).text_color(muted).child(body).into_any_element(),
                 BlockKind::Divider => div().my_1().h(px(1.)).bg(theme.colors().border).into_any_element(),
                 BlockKind::Image(_) if !show_images => body.text_color(muted).into_any_element(),

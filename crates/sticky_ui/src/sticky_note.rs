@@ -498,16 +498,20 @@ impl Render for StickyNote {
                                     }))
                             })
                             .when(self.compact, |bar| {
-                                bar.flex().items_center().px(px(12.)).child(
-                                    div()
-                                        .debug_selector(|| "sticky-compact-title".into())
-                                        .w_full()
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .text_size(px(14.))
-                                        .line_height(px(20.))
-                                        .truncate()
-                                        .child(self.title.clone()),
-                                )
+                                bar.flex()
+                                    .items_center()
+                                    .px(px(12.))
+                                    .tooltip(popup::tooltip(self.title.clone()))
+                                    .child(
+                                        div()
+                                            .debug_selector(|| "sticky-compact-title".into())
+                                            .w_full()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_size(px(14.))
+                                            .line_height(px(20.))
+                                            .truncate()
+                                            .child(self.title.clone()),
+                                    )
                             }),
                     )
                     .child(
@@ -617,6 +621,7 @@ impl Render for StickyPalette {
                         .bg(gpui::rgb(*color))
                         .border_2()
                         .border_color(if self.selected == index { theme.colors().accent } else { theme.colors().border })
+                        .when(self.selected != index, |el| el.hover(|s| s.border_color(theme.colors().text_muted)))
                         .cursor_pointer()
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.note.update(cx, |note, window, cx| {

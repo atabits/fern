@@ -2644,10 +2644,13 @@ impl CalendarView {
         let mut axis = v_flex().w(gutter).flex_none().child(
             div()
                 .h(px(week_axis::FOLDED_HEIGHT))
+                .pb_1()
                 .flex()
                 .items_center()
                 .justify_center()
                 .bg(theme.colors().panel_background)
+                .border_b_1()
+                .border_color(theme.colors().border_variant)
                 .flex_col()
                 .child(Label::new(calendar::format_hour(0, strings)).size(LabelSize::XSmall).color(Color::Muted))
                 .child(Label::new(format!("– {}", calendar::format_hour(7, strings))).size(LabelSize::XSmall).color(Color::Muted)),
@@ -2657,6 +2660,7 @@ impl CalendarView {
                 h_flex()
                     .h(px(week_axis::HOUR_HEIGHT))
                     .px_1()
+                    .pt(px(2.))
                     .items_start()
                     .when_some(secondary_tz, |el, tz| {
                         el.child(
@@ -2674,10 +2678,13 @@ impl CalendarView {
         axis = axis.child(
             div()
                 .h(px(week_axis::FOLDED_HEIGHT))
+                .pt_1()
                 .flex()
                 .items_center()
                 .justify_center()
                 .bg(theme.colors().panel_background)
+                .border_t_1()
+                .border_color(theme.colors().border_variant)
                 .flex_col()
                 .child(Label::new(calendar::format_hour(21, strings)).size(LabelSize::XSmall).color(Color::Muted))
                 .child(Label::new(format!("– {}", calendar::format_hour(0, strings))).size(LabelSize::XSmall).color(Color::Muted)),

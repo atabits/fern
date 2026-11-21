@@ -1884,13 +1884,15 @@ impl Render for MatrixView {
                         div()
                             .debug_selector(|| "matrix-header-menu-trigger".to_owned())
                             .relative()
-                            .child(IconButton::new("matrix-more", IconName::Ellipsis).on_click(cx.listener(
-                                |this, _, window, cx| {
-                                    this.header_menu = !this.header_menu;
-                                    window.focus(&this.focus, cx);
-                                    cx.notify();
-                                },
-                            )))
+                            .child(
+                                IconButton::new("matrix-more", IconName::Ellipsis)
+                                    .tooltip(ui::Tooltip::text(strings.more))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.header_menu = !this.header_menu;
+                                        window.focus(&this.focus, cx);
+                                        cx.notify();
+                                    })),
+                            )
                             .when(self.header_menu, |el| {
                                 el.child(PopoverAttachment::new(
                                     Placement::BelowRight,
@@ -2084,6 +2086,7 @@ impl Render for MatrixView {
             })
             .when_some(self.profile_editor.as_ref(), |el, (editing, input)| {
                 let heading = if editing.is_some() { strings.matrix_rename_profile } else { strings.matrix_new_profile };
+                let can_save = !input.read(cx).text().trim().is_empty();
                 el.child(
                     div()
                         .absolute()
@@ -2140,6 +2143,7 @@ impl Render for MatrixView {
                                                 .border_1()
                                                 .border_color(theme.colors().border)
                                                 .cursor_pointer()
+                                                .hover(|s| s.bg(theme.colors().element_hover))
                                                 .child(Label::new(strings.cancel).size(LabelSize::Small))
                                                 .on_click(cx.listener(|this, _, window, cx| {
                                                     this.profile_editor = None;
@@ -2155,10 +2159,10 @@ impl Render for MatrixView {
                                                 .flex()
                                                 .items_center()
                                                 .rounded(px(6.))
-                                                .bg(theme.colors().accent)
-                                                .cursor_pointer()
+                                                .bg(theme.colors().accent.opacity(if can_save { 1. } else { 0.5 }))
+                                                .when(can_save, |el| el.cursor_pointer().hover(|s| s.opacity(0.9)))
                                                 .child(Label::new(strings.save).size(LabelSize::Small).color(Color::OnAccent))
-                                                .on_click(cx.listener(|this, _, _, cx| this.save_profile_editor(cx))),
+                                                .when(can_save, |el| el.on_click(cx.listener(|this, _, _, cx| this.save_profile_editor(cx)))),
                                         ),
                                 ),
                         ),

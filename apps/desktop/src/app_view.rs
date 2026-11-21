@@ -1662,9 +1662,12 @@ impl AppView {
                 .gap_2()
                 .children(self.active_alerts.iter().enumerate().map(|(i, notice)| {
                     let target = notice.target;
+                    let focus_title = notice.title.clone();
                     let (when, _) = crate::task_rows::due_label(notice.at.date(), Some(notice.at.time()), today, strings);
                     let actions = reminders::actions(&self.store, target);
                     let dismiss_notice = notice.clone();
+                    let focus_notice = notice.clone();
+                    let can_focus = matches!(target, Target::Task(_) | Target::Habit(_));
                     v_flex()
                         .id(SharedString::from(format!("alert-{i}")))
                         .p_3()
@@ -1689,6 +1692,36 @@ impl AppView {
                                         .child(Label::new(notice.title.clone()).truncate())
                                         .on_click(cx.listener(move |this, _, window, cx| this.open_notice(target, window, cx))),
                                 )
+                                .when(can_focus, |el| {
+                                    el.child(
+                                        IconButton::new(SharedString::from(format!("alert-{i}-focus")), IconName::CircleDot)
+                                            .size(px(22.))
+                                            .icon_size(IconSize::XSmall)
+                                            .icon_color(Color::Muted)
+                                            .hover_icon_color(Color::Accent)
+                                            .tooltip(Tooltip::text(strings.start_pomo))
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                cx.stop_propagation();
+                                                this.active_alerts.retain(|n| n.target != focus_notice.target);
+                                                this.notices.items.retain(|n| n != &focus_notice);
+                                                match target {
+                                                    Target::Task(id) => {
+                                                        this.focus.update(cx, |focus, cx| {
+                                                            focus.start_for(Some(id), focus_title.clone(), false, cx);
+                                                        });
+                                                    }
+                                                    Target::Habit(id) => {
+                                                        this.focus.update(cx, |focus, cx| {
+                                                            focus.start_for_habit(Some(id), focus_title.clone(), false, cx);
+                                                        });
+                                                    }
+                                                    Target::Countdown(_) => {}
+                                                }
+                                                let _ = this.select(Section::Pomodoro, window, cx);
+                                                cx.notify();
+                                            })),
+                                    )
+                                })
                                 .child(
                                     div()
                                         .id(SharedString::from(format!("alert-{i}-dismiss")))
@@ -1713,17 +1746,28 @@ impl AppView {
                                 h_flex().flex_wrap().gap_1().children(actions.iter().map(|&action| {
                                     let notice = notice.clone();
                                     let key = action.key();
+                                    let primary = matches!(
+                                        action,
+                                        NoticeAction::Complete | NoticeAction::CheckIn | NoticeAction::PlusOne
+                                    );
                                     div()
                                         .id(SharedString::from(format!("alert-{i}-{key}")))
                                         .debug_selector(move || format!("alert-{i}-{key}"))
                                         .px_2()
                                         .py_0p5()
                                         .rounded(px(4.))
-                                        .border_1()
-                                        .border_color(theme.colors().border)
-                                        .hover(|s| s.bg(theme.colors().element_hover))
+                                        .when(primary, |btn| {
+                                            btn.bg(theme.colors().accent)
+                                                .hover(|s| s.opacity(0.9))
+                                                .child(Label::new(action.label(strings)).size(LabelSize::Small).color(Color::OnAccent))
+                                        })
+                                        .when(!primary, |btn| {
+                                            btn.border_1()
+                                                .border_color(theme.colors().border)
+                                                .hover(|s| s.bg(theme.colors().element_hover))
+                                                .child(Label::new(action.label(strings)).size(LabelSize::Small))
+                                        })
                                         .cursor_pointer()
-                                        .child(Label::new(action.label(strings)).size(LabelSize::Small))
                                         .on_click(cx.listener(move |this, _, window, cx| {
                                             cx.stop_propagation();
                                             this.answer_notice(&notice, Reply::Action(action), window, cx);

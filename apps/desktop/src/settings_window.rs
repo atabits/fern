@@ -1445,6 +1445,7 @@ impl SettingsWindow {
                 let current = WEEK_STARTS.iter().position(|d| *d == week_start).unwrap_or(0);
                 let hour12 = self.preferences.hour12;
                 let week_numbers = self.preferences.week_numbers;
+                let countdown_dates = self.preferences.countdown_dates;
                 // The original shows each format on the year's last day.
                 let sample = chrono::NaiveDate::from_ymd_opt(chrono::Local::now().year(), 12, 31).expect("December 31 exists");
                 let current_format = self.preferences.date_format;
@@ -1496,18 +1497,31 @@ impl SettingsWindow {
                         ))),
                 )
                 .child(
-                    group().child(
-                        h_flex()
-                            .id("week-numbers")
-                            .h(px(ROW_HEIGHT))
-                            .px_4()
-                            .cursor_pointer()
-                            .child(div().flex_1().child(Label::new(strings.show_week_numbers)))
-                            .child(Switch::new().toggle_state(week_numbers))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.update(window, cx, |p| p.week_numbers = !week_numbers)
-                            })),
-                    ),
+                    group()
+                        .child(
+                            h_flex()
+                                .id("week-numbers")
+                                .h(px(ROW_HEIGHT))
+                                .px_4()
+                                .cursor_pointer()
+                                .child(div().flex_1().child(Label::new(strings.show_week_numbers)))
+                                .child(Switch::new().toggle_state(week_numbers))
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.update(window, cx, |p| p.week_numbers = !week_numbers)
+                                })),
+                        )
+                        .child(
+                            h_flex()
+                                .id("countdown-dates")
+                                .h(px(ROW_HEIGHT))
+                                .px_4()
+                                .cursor_pointer()
+                                .child(div().flex_1().child(Label::new(strings.show_countdown_mode)))
+                                .child(Switch::new().toggle_state(countdown_dates))
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.update(window, cx, |p| p.countdown_dates = !countdown_dates)
+                                })),
+                        ),
                 )
                 .into_any_element()
             }

@@ -848,6 +848,7 @@ pub struct Strings {
     pub time_format: &'static str,
     pub date_format: &'static str,
     pub show_week_numbers: &'static str,
+    pub show_countdown_mode: &'static str,
     /// 24-hour, 12-hour.
     pub time_formats: [&'static str; 2],
     /// Monday, Sunday, Saturday, as in `fern_core::WEEK_STARTS`.
@@ -1838,6 +1839,7 @@ pub static EN: Strings = Strings {
     time_format: "Time Format",
     date_format: "Date Format",
     show_week_numbers: "Show Week Numbers (W)",
+    show_countdown_mode: "Countdown Mode",
     time_formats: ["24 Hour (13:00)", "12 Hour (1:00 PM)"],
     week_start_names: ["Monday", "Sunday", "Saturday"],
     color_series: "Color Series",
@@ -2811,6 +2813,7 @@ pub static ZH_CN: Strings = Strings {
     time_format: "时间格式",
     date_format: "日期格式",
     show_week_numbers: "显示周数(W)",
+    show_countdown_mode: "倒数日模式",
     time_formats: ["24小时制(13:00)", "12小时制(下午1:00)"],
     week_start_names: ["周一", "周日", "周六"],
     color_series: "配色方案",
@@ -3793,6 +3796,7 @@ pub static RU: Strings = Strings {
     time_format: "Формат времени",
     date_format: "Формат даты",
     show_week_numbers: "Показывать номера недель (W)",
+    show_countdown_mode: "Режим обратного отсчёта",
     time_formats: ["24 часа (13:00)", "12 часов (1:00 PM)"],
     week_start_names: ["Понедельник", "Воскресенье", "Суббота"],
     color_series: "Цветовые темы",

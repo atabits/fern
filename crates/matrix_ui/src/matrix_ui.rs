@@ -232,6 +232,7 @@ pub struct MatrixView {
     active_profile_id: Option<Id>,
     profile_menu: bool,
     profile_editor: Option<(Option<Id>, Entity<TextInput>)>,
+    confirm_delete_profile: Option<(Id, String)>,
 }
 
 impl EventEmitter<OpenTask> for MatrixView {}
@@ -285,6 +286,7 @@ impl MatrixView {
             active_profile_id: None,
             profile_menu: false,
             profile_editor: None,
+            confirm_delete_profile: None,
         };
         this.reload(cx);
         cx.observe_global::<desktop_common::data_version::DataVersion>(|this, cx| {
@@ -626,7 +628,10 @@ impl MatrixView {
     }
 
     pub fn try_dismiss_transient(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        if self.profile_editor.take().is_some() || std::mem::take(&mut self.profile_menu) {
+        if self.confirm_delete_profile.take().is_some()
+            || self.profile_editor.take().is_some()
+            || std::mem::take(&mut self.profile_menu)
+        {
             cx.notify();
             return true;
         }
@@ -1769,7 +1774,7 @@ impl Render for MatrixView {
                                                 div()
                                                     .flex_1()
                                                     .min_w_0()
-                                                    .child(Label::new(display_name).color(if active { Color::Accent } else { Color::Default }).truncate()),
+                                                    .child(Label::new(display_name.clone()).color(if active { Color::Accent } else { Color::Default }).truncate()),
                                             )
                                             .end_slot(
                                                 h_flex()
@@ -1780,20 +1785,26 @@ impl Render for MatrixView {
                                                             .size(px(20.))
                                                             .icon_size(IconSize::XSmall)
                                                             .icon_color(Color::Muted)
+                                                            .tooltip(ui::Tooltip::text(strings.edit))
                                                             .on_click(cx.listener(move |this, _, window, cx| {
                                                                 cx.stop_propagation();
                                                                 this.open_profile_editor(Some(id), &raw_name, window, cx);
                                                             })),
                                                     )
                                                     .when(can_delete, |el| {
+                                                        let del_name = display_name.clone();
                                                         el.child(
                                                             IconButton::new(SharedString::from(format!("matrix-profile-delete-{id}")), IconName::Trash)
                                                                 .size(px(20.))
                                                                 .icon_size(IconSize::XSmall)
                                                                 .icon_color(Color::Muted)
+                                                                .hover_icon_color(theme.status().error)
+                                                                .tooltip(ui::Tooltip::text(strings.delete))
                                                                 .on_click(cx.listener(move |this, _, _, cx| {
                                                                     cx.stop_propagation();
-                                                                    this.delete_profile(id, cx);
+                                                                    this.profile_menu = false;
+                                                                    this.confirm_delete_profile = Some((id, del_name.clone()));
+                                                                    cx.notify();
                                                                 })),
                                                         )
                                                     }),
@@ -1960,6 +1971,85 @@ impl Render for MatrixView {
             .children(task_ctx)
             .children(floating_detail)
             .children(edit_modal)
+            .when_some(self.confirm_delete_profile.clone(), |el, (id, name)| {
+                el.child(
+                    div()
+                        .id("matrix-delete-profile-backdrop")
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .bg(gpui::black().opacity(0.35))
+                        .occlude()
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.confirm_delete_profile = None;
+                            window.focus(&this.focus, cx);
+                            cx.notify();
+                        }))
+                        .child(
+                            v_flex()
+                                .id("matrix-delete-profile-modal")
+                                .w(px(340.))
+                                .p_5()
+                                .gap_3()
+                                .rounded(px(10.))
+                                .bg(theme.colors().elevated_surface_background)
+                                .border_1()
+                                .border_color(theme.colors().border)
+                                .shadow_lg()
+                                .on_click(|_, _, cx| cx.stop_propagation())
+                                .child(
+                                    Label::new(format!("{} \"{name}\"?", strings.delete))
+                                        .size(LabelSize::Large)
+                                        .weight(FontWeight::SEMIBOLD),
+                                )
+                                .child(
+                                    h_flex()
+                                        .pt_2()
+                                        .gap_2()
+                                        .justify_end()
+                                        .child(
+                                            div()
+                                                .id("matrix-delete-profile-cancel")
+                                                .px_3()
+                                                .h(px(30.))
+                                                .flex()
+                                                .items_center()
+                                                .rounded(px(6.))
+                                                .border_1()
+                                                .border_color(theme.colors().border)
+                                                .cursor_pointer()
+                                                .hover(|s| s.bg(theme.colors().element_hover))
+                                                .child(Label::new(strings.cancel).size(LabelSize::Small))
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    this.confirm_delete_profile = None;
+                                                    window.focus(&this.focus, cx);
+                                                    cx.notify();
+                                                })),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("matrix-delete-profile-confirm")
+                                                .px_3()
+                                                .h(px(30.))
+                                                .flex()
+                                                .items_center()
+                                                .rounded(px(6.))
+                                                .bg(theme.status().error)
+                                                .cursor_pointer()
+                                                .hover(|s| s.opacity(0.9))
+                                                .child(Label::new(strings.delete).size(LabelSize::Small).color(Color::OnAccent))
+                                                .on_click(cx.listener(move |this, _, window, cx| {
+                                                    this.confirm_delete_profile = None;
+                                                    this.delete_profile(id, cx);
+                                                    window.focus(&this.focus, cx);
+                                                })),
+                                        ),
+                                ),
+                        ),
+                )
+            })
             .when_some(self.profile_editor.as_ref(), |el, (editing, input)| {
                 let heading = if editing.is_some() { strings.matrix_rename_profile } else { strings.matrix_new_profile };
                 el.child(

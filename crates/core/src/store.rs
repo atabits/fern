@@ -2320,6 +2320,16 @@ impl Store {
         })
     }
 
+    /// Completes a repeating task permanently, clearing its recurrence rule so no future
+    /// occurrence is scheduled ("Complete All").
+    pub fn complete_forever(&self, id: Id, today: NaiveDate) -> Result<()> {
+        self.in_tx(|| {
+            self.set_repeat(id, None, today)?;
+            self.set_completed(id, true)?;
+            Ok(())
+        })
+    }
+
     /// Ancestor IDs of `id`, from its immediate parent up to the root (cycle-safe).
     pub fn ancestors(&self, id: Id) -> Result<Vec<Id>> {
         let mut out = Vec::new();

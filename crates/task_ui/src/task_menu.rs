@@ -20,6 +20,8 @@ pub enum MenuAction {
     Due(Option<i64>),
     /// The original's "Skip the Recurrence" for a repeating task, and "Clear" for a dated one.
     SkipRecurrence,
+    /// Completes a repeating task permanently without scheduling a next occurrence.
+    CompleteForever,
     ClearDate,
     Priority(Priority),
     AddSubtask,
@@ -74,6 +76,7 @@ pub fn apply(store: &Store, task: &Task, action: MenuAction, today: NaiveDate) -
     Some(match action {
         MenuAction::Due(Some(days)) => store.set_due(id, Some(today + Duration::days(days)), None),
         MenuAction::SkipRecurrence => store.skip_recurrence(id),
+        MenuAction::CompleteForever => store.complete_forever(id, today),
         MenuAction::ClearDate => store.set_due(id, None, None),
         MenuAction::Priority(priority) => store.set_priority(id, priority),
         MenuAction::UnlinkParent => store.unlink_parent(id),
@@ -205,6 +208,9 @@ pub fn render<V: 'static>(
                 cx,
             ))
         })
+        .when(!note && task.repeat.is_some() && !task.is_completed(), |el| {
+            el.child(item("task-menu-complete-forever", IconName::SquareCheckBig, strings.complete_forever, MenuAction::CompleteForever, cx))
+        })
         .child(item("task-menu-wont-do", IconName::SquareX, strings.mark_wont_do, MenuAction::WontDo, cx))
         .child(
             SubmenuItem::new("task-menu-move", strings.move_to)
@@ -308,6 +314,16 @@ mod tests {
         assert_eq!(child.parent_id, Some(parent.id));
         apply(&store, &child, MenuAction::UnlinkParent, today).unwrap()?;
         assert_eq!(store.task(child.id)?.unwrap().parent_id, None);
+
+        let repeating = store.add_task("Pay rent")?;
+        store.set_due(repeating.id, Some(today), None)?;
+        store.set_repeat(repeating.id, Some(fern_core::Recurrence::new(fern_core::Frequency::Daily, 1)), today)?;
+        let before_count = store.tasks()?.len();
+        apply(&store, &store.task(repeating.id)?.unwrap(), MenuAction::CompleteForever, today).unwrap()?;
+        let done = store.task(repeating.id)?.unwrap();
+        assert!(done.is_completed());
+        assert!(done.repeat.is_none());
+        assert_eq!(store.tasks()?.len(), before_count, "no next occurrence is spawned");
         Ok(())
     }
 }

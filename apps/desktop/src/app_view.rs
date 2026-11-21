@@ -1132,7 +1132,28 @@ impl AppView {
         // The system-wide ones, which work while another app is in front (see `hotkeys`).
         // Each is changed by clicking it and pressing the new keys, as in the original's Settings.
         if cfg!(windows) {
-            body = body.child(heading(strings.global_shortcuts));
+            body = body.child(
+                h_flex()
+                    .pt_4()
+                    .pb_1()
+                    .items_center()
+                    .child(div().flex_1().child(Label::new(strings.global_shortcuts).size(LabelSize::Small).color(Color::Muted)))
+                    .child(
+                        div()
+                            .id("global-shortcuts-reset")
+                            .px_1p5()
+                            .py_0p5()
+                            .rounded(px(4.))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(theme.colors().element_hover))
+                            .child(Label::new(strings.habit_reset).size(LabelSize::XSmall).color(Color::Accent))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.recording_hotkey = None;
+                                crate::hotkeys::reset_defaults(cx);
+                                cx.notify();
+                            })),
+                    ),
+            );
             let labels = [strings.global_quick_add, strings.global_show_hide, strings.global_focus_mini];
             for (i, (binding, taken)) in crate::hotkeys::bindings(cx).into_iter().enumerate() {
                 let recording = self.recording_hotkey == Some(i);

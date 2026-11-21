@@ -145,6 +145,14 @@ pub fn set(index: usize, binding: Option<Binding>, cx: &mut App) {
     cx.refresh_windows();
 }
 
+/// Restores all system-wide shortcuts to their built-in defaults.
+pub fn reset_defaults(cx: &mut App) {
+    for (i, default) in DEFAULTS.iter().enumerate() {
+        let binding = (*default != "off").then(|| Binding::parse(default)).flatten();
+        set(i, binding, cx);
+    }
+}
+
 /// Registers the shortcuts for the main window.
 pub fn init(window: WindowHandle<AppView>, store: Rc<Store>, cx: &mut App) {
     let bindings = std::array::from_fn(|i| match store.setting(SETTINGS[i]).ok().flatten() {

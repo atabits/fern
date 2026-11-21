@@ -827,6 +827,42 @@ impl TaskDetail {
         self.sync_checklist(cx);
     }
 
+    fn uncheck_all_checklist_items(&mut self, cx: &mut Context<Self>) {
+        let done_ids: Vec<Id> = self.checklist.iter().filter(|r| r.item.completed).map(|r| r.item.id).collect();
+        if done_ids.is_empty() {
+            return;
+        }
+        if !self.edit_draft(cx, |_, draft| {
+            for item in &mut draft.checklist {
+                item.completed = false;
+            }
+        }) {
+            self.save(cx, |store, _| {
+                for id in done_ids {
+                    store.set_checklist_item_completed(id, false)?;
+                }
+                Ok(())
+            });
+        }
+        self.sync_checklist(cx);
+    }
+
+    fn clear_completed_checklist_items(&mut self, cx: &mut Context<Self>) {
+        let done_ids: Vec<Id> = self.checklist.iter().filter(|r| r.item.completed).map(|r| r.item.id).collect();
+        if done_ids.is_empty() {
+            return;
+        }
+        if !self.edit_draft(cx, |_, draft| draft.checklist.retain(|item| !item.completed)) {
+            self.save(cx, |store, _| {
+                for id in done_ids {
+                    store.delete_checklist_item(id)?;
+                }
+                Ok(())
+            });
+        }
+        self.sync_checklist(cx);
+    }
+
     fn start_checklist(&mut self, cx: &mut Context<Self>) {
         self.show_checklist = true;
         self.editor_window.pending_focus = Some(FocusTarget::NewItem);
@@ -1899,12 +1935,38 @@ impl TaskDetail {
     }
 
     fn render_checklist(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let strings = i18n::t(cx);
         let theme = cx.theme().clone();
         let total = self.checklist.len();
         let done_count = self.checklist.iter().filter(|r| r.item.completed).count();
         v_flex()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .when(total > 0, |el| el.child(Self::render_progress_bar(done_count, total, &theme)))
+            .when(total > 0, |el| {
+                el.child(
+                    h_flex()
+                        .gap_1()
+                        .items_center()
+                        .child(div().flex_1().min_w_0().child(Self::render_progress_bar(done_count, total, &theme)))
+                        .when(done_count > 0, |bar| {
+                            bar.child(
+                                IconButton::new("checklist-uncheck-all", IconName::RotateCcw)
+                                    .size(px(22.))
+                                    .icon_size(IconSize::XSmall)
+                                    .icon_color(Color::Muted)
+                                    .tooltip(Tooltip::text(strings.checklist_uncheck_all))
+                                    .on_click(cx.listener(|this, _, _, cx| this.uncheck_all_checklist_items(cx))),
+                            )
+                            .child(
+                                IconButton::new("checklist-clear-completed", IconName::BrushCleaning)
+                                    .size(px(22.))
+                                    .icon_size(IconSize::XSmall)
+                                    .icon_color(Color::Muted)
+                                    .tooltip(Tooltip::text(strings.checklist_clear_completed))
+                                    .on_click(cx.listener(|this, _, _, cx| this.clear_completed_checklist_items(cx))),
+                            )
+                        }),
+                )
+            })
             .children(self.checklist.iter().map(|row| {
                 let id = row.item.id;
                 let done = row.item.completed;

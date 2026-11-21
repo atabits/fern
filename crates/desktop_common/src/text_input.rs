@@ -47,6 +47,8 @@ actions!(
         Paste,
         Cut,
         Copy,
+        Undo,
+        Redo,
         Enter,
         Cancel,
     ]
@@ -110,6 +112,8 @@ pub struct TextInput {
     intercept_multiline_paste: bool,
     /// Hides the touch keyboard this input opened once it loses focus.
     keyboard_blur: Option<Subscription>,
+    undo_stack: Vec<(SharedString, Range<usize>)>,
+    redo_stack: Vec<(SharedString, Range<usize>)>,
 }
 
 /// The layout from the last frame, used for mouse hit-testing, up/down arrows and IME.
@@ -199,6 +203,8 @@ impl TextInput {
             masked: false,
             intercept_multiline_paste: false,
             keyboard_blur: None,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
         }
     }
 
@@ -239,6 +245,8 @@ impl TextInput {
         self.last_layout = None;
         self.pending_click = None;
         self.highlights.clear();
+        self.undo_stack.clear();
+        self.redo_stack.clear();
         cx.notify();
     }
 
@@ -263,6 +271,7 @@ impl TextInput {
 
     /// Replaces the text as an edit — it emits [`Changed`] — and selects `selection`.
     pub fn edit(&mut self, text: String, selection: Range<usize>, window: &Window, cx: &mut Context<Self>) {
+        self.push_undo_snapshot();
         let len = text.len();
         let clamp_boundary = |offset: usize| {
             let mut idx = offset.min(len);
@@ -305,6 +314,51 @@ impl TextInput {
 
     fn cancel(&mut self, _: &Cancel, _window: &mut Window, cx: &mut Context<Self>) {
         cx.emit(Cancelled);
+    }
+
+    fn push_undo_snapshot(&mut self) {
+        if self.masked {
+            return;
+        }
+        if self.undo_stack.last().is_some_and(|(text, _)| *text == self.content) {
+            return;
+        }
+        const MAX_UNDO: usize = 64;
+        if self.undo_stack.len() >= MAX_UNDO {
+            self.undo_stack.remove(0);
+        }
+        self.undo_stack.push((self.content.clone(), self.selected_range.clone()));
+        self.redo_stack.clear();
+    }
+
+    fn undo(&mut self, _: &Undo, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((prev_text, prev_sel)) = self.undo_stack.pop() else {
+            cx.propagate();
+            return;
+        };
+        self.redo_stack.push((self.content.clone(), self.selected_range.clone()));
+        self.content = prev_text;
+        self.selected_range = prev_sel;
+        self.selection_reversed = false;
+        self.marked_range = None;
+        window.notify_text_input_changed(&self.focus_handle);
+        cx.emit(Changed);
+        cx.notify();
+    }
+
+    fn redo(&mut self, _: &Redo, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((next_text, next_sel)) = self.redo_stack.pop() else {
+            cx.propagate();
+            return;
+        };
+        self.undo_stack.push((self.content.clone(), self.selected_range.clone()));
+        self.content = next_text;
+        self.selected_range = next_sel;
+        self.selection_reversed = false;
+        self.marked_range = None;
+        window.notify_text_input_changed(&self.focus_handle);
+        cx.emit(Changed);
+        cx.notify();
     }
 
     fn enter(&mut self, _: &Enter, window: &mut Window, cx: &mut Context<Self>) {
@@ -826,6 +880,7 @@ impl EntityInputHandler for TextInput {
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
 
+        self.push_undo_snapshot();
         self.content =
             (self.content[0..range.start].to_owned() + new_text + &self.content[range.end..])
                 .into();
@@ -851,6 +906,7 @@ impl EntityInputHandler for TextInput {
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
 
+        self.push_undo_snapshot();
         self.content =
             (self.content[0..range.start].to_owned() + new_text + &self.content[range.end..])
                 .into();
@@ -1303,6 +1359,8 @@ impl Render for TextInput {
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::cut))
             .on_action(cx.listener(Self::copy))
+            .on_action(cx.listener(Self::undo))
+            .on_action(cx.listener(Self::redo))
             .on_action(cx.listener(Self::enter))
             .when(self.cancellable, |el| el.on_action(cx.listener(Self::cancel)))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))

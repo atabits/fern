@@ -719,11 +719,12 @@ impl CalendarView {
         };
         // Hover is a light overlay: it must not erase a busy day's tint or today's marker.
         let hovered = background.blend(colors.text.opacity(if level > 0 { 0.03 } else { 0.05 }));
+        let cell_group = SharedString::from(format!("year-date-{month}-{date}"));
         h_flex()
             .id(SharedString::from(format!("year-{month}-{date}")))
             .debug_selector(|| format!("year-date-{month}-{date}"))
             .relative()
-            .group("year-date")
+            .group(cell_group.clone())
             .flex_1()
             .min_w_0()
             .min_h_0()
@@ -769,7 +770,7 @@ impl CalendarView {
                     .when(is_today && !is_open, |el| el.text_color(colors.on_accent))
                     .when(!heatmap, |el| {
                         el.when(is_today || is_open, |el| el.bg(background))
-                            .group_hover("year-date", move |style| style.bg(hovered))
+                            .group_hover(cell_group, move |style| style.bg(hovered))
                     })
                     .when(!in_month, |el| el.text_color(colors.text.opacity(0.65)))
                     .child(ui::LabelText::new(date.day().to_string())),

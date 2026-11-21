@@ -532,6 +532,7 @@ impl TaskDetail {
                     .child(h_flex().flex_wrap().children(picks)),
             )
         });
+        let has_comment_text = !self.comment_input.read(cx).text().trim().is_empty();
         div()
             .px_5()
             .pb_2()
@@ -557,7 +558,26 @@ impl TaskDetail {
                                 })),
                         )
                         .children(emoji_menu),
-                    ),
+                    )
+                    .when(has_comment_text, |el| {
+                        el.child(
+                            IconButton::new("comment-send", IconName::ArrowUp)
+                                .icon_color(Color::Accent)
+                                .tooltip(Tooltip::text(i18n::t(cx).add))
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    let text = this.comment_input.read(cx).text().trim().to_owned();
+                                    if !text.is_empty()
+                                        && let Some(task) = this.task_id()
+                                        && this.session.store.add_comment(task, &text).is_ok()
+                                    {
+                                        this.comment_input.update(cx, |input, cx| input.clear(window, cx));
+                                        this.sync_comments();
+                                        cx.emit(TaskUpdated);
+                                        cx.notify();
+                                    }
+                                })),
+                        )
+                    }),
             )
             .into_any_element()
     }
@@ -662,16 +682,24 @@ impl TaskDetail {
     /// The attached files under the notes: a click opens one with the system's app.
     fn render_attachments(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
+        let strings = i18n::t(cx);
         v_flex().gap_1().children(self.session.attachments.iter().map(|attachment| {
             let path = match &self.session.draft {
                 Some(draft) => draft.attachments.iter().find(|prepared| prepared.metadata().id == attachment.id).map(|prepared| prepared.path().to_owned()),
                 None => self.session.attachments_dir.as_ref().map(|dir| attachment.path(dir)),
             };
             let removed = attachment.clone();
+            let att_id = attachment.id;
+            let group_name = SharedString::from(format!("attachment-{att_id}"));
+            let is_image = attachment
+                .name
+                .rsplit('.')
+                .next()
+                .is_some_and(|ext| matches!(ext.to_ascii_lowercase().as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg"));
             h_flex()
-                .id(SharedString::from(format!("attachment-{}", attachment.id)))
+                .id(group_name.clone())
                 .debug_selector(|| "task-attachment".to_owned())
-                .group("attachment")
+                .group(group_name)
                 .h(px(36.))
                 .px_2()
                 .gap_2()
@@ -680,11 +708,16 @@ impl TaskDetail {
                 .border_color(theme.colors().border_variant)
                 .cursor_pointer()
                 .hover(|s| s.bg(theme.colors().element_hover))
-                .child(Icon::new(IconName::Paperclip).size(IconSize::Small).color(Color::Muted))
+                .child(Icon::new(if is_image { IconName::Image } else { IconName::Paperclip }).size(IconSize::Small).color(Color::Muted))
                 .child(div().flex_1().min_w_0().child(Label::new(attachment.name.clone()).size(LabelSize::Small).truncate()))
                 .child(Label::new(format_size(attachment.size)).size(LabelSize::XSmall).color(Color::Muted))
                 .child(
-                    IconButton::new("attachment-delete", IconName::X).size(px(20.)).icon_size(IconSize::XSmall).on_click(
+                    IconButton::new(SharedString::from(format!("attachment-delete-{att_id}")), IconName::X)
+                        .size(px(20.))
+                        .icon_size(IconSize::XSmall)
+                        .hover_icon_color(theme.status().error)
+                        .tooltip(Tooltip::text(strings.delete))
+                        .on_click(
                         cx.listener(move |this, _, _, cx| {
                             cx.stop_propagation();
                             if let Some(draft) = &mut this.session.draft {

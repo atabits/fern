@@ -520,6 +520,14 @@ impl MatrixView {
     fn start_add(&mut self, quadrant: usize, window: &mut Window, cx: &mut Context<Self>) {
         let strings = i18n::t(cx);
         let input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.matrix_add_placeholder, cx).without_cancel());
+        cx.subscribe(&input, |this, input, _: &desktop_common::text_input::Changed, cx| {
+            let text = input.read(cx).text().to_owned();
+            let list_names: Vec<String> = this.lists.iter().map(|l| l.name.clone()).collect();
+            let recognition = this.store.preferences().map(|p| p.recognition).unwrap_or_default();
+            let parsed = fern_core::parse_quick_add_with(&text, Local::now().date_naive(), &list_names, recognition);
+            input.update(cx, |input, cx| input.set_highlights(parsed.spans, cx));
+        })
+        .detach();
         cx.subscribe_in(&input, window, move |this, input, Submitted(title), window, cx| {
             if title.trim().is_empty() {
                 return;

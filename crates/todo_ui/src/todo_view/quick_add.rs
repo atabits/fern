@@ -106,10 +106,23 @@ impl TodoView {
 
     /// The system-wide Quick Add's task: added as from All, so that it takes the Settings'
     /// defaults (the default list among them) and nothing from the view or the add field's menu.
-    pub fn add_quick(&mut self, text: &str, cx: &mut Context<Self>) {
-        let result = self.add_task_as(text, &View::All, &AddDraft::default());
+    /// Adds a task from the system-wide Quick Add window, with optional date, priority, and list.
+    pub fn add_quick_with(
+        &mut self,
+        text: &str,
+        date: Option<NaiveDate>,
+        priority: Option<Priority>,
+        list: Option<Option<Id>>,
+        cx: &mut Context<Self>,
+    ) {
+        let draft = AddDraft { date, priority, list, ..Default::default() };
+        let result = self.add_task_as(text, &View::All, &draft);
         self.check(result);
         self.reload(cx);
+    }
+
+    pub fn add_quick(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.add_quick_with(text, None, None, None, cx);
     }
 
     pub(super) fn add_task(&mut self, input: &str, cx: &App) -> Option<Task> {

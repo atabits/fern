@@ -755,8 +755,22 @@ impl AppView {
     }
 
     /// A task from the Quick Add window.
-    pub fn add_quick_task(&mut self, text: &str, cx: &mut Context<Self>) {
-        self.todo.update(cx, |todo, cx| todo.add_quick(text, cx));
+    pub fn add_quick_task_with(
+        &mut self,
+        text: &str,
+        date: Option<chrono::NaiveDate>,
+        priority: Option<fern_core::Priority>,
+        list: Option<Option<fern_core::Id>>,
+        cx: &mut Context<Self>,
+    ) {
+        self.todo.update(cx, |todo, cx| todo.add_quick_with(text, date, priority, list, cx));
+    }
+
+    /// Lists and quick-add recognition preference for the Quick Add window.
+    pub fn quick_add_context(&self) -> (Vec<fern_core::List>, fern_core::Recognition) {
+        let lists = self.store.lists().unwrap_or_default().into_iter().filter(|l| !l.archived).collect();
+        let recognition = self.store.preferences().map(|p| p.recognition).unwrap_or_default();
+        (lists, recognition)
     }
 
     /// The add field of the task list, focused: New Task.

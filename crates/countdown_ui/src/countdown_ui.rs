@@ -1550,10 +1550,16 @@ impl Render for CountdownView {
                     .child(
                         div()
                             .relative()
-                            .child(IconButton::new("countdown-add", IconName::Plus).icon_size(IconSize::XLarge).icon_color(Color::Default).on_click(cx.listener(|this, _, _, cx| {
-                                this.add_menu = !this.add_menu;
-                                cx.notify();
-                            })))
+                            .child(
+                                IconButton::new("countdown-add", IconName::Plus)
+                                    .icon_size(IconSize::XLarge)
+                                    .icon_color(Color::Default)
+                                    .tooltip(Tooltip::text(strings.countdown_new))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.add_menu = !this.add_menu;
+                                        cx.notify();
+                                    })),
+                            )
                             // The original's "+" asks for the kind first: 162 px wide, a row every 34 px.
                             .when(self.add_menu, |el| {
                                 el.child(PopoverAttachment::new(
@@ -1582,10 +1588,15 @@ impl Render for CountdownView {
                     .child(
                         div()
                             .relative()
-                            .child(IconButton::new("countdown-more", IconName::Ellipsis).icon_color(Color::Default).on_click(cx.listener(|this, _, _, cx| {
-                                this.header_menu = !this.header_menu;
-                                cx.notify();
-                            })))
+                            .child(
+                                IconButton::new("countdown-more", IconName::Ellipsis)
+                                    .icon_color(Color::Default)
+                                    .tooltip(Tooltip::text(strings.more))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.header_menu = !this.header_menu;
+                                        cx.notify();
+                                    })),
+                            )
                             .when(self.header_menu, |el| {
                                 el.child(PopoverAttachment::new(
                                     Placement::BelowRight,
@@ -1624,6 +1635,7 @@ impl Render for CountdownView {
                     .rounded(px(16.))
                     .cursor_pointer()
                     .when(selected, |el| el.bg(theme.colors().accent.opacity(0.2)))
+                    .when(!selected, |el| el.hover(|s| s.bg(theme.colors().element_hover)))
                     .child(Label::new(label).color(if selected { Color::Accent } else { Color::Muted }))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.filter = filter;
@@ -1637,7 +1649,47 @@ impl Render for CountdownView {
                         .id("countdown-grid")
                         .px(px(22.))
                         .when(cards.is_empty(), |el| {
-                            el.child(div().pt_8().child(Label::new(strings.countdown_empty).color(Color::Muted)))
+                            let default_kind = match self.filter {
+                                Filter::All => CountdownKind::Countdown,
+                                Filter::Kind(k) => k,
+                            };
+                            el.child(
+                                v_flex()
+                                    .w_full()
+                                    .py(px(64.))
+                                    .items_center()
+                                    .justify_center()
+                                    .gap_3()
+                                    .child(
+                                        div()
+                                            .size(px(52.))
+                                            .rounded_full()
+                                            .bg(theme.colors().surface_background)
+                                            .border_1()
+                                            .border_color(theme.colors().border_variant)
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .child(Icon::new(IconName::FernCountdown).size(IconSize::Large).color(Color::Muted)),
+                                    )
+                                    .child(Label::new(strings.countdown_empty).size(LabelSize::Small).color(Color::Muted))
+                                    .child(
+                                        h_flex()
+                                            .id("countdown-empty-add")
+                                            .h(px(32.))
+                                            .px_3p5()
+                                            .gap_1p5()
+                                            .rounded(px(6.))
+                                            .bg(theme.colors().accent)
+                                            .hover(|s| s.opacity(0.9))
+                                            .cursor_pointer()
+                                            .child(Icon::new(IconName::Plus).size(IconSize::Small).color(Color::IconOnAccent))
+                                            .child(Label::new(strings.countdown_new).size(LabelSize::Small).color(Color::OnAccent))
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                this.start_new_kind(default_kind, window, cx);
+                                            })),
+                                    ),
+                            )
                         })
                         .child(div().flex().flex_wrap().gap(px(20.)).children(cards)),
                 )

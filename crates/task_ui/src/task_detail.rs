@@ -1801,8 +1801,8 @@ impl TaskDetail {
                 .justify_center()
                 .rounded(px(6.))
                 .cursor_pointer()
-                .when(primary, |el| el.bg(theme.colors().accent))
-                .when(!primary, |el| el.border_1().border_color(theme.colors().border))
+                .when(primary, |el| el.bg(theme.colors().accent).hover(|s| s.opacity(0.9)))
+                .when(!primary, |el| el.border_1().border_color(theme.colors().border).hover(|s| s.bg(theme.colors().element_hover)))
                 .child(Label::new(label).size(LabelSize::Small).when(primary, |l| l.color(Color::OnAccent)))
         };
         popover(cx)
@@ -2731,8 +2731,8 @@ impl TaskDetail {
                 .justify_center()
                 .rounded(px(6.))
                 .cursor_pointer()
-                .when(primary, |el| el.bg(theme.colors().accent))
-                .when(!primary, |el| el.border_1().border_color(theme.colors().border))
+                .when(primary, |el| el.bg(theme.colors().accent).hover(|s| s.opacity(0.9)))
+                .when(!primary, |el| el.border_1().border_color(theme.colors().border).hover(|s| s.bg(theme.colors().element_hover)))
                 .child(Label::new(label).size(LabelSize::Small).when(primary, |label| label.color(Color::OnAccent)))
         };
 
@@ -2912,8 +2912,8 @@ impl TaskDetail {
                 .justify_center()
                 .rounded(px(6.))
                 .cursor_pointer()
-                .when(primary, |el| el.bg(theme.colors().accent))
-                .when(!primary, |el| el.border_1().border_color(theme.colors().border))
+                .when(primary, |el| el.bg(theme.colors().accent).hover(|s| s.opacity(0.9)))
+                .when(!primary, |el| el.border_1().border_color(theme.colors().border).hover(|s| s.bg(theme.colors().element_hover)))
                 .child(Label::new(label).size(LabelSize::Small).when(primary, |label| label.color(Color::OnAccent)))
         };
         v_flex()
@@ -3050,8 +3050,8 @@ impl TaskDetail {
                 .justify_center()
                 .rounded(px(6.))
                 .cursor_pointer()
-                .when(primary, |el| el.bg(theme.colors().accent))
-                .when(!primary, |el| el.border_1().border_color(theme.colors().border))
+                .when(primary, |el| el.bg(theme.colors().accent).hover(|s| s.opacity(0.9)))
+                .when(!primary, |el| el.border_1().border_color(theme.colors().border).hover(|s| s.bg(theme.colors().element_hover)))
                 .child(Label::new(label).size(LabelSize::Small).when(primary, |label| label.color(Color::OnAccent)))
         };
         // The original's repeat modes: Due Dates, Completion Date, Specific Dates, Forgetting Curve.

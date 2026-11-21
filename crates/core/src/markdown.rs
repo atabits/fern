@@ -111,6 +111,12 @@ fn single_of_double(before: &str, after: &str, markers: &str) -> bool {
 
 fn link(text: &str, selection: Range<usize>) -> (String, Range<usize>) {
     let (before, inner, after) = (&text[..selection.start], &text[selection.clone()], &text[selection.end..]);
+    let trimmed = inner.trim();
+    if trimmed.starts_with("https://") || trimmed.starts_with("http://") || trimmed.starts_with("mailto:") {
+        let new = format!("{before}[]({trimmed}){after}");
+        let cursor = selection.start + 1;
+        return (new, cursor..cursor);
+    }
     let new = format!("{before}[{inner}](){after}");
     // The cursor goes where there is something to type: the URL, or the text when there is none.
     let cursor = if inner.is_empty() { selection.start + 1 } else { selection.end + 3 };
@@ -139,6 +145,16 @@ fn existing_prefix(line: &str, format: Format) -> Option<usize> {
             let digits = line.len() - line.trim_start_matches(|c: char| c.is_ascii_digit()).len();
             (digits > 0 && line[digits..].starts_with(". ")).then_some(digits + 2)
         }
+        Format::Checklist => ["- [ ] ", "- [x] ", "- [X] "]
+            .into_iter()
+            .find(|p| line.starts_with(p))
+            .map(str::len),
+        Format::Bullets => (line.starts_with("* ")
+            || (line.starts_with("- ")
+                && !line.starts_with("- [ ] ")
+                && !line.starts_with("- [x] ")
+                && !line.starts_with("- [X] ")))
+            .then_some(2),
         _ => format.prefix(1).filter(|p| line.starts_with(p.as_str())).map(|p| p.len()),
     }
 }
@@ -632,5 +648,18 @@ mod tests {
         assert_eq!(count_words("Привет, мир! 2026"), 3);
         assert_eq!(count_words("你好世界"), 4);
         assert_eq!(count_words("Hello 世界 test"), 4);
+    }
+
+    #[test]
+    fn link_wraps_selected_url_and_prefix_toggles_dash_bullets_and_checked_items() {
+        let (out, sel) = apply("see https://example.com now", 4..23, Format::Link);
+        assert_eq!(out, "see [](https://example.com) now");
+        assert_eq!(sel, 5..5);
+
+        let (out, _) = apply("- bullet", 2..2, Format::Bullets);
+        assert_eq!(out, "bullet");
+
+        let (out, _) = apply("- [x] done", 6..6, Format::Checklist);
+        assert_eq!(out, "done");
     }
 }

@@ -3418,6 +3418,9 @@ impl Render for CalendarView {
                     IconButton::new("calendar-add", IconName::Plus)
                         .size(px(28.))
                         .icon_size(IconSize::Small)
+                        .when(self.task_editor.is_none(), |button| {
+                            button.tip(strings.add_task, ui::TipSide::Below)
+                        })
                         // An open editor handles this as an outside click. Do not also
                         // register a click that would reopen it on mouse-up.
                         .when(self.task_editor.is_none(), |button| {
@@ -3452,6 +3455,7 @@ impl Render for CalendarView {
                             .px_3()
                             .gap_1()
                             .cursor_pointer()
+                            .hover(|s| s.bg(theme.colors().ghost_element_hover))
                             .child(
                                 Label::new(match self.mode {
                                     CalendarMode::Week => strings.week,
@@ -3498,6 +3502,8 @@ impl Render for CalendarView {
                             .border_x_1()
                             .border_color(theme.colors().border)
                             .cursor_pointer()
+                            .hover(|s| s.bg(theme.colors().ghost_element_hover))
+                            .tooltip(ui::Tooltip::text(format!("{} (T)", strings.today)))
                             .child(Label::new(strings.today))
                             .on_click(cx.listener(|this, _, _, cx| this.go_to_today(cx))),
                     )

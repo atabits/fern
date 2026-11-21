@@ -110,8 +110,8 @@ pub struct TextInput {
     /// Byte ranges shown in the accent color on a tinted background, such as the date and tags
     /// quick add recognized.
     highlights: Vec<Range<usize>>,
-    /// A password field: the text shows as "*", one per byte so that every offset stays the
-    /// same, and it cannot be copied.
+    /// A password field: the text shows as "*", one per Unicode scalar value, and it cannot be
+    /// copied.
     masked: bool,
     /// When true on a single-line input, pasting 2+ non-empty lines emits [`MultiLinePasted`]
     /// instead of flattening newlines into spaces (used for Batch Add Tasks).
@@ -259,6 +259,7 @@ impl TextInput {
     /// Places the caret at the character nearest `position` (in window coordinates).
     /// When called before the first layout, defers resolution until the initial prepaint.
     pub fn place_cursor_at(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        self.marked_range = None;
         if self.last_layout.is_some() {
             let offset = self.index_for_mouse_position(position);
             self.selected_range = offset..offset;
@@ -278,21 +279,14 @@ impl TextInput {
     /// Replaces the text as an edit — it emits [`Changed`] — and selects `selection`.
     pub fn edit(&mut self, text: String, selection: Range<usize>, window: &Window, cx: &mut Context<Self>) {
         self.push_undo_snapshot();
-        let len = text.len();
-        let clamp_boundary = |offset: usize| {
-            let mut idx = offset.min(len);
-            while idx > 0 && !text.is_char_boundary(idx) {
-                idx -= 1;
-            }
-            idx
-        };
-        let start = clamp_boundary(selection.start);
-        let end = clamp_boundary(selection.end).max(start);
+        let start = snap_char_boundary(&text, selection.start);
+        let end = snap_char_boundary(&text, selection.end).max(start);
         self.content = text.into();
         self.selected_range = start..end;
         self.selection_reversed = false;
         self.marked_range = None;
         self.pending_click = None;
+        self.highlights.clear();
         window.notify_text_input_changed(&self.focus_handle);
         cx.emit(Changed);
         cx.notify();
@@ -303,12 +297,34 @@ impl TextInput {
         window.notify_text_input_changed(&self.focus_handle);
     }
 
-    /// Marks ranges of the text (byte offsets) as recognized; out-of-range ones are ignored.
+    /// Marks ranges of the text (byte offsets) as recognized; ranges are snapped to UTF-8 char
+    /// boundaries, clamped to the current text, sorted, and merged so overlapping/out-of-range
+    /// ranges can never panic during display shaping.
     pub fn set_highlights(&mut self, ranges: Vec<Range<usize>>, cx: &mut Context<Self>) {
-        let len = self.content.len();
-        let ranges: Vec<Range<usize>> = ranges.into_iter().filter(|r| r.start < r.end && r.end <= len).collect();
-        if ranges != self.highlights {
-            self.highlights = ranges;
+        let mut normalized: Vec<Range<usize>> = ranges
+            .into_iter()
+            .filter_map(|r| {
+                if r.start >= r.end {
+                    return None;
+                }
+                let start = snap_char_boundary(&self.content, r.start);
+                let end = snap_char_boundary(&self.content, r.end);
+                (start < end).then_some(start..end)
+            })
+            .collect();
+        normalized.sort_by_key(|r| (r.start, r.end));
+        let mut merged: Vec<Range<usize>> = Vec::with_capacity(normalized.len());
+        for range in normalized {
+            if let Some(last) = merged.last_mut()
+                && range.start <= last.end
+            {
+                last.end = last.end.max(range.end);
+            } else {
+                merged.push(range);
+            }
+        }
+        if merged != self.highlights {
+            self.highlights = merged;
             cx.notify();
         }
     }
@@ -347,6 +363,7 @@ impl TextInput {
         self.selected_range = prev_sel;
         self.selection_reversed = false;
         self.marked_range = None;
+        self.highlights.clear();
         window.notify_text_input_changed(&self.focus_handle);
         cx.emit(Changed);
         cx.notify();
@@ -362,6 +379,7 @@ impl TextInput {
         self.selected_range = next_sel;
         self.selection_reversed = false;
         self.marked_range = None;
+        self.highlights.clear();
         window.notify_text_input_changed(&self.focus_handle);
         cx.emit(Changed);
         cx.notify();
@@ -369,21 +387,23 @@ impl TextInput {
 
     fn enter(&mut self, _: &Enter, window: &mut Window, cx: &mut Context<Self>) {
         if self.mode == Mode::MultiLine {
-            if self.selected_range.is_empty() {
+            if self.selected_range.is_empty() && self.marked_range.is_none() {
                 let cursor = self.selected_range.end;
                 let line_start = self.content[..cursor].rfind('\n').map_or(0, |i| i + 1);
+                let line_end = self.content[cursor..].find('\n').map_or(self.content.len(), |i| cursor + i);
                 let before_cursor = &self.content[line_start..cursor];
+                let after_cursor = &self.content[cursor..line_end];
                 match markdown_list_continuation(before_cursor) {
                     Some(ListEnter::Continue(prefix)) => {
                         self.replace_text_in_range(None, &format!("\n{prefix}"), window, cx);
                         return;
                     }
-                    Some(ListEnter::ClearLine) => {
-                        self.selected_range = line_start..cursor;
+                    Some(ListEnter::ClearLine) if after_cursor.trim().is_empty() => {
+                        self.selected_range = line_start..line_end;
                         self.replace_text_in_range(None, "", window, cx);
                         return;
                     }
-                    None => {}
+                    Some(ListEnter::ClearLine) | None => {}
                 }
             }
             self.replace_text_in_range(None, "\n", window, cx);
@@ -646,8 +666,9 @@ impl TextInput {
 
     fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+            let normalized = normalize_line_endings(&text);
             if self.mode == Mode::SingleLine && self.intercept_multiline_paste {
-                let lines: Vec<String> = text
+                let lines: Vec<String> = normalized
                     .lines()
                     .map(str::trim)
                     .filter(|l| !l.is_empty())
@@ -659,9 +680,9 @@ impl TextInput {
                 }
             }
             let text = if self.mode == Mode::MultiLine {
-                text
+                normalized
             } else {
-                text.replace('\n', " ")
+                normalized.replace('\n', " ")
             };
             self.replace_text_in_range(None, &text, window, cx);
         }
@@ -685,8 +706,12 @@ impl TextInput {
     }
 
     fn move_to(&mut self, offset: usize, window: &Window, cx: &mut Context<Self>) {
+        let had_marked = self.marked_range.take().is_some();
         self.selected_range = offset..offset;
         self.selection_reversed = false;
+        if had_marked {
+            window.notify_text_input_changed(&self.focus_handle);
+        }
         window.notify_text_selection_changed(&self.focus_handle);
         cx.notify()
     }
@@ -699,13 +724,24 @@ impl TextInput {
         }
     }
 
+    /// Maps a byte offset in `self.content` to a byte offset in the displayed text
+    /// (which differs when `self.masked` replaces each Unicode `char` with a single `'*'`).
+    fn display_offset(&self, byte_offset: usize) -> usize {
+        let clamped = snap_char_boundary(&self.content, byte_offset);
+        if self.masked {
+            self.content[..clamped].chars().count()
+        } else {
+            clamped
+        }
+    }
+
     /// The offset one line above (`direction = -1`) or below (`1`) at the same x.
     fn vertical_offset(&self, direction: f32) -> usize {
         let cursor = self.cursor_offset();
         let Some(layout) = self.last_layout.as_ref() else {
             return cursor;
         };
-        let position = layout.position_for_offset(cursor);
+        let position = layout.position_for_offset(self.display_offset(cursor));
         let target_y = position.y + layout.line_height * (direction + 0.5);
         if target_y < px(0.) {
             return 0;
@@ -726,7 +762,7 @@ impl TextInput {
         let Some(layout) = self.last_layout.as_ref() else {
             return if end { self.content.len() } else { 0 };
         };
-        let y = layout.position_for_offset(cursor).y + layout.line_height * 0.5;
+        let y = layout.position_for_offset(self.display_offset(cursor)).y + layout.line_height * 0.5;
         let x = if end { px(f32::MAX / 4.) } else { px(0.) };
         self.offset_for_text_position(layout, point(x, y))
     }
@@ -747,12 +783,18 @@ impl TextInput {
     fn offset_for_text_position(&self, layout: &TextLayout, position: Point<Pixels>) -> usize {
         let offset = layout.offset_for_position(position);
         if self.masked {
-            // Each mask glyph represents a byte, but editing must never split the
-            // original UTF-8 character or an emoji/combining-character sequence.
-            self.content.grapheme_indices(true)
+            // Each mask glyph represents one Unicode scalar value (`char`), and editing
+            // must never split a multi-scalar grapheme cluster (combining marks / ZWJ emoji).
+            let byte_offset = self
+                .content
+                .char_indices()
+                .nth(offset)
+                .map_or(self.content.len(), |(idx, _)| idx);
+            self.content
+                .grapheme_indices(true)
                 .map(|(index, _)| index)
                 .chain(std::iter::once(self.content.len()))
-                .min_by_key(|index| index.abs_diff(offset))
+                .min_by_key(|index| index.abs_diff(byte_offset))
                 .unwrap_or(0)
         } else {
             offset
@@ -760,6 +802,7 @@ impl TextInput {
     }
 
     fn select_to(&mut self, offset: usize, window: &Window, cx: &mut Context<Self>) {
+        let had_marked = self.marked_range.take().is_some();
         if self.selection_reversed {
             self.selected_range.start = offset
         } else {
@@ -768,6 +811,9 @@ impl TextInput {
         if self.selected_range.end < self.selected_range.start {
             self.selection_reversed = !self.selection_reversed;
             self.selected_range = self.selected_range.end..self.selected_range.start;
+        }
+        if had_marked {
+            window.notify_text_input_changed(&self.focus_handle);
         }
         window.notify_text_selection_changed(&self.focus_handle);
         cx.notify()
@@ -808,7 +854,12 @@ impl TextInput {
     }
 
     fn range_from_utf16(&self, range_utf16: &Range<usize>) -> Range<usize> {
-        self.offset_from_utf16(range_utf16.start)..self.offset_from_utf16(range_utf16.end)
+        let (start, end) = if range_utf16.start <= range_utf16.end {
+            (range_utf16.start, range_utf16.end)
+        } else {
+            (range_utf16.end, range_utf16.start)
+        };
+        self.offset_from_utf16(start)..self.offset_from_utf16(end)
     }
 
     fn previous_boundary(&self, offset: usize) -> usize {
@@ -945,19 +996,28 @@ impl EntityInputHandler for TextInput {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let was_marked = self.marked_range.is_some();
         let range = range_utf16
             .as_ref()
             .map(|range_utf16| self.range_from_utf16(range_utf16))
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
 
-        self.push_undo_snapshot();
+        if !was_marked {
+            self.push_undo_snapshot();
+        }
         self.content =
             (self.content[0..range.start].to_owned() + new_text + &self.content[range.end..])
                 .into();
         self.selected_range = range.start + new_text.len()..range.start + new_text.len();
         self.selection_reversed = false;
         self.marked_range.take();
+        self.highlights.clear();
+        // If an IME composition ended back at the exact pre-composition content, drop the
+        // redundant snapshot so Undo reverts the prior edit instead of being a no-op.
+        if was_marked && self.undo_stack.last().is_some_and(|(text, _)| *text == self.content) {
+            self.undo_stack.pop();
+        }
         window.notify_text_input_changed(&self.focus_handle);
         cx.emit(Changed);
         cx.notify();
@@ -971,13 +1031,18 @@ impl EntityInputHandler for TextInput {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let was_marked = self.marked_range.is_some();
         let range = range_utf16
             .as_ref()
             .map(|range_utf16| self.range_from_utf16(range_utf16))
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
 
-        self.push_undo_snapshot();
+        // Snapshot once when IME composition begins; intermediate preedit updates must not
+        // flood the 64-entry undo stack.
+        if !was_marked && !(range.is_empty() && new_text.is_empty()) {
+            self.push_undo_snapshot();
+        }
         self.content =
             (self.content[0..range.start].to_owned() + new_text + &self.content[range.end..])
                 .into();
@@ -985,14 +1050,23 @@ impl EntityInputHandler for TextInput {
             self.marked_range = Some(range.start..range.start + new_text.len());
         } else {
             self.marked_range = None;
+            if was_marked && self.undo_stack.last().is_some_and(|(text, _)| *text == self.content) {
+                self.undo_stack.pop();
+            }
         }
+        self.highlights.clear();
         let insertion_start_utf16 = self.offset_to_utf16(range.start);
         let inserted_length_utf16 = new_text.encode_utf16().count();
         self.selected_range = new_selected_range_utf16
             .map(|selected| {
+                let (s, e) = if selected.start <= selected.end {
+                    (selected.start, selected.end)
+                } else {
+                    (selected.end, selected.start)
+                };
                 self.range_from_utf16(
-                    &(insertion_start_utf16 + selected.start.min(inserted_length_utf16)
-                        ..insertion_start_utf16 + selected.end.min(inserted_length_utf16)),
+                    &(insertion_start_utf16 + s.min(inserted_length_utf16)
+                        ..insertion_start_utf16 + e.min(inserted_length_utf16)),
                 )
             })
             .unwrap_or_else(|| range.start + new_text.len()..range.start + new_text.len());
@@ -1012,8 +1086,8 @@ impl EntityInputHandler for TextInput {
     ) -> Option<Bounds<Pixels>> {
         let layout = self.last_layout.as_ref()?;
         let range = self.range_from_utf16(&range_utf16);
-        let start = layout.position_for_offset(range.start);
-        let end = layout.position_for_offset(range.end);
+        let start = layout.position_for_offset(self.display_offset(range.start));
+        let end = layout.position_for_offset(self.display_offset(range.end));
         let origin = layout.origin();
         Some(Bounds::from_corners(
             origin + start,
@@ -1073,9 +1147,9 @@ impl IntoElement for TextElement {
     }
 }
 
-/// A password field's text: one "*" per byte, so that offsets into it match the real text.
+/// A password field's text: one "*" per Unicode scalar value (`char`), not per UTF-8 byte.
 fn masked_text(text: &str) -> SharedString {
-    "*".repeat(text.len()).into()
+    "*".repeat(text.chars().count()).into()
 }
 
 /// The text to display and its style runs (placeholder, IME underline).
@@ -1094,8 +1168,9 @@ fn display_runs(
     } else {
         (input.content.clone(), style.color)
     };
+    let text_len = text.len();
     let run = TextRun {
-        len: text.len(),
+        len: text_len,
         font: style.font(),
         color,
         background_color: None,
@@ -1103,35 +1178,43 @@ fn display_runs(
         strikethrough: None,
     };
     let runs = match input.marked_range.as_ref() {
-        Some(marked) if !is_placeholder => vec![
-            TextRun { len: marked.start, ..run.clone() },
-            TextRun {
-                len: marked.end - marked.start,
-                underline: Some(UnderlineStyle {
-                    color: Some(run.color),
-                    thickness: px(1.0),
-                    wavy: false,
-                }),
-                ..run.clone()
-            },
-            TextRun { len: text.len() - marked.end, ..run },
-        ]
-        .into_iter()
-        .filter(|run| run.len > 0)
-        .collect(),
+        Some(marked) if !is_placeholder => {
+            let start = input.display_offset(marked.start).min(text_len);
+            let end = input.display_offset(marked.end).clamp(start, text_len);
+            vec![
+                TextRun { len: start, ..run.clone() },
+                TextRun {
+                    len: end - start,
+                    underline: Some(UnderlineStyle {
+                        color: Some(run.color),
+                        thickness: px(1.0),
+                        wavy: false,
+                    }),
+                    ..run.clone()
+                },
+                TextRun { len: text_len - end, ..run },
+            ]
+            .into_iter()
+            .filter(|run| run.len > 0)
+            .collect()
+        }
         // Highlighted ranges take the accent color.
         _ if !is_placeholder && !input.highlights.is_empty() => {
             let mut runs = Vec::new();
             let mut at = 0;
             for range in &input.highlights {
-                if range.start > at {
-                    runs.push(TextRun { len: range.start - at, ..run.clone() });
+                let start = input.display_offset(range.start).clamp(at, text_len);
+                let end = input.display_offset(range.end).clamp(start, text_len);
+                if start > at {
+                    runs.push(TextRun { len: start - at, ..run.clone() });
                 }
-                runs.push(TextRun { len: range.end - range.start, color: highlight_color, ..run.clone() });
-                at = range.end;
+                if end > start {
+                    runs.push(TextRun { len: end - start, color: highlight_color, ..run.clone() });
+                }
+                at = end;
             }
-            if at < text.len() {
-                runs.push(TextRun { len: text.len() - at, ..run });
+            if at < text_len {
+                runs.push(TextRun { len: text_len - at, ..run });
             }
             runs
         }
@@ -1273,7 +1356,7 @@ impl Element for TextElement {
                 .map_or(px(0.), |layout| layout.scroll_left)
                 .min(max_scroll);
             if input.focus_handle.is_focused(window) || input.is_selecting {
-                let caret_x = layout.position_for_offset(input.cursor_offset()).x;
+                let caret_x = layout.position_for_offset(input.display_offset(input.cursor_offset())).x;
                 layout.scroll_left = layout.scroll_left
                     .max(caret_x - viewport_width)
                     .min(caret_x)
@@ -1286,14 +1369,14 @@ impl Element for TextElement {
         let mut selection = Vec::new();
         let mut cursor = None;
         if selected_range.is_empty() {
-            let position = layout.position_for_offset(input.cursor_offset());
+            let position = layout.position_for_offset(input.display_offset(input.cursor_offset()));
             cursor = Some(fill(
                 Bounds::new(origin + position, size(CARET_WIDTH, line_height)),
                 theme.colors().accent,
             ));
         } else {
-            let start = layout.position_for_offset(selected_range.start);
-            let end = layout.position_for_offset(selected_range.end);
+            let start = layout.position_for_offset(input.display_offset(selected_range.start));
+            let end = layout.position_for_offset(input.display_offset(selected_range.end));
             let rect = |from: Point<Pixels>, to_x: Pixels| {
                 fill(
                     Bounds::from_corners(
@@ -1307,10 +1390,12 @@ impl Element for TextElement {
                 selection.push(rect(start, end.x));
             } else {
                 selection.push(rect(start, bounds.size.width));
-                let mut y = start.y + line_height;
-                while y < end.y {
-                    selection.push(rect(point(px(0.), y), bounds.size.width));
-                    y += line_height;
+                if line_height > px(0.) {
+                    let mut y = start.y + line_height;
+                    while y < end.y {
+                        selection.push(rect(point(px(0.), y), bounds.size.width));
+                        y += line_height;
+                    }
                 }
                 selection.push(rect(point(px(0.), end.y), end.x));
             }
@@ -1324,8 +1409,8 @@ impl Element for TextElement {
                 .highlights
                 .iter()
                 .filter_map(|range| {
-                    let start = layout.position_for_offset(range.start);
-                    let end = layout.position_for_offset(range.end);
+                    let start = layout.position_for_offset(input.display_offset(range.start));
+                    let end = layout.position_for_offset(input.display_offset(range.end));
                     (start.y == end.y).then(|| {
                         fill(
                             Bounds::from_corners(
@@ -1559,6 +1644,54 @@ fn adjust_lines_indent(text: &str, sel: Range<usize>, indent: bool) -> (String, 
 
     out.push_str(&text[end_line_end..]);
     (out, new_start..new_end.max(new_start))
+}
+
+/// Clamps `offset` to `text.len()` and backs up to the nearest valid UTF-8 char boundary.
+fn snap_char_boundary(text: &str, offset: usize) -> usize {
+    let mut idx = offset.min(text.len());
+    while idx > 0 && !text.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
+}
+
+/// Converts Windows (`\r\n`) and legacy Mac (`\r`) line endings to `\n`.
+fn normalize_line_endings(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+/// Wires both [`Submitted`] (Enter) and [`Cancelled`] (Escape) for a dialog [`TextInput`]
+/// in a single call so dialog inputs never forget Escape handling.
+pub fn wire_dialog_input<V: 'static>(
+    input: &Entity<TextInput>,
+    cx: &mut Context<V>,
+    mut on_submit: impl FnMut(&mut V, &str, &mut Context<V>) + 'static,
+    mut on_cancel: impl FnMut(&mut V, &mut Context<V>) + 'static,
+) -> [Subscription; 2] {
+    let sub_submit = cx.subscribe(input, move |this, _, event: &Submitted, cx| {
+        on_submit(this, &event.0, cx);
+    });
+    let sub_cancel = cx.subscribe(input, move |this, _, _: &Cancelled, cx| {
+        on_cancel(this, cx);
+    });
+    [sub_submit, sub_cancel]
+}
+
+/// Window-aware variant of [`wire_dialog_input`] using [`Context::subscribe_in`].
+pub fn wire_dialog_input_in<V: 'static>(
+    input: &Entity<TextInput>,
+    window: &Window,
+    cx: &mut Context<V>,
+    mut on_submit: impl FnMut(&mut V, &str, &mut Window, &mut Context<V>) + 'static,
+    mut on_cancel: impl FnMut(&mut V, &mut Window, &mut Context<V>) + 'static,
+) -> [Subscription; 2] {
+    let sub_submit = cx.subscribe_in(input, window, move |this, _, event: &Submitted, window, cx| {
+        on_submit(this, &event.0, window, cx);
+    });
+    let sub_cancel = cx.subscribe_in(input, window, move |this, _, _: &Cancelled, window, cx| {
+        on_cancel(this, window, cx);
+    });
+    [sub_submit, sub_cancel]
 }
 
 #[cfg(test)]

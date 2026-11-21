@@ -3204,8 +3204,8 @@ impl TodoView {
                                 |el, tz| el.child(Label::new(tz).size(LabelSize::XSmall).color(Color::Muted)),
                             )
                         })
-                        .child(
-                            Label::new(label)
+                        .child({
+                            let due_label = Label::new(label)
                                 .size(LabelSize::Small)
                                 .color(if closed_view {
                                     Color::Muted
@@ -3213,8 +3213,25 @@ impl TodoView {
                                     Color::Error
                                 } else {
                                     Color::Accent
-                                }),
-                        )
+                                });
+                            if closed_view {
+                                due_label.into_any_element()
+                            } else {
+                                div()
+                                    .id(SharedString::from(format!("due-toggle-{id}")))
+                                    .px_1()
+                                    .rounded(px(4.))
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(theme.colors().element_hover))
+                                    .child(due_label)
+                                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.save_preferences(|p| p.countdown_dates = !p.countdown_dates, cx);
+                                    }))
+                                    .into_any_element()
+                            }
+                        })
                     })
                     // As the original's, a note with text shows a small page at the row's end.
                     .when(task.kind == fern_core::Kind::Note && !task.notes.trim().is_empty(), |el| {

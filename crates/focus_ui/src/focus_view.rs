@@ -4229,11 +4229,11 @@ impl Render for FocusView {
                                             .h(px(30.))
                                             .gap_1p5()
                                             .rounded(px(6.))
-                                            .bg(theme.colors().accent.opacity(0.14))
-                                            .hover(|s| s.bg(theme.colors().accent.opacity(0.22)))
+                                            .bg(theme.colors().accent)
+                                            .hover(|s| s.opacity(0.9))
                                             .cursor_pointer()
-                                            .child(Icon::new(IconName::Plus).size(IconSize::XSmall).color(Color::Accent))
-                                            .child(Label::new(strings.add_timer).size(LabelSize::Small).color(Color::Accent))
+                                            .child(Icon::new(IconName::Plus).size(IconSize::XSmall).color(Color::IconOnAccent))
+                                            .child(Label::new(strings.add_timer).size(LabelSize::Small).color(Color::OnAccent))
                                             .on_click(cx.listener(|this, _, window, cx| this.open_timer(None, window, cx))),
                                     ),
                             )

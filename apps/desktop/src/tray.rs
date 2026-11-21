@@ -146,6 +146,17 @@ pub fn prepare_quit() {
     remove_icon();
 }
 
+/// Restores the main window from the system tray (or minimized state) and brings it to front.
+pub fn restore_main_window() -> bool {
+    let Some(mut state) = STATE.get() else {
+        return false;
+    };
+    state.hidden_in_tray = false;
+    STATE.set(Some(state));
+    restore(state.hwnd);
+    true
+}
+
 pub fn update_labels(strings: &'static Strings) {
     LABELS.with(|labels| *labels.borrow_mut() = TrayLabels::from_strings(strings));
 }

@@ -17,9 +17,9 @@ use gpui::{App, Global, Keystroke, WindowHandle};
 use crate::app_view::AppView;
 
 /// The shortcuts, in the order the panel lists them.
-pub const COUNT: usize = 2;
-const DEFAULTS: [&str; COUNT] = ["ctrl-shift-a", "ctrl-shift-e"];
-const SETTINGS: [&str; COUNT] = ["hotkey_quick_add", "hotkey_show_hide"];
+pub const COUNT: usize = 3;
+const DEFAULTS: [&str; COUNT] = ["ctrl-shift-a", "ctrl-shift-e", "off"];
+const SETTINGS: [&str; COUNT] = ["hotkey_quick_add", "hotkey_show_hide", "hotkey_focus_mini"];
 
 /// A key with its modifiers, kept as GPUI writes keystrokes ("ctrl-shift-a").
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -178,10 +178,20 @@ fn start(window: WindowHandle<AppView>, shared: Arc<Mutex<Shared>>, cx: &mut App
                     cx.update(|cx| crate::quick_add_window::open(window, cx));
                     Ok(())
                 }
-                Event::Pressed(_) => window
+                Event::Pressed(1) => window
                     .update(cx, |_, window, _| {
-                        if window.is_window_active() { window.minimize_window() } else { window.activate_window() }
+                        if window.is_window_active() {
+                            if !crate::tray::hide_to_tray() {
+                                window.minimize_window();
+                            }
+                        } else {
+                            crate::tray::restore_main_window();
+                            window.activate_window();
+                        }
                     })
+                    .map_err(|_| ()),
+                Event::Pressed(_) => window
+                    .update(cx, |view, _, cx| view.toggle_focus_mini(cx))
                     .map_err(|_| ()),
                 // A shortcut found taken: the panel shows it.
                 Event::Registered => {

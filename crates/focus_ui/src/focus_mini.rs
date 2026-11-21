@@ -49,6 +49,17 @@ pub fn open(focus: Entity<FocusView>, cx: &mut App) {
     }
 }
 
+/// Toggles the floating focus mini window: closes it if already open, otherwise opens it.
+pub fn toggle(focus: Entity<FocusView>, cx: &mut App) {
+    if let Some(handle) = cx.try_global::<OpenFocusMini>().and_then(|g| g.0)
+        && handle.update(cx, |_, window, _| window.remove_window()).is_ok()
+    {
+        cx.set_global(OpenFocusMini(None));
+        return;
+    }
+    open(focus, cx);
+}
+
 pub struct FocusMini {
     focus: Entity<FocusView>,
     /// Kept over the other windows by its pin (Windows).

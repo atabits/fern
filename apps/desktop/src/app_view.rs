@@ -1119,7 +1119,7 @@ impl AppView {
         // Each is changed by clicking it and pressing the new keys, as in the original's Settings.
         if cfg!(windows) {
             body = body.child(heading(strings.global_shortcuts));
-            let labels = [strings.global_quick_add, strings.global_show_hide];
+            let labels = [strings.global_quick_add, strings.global_show_hide, strings.global_focus_mini];
             for (i, (binding, taken)) in crate::hotkeys::bindings(cx).into_iter().enumerate() {
                 let recording = self.recording_hotkey == Some(i);
                 let text = if recording {
@@ -1699,6 +1699,12 @@ impl AppView {
     pub fn start_focus_from_tray(&mut self, stopwatch: bool, cx: &mut Context<Self>) {
         self.focus.update(cx, |focus, cx| focus.start_mode(stopwatch, cx));
         crate::focus_view::focus_mini::open(self.focus.clone(), cx);
+    }
+
+    /// Opens or closes the floating focus mini window (global shortcut).
+    #[cfg(windows)]
+    pub fn toggle_focus_mini(&mut self, cx: &mut Context<Self>) {
+        crate::focus_view::focus_mini::toggle(self.focus.clone(), cx);
     }
 }
 

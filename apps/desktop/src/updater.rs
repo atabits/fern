@@ -214,11 +214,9 @@ impl Updater {
                     // Release global hotkeys, tray icon, and single-instance mutex BEFORE
                     // spawning the new process so it does not hit hotkey lockout or forward back.
                     crate::hotkeys::shutdown(cx);
+                    crate::tray::prepare_quit();
                     #[cfg(windows)]
-                    {
-                        crate::tray::prepare_quit();
-                        crate::single_instance::release();
-                    }
+                    crate::single_instance::release();
                     match install.launch(&staged) {
                         Ok(()) => cx.quit(),
                         Err(err) => {

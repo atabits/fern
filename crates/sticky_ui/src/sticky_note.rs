@@ -205,11 +205,11 @@ impl StickyNote {
             this.sync_detail_popup(cx);
         }).detach();
         #[cfg(windows)]
-        {
-            sizing::set_compact(window, note.compact);
-            set_topmost(window, note.pinned);
-            set_opacity(window, settings.opacity);
-        }
+        sizing::set_compact(window, note.compact);
+        set_topmost(window, note.pinned);
+        set_opacity(window, settings.opacity);
+        #[cfg(target_os = "linux")]
+        set_skip_taskbar(window, settings.hide_from_taskbar);
         cx.observe_window_bounds(window, |this, window, cx| this.bounds_changed(window, cx)).detach();
         let weak = cx.weak_entity();
         window.on_window_should_close(cx, move |_, cx| {
@@ -252,22 +252,23 @@ impl StickyNote {
         self.remember(window, cx);
     }
 
-    fn toggle_pin(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+    fn toggle_pin(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.pinned = !self.pinned;
-        #[cfg(windows)]
-        set_topmost(_window, self.pinned);
-        self.remember(_window, cx);
+        set_topmost(window, self.pinned);
+        self.remember(window, cx);
         cx.notify();
     }
 
-    #[cfg(windows)]
-    fn align_edge(&mut self, edge: sizing::ScreenEdge, window: &mut Window, cx: &mut Context<Self>) {
-        sizing::align_to_edge(window, edge);
+    fn align_edge(&mut self, edge: ScreenEdge, window: &mut Window, cx: &mut Context<Self>) {
+        align_to_edge(window, edge);
         self.remember(window, cx);
     }
 
-    #[cfg(not(windows))]
-    fn align_edge(&mut self, _edge: u8, _window: &mut Window, _cx: &mut Context<Self>) {}
+    /// Marks the note closed in local state and removes its native window.
+    pub fn close_and_forget(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.forget(cx);
+        window.remove_window();
+    }
 
     fn toggle_compact(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.compact = !self.compact;
@@ -424,17 +425,19 @@ impl StickyNote {
         cx.notify();
     }
 
-    fn settings_changed(&mut self, settings: StickySettings, _window: &Window, cx: &mut Context<Self>) {
+    fn settings_changed(&mut self, settings: StickySettings, window: &Window, cx: &mut Context<Self>) {
         let old = self.style();
         self.settings = settings;
         #[cfg(windows)]
-        {
-            if let Some(button) = &mut self.taskbar {
-                button.set_hidden(settings.hide_from_taskbar, cx);
-            }
-            if old.opacity != settings.opacity {
-                set_opacity(_window, settings.opacity);
-            }
+        if let Some(button) = &mut self.taskbar {
+            button.set_hidden(settings.hide_from_taskbar, cx);
+        }
+        #[cfg(target_os = "linux")]
+        if old.hide_from_taskbar != settings.hide_from_taskbar {
+            set_skip_taskbar(window, settings.hide_from_taskbar);
+        }
+        if old.opacity != settings.opacity {
+            set_opacity(window, settings.opacity);
         }
         if old.color != self.style().color || old.font != settings.font {
             self.update_style(cx);
@@ -491,22 +494,13 @@ impl Render for StickyNote {
                 this.detail.update(cx, |detail, cx| detail.print_current(cx));
             }))
             .on_action(cx.listener(|this, _: &AlignTop, window, cx| {
-                #[cfg(windows)]
-                this.align_edge(sizing::ScreenEdge::Top, window, cx);
-                #[cfg(not(windows))]
-                this.align_edge(0, window, cx);
+                this.align_edge(ScreenEdge::Top, window, cx);
             }))
             .on_action(cx.listener(|this, _: &AlignLeft, window, cx| {
-                #[cfg(windows)]
-                this.align_edge(sizing::ScreenEdge::Left, window, cx);
-                #[cfg(not(windows))]
-                this.align_edge(1, window, cx);
+                this.align_edge(ScreenEdge::Left, window, cx);
             }))
             .on_action(cx.listener(|this, _: &AlignRight, window, cx| {
-                #[cfg(windows)]
-                this.align_edge(sizing::ScreenEdge::Right, window, cx);
-                #[cfg(not(windows))]
-                this.align_edge(2, window, cx);
+                this.align_edge(ScreenEdge::Right, window, cx);
             }))
             .size_full()
             .overflow_hidden()
@@ -583,7 +577,7 @@ impl Render for StickyNote {
                             .tooltip(popup::tooltip(strings.color))
                             .on_click(cx.listener(|this, _, window, cx| this.toggle_palette(window, cx))),
                         )
-                        .when(cfg!(windows), |bar| bar.child(
+                        .child(
                             IconButton::new("sticky-pin", if self.pinned { IconName::PinOff } else { IconName::Pin })
                                 .size(px(20.))
                                 .icon_size(IconSize::Small)
@@ -591,7 +585,7 @@ impl Render for StickyNote {
                                 .hover_color(foreground.opacity(0.12))
                                 .tooltip(popup::tooltip(if self.pinned { strings.unpin } else { strings.pin }))
                                 .on_click(cx.listener(|this, _, window, cx| this.toggle_pin(window, cx))),
-                        ))
+                        )
                         .child(
                         IconButton::new("sticky-compact", if self.compact { IconName::ChevronDown } else { IconName::ChevronUp })
                             .size(px(20.)).icon_size(IconSize::Small).icon_color(Color::Custom(foreground))
@@ -630,9 +624,8 @@ struct StickyPalette {
 }
 
 impl StickyPalette {
-    fn new(note: WindowHandle<StickyNote>, selected: usize, _pinned: bool, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        #[cfg(windows)]
-        set_topmost(window, _pinned);
+    fn new(note: WindowHandle<StickyNote>, selected: usize, pinned: bool, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        set_topmost(window, pinned);
         cx.observe_window_activation(window, |this, window, cx| {
             if !window.is_window_active()
                 && !this.note.update(cx, |_, owner, _| owner.is_window_active()).unwrap_or(false)
@@ -688,23 +681,11 @@ impl Render for StickyPalette {
     }
 }
 
-/// Whole-window alpha, including the native surface, rather than a translucent fill.
+#[cfg(target_os = "linux")]
+use desktop_common::sticky_windows::set_skip_taskbar;
 #[cfg(windows)]
-fn set_opacity(window: &Window, opacity: u8) {
-    use windows::Win32::UI::WindowsAndMessaging::*;
-    let Some(hwnd) = win32_window_handle(window) else { return };
-    unsafe {
-        let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style | WS_EX_LAYERED.0 as isize);
-        let alpha = (u16::from(opacity.clamp(10, 100)) * 255 / 100) as u8;
-        if let Err(err) = SetLayeredWindowAttributes(hwnd, windows::Win32::Foundation::COLORREF(0), alpha, LWA_ALPHA) {
-            eprintln!("failed to set note opacity: {err}");
-        }
-    }
-}
-
-#[cfg(windows)]
-pub(crate) use desktop_common::sticky_windows::{set_topmost, win32_window_handle};
+pub(crate) use desktop_common::sticky_windows::win32_window_handle;
+use desktop_common::sticky_windows::{ScreenEdge, align_to_edge, set_opacity, set_topmost};
 
 #[cfg(test)]
 mod tests {

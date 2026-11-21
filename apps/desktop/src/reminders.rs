@@ -4,7 +4,9 @@
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex};
+#[cfg(windows)]
+use std::sync::mpsc;
 use std::time::Duration;
 #[cfg(windows)]
 use std::time::Instant;
@@ -64,21 +66,28 @@ impl Drop for WaiterSlot {
     }
 }
 
+type CancelFn = Box<dyn FnOnce() + Send>;
+
 /// Dropping this handle cancels the pending toast waiter thread immediately.
 struct ToastCancel {
-    slot: Arc<Mutex<Option<mpsc::Sender<Option<Reply>>>>>,
+    on_cancel: Arc<Mutex<Option<CancelFn>>>,
 }
 
 impl ToastCancel {
     fn inert() -> Self {
-        Self { slot: Arc::new(Mutex::new(None)) }
+        Self { on_cancel: Arc::new(Mutex::new(None)) }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn new(f: impl FnOnce() + Send + 'static) -> Self {
+        Self { on_cancel: Arc::new(Mutex::new(Some(Box::new(f)))) }
     }
 
     fn cancel(&self) {
-        if let Ok(mut guard) = self.slot.lock()
-            && let Some(sender) = guard.take()
+        if let Ok(mut guard) = self.on_cancel.lock()
+            && let Some(callback) = guard.take()
         {
-            sender.send(None).ok();
+            callback();
         }
     }
 }
@@ -150,7 +159,6 @@ impl NoticeAction {
         }
     }
 
-    #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub fn from_key(key: &str) -> Option<Self> {
         [
             NoticeAction::Snooze,
@@ -185,7 +193,6 @@ impl NoticeAction {
 /// What a click on a desktop notification asks for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reply {
-    #[cfg_attr(target_os = "macos", allow(dead_code))]
     Open,
     Action(NoticeAction),
 }
@@ -452,6 +459,15 @@ fn show_windows_toast(
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+fn ensure_macos_app() {
+    use std::sync::OnceLock;
+    static INIT: OnceLock<()> = OnceLock::new();
+    INIT.get_or_init(|| {
+        let _ = notify_rust::set_application("io.github.atabits.fern");
+    });
+}
+
 /// Shows a fire-and-forget desktop notification without blocking an OS waiter thread.
 fn show_notification_only(title: String, body: String, constant: bool) {
     #[cfg(windows)]
@@ -465,6 +481,8 @@ fn show_notification_only(title: String, body: String, constant: bool) {
     #[cfg(not(windows))]
     {
         std::thread::spawn(move || {
+            #[cfg(target_os = "macos")]
+            ensure_macos_app();
             let mut notification = notify_rust::Notification::new();
             notification.appname("Fern").summary(&title).body(&body).icon("alarm-clock");
             if constant {
@@ -493,7 +511,14 @@ fn show(
     };
     let (done_tx, done_rx) = mpsc::channel::<Option<Reply>>();
     let done_slot = Arc::new(Mutex::new(Some(done_tx)));
-    let cancel = ToastCancel { slot: Arc::clone(&done_slot) };
+    let cancel_slot = Arc::clone(&done_slot);
+    let cancel = ToastCancel::new(move || {
+        if let Ok(mut guard) = cancel_slot.lock()
+            && let Some(sender) = guard.take()
+        {
+            sender.send(None).ok();
+        }
+    });
     std::thread::spawn(move || {
         let wait = ToastWait { tx, done_tx: done_slot, done_rx, _slot: slot };
         if let Err(err) = show_windows_toast(&title, &body, &actions, constant, Some(wait)) {
@@ -503,7 +528,7 @@ fn show(
     (rx, cancel)
 }
 
-#[cfg(not(windows))]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn show(
     title: String,
     body: String,
@@ -511,12 +536,16 @@ fn show(
     constant: bool,
 ) -> (futures::channel::oneshot::Receiver<Reply>, ToastCancel) {
     let (tx, rx) = futures::channel::oneshot::channel();
-    let Some(_slot) = WaiterSlot::try_acquire() else {
+    let Some(slot) = WaiterSlot::try_acquire() else {
         show_notification_only(title, body, constant);
         return (rx, ToastCancel::inert());
     };
+    let (cancel_tx, cancel_rx) = futures::channel::oneshot::channel::<()>();
+    let cancel = ToastCancel::new(move || {
+        let _ = cancel_tx.send(());
+    });
     std::thread::spawn(move || {
-        let _guard = _slot;
+        let _guard = slot;
         let mut notification = notify_rust::Notification::new();
         notification.appname("Fern").summary(&title).body(&body).icon("alarm-clock");
         // Settings → Notifications → "Constant Reminder": the notification stays until dismissed.
@@ -527,8 +556,70 @@ fn show(
             notification.action(key, label);
         }
         notification.action("default", &title);
+        futures::executor::block_on(async move {
+            let handle = match notification.show_async().await {
+                Ok(handle) => handle,
+                Err(err) => {
+                    eprintln!("failed to show a reminder: {err}");
+                    return;
+                }
+            };
+            let reply_slot = Arc::new(Mutex::new(None::<Reply>));
+            let reply_cb = Arc::clone(&reply_slot);
+            let canceled = {
+                let wait_fut = handle.wait_for_action_async(move |response| {
+                    let reply = match response {
+                        notify_rust::NotificationResponse::Default => Some(Reply::Open),
+                        notify_rust::NotificationResponse::Action(key) => {
+                            NoticeAction::from_key(key).map(Reply::Action)
+                        }
+                        _ => None,
+                    };
+                    if let Ok(mut guard) = reply_cb.lock() {
+                        *guard = reply;
+                    }
+                });
+                futures::pin_mut!(wait_fut);
+                futures::pin_mut!(cancel_rx);
+                matches!(futures::future::select(wait_fut, cancel_rx).await, futures::future::Either::Right(_))
+            };
+            if canceled {
+                handle.close_async().await;
+            } else if let Ok(mut guard) = reply_slot.lock()
+                && let Some(reply) = guard.take()
+            {
+                tx.send(reply).ok();
+            }
+        });
+    });
+    (rx, cancel)
+}
+
+#[cfg(target_os = "macos")]
+fn show(
+    title: String,
+    body: String,
+    actions: Vec<(&'static str, &'static str)>,
+    constant: bool,
+) -> (futures::channel::oneshot::Receiver<Reply>, ToastCancel) {
+    let (tx, rx) = futures::channel::oneshot::channel();
+    let Some(slot) = WaiterSlot::try_acquire() else {
+        show_notification_only(title, body, constant);
+        return (rx, ToastCancel::inert());
+    };
+    std::thread::spawn(move || {
+        let _guard = slot;
+        ensure_macos_app();
+        let mut notification = notify_rust::Notification::new();
+        notification.appname("Fern").summary(&title).body(&body);
+        if constant {
+            notification.timeout(notify_rust::Timeout::Never);
+        }
+        // macOS maps body clicks to `"default"` automatically; only register real action buttons.
+        for (key, label) in &actions {
+            notification.action(key, label);
+        }
         match notification.show() {
-            #[cfg(all(unix, not(target_os = "macos")))]
             Ok(handle) => handle.wait_for_action(|key| {
                 let reply = if key == "default" {
                     Some(Reply::Open)
@@ -539,8 +630,6 @@ fn show(
                     tx.send(reply).ok();
                 }
             }),
-            #[cfg(target_os = "macos")]
-            Ok(_) => drop(tx),
             Err(err) => eprintln!("failed to show a reminder: {err}"),
         }
     });

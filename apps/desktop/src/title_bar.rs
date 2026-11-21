@@ -285,7 +285,11 @@ fn window_button(button: WindowButton, maximized: bool, active: bool, cx: &App) 
             el.on_mouse_move(|_, _, cx| cx.stop_propagation()).on_click(move |_, window, cx| {
                 cx.stop_propagation();
                 match button {
-                    WindowButton::Minimize => window.minimize_window(),
+                    WindowButton::Minimize => {
+                        if !crate::tray::hide_to_tray_if_enabled() {
+                            window.minimize_window();
+                        }
+                    }
                     WindowButton::Maximize => window.zoom_window(),
                     WindowButton::Close => window.dispatch_action(Box::new(CloseWindow), cx),
                 }

@@ -35,7 +35,6 @@ mod sidebar;
 #[cfg(windows)]
 mod single_instance;
 mod title_bar;
-#[cfg(windows)]
 mod tray;
 mod updater;
 mod user_themes;
@@ -116,7 +115,11 @@ fn main() -> Result<()> {
 
     let platform = gpui_platform::current_platform(false);
     let text_system = platform.text_system();
-    gpui::Application::with_platform(platform).with_assets(Assets).run(move |cx: &mut App| {
+    let app = gpui::Application::with_platform(platform).with_assets(Assets);
+    app.on_reopen(|_cx| {
+        tray::restore_main_window();
+    });
+    app.run(move |cx: &mut App| {
         cx.set_global(DbPath(db_path));
         ui::init_label_metrics(text_system, cx);
         theme::init(cx);
@@ -136,11 +139,9 @@ fn main() -> Result<()> {
         let bounds = Bounds::centered(None, size(px(1280.), px(760.)), cx);
         let (titlebar, decorations) = title_bar::window_options();
         let store_for_hotkeys = store.clone();
-        #[cfg(windows)]
         let store_for_tray = store.clone();
         let store_for_themes = store.clone();
         // Prepare the tray channel before creating the window/icon so early clicks are never dropped.
-        #[cfg(windows)]
         let tray_rx = tray::prepare_channel();
         let main_window = cx.open_window(
             WindowOptions {
@@ -156,7 +157,6 @@ fn main() -> Result<()> {
             },
             |window, cx| {
                 touch::init(window, cx);
-                #[cfg(windows)]
                 tray::init(window, &store, cx);
                 cx.new(|cx| {
                     let mut view = AppView::new(store, first_start, window, cx);
@@ -168,7 +168,6 @@ fn main() -> Result<()> {
             },
         )
         .expect("failed to open the main window");
-        #[cfg(windows)]
         tray::connect(tray_rx, main_window, store_for_tray, cx);
         AppView::register_window_actions(main_window, cx);
         updater::set_before_restart_hook(

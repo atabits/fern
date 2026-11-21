@@ -64,7 +64,6 @@ pub struct AppView {
     /// Cached `store.sync_config().is_some()` so `render` never queries SQLite every frame.
     pub(crate) has_sync_config: bool,
     /// Cached `tray::always_on_top` so `render_account_menu` never queries SQLite every frame.
-    #[cfg(windows)]
     always_on_top: bool,
     /// Settings → Features: the sections shown in the sidebar.
     pub(crate) features: fern_core::Features,
@@ -93,7 +92,6 @@ impl AppView {
             cx.defer(move |cx| {
                 if target == main_window.into() {
                     let _ = main_window.update(cx, |view, window, cx| {
-                        #[cfg(windows)]
                         if crate::tray::hide_to_tray() {
                             return;
                         }
@@ -104,18 +102,10 @@ impl AppView {
                     });
                 } else if let Some(settings) = target.downcast::<SettingsWindow>() {
                     let _ = settings.update(cx, |settings, window, cx| settings.close(window, cx));
-                } else if target.downcast::<crate::sticky_note::StickyNote>().is_some() {
-                    // StickyNote handles CloseWindow itself (calling `forget(cx)`) when focused.
-                    // If Ctrl+W bubbles here while unfocused, request a native close so
-                    // `on_window_should_close` runs instead of `remove_window()` resurrecting it.
-                    #[cfg(windows)]
-                    let _ = target.update(cx, |_, window, _| {
-                        if let Some(hwnd) = desktop_common::sticky_windows::win32_window_handle(window) {
-                            use windows::Win32::Foundation::{LPARAM, WPARAM};
-                            use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_CLOSE};
-                            let _ = unsafe { PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)) };
-                        }
-                    });
+                } else if let Some(sticky) = target.downcast::<crate::sticky_note::StickyNote>() {
+                    // StickyNote handles CloseWindow itself when focused; if Ctrl+W bubbles here
+                    // while unfocused, forget it before removing its window across every OS.
+                    let _ = sticky.update(cx, |note, window, cx| note.close_and_forget(window, cx));
                 } else {
                     let _ = target.update(cx, |_, window, _| window.remove_window());
                 }
@@ -132,11 +122,9 @@ impl AppView {
                 }).unwrap_or(true);
                 if can_quit {
                     crate::hotkeys::shutdown(cx);
+                    crate::tray::prepare_quit();
                     #[cfg(windows)]
-                    {
-                        crate::tray::prepare_quit();
-                        crate::single_instance::release();
-                    }
+                    crate::single_instance::release();
                     cx.quit();
                 }
             });
@@ -146,6 +134,10 @@ impl AppView {
     pub fn new(store: Rc<Store>, first_start: bool, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let app_view = cx.weak_entity();
         window.on_window_should_close(cx, move |window, cx| {
+            #[cfg(not(windows))]
+            if crate::tray::hide_to_tray() {
+                return false;
+            }
             app_view.update(cx, |view, cx| {
                 if !view.prepare_to_leave_calendar(window, cx) {
                     return false;
@@ -233,16 +225,12 @@ impl AppView {
         .detach();
         let focus = cx.new(|cx| FocusView::new(store.clone(), cx));
         cx.observe(&focus, |_, focus, cx| {
-            #[cfg(windows)]
-            {
-                let tip = match focus.read(cx).running_clock() {
-                    Some((clock, true)) => format!("Fern — {clock} (Paused)"),
-                    Some((clock, false)) => format!("Fern — {clock}"),
-                    None => "Fern".to_owned(),
-                };
-                crate::tray::set_tooltip(&tip);
-            }
-            let _ = focus;
+            let tip = match focus.read(cx).running_clock() {
+                Some((clock, true)) => format!("Fern — {clock} (Paused)"),
+                Some((clock, false)) => format!("Fern — {clock}"),
+                None => "Fern".to_owned(),
+            };
+            crate::tray::set_tooltip(&tip);
             cx.notify();
         })
         .detach();
@@ -255,7 +243,6 @@ impl AppView {
         let store_features = initial_prefs.features;
         let rail_order = initial_prefs.rail_order;
         let has_sync_config = store.sync_config().ok().flatten().is_some();
-        #[cfg(windows)]
         let always_on_top = crate::tray::TrayPrefs::current(&store, cx).always_on_top;
         let update_notice = release_notes::take_update_notice(&store, first_start).unwrap_or_else(|err| {
             eprintln!("failed to read the update notification: {err:#}");
@@ -266,7 +253,6 @@ impl AppView {
             this.open_settings(Some(notes.clone()), window, cx);
         })
         .detach();
-        #[cfg(windows)]
         cx.observe_global::<crate::tray::TrayPrefs>(|this, cx| {
             this.always_on_top = cx.global::<crate::tray::TrayPrefs>().always_on_top;
             cx.notify();
@@ -291,7 +277,6 @@ impl AppView {
             active_alerts: Vec::new(),
             sync: crate::sync::SyncStatus::Off,
             has_sync_config,
-            #[cfg(windows)]
             always_on_top,
             features: store_features,
             rail_order,
@@ -543,7 +528,6 @@ impl AppView {
 
     fn render_account_menu(&self, cx: &mut Context<Self>) -> AnyElement {
         let strings = i18n::t(cx);
-        #[cfg(windows)]
         let topmost = self.always_on_top;
         popover(cx)
             .min_w(px(196.))
@@ -568,28 +552,20 @@ impl AppView {
                         this.open_settings_page(settings_window::Page::Shortcuts, window, cx);
                     })),
             )
-            .when(cfg!(windows), |el| {
-                #[cfg(windows)]
-                {
-                    el.child(div().my_1().child(Divider::horizontal())).child(
-                        ListItem::new("account-always-on-top")
-                            .start_slot(Icon::new(if topmost { IconName::PinOff } else { IconName::Pin }).color(if topmost { Color::Accent } else { Color::Icon }))
-                            .child(Label::new(strings.tray_always_on_top).color(if topmost { Color::Accent } else { Color::Default }))
-                            .when(topmost, |item| item.end_slot(Icon::new(IconName::Check).size(IconSize::Small).color(Color::Accent)))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.account_menu_open = false;
-                                if let Err(err) = crate::tray::set_always_on_top(&this.store, !topmost, cx) {
-                                    eprintln!("failed to toggle always_on_top: {err:#}");
-                                }
-                                cx.notify();
-                            })),
-                    )
-                }
-                #[cfg(not(windows))]
-                {
-                    el
-                }
-            })
+            .child(div().my_1().child(Divider::horizontal()))
+            .child(
+                ListItem::new("account-always-on-top")
+                    .start_slot(Icon::new(if topmost { IconName::PinOff } else { IconName::Pin }).color(if topmost { Color::Accent } else { Color::Icon }))
+                    .child(Label::new(strings.tray_always_on_top).color(if topmost { Color::Accent } else { Color::Default }))
+                    .when(topmost, |item| item.end_slot(Icon::new(IconName::Check).size(IconSize::Small).color(Color::Accent)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.account_menu_open = false;
+                        if let Err(err) = crate::tray::set_always_on_top(&this.store, !topmost, cx) {
+                            eprintln!("failed to toggle always_on_top: {err:#}");
+                        }
+                        cx.notify();
+                    })),
+            )
             .into_any_element()
     }
 
@@ -807,7 +783,9 @@ impl AppView {
             cx.notify();
         }
         #[cfg(not(test))]
-        window.minimize_window();
+        if !crate::tray::hide_to_tray_if_enabled() {
+            window.minimize_window();
+        }
     }
 
     /// Syncs on start, whenever there are local changes to send, and every few minutes to fetch
@@ -1411,14 +1389,12 @@ impl AppView {
 
     /// Starts a Pomodoro (`stopwatch == false`) or stopwatch (`stopwatch == true`) from the tray
     /// without opening the main window, and opens the floating mini clock.
-    #[cfg(any(windows, test))]
     pub fn start_focus_from_tray(&mut self, stopwatch: bool, cx: &mut Context<Self>) {
         self.focus.update(cx, |focus, cx| focus.start_mode(stopwatch, cx));
         crate::focus_view::focus_mini::open(self.focus.clone(), cx);
     }
 
     /// Opens or closes the floating focus mini window (global shortcut).
-    #[cfg(windows)]
     pub fn toggle_focus_mini(&mut self, cx: &mut Context<Self>) {
         crate::focus_view::focus_mini::toggle(self.focus.clone(), cx);
     }

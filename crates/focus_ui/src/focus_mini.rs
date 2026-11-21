@@ -36,11 +36,10 @@ pub fn open(focus: Entity<FocusView>, cx: &mut App) {
     let opened = cx.open_window(options, |window, cx| {
         cx.new(|cx| {
             cx.observe(&focus, |_, _, cx| cx.notify()).detach();
-            #[cfg(windows)]
             desktop_common::sticky_windows::set_topmost(window, true);
             let focus_handle = cx.focus_handle();
             window.focus(&focus_handle, cx);
-            FocusMini { focus, focus_handle, pinned: cfg!(windows), should_move: false }
+            FocusMini { focus, focus_handle, pinned: true, should_move: false }
         })
     });
     match opened {
@@ -188,19 +187,16 @@ impl Render for FocusMini {
                                 cx.notify();
                             })),
                     )
-                    .when(cfg!(windows), |el| {
-                        el.child(
-                            button("focus-mini-pin", if self.pinned { IconName::PinOff } else { IconName::Pin })
-                                .icon_color(if self.pinned { Color::Accent } else { Color::Muted })
-                                .tooltip(Tooltip::text(if self.pinned { strings.unpin } else { strings.pin }))
-                                .on_click(cx.listener(|this, _, _window, cx| {
-                                    this.pinned = !this.pinned;
-                                    #[cfg(windows)]
-                                    desktop_common::sticky_windows::set_topmost(_window, this.pinned);
-                                    cx.notify();
-                                })),
-                        )
-                    })
+                    .child(
+                        button("focus-mini-pin", if self.pinned { IconName::PinOff } else { IconName::Pin })
+                            .icon_color(if self.pinned { Color::Accent } else { Color::Muted })
+                            .tooltip(Tooltip::text(if self.pinned { strings.unpin } else { strings.pin }))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.pinned = !this.pinned;
+                                desktop_common::sticky_windows::set_topmost(window, this.pinned);
+                                cx.notify();
+                            })),
+                    )
                     .child(
                         button("focus-mini-close", IconName::X)
                             .icon_color(Color::Muted)

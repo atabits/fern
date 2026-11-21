@@ -103,9 +103,7 @@ pub struct SettingsWindow {
     cached_tags: Vec<fern_core::Tag>,
     cached_lists: Vec<fern_core::List>,
     sound_enabled: bool,
-    #[cfg(windows)]
     minimize_to_tray: bool,
-    #[cfg(windows)]
     always_on_top: bool,
     installed_notes: Option<Rc<ReleaseNotes>>,
     release_notes: Option<Rc<ReleaseNotes>>,
@@ -207,7 +205,6 @@ impl SettingsWindow {
         let cached_tags = store.tags().unwrap_or_default();
         let cached_lists = store.lists().unwrap_or_default();
         let sound_enabled = desktop_common::sound::enabled(&store);
-        #[cfg(windows)]
         let tray_prefs = crate::tray::TrayPrefs::current(&store, cx);
         let field = |placeholder: &'static str, text: String, masked: bool, cx: &mut Context<Self>| {
             let input = cx.new(|cx| {
@@ -236,7 +233,6 @@ impl SettingsWindow {
             this.refresh_cached_collections(cx);
         })
         .detach();
-        #[cfg(windows)]
         cx.observe_global::<crate::tray::TrayPrefs>(|this, cx| {
             let prefs = *cx.global::<crate::tray::TrayPrefs>();
             this.minimize_to_tray = prefs.minimize_to_tray;
@@ -278,9 +274,7 @@ impl SettingsWindow {
             cached_tags,
             cached_lists,
             sound_enabled,
-            #[cfg(windows)]
             minimize_to_tray: tray_prefs.minimize_to_tray,
-            #[cfg(windows)]
             always_on_top: tray_prefs.always_on_top,
             installed_notes,
             release_notes: None,
@@ -1947,7 +1941,6 @@ impl SettingsWindow {
                             cx.notify();
                         })),
                 ));
-                #[cfg(windows)]
                 let body = {
                     let enabled = self.minimize_to_tray;
                     let topmost = self.always_on_top;

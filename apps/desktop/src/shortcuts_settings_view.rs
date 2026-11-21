@@ -7,7 +7,6 @@ use ui::{Button, ButtonVariant, ConfirmDialog};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum RecordingTarget {
     Action(usize),
-    #[cfg(windows)]
     Global(crate::hotkeys::Hotkey),
 }
 
@@ -182,7 +181,6 @@ impl SettingsWindow {
                     self.recording_rejected = false;
                     match target {
                         RecordingTarget::Action(idx) => self.apply_action_shortcut(idx, None, cx),
-                        #[cfg(windows)]
                         RecordingTarget::Global(hotkey) => crate::hotkeys::set(hotkey, None, cx),
                     }
                     cx.notify();
@@ -214,7 +212,6 @@ impl SettingsWindow {
                     }
                 }
             }
-            #[cfg(windows)]
             RecordingTarget::Global(hotkey) => {
                 if keymap::is_bare_modifier(ks) {
                     return;
@@ -302,15 +299,12 @@ impl SettingsWindow {
         // 0: General
         scroll_body = scroll_body.child(render_section(ShortcutSection::General, 0, cx));
 
-        // 1: Global Actions (Windows)
-        #[cfg(windows)]
-        {
-            scroll_body = scroll_body.child(
-                v_flex()
-                    .child(section_header(1))
-                    .child(group_card().children(self.render_global_shortcut_rows(cx))),
-            );
-        }
+        // 1: Global Actions
+        scroll_body = scroll_body.child(
+            v_flex()
+                .child(section_header(1))
+                .child(group_card().children(self.render_global_shortcut_rows(cx))),
+        );
 
         // 2: New Task
         scroll_body = scroll_body.child(render_section(ShortcutSection::NewTask, 2, cx));
@@ -358,7 +352,6 @@ impl SettingsWindow {
                     let allow_unmodified = SHORTCUT_SPECS.get(idx).is_some_and(|s| s.allow_unmodified);
                     (strings.shortcut_labels[idx], usize::from(allow_unmodified))
                 }
-                #[cfg(windows)]
                 RecordingTarget::Global(hotkey) => (hotkey.label(strings), 2),
             };
             let rejected = self.recording_rejected;
@@ -540,7 +533,6 @@ impl SettingsWindow {
             .into_any_element()
     }
 
-    #[cfg(windows)]
     fn render_global_shortcut_rows(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let strings = i18n::t(cx);
         let all = crate::hotkeys::bindings(cx);

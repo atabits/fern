@@ -683,7 +683,6 @@ pub struct Strings {
     pub notifications_page: &'static str,
     /// Settings → Notifications: each switch's name and what it does.
     pub notification_items: [(&'static str, &'static str); 3],
-    #[cfg(windows)]
     pub minimize_to_tray: &'static str,
     pub completion_sound: &'static str,
     pub tray_focus: &'static str,
@@ -1753,7 +1752,6 @@ pub static EN: Strings = Strings {
         ("Desktop Reminder", "Reminders pop up as desktop notifications; off, they only go to the bell."),
         ("Constant Reminder", "Reminders stay on screen until you dismiss them."),
     ],
-    #[cfg(windows)]
     minimize_to_tray: "Minimize to notification area",
     completion_sound: "Completion sound",
     tray_focus: "Focus",
@@ -2795,7 +2793,6 @@ pub static ZH_CN: Strings = Strings {
         ("桌面弹窗提醒", "提醒以桌面弹窗弹出；关闭后仅显示在通知铃铛内。"),
         ("常驻提醒", "提醒弹窗保持显示直到手动关闭。"),
     ],
-    #[cfg(windows)]
     minimize_to_tray: "最小化到通知区域",
     completion_sound: "完成音效",
     tray_focus: "专注",
@@ -3840,7 +3837,6 @@ pub static RU: Strings = Strings {
         ("Уведомления на рабочем столе", "Напоминания появляются как уведомления системы; если выключить, они только попадают в колокольчик."),
         ("Постоянное напоминание", "Напоминания остаются на экране, пока вы их не закроете."),
     ],
-    #[cfg(windows)]
     minimize_to_tray: "Сворачивать в область уведомлений",
     completion_sound: "Звук завершения",
     tray_focus: "Сфокусироваться",

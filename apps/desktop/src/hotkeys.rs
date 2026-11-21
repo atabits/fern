@@ -1,27 +1,36 @@
-//! System-wide shortcuts, as the original's desktop app has them: they work while another app
-//! is in front. Windows only, where `RegisterHotKey` makes them; GPUI has no such shortcuts.
+//! System-wide shortcuts that work while another application is in front.
 //!
-//! - Quick Add (Ctrl+Shift+A at first): a small field over every window (see `quick_add_window`).
-//! - Show / Hide (Ctrl+Shift+E at first): shows the main window, or hides it (to tray when enabled,
-//!   otherwise minimized) when it is in front.
-//! - Focus Mini & Pin Window: off by default, configurable in the Shortcuts panel.
+//! - **Windows**: Win32 `RegisterHotKey` message thread (`hotkeys/windows.rs`).
+//! - **macOS**: Carbon HIToolbox `RegisterEventHotKey` (`hotkeys/macos.rs`, no Accessibility permission required).
+//! - **Linux**: X11 root-window passive grabs via `x11rb` (`hotkeys/linux.rs`).
 //!
-//! Each can be changed or turned off from the Shortcuts panel, as in the original's Settings;
-//! a shortcut another app holds is shown as taken.
+//! Each shortcut can be changed or turned off from Settings → Shortcuts; a shortcut held by
+//! another application is reported as taken.
 
 use std::rc::Rc;
-#[cfg(windows)]
 use std::sync::{Arc, Condvar, Mutex};
 
 use fern_core::Store;
-use gpui::{App, WindowHandle};
-#[cfg(windows)]
-use gpui::{Global, Keystroke};
+use futures::StreamExt as _;
+use gpui::{App, Global, Keystroke, WindowHandle};
 
 use crate::app_view::AppView;
 
-/// System-wide shortcuts, in the order the Shortcuts panel lists them.
-#[cfg(any(windows, test))]
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(windows)]
+mod windows;
+
+#[cfg(target_os = "linux")]
+use linux as platform;
+#[cfg(target_os = "macos")]
+use macos as platform;
+#[cfg(windows)]
+use windows as platform;
+
+/// System-wide shortcuts, in the order Settings → Shortcuts lists them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Hotkey {
     QuickAdd = 0,
@@ -30,10 +39,8 @@ pub enum Hotkey {
     PinWindow = 3,
 }
 
-#[cfg(any(windows, test))]
 pub const COUNT: usize = 4;
 
-#[cfg(any(windows, test))]
 impl Hotkey {
     pub const ALL: [Self; COUNT] = [
         Self::QuickAdd,
@@ -42,20 +49,18 @@ impl Hotkey {
         Self::PinWindow,
     ];
 
-    #[cfg(windows)]
     pub const fn index(self) -> usize {
         self as usize
     }
 
-    const fn win32_id(self) -> i32 {
-        (self as i32) + 1
+    pub(super) const fn id(self) -> u32 {
+        (self as u32) + 1
     }
 
-    fn from_win32_id(id: usize) -> Option<Self> {
+    pub(super) fn from_id(id: usize) -> Option<Self> {
         Self::ALL.get(id.checked_sub(1)?).copied()
     }
 
-    #[cfg(windows)]
     const fn setting_key(self) -> &'static str {
         match self {
             Self::QuickAdd => "hotkey_quick_add",
@@ -65,17 +70,27 @@ impl Hotkey {
         }
     }
 
-    #[cfg(windows)]
     const fn default_setting(self) -> &'static str {
         match self {
-            Self::QuickAdd => "ctrl-shift-a",
-            Self::ShowHide => "ctrl-shift-e",
+            Self::QuickAdd => {
+                if cfg!(target_os = "macos") {
+                    "cmd-shift-a"
+                } else {
+                    "ctrl-shift-a"
+                }
+            }
+            Self::ShowHide => {
+                if cfg!(target_os = "macos") {
+                    "cmd-shift-e"
+                } else {
+                    "ctrl-shift-e"
+                }
+            }
             Self::FocusMini => "off",
             Self::PinWindow => "off",
         }
     }
 
-    #[cfg(windows)]
     pub fn label(self, strings: &'static crate::i18n::Strings) -> &'static str {
         match self {
             Self::QuickAdd => strings.global_quick_add,
@@ -86,18 +101,16 @@ impl Hotkey {
     }
 }
 
-/// A key with its modifiers, kept as GPUI writes keystrokes ("ctrl-shift-a").
-#[cfg(any(windows, test))]
+/// A key with its modifiers, stored as GPUI writes keystrokes ("ctrl-shift-a" / "cmd-shift-a").
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Binding {
-    ctrl: bool,
-    alt: bool,
-    shift: bool,
-    win: bool,
-    key: String,
+    pub(super) ctrl: bool,
+    pub(super) alt: bool,
+    pub(super) shift: bool,
+    pub(super) win: bool,
+    pub(super) key: String,
 }
 
-#[cfg(any(windows, test))]
 impl Binding {
     fn parse(text: &str) -> Option<Self> {
         let mut binding = Binding { ctrl: false, alt: false, shift: false, win: false, key: String::new() };
@@ -115,11 +128,16 @@ impl Binding {
     }
 
     /// A pressed keystroke, when it can be a system-wide shortcut: a letter, a digit, a function
-    /// key or Space, with Ctrl, Alt or Win (Shift alone would take typing away).
-    #[cfg(windows)]
+    /// key or Space, with Ctrl, Alt or Cmd/Win/Super (Shift alone would interfere with typing).
     pub fn from_keystroke(keystroke: &Keystroke) -> Option<Self> {
         let m = &keystroke.modifiers;
-        let binding = Binding { ctrl: m.control, alt: m.alt, shift: m.shift, win: m.platform, key: keystroke.key.to_lowercase() };
+        let binding = Binding {
+            ctrl: m.control,
+            alt: m.alt,
+            shift: m.shift,
+            win: m.platform,
+            key: keystroke.key.to_lowercase(),
+        };
         (binding.ctrl || binding.alt || binding.win).then_some(())?;
         binding.virtual_key()?;
         Some(binding)
@@ -127,7 +145,13 @@ impl Binding {
 
     fn to_setting(&self) -> String {
         let mut parts: Vec<&str> = Vec::new();
-        for (on, name) in [(self.ctrl, "ctrl"), (self.alt, "alt"), (self.shift, "shift"), (self.win, "win")] {
+        let platform_key = if cfg!(target_os = "macos") { "cmd" } else { "win" };
+        for (on, name) in [
+            (self.ctrl, "ctrl"),
+            (self.alt, "alt"),
+            (self.shift, "shift"),
+            (self.win, platform_key),
+        ] {
             if on {
                 parts.push(name);
             }
@@ -136,10 +160,22 @@ impl Binding {
         parts.join("-")
     }
 
-    /// "Ctrl+Shift+A", as the panel shows it.
+    /// Formats the binding for display in the Shortcuts page (e.g. "Ctrl+Shift+A" or "Cmd+Shift+A").
     pub fn label(&self) -> String {
         let mut parts: Vec<String> = Vec::new();
-        for (on, name) in [(self.ctrl, "Ctrl"), (self.alt, "Alt"), (self.shift, "Shift"), (self.win, "Win")] {
+        let platform_label = if cfg!(target_os = "macos") {
+            "Cmd"
+        } else if cfg!(target_os = "linux") {
+            "Super"
+        } else {
+            "Win"
+        };
+        for (on, name) in [
+            (self.ctrl, "Ctrl"),
+            (self.alt, "Alt"),
+            (self.shift, "Shift"),
+            (self.win, platform_label),
+        ] {
             if on {
                 parts.push(name.to_owned());
             }
@@ -152,8 +188,8 @@ impl Binding {
         parts.join("+")
     }
 
-    /// Windows' virtual-key code of the key.
-    fn virtual_key(&self) -> Option<u32> {
+    /// Windows virtual-key code (also used to validate supported keys cross-platform).
+    pub(super) fn virtual_key(&self) -> Option<u32> {
         let key = self.key.as_str();
         match key.len() {
             1 => {
@@ -161,35 +197,115 @@ impl Binding {
                 c.is_ascii_alphanumeric().then_some(c as u32)
             }
             _ if key == "space" => Some(0x20),
-            _ => key.strip_prefix('f').and_then(|n| n.parse::<u32>().ok()).filter(|n| (1..=12).contains(n)).map(|n| 0x6F + n),
+            _ => key
+                .strip_prefix('f')
+                .and_then(|n| n.parse::<u32>().ok())
+                .filter(|n| (1..=12).contains(n))
+                .map(|n| 0x6F + n),
+        }
+    }
+
+    /// macOS Carbon HIToolbox ANSI virtual keycode (`kVK_*`).
+    #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+    pub(super) fn mac_key_code(&self) -> Option<u32> {
+        match self.key.as_str() {
+            "a" => Some(0x00),
+            "s" => Some(0x01),
+            "d" => Some(0x02),
+            "f" => Some(0x03),
+            "h" => Some(0x04),
+            "g" => Some(0x05),
+            "z" => Some(0x06),
+            "x" => Some(0x07),
+            "c" => Some(0x08),
+            "v" => Some(0x09),
+            "b" => Some(0x0B),
+            "q" => Some(0x0C),
+            "w" => Some(0x0D),
+            "e" => Some(0x0E),
+            "r" => Some(0x0F),
+            "y" => Some(0x10),
+            "t" => Some(0x11),
+            "1" => Some(0x12),
+            "2" => Some(0x13),
+            "3" => Some(0x14),
+            "4" => Some(0x15),
+            "6" => Some(0x16),
+            "5" => Some(0x17),
+            "9" => Some(0x19),
+            "7" => Some(0x1A),
+            "8" => Some(0x1C),
+            "0" => Some(0x1D),
+            "o" => Some(0x1F),
+            "u" => Some(0x20),
+            "i" => Some(0x22),
+            "p" => Some(0x23),
+            "l" => Some(0x25),
+            "j" => Some(0x26),
+            "k" => Some(0x28),
+            "n" => Some(0x2D),
+            "m" => Some(0x2E),
+            "space" => Some(0x31),
+            "f1" => Some(0x7A),
+            "f2" => Some(0x78),
+            "f3" => Some(0x63),
+            "f4" => Some(0x76),
+            "f5" => Some(0x60),
+            "f6" => Some(0x61),
+            "f7" => Some(0x62),
+            "f8" => Some(0x64),
+            "f9" => Some(0x65),
+            "f10" => Some(0x6D),
+            "f11" => Some(0x67),
+            "f12" => Some(0x6F),
+            _ => None,
+        }
+    }
+
+    /// X11 keysym (`XK_*`) for Linux passive root-window key grabs.
+    #[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
+    pub(super) fn x11_keysym(&self) -> Option<u32> {
+        let key = self.key.as_str();
+        match key.len() {
+            1 => {
+                let c = key.chars().next()?.to_ascii_lowercase();
+                c.is_ascii_alphanumeric().then_some(c as u32)
+            }
+            _ if key == "space" => Some(0x0020),
+            _ => key
+                .strip_prefix('f')
+                .and_then(|n| n.parse::<u32>().ok())
+                .filter(|n| (1..=12).contains(n))
+                .map(|n| 0xFFBE + (n - 1)),
         }
     }
 }
 
-/// What the shortcuts' thread registers, and what it could not.
-#[cfg(windows)]
 #[derive(Default)]
-struct Shared {
-    bindings: [Option<Binding>; COUNT],
-    taken: [bool; COUNT],
-    /// The thread to wake when the bindings change or when shutting down.
-    thread: Option<u32>,
-    /// Set once the listener thread has unregistered all hotkeys and exited.
-    stopped: bool,
+pub(super) struct Shared {
+    pub bindings: [Option<Binding>; COUNT],
+    pub taken: [bool; COUNT],
+    #[cfg(windows)]
+    pub thread: Option<u32>,
+    #[cfg(target_os = "linux")]
+    pub wake_window: Option<u32>,
+    pub stopped: bool,
 }
 
-#[cfg(windows)]
+pub(super) enum Event {
+    Pressed(Hotkey),
+    Registered,
+}
+
 struct GlobalHotkeys {
     store: Rc<Store>,
     shared: Arc<Mutex<Shared>>,
     stopped_cv: Arc<Condvar>,
 }
 
-#[cfg(windows)]
 impl Global for GlobalHotkeys {}
 
 /// Each shortcut as set (`None` when off) and whether another app holds it.
-#[cfg(windows)]
 pub fn bindings(cx: &App) -> [(Hotkey, Option<Binding>, bool); COUNT] {
     let Some(global) = cx.try_global::<GlobalHotkeys>() else {
         return std::array::from_fn(|i| (Hotkey::ALL[i], None, false));
@@ -198,36 +314,24 @@ pub fn bindings(cx: &App) -> [(Hotkey, Option<Binding>, bool); COUNT] {
     std::array::from_fn(|i| (Hotkey::ALL[i], shared.bindings[i].clone(), shared.taken[i]))
 }
 
-#[cfg(windows)]
-fn wake_listener(thread: Option<u32>) {
-    if let Some(thread) = thread {
-        use windows::Win32::Foundation::{LPARAM, WPARAM};
-        use windows::Win32::UI::WindowsAndMessaging::{PostThreadMessageW, WM_APP};
-        unsafe { PostThreadMessageW(thread, WM_APP, WPARAM(0), LPARAM(0)) }.ok();
-    }
-}
-
-/// Changes a shortcut (`None` turns it off), keeps it in the store and registers it anew.
-#[cfg(windows)]
+/// Changes a shortcut (`None` turns it off), keeps it in the store, and registers it anew.
 pub fn set(hotkey: Hotkey, binding: Option<Binding>, cx: &mut App) {
     let Some(global) = cx.try_global::<GlobalHotkeys>() else { return };
     let value = binding.as_ref().map_or_else(|| "off".to_owned(), Binding::to_setting);
     if let Err(err) = global.store.set_setting(hotkey.setting_key(), &value) {
         eprintln!("failed to save the shortcut: {err:#}");
     }
-    let thread = {
+    {
         let mut shared = global.shared.lock().unwrap_or_else(|e| e.into_inner());
         let idx = hotkey.index();
         shared.bindings[idx] = binding;
         shared.taken[idx] = false;
-        shared.thread
-    };
-    wake_listener(thread);
+    }
+    platform::reload(&global.shared);
     cx.refresh_windows();
 }
 
 /// Restores all system-wide shortcuts to their built-in defaults in a single batched update.
-#[cfg(windows)]
 pub fn reset_defaults(cx: &mut App) {
     let Some(global) = cx.try_global::<GlobalHotkeys>() else { return };
     let defaults: [Option<Binding>; COUNT] = std::array::from_fn(|i| {
@@ -238,53 +342,23 @@ pub fn reset_defaults(cx: &mut App) {
         }
         (default != "off").then(|| Binding::parse(default)).flatten()
     });
-    let thread = {
+    {
         let mut shared = global.shared.lock().unwrap_or_else(|e| e.into_inner());
         shared.bindings = defaults;
         shared.taken = [false; COUNT];
-        shared.thread
-    };
-    wake_listener(thread);
+    }
+    platform::reload(&global.shared);
     cx.refresh_windows();
 }
 
-#[cfg(not(windows))]
-pub fn reset_defaults(_cx: &mut App) {}
-
 /// Unregisters all global hotkeys synchronously (up to a short timeout) before spawning a
-/// replacement instance on update so the new process does not hit `taken = true`.
-#[cfg(windows)]
+/// replacement instance on update or quitting so another instance does not hit `taken = true`.
 pub fn shutdown(cx: &App) {
-    use std::time::{Duration, Instant};
-    use windows::Win32::Foundation::{LPARAM, WPARAM};
-    use windows::Win32::UI::WindowsAndMessaging::{PostThreadMessageW, WM_QUIT};
-
     let Some(global) = cx.try_global::<GlobalHotkeys>() else { return };
-    let mut shared = global.shared.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(thread) = shared.thread else { return };
-    if shared.stopped {
-        return;
-    }
-    let _ = unsafe { PostThreadMessageW(thread, WM_QUIT, WPARAM(0), LPARAM(0)) };
-    let deadline = Instant::now() + Duration::from_millis(500);
-    while !shared.stopped {
-        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else { break };
-        let (guard, timeout) = global
-            .stopped_cv
-            .wait_timeout(shared, remaining)
-            .unwrap_or_else(|e| e.into_inner());
-        shared = guard;
-        if timeout.timed_out() {
-            break;
-        }
-    }
+    platform::shutdown(&global.shared, &global.stopped_cv);
 }
 
-#[cfg(not(windows))]
-pub fn shutdown(_cx: &App) {}
-
 /// Registers the shortcuts for the main window.
-#[cfg(windows)]
 pub fn init(window: WindowHandle<AppView>, store: Rc<Store>, cx: &mut App) {
     let bindings = std::array::from_fn(|i| {
         let hotkey = Hotkey::ALL[i];
@@ -306,33 +380,9 @@ pub fn init(window: WindowHandle<AppView>, store: Rc<Store>, cx: &mut App) {
     if std::env::var("FERN_DEV_STATE").is_ok_and(|state| state.contains("quick-add-window")) {
         cx.defer(move |cx| crate::quick_add_window::open(window, cx));
     }
-    start(window, shared, stopped_cv, cx);
-}
-
-#[cfg(not(windows))]
-pub fn init(window: WindowHandle<AppView>, _store: Rc<Store>, cx: &mut App) {
-    #[cfg(debug_assertions)]
-    if std::env::var("FERN_DEV_STATE").is_ok_and(|state| state.contains("quick-add-window")) {
-        cx.defer(move |cx| crate::quick_add_window::open(window, cx));
-    }
-    #[cfg(not(debug_assertions))]
-    let _ = (window, cx);
-}
-
-#[cfg(windows)]
-fn start(
-    window: WindowHandle<AppView>,
-    shared: Arc<Mutex<Shared>>,
-    stopped_cv: Arc<Condvar>,
-    cx: &mut App,
-) {
-    use futures::StreamExt as _;
 
     let (tx, mut rx) = futures::channel::mpsc::unbounded();
-    std::thread::Builder::new()
-        .name("hotkeys".into())
-        .spawn(move || listen(shared, stopped_cv, tx))
-        .ok();
+    platform::start(shared, stopped_cv, tx);
     cx.spawn(async move |cx| {
         while let Some(event) = rx.next().await {
             let handled = match event {
@@ -366,7 +416,6 @@ fn start(
                     });
                     Ok(())
                 }
-                // A shortcut found taken: the panel shows it.
                 Event::Registered => {
                     cx.update(|cx| cx.refresh_windows());
                     Ok(())
@@ -380,114 +429,35 @@ fn start(
     .detach();
 }
 
-#[cfg(windows)]
-enum Event {
-    Pressed(Hotkey),
-    Registered,
-}
-
-/// The shortcuts' thread: registers them, passes each press on, and registers them anew when
-/// they change, until `WM_QUIT` or the app ends.
-#[cfg(windows)]
-fn listen(
-    shared: Arc<Mutex<Shared>>,
-    stopped_cv: Arc<Condvar>,
-    tx: futures::channel::mpsc::UnboundedSender<Event>,
-) {
-    use windows::Win32::System::Threading::GetCurrentThreadId;
-    use windows::Win32::UI::Input::KeyboardAndMouse::{
-        HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, MOD_WIN, RegisterHotKey,
-        UnregisterHotKey,
-    };
-    use windows::Win32::UI::WindowsAndMessaging::{
-        GetMessageW, MSG, PM_NOREMOVE, PeekMessageW, WM_APP, WM_HOTKEY, WM_USER,
-    };
-
-    let unregister_all = || {
-        for hotkey in Hotkey::ALL {
-            unsafe { UnregisterHotKey(None, hotkey.win32_id()) }.ok();
-        }
-    };
-    let register = |shared: &Mutex<Shared>| {
-        let mut shared = shared.lock().unwrap_or_else(|e| e.into_inner());
-        for hotkey in Hotkey::ALL {
-            let idx = hotkey.index();
-            unsafe { UnregisterHotKey(None, hotkey.win32_id()) }.ok();
-            let Some(binding) = shared.bindings[idx].clone() else {
-                shared.taken[idx] = false;
-                continue;
-            };
-            let Some(key) = binding.virtual_key() else {
-                shared.taken[idx] = false;
-                continue;
-            };
-            let mut modifiers = MOD_NOREPEAT;
-            for (on, flag) in [
-                (binding.ctrl, MOD_CONTROL),
-                (binding.alt, MOD_ALT),
-                (binding.shift, MOD_SHIFT),
-                (binding.win, MOD_WIN),
-            ] {
-                if on {
-                    modifiers |= flag;
-                }
-            }
-            // Thread-wide (no window): WM_HOTKEY comes to this thread's queue.
-            shared.taken[idx] =
-                unsafe { RegisterHotKey(None, hotkey.win32_id(), HOT_KEY_MODIFIERS(modifiers.0), key) }
-                    .is_err();
-        }
-    };
-
-    // The queue exists once the thread has asked for a message; only then can it be woken.
-    let mut msg = MSG::default();
-    let _ = unsafe { PeekMessageW(&mut msg, None, WM_USER, WM_USER, PM_NOREMOVE) };
-    shared.lock().unwrap_or_else(|e| e.into_inner()).thread = Some(unsafe { GetCurrentThreadId() });
-    register(&shared);
-    if tx.unbounded_send(Event::Registered).is_ok() {
-        // `GetMessageW` returns > 0 for messages, 0 for WM_QUIT, and -1 on error.
-        while unsafe { GetMessageW(&mut msg, None, 0, 0) }.0 > 0 {
-            let event = match msg.message {
-                WM_HOTKEY => {
-                    let Some(hotkey) = Hotkey::from_win32_id(msg.wParam.0) else { continue };
-                    Event::Pressed(hotkey)
-                }
-                WM_APP => {
-                    register(&shared);
-                    Event::Registered
-                }
-                _ => continue,
-            };
-            if tx.unbounded_send(event).is_err() {
-                break;
-            }
-        }
-    }
-    unregister_all();
-    let mut guard = shared.lock().unwrap_or_else(|e| e.into_inner());
-    guard.stopped = true;
-    guard.thread = None;
-    stopped_cv.notify_all();
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn hotkey_win32_ids_roundtrip_and_reject_out_of_bounds() {
-        assert_eq!(Hotkey::from_win32_id(0), None);
+    fn hotkey_ids_roundtrip_and_reject_out_of_bounds() {
+        assert_eq!(Hotkey::from_id(0), None);
         for hotkey in Hotkey::ALL {
-            assert_eq!(Hotkey::from_win32_id(hotkey.win32_id() as usize), Some(hotkey));
+            assert_eq!(Hotkey::from_id(hotkey.id() as usize), Some(hotkey));
         }
-        assert_eq!(Hotkey::from_win32_id(COUNT + 1), None);
+        assert_eq!(Hotkey::from_id(COUNT + 1), None);
     }
 
     #[test]
-    fn binding_parses_and_formats_labels() {
+    fn binding_parses_formats_and_maps_all_platform_keycodes() {
         let binding = Binding::parse("ctrl-shift-a").unwrap();
         assert_eq!(binding.label(), "Ctrl+Shift+A");
         assert_eq!(binding.to_setting(), "ctrl-shift-a");
         assert!(Binding::parse("off").is_none());
+
+        // Every supported key (a-z, 0-9, space, f1-f12) must map cleanly across Windows, macOS, and Linux.
+        let mut keys: Vec<String> = ('a'..='z').chain('0'..='9').map(|c| c.to_string()).collect();
+        keys.push("space".to_owned());
+        keys.extend((1..=12).map(|n| format!("f{n}")));
+        for key in keys {
+            let parsed = Binding::parse(&format!("ctrl-{key}")).expect(&key);
+            assert!(parsed.virtual_key().is_some(), "missing win32 vk for {key}");
+            assert!(parsed.mac_key_code().is_some(), "missing macOS keycode for {key}");
+            assert!(parsed.x11_keysym().is_some(), "missing X11 keysym for {key}");
+        }
     }
 }

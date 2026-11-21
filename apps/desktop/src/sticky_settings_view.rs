@@ -26,7 +26,7 @@ impl SettingsWindow {
             .child(
                 group()
                     .child(row(strings.color).child(div().max_w(px(208.)).py_2().child(palette)))
-                    .when(cfg!(windows), |panel| panel.child(row(strings.sticky_opacity)
+                    .child(row(strings.sticky_opacity)
                         .child(div().when(opacity_at_min, |el| el.opacity(0.35)).child(
                             IconButton::new("sticky-opacity-less", IconName::Minus)
                                 .when(!opacity_at_min, |btn| btn.on_click(cx.listener(|this, _, _, cx| this.update_sticky(cx, |s| s.opacity = s.opacity.saturating_sub(10).max(10)))))
@@ -35,7 +35,7 @@ impl SettingsWindow {
                         .child(div().when(opacity_at_max, |el| el.opacity(0.35)).child(
                             IconButton::new("sticky-opacity-more", IconName::Plus)
                                 .when(!opacity_at_max, |btn| btn.on_click(cx.listener(|this, _, _, cx| this.update_sticky(cx, |s| s.opacity = (s.opacity + 10).min(100)))))
-                        ))))
+                        )))
                     .child(row(strings.sticky_font_size)
                         .child(div().when(font_at_min, |el| el.opacity(0.35)).child(
                             IconButton::new("sticky-font-less", IconName::Minus)
@@ -47,19 +47,19 @@ impl SettingsWindow {
                                 .when(!font_at_max, |btn| btn.on_click(cx.listener(|this, _, _, cx| this.update_sticky(cx, |s| s.font = (s.font + 1).min(3)))))
                         ))),
             )
-            .when(cfg!(windows), |panel| panel.child(
+            .child(
                 group()
                     .child(row(strings.sticky_pin_default).id("sticky-pin-default").cursor_pointer()
                         .hover(|s| s.bg(colors.ghost_element_hover))
                         .child(Switch::new().toggle_state(settings.pin_default))
                         .on_click(cx.listener(|this, _, _, cx| this.update_sticky(cx, |s| s.pin_default = !s.pin_default))))
-                    .child(v_flex()
+                    .when(cfg!(any(windows, target_os = "linux")), |panel| panel.child(v_flex()
                         .child(row(strings.sticky_hide_from_taskbar).id("sticky-hide-from-taskbar").cursor_pointer()
                             .hover(|s| s.bg(colors.ghost_element_hover))
                             .child(Switch::new().toggle_state(settings.hide_from_taskbar))
                             .on_click(cx.listener(|this, _, _, cx| this.update_sticky(cx, |s| s.hide_from_taskbar = !s.hide_from_taskbar))))
-                        .child(div().px_4().pb_2().child(Label::new(strings.sticky_task_view_hint).size(LabelSize::Small).color(Color::Muted)))),
-            ))
+                        .child(div().px_4().pb_2().child(Label::new(strings.sticky_task_view_hint).size(LabelSize::Small).color(Color::Muted))))),
+            )
             .children(self.sticky_error.clone().map(|message| Label::new(message).color(Color::Error)))
             .into_any_element()
     }

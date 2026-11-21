@@ -72,7 +72,6 @@ pub struct QuickAddWindow {
 
 impl QuickAddWindow {
     fn new(main: WindowHandle<AppView>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        #[cfg(windows)]
         desktop_common::sticky_windows::set_topmost(window, true);
         let (lists, recognition) = main
             .read_with(cx, |view, _| view.quick_add_context())

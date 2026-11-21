@@ -3307,21 +3307,42 @@ impl TodoView {
                     .when(task.kind == fern_core::Kind::Note && !task.notes.trim().is_empty(), |el| {
                         el.child(Icon::new(IconName::FileText).size(IconSize::XSmall).color(Color::Muted))
                     })
-                    // And a task with subtasks a small tree, open or folded.
-                    .when(has_children, |el| el.child(Icon::new(IconName::ListTree).size(IconSize::XSmall).color(Color::Muted)))
+                    // And a task with subtasks a small tree + progress count, open or folded.
+                    .when(has_children, |el| {
+                        let subs: Vec<&Task> = self
+                            .tasks
+                            .iter()
+                            .filter(|t| t.parent_id == Some(id) && !t.is_deleted() && !t.is_wont_do())
+                            .collect();
+                        let done_subs = subs.iter().filter(|t| t.is_completed()).count();
+                        let total_subs = subs.len();
+                        el.child(
+                            h_flex()
+                                .gap_0p5()
+                                .child(Icon::new(IconName::ListTree).size(IconSize::XSmall).color(Color::Muted))
+                                .when(total_subs > 0, |row| {
+                                    row.child(
+                                        Label::new(format!("{done_subs}/{total_subs}"))
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Muted),
+                                    )
+                                }),
+                        )
+                    })
                     .when(self.view == View::Trash, |el| {
                         el.child(
                             div()
-                                .id("restore")
+                                .id(SharedString::from(format!("restore-{id}")))
                                 .flex_none()
                                 .opacity(if crate::touch::active() { 1. } else { 0. })
                                 .group_hover(group.clone(), |s| s.opacity(1.))
                                 .child(
-                                    IconButton::new("restore-button", IconName::RotateCcw)
+                                    IconButton::new(SharedString::from(format!("restore-button-{id}")), IconName::RotateCcw)
                                         .size(px(20.))
                                         .icon_size(IconSize::Small)
                                         .icon_color(Color::Muted)
                                         .hover_icon_color(Color::Icon)
+                                        .tooltip(Tooltip::text(strings.restore))
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             cx.stop_propagation();
                                             this.restore(id, cx);

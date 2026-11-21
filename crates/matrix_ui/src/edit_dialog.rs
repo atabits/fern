@@ -2,7 +2,7 @@ use fern_core::matrix::{MatrixDate, MatrixKind, QuadrantRule};
 use fern_core::Priority;
 use gpui::FontWeight;
 use ui::prelude::*;
-use ui::{Placement, PopoverAttachment, popover};
+use ui::{Button, ButtonSize, ButtonVariant, Modal, Placement, PopoverAttachment, ToggleChip, popover};
 
 use desktop_common::habit_helpers::HABIT_EMOJI;
 use fern_i18n as i18n;
@@ -22,20 +22,8 @@ impl MatrixView {
         let name_valid = QuadrantRule::validate_name(&typed_name);
 
         let chip = |id: SharedString, label: SharedString, on: bool, change: Box<dyn Fn(&mut QuadrantRule)>| {
-            div()
-                .id(id)
-                .px_2()
-                .py_0p5()
-                .rounded(px(4.))
-                .cursor_pointer()
-                .when(on, |el| el.bg(theme.colors().accent).hover(|s| s.opacity(0.9)))
-                .when(!on, |el| {
-                    el.bg(theme.colors().surface_background)
-                        .border_1()
-                        .border_color(theme.colors().border)
-                        .hover(|s| s.bg(theme.colors().element_hover))
-                })
-                .child(Label::new(label).size(LabelSize::XSmall).when(on, |l| l.color(Color::OnAccent)))
+            ToggleChip::new(id, label)
+                .toggle_state(on)
                 .on_click(cx.listener(move |this, _, _, cx| {
                     if let Some((_, rule)) = this.editing.as_mut() {
                         change(rule);
@@ -60,12 +48,12 @@ impl MatrixView {
                 None => items.push(tag.to_owned()),
             }
         }
-        let row = |label: &'static str, chips: Vec<Stateful<Div>>| {
+        let row = |label: &'static str, chips: Vec<ToggleChip>| {
             h_flex()
                 .gap_2()
                 .items_start()
-                .child(div().w(px(74.)).flex_none().pt_0p5().child(Label::new(label).size(LabelSize::Small).color(Color::Muted)))
-                .child(div().flex_1().flex().flex_wrap().gap_1().children(chips))
+                .child(div().w(px(74.)).flex_none().pt_1().child(Label::new(label).size(LabelSize::Small).color(Color::Muted)))
+                .child(div().flex_1().flex().flex_wrap().gap_1p5().children(chips))
         };
         let all = |id: &'static str, empty: bool, clear: Box<dyn Fn(&mut QuadrantRule)>| {
             chip(id.into(), strings.filter_all.into(), empty, clear)
@@ -148,7 +136,7 @@ impl MatrixView {
         }
 
         // Type (All / Task / Note)
-        let kind_chips: Vec<Stateful<Div>> = MatrixKind::ALL
+        let kind_chips: Vec<ToggleChip> = MatrixKind::ALL
             .into_iter()
             .enumerate()
             .map(|(i, kind)| {
@@ -161,184 +149,143 @@ impl MatrixView {
             })
             .collect();
 
-        let button = |id: &'static str, label: &'static str, primary: bool, disabled: bool| {
-            div()
-                .id(id)
-                .h(px(30.))
-                .px_4()
-                .flex()
-                .items_center()
-                .rounded(px(6.))
-                .when(!disabled, |el| el.cursor_pointer())
-                .when(disabled, |el| el.opacity(0.45).cursor_default())
-                .when(primary, |el| {
-                    el.bg(theme.colors().accent)
-                        .when(!disabled, |el| el.hover(|s| s.opacity(0.9)))
-                })
-                .when(!primary, |el| {
-                    el.border_1()
-                        .border_color(theme.colors().border)
-                        .when(!disabled, |el| el.hover(|s| s.bg(theme.colors().element_hover)))
-                })
-                .child(Label::new(label).size(LabelSize::Small).when(primary, |label| label.color(Color::OnAccent)))
-        };
-
-        div()
-            .id("matrix-edit-backdrop")
-            .absolute()
-            .inset_0()
-            .flex()
-            .items_center()
-            .justify_center()
-            .bg(gpui::black().opacity(0.32))
-            .occlude()
+        Modal::new("matrix-edit-backdrop")
+            .width(px(500.))
+            .max_height(px(600.))
+            .child(
+                h_flex()
+                    .justify_between()
+                    .child(Label::new(strings.edit_matrix).size(LabelSize::Large).weight(FontWeight::SEMIBOLD))
+                    .child(
+                        IconButton::new("matrix-edit-x", IconName::X)
+                            .icon_color(Color::Muted)
+                            .tooltip(Tooltip::text(strings.close))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.finish_edit(None, cx);
+                            })),
+                    ),
+            )
+            // Name row + emoji picker
             .child(
                 v_flex()
-                    .id("matrix-edit-dialog")
-                    .w(px(500.))
-                    .max_h(px(600.))
-                    .p_5()
-                    .gap_3()
-                    .rounded(px(10.))
-                    .border_1()
-                    .border_color(theme.colors().border)
-                    .bg(theme.colors().elevated_surface_background)
-                    .shadow_lg()
+                    .gap_1()
                     .child(
                         h_flex()
-                            .justify_between()
-                            .child(Label::new(strings.edit_matrix).size(LabelSize::Large).weight(FontWeight::SEMIBOLD))
-                            .child(
-                                IconButton::new("matrix-edit-x", IconName::X)
-                                    .icon_color(Color::Muted)
-                                    .tooltip(Tooltip::text(strings.close))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.finish_edit(None, cx);
-                                    })),
-                            ),
-                    )
-                    // Name row + emoji picker
-                    .child(
-                        v_flex()
-                            .gap_1()
-                            .child(
-                                h_flex()
-                                    .h(px(34.))
-                                    .px_2()
-                                    .gap_2()
-                                    .rounded(px(6.))
-                                    .border_1()
-                                    .border_color(if name_valid { theme.colors().border } else { theme.status().error })
-                                    .bg(theme.colors().background)
-                                    .child(
-                                        div()
-                                            .size(px(16.))
-                                            .flex_none()
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .rounded_full()
-                                            .bg(color)
-                                            .text_color(gpui::white())
-                                            .text_size(px(8.))
-                                            .font_weight(FontWeight::BOLD)
-                                            .child(numeral),
-                                    )
-                                    .child(div().flex_1().min_w_0().child(self.name_input.clone()))
-                                    .child(
-                                        div()
-                                            .relative()
-                                            .child(
-                                                IconButton::new("matrix-name-emoji", IconName::Smile)
-                                                    .icon_size(IconSize::Small)
-                                                    .on_click(cx.listener(|this, _, _, cx| {
-                                                        this.emoji_picker_open = !this.emoji_picker_open;
-                                                        cx.notify();
-                                                    })),
-                                            )
-                                            .when(self.emoji_picker_open, |el| {
-                                                el.child(PopoverAttachment::new(
-                                                    Placement::BelowRight,
-                                                    popover(cx)
-                                                        .w(px(236.))
-                                                        .p_2()
-                                                        .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                                                            this.emoji_picker_open = false;
-                                                            cx.notify();
-                                                        }))
-                                                        .child(div().flex().flex_wrap().gap_1().children(
-                                                            HABIT_EMOJI.iter().enumerate().map(|(i, emoji)| {
-                                                                div()
-                                                                    .id(SharedString::from(format!("matrix-em-{i}")))
-                                                                    .size(px(28.))
-                                                                    .rounded(px(6.))
-                                                                    .flex()
-                                                                    .items_center()
-                                                                    .justify_center()
-                                                                    .cursor_pointer()
-                                                                    .hover(|s| s.bg(theme.colors().element_hover))
-                                                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                                                        let current = this.name_input.read(cx).text().to_owned();
-                                                                        let next = if current.trim().is_empty() {
-                                                                            (*emoji).to_owned()
-                                                                        } else {
-                                                                            format!("{emoji} {current}")
-                                                                        };
-                                                                        this.name_input.update(cx, |inp, cx| inp.set_text(next, cx));
-                                                                        this.emoji_picker_open = false;
-                                                                        cx.notify();
-                                                                    }))
-                                                                    .child(*emoji)
-                                                            }),
-                                                        )),
-                                                ))
-                                            }),
-                                    ),
-                            )
-                            .when(!name_valid, |el| {
-                                el.child(Label::new(strings.matrix_invalid_name).size(LabelSize::XSmall).color(Color::Error))
-                            }),
-                    )
-                    .child(
-                        v_scroll(
-                            "matrix-edit-rows",
-                            v_flex()
-                                .id("matrix-edit-rows-inner")
-                                .gap_3()
-                                .child(row(strings.filter_lists, list_chips))
-                                .child(row(strings.tags, tag_chips))
-                                .child(row(strings.filter_date, date_chips))
-                                .child(row(strings.filter_priority, priority_chips))
-                                .child(row(strings.matrix_kind_label, kind_chips)),
-                        )
-                        .min_h_0()
-                        .max_h(px(380.))
-                        .compact(),
-                    )
-                    .child(
-                        h_flex()
+                            .h(px(34.))
+                            .px_2()
                             .gap_2()
-                            .pt_1()
+                            .rounded(px(6.))
+                            .border_1()
+                            .border_color(if name_valid { theme.colors().border } else { theme.status().error })
+                            .bg(theme.colors().background)
                             .child(
                                 div()
-                                    .id("matrix-restore")
-                                    .px_2()
-                                    .py_1()
-                                    .rounded(px(4.))
-                                    .hover(|s| s.bg(theme.colors().element_hover))
-                                    .cursor_pointer()
-                                    .child(Label::new(strings.restore).size(LabelSize::Small).color(Color::Accent))
-                                    .on_click(cx.listener(|this, _, _, cx| this.finish_edit(Some(false), cx))),
+                                    .size(px(16.))
+                                    .flex_none()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded_full()
+                                    .bg(color)
+                                    .text_color(theme.colors().on_accent)
+                                    .text_size(px(8.))
+                                    .font_weight(FontWeight::BOLD)
+                                    .child(numeral),
                             )
-                            .child(div().flex_1())
-                            .child(button("matrix-close", strings.close, false, false).on_click(cx.listener(|this, _, _, cx| {
-                                this.finish_edit(None, cx);
-                            })))
+                            .child(div().flex_1().min_w_0().child(self.name_input.clone()))
                             .child(
-                                button("matrix-save", strings.save, true, !name_valid).when(name_valid, |el| {
-                                    el.on_click(cx.listener(|this, _, _, cx| this.finish_edit(Some(true), cx)))
-                                }),
+                                div()
+                                    .relative()
+                                    .child(
+                                        IconButton::new("matrix-name-emoji", IconName::Smile)
+                                            .icon_size(IconSize::Small)
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.emoji_picker_open = !this.emoji_picker_open;
+                                                cx.notify();
+                                            })),
+                                    )
+                                    .when(self.emoji_picker_open, |el| {
+                                        el.child(PopoverAttachment::new(
+                                            Placement::BelowRight,
+                                            popover(cx)
+                                                .w(px(236.))
+                                                .p_2()
+                                                .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                                                    this.emoji_picker_open = false;
+                                                    cx.notify();
+                                                }))
+                                                .child(div().flex().flex_wrap().gap_1().children(
+                                                    HABIT_EMOJI.iter().enumerate().map(|(i, emoji)| {
+                                                        div()
+                                                            .id(SharedString::from(format!("matrix-em-{i}")))
+                                                            .size(px(28.))
+                                                            .rounded(px(6.))
+                                                            .flex()
+                                                            .items_center()
+                                                            .justify_center()
+                                                            .cursor_pointer()
+                                                            .hover(|s| s.bg(theme.colors().element_hover))
+                                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                                let current = this.name_input.read(cx).text().to_owned();
+                                                                let next = if current.trim().is_empty() {
+                                                                    (*emoji).to_owned()
+                                                                } else {
+                                                                    format!("{emoji} {current}")
+                                                                };
+                                                                this.name_input.update(cx, |inp, cx| inp.set_text(next, cx));
+                                                                this.emoji_picker_open = false;
+                                                                cx.notify();
+                                                            }))
+                                                            .child(*emoji)
+                                                    }),
+                                                )),
+                                        ))
+                                    }),
                             ),
+                    )
+                    .when(!name_valid, |el| {
+                        el.child(Label::new(strings.matrix_invalid_name).size(LabelSize::XSmall).color(Color::Error))
+                    }),
+            )
+            .child(
+                v_scroll(
+                    "matrix-edit-rows",
+                    v_flex()
+                        .id("matrix-edit-rows-inner")
+                        .gap_3()
+                        .child(row(strings.filter_lists, list_chips))
+                        .child(row(strings.tags, tag_chips))
+                        .child(row(strings.filter_date, date_chips))
+                        .child(row(strings.filter_priority, priority_chips))
+                        .child(row(strings.matrix_kind_label, kind_chips)),
+                )
+                .min_h_0()
+                .max_h(px(380.))
+                .compact(),
+            )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .pt_1()
+                    .child(
+                        Button::new("matrix-restore", strings.restore)
+                            .variant(ButtonVariant::Ghost)
+                            .size(ButtonSize::Sm)
+                            .on_click(cx.listener(|this, _, _, cx| this.finish_edit(Some(false), cx))),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        Button::new("matrix-close", strings.close)
+                            .variant(ButtonVariant::Secondary)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.finish_edit(None, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("matrix-save", strings.save)
+                            .variant(ButtonVariant::Primary)
+                            .disabled(!name_valid)
+                            .on_click(cx.listener(|this, _, _, cx| this.finish_edit(Some(true), cx))),
                     ),
             )
             .into_any_element()

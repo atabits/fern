@@ -94,6 +94,7 @@ pub(super) enum ConfirmDeleteTarget {
     List(Id, String),
     Tag(String),
     Filter(Id, String),
+    BatchPurge(usize),
 }
 
 pub struct TodoView {
@@ -2897,6 +2898,10 @@ impl TodoView {
                     return;
                 }
             }
+            ConfirmDeleteTarget::BatchPurge(_) => {
+                self.run_batch(true, cx, |store, ids| store.batch_purge(ids));
+                return;
+            }
         }
         crate::data_version::data_changed(cx.entity_id(), cx);
         self.reload(cx);
@@ -4258,6 +4263,14 @@ impl Render for TodoView {
                     ConfirmDeleteTarget::Filter(_, name) => (
                         format!("{} \"{name}\"?", strings.delete_filter),
                         strings.confirm_delete_filter_hint,
+                    ),
+                    ConfirmDeleteTarget::BatchPurge(count) => (
+                        format!(
+                            "{} ({})?",
+                            strings.delete_forever,
+                            strings.batch_selected.replace("{n}", &count.to_string())
+                        ),
+                        strings.confirm_delete_forever_hint,
                     ),
                 };
                 el.child(

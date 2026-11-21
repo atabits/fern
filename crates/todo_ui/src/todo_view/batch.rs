@@ -260,7 +260,11 @@ impl TodoView {
                     .child(
                         action_chip("batch-purge", IconName::Trash, strings.delete_forever, false, Some(Color::Error))
                             .on_click(cx.listener(|this, _, _, cx| {
-                                this.run_batch(true, cx, |store, ids| store.batch_purge(ids));
+                                let count = this.selected_task_ids().len();
+                                if count > 0 {
+                                    this.confirm_delete = Some(super::ConfirmDeleteTarget::BatchPurge(count));
+                                    cx.notify();
+                                }
                             })),
                     ),
             );
@@ -656,7 +660,13 @@ impl TodoView {
                 )
                 .child(
                     bar_btn("batch-bar-purge", IconName::Trash, strings.delete_forever, Color::Error)
-                        .on_click(cx.listener(|this, _, _, cx| this.run_batch(true, cx, |store, ids| store.batch_purge(ids)))),
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            let count = this.selected_task_ids().len();
+                            if count > 0 {
+                                this.confirm_delete = Some(super::ConfirmDeleteTarget::BatchPurge(count));
+                                cx.notify();
+                            }
+                        })),
                 )
             })
             .when(self.view != View::Trash, |el| {

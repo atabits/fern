@@ -293,6 +293,7 @@ fn parse_date(words: &[String], today: NaiveDate) -> Option<(NaiveDate, usize)> 
         "послезавтра" | "后天" => return Some((today + Duration::days(2), 1)),
         "下周" => return Some((today + Duration::days(7), 1)),
         "下个月" => return today.checked_add_months(Months::new(1)).map(|d| (d, 1)),
+        "明年" => return today.checked_add_months(Months::new(12)).map(|d| (d, 1)),
         "weekend" | "выходные" | "выходных" | "周末" => {
             let ahead = (Weekday::Sat.num_days_from_monday() as i64
                 - today.weekday().num_days_from_monday() as i64)
@@ -319,6 +320,9 @@ fn parse_date(words: &[String], today: NaiveDate) -> Option<(NaiveDate, usize)> 
         if matches!(words[1].as_str(), "month" | "месяц" | "месяце") {
             return today.checked_add_months(Months::new(1)).map(|d| (d, 2));
         }
+        if matches!(words[1].as_str(), "year" | "год" | "году") {
+            return today.checked_add_months(Months::new(12)).map(|d| (d, 2));
+        }
     }
     if let Some(weekday) = parse_weekday(first) {
         let ahead = (weekday.num_days_from_monday() as i64
@@ -336,16 +340,39 @@ fn parse_date(words: &[String], today: NaiveDate) -> Option<(NaiveDate, usize)> 
         };
         return shift(today, count, unit).map(|date| (date, len));
     }
+    if let Some(stem) = first.strip_suffix("天后")
+        && let Ok(n) = stem.parse::<u32>()
+    {
+        return Some((today + Duration::days(n as i64), 1));
+    }
+    if let Some(stem) = first.strip_suffix("周后")
+        && let Ok(n) = stem.parse::<u32>()
+    {
+        return Some((today + Duration::weeks(n as i64), 1));
+    }
+    if let Some(stem) = first.strip_suffix("个月后")
+        && let Ok(n) = stem.parse::<u32>()
+    {
+        return today.checked_add_months(Months::new(n)).map(|d| (d, 1));
+    }
     if let Some(date) = parse_numeric_date(first, today) {
         return Some((date, 1));
     }
     if words.len() >= 2
-        && let (Ok(day), Some(month)) = (first.parse::<u32>(), parse_month(&words[1]))
+        && let Some(month) = parse_month(&words[1])
     {
-        let date = NaiveDate::from_ymd_opt(today.year(), month, day)?;
-        // "13 March" said in November means March of next year.
-        let date = if date < today { NaiveDate::from_ymd_opt(today.year() + 1, month, day)? } else { date };
-        return Some((date, 2));
+        let raw_day = first
+            .strip_suffix("st")
+            .or_else(|| first.strip_suffix("nd"))
+            .or_else(|| first.strip_suffix("rd"))
+            .or_else(|| first.strip_suffix("th"))
+            .unwrap_or(first);
+        if let Ok(day) = raw_day.parse::<u32>() {
+            let date = NaiveDate::from_ymd_opt(today.year(), month, day)?;
+            // "13 March" said in November means March of next year.
+            let date = if date < today { NaiveDate::from_ymd_opt(today.year() + 1, month, day)? } else { date };
+            return Some((date, 2));
+        }
     }
     if words.len() >= 2
         && let Some(month) = parse_month(first)
@@ -384,14 +411,28 @@ fn parse_numeric_date(word: &str, today: NaiveDate) -> Option<NaiveDate> {
     if let Ok(date) = NaiveDate::parse_from_str(word, "%Y-%m-%d") {
         return Some(date);
     }
-    let parts: Vec<&str> = word.split('.').collect();
+    if let Ok(date) = NaiveDate::parse_from_str(word, "%Y/%m/%d") {
+        return Some(date);
+    }
     let num = |s: &str| s.parse::<u32>().ok();
-    match parts.as_slice() {
+    let dot_parts: Vec<&str> = word.split('.').collect();
+    match dot_parts.as_slice() {
         [d, m] if d.len() <= 2 && m.len() <= 2 => {
+            let date = NaiveDate::from_ymd_opt(today.year(), num(m)?, num(d)?)?;
+            return if date < today { NaiveDate::from_ymd_opt(today.year() + 1, num(m)?, num(d)?) } else { Some(date) };
+        }
+        [d, m, y] if d.len() <= 2 && m.len() <= 2 && y.len() == 4 => {
+            return NaiveDate::from_ymd_opt(y.parse().ok()?, num(m)?, num(d)?);
+        }
+        _ => {}
+    }
+    let slash_parts: Vec<&str> = word.split('/').collect();
+    match slash_parts.as_slice() {
+        [m, d] if m.len() <= 2 && d.len() <= 2 => {
             let date = NaiveDate::from_ymd_opt(today.year(), num(m)?, num(d)?)?;
             if date < today { NaiveDate::from_ymd_opt(today.year() + 1, num(m)?, num(d)?) } else { Some(date) }
         }
-        [d, m, y] if d.len() <= 2 && m.len() <= 2 && y.len() == 4 => {
+        [m, d, y] if m.len() <= 2 && d.len() <= 2 && y.len() == 4 => {
             NaiveDate::from_ymd_opt(y.parse().ok()?, num(m)?, num(d)?)
         }
         _ => None,
@@ -638,5 +679,19 @@ mod tests {
         assert_eq!(p.due_date, Some(today() + Duration::days(1)));
         assert_eq!(p.repeat, Some(Recurrence::new(Frequency::Daily, 1)));
         assert_eq!(p.priority, Some(Priority::High));
+    }
+
+    #[test]
+    fn recognizes_slash_dates_ordinal_day_first_next_year_and_zh_relative() {
+        let d = |y, m, day| NaiveDate::from_ymd_opt(y, m, day).unwrap();
+        assert_eq!(parse_quick_add("Trip 2026/11/25", today(), &[]).due_date, Some(d(2026, 11, 25)));
+        assert_eq!(parse_quick_add("Trip 11/25", today(), &[]).due_date, Some(d(2026, 11, 25)));
+        assert_eq!(parse_quick_add("Trip 11/25/2027", today(), &[]).due_date, Some(d(2027, 11, 25)));
+        assert_eq!(parse_quick_add("Event 13th nov", today(), &[]).due_date, Some(d(2026, 11, 13)));
+        assert_eq!(parse_quick_add("Renew next year", today(), &[]).due_date, Some(d(2027, 10, 18)));
+        assert_eq!(parse_quick_add("Renew 明年", today(), &[]).due_date, Some(d(2027, 10, 18)));
+        assert_eq!(parse_quick_add("汇报 3天后", today(), &[]).due_date, Some(d(2026, 10, 21)));
+        assert_eq!(parse_quick_add("复盘 2周后", today(), &[]).due_date, Some(d(2026, 11, 1)));
+        assert_eq!(parse_quick_add("体检 1个月后", today(), &[]).due_date, Some(d(2026, 11, 18)));
     }
 }

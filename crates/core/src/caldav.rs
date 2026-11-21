@@ -427,14 +427,14 @@ fn first_child_text<'a>(xml: &'a str, target: &str) -> Option<&'a str> {
 /// returns `Some(Some(end_index))` (or `Some(None)` if unclosed). Returns `None` for normal tags.
 fn skip_xml_special(xml: &str, start: usize) -> Option<Option<usize>> {
     let slice = &xml[start..];
-    if slice.starts_with("<![CDATA[") {
-        return Some(slice[9..].find("]]>").map(|end| start + 9 + end + 3));
+    if let Some(rest) = slice.strip_prefix("<![CDATA[") {
+        return Some(rest.find("]]>").map(|end| start + 9 + end + 3));
     }
-    if slice.starts_with("<!--") {
-        return Some(slice[4..].find("-->").map(|end| start + 4 + end + 3));
+    if let Some(rest) = slice.strip_prefix("<!--") {
+        return Some(rest.find("-->").map(|end| start + 4 + end + 3));
     }
-    if slice.starts_with("<?") {
-        return Some(slice[2..].find("?>").map(|end| start + 2 + end + 2));
+    if let Some(rest) = slice.strip_prefix("<?") {
+        return Some(rest.find("?>").map(|end| start + 2 + end + 2));
     }
     None
 }

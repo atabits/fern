@@ -439,7 +439,7 @@ mod tests {
         t_neg.created_at = -10_000;
         let mut t_future = store.add_task("clock skew future").unwrap();
         t_future.created_at = Local::now().timestamp_millis() + 10 * 86_400_000;
-        assert_eq!(days_using(&[t_zero.clone(), t_neg.clone()], today), 0);
+        assert_eq!(days_using(&[t_zero, t_neg], today), 0);
         assert_eq!(days_using(&[t_future], today), 0);
 
         // Sparse more_productive_than handles decades-old created_at without huge dense Vec allocations.

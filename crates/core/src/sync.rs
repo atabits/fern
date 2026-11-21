@@ -716,7 +716,7 @@ mod tests {
         row.insert("created_at".into(), Json::from(12345));
         row.insert("future_ai_priority_score".into(), Json::from(99));
         row.insert("another_v2_column".into(), Json::from("hello"));
-        let future_change = Change { entity: "lists".into(), key: id.clone(), at: 500, row: Some(row) };
+        let future_change = Change { entity: "lists".into(), key: id, at: 500, row: Some(row) };
 
         // Empty row or row with only unknown columns is skipped cleanly without SQL errors.
         let empty_change = Change {

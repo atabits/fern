@@ -7704,7 +7704,7 @@ mod tests {
         let att_child = store.add_attachment(child.id, &source, &attachments_dir)?;
         let name_parent = format!("{}-{}", att_parent.id, att_parent.name);
         let name_child = format!("{}-{}", att_child.id, att_child.name);
-        store.mark_files_synced(&[name_parent.clone(), name_child.clone()])?;
+        store.mark_files_synced(&[name_parent, name_child])?;
         assert!(att_parent.path(&attachments_dir).exists());
         assert!(att_child.path(&attachments_dir).exists());
 

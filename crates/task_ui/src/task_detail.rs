@@ -1819,6 +1819,65 @@ impl TaskDetail {
             )
             .child(
                 h_flex()
+                    .gap_1p5()
+                    .children(
+                        (if draft.minutes { [30_u32, 60, 120, 240] } else { [1, 2, 4, 6] })
+                            .into_iter()
+                            .map(|preset| {
+                                let selected = draft.amount == preset;
+                                let label = if draft.minutes {
+                                    fern_core::format_minutes(preset as i64)
+                                } else {
+                                    preset.to_string()
+                                };
+                                div()
+                                    .id(SharedString::from(format!("estimate-preset-{preset}")))
+                                    .flex_1()
+                                    .h(px(24.))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(px(5.))
+                                    .cursor_pointer()
+                                    .bg(if selected {
+                                        theme.colors().accent.opacity(0.18)
+                                    } else {
+                                        theme.colors().element_hover
+                                    })
+                                    .hover(|s| s.bg(theme.colors().accent.opacity(0.24)))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.session.estimate_draft.amount = preset;
+                                        cx.notify();
+                                    }))
+                                    .child(
+                                        Label::new(label)
+                                            .size(LabelSize::XSmall)
+                                            .color(if selected { Color::Accent } else { Color::Muted }),
+                                    )
+                            }),
+                    )
+                    .when(draft.amount > 0, |el| {
+                        el.child(
+                            div()
+                                .id("estimate-clear")
+                                .px_2()
+                                .h(px(24.))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(5.))
+                                .cursor_pointer()
+                                .hover(|s| s.bg(theme.colors().element_hover))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.session.estimate_draft.amount = 0;
+                                    cx.notify();
+                                }))
+                                .child(Label::new(strings.clear).size(LabelSize::XSmall).color(Color::Muted)),
+                        )
+                    }),
+            )
+            .child(
+                h_flex()
                     .gap_2()
                     .child(button("estimate-cancel", strings.cancel, false).on_click(cx.listener(|this, _, _, cx| this.close_popup(cx))))
                     .child(button("estimate-ok", strings.ok, true).on_click(cx.listener(|this, _, _, cx| {

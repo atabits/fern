@@ -1272,7 +1272,7 @@ impl TodoView {
                     ListItem::new("empty-trash")
                         .start_slot(Icon::new(IconName::Trash).color(Color::Error))
                         .child(Label::new(strings.empty_trash).color(Color::Error))
-                        .on_click(cx.listener(|this, _, _, cx| this.empty_trash(cx))),
+                        .on_click(cx.listener(|this, _, _, cx| this.request_empty_trash(cx))),
                 )
             })
             .when(!in_trash && !matches!(self.view, View::Completed | View::WontDo | View::Search(_)), |el| {

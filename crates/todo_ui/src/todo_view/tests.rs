@@ -1463,3 +1463,40 @@ fn timeline_resize_weekends_and_secondary_timezone(cx: &mut TestAppContext) {
     assert_eq!(updated.due_date, Some(target_start));
     assert_eq!(updated.end_date, Some(target_end));
 }
+
+#[gpui::test]
+fn empty_trash_requires_confirmation_before_purging(cx: &mut TestAppContext) {
+    let store = Rc::new(Store::open_in_memory().unwrap());
+    let task = store.add_task("Deleted item").unwrap();
+    store.delete_task(task.id).unwrap();
+
+    cx.update(|cx| {
+        theme::init(cx);
+        cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+        crate::keymap::load_default(&assets::Assets, cx).unwrap();
+    });
+    let (view, cx) = cx.add_window_view(|window, cx| TodoView::new(store.clone(), window, cx));
+    cx.simulate_resize(gpui::size(px(1200.), px(700.)));
+    cx.update(|window, cx| view.update(cx, |v, cx| v.select_view(View::Trash, window, cx)));
+    cx.run_until_parked();
+
+    let btn = cx.debug_bounds("empty-trash-button").unwrap().center();
+    cx.simulate_click(btn, Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("confirm-empty-trash-modal").is_some());
+    assert!(store.task(task.id).unwrap().is_some(), "trash must not purge before confirmation");
+
+    let cancel = cx.debug_bounds("empty-trash-cancel").unwrap().center();
+    cx.simulate_click(cancel, Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("confirm-empty-trash-modal").is_none());
+    assert!(store.task(task.id).unwrap().is_some());
+
+    cx.simulate_click(btn, Modifiers::default());
+    cx.run_until_parked();
+    let confirm = cx.debug_bounds("empty-trash-confirm").unwrap().center();
+    cx.simulate_click(confirm, Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("confirm-empty-trash-modal").is_none());
+    assert!(store.task(task.id).unwrap().is_none(), "confirming permanently purges trash");
+}

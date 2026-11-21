@@ -146,6 +146,7 @@ pub struct TodoView {
     panel_drag: Option<PanelDragState>,
     search_input: Entity<TextInput>,
     header_menu_open: bool,
+    confirm_empty_trash: bool,
     /// Filters of the Completed and Won't Do views; `None` lists means all lists.
     closed_range: ClosedRange,
     closed_lists: Option<Vec<Option<Id>>>,
@@ -418,6 +419,7 @@ impl TodoView {
             panel_drag: None,
             search_input,
             header_menu_open: false,
+            confirm_empty_trash: false,
             closed_range: ClosedRange::All,
             closed_lists: None,
             closed_menu: None,
@@ -1829,6 +1831,7 @@ impl TodoView {
             self.merge_dialog.take().is_some(),
             self.suggestions_open.take().is_some(),
             std::mem::take(&mut self.header_menu_open),
+            std::mem::take(&mut self.confirm_empty_trash),
             std::mem::take(&mut self.postpone_menu),
             std::mem::take(&mut self.scale_menu_open),
             std::mem::take(&mut self.templates_open),
@@ -2803,8 +2806,18 @@ impl TodoView {
         self.reload(cx);
     }
 
+    fn request_empty_trash(&mut self, cx: &mut Context<Self>) {
+        self.header_menu_open = false;
+        if self.tasks.is_empty() {
+            return;
+        }
+        self.confirm_empty_trash = true;
+        cx.notify();
+    }
+
     fn empty_trash(&mut self, cx: &mut Context<Self>) {
         self.header_menu_open = false;
+        self.confirm_empty_trash = false;
         let result = self.store.empty_trash();
         self.check(result);
         self.reload(cx);
@@ -3617,8 +3630,11 @@ impl Render for TodoView {
                     )
                     .when(self.view == View::Trash, |el| {
                         el.child(
-                            IconButton::new("empty-trash-button", IconName::BrushCleaning)
-                                .on_click(cx.listener(|this, _, _, cx| this.empty_trash(cx))),
+                            div().debug_selector(|| "empty-trash-button".to_owned()).child(
+                                IconButton::new("empty-trash-button", IconName::BrushCleaning)
+                                    .tooltip(Tooltip::text(strings.empty_trash))
+                                    .on_click(cx.listener(|this, _, _, cx| this.request_empty_trash(cx))),
+                            ),
                         )
                     })
                     // The original's light bulb in Today: Suggested Tasks.
@@ -3988,6 +4004,78 @@ impl Render for TodoView {
             .children(self.folder_dialog.clone())
             .children(self.tag_dialog.clone())
             .children(self.merge_dialog.clone())
+            .when(self.confirm_empty_trash, |el| {
+                el.child(
+                    div()
+                        .id("confirm-empty-trash-backdrop")
+                        .debug_selector(|| "confirm-empty-trash-modal".to_owned())
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .bg(gpui::black().opacity(0.35))
+                        .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                            this.confirm_empty_trash = false;
+                            cx.notify();
+                        }))
+                        .child(
+                            v_flex()
+                                .id("confirm-empty-trash-card")
+                                .w(px(340.))
+                                .p_5()
+                                .gap_3()
+                                .rounded(px(10.))
+                                .bg(theme.colors().elevated_surface_background)
+                                .border_1()
+                                .border_color(theme.colors().border)
+                                .shadow_lg()
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .child(Label::new(strings.confirm_empty_trash).size(LabelSize::Large).weight(FontWeight::SEMIBOLD))
+                                .child(Label::new(strings.confirm_empty_trash_hint).size(LabelSize::Small).color(Color::Muted))
+                                .child(
+                                    h_flex()
+                                        .pt_2()
+                                        .gap_2()
+                                        .justify_end()
+                                        .child(
+                                            div()
+                                                .id("empty-trash-cancel")
+                                                .debug_selector(|| "empty-trash-cancel".to_owned())
+                                                .px_3()
+                                                .h(px(30.))
+                                                .flex()
+                                                .items_center()
+                                                .rounded(px(6.))
+                                                .border_1()
+                                                .border_color(theme.colors().border)
+                                                .cursor_pointer()
+                                                .hover(|s| s.bg(theme.colors().element_hover))
+                                                .child(Label::new(strings.cancel).size(LabelSize::Small))
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.confirm_empty_trash = false;
+                                                    cx.notify();
+                                                })),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("empty-trash-confirm")
+                                                .debug_selector(|| "empty-trash-confirm".to_owned())
+                                                .px_3()
+                                                .h(px(30.))
+                                                .flex()
+                                                .items_center()
+                                                .rounded(px(6.))
+                                                .bg(theme.status().error)
+                                                .cursor_pointer()
+                                                .hover(|s| s.bg(theme.status().error.opacity(0.9)))
+                                                .child(Label::new(strings.empty_trash).size(LabelSize::Small).color(Color::OnAccent))
+                                                .on_click(cx.listener(|this, _, _, cx| this.empty_trash(cx))),
+                                        ),
+                                ),
+                        ),
+                )
+            })
     }
 }
 

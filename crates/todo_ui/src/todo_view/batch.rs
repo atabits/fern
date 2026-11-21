@@ -279,6 +279,9 @@ impl TodoView {
                                 None,
                             )
                             .on_click(cx.listener(move |this, _, _, cx| {
+                                if !all_completed {
+                                    desktop_common::sound::play_complete(&this.store);
+                                }
                                 this.run_batch(false, cx, move |store, ids| store.batch_complete(ids, !all_completed));
                             })),
                         )
@@ -317,6 +320,21 @@ impl TodoView {
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.run_batch(false, cx, move |store, ids| store.batch_set_pinned(ids, !all_pinned));
                             })),
+                        )
+                        .child(
+                            action_chip("batch-merge", IconName::ListChecks, strings.batch_merge, false, None)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    let ids = this.selected_task_ids();
+                                    let merged = this.check(this.store.batch_merge_tasks(&ids)).flatten();
+                                    if let Some(target_id) = merged {
+                                        this.multi_selected.clear();
+                                        this.batch_menu = None;
+                                        this.selected = None;
+                                        this.reload(cx);
+                                        this.select(target_id, cx);
+                                        crate::data_version::data_changed(cx.entity_id(), cx);
+                                    }
+                                })),
                         ),
                 )
                 // Due dates.
@@ -630,6 +648,9 @@ impl TodoView {
                         Color::Icon,
                     )
                     .on_click(cx.listener(move |this, _, _, cx| {
+                        if !all_completed {
+                            desktop_common::sound::play_complete(&this.store);
+                        }
                         this.run_batch(false, cx, move |store, ids| store.batch_complete(ids, !all_completed));
                     })),
                 )

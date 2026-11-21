@@ -5102,6 +5102,67 @@ impl Store {
         })
     }
 
+    /// Merges multiple selected tasks into the first task: subsequent tasks (and their checklist
+    /// items) become checklist items on the first task, their tags and notes are merged in, and
+    /// the absorbed tasks are moved to the Trash.
+    pub fn batch_merge_tasks(&self, ids: &[Id]) -> Result<Option<Id>> {
+        if ids.len() < 2 {
+            return Ok(None);
+        }
+        self.in_tx(|| {
+            let Some(target) = self.task(ids[0])? else {
+                return Ok(None);
+            };
+            let mut tags = target.tags.clone();
+            let mut tags_changed = false;
+            let mut notes = target.notes.trim_end().to_owned();
+            let mut notes_changed = false;
+
+            for &other_id in &ids[1..] {
+                if other_id == target.id {
+                    continue;
+                }
+                let Some(other) = self.task(other_id)? else {
+                    continue;
+                };
+                if !other.title.trim().is_empty() {
+                    let added = self.add_checklist_item(target.id, other.title.trim(), None)?;
+                    if other.is_completed() {
+                        self.set_checklist_item_completed(added.id, true)?;
+                    }
+                }
+                for item in self.checklist(other.id)? {
+                    let copied = self.add_checklist_item(target.id, &item.title, None)?;
+                    if item.completed {
+                        self.set_checklist_item_completed(copied.id, true)?;
+                    }
+                }
+                for tag in other.tags {
+                    if !tags.iter().any(|existing| existing.eq_ignore_ascii_case(&tag)) {
+                        tags.push(tag);
+                        tags_changed = true;
+                    }
+                }
+                let other_notes = other.notes.trim();
+                if !other_notes.is_empty() {
+                    if !notes.is_empty() {
+                        notes.push_str("\n\n");
+                    }
+                    notes.push_str(other_notes);
+                    notes_changed = true;
+                }
+                self.delete_task(other.id)?;
+            }
+            if tags_changed {
+                self.replace_task_tags(target.id, &tags)?;
+            }
+            if notes_changed {
+                self.set_notes(target.id, &notes)?;
+            }
+            Ok(Some(target.id))
+        })
+    }
+
     fn set_deleted(&self, id: Id, deleted_at: Option<i64>) -> Result<()> {
         self.in_tx(|| {
             let mut stmt = self.conn.prepare_cached("UPDATE tasks SET deleted_at = ?2 WHERE id = ?1")?;
@@ -7280,6 +7341,41 @@ mod tests {
         // Marking an unpushed draft deleted drops it immediately.
         assert!(store.mark_calendar_event_deleted(sub_id, "l1")?);
         assert!(store.calendar_events(sub_id)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn batch_merge_tasks_combines_checklist_tags_and_notes() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let a = store.add_task("Trip prep")?;
+        store.set_tags(a.id, &["travel".into()])?;
+        store.set_notes(a.id, "Main note")?;
+        let b = store.add_task("Pack passport")?;
+        store.set_tags(b.id, &["Travel".into(), "urgent".into()])?;
+        store.set_notes(b.id, "Passport note")?;
+        let sub = store.add_checklist_item(b.id, "Check expiry", None)?;
+        store.set_checklist_item_completed(sub.id, true)?;
+        let c = store.add_task("Book taxi")?;
+        store.set_completed(c.id, true)?;
+
+        let merged_id = store.batch_merge_tasks(&[a.id, b.id, c.id])?;
+        assert_eq!(merged_id, Some(a.id));
+
+        let merged = store.task(a.id)?.unwrap();
+        assert_eq!(merged.tags, vec!["travel".to_owned(), "urgent".to_owned()]);
+        assert_eq!(merged.notes, "Main note\n\nPassport note");
+
+        let items = store.checklist(a.id)?;
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].title, "Pack passport");
+        assert!(!items[0].completed);
+        assert_eq!(items[1].title, "Check expiry");
+        assert!(items[1].completed);
+        assert_eq!(items[2].title, "Book taxi");
+        assert!(items[2].completed);
+
+        assert!(store.task(b.id)?.unwrap().is_deleted());
+        assert!(store.task(c.id)?.unwrap().is_deleted());
         Ok(())
     }
 }

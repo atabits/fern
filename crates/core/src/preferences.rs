@@ -295,6 +295,37 @@ impl DateFormat {
     }
 }
 
+/// The first day of the next week after `today`, honoring the user's configured `week_start`.
+///
+/// With `week_start == Weekday::Mon`: Sunday maps to tomorrow (Monday) and Monday maps to
+/// next Monday (`+7` days). With `week_start == Weekday::Sun`: Saturday maps to tomorrow (Sunday)
+/// and Sunday maps to next Sunday (`+7` days).
+pub fn next_week_date(today: NaiveDate, week_start: Weekday) -> NaiveDate {
+    let offset = (today.weekday().num_days_from_monday() + 7 - week_start.num_days_from_monday()) % 7;
+    today + Duration::days(7 - offset as i64)
+}
+
+/// Canonical quick-reschedule date shortcuts shared across menus, pickers, and quick-add.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum QuickDate {
+    Today,
+    Tomorrow,
+    NextWeek,
+    NoDate,
+}
+
+impl QuickDate {
+    /// Resolves this shortcut into a due date relative to `today` and `week_start`.
+    pub fn resolve(self, today: NaiveDate, week_start: Weekday) -> Option<NaiveDate> {
+        match self {
+            Self::Today => Some(today),
+            Self::Tomorrow => Some(today + Duration::days(1)),
+            Self::NextWeek => Some(next_week_date(today, week_start)),
+            Self::NoDate => None,
+        }
+    }
+}
+
 /// The original's "Default Date" for new tasks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DefaultDate {
@@ -310,11 +341,16 @@ impl DefaultDate {
 
     /// The day it means; "Next Week" is the next Monday, as the original's date shortcuts.
     pub fn date(self, today: NaiveDate) -> NaiveDate {
+        self.date_with_week_start(today, Weekday::Mon)
+    }
+
+    /// Like [`Self::date`], honoring the user's configured `week_start` for [`Self::NextWeek`].
+    pub fn date_with_week_start(self, today: NaiveDate, week_start: Weekday) -> NaiveDate {
         match self {
             DefaultDate::Today => today,
             DefaultDate::Tomorrow => today + Duration::days(1),
             DefaultDate::DayAfterTomorrow => today + Duration::days(2),
-            DefaultDate::NextWeek => today + Duration::days(7 - today.weekday().num_days_from_monday() as i64),
+            DefaultDate::NextWeek => next_week_date(today, week_start),
         }
     }
 
@@ -840,6 +876,17 @@ mod tests {
         let monday = NaiveDate::from_ymd_opt(2026, 10, 19).unwrap();
         assert_eq!(DefaultDate::NextWeek.date(monday), NaiveDate::from_ymd_opt(2026, 10, 26).unwrap());
         assert_eq!(TaskDefaults::default().timed_reminder, Some(0));
+
+        // Canonical next_week_date & QuickDate respect week_start.
+        assert_eq!(next_week_date(sunday, Weekday::Mon), monday);
+        assert_eq!(next_week_date(monday, Weekday::Mon), NaiveDate::from_ymd_opt(2026, 10, 26).unwrap());
+        assert_eq!(next_week_date(sunday, Weekday::Sun), NaiveDate::from_ymd_opt(2026, 10, 25).unwrap());
+        let saturday = NaiveDate::from_ymd_opt(2026, 10, 17).unwrap();
+        assert_eq!(next_week_date(saturday, Weekday::Sun), sunday);
+        assert_eq!(QuickDate::Today.resolve(sunday, Weekday::Mon), Some(sunday));
+        assert_eq!(QuickDate::Tomorrow.resolve(sunday, Weekday::Mon), Some(monday));
+        assert_eq!(QuickDate::NextWeek.resolve(sunday, Weekday::Mon), Some(monday));
+        assert_eq!(QuickDate::NoDate.resolve(sunday, Weekday::Mon), None);
     }
 
     #[test]

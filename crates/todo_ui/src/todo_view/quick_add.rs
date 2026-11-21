@@ -46,6 +46,7 @@ impl TodoView {
             Ok(task)
         })();
         if let Some(task) = self.check(result) {
+            crate::data_version::data_changed(cx.entity_id(), cx);
             self.reload(cx);
             self.select(task.id, cx);
         }
@@ -91,6 +92,9 @@ impl TodoView {
                             IconButton::new(SharedString::from(format!("delete-template-{id}")), IconName::X)
                                 .size(px(20.))
                                 .icon_size(IconSize::XSmall)
+                                .icon_color(Color::Muted)
+                                .hover_icon_color(Color::Error)
+                                .tooltip(Tooltip::text(strings.delete))
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     cx.stop_propagation();
                                     let result = this.store.delete_template(id);
@@ -654,32 +658,50 @@ impl TodoView {
             Some(field @ (RangeField::StartDate | RangeField::EndDate)) => {
                 let shown = if field == RangeField::EndDate { range.end_date } else { range.date };
                 let month = crate::calendar::month_start(shown.unwrap_or(today));
+                let (span_start, span_end) = match (range.date, range.end_date) {
+                    (Some(s), Some(e)) => (Some(s.min(e)), Some(s.max(e))),
+                    (s, e) => (s, e),
+                };
                 Some(
                     v_flex()
                         .children(crate::calendar::month_grid(month).chunks(7).map(|week| {
                             h_flex().children(week.iter().map(|&date| {
-                                let selected = shown == Some(date);
-                                div().flex_1().flex().justify_center().child(
-                                    div()
-                                        .id(SharedString::from(format!("add-range-day-{date}")))
-                                        .size(px(26.))
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .rounded_full()
-                                        .cursor_pointer()
-                                        .when(selected, |el| el.bg(theme.colors().accent))
-                                        .when(!selected, |el| el.hover(|s| s.bg(theme.colors().element_hover)))
-                                        .child(Label::new(date.day().to_string()).centered().size(LabelSize::Small).color(
-                                            if selected { Color::OnAccent } else if date.month() == month.month() { Color::Default } else { Color::Muted },
-                                        ))
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            if let Some(range) = this.add_range.as_mut() {
-                                                range.pick_range_date(date);
-                                            }
-                                            cx.notify();
-                                        })),
-                                )
+                                let is_endpoint = span_start == Some(date) || span_end == Some(date);
+                                let in_span = matches!((span_start, span_end), (Some(s), Some(e)) if date > s && date < e);
+                                div()
+                                    .flex_1()
+                                    .flex()
+                                    .justify_center()
+                                    .when(in_span, |el| el.bg(theme.colors().accent.opacity(0.16)))
+                                    .child(
+                                        div()
+                                            .id(SharedString::from(format!("add-range-day-{date}")))
+                                            .size(px(26.))
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .rounded_full()
+                                            .cursor_pointer()
+                                            .when(is_endpoint, |el| el.bg(theme.colors().accent))
+                                            .when(!is_endpoint, |el| el.hover(|s| s.bg(theme.colors().element_hover)))
+                                            .child(Label::new(date.day().to_string()).centered().size(LabelSize::Small).color(
+                                                if is_endpoint {
+                                                    Color::OnAccent
+                                                } else if in_span {
+                                                    Color::Accent
+                                                } else if date.month() == month.month() {
+                                                    Color::Default
+                                                } else {
+                                                    Color::Muted
+                                                },
+                                            ))
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                if let Some(range) = this.add_range.as_mut() {
+                                                    range.pick_range_date(date);
+                                                }
+                                                cx.notify();
+                                            })),
+                                    )
                             }))
                         }))
                         .into_any_element(),

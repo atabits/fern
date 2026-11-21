@@ -701,7 +701,7 @@ impl AppView {
                         .child(div().flex_none().pl_1().pt(px(5.)).child(
                             Icon::new(IconName::CircleCheck).size(IconSize::Small).color(Color::Accent),
                         ))
-                        .child(div().flex_1().min_w_0().pt_1().child(
+                        .child(div().flex_1().min_w_0().pt_1().line_height(px(20.)).child(
                             Label::new(message).weight(gpui::FontWeight::MEDIUM),
                         ))
                         .child(

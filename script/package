@@ -145,7 +145,7 @@ Section: utils
 Priority: optional
 Depends: libc6, libfontconfig1, libfreetype6, libvulkan1, libwayland-client0, libx11-xcb1, libxcb1, libxkbcommon0, libxkbcommon-x11-0
 Description: Tasks, calendar, habits and focus in one native app
- A free, open-source task manager inspired by TickTick. It works offline,
+ A free, open-source native task manager. It works offline,
  needs no account and keeps the data on this computer.
 EOF
             dpkg-deb -Zxz --root-owner-group --build "$deb" "$dist/$name.deb" > /dev/null

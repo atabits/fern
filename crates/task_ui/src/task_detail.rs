@@ -1533,6 +1533,22 @@ impl TaskDetail {
                     cx.write_to_clipboard(gpui::ClipboardItem::new_string(fern_core::link::task_link(task.id)));
                 }
             })), cx))
+            .child(self.close_side_menu_on_hover(item("more-copy-markdown", IconName::Code, strings.copy_markdown).on_click(cx.listener(|this, _, _, cx| {
+                this.close_popup(cx);
+                if let Some(task) = this.session.task.as_ref() {
+                    let checklist = this.session.store.checklist(task.id).unwrap_or_default();
+                    let text = fern_core::markdown::format_task_markdown(task, &checklist, &this.session.subtasks);
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+                }
+            })), cx))
+            .child(self.close_side_menu_on_hover(item("more-copy-plain", IconName::FileText, strings.copy_plain_text).on_click(cx.listener(|this, _, _, cx| {
+                this.close_popup(cx);
+                if let Some(task) = this.session.task.as_ref() {
+                    let checklist = this.session.store.checklist(task.id).unwrap_or_default();
+                    let text = fern_core::markdown::format_task_plain_text(task, &checklist, &this.session.subtasks);
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+                }
+            })), cx))
             .when(is_note || (task.parent_id.is_none() && self.session.subtasks.is_empty()), |el| {
                 el.child(self.close_side_menu_on_hover(
                     item(

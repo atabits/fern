@@ -329,6 +329,119 @@ fn inline(line: &str) -> (String, Vec<(std::ops::Range<usize>, Style)>) {
     (text, runs)
 }
 
+/// Formats a task (with its optional checklist and subtasks) as Markdown
+/// ("Export → Markdown" output).
+pub fn format_task_markdown(
+    task: &crate::model::Task,
+    checklist: &[crate::model::ChecklistItem],
+    subtasks: &[crate::model::Task],
+) -> String {
+    let mut out = String::new();
+    out.push_str("# ");
+    out.push_str(task.title.trim());
+    let mut meta = Vec::new();
+    if let Some(date) = task.due_date {
+        match task.due_time {
+            Some(time) => meta.push(format!("{date} {}", time.format("%H:%M"))),
+            None => meta.push(date.to_string()),
+        }
+    }
+    for tag in &task.tags {
+        meta.push(format!("#{tag}"));
+    }
+    if !meta.is_empty() {
+        out.push_str("\n\n");
+        out.push_str(&meta.join(" "));
+    }
+    let notes = task.notes.trim();
+    if !notes.is_empty() {
+        out.push_str("\n\n");
+        out.push_str(notes);
+    }
+    if !checklist.is_empty() {
+        out.push_str("\n\n");
+        for (i, item) in checklist.iter().enumerate() {
+            if i > 0 {
+                out.push('\n');
+            }
+            let mark = if item.completed { "x" } else { " " };
+            out.push_str(&format!("- [{mark}] {}", item.title.trim()));
+        }
+    }
+    if !subtasks.is_empty() {
+        out.push_str("\n\n");
+        for (i, sub) in subtasks.iter().enumerate() {
+            if i > 0 {
+                out.push('\n');
+            }
+            let mark = if sub.is_completed() { "x" } else { " " };
+            out.push_str(&format!("- [{mark}] {}", sub.title.trim()));
+        }
+    }
+    out
+}
+
+/// Formats a task (with its optional checklist and subtasks) as clean plain text
+/// ("Export → Plain Text" output).
+pub fn format_task_plain_text(
+    task: &crate::model::Task,
+    checklist: &[crate::model::ChecklistItem],
+    subtasks: &[crate::model::Task],
+) -> String {
+    let mut out = String::new();
+    out.push_str(task.title.trim());
+    let mut meta = Vec::new();
+    if let Some(date) = task.due_date {
+        match task.due_time {
+            Some(time) => meta.push(format!("{date} {}", time.format("%H:%M"))),
+            None => meta.push(date.to_string()),
+        }
+    }
+    for tag in &task.tags {
+        meta.push(format!("#{tag}"));
+    }
+    if !meta.is_empty() {
+        out.push('\n');
+        out.push_str(&meta.join(" "));
+    }
+    let notes = task.notes.trim();
+    if !notes.is_empty() {
+        let plain_notes: Vec<String> = blocks(notes)
+            .into_iter()
+            .map(|b| match b.kind {
+                BlockKind::Divider => "---".to_owned(),
+                BlockKind::Bullet => format!("• {}", b.text),
+                BlockKind::Numbered(n) => format!("{n}. {}", b.text),
+                BlockKind::Check(done) => format!("[{}] {}", if done { "x" } else { " " }, b.text),
+                _ => b.text,
+            })
+            .collect();
+        out.push_str("\n\n");
+        out.push_str(&plain_notes.join("\n"));
+    }
+    if !checklist.is_empty() {
+        out.push_str("\n\n");
+        for (i, item) in checklist.iter().enumerate() {
+            if i > 0 {
+                out.push('\n');
+            }
+            let mark = if item.completed { "x" } else { " " };
+            out.push_str(&format!("[{mark}] {}", item.title.trim()));
+        }
+    }
+    if !subtasks.is_empty() {
+        out.push_str("\n\n");
+        for (i, sub) in subtasks.iter().enumerate() {
+            if i > 0 {
+                out.push('\n');
+            }
+            let mark = if sub.is_completed() { "x" } else { " " };
+            out.push_str(&format!("[{mark}] {}", sub.title.trim()));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -410,5 +523,35 @@ mod tests {
         assert_eq!(apply("one\n", 4..4, Format::Divider), ("one\n---".into(), 7..7));
         assert_eq!(insert("at ", 3..3, "14:05"), ("at 14:05".into(), 8..8));
         assert_eq!(insert("é", 1..9, "x").0, "x", "a selection inside a character or past the end is clamped");
+    }
+
+    #[test]
+    fn task_export_formats_markdown_and_plain_text() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let task = store.add_task("Ship v1.0").unwrap();
+        store.set_notes(task.id, "Review **notes** and *docs*").unwrap();
+        store
+            .set_due(
+                task.id,
+                chrono::NaiveDate::from_ymd_opt(2026, 11, 21),
+                chrono::NaiveTime::from_hms_opt(14, 30, 0),
+            )
+            .unwrap();
+        store.set_tags(task.id, &["release".to_owned()]).unwrap();
+        let item1 = store.add_checklist_item(task.id, "Run tests", None).unwrap();
+        store.set_checklist_item_completed(item1.id, true).unwrap();
+        store.add_checklist_item(task.id, "Tag build", None).unwrap();
+
+        let task = store.task(task.id).unwrap().unwrap();
+        let checklist = store.checklist(task.id).unwrap();
+        let md = format_task_markdown(&task, &checklist, &[]);
+        assert!(md.starts_with("# Ship v1.0\n\n2026-11-21 14:30 #release"));
+        assert!(md.contains("Review **notes** and *docs*"));
+        assert!(md.contains("- [x] Run tests\n- [ ] Tag build"));
+
+        let plain = format_task_plain_text(&task, &checklist, &[]);
+        assert!(plain.starts_with("Ship v1.0\n2026-11-21 14:30 #release"));
+        assert!(plain.contains("Review notes and docs"));
+        assert!(plain.contains("[x] Run tests\n[ ] Tag build"));
     }
 }

@@ -123,6 +123,24 @@ impl HabitView {
                         let after_archive = habit.archived_date.is_some_and(|a| date > a);
                         let blocked = is_archived || future;
                         let dimmed = !in_this_month || future || before_start || after_archive;
+                        let date_label = calendar::format_date(date, strings);
+                        let record = records.iter().find(|r| r.date == date);
+                        let day_tip: SharedString = if let Some(goal) = habit.goal.as_ref() {
+                            let amt = record.map(|r| r.value).unwrap_or(0.0);
+                            if amt > 0.0 {
+                                format!("{date_label} · {}/{} {}", format_amount(amt), format_amount(goal.amount), goal.unit).into()
+                            } else if checked.contains(&date) {
+                                format!("{date_label} · {}", strings.completed).into()
+                            } else {
+                                date_label.into()
+                            }
+                        } else if checked.contains(&date) {
+                            format!("{date_label} · {}", strings.completed).into()
+                        } else if record.is_some_and(|r| r.is_undone()) {
+                            format!("{date_label} · {}", strings.habit_unachieved).into()
+                        } else {
+                            date_label.into()
+                        };
                         v_flex()
                             .flex_1()
                             .items_center()
@@ -137,6 +155,7 @@ impl HabitView {
                             .child(
                                 self.checkin_mark(habit, date, px(26.), cx)
                                     .id(SharedString::from(format!("detail-checkin-{date}")))
+                                    .tooltip(ui::Tooltip::text(day_tip))
                                     .when(!blocked, |el| {
                                         el.cursor_pointer()
                                             .on_click(cx.listener(move |this, _, window, cx| {

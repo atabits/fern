@@ -1732,10 +1732,9 @@ impl SettingsWindow {
                         .id("completion-sound")
                         .h(px(ROW_HEIGHT))
                         .px_4()
-                        .gap_2()
                         .cursor_pointer()
-                        .child(Checkbox::new("completion-sound-checkbox").accent().toggle_state(sound_enabled))
-                        .child(Label::new(strings.completion_sound))
+                        .child(div().flex_1().child(Label::new(strings.completion_sound)))
+                        .child(Switch::new().toggle_state(sound_enabled))
                         .on_click(cx.listener(|this, _, _, cx| {
                             let next = !desktop_common::sound::enabled(&this.store);
                             if let Err(err) = desktop_common::sound::set_enabled(&this.store, next) {
@@ -1754,10 +1753,9 @@ impl SettingsWindow {
                             .id("minimize-to-tray")
                             .h(px(ROW_HEIGHT))
                             .px_4()
-                            .gap_2()
                             .cursor_pointer()
-                            .child(Checkbox::new("minimize-to-tray-checkbox").accent().toggle_state(enabled))
-                            .child(Label::new(strings.minimize_to_tray))
+                            .child(div().flex_1().child(Label::new(strings.minimize_to_tray)))
+                            .child(Switch::new().toggle_state(enabled))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 let enabled = crate::tray::enabled(&this.store);
                                 if let Err(err) = crate::tray::set_enabled(&this.store, !enabled) {

@@ -1479,7 +1479,13 @@ impl AppView {
                     self.store.snooze_task(id, now + chrono::Duration::minutes(mins))
                 } else {
                     match action {
-                        NoticeAction::Complete => self.store.complete(id, true).map(|_| ()),
+                        NoticeAction::Complete => {
+                            let res = self.store.complete(id, true).map(|_| ());
+                            if res.is_ok() {
+                                desktop_common::sound::play_complete(&self.store);
+                            }
+                            res
+                        }
                         NoticeAction::Dismiss => self.store.clear_task_snooze(id),
                         _ => Ok(()),
                     }
@@ -1496,7 +1502,11 @@ impl AppView {
                             if self.store.checkins(habit).unwrap_or_default().contains(&today) {
                                 Ok(())
                             } else {
-                                self.store.toggle_checkin(habit, today).map(|_| ())
+                                let res = self.store.toggle_checkin(habit, today).map(|_| ());
+                                if res.is_ok() {
+                                    desktop_common::sound::play_complete(&self.store);
+                                }
+                                res
                             }
                         }
                         NoticeAction::PlusOne => {

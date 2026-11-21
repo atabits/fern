@@ -1053,8 +1053,12 @@ impl MatrixView {
         let tag_color = |name: &str| {
             lists_panel::color(self.tags.iter().find(|t| t.name == name).and_then(|t| t.color.as_deref()), cx)
         };
-        let due = task.due_date.map(|date| task_rows::due_label(date, task.due_time, today, strings));
+        let countdown_dates = self.store.preferences().map(|p| p.countdown_dates).unwrap_or(false);
+        let due = task
+            .due_date
+            .map(|date| task_rows::row_due_label(date, task.due_time, today, strings, countdown_dates));
         let has_notes = !is_note && !task.notes.trim().is_empty();
+        let has_location = task.location.as_deref().is_some_and(|l| !l.trim().is_empty());
         let has_subtasks = task.checklist.is_some() || self.tasks.iter().any(|t| t.parent_id == Some(id));
         let has_reminder = !task.reminders.is_empty();
         let dragged = DraggedTask { id, title: task.title.clone().into() };
@@ -1139,26 +1143,49 @@ impl MatrixView {
                     .when(has_notes, |el| {
                         el.child(Icon::new(IconName::FileText).size(IconSize::XSmall).color(Color::Muted))
                     })
+                    .when(has_location, |el| {
+                        el.child(Icon::new(IconName::MapPin).size(IconSize::XSmall).color(Color::Muted))
+                    })
                     .when(has_subtasks, |el| {
                         el.child(Icon::new(IconName::ListTree).size(IconSize::XSmall).color(Color::Muted))
                     })
                     .when(has_reminder, |el| {
-                        el.child(Icon::new(IconName::AlarmClock).size(IconSize::XSmall).color(Color::Muted))
+                        el.child(
+                            Icon::new(IconName::AlarmClock)
+                                .size(IconSize::XSmall)
+                                .color(if task.constant_reminder { Color::Accent } else { Color::Muted }),
+                        )
                     })
                     .when(task.repeat.is_some(), |el| {
                         el.child(Icon::new(IconName::Repeat).size(IconSize::XSmall).color(Color::Accent))
                     })
                     .when_some(due, |el, (label, overdue)| {
                         el.child(
-                            Label::new(label)
-                                .size(LabelSize::Small)
-                                .color(if completed {
-                                    Color::Muted
-                                } else if overdue {
-                                    Color::Error
-                                } else {
-                                    Color::Accent
-                                }),
+                            div()
+                                .id(SharedString::from(format!("matrix-due-toggle-{quadrant}-{id}")))
+                                .px_1()
+                                .rounded(px(4.))
+                                .cursor_pointer()
+                                .hover(|s| s.bg(theme.colors().element_hover))
+                                .child(
+                                    Label::new(label)
+                                        .size(LabelSize::Small)
+                                        .color(if completed {
+                                            Color::Muted
+                                        } else if overdue {
+                                            Color::Error
+                                        } else {
+                                            Color::Accent
+                                        }),
+                                )
+                                .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    if let Err(err) = this.store.update_preferences(|p| p.countdown_dates = !p.countdown_dates) {
+                                        eprintln!("failed to toggle countdown dates: {err:#}");
+                                    }
+                                    cx.notify();
+                                })),
                         )
                     }),
             )

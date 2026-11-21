@@ -1047,7 +1047,25 @@ impl Render for SummaryView {
                             .h(px(52.))
                             .px_4()
                             .gap_2()
-                            .child(div().flex_1().text_size(px(20.)).font_weight(FontWeight::SEMIBOLD).child(strings.summary)),
+                            .child(div().flex_1().text_size(px(20.)).font_weight(FontWeight::SEMIBOLD).child(strings.summary))
+                            .when(self.has_manual_edits(cx), |el| {
+                                el.child(
+                                    h_flex()
+                                        .id("summary-reset-edits")
+                                        .px_2()
+                                        .py_1()
+                                        .gap_1()
+                                        .rounded(px(6.))
+                                        .cursor_pointer()
+                                        .hover(|s| s.bg(colors.element_hover))
+                                        .child(Icon::new(IconName::RotateCcw).size(IconSize::XSmall).color(Color::Muted))
+                                        .child(Label::new(strings.habit_reset).size(LabelSize::Small).color(Color::Muted))
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.pending_options = Some(this.options.clone());
+                                            cx.notify();
+                                        })),
+                                )
+                            }),
                     )
                     // The original's report: its toolbar always on top, in a frame with the report.
                     .child(

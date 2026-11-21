@@ -169,6 +169,13 @@ pub struct TodoView {
     sort_menu_return_focus: Option<FocusHandle>,
     /// The current list's "Show Details", read when the list loads.
     show_details: bool,
+    /// Cached per-view flags & sort/group settings (refreshed in `reload_view_settings` so
+    /// `render()` and `move_task_drag()` perform zero SQLite queries).
+    show_completed: bool,
+    sort_descending: bool,
+    hide_new_section: bool,
+    sort_by: SortBy,
+    group_by: GroupBy,
     /// The current list's layout: cards in columns instead of rows (the menu's View).
     kanban: bool,
     /// The original's Timeline view, and the first day it shows.
@@ -196,6 +203,7 @@ pub struct TodoView {
     kanban_quick_add: bool,
     kanban_workflow: bool,
     kanban_quick_adds: HashMap<String, (DropTarget, Entity<TextInput>)>,
+    kanban_col_scrolls: HashMap<String, gpui::ScrollHandle>,
     timeline_secondary_tz: Option<String>,
     timeline_tz_menu: bool,
     timeline_tz_input: Entity<TextInput>,
@@ -218,6 +226,7 @@ pub struct TodoView {
     /// Today's "Suggested Tasks" panel (the header's light bulb), and whether its Long Unfinished
     /// list is shown in full.
     suggestions_open: Option<bool>,
+    cached_suggestions: fern_core::suggest::Suggestions,
     /// The header menu's View Options dialog and its Show Date by dropdown, while open.
     view_options: Option<bool>,
     section_rename: Option<(Id, Entity<TextInput>)>,
@@ -240,6 +249,12 @@ pub struct TodoView {
     /// Today and Next 7 Days: the habits due today, whether each is checked in and its amount;
     /// empty elsewhere or when the habit settings keep them out.
     today_habits: Vec<(fern_core::Habit, bool, f64)>,
+    /// Today's countdowns shown in the Today list (cached on reload; empty outside Today).
+    today_countdowns: Vec<fern_core::Countdown>,
+    /// Cached subtask progress `(done, total)` per parent task ID, computed in O(N) on reload.
+    subtask_progress: HashMap<Id, (usize, usize)>,
+    /// Cached templates list for the quick-add templates popover.
+    cached_templates: Vec<fern_core::Template>,
     /// Right-click context menu on a habit row in Today / Next 7 Days.
     habit_menu: Option<(Id, gpui::Point<Pixels>)>,
     /// The Summary smart list's report.
@@ -277,8 +292,8 @@ pub struct TodoView {
     multi_selected: HashSet<Id>,
     selection_anchor: Option<Id>,
     batch_menu: Option<BatchMenu>,
-    /// A task row's right-click menu: the task, pointer window coordinates, and precomputed nesting.
-    context_menu: Option<(Id, gpui::Point<Pixels>, task_menu::TaskNesting)>,
+    /// A task row's right-click menu: the cached task, pointer window coordinates, and precomputed nesting.
+    context_menu: Option<(Task, gpui::Point<Pixels>, task_menu::TaskNesting)>,
     /// Its side menu open: 0 Move to, 1 Start Focus.
     context_side: Option<u8>,
     error: Option<String>,
@@ -449,6 +464,11 @@ impl TodoView {
             sort_menu_focus: cx.focus_handle(),
             sort_menu_return_focus: None,
             show_details: false,
+            show_completed: true,
+            sort_descending: false,
+            hide_new_section: false,
+            sort_by: SortBy::Custom,
+            group_by: GroupBy::Custom,
             kanban: false,
             timeline: false,
             timeline_from: Self::today(),
@@ -465,6 +485,7 @@ impl TodoView {
             kanban_quick_add: false,
             kanban_workflow: false,
             kanban_quick_adds: HashMap::new(),
+            kanban_col_scrolls: HashMap::new(),
             timeline_secondary_tz: None,
             timeline_tz_menu: false,
             timeline_tz_input,
@@ -481,6 +502,7 @@ impl TodoView {
             timeline_folded: HashSet::new(),
             view_options: None,
             suggestions_open: None,
+            cached_suggestions: fern_core::suggest::Suggestions::default(),
             section_rename: None,
             title_edit: None,
             section_menu: None,
@@ -504,6 +526,9 @@ impl TodoView {
             mini_month: crate::calendar::month_start(Self::today()),
             busy_days: HashSet::new(),
             today_habits: Vec::new(),
+            today_countdowns: Vec::new(),
+            subtask_progress: HashMap::new(),
+            cached_templates: Vec::new(),
             habit_menu: None,
             summary,
             filter_edit: None,
@@ -669,12 +694,18 @@ impl TodoView {
                         self.store.save_template(id).ok();
                     }
                 }
-                Some(("menu", "templates")) => self.templates_open = true,
+                Some(("menu", "templates")) => {
+                    self.cached_templates = self.store.templates().unwrap_or_default();
+                    self.templates_open = true;
+                }
                 Some(("menu", "input-box")) => self.input_box_open = true,
                 Some(("menu", "timeline")) => self.set_layout(false, true, cx),
                 Some(("menu", "kanban")) => self.set_layout(true, false, cx),
                 Some(("menu", "view-options")) => self.view_options = Some(false),
-                Some(("menu", "suggestions")) => self.suggestions_open = Some(false),
+                Some(("menu", "suggestions")) => {
+                    self.suggestions_open = Some(false);
+                    self.refresh_suggestions();
+                }
                 Some(("menu", "view-options-date")) => self.view_options = Some(true),
                 Some(("show-date", "countdown")) => self.save_preferences(|p| p.countdown_dates = true, cx),
                 Some(("menu", "arrange")) => {
@@ -1019,10 +1050,7 @@ impl TodoView {
             .filter(|t| !t.is_closed() && !t.is_deleted())
             .filter_map(|t| t.due_date)
             .collect();
-        self.show_details = self.view_flag("show_details", false);
-        self.kanban = self.view_flag("kanban", false);
-        self.timeline = self.view_flag("timeline", false);
-        self.kanban_workflow = self.view_flag("kanban_workflow", false);
+        self.reload_view_settings();
         self.kanban_column_size = match self.store.setting("kanban:column_size").ok().flatten().as_deref() {
             Some("s") => 0,
             Some("l") => 2,
@@ -1087,19 +1115,30 @@ impl TodoView {
             .collect();
         self.collapsed_tags = self.store.setting("collapsed_tags").ok().flatten().unwrap_or_default().lines().map(str::to_owned).collect();
         self.tags_collapsed = self.store.setting("tags_collapsed").ok().flatten().is_some_and(|v| v == "1");
+        if self.suggestions_open.is_some() && self.view == View::Today {
+            self.cached_suggestions = fern_core::suggest::suggestions(&all_tasks, today);
+        }
+        if let Some(edit) = self.filter_edit.as_mut() {
+            edit.all_tasks = all_tasks.clone();
+        }
+        if self.templates_open {
+            self.cached_templates = self.store.templates().unwrap_or_default();
+        }
         if let Some(counts) = self.check(self.store.counts_from(&all_tasks, today)) {
             self.counts = counts;
         }
         let show_completed = matches!(self.view, View::Today | View::Tomorrow | View::Next7Days)
-            && self.view_flag("show_completed", true);
+            && self.show_completed;
         if let Some(tasks) = self.check(self.store.tasks_in_from_with_today_completed(all_tasks, &self.view, today, show_completed)) {
             self.tasks = tasks;
         }
-        self.ensure_kanban_sections(i18n::t(cx));
+        self.ensure_kanban_sections(i18n::t(cx), cx);
+        self.refresh_subtask_progress();
         if let Some(tags) = self.check(self.store.tags()) {
             self.tags = tags;
         }
         self.reload_today_habits();
+        self.reload_today_countdowns();
         let lists = self.active_lists();
         if switched {
             self.reset_view_transients(cx);
@@ -1128,7 +1167,45 @@ impl TodoView {
                 detail.refresh(selected, cx);
             });
         }
+        self.sync_kanban_column_state(cx);
         cx.notify();
+    }
+
+    fn reload_today_countdowns(&mut self) {
+        if self.view != View::Today {
+            self.today_countdowns.clear();
+            return;
+        }
+        let today = Self::today();
+        self.today_countdowns = self
+            .store
+            .countdowns()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|c| !c.archived && c.show_in_list.shows(c.next_date(today), today))
+            .collect();
+    }
+
+    fn refresh_subtask_progress(&mut self) {
+        self.subtask_progress.clear();
+        let tree = fern_core::TaskTree::build(&self.tasks);
+        for task in &self.tasks {
+            if !tree.has_children(task.id) {
+                continue;
+            }
+            let mut done = 0usize;
+            let mut total = 0usize;
+            for child in tree.children(task.id) {
+                if child.is_deleted() || child.is_wont_do() {
+                    continue;
+                }
+                total += 1;
+                if child.is_completed() {
+                    done += 1;
+                }
+            }
+            self.subtask_progress.insert(task.id, (done, total));
+        }
     }
 
     /// Today and Next 7 Days list the habits due today, unless turned off in the habit settings.
@@ -1271,8 +1348,12 @@ impl TodoView {
                 let key = label.clone();
                 let accent = cx.theme().colors().accent;
                 let drop_on_header = drop.clone();
+                let header_id: SharedString = match &drop {
+                    Some(DropTarget::Section(Some(id))) => format!("day-sec-{id}").into(),
+                    _ => format!("day-{ix}-{label}").into(),
+                };
                 h_flex()
-                    .id(SharedString::from(format!("day-{label}")))
+                    .id(header_id)
                     .rounded(px(6.))
                     .cursor_pointer()
                     .when_some(drop_on_header, |el, target| {
@@ -1285,7 +1366,7 @@ impl TodoView {
                             }))
                     })
                     .child(div().w(px(GUTTER)).flex_none().pl(px(4.)).child(chevron(collapsed)))
-                    .child(div().flex_1().min_w_0().child(self.render_group_header(label, count, drop.as_ref(), 36., cx)))
+                    .child(div().flex_1().min_w_0().child(self.render_group_header(ix, label, count, drop.as_ref(), 36., cx)))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if this.section_rename.is_none() {
                             this.toggle_day(key.clone(), cx);
@@ -1455,6 +1536,7 @@ impl TodoView {
     /// Delete, and is replaced by a field while it is renamed.
     fn render_group_header(
         &self,
+        entry_ix: usize,
         label: String,
         count: usize,
         drop: Option<&DropTarget>,
@@ -1469,7 +1551,10 @@ impl TodoView {
             _ => None,
         };
         let renaming = section.and_then(|id| self.section_rename.as_ref().filter(|(s, _)| *s == id)).map(|(_, input)| input.clone());
-        let group = SharedString::from(format!("group-header-{label}"));
+        let group: SharedString = match section {
+            Some(id) => format!("group-header-sec-{id}").into(),
+            None => format!("group-header-{entry_ix}-{label}").into(),
+        };
         h_flex()
             .id(group.clone())
             .group(group.clone())
@@ -1625,9 +1710,17 @@ impl TodoView {
         let strings = i18n::t(cx);
         let title = self.view_title(strings);
         let html = crate::print::list_html(&title, &self.tasks, Self::today(), strings);
-        if let Err(err) = crate::print::open("list", &html) {
-            self.error = Some(err.to_string());
-        }
+        let task = crate::print::open_async("list", html, cx);
+        cx.spawn(async move |this, cx| {
+            if let Err(err) = task.await {
+                this.update(cx, |this, cx| {
+                    this.error = Some(err.to_string());
+                    cx.notify();
+                })
+                .ok();
+            }
+        })
+        .detach();
         cx.notify();
     }
 
@@ -1648,6 +1741,7 @@ impl TodoView {
 
     fn start_new_section(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let _ = self.store.set_setting(&format!("kanban:hide_new_section:{}", self.view_key()), "0");
+        self.hide_new_section = false;
         let strings = i18n::t(cx);
         let input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.section_name, cx));
         cx.subscribe(&input, |this, _, Submitted(name), cx| {
@@ -1716,15 +1810,60 @@ impl TodoView {
         if let Some(preferences) = self.check(result) {
             self.preferences = preferences;
             self.sync_detail_inset(cx);
+            crate::data_version::data_changed(cx.entity_id(), cx);
         }
         cx.notify();
     }
 
 
-    /// A per-list switch of the header's "…" menu ("Show Completed", "Show Details").
-    fn view_flag(&self, name: &str, default: bool) -> bool {
+    /// Reads a per-view boolean flag from SQLite (used only in `reload_view_settings`).
+    fn load_view_flag(&self, name: &str, default: bool) -> bool {
         let key = format!("{name}:{}", self.view_key());
         self.store.setting(&key).ok().flatten().map_or(default, |v| v == "1")
+    }
+
+    /// Loads all per-view flags and sort/group settings from SQLite into cached fields so
+    /// `render()`, `rows()`, `board_columns()`, and `move_task_drag()` perform zero DB queries.
+    fn reload_view_settings(&mut self) {
+        self.show_details = self.load_view_flag("show_details", false);
+        self.kanban = self.load_view_flag("kanban", false);
+        self.timeline = self.load_view_flag("timeline", false);
+        self.kanban_workflow = self.load_view_flag("kanban_workflow", false);
+        self.show_completed = self.load_view_flag("show_completed", true);
+        self.sort_descending = self.load_view_flag("descending", false);
+        self.hide_new_section = self.load_view_flag("kanban:hide_new_section", false);
+
+        let key = self.view_key();
+        let get = |what: &str| self.store.setting(&format!("{what}:{key}")).ok().flatten().unwrap_or_default();
+        // A tag's view is grouped by list until chosen otherwise, as the original's.
+        let group = match get("group") {
+            g if g.is_empty() && matches!(self.view, View::Tag(_)) => GroupBy::List,
+            // The original's board of a smart list has a column per list.
+            g if g.is_empty() && self.kanban && self.view.shows_list_names() => GroupBy::List,
+            g => GroupBy::from_key(&g),
+        };
+        let group = if self.kanban && !self.timeline && group == GroupBy::None {
+            if self.view.shows_list_names() { GroupBy::List } else { GroupBy::Custom }
+        } else {
+            group
+        };
+        self.sort_by = SortBy::from_key(&get("sort"));
+        self.group_by = group;
+    }
+
+    /// Cached per-list switch of the header's "…" menu ("Show Completed", "Show Details", etc.).
+    /// Pure memory read — zero SQLite queries.
+    fn view_flag(&self, name: &str, default: bool) -> bool {
+        match name {
+            "show_details" => self.show_details,
+            "kanban" => self.kanban,
+            "timeline" => self.timeline,
+            "kanban_workflow" => self.kanban_workflow,
+            "show_completed" => self.show_completed,
+            "descending" => self.sort_descending,
+            "kanban:hide_new_section" => self.hide_new_section,
+            _ => default,
+        }
     }
 
     fn toggle_view_flag(&mut self, name: &str, default: bool, cx: &mut Context<Self>) {
@@ -1732,10 +1871,7 @@ impl TodoView {
         let value = !self.view_flag(name, default);
         let result = self.store.set_setting(&key, if value { "1" } else { "0" });
         self.check(result);
-        self.show_details = self.view_flag("show_details", false);
-        self.kanban = self.view_flag("kanban", false);
-        self.timeline = self.view_flag("timeline", false);
-        self.kanban_workflow = self.view_flag("kanban_workflow", false);
+        self.reload_view_settings();
         self.header_menu_open = false;
         if name == "show_completed" && matches!(self.view, View::Today | View::Tomorrow | View::Next7Days) {
             if value {
@@ -1743,6 +1879,7 @@ impl TodoView {
             }
             self.reload(cx);
         } else {
+            self.sync_kanban_column_state(cx);
             cx.notify();
         }
     }
@@ -1757,14 +1894,14 @@ impl TodoView {
             let result = self.store.set_setting(&format!("{name}:{key}"), if on { "1" } else { "0" });
             self.check(result);
         }
-        self.kanban = kanban;
-        self.timeline = timeline;
+        self.reload_view_settings();
         self.timeline_from = Self::today();
         self.header_menu_open = false;
         if kanban && !timeline {
             let strings = i18n::t(cx);
-            self.ensure_kanban_sections(strings);
+            self.ensure_kanban_sections(strings, cx);
         }
+        self.sync_kanban_column_state(cx);
         if was_board != self.uses_board_layout() {
             self.sync_layout_selection(cx);
         }
@@ -1773,21 +1910,7 @@ impl TodoView {
 
 
     fn sort_settings(&self) -> (SortBy, GroupBy) {
-        let key = self.view_key();
-        let get = |what: &str| self.store.setting(&format!("{what}:{key}")).ok().flatten().unwrap_or_default();
-        // A tag's view is grouped by list until chosen otherwise, as the original's.
-        let group = match get("group") {
-            key if key.is_empty() && matches!(self.view, View::Tag(_)) => GroupBy::List,
-            // The original's board of a smart list has a column per list.
-            key if key.is_empty() && self.kanban && self.view.shows_list_names() => GroupBy::List,
-            key => GroupBy::from_key(&key),
-        };
-        let group = if self.kanban && !self.timeline && group == GroupBy::None {
-            if self.view.shows_list_names() { GroupBy::List } else { GroupBy::Custom }
-        } else {
-            group
-        };
-        (SortBy::from_key(&get("sort")), group)
+        (self.sort_by, self.group_by)
     }
 
     fn set_sort(&mut self, sort: Option<SortBy>, group: Option<GroupBy>, window: &mut Window, cx: &mut Context<Self>) {
@@ -1798,10 +1921,12 @@ impl TodoView {
             .chain(group.map(|g| self.store.set_setting(&format!("group:{key}"), g.key())))
             .collect::<anyhow::Result<Vec<()>>>();
         self.check(result);
+        self.reload_view_settings();
         if group == Some(GroupBy::Custom) {
             let strings = i18n::t(cx);
-            self.ensure_kanban_sections(strings);
+            self.ensure_kanban_sections(strings, cx);
         }
+        self.sync_kanban_column_state(cx);
         self.close_sort_menu(window, cx);
     }
 
@@ -1848,6 +1973,14 @@ impl TodoView {
             return true;
         }
 
+        if std::mem::take(&mut self.timeline_tz_menu) {
+            if self.timeline_tz_input.focus_handle(cx).is_focused(window) {
+                window.focus(&self.list_focus, cx);
+            }
+            cx.notify();
+            return true;
+        }
+
         // These menus don't move keyboard focus when opened from the list.
         let dismissed_menu = [
             self.context_menu.take().is_some(),
@@ -1887,6 +2020,21 @@ impl TodoView {
         if self.title_edit.is_some() {
             self.finish_title_edit(false, cx);
             window.focus(&self.list_focus, cx);
+            return true;
+        }
+        if let Some((_, _, input)) = self.column_add.take() {
+            if input.focus_handle(cx).is_focused(window) {
+                window.focus(&self.list_focus, cx);
+            }
+            cx.notify();
+            return true;
+        }
+        if let Some(input) = self.new_section.take() {
+            self.new_section_index = None;
+            if input.focus_handle(cx).is_focused(window) {
+                window.focus(&self.list_focus, cx);
+            }
+            cx.notify();
             return true;
         }
         if self.section_rename.take().is_some() {
@@ -2054,6 +2202,7 @@ impl TodoView {
         self.sort_menu = None;
         self.sort_menu_return_focus = None;
         self.scale_menu_open = false;
+        self.timeline_tz_menu = false;
         self.arrange_open = false;
         self.suggestions_open = None;
         self.section_menu = None;
@@ -2067,6 +2216,7 @@ impl TodoView {
         self.title_edit = None;
         self.kanban_pan = None;
         self.kanban_quick_adds.clear();
+        self.kanban_col_scrolls.clear();
         self.clear_task_drag_state();
         self.completing.clear();
     }
@@ -2270,8 +2420,11 @@ impl TodoView {
         if select_task {
             self.select(id, cx);
         }
+        let Some(task) = self.tasks.iter().find(|t| t.id == id).cloned().or_else(|| self.store.task(id).ok().flatten()) else {
+            return;
+        };
         let nesting = task_menu::TaskNesting::of(&self.store, id);
-        self.context_menu = Some((id, position, nesting));
+        self.context_menu = Some((task, position, nesting));
         self.context_side = None;
         cx.notify();
     }
@@ -2331,33 +2484,13 @@ impl TodoView {
             .on_action(cx.listener(|this, _: &crate::actions::Redo, _, cx| this.apply_redo(cx)))
     }
 
-    fn render_empty_state(&self, strings: &'static Strings, theme: &theme::Theme, px_fallback: Pixels) -> AnyElement {
+    fn render_empty_state(&self, strings: &'static Strings, _theme: &theme::Theme, _px_fallback: Pixels) -> AnyElement {
         match &self.view {
-            View::Day(_) => v_flex()
-                .pt(px(160.))
-                .items_center()
-                .gap_1()
-                .child(Icon::new(IconName::CalendarCheck).size(IconSize::Medium).color(Color::Muted))
-                .child(Label::new(strings.free_day))
-                .child(Label::new(strings.free_day_hint).size(LabelSize::Small).color(Color::Muted))
+            View::Day(_) => EmptyState::new(IconName::CalendarCheck, strings.free_day_hint)
+                .title(strings.free_day)
                 .into_any_element(),
-            View::Tomorrow => v_flex()
-                .pt(px(160.))
-                .items_center()
-                .gap_1()
-                .child(
-                    div()
-                        .size(px(96.))
-                        .mb_2()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded_full()
-                        .bg(theme.colors().element_hover)
-                        .child(Icon::new(IconName::Map).size(IconSize::XLarge).color(Color::Accent)),
-                )
-                .child(Label::new(strings.no_tasks_tomorrow))
-                .child(Label::new(strings.plan_ahead).size(LabelSize::Small).color(Color::Muted))
+            View::Tomorrow => EmptyState::new(IconName::Map, strings.plan_ahead)
+                .title(strings.no_tasks_tomorrow)
                 .into_any_element(),
             other => {
                 let (icon, message) = match other {
@@ -2373,26 +2506,7 @@ impl TodoView {
                     View::Filter(_) => (IconName::Layers, strings.no_tasks),
                     _ => (IconName::ListChecks, strings.no_tasks),
                 };
-                v_flex()
-                    .w_full()
-                    .px(px_fallback)
-                    .pt(px(120.))
-                    .items_center()
-                    .gap_3()
-                    .child(
-                        div()
-                            .size(px(56.))
-                            .rounded_full()
-                            .bg(theme.colors().surface_background)
-                            .border_1()
-                            .border_color(theme.colors().border_variant)
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(Icon::new(icon).size(IconSize::Large).color(Color::Muted)),
-                    )
-                    .child(Label::new(message).size(LabelSize::Small).color(Color::Muted))
-                    .into_any_element()
+                EmptyState::new(icon, message).into_any_element()
             }
         }
     }
@@ -2640,26 +2754,53 @@ impl TodoView {
         self.reload(cx);
     }
 
+    /// Completes a task dropped onto a Completed target via `desktop_common::task_ops::toggle_task_completion`
+    /// so repeating tasks advance cleanly, completion sound plays after DB success, and Undo is offered.
+    /// Returns `Ok(true)` when a repeating task advanced to its next occurrence (and stayed open).
+    pub(super) fn complete_task_from_drop(&mut self, task: &Task, cx: &mut Context<Self>) -> anyhow::Result<bool> {
+        if task.is_completed() {
+            return Ok(false);
+        }
+        let undo = desktop_common::task_ops::toggle_task_completion(
+            &self.store,
+            task,
+            true,
+            cx.entity_id(),
+            cx,
+        )?;
+        let advanced_repeat = matches!(undo, Some(crate::undo::UndoAction::ReopenRepeat { .. }));
+        if let Some(action) = undo {
+            let label = i18n::t(cx).undo_completed.replace("{title}", &task.title);
+            self.offer_undo(action, label, cx);
+            crate::completion_mark::record(task.id, cx);
+        }
+        Ok(advanced_repeat)
+    }
+
     /// A task dropped on an entry of the lists column takes that entry's meaning: a list moves it,
     /// a tag tags it, Today/Tomorrow set its date, Completed completes it, Trash deletes it.
     fn drop_on_view(&mut self, view: View, id: Id, cx: &mut Context<Self>) {
         self.clear_task_drag_state();
         let today = Self::today();
-        let time = self.store.task(id).ok().flatten().and_then(|t| t.due_time);
+        let existing = self.store.task(id).ok().flatten();
+        let time = existing.as_ref().and_then(|t| t.due_time);
         let result = match &view {
             View::Inbox => self.store.set_list(id, None),
             View::List(list) => self.store.set_list(id, Some(*list)),
-            View::Tag(tag) => match self.store.task(id) {
-                Ok(Some(task)) if !task.tags.iter().any(|t| t.to_lowercase() == tag.to_lowercase()) => {
+            View::Tag(tag) => match existing {
+                Some(task) if !task.tags.iter().any(|t| t.to_lowercase() == tag.to_lowercase()) => {
                     let mut tags = task.tags;
                     tags.push(tag.clone());
                     self.store.set_tags(id, &tags)
                 }
-                other => other.map(|_| ()),
+                _ => Ok(()),
             },
             View::Today | View::Next7Days => self.store.set_due(id, Some(today), time),
             View::Tomorrow => self.store.set_due(id, Some(today + Duration::days(1)), time),
-            View::Completed => self.store.set_completed(id, true),
+            View::Completed => match existing {
+                Some(task) => self.complete_task_from_drop(&task, cx).map(|_| ()),
+                None => Ok(()),
+            },
             View::WontDo => self.store.set_wont_do(id, true),
             View::Trash => self.store.delete_task(id),
             View::Day(day) => self.store.set_due(id, Some(*day), time),
@@ -2767,6 +2908,7 @@ impl TodoView {
     fn apply_task_drop(&mut self, dragged: Id, plan: task_rows::TaskDropPlan, cx: &mut Context<Self>) {
         let result = (|| -> anyhow::Result<()> {
             let Some(dragged_task) = self.store.task(dragged)? else { return Ok(()) };
+            let mut advanced_repeat = false;
             if let Some(group_drop) = plan.group_drop {
                 match group_drop {
                     DropTarget::Section(sec) => {
@@ -2794,9 +2936,7 @@ impl TodoView {
                         }
                     }
                     DropTarget::Complete => {
-                        if !dragged_task.is_completed() {
-                            self.store.set_completed(dragged, true)?;
-                        }
+                        advanced_repeat = self.complete_task_from_drop(&dragged_task, cx)?;
                     }
                     DropTarget::Kind(kind) => {
                         if dragged_task.is_completed() {
@@ -2818,7 +2958,9 @@ impl TodoView {
             {
                 self.store.set_completed(dragged, false)?;
             }
-            self.store.move_task_in_tree(dragged, plan.new_parent, plan.order_target)?;
+            if !advanced_repeat {
+                self.store.move_task_in_tree(dragged, plan.new_parent, plan.order_target)?;
+            }
             Ok(())
         })();
         if self.check(result).is_some()
@@ -3349,13 +3491,7 @@ impl TodoView {
                     })
                     // And a task with subtasks a small tree + progress count, open or folded.
                     .when(has_children, |el| {
-                        let subs: Vec<&Task> = self
-                            .tasks
-                            .iter()
-                            .filter(|t| t.parent_id == Some(id) && !t.is_deleted() && !t.is_wont_do())
-                            .collect();
-                        let done_subs = subs.iter().filter(|t| t.is_completed()).count();
-                        let total_subs = subs.len();
+                        let (done_subs, total_subs) = self.subtask_progress.get(&id).copied().unwrap_or((0, 0));
                         el.child(
                             h_flex()
                                 .gap_0p5()
@@ -3659,22 +3795,12 @@ impl TodoView {
     /// The countdowns whose Show puts them in Today (on the day by default, as in the original),
     /// each with its icon, name and the days left.
     fn render_countdowns(&self, strings: &Strings, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if self.view != View::Today {
+        if self.view != View::Today || self.today_countdowns.is_empty() {
             return None;
         }
         let theme = cx.theme().clone();
         let today = Self::today();
-        let countdowns: Vec<fern_core::Countdown> = self
-            .store
-            .countdowns()
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|c| !c.archived && c.show_in_list.shows(c.next_date(today), today))
-            .collect();
-        if countdowns.is_empty() {
-            return None;
-        }
-        let count = countdowns.len();
+        let count = self.today_countdowns.len();
         Some(
             v_flex()
                 .child(
@@ -3685,7 +3811,7 @@ impl TodoView {
                         .child(Label::new(strings.section_countdown).weight(FontWeight::BOLD))
                         .child(div().pl_1().child(Label::new(count.to_string()).size(LabelSize::Small).color(Color::Muted))),
                 )
-                .children(countdowns.into_iter().map(|countdown| {
+                .children(self.today_countdowns.iter().map(|countdown| {
                     let date = countdown.next_date(today);
                     let days = countdown.span(today).total_days;
                     let when = if date == today { strings.today.to_owned() } else { format!("{days} {}", strings.habit_days) };
@@ -3698,7 +3824,7 @@ impl TodoView {
                             Some(icon) => div().w(px(16.)).child(icon).into_any_element(),
                             None => Icon::new(crate::countdown_view::kind_icon(countdown.kind)).color(Color::Accent).into_any_element(),
                         })
-                        .child(div().flex_1().min_w_0().child(Label::new(countdown.name).truncate()))
+                        .child(div().flex_1().min_w_0().child(Label::new(countdown.name.clone()).truncate()))
                         .child(Label::new(when).size(LabelSize::Small).color(Color::Accent))
                         .border_b_1()
                         .border_color(theme.colors().border_variant)
@@ -3847,7 +3973,12 @@ impl Render for TodoView {
                                 .toggle_state(self.suggestions_open.is_some())
                                 .tooltip(Tooltip::text(strings.suggested_tasks))
                                 .on_click(cx.listener(|this, _, _, cx| {
-                                    this.suggestions_open = if this.suggestions_open.is_some() { None } else { Some(false) };
+                                    if this.suggestions_open.is_some() {
+                                        this.suggestions_open = None;
+                                    } else {
+                                        this.refresh_suggestions();
+                                        this.suggestions_open = Some(false);
+                                    }
                                     cx.notify();
                                 })),
                         )
@@ -3990,7 +4121,15 @@ impl Render for TodoView {
                             .absolute()
                             .size_0()
                     })
-                    .when(rows_empty, |el| el.child(self.render_empty_state(strings, &theme, px(12.))))
+                    .when(rows_empty, |el| {
+                        el.child(
+                            div()
+                                .w_full()
+                                .pt(px(80.))
+                                .flex_none()
+                                .child(self.render_empty_state(strings, &theme, px(12.))),
+                        )
+                    })
                     .child(
                         div()
                             .relative()
@@ -4218,73 +4357,23 @@ impl Render for TodoView {
             .when(self.confirm_empty_trash, |el| {
                 el.child(
                     div()
-                        .id("confirm-empty-trash-backdrop")
-                        .debug_selector(|| "confirm-empty-trash-modal".to_owned())
                         .absolute()
                         .inset_0()
-                        .occlude()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .bg(gpui::black().opacity(0.35))
-                        .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                            this.confirm_empty_trash = false;
-                            cx.notify();
-                        }))
+                        .when(cfg!(test), |el| {
+                            el.debug_selector(|| "confirm-empty-trash-modal".to_owned())
+                        })
                         .child(
-                            v_flex()
-                                .id("confirm-empty-trash-card")
-                                .w(px(340.))
-                                .p_5()
-                                .gap_3()
-                                .rounded(px(10.))
-                                .bg(theme.colors().elevated_surface_background)
-                                .border_1()
-                                .border_color(theme.colors().border)
-                                .shadow_lg()
-                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                                .child(div().text_size(px(16.)).font_weight(FontWeight::SEMIBOLD).child(strings.confirm_empty_trash))
-                                .child(div().text_size(px(12.)).text_color(theme.colors().text_muted).child(strings.confirm_empty_trash_hint))
-                                .child(
-                                    h_flex()
-                                        .pt_2()
-                                        .gap_2()
-                                        .justify_end()
-                                        .child(
-                                            div()
-                                                .id("empty-trash-cancel")
-                                                .debug_selector(|| "empty-trash-cancel".to_owned())
-                                                .px_3()
-                                                .h(px(30.))
-                                                .flex()
-                                                .items_center()
-                                                .rounded(px(6.))
-                                                .border_1()
-                                                .border_color(theme.colors().border)
-                                                .cursor_pointer()
-                                                .hover(|s| s.bg(theme.colors().element_hover))
-                                                .child(Label::new(strings.cancel).size(LabelSize::Small))
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.confirm_empty_trash = false;
-                                                    cx.notify();
-                                                })),
-                                        )
-                                        .child(
-                                            div()
-                                                .id("empty-trash-confirm")
-                                                .debug_selector(|| "empty-trash-confirm".to_owned())
-                                                .px_3()
-                                                .h(px(30.))
-                                                .flex()
-                                                .items_center()
-                                                .rounded(px(6.))
-                                                .bg(theme.status().error)
-                                                .cursor_pointer()
-                                                .hover(|s| s.bg(theme.status().error.opacity(0.9)))
-                                                .child(Label::new(strings.empty_trash).size(LabelSize::Small).color(Color::OnAccent))
-                                                .on_click(cx.listener(|this, _, _, cx| this.empty_trash(cx))),
-                                        ),
-                                ),
+                            ConfirmDialog::new("confirm-empty-trash", strings.confirm_empty_trash)
+                                .width(px(340.))
+                                .description(strings.confirm_empty_trash_hint)
+                                .cancel_label(strings.cancel)
+                                .confirm_label(strings.empty_trash)
+                                .destructive(true)
+                                .on_cancel(cx.listener(|this, _, _, cx| {
+                                    this.confirm_empty_trash = false;
+                                    cx.notify();
+                                }))
+                                .on_confirm(cx.listener(|this, _, _, cx| this.empty_trash(cx))),
                         ),
                 )
             })
@@ -4316,74 +4405,19 @@ impl Render for TodoView {
                     ),
                 };
                 el.child(
-                    div()
-                        .id("confirm-delete-backdrop")
-                        .absolute()
-                        .inset_0()
-                        .occlude()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .bg(gpui::black().opacity(0.35))
-                        .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                    ConfirmDialog::new("confirm-delete", title)
+                        .width(px(340.))
+                        .description(hint)
+                        .cancel_label(strings.cancel)
+                        .confirm_label(strings.delete)
+                        .destructive(true)
+                        .on_cancel(cx.listener(|this, _, _, cx| {
                             this.confirm_delete = None;
                             cx.notify();
                         }))
-                        .child(
-                            v_flex()
-                                .id("confirm-delete-card")
-                                .w(px(340.))
-                                .p_5()
-                                .gap_3()
-                                .rounded(px(10.))
-                                .bg(theme.colors().elevated_surface_background)
-                                .border_1()
-                                .border_color(theme.colors().border)
-                                .shadow_lg()
-                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                                .child(div().text_size(px(16.)).font_weight(FontWeight::SEMIBOLD).child(title))
-                                .child(div().text_size(px(12.)).text_color(theme.colors().text_muted).child(hint))
-                                .child(
-                                    h_flex()
-                                        .pt_2()
-                                        .gap_2()
-                                        .justify_end()
-                                        .child(
-                                            div()
-                                                .id("confirm-delete-cancel")
-                                                .px_3()
-                                                .h(px(30.))
-                                                .flex()
-                                                .items_center()
-                                                .rounded(px(6.))
-                                                .border_1()
-                                                .border_color(theme.colors().border)
-                                                .cursor_pointer()
-                                                .hover(|s| s.bg(theme.colors().element_hover))
-                                                .child(Label::new(strings.cancel).size(LabelSize::Small))
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.confirm_delete = None;
-                                                    cx.notify();
-                                                })),
-                                        )
-                                        .child(
-                                            div()
-                                                .id("confirm-delete-ok")
-                                                .px_3()
-                                                .h(px(30.))
-                                                .flex()
-                                                .items_center()
-                                                .rounded(px(6.))
-                                                .bg(theme.status().error)
-                                                .cursor_pointer()
-                                                .hover(|s| s.bg(theme.status().error.opacity(0.9)))
-                                                .child(Label::new(strings.delete).size(LabelSize::Small).color(Color::OnAccent))
-                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                    this.execute_confirmed_delete(target.clone(), cx);
-                                                })),
-                                        ),
-                                ),
-                        ),
+                        .on_confirm(cx.listener(move |this, _, _, cx| {
+                            this.execute_confirmed_delete(target.clone(), cx);
+                        })),
                 )
             })
             .when_some(self.batch_add_pending.clone(), |el, lines| {
@@ -4393,110 +4427,69 @@ impl Render for TodoView {
                 let desc = strings.batch_add_tasks_desc.replace("{n}", &count.to_string());
                 let add_label = format!("{} ({count})", strings.add);
                 el.child(
-                    div()
-                        .id("batch-add-backdrop")
-                        .absolute()
-                        .inset_0()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .bg(gpui::black().opacity(0.45))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _, _, cx| {
-                                this.batch_add_pending = None;
-                                cx.notify();
-                            }),
-                        )
+                    Modal::new("batch-add-backdrop")
+                        .width(px(380.))
+                        .padding(px(16.))
+                        .on_dismiss(cx.listener(|this, _, _, cx| {
+                            this.batch_add_pending = None;
+                            cx.notify();
+                        }))
+                        .child(Label::new(strings.batch_add_tasks).size(LabelSize::Large).weight(FontWeight::SEMIBOLD))
+                        .child(Label::new(desc).size(LabelSize::Small).color(Color::Muted))
                         .child(
                             v_flex()
-                                .id("batch-add-modal")
-                                .w(px(380.))
-                                .p_4()
-                                .gap_3()
-                                .rounded(px(10.))
-                                .bg(theme.colors().elevated_surface_background)
+                                .p_2()
+                                .gap_1()
+                                .rounded(px(6.))
+                                .bg(theme.colors().surface_background)
                                 .border_1()
-                                .border_color(theme.colors().border)
-                                .shadow_lg()
-                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                                .child(Label::new(strings.batch_add_tasks).size(LabelSize::Large).weight(FontWeight::SEMIBOLD))
-                                .child(Label::new(desc).size(LabelSize::Small).color(Color::Muted))
-                                .child(
-                                    v_flex()
-                                        .p_2()
-                                        .gap_1()
-                                        .rounded(px(6.))
-                                        .bg(theme.colors().surface_background)
-                                        .border_1()
-                                        .border_color(theme.colors().border_variant)
-                                        .children(preview.into_iter().map(|line| {
-                                            h_flex()
-                                                .gap_1p5()
-                                                .child(div().w(px(4.)).h(px(4.)).rounded_full().bg(theme.colors().accent))
-                                                .child(Label::new(line).size(LabelSize::XSmall).truncate())
-                                        }))
-                                        .when(extra > 0, |list| {
-                                            list.child(
-                                                Label::new(format!("+{extra}"))
-                                                    .size(LabelSize::XSmall)
-                                                    .color(Color::Muted),
-                                            )
-                                        }),
-                                )
-                                .child(
+                                .border_color(theme.colors().border_variant)
+                                .children(preview.into_iter().map(|line| {
                                     h_flex()
-                                        .pt_1()
-                                        .gap_2()
-                                        .justify_end()
+                                        .gap_1p5()
+                                        .child(div().w(px(4.)).h(px(4.)).rounded_full().bg(theme.colors().accent))
+                                        .child(Label::new(line).size(LabelSize::XSmall).truncate())
+                                }))
+                                .when(extra > 0, |list| {
+                                    list.child(
+                                        Label::new(format!("+{extra}"))
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Muted),
+                                    )
+                                }),
+                        )
+                        .child(
+                            h_flex()
+                                .pt_1()
+                                .gap_2()
+                                .justify_end()
+                                .child(
+                                    div()
+                                        .when(cfg!(test), |el| el.debug_selector(|| "batch-add-cancel".to_owned()))
                                         .child(
-                                            div()
-                                                .id("batch-add-cancel")
-                                                .debug_selector(|| "batch-add-cancel".to_owned())
-                                                .px_3()
-                                                .h(px(30.))
-                                                .flex()
-                                                .items_center()
-                                                .rounded(px(6.))
-                                                .border_1()
-                                                .border_color(theme.colors().border)
-                                                .cursor_pointer()
-                                                .hover(|s| s.bg(theme.colors().element_hover))
-                                                .child(Label::new(strings.cancel).size(LabelSize::Small))
+                                            Button::new("batch-add-cancel", strings.cancel)
+                                                .variant(ButtonVariant::Secondary)
                                                 .on_click(cx.listener(|this, _, _, cx| {
                                                     this.batch_add_pending = None;
                                                     cx.notify();
                                                 })),
-                                        )
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .when(cfg!(test), |el| el.debug_selector(|| "batch-add-as-one".to_owned()))
                                         .child(
-                                            div()
-                                                .id("batch-add-as-one")
-                                                .debug_selector(|| "batch-add-as-one".to_owned())
-                                                .px_3()
-                                                .h(px(30.))
-                                                .flex()
-                                                .items_center()
-                                                .rounded(px(6.))
-                                                .border_1()
-                                                .border_color(theme.colors().border)
-                                                .cursor_pointer()
-                                                .hover(|s| s.bg(theme.colors().element_hover))
-                                                .child(Label::new(strings.batch_add_as_one).size(LabelSize::Small))
+                                            Button::new("batch-add-as-one", strings.batch_add_as_one)
+                                                .variant(ButtonVariant::Secondary)
                                                 .on_click(cx.listener(|this, _, _, cx| this.paste_batch_as_one(cx))),
-                                        )
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .when(cfg!(test), |el| el.debug_selector(|| "batch-add-confirm".to_owned()))
                                         .child(
-                                            div()
-                                                .id("batch-add-confirm")
-                                                .debug_selector(|| "batch-add-confirm".to_owned())
-                                                .px_3()
-                                                .h(px(30.))
-                                                .flex()
-                                                .items_center()
-                                                .rounded(px(6.))
-                                                .bg(theme.colors().accent)
-                                                .cursor_pointer()
-                                                .hover(|s| s.bg(theme.colors().accent.opacity(0.9)))
-                                                .child(Label::new(add_label).size(LabelSize::Small).color(Color::OnAccent))
+                                            Button::new("batch-add-confirm", add_label)
+                                                .variant(ButtonVariant::Primary)
                                                 .on_click(cx.listener(|this, _, window, cx| this.confirm_batch_add(window, cx))),
                                         ),
                                 ),

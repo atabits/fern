@@ -25,6 +25,7 @@ pub(super) struct FilterEdit {
     pub(super) inputs: Vec<FilterInputs>,
     pub(super) chain_menu: Option<usize>,
     pub(super) preview: bool,
+    pub(super) all_tasks: Vec<Task>,
     pub(super) examples_open: bool,
     error: Option<&'static str>,
 }
@@ -71,33 +72,9 @@ fn chip(
     id: impl Into<SharedString>,
     label: impl Into<SharedString>,
     selected: bool,
-    cx: &App,
-) -> gpui::Stateful<gpui::Div> {
-    let colors = cx.theme().colors();
-    div()
-        .id(id.into())
-        .min_h(px(28.))
-        .px_2()
-        .py_1()
-        .flex()
-        .items_center()
-        .rounded(px(6.))
-        .cursor_pointer()
-        .when(selected, |el| {
-            el.bg(colors.accent.opacity(0.22))
-                .hover(|s| s.bg(colors.accent.opacity(0.32)))
-        })
-        .when(!selected, |el| {
-            el.bg(colors.surface_background)
-                .border_1()
-                .border_color(colors.border)
-                .hover(|s| s.bg(colors.element_hover))
-        })
-        .child(Label::new(label).size(LabelSize::Small).color(if selected {
-            Color::Accent
-        } else {
-            Color::Default
-        }))
+    _cx: &App,
+) -> ToggleChip {
+    ToggleChip::new(id.into(), label).toggle_state(selected)
 }
 impl TodoView {
     fn filter_input(
@@ -171,6 +148,7 @@ impl TodoView {
         }
         let name = Self::filter_input(draft.name.clone(), strings.filter_name, cx);
         let inputs = Self::filter_inputs(&draft, cx);
+        let all_tasks = self.store.tasks().unwrap_or_default();
         window.focus(&name.focus_handle(cx), cx);
         self.header_menu_open = false;
         self.filter_edit = Some(FilterEdit {
@@ -180,6 +158,7 @@ impl TodoView {
             inputs,
             chain_menu: None,
             preview: false,
+            all_tasks,
             examples_open: false,
             error: None,
         });
@@ -233,10 +212,13 @@ impl TodoView {
     }
     fn set_filter_preview(&mut self, preview: bool, cx: &mut Context<Self>) {
         if let Some(edit) = self.filter_edit.as_mut() {
-            if preview && let Err(error) = edit.snapshot(cx) {
-                edit.error = Some(input_error(error, i18n::t(cx)));
-                cx.notify();
-                return;
+            if preview {
+                if let Err(error) = edit.snapshot(cx) {
+                    edit.error = Some(input_error(error, i18n::t(cx)));
+                    cx.notify();
+                    return;
+                }
+                edit.all_tasks = self.store.tasks().unwrap_or_default();
             }
             edit.preview = preview;
             edit.error = None;
@@ -310,8 +292,7 @@ impl TodoView {
                     .into_any_element();
             }
         };
-        let tasks = self.store.tasks().unwrap_or_default();
-        let shown = draft.preview(&tasks, today, self.preferences.week_start);
+        let shown = draft.preview(&edit.all_tasks, today, self.preferences.week_start);
         let lists: Vec<(Option<Id>, SharedString)> =
             std::iter::once((None, SharedString::new_static(strings.inbox)))
                 .chain(

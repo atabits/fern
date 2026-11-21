@@ -53,7 +53,7 @@ impl TodoView {
     }
 
     pub(super) fn render_templates(&self, strings: &Strings, cx: &mut Context<Self>) -> AnyElement {
-        let templates = self.store.templates().unwrap_or_default();
+        let templates = &self.cached_templates;
         let theme = cx.theme().clone();
         popover(cx)
             .w(px(280.))
@@ -65,7 +65,7 @@ impl TodoView {
             .when(templates.is_empty(), |el| {
                 el.child(div().px_2().py_2().child(Label::new(strings.no_templates).size(LabelSize::Small).color(Color::Muted)))
             })
-            .children(templates.into_iter().map(|template| {
+            .children(templates.iter().cloned().map(|template| {
                 let id = template.id;
                 let group = SharedString::from(format!("template-{id}"));
                 let tags = (!template.tags.is_empty())
@@ -99,6 +99,7 @@ impl TodoView {
                                     cx.stop_propagation();
                                     let result = this.store.delete_template(id);
                                     this.check(result);
+                                    this.cached_templates = this.store.templates().unwrap_or_default();
                                     cx.notify();
                                 })),
                         ),
@@ -219,7 +220,7 @@ impl TodoView {
         // Outside the Inbox and lists, new tasks go to the default list from the Settings.
         let default_list = match view {
             View::Inbox | View::List(_) => None,
-            _ => self.store.preferences().ok().and_then(|p| p.default_list),
+            _ => self.preferences.default_list,
         };
         // The "▾" menu's list goes before the view's and the default one.
         let draft_list = draft.list;
@@ -1092,6 +1093,7 @@ impl TodoView {
                     .child(Label::new(strings.add_from_template))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.add_menu_open = false;
+                        this.cached_templates = this.store.templates().unwrap_or_default();
                         this.templates_open = true;
                         cx.notify();
                     })),

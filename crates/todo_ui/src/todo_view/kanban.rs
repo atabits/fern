@@ -57,7 +57,7 @@ impl BoardCol {
 
 
 impl TodoView {
-    pub(super) fn ensure_kanban_sections(&mut self, strings: &Strings) {
+    pub(super) fn ensure_kanban_sections(&mut self, strings: &Strings, cx: &mut Context<Self>) {
         if !self.kanban
             || self.timeline
             || matches!(self.view, View::Trash | View::Completed | View::WontDo | View::Search(_))
@@ -65,13 +65,23 @@ impl TodoView {
             return;
         }
         let Some(owner) = self.section_owner() else { return };
+        let mut mutated = false;
         if self.sections.is_empty()
             && let Some(section) = self.check(self.store.add_list_section(owner, strings.not_sectioned))
         {
             self.sections.push(section);
+            mutated = true;
         }
-        let Some(first_id) = self.sections.first().map(|s| s.id) else { return };
+        let Some(first_id) = self.sections.first().map(|s| s.id) else {
+            if mutated {
+                crate::data_version::data_changed(cx.entity_id(), cx);
+            }
+            return;
+        };
         if self.sort_settings().1 != GroupBy::Custom {
+            if mutated {
+                crate::data_version::data_changed(cx.entity_id(), cx);
+            }
             return;
         }
         let known: HashSet<Id> = self.sections.iter().map(|s| s.id).collect();
@@ -82,31 +92,33 @@ impl TodoView {
             .map(|t| t.id)
             .collect();
         if unsectioned_roots.is_empty() {
+            if mutated {
+                crate::data_version::data_changed(cx.entity_id(), cx);
+            }
             return;
         }
         for root_id in &unsectioned_roots {
             let result = self.store.set_section(*root_id, Some(first_id));
-            self.check(result);
-        }
-        let mut moved: HashSet<Id> = unsectioned_roots.into_iter().collect();
-        loop {
-            let mut added = false;
-            for t in &self.tasks {
-                if let Some(p) = t.parent_id
-                    && moved.contains(&p)
-                    && moved.insert(t.id)
-                {
-                    added = true;
-                }
-            }
-            if !added {
-                break;
+            if self.check(result).is_some() {
+                mutated = true;
             }
         }
+        let tree = fern_core::TaskTree::build(&self.tasks);
+        let mut moved: HashSet<Id> = HashSet::new();
+        for root_id in unsectioned_roots {
+            moved.insert(root_id);
+            for desc in tree.descendants(root_id) {
+                moved.insert(desc.id);
+            }
+        }
+        drop(tree);
         for task in &mut self.tasks {
             if moved.contains(&task.id) {
                 task.section_id = Some(first_id);
             }
+        }
+        if mutated {
+            crate::data_version::data_changed(cx.entity_id(), cx);
         }
     }
 
@@ -122,37 +134,11 @@ impl TodoView {
         }
         task_rows::order_tasks(&mut tasks, sort, descending);
 
-        let ids: HashSet<Id> = tasks.iter().map(|t| t.id).collect();
-        let mut children_map: HashMap<Id, Vec<&Task>> = HashMap::new();
-        let mut roots: Vec<&Task> = Vec::new();
-        for task in &tasks {
-            match task.parent_id.filter(|p| ids.contains(p)) {
-                Some(parent) => children_map.entry(parent).or_default().push(task),
-                None => roots.push(task),
-            }
-        }
-        fn collect_descendants(
-            parent: Id,
-            map: &HashMap<Id, Vec<&Task>>,
-            visited: &mut HashSet<Id>,
-            out: &mut Vec<Task>,
-        ) {
-            if let Some(kids) = map.get(&parent) {
-                for kid in kids {
-                    if !visited.insert(kid.id) {
-                        continue;
-                    }
-                    out.push((*kid).clone());
-                    collect_descendants(kid.id, map, visited, out);
-                }
-            }
-        }
-        let all_cards: Vec<(Task, Vec<Task>)> = roots
-            .into_iter()
+        let tree = fern_core::TaskTree::build(&tasks);
+        let all_cards: Vec<(Task, Vec<Task>)> = tree
+            .roots()
             .map(|root| {
-                let mut subs = Vec::new();
-                let mut visited = HashSet::from([root.id]);
-                collect_descendants(root.id, &children_map, &mut visited, &mut subs);
+                let subs = tree.descendants(root.id).into_iter().cloned().collect();
                 (root.clone(), subs)
             })
             .collect();
@@ -392,78 +378,31 @@ impl TodoView {
     /// Flattens a kanban subsection's cards into visible rows preserving real multi-level
     /// nesting depth, per-parent collapse state, and `KanbanItemUi` card-slice role.
     pub(super) fn kanban_visible_rows(&self, cards: &[BoardCard]) -> Vec<KanbanVisibleRow> {
-        fn count_descendants(
-            id: Id,
-            children: &HashMap<Id, Vec<&Task>>,
-            visited: &mut HashSet<Id>,
-        ) -> (usize, usize) {
-            let mut done = 0;
-            let mut total = 0;
-            if let Some(kids) = children.get(&id) {
-                for kid in kids {
-                    if !visited.insert(kid.id) {
-                        continue;
-                    }
-                    total += 1;
-                    if kid.is_completed() {
-                        done += 1;
-                    }
-                    let (d, t) = count_descendants(kid.id, children, visited);
-                    done += d;
-                    total += t;
-                }
-            }
-            (done, total)
-        }
-        fn push_tree(
-            task: &Task,
-            depth: usize,
-            children: &HashMap<Id, Vec<&Task>>,
-            collapsed_tasks: &HashSet<Id>,
-            visited: &mut HashSet<Id>,
-            out: &mut Vec<KanbanVisibleRow>,
-        ) {
-            let kids = children.get(&task.id);
-            let has_children = kids.is_some_and(|k| !k.is_empty());
-            let collapsed = has_children && collapsed_tasks.contains(&task.id);
-            let (descendant_done, descendant_total) = if collapsed {
-                let mut count_visited = HashSet::from([task.id]);
-                count_descendants(task.id, children, &mut count_visited)
-            } else {
-                (0, 0)
-            };
-            out.push(KanbanVisibleRow {
-                task: task.clone(),
-                depth,
-                has_children,
-                collapsed,
-                descendant_done,
-                descendant_total,
-                ui: KanbanItemUi::Root,
-            });
-            if !collapsed {
-                for kid in kids.into_iter().flatten() {
-                    if visited.insert(kid.id) {
-                        push_tree(kid, depth + 1, children, collapsed_tasks, visited, out);
-                    }
-                }
-            }
-        }
-
         let mut out = Vec::new();
         for (root, subs) in cards {
-            let mut card_ids: HashSet<Id> = HashSet::with_capacity(subs.len() + 1);
-            card_ids.insert(root.id);
-            for sub in subs {
-                card_ids.insert(sub.id);
+            let mut card_tasks = Vec::with_capacity(subs.len() + 1);
+            card_tasks.push(root.clone());
+            card_tasks.extend(subs.iter().cloned());
+            let tree = fern_core::TaskTree::build(&card_tasks);
+            for (task, depth) in tree.flatten_with_depth(|id| !self.collapsed_tasks.contains(&id)) {
+                let has_children = tree.has_children(task.id);
+                let collapsed = has_children && self.collapsed_tasks.contains(&task.id);
+                let (descendant_done, descendant_total) = if collapsed {
+                    let descs = tree.descendants(task.id);
+                    (descs.iter().filter(|d| d.is_completed()).count(), descs.len())
+                } else {
+                    (0, 0)
+                };
+                out.push(KanbanVisibleRow {
+                    task: task.clone(),
+                    depth,
+                    has_children,
+                    collapsed,
+                    descendant_done,
+                    descendant_total,
+                    ui: KanbanItemUi::Root,
+                });
             }
-            let mut children: HashMap<Id, Vec<&Task>> = HashMap::new();
-            for sub in subs {
-                let parent = sub.parent_id.filter(|p| card_ids.contains(p)).unwrap_or(root.id);
-                children.entry(parent).or_default().push(sub);
-            }
-            let mut visited = HashSet::from([root.id]);
-            push_tree(root, 0, &children, &self.collapsed_tasks, &mut visited, &mut out);
         }
 
         for i in 0..out.len() {
@@ -565,7 +504,7 @@ impl TodoView {
         };
         let card_bg = if selected {
             if dark {
-                base_surface.blend(gpui::white().opacity(0.06))
+                base_surface.blend(theme.colors().text.opacity(0.06))
             } else {
                 base_surface.blend(theme.colors().accent.opacity(0.10))
             }
@@ -907,6 +846,7 @@ impl TodoView {
         } else {
             self.kanban_quick_adds.clear();
         }
+        self.sync_kanban_column_state(cx);
         cx.notify();
     }
 
@@ -916,6 +856,7 @@ impl TodoView {
         let result = self.store.set_setting(&key, if next { "1" } else { "0" });
         self.check(result);
         self.kanban_workflow = next;
+        self.sync_kanban_column_state(cx);
         cx.notify();
     }
 
@@ -1002,6 +943,29 @@ impl TodoView {
                 }
             }
         }
+    }
+
+    /// Keeps per-column scroll handles and quick-add `TextInput` entities synchronized with the
+    /// active board columns outside of `render()` (called from `reload_inner`, layout/sort/option
+    /// toggles, and section mutations).
+    pub(super) fn sync_kanban_column_state(&mut self, cx: &mut Context<Self>) {
+        if !self.kanban
+            || self.timeline
+            || matches!(self.view, View::Trash | View::Completed | View::WontDo | View::Search(_))
+        {
+            self.kanban_quick_adds.clear();
+            self.kanban_col_scrolls.clear();
+            return;
+        }
+        let strings = i18n::t(cx);
+        let columns = self.board_columns(strings);
+        let mut active_col_keys = HashSet::with_capacity(columns.len());
+        for col in &columns {
+            active_col_keys.insert(col.key.clone());
+            self.kanban_col_scrolls.entry(col.key.clone()).or_default();
+        }
+        self.kanban_col_scrolls.retain(|k, _| active_col_keys.contains(k));
+        self.sync_kanban_quick_adds(&columns, strings, cx);
     }
 
     pub(super) fn sync_kanban_quick_adds(&mut self, columns: &[BoardCol], strings: &'static Strings, cx: &mut Context<Self>) {
@@ -1406,6 +1370,20 @@ impl TodoView {
     /// A card dropped on a kanban column takes the column's value: its section, kind, date,
     /// priority or tag, or completion. Leaving the Completed subsection reopens the task.
     pub(super) fn drop_on_column(&mut self, id: Id, target: DropTarget, cx: &mut Context<Self>) {
+        if target == DropTarget::Complete {
+            let result = (|| -> anyhow::Result<()> {
+                let Some(task) = self.store.task(id)? else { return Ok(()) };
+                if task.parent_id.is_some() {
+                    self.store.set_parent(id, None)?;
+                }
+                let fresh = self.store.task(id)?.unwrap_or(task);
+                self.complete_task_from_drop(&fresh, cx)?;
+                Ok(())
+            })();
+            self.check(result);
+            self.reload(cx);
+            return;
+        }
         let result = self.apply_column_drop(id, target, true);
         self.check(result);
         self.reload(cx);
@@ -1418,9 +1396,12 @@ impl TodoView {
             if task.parent_id.is_some() {
                 self.store.set_parent(id, None)?;
             }
-            if let Some(col_target) = column_drop {
+            if let Some(col_target) = column_drop
+                && col_target != DropTarget::Complete
+            {
                 self.apply_column_value(id, col_target)?;
             }
+            let task = self.store.task(id)?.unwrap_or(task);
             match sub {
                 KanbanSub::Pinned => {
                     if task.is_completed() {
@@ -1439,9 +1420,7 @@ impl TodoView {
                     }
                 }
                 KanbanSub::Completed => {
-                    if !task.is_completed() {
-                        self.store.set_completed(id, true)?;
-                    }
+                    self.complete_task_from_drop(&task, cx)?;
                 }
             }
             Ok(())
@@ -1582,11 +1561,10 @@ impl TodoView {
             .find_map(|c| c.row_subs.get(&plan.target_id).copied());
         let result = (|| -> anyhow::Result<()> {
             let Some(dragged_task) = self.store.task(dragged)? else { return Ok(()) };
+            let mut advanced_repeat = false;
             match target_sub {
                 Some(KanbanSub::Completed) => {
-                    if !dragged_task.is_completed() {
-                        self.store.set_completed(dragged, true)?;
-                    }
+                    advanced_repeat = self.complete_task_from_drop(&dragged_task, cx)?;
                 }
                 Some(KanbanSub::Pinned) => {
                     if dragged_task.is_completed() {
@@ -1606,7 +1584,9 @@ impl TodoView {
                 }
                 None => {}
             }
-            self.store.move_task_in_tree(dragged, plan.new_parent, plan.order_target)?;
+            if !advanced_repeat {
+                self.store.move_task_in_tree(dragged, plan.new_parent, plan.order_target)?;
+            }
             Ok(())
         })();
         if self.check(result).is_some()
@@ -1762,14 +1742,13 @@ impl TodoView {
                 .child(self.render_empty_state(strings, &theme, px(24.)))
                 .into_any_element();
         }
-        self.sync_kanban_quick_adds(&columns, strings, cx);
         let dark = theme.is_dark();
         let col_width = self.kanban_column_width();
         let colored = self.kanban_column_color;
         let card_px = if colored { px(10.) } else { px(12.) };
         let owner = self.section_owner();
         let show_list_name = self.view.shows_list_names() && self.sort_settings().1 != GroupBy::List;
-        let hide_new_section = self.view_flag("kanban:hide_new_section", false);
+        let hide_new_section = self.hide_new_section;
         // Position where an inline "Add Section to Left / Right" input should appear among columns.
         let inline_new_col_pos: Option<usize> = self.new_section.as_ref().and(self.new_section_index).map(|sec_idx| {
             let mut seen_sections = 0usize;
@@ -2030,6 +2009,8 @@ impl TodoView {
                 cx.has_active_drag() && self.kanban_hover_col.as_deref() == Some(col_key.as_str());
             let col_bounds = self.kanban_col_bounds.clone();
             let col_key_for_bounds = col_key.clone();
+            let col_key_for_ids = col_key.clone();
+            let col_scroll_handle = self.kanban_col_scrolls.get(&col_key).cloned();
             drag_cols.push(KanbanColRows {
                 key: col_key,
                 drop,
@@ -2038,7 +2019,7 @@ impl TodoView {
             });
             rendered_cols.push(
                 v_flex()
-                    .id(SharedString::from(format!("kanban-column-{i}")))
+                    .id(SharedString::from(format!("kanban-column-{col_key_for_ids}")))
                     .debug_selector(move || format!("kanban-column-{i}"))
                     .relative()
                     .rounded(px(14.))
@@ -2122,27 +2103,25 @@ impl TodoView {
                             .child(div().flex_1().min_w_0().child(input))
                     }))
                     .when(has_cards, |el| {
-                        el.child(
-                            v_scroll(
-                                SharedString::from(format!("kanban-cards-scroll-{i}")),
-                                v_flex()
-                                    .id(SharedString::from(format!("kanban-cards-{i}")))
-                                    .px(card_px)
-                                    .pt(px(2.))
-                                    .pb(px(12.))
-                                    .children(col_items),
-                            )
-                            .mt(px(2.))
-                            .min_h_0(),
+                        let scroll = v_scroll(
+                            SharedString::from(format!("kanban-cards-scroll-{col_key_for_ids}")),
+                            v_flex()
+                                .id(SharedString::from(format!("kanban-cards-{col_key_for_ids}")))
+                                .px(card_px)
+                                .pt(px(2.))
+                                .pb(px(12.))
+                                .children(col_items),
                         )
+                        .mt(px(2.))
+                        .min_h_0();
+                        el.child(match col_scroll_handle {
+                            Some(handle) => scroll.track_scroll(&handle),
+                            None => scroll,
+                        })
                     })
                     .when(!has_cards, |el| {
                         el.h_full().when(tint.is_none(), |el| {
-                            let top = if dark {
-                                gpui::white().opacity(0.025)
-                            } else {
-                                Hsla::from(gpui::rgb(0x191919)).opacity(0.03)
-                            };
+                            let top = theme.colors().text.opacity(0.03);
                             el.child(
                                 div()
                                     .flex_1()
@@ -2214,7 +2193,9 @@ impl TodoView {
                     }
                     let delta = event.position.x - start_x;
                     let offset = this.kanban_scroll.offset();
-                    this.kanban_scroll.set_offset(gpui::point((start_offset_x + delta).min(px(0.)), offset.y));
+                    let max_x = this.kanban_scroll.max_offset().x.max(px(0.));
+                    this.kanban_scroll
+                        .set_offset(gpui::point((start_offset_x + delta).clamp(-max_x, px(0.)), offset.y));
                     cx.notify();
                 }))
                 .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, _| {
@@ -2262,6 +2243,7 @@ impl TodoView {
                                                         .on_click(cx.listener(|this, _, _, cx| {
                                                             cx.stop_propagation();
                                                             let _ = this.store.set_setting(&format!("kanban:hide_new_section:{}", this.view_key()), "1");
+                                                            this.hide_new_section = true;
                                                             cx.notify();
                                                         })),
                                                 ),

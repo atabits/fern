@@ -1483,18 +1483,20 @@ fn empty_trash_requires_confirmation_before_purging(cx: &mut TestAppContext) {
     let btn = cx.debug_bounds("empty-trash-button").unwrap().center();
     cx.simulate_click(btn, Modifiers::default());
     cx.run_until_parked();
-    assert!(cx.debug_bounds("confirm-empty-trash-modal").is_some());
+    let modal_bounds = cx.debug_bounds("confirm-empty-trash-modal").unwrap();
     assert!(store.task(task.id).unwrap().is_some(), "trash must not purge before confirmation");
 
-    let cancel = cx.debug_bounds("empty-trash-cancel").unwrap().center();
-    cx.simulate_click(cancel, Modifiers::default());
+    // Click backdrop to dismiss (triggers ConfirmDialog::on_cancel).
+    cx.simulate_click(gpui::point(px(10.), px(10.)), Modifiers::default());
     cx.run_until_parked();
     assert!(cx.debug_bounds("confirm-empty-trash-modal").is_none());
     assert!(store.task(task.id).unwrap().is_some());
 
+    // Re-open and click the destructive confirm button at bottom-right of the 340px centered dialog.
     cx.simulate_click(btn, Modifiers::default());
     cx.run_until_parked();
-    let confirm = cx.debug_bounds("empty-trash-confirm").unwrap().center();
+    assert!(cx.debug_bounds("confirm-empty-trash-modal").is_some());
+    let confirm = gpui::point(modal_bounds.center().x + px(110.), modal_bounds.center().y + px(42.));
     cx.simulate_click(confirm, Modifiers::default());
     cx.run_until_parked();
     assert!(cx.debug_bounds("confirm-empty-trash-modal").is_none());
@@ -1532,4 +1534,181 @@ fn batch_add_multiline_paste_creates_multiple_tasks(cx: &mut gpui::TestAppContex
     assert!(titles.contains(&"Buy milk".to_owned()));
     assert!(titles.contains(&"Call dentist".to_owned()));
     assert!(titles.contains(&"Send report".to_owned()));
+}
+
+#[gpui::test]
+fn dismiss_transient_clears_timeline_tz_column_add_and_new_section(cx: &mut TestAppContext) {
+    let store = Rc::new(Store::open_in_memory().unwrap());
+    cx.update(|cx| {
+        theme::init(cx);
+        cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+        crate::keymap::load_default(&assets::Assets, cx).unwrap();
+    });
+    let (view, cx) = cx.add_window_view(|window, cx| TodoView::new(store.clone(), window, cx));
+    cx.simulate_resize(gpui::size(px(1200.), px(700.)));
+    cx.run_until_parked();
+
+    cx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            // 1. Timeline secondary timezone menu
+            v.timeline_tz_menu = true;
+            assert!(v.dismiss_transient(window, cx));
+            assert!(!v.timeline_tz_menu);
+
+            // 2. Kanban column quick-add input
+            let col_input = cx.new(|cx| TextInput::new(crate::text_input::Mode::SingleLine, "Add", cx));
+            window.focus(&col_input.focus_handle(cx), cx);
+            v.column_add = Some((0, DropTarget::Section(None), col_input));
+            assert!(v.dismiss_transient(window, cx));
+            assert!(v.column_add.is_none());
+            assert!(v.list_focus.is_focused(window));
+
+            // 3. Inline "Add Section" input
+            let sec_input = cx.new(|cx| TextInput::new(crate::text_input::Mode::SingleLine, "Section", cx));
+            window.focus(&sec_input.focus_handle(cx), cx);
+            v.new_section = Some(sec_input);
+            v.new_section_index = Some(1);
+            assert!(v.dismiss_transient(window, cx));
+            assert!(v.new_section.is_none());
+            assert!(v.new_section_index.is_none());
+            assert!(v.list_focus.is_focused(window));
+
+            // 4. Clean state returns false
+            assert!(!v.dismiss_transient(window, cx));
+        });
+    });
+}
+
+#[gpui::test]
+fn kanban_scroll_handles_keyed_by_column_key_and_synced_outside_render(cx: &mut TestAppContext) {
+    let store = Rc::new(Store::open_in_memory().unwrap());
+    let list = store.create_list("Board").unwrap();
+    let sec_a = store.add_list_section(Some(list.id), "Backlog").unwrap();
+    let sec_b = store.add_list_section(Some(list.id), "Doing").unwrap();
+    let t1 = store.add_task("Alpha").unwrap();
+    store.set_list(t1.id, Some(list.id)).unwrap();
+    store.set_section(t1.id, Some(sec_a.id)).unwrap();
+    let t2 = store.add_task("Beta").unwrap();
+    store.set_list(t2.id, Some(list.id)).unwrap();
+    store.set_section(t2.id, Some(sec_b.id)).unwrap();
+
+    cx.update(|cx| {
+        theme::init(cx);
+        cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+        crate::keymap::load_default(&assets::Assets, cx).unwrap();
+    });
+    let (view, cx) = cx.add_window_view(|window, cx| TodoView::new(store.clone(), window, cx));
+    cx.simulate_resize(gpui::size(px(1200.), px(700.)));
+
+    let key_a = format!("sec:{}", sec_a.id);
+    let key_b = format!("sec:{}", sec_b.id);
+
+    // Enable kanban quick add and switch to kanban without rendering first —
+    // reload() must eagerly populate both scroll handles and quick-add inputs by col.key.
+    let handle_b_before = cx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.select_view(View::List(list.id), window, cx);
+            v.toggle_kanban_quick_add(cx);
+            v.set_layout(true, false, cx);
+            assert!(v.kanban_col_scrolls.contains_key(&key_a));
+            assert!(v.kanban_col_scrolls.contains_key(&key_b));
+            assert!(v.kanban_quick_adds.contains_key(&key_a));
+            assert!(v.kanban_quick_adds.contains_key(&key_b));
+            v.kanban_col_scrolls.get(&key_b).unwrap().clone()
+        })
+    });
+
+    // Reorder sections so sec_b moves from index 1 to index 0.
+    // Its scroll handle must stay bound to key_b rather than positional index.
+    store.reorder_list_sections(Some(list.id), sec_b.id, sec_a.id).unwrap();
+    cx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.reload(cx);
+            handle_b_before.set_offset(gpui::point(px(0.), px(-42.)));
+            let handle_b_after = v.kanban_col_scrolls.get(&key_b).unwrap();
+            assert_eq!(handle_b_after.offset(), gpui::point(px(0.), px(-42.)));
+            assert_eq!(v.kanban_col_scrolls.get(&key_a).unwrap().offset(), gpui::point(px(0.), px(0.)));
+        });
+    });
+
+    // Deleting sec_a prunes its scroll handle and quick-add input on reload.
+    store.delete_list_section(sec_a.id).unwrap();
+    cx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.reload(cx);
+            assert!(!v.kanban_col_scrolls.contains_key(&key_a));
+            assert!(!v.kanban_quick_adds.contains_key(&key_a));
+            assert!(v.kanban_col_scrolls.contains_key(&key_b));
+        });
+    });
+}
+
+#[gpui::test]
+fn drag_to_completed_in_list_and_kanban_advances_repeating_task_with_undo(cx: &mut TestAppContext) {
+    let store = Rc::new(Store::open_in_memory().unwrap());
+    let today = TodoView::today();
+    let list = store.create_list("Recurring").unwrap();
+
+    // Task 1: completed via sidebar drag to View::Completed
+    let t1 = store.add_task("Daily standup").unwrap();
+    store.set_list(t1.id, Some(list.id)).unwrap();
+    store.set_due(t1.id, Some(today), None).unwrap();
+    store.set_repeat(t1.id, Some(fern_core::Recurrence::new(fern_core::Frequency::Daily, 1)), today).unwrap();
+
+    // Task 2: completed via Kanban drop onto DropTarget::Complete
+    let t2 = store.add_task("Daily review").unwrap();
+    store.set_list(t2.id, Some(list.id)).unwrap();
+    store.set_due(t2.id, Some(today), None).unwrap();
+    store.set_repeat(t2.id, Some(fern_core::Recurrence::new(fern_core::Frequency::Daily, 1)), today).unwrap();
+
+    cx.update(|cx| {
+        theme::init(cx);
+        cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+        crate::keymap::load_default(&assets::Assets, cx).unwrap();
+    });
+    let (view, cx) = cx.add_window_view(|window, cx| TodoView::new(store.clone(), window, cx));
+    cx.simulate_resize(gpui::size(px(1200.), px(700.)));
+    cx.run_until_parked();
+
+    // 1. Drag to sidebar Completed smart list
+    cx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.drop_on_view(View::Completed, t1.id, cx);
+            assert!(
+                matches!(v.undo, Some((crate::undo::UndoAction::ReopenRepeat { id, .. }, _, _)) if id == t1.id),
+                "drop_on_view(Completed) must advance repeating task and offer ReopenRepeat undo"
+            );
+        });
+    });
+    let t1_after = store.task(t1.id).unwrap().unwrap();
+    assert!(!t1_after.is_completed(), "repeating task should advance to next occurrence rather than stay completed");
+    assert_eq!(t1_after.due_date, Some(today + Duration::days(1)));
+    let completed_t1_copies: Vec<_> = store
+        .tasks()
+        .unwrap()
+        .into_iter()
+        .filter(|t| t.title == "Daily standup" && t.is_completed())
+        .collect();
+    assert_eq!(completed_t1_copies.len(), 1, "should spawn one completed copy for today's occurrence");
+
+    // 2. Drag onto Kanban Completed column (DropTarget::Complete)
+    cx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.drop_on_column(t2.id, DropTarget::Complete, cx);
+            assert!(
+                matches!(v.undo, Some((crate::undo::UndoAction::ReopenRepeat { id, .. }, _, _)) if id == t2.id),
+                "kanban drop onto Complete must advance repeating task and offer ReopenRepeat undo"
+            );
+        });
+    });
+    let t2_after = store.task(t2.id).unwrap().unwrap();
+    assert!(!t2_after.is_completed(), "repeating task dropped on kanban Complete must advance");
+    assert_eq!(t2_after.due_date, Some(today + Duration::days(1)));
+    let completed_t2_copies: Vec<_> = store
+        .tasks()
+        .unwrap()
+        .into_iter()
+        .filter(|t| t.title == "Daily review" && t.is_completed())
+        .collect();
+    assert_eq!(completed_t2_copies.len(), 1, "kanban Complete drop should spawn one completed copy");
 }

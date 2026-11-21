@@ -298,7 +298,9 @@ impl TodoView {
                     .drag_over::<DraggedTask>(move |style, _, _, _| style.bg(accent.opacity(0.15)))
                     .on_drop(cx.listener(move |this, dragged: &DraggedTask, _, cx| {
                         let result = this.store.move_dates(dragged.id, date);
-                        this.check(result);
+                        if this.check(result).is_some() {
+                            crate::data_version::data_changed(cx.entity_id(), cx);
+                        }
                         this.reload(cx);
                     }))
                     .drag_over::<ResizedTask>(move |style, _, _, _| style.bg(accent.opacity(0.18)))

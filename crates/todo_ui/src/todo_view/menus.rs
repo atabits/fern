@@ -173,12 +173,17 @@ impl TodoView {
     }
 
 
+    pub(super) fn refresh_suggestions(&mut self) {
+        let tasks = self.store.tasks().unwrap_or_default();
+        self.cached_suggestions = fern_core::suggest::suggestions(&tasks, Self::today());
+    }
+
     /// The original's Suggested Tasks: Recently Added and Long Unfinished, each with "+" to plan
     /// the task for today; four of the long unfinished ones until "More".
     pub(super) fn render_suggestions(&self, all: bool, strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
         let today = Self::today();
-        let found = fern_core::suggest::suggestions(&self.store.tasks().unwrap_or_default(), today);
+        let found = &self.cached_suggestions;
         let row = |task: &Task, note: String, cx: &mut Context<Self>| {
             let id = task.id;
             h_flex()
@@ -856,18 +861,21 @@ impl TodoView {
     /// A right-click menu choice (see `task_menu`).
     pub(super) fn context_action(&mut self, action: task_menu::MenuAction, window: &mut Window, cx: &mut Context<Self>) {
         use task_menu::MenuAction;
-        let Some((id, _, _)) = self.context_menu else { return };
+        let Some((id, _, _, _)) = self.context_menu.as_ref().map(|(t, p, n)| (t.id, *p, *n, t.title.clone())) else { return };
         if let MenuAction::Side(side) = action {
             self.context_side = side;
             cx.notify();
             return;
         }
-        self.context_menu = None;
+        let Some((cached_task, _, _)) = self.context_menu.take() else { return };
         self.context_side = None;
-        let Some(task) = self.tasks.iter().find(|t| t.id == id).cloned().or_else(|| self.store.task(id).ok().flatten()) else {
-            cx.notify();
-            return;
-        };
+        let task = self
+            .tasks
+            .iter()
+            .find(|t| t.id == id)
+            .cloned()
+            .or_else(|| self.store.task(id).ok().flatten())
+            .unwrap_or(cached_task);
         if let Some(result) = task_menu::apply(&self.store, &task, action, Self::today()) {
             self.check(result);
             self.reload(cx);
@@ -890,19 +898,19 @@ impl TodoView {
 
     /// The task's right-click menu, as the original's, at the pointer.
     pub(super) fn render_context_menu(&self, strings: &'static Strings, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let (id, position, nesting) = self.context_menu?;
-        let task = self.tasks.iter().find(|t| t.id == id).cloned().or_else(|| self.store.task(id).ok().flatten())?;
+        let (cached_task, position, nesting) = self.context_menu.as_ref()?;
+        let task = self.tasks.iter().find(|t| t.id == cached_task.id).unwrap_or(cached_task);
         let menu = task_menu::render(
-            &task,
+            task,
             &self.active_lists(),
             task_menu::MenuKind::List,
-            nesting,
+            *nesting,
             self.context_side,
             strings,
             cx,
             std::rc::Rc::new(|this: &mut Self, action, window, cx| this.context_action(action, window, cx)),
         );
-        Some(task_menu::place(position, menu))
+        Some(task_menu::place(*position, menu))
     }
 
     pub(super) fn set_closed_menu(&mut self, menu: Option<ClosedMenu>, cx: &mut Context<Self>) {

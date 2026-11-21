@@ -510,6 +510,7 @@ impl TodoView {
         let has_note_icon = details_line.is_none() && !task.notes.trim().is_empty();
         let due = task.due_date.map(|date| task_rows::row_due_label(date, task.due_time, today, strings, self.preferences.countdown_dates));
         let has_reminders = !task.reminders.is_empty() && !settled_done;
+        let has_location = task.location.as_deref().is_some_and(|l| !l.trim().is_empty());
         let checklist = task.checklist.filter(|_| !settled_done);
         let list_info = (depth == 0 && show_list_name).then(|| {
             task.list_id
@@ -520,6 +521,7 @@ impl TodoView {
         });
         let has_tips_row = due.is_some()
             || has_note_icon
+            || has_location
             || task.repeat.is_some()
             || has_reminders
             || checklist.is_some()
@@ -732,16 +734,36 @@ impl TodoView {
                                         } else {
                                             Color::Accent
                                         };
-                                        el.child(Label::new(label).size(LabelSize::XSmall).color(color))
+                                        el.child(
+                                            div()
+                                                .id(SharedString::from(format!("kanban-due-toggle-{id}")))
+                                                .px_0p5()
+                                                .rounded(px(3.))
+                                                .cursor_pointer()
+                                                .hover(|s| s.bg(theme.colors().element_hover))
+                                                .child(Label::new(label).size(LabelSize::XSmall).color(color))
+                                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    cx.stop_propagation();
+                                                    this.save_preferences(|p| p.countdown_dates = !p.countdown_dates, cx);
+                                                })),
+                                        )
                                     })
                                     .when(has_note_icon, |el| {
                                         el.child(Icon::new(IconName::FileText).size(IconSize::XSmall).color(Color::Muted))
+                                    })
+                                    .when(has_location, |el| {
+                                        el.child(Icon::new(IconName::MapPin).size(IconSize::XSmall).color(Color::Muted))
                                     })
                                     .when(task.repeat.is_some(), |el| {
                                         el.child(Icon::new(IconName::Repeat).size(IconSize::XSmall).color(Color::Muted))
                                     })
                                     .when(has_reminders, |el| {
-                                        el.child(Icon::new(IconName::AlarmClock).size(IconSize::XSmall).color(Color::Muted))
+                                        el.child(
+                                            Icon::new(IconName::AlarmClock)
+                                                .size(IconSize::XSmall)
+                                                .color(if task.constant_reminder { Color::Accent } else { Color::Muted }),
+                                        )
                                     })
                                     .when_some(checklist, |el, (done_items, total)| {
                                         el.child(

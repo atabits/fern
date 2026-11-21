@@ -665,14 +665,10 @@ impl TodoView {
                 self.check(result);
             }
             (ListAction::Delete, Some(ListMenuTarget::Tag(tag))) => {
-                let result = self.store.delete_tag(&tag);
-                self.check(result);
-                if self.view == View::Tag(tag) {
-                    self.header_menu_open = false;
-                    crate::data_version::data_changed(cx.entity_id(), cx);
-                    self.set_view(View::Inbox, cx);
-                    return;
-                }
+                self.confirm_delete = Some(ConfirmDeleteTarget::Tag(tag));
+                self.header_menu_open = false;
+                cx.notify();
+                return;
             }
             (ListAction::ShowTags(visibility), _) => {
                 self.save_preferences(|p| p.set_visibility(fern_core::SmartList::Tags, visibility), cx);
@@ -705,14 +701,16 @@ impl TodoView {
             }
             (ListAction::Delete, _) => {
                 if let Some(id) = list {
-                    let result = self.store.delete_list(id);
-                    self.check(result);
-                    if current == Some(id) {
-                        self.header_menu_open = false;
-                        crate::data_version::data_changed(cx.entity_id(), cx);
-                        self.set_view(View::Inbox, cx);
-                        return;
-                    }
+                    let name = self
+                        .lists
+                        .iter()
+                        .find(|l| l.id == id)
+                        .map(|l| l.name.clone())
+                        .unwrap_or_default();
+                    self.confirm_delete = Some(ConfirmDeleteTarget::List(id, name));
+                    self.header_menu_open = false;
+                    cx.notify();
+                    return;
                 }
             }
             _ => {}

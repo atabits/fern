@@ -89,6 +89,13 @@ struct CompletingTask {
 }
 
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum ConfirmDeleteTarget {
+    List(Id, String),
+    Tag(String),
+    Filter(Id, String),
+}
+
 pub struct TodoView {
     store: Rc<Store>,
     view: View,
@@ -147,6 +154,7 @@ pub struct TodoView {
     search_input: Entity<TextInput>,
     header_menu_open: bool,
     confirm_empty_trash: bool,
+    confirm_delete: Option<ConfirmDeleteTarget>,
     /// Lines pasted into Quick Add awaiting confirmation for Batch Add Tasks.
     batch_add_pending: Option<Vec<String>>,
     /// Filters of the Completed and Won't Do views; `None` lists means all lists.
@@ -430,6 +438,7 @@ impl TodoView {
             search_input,
             header_menu_open: false,
             confirm_empty_trash: false,
+            confirm_delete: None,
             batch_add_pending: None,
             closed_range: ClosedRange::All,
             closed_lists: None,
@@ -1853,6 +1862,7 @@ impl TodoView {
             self.suggestions_open.take().is_some(),
             std::mem::take(&mut self.header_menu_open),
             std::mem::take(&mut self.confirm_empty_trash),
+            self.confirm_delete.take().is_some(),
             self.batch_add_pending.take().is_some(),
             std::mem::take(&mut self.postpone_menu),
             std::mem::take(&mut self.scale_menu_open),
@@ -2855,6 +2865,40 @@ impl TodoView {
         self.confirm_empty_trash = false;
         let result = self.store.empty_trash();
         self.check(result);
+        self.reload(cx);
+    }
+
+    fn execute_confirmed_delete(&mut self, target: ConfirmDeleteTarget, cx: &mut Context<Self>) {
+        self.confirm_delete = None;
+        match target {
+            ConfirmDeleteTarget::List(id, _) => {
+                let result = self.store.delete_list(id);
+                self.check(result);
+                if self.view == View::List(id) {
+                    crate::data_version::data_changed(cx.entity_id(), cx);
+                    self.set_view(View::Inbox, cx);
+                    return;
+                }
+            }
+            ConfirmDeleteTarget::Tag(tag) => {
+                let result = self.store.delete_tag(&tag);
+                self.check(result);
+                if self.view == View::Tag(tag) {
+                    crate::data_version::data_changed(cx.entity_id(), cx);
+                    self.set_view(View::Inbox, cx);
+                    return;
+                }
+            }
+            ConfirmDeleteTarget::Filter(id, _) => {
+                let result = self.store.delete_filter(id);
+                if self.check(result).is_some() && self.view == View::Filter(id) {
+                    crate::data_version::data_changed(cx.entity_id(), cx);
+                    self.set_view(View::Inbox, cx);
+                    return;
+                }
+            }
+        }
+        crate::data_version::data_changed(cx.entity_id(), cx);
         self.reload(cx);
     }
 
@@ -4162,6 +4206,91 @@ impl Render for TodoView {
                                                 .hover(|s| s.bg(theme.status().error.opacity(0.9)))
                                                 .child(Label::new(strings.empty_trash).size(LabelSize::Small).color(Color::OnAccent))
                                                 .on_click(cx.listener(|this, _, _, cx| this.empty_trash(cx))),
+                                        ),
+                                ),
+                        ),
+                )
+            })
+            .when_some(self.confirm_delete.clone(), |el, target| {
+                let (title, hint) = match &target {
+                    ConfirmDeleteTarget::List(_, name) => (
+                        format!("{} \"{name}\"?", strings.delete),
+                        strings.confirm_delete_list_hint,
+                    ),
+                    ConfirmDeleteTarget::Tag(tag) => (
+                        format!("{} \"#{tag}\"?", strings.delete),
+                        strings.confirm_delete_tag_hint,
+                    ),
+                    ConfirmDeleteTarget::Filter(_, name) => (
+                        format!("{} \"{name}\"?", strings.delete_filter),
+                        strings.confirm_delete_filter_hint,
+                    ),
+                };
+                el.child(
+                    div()
+                        .id("confirm-delete-backdrop")
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .bg(gpui::black().opacity(0.35))
+                        .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                            this.confirm_delete = None;
+                            cx.notify();
+                        }))
+                        .child(
+                            v_flex()
+                                .id("confirm-delete-card")
+                                .w(px(340.))
+                                .p_5()
+                                .gap_3()
+                                .rounded(px(10.))
+                                .bg(theme.colors().elevated_surface_background)
+                                .border_1()
+                                .border_color(theme.colors().border)
+                                .shadow_lg()
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .child(Label::new(title).size(LabelSize::Large).weight(FontWeight::SEMIBOLD))
+                                .child(Label::new(hint).size(LabelSize::Small).color(Color::Muted))
+                                .child(
+                                    h_flex()
+                                        .pt_2()
+                                        .gap_2()
+                                        .justify_end()
+                                        .child(
+                                            div()
+                                                .id("confirm-delete-cancel")
+                                                .px_3()
+                                                .h(px(30.))
+                                                .flex()
+                                                .items_center()
+                                                .rounded(px(6.))
+                                                .border_1()
+                                                .border_color(theme.colors().border)
+                                                .cursor_pointer()
+                                                .hover(|s| s.bg(theme.colors().element_hover))
+                                                .child(Label::new(strings.cancel).size(LabelSize::Small))
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.confirm_delete = None;
+                                                    cx.notify();
+                                                })),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("confirm-delete-ok")
+                                                .px_3()
+                                                .h(px(30.))
+                                                .flex()
+                                                .items_center()
+                                                .rounded(px(6.))
+                                                .bg(theme.status().error)
+                                                .cursor_pointer()
+                                                .hover(|s| s.bg(theme.status().error.opacity(0.9)))
+                                                .child(Label::new(strings.delete).size(LabelSize::Small).color(Color::OnAccent))
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.execute_confirmed_delete(target.clone(), cx);
+                                                })),
                                         ),
                                 ),
                         ),

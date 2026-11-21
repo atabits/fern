@@ -268,10 +268,15 @@ impl TodoView {
     }
     pub(super) fn delete_current_filter(&mut self, cx: &mut Context<Self>) {
         if let View::Filter(id) = self.view {
-            let result = self.store.delete_filter(id);
-            if self.check(result).is_some() {
-                self.set_view(View::Inbox, cx);
-            }
+            let name = self
+                .filters
+                .iter()
+                .find(|(f, _)| f.id == id)
+                .map(|(f, _)| f.name.clone())
+                .unwrap_or_default();
+            self.header_menu_open = false;
+            self.confirm_delete = Some(ConfirmDeleteTarget::Filter(id, name));
+            cx.notify();
         }
     }
     fn render_filter_preview(&self, edit: &FilterEdit, cx: &mut Context<Self>) -> AnyElement {

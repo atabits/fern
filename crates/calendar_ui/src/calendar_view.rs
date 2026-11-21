@@ -2405,8 +2405,24 @@ impl CalendarView {
                     .children(events.into_iter().take(event_room).map(|event| self.event_bar(event, date, cx)))
                     .children(extras.into_iter().take(room))
                     .when(hidden > 0 && slots > 0, |el| {
-                        el.child(h_flex().h(px(DAY_ITEM_HEIGHT)).flex_none().px_1()
-                            .child(Label::new(format!("+{hidden}")).size(LabelSize::XSmall).color(Color::Muted)))
+                        el.child(
+                            h_flex()
+                                .id(SharedString::from(format!("calendar-more-{date}")))
+                                .h(px(DAY_ITEM_HEIGHT))
+                                .flex_none()
+                                .px_1()
+                                .rounded(px(4.))
+                                .cursor_pointer()
+                                .hover(|s| s.bg(theme.colors().element_hover))
+                                .child(Label::new(format!("+{hidden}")).size(LabelSize::XSmall).color(Color::Accent))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.anchor = date;
+                                    this.month = calendar::month_start(date);
+                                    this.selected_day = Some(date);
+                                    this.set_mode(CalendarMode::Day, cx);
+                                })),
+                        )
                     }),
             )
             .when_some(editor, |el, editor| {

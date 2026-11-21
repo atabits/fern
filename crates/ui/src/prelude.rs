@@ -8,6 +8,8 @@ pub use gpui::{
 pub use theme::ActiveTheme;
 
 pub use crate::{
-    Checkbox, Chip, Clickable, Color, Disableable, Divider, Icon, IconButton, IconName, IconSize,
-    Label, LabelSize, ListItem, Switch, Toggleable, Tooltip, h_flex, v_flex, v_scroll,
+    Button, ButtonSize, ButtonVariant, Checkbox, Chip, Clickable, Color, ConfirmDialog,
+    Disableable, Divider, EmptyState, Icon, IconButton, IconName, IconSize, Label, LabelSize,
+    ListItem, Modal, SegmentedTab, SegmentedTabs, Switch, ToggleChip, Toggleable, Tooltip, h_flex,
+    v_flex, v_scroll,
 };

@@ -547,12 +547,25 @@ impl Render for SearchModal {
                                 .child(if task.kind == Kind::Note {
                                     Icon::new(IconName::FileText).size(IconSize::Small).color(Color::Muted).into_any_element()
                                 } else {
+                                    let done = task.is_completed();
                                     Checkbox::new(SharedString::from(format!("search-checkbox-{id}")))
                                         .size(px(14.))
-                                        .toggle_state(task.is_completed())
+                                        .toggle_state(done)
                                         .in_progress(task.is_in_progress())
                                         .dismissed(task.is_wont_do())
                                         .tint(task_rows::priority_color(task.priority, &theme))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            if !done {
+                                                desktop_common::sound::play_complete(&this.store);
+                                            }
+                                            if let Err(err) = this.store.set_completed(id, !done) {
+                                                eprintln!("failed to toggle task from search: {err:#}");
+                                            } else {
+                                                desktop_common::data_version::data_changed(cx.entity_id(), cx);
+                                                this.refresh(cx);
+                                            }
+                                        }))
                                         .into_any_element()
                                 })
                                 .child(
@@ -561,7 +574,7 @@ impl Render for SearchModal {
                                         .min_w_0()
                                         .truncate()
                                         .text_size(px(13.))
-                                        .when(task.is_completed(), |el| el.text_color(theme.colors().text_muted))
+                                        .when(task.is_completed(), |el| el.text_color(theme.colors().text_muted).line_through())
                                         .child(self.highlighted(&task.title, &query, cx)),
                                 )
                                 .when_some(due, |el, (label, overdue)| {

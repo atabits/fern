@@ -2003,13 +2003,17 @@ impl FocusView {
         let nav = |id: &'static str, label: String, back: fn(&mut StatsPage), forward: fn(&mut StatsPage), cx: &mut Context<Self>| {
             h_flex()
                 .gap_1()
-                .child(IconButton::new(SharedString::from(format!("{id}-back")), IconName::ChevronLeft).on_click(
-                    cx.listener(move |this, _, _, cx| this.update_stats(cx, back)),
-                ))
+                .child(
+                    IconButton::new(SharedString::from(format!("{id}-back")), IconName::ChevronLeft)
+                        .tooltip(Tooltip::text("←"))
+                        .on_click(cx.listener(move |this, _, _, cx| this.update_stats(cx, back))),
+                )
                 .child(Label::new(label).size(LabelSize::Small))
-                .child(IconButton::new(SharedString::from(format!("{id}-forward")), IconName::ChevronRight).on_click(
-                    cx.listener(move |this, _, _, cx| this.update_stats(cx, forward)),
-                ))
+                .child(
+                    IconButton::new(SharedString::from(format!("{id}-forward")), IconName::ChevronRight)
+                        .tooltip(Tooltip::text("→"))
+                        .on_click(cx.listener(move |this, _, _, cx| this.update_stats(cx, forward))),
+                )
         };
         // As the original's: numbers large with a duration's "h" and "m" small beside them.
         let overview_item = |parts: Vec<(i64, Option<char>)>, label: &'static str, change: Option<(String, i64)>| {
@@ -2498,6 +2502,7 @@ impl FocusView {
                 .rounded(px(14.))
                 .border_1()
                 .border_color(if open { theme.colors().accent } else { theme.colors().border })
+                .hover(|s| s.bg(theme.colors().ghost_element_hover))
                 .cursor_pointer()
                 .child(Label::new(text).size(LabelSize::Small))
                 .child(Icon::new(IconName::ChevronDown).size(IconSize::XSmall).color(Color::Muted))
@@ -2534,13 +2539,19 @@ impl FocusView {
                     .child(div().flex_1().child(Label::new(strings.stats_details).weight(FontWeight::SEMIBOLD)))
                     .child(pill("details-by", 0, by_names[page.details_by as usize], by_options, cx))
                     .child(pill("details-period", 1, period_names[period_index], period_options, cx))
-                    .child(IconButton::new("details-back", IconName::ChevronLeft).size(px(22.)).on_click(cx.listener(
-                        move |this, _, _, cx| this.update_stats(cx, |p| p.details_day = step(p.details_day, false)),
-                    )))
+                    .child(
+                        IconButton::new("details-back", IconName::ChevronLeft)
+                            .size(px(22.))
+                            .tooltip(Tooltip::text("←"))
+                            .on_click(cx.listener(move |this, _, _, cx| this.update_stats(cx, |p| p.details_day = step(p.details_day, false)))),
+                    )
                     .child(Label::new(label).size(LabelSize::Small))
-                    .child(IconButton::new("details-forward", IconName::ChevronRight).size(px(22.)).on_click(cx.listener(
-                        move |this, _, _, cx| this.update_stats(cx, |p| p.details_day = step(p.details_day, true)),
-                    ))),
+                    .child(
+                        IconButton::new("details-forward", IconName::ChevronRight)
+                            .size(px(22.))
+                            .tooltip(Tooltip::text("→"))
+                            .on_click(cx.listener(move |this, _, _, cx| this.update_stats(cx, |p| p.details_day = step(p.details_day, true)))),
+                    ),
             )
             .child(
                 h_flex()
@@ -3032,6 +3043,7 @@ impl FocusView {
                         .gap_1()
                         .rounded(px(8.))
                         .bg(theme.colors().surface_background)
+                        .hover(|s| s.bg(theme.colors().element_hover))
                         .cursor_pointer()
                         .child(Label::new(names[index]).size(LabelSize::Small))
                         .child(Icon::new(IconName::ChevronDown).size(IconSize::XSmall).color(Color::Muted))
@@ -3045,13 +3057,17 @@ impl FocusView {
                         .gap_1()
                         .rounded(px(8.))
                         .bg(theme.colors().surface_background)
-                        .child(IconButton::new("task-day-back", IconName::ChevronLeft).on_click(cx.listener(move |this, _, _, cx| {
-                            this.update_stats(cx, |p| p.day = step(p.day, false))
-                        })))
+                        .child(
+                            IconButton::new("task-day-back", IconName::ChevronLeft)
+                                .tooltip(Tooltip::text("←"))
+                                .on_click(cx.listener(move |this, _, _, cx| this.update_stats(cx, |p| p.day = step(p.day, false)))),
+                        )
                         .child(div().min_w(px(90.)).flex().justify_center().child(Label::new(period_label).size(LabelSize::Small)))
-                        .child(IconButton::new("task-day-forward", IconName::ChevronRight).on_click(cx.listener(move |this, _, _, cx| {
-                            this.update_stats(cx, |p| p.day = step(p.day, true))
-                        }))),
+                        .child(
+                            IconButton::new("task-day-forward", IconName::ChevronRight)
+                                .tooltip(Tooltip::text("→"))
+                                .on_click(cx.listener(move |this, _, _, cx| this.update_stats(cx, |p| p.day = step(p.day, true)))),
+                        ),
                 )
                 .into_any_element(),
             h_flex()

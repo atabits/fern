@@ -87,6 +87,7 @@ pub struct FocusView {
     delete_all_armed: bool,
     /// The records ticked in Batch Management, its filters and the filter whose menu is open.
     batch: HashSet<Id>,
+    confirm_batch_delete: bool,
     batch_filter: fern_core::focus::RecordFilter,
     batch_menu: Option<u8>,
     /// A filter's Custom fields, while open: the filter (0 Date, 1 Duration) and its two fields
@@ -344,6 +345,7 @@ impl FocusView {
             timer_menu: None,
             delete_all_armed: false,
             batch: HashSet::new(),
+            confirm_batch_delete: false,
             batch_filter: Default::default(),
             batch_menu: None,
             batch_custom: None,
@@ -1146,12 +1148,8 @@ impl FocusView {
                                 .cursor_pointer()
                                 .child(Label::new(strings.delete).size(LabelSize::Small).color(Color::Error))
                                 .on_click(cx.listener(|this, _, _, cx| {
-                                    let ids: Vec<Id> = this.batch.drain().collect();
-                                    if let Err(err) = this.store.delete_focus_sessions(&ids) {
-                                        eprintln!("failed to delete the records: {err:#}");
-                                    }
-                                    this.set_record_menu(None, cx);
-                                    this.reload(cx);
+                                    this.confirm_batch_delete = true;
+                                    cx.notify();
                                 })),
                         )
                     }),
@@ -1871,6 +1869,10 @@ impl FocusView {
                 || std::mem::take(&mut stats.classify_menu)
                 || stats.details_menu.take().is_some()
         }) {
+            cx.notify();
+            return true;
+        }
+        if std::mem::take(&mut self.confirm_batch_delete) {
             cx.notify();
             return true;
         }
@@ -4091,6 +4093,97 @@ impl Render for FocusView {
             .child(right)
             .children(self.render_record_dialog(cx))
             .children(self.render_modal(cx))
+            .when(self.confirm_batch_delete, |el| {
+                let strings = i18n::t(cx);
+                let theme = cx.theme().clone();
+                el.child(
+                    div()
+                        .id("focus-batch-delete-backdrop")
+                        .absolute()
+                        .inset_0()
+                        .bg(gpui::black().opacity(0.35))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.confirm_batch_delete = false;
+                            cx.notify();
+                        }))
+                        .child(
+                            v_flex()
+                                .id("focus-batch-delete-modal")
+                                .w(px(360.))
+                                .p_5()
+                                .gap_3()
+                                .rounded(px(12.))
+                                .bg(theme.colors().elevated_surface_background)
+                                .border_1()
+                                .border_color(theme.colors().border)
+                                .shadow_lg()
+                                .on_click(|_, _, cx| cx.stop_propagation())
+                                .child(
+                                    div()
+                                        .text_size(px(16.))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(theme.colors().text)
+                                        .child(strings.focus_batch_delete_title),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(13.))
+                                        .text_color(theme.colors().text_muted)
+                                        .child(strings.focus_batch_delete_message),
+                                )
+                                .child(
+                                    h_flex()
+                                        .justify_end()
+                                        .gap_2()
+                                        .pt_1()
+                                        .child(
+                                            div()
+                                                .id("focus-batch-delete-cancel")
+                                                .px_3()
+                                                .py_1()
+                                                .rounded(px(6.))
+                                                .border_1()
+                                                .border_color(theme.colors().border)
+                                                .text_size(px(13.))
+                                                .text_color(theme.colors().text)
+                                                .hover(|s| s.bg(theme.colors().element_hover))
+                                                .cursor_pointer()
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.confirm_batch_delete = false;
+                                                    cx.notify();
+                                                }))
+                                                .child(strings.cancel),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("focus-batch-delete-confirm")
+                                                .px_3()
+                                                .py_1()
+                                                .rounded(px(6.))
+                                                .bg(theme.status().error)
+                                                .text_size(px(13.))
+                                                .font_weight(FontWeight::MEDIUM)
+                                                .text_color(gpui::white())
+                                                .hover(|s| s.opacity(0.9))
+                                                .cursor_pointer()
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.confirm_batch_delete = false;
+                                                    let ids: Vec<Id> = this.batch.drain().collect();
+                                                    if let Err(err) = this.store.delete_focus_sessions(&ids) {
+                                                        eprintln!("failed to delete the records: {err:#}");
+                                                    }
+                                                    this.set_record_menu(None, cx);
+                                                    this.reload(cx);
+                                                }))
+                                                .child(strings.delete),
+                                        ),
+                                ),
+                        ),
+                )
+            })
             .into_any_element()
     }
 }

@@ -244,6 +244,13 @@ fn parse_priority(value: &str) -> Option<Priority> {
 }
 
 fn parse_time(word: &str) -> Option<NaiveTime> {
+    match word {
+        "morning" | "утром" | "早上" => return NaiveTime::from_hms_opt(9, 0, 0),
+        "noon" | "днём" | "днем" | "中午" => return NaiveTime::from_hms_opt(12, 0, 0),
+        "afternoon" | "下午" => return NaiveTime::from_hms_opt(14, 0, 0),
+        "evening" | "tonight" | "вечером" | "晚上" => return NaiveTime::from_hms_opt(19, 0, 0),
+        _ => {}
+    }
     let (clock, pm) = match word.strip_suffix("pm") {
         Some(clock) => (clock, Some(true)),
         None => match word.strip_suffix("am") {
@@ -285,13 +292,33 @@ fn parse_date(words: &[String], today: NaiveDate) -> Option<(NaiveDate, usize)> 
         "завтра" | "tomorrow" | "明天" => return Some((today + Duration::days(1), 1)),
         "послезавтра" | "后天" => return Some((today + Duration::days(2), 1)),
         "下周" => return Some((today + Duration::days(7), 1)),
+        "下个月" => return today.checked_add_months(Months::new(1)).map(|d| (d, 1)),
+        "weekend" | "выходные" | "выходных" | "周末" => {
+            let ahead = (Weekday::Sat.num_days_from_monday() as i64
+                - today.weekday().num_days_from_monday() as i64)
+                .rem_euclid(7);
+            return Some((today + Duration::days(ahead), 1));
+        }
         _ => {}
     }
-    if matches!(first, "next" | "следующая" | "следующую" | "следующей")
+    if matches!(first, "this" | "эти" | "этих")
         && words.len() >= 2
-        && matches!(words[1].as_str(), "week" | "неделя" | "неделю" | "неделе")
+        && matches!(words[1].as_str(), "weekend" | "выходные" | "выходных")
     {
-        return Some((today + Duration::days(7), 2));
+        let ahead = (Weekday::Sat.num_days_from_monday() as i64
+            - today.weekday().num_days_from_monday() as i64)
+            .rem_euclid(7);
+        return Some((today + Duration::days(ahead), 2));
+    }
+    if matches!(first, "next" | "следующая" | "следующую" | "следующей" | "следующий" | "следующем")
+        && words.len() >= 2
+    {
+        if matches!(words[1].as_str(), "week" | "неделя" | "неделю" | "неделе") {
+            return Some((today + Duration::days(7), 2));
+        }
+        if matches!(words[1].as_str(), "month" | "месяц" | "месяце") {
+            return today.checked_add_months(Months::new(1)).map(|d| (d, 2));
+        }
     }
     if let Some(weekday) = parse_weekday(first) {
         let ahead = (weekday.num_days_from_monday() as i64
@@ -319,6 +346,21 @@ fn parse_date(words: &[String], today: NaiveDate) -> Option<(NaiveDate, usize)> 
         // "13 March" said in November means March of next year.
         let date = if date < today { NaiveDate::from_ymd_opt(today.year() + 1, month, day)? } else { date };
         return Some((date, 2));
+    }
+    if words.len() >= 2
+        && let Some(month) = parse_month(first)
+    {
+        let raw_day = words[1]
+            .strip_suffix("st")
+            .or_else(|| words[1].strip_suffix("nd"))
+            .or_else(|| words[1].strip_suffix("rd"))
+            .or_else(|| words[1].strip_suffix("th"))
+            .unwrap_or(&words[1]);
+        if let Ok(day) = raw_day.parse::<u32>() {
+            let date = NaiveDate::from_ymd_opt(today.year(), month, day)?;
+            let date = if date < today { NaiveDate::from_ymd_opt(today.year() + 1, month, day)? } else { date };
+            return Some((date, 2));
+        }
     }
     None
 }
@@ -462,7 +504,18 @@ mod tests {
         assert_eq!(date("x 13.11.2027"), Some(d(2027, 11, 13)));
         assert_eq!(date("x 2026-12-31"), Some(d(2026, 12, 31)));
         assert_eq!(date("x 13 nov"), Some(d(2026, 11, 13)));
+        assert_eq!(date("x nov 13"), Some(d(2026, 11, 13)));
+        assert_eq!(date("x nov 13th"), Some(d(2026, 11, 13)));
+        assert_eq!(date("x march 5"), Some(d(2027, 3, 5)));
         assert_eq!(date("x by 5 march"), Some(d(2027, 3, 5)));
+        assert_eq!(date("x next month"), Some(d(2026, 11, 18)));
+        assert_eq!(date("x следующий месяц"), Some(d(2026, 11, 18)));
+        assert_eq!(date("x 下个月"), Some(d(2026, 11, 18)));
+        // 2026-10-18 is Sunday, so upcoming Saturday is 2026-10-24.
+        assert_eq!(date("x this weekend"), Some(d(2026, 10, 24)));
+        assert_eq!(date("x выходные"), Some(d(2026, 10, 24)));
+        assert_eq!(parse_quick_add("call mom завтра вечером", today(), &[]).due_time, t(19, 0));
+        assert_eq!(parse_quick_add("standup tomorrow morning", today(), &[]).due_time, t(9, 0));
         assert_eq!(parse_quick_add("Pay rent by 5 march", today(), &[]).title, "Pay rent");
     }
 

@@ -7,7 +7,7 @@ use icons::IconName;
 use theme::ActiveTheme;
 
 use crate::traits::ClickHandler;
-use crate::{Clickable, Color, Icon, IconSize, Toggleable};
+use crate::{Clickable, Color, Disableable, Icon, IconSize, Toggleable};
 
 /// A square button with an icon and a hover background.
 type TooltipBuilder = Box<dyn Fn(&mut Window, &mut App) -> AnyView + 'static>;
@@ -21,6 +21,7 @@ pub struct IconButton {
     hover_icon_color: Option<Color>,
     size: Pixels,
     selected: bool,
+    disabled: bool,
     hover_color: Option<gpui::Hsla>,
     on_click: Option<ClickHandler>,
     tooltip: Option<TooltipBuilder>,
@@ -37,6 +38,7 @@ impl IconButton {
             hover_icon_color: None,
             size: px(26.),
             selected: false,
+            disabled: false,
             hover_color: None,
             on_click: None,
             tooltip: None,
@@ -98,6 +100,13 @@ impl Toggleable for IconButton {
     }
 }
 
+impl Disableable for IconButton {
+    fn disabled(mut self, disabled: bool) -> Self {
+        self.disabled = disabled;
+        self
+    }
+}
+
 impl RenderOnce for IconButton {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let colors = cx.theme().colors();
@@ -105,9 +114,12 @@ impl RenderOnce for IconButton {
         let tip = self.tip;
         let hover_color = self.hover_color.unwrap_or(colors.ghost_element_hover);
         let tip_key = gpui::ElementId::NamedChild(std::sync::Arc::new(self.id.clone()), "tip".into());
-        let hover_group = self.hover_icon_color.filter(|_| !self.selected).map(|color| {
-            (gpui::SharedString::from(format!("icon-button-{:?}", self.id)), color)
-        });
+        let hover_group = self
+            .hover_icon_color
+            .filter(|_| !self.selected && !self.disabled)
+            .map(|color| {
+                (gpui::SharedString::from(format!("icon-button-{:?}", self.id)), color)
+            });
         let icon = Icon::new(self.icon)
             .size(self.icon_size)
             .color(icon_color)
@@ -121,15 +133,80 @@ impl RenderOnce for IconButton {
             .items_center()
             .justify_center()
             .rounded(px(6.))
-            .cursor_pointer()
             .when(self.selected, |el| el.bg(colors.element_selected))
-            .when(!self.selected, |el| el.hover(|style| style.bg(hover_color)))
-            .when_some(self.on_click, |el, handler| el.on_click(handler))
+            .when(self.disabled, |el| el.opacity(0.4).cursor_default())
+            .when(!self.disabled, |el| {
+                el.cursor_pointer()
+                    .when(!self.selected, |el| el.hover(|style| style.bg(hover_color)))
+                    .when_some(self.on_click, |el, handler| el.on_click(handler))
+            })
             .when_some(self.tooltip, |el, tooltip| el.tooltip(tooltip))
             .child(icon);
         match tip {
             Some((text, side)) => crate::with_tip(button, tip_key, text, side, window, cx),
             None => button,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{cell::Cell, rc::Rc};
+
+    use gpui::{Context, Modifiers, Render, TestAppContext, size};
+
+    use super::*;
+
+    struct IconButtonTestView {
+        enabled_clicks: Rc<Cell<usize>>,
+        disabled_clicks: Rc<Cell<usize>>,
+    }
+
+    impl Render for IconButtonTestView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let enabled = self.enabled_clicks.clone();
+            let disabled = self.disabled_clicks.clone();
+            crate::h_flex()
+                .p_4()
+                .gap_2()
+                .child(
+                    div()
+                        .debug_selector(|| "ib-enabled".to_owned())
+                        .child(IconButton::new("ib-enabled", IconName::Plus).on_click(
+                            move |_, _, _| enabled.set(enabled.get() + 1),
+                        )),
+                )
+                .child(
+                    div()
+                        .debug_selector(|| "ib-disabled".to_owned())
+                        .child(
+                            IconButton::new("ib-disabled", IconName::Trash)
+                                .disabled(true)
+                                .on_click(move |_, _, _| disabled.set(disabled.get() + 1)),
+                        ),
+                )
+        }
+    }
+
+    #[gpui::test]
+    fn disabled_icon_button_suppresses_clicks(cx: &mut TestAppContext) {
+        cx.update(theme::init);
+        let enabled = Rc::new(Cell::new(0));
+        let disabled = Rc::new(Cell::new(0));
+        let (_, cx) = cx.add_window_view(|_, _| IconButtonTestView {
+            enabled_clicks: enabled.clone(),
+            disabled_clicks: disabled.clone(),
+        });
+        cx.simulate_resize(size(px(200.), px(100.)));
+        cx.run_until_parked();
+
+        let enabled_bounds = cx.debug_bounds("ib-enabled").unwrap();
+        let disabled_bounds = cx.debug_bounds("ib-disabled").unwrap();
+
+        cx.simulate_click(enabled_bounds.center(), Modifiers::default());
+        assert_eq!(enabled.get(), 1);
+
+        cx.simulate_click(disabled_bounds.center(), Modifiers::default());
+        assert_eq!(disabled.get(), 0);
     }
 }

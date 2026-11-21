@@ -9,4 +9,9 @@ pub trait Toggleable {
     fn toggle_state(self, selected: bool) -> Self;
 }
 
+pub trait Disableable {
+    /// Marks the element as disabled, suppressing interaction and dimming its appearance.
+    fn disabled(self, disabled: bool) -> Self;
+}
+
 pub(crate) type ClickHandler = Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>;

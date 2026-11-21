@@ -9,4 +9,4 @@ mod traits;
 pub use color::Color;
 pub use components::*;
 pub use icons::IconName;
-pub use traits::{Clickable, Toggleable};
+pub use traits::{Clickable, Disableable, Toggleable};

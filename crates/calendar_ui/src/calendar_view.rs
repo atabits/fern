@@ -3374,9 +3374,10 @@ impl Render for CalendarView {
                 .tip(strings.mini_calendar, ui::TipSide::Below)
                 .on_click(cx.listener(|this, _, _, cx| this.toggle_calendar_sidebar(cx))))
             .child(
-                div().flex_1().flex().items_center().child(
+                div().flex_1().min_w_0().flex().items_center().child(
                     div()
                         .relative()
+                        .max_w_full()
                         .child(
                             h_flex()
                                 .id("calendar-month-title")
@@ -3403,9 +3404,12 @@ impl Render for CalendarView {
                                         }))
                                 })
                                 .child(
-                                    Label::new(title_text)
-                                        .size(LabelSize::Large)
-                                        .weight(FontWeight::SEMIBOLD),
+                                    div().min_w_0().child(
+                                        Label::new(title_text)
+                                            .size(LabelSize::Large)
+                                            .weight(FontWeight::SEMIBOLD)
+                                            .truncate(),
+                                    ),
                                 )
                                 .when(can_pick_month, |el| {
                                     el.child(
@@ -3580,6 +3584,7 @@ impl Render for CalendarView {
                     .map(|day| {
                         div()
                             .flex_1()
+                            .min_w_0()
                             .flex()
                             .justify_center()
                             .child(Label::new(day).size(LabelSize::Small).color(Color::Muted))

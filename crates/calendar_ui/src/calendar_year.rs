@@ -1,7 +1,7 @@
 //! The calendar's year overview and its day popovers.
 
 use std::cell::Cell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -23,11 +23,27 @@ pub(super) struct YearJump {
 
 pub(super) const YEAR_RANGE: std::ops::RangeInclusive<i32> = 1910..=2099;
 
+const YEAR_MIN_DAY: NaiveDate = match NaiveDate::from_ymd_opt(*YEAR_RANGE.start(), 1, 1) {
+    Some(date) => date,
+    None => panic!("YEAR_RANGE start is a valid date"),
+};
+const YEAR_MAX_DAY: NaiveDate = match NaiveDate::from_ymd_opt(*YEAR_RANGE.end(), 12, 31) {
+    Some(date) => date,
+    None => panic!("YEAR_RANGE end is a valid date"),
+};
+const YEAR_LAST_JAN: NaiveDate = match NaiveDate::from_ymd_opt(*YEAR_RANGE.end(), 1, 1) {
+    Some(date) => date,
+    None => panic!("YEAR_RANGE end January is a valid date"),
+};
+
 pub(super) fn clamp_year_day(day: NaiveDate) -> NaiveDate {
-    day.clamp(
-        NaiveDate::from_ymd_opt(*YEAR_RANGE.start(), 1, 1).unwrap(),
-        NaiveDate::from_ymd_opt(*YEAR_RANGE.end(), 12, 31).unwrap(),
-    )
+    day.clamp(YEAR_MIN_DAY, YEAR_MAX_DAY)
+}
+
+fn align_month_to_columns(date: NaiveDate, columns: usize) -> NaiveDate {
+    let columns = columns.max(1);
+    let month = (date.month0() as usize / columns * columns + 1).clamp(1, 12) as u32;
+    NaiveDate::from_ymd_opt(date.year(), month, 1).unwrap_or(date)
 }
 
 const YEAR_SCROLL_DURATION: Duration = Duration::from_millis(280);
@@ -77,23 +93,23 @@ struct YearLayout {
 
 impl YearLayout {
     fn new(size: Size<Pixels>, week_numbers: bool) -> Self {
-        let width = f32::from(size.width);
-        let height = f32::from(size.height);
+        let width = f32::from(size.width).max(1.);
+        let height = f32::from(size.height).max(1.);
         let columns = if width >= height { 4 } else { 3 };
         let rows = (12 / columns) as f32;
         let padding = (width * 0.035).clamp(8., 52.);
         let column_gap = (width * 0.03).clamp(8., 52.);
         let row_gap = (height / rows * 0.12).clamp(4., 24.);
-        let month_height = (height - 16. - (rows - 1.) * row_gap) / rows;
+        let month_height = ((height - 16. - (rows - 1.) * row_gap) / rows).max(1.);
         let heading_height = (month_height * 0.15).clamp(13., 29.);
         let month_width =
-            (width - 2. * padding - (columns - 1) as f32 * column_gap) / columns as f32;
+            ((width - 2. * padding - (columns - 1) as f32 * column_gap) / columns as f32).max(1.);
         let day_width = month_width / if week_numbers { 8. } else { 7. };
-        let day_height = (month_height - heading_height) / 7.;
-        let cell = day_width.min(day_height);
+        let day_height = ((month_height - heading_height) / 7.).max(1.);
+        let cell = day_width.min(day_height).max(1.);
         Self {
             columns,
-            height: size.height,
+            height: px(height),
             year_heading_height: px((month_height * 0.2).clamp(20., 36.)),
             row_stride: px(month_height + row_gap),
             padding: px(padding),
@@ -107,34 +123,108 @@ impl YearLayout {
     }
 
     fn page_height(&self) -> Pixels {
-        self.height + self.year_heading_height
+        (self.height + self.year_heading_height).max(px(1.))
     }
 
     fn position(&self, month: NaiveDate) -> f32 {
         let row = month.month0() as usize / self.columns;
         (month.year() - YEAR_RANGE.start()) as f32
             + f32::from(self.year_heading_height + self.row_stride * row as f32)
-                / f32::from(self.page_height())
+                / f32::from(self.page_height()).max(1.)
     }
 
     fn closest_month(&self, position: f32) -> NaiveDate {
+        if !position.is_finite() {
+            return YEAR_MIN_DAY;
+        }
         let center_year = position.floor() as i32 + YEAR_RANGE.start();
-        let last_month = NaiveDate::from_ymd_opt(*YEAR_RANGE.end(), 1, 1).unwrap();
         ((center_year - 1)..=(center_year + 1))
             .filter(|year| YEAR_RANGE.contains(year))
             .flat_map(|year| {
                 (1..=12)
                     .step_by(self.columns)
-                    .map(move |month| NaiveDate::from_ymd_opt(year, month as u32, 1).unwrap())
+                    .filter_map(move |month| NaiveDate::from_ymd_opt(year, month as u32, 1))
             })
-            .filter(|month| *month <= last_month)
+            .filter(|month| *month <= YEAR_LAST_JAN)
             .min_by(|a, b| {
                 (self.position(*a) - position)
                     .abs()
                     .total_cmp(&(self.position(*b) - position).abs())
             })
-            .unwrap_or(last_month)
+            .unwrap_or(YEAR_LAST_JAN)
     }
+}
+
+fn holiday_dates_in_range(
+    countdowns: &[fern_core::Countdown],
+    from: NaiveDate,
+    until: NaiveDate,
+    cx: &App,
+) -> HashSet<NaiveDate> {
+    let mut dates = HashSet::new();
+    for countdown in countdowns {
+        if countdown.archived || countdown.kind != fern_core::CountdownKind::Holiday {
+            continue;
+        }
+        if let Some(repeat) = &countdown.repeat {
+            let mut cur = countdown.date;
+            while cur <= until {
+                if cur >= from {
+                    dates.insert(cur);
+                }
+                let next = repeat.next_after(cur);
+                if next <= cur {
+                    break;
+                }
+                cur = next;
+            }
+        } else {
+            for year in from.year().max(countdown.date.year())..=until.year() {
+                if let Some(date) = countdown
+                    .date
+                    .with_year(year)
+                    .or_else(|| NaiveDate::from_ymd_opt(year, 2, 28))
+                    && date >= from
+                    && date <= until
+                {
+                    dates.insert(date);
+                }
+            }
+        }
+    }
+    if let Some(feeds) = crate::subscriptions::feeds(cx) {
+        for cal in feeds.read(cx).calendars() {
+            let sub = &cal.subscription;
+            if sub.hidden {
+                continue;
+            }
+            let title_lower = sub.name.to_lowercase();
+            let url_lower = sub.url.to_lowercase();
+            let is_holiday_feed = title_lower.contains("holiday")
+                || title_lower.contains("праздник")
+                || title_lower.contains("节假日")
+                || title_lower.contains("假日")
+                || url_lower.contains("holiday");
+            if !is_holiday_feed {
+                continue;
+            }
+            for event in &cal.events {
+                if !event.all_day() {
+                    continue;
+                }
+                for occ in event.occurrences_in(from, until) {
+                    let mut d = occ.start.max(from);
+                    let end = occ.end.min(until);
+                    while d <= end {
+                        dates.insert(d);
+                        let Some(next) = d.succ_opt() else { break };
+                        d = next;
+                    }
+                }
+            }
+        }
+    }
+    dates
 }
 
 fn dates_between(from: NaiveDate, through: NaiveDate) -> impl Iterator<Item = NaiveDate> {
@@ -166,10 +256,7 @@ impl CalendarView {
     }
 
     pub(super) fn navigate_year(&mut self, target: NaiveDate, cx: &mut Context<Self>) {
-        let target = target.clamp(
-            NaiveDate::from_ymd_opt(*YEAR_RANGE.start(), 1, 1).unwrap(),
-            NaiveDate::from_ymd_opt(*YEAR_RANGE.end(), 1, 1).unwrap(),
-        );
+        let target = target.clamp(YEAR_MIN_DAY, YEAR_LAST_JAN);
         if (target == self.month && self.year_scroll.precise_position.is_none())
             || !self.finish_task_before_navigation(cx)
         {
@@ -208,7 +295,12 @@ impl CalendarView {
             return;
         }
         cx.stop_propagation();
-        let Some(size) = self.year_size else { return };
+        let Some(size) = self
+            .year_size
+            .filter(|s| s.width > px(0.) && s.height > px(0.))
+        else {
+            return;
+        };
         let layout = YearLayout::new(size, calendar::week_numbers());
         if event.delta.precise() {
             if !self.finish_task_before_navigation(cx) {
@@ -225,10 +317,8 @@ impl CalendarView {
                         .map(|motion| motion.position(now))
                 })
                 .unwrap_or_else(|| layout.position(self.month));
-            let first = NaiveDate::from_ymd_opt(*YEAR_RANGE.start(), 1, 1).unwrap();
-            let last = NaiveDate::from_ymd_opt(*YEAR_RANGE.end(), 1, 1).unwrap();
             let position = (current - delta.y / layout.page_height())
-                .clamp(layout.position(first), layout.position(last));
+                .clamp(layout.position(YEAR_MIN_DAY), layout.position(YEAR_LAST_JAN));
             self.year_scroll.precise_position = Some(position);
             self.year_scroll.transition = None;
             self.month = layout.closest_month(position);
@@ -263,9 +353,22 @@ impl CalendarView {
     }
 
     fn year_counts(&self, year: i32, today: NaiveDate, cx: &App) -> BTreeMap<NaiveDate, usize> {
-        let first = NaiveDate::from_ymd_opt(year, 1, 1).unwrap();
-        let last = NaiveDate::from_ymd_opt(year, 12, 31).unwrap();
-        let holidays = self.store.holiday_dates(first, last).unwrap_or_default();
+        let (Some(first), Some(last)) = (
+            NaiveDate::from_ymd_opt(year, 1, 1),
+            NaiveDate::from_ymd_opt(year, 12, 31),
+        ) else {
+            return BTreeMap::new();
+        };
+        let has_skip_holidays = self.options.show_repeats
+            && self
+                .tasks
+                .iter()
+                .any(|t| !t.is_closed() && t.repeat.as_ref().is_some_and(|r| r.skip_holidays));
+        let holidays = if has_skip_holidays {
+            holiday_dates_in_range(&self.countdowns, first, last, cx)
+        } else {
+            HashSet::new()
+        };
         let mut counts: BTreeMap<_, _> = if self.options.show_countdowns {
             fern_core::agenda::agenda(&[], &self.countdowns, first, last)
                 .into_iter()
@@ -499,12 +602,20 @@ impl CalendarView {
         } else {
             layout.position(self.month)
         };
+        let position = if position.is_finite() {
+            position
+        } else {
+            layout.position(self.month)
+        };
         let previous_size = self.year_size;
         let view = cx.entity().downgrade();
         // Measure the actual calendar, including the space taken by either sidebar.
         let measure = canvas(
             move |bounds, _, cx| {
-                if previous_size != Some(bounds.size) {
+                if bounds.size.width > px(0.)
+                    && bounds.size.height > px(0.)
+                    && previous_size != Some(bounds.size)
+                {
                     let view = view;
                     cx.defer(move |cx| {
                         view.update(cx, |this, cx| {
@@ -514,9 +625,7 @@ impl CalendarView {
                                 // An orientation change changes how many months a row holds.
                                 let columns =
                                     YearLayout::new(bounds.size, calendar::week_numbers()).columns;
-                                let month =
-                                    (this.month.month0() as usize / columns * columns + 1) as u32;
-                                this.month = this.month.with_month(month).unwrap();
+                                this.month = align_month_to_columns(this.month, columns);
                                 cx.notify();
                             }
                         })
@@ -526,12 +635,13 @@ impl CalendarView {
             },
             |_, _, _, _| {},
         );
+        let page_height = f32::from(layout.page_height()).max(1.);
+        let viewport_height = f32::from(size.height).max(1.);
         let first = position.floor() as i32 + YEAR_RANGE.start();
-        let last = (position + f32::from(size.height) / f32::from(layout.page_height())).ceil()
-            as i32
+        let last = (position + viewport_height / page_height).ceil() as i32
             + YEAR_RANGE.start()
             - 1;
-        let visible_years = first.max(*YEAR_RANGE.start())..=last.min(*YEAR_RANGE.end());
+        let visible_years = first.max(*YEAR_RANGE.start())..=last.max(first).min(*YEAR_RANGE.end());
         for year in visible_years.clone() {
             self.ensure_year_heatmap(year, today, cx);
         }
@@ -578,7 +688,7 @@ impl CalendarView {
     ) -> Div {
         let empty = BTreeMap::new();
         let counts = self.year_heatmap.get(&year).unwrap_or(&empty);
-        let mut months = (1..=12).map(|month| NaiveDate::from_ymd_opt(year, month, 1).unwrap());
+        let mut months = (1..=12).filter_map(|month| NaiveDate::from_ymd_opt(year, month, 1));
         let rows = (0..12 / layout.columns)
             .map(|_| {
                 h_flex()
@@ -1127,5 +1237,36 @@ mod tests {
                 assert_eq!(view.month, NaiveDate::from_ymd_opt(1910, 1, 1).unwrap());
             })
         });
+    }
+
+    #[test]
+    fn year_layout_and_month_alignment_are_safe_on_zero_and_tiny_viewports() {
+        let jan = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+        for (w, h) in [(0., 0.), (1., 1.), (10., 10.), (200., 50.), (50., 200.)] {
+            let layout = YearLayout::new(size(px(w), px(h)), true);
+            assert!(layout.page_height() >= px(1.));
+            assert!(layout.row_stride >= px(1.));
+            assert!(layout.marker_size >= px(8.));
+            let pos = layout.position(jan);
+            assert!(pos.is_finite());
+            assert_eq!(layout.closest_month(pos), jan);
+            assert_eq!(layout.closest_month(f32::NAN), YEAR_MIN_DAY);
+        }
+
+        // Day 31 aligned to a 30-day or 28-day month must never panic.
+        let oct_31 = NaiveDate::from_ymd_opt(2026, 10, 31).unwrap();
+        assert_eq!(
+            align_month_to_columns(oct_31, 4),
+            NaiveDate::from_ymd_opt(2026, 9, 1).unwrap()
+        );
+        assert_eq!(
+            align_month_to_columns(oct_31, 3),
+            NaiveDate::from_ymd_opt(2026, 10, 1).unwrap()
+        );
+        let may_31 = NaiveDate::from_ymd_opt(2026, 5, 31).unwrap();
+        assert_eq!(
+            align_month_to_columns(may_31, 3),
+            NaiveDate::from_ymd_opt(2026, 4, 1).unwrap()
+        );
     }
 }

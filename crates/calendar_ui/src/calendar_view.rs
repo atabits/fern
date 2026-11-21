@@ -103,8 +103,8 @@ pub struct CalendarView {
     /// The countdowns the Agenda lists, and the one whose card is open (its date and id).
     countdowns: Vec<fern_core::Countdown>,
     open_countdown: Option<(NaiveDate, Id)>,
-    /// A task's right-click menu: the task and where the click was, and its open side menu.
-    context_menu: Option<(Id, gpui::Point<Pixels>)>,
+    /// A task's right-click menu: the task snapshot, nesting state, position, and open side menu.
+    context_menu: Option<ContextMenuState>,
     context_side: Option<u8>,
     /// The Year view's day card, opened by clicking a day.
     year_day: Option<(NaiveDate, NaiveDate)>,
@@ -129,6 +129,9 @@ pub struct CalendarView {
     arrange: Option<usize>,
     arrange_collapsed: HashSet<(usize, String)>,
     undated: Vec<Task>,
+    /// Cached lists and preferences (refreshed on `reload()`, never queried in `render()`).
+    lists: Vec<fern_core::List>,
+    preferences: fern_core::Preferences,
     /// The colors tasks take with Color By List or Tag.
     list_colors: std::collections::HashMap<Id, gpui::Hsla>,
     tag_colors: std::collections::HashMap<String, gpui::Hsla>,
@@ -141,6 +144,13 @@ pub struct CalendarView {
     focus_sessions: Vec<fern_core::FocusSession>,
     timed_resize: Option<TimedResize>,
     event_editor: Option<EventEditor>,
+}
+
+struct ContextMenuState {
+    id: Id,
+    position: gpui::Point<Pixels>,
+    task: Task,
+    nesting: crate::task_menu::TaskNesting,
 }
 
 #[derive(Clone, Debug)]
@@ -384,6 +394,8 @@ impl CalendarView {
             arrange: None,
             arrange_collapsed: HashSet::new(),
             undated: Vec::new(),
+            lists: Vec::new(),
+            preferences: fern_core::Preferences::default(),
             list_colors: Default::default(),
             tag_colors: Default::default(),
             list_names: Vec::new(),
@@ -1033,7 +1045,7 @@ impl CalendarView {
             return;
         }
         let Ok(Some(task)) = self.store.task(id) else { return };
-        let lists = self.store.lists().unwrap_or_default();
+        let lists = self.lists.clone();
         self.detail.update(cx, |detail, cx| {
             detail.set_lists(lists);
             detail.show(Some(task), cx);
@@ -1200,12 +1212,16 @@ impl CalendarView {
             .into_any_element()
     }
 
-    /// Re-reads the tasks of the shown days.
+    /// Opens a task's right-click menu, snapshotting task & nesting state outside `render()`.
     fn open_context(&mut self, id: Id, position: gpui::Point<Pixels>, cx: &mut Context<Self>) {
         if !self.finish_task_before_navigation(cx) {
             return;
         }
-        self.context_menu = Some((id, position));
+        let Some(task) = self.store.task(id).ok().flatten() else {
+            return;
+        };
+        let nesting = crate::task_menu::TaskNesting::of(&self.store, task.id);
+        self.context_menu = Some(ContextMenuState { id, position, task, nesting });
         self.context_side = None;
         cx.notify();
     }
@@ -1214,7 +1230,7 @@ impl CalendarView {
     /// open the task in the list.
     fn context_action(&mut self, action: crate::task_menu::MenuAction, cx: &mut Context<Self>) {
         use crate::task_menu::MenuAction;
-        let Some((id, _)) = self.context_menu else { return };
+        let Some(id) = self.context_menu.as_ref().map(|menu| menu.id) else { return };
         if let MenuAction::Side(side) = action {
             self.context_side = side;
             cx.notify();
@@ -1256,20 +1272,18 @@ impl CalendarView {
 
     /// The task's right-click menu, as the original's calendar has it (no Add Subtask or Pin).
     fn render_context_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let (id, position) = self.context_menu?;
-        let task = self.store.task(id).ok().flatten()?;
-        let lists = self.store.lists().unwrap_or_default();
+        let state = self.context_menu.as_ref()?;
         let menu = crate::task_menu::render(
-            &task,
-            &lists,
+            &state.task,
+            &self.lists,
             crate::task_menu::MenuKind::Calendar,
-            crate::task_menu::TaskNesting::of(&self.store, task.id),
+            state.nesting,
             self.context_side,
             i18n::t(cx),
             cx,
             Rc::new(|this: &mut Self, action, _, cx| this.context_action(action, cx)),
         );
-        Some(crate::task_menu::place(position, menu))
+        Some(crate::task_menu::place(state.position, menu))
     }
 
     /// Opens a task's right-click menu from the debug-build dev state (`calendar-context=<title part>`).
@@ -1283,9 +1297,23 @@ impl CalendarView {
     pub fn reload(&mut self, cx: &mut Context<Self>) {
         self.year_heatmap.clear();
         self.options = self.store.calendar_options().unwrap_or_default();
+        self.preferences = self.store.preferences().unwrap_or_default();
         let lists = self.store.lists().unwrap_or_default();
         self.list_colors = lists.iter().filter_map(|l| crate::lists_panel::parse_color(l.color.as_deref()).map(|c| (l.id, c))).collect();
         self.list_names = lists.iter().filter(|l| !l.archived).map(|l| (l.id, l.name.clone())).collect();
+        self.lists = lists;
+        if let Some(menu) = &mut self.context_menu {
+            match self.store.task(menu.id) {
+                Ok(Some(task)) if !task.is_deleted() => {
+                    menu.nesting = crate::task_menu::TaskNesting::of(&self.store, task.id);
+                    menu.task = task;
+                }
+                _ => {
+                    self.context_menu = None;
+                    self.context_side = None;
+                }
+            }
+        }
         let all_tags = self.store.tags().unwrap_or_default();
         self.tag_names = all_tags.iter().map(|t| t.name.clone()).collect();
         self.tag_colors = all_tags
@@ -2087,7 +2115,8 @@ impl CalendarView {
         self.open_countdown = None;
         self.year_day = None;
         let list = self.filter.single_list().unwrap_or_else(|| {
-            self.store.preferences().ok().and_then(|preferences| preferences.default_list)
+            self.preferences
+                .default_list
                 .filter(|id| self.list_names.iter().any(|(list, _)| list == id))
         });
         let editor = cx.new(|cx| CalendarTaskEditor::new(self.store.clone(), date, list, day.is_none(), window, cx));

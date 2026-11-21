@@ -39,6 +39,8 @@ pub enum OptionsEvent {
 pub struct CalendarOptionsDialog {
     store: Rc<Store>,
     options: CalendarOptions,
+    lists: Vec<fern_core::List>,
+    tags: Vec<fern_core::Tag>,
     page: Page,
     color_menu: bool,
     tz_menu: bool,
@@ -52,9 +54,24 @@ impl EventEmitter<OptionsEvent> for CalendarOptionsDialog {}
 impl CalendarOptionsDialog {
     pub fn new(store: Rc<Store>, page: Page, cx: &mut Context<Self>) -> Self {
         let options = store.calendar_options().unwrap_or_default();
+        let lists = store.lists().unwrap_or_default();
+        let tags = store.tags().unwrap_or_default();
         let tz_input = cx.new(|cx| TextInput::new(Mode::SingleLine, "", cx).without_cancel());
         cx.subscribe(&tz_input, |_, _, _: &Changed, cx| cx.notify()).detach();
-        Self { store, options, page, color_menu: false, tz_menu: false, tz_input, color_tab: 0 }
+        cx.observe_global::<crate::data_version::DataVersion>(|this, cx| {
+            if crate::data_version::changed_elsewhere(cx.entity_id(), cx) {
+                this.reload(cx);
+            }
+        })
+        .detach();
+        Self { store, options, lists, tags, page, color_menu: false, tz_menu: false, tz_input, color_tab: 0 }
+    }
+
+    fn reload(&mut self, cx: &mut Context<Self>) {
+        self.options = self.store.calendar_options().unwrap_or_default();
+        self.lists = self.store.lists().unwrap_or_default();
+        self.tags = self.store.tags().unwrap_or_default();
+        cx.notify();
     }
 
     /// Opens the Color By dropdown, for the debug-build dev state.
@@ -266,16 +283,14 @@ impl CalendarOptionsDialog {
                 let index = ColorBy::ALL.iter().position(|c| *c == o.color_by).unwrap_or(0);
                 let rows = match o.color_by {
                     ColorBy::List => std::iter::once(row(IconName::Inbox, strings.inbox.into(), accent))
-                        .chain(self.store.lists().unwrap_or_default().into_iter().filter(|l| !l.archived).map(|l| {
+                        .chain(self.lists.iter().filter(|l| !l.archived).map(|l| {
                             row(IconName::List, l.name.clone().into(), parse_color(l.color.as_deref()).unwrap_or(accent))
                         }))
                         .map(IntoElement::into_any_element)
                         .collect(),
                     ColorBy::Tag => self
-                        .store
-                        .tags()
-                        .unwrap_or_default()
-                        .into_iter()
+                        .tags
+                        .iter()
                         .map(|t| row(IconName::Tag, t.name.clone().into(), parse_color(t.color.as_deref()).unwrap_or(accent)).into_any_element())
                         .collect(),
                     ColorBy::Priority => [Priority::High, Priority::Medium, Priority::Low, Priority::None]
@@ -525,35 +540,14 @@ impl CalendarOptionsDialog {
 impl Render for CalendarOptionsDialog {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let strings = i18n::t(cx);
-        let theme = cx.theme().clone();
         let body = match self.page {
             Page::Main => self.render_main(strings, cx),
             Page::Color => self.render_color(strings, cx),
             Page::Style => self.render_style(strings, cx),
         };
-        div()
-            .absolute()
-            .inset_0()
-            .flex()
-            .items_center()
-            .justify_center()
-            .bg(gpui::black().opacity(0.35))
-            .occlude()
-            .id("calendar-options-backdrop")
-            .on_click(cx.listener(|_, _, _, cx| cx.emit(OptionsEvent::Closed)))
-            .child(
-                div()
-                    .id("calendar-options")
-                    .w(px(WIDTH))
-                    .p_5()
-                    .rounded(px(10.))
-                    .bg(theme.colors().elevated_surface_background)
-                    .border_1()
-                    .border_color(theme.colors().border)
-                    .shadow_lg()
-                    // Clicks inside stay inside.
-                    .on_click(|_, _, cx| cx.stop_propagation())
-                    .child(body),
-            )
+        Modal::new("calendar-options-backdrop")
+            .width(px(WIDTH))
+            .on_dismiss(cx.listener(|_, _, _, cx| cx.emit(OptionsEvent::Closed)))
+            .child(body)
     }
 }

@@ -381,6 +381,22 @@ pub fn format_task_markdown(
     out
 }
 
+/// Converts Markdown text into clean plain text by stripping syntax markers while preserving
+/// readable list bullets, numbering, and checkboxes.
+pub fn plain_text(text: &str) -> String {
+    blocks(text)
+        .into_iter()
+        .map(|b| match b.kind {
+            BlockKind::Divider => "---".to_owned(),
+            BlockKind::Bullet => format!("• {}", b.text),
+            BlockKind::Numbered(n) => format!("{n}. {}", b.text),
+            BlockKind::Check(done) => format!("[{}] {}", if done { "x" } else { " " }, b.text),
+            _ => b.text,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Formats a task (with its optional checklist and subtasks) as clean plain text
 /// ("Export → Plain Text" output).
 pub fn format_task_plain_text(
@@ -406,18 +422,8 @@ pub fn format_task_plain_text(
     }
     let notes = task.notes.trim();
     if !notes.is_empty() {
-        let plain_notes: Vec<String> = blocks(notes)
-            .into_iter()
-            .map(|b| match b.kind {
-                BlockKind::Divider => "---".to_owned(),
-                BlockKind::Bullet => format!("• {}", b.text),
-                BlockKind::Numbered(n) => format!("{n}. {}", b.text),
-                BlockKind::Check(done) => format!("[{}] {}", if done { "x" } else { " " }, b.text),
-                _ => b.text,
-            })
-            .collect();
         out.push_str("\n\n");
-        out.push_str(&plain_notes.join("\n"));
+        out.push_str(&plain_text(notes));
     }
     if !checklist.is_empty() {
         out.push_str("\n\n");

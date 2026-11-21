@@ -46,6 +46,8 @@ pub struct SummaryView {
     saved: Option<String>,
     /// The "Save as" menu, while open.
     save_menu: bool,
+    /// The "Copy" format menu (Markdown / Plain Text), while open.
+    copy_menu: bool,
     /// The report as an editable document, the original's way: Markdown text that Copy and
     /// Send Email then use. New options make the report again.
     editor: Option<Entity<TextInput>>,
@@ -191,6 +193,7 @@ impl SummaryView {
             saved: None,
             custom: None,
             save_menu: false,
+            copy_menu: false,
             naming: None,
             more_side: None,
             editor: None,
@@ -269,6 +272,7 @@ impl SummaryView {
         } else {
             self.menu.take().is_some()
                 || std::mem::take(&mut self.save_menu)
+                || std::mem::take(&mut self.copy_menu)
                 || std::mem::take(&mut self.heading_menu)
                 || self.naming.take().is_some()
                 || self.custom.take().is_some()
@@ -277,6 +281,22 @@ impl SummaryView {
             cx.notify();
         }
         dismissed
+    }
+
+    fn copy_text(&mut self, text: String, cx: &mut Context<Self>) {
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        self.copy_menu = false;
+        self.copied = true;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(std::time::Duration::from_secs(2)).await;
+            this.update(cx, |this, cx| {
+                this.copied = false;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn update(&mut self, cx: &mut Context<Self>, change: impl FnOnce(&mut SummaryOptions)) {
@@ -1075,19 +1095,50 @@ impl Render for SummaryView {
                                     cx.notify();
                                 }))
                                 .children(menu)
-                        }).child(
+                        }).child({
+                            let md_text = markdown.clone();
+                            let plain_text = markdown::plain_text(&markdown);
+                            let copy_popover = self.copy_menu.then(|| {
+                                PopoverAttachment::new(
+                                    Placement::AboveRight,
+                                    popover(cx)
+                                        .min_w(px(180.))
+                                        .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                                            this.copy_menu = false;
+                                            cx.notify();
+                                        }))
+                                        .child(
+                                            ListItem::new("summary-copy-markdown")
+                                                .start_slot(Icon::new(IconName::FileText).color(Color::Muted))
+                                                .child(Label::new(strings.copy_markdown))
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.copy_text(md_text.clone(), cx);
+                                                })),
+                                        )
+                                        .child(
+                                            ListItem::new("summary-copy-plain")
+                                                .start_slot(Icon::new(IconName::Copy).color(Color::Muted))
+                                                .child(Label::new(strings.copy_plain_text))
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.copy_text(plain_text.clone(), cx);
+                                                })),
+                                        ),
+                                )
+                            });
                             h_flex()
                                 .id("summary-copy")
+                                .relative()
                                 .gap_1()
                                 .cursor_pointer()
                                 .child(Icon::new(IconName::Copy).size(IconSize::Small).color(Color::Muted))
                                 .child(Label::new(if self.copied { strings.summary_copied } else { strings.summary_copy }))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    cx.write_to_clipboard(ClipboardItem::new_string(markdown.clone()));
-                                    this.copied = true;
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.save_menu = false;
+                                    this.copy_menu = !this.copy_menu;
                                     cx.notify();
-                                })),
-                        ),
+                                }))
+                                .children(copy_popover)
+                        }),
                     ),
             )
             .child(self.render_options(cx))

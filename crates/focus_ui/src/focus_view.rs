@@ -150,22 +150,39 @@ struct StatsPage {
 const CARD_HEIGHT: f32 = 323.;
 const CHART_HEIGHT: f32 = 240.;
 
-fn bar_chart(values: &[i64], labels: Vec<String>, highlight: Option<usize>, height: f32, cx: &App) -> Div {
+fn bar_chart(
+    id: &'static str,
+    values: &[i64],
+    labels: Vec<String>,
+    tooltips: Vec<String>,
+    highlight: Option<usize>,
+    height: f32,
+    cx: &App,
+) -> Div {
     let colors = cx.theme().colors();
     let top = values.iter().copied().max().unwrap_or(0).max(1) as f32;
     v_flex()
         .gap_1()
         // As the original's: a thin bar over a grey track the chart's full height.
         .child(h_flex().h(px(height)).gap_1().children(values.iter().enumerate().map(|(i, v)| {
-            div().flex_1().h_full().flex().justify_center().child(
-                div().w(px(6.)).h_full().flex().flex_col().justify_end().rounded(px(3.)).bg(colors.element_hover).child(
-                    div()
-                        .w_full()
-                        .h(px((height * *v as f32 / top).max(if *v > 0 { 2. } else { 0. })))
-                        .rounded(px(3.))
-                        .bg(if highlight == Some(i) || highlight.is_none() { colors.accent } else { colors.accent.opacity(0.6) }),
-                ),
-            )
+            div()
+                .id(SharedString::from(format!("{id}-{i}")))
+                .flex_1()
+                .h_full()
+                .flex()
+                .justify_center()
+                .rounded(px(4.))
+                .hover(|s| s.bg(colors.element_hover.opacity(0.4)))
+                .when_some(tooltips.get(i).cloned(), |el, tip| el.tooltip(Tooltip::text(tip)))
+                .child(
+                    div().w(px(6.)).h_full().flex().flex_col().justify_end().rounded(px(3.)).bg(colors.element_hover).child(
+                        div()
+                            .w_full()
+                            .h(px((height * *v as f32 / top).max(if *v > 0 { 2. } else { 0. })))
+                            .rounded(px(3.))
+                            .bg(if highlight == Some(i) || highlight.is_none() { colors.accent } else { colors.accent.opacity(0.6) }),
+                    ),
+                )
         })))
         .child(h_flex().gap_1().children(labels.into_iter().map(|l| {
             div().flex_1().flex().justify_center().child(Label::new(l).size(LabelSize::XSmall).color(Color::Muted))
@@ -193,7 +210,15 @@ fn summary_parts(template: &str, counts: &[(&str, String)]) -> Vec<(String, bool
 /// A smooth line with a shaded area under it, scaled between the values' minimum and maximum,
 /// as in the original's "My Achievement Score".
 /// `from_zero` starts the scale at zero (counts); otherwise at the lowest value (the score).
-fn line_chart(values: &[i64], labels: Vec<String>, height: f32, from_zero: bool, cx: &App) -> Div {
+fn line_chart(
+    id: &'static str,
+    values: &[i64],
+    labels: Vec<String>,
+    tooltips: Vec<String>,
+    height: f32,
+    from_zero: bool,
+    cx: &App,
+) -> Div {
     let colors = cx.theme().colors();
     let (accent, dot) = (colors.accent, colors.text);
     let low = if from_zero { 0 } else { values.iter().copied().min().unwrap_or(0) };
@@ -256,7 +281,21 @@ fn line_chart(values: &[i64], labels: Vec<String>, height: f32, from_zero: bool,
                 .items_start()
                 .gap_2()
                 .child(v_flex().h(px(height)).justify_between().children((0..=5).rev().map(|i| axis(low + step * i))))
-                .child(div().flex_1().child(plot)),
+                .child(
+                    div()
+                        .relative()
+                        .flex_1()
+                        .child(plot)
+                        .child(h_flex().absolute().inset_0().children(tooltips.into_iter().enumerate().map(|(i, tip)| {
+                            div()
+                                .id(SharedString::from(format!("{id}-{i}")))
+                                .flex_1()
+                                .h_full()
+                                .rounded(px(4.))
+                                .hover(|s| s.bg(colors.element_hover.opacity(0.3)))
+                                .tooltip(Tooltip::text(tip))
+                        }))),
+                ),
         )
         .child(h_flex().pl(px(36.)).children(labels.into_iter().map(|l| {
             div().flex_1().flex().justify_center().child(Label::new(l).size(LabelSize::XSmall).color(Color::Muted))
@@ -2012,13 +2051,11 @@ impl FocusView {
                     .color(Color::Muted),
             )
             // As the original's, the week as a curve.
-            .child(line_chart(
-                &week,
-                crate::calendar::weekday_labels(&strings.weekdays_short).iter().map(|d| (*d).to_owned()).collect(),
-                CHART,
-                true,
-                cx,
-            ));
+            .child({
+                let trend_labels: Vec<String> = crate::calendar::weekday_labels(&strings.weekdays_short).iter().map(|d| (*d).to_owned()).collect();
+                let trend_tips: Vec<String> = trend_labels.iter().zip(&week).map(|(l, v)| format!("{l} · {}", format_minutes(*v))).collect();
+                line_chart("focus-trends", &week, trend_labels, trend_tips, CHART, true, cx)
+            });
 
         // Timeline: the week's sessions as blocks on a day's hours, as in the original.
         const TIMELINE: f32 = 200.;
@@ -2532,6 +2569,24 @@ impl FocusView {
                 )
             });
             let labels = labels(curve);
+            let chart_id: &'static str = match curve {
+                0 => "stats-curve-0",
+                1 => "stats-curve-1",
+                2 => "stats-curve-2",
+                _ => "stats-curve-3",
+            };
+            let tooltips: Vec<String> = labels
+                .iter()
+                .zip(&values)
+                .map(|(l, v)| {
+                    let formatted = match curve {
+                        1 => format!("{v}%"),
+                        3 => format_minutes(*v),
+                        _ => v.to_string(),
+                    };
+                    format!("{l} · {formatted}")
+                })
+                .collect();
             card()
                 .flex_1()
                 .h(px(CARD_HEIGHT))
@@ -2559,9 +2614,9 @@ impl FocusView {
                 )
                 .map(|el| {
                     if line {
-                        el.child(line_chart(&values, labels, CHART_HEIGHT, true, cx))
+                        el.child(line_chart(chart_id, &values, labels, tooltips, CHART_HEIGHT, true, cx))
                     } else {
-                        el.child(bar_chart(&values, labels, Some(6), CHART_HEIGHT, cx))
+                        el.child(bar_chart(chart_id, &values, labels, tooltips, Some(6), CHART_HEIGHT, cx))
                     }
                 })
         };
@@ -2690,7 +2745,10 @@ impl FocusView {
                                         ),
                                 ),
                         )
-                        .child(line_chart(&scores, day_labels, CHART_HEIGHT, false, cx)),
+                        .child({
+                            let score_tips: Vec<String> = day_labels.iter().zip(&scores).map(|(l, v)| format!("{l} · {v}")).collect();
+                            line_chart("stats-achievement-score", &scores, day_labels, score_tips, CHART_HEIGHT, false, cx)
+                        }),
                 )
                 .into_any_element(),
             h_flex()
@@ -2838,10 +2896,16 @@ impl FocusView {
                     }
                 })
                 .collect();
+            let tooltips: Vec<String> = (0..days)
+                .map(|i| {
+                    let day = first + chrono::Duration::days(i as i64);
+                    format!("{} · {}", crate::task_rows::short_date(day, strings), values[i])
+                })
+                .collect();
             card()
                 .flex_1()
                 .child(Label::new(strings.stats_completion_distribution).weight(FontWeight::SEMIBOLD))
-                .child(bar_chart(&values, labels, None, 120., cx))
+                .child(bar_chart("stats-task-dist", &values, labels, tooltips, None, 120., cx))
         });
 
         // Daily shows how tasks ended beside the overview; Weekly and Monthly put the completion

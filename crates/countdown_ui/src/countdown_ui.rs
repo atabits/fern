@@ -9,8 +9,9 @@ use fern_core::countdown::{DatePart, days_in_month, with_date_part};
 use fern_core::{Countdown, CountdownKind, DateFormat, Id, Store};
 use gpui::{Entity, Focusable as _, FontWeight, ScrollHandle, Subscription};
 use ui::prelude::*;
-use ui::{Placement, PopoverAttachment, popover};
+use ui::{ConfirmDialog, EmptyState, Placement, PopoverAttachment, popover};
 
+use desktop_common::data_version::{DataVersion, changed_elsewhere, data_changed};
 use desktop_common::{actions, calendar, colors as lists_panel, layout, paths::attachments_dir, touch};
 use desktop_common::text_input::{Cancelled, Changed, Mode, Submitted, TextInput};
 use fern_i18n::{self as i18n, Strings};
@@ -223,6 +224,8 @@ pub struct CountdownView {
     header_menu: bool,
     /// Listing the archived countdowns.
     show_archived: bool,
+    /// Cached value of `HIDE_GROUP_SETTING` (loaded in `reload`, never queried during `render`).
+    hide_group: bool,
 }
 
 /// Hides the kind tabs (the header "…" menu's Hide Group).
@@ -262,13 +265,27 @@ impl CountdownView {
             title_menu: false,
             header_menu: false,
             show_archived: false,
+            hide_group: false,
         };
         this.reload(cx);
+        cx.observe_global::<DataVersion>(|this, cx| {
+            if changed_elsewhere(cx.entity_id(), cx) {
+                this.reload(cx);
+            }
+        })
+        .detach();
         this
     }
 
     pub fn reload(&mut self, cx: &mut Context<Self>) {
         self.countdowns = self.store.countdowns().unwrap_or_default();
+        self.hide_group = self
+            .store
+            .setting(HIDE_GROUP_SETTING)
+            .ok()
+            .flatten()
+            .as_deref()
+            == Some("1");
         cx.notify();
     }
 
@@ -508,15 +525,22 @@ impl CountdownView {
     }
 
     fn save_draft(&mut self, cx: &mut Context<Self>) {
-        let Some(date) = self.draft.as_ref().and_then(|draft| draft.date_from_fields(cx)) else {
+        let Some(draft) = self.draft.as_ref() else { return };
+        let name = draft.name.read(cx).text().trim().to_owned();
+        if name.is_empty() {
+            cx.notify();
+            return;
+        }
+        let Some(date) = draft.date_from_fields(cx) else {
             if let Some(draft) = self.draft.as_mut() {
-                if draft.date_in_popover() { draft.open = Some(DraftRow::Date); }
+                if draft.date_in_popover() {
+                    draft.open = Some(DraftRow::Date);
+                }
                 cx.notify();
             }
             return;
         };
         let Some(draft) = self.draft.take() else { return };
-        let name = draft.name.read(cx).text().to_owned();
         let added = match draft.editing {
             Some(id) => self.store.update_countdown(id, &name, date, draft.kind, draft.repeat.as_ref()).map(|()| id),
             None => self.store.add_countdown(&name, date, draft.kind).and_then(|countdown| {
@@ -536,6 +560,8 @@ impl CountdownView {
         });
         if let Err(err) = added {
             eprintln!("failed to add the countdown: {err:#}");
+        } else {
+            data_changed(cx.entity_id(), cx);
         }
         self.reload(cx);
     }
@@ -543,6 +569,27 @@ impl CountdownView {
     fn delete(&mut self, id: Id, cx: &mut Context<Self>) {
         if let Err(err) = self.store.delete_countdown(id) {
             eprintln!("failed to delete the countdown: {err:#}");
+        } else {
+            data_changed(cx.entity_id(), cx);
+        }
+        self.reload(cx);
+    }
+
+    fn toggle_pin(&mut self, id: Id, pinned: bool, cx: &mut Context<Self>) {
+        if let Err(err) = self.store.set_countdown_pinned(id, !pinned) {
+            eprintln!("failed to pin the countdown: {err:#}");
+        } else {
+            data_changed(cx.entity_id(), cx);
+        }
+        self.reload(cx);
+    }
+
+    fn toggle_archive(&mut self, id: Id, archived: bool, cx: &mut Context<Self>) {
+        self.card_menu = None;
+        if let Err(err) = self.store.set_countdown_archived(id, !archived) {
+            eprintln!("failed to archive the countdown: {err:#}");
+        } else {
+            data_changed(cx.entity_id(), cx);
         }
         self.reload(cx);
     }
@@ -599,7 +646,7 @@ impl CountdownView {
                         div()
                             .text_size(px(16.))
                             .font_weight(FontWeight::SEMIBOLD)
-                            .when(has_picture, |el| el.text_color(gpui::white()))
+                            .when(has_picture, |el| el.text_color(theme.colors().on_accent))
                             .child(countdown.name.clone()),
                     ),
             )
@@ -617,7 +664,7 @@ impl CountdownView {
                     }))
                     .child(numbers),
             )
-            .child(div().text_size(px(12.)).when(has_picture, |el| el.text_color(gpui::white().opacity(0.85))).when(!has_picture, |el| el.text_color(theme.colors().text_muted)).child(subtitle))
+            .child(div().text_size(px(12.)).when(has_picture, |el| el.text_color(theme.colors().on_accent.opacity(0.85))).when(!has_picture, |el| el.text_color(theme.colors().text_muted)).child(subtitle))
             // The original's pin, beside the "…": a pinned card stays first and shows it.
             .child({
                 let pinned = countdown.pinned_at.is_some();
@@ -635,10 +682,7 @@ impl CountdownView {
                             .tooltip(Tooltip::text(if pinned { strings.unpin } else { strings.pin }))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 cx.stop_propagation();
-                                if let Err(err) = this.store.set_countdown_pinned(id, !pinned) {
-                                    eprintln!("failed to pin the countdown: {err:#}");
-                                }
-                                this.reload(cx);
+                                this.toggle_pin(id, pinned, cx);
                             })),
                     )
             })
@@ -682,11 +726,7 @@ impl CountdownView {
                                         .start_slot(Icon::new(if archived { IconName::ArchiveRestore } else { IconName::Archive }).color(Color::Icon))
                                         .child(Label::new(if archived { strings.habit_unarchive } else { strings.habit_archive }))
                                         .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.card_menu = None;
-                                            if let Err(err) = this.store.set_countdown_archived(id, !archived) {
-                                                eprintln!("failed to archive the countdown: {err:#}");
-                                            }
-                                            this.reload(cx);
+                                            this.toggle_archive(id, archived, cx);
                                         }))
                                 })
                                 .child({
@@ -1462,7 +1502,7 @@ impl Render for CountdownView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let strings = i18n::t(cx);
         let theme = cx.theme().clone();
-        let hide_group = self.store.setting(HIDE_GROUP_SETTING).ok().flatten().as_deref() == Some("1");
+        let hide_group = self.hide_group;
         let filters = [
             (Filter::All, strings.countdown_all),
             (Filter::Kind(CountdownKind::Countdown), strings.countdown_kind_countdown),
@@ -1620,7 +1660,9 @@ impl Render for CountdownView {
                                                 .child(Label::new(if hide_group { strings.countdown_show_group } else { strings.countdown_hide_group }))
                                                 .on_click(cx.listener(move |this, _, _, cx| {
                                                     this.header_menu = false;
-                                                    if let Err(err) = this.store.set_setting(HIDE_GROUP_SETTING, if hide_group { "0" } else { "1" }) {
+                                                    let next = !hide_group;
+                                                    this.hide_group = next;
+                                                    if let Err(err) = this.store.set_setting(HIDE_GROUP_SETTING, if next { "1" } else { "0" }) {
                                                         eprintln!("failed to save the countdown setting: {err:#}");
                                                     }
                                                     cx.notify();
@@ -1661,41 +1703,15 @@ impl Render for CountdownView {
                                 Filter::Kind(k) => k,
                             };
                             el.child(
-                                v_flex()
-                                    .w_full()
-                                    .py(px(64.))
-                                    .items_center()
-                                    .justify_center()
-                                    .gap_3()
-                                    .child(
-                                        div()
-                                            .size(px(52.))
-                                            .rounded_full()
-                                            .bg(theme.colors().surface_background)
-                                            .border_1()
-                                            .border_color(theme.colors().border_variant)
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .child(Icon::new(IconName::FernCountdown).size(IconSize::Large).color(Color::Muted)),
-                                    )
-                                    .child(Label::new(strings.countdown_empty).size(LabelSize::Small).color(Color::Muted))
-                                    .child(
-                                        h_flex()
-                                            .id("countdown-empty-add")
-                                            .h(px(32.))
-                                            .px_3p5()
-                                            .gap_1p5()
-                                            .rounded(px(6.))
-                                            .bg(theme.colors().accent)
-                                            .hover(|s| s.opacity(0.9))
-                                            .cursor_pointer()
-                                            .child(Icon::new(IconName::Plus).size(IconSize::Small).color(Color::IconOnAccent))
-                                            .child(Label::new(strings.countdown_new).size(LabelSize::Small).color(Color::OnAccent))
-                                            .on_click(cx.listener(move |this, _, window, cx| {
-                                                this.start_new_kind(default_kind, window, cx);
-                                            })),
+                                div().w_full().py(px(40.)).child(
+                                    EmptyState::new(IconName::FernCountdown, strings.countdown_empty).action(
+                                        "countdown-empty-add",
+                                        strings.countdown_new,
+                                        cx.listener(move |this, _, window, cx| {
+                                            this.start_new_kind(default_kind, window, cx);
+                                        }),
                                     ),
+                                ),
                             )
                         })
                         .child(div().flex().flex_wrap().gap(px(20.)).children(cards)),
@@ -1706,81 +1722,20 @@ impl Render for CountdownView {
             .children(modal)
             .when_some(self.confirm_delete.clone(), |el, (id, name)| {
                 el.child(
-                    div()
-                        .id("countdown-delete-backdrop")
-                        .absolute()
-                        .inset_0()
-                        .occlude()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .bg(gpui::black().opacity(0.45))
-                        .on_mouse_down(
-                            gpui::MouseButton::Left,
-                            cx.listener(|this, _, _, cx| {
-                                this.confirm_delete = None;
-                                cx.notify();
-                            }),
-                        )
-                        .child(
-                            v_flex()
-                                .id("countdown-delete-modal")
-                                .debug_selector(|| "countdown-delete-modal".to_owned())
-                                .w(px(340.))
-                                .p_4()
-                                .gap_3()
-                                .rounded(px(10.))
-                                .bg(theme.colors().elevated_surface_background)
-                                .border_1()
-                                .border_color(theme.colors().border)
-                                .shadow_lg()
-                                .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                                .child(Label::new(strings.confirm_delete_countdown).size(LabelSize::Large).weight(FontWeight::SEMIBOLD))
-                                .child(Label::new(name).size(LabelSize::Small).color(Color::Muted).truncate())
-                                .child(
-                                    h_flex()
-                                        .pt_1()
-                                        .gap_2()
-                                        .justify_end()
-                                        .child(
-                                            div()
-                                                .id("countdown-delete-cancel")
-                                                .debug_selector(|| "countdown-delete-cancel".to_owned())
-                                                .px_3()
-                                                .h(px(30.))
-                                                .flex()
-                                                .items_center()
-                                                .rounded(px(6.))
-                                                .border_1()
-                                                .border_color(theme.colors().border)
-                                                .cursor_pointer()
-                                                .hover(|s| s.bg(theme.colors().element_hover))
-                                                .child(Label::new(strings.cancel).size(LabelSize::Small))
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.confirm_delete = None;
-                                                    cx.notify();
-                                                })),
-                                        )
-                                        .child(
-                                            div()
-                                                .id("countdown-delete-confirm")
-                                                .debug_selector(|| "countdown-delete-confirm".to_owned())
-                                                .px_3()
-                                                .h(px(30.))
-                                                .flex()
-                                                .items_center()
-                                                .rounded(px(6.))
-                                                .bg(theme.status().error)
-                                                .cursor_pointer()
-                                                .hover(|s| s.bg(theme.status().error.opacity(0.9)))
-                                                .child(Label::new(strings.delete).size(LabelSize::Small).color(Color::OnAccent))
-                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                    this.confirm_delete = None;
-                                                    this.delete(id, cx);
-                                                })),
-                                        ),
-                                ),
-                        ),
+                    ConfirmDialog::new("countdown-delete-modal", strings.confirm_delete_countdown)
+                        .width(px(340.))
+                        .description(name)
+                        .cancel_label(strings.cancel)
+                        .confirm_label(strings.delete)
+                        .destructive(true)
+                        .on_cancel(cx.listener(|this, _, _, cx| {
+                            this.confirm_delete = None;
+                            cx.notify();
+                        }))
+                        .on_confirm(cx.listener(move |this, _, _, cx| {
+                            this.confirm_delete = None;
+                            this.delete(id, cx);
+                        })),
                 )
             })
     }
@@ -1929,5 +1884,74 @@ mod tests {
         assert_eq!(countdowns.len(), 1);
         assert_eq!(countdowns[0].date, NaiveDate::from_ymd_opt(1910, 2, 28).unwrap());
         assert_eq!(countdowns[0].repeat.as_ref().unwrap().frequency, Frequency::Yearly);
+    }
+
+    #[gpui::test]
+    fn countdown_mutations_emit_data_changed_and_empty_name_preserves_draft(cx: &mut TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        cx.update(|cx| {
+            theme::init(cx);
+            assert!(keymap::load_default(&assets::Assets, cx).unwrap().is_empty());
+        });
+        let (view, cx) = cx.add_window_view(|_, cx| CountdownView::new(store.clone(), cx));
+        let bumps = Rc::new(std::cell::Cell::new(0usize));
+        let bumps_obs = bumps.clone();
+        let _observer = cx.update(|_, cx| {
+            cx.new(|cx| {
+                cx.observe_global::<DataVersion>(move |_: &mut (), cx| {
+                    if changed_elsewhere(cx.entity_id(), cx) {
+                        bumps_obs.set(bumps_obs.get() + 1);
+                    }
+                })
+                .detach();
+            })
+        });
+
+        // 1. Saving with an empty/whitespace name must preserve the draft rather than dropping it.
+        cx.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                v.start_new_kind(CountdownKind::Anniversary, window, cx);
+                let draft = v.draft.as_mut().unwrap();
+                draft.name.update(cx, |inp, cx| inp.set_text("   ", cx));
+                v.save_draft(cx);
+                assert!(v.draft.is_some(), "empty name must not destroy draft");
+                assert!(v.countdowns.is_empty());
+            });
+        });
+        assert_eq!(bumps.get(), 0);
+
+        // 2. Create emits data_changed.
+        cx.update(|_, cx| {
+            view.update(cx, |v, cx| {
+                v.draft.as_ref().unwrap().name.update(cx, |inp, cx| inp.set_text("Launch Day", cx));
+                v.save_draft(cx);
+                assert!(v.draft.is_none());
+            });
+        });
+        assert_eq!(bumps.get(), 1, "create must emit data_changed");
+        let id = store.countdowns().unwrap()[0].id;
+
+        // 3. Edit emits data_changed.
+        cx.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                v.start_edit(id, window, cx);
+                v.draft.as_ref().unwrap().name.update(cx, |inp, cx| inp.set_text("Launch Day v2", cx));
+                v.save_draft(cx);
+            });
+        });
+        assert_eq!(bumps.get(), 2, "edit must emit data_changed");
+
+        // 4. Pin emits data_changed.
+        cx.update(|_, cx| view.update(cx, |v, cx| v.toggle_pin(id, false, cx)));
+        assert_eq!(bumps.get(), 3, "pin must emit data_changed");
+
+        // 5. Archive emits data_changed.
+        cx.update(|_, cx| view.update(cx, |v, cx| v.toggle_archive(id, false, cx)));
+        assert_eq!(bumps.get(), 4, "archive must emit data_changed");
+
+        // 6. Delete emits data_changed.
+        cx.update(|_, cx| view.update(cx, |v, cx| v.delete(id, cx)));
+        assert_eq!(bumps.get(), 5, "delete must emit data_changed");
+        assert!(store.countdowns().unwrap().is_empty());
     }
 }

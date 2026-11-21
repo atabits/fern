@@ -4182,7 +4182,64 @@ impl Render for FocusView {
                         .px_3()
                         .children(timer_rows)
                         .when(!self.archived_tab && rows.is_empty() && self.timers.is_empty(), |el| {
-                            el.child(div().px_2().pt_4().child(Label::new(strings.focus_no_tasks).color(Color::Muted)))
+                            el.child(
+                                v_flex()
+                                    .w_full()
+                                    .py(px(48.))
+                                    .items_center()
+                                    .justify_center()
+                                    .gap_3()
+                                    .child(
+                                        div()
+                                            .size(px(48.))
+                                            .rounded_full()
+                                            .bg(theme.colors().surface_background)
+                                            .border_1()
+                                            .border_color(theme.colors().border_variant)
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .child(Icon::new(IconName::CircleDot).size(IconSize::Large).color(Color::Muted)),
+                                    )
+                                    .child(Label::new(strings.focus_no_tasks).size(LabelSize::Small).color(Color::Muted))
+                                    .child(
+                                        h_flex()
+                                            .id("focus-empty-add-timer")
+                                            .px_3()
+                                            .h(px(30.))
+                                            .gap_1p5()
+                                            .rounded(px(6.))
+                                            .bg(theme.colors().accent.opacity(0.14))
+                                            .hover(|s| s.bg(theme.colors().accent.opacity(0.22)))
+                                            .cursor_pointer()
+                                            .child(Icon::new(IconName::Plus).size(IconSize::XSmall).color(Color::Accent))
+                                            .child(Label::new(strings.add_timer).size(LabelSize::Small).color(Color::Accent))
+                                            .on_click(cx.listener(|this, _, window, cx| this.open_timer(None, window, cx))),
+                                    ),
+                            )
+                        })
+                        .when(self.archived_tab && self.timers.is_empty(), |el| {
+                            el.child(
+                                v_flex()
+                                    .w_full()
+                                    .py(px(48.))
+                                    .items_center()
+                                    .justify_center()
+                                    .gap_3()
+                                    .child(
+                                        div()
+                                            .size(px(48.))
+                                            .rounded_full()
+                                            .bg(theme.colors().surface_background)
+                                            .border_1()
+                                            .border_color(theme.colors().border_variant)
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .child(Icon::new(IconName::Archive).size(IconSize::Large).color(Color::Muted)),
+                                    )
+                                    .child(Label::new(strings.nothing_found).size(LabelSize::Small).color(Color::Muted)),
+                            )
                         })
                         .when(!self.archived_tab && !self.timers.is_empty() && !rows.is_empty(), |el| el.child(div().my_1().child(Divider::horizontal())))
                         .when(!self.archived_tab, |el| el.children(rows)),

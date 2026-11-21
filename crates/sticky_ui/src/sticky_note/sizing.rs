@@ -47,6 +47,9 @@ unsafe extern "system" fn subclass_proc(
     }
     let result = unsafe { DefSubclassProc(hwnd, message, wparam, lparam) };
     if message == WM_GETMINMAXINFO && compact == 0 {
+        let Some(limits) = (unsafe { (lparam.0 as *mut MINMAXINFO).as_mut() }) else {
+            return result;
+        };
         // GPUI has already included the native frame in the compact minimum from
         // WindowOptions. Keep that calculation, width and maximum constraints;
         // only add the extra client height required by the expanded editor.
@@ -54,8 +57,6 @@ unsafe extern "system" fn subclass_proc(
         let scale = if dpi == 0 { 1. } else { dpi as f32 / 96. };
         let compact_height = (COMPACT_HEIGHT * scale).floor() as i32;
         let expanded_height = (MIN_EXPANDED_HEIGHT * scale).ceil() as i32;
-        // Windows supplies a valid MINMAXINFO for this message.
-        let limits = unsafe { &mut *(lparam.0 as *mut MINMAXINFO) };
         limits.ptMinTrackSize.y += expanded_height - compact_height;
     }
     result
@@ -101,10 +102,11 @@ mod tests {
         _: usize,
     ) -> LRESULT {
         let result = unsafe { DefSubclassProc(hwnd, message, wparam, lparam) };
-        if message == WM_GETMINMAXINFO {
+        if message == WM_GETMINMAXINFO
+            && let Some(limits) = (unsafe { (lparam.0 as *mut MINMAXINFO).as_mut() })
+        {
             // GPUI writes its WindowOptions minimum here. Supply a fixed base
             // to verify that our callback extends, rather than replaces it.
-            let limits = unsafe { &mut *(lparam.0 as *mut MINMAXINFO) };
             limits.ptMinTrackSize.x = 360;
             limits.ptMinTrackSize.y = 48;
         }
@@ -170,5 +172,10 @@ mod tests {
             expanded.ptMinTrackSize,
             "updating the mode must not stack callbacks"
         );
+
+        // Sending WM_GETMINMAXINFO with a null LPARAM must not dereference null.
+        unsafe {
+            SendMessageW(hwnd, WM_GETMINMAXINFO, None, Some(LPARAM(0)));
+        }
     }
 }

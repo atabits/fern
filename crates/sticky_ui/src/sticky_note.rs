@@ -156,6 +156,7 @@ pub struct StickyNote {
     color: Option<usize>,
     palette: Option<WindowHandle<StickyPalette>>,
     detail_popup: Option<WindowHandle<popup::DetailPopup>>,
+    opening_detail_popup: bool,
     compact: bool,
     expanded_height: Pixels,
     last_bounds: Bounds<Pixels>,
@@ -216,7 +217,7 @@ impl StickyNote {
             saved_task: None, color: note.color.filter(|color| *color < PALETTE.len()),
             #[cfg(windows)]
             taskbar: win32_window_handle(window).map(|hwnd| taskbar::TaskbarButton::new(hwnd, settings.hide_from_taskbar, cx)),
-            palette: None, detail_popup: None,
+            palette: None, detail_popup: None, opening_detail_popup: false,
             compact: note.compact,
             expanded_height: if note.compact { note.expanded_height() } else { initial_bounds.size.height.max(px(MIN_EXPANDED_HEIGHT)) },
             last_bounds: initial_bounds,
@@ -293,6 +294,7 @@ impl StickyNote {
 
     fn dismiss_transients(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.close_palette(cx);
+        self.opening_detail_popup = false;
         if let Some(popup) = self.detail_popup.take() {
             popup.update(cx, |_, window, _| window.remove_window()).ok();
         }
@@ -301,6 +303,7 @@ impl StickyNote {
 
     fn sync_detail_popup(&mut self, cx: &mut Context<Self>) {
         if !self.detail.read(cx).has_popup()
+            || self.opening_detail_popup
             || self.detail_popup.is_some_and(|popup| popup.read(cx).is_ok()) { return; }
         // Measuring elements uses GPUI's layout state and must happen during render.
         cx.notify();
@@ -315,6 +318,7 @@ impl StickyNote {
     }
 
     fn open_detail_popup(&mut self, anchor: popup::Anchor, measured: gpui::Size<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        self.opening_detail_popup = false;
         if !self.detail.read(cx).has_popup()
             || self.detail_popup.is_some_and(|popup| popup.read(cx).is_ok()) { return; }
         self.close_palette(cx);
@@ -330,7 +334,10 @@ impl StickyNote {
             cx.new(|cx| popup::DetailPopup::new(note, detail.clone(), anchor, anchored, return_focus.clone(), window, cx))
         }, cx) {
             Ok(popup) => self.detail_popup = Some(popup),
-            Err(err) => eprintln!("failed to open sticky task menu: {err:#}"),
+            Err(err) => {
+                eprintln!("failed to open sticky task menu: {err:#}");
+                self.detail.update(cx, |detail, cx| detail.dismiss_popup(window, cx));
+            }
         }
     }
 
@@ -353,6 +360,7 @@ impl StickyNote {
 
     fn forget(&mut self, cx: &mut App) {
         self.close_palette(cx);
+        self.opening_detail_popup = false;
         if let Some(popup) = self.detail_popup.take() {
             popup.update(cx, |_, window, _| window.remove_window()).ok();
         }
@@ -434,8 +442,10 @@ impl StickyNote {
 impl Render for StickyNote {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.detail.read(cx).has_popup()
+            && !self.opening_detail_popup
             && !self.detail_popup.is_some_and(|popup| popup.read(cx).is_ok())
         {
+            self.opening_detail_popup = true;
             let anchor = self.popup_anchor(_window, cx);
             let measured = popup::measure_detail(&self.detail, anchor, _window, cx);
             cx.defer_in(_window, move |this, window, cx| this.open_detail_popup(anchor, measured, window, cx));

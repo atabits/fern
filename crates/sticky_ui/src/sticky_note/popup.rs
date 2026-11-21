@@ -129,6 +129,9 @@ pub(super) fn attach(
     use windows::Win32::UI::WindowsAndMessaging::*;
     if let (Some(owner), Some(popup)) = (owner, win32_window_handle(window)) {
         unsafe {
+            if !IsWindow(Some(owner)).as_bool() || !IsWindow(Some(popup)).as_bool() {
+                return;
+            }
             SetWindowLongPtrW(popup, GWLP_HWNDPARENT, owner.0 as isize);
             // GPUI's Windows PopUp currently uses an overlapped window style. DWM then
             // draws a second rounded frame around our transparent shadow margin.
@@ -192,6 +195,9 @@ fn fit_window(_window: &mut Window, _bounds: Bounds<Pixels>, _cx: &mut App) -> b
         // refresh the viewport and paint mask before drawing the enlarged menu.
         _cx.foreground_executor()
             .spawn(async move {
+                if !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
+                    return;
+                }
                 if let Err(err) = unsafe {
                     SetWindowPos(
                         hwnd,
@@ -376,6 +382,7 @@ impl DetailPopup {
     }
 
     fn close(&mut self, restore: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let closing = window.window_handle().downcast::<Self>();
         let target = window
             .focused(cx)
             .filter(|focus| self.detail.read(cx).is_editor_focus(focus, cx))
@@ -391,8 +398,10 @@ impl DetailPopup {
         window.remove_window();
         cx.defer(move |cx| {
             note.update(cx, |note, owner, cx| {
-                note.detail_popup = None;
-                if restore {
+                if closing.is_some() && note.detail_popup == closing {
+                    note.detail_popup = None;
+                }
+                if restore && note.detail_popup.is_none() {
                     owner.activate_window();
                     if let Some(focus) = target {
                         owner.focus(&focus, cx);

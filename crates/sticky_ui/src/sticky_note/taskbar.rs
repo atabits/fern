@@ -9,12 +9,12 @@ use windows::Win32::Foundation::{E_FAIL, ERROR_SUCCESS, GetLastError, HWND, RECT
 use windows::Win32::UI::Input::KeyboardAndMouse::{SetActiveWindow, SetFocus};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DestroyWindow, GW_OWNER, GWL_EXSTYLE, GWLP_HWNDPARENT, GetClientRect,
-    GetWindow, GetWindowLongPtrW, GetWindowPlacement, GetWindowRect, IsIconic, IsWindowVisible,
-    SET_WINDOW_POS_FLAGS, SW_RESTORE, SW_SHOWMINNOACTIVE, SW_SHOWNA, SW_SHOWNOACTIVATE,
-    SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSENDCHANGING, SWP_NOSIZE,
-    SWP_NOZORDER, SWP_SHOWWINDOW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPlacement,
-    SetWindowPos, ShowWindow, WINDOW_EX_STYLE, WINDOW_LONG_PTR_INDEX, WINDOWPLACEMENT,
-    WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW,
+    GetWindow, GetWindowLongPtrW, GetWindowPlacement, GetWindowRect, IsIconic, IsWindow,
+    IsWindowVisible, SET_WINDOW_POS_FLAGS, SW_RESTORE, SW_SHOWMINNOACTIVE, SW_SHOWNA,
+    SW_SHOWNOACTIVATE, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER,
+    SWP_NOSENDCHANGING, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SetForegroundWindow,
+    SetWindowLongPtrW, SetWindowPlacement, SetWindowPos, ShowWindow, WINDOW_EX_STYLE,
+    WINDOW_LONG_PTR_INDEX, WINDOWPLACEMENT, WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW,
 };
 use windows::core::{Error, PCWSTR, Result, w};
 
@@ -61,8 +61,14 @@ impl TaskbarButton {
         let window = self.window.clone();
         let background = cx.background_executor().clone();
         self.update = Some(cx.foreground_executor().spawn(async move {
+            if !window.is_valid() {
+                return;
+            }
             if let Err(first) = window.apply(hidden) {
                 background.timer(Duration::from_millis(150)).await;
+                if !window.is_valid() {
+                    return;
+                }
                 if let Err(err) = window.apply(hidden) {
                     eprintln!(
                         "failed to change sticky note taskbar visibility: {first}; retry: {err}"
@@ -74,6 +80,10 @@ impl TaskbarButton {
 }
 
 impl NoteHandle {
+    fn is_valid(&self) -> bool {
+        unsafe { IsWindow(Some(self.note)) }.as_bool()
+    }
+
     fn is_visible(&self) -> bool {
         unsafe { IsWindowVisible(self.note) }.as_bool()
     }
@@ -105,6 +115,9 @@ impl NoteHandle {
     }
 
     fn apply(&self, hidden: bool) -> Result<()> {
+        if !self.is_valid() {
+            return Ok(());
+        }
         self.applied_hidden.set(None);
         let change = self.change_style(hidden);
         self.restore_visibility()?;
@@ -172,18 +185,24 @@ impl Drop for NoteHandle {
             return;
         };
         // GPUI may release the view before the native note is destroyed.
-        if unsafe { GetWindow(self.note, GW_OWNER) }.ok() == Some(owner)
+        if self.is_valid()
+            && unsafe { GetWindow(self.note, GW_OWNER) }.ok() == Some(owner)
             && let Err(err) = set_window_long(self.note, GWLP_HWNDPARENT, 0)
         {
             eprintln!("failed to detach sticky note from its taskbar owner: {err}");
         }
-        let _ = unsafe { DestroyWindow(owner) };
+        if unsafe { IsWindow(Some(owner)) }.as_bool() {
+            let _ = unsafe { DestroyWindow(owner) };
+        }
     }
 }
 
 pub(super) fn show_inactive(note: HWND, bounds: Bounds<Pixels>, scale: f32, cx: &App) {
     cx.foreground_executor()
         .spawn(async move {
+            if !unsafe { IsWindow(Some(note)) }.as_bool() {
+                return;
+            }
             if let Err(err) = place_inactive(note, bounds, scale) {
                 eprintln!("failed to show restored sticky note: {err}");
             }
@@ -195,6 +214,9 @@ pub(super) fn activate(note: HWND, cx: &App) {
     cx.foreground_executor()
         .spawn(async move {
             unsafe {
+                if !IsWindow(Some(note)).as_bool() {
+                    return;
+                }
                 if IsIconic(note).as_bool() {
                     let _ = ShowWindow(note, SW_RESTORE);
                 }

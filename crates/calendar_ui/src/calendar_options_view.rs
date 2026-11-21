@@ -222,6 +222,8 @@ impl CalendarOptionsDialog {
                         .relative()
                         .h(px(40.))
                         .px_4()
+                        .rounded(px(6.))
+                        .hover(|s| s.bg(theme.colors().ghost_element_hover))
                         .cursor_pointer()
                         .child(div().flex_1().child(Label::new(strings.secondary_timezone)))
                         .child(
@@ -340,6 +342,7 @@ impl CalendarOptionsDialog {
                 .rounded_full()
                 .cursor_pointer()
                 .bg(if on { accent.opacity(0.15) } else { theme.colors().element_selected })
+                .when(!on, |el| el.hover(|s| s.bg(theme.colors().element_hover)))
                 .child(Label::new(*label).color(if on { Color::Accent } else { Color::Muted }))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.color_tab = i;
@@ -353,7 +356,12 @@ impl CalendarOptionsDialog {
                 h_flex()
                     .child(div().w(px(26.)))
                     .child(tabs)
-                    .child(IconButton::new("calendar-options-x", IconName::X).icon_color(Color::Muted).on_click(cx.listener(|_, _, _, cx| cx.emit(OptionsEvent::Closed)))),
+                    .child(
+                        IconButton::new("calendar-options-x", IconName::X)
+                            .icon_color(Color::Muted)
+                            .tooltip(ui::Tooltip::text(strings.close))
+                            .on_click(cx.listener(|_, _, _, cx| cx.emit(OptionsEvent::Closed))),
+                    ),
             )
             .child(
                 h_flex()
@@ -372,6 +380,7 @@ impl CalendarOptionsDialog {
                                 .rounded(px(4.))
                                 .cursor_pointer()
                                 .when(self.color_menu, |el| el.bg(theme.colors().element_hover))
+                                .when(!self.color_menu, |el| el.hover(|s| s.bg(theme.colors().element_hover)))
                                 .child(Label::new(choices[chosen]).color(Color::Muted))
                                 .child(Icon::new(IconName::ChevronsUpDown).size(IconSize::XSmall).color(Color::Muted))
                                 .on_click(cx.listener(|this, _, _, cx| {
@@ -417,6 +426,7 @@ impl CalendarOptionsDialog {
                     .justify_center()
                     .cursor_pointer()
                     .when(i == chosen, |el| el.border_2().border_color(color))
+                    .when(i != chosen, |el| el.hover(|s| s.border_2().border_color(color.opacity(0.55))))
                     .child(div().size(px(if i == chosen { 12. } else { 18. })).rounded_full().bg(color))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.change(cx, |o| if habit { o.habit_fixed = i } else { o.countdown_fixed = i })
@@ -463,6 +473,8 @@ impl CalendarOptionsDialog {
                 .items_center()
                 .gap_2()
                 .py_3()
+                .rounded(px(8.))
+                .hover(|s| s.bg(theme.colors().ghost_element_hover))
                 .cursor_pointer()
                 .child(h_flex().gap_2().items_start().child(hours()).child(item(modern)))
                 .child(radio(on, label))
@@ -489,6 +501,8 @@ impl CalendarOptionsDialog {
                 .items_center()
                 .gap_2()
                 .py_3()
+                .rounded(px(8.))
+                .hover(|s| s.bg(theme.colors().ghost_element_hover))
                 .cursor_pointer()
                 .child(month(shown))
                 .child(radio(on, label))

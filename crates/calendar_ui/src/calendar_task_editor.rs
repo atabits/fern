@@ -118,7 +118,7 @@ pub(super) fn month_picker(
     let today = Local::now().date_naive();
     let shift = Rc::new(shift);
     let pick = Rc::new(pick);
-    let arrow = |id, icon, delta| {
+    let arrow = |id, icon, delta, tip: &'static str| {
         let shift = shift.clone();
         IconButton::new(id, icon)
             .size(px(22.))
@@ -126,6 +126,7 @@ pub(super) fn month_picker(
             .icon_color(colors.list_text_muted)
             .hover_icon_color(colors.list_text)
             .hover_color(colors.list_hover)
+            .tooltip(Tooltip::text(tip))
             .on_click(move |_, window, cx| shift(&delta, window, cx))
     };
     let short_title = format!("{} {}", strings.months_short[month.month0() as usize], month.year());
@@ -142,7 +143,7 @@ pub(super) fn month_picker(
                         .min_w_0()
                         .child(Label::new(short_title).weight(FontWeight::SEMIBOLD).color(colors.list_text).truncate()),
                 )
-                .child(arrow("calendar-picker-prev", IconName::ChevronLeft, -1))
+                .child(arrow("calendar-picker-prev", IconName::ChevronLeft, -1, "←"))
                 .child(
                     IconButton::new("calendar-picker-today", IconName::Circle)
                         .size(px(22.))
@@ -150,9 +151,10 @@ pub(super) fn month_picker(
                         .icon_color(colors.list_text_muted)
                         .hover_icon_color(colors.list_text)
                         .hover_color(colors.list_hover)
+                        .tooltip(Tooltip::text(strings.today))
                         .on_click(move |_, window, cx| go_today(&(), window, cx)),
                 )
-                .child(arrow("calendar-picker-next", IconName::ChevronRight, 1)),
+                .child(arrow("calendar-picker-next", IconName::ChevronRight, 1, "→")),
         )
         .child(h_flex().h(px(22.)).children(
             calendar::weekday_labels(&strings.weekdays_short).map(|day| {

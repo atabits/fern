@@ -116,6 +116,11 @@ impl HabitView {
             input.set_text(initial_note, cx);
             input
         });
+        cx.subscribe(&note_input, |this, _, _: &Cancelled, cx| {
+            this.log_modal = None;
+            cx.notify();
+        })
+        .detach();
         window.focus(&note_input.focus_handle(cx), cx);
         self.log_modal = Some(HabitLogModal {
             habit_id,
@@ -254,12 +259,14 @@ impl HabitView {
                                 )
                                 .child(Label::new(habit_name).size(LabelSize::XSmall).color(Color::Muted)),
                         )
-                        .child(IconButton::new("log-modal-close", IconName::X).on_click(cx.listener(
-                            |this, _, _, cx| {
-                                this.log_modal = None;
-                                cx.notify();
-                            },
-                        ))),
+                        .child(
+                            IconButton::new("log-modal-close", IconName::X)
+                                .tooltip(Tooltip::text(strings.close))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.log_modal = None;
+                                    cx.notify();
+                                })),
+                        ),
                 )
                 // Mood picker (5 emojis)
                 .child(
@@ -393,10 +400,14 @@ impl HabitView {
                     h_flex()
                         .justify_between()
                         .child(Label::new(strings.habit_how_much).size(LabelSize::Default).weight(FontWeight::SEMIBOLD))
-                        .child(IconButton::new("amt-close", IconName::X).on_click(cx.listener(|this, _, _, cx| {
-                            this.amount_modal = None;
-                            cx.notify();
-                        }))),
+                        .child(
+                            IconButton::new("amt-close", IconName::X)
+                                .tooltip(Tooltip::text(strings.close))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.amount_modal = None;
+                                    cx.notify();
+                                })),
+                        ),
                 )
                 .child(
                     Label::new(format!(
@@ -606,12 +617,14 @@ impl HabitView {
                                 .child(Label::new(strings.habit_cycles).size(LabelSize::Large).weight(FontWeight::SEMIBOLD))
                                 .child(Label::new(modal.habit_name.clone()).size(LabelSize::XSmall).color(Color::Muted)),
                         )
-                        .child(IconButton::new("cycles-list-close", IconName::X).on_click(cx.listener(
-                            |this, _, _, cx| {
-                                this.cycles_modal = None;
-                                cx.notify();
-                            },
-                        ))),
+                        .child(
+                            IconButton::new("cycles-list-close", IconName::X)
+                                .tooltip(Tooltip::text(strings.close))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.cycles_modal = None;
+                                    cx.notify();
+                                })),
+                        ),
                 )
                 .child(
                     v_scroll(

@@ -101,6 +101,7 @@ impl HabitView {
         });
         let reminder_input = self.make_reminder_input(cx);
         let icon_text = self.make_icon_text_input(cx);
+        self.wire_edit_inputs(&name, &amount_input, &step_input, &unit, cx);
 
         let mut reminders = Vec::new();
         let mut auto_reminder = false;
@@ -181,6 +182,7 @@ impl HabitView {
         });
         let reminder_input = self.make_reminder_input(cx);
         let icon_text = self.make_icon_text_input(cx);
+        self.wire_edit_inputs(&name, &amount_input, &step_input, &unit, cx);
 
         let auto_reminder = habit.reminders.len() == 1
             && habit.section.default_reminder() == Some(habit.reminders[0]);
@@ -219,6 +221,34 @@ impl HabitView {
         self.card_menu = None;
         self.day_menu = None;
         cx.notify();
+    }
+
+    fn wire_edit_inputs(
+        &self,
+        name: &Entity<TextInput>,
+        amount_input: &Entity<TextInput>,
+        step_input: &Entity<TextInput>,
+        unit: &Entity<TextInput>,
+        cx: &mut Context<Self>,
+    ) {
+        cx.subscribe(name, |this, _, _: &Submitted, cx| {
+            this.request_save_edit(cx);
+        })
+        .detach();
+        for input in [name, amount_input, step_input, unit] {
+            cx.subscribe(input, |this, _, _: &Cancelled, cx| {
+                if let Some(edit) = this.editing.as_mut()
+                    && edit.open.is_some()
+                {
+                    edit.open = None;
+                    edit.start_calendar = None;
+                } else {
+                    this.editing = None;
+                }
+                cx.notify();
+            })
+            .detach();
+        }
     }
 
     fn make_reminder_input(&self, cx: &mut Context<Self>) -> Entity<TextInput> {
@@ -450,6 +480,7 @@ impl HabitView {
                 .border_color(if open { theme.colors().accent } else { theme.colors().border })
                 .bg(theme.colors().background)
                 .cursor_pointer()
+                .hover(|s| s.bg(theme.colors().element_hover))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.update_edit(cx, |e| {
                         let opening = e.open != Some(which);
@@ -503,10 +534,14 @@ impl HabitView {
                 h_flex()
                     .justify_between()
                     .child(Label::new(title_text).size(LabelSize::Large).weight(FontWeight::SEMIBOLD))
-                    .child(IconButton::new("habit-edit-close", IconName::X).on_click(cx.listener(|this, _, _, cx| {
-                        this.editing = None;
-                        cx.notify();
-                    }))),
+                    .child(
+                        IconButton::new("habit-edit-close", IconName::X)
+                            .tooltip(Tooltip::text(strings.close))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.editing = None;
+                                cx.notify();
+                            })),
+                    ),
             )
             // Name + Icon picker trigger
             .child(

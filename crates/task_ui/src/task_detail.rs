@@ -3796,7 +3796,24 @@ impl Render for TaskDetail {
             return panel
                 .items_center()
                 .justify_center()
-                .child(Label::new(strings.select_task).color(Color::Muted));
+                .child(
+                    v_flex()
+                        .items_center()
+                        .gap_3()
+                        .child(
+                            div()
+                                .size(px(52.))
+                                .rounded_full()
+                                .bg(theme.colors().surface_background)
+                                .border_1()
+                                .border_color(theme.colors().border_variant)
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(Icon::new(IconName::SquareCheck).size(IconSize::Large).color(Color::Muted)),
+                        )
+                        .child(Label::new(strings.select_task).size(LabelSize::Small).color(Color::Muted)),
+                );
         };
         let done = task.is_completed();
         let notes_focus = self.notes.focus_handle(cx);

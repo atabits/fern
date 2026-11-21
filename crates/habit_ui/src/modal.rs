@@ -938,7 +938,7 @@ impl HabitView {
                             .child(
                                 Label::new(strings.weekdays_short[day])
                                     .size(LabelSize::XSmall)
-                                    .color(if on { Color::Custom(gpui::white()) } else { Color::Default }),
+                                    .color(if on { Color::OnAccent } else { Color::Default }),
                             )
                     }))
                     .into_any_element(),
@@ -961,7 +961,7 @@ impl HabitView {
                             .child(
                                 Label::new(n.to_string())
                                     .size(LabelSize::Small)
-                                    .color(if selected { Color::Custom(gpui::white()) } else { Color::Default }),
+                                    .color(if selected { Color::OnAccent } else { Color::Default }),
                             )
                     }))
                     .into_any_element(),
@@ -1186,7 +1186,7 @@ impl HabitView {
                             Label::new(date.day().to_string())
                                 .size(LabelSize::XSmall)
                                 .color(if selected {
-                                    Color::Custom(gpui::white())
+                                    Color::OnAccent
                                 } else if date == today {
                                     Color::Accent
                                 } else {

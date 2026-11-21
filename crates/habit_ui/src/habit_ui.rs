@@ -17,7 +17,7 @@ use fern_core::habit::{
 use fern_core::{Id, Store};
 use gpui::{Entity, Focusable as _, FontWeight, Point};
 use ui::prelude::*;
-use ui::{Placement, PopoverAttachment, popover};
+use ui::{EmptyState, Placement, PopoverAttachment, popover};
 
 use desktop_common::data_version::{DataVersion, changed_elsewhere, data_changed};
 use desktop_common::habit_helpers::progress_ring;
@@ -135,6 +135,9 @@ pub struct HabitView {
     month: NaiveDate,
     show_archived: bool,
     list_layout: bool,
+    in_today: bool,
+    sort_by_status: bool,
+    show_best_streak: bool,
     detail_width: f32,
     resizing_detail: bool,
     collapsed_sections: HashSet<String>,
@@ -200,6 +203,9 @@ impl HabitView {
             month: calendar::month_start(Local::now().date_naive()),
             show_archived: false,
             list_layout,
+            in_today: true,
+            sort_by_status: false,
+            show_best_streak: false,
             detail_width,
             resizing_detail: false,
             collapsed_sections,
@@ -233,6 +239,24 @@ impl HabitView {
         self.habits = self.store.habits().unwrap_or_default();
         self.sections = self.store.habit_sections().unwrap_or_default();
         self.records = self.store.all_habit_checkins().unwrap_or_default();
+        self.in_today = self
+            .store
+            .setting(IN_TODAY_SETTING)
+            .ok()
+            .flatten()
+            .is_none_or(|v| v == "1");
+        self.sort_by_status = self
+            .store
+            .setting(SORT_SETTING)
+            .ok()
+            .flatten()
+            .is_some_and(|v| v == "1");
+        self.show_best_streak = self
+            .store
+            .setting(STREAK_BEST_SETTING)
+            .ok()
+            .flatten()
+            .is_some_and(|v| v == "1");
         self.checkins = self
             .habits
             .iter()
@@ -320,10 +344,21 @@ impl HabitView {
     }
 
     pub(crate) fn flag(&self, key: &str, default: bool) -> bool {
-        self.store.setting(key).ok().flatten().map_or(default, |v| v == "1")
+        match key {
+            IN_TODAY_SETTING => self.in_today,
+            SORT_SETTING => self.sort_by_status,
+            STREAK_BEST_SETTING => self.show_best_streak,
+            _ => default,
+        }
     }
 
     pub(crate) fn set_flag(&mut self, key: &str, on: bool, cx: &mut Context<Self>) {
+        match key {
+            IN_TODAY_SETTING => self.in_today = on,
+            SORT_SETTING => self.sort_by_status = on,
+            STREAK_BEST_SETTING => self.show_best_streak = on,
+            _ => {}
+        }
         if let Err(err) = self.store.set_setting(key, if on { "1" } else { "0" }) {
             eprintln!("failed to save setting {key}: {err:#}");
         }
@@ -387,9 +422,17 @@ impl HabitView {
         if self.habits.iter().find(|h| h.id == habit_id).is_none_or(|h| h.archived) {
             return;
         }
-        if date > Local::now().date_naive() {
+        let today = Local::now().date_naive();
+        if date > today {
             return;
         }
+        if (today - date).num_days() > habit::MAX_EDITABLE_PAST_DAYS {
+            self.day_menu = None;
+            self.detail_notice = Some(i18n::t(cx).habit_past_limit.to_owned());
+            cx.notify();
+            return;
+        }
+        self.detail_notice = None;
         self.card_menu = None;
         self.day_menu = Some(DayContextMenu { habit_id, date, position });
         cx.notify();
@@ -690,7 +733,7 @@ impl HabitView {
                 }
                 return base
                     .bg(accent)
-                    .child(Icon::new(IconName::Check).size(IconSize::XSmall).color(Color::Custom(gpui::white())));
+                    .child(Icon::new(IconName::Check).size(IconSize::XSmall).color(Color::IconOnAccent));
             }
             if c.is_undone() {
                 return base
@@ -1593,7 +1636,7 @@ impl Render for HabitView {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .child(Icon::new(IconName::Check).size(IconSize::XSmall).color(Color::Custom(gpui::white())))
+                            .child(Icon::new(IconName::Check).size(IconSize::XSmall).color(Color::IconOnAccent))
                             .into_any_element(),
                         DayProgress::Fraction(frac) => progress_ring(
                             px(24.),
@@ -1778,53 +1821,22 @@ impl Render for HabitView {
                         .px(px(22.))
                         .pb_6()
                         .when(sections_ui.is_empty(), |el| {
-                            el.child(
-                                v_flex()
-                                    .w_full()
-                                    .py(px(56.))
-                                    .items_center()
-                                    .justify_center()
-                                    .gap_3()
-                                    .child(
-                                        div()
-                                            .size(px(52.))
-                                            .rounded_full()
-                                            .bg(theme.colors().surface_background)
-                                            .border_1()
-                                            .border_color(theme.colors().border_variant)
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .child(Icon::new(IconName::FernHabit).size(IconSize::Large).color(Color::Muted)),
-                                    )
-                                    .child(
-                                        Label::new(if self.show_archived {
-                                            strings.habit_no_archived
-                                        } else {
-                                            strings.habit_empty
-                                        })
-                                        .size(LabelSize::Small)
-                                        .color(Color::Muted),
-                                    )
-                                    .when(!self.show_archived && self.selected_date.is_none(), |col| {
-                                        col.child(
-                                            h_flex()
-                                                .id("habit-empty-add")
-                                                .h(px(32.))
-                                                .px_3p5()
-                                                .gap_1p5()
-                                                .rounded(px(6.))
-                                                .bg(theme.colors().accent)
-                                                .hover(|s| s.opacity(0.9))
-                                                .cursor_pointer()
-                                                .child(Icon::new(IconName::Plus).size(IconSize::Small).color(Color::IconOnAccent))
-                                                .child(Label::new(strings.habit_add_title).size(LabelSize::Small).color(Color::OnAccent))
-                                                .on_click(cx.listener(|this, _, window, cx| {
-                                                    this.open_create_modal(HabitSection::Others, window, cx);
-                                                })),
-                                        )
+                            let message = if self.show_archived {
+                                strings.habit_no_archived
+                            } else {
+                                strings.habit_empty
+                            };
+                            let mut empty = EmptyState::new(IconName::FernHabit, message);
+                            if !self.show_archived && self.selected_date.is_none() {
+                                empty = empty.action(
+                                    "habit-empty-add",
+                                    strings.habit_add_title,
+                                    cx.listener(|this, _, window, cx| {
+                                        this.open_create_modal(HabitSection::Others, window, cx);
                                     }),
-                            )
+                                );
+                            }
+                            el.child(div().w_full().py(px(32.)).child(empty))
                         })
                         .child(v_flex().gap_3().children(sections_ui)),
                 )
@@ -1840,30 +1852,7 @@ impl Render for HabitView {
             .h_full()
             .child(match detail {
                 Some(detail) => detail,
-                None => div()
-                    .size_full()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(
-                        v_flex()
-                            .items_center()
-                            .gap_3()
-                            .child(
-                                div()
-                                    .size(px(52.))
-                                    .rounded_full()
-                                    .bg(theme.colors().surface_background)
-                                    .border_1()
-                                    .border_color(theme.colors().border_variant)
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .child(Icon::new(IconName::FernHabit).size(IconSize::Large).color(Color::Muted)),
-                            )
-                            .child(Label::new(strings.habit_select).size(LabelSize::Small).color(Color::Muted)),
-                    )
-                    .into_any_element(),
+                None => EmptyState::new(IconName::FernHabit, strings.habit_select).into_any_element(),
             })
             .child(resize::handle(
                 resize::Panel::Detail,
@@ -2055,6 +2044,86 @@ mod tests {
                 assert!(matches!(view.confirm, Some(ConfirmAction::ResetCheckin { .. })));
                 view.execute_confirm(cx);
                 assert!(!view.checkins.get(&water.id).unwrap().contains(&today));
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn day_menu_enforces_90_day_limit_and_calendar_blocks_archived_quantifiable_habits(cx: &mut TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let today = Local::now().date_naive();
+        let active = store.add_habit("Meditate").unwrap();
+        let archived_goal = store
+            .create_habit(&HabitDraft {
+                name: "Hydrate".into(),
+                goal: Some(Goal { amount: 2.0, unit: "L".into(), mode: CheckinMode::Manual }),
+                ..Default::default()
+            })
+            .unwrap();
+        store.set_habit_archived(archived_goal.id, true).unwrap();
+
+        cx.update(theme::init);
+        let (view, cx) = cx.add_window_view(|_, cx| HabitView::new(store.clone(), cx));
+
+        // Right-clicking a day older than MAX_EDITABLE_PAST_DAYS must NOT open day_menu and sets detail_notice.
+        let too_old = today - Duration::days(habit::MAX_EDITABLE_PAST_DAYS + 1);
+        let within_limit = today - Duration::days(habit::MAX_EDITABLE_PAST_DAYS);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.open_day_menu(active.id, too_old, gpui::point(px(10.), px(10.)), cx);
+                assert!(view.day_menu.is_none());
+                assert!(view.detail_notice.is_some());
+
+                // Right-clicking at the exact boundary succeeds and clears the notice.
+                view.open_day_menu(active.id, within_limit, gpui::point(px(10.), px(10.)), cx);
+                assert!(view.day_menu.is_some());
+                assert!(view.detail_notice.is_none());
+
+                // Clicking calendar day on an archived quantifiable habit must NOT open amount_modal.
+                view.handle_detail_calendar_click(archived_goal.id, today, true, window, cx);
+                assert!(view.amount_modal.is_none());
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn amount_modal_preserves_typo_and_auto_pops_log_on_completion(cx: &mut TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let today = Local::now().date_naive();
+        let run = store
+            .create_habit(&HabitDraft {
+                name: "Run".into(),
+                goal: Some(Goal { amount: 5.0, unit: "km".into(), mode: CheckinMode::Manual }),
+                record_enable: true,
+                ..Default::default()
+            })
+            .unwrap();
+
+        cx.update(theme::init);
+        let (view, cx) = cx.add_window_view(|_, cx| HabitView::new(store.clone(), cx));
+
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.open_amount_modal(run.id, today, true, window, cx);
+                let input = view.amount_modal.as_ref().unwrap().input.clone();
+                input.update(cx, |inp, cx| inp.set_text("5..km", cx));
+
+                // Submitting invalid text keeps the modal open and preserves the typed string.
+                view.submit_amount_modal(Some(window), cx);
+                let still_open = view.amount_modal.as_ref().expect("modal must remain open on invalid input");
+                assert_eq!(still_open.input.read(cx).text(), "5..km");
+                assert!(!view.checkins.get(&run.id).unwrap().contains(&today));
+                assert!(view.log_modal.is_none());
+
+                // Fixing the typo and submitting completes the habit and auto-pops Habit Log.
+                input.update(cx, |inp, cx| inp.set_text("5", cx));
+                view.submit_amount_modal(Some(window), cx);
+                assert!(view.amount_modal.is_none());
+                assert!(view.checkins.get(&run.id).unwrap().contains(&today));
+                let log = view.log_modal.as_ref().expect("auto-pop Habit Log should open");
+                assert!(log.auto_popped);
+                assert_eq!(log.habit_id, run.id);
+                assert_eq!(log.date, today);
             });
         });
     }

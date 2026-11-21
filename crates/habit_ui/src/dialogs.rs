@@ -6,6 +6,7 @@ use fern_core::habit::{
 use fern_core::Id;
 use gpui::{Entity, Focusable as _, FontWeight};
 use ui::prelude::*;
+use ui::{Button, ButtonVariant, ConfirmDialog, Modal};
 
 use desktop_common::habit_helpers::mood_emoji;
 use desktop_common::text_input::{Cancelled, Mode, Submitted, TextInput};
@@ -46,7 +47,7 @@ pub(crate) fn action_button(
         .child(
             Label::new(label)
                 .size(LabelSize::Small)
-                .color(if filled { Color::Custom(gpui::white()) } else { Color::Default }),
+                .color(if filled { Color::OnAccent } else { Color::Default }),
         )
 }
 
@@ -158,6 +159,9 @@ impl HabitView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.habits.iter().find(|h| h.id == habit_id).is_none_or(|h| h.archived) {
+            return;
+        }
         let existing_val = self
             .records
             .get(&habit_id)
@@ -175,8 +179,8 @@ impl HabitView {
             inp.set_text(initial, cx);
             inp
         });
-        cx.subscribe(&input, |this, _, _: &Submitted, cx| {
-            this.submit_amount_modal(cx);
+        cx.subscribe_in(&input, window, |this, _, _: &Submitted, window, cx| {
+            this.submit_amount_modal(Some(window), cx);
         })
         .detach();
         cx.subscribe(&input, |this, _, _: &Cancelled, cx| {
@@ -191,32 +195,39 @@ impl HabitView {
         cx.notify();
     }
 
-    pub(crate) fn submit_amount_modal(&mut self, cx: &mut Context<Self>) {
-        let Some(modal) = self.amount_modal.take() else { return };
+    pub(crate) fn submit_amount_modal(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
+        let Some(modal) = self.amount_modal.as_ref() else { return };
+        let habit_id = modal.habit_id;
+        let date = modal.date;
+        let increase = modal.increase;
         let raw = modal.input.read(cx).text().to_owned();
-        let was_done = self.checkins.get(&modal.habit_id).is_some_and(|d| d.contains(&modal.date));
-        if modal.increase {
-            let Some(delta) = parse_amount(&raw) else {
-                cx.notify();
-                return;
-            };
-            if let Err(err) = self.store.add_checkin_amount(modal.habit_id, modal.date, delta) {
-                eprintln!("failed to add check-in amount: {err:#}");
-            }
+        let parsed = if increase {
+            parse_amount(&raw)
         } else {
-            let Some(total) = parse_amount_non_negative(&raw) else {
-                cx.notify();
-                return;
-            };
-            if let Err(err) = self.store.set_checkin_amount(modal.habit_id, modal.date, total) {
-                eprintln!("failed to set check-in amount: {err:#}");
-            }
+            parse_amount_non_negative(&raw)
+        };
+        let Some(amount) = parsed else {
+            // Preserve the open modal and typed input so the user can fix a typo.
+            cx.notify();
+            return;
+        };
+        self.amount_modal = None;
+        let was_done = self.checkins.get(&habit_id).is_some_and(|d| d.contains(&date));
+        let res = if increase {
+            self.store.add_checkin_amount(habit_id, date, amount).map(|_| ())
+        } else {
+            self.store.set_checkin_amount(habit_id, date, amount)
+        };
+        if let Err(err) = res {
+            eprintln!("failed to save check-in amount: {err:#}");
+            cx.notify();
+            return;
         }
         self.notify_data_changed(cx);
         self.reload(cx);
-        let now_done = self.checkins.get(&modal.habit_id).is_some_and(|d| d.contains(&modal.date));
+        let now_done = self.checkins.get(&habit_id).is_some_and(|d| d.contains(&date));
         if !was_done && now_done {
-            self.after_checkin_completed(modal.habit_id, modal.date, None, cx);
+            self.after_checkin_completed(habit_id, date, window, cx);
         }
     }
 
@@ -231,142 +242,135 @@ impl HabitView {
             .unwrap_or_default();
         let char_count = modal.note_input.read(cx).text().chars().count();
 
-        modal_backdrop(
-            "habit-log-modal",
-            v_flex()
-                .w(px(420.))
-                .rounded(px(10.))
-                .border_1()
-                .border_color(theme.colors().border)
-                .bg(theme.colors().elevated_surface_background)
-                .shadow_lg()
-                .p_5()
-                .gap_3()
-                .child(
-                    h_flex()
-                        .justify_between()
-                        .child(
-                            v_flex()
-                                .gap_0p5()
-                                .child(
-                                    Label::new(format!(
-                                        "{}{}",
-                                        strings.habit_log_on,
-                                        desktop_common::calendar::format_date(modal.date, strings)
-                                    ))
-                                    .size(LabelSize::Large)
-                                    .weight(FontWeight::SEMIBOLD),
-                                )
-                                .child(Label::new(habit_name).size(LabelSize::XSmall).color(Color::Muted)),
-                        )
-                        .child(
-                            IconButton::new("log-modal-close", IconName::X)
-                                .tooltip(Tooltip::text(strings.close))
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.log_modal = None;
-                                    cx.notify();
-                                })),
-                        ),
-                )
-                // Mood picker (5 emojis)
-                .child(
-                    v_flex()
-                        .gap_1p5()
-                        .child(Label::new(strings.habit_mood_prompt).size(LabelSize::XSmall).color(Color::Muted))
-                        .child(h_flex().gap_2().children(MOODS.map(|m| {
-                            let selected = modal.mood == m;
-                            let emoji = mood_emoji(m).unwrap_or("");
-                            div()
-                                .id(SharedString::from(format!("log-mood-{m}")))
-                                .size(px(36.))
-                                .rounded_full()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .text_size(px(20.))
-                                .cursor_pointer()
-                                .bg(if selected {
-                                    theme.colors().accent.opacity(0.22)
-                                } else {
-                                    theme.colors().surface_background
-                                })
-                                .border_1()
-                                .border_color(if selected {
-                                    theme.colors().accent
-                                } else {
-                                    gpui::transparent_black()
-                                })
-                                .hover(|s| s.bg(theme.colors().accent.opacity(if selected { 0.28 } else { 0.12 })))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    if let Some(lm) = this.log_modal.as_mut() {
-                                        lm.mood = if lm.mood == m { 0 } else { m };
-                                        cx.notify();
-                                    }
-                                }))
-                                .child(emoji)
-                        }))),
-                )
-                // Note text area
-                .child(
-                    v_flex()
-                        .gap_1()
-                        .child(
-                            div()
-                                .h(px(110.))
-                                .p_2()
-                                .rounded(px(6.))
-                                .border_1()
-                                .border_color(theme.colors().border)
-                                .bg(theme.colors().background)
-                                .child(modal.note_input.clone()),
-                        )
-                        .child(
-                            h_flex().justify_end().child(
-                                Label::new(format!("{char_count}/{MAX_LOG_NOTE_CHARS}"))
-                                    .size(LabelSize::XSmall)
-                                    .color(if char_count > MAX_LOG_NOTE_CHARS {
-                                        Color::Error
-                                    } else {
-                                        Color::Muted
-                                    }),
-                            ),
-                        ),
-                )
-                // Auto-pop opt-out
-                .when(modal.auto_popped, |el| {
-                    el.child(
-                        h_flex()
-                            .id("log-no-auto-pop")
-                            .gap_2()
-                            .cursor_pointer()
+        Modal::new("habit-log-modal")
+            .width(px(420.))
+            .child(
+                h_flex()
+                    .justify_between()
+                    .child(
+                        v_flex()
+                            .gap_0p5()
+                            .child(
+                                Label::new(format!(
+                                    "{}{}",
+                                    strings.habit_log_on,
+                                    desktop_common::calendar::format_date(modal.date, strings)
+                                ))
+                                .size(LabelSize::Large)
+                                .weight(FontWeight::SEMIBOLD),
+                            )
+                            .child(Label::new(habit_name).size(LabelSize::XSmall).color(Color::Muted)),
+                    )
+                    .child(
+                        IconButton::new("log-modal-close", IconName::X)
+                            .tooltip(Tooltip::text(strings.close))
                             .on_click(cx.listener(|this, _, _, cx| {
+                                this.log_modal = None;
+                                cx.notify();
+                            })),
+                    ),
+            )
+            // Mood picker (5 emojis)
+            .child(
+                v_flex()
+                    .gap_1p5()
+                    .child(Label::new(strings.habit_mood_prompt).size(LabelSize::XSmall).color(Color::Muted))
+                    .child(h_flex().gap_2().children(MOODS.map(|m| {
+                        let selected = modal.mood == m;
+                        let emoji = mood_emoji(m).unwrap_or("");
+                        div()
+                            .id(SharedString::from(format!("log-mood-{m}")))
+                            .size(px(36.))
+                            .rounded_full()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_size(px(20.))
+                            .cursor_pointer()
+                            .bg(if selected {
+                                theme.colors().accent.opacity(0.22)
+                            } else {
+                                theme.colors().surface_background
+                            })
+                            .border_1()
+                            .border_color(if selected {
+                                theme.colors().accent
+                            } else {
+                                gpui::transparent_black()
+                            })
+                            .hover(|s| s.bg(theme.colors().accent.opacity(if selected { 0.28 } else { 0.12 })))
+                            .on_click(cx.listener(move |this, _, _, cx| {
                                 if let Some(lm) = this.log_modal.as_mut() {
-                                    lm.disable_auto_pop = !lm.disable_auto_pop;
+                                    lm.mood = if lm.mood == m { 0 } else { m };
                                     cx.notify();
                                 }
                             }))
-                            .child(Checkbox::new("log-no-auto-pop-box").toggle_state(modal.disable_auto_pop))
-                            .child(Label::new(strings.habit_do_not_show_again).size(LabelSize::XSmall).color(Color::Muted)),
+                            .child(emoji)
+                    }))),
+            )
+            // Note text area
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(
+                        div()
+                            .h(px(110.))
+                            .p_2()
+                            .rounded(px(6.))
+                            .border_1()
+                            .border_color(theme.colors().border)
+                            .bg(theme.colors().background)
+                            .child(modal.note_input.clone()),
                     )
-                })
-                // Footer
-                .child(
+                    .child(
+                        h_flex().justify_end().child(
+                            Label::new(format!("{char_count}/{MAX_LOG_NOTE_CHARS}"))
+                                .size(LabelSize::XSmall)
+                                .color(if char_count > MAX_LOG_NOTE_CHARS {
+                                    Color::Error
+                                } else {
+                                    Color::Muted
+                                }),
+                        ),
+                    ),
+            )
+            // Auto-pop opt-out
+            .when(modal.auto_popped, |el| {
+                el.child(
                     h_flex()
-                        .justify_end()
+                        .id("log-no-auto-pop")
                         .gap_2()
-                        .child(action_button("log-modal-cancel", strings.cancel, false, false, false, cx).on_click(cx.listener(
-                            |this, _, _, cx| {
+                        .cursor_pointer()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if let Some(lm) = this.log_modal.as_mut() {
+                                lm.disable_auto_pop = !lm.disable_auto_pop;
+                                cx.notify();
+                            }
+                        }))
+                        .child(Checkbox::new("log-no-auto-pop-box").toggle_state(modal.disable_auto_pop))
+                        .child(Label::new(strings.habit_do_not_show_again).size(LabelSize::XSmall).color(Color::Muted)),
+                )
+            })
+            // Footer
+            .child(
+                h_flex()
+                    .justify_end()
+                    .gap_2()
+                    .child(
+                        Button::new("log-modal-cancel", strings.cancel)
+                            .variant(ButtonVariant::Secondary)
+                            .on_click(cx.listener(|this, _, _, cx| {
                                 this.log_modal = None;
                                 cx.notify();
-                            },
-                        )))
-                        .child(
-                            action_button("log-modal-save", strings.save, true, false, false, cx)
-                                .on_click(cx.listener(|this, _, _, cx| this.save_log_modal(cx))),
-                        ),
-                )
-                .into_any_element(),
-        )
+                            })),
+                    )
+                    .child(
+                        Button::new("log-modal-save", strings.save)
+                            .variant(ButtonVariant::Primary)
+                            .on_click(cx.listener(|this, _, _, cx| this.save_log_modal(cx))),
+                    ),
+            )
+            .into_any_element()
     }
 
     pub(crate) fn render_amount_modal(&self, modal: &AmountModal, cx: &mut Context<Self>) -> AnyElement {
@@ -384,77 +388,78 @@ impl HabitView {
             .and_then(|recs| recs.iter().find(|r| r.date == modal.date))
             .map_or(0.0, |r| r.value);
         let mode_title = if modal.increase { strings.habit_increase } else { strings.habit_total };
+        let raw = modal.input.read(cx).text();
+        let invalid = !raw.trim().is_empty()
+            && if modal.increase {
+                parse_amount(raw).is_none()
+            } else {
+                parse_amount_non_negative(raw).is_none()
+            };
 
-        modal_backdrop(
-            "habit-amount-modal",
-            v_flex()
-                .w(px(340.))
-                .rounded(px(10.))
-                .border_1()
-                .border_color(theme.colors().border)
-                .bg(theme.colors().elevated_surface_background)
-                .shadow_lg()
-                .p_5()
-                .gap_3()
-                .child(
-                    h_flex()
-                        .justify_between()
-                        .child(Label::new(strings.habit_how_much).size(LabelSize::Default).weight(FontWeight::SEMIBOLD))
-                        .child(
-                            IconButton::new("amt-close", IconName::X)
-                                .tooltip(Tooltip::text(strings.close))
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.amount_modal = None;
-                                    cx.notify();
-                                })),
-                        ),
-                )
-                .child(
-                    Label::new(format!(
-                        "{mode_title} · {} / {} {unit}",
-                        format_amount(current_val),
-                        format_amount(goal_amt)
-                    ))
-                    .size(LabelSize::XSmall)
-                    .color(Color::Muted),
-                )
-                .child(
-                    h_flex()
-                        .gap_2()
-                        .items_center()
-                        .child(
-                            h_flex()
-                                .flex_1()
-                                .h(px(34.))
-                                .px_2()
-                                .rounded(px(6.))
-                                .border_1()
-                                .border_color(theme.colors().accent)
-                                .bg(theme.colors().background)
-                                .child(modal.input.clone()),
-                        )
-                        .when(!unit.is_empty(), |el| el.child(Label::new(unit).size(LabelSize::Small).color(Color::Muted))),
-                )
-                .child(
-                    h_flex()
-                        .justify_end()
-                        .gap_2()
-                        .child(action_button("amt-cancel", strings.cancel, false, false, false, cx).on_click(cx.listener(|this, _, _, cx| {
-                            this.amount_modal = None;
-                            cx.notify();
-                        })))
-                        .child(
-                            action_button("amt-save", strings.save, true, false, false, cx)
-                                .on_click(cx.listener(|this, _, _, cx| this.submit_amount_modal(cx))),
-                        ),
-                )
-                .into_any_element(),
-        )
+        Modal::new("habit-amount-modal")
+            .width(px(340.))
+            .child(
+                h_flex()
+                    .justify_between()
+                    .child(Label::new(strings.habit_how_much).size(LabelSize::Default).weight(FontWeight::SEMIBOLD))
+                    .child(
+                        IconButton::new("amt-close", IconName::X)
+                            .tooltip(Tooltip::text(strings.close))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.amount_modal = None;
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(
+                Label::new(format!(
+                    "{mode_title} · {} / {} {unit}",
+                    format_amount(current_val),
+                    format_amount(goal_amt)
+                ))
+                .size(LabelSize::XSmall)
+                .color(Color::Muted),
+            )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        h_flex()
+                            .flex_1()
+                            .h(px(34.))
+                            .px_2()
+                            .rounded(px(6.))
+                            .border_1()
+                            .border_color(if invalid { theme.status().error } else { theme.colors().accent })
+                            .bg(theme.colors().background)
+                            .child(modal.input.clone()),
+                    )
+                    .when(!unit.is_empty(), |el| el.child(Label::new(unit).size(LabelSize::Small).color(Color::Muted))),
+            )
+            .child(
+                h_flex()
+                    .justify_end()
+                    .gap_2()
+                    .child(
+                        Button::new("amt-cancel", strings.cancel)
+                            .variant(ButtonVariant::Secondary)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.amount_modal = None;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("amt-save", strings.save)
+                            .variant(ButtonVariant::Primary)
+                            .on_click(cx.listener(|this, _, window, cx| this.submit_amount_modal(Some(window), cx))),
+                    ),
+            )
+            .into_any_element()
     }
 
     pub(crate) fn render_confirm_modal(&self, action: &ConfirmAction, cx: &mut Context<Self>) -> AnyElement {
         let strings = i18n::t(cx);
-        let theme = cx.theme().clone();
         let (title, message, confirm_label, destructive) = match action {
             ConfirmAction::ResetCheckin { .. } => (strings.habit_reset, strings.habit_reset_confirm, strings.habit_reset, false),
             ConfirmAction::DeleteHabit { .. } => (strings.delete, strings.habit_delete_confirm, strings.delete, true),
@@ -463,35 +468,18 @@ impl HabitView {
             ConfirmAction::SaveHabitCycleChange { .. } => (strings.edit_habit, strings.habit_cycle_reset_confirm, strings.save, false),
         };
 
-        modal_backdrop(
-            "habit-confirm-modal",
-            v_flex()
-                .w(px(360.))
-                .rounded(px(10.))
-                .border_1()
-                .border_color(theme.colors().border)
-                .bg(theme.colors().elevated_surface_background)
-                .shadow_lg()
-                .p_5()
-                .gap_3()
-                .child(Label::new(title).size(LabelSize::Large).weight(FontWeight::SEMIBOLD))
-                .child(Label::new(message).size(LabelSize::Small).color(Color::Muted))
-                .child(
-                    h_flex()
-                        .justify_end()
-                        .gap_2()
-                        .pt_1()
-                        .child(action_button("confirm-cancel", strings.cancel, false, false, false, cx).on_click(cx.listener(|this, _, _, cx| {
-                            this.confirm = None;
-                            cx.notify();
-                        })))
-                        .child(
-                            action_button("confirm-ok", confirm_label, true, destructive, false, cx)
-                                .on_click(cx.listener(|this, _, _, cx| this.execute_confirm(cx))),
-                        ),
-                )
-                .into_any_element(),
-        )
+        ConfirmDialog::new("habit-confirm-modal", title)
+            .width(px(360.))
+            .description(message)
+            .cancel_label(strings.cancel)
+            .confirm_label(confirm_label)
+            .destructive(destructive)
+            .on_cancel(cx.listener(|this, _, _, cx| {
+                this.confirm = None;
+                cx.notify();
+            }))
+            .on_confirm(cx.listener(|this, _, _, cx| this.execute_confirm(cx)))
+            .into_any_element()
     }
 
     pub(crate) fn execute_confirm(&mut self, cx: &mut Context<Self>) {
@@ -542,50 +530,42 @@ impl HabitView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let strings = i18n::t(cx);
-        let theme = cx.theme().clone();
         let habit_id = modal.habit_id;
         let body = strings.habit_cycle_done_body.replace("{n}", &modal.target_days.to_string());
 
-        modal_backdrop(
-            "habit-cycle-done-modal",
-            v_flex()
-                .w(px(380.))
-                .rounded(px(10.))
-                .border_1()
-                .border_color(theme.colors().border)
-                .bg(theme.colors().elevated_surface_background)
-                .shadow_lg()
-                .p_5()
-                .gap_3()
-                .child(
-                    h_flex()
-                        .gap_2()
-                        .items_center()
-                        .child(div().text_size(px(22.)).child("🏆"))
-                        .child(Label::new(strings.habit_cycle_done_title).size(LabelSize::Large).weight(FontWeight::SEMIBOLD)),
-                )
-                .child(Label::new(body).size(LabelSize::Small).color(Color::Muted))
-                .child(
-                    h_flex()
-                        .justify_end()
-                        .gap_2()
-                        .pt_1()
-                        .child(action_button("cycle-archive", strings.habit_end_and_archive, false, false, false, cx).on_click(cx.listener(
-                            move |this, _, _, cx| {
+        Modal::new("habit-cycle-done-modal")
+            .width(px(380.))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(div().text_size(px(22.)).child("🏆"))
+                    .child(Label::new(strings.habit_cycle_done_title).size(LabelSize::Large).weight(FontWeight::SEMIBOLD)),
+            )
+            .child(Label::new(body).size(LabelSize::Small).color(Color::Muted))
+            .child(
+                h_flex()
+                    .justify_end()
+                    .gap_2()
+                    .pt_1()
+                    .child(
+                        Button::new("cycle-archive", strings.habit_end_and_archive)
+                            .variant(ButtonVariant::Secondary)
+                            .on_click(cx.listener(move |this, _, _, cx| {
                                 this.cycle_completed = None;
                                 this.set_archived(habit_id, true, cx);
-                            },
-                        )))
-                        .child(
-                            action_button("cycle-continue", strings.habit_continue_cycle, true, false, false, cx)
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.cycle_completed = None;
-                                    cx.notify();
-                                })),
-                        ),
-                )
-                .into_any_element(),
-        )
+                            })),
+                    )
+                    .child(
+                        Button::new("cycle-continue", strings.habit_continue_cycle)
+                            .variant(ButtonVariant::Primary)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.cycle_completed = None;
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .into_any_element()
     }
 
     pub(crate) fn render_completed_cycles_modal(
@@ -596,70 +576,64 @@ impl HabitView {
         let strings = i18n::t(cx);
         let theme = cx.theme().clone();
 
-        modal_backdrop(
-            "habit-cycles-list-modal",
-            v_flex()
-                .w(px(380.))
-                .max_h(px(460.))
-                .rounded(px(10.))
-                .border_1()
-                .border_color(theme.colors().border)
-                .bg(theme.colors().elevated_surface_background)
-                .shadow_lg()
-                .p_5()
-                .gap_3()
-                .child(
-                    h_flex()
-                        .justify_between()
-                        .child(
-                            v_flex()
-                                .gap_0p5()
-                                .child(Label::new(strings.habit_cycles).size(LabelSize::Large).weight(FontWeight::SEMIBOLD))
-                                .child(Label::new(modal.habit_name.clone()).size(LabelSize::XSmall).color(Color::Muted)),
-                        )
-                        .child(
-                            IconButton::new("cycles-list-close", IconName::X)
-                                .tooltip(Tooltip::text(strings.close))
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.cycles_modal = None;
-                                    cx.notify();
-                                })),
-                        ),
-                )
-                .child(
-                    v_scroll(
-                        "cycles-list-scroll",
-                        v_flex().id("cycles-list-body").gap_1p5().children(modal.cycles.iter().rev().enumerate().map(|(i, c)| {
-                            h_flex()
-                                .px_3()
-                                .py_2()
-                                .rounded(px(6.))
-                                .bg(theme.colors().surface_background)
-                                .justify_between()
-                                .child(
-                                    h_flex()
-                                        .gap_2()
-                                        .child(Label::new(format!("#{}", modal.cycles.len() - i)).size(LabelSize::Small).color(Color::Accent))
-                                        .child(
-                                            Label::new(format!(
-                                                "{} — {}",
-                                                desktop_common::calendar::format_date(c.start, strings),
-                                                desktop_common::calendar::format_date(c.end, strings),
-                                            ))
-                                            .size(LabelSize::Small),
-                                        ),
-                                )
-                                .child(
-                                    Label::new(format!("{} {}", c.count, crate::modal::day_unit_str(c.count as i64, strings)))
-                                        .size(LabelSize::XSmall)
-                                        .color(Color::Muted),
-                                )
-                        })),
+        Modal::new("habit-cycles-list-modal")
+            .width(px(380.))
+            .max_height(px(460.))
+            .on_dismiss(cx.listener(|this, _, _, cx| {
+                this.cycles_modal = None;
+                cx.notify();
+            }))
+            .child(
+                h_flex()
+                    .justify_between()
+                    .child(
+                        v_flex()
+                            .gap_0p5()
+                            .child(Label::new(strings.habit_cycles).size(LabelSize::Large).weight(FontWeight::SEMIBOLD))
+                            .child(Label::new(modal.habit_name.clone()).size(LabelSize::XSmall).color(Color::Muted)),
                     )
-                    .max_h(px(300.)),
+                    .child(
+                        IconButton::new("cycles-list-close", IconName::X)
+                            .tooltip(Tooltip::text(strings.close))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.cycles_modal = None;
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(
+                v_scroll(
+                    "cycles-list-scroll",
+                    v_flex().id("cycles-list-body").gap_1p5().children(modal.cycles.iter().rev().enumerate().map(|(i, c)| {
+                        h_flex()
+                            .px_3()
+                            .py_2()
+                            .rounded(px(6.))
+                            .bg(theme.colors().surface_background)
+                            .justify_between()
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .child(Label::new(format!("#{}", modal.cycles.len() - i)).size(LabelSize::Small).color(Color::Accent))
+                                    .child(
+                                        Label::new(format!(
+                                            "{} — {}",
+                                            desktop_common::calendar::format_date(c.start, strings),
+                                            desktop_common::calendar::format_date(c.end, strings),
+                                        ))
+                                        .size(LabelSize::Small),
+                                    ),
+                            )
+                            .child(
+                                Label::new(format!("{} {}", c.count, crate::modal::day_unit_str(c.count as i64, strings)))
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                            )
+                    })),
                 )
-                .into_any_element(),
-        )
+                .max_h(px(300.)),
+            )
+            .into_any_element()
     }
 }
 

@@ -761,7 +761,7 @@ impl HabitView {
         )
     }
 
-    fn handle_detail_calendar_click(
+    pub(crate) fn handle_detail_calendar_click(
         &mut self,
         habit_id: fern_core::Id,
         date: NaiveDate,
@@ -769,6 +769,9 @@ impl HabitView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.habits.iter().find(|h| h.id == habit_id).is_none_or(|h| h.archived) {
+            return;
+        }
         let today = Local::now().date_naive();
         if date > today {
             return;

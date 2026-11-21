@@ -756,41 +756,52 @@ impl HabitView {
                         .child(Label::new(strings.export))
                         .on_click(cx.listener(|this, _, _, cx| this.export_csv(cx))),
                 ),
-            HeaderMore::Settings => popover(cx)
-                .w(px(270.))
-                .p_3()
-                .gap_3()
-                .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                    this.header_more = None;
-                    cx.notify();
-                }))
-                .child(
-                    h_flex()
-                        .id("habit-set-in-today")
-                        .justify_between()
-                        .items_center()
-                        .cursor_pointer()
-                        .on_click(cx.listener(move |this, _, _, cx| this.set_flag(IN_TODAY_SETTING, !in_today, cx)))
-                        .child(Label::new(strings.habits_in_today).size(LabelSize::Small))
-                        .child(Checkbox::new("habit-in-today-box").toggle_state(in_today)),
-                )
-                .child(
-                    v_flex()
-                        .gap_1()
-                        .child(
-                            h_flex()
-                                .id("habit-set-sort")
-                                .justify_between()
-                                .items_center()
-                                .cursor_pointer()
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.set_flag(SORT_SETTING, !sort_status, cx);
-                                }))
-                                .child(Label::new(strings.habits_sort_by_status).size(LabelSize::Small))
-                                .child(Checkbox::new("habit-sort-box").toggle_state(sort_status)),
-                        )
-                        .child(Label::new(strings.habits_sort_hint).size(LabelSize::XSmall).color(Color::Muted)),
-                ),
+            HeaderMore::Settings => {
+                let hover_bg = cx.theme().colors().element_hover;
+                popover(cx)
+                    .w(px(270.))
+                    .p_3()
+                    .gap_3()
+                    .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                        this.header_more = None;
+                        cx.notify();
+                    }))
+                    .child(
+                        h_flex()
+                            .id("habit-set-in-today")
+                            .px_1p5()
+                            .py_1()
+                            .rounded(px(5.))
+                            .hover(move |s| s.bg(hover_bg))
+                            .justify_between()
+                            .items_center()
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, _, cx| this.set_flag(IN_TODAY_SETTING, !in_today, cx)))
+                            .child(Label::new(strings.habits_in_today).size(LabelSize::Small))
+                            .child(Checkbox::new("habit-in-today-box").toggle_state(in_today)),
+                    )
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .child(
+                                h_flex()
+                                    .id("habit-set-sort")
+                                    .px_1p5()
+                                    .py_1()
+                                    .rounded(px(5.))
+                                    .hover(move |s| s.bg(hover_bg))
+                                    .justify_between()
+                                    .items_center()
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.set_flag(SORT_SETTING, !sort_status, cx);
+                                    }))
+                                    .child(Label::new(strings.habits_sort_by_status).size(LabelSize::Small))
+                                    .child(Checkbox::new("habit-sort-box").toggle_state(sort_status)),
+                            )
+                            .child(div().px_1p5().child(Label::new(strings.habits_sort_hint).size(LabelSize::XSmall).color(Color::Muted))),
+                    )
+            }
         }
     }
 
@@ -837,6 +848,9 @@ impl HabitView {
                 h_flex()
                     .id(SharedString::from(format!("habit-sec-toggle-{key}")))
                     .gap_1()
+                    .px_1()
+                    .rounded(px(4.))
+                    .hover(|s| s.bg(theme.colors().ghost_element_hover))
                     .items_center()
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -871,6 +885,7 @@ impl HabitView {
                 el.child(
                     IconButton::new(SharedString::from(format!("sec-add-{key}")), IconName::Plus)
                         .icon_size(IconSize::XSmall)
+                        .tooltip(Tooltip::text(strings.habit_add_title))
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.open_create_modal(section, window, cx);
                         })),
@@ -883,6 +898,7 @@ impl HabitView {
                         .child(
                             IconButton::new(SharedString::from(format!("sec-more-{cid}")), IconName::Ellipsis)
                                 .icon_size(IconSize::XSmall)
+                                .tooltip(Tooltip::text(strings.more))
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.section_menu = Some(cid);
                                     cx.notify();

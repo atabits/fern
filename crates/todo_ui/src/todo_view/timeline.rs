@@ -334,6 +334,7 @@ impl TodoView {
                             .border_1()
                             .border_color(theme.colors().border)
                             .cursor_pointer()
+                            .hover(|s| s.bg(theme.colors().element_hover))
                             .child(Label::new(strings.today).size(LabelSize::Small))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.timeline_from = Self::today();
@@ -353,7 +354,13 @@ impl TodoView {
                             .w(px(LABEL_WIDTH))
                             .flex_none()
                             .px_1()
-                            .child(IconButton::new("timeline-prev", IconName::ChevronLeft).size(px(20.)).icon_size(IconSize::XSmall).on_click(shift(-step))),
+                            .child(
+                                IconButton::new("timeline-prev", IconName::ChevronLeft)
+                                    .size(px(20.))
+                                    .icon_size(IconSize::XSmall)
+                                    .tooltip(Tooltip::text("←"))
+                                    .on_click(shift(-step)),
+                            ),
                     )
                     .child(h_flex().flex_1().children(days.iter().map(|date| {
                         let is_today = *date == today;
@@ -368,6 +375,7 @@ impl TodoView {
                             _ => Color::Default,
                         };
                         div()
+                            .id(SharedString::from(format!("timeline-hdr-day-{date}")))
                             .flex_1()
                             .min_w_0()
                             .h_full()
@@ -375,9 +383,16 @@ impl TodoView {
                             .items_center()
                             .justify_center()
                             .when(weekend(date), |el| el.bg(theme.colors().element_hover.opacity(0.5)))
+                            .tooltip(Tooltip::text(crate::calendar::format_date(*date, strings)))
                             .when(labelled || is_today, |el| el.child(Label::new(date.day().to_string()).centered().weight(FontWeight::SEMIBOLD).color(color)))
                     })))
-                    .child(IconButton::new("timeline-next", IconName::ChevronRight).size(px(20.)).icon_size(IconSize::XSmall).on_click(shift(step))),
+                    .child(
+                        IconButton::new("timeline-next", IconName::ChevronRight)
+                            .size(px(20.))
+                            .icon_size(IconSize::XSmall)
+                            .tooltip(Tooltip::text("→"))
+                            .on_click(shift(step)),
+                    ),
             );
         let rows = groups.into_iter().enumerate().map(|(i, (label, _, cards))| {
             let bars: Vec<(Task, usize, usize)> = cards
@@ -405,6 +420,7 @@ impl TodoView {
                         .pl_2()
                         .pt(px(14.))
                         .cursor_pointer()
+                        .hover(|s| s.bg(theme.colors().ghost_element_hover))
                         .child(Icon::new(if folded { IconName::ChevronRight } else { IconName::ChevronDown }).size(IconSize::XSmall).color(Color::Muted))
                         .child(Label::new(label).size(LabelSize::Small).weight(FontWeight::SEMIBOLD))
                         .on_click(cx.listener(move |this, _, _, cx| {

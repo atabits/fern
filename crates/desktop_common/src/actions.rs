@@ -9,6 +9,7 @@ actions!(
         CloseWindow,
         NewTask,
         Search,
+        SyncNow,
         ToggleSidebar,
         ShowInbox,
         ShowToday,
@@ -49,6 +50,7 @@ actions!(
         PriorityHigh,
         ToggleAllSubtasks,
         AddSubtask,
+        Undo,
     ]
 );
 

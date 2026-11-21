@@ -2285,6 +2285,7 @@ impl TodoView {
             .on_action(cx.listener(|this, _: &PriorityHigh, _, cx| this.set_selected_priority(Priority::High, cx)))
             .on_action(cx.listener(Self::toggle_all_subtasks))
             .on_action(cx.listener(Self::add_subtask_selected))
+            .on_action(cx.listener(|this, _: &crate::actions::Undo, _, cx| this.apply_undo(cx)))
     }
 
     fn render_empty_state(&self, strings: &'static Strings, theme: &theme::Theme, px_fallback: Pixels) -> AnyElement {

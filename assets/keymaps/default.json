@@ -10,6 +10,8 @@
     "bindings": {
       "secondary-n": "fern::NewTask",
       "secondary-f": "fern::Search",
+      "secondary-k": "fern::Search",
+      "secondary-s": "fern::SyncNow",
       "secondary-\\": "fern::ToggleSidebar",
       "secondary-1": "fern::ShowInbox",
       "secondary-2": "fern::ShowToday",
@@ -40,6 +42,7 @@
       "tab 3": "task_list::SetNextWeek",
       "tab e": "task_list::ToggleAllSubtasks",
       "shift-enter": "task_list::AddSubtask",
+      "secondary-z": "task_list::Undo",
       "alt-0": "task_list::PriorityNone",
       "alt-1": "task_list::PriorityLow",
       "alt-2": "task_list::PriorityMedium",

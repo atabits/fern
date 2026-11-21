@@ -7,7 +7,7 @@ use ui::{Placement, PopoverAttachment, popover};
 
 use crate::actions::{
     CloseWindow, DismissTransient, MinimizeWindow, NewTask, OpenSettings, Quit, Search, ShowInbox,
-    ShowNext7Days, ShowShortcuts, ShowToday, ShowTomorrow, ToggleSidebar,
+    ShowNext7Days, ShowShortcuts, ShowToday, ShowTomorrow, SyncNow, ToggleSidebar,
 };
 use crate::calendar_view::{self, CalendarView};
 use crate::countdown_view::CountdownView;
@@ -1775,6 +1775,7 @@ impl Render for AppView {
             .on_action(cx.listener(Self::minimize_window))
             .on_action(cx.listener(Self::new_task))
             .on_action(cx.listener(Self::search))
+            .on_action(cx.listener(|this, _: &SyncNow, _, cx| this.sync_now(cx)))
             .on_action(cx.listener(Self::toggle_sidebar))
             .on_action(cx.listener(|this, _: &ShowShortcuts, _, cx| this.toggle_shortcuts(cx)))
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| this.open_settings(None, window, cx)))

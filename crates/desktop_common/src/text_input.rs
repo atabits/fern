@@ -43,6 +43,12 @@ actions!(
         End,
         SelectHome,
         SelectEnd,
+        DocumentHome,
+        DocumentEnd,
+        SelectDocumentHome,
+        SelectDocumentEnd,
+        Indent,
+        Outdent,
         ShowCharacterPalette,
         Paste,
         Cut,
@@ -473,6 +479,54 @@ impl TextInput {
     fn select_end(&mut self, _: &SelectEnd, window: &mut Window, cx: &mut Context<Self>) {
         let offset = self.visual_line_edge(true);
         self.select_to(offset, window, cx);
+    }
+
+    fn document_home(&mut self, _: &DocumentHome, window: &mut Window, cx: &mut Context<Self>) {
+        self.move_to(0, window, cx);
+    }
+
+    fn document_end(&mut self, _: &DocumentEnd, window: &mut Window, cx: &mut Context<Self>) {
+        self.move_to(self.content.len(), window, cx);
+    }
+
+    fn select_document_home(
+        &mut self,
+        _: &SelectDocumentHome,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.select_to(0, window, cx);
+    }
+
+    fn select_document_end(
+        &mut self,
+        _: &SelectDocumentEnd,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.select_to(self.content.len(), window, cx);
+    }
+
+    fn indent(&mut self, _: &Indent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.mode != Mode::MultiLine {
+            cx.propagate();
+            return;
+        }
+        let (new_text, new_sel) = adjust_lines_indent(&self.content, self.selected_range.clone(), true);
+        if new_text != self.content.as_ref() {
+            self.edit(new_text, new_sel, window, cx);
+        }
+    }
+
+    fn outdent(&mut self, _: &Outdent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.mode != Mode::MultiLine {
+            cx.propagate();
+            return;
+        }
+        let (new_text, new_sel) = adjust_lines_indent(&self.content, self.selected_range.clone(), false);
+        if new_text != self.content.as_ref() {
+            self.edit(new_text, new_sel, window, cx);
+        }
     }
 
     fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
@@ -1372,6 +1426,12 @@ impl Render for TextInput {
             .on_action(cx.listener(Self::end))
             .on_action(cx.listener(Self::select_home))
             .on_action(cx.listener(Self::select_end))
+            .on_action(cx.listener(Self::document_home))
+            .on_action(cx.listener(Self::document_end))
+            .on_action(cx.listener(Self::select_document_home))
+            .on_action(cx.listener(Self::select_document_end))
+            .on_action(cx.listener(Self::indent))
+            .on_action(cx.listener(Self::outdent))
             .on_action(cx.listener(Self::show_character_palette))
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::cut))
@@ -1440,6 +1500,65 @@ fn markdown_list_continuation(line: &str) -> Option<ListEnter> {
         });
     }
     None
+}
+
+fn adjust_lines_indent(text: &str, sel: Range<usize>, indent: bool) -> (String, Range<usize>) {
+    let start_line_begin = text[..sel.start].rfind('\n').map_or(0, |i| i + 1);
+    // If a non-empty selection ends right at the start of a line (right after `\n`), don't include that trailing line.
+    let effective_end = if sel.end > sel.start && text[..sel.end].ends_with('\n') {
+        sel.end - 1
+    } else {
+        sel.end
+    };
+    let end_line_end = text[effective_end..]
+        .find('\n')
+        .map_or(text.len(), |i| effective_end + i);
+
+    let mut out = String::with_capacity(text.len() + 16);
+    out.push_str(&text[..start_line_begin]);
+
+    let mut new_start = sel.start;
+    let mut new_end = sel.end;
+    let mut line_start = start_line_begin;
+
+    for (idx, line) in text[start_line_begin..end_line_end].split('\n').enumerate() {
+        if idx > 0 {
+            out.push('\n');
+        }
+        if indent {
+            out.push_str("  ");
+            out.push_str(line);
+            if line_start <= sel.start {
+                new_start += 2;
+            }
+            if line_start <= effective_end {
+                new_end += 2;
+            }
+        } else {
+            let removed = if line.starts_with("  ") {
+                2
+            } else if line.starts_with(' ') || line.starts_with('\t') {
+                1
+            } else {
+                0
+            };
+            out.push_str(&line[removed..]);
+            if removed > 0 {
+                if line_start <= sel.start {
+                    let shift = (sel.start - line_start).min(removed);
+                    new_start -= shift;
+                }
+                if line_start <= effective_end {
+                    let shift = (sel.end - line_start).min(removed);
+                    new_end -= shift;
+                }
+            }
+        }
+        line_start += line.len() + 1;
+    }
+
+    out.push_str(&text[end_line_end..]);
+    (out, new_start..new_end.max(new_start))
 }
 
 #[cfg(test)]

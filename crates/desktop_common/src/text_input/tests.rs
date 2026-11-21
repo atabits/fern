@@ -330,3 +330,27 @@ fn markdown_list_continuation_handles_bullets_checklists_quotes_and_numbers() {
     assert_eq!(markdown_list_continuation("9. "), Some(ListEnter::ClearLine));
     assert_eq!(markdown_list_continuation("Plain text"), None);
 }
+
+#[test]
+fn adjust_lines_indent_indents_and_outdents_single_and_multiple_lines() {
+    let (out, sel) = adjust_lines_indent("- item", 4..4, true);
+    assert_eq!(out, "  - item");
+    assert_eq!(sel, 6..6);
+
+    let (out, sel) = adjust_lines_indent("  - item", 6..6, false);
+    assert_eq!(out, "- item");
+    assert_eq!(sel, 4..4);
+
+    let (out, sel) = adjust_lines_indent("- a\n- b", 1..6, true);
+    assert_eq!(out, "  - a\n  - b");
+    assert_eq!(sel, 3..10);
+
+    let (out, sel) = adjust_lines_indent("  a\n  b", 2..7, false);
+    assert_eq!(out, "a\nb");
+    assert_eq!(sel, 0..3);
+
+    // Trailing newline at end of selection should not indent the next untouched line.
+    let (out, sel) = adjust_lines_indent("a\nb", 0..2, true);
+    assert_eq!(out, "  a\nb");
+    assert_eq!(sel, 2..4);
+}

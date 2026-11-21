@@ -168,6 +168,12 @@
       "end": "text_input::End",
       "shift-home": "text_input::SelectHome",
       "shift-end": "text_input::SelectEnd",
+      "ctrl-home": "text_input::DocumentHome",
+      "ctrl-end": "text_input::DocumentEnd",
+      "ctrl-shift-home": "text_input::SelectDocumentHome",
+      "ctrl-shift-end": "text_input::SelectDocumentEnd",
+      "tab": "text_input::Indent",
+      "shift-tab": "text_input::Outdent",
       "enter": "text_input::Enter",
       "escape": "text_input::Cancel",
       "ctrl-cmd-space": "text_input::ShowCharacterPalette"

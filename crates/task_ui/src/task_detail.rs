@@ -754,6 +754,9 @@ impl TaskDetail {
 
     fn toggle_subtask(&mut self, id: Id, completed: bool, cx: &mut Context<Self>) {
         self.save(cx, |store, _| store.set_completed(id, completed));
+        if completed {
+            desktop_common::sound::play_complete(&self.session.store);
+        }
         self.reload_current_task();
         cx.notify();
     }
@@ -810,6 +813,9 @@ impl TaskDetail {
             if let Some(item) = draft.checklist.iter_mut().find(|item| item.id == id) { item.completed = completed; }
         }) {
             self.save(cx, |store, _| store.set_checklist_item_completed(id, completed));
+        }
+        if completed {
+            desktop_common::sound::play_complete(&self.session.store);
         }
         self.sync_checklist(cx);
     }
@@ -1848,6 +1854,7 @@ impl TaskDetail {
             let label = i18n::t(cx).undo_completed.replace("{title}", &task.title);
             cx.emit(Undoable(action, label));
             crate::completion_mark::record(task.id, cx);
+            desktop_common::sound::play_complete(&self.session.store);
         }
         if let Ok(Some(fresh)) = self.session.store.task(task.id) {
             *task = fresh;
@@ -1856,10 +1863,32 @@ impl TaskDetail {
         cx.notify();
     }
 
+    fn render_progress_bar(done: usize, total: usize, theme: &theme::Theme) -> AnyElement {
+        let ratio = if total == 0 { 0.0 } else { (done as f32 / total as f32).clamp(0.0, 1.0) };
+        h_flex()
+            .gap_2()
+            .pb_1()
+            .items_center()
+            .child(
+                div()
+                    .flex_1()
+                    .h(px(3.))
+                    .rounded_full()
+                    .overflow_hidden()
+                    .bg(theme.colors().border_variant)
+                    .child(div().h_full().w(gpui::relative(ratio)).rounded_full().bg(theme.colors().accent)),
+            )
+            .child(Label::new(format!("{done}/{total}")).size(LabelSize::XSmall).color(Color::Muted))
+            .into_any_element()
+    }
+
     fn render_checklist(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
+        let total = self.checklist.len();
+        let done_count = self.checklist.iter().filter(|r| r.item.completed).count();
         v_flex()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .when(total > 0, |el| el.child(Self::render_progress_bar(done_count, total, &theme)))
             .children(self.checklist.iter().map(|row| {
                 let id = row.item.id;
                 let done = row.item.completed;
@@ -1912,10 +1941,14 @@ impl TaskDetail {
     }
 
     fn render_subtasks(&self, strings: &'static Strings, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
         let can_add = self.can_add_subtask();
         let can_edit = self.session.task.as_ref().is_some_and(|t| !t.is_deleted());
+        let total = self.session.subtasks.len();
+        let done_count = self.session.subtasks.iter().filter(|s| s.is_completed()).count();
         v_flex()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .when(total > 0, |el| el.child(Self::render_progress_bar(done_count, total, &theme)))
             .children(self.session.subtasks.iter().map(|subtask| {
                 let id = subtask.id;
                 let done = subtask.is_completed();
@@ -1928,19 +1961,27 @@ impl TaskDetail {
                                 .size(px(14.))
                                 .toggle_state(done)
                                 .in_progress(subtask.is_in_progress())
+                                .dismissed(subtask.is_wont_do())
+                                .tint(task_rows::priority_color(subtask.priority, &theme))
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     cx.stop_propagation();
                                     this.toggle_subtask(id, !done, cx);
                                 })),
                         )
                         .child(
-                            Label::new(if subtask.title.is_empty() {
-                                SharedString::new_static(strings.untitled)
-                            } else {
-                                subtask.title.clone().into()
-                            })
-                            .color(if done { Color::Muted } else { Color::Default })
-                            .truncate(),
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .when(done, |el| el.line_through())
+                                .child(
+                                    Label::new(if subtask.title.is_empty() {
+                                        SharedString::new_static(strings.untitled)
+                                    } else {
+                                        subtask.title.clone().into()
+                                    })
+                                    .color(if done { Color::Muted } else { Color::Default })
+                                    .truncate(),
+                                ),
                         )
                         .end_slot(
                             h_flex()

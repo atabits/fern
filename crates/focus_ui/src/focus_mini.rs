@@ -95,7 +95,10 @@ impl Render for FocusMini {
                             }
                         });
                     }
-                    "escape" => window.remove_window(),
+                    "escape" => {
+                        cx.set_global(OpenFocusMini(None));
+                        window.remove_window();
+                    }
                     _ => {}
                 }
             }))
@@ -119,6 +122,7 @@ impl Render for FocusMini {
                             .h_full()
                             .justify_center()
                             .pl_4()
+                            .tooltip(Tooltip::text(label.clone()))
                             .window_control_area(WindowControlArea::Drag)
                             .when(!cfg!(windows), |el| {
                                 el.on_mouse_down(gpui::MouseButton::Left, cx.listener(|this, _, _, _| this.should_move = true))
@@ -189,7 +193,10 @@ impl Render for FocusMini {
                         button("focus-mini-close", IconName::X)
                             .icon_color(Color::Muted)
                             .tooltip(Tooltip::text(strings.close))
-                            .on_click(|_, window, _| window.remove_window()),
+                            .on_click(|_, window, cx| {
+                                cx.set_global(OpenFocusMini(None));
+                                window.remove_window();
+                            }),
                     ),
             )
             .when_some(progress, |el, ratio| {

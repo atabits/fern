@@ -569,6 +569,12 @@ impl FocusView {
         cx.notify();
     }
 
+    /// When a focus timer is running, returns its formatted clock string and paused flag for the
+    /// sidebar badge.
+    pub fn running_clock(&self) -> Option<(String, bool)> {
+        self.running.as_ref().map(|r| (format_clock(r.timer.display(now_ms())), r.timer.is_paused()))
+    }
+
     /// The clock as shown at `now`, what it is for (the task, the habit or the break), and
     /// whether a session runs and is paused; the timer bar, the page and the mini window show it.
     pub fn clock_state(&self, now: i64, strings: &'static i18n::Strings) -> (String, SharedString, bool, bool) {

@@ -215,6 +215,7 @@ impl AppView {
         })
         .detach();
         let focus = cx.new(|cx| FocusView::new(store.clone(), cx));
+        cx.observe(&focus, |_, _, cx| cx.notify()).detach();
         cx.subscribe(&focus, |this, _, crate::focus_view::StatsClosed, cx| {
             this.statistics_open = false;
             cx.notify();
@@ -1802,6 +1803,7 @@ impl Render for AppView {
             .text_color(theme.colors().text)
             .when(self.statistics_open, |el| el.child(div().size_full().child(self.focus.clone())))
             .when(!self.statistics_open, |el| {
+                let focus_clock = self.focus.read(cx).running_clock();
                 el.child(sidebar::render(
                     self.section,
                     self.nav_hovered,
@@ -1815,6 +1817,7 @@ impl Render for AppView {
                     account_menu,
                     bell,
                     sync_button,
+                    focus_clock,
                     features,
                     cx,
                 ))

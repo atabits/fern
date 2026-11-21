@@ -150,6 +150,7 @@ pub fn render(
     account_menu: Option<AnyElement>,
     bell: Bell,
     sync: Option<SyncButton>,
+    focus_clock: Option<(String, bool)>,
     features: fern_core::Features,
     cx: &App,
 ) -> impl IntoElement {
@@ -241,6 +242,41 @@ pub fn render(
                                 .size(px(40.))
                                 .rounded(px(8.))
                                 .bg(colors.sidebar_icon_muted.opacity(0.10))
+                                .into_any_element()
+                        } else if section == Section::Pomodoro
+                            && let Some((clock, paused)) = &focus_clock
+                        {
+                            v_flex()
+                                .size(px(40.))
+                                .items_center()
+                                .justify_center()
+                                .gap(px(1.))
+                                .child(
+                                    Icon::new(section.icon()).size(IconSize::Custom(px(20.))).color(
+                                        if section == active {
+                                            colors.sidebar_icon
+                                        } else if *paused {
+                                            colors.sidebar_icon_muted
+                                        } else {
+                                            colors.accent
+                                        },
+                                    ),
+                                )
+                                .child(
+                                    div()
+                                        .px(px(3.))
+                                        .rounded(px(3.))
+                                        .bg(if *paused {
+                                            colors.sidebar_icon_muted.opacity(0.18)
+                                        } else {
+                                            colors.accent.opacity(0.18)
+                                        })
+                                        .text_size(px(9.))
+                                        .line_height(px(11.))
+                                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                                        .text_color(if *paused { colors.sidebar_icon_muted } else { colors.accent })
+                                        .child(clock.clone()),
+                                )
                                 .into_any_element()
                         } else {
                             div()

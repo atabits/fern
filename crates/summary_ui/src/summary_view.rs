@@ -524,6 +524,7 @@ impl SummaryView {
                     ),
             )
         });
+        let hover_bg = cx.theme().colors().ghost_element_hover;
         h_flex()
             .h(px(40.))
             .px_4()
@@ -532,8 +533,12 @@ impl SummaryView {
                 h_flex()
                     .id(SharedString::from(format!("summary-{label}")))
                     .relative()
+                    .px_1p5()
+                    .py_0p5()
                     .gap_1()
+                    .rounded(px(5.))
                     .cursor_pointer()
+                    .hover(move |s| s.bg(hover_bg))
                     .child(Label::new(value).color(Color::Muted))
                     .child(Icon::new(IconName::ChevronsUpDown).size(IconSize::XSmall).color(Color::Muted))
                     .on_click(cx.listener(move |this, _, _, cx| this.set_menu((!open).then_some(menu), cx)))
@@ -568,12 +573,16 @@ impl SummaryView {
                             .border_1()
                             .border_color(if selected { colors.accent } else { colors.border })
                             .cursor_pointer()
+                            .hover(|s| s.bg(colors.ghost_element_hover))
                             .child(Label::new(template.name).size(LabelSize::Small).color(if selected { Color::Accent } else { Color::Default }))
                             .child(
                                 div().when(!crate::touch::active(), |el| el.invisible()).group_hover(group, |s| s.visible()).child(
                                     IconButton::new(SharedString::from(format!("delete-template-{id}")), IconName::X)
                                         .size(px(16.))
                                         .icon_size(IconSize::XSmall)
+                                        .icon_color(Color::Muted)
+                                        .hover_icon_color(Color::Error)
+                                        .tooltip(Tooltip::text(strings.delete))
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             cx.stop_propagation();
                                             if let Err(err) = this.store.delete_summary_template(id) {

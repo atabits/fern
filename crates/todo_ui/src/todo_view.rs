@@ -3331,9 +3331,10 @@ impl TodoView {
                     })
                     .when(self.view == View::Trash, |el| {
                         el.child(
-                            div()
-                                .id(SharedString::from(format!("restore-{id}")))
+                            h_flex()
+                                .id(SharedString::from(format!("trash-actions-{id}")))
                                 .flex_none()
+                                .gap_1()
                                 .opacity(if crate::touch::active() { 1. } else { 0. })
                                 .group_hover(group.clone(), |s| s.opacity(1.))
                                 .child(
@@ -3346,6 +3347,18 @@ impl TodoView {
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             cx.stop_propagation();
                                             this.restore(id, cx);
+                                        })),
+                                )
+                                .child(
+                                    IconButton::new(SharedString::from(format!("purge-button-{id}")), IconName::Trash)
+                                        .size(px(20.))
+                                        .icon_size(IconSize::Small)
+                                        .icon_color(Color::Muted)
+                                        .hover_icon_color(theme.status().error)
+                                        .tooltip(Tooltip::text(strings.delete))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.delete(id, cx);
                                         })),
                                 ),
                         )

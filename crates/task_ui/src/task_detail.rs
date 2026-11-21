@@ -11,7 +11,7 @@ use gpui::{Entity, EventEmitter, ExternalPaths, FocusHandle, Focusable, FontWeig
 use ui::prelude::*;
 use ui::{Placement, PopoverAttachment, SubmenuItem, TipSide, popover, with_tip};
 
-use crate::actions::DismissTransient;
+use crate::actions::{self as md, DismissTransient};
 use crate::calendar;
 use crate::due_picker::{self, CustomReminder, DueDraft, DueMenu, DueTab, RangeField, ReminderUnit};
 use crate::i18n::{self, CurrentLocale, Strings};
@@ -4083,6 +4083,18 @@ impl Render for TaskDetail {
                     } else {
                         div()
                             .debug_selector(|| "task-notes-editor".to_owned())
+                            .key_context("SummaryEditor")
+                            .on_action(cx.listener(|this, _: &md::Bold, window, cx| this.toolbar_action(ToolbarAction::Format(Some(fern_core::markdown::Format::Bold)), window, cx)))
+                            .on_action(cx.listener(|this, _: &md::Highlight, window, cx| this.toolbar_action(ToolbarAction::Format(Some(fern_core::markdown::Format::Highlight)), window, cx)))
+                            .on_action(cx.listener(|this, _: &md::CheckItem, window, cx| this.toolbar_action(ToolbarAction::Format(Some(fern_core::markdown::Format::Checklist)), window, cx)))
+                            .on_action(cx.listener(|this, _: &md::BulletedList, window, cx| this.toolbar_action(ToolbarAction::Format(Some(fern_core::markdown::Format::Bullets)), window, cx)))
+                            .on_action(cx.listener(|this, _: &md::NumberedList, window, cx| this.toolbar_action(ToolbarAction::Format(Some(fern_core::markdown::Format::Numbered)), window, cx)))
+                            .on_action(cx.listener(|this, _: &md::Italic, window, cx| this.toolbar_action(ToolbarAction::Format(Some(fern_core::markdown::Format::Italic)), window, cx)))
+                            .on_action(cx.listener(|this, _: &md::Underline, window, cx| this.toolbar_action(ToolbarAction::Format(Some(fern_core::markdown::Format::Underline)), window, cx)))
+                            .on_action(cx.listener(|this, _: &md::Strike, window, cx| this.toolbar_action(ToolbarAction::Format(Some(fern_core::markdown::Format::Strike)), window, cx)))
+                            .on_action(cx.listener(|this, _: &md::Link, window, cx| this.toolbar_action(ToolbarAction::Format(Some(fern_core::markdown::Format::Link)), window, cx)))
+                            .on_action(cx.listener(|this, _: &md::Code, window, cx| this.toolbar_action(ToolbarAction::Format(Some(fern_core::markdown::Format::Code)), window, cx)))
+                            .on_action(cx.listener(|this, _: &md::Quote, window, cx| this.toolbar_action(ToolbarAction::Format(Some(fern_core::markdown::Format::Quote)), window, cx)))
                             .when(sticky && !notes_editing, |el| el.opacity(0.))
                             .text_size(px(15.))
                             .line_height(px(22.))

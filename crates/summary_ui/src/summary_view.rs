@@ -1136,11 +1136,16 @@ impl Render for SummaryView {
                             h_flex()
                                 .id("summary-save-as")
                                 .relative()
+                                .px_2()
+                                .py_1()
                                 .gap_1()
+                                .rounded(px(6.))
                                 .cursor_pointer()
+                                .hover(|s| s.bg(colors.ghost_element_hover))
                                 .child(Icon::new(IconName::Share).size(IconSize::Small).color(Color::Muted))
                                 .child(Label::new(strings.summary_save_as))
                                 .on_click(cx.listener(|this, _, _, cx| {
+                                    this.copy_menu = false;
                                     this.save_menu = !this.save_menu;
                                     cx.notify();
                                 }))
@@ -1178,10 +1183,21 @@ impl Render for SummaryView {
                             h_flex()
                                 .id("summary-copy")
                                 .relative()
+                                .px_2()
+                                .py_1()
                                 .gap_1()
+                                .rounded(px(6.))
                                 .cursor_pointer()
-                                .child(Icon::new(IconName::Copy).size(IconSize::Small).color(Color::Muted))
-                                .child(Label::new(if self.copied { strings.summary_copied } else { strings.summary_copy }))
+                                .hover(|s| s.bg(colors.ghost_element_hover))
+                                .child(
+                                    Icon::new(if self.copied { IconName::Check } else { IconName::Copy })
+                                        .size(IconSize::Small)
+                                        .color(if self.copied { Color::Accent } else { Color::Muted }),
+                                )
+                                .child(
+                                    Label::new(if self.copied { strings.summary_copied } else { strings.summary_copy })
+                                        .color(if self.copied { Color::Accent } else { Color::Default }),
+                                )
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.save_menu = false;
                                     this.copy_menu = !this.copy_menu;

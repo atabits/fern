@@ -11,15 +11,17 @@
 
 use std::rc::Rc;
 #[cfg(windows)]
-use std::sync::Condvar;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 use fern_core::Store;
-use gpui::{App, Global, Keystroke, WindowHandle};
+use gpui::{App, WindowHandle};
+#[cfg(windows)]
+use gpui::{Global, Keystroke};
 
 use crate::app_view::AppView;
 
 /// System-wide shortcuts, in the order the Shortcuts panel lists them.
+#[cfg(any(windows, test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Hotkey {
     QuickAdd = 0,
@@ -28,8 +30,10 @@ pub enum Hotkey {
     PinWindow = 3,
 }
 
+#[cfg(any(windows, test))]
 pub const COUNT: usize = 4;
 
+#[cfg(any(windows, test))]
 impl Hotkey {
     pub const ALL: [Self; COUNT] = [
         Self::QuickAdd,
@@ -38,20 +42,20 @@ impl Hotkey {
         Self::PinWindow,
     ];
 
+    #[cfg(windows)]
     pub const fn index(self) -> usize {
         self as usize
     }
 
-    #[cfg(any(windows, test))]
     const fn win32_id(self) -> i32 {
         (self as i32) + 1
     }
 
-    #[cfg(any(windows, test))]
     fn from_win32_id(id: usize) -> Option<Self> {
         Self::ALL.get(id.checked_sub(1)?).copied()
     }
 
+    #[cfg(windows)]
     const fn setting_key(self) -> &'static str {
         match self {
             Self::QuickAdd => "hotkey_quick_add",
@@ -61,6 +65,7 @@ impl Hotkey {
         }
     }
 
+    #[cfg(windows)]
     const fn default_setting(self) -> &'static str {
         match self {
             Self::QuickAdd => "ctrl-shift-a",
@@ -70,6 +75,7 @@ impl Hotkey {
         }
     }
 
+    #[cfg(windows)]
     pub fn label(self, strings: &'static crate::i18n::Strings) -> &'static str {
         match self {
             Self::QuickAdd => strings.global_quick_add,
@@ -81,6 +87,7 @@ impl Hotkey {
 }
 
 /// A key with its modifiers, kept as GPUI writes keystrokes ("ctrl-shift-a").
+#[cfg(any(windows, test))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Binding {
     ctrl: bool,
@@ -90,6 +97,7 @@ pub struct Binding {
     key: String,
 }
 
+#[cfg(any(windows, test))]
 impl Binding {
     fn parse(text: &str) -> Option<Self> {
         let mut binding = Binding { ctrl: false, alt: false, shift: false, win: false, key: String::new() };
@@ -108,6 +116,7 @@ impl Binding {
 
     /// A pressed keystroke, when it can be a system-wide shortcut: a letter, a digit, a function
     /// key or Space, with Ctrl, Alt or Win (Shift alone would take typing away).
+    #[cfg(windows)]
     pub fn from_keystroke(keystroke: &Keystroke) -> Option<Self> {
         let m = &keystroke.modifiers;
         let binding = Binding { ctrl: m.control, alt: m.alt, shift: m.shift, win: m.platform, key: keystroke.key.to_lowercase() };
@@ -158,6 +167,7 @@ impl Binding {
 }
 
 /// What the shortcuts' thread registers, and what it could not.
+#[cfg(windows)]
 #[derive(Default)]
 struct Shared {
     bindings: [Option<Binding>; COUNT],
@@ -165,20 +175,21 @@ struct Shared {
     /// The thread to wake when the bindings change or when shutting down.
     thread: Option<u32>,
     /// Set once the listener thread has unregistered all hotkeys and exited.
-    #[cfg(windows)]
     stopped: bool,
 }
 
+#[cfg(windows)]
 struct GlobalHotkeys {
     store: Rc<Store>,
     shared: Arc<Mutex<Shared>>,
-    #[cfg(windows)]
     stopped_cv: Arc<Condvar>,
 }
 
+#[cfg(windows)]
 impl Global for GlobalHotkeys {}
 
 /// Each shortcut as set (`None` when off) and whether another app holds it.
+#[cfg(windows)]
 pub fn bindings(cx: &App) -> [(Hotkey, Option<Binding>, bool); COUNT] {
     let Some(global) = cx.try_global::<GlobalHotkeys>() else {
         return std::array::from_fn(|i| (Hotkey::ALL[i], None, false));
@@ -197,6 +208,7 @@ fn wake_listener(thread: Option<u32>) {
 }
 
 /// Changes a shortcut (`None` turns it off), keeps it in the store and registers it anew.
+#[cfg(windows)]
 pub fn set(hotkey: Hotkey, binding: Option<Binding>, cx: &mut App) {
     let Some(global) = cx.try_global::<GlobalHotkeys>() else { return };
     let value = binding.as_ref().map_or_else(|| "off".to_owned(), Binding::to_setting);
@@ -210,14 +222,12 @@ pub fn set(hotkey: Hotkey, binding: Option<Binding>, cx: &mut App) {
         shared.taken[idx] = false;
         shared.thread
     };
-    #[cfg(windows)]
     wake_listener(thread);
-    #[cfg(not(windows))]
-    let _ = thread;
     cx.refresh_windows();
 }
 
 /// Restores all system-wide shortcuts to their built-in defaults in a single batched update.
+#[cfg(windows)]
 pub fn reset_defaults(cx: &mut App) {
     let Some(global) = cx.try_global::<GlobalHotkeys>() else { return };
     let defaults: [Option<Binding>; COUNT] = std::array::from_fn(|i| {
@@ -234,47 +244,47 @@ pub fn reset_defaults(cx: &mut App) {
         shared.taken = [false; COUNT];
         shared.thread
     };
-    #[cfg(windows)]
     wake_listener(thread);
-    #[cfg(not(windows))]
-    let _ = thread;
     cx.refresh_windows();
 }
 
+#[cfg(not(windows))]
+pub fn reset_defaults(_cx: &mut App) {}
+
 /// Unregisters all global hotkeys synchronously (up to a short timeout) before spawning a
 /// replacement instance on update so the new process does not hit `taken = true`.
+#[cfg(windows)]
 pub fn shutdown(cx: &App) {
-    let Some(global) = cx.try_global::<GlobalHotkeys>() else { return };
-    #[cfg(windows)]
-    {
-        use std::time::{Duration, Instant};
-        use windows::Win32::Foundation::{LPARAM, WPARAM};
-        use windows::Win32::UI::WindowsAndMessaging::{PostThreadMessageW, WM_QUIT};
+    use std::time::{Duration, Instant};
+    use windows::Win32::Foundation::{LPARAM, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{PostThreadMessageW, WM_QUIT};
 
-        let mut shared = global.shared.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(thread) = shared.thread else { return };
-        if shared.stopped {
-            return;
-        }
-        let _ = unsafe { PostThreadMessageW(thread, WM_QUIT, WPARAM(0), LPARAM(0)) };
-        let deadline = Instant::now() + Duration::from_millis(500);
-        while !shared.stopped {
-            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else { break };
-            let (guard, timeout) = global
-                .stopped_cv
-                .wait_timeout(shared, remaining)
-                .unwrap_or_else(|e| e.into_inner());
-            shared = guard;
-            if timeout.timed_out() {
-                break;
-            }
+    let Some(global) = cx.try_global::<GlobalHotkeys>() else { return };
+    let mut shared = global.shared.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(thread) = shared.thread else { return };
+    if shared.stopped {
+        return;
+    }
+    let _ = unsafe { PostThreadMessageW(thread, WM_QUIT, WPARAM(0), LPARAM(0)) };
+    let deadline = Instant::now() + Duration::from_millis(500);
+    while !shared.stopped {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else { break };
+        let (guard, timeout) = global
+            .stopped_cv
+            .wait_timeout(shared, remaining)
+            .unwrap_or_else(|e| e.into_inner());
+        shared = guard;
+        if timeout.timed_out() {
+            break;
         }
     }
-    #[cfg(not(windows))]
-    let _ = global;
 }
 
+#[cfg(not(windows))]
+pub fn shutdown(_cx: &App) {}
+
 /// Registers the shortcuts for the main window.
+#[cfg(windows)]
 pub fn init(window: WindowHandle<AppView>, store: Rc<Store>, cx: &mut App) {
     let bindings = std::array::from_fn(|i| {
         let hotkey = Hotkey::ALL[i];
@@ -285,12 +295,10 @@ pub fn init(window: WindowHandle<AppView>, store: Rc<Store>, cx: &mut App) {
         }
     });
     let shared = Arc::new(Mutex::new(Shared { bindings, ..Default::default() }));
-    #[cfg(windows)]
     let stopped_cv = Arc::new(Condvar::new());
     cx.set_global(GlobalHotkeys {
         store,
         shared: shared.clone(),
-        #[cfg(windows)]
         stopped_cv: stopped_cv.clone(),
     });
     // Debug builds: `FERN_DEV_STATE=quick-add-window` opens Quick Add, as its shortcut would.
@@ -298,10 +306,17 @@ pub fn init(window: WindowHandle<AppView>, store: Rc<Store>, cx: &mut App) {
     if std::env::var("FERN_DEV_STATE").is_ok_and(|state| state.contains("quick-add-window")) {
         cx.defer(move |cx| crate::quick_add_window::open(window, cx));
     }
-    #[cfg(windows)]
     start(window, shared, stopped_cv, cx);
-    #[cfg(not(windows))]
-    let _ = (window, shared);
+}
+
+#[cfg(not(windows))]
+pub fn init(window: WindowHandle<AppView>, _store: Rc<Store>, cx: &mut App) {
+    #[cfg(debug_assertions)]
+    if std::env::var("FERN_DEV_STATE").is_ok_and(|state| state.contains("quick-add-window")) {
+        cx.defer(move |cx| crate::quick_add_window::open(window, cx));
+    }
+    #[cfg(not(debug_assertions))]
+    let _ = (window, cx);
 }
 
 #[cfg(windows)]

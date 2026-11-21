@@ -1411,6 +1411,7 @@ impl AppView {
 
     /// Starts a Pomodoro (`stopwatch == false`) or stopwatch (`stopwatch == true`) from the tray
     /// without opening the main window, and opens the floating mini clock.
+    #[cfg(any(windows, test))]
     pub fn start_focus_from_tray(&mut self, stopwatch: bool, cx: &mut Context<Self>) {
         self.focus.update(cx, |focus, cx| focus.start_mode(stopwatch, cx));
         crate::focus_view::focus_mini::open(self.focus.clone(), cx);

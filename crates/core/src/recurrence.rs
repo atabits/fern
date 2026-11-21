@@ -132,13 +132,21 @@ impl Recurrence {
         if let Some(nth) = self.nth_workday {
             let workdays: Vec<NaiveDate> =
                 first.iter_days().take_while(|d| *d <= last).filter(|d| is_workday(*d)).collect();
-            let pick = if nth < 0 { workdays.last() } else { workdays.get(nth.max(1) as usize - 1) };
+            let pick = if nth < 0 {
+                workdays.last()
+            } else {
+                usize::try_from(nth - 1).ok().and_then(|i| workdays.get(i))
+            };
             return pick.copied().into_iter().collect();
         }
         if let Some((nth, weekday)) = self.nth_weekday {
             let matching: Vec<NaiveDate> =
                 first.iter_days().take_while(|d| *d <= last).filter(|d| d.weekday() == weekday).collect();
-            let pick = if nth < 0 { matching.last() } else { matching.get(nth as usize - 1) };
+            let pick = if nth < 0 {
+                matching.last()
+            } else {
+                usize::try_from(nth - 1).ok().and_then(|i| matching.get(i))
+            };
             return pick.copied().into_iter().collect();
         }
         first
@@ -421,6 +429,9 @@ impl FromStr for Recurrence {
                             weekdays |= 1 << index;
                         } else {
                             let nth: i8 = ordinal.trim_start_matches('+').parse().map_err(|_| error())?;
+                            if nth == 0 {
+                                return Err(error());
+                            }
                             let weekday = Weekday::try_from(index as u8).map_err(|_| error())?;
                             nth_weekday = Some((nth, weekday));
                         }
@@ -435,7 +446,13 @@ impl FromStr for Recurrence {
                         }
                     }
                 }
-                "BYSETPOS" => setpos = Some(value.parse::<i8>().map_err(|_| error())?),
+                "BYSETPOS" => {
+                    let pos = value.parse::<i8>().map_err(|_| error())?;
+                    if pos == 0 {
+                        return Err(error());
+                    }
+                    setpos = Some(pos);
+                }
                 "X-SKIP" | "TT_SKIP" => parse_skip_tokens(value, &mut skip_weekends, &mut skip_holidays),
                 "X-FROM" => from_completion = value == "COMPLETION",
                 "X-DATES" => {
@@ -621,5 +638,18 @@ mod tests {
         // Friday 2026-10-16 -> Sat/Sun skipped -> Mon 2026-10-19 is a holiday -> Tue 2026-10-20.
         let next = holiday_skip.next_after_with_holidays(d(2026, 10, 16), |day| day == d(2026, 10, 19));
         assert_eq!(next, d(2026, 10, 20));
+    }
+
+    #[test]
+    fn zero_ordinal_byday_is_rejected_and_days_in_never_underflows() {
+        assert!("FREQ=MONTHLY;BYDAY=0MO".parse::<Recurrence>().is_err());
+        assert!("FREQ=MONTHLY;BYDAY=+0FR".parse::<Recurrence>().is_err());
+        assert!("FREQ=MONTHLY;BYDAY=MO,TU,WE,TH,FR;BYSETPOS=0".parse::<Recurrence>().is_err());
+
+        // Even a manually constructed invalid zero ordinal must not underflow/panic.
+        let bad_weekday = Recurrence { nth_weekday: Some((0, Weekday::Mon)), ..Recurrence::new(Frequency::Monthly, 1) };
+        assert!(bad_weekday.days_in(d(2026, 10, 1)).is_empty());
+        let bad_workday = Recurrence { nth_workday: Some(0), ..Recurrence::new(Frequency::Monthly, 1) };
+        assert!(bad_workday.days_in(d(2026, 10, 1)).is_empty());
     }
 }

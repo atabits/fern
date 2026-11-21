@@ -247,12 +247,61 @@ impl Event {
             return Vec::new();
         }
         let mut occurrences = Vec::new();
-        let mut day = self.source_start.date();
+        let source_start_day = self.source_start.date();
+        let mut day = source_start_day;
         let mut seen = 0;
+        // Fast-forward long-running unbounded daily/weekly rules near `from` so events starting
+        // decades ago (e.g. DTSTART:19700101) do not exhaust the iteration bound before `from`.
+        if self.count.is_none()
+            && let Some(rule) = &self.repeat
+            && !rule.is_specific_dates()
+            && !rule.forgetting_curve
+            && !rule.lunar
+            && !rule.skip_weekends
+            && !rule.skip_holidays
+        {
+            let span_days = match self.length {
+                EventLength::Days(days) => days.max(1),
+                EventLength::Exact(length) => length.num_days().max(0) + 1,
+                EventLength::Nominal(length) => length.days.max(0) + length.elapsed.num_days().max(0) + 1,
+            };
+            let target_day = from.checked_sub_signed(Duration::days(span_days + 2)).unwrap_or(NaiveDate::MIN);
+            if day < target_day {
+                match rule.frequency {
+                    crate::recurrence::Frequency::Daily => {
+                        let step = i64::from(rule.interval.max(1));
+                        let delta = (target_day - day).num_days();
+                        if delta > step {
+                            let jumps = (delta / step) - 1;
+                            if let Some(jumped) = day.checked_add_signed(Duration::days(jumps * step)) {
+                                day = jumped;
+                            }
+                        }
+                    }
+                    crate::recurrence::Frequency::Weekly => {
+                        let step_days = i64::from(rule.interval.max(1)) * 7;
+                        if rule.weekdays != 0 {
+                            let first_next = rule.next_after(day);
+                            if first_next > day && first_next < target_day {
+                                day = first_next;
+                            }
+                        }
+                        let delta = (target_day - day).num_days();
+                        if delta > step_days {
+                            let jumps = (delta / step_days) - 1;
+                            if let Some(jumped) = day.checked_add_signed(Duration::days(jumps * step_days)) {
+                                day = jumped;
+                            }
+                        }
+                    }
+                    crate::recurrence::Frequency::Monthly | crate::recurrence::Frequency::Yearly => {}
+                }
+            }
+        }
         // A source date can fall up to two dates either side of the display date.
         let last_source_day = to.checked_add_signed(Duration::days(2)).unwrap_or(NaiveDate::MAX);
         // A bound for broken rules: no feed repeats more than daily for this long.
-        for index in 0..20_000 {
+        for _ in 0..20_000 {
             let source = self.source_start.on_date(day);
             if day > last_source_day || self.until.is_some_and(|until| source.is_after(until))
                 || self.count.is_some_and(|count| seen >= count)
@@ -261,7 +310,7 @@ impl Event {
             }
             // DTSTART has the explicit-time gap policy. A nonexistent generated time is
             // skipped and does not consume COUNT, as required by RFC 5545 section 3.3.10.
-            if let Some(occurrence) = self.occurrence(source, target, index != 0) {
+            if let Some(occurrence) = self.occurrence(source, target, day != source_start_day) {
                 seen += 1;
                 if occurrence.start <= to && occurrence.end >= from
                     && source.identity().is_some_and(|id| !self.except.contains(&id))
@@ -592,11 +641,18 @@ pub fn serialize_event(draft: &EventDraft) -> String {
         raw_lines.push(format!("DTEND;VALUE=DATE:{}", end_excl.format("%Y%m%d")));
     } else if let Some(st) = draft.start_time {
         let end_date = draft.end_date.max(draft.start_date);
-        let et = draft.end_time.unwrap_or_else(|| st + chrono::Duration::hours(1));
-        let (final_end_date, final_end_time) = if end_date == draft.start_date && et <= st {
-            (draft.start_date + chrono::Duration::days(1), et)
-        } else {
-            (end_date, et)
+        let (final_end_date, final_end_time) = match draft.end_time {
+            Some(et) => {
+                if end_date == draft.start_date && et < st {
+                    (draft.start_date + chrono::Duration::days(1), et)
+                } else {
+                    (end_date, et)
+                }
+            }
+            None => {
+                let end_dt = end_date.and_time(st) + chrono::Duration::hours(1);
+                (end_dt.date(), end_dt.time())
+            }
         };
         let tz = draft.timezone.as_deref().and_then(|z| z.parse::<Tz>().ok());
         match tz {
@@ -716,6 +772,74 @@ BEGIN:VEVENT\r\nUID:b\r\nSUMMARY:Trip to the\r\n  mountains\r\nDTSTART;VALUE=DAT
         assert!(parsed_all[0].all_day());
         let occ = parsed_all[0].occurrences_in(d(2026, 11, 12), d(2026, 11, 14))[0];
         assert_eq!(occ.end, d(2026, 11, 14));
+    }
+
+    #[test]
+    fn serialize_event_handles_zero_minute_and_overnight_default_end() {
+        // 0-minute event (10:00..10:00) must stay on the same day, not become 24 hours.
+        let zero_min = EventDraft {
+            uid: "ev-zero".into(),
+            title: "Ping".into(),
+            location: String::new(),
+            notes: String::new(),
+            start_date: d(2026, 11, 10),
+            start_time: NaiveTime::from_hms_opt(10, 0, 0),
+            end_date: d(2026, 11, 10),
+            end_time: NaiveTime::from_hms_opt(10, 0, 0),
+            all_day: false,
+            timezone: None,
+        };
+        let parsed_zero = parse(&serialize_event(&zero_min));
+        assert_eq!(parsed_zero.len(), 1);
+        let occ = parsed_zero[0].occurrences_in(d(2026, 11, 10), d(2026, 11, 11))[0];
+        assert_eq!(occ.start, d(2026, 11, 10));
+        assert_eq!(occ.end, d(2026, 11, 10));
+        assert_eq!(occ.start_time, NaiveTime::from_hms_opt(10, 0, 0));
+        assert_eq!(occ.end_time, NaiveTime::from_hms_opt(10, 0, 0));
+
+        // Overnight default end (23:30 + 1h) must advance end_date even on multi-day drafts.
+        let overnight = EventDraft {
+            uid: "ev-overnight".into(),
+            title: "Late deploy".into(),
+            location: String::new(),
+            notes: String::new(),
+            start_date: d(2026, 11, 10),
+            start_time: NaiveTime::from_hms_opt(23, 30, 0),
+            end_date: d(2026, 11, 11),
+            end_time: None,
+            all_day: false,
+            timezone: None,
+        };
+        let parsed_over = parse(&serialize_event(&overnight));
+        assert_eq!(parsed_over.len(), 1);
+        let occ = parsed_over[0].occurrences_in(d(2026, 11, 10), d(2026, 11, 13))[0];
+        assert_eq!(occ.start, d(2026, 11, 10));
+        assert_eq!(occ.end, d(2026, 11, 12));
+        assert_eq!(occ.end_time, NaiveTime::from_hms_opt(0, 30, 0));
+    }
+
+    #[test]
+    fn old_daily_and_weekly_rrules_fast_forward_past_20000_days() {
+        let feed = "BEGIN:VCALENDAR\r\n\
+BEGIN:VEVENT\r\nUID:daily-1970\r\nSUMMARY:Daily since 1970\r\nDTSTART;VALUE=DATE:19700101\r\nRRULE:FREQ=DAILY;INTERVAL=1\r\nEND:VEVENT\r\n\
+BEGIN:VEVENT\r\nUID:daily-3-1970\r\nSUMMARY:Every 3 days\r\nDTSTART;VALUE=DATE:19700101\r\nRRULE:FREQ=DAILY;INTERVAL=3\r\nEND:VEVENT\r\n\
+BEGIN:VEVENT\r\nUID:weekly-1970\r\nSUMMARY:Weekly MW since 1970\r\nDTSTART;VALUE=DATE:19700101\r\nRRULE:FREQ=WEEKLY;INTERVAL=2;BYDAY=MO,WE\r\nEND:VEVENT\r\n\
+END:VCALENDAR\r\n";
+        let events = parse(feed);
+        assert_eq!(events.len(), 3);
+        let daily = events[0].starts_in(d(2026, 11, 1), d(2026, 11, 3));
+        assert_eq!(daily, vec![d(2026, 11, 1), d(2026, 11, 2), d(2026, 11, 3)]);
+
+        // Check exact phase preservation for INTERVAL=3 from 1970-01-01.
+        let every_three = events[1].starts_in(d(2026, 11, 1), d(2026, 11, 6));
+        assert!(!every_three.is_empty());
+        for day in &every_three {
+            assert_eq!((*day - d(1970, 1, 1)).num_days() % 3, 0);
+        }
+
+        // Weekly BYDAY=MO,WE;INTERVAL=2 should still produce occurrences in 2026.
+        let weekly = events[2].starts_in(d(2026, 11, 1), d(2026, 11, 30));
+        assert!(!weekly.is_empty());
     }
 }
 

@@ -180,8 +180,8 @@ pub fn auth_header(username: &str, password: &str) -> Option<String> {
     Some(format!("Basic {}", base64_encode(creds.as_bytes())))
 }
 
-/// Resolves a WebDAV `<href>` (absolute URL, root-relative `/...`, or relative path)
-/// against `base_url`.
+/// Resolves a WebDAV `<href>` (absolute URL, protocol-relative `//...`, root-relative `/...`,
+/// query/fragment reference, or relative path with `.`/`..` segments) against `base_url`.
 pub fn resolve_href(base_url: &str, href: &str) -> String {
     let href = href.trim();
     if href.is_empty() {
@@ -190,19 +190,60 @@ pub fn resolve_href(base_url: &str, href: &str) -> String {
     if href.starts_with("http://") || href.starts_with("https://") {
         return href.to_owned();
     }
-    let Some((scheme_sep, rest)) = base_url.find("://").map(|i| (&base_url[..i + 3], &base_url[i + 3..])) else {
+    let Some(sep) = base_url.find("://") else {
         return href.to_owned();
     };
-    let authority = rest.split('/').next().unwrap_or(rest);
-    if href.starts_with('/') {
-        return format!("{scheme_sep}{authority}{href}");
+    let scheme = &base_url[..sep];
+    let scheme_sep = &base_url[..sep + 3];
+    let rest = &base_url[sep + 3..];
+    if href.starts_with("//") {
+        return format!("{scheme}:{href}");
     }
-    let trimmed = base_url.split('?').next().unwrap_or(base_url);
-    let base_dir = match trimmed.rfind('/') {
-        Some(idx) if idx > scheme_sep.len() + authority.len() => &trimmed[..=idx],
-        _ => return format!("{scheme_sep}{authority}/{href}"),
+    if href.starts_with('#') {
+        let before_frag = base_url.split('#').next().unwrap_or(base_url);
+        return format!("{before_frag}{href}");
+    }
+    if href.starts_with('?') {
+        let before_query = base_url.split(['?', '#']).next().unwrap_or(base_url);
+        return format!("{before_query}{href}");
+    }
+    let auth_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..auth_end];
+    let base_after_auth = &rest[auth_end..];
+    let suffix_idx = href.find(['?', '#']).unwrap_or(href.len());
+    let (href_path, href_suffix) = href.split_at(suffix_idx);
+    if href_path.starts_with('/') {
+        let normalized = normalize_url_path(href_path);
+        return format!("{scheme_sep}{authority}{normalized}{href_suffix}");
+    }
+    let base_path = base_after_auth.split(['?', '#']).next().unwrap_or("");
+    let base_dir = match base_path.rfind('/') {
+        Some(idx) => &base_path[..=idx],
+        None => "/",
     };
-    format!("{base_dir}{href}")
+    let joined = format!("{base_dir}{href_path}");
+    let normalized = normalize_url_path(&joined);
+    format!("{scheme_sep}{authority}{normalized}{href_suffix}")
+}
+
+fn normalize_url_path(path: &str) -> String {
+    let trailing_slash = path.ends_with('/') || path.ends_with("/.") || path.ends_with("/..") || path == "." || path == "..";
+    let mut stack: Vec<&str> = Vec::new();
+    for seg in path.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                stack.pop();
+            }
+            other => stack.push(other),
+        }
+    }
+    let mut out = String::from("/");
+    out.push_str(&stack.join("/"));
+    if trailing_slash && !out.ends_with('/') {
+        out.push('/');
+    }
+    out
 }
 
 /// Builds a canonical resource URL for a `VEVENT` with `uid` inside `calendar_url`.
@@ -237,7 +278,7 @@ pub fn parse_multistatus(xml: &str) -> Vec<DavResource> {
     let mut out = Vec::new();
     for block in element_blocks(xml, "response") {
         let href = first_child_text(&block, "href").unwrap_or_default();
-        let mut res = DavResource { href: unescape_xml(href.trim()), ..Default::default() };
+        let mut res = DavResource { href: decode_cdata_or_xml(href).trim().to_owned(), ..Default::default() };
 
         let propstats = element_blocks(&block, "propstat");
         if propstats.is_empty() {
@@ -246,8 +287,9 @@ pub fn parse_multistatus(xml: &str) -> Vec<DavResource> {
             res.status_ok = true;
         } else {
             for propstat in propstats {
-                let status_text = first_child_text(&propstat, "status").unwrap_or_default();
-                let ok = status_is_ok(status_text);
+                let status_raw = first_child_text(&propstat, "status").unwrap_or_default();
+                let status_text = decode_cdata_or_xml(status_raw);
+                let ok = status_is_ok(&status_text);
                 if ok {
                     res.status_ok = true;
                 }
@@ -279,7 +321,7 @@ fn apply_prop_block(prop_xml: &str, res: &mut DavResource, ok: bool) {
     if res.etag.is_none()
         && let Some(etag) = first_element_inner(prop_xml, "getetag")
     {
-        let etag = unescape_xml(etag.trim());
+        let etag = decode_cdata_or_xml(etag).trim().to_owned();
         if !etag.is_empty() {
             res.etag = Some(etag);
         }
@@ -287,7 +329,7 @@ fn apply_prop_block(prop_xml: &str, res: &mut DavResource, ok: bool) {
     if res.display_name.is_none()
         && let Some(name) = first_element_inner(prop_xml, "displayname")
     {
-        let name = unescape_xml(name.trim());
+        let name = decode_cdata_or_xml(name).trim().to_owned();
         if !name.is_empty() {
             res.display_name = Some(name);
         }
@@ -304,7 +346,7 @@ fn apply_prop_block(prop_xml: &str, res: &mut DavResource, ok: bool) {
         && let Some(principal_block) = first_element_block(prop_xml, "current-user-principal")
         && let Some(href) = first_child_text(principal_block, "href")
     {
-        let href = unescape_xml(href.trim());
+        let href = decode_cdata_or_xml(href).trim().to_owned();
         if !href.is_empty() {
             res.current_user_principal = Some(href);
         }
@@ -313,7 +355,7 @@ fn apply_prop_block(prop_xml: &str, res: &mut DavResource, ok: bool) {
         && let Some(home_block) = first_element_block(prop_xml, "calendar-home-set")
         && let Some(href) = first_child_text(home_block, "href")
     {
-        let href = unescape_xml(href.trim());
+        let href = decode_cdata_or_xml(href).trim().to_owned();
         if !href.is_empty() {
             res.calendar_home_set = Some(href);
         }
@@ -378,7 +420,89 @@ fn first_element_inner<'a>(xml: &'a str, target: &str) -> Option<&'a str> {
 }
 
 fn first_child_text<'a>(xml: &'a str, target: &str) -> Option<&'a str> {
-    find_next_element_inner(xml, target, 0)
+    first_direct_child_inner(xml, target)
+}
+
+/// If `xml[start..]` begins with an XML comment, CDATA section, or processing instruction,
+/// returns `Some(Some(end_index))` (or `Some(None)` if unclosed). Returns `None` for normal tags.
+fn skip_xml_special(xml: &str, start: usize) -> Option<Option<usize>> {
+    let slice = &xml[start..];
+    if slice.starts_with("<![CDATA[") {
+        return Some(slice[9..].find("]]>").map(|end| start + 9 + end + 3));
+    }
+    if slice.starts_with("<!--") {
+        return Some(slice[4..].find("-->").map(|end| start + 4 + end + 3));
+    }
+    if slice.starts_with("<?") {
+        return Some(slice[2..].find("?>").map(|end| start + 2 + end + 2));
+    }
+    None
+}
+
+/// Finds the inner content of the first direct child element of `xml` matching `target` local name,
+/// ignoring descendant elements of sibling children, comments, CDATA, and PIs.
+fn first_direct_child_inner<'a>(xml: &'a str, target: &str) -> Option<&'a str> {
+    let open_lt = xml.find('<')?;
+    let open_end = find_tag_end(xml, open_lt + 1)?;
+    if xml[open_lt + 1..open_end].trim().ends_with('/') {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut pos = open_end + 1;
+    while pos < xml.len() {
+        let rel = xml[pos..].find('<')?;
+        let start = pos + rel;
+        if let Some(after) = skip_xml_special(xml, start) {
+            pos = after?;
+            continue;
+        }
+        let end = find_tag_end(xml, start + 1)?;
+        let body = xml[start + 1..end].trim();
+        if body.starts_with('/') {
+            if depth == 0 {
+                // Reached the closing tag of the parent element.
+                return None;
+            }
+            depth -= 1;
+            pos = end + 1;
+            continue;
+        }
+        let self_closing = body.ends_with('/');
+        if depth == 0 && local_tag_name(body).eq_ignore_ascii_case(target) {
+            if self_closing {
+                return Some("");
+            }
+            // Scan until the matching closing tag for this direct child.
+            let inner_start = end + 1;
+            let mut inner_depth = 1usize;
+            let mut scan = inner_start;
+            while scan < xml.len() {
+                let next_lt = xml[scan..].find('<')?;
+                let tag_start = scan + next_lt;
+                if let Some(after) = skip_xml_special(xml, tag_start) {
+                    scan = after?;
+                    continue;
+                }
+                let tag_end = find_tag_end(xml, tag_start + 1)?;
+                let tag_body = xml[tag_start + 1..tag_end].trim();
+                if tag_body.starts_with('/') {
+                    inner_depth = inner_depth.saturating_sub(1);
+                    if inner_depth == 0 {
+                        return Some(&xml[inner_start..tag_start]);
+                    }
+                } else if !tag_body.ends_with('/') {
+                    inner_depth += 1;
+                }
+                scan = tag_end + 1;
+            }
+            return None;
+        }
+        if !self_closing {
+            depth += 1;
+        }
+        pos = end + 1;
+    }
+    None
 }
 
 /// Finds the full slice `<tag ...>...</tag>` for the first occurrence starting at `from`.
@@ -488,6 +612,11 @@ fn child_tag_local_names(xml: &str) -> Vec<String> {
     while pos < xml.len() {
         let Some(rel) = xml[pos..].find('<') else { break };
         let start = pos + rel;
+        if let Some(after) = skip_xml_special(xml, start) {
+            let Some(next) = after else { break };
+            pos = next;
+            continue;
+        }
         let Some(end) = find_tag_end(xml, start + 1) else { break };
         let inner = xml[start + 1..end].trim();
         if !inner.starts_with('/') && !inner.starts_with('!') && !inner.starts_with('?') {
@@ -506,9 +635,16 @@ fn has_tag(xml: &str, target: &str) -> bool {
     while pos < xml.len() {
         let Some(rel) = xml[pos..].find('<') else { break };
         let start = pos + rel;
+        if let Some(after) = skip_xml_special(xml, start) {
+            let Some(next) = after else { break };
+            pos = next;
+            continue;
+        }
         let Some(end) = find_tag_end(xml, start + 1) else { break };
         let inner = xml[start + 1..end].trim();
-        if !inner.starts_with('/') && local_tag_name(inner).eq_ignore_ascii_case(target) {
+        if !inner.starts_with('/') && !inner.starts_with('!') && !inner.starts_with('?')
+            && local_tag_name(inner).eq_ignore_ascii_case(target)
+        {
             return true;
         }
         pos = end + 1;
@@ -518,12 +654,48 @@ fn has_tag(xml: &str, target: &str) -> bool {
 
 fn decode_cdata_or_xml(raw: &str) -> String {
     let trimmed = raw.trim();
-    if let Some(after) = trimmed.strip_prefix("<![CDATA[")
-        && let Some(inner) = after.strip_suffix("]]>")
-    {
-        return inner.to_owned();
+    if !trimmed.contains("<![CDATA[") && !trimmed.contains("<!--") {
+        return unescape_xml(trimmed);
     }
-    unescape_xml(trimmed)
+    let mut out = String::with_capacity(trimmed.len());
+    let mut pos = 0usize;
+    while pos < trimmed.len() {
+        let rest = &trimmed[pos..];
+        let next_cdata = rest.find("<![CDATA[").map(|i| (i, true));
+        let next_comment = rest.find("<!--").map(|i| (i, false));
+        let next = match (next_cdata, next_comment) {
+            (Some(a), Some(b)) => Some(if a.0 <= b.0 { a } else { b }),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
+        let Some((rel, is_cdata)) = next else {
+            out.push_str(&unescape_xml(rest));
+            break;
+        };
+        if rel > 0 {
+            out.push_str(&unescape_xml(&rest[..rel]));
+        }
+        let start = pos + rel;
+        if is_cdata {
+            let content_start = start + 9;
+            if let Some(end_rel) = trimmed[content_start..].find("]]>") {
+                out.push_str(&trimmed[content_start..content_start + end_rel]);
+                pos = content_start + end_rel + 3;
+            } else {
+                out.push_str(&trimmed[content_start..]);
+                break;
+            }
+        } else {
+            let comment_start = start + 4;
+            if let Some(end_rel) = trimmed[comment_start..].find("-->") {
+                pos = comment_start + end_rel + 3;
+            } else {
+                break;
+            }
+        }
+    }
+    out
 }
 
 fn escape_xml(s: &str) -> String {
@@ -714,5 +886,69 @@ END:VCALENDAR]]></c:calendar-data>
     fn builds_multiget_with_escaped_hrefs() {
         let body = calendar_multiget_body(&["/cals/a&b.ics"]);
         assert!(body.contains("<d:href>/cals/a&amp;b.ics</d:href>"));
+    }
+
+    #[test]
+    fn ignores_xml_comments_handles_split_cdata_and_direct_child_href() {
+        let xml = r#"<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:response>
+    <d:propstat>
+      <d:prop>
+        <d:current-user-principal><d:href>/dav/principals/alice/</d:href></d:current-user-principal>
+        <d:resourcetype><!-- <c:calendar/> --><d:collection/></d:resourcetype>
+        <d:current-user-privilege-set>
+          <d:privilege><d:read/></d:privilege>
+          <!-- <d:privilege><d:write/></d:privilege> -->
+        </d:current-user-privilege-set>
+        <c:calendar-data><![CDATA[BEGIN:VCALENDAR
+SUMMARY:Part1 & ]]>amp; <![CDATA[Part2
+END:VCALENDAR]]></c:calendar-data>
+      </d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+    <d:href>/dav/actual-response/</d:href>
+  </d:response>
+</d:multistatus>"#;
+
+        let resources = parse_multistatus(xml);
+        assert_eq!(resources.len(), 1);
+        let r = &resources[0];
+        assert_eq!(r.href, "/dav/actual-response/", "must not pick descendant <href> from <propstat>");
+        assert_eq!(r.current_user_principal.as_deref(), Some("/dav/principals/alice/"));
+        assert!(!r.is_calendar, "commented-out <calendar/> must be ignored");
+        assert!(r.is_collection);
+        assert!(r.read_only, "commented-out <write/> must not mark calendar writable");
+        assert_eq!(
+            r.calendar_data.as_deref(),
+            Some("BEGIN:VCALENDAR\nSUMMARY:Part1 & amp; Part2\nEND:VCALENDAR")
+        );
+    }
+
+    #[test]
+    fn resolves_hrefs_with_query_fragment_dot_segments_and_protocol_relative() {
+        assert_eq!(
+            resolve_href("https://dav.example.com?token=1", "/cal/a.ics"),
+            "https://dav.example.com/cal/a.ics"
+        );
+        assert_eq!(
+            resolve_href("https://dav.example.com/a/b/c?x=1#y", "../d.ics?v=2#top"),
+            "https://dav.example.com/a/d.ics?v=2#top"
+        );
+        assert_eq!(
+            resolve_href("https://dav.example.com/a/b/#frag", "./ev.ics"),
+            "https://dav.example.com/a/b/ev.ics"
+        );
+        assert_eq!(
+            resolve_href("https://dav.example.com/a/b/", "//other.example.com/c.ics"),
+            "https://other.example.com/c.ics"
+        );
+        assert_eq!(
+            resolve_href("https://dav.example.com/cal/ev.ics?a=1#old", "?b=2"),
+            "https://dav.example.com/cal/ev.ics?b=2"
+        );
+        assert_eq!(
+            resolve_href("https://dav.example.com/cal/ev.ics?a=1#old", "#new"),
+            "https://dav.example.com/cal/ev.ics?a=1#new"
+        );
     }
 }

@@ -430,3 +430,45 @@ fn examples_and_preview_use_the_same_evaluator() -> Result<()> {
     assert!(store.filters()?.is_empty());
     Ok(())
 }
+
+#[test]
+fn negated_note_type_does_not_enable_past_dated_notes_in_date_rules() -> Result<()> {
+    let store = Store::open_in_memory()?;
+    let today = date("2026-11-13");
+    let created = store.add_task("Old note")?;
+    store.set_kind(created.id, Kind::Note)?;
+    store.set_due(created.id, Some(date("2026-11-10")), None)?;
+    let past_note = store.task(created.id)?.unwrap();
+    let f = SmartFilter {
+        rules: FilterRules {
+            version: 1,
+            advanced: true,
+            conditions: vec![
+                Condition::new(ConditionValue::Date(vec![DateRule::Overdue])),
+                Condition {
+                    join: Join::Or,
+                    not: true,
+                    ..Condition::new(ConditionValue::Type(Some(Kind::Note)))
+                },
+            ],
+        },
+        ..SmartFilter::new()
+    };
+    // NOT Type=Note must NOT set has_note_type = true; past-dated note must not match Overdue OR NOT Note.
+    assert!(!f.matches(&past_note, today, Weekday::Mon));
+
+    // Positive Type=Note still matches past-dated note on Overdue.
+    let positive = SmartFilter {
+        rules: FilterRules {
+            version: 1,
+            advanced: true,
+            conditions: vec![
+                Condition::new(ConditionValue::Date(vec![DateRule::Overdue])),
+                Condition::new(ConditionValue::Type(Some(Kind::Note))),
+            ],
+        },
+        ..SmartFilter::new()
+    };
+    assert!(positive.matches(&past_note, today, Weekday::Mon));
+    Ok(())
+}

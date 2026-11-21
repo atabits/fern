@@ -423,9 +423,7 @@ fn parse_date(words: &[String], today: NaiveDate) -> Option<(NaiveDate, usize)> 
             .or_else(|| first.strip_suffix("th"))
             .unwrap_or(first);
         if let Ok(day) = raw_day.parse::<u32>() {
-            let date = NaiveDate::from_ymd_opt(today.year(), month, day)?;
-            // "13 March" said in November means March of next year.
-            let date = if date < today { NaiveDate::from_ymd_opt(today.year() + 1, month, day)? } else { date };
+            let date = next_month_day(today, month, day)?;
             return Some((date, 2));
         }
     }
@@ -439,9 +437,22 @@ fn parse_date(words: &[String], today: NaiveDate) -> Option<(NaiveDate, usize)> 
             .or_else(|| words[1].strip_suffix("th"))
             .unwrap_or(&words[1]);
         if let Ok(day) = raw_day.parse::<u32>() {
-            let date = NaiveDate::from_ymd_opt(today.year(), month, day)?;
-            let date = if date < today { NaiveDate::from_ymd_opt(today.year() + 1, month, day)? } else { date };
+            let date = next_month_day(today, month, day)?;
             return Some((date, 2));
+        }
+    }
+    None
+}
+
+/// Returns the next occurrence of `(month, day)` on or after `today`, advancing across non-leap
+/// years for February 29 (up to 8 years for century non-leap years such as 2100).
+fn next_month_day(today: NaiveDate, month: u32, day: u32) -> Option<NaiveDate> {
+    for offset in 0..=8 {
+        let year = today.year().checked_add(offset)?;
+        if let Some(date) = NaiveDate::from_ymd_opt(year, month, day)
+            && date >= today
+        {
+            return Some(date);
         }
     }
     None
@@ -473,8 +484,7 @@ fn parse_numeric_date(word: &str, today: NaiveDate) -> Option<NaiveDate> {
     let dot_parts: Vec<&str> = word.split('.').collect();
     match dot_parts.as_slice() {
         [d, m] if d.len() <= 2 && m.len() <= 2 => {
-            let date = NaiveDate::from_ymd_opt(today.year(), num(m)?, num(d)?)?;
-            return if date < today { NaiveDate::from_ymd_opt(today.year() + 1, num(m)?, num(d)?) } else { Some(date) };
+            return next_month_day(today, num(m)?, num(d)?);
         }
         [d, m, y] if d.len() <= 2 && m.len() <= 2 && y.len() == 4 => {
             return NaiveDate::from_ymd_opt(y.parse().ok()?, num(m)?, num(d)?);
@@ -484,8 +494,7 @@ fn parse_numeric_date(word: &str, today: NaiveDate) -> Option<NaiveDate> {
     let slash_parts: Vec<&str> = word.split('/').collect();
     match slash_parts.as_slice() {
         [m, d] if m.len() <= 2 && d.len() <= 2 => {
-            let date = NaiveDate::from_ymd_opt(today.year(), num(m)?, num(d)?)?;
-            if date < today { NaiveDate::from_ymd_opt(today.year() + 1, num(m)?, num(d)?) } else { Some(date) }
+            next_month_day(today, num(m)?, num(d)?)
         }
         [m, d, y] if m.len() <= 2 && d.len() <= 2 && y.len() == 4 => {
             NaiveDate::from_ymd_opt(y.parse().ok()?, num(m)?, num(d)?)
@@ -812,5 +821,31 @@ mod tests {
         let p = parse_quick_add("Doctor day after tomorrow", today(), &[]);
         assert_eq!(p.title, "Doctor");
         assert_eq!(p.due_date, NaiveDate::from_ymd_opt(2026, 10, 20));
+    }
+
+    #[test]
+    fn parses_feb_29_by_advancing_to_next_leap_year() {
+        let non_leap = NaiveDate::from_ymd_opt(2026, 1, 15).unwrap();
+        let after_leap = NaiveDate::from_ymd_opt(2028, 3, 1).unwrap();
+        let leap_day = NaiveDate::from_ymd_opt(2028, 2, 29).unwrap();
+
+        assert_eq!(
+            parse_quick_add("Party 29 feb", non_leap, &[]).due_date,
+            NaiveDate::from_ymd_opt(2028, 2, 29)
+        );
+        assert_eq!(
+            parse_quick_add("Party feb 29", after_leap, &[]).due_date,
+            NaiveDate::from_ymd_opt(2032, 2, 29)
+        );
+        assert_eq!(
+            parse_quick_add("Party 29.02", after_leap, &[]).due_date,
+            NaiveDate::from_ymd_opt(2032, 2, 29)
+        );
+        assert_eq!(
+            parse_quick_add("Party 02/29", leap_day, &[]).due_date,
+            Some(leap_day)
+        );
+        // Invalid calendar dates still do not parse.
+        assert_eq!(parse_quick_add("Bad 31 feb", non_leap, &[]).due_date, None);
     }
 }

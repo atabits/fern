@@ -303,6 +303,32 @@ impl Habit {
     pub fn goal_amount(&self) -> f64 {
         self.goal.as_ref().map_or(1.0, |g| g.amount.max(0.01))
     }
+
+    /// Computes total days, active streak, and best streak while honoring this habit's `ex_dates`.
+    pub fn stats(&self, checkins: &HashSet<NaiveDate>, today: NaiveDate, week_start: Weekday) -> HabitStats {
+        stats_with_ex_dates(&self.frequency, checkins, &self.ex_dates, today, week_start)
+    }
+
+    /// Computes monthly check-in count and completion rate while honoring `start_date`,
+    /// `archived_date`, and `ex_dates`.
+    pub fn month_stats(
+        &self,
+        checkins: &HashSet<NaiveDate>,
+        month: NaiveDate,
+        today: NaiveDate,
+        week_start: Weekday,
+    ) -> MonthStats {
+        month_stats_with_ex_dates(
+            &self.frequency,
+            checkins,
+            &self.ex_dates,
+            month,
+            today,
+            self.start_date,
+            self.archived_date,
+            week_start,
+        )
+    }
 }
 
 /// How often a habit is meant to be done.
@@ -573,15 +599,30 @@ pub fn stats_with(
     today: NaiveDate,
     week_start: Weekday,
 ) -> HabitStats {
+    stats_with_ex_dates(frequency, checkins, &[], today, week_start)
+}
+
+/// Computes total days, current streak, and best streak while treating skipped `ex_dates` as
+/// unscheduled so explicitly skipped days never break streaks.
+pub fn stats_with_ex_dates(
+    frequency: &Frequency,
+    checkins: &HashSet<NaiveDate>,
+    ex_dates: &[NaiveDate],
+    today: NaiveDate,
+    week_start: Weekday,
+) -> HabitStats {
     let total_days = checkins.len();
     let past_or_today: Vec<NaiveDate> = checkins.iter().copied().filter(|d| *d <= today).collect();
     if past_or_today.is_empty() {
         return HabitStats { total_days, streak: 0, best_streak: 0 };
     }
+    let skipped: HashSet<NaiveDate> = ex_dates.iter().copied().collect();
 
     match *frequency {
         Frequency::Daily { weekdays } => {
-            let scheduled = |day: NaiveDate| weekdays & (1 << day.weekday().num_days_from_monday()) != 0;
+            let scheduled = |day: NaiveDate| {
+                !skipped.contains(&day) && (weekdays & (1 << day.weekday().num_days_from_monday()) != 0)
+            };
             let Some(oldest) = past_or_today.iter().min().copied() else {
                 return HabitStats { total_days, streak: 0, best_streak: 0 };
             };
@@ -614,7 +655,14 @@ pub fn stats_with(
             let mut week = first_week;
             while week <= current_week {
                 let count = by_week.get(&week).copied().unwrap_or(0);
-                if week == current_week || count >= target {
+                let skipped_days = (0..7)
+                    .filter(|&offset| {
+                        let d = week + Duration::days(offset);
+                        skipped.contains(&d) && !checkins.contains(&d)
+                    })
+                    .count();
+                let effective_target = target.min(7usize.saturating_sub(skipped_days));
+                if week == current_week || count >= effective_target {
                     run += count;
                     best = best.max(run);
                 } else {
@@ -633,7 +681,8 @@ pub fn stats_with(
             let mut run = 1usize;
             let mut best = 1usize;
             for pair in dates.windows(2) {
-                if (pair[1] - pair[0]).num_days() <= interval {
+                let skipped_between = skipped.iter().filter(|&&d| d > pair[0] && d < pair[1]).count() as i64;
+                if (pair[1] - pair[0]).num_days() - skipped_between <= interval {
                     run += 1;
                     best = best.max(run);
                 } else {
@@ -641,7 +690,8 @@ pub fn stats_with(
                 }
             }
             let newest = dates.last().copied().unwrap_or(today);
-            let streak = if (today - newest).num_days() <= interval { run } else { 0 };
+            let skipped_tail = skipped.iter().filter(|&&d| d > newest && d <= today).count() as i64;
+            let streak = if (today - newest).num_days() - skipped_tail <= interval { run } else { 0 };
             HabitStats { total_days, streak, best_streak: best }
         }
     }
@@ -680,6 +730,22 @@ pub fn month_stats_with(
     archived_date: Option<NaiveDate>,
     week_start: Weekday,
 ) -> MonthStats {
+    month_stats_with_ex_dates(frequency, checkins, &[], month, today, start_date, archived_date, week_start)
+}
+
+/// Computes monthly check-in count and rate while excluding skipped `ex_dates` from scheduled days
+/// so explicitly skipped days do not penalize completion rate.
+#[allow(clippy::too_many_arguments)]
+pub fn month_stats_with_ex_dates(
+    frequency: &Frequency,
+    checkins: &HashSet<NaiveDate>,
+    ex_dates: &[NaiveDate],
+    month: NaiveDate,
+    today: NaiveDate,
+    start_date: Option<NaiveDate>,
+    archived_date: Option<NaiveDate>,
+    week_start: Weekday,
+) -> MonthStats {
     let in_month = |date: &NaiveDate| date.year() == month.year() && date.month() == month.month();
     let days = checkins.iter().filter(|date| in_month(date)).count();
     let first = month.with_day(1).unwrap_or(month);
@@ -704,13 +770,15 @@ pub fn month_stats_with(
     if effective_end < active_start {
         return MonthStats { days, rate: 0 };
     }
+    let skipped: HashSet<NaiveDate> = ex_dates.iter().copied().collect();
 
     let scheduled: i64 = match *frequency {
         Frequency::Daily { weekdays } => {
             let mut count = 0i64;
             let mut day = active_start;
             while day <= effective_end {
-                if weekdays & (1 << day.weekday().num_days_from_monday()) != 0 {
+                let is_weekday = weekdays & (1 << day.weekday().num_days_from_monday()) != 0;
+                if is_weekday && (!skipped.contains(&day) || checkins.contains(&day)) {
                     count += 1;
                 }
                 day += Duration::days(1);
@@ -719,8 +787,12 @@ pub fn month_stats_with(
         }
         Frequency::Interval { days: interval } => {
             let interval = interval.max(1) as i64;
-            let span = (effective_end - active_start).num_days() + 1;
-            ((span + interval - 1) / interval).max(1)
+            let skipped_in_window = skipped
+                .iter()
+                .filter(|&&d| d >= active_start && d <= effective_end && !checkins.contains(&d))
+                .count() as i64;
+            let span = ((effective_end - active_start).num_days() + 1 - skipped_in_window).max(0);
+            if span == 0 { 0 } else { ((span + interval - 1) / interval).max(1) }
         }
         Frequency::Weekly { days: target } => {
             let target = target.max(1) as i64;
@@ -731,7 +803,11 @@ pub fn month_stats_with(
                 let seg_start = ws.max(active_start);
                 let seg_end = we.min(effective_end);
                 if seg_start <= seg_end {
-                    let in_window_days = (seg_end - seg_start).num_days() + 1;
+                    let skipped_in_seg = skipped
+                        .iter()
+                        .filter(|&&d| d >= seg_start && d <= seg_end && !checkins.contains(&d))
+                        .count() as i64;
+                    let in_window_days = ((seg_end - seg_start).num_days() + 1 - skipped_in_seg).max(0);
                     let done_outside_month = checkins
                         .iter()
                         .filter(|d| **d >= ws && **d <= we && !in_month(d))
@@ -1155,5 +1231,38 @@ mod tests {
         assert_eq!(month_stats(&checked, september, today), MonthStats { days: 1, rate: 3 });
         let november = NaiveDate::from_ymd_opt(2026, 11, 1).unwrap();
         assert_eq!(month_stats(&checked, november, today), MonthStats::default());
+    }
+
+    #[test]
+    fn ex_dates_do_not_break_streaks_or_penalize_month_rate() {
+        // Mon Oct 19 .. Thu Oct 22 checked, Fri Oct 23 skipped, Sat Oct 24 checked.
+        let checked: HashSet<_> = [d(19), d(20), d(21), d(22), d(24)].into();
+        let ex_dates = vec![d(23)];
+        let s = stats_with_ex_dates(&Frequency::default(), &checked, &ex_dates, d(24), Weekday::Mon);
+        assert_eq!(s, HabitStats { total_days: 5, streak: 5, best_streak: 5 });
+
+        // Month rate over Oct 19..24 (6 days, 1 skipped => 5 scheduled, 5 done => 100%).
+        let ms = month_stats_with_ex_dates(
+            &Frequency::default(),
+            &checked,
+            &ex_dates,
+            d(1),
+            d(24),
+            Some(d(19)),
+            None,
+            Weekday::Mon,
+        );
+        assert_eq!(ms, MonthStats { days: 5, rate: 100 });
+
+        // Habit convenience methods honor habit.ex_dates directly.
+        let habit = Habit { start_date: Some(d(19)), ex_dates, ..sample_habit("Run") };
+        assert_eq!(habit.stats(&checked, d(24), Weekday::Mon), s);
+        assert_eq!(habit.month_stats(&checked, d(1), d(24), Weekday::Mon), ms);
+
+        // Interval habit: every 2 days; done on Oct 1 and Oct 4 with Oct 2 skipped -> effective gap is 2 <= 2.
+        let interval = Frequency::Interval { days: 2 };
+        let i_checked: HashSet<_> = [d(1), d(4)].into();
+        let i_stats = stats_with_ex_dates(&interval, &i_checked, &[d(2)], d(4), Weekday::Mon);
+        assert_eq!(i_stats, HabitStats { total_days: 2, streak: 2, best_streak: 2 });
     }
 }

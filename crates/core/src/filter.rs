@@ -522,7 +522,7 @@ impl SmartFilter {
             .rules
             .conditions
             .iter()
-            .any(|c| c.value == ConditionValue::Type(Some(Kind::Note)));
+            .any(|c| !c.not && c.value == ConditionValue::Type(Some(Kind::Note)));
         let mut any = false;
         let mut group = true;
         for (i, c) in self.rules.conditions.iter().enumerate() {

@@ -1,5 +1,7 @@
 //! Task statistics for the Statistics page's Overview and Task tabs.
 
+use std::collections::HashMap;
+
 use chrono::{Datelike, Duration, Local, Months, NaiveDate, TimeZone, Weekday};
 
 use crate::focus::FocusSession;
@@ -54,10 +56,11 @@ pub fn completed_by_list(tasks: &[Task], day: NaiveDate) -> Vec<(Option<Id>, usi
 pub fn days_using(tasks: &[Task], today: NaiveDate) -> i64 {
     tasks
         .iter()
+        .filter(|t| t.created_at > 0)
         .filter_map(|t| Local.timestamp_millis_opt(t.created_at).single())
         .map(|t| t.date_naive())
         .min()
-        .map_or(0, |first| (today - first).num_days() + 1)
+        .map_or(0, |first| ((today - first).num_days() + 1).max(0))
 }
 
 /// The previous day, for "from yesterday".
@@ -84,17 +87,25 @@ pub fn buckets(bucket: Bucket, today: NaiveDate, week_start: Weekday, count: usi
         .rev()
         .map(|back| match bucket {
             Bucket::Day => {
-                let day = today - Duration::days(back);
+                let day = today.checked_sub_signed(Duration::days(back)).unwrap_or(NaiveDate::MIN);
                 (day, day)
             }
             Bucket::Week => {
                 let offset = (today.weekday().num_days_from_monday() + 7 - week_start.num_days_from_monday()) % 7;
-                let first = today - Duration::days(offset as i64) - Duration::weeks(back);
-                (first, first + Duration::days(6))
+                let week_anchor = today.checked_sub_signed(Duration::days(offset as i64)).unwrap_or(NaiveDate::MIN);
+                let first = week_anchor.checked_sub_signed(Duration::weeks(back)).unwrap_or(NaiveDate::MIN);
+                let last = first.checked_add_signed(Duration::days(6)).unwrap_or(NaiveDate::MAX);
+                (first, last)
             }
             Bucket::Month => {
-                let first = today.with_day(1).expect("every month has a first day") - Months::new(back as u32);
-                (first, first + Months::new(1) - Duration::days(1))
+                let base = today.with_day(1).expect("every month has a first day");
+                let back_months = u32::try_from(back).unwrap_or(u32::MAX);
+                let first = base.checked_sub_months(Months::new(back_months)).unwrap_or(NaiveDate::MIN);
+                let last = first
+                    .checked_add_months(Months::new(1))
+                    .and_then(|d| d.pred_opt())
+                    .unwrap_or(NaiveDate::MAX);
+                (first, last)
             }
         })
         .collect()
@@ -135,7 +146,10 @@ pub fn focus_in(sessions: &[FocusSession], periods: &[(NaiveDate, NaiveDate)]) -
                     let day = s.start_local().date_naive();
                     day >= *first && day <= *last
                 })
-                .fold((0, 0), |(count, minutes), s| (count + 1, minutes + (s.ended_at - s.started_at) / 60_000))
+                .fold((0, 0), |(count, minutes), s| {
+                    let dur_min = s.ended_at.saturating_sub(s.started_at).max(0) / 60_000;
+                    (count + 1, minutes + dur_min)
+                })
         })
         .collect()
 }
@@ -148,11 +162,23 @@ pub fn more_productive_than(tasks: &[Task], today: NaiveDate) -> u32 {
     if days <= 0 {
         return 0;
     }
-    let first = today - Duration::days(days);
-    let counts = completed_by_day(tasks, first, days as usize + 1);
-    let today_count = counts[days as usize];
-    let fewer = counts[..days as usize].iter().filter(|c| **c < today_count).count();
-    (fewer * 100 / days as usize) as u32
+    let first = today.checked_sub_signed(Duration::days(days)).unwrap_or(NaiveDate::MIN);
+    let mut counts: HashMap<NaiveDate, usize> = HashMap::new();
+    for day in tasks.iter().filter(|t| !t.is_deleted()).filter_map(completed_on) {
+        if day >= first && day <= today {
+            *counts.entry(day).or_default() += 1;
+        }
+    }
+    let today_count = counts.get(&today).copied().unwrap_or(0);
+    if today_count == 0 {
+        return 0;
+    }
+    let not_fewer = counts
+        .iter()
+        .filter(|&(day, &count)| *day < today && count >= today_count)
+        .count() as i64;
+    let fewer = (days - not_fewer).max(0);
+    ((fewer as u128 * 100) / (days as u128)) as u32
 }
 
 /// The Task tab's "Completion Rate Distribution": how the period's tasks ended.
@@ -401,5 +427,46 @@ mod tests {
         let counts = completed_by_tag_in(&tasks, today, today);
         assert_eq!(counts[0], (Some("home".to_owned()), 2));
         assert!(counts.contains(&(Some("work".to_owned()), 1)) && counts.contains(&(None, 1)));
+    }
+
+    #[test]
+    fn guards_against_clock_skew_zero_created_at_and_month_bounds() {
+        let store = Store::open_in_memory().unwrap();
+        let today = Local::now().date_naive();
+        let mut t_zero = store.add_task("corrupt zero").unwrap();
+        t_zero.created_at = 0;
+        let mut t_neg = store.add_task("corrupt neg").unwrap();
+        t_neg.created_at = -10_000;
+        let mut t_future = store.add_task("clock skew future").unwrap();
+        t_future.created_at = Local::now().timestamp_millis() + 10 * 86_400_000;
+        assert_eq!(days_using(&[t_zero.clone(), t_neg.clone()], today), 0);
+        assert_eq!(days_using(&[t_future], today), 0);
+
+        // Sparse more_productive_than handles decades-old created_at without huge dense Vec allocations.
+        let mut t_old = store.add_task("old").unwrap();
+        t_old.created_at = Local.with_ymd_and_hms(1975, 1, 1, 12, 0, 0).single().unwrap().timestamp_millis();
+        let mut t_done = store.add_task("done today").unwrap();
+        t_done.completed_at = Some(Local::now().timestamp_millis());
+        assert!(more_productive_than(&[t_old, t_done], today) >= 99);
+
+        // Backward clock jump during a focus session must not yield negative minutes.
+        let now_ms = Local::now().timestamp_millis();
+        let skewed_session = FocusSession {
+            id: uuid::Uuid::now_v7(),
+            task_id: None,
+            habit_id: None,
+            title: "Skewed".into(),
+            started_at: now_ms,
+            ended_at: now_ms - 600_000,
+            stopwatch: false,
+            note: String::new(),
+        };
+        assert_eq!(focus_in(&[skewed_session], &[(today, today)]), vec![(1, 0)]);
+
+        // Extreme month bucket near NaiveDate::MIN must not panic.
+        let b = buckets(Bucket::Month, NaiveDate::from_ymd_opt(2026, 1, 15).unwrap(), Weekday::Mon, 2);
+        assert_eq!(b.len(), 2);
+        let early = buckets(Bucket::Month, NaiveDate::from_ymd_opt(-262_000, 1, 1).unwrap(), Weekday::Mon, 24);
+        assert_eq!(early.len(), 24);
     }
 }

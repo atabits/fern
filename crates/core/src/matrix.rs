@@ -376,18 +376,41 @@ pub fn quadrants_of(
         .collect()
 }
 
-/// Builds a map from lowercased parent tag name to its set of descendant tag names (lowercased).
+/// Builds a map from lowercased parent tag name to its transitive set of descendant tag names
+/// (lowercased, including itself), cycle-safe.
 pub fn build_tag_families(tags: &[crate::model::Tag]) -> HashMap<String, HashSet<String>> {
-    let mut map: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut children: HashMap<String, Vec<String>> = HashMap::new();
+    let mut all_names: HashSet<String> = HashSet::new();
     for tag in tags {
         let lower = tag.name.to_lowercase();
-        map.entry(lower.clone()).or_default().insert(lower.clone());
+        all_names.insert(lower.clone());
         if let Some(parent) = &tag.parent {
-            map.entry(parent.to_lowercase()).or_default().insert(lower);
+            let parent_lower = parent.to_lowercase();
+            all_names.insert(parent_lower.clone());
+            children.entry(parent_lower).or_default().push(lower);
         }
+    }
+    let mut map: HashMap<String, HashSet<String>> = HashMap::with_capacity(all_names.len());
+    for root in all_names {
+        let mut family = HashSet::from([root.clone()]);
+        let mut stack = vec![root.clone()];
+        while let Some(cur) = stack.pop() {
+            if let Some(kids) = children.get(&cur) {
+                for kid in kids {
+                    if family.insert(kid.clone()) {
+                        stack.push(kid.clone());
+                    }
+                }
+            }
+        }
+        map.insert(root, family);
     }
     map
 }
+
+/// Deterministic ID used for the default Matrix profile so multiple devices syncing before first
+/// profile creation converge on one `"Default"` profile instead of creating duplicates.
+pub const DEFAULT_MATRIX_PROFILE_ID: Id = uuid::Uuid::from_u128(0x0000_0000_0000_4000_8000_0000_0000_0001);
 
 /// A named 4-quadrant Eisenhower Matrix profile.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -441,29 +464,31 @@ impl Store {
     /// Saves a quadrant's rule; `None` restores the default.
     pub fn save_matrix_rule(&self, quadrant: usize, rule: Option<&QuadrantRule>) -> anyhow::Result<()> {
         anyhow::ensure!(quadrant < 4, "there are four quadrants");
-        let key = quadrant.to_string();
-        match rule {
-            Some(rule) => self.conn.execute(
-                "INSERT INTO matrix_rules (quadrant, rule) VALUES (?1, ?2)
-                 ON CONFLICT(quadrant) DO UPDATE SET rule = excluded.rule",
-                rusqlite::params![key, rule.to_storage()],
-            )?,
-            None => self.conn.execute("DELETE FROM matrix_rules WHERE quadrant = ?1", [key])?,
-        };
-        if let Ok((first_id, raw)) = self
-            .conn
-            .query_row("SELECT id, rules_json FROM matrix_profiles ORDER BY sort_order, rowid LIMIT 1", [], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-            })
-        {
-            let mut rules = decode_profile_rules(&raw);
-            rules[quadrant] = rule.cloned().unwrap_or_else(|| QuadrantRule::defaults()[quadrant].clone());
-            self.conn.execute(
-                "UPDATE matrix_profiles SET rules_json = ?2, updated_at = ?3 WHERE id = ?1",
-                rusqlite::params![first_id, encode_profile_rules(&rules), crate::store::now_ms()],
-            )?;
-        }
-        Ok(())
+        self.in_tx(|| {
+            let key = quadrant.to_string();
+            match rule {
+                Some(rule) => self.conn.execute(
+                    "INSERT INTO matrix_rules (quadrant, rule) VALUES (?1, ?2)
+                     ON CONFLICT(quadrant) DO UPDATE SET rule = excluded.rule",
+                    rusqlite::params![key, rule.to_storage()],
+                )?,
+                None => self.conn.execute("DELETE FROM matrix_rules WHERE quadrant = ?1", [key])?,
+            };
+            if let Ok((first_id, raw)) = self
+                .conn
+                .query_row("SELECT id, rules_json FROM matrix_profiles ORDER BY sort_order, rowid LIMIT 1", [], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })
+            {
+                let mut rules = decode_profile_rules(&raw);
+                rules[quadrant] = rule.cloned().unwrap_or_else(|| QuadrantRule::defaults()[quadrant].clone());
+                self.conn.execute(
+                    "UPDATE matrix_profiles SET rules_json = ?2, updated_at = ?3 WHERE id = ?1",
+                    rusqlite::params![first_id, encode_profile_rules(&rules), crate::store::now_ms()],
+                )?;
+            }
+            Ok(())
+        })
     }
 
     /// Applies the 4-quadrant Date + Priority template, preserving any custom quadrant names.
@@ -482,7 +507,8 @@ impl Store {
         Ok(template)
     }
 
-    /// Ensures at least one profile exists (seeding the first one from legacy `matrix_rules`).
+    /// Ensures at least one persisted profile exists (seeding `"Default"` with the deterministic
+    /// [`DEFAULT_MATRIX_PROFILE_ID`] from legacy `matrix_rules`). Called only on write paths.
     fn ensure_default_matrix_profile(&self) -> anyhow::Result<Id> {
         if let Some(id_str) = self
             .conn
@@ -492,19 +518,19 @@ impl Store {
         {
             return Ok(id);
         }
-        let id = uuid::Uuid::now_v7();
+        let id = DEFAULT_MATRIX_PROFILE_ID;
         let rules = self.matrix_rules()?;
         let json = encode_profile_rules(&rules);
         self.conn.execute(
-            "INSERT INTO matrix_profiles (id, name, rules_json, sort_order, updated_at) VALUES (?1, 'Default', ?2, 0, ?3)",
+            "INSERT OR IGNORE INTO matrix_profiles (id, name, rules_json, sort_order, updated_at) VALUES (?1, 'Default', ?2, 0, ?3)",
             rusqlite::params![id.to_string(), json, crate::store::now_ms()],
         )?;
         Ok(id)
     }
 
-    /// All Eisenhower Matrix profiles in display order (creating `"Default"` on first call).
+    /// All Eisenhower Matrix profiles in display order. When none are persisted yet, returns a
+    /// read-only `"Default"` fallback with [`DEFAULT_MATRIX_PROFILE_ID`] without mutating SQLite.
     pub fn matrix_profiles(&self) -> anyhow::Result<Vec<MatrixProfile>> {
-        self.ensure_default_matrix_profile()?;
         let mut stmt = self
             .conn
             .prepare_cached("SELECT id, name, rules_json, sort_order FROM matrix_profiles ORDER BY sort_order, rowid")?;
@@ -523,10 +549,18 @@ impl Store {
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
+        if rows.is_empty() {
+            return Ok(vec![MatrixProfile {
+                id: DEFAULT_MATRIX_PROFILE_ID,
+                name: "Default".to_owned(),
+                rules: self.matrix_rules()?,
+                sort_order: 0,
+            }]);
+        }
         Ok(rows)
     }
 
-    /// The currently active Matrix profile ID (falls back to the first profile).
+    /// The currently active Matrix profile ID (falls back to the first profile without mutating SQLite).
     pub fn active_matrix_profile_id(&self) -> anyhow::Result<Id> {
         let profiles = self.matrix_profiles()?;
         if let Some(saved) = self.setting("matrix_active_profile")?
@@ -535,9 +569,7 @@ impl Store {
         {
             return Ok(id);
         }
-        let first = profiles[0].id;
-        self.set_setting("matrix_active_profile", &first.to_string())?;
-        Ok(first)
+        Ok(profiles[0].id)
     }
 
     pub fn set_active_matrix_profile(&self, id: Id) -> anyhow::Result<()> {
@@ -551,98 +583,118 @@ impl Store {
     pub fn create_matrix_profile(&self, name: &str, rules: Option<[QuadrantRule; 4]>) -> anyhow::Result<MatrixProfile> {
         let trimmed = name.trim();
         anyhow::ensure!(!trimmed.is_empty(), "matrix profile name cannot be empty");
-        self.ensure_default_matrix_profile()?;
-        let max_order: i64 = self
-            .conn
-            .query_row("SELECT COALESCE(MAX(sort_order), -1) FROM matrix_profiles", [], |r| r.get(0))?;
-        let profile = MatrixProfile {
-            id: uuid::Uuid::now_v7(),
-            name: trimmed.to_owned(),
-            rules: rules.unwrap_or_else(QuadrantRule::defaults),
-            sort_order: max_order + 1,
-        };
-        self.conn.execute(
-            "INSERT INTO matrix_profiles (id, name, rules_json, sort_order, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params![
-                profile.id.to_string(),
-                profile.name,
-                encode_profile_rules(&profile.rules),
-                profile.sort_order,
-                crate::store::now_ms()
-            ],
-        )?;
-        Ok(profile)
+        self.in_tx(|| {
+            self.ensure_default_matrix_profile()?;
+            let max_order: i64 = self
+                .conn
+                .query_row("SELECT COALESCE(MAX(sort_order), -1) FROM matrix_profiles", [], |r| r.get(0))?;
+            let profile = MatrixProfile {
+                id: uuid::Uuid::now_v7(),
+                name: trimmed.to_owned(),
+                rules: rules.unwrap_or_else(QuadrantRule::defaults),
+                sort_order: max_order + 1,
+            };
+            self.conn.execute(
+                "INSERT INTO matrix_profiles (id, name, rules_json, sort_order, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    profile.id.to_string(),
+                    profile.name,
+                    encode_profile_rules(&profile.rules),
+                    profile.sort_order,
+                    crate::store::now_ms()
+                ],
+            )?;
+            Ok(profile)
+        })
     }
 
     pub fn rename_matrix_profile(&self, id: Id, name: &str) -> anyhow::Result<()> {
         let trimmed = name.trim();
         anyhow::ensure!(!trimmed.is_empty(), "matrix profile name cannot be empty");
-        let changed = self.conn.execute(
-            "UPDATE matrix_profiles SET name = ?2, updated_at = ?3 WHERE id = ?1",
-            rusqlite::params![id.to_string(), trimmed, crate::store::now_ms()],
-        )?;
-        anyhow::ensure!(changed > 0, "matrix profile not found");
-        Ok(())
+        self.in_tx(|| {
+            if id == DEFAULT_MATRIX_PROFILE_ID {
+                self.ensure_default_matrix_profile()?;
+            }
+            let changed = self.conn.execute(
+                "UPDATE matrix_profiles SET name = ?2, updated_at = ?3 WHERE id = ?1",
+                rusqlite::params![id.to_string(), trimmed, crate::store::now_ms()],
+            )?;
+            anyhow::ensure!(changed > 0, "matrix profile not found");
+            Ok(())
+        })
     }
 
     /// Deletes a non-last Matrix profile and switches active selection if needed.
     pub fn delete_matrix_profile(&self, id: Id) -> anyhow::Result<bool> {
-        let profiles = self.matrix_profiles()?;
-        if profiles.len() <= 1 || !profiles.iter().any(|p| p.id == id) {
-            return Ok(false);
-        }
-        self.conn.execute("DELETE FROM matrix_profiles WHERE id = ?1", [id.to_string()])?;
-        if self.setting("matrix_active_profile")?.as_deref() == Some(id.to_string().as_str())
-            && let Some(next) = profiles.into_iter().find(|p| p.id != id)
-        {
-            self.set_setting("matrix_active_profile", &next.id.to_string())?;
-        }
-        Ok(true)
+        self.in_tx(|| {
+            let profiles = self.matrix_profiles()?;
+            if profiles.len() <= 1 || !profiles.iter().any(|p| p.id == id) {
+                return Ok(false);
+            }
+            self.conn.execute("DELETE FROM matrix_profiles WHERE id = ?1", [id.to_string()])?;
+            if self.setting("matrix_active_profile")?.as_deref() == Some(id.to_string().as_str())
+                && let Some(next) = profiles.into_iter().find(|p| p.id != id)
+            {
+                self.set_setting("matrix_active_profile", &next.id.to_string())?;
+            }
+            Ok(true)
+        })
     }
 
     /// Saves one quadrant rule for `profile_id` (`None` restores the quadrant's default).
     pub fn save_matrix_profile_rule(&self, profile_id: Id, quadrant: usize, rule: Option<&QuadrantRule>) -> anyhow::Result<()> {
         anyhow::ensure!(quadrant < 4, "there are four quadrants");
-        let profiles = self.matrix_profiles()?;
-        let is_first = profiles.first().is_some_and(|p| p.id == profile_id);
-        let mut target = profiles.into_iter().find(|p| p.id == profile_id).ok_or_else(|| anyhow::anyhow!("matrix profile not found"))?;
-        target.rules[quadrant] = rule.cloned().unwrap_or_else(|| QuadrantRule::defaults()[quadrant].clone());
-        self.conn.execute(
-            "UPDATE matrix_profiles SET rules_json = ?2, updated_at = ?3 WHERE id = ?1",
-            rusqlite::params![profile_id.to_string(), encode_profile_rules(&target.rules), crate::store::now_ms()],
-        )?;
-        if is_first {
-            let key = quadrant.to_string();
-            match rule {
-                Some(rule) => self.conn.execute(
-                    "INSERT INTO matrix_rules (quadrant, rule) VALUES (?1, ?2)
-                     ON CONFLICT(quadrant) DO UPDATE SET rule = excluded.rule",
-                    rusqlite::params![key, rule.to_storage()],
-                )?,
-                None => self.conn.execute("DELETE FROM matrix_rules WHERE quadrant = ?1", [key])?,
-            };
-        }
-        Ok(())
+        self.in_tx(|| {
+            if profile_id == DEFAULT_MATRIX_PROFILE_ID {
+                self.ensure_default_matrix_profile()?;
+            }
+            let profiles = self.matrix_profiles()?;
+            let is_first = profiles.first().is_some_and(|p| p.id == profile_id);
+            let mut target = profiles
+                .into_iter()
+                .find(|p| p.id == profile_id)
+                .ok_or_else(|| anyhow::anyhow!("matrix profile not found"))?;
+            target.rules[quadrant] = rule.cloned().unwrap_or_else(|| QuadrantRule::defaults()[quadrant].clone());
+            self.conn.execute(
+                "UPDATE matrix_profiles SET rules_json = ?2, updated_at = ?3 WHERE id = ?1",
+                rusqlite::params![profile_id.to_string(), encode_profile_rules(&target.rules), crate::store::now_ms()],
+            )?;
+            if is_first {
+                let key = quadrant.to_string();
+                match rule {
+                    Some(rule) => self.conn.execute(
+                        "INSERT INTO matrix_rules (quadrant, rule) VALUES (?1, ?2)
+                         ON CONFLICT(quadrant) DO UPDATE SET rule = excluded.rule",
+                        rusqlite::params![key, rule.to_storage()],
+                    )?,
+                    None => self.conn.execute("DELETE FROM matrix_rules WHERE quadrant = ?1", [key])?,
+                };
+            }
+            Ok(())
+        })
     }
 
     /// Applies the Date + Priority template to `profile_id`, keeping its custom quadrant names.
     pub fn apply_matrix_profile_date_template(&self, profile_id: Id) -> anyhow::Result<[QuadrantRule; 4]> {
-        let profiles = self.matrix_profiles()?;
-        let is_first = profiles.first().is_some_and(|p| p.id == profile_id);
-        let current = profiles
-            .into_iter()
-            .find(|p| p.id == profile_id)
-            .ok_or_else(|| anyhow::anyhow!("matrix profile not found"))?;
-        let mut template = QuadrantRule::date_priority_template();
-        for (i, rule) in template.iter_mut().enumerate() {
-            rule.name = current.rules[i].name.clone();
-        }
-        self.conn.execute(
-            "UPDATE matrix_profiles SET rules_json = ?2, updated_at = ?3 WHERE id = ?1",
-            rusqlite::params![profile_id.to_string(), encode_profile_rules(&template), crate::store::now_ms()],
-        )?;
-        if is_first {
-            self.in_tx(|| {
+        self.in_tx(|| {
+            if profile_id == DEFAULT_MATRIX_PROFILE_ID {
+                self.ensure_default_matrix_profile()?;
+            }
+            let profiles = self.matrix_profiles()?;
+            let is_first = profiles.first().is_some_and(|p| p.id == profile_id);
+            let current = profiles
+                .into_iter()
+                .find(|p| p.id == profile_id)
+                .ok_or_else(|| anyhow::anyhow!("matrix profile not found"))?;
+            let mut template = QuadrantRule::date_priority_template();
+            for (i, rule) in template.iter_mut().enumerate() {
+                rule.name = current.rules[i].name.clone();
+            }
+            self.conn.execute(
+                "UPDATE matrix_profiles SET rules_json = ?2, updated_at = ?3 WHERE id = ?1",
+                rusqlite::params![profile_id.to_string(), encode_profile_rules(&template), crate::store::now_ms()],
+            )?;
+            if is_first {
                 for (i, rule) in template.iter().enumerate() {
                     let key = i.to_string();
                     self.conn.execute(
@@ -651,10 +703,9 @@ impl Store {
                         rusqlite::params![key, rule.to_storage()],
                     )?;
                 }
-                Ok(())
-            })?;
-        }
-        Ok(template)
+            }
+            Ok(template)
+        })
     }
 
     /// Loads tasks visible in the matrix: excludes deleted, Won't Do, and archived lists;
@@ -705,111 +756,125 @@ impl Store {
         Ok(open)
     }
 
-    /// Updates saved `matrix_rules` rows when a tag is renamed or merged (`from` -> `into`).
+    /// Updates saved `matrix_rules` and `matrix_profiles` rows when a tag is renamed or merged (`from` -> `into`).
     pub(crate) fn update_matrix_rules_for_tag_rename(&self, from: &str, into: &str) -> anyhow::Result<()> {
         let from_lower = from.to_lowercase();
         let into_lower = into.to_lowercase();
-        let mut stmt = self.conn.prepare_cached("SELECT quadrant, rule FROM matrix_rules")?;
-        let rows: Vec<(String, String)> = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-            .collect::<Result<_, _>>()?;
-        for (quadrant, text) in rows {
-            if let Ok(index) = quadrant.parse::<usize>()
-                && index < 4
-                && let Some(mut rule) = QuadrantRule::from_storage(&text)
-            {
-                let mut changed = false;
-                let mut next_tags: Vec<String> = Vec::with_capacity(rule.tags.len());
-                for tag in rule.tags {
-                    if tag.to_lowercase() == from_lower {
-                        changed = true;
-                        if !next_tags.iter().any(|t| t.to_lowercase() == into_lower) {
-                            next_tags.push(into.to_owned());
+        self.in_tx(|| {
+            let mut stmt = self.conn.prepare_cached("SELECT quadrant, rule FROM matrix_rules")?;
+            let rows: Vec<(String, String)> = stmt
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<Result<_, _>>()?;
+            drop(stmt);
+            for (quadrant, text) in rows {
+                if let Ok(index) = quadrant.parse::<usize>()
+                    && index < 4
+                    && let Some(mut rule) = QuadrantRule::from_storage(&text)
+                {
+                    let mut changed = false;
+                    let mut next_tags: Vec<String> = Vec::with_capacity(rule.tags.len());
+                    for tag in rule.tags {
+                        if tag.to_lowercase() == from_lower {
+                            changed = true;
+                            if !next_tags.iter().any(|t| t.to_lowercase() == into_lower) {
+                                next_tags.push(into.to_owned());
+                            }
+                        } else if !next_tags.iter().any(|t| t.to_lowercase() == tag.to_lowercase()) {
+                            next_tags.push(tag);
                         }
-                    } else if !next_tags.iter().any(|t| t.to_lowercase() == tag.to_lowercase()) {
-                        next_tags.push(tag);
+                    }
+                    if changed {
+                        rule.tags = next_tags;
+                        self.conn.execute(
+                            "INSERT INTO matrix_rules (quadrant, rule) VALUES (?1, ?2)
+                             ON CONFLICT(quadrant) DO UPDATE SET rule = excluded.rule",
+                            rusqlite::params![quadrant, rule.to_storage()],
+                        )?;
                     }
                 }
-                if changed {
+            }
+            let mut p_stmt = self.conn.prepare_cached("SELECT id, rules_json FROM matrix_profiles")?;
+            let p_rows: Vec<(String, String)> = p_stmt
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<Result<_, _>>()?;
+            drop(p_stmt);
+            for (id, raw_rules) in p_rows {
+                let mut rules = decode_profile_rules(&raw_rules);
+                let mut any_changed = false;
+                for rule in &mut rules {
+                    let mut changed = false;
+                    let mut next_tags: Vec<String> = Vec::with_capacity(rule.tags.len());
+                    for tag in rule.tags.drain(..) {
+                        if tag.to_lowercase() == from_lower {
+                            changed = true;
+                            if !next_tags.iter().any(|t| t.to_lowercase() == into_lower) {
+                                next_tags.push(into.to_owned());
+                            }
+                        } else if !next_tags.iter().any(|t| t.to_lowercase() == tag.to_lowercase()) {
+                            next_tags.push(tag);
+                        }
+                    }
                     rule.tags = next_tags;
-                    self.save_matrix_rule(index, Some(&rule))?;
+                    any_changed |= changed;
+                }
+                if any_changed {
+                    self.conn.execute(
+                        "UPDATE matrix_profiles SET rules_json = ?2, updated_at = ?3 WHERE id = ?1",
+                        rusqlite::params![id, encode_profile_rules(&rules), crate::store::now_ms()],
+                    )?;
                 }
             }
-        }
-        let mut p_stmt = self.conn.prepare_cached("SELECT id, rules_json FROM matrix_profiles")?;
-        let p_rows: Vec<(String, String)> = p_stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-            .collect::<Result<_, _>>()?;
-        drop(p_stmt);
-        for (id, raw_rules) in p_rows {
-            let mut rules = decode_profile_rules(&raw_rules);
-            let mut any_changed = false;
-            for rule in &mut rules {
-                let mut changed = false;
-                let mut next_tags: Vec<String> = Vec::with_capacity(rule.tags.len());
-                for tag in rule.tags.drain(..) {
-                    if tag.to_lowercase() == from_lower {
-                        changed = true;
-                        if !next_tags.iter().any(|t| t.to_lowercase() == into_lower) {
-                            next_tags.push(into.to_owned());
-                        }
-                    } else if !next_tags.iter().any(|t| t.to_lowercase() == tag.to_lowercase()) {
-                        next_tags.push(tag);
-                    }
-                }
-                rule.tags = next_tags;
-                any_changed |= changed;
-            }
-            if any_changed {
-                self.conn.execute(
-                    "UPDATE matrix_profiles SET rules_json = ?2, updated_at = ?3 WHERE id = ?1",
-                    rusqlite::params![id, encode_profile_rules(&rules), crate::store::now_ms()],
-                )?;
-            }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Removes a deleted tag from any saved `matrix_rules` and `matrix_profiles` rows.
     pub(crate) fn prune_matrix_rules_for_tag_delete(&self, name: &str) -> anyhow::Result<()> {
         let target = name.to_lowercase();
-        let mut stmt = self.conn.prepare_cached("SELECT quadrant, rule FROM matrix_rules")?;
-        let rows: Vec<(String, String)> = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-            .collect::<Result<_, _>>()?;
-        for (quadrant, text) in rows {
-            if let Ok(index) = quadrant.parse::<usize>()
-                && index < 4
-                && let Some(mut rule) = QuadrantRule::from_storage(&text)
-            {
-                let before = rule.tags.len();
-                rule.tags.retain(|t| t.to_lowercase() != target);
-                if rule.tags.len() != before {
-                    self.save_matrix_rule(index, Some(&rule))?;
+        self.in_tx(|| {
+            let mut stmt = self.conn.prepare_cached("SELECT quadrant, rule FROM matrix_rules")?;
+            let rows: Vec<(String, String)> = stmt
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<Result<_, _>>()?;
+            drop(stmt);
+            for (quadrant, text) in rows {
+                if let Ok(index) = quadrant.parse::<usize>()
+                    && index < 4
+                    && let Some(mut rule) = QuadrantRule::from_storage(&text)
+                {
+                    let before = rule.tags.len();
+                    rule.tags.retain(|t| t.to_lowercase() != target);
+                    if rule.tags.len() != before {
+                        self.conn.execute(
+                            "INSERT INTO matrix_rules (quadrant, rule) VALUES (?1, ?2)
+                             ON CONFLICT(quadrant) DO UPDATE SET rule = excluded.rule",
+                            rusqlite::params![quadrant, rule.to_storage()],
+                        )?;
+                    }
                 }
             }
-        }
-        let mut p_stmt = self.conn.prepare_cached("SELECT id, rules_json FROM matrix_profiles")?;
-        let p_rows: Vec<(String, String)> = p_stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-            .collect::<Result<_, _>>()?;
-        drop(p_stmt);
-        for (id, raw_rules) in p_rows {
-            let mut rules = decode_profile_rules(&raw_rules);
-            let mut any_changed = false;
-            for rule in &mut rules {
-                let before = rule.tags.len();
-                rule.tags.retain(|t| t.to_lowercase() != target);
-                any_changed |= rule.tags.len() != before;
+            let mut p_stmt = self.conn.prepare_cached("SELECT id, rules_json FROM matrix_profiles")?;
+            let p_rows: Vec<(String, String)> = p_stmt
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<Result<_, _>>()?;
+            drop(p_stmt);
+            for (id, raw_rules) in p_rows {
+                let mut rules = decode_profile_rules(&raw_rules);
+                let mut any_changed = false;
+                for rule in &mut rules {
+                    let before = rule.tags.len();
+                    rule.tags.retain(|t| t.to_lowercase() != target);
+                    any_changed |= rule.tags.len() != before;
+                }
+                if any_changed {
+                    self.conn.execute(
+                        "UPDATE matrix_profiles SET rules_json = ?2, updated_at = ?3 WHERE id = ?1",
+                        rusqlite::params![id, encode_profile_rules(&rules), crate::store::now_ms()],
+                    )?;
+                }
             }
-            if any_changed {
-                self.conn.execute(
-                    "UPDATE matrix_profiles SET rules_json = ?2, updated_at = ?3 WHERE id = ?1",
-                    rusqlite::params![id, encode_profile_rules(&rules), crate::store::now_ms()],
-                )?;
-            }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 }
 
@@ -968,6 +1033,57 @@ mod tests {
         // Deleting active second profile switches back to first.
         assert!(store.delete_matrix_profile(work.id)?);
         assert_eq!(store.active_matrix_profile_id()?, profiles[0].id);
+        Ok(())
+    }
+
+    #[test]
+    fn build_tag_families_traverses_multi_level_and_guards_cycles() {
+        let tag = |name: &str, parent: Option<&str>| crate::model::Tag {
+            name: name.into(),
+            color: None,
+            open_count: 0,
+            parent: parent.map(str::to_owned),
+            pinned: false,
+        };
+        let tags = vec![
+            tag("Work", None),
+            tag("Backend", Some("Work")),
+            tag("Rust", Some("Backend")),
+            tag("CycleA", Some("CycleB")),
+            tag("CycleB", Some("CycleA")),
+        ];
+        let families = build_tag_families(&tags);
+        let work = &families["work"];
+        assert!(work.contains("work"));
+        assert!(work.contains("backend"));
+        assert!(work.contains("rust"), "grandchild tag must be in ancestor family");
+        assert!(families["cyclea"].contains("cycleb"));
+        assert!(families["cycleb"].contains("cyclea"));
+    }
+
+    #[test]
+    fn matrix_profiles_getter_is_read_only_and_sync_converges_default_profile() -> anyhow::Result<()> {
+        let a = Store::open_in_memory()?;
+        let b = Store::open_in_memory()?;
+
+        // Reading profiles and active ID on fresh stores must NOT write to matrix_profiles or sync_log.
+        let pa = a.matrix_profiles()?;
+        let pb = b.matrix_profiles()?;
+        assert_eq!(pa.len(), 1);
+        assert_eq!(pa[0].id, DEFAULT_MATRIX_PROFILE_ID);
+        assert_eq!(pb[0].id, DEFAULT_MATRIX_PROFILE_ID);
+        assert_eq!(a.active_matrix_profile_id()?, DEFAULT_MATRIX_PROFILE_ID);
+        assert!(a.changes_since(0)?.0.is_empty(), "read-only getter must not dirty sync_log");
+        assert!(b.changes_since(0)?.0.is_empty(), "read-only getter must not dirty sync_log");
+
+        // Even if both devices edit the default profile offline, syncing merges them into 1 profile.
+        let rule_a = QuadrantRule { name: "From A".into(), ..QuadrantRule::defaults()[0].clone() };
+        let rule_b = QuadrantRule { name: "From B".into(), ..QuadrantRule::defaults()[0].clone() };
+        a.save_matrix_profile_rule(DEFAULT_MATRIX_PROFILE_ID, 0, Some(&rule_a))?;
+        b.save_matrix_profile_rule(DEFAULT_MATRIX_PROFILE_ID, 0, Some(&rule_b))?;
+        let (changes_a, _) = a.changes_since(0)?;
+        b.apply_changes(&changes_a)?;
+        assert_eq!(b.matrix_profiles()?.len(), 1, "deterministic default UUID prevents duplicate Default profiles");
         Ok(())
     }
 }

@@ -130,6 +130,7 @@ pub struct TagDialog {
     store: Rc<Store>,
     /// The tag being edited; `None` adds one.
     editing: Option<String>,
+    tags: Vec<fern_core::Tag>,
     name: Entity<TextInput>,
     color: Option<String>,
     parent: Option<String>,
@@ -144,7 +145,8 @@ impl TagDialog {
     /// Add Tags (under `parent` for the menu's Add Sub-tag), or Edit Tag for `editing`.
     pub fn new(store: Rc<Store>, editing: Option<String>, parent: Option<String>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let strings = i18n::t(cx);
-        let tag = editing.as_ref().and_then(|name| store.tags().ok()?.into_iter().find(|t| &t.name == name));
+        let tags = store.tags().unwrap_or_default();
+        let tag = editing.as_ref().and_then(|name| tags.iter().find(|t| &t.name == name).cloned());
         let name = cx.new(|cx| {
             let mut input = TextInput::new(Mode::SingleLine, strings.list_name, cx);
             if let Some(tag) = &tag {
@@ -166,6 +168,7 @@ impl TagDialog {
             parent: tag.as_ref().map_or(parent, |t| t.parent.clone()),
             store,
             editing,
+            tags,
             name,
             parent_open: false,
             error: None,
@@ -203,10 +206,10 @@ impl Render for TagDialog {
         let strings = i18n::t(cx);
         let theme = cx.theme().clone();
         // Parents are top-level tags other than this one; a tag with sub-tags stays top-level.
-        let tags = self.store.tags().unwrap_or_default();
         let editing = self.editing.clone();
-        let has_children = editing.as_ref().is_some_and(|name| tags.iter().any(|t| t.parent.as_ref() == Some(name)));
-        let parents: Vec<String> = tags
+        let has_children = editing.as_ref().is_some_and(|name| self.tags.iter().any(|t| t.parent.as_ref() == Some(name)));
+        let parents: Vec<String> = self
+            .tags
             .iter()
             .filter(|t| t.parent.is_none() && Some(&t.name) != editing.as_ref())
             .map(|t| t.name.clone())
@@ -326,6 +329,7 @@ impl Render for TagDialog {
 /// The original's Merge Tags: the tag's tasks go to the chosen tag, and the tag is deleted.
 pub struct MergeDialog {
     store: Rc<Store>,
+    tags: Vec<fern_core::Tag>,
     from: String,
     into: Option<String>,
     open: bool,
@@ -335,7 +339,8 @@ impl EventEmitter<TagEvent> for MergeDialog {}
 
 impl MergeDialog {
     pub fn new(store: Rc<Store>, from: String) -> Self {
-        Self { store, from, into: None, open: false }
+        let tags = store.tags().unwrap_or_default();
+        Self { store, tags, from, into: None, open: false }
     }
 
     fn confirm(&mut self, cx: &mut Context<Self>) {
@@ -355,7 +360,7 @@ impl MergeDialog {
 impl Render for MergeDialog {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let strings = i18n::t(cx);
-        let others: Vec<String> = self.store.tags().unwrap_or_default().into_iter().map(|t| t.name).filter(|n| *n != self.from).collect();
+        let others: Vec<String> = self.tags.iter().map(|t| t.name.clone()).filter(|n| *n != self.from).collect();
         let into = self.into.clone();
         let items: Vec<AnyElement> = others
             .into_iter()

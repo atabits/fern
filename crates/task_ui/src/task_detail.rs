@@ -275,8 +275,16 @@ impl TaskDetail {
     }
 
     pub fn is_editor_focus(&self, focus: &FocusHandle, cx: &App) -> bool {
-        [&self.title, &self.notes, &self.comment_input, &self.subtask_input, &self.new_item]
-            .into_iter().any(|input| input.focus_handle(cx) == *focus)
+        [
+            &self.title,
+            &self.notes,
+            &self.comment_input,
+            &self.subtask_input,
+            &self.new_item,
+            &self.location_input,
+        ]
+        .into_iter()
+        .any(|input| input.focus_handle(cx) == *focus)
             || self.checklist.iter().any(|row| row.input.focus_handle(cx) == *focus)
     }
 
@@ -371,6 +379,7 @@ impl TaskDetail {
         self.session.attachment_errors.clear();
         self.subtask_open = false;
         self.session.activity = None;
+        self.session.preferences = self.session.store.preferences().unwrap_or_default();
         self.session.all_tags = self.session.store.tags().unwrap_or_default();
         self.checklist.clear();
         self.sync_checklist(cx);
@@ -939,6 +948,10 @@ impl TaskDetail {
 
     /// Changes from another window can edit the task's fields. Keep the caret for edits already in the inputs.
     pub fn refresh(&mut self, task: Option<Task>, cx: &mut Context<Self>) {
+        if self.session.draft.is_some() {
+            return;
+        }
+        self.session.preferences = self.session.store.preferences().unwrap_or_default();
         match task {
             Some(task) if self.task_id() == Some(task.id) => {
                 if self.task_title() != Some(task.title.as_str()) && self.title.read(cx).text() != task.title {
@@ -983,6 +996,7 @@ impl TaskDetail {
         self.session.tag_draft = None;
         match popup {
             Popup::Due => {
+                self.session.preferences = self.session.store.preferences().unwrap_or_default();
                 let today = Local::now().date_naive();
                 self.tz_input.update(cx, |input, cx| input.set_text("", cx));
                 self.session.due_draft = self.session.task.as_ref().map(|task| self.due_preview(task, today));
@@ -1009,38 +1023,36 @@ impl TaskDetail {
             Popup::LinkParent => {
                 self.link_search.update(cx, |input, cx| input.set_text("", cx));
                 self.session.link_parent_candidates = if let Some(task) = self.session.task.as_ref() {
-                    let excluded: std::collections::HashSet<Id> = self
-                        .session
-                        .store
-                        .descendants(task.id)
-                        .unwrap_or_default()
-                        .into_iter()
+                    let all_tasks = self.session.store.tasks().unwrap_or_default();
+                    let tree = fern_core::TaskTree::build(&all_tasks);
+                    let task_depth = tree.depth(task.id);
+                    let descendants = tree.descendants(task.id);
+                    let subtree_height = descendants
+                        .iter()
+                        .map(|desc| tree.depth(desc.id).saturating_sub(task_depth))
+                        .max()
+                        .unwrap_or(0);
+                    let excluded: std::collections::HashSet<Id> = descendants
+                        .iter()
+                        .map(|desc| desc.id)
                         .chain([task.id])
                         .collect();
-                    let all_tasks = self.session.store.tasks().unwrap_or_default();
-                    let parent_map: std::collections::HashMap<Id, Option<Id>> =
-                        all_tasks.iter().map(|t| (t.id, t.parent_id)).collect();
-                    let depth_of = |id: Id| -> usize {
-                        let mut depth = 0;
-                        let mut cur = id;
-                        while let Some(Some(p)) = parent_map.get(&cur) {
-                            depth += 1;
-                            cur = *p;
-                            if depth > fern_core::MAX_SUBTASK_DEPTH {
-                                break;
-                            }
-                        }
-                        depth
-                    };
+                    let depth_by_id: std::collections::HashMap<Id, usize> = all_tasks
+                        .iter()
+                        .map(|t| (t.id, tree.depth(t.id)))
+                        .collect();
+                    drop(descendants);
+                    drop(tree);
                     all_tasks
                         .into_iter()
                         .filter(|t| {
+                            let cand_depth = depth_by_id.get(&t.id).copied().unwrap_or(0);
                             !t.is_closed()
                                 && !t.is_deleted()
                                 && t.kind != Kind::Note
                                 && !excluded.contains(&t.id)
                                 && task.parent_id != Some(t.id)
-                                && depth_of(t.id) < fern_core::MAX_SUBTASK_DEPTH
+                                && cand_depth + 1 + subtree_height <= fern_core::MAX_SUBTASK_DEPTH
                         })
                         .collect()
                 } else {
@@ -1071,7 +1083,7 @@ impl TaskDetail {
     /// Opens the due-date picker (the "Set date" shortcut).
     /// Settings → Task Default → Default Duration, in minutes.
     fn default_duration(&self) -> i64 {
-        self.session.store.preferences().map_or(60, |p| p.task_defaults.duration)
+        self.session.preferences.task_defaults.duration
     }
 
     /// The details' own pickers, for the task list's right-click menu: `subtask` focuses the Add
@@ -1670,9 +1682,7 @@ impl TaskDetail {
                 if let Some(task) = this.session.task.clone() {
                     let checklist = this.session.store.checklist(task.id).unwrap_or_default();
                     let html = crate::print::task_html(&task, &checklist, Local::now().date_naive(), i18n::t(cx));
-                    if let Err(err) = crate::print::open("task", &html) {
-                        eprintln!("failed to print: {err}");
-                    }
+                    crate::print::open_in_background("task", html, cx);
                 }
             })), cx))
             .child(div().my_1().child(Divider::horizontal()))
@@ -2166,7 +2176,7 @@ impl TaskDetail {
         let total = self.session.subtasks.len();
         let done_count = self.session.subtasks.iter().filter(|s| s.is_completed()).count();
         let today = Local::now().date_naive();
-        let countdown_dates = self.session.store.preferences().map(|p| p.countdown_dates).unwrap_or(false);
+        let countdown_dates = self.session.preferences.countdown_dates;
         v_flex()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .when(total > 0, |el| el.child(Self::render_progress_bar(done_count, total, &theme)))

@@ -7,6 +7,7 @@ use super::*;
 
 pub(super) struct TaskDetailSession {
     pub store: Rc<Store>,
+    pub preferences: fern_core::Preferences,
     pub attachments_dir: Option<PathBuf>,
     pub attachments: Vec<fern_core::Attachment>,
     pub attachment_errors: Vec<String>,
@@ -31,8 +32,10 @@ pub(super) struct TaskDetailSession {
 
 impl TaskDetailSession {
     pub fn new(store: Rc<Store>) -> Self {
+        let preferences = store.preferences().unwrap_or_default();
         Self {
             store,
+            preferences,
             attachments_dir: crate::attachments_dir().ok(),
             attachments: Vec::new(),
             attachment_errors: Vec::new(),

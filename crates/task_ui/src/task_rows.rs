@@ -58,61 +58,39 @@ pub fn build_rows(
     collapsed_sections: &HashSet<Section>,
     grouped: bool,
 ) -> Vec<Row> {
-    let groups: Vec<(Section, Vec<&Task>)> = if grouped {
-        [Section::Tasks, Section::Notes, Section::Completed]
-            .iter()
-            .map(|&section| (section, tasks.iter().filter(|t| Section::of(t) == section).collect::<Vec<_>>()))
-            .filter(|(_, tasks)| !tasks.is_empty())
-            .collect()
-    } else {
-        vec![(Section::Tasks, tasks.iter().collect())]
+    let mut rows = Vec::new();
+    let push_tree_rows = |slice: &[Task], collapsed_tasks: &HashSet<Id>, rows: &mut Vec<Row>| {
+        let tree = fern_core::TaskTree::build(slice);
+        for (task, depth) in tree.flatten_with_depth(|id| !collapsed_tasks.contains(&id)) {
+            rows.push(Row::Task {
+                task: task.clone(),
+                depth,
+                has_children: tree.has_children(task.id),
+                collapsed: collapsed_tasks.contains(&task.id),
+            });
+        }
     };
+    if !grouped {
+        push_tree_rows(tasks, collapsed_tasks, &mut rows);
+        return rows;
+    }
+
+    let groups: Vec<(Section, Vec<Task>)> = [Section::Tasks, Section::Notes, Section::Completed]
+        .iter()
+        .map(|&section| (section, tasks.iter().filter(|t| Section::of(t) == section).cloned().collect::<Vec<_>>()))
+        .filter(|(_, tasks)| !tasks.is_empty())
+        .collect();
     let with_headers = groups.len() > 1;
 
-    let mut rows = Vec::new();
-    for (section, tasks) in groups {
+    for (section, group_tasks) in groups {
         let collapsed = with_headers && collapsed_sections.contains(&section);
         if with_headers {
-            rows.push(Row::Section { section, count: tasks.len(), collapsed });
+            rows.push(Row::Section { section, count: group_tasks.len(), collapsed });
         }
         if collapsed {
             continue;
         }
-
-        let ids: HashSet<Id> = tasks.iter().map(|t| t.id).collect();
-        let mut children: HashMap<Id, Vec<&Task>> = HashMap::new();
-        let mut roots = Vec::new();
-        for task in &tasks {
-            match task.parent_id.filter(|p| ids.contains(p)) {
-                Some(parent) => children.entry(parent).or_default().push(task),
-                None => roots.push(*task),
-            }
-        }
-
-        fn push(
-            task: &Task,
-            depth: usize,
-            children: &HashMap<Id, Vec<&Task>>,
-            collapsed_tasks: &HashSet<Id>,
-            rows: &mut Vec<Row>,
-        ) {
-            let kids = children.get(&task.id);
-            let collapsed = collapsed_tasks.contains(&task.id);
-            rows.push(Row::Task {
-                task: task.clone(),
-                depth,
-                has_children: kids.is_some(),
-                collapsed,
-            });
-            if !collapsed {
-                for kid in kids.into_iter().flatten() {
-                    push(kid, depth + 1, children, collapsed_tasks, rows);
-                }
-            }
-        }
-        for root in roots {
-            push(root, 0, &children, collapsed_tasks, &mut rows);
-        }
+        push_tree_rows(&group_tasks, collapsed_tasks, &mut rows);
     }
     rows
 }
@@ -339,11 +317,17 @@ pub fn section_rows(tasks: &[Task], sections: &[ListSection], collapsed_tasks: &
         rows.extend(build_rows(&tasks, collapsed_tasks, &HashSet::new(), false));
     };
     let known: HashSet<Id> = sections.iter().map(|s| s.id).collect();
-    let unsectioned: Vec<Task> =
-        open.iter().filter(|t| t.section_id.is_none_or(|s| !known.contains(&s))).cloned().collect();
+    let mut unsectioned: Vec<Task> = Vec::new();
+    let mut by_section: HashMap<Id, Vec<Task>> = HashMap::with_capacity(sections.len());
+    for task in open {
+        match task.section_id.filter(|s| known.contains(s)) {
+            Some(sec_id) => by_section.entry(sec_id).or_default().push(task),
+            None => unsectioned.push(task),
+        }
+    }
     group(strings.not_sectioned.to_owned(), DropTarget::Section(None), unsectioned, false, &mut rows);
     for section in sections {
-        let tasks: Vec<Task> = open.iter().filter(|t| t.section_id == Some(section.id)).cloned().collect();
+        let tasks = by_section.remove(&section.id).unwrap_or_default();
         group(section.name.clone(), DropTarget::Section(Some(section.id)), tasks, true, &mut rows);
     }
     group(strings.group_completed.to_owned(), DropTarget::Complete, done, false, &mut rows);

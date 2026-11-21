@@ -373,7 +373,7 @@ pub fn quick_dates(today: NaiveDate) -> [NaiveDate; 4] {
     [
         today,
         today + Duration::days(1),
-        today + Duration::days(7),
+        fern_core::next_week_date(today, calendar::week_start()),
         today.checked_add_months(Months::new(1)).unwrap_or(today),
     ]
 }
@@ -825,5 +825,19 @@ mod tests {
         same.range_field = Some(RangeField::EndTime);
         same.pick_range_time(NaiveTime::from_hms_opt(12, 0, 0).unwrap());
         assert_eq!(same.end_time, NaiveTime::from_hms_opt(14, 0, 0));
+    }
+
+    #[test]
+    fn quick_dates_next_week_aligns_with_core_next_week_date() {
+        let sunday = d(2026, 10, 18);
+        let monday = d(2026, 10, 19);
+        assert_eq!(
+            quick_dates(sunday)[2],
+            fern_core::next_week_date(sunday, calendar::week_start())
+        );
+        assert_eq!(
+            quick_dates(monday)[2],
+            fern_core::next_week_date(monday, calendar::week_start())
+        );
     }
 }

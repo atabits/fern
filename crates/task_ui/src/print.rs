@@ -58,23 +58,14 @@ fn task_line(task: &Task, today: NaiveDate, strings: &Strings, depth: usize) -> 
     )
 }
 
-fn push_tree(parent_id: fern_core::Id, tasks: &[Task], today: NaiveDate, strings: &Strings, depth: usize, body: &mut String) {
-    if depth > 8 {
-        return;
-    }
-    for sub in tasks.iter().filter(|t| t.parent_id == Some(parent_id)) {
-        body.push_str(&task_line(sub, today, strings, depth));
-        push_tree(sub.id, tasks, today, strings, depth + 1, body);
-    }
-}
-
 /// A list page: its title and tasks, subtasks indented recursively under their parents.
 pub fn list_html(title: &str, tasks: &[Task], today: NaiveDate, strings: &Strings) -> String {
-    let ids: std::collections::HashSet<_> = tasks.iter().map(|t| t.id).collect();
+    let tree = fern_core::TaskTree::build(tasks);
     let mut body = String::new();
-    for task in tasks.iter().filter(|t| t.parent_id.is_none_or(|p| !ids.contains(&p))) {
-        body.push_str(&task_line(task, today, strings, 0));
-        push_tree(task.id, tasks, today, strings, 1, &mut body);
+    for (task, depth) in tree.flatten_with_depth(|_| true) {
+        if depth <= 8 {
+            body.push_str(&task_line(task, today, strings, depth));
+        }
     }
     page(title, &format!("<ul>{body}</ul>"))
 }
@@ -180,6 +171,24 @@ pub fn open(name: &str, html: &str) -> std::io::Result<()> {
     let path = crate::scratch_dir()?.join(format!("fern-print-{name}.html"));
     std::fs::write(&path, html)?;
     open_print_file(&path)
+}
+
+/// Runs [`open`] on GPUI's background thread pool so disk I/O and browser launching never block the UI thread.
+pub fn open_async(name: impl Into<String>, html: String, cx: &gpui::App) -> gpui::Task<std::io::Result<()>> {
+    let name = name.into();
+    cx.background_executor().spawn(async move { open(&name, &html) })
+}
+
+/// Fire-and-forget background print helper that logs any I/O error.
+pub fn open_in_background(name: impl Into<String>, html: String, cx: &gpui::App) {
+    let name = name.into();
+    cx.background_executor()
+        .spawn(async move {
+            if let Err(err) = open(&name, &html) {
+                eprintln!("failed to print: {err}");
+            }
+        })
+        .detach();
 }
 
 #[cfg(windows)]

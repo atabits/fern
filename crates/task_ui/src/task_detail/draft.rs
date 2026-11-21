@@ -307,6 +307,21 @@ impl TaskDetail {
             }
         }
         let constant_reminder = due.constant_reminder && !due.reminders.is_empty();
+        let (end_date, end_time) = match (due.date, task.end_date) {
+            (Some(start), Some(end)) => {
+                let clamped_end = end.max(start);
+                let clamped_end_time = if clamped_end == start {
+                    match (due.time, task.end_time) {
+                        (Some(st), Some(et)) if et < st => Some(st),
+                        _ => task.end_time,
+                    }
+                } else {
+                    task.end_time
+                };
+                (Some(clamped_end), clamped_end_time)
+            }
+            _ => (None, None),
+        };
         let fields = TaskDraft {
             title,
             notes: notes.to_owned(),
@@ -322,8 +337,8 @@ impl TaskDetail {
             repeat: due.repeat,
             reminders: due.reminders,
             tags,
-            end_date: task.end_date,
-            end_time: task.end_time,
+            end_date,
+            end_time,
             section_id,
             checklist,
             location: {
@@ -800,5 +815,104 @@ mod tests {
             "Attached before saving"
         );
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[gpui::test]
+    fn refresh_preserves_open_draft_and_location_is_editor_focus(cx: &mut TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let other = store.add_task("Background synced task").unwrap();
+        let day = NaiveDate::from_ymd_opt(2028, 7, 6).unwrap();
+        cx.update(theme::init);
+        let (detail, cx) = cx.add_window_view(|window, cx| {
+            let mut detail = TaskDetail::new(store.clone(), window, cx);
+            detail.begin_draft(day, None, false, cx);
+            detail
+        });
+        cx.update(|_, cx| {
+            detail.update(cx, |detail, cx| {
+                detail
+                    .title
+                    .update(cx, |input, cx| input.set_text("Unsaved draft title", cx));
+                detail
+                    .notes
+                    .update(cx, |input, cx| input.set_text("Unsaved draft notes", cx));
+                detail
+                    .location_input
+                    .update(cx, |input, cx| input.set_text("HQ", cx));
+                assert!(detail.is_editor_focus(&detail.location_input.focus_handle(cx), cx));
+
+                // Background DataVersion/sync refresh passing None or another task must NOT wipe the draft.
+                detail.refresh(None, cx);
+                detail.refresh(Some(other.clone()), cx);
+                assert!(detail.session.draft.is_some());
+                assert_eq!(detail.title.read(cx).text(), "Unsaved draft title");
+                assert_eq!(detail.notes.read(cx).text(), "Unsaved draft notes");
+                assert_eq!(detail.location_input.read(cx).text(), "HQ");
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn commit_draft_clamps_end_date_to_start_and_link_parent_respects_descendant_height(
+        cx: &mut TestAppContext,
+    ) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let start = NaiveDate::from_ymd_opt(2028, 7, 10).unwrap();
+        let earlier = NaiveDate::from_ymd_opt(2028, 7, 5).unwrap();
+        cx.update(theme::init);
+        let (detail, cx) = cx.add_window_view(|window, cx| {
+            let mut detail = TaskDetail::new(store.clone(), window, cx);
+            detail.begin_draft(start, None, false, cx);
+            detail
+        });
+        cx.update(|_, cx| {
+            detail.update(cx, |detail, cx| {
+                detail
+                    .title
+                    .update(cx, |input, cx| input.set_text("Clamped duration", cx));
+                detail.edit_draft(cx, |task, _| {
+                    task.due_date = Some(start);
+                    task.end_date = Some(earlier);
+                });
+                assert!(detail.finish_draft(cx));
+            });
+        });
+        let saved = store.tasks().unwrap();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].due_date, Some(start));
+        assert_eq!(saved[0].end_date, Some(start));
+
+        // Build a task with a child (subtree height = 1) and another chain at depth MAX_SUBTASK_DEPTH - 1.
+        let root_a = store.add_task("Target root").unwrap();
+        let mut deep_cand = root_a.clone();
+        for level in 1..fern_core::MAX_SUBTASK_DEPTH {
+            deep_cand = store
+                .add_subtask(deep_cand.id, &format!("Level {level}"))
+                .unwrap();
+        }
+        let parent_with_child = store.add_task("Has child").unwrap();
+        let _child = store
+            .add_subtask(parent_with_child.id, "Nested child")
+            .unwrap();
+        cx.update(|_, cx| {
+            detail.update(cx, |detail, cx| {
+                detail.show(Some(parent_with_child.clone()), cx);
+                detail.open_popup(Popup::LinkParent, cx);
+                let ids: Vec<Id> = detail
+                    .session
+                    .link_parent_candidates
+                    .iter()
+                    .map(|t| t.id)
+                    .collect();
+                assert!(
+                    !ids.contains(&deep_cand.id),
+                    "candidate at depth MAX-1 would push descendant past MAX_SUBTASK_DEPTH"
+                );
+                assert!(
+                    ids.contains(&root_a.id),
+                    "depth-0 candidate can still hold a subtree of height 1"
+                );
+            });
+        });
     }
 }

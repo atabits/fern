@@ -538,6 +538,13 @@ impl Render for StickyNote {
                                 })),
                         ))
                         .child(
+                        IconButton::new("sticky-compact", if self.compact { IconName::ChevronDown } else { IconName::ChevronUp })
+                            .size(px(20.)).icon_size(IconSize::Small).icon_color(Color::Custom(foreground))
+                            .hover_color(foreground.opacity(0.12))
+                            .tooltip(popup::tooltip(if self.compact { strings.habit_expand } else { strings.habit_collapse }))
+                            .on_click(cx.listener(|this, _, window, cx| this.toggle_compact(window, cx))),
+                        )
+                        .child(
                         IconButton::new("sticky-close", IconName::X)
                             .icon_color(Color::Custom(foreground))
                             .size(px(20.))

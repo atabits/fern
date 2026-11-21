@@ -2354,21 +2354,41 @@ impl TodoView {
                 .child(Label::new(strings.no_tasks_tomorrow))
                 .child(Label::new(strings.plan_ahead).size(LabelSize::Small).color(Color::Muted))
                 .into_any_element(),
-            other => div()
-                .px(px_fallback)
-                .pt_8()
-                .child(
-                    Label::new(match other {
-                        View::Completed => strings.no_completed_tasks,
-                        View::WontDo => strings.no_wont_do,
-                        View::Trash => strings.trash_is_empty,
-                        View::Search(query) if query.trim().is_empty() => strings.search_hint,
-                        View::Search(_) => strings.nothing_found,
-                        _ => strings.no_tasks,
-                    })
-                    .color(Color::Muted),
-                )
-                .into_any_element(),
+            other => {
+                let (icon, message) = match other {
+                    View::Inbox => (IconName::Inbox, strings.no_tasks),
+                    View::Today => (IconName::Sun, strings.no_tasks),
+                    View::Next7Days => (IconName::CalendarDays, strings.no_tasks),
+                    View::Completed => (IconName::SquareCheck, strings.no_completed_tasks),
+                    View::WontDo => (IconName::SquareX, strings.no_wont_do),
+                    View::Trash => (IconName::Trash, strings.trash_is_empty),
+                    View::Search(query) if query.trim().is_empty() => (IconName::Search, strings.search_hint),
+                    View::Search(_) => (IconName::Search, strings.nothing_found),
+                    View::Tag(_) => (IconName::Tag, strings.no_tasks),
+                    View::Filter(_) => (IconName::Layers, strings.no_tasks),
+                    _ => (IconName::ListChecks, strings.no_tasks),
+                };
+                v_flex()
+                    .w_full()
+                    .px(px_fallback)
+                    .pt(px(120.))
+                    .items_center()
+                    .gap_3()
+                    .child(
+                        div()
+                            .size(px(56.))
+                            .rounded_full()
+                            .bg(theme.colors().surface_background)
+                            .border_1()
+                            .border_color(theme.colors().border_variant)
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(Icon::new(icon).size(IconSize::Large).color(Color::Muted)),
+                    )
+                    .child(Label::new(message).size(LabelSize::Small).color(Color::Muted))
+                    .into_any_element()
+            }
         }
     }
 

@@ -168,6 +168,8 @@ pub fn render(
     on_mini: impl Fn(MiniAction, &mut Window, &mut App) + Clone + 'static,
     cx: &App,
 ) -> impl IntoElement {
+    let on_add_list = std::rc::Rc::new(on_add_list);
+    let on_add_filter = std::rc::Rc::new(on_add_filter);
     let Props {
         active,
         counts,
@@ -778,7 +780,10 @@ pub fn render(
                         .hover_icon_color(colors.list_text)
                         .hover_color(colors.list_hover)
                         .tooltip(Tooltip::text(strings.add_list))
-                        .on_click(on_add_list),
+                        .on_click({
+                            let on_add_list = on_add_list.clone();
+                            move |ev, window, cx| on_add_list(ev, window, cx)
+                        }),
                 )),
             )
             .into_any_element()
@@ -816,7 +821,10 @@ pub fn render(
                         .hover_icon_color(colors.list_text)
                         .hover_color(colors.list_hover)
                         .tooltip(Tooltip::text(strings.add_filter))
-                        .on_click(on_add_filter),
+                        .on_click({
+                            let on_add_filter = on_add_filter.clone();
+                            move |ev, window, cx| on_add_filter(ev, window, cx)
+                        }),
                 )),
             )
             .into_any_element()
@@ -950,16 +958,22 @@ pub fn render(
                     lists_column = push_row(lists_column, PanelChild::SectionHeading(SidebarSection::Lists), h);
                     if !lists_section_dragged {
                         if lists.is_empty() {
+                            let on_add_list = on_add_list.clone();
                             lists_column = push_row(
                                 lists_column,
                                 PanelChild::Hint(SidebarSection::Lists),
                                 div()
+                                    .id("lists-empty-hint")
                                     .mx_1()
                                     .mb_1()
                                     .px(px(14.))
                                     .py(px(10.))
                                     .rounded(px(6.))
                                     .bg(colors.ghost_element_hover)
+                                    .hover(|s| s.bg(colors.list_hover))
+                                    .cursor_pointer()
+                                    .tooltip(Tooltip::text(strings.add_list))
+                                    .on_click(move |ev, window, cx| on_add_list(ev, window, cx))
                                     .child(Label::new(strings.lists_hint).size(LabelSize::Small).color(colors.list_text_muted))
                                     .into_any_element(),
                             );
@@ -985,16 +999,22 @@ pub fn render(
                     lists_column = push_row(lists_column, PanelChild::SectionHeading(SidebarSection::Filters), h);
                     if !filters_section_dragged {
                         if filters.is_empty() {
+                            let on_add_filter = on_add_filter.clone();
                             lists_column = push_row(
                                 lists_column,
                                 PanelChild::Hint(SidebarSection::Filters),
                                 div()
+                                    .id("filters-empty-hint")
                                     .mx_1()
                                     .mb_1()
                                     .px(px(14.))
                                     .py(px(10.))
                                     .rounded(px(6.))
                                     .bg(colors.ghost_element_hover)
+                                    .hover(|s| s.bg(colors.list_hover))
+                                    .cursor_pointer()
+                                    .tooltip(Tooltip::text(strings.add_filter))
+                                    .on_click(move |ev, window, cx| on_add_filter(ev, window, cx))
                                     .child(Label::new(strings.filters_hint).size(LabelSize::Small).color(colors.list_text_muted))
                                     .into_any_element(),
                             );
@@ -1104,6 +1124,7 @@ fn mini_calendar(
                 .cursor_pointer()
                 .hover(|s| s.bg(colors.list_hover))
                 .when(filled, |el| el.bg(colors.accent))
+                .tooltip(Tooltip::text(calendar::format_date(date, strings)))
                 .on_click(move |_, window, cx| on_select(View::Day(date), window, cx))
                 .items_center()
                 .justify_center()
@@ -1178,7 +1199,7 @@ fn mini_calendar(
                 h_flex()
                     .child(div().flex_1().child(Label::new(calendar::month_title(mini.month, strings)).color(colors.list_text).size(LabelSize::Small)))
                     .child(arrows("mini-back", IconName::ChevronLeft, MiniAction::Shift(-1)))
-                    .child(arrows("mini-this-month", IconName::Circle, MiniAction::ThisMonth))
+                    .child(arrows("mini-this-month", IconName::Circle, MiniAction::ThisMonth).tooltip(Tooltip::text(strings.today)))
                     .child(arrows("mini-forward", IconName::ChevronRight, MiniAction::Shift(1))),
             )
             .child(weekdays)

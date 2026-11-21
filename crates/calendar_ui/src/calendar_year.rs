@@ -697,11 +697,9 @@ impl CalendarView {
         let is_today = date == today && in_month;
         let is_open = self.year_day == Some((month, date));
         let accent = colors.accent;
-        let level = if in_month {
-            calendar::heatmap_level(counts.get(&date).copied().unwrap_or(0))
-        } else {
-            0
-        };
+        let count = if in_month { counts.get(&date).copied().unwrap_or(0) } else { 0 };
+        let level = calendar::heatmap_level(count);
+        let strings = i18n::t(cx);
         let anchor_bounds = Rc::new(Cell::new(None));
         let heatmap = self.options.heatmap;
         // The web's four heat levels use different opacities in light and dark themes.
@@ -732,6 +730,9 @@ impl CalendarView {
             .justify_center()
             .m(px(0.5))
             .cursor_pointer()
+            .when(count > 0, |el| {
+                el.tooltip(ui::Tooltip::text(format!("{} · {count}", calendar::format_date(date, strings))))
+            })
             .when(heatmap, |el| {
                 el.when(is_open || is_today || level > 0, |el| el.bg(background))
                     .hover(move |style| style.bg(hovered))

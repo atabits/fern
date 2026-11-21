@@ -15,7 +15,7 @@ use crate::app_view::AppView;
 use crate::i18n;
 use crate::lists_panel;
 use crate::task_rows;
-use crate::text_input::{Cancelled, Changed, Mode, Submitted, TextInput};
+use crate::text_input::{Cancelled, Changed, Mode, MultiLinePasted, Submitted, TextInput};
 
 const WIDTH: f32 = 560.;
 const HEIGHT: f32 = 96.;
@@ -61,6 +61,7 @@ pub struct QuickAddWindow {
     picked_date: Option<NaiveDate>,
     parsed_due: Option<(NaiveDate, Option<NaiveTime>)>,
     parsed_repeat: bool,
+    batch_lines: Vec<String>,
     priority: Priority,
     /// `None` means Inbox; `Some(id)` targets a specific list.
     list_id: Option<Id>,
@@ -74,12 +75,20 @@ impl QuickAddWindow {
             .read_with(cx, |view, _| view.quick_add_context())
             .unwrap_or_default();
         let strings = i18n::t(cx);
-        let input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.add_task, cx));
+        let input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.add_task, cx).intercept_multiline_paste());
         cx.subscribe_in(&input, window, |this, _, Submitted(_), window, cx| {
             this.submit(window, cx);
         })
         .detach();
+        cx.subscribe(&input, |this, _, MultiLinePasted(lines), cx| {
+            this.batch_lines = lines.clone();
+            cx.notify();
+        })
+        .detach();
         cx.subscribe(&input, |this, _, _: &Changed, cx| {
+            if !this.batch_lines.is_empty() {
+                this.batch_lines.clear();
+            }
             this.update_parsed_due(cx);
             cx.notify();
         })
@@ -101,6 +110,7 @@ impl QuickAddWindow {
             picked_date: None,
             parsed_due: None,
             parsed_repeat: false,
+            batch_lines: Vec::new(),
             priority: Priority::None,
             list_id: None,
         }
@@ -117,11 +127,23 @@ impl QuickAddWindow {
     }
 
     fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let date = self.picked_date;
+        let priority = (self.priority != Priority::None).then_some(self.priority);
+        let list = self.list_id.map(Some);
+        if !self.batch_lines.is_empty() {
+            let lines = std::mem::take(&mut self.batch_lines);
+            self.main
+                .update(cx, |view, _, cx| {
+                    for line in &lines {
+                        view.add_quick_task_with(line, date, priority, list, cx);
+                    }
+                })
+                .ok();
+            close(window, cx);
+            return;
+        }
         let text = self.input.read(cx).text().trim().to_owned();
         if !text.is_empty() {
-            let date = self.picked_date;
-            let priority = (self.priority != Priority::None).then_some(self.priority);
-            let list = self.list_id.map(Some);
             self.main
                 .update(cx, |view, _, cx| view.add_quick_task_with(&text, date, priority, list, cx))
                 .ok();
@@ -176,7 +198,13 @@ impl Render for QuickAddWindow {
         let today = Local::now().date_naive();
         let tomorrow = today + Duration::days(1);
         let next_week = today + Duration::days(7 - today.weekday().num_days_from_monday() as i64);
-        let has_text = !self.input.read(cx).text().trim().is_empty();
+        let batch_count = self.batch_lines.len();
+        let has_text = batch_count > 0 || !self.input.read(cx).text().trim().is_empty();
+        let add_label: SharedString = if batch_count > 0 {
+            format!("{} ({batch_count})", strings.add).into()
+        } else {
+            strings.add.into()
+        };
         let shown_due = self.parsed_due.or_else(|| self.picked_date.map(|d| (d, None)));
 
         let date_chip = |id: &'static str, label: &'static str, date: NaiveDate, cx: &mut Context<Self>| {
@@ -244,6 +272,32 @@ impl Render for QuickAddWindow {
                                 .child(Label::new(label).size(LabelSize::XSmall).color(Color::Accent)),
                         )
                     })
+                    .when(batch_count > 0, |el| {
+                        el.child(
+                            h_flex()
+                                .id("qa-batch-pill")
+                                .h(px(22.))
+                                .px_1p5()
+                                .gap_1()
+                                .rounded(px(4.))
+                                .bg(theme.colors().accent.opacity(0.14))
+                                .child(
+                                    Label::new(strings.batch_selected.replace("{n}", &batch_count.to_string()))
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Accent),
+                                )
+                                .child(
+                                    IconButton::new("qa-batch-clear", IconName::X)
+                                        .size(px(16.))
+                                        .icon_size(IconSize::XSmall)
+                                        .icon_color(Color::Accent)
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.batch_lines.clear();
+                                            cx.notify();
+                                        })),
+                                ),
+                        )
+                    })
                     .when(shown_due.is_none() && self.parsed_repeat, |el| {
                         el.child(
                             h_flex()
@@ -301,7 +355,7 @@ impl Render for QuickAddWindow {
                                 })
                             })
                             .child(
-                                Label::new(strings.add)
+                                Label::new(add_label)
                                     .size(LabelSize::Small)
                                     .color(if has_text { Color::OnAccent } else { Color::Muted }),
                             )

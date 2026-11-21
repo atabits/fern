@@ -1309,6 +1309,7 @@ impl AppView {
                     .child(
                         IconButton::new("close-shortcuts", IconName::X)
                             .icon_color(Color::Muted)
+                            .tip(strings.close, ui::TipSide::Below)
                             .on_click(cx.listener(|this, _, _, cx| this.toggle_shortcuts(cx))),
                     ),
             )

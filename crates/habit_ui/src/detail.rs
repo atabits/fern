@@ -259,12 +259,14 @@ impl HabitView {
                         .child(
                             div()
                                 .relative()
-                                .child(IconButton::new("habit-detail-more", IconName::Ellipsis).on_click(cx.listener(
-                                    |this, _, _, cx| {
-                                        this.detail_menu_open = true;
-                                        cx.notify();
-                                    },
-                                )))
+                                .child(
+                                    IconButton::new("habit-detail-more", IconName::Ellipsis)
+                                        .tooltip(ui::Tooltip::text(strings.more))
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.detail_menu_open = true;
+                                            cx.notify();
+                                        })),
+                                )
                                 .when(self.detail_menu_open, |el| {
                                     el.child(self.render_detail_menu(habit, cx))
                                 }),
@@ -280,12 +282,15 @@ impl HabitView {
                             .bg(theme.colors().surface_background)
                             .justify_between()
                             .child(Label::new(notice).size(LabelSize::XSmall).color(Color::Muted))
-                            .child(IconButton::new("notice-dismiss", IconName::X).icon_size(IconSize::XSmall).on_click(
-                                cx.listener(|this, _, _, cx| {
-                                    this.detail_notice = None;
-                                    cx.notify();
-                                }),
-                            )),
+                            .child(
+                                IconButton::new("notice-dismiss", IconName::X)
+                                    .icon_size(IconSize::XSmall)
+                                    .tooltip(ui::Tooltip::text(strings.dismiss))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.detail_notice = None;
+                                        cx.notify();
+                                    })),
+                            ),
                     )
                 })
                 // Stats grid (2 columns x 2 or 3 rows)
@@ -447,18 +452,22 @@ impl HabitView {
                                                     .child(Label::new(strings.today).size(LabelSize::XSmall).color(Color::Accent)),
                                             )
                                         })
-                                        .child(IconButton::new("habit-month-prev", IconName::ChevronLeft).on_click(
-                                            cx.listener(|this, _, _, cx| {
-                                                this.month = calendar::add_months(this.month, -1);
-                                                cx.notify();
-                                            }),
-                                        ))
-                                        .child(IconButton::new("habit-month-next", IconName::ChevronRight).on_click(
-                                            cx.listener(|this, _, _, cx| {
-                                                this.month = calendar::add_months(this.month, 1);
-                                                cx.notify();
-                                            }),
-                                        )),
+                                        .child(
+                                            IconButton::new("habit-month-prev", IconName::ChevronLeft)
+                                                .tooltip(ui::Tooltip::text("←"))
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.month = calendar::add_months(this.month, -1);
+                                                    cx.notify();
+                                                })),
+                                        )
+                                        .child(
+                                            IconButton::new("habit-month-next", IconName::ChevronRight)
+                                                .tooltip(ui::Tooltip::text("→"))
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.month = calendar::add_months(this.month, 1);
+                                                    cx.notify();
+                                                })),
+                                        ),
                                 ),
                         )
                         .child(weekdays)
@@ -490,6 +499,7 @@ impl HabitView {
                                     el.child(
                                         IconButton::new("habit-log-add", IconName::Plus)
                                             .icon_size(IconSize::XSmall)
+                                            .tooltip(ui::Tooltip::text(strings.habit_record))
                                             .on_click(cx.listener(move |this, _, window, cx| {
                                                 let target_date = this.selected_date.unwrap_or(today);
                                                 this.open_log_modal(id, target_date, false, window, cx);

@@ -84,13 +84,40 @@ impl ScrollTarget {
     fn drag_started(&self) {
         if let Self::List(list) = self {
             list.scrollbar_drag_started();
+            #[cfg(test)]
+            tests::record_list_drag_delta(1);
         }
     }
 
     fn drag_ended(&self) {
         if let Self::List(list) = self {
             list.scrollbar_drag_ended();
+            #[cfg(test)]
+            tests::record_list_drag_delta(-1);
         }
+    }
+}
+
+/// RAII guard for an active thumb drag so `ListState::scrollbar_drag_ended()` always runs
+/// even if `ScrollbarView` unmounts or drops mid-drag.
+struct DragGuard {
+    grab_offset: Pixels,
+    target: ScrollTarget,
+}
+
+impl DragGuard {
+    fn start(grab_offset: Pixels, target: ScrollTarget) -> Self {
+        target.drag_started();
+        Self {
+            grab_offset,
+            target,
+        }
+    }
+}
+
+impl Drop for DragGuard {
+    fn drop(&mut self) {
+        self.target.drag_ended();
     }
 }
 
@@ -121,7 +148,7 @@ impl ScrollbarConfig {
 /// enter/leave repaints only this scrollbar rather than refreshing the entire window.
 struct ScrollbarView {
     config: ScrollbarConfig,
-    grab_offset: Option<Pixels>,
+    drag: Option<DragGuard>,
     hovered: bool,
     _activation: Subscription,
 }
@@ -130,11 +157,7 @@ impl ScrollbarView {
     fn new(config: ScrollbarConfig, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let activation = cx.observe_window_activation(window, |this, window, cx| {
             if !window.is_window_active() {
-                let mut changed = false;
-                if this.grab_offset.take().is_some() {
-                    this.config.target.drag_ended();
-                    changed = true;
-                }
+                let mut changed = this.end_drag();
                 if std::mem::take(&mut this.hovered) {
                     changed = true;
                 }
@@ -145,10 +168,20 @@ impl ScrollbarView {
         });
         Self {
             config,
-            grab_offset: None,
+            drag: None,
             hovered: false,
             _activation: activation,
         }
+    }
+
+    fn end_drag(&mut self) -> bool {
+        self.drag.take().is_some()
+    }
+}
+
+impl Drop for ScrollbarView {
+    fn drop(&mut self) {
+        self.drag = None;
     }
 }
 
@@ -165,7 +198,7 @@ impl Render for ScrollbarView {
         });
         let view = cx.entity().downgrade();
         let view_for_paint = view;
-        let initial_dragging = self.grab_offset.is_some();
+        let initial_dragging = self.drag.is_some();
 
         canvas(
             {
@@ -228,9 +261,7 @@ impl Render for ScrollbarView {
                 let Some((hitbox, thumb, travel, overflow)) = layout else {
                     if initial_dragging {
                         let _ = view_for_paint.update(cx, |this, _| {
-                            if this.grab_offset.take().is_some() {
-                                this.config.target.drag_ended();
-                            }
+                            this.end_drag();
                             this.hovered = false;
                         });
                     }
@@ -339,14 +370,19 @@ impl Render for ScrollbarView {
                                 (pointer - (track_start + travel * fraction))
                                     .clamp(px(0.), thumb_len)
                             };
-                            target.drag_started();
+                            let mut started = false;
                             let _ = view.update(cx, |this, cx| {
-                                this.grab_offset = Some(grab);
+                                this.end_drag();
+                                this.drag =
+                                    Some(DragGuard::start(grab, this.config.target.clone()));
                                 this.hovered = true;
+                                started = true;
                                 cx.notify();
                             });
-                            scroll_to(&target, pointer, grab, window);
-                            cx.stop_propagation();
+                            if started {
+                                scroll_to(&target, pointer, grab, window);
+                                cx.stop_propagation();
+                            }
                         }
                     }
                 });
@@ -363,8 +399,8 @@ impl Render for ScrollbarView {
                         let mut ended_drag = false;
                         let _ = view.update(cx, |this, cx| {
                             if event.pressed_button == Some(MouseButton::Left) {
-                                drag_grab = this.grab_offset;
-                            } else if this.grab_offset.take().is_some() {
+                                drag_grab = this.drag.as_ref().map(|drag| drag.grab_offset);
+                            } else if this.end_drag() {
                                 ended_drag = true;
                                 this.hovered = hitbox.is_hovered(window);
                                 cx.notify();
@@ -380,7 +416,6 @@ impl Render for ScrollbarView {
                             return;
                         }
                         if ended_drag {
-                            target.drag_ended();
                             return;
                         }
                         let next_hovered = hitbox.is_hovered(window);
@@ -397,20 +432,18 @@ impl Render for ScrollbarView {
 
                 window.on_mouse_event({
                     let hitbox = hitbox.clone();
-                    let target = target.clone();
                     let view = view_for_paint.clone();
                     move |event: &MouseUpEvent, phase, window, cx| {
                         if phase.capture() && event.button == MouseButton::Left {
                             let mut ended = false;
                             let _ = view.update(cx, |this, cx| {
-                                if this.grab_offset.take().is_some() {
+                                if this.end_drag() {
                                     ended = true;
                                     this.hovered = hitbox.is_hovered(window);
                                     cx.notify();
                                 }
                             });
                             if ended {
-                                target.drag_ended();
                                 cx.stop_propagation();
                             }
                         }
@@ -418,19 +451,14 @@ impl Render for ScrollbarView {
                 });
 
                 window.on_mouse_event({
-                    let target = target.clone();
                     let view = view_for_paint.clone();
                     move |event: &MouseExitEvent, phase, _window, cx| {
                         if !phase.capture() {
                             return;
                         }
-                        let mut ended = false;
                         let _ = view.update(cx, |this, cx| {
                             let mut changed = false;
-                            if event.pressed_button != Some(MouseButton::Left)
-                                && this.grab_offset.take().is_some()
-                            {
-                                ended = true;
+                            if event.pressed_button != Some(MouseButton::Left) && this.end_drag() {
                                 changed = true;
                             }
                             if std::mem::take(&mut this.hovered) {
@@ -440,9 +468,6 @@ impl Render for ScrollbarView {
                                 cx.notify();
                             }
                         });
-                        if ended {
-                            target.drag_ended();
-                        }
                     }
                 });
             },
@@ -690,6 +715,22 @@ mod tests {
     use gpui::{
         Context, InteractiveElement, ListAlignment, Modifiers, Render, TestAppContext, Window, list,
     };
+
+    thread_local! {
+        static LIST_DRAG_BALANCE: Cell<isize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn record_list_drag_delta(delta: isize) {
+        LIST_DRAG_BALANCE.with(|balance| balance.set(balance.get() + delta));
+    }
+
+    fn list_drag_balance() -> isize {
+        LIST_DRAG_BALANCE.with(Cell::get)
+    }
+
+    fn reset_list_drag_balance() {
+        LIST_DRAG_BALANCE.with(|balance| balance.set(0));
+    }
 
     #[derive(Default)]
     struct FlexTestView {
@@ -1008,5 +1049,77 @@ mod tests {
         cx.simulate_mouse_move(bar_left, MouseButton::Left, modifiers);
         cx.simulate_mouse_up(bar_left, MouseButton::Left, modifiers);
         assert_eq!(cx.debug_bounds("h-content").unwrap().left(), initial.left());
+    }
+
+    struct UnmountDragTestView {
+        state: ListState,
+        show_scrollbar: bool,
+    }
+
+    impl Render for UnmountDragTestView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let mut root = div()
+                .relative()
+                .size_full()
+                .debug_selector(|| "unmount-list-viewport".to_owned())
+                .child(
+                    list(self.state.clone(), |_, _, _| {
+                        div().h(px(40.)).w_full().into_any_element()
+                    })
+                    .size_full(),
+                );
+            if self.show_scrollbar {
+                root = root.child(
+                    div()
+                        .debug_selector(|| "unmount-scrollbar-wrap".to_owned())
+                        .absolute()
+                        .inset_0()
+                        .child(VerticalScrollbar::for_list(
+                            "unmount-list-scrollbar",
+                            self.state.clone(),
+                        )),
+                );
+            }
+            root
+        }
+    }
+
+    #[gpui::test]
+    fn unmounting_list_scrollbar_during_drag_ends_list_drag(cx: &mut TestAppContext) {
+        cx.update(theme::init);
+        reset_list_drag_balance();
+
+        let state = ListState::new(40, ListAlignment::Top, px(400.)).measure_all();
+        let (view, cx) = cx.add_window_view(|_, _| UnmountDragTestView {
+            state,
+            show_scrollbar: true,
+        });
+        cx.simulate_resize(size(px(300.), px(240.)));
+        cx.run_until_parked();
+
+        let viewport = cx.debug_bounds("unmount-list-viewport").unwrap();
+        let bar_pt = point(viewport.right() - px(6.), viewport.top() + px(20.));
+        let modifiers = Modifiers::default();
+        cx.simulate_mouse_move(bar_pt, None, modifiers);
+        cx.simulate_mouse_down(bar_pt, MouseButton::Left, modifiers);
+        cx.run_until_parked();
+        assert_eq!(list_drag_balance(), 1, "drag must be active after mouse down");
+        assert!(cx.debug_bounds("unmount-scrollbar-wrap").is_some());
+
+        // Unmount the scrollbar mid-drag without sending mouse up.
+        view.update(cx, |this, cx| {
+            this.show_scrollbar = false;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("unmount-scrollbar-wrap").is_none(),
+            "scrollbar must be unmounted after redraw"
+        );
+        assert_eq!(
+            list_drag_balance(),
+            0,
+            "dropping ScrollbarView mid-drag must call scrollbar_drag_ended()"
+        );
     }
 }

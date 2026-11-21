@@ -525,7 +525,7 @@ impl HabitView {
                                                 .items_center()
                                                 .child(div().size(px(8.)).rounded_full().bg(dot_color))
                                                 .child(
-                                                    Label::new(entry_date.format("%b %d").to_string())
+                                                    Label::new(calendar::short_date(entry_date, strings))
                                                         .size(LabelSize::XSmall)
                                                         .color(Color::Muted),
                                                 )

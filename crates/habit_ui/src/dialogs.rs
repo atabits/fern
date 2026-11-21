@@ -244,9 +244,13 @@ impl HabitView {
                             v_flex()
                                 .gap_0p5()
                                 .child(
-                                    Label::new(format!("{}{}", strings.habit_log_on, modal.date.format("%Y-%m-%d")))
-                                        .size(LabelSize::Large)
-                                        .weight(FontWeight::SEMIBOLD),
+                                    Label::new(format!(
+                                        "{}{}",
+                                        strings.habit_log_on,
+                                        desktop_common::calendar::format_date(modal.date, strings)
+                                    ))
+                                    .size(LabelSize::Large)
+                                    .weight(FontWeight::SEMIBOLD),
                                 )
                                 .child(Label::new(habit_name).size(LabelSize::XSmall).color(Color::Muted)),
                         )
@@ -285,6 +289,7 @@ impl HabitView {
                                 } else {
                                     gpui::transparent_black()
                                 })
+                                .hover(|s| s.bg(theme.colors().accent.opacity(if selected { 0.28 } else { 0.12 })))
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     if let Some(lm) = this.log_modal.as_mut() {
                                         lm.mood = if lm.mood == m { 0 } else { m };

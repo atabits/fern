@@ -1609,10 +1609,16 @@ impl FocusView {
                     .relative()
                     .opacity(if menu_open || crate::touch::active() { 1. } else { 0. })
                     .group_hover(group, |s| s.opacity(1.))
-                    .child(IconButton::new("timer-more", IconName::Ellipsis).size(px(22.)).icon_size(IconSize::Small).on_click(cx.listener(move |this, _, _, cx| {
-                        this.timer_menu = if this.timer_menu == Some(id) { None } else { Some(id) };
-                        cx.notify();
-                    })))
+                    .child(
+                        IconButton::new(SharedString::from(format!("timer-more-{id}")), IconName::Ellipsis)
+                            .size(px(22.))
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text(strings.more))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.timer_menu = if this.timer_menu == Some(id) { None } else { Some(id) };
+                                cx.notify();
+                            })),
+                    )
                     .when(menu_open, |el| {
                         el.child(PopoverAttachment::new(
                             Placement::BelowRight,
@@ -4220,6 +4226,13 @@ impl Render for FocusView {
                         div().size(px(40.)).flex().items_center().justify_center().rounded_full().bg(theme.colors().accent.opacity(0.18)).child(
                             IconButton::new("focus-play", if running && !paused { IconName::Pause } else { IconName::Play })
                                 .icon_color(Color::Accent)
+                                .tooltip(Tooltip::text(if running && !paused {
+                                    strings.focus_pause
+                                } else if paused {
+                                    strings.focus_continue
+                                } else {
+                                    strings.focus_start
+                                }))
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     if running { this.toggle_pause(cx) } else { this.start(None, cx) }
                                 })),
@@ -4247,7 +4260,27 @@ impl Render for FocusView {
                         .id("focus-record")
                         .pr(px(14.))
                         .when(record.is_empty(), |el| {
-                            el.child(div().pt_4().child(Label::new(strings.focus_no_record).color(Color::Muted)))
+                            el.child(
+                                v_flex()
+                                    .w_full()
+                                    .py(px(40.))
+                                    .items_center()
+                                    .justify_center()
+                                    .gap_3()
+                                    .child(
+                                        div()
+                                            .size(px(48.))
+                                            .rounded_full()
+                                            .bg(theme.colors().surface_background)
+                                            .border_1()
+                                            .border_color(theme.colors().border_variant)
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .child(Icon::new(IconName::Timer).size(IconSize::Large).color(Color::Muted)),
+                                    )
+                                    .child(Label::new(strings.focus_no_record).size(LabelSize::Small).color(Color::Muted)),
+                            )
                         })
                         .children(record),
                 )

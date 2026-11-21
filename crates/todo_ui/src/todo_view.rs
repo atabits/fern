@@ -1492,6 +1492,7 @@ impl TodoView {
                             IconButton::new(SharedString::from(format!("section-more-{id}")), IconName::Ellipsis)
                                 .size(px(22.))
                                 .icon_size(IconSize::Small)
+                                .tooltip(Tooltip::text(strings.more))
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     cx.stop_propagation();
                                     this.section_menu = Some(id);
@@ -3802,6 +3803,7 @@ impl Render for TodoView {
                     .pr(px(16.))
                     .child(
                         IconButton::new("toggle-sidebar", IconName::PanelLeft)
+                            .tooltip(Tooltip::text(strings.shortcut_labels[2]))
                             .on_click(cx.listener(|this, _, _, cx| this.toggle_lists(cx))),
                     )
                     .child(
@@ -3956,6 +3958,7 @@ impl Render for TodoView {
                                     .size(px(24.))
                                     .icon_size(IconSize::Small)
                                     .icon_color(Color::Muted)
+                                    .tooltip(Tooltip::text(strings.more))
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.add_menu_open = !this.add_menu_open;
                                         this.add_list_side = false;

@@ -2259,6 +2259,11 @@ impl TaskDetail {
                         let is_selected = picked == Some(date);
                         let duration = draft.tab == DueTab::Duration;
                         let is_today = date == today;
+                        let is_other_endpoint = duration
+                            && !is_selected
+                            && (draft.date == Some(date) || draft.end_date == Some(date));
+                        let in_range = duration
+                            && matches!((draft.date, draft.end_date), (Some(s), Some(e)) if date > s && date < e);
                         div().flex_1().flex().justify_center().child(
                             div()
                                 .id(SharedString::from(format!("day-{date}")))
@@ -2270,12 +2275,16 @@ impl TaskDetail {
                                 .rounded_full()
                                 .cursor_pointer()
                                 .when(is_selected, |el| el.bg(theme.colors().accent))
-                                .when(!is_selected && is_today, |el| el.bg(theme.colors().accent.opacity(0.18)))
+                                .when(is_other_endpoint, |el| el.bg(theme.colors().accent.opacity(0.32)))
+                                .when(in_range, |el| el.bg(theme.colors().accent.opacity(0.14)))
+                                .when(!is_selected && !is_other_endpoint && !in_range && is_today, |el| {
+                                    el.bg(theme.colors().accent.opacity(0.18))
+                                })
                                 .when(!is_selected, |el| el.hover(|s| s.bg(theme.colors().element_hover)))
                                 .child(Label::new(date.day().to_string()).centered().size(LabelSize::Small).color(
                                     if is_selected {
                                         Color::OnAccent
-                                    } else if is_today {
+                                    } else if is_today || is_other_endpoint {
                                         Color::Accent
                                     } else if in_month {
                                         Color::Default

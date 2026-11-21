@@ -147,10 +147,14 @@ impl TodoView {
                     .border_b_1()
                     .border_color(theme.colors().border)
                     .child(div().flex_1().child(Label::new(strings.list_activities).size(LabelSize::Large)))
-                    .child(IconButton::new("close-list-activity", IconName::X).on_click(cx.listener(|this, _, _, cx| {
-                        this.list_activity = None;
-                        cx.notify();
-                    }))),
+                    .child(
+                        IconButton::new("close-list-activity", IconName::X)
+                            .tooltip(Tooltip::text(strings.close))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.list_activity = None;
+                                cx.notify();
+                            })),
+                    ),
             )
             .child(
                 v_scroll(
@@ -239,10 +243,15 @@ impl TodoView {
                         .child(
                             h_flex()
                                 .child(div().flex_1().text_size(px(16.)).font_weight(FontWeight::SEMIBOLD).child(strings.suggested_tasks))
-                                .child(IconButton::new("suggestions-x", IconName::X).icon_color(Color::Muted).on_click(cx.listener(|this, _, _, cx| {
-                                    this.suggestions_open = None;
-                                    cx.notify();
-                                }))),
+                                .child(
+                                    IconButton::new("suggestions-x", IconName::X)
+                                        .icon_color(Color::Muted)
+                                        .tooltip(Tooltip::text(strings.close))
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.suggestions_open = None;
+                                            cx.notify();
+                                        })),
+                                ),
                         )
                         .when(recent.is_empty() && long.is_empty(), |el| el.child(Label::new(strings.no_suggestions).color(Color::Muted)))
                         .when(!recent.is_empty(), |el| el.child(heading(strings.recently_added)).children(recent))
@@ -396,10 +405,15 @@ impl TodoView {
                     .child(
                         h_flex()
                             .child(div().flex_1().text_size(px(16.)).font_weight(FontWeight::SEMIBOLD).child(strings.view_options))
-                            .child(IconButton::new("view-options-x", IconName::X).icon_color(Color::Muted).on_click(cx.listener(|this, _, _, cx| {
-                                this.view_options = None;
-                                cx.notify();
-                            }))),
+                            .child(
+                                IconButton::new("view-options-x", IconName::X)
+                                    .icon_color(Color::Muted)
+                                    .tooltip(Tooltip::text(strings.close))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.view_options = None;
+                                        cx.notify();
+                                    })),
+                            ),
                     )
                     .child(
                         h_flex()
@@ -950,12 +964,22 @@ impl TodoView {
                 .child(
                     h_flex()
                         .child(div().flex_1().child(Label::new(crate::calendar::month_title(month, strings)).weight(FontWeight::SEMIBOLD)))
-                        .child(IconButton::new("range-prev", IconName::ChevronLeft).size(px(22.)).on_click(cx.listener(
-                            |this, _, _, cx| this.update_other_date(cx, |_, _, _, month| *month = crate::calendar::add_months(*month, -1)),
-                        )))
-                        .child(IconButton::new("range-next", IconName::ChevronRight).size(px(22.)).on_click(cx.listener(
-                            |this, _, _, cx| this.update_other_date(cx, |_, _, _, month| *month = crate::calendar::add_months(*month, 1)),
-                        ))),
+                        .child(
+                            IconButton::new("range-prev", IconName::ChevronLeft)
+                                .size(px(22.))
+                                .tooltip(Tooltip::text("←"))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.update_other_date(cx, |_, _, _, month| *month = crate::calendar::add_months(*month, -1))
+                                })),
+                        )
+                        .child(
+                            IconButton::new("range-next", IconName::ChevronRight)
+                                .size(px(22.))
+                                .tooltip(Tooltip::text("→"))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.update_other_date(cx, |_, _, _, month| *month = crate::calendar::add_months(*month, 1))
+                                })),
+                        ),
                 )
                 .child(h_flex().children(crate::calendar::weekday_labels(&strings.weekdays_narrow).iter().map(|day| {
                     div().flex_1().flex().justify_center().child(Label::new(*day).size(LabelSize::XSmall).color(Color::Muted))

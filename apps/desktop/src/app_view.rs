@@ -498,9 +498,9 @@ impl AppView {
                 let (needle, ago) = spec.split_once('>').unwrap_or((spec, "0"));
                 let at = chrono::Local::now().naive_local() - chrono::Duration::hours(ago.parse().unwrap_or(0));
                 if let Some(task) = this.store.tasks().unwrap_or_default().into_iter().find(|t| t.title.contains(needle)) {
-                    this.add_notices(vec![Notice { target: Target::Task(task.id), title: task.title, at, constant: task.constant_reminder }], cx);
+                    this.add_notices(vec![Notice { target: Target::Task(task.id), title: task.title, at, constant: task.constant_reminder, has_goal: false }], cx);
                 } else if let Some(habit) = this.store.habits().unwrap_or_default().into_iter().find(|h| h.name.contains(needle)) {
-                    this.add_notices(vec![Notice { target: Target::Habit(habit.id), title: habit.name, at, constant: habit.constant_reminder }], cx);
+                    this.add_notices(vec![Notice { target: Target::Habit(habit.id), title: habit.name, at, constant: habit.constant_reminder, has_goal: habit.goal.is_some() }], cx);
                 }
             }
             // `theme=light|dark|system`, saved like a pick in the Settings.
@@ -1665,7 +1665,7 @@ impl AppView {
                     let target = notice.target;
                     let focus_title = notice.title.clone();
                     let (when, _) = crate::task_rows::due_label(notice.at.date(), Some(notice.at.time()), today, strings);
-                    let actions = reminders::actions(&self.store, target);
+                    let actions = notice.actions();
                     let dismiss_notice = notice.clone();
                     let focus_notice = notice.clone();
                     let can_focus = matches!(target, Target::Task(_) | Target::Habit(_));
@@ -1830,7 +1830,7 @@ impl AppView {
                     v_flex().id("notices").children(self.notices.items.iter().enumerate().map(|(i, notice)| {
                         let target = notice.target;
                         let (when, _) = crate::task_rows::due_label(notice.at.date(), Some(notice.at.time()), today, strings);
-                        let actions = reminders::actions(&self.store, target);
+                        let actions = notice.actions();
                         let buttons = actions.iter().map(|&action| {
                             let notice = notice.clone();
                             div()
@@ -2434,7 +2434,7 @@ mod tests {
         cx.update(|_, cx| {
             app.update(cx, |app, cx| {
                 app.push_active_alerts(
-                    vec![Notice { target: Target::Task(t1.id), title: t1.title.clone(), at, constant: true }],
+                    vec![Notice { target: Target::Task(t1.id), title: t1.title.clone(), at, constant: true, has_goal: false }],
                     cx,
                 );
             });
@@ -2453,7 +2453,7 @@ mod tests {
         cx.update(|_, cx| {
             app.update(cx, |app, cx| {
                 app.push_active_alerts(
-                    vec![Notice { target: Target::Task(t2.id), title: t2.title.clone(), at, constant: false }],
+                    vec![Notice { target: Target::Task(t2.id), title: t2.title.clone(), at, constant: false, has_goal: false }],
                     cx,
                 );
             });

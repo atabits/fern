@@ -38,19 +38,25 @@ mod tray;
 mod updater;
 mod user_themes;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use anyhow::{Context as _, Result};
 use fern_core::Store;
-use gpui::{App, Bounds, WindowBounds, WindowOptions, prelude::*, px, size};
+use gpui::{App, Bounds, Global, WindowBounds, WindowOptions, prelude::*, px, size};
 
 use crate::app_view::AppView;
 use assets::Assets;
 use crate::i18n::{CurrentLocale, Locale};
 
+/// Path to the on-disk SQLite database so background workers can open a WAL connection
+/// off the foreground UI thread.
+pub(crate) struct DbPath(pub PathBuf);
+
+impl Global for DbPath {}
+
 /// Opens the data, and whether it was just created: the first start.
-fn open_store(dir: &Path) -> Result<(Store, bool)> {
+fn open_store(dir: &Path) -> Result<(Store, bool, PathBuf)> {
     std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
     let path = dir.join("tasks.db");
     let first_start = !path.exists();
@@ -67,7 +73,7 @@ fn open_store(dir: &Path) -> Result<(Store, bool)> {
     if let Err(err) = store.compact_sync_log() {
         eprintln!("failed to compact the sync log: {err:#}");
     }
-    Ok((store, first_start))
+    Ok((store, first_start, path))
 }
 
 /// The first start fills the Inbox with a few tips, the first one on top.
@@ -89,7 +95,7 @@ fn main() -> Result<()> {
         None => return Ok(()),
     };
 
-    let (store, first_start) = open_store(&dir)?;
+    let (store, first_start, db_path) = open_store(&dir)?;
     let store = Rc::new(store);
     let locale = store
         .setting("locale")?
@@ -109,6 +115,7 @@ fn main() -> Result<()> {
     let platform = gpui_platform::current_platform(false);
     let text_system = platform.text_system();
     gpui::Application::with_platform(platform).with_assets(Assets).run(move |cx: &mut App| {
+        cx.set_global(DbPath(db_path));
         ui::init_label_metrics(text_system, cx);
         theme::init(cx);
         user_themes::load(cx);

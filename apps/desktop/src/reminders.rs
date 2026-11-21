@@ -1,12 +1,17 @@
 //! Fires task reminders as desktop notifications while the app runs, and keeps them for the
 //! sidebar's notification bell together with the ones missed while the app was closed.
 
+use std::path::Path;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
+#[cfg(windows)]
+use std::time::Instant;
 
 use chrono::{Local, NaiveDateTime};
 use fern_core::{Id, Store, reminder};
-use gpui::{AnyWindowHandle, Context};
+use gpui::{AnyWindowHandle, AppContext as _, Context};
 
 use crate::app_view::AppView;
 use crate::i18n;
@@ -17,9 +22,72 @@ const CHECK_EVERY: Duration = Duration::from_secs(20);
 /// How often constant reminders ("annoying alerts") re-notify while unacknowledged.
 pub const ANNOYING_REPEAT_SECS: u64 = 60;
 const ANNOYING_MAX_REPEATS: usize = 15;
+/// Maximum number of concurrent interactive toast waiter OS threads.
+const MAX_TOAST_WAITERS: usize = 8;
+/// Maximum time an interactive toast waiter stays alive waiting for a click.
+#[cfg(windows)]
+const TOAST_WAIT_TIMEOUT: Duration = Duration::from_secs(600);
+/// Wake interval inside the waiter loop to detect dropped receivers without blocking 600s.
+#[cfg(windows)]
+const TOAST_POLL_SLICE: Duration = Duration::from_secs(5);
 /// The setting with the last time reminders were checked, to find the ones missed in between.
 const CHECKED_AT: &str = "reminders_checked_at";
 const STAMP_FORMAT: &str = "%Y-%m-%dT%H:%M:%S";
+
+static ACTIVE_WAITERS: AtomicUsize = AtomicUsize::new(0);
+
+struct WaiterSlot;
+
+impl WaiterSlot {
+    fn try_acquire() -> Option<Self> {
+        let mut current = ACTIVE_WAITERS.load(Ordering::Acquire);
+        loop {
+            if current >= MAX_TOAST_WAITERS {
+                return None;
+            }
+            match ACTIVE_WAITERS.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(Self),
+                Err(next) => current = next,
+            }
+        }
+    }
+}
+
+impl Drop for WaiterSlot {
+    fn drop(&mut self) {
+        ACTIVE_WAITERS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Dropping this handle cancels the pending toast waiter thread immediately.
+struct ToastCancel {
+    slot: Arc<Mutex<Option<mpsc::Sender<Option<Reply>>>>>,
+}
+
+impl ToastCancel {
+    fn inert() -> Self {
+        Self { slot: Arc::new(Mutex::new(None)) }
+    }
+
+    fn cancel(&self) {
+        if let Ok(mut guard) = self.slot.lock()
+            && let Some(sender) = guard.take()
+        {
+            sender.send(None).ok();
+        }
+    }
+}
+
+impl Drop for ToastCancel {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
 
 /// What a reminder is about.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -129,6 +197,19 @@ pub struct Notice {
     pub title: String,
     pub at: NaiveDateTime,
     pub constant: bool,
+    /// Cached `habit.goal.is_some()` for `Target::Habit` so `render()` never queries SQLite.
+    pub has_goal: bool,
+}
+
+impl Notice {
+    /// The actions offered for this notice without hitting the database.
+    pub fn actions(&self) -> &'static [NoticeAction] {
+        match self.target {
+            Target::Task(_) => NoticeAction::for_task(),
+            Target::Countdown(_) => NoticeAction::for_countdown(),
+            Target::Habit(_) => NoticeAction::for_habit(self.has_goal),
+        }
+    }
 }
 
 /// The bell's notifications, newest first, and how many are unread.
@@ -161,6 +242,7 @@ pub fn fired(store: &Store, after: NaiveDateTime, until: NaiveDateTime) -> Vec<N
             title: task.title.clone(),
             at,
             constant: task.constant_reminder,
+            has_goal: false,
         })
         .collect();
     let habits = store.habits().unwrap_or_default();
@@ -173,6 +255,7 @@ pub fn fired(store: &Store, after: NaiveDateTime, until: NaiveDateTime) -> Vec<N
                 title: habit.name.clone(),
                 at,
                 constant: habit.constant_reminder,
+                has_goal: habit.goal.is_some(),
             }),
     );
     let countdowns = store.countdowns().unwrap_or_default();
@@ -184,6 +267,7 @@ pub fn fired(store: &Store, after: NaiveDateTime, until: NaiveDateTime) -> Vec<N
                 title: countdown.name.clone(),
                 at,
                 constant: countdown.constant_reminder,
+                has_goal: false,
             }),
     );
     let snoozes = store.habit_snoozes().unwrap_or_default();
@@ -195,12 +279,13 @@ pub fn fired(store: &Store, after: NaiveDateTime, until: NaiveDateTime) -> Vec<N
                 title: habit.name.clone(),
                 at,
                 constant: habit.constant_reminder,
+                has_goal: habit.goal.is_some(),
             }),
     );
     notices
 }
 
-/// The actions a notice offers.
+#[cfg(test)]
 pub fn actions(store: &Store, target: Target) -> &'static [NoticeAction] {
     match target {
         Target::Task(_) => NoticeAction::for_task(),
@@ -252,14 +337,21 @@ pub(crate) fn build_toast_xml(title: &str, body: &str, actions: &[(&str, &str)],
 }
 
 #[cfg(windows)]
+struct ToastWait {
+    tx: futures::channel::oneshot::Sender<Reply>,
+    done_tx: Arc<Mutex<Option<mpsc::Sender<Option<Reply>>>>>,
+    done_rx: mpsc::Receiver<Option<Reply>>,
+    _slot: WaiterSlot,
+}
+
+#[cfg(windows)]
 fn show_windows_toast(
     title: &str,
     body: &str,
     actions: &[(&str, &str)],
     constant: bool,
-    tx: futures::channel::oneshot::Sender<Reply>,
+    wait: Option<ToastWait>,
 ) -> windows::core::Result<()> {
-    use std::sync::{Arc, Mutex, mpsc};
     use windows::Data::Xml::Dom::XmlDocument;
     use windows::Foundation::TypedEventHandler;
     use windows::UI::Notifications::{
@@ -284,8 +376,16 @@ fn show_windows_toast(
     doc.LoadXml(&HSTRING::from(xml))?;
     let toast = ToastNotification::CreateToastNotification(&doc)?;
 
-    let (done_tx, done_rx) = mpsc::channel::<Option<Reply>>();
-    let done_tx = Arc::new(Mutex::new(Some(done_tx)));
+    let notifier = ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(
+        r"{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe",
+    ))?;
+
+    let Some(ToastWait { tx, done_tx, done_rx, _slot }) = wait else {
+        // Fire-and-forget (e.g. daily summary or waiter cap reached): show and exit immediately.
+        notifier.Show(&toast)?;
+        return Ok(());
+    };
+
     let send_once = |slot: &Arc<Mutex<Option<mpsc::Sender<Option<Reply>>>>>, reply: Option<Reply>| {
         if let Ok(mut guard) = slot.lock()
             && let Some(sender) = guard.take()
@@ -329,13 +429,22 @@ fn show_windows_toast(
         },
     ))?;
 
-    let notifier = ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(
-        r"{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe",
-    ))?;
     notifier.Show(&toast)?;
 
-    if let Ok(Some(reply)) = done_rx.recv_timeout(Duration::from_secs(600)) {
-        tx.send(reply).ok();
+    let deadline = Instant::now() + TOAST_WAIT_TIMEOUT;
+    loop {
+        if tx.is_canceled() {
+            break;
+        }
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else { break };
+        match done_rx.recv_timeout(remaining.min(TOAST_POLL_SLICE)) {
+            Ok(Some(reply)) => {
+                tx.send(reply).ok();
+                break;
+            }
+            Ok(None) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+        }
     }
     toast.RemoveActivated(act_token).ok();
     toast.RemoveDismissed(dis_token).ok();
@@ -343,22 +452,55 @@ fn show_windows_toast(
     Ok(())
 }
 
-/// Shows a desktop notification with its actions as buttons, and waits on a thread of its own for
-/// the one clicked, if any.
+/// Shows a fire-and-forget desktop notification without blocking an OS waiter thread.
+fn show_notification_only(title: String, body: String, constant: bool) {
+    #[cfg(windows)]
+    {
+        std::thread::spawn(move || {
+            if let Err(err) = show_windows_toast(&title, &body, &[], constant, None) {
+                eprintln!("failed to show a reminder: {err:#}");
+            }
+        });
+    }
+    #[cfg(not(windows))]
+    {
+        std::thread::spawn(move || {
+            let mut notification = notify_rust::Notification::new();
+            notification.appname("Fern").summary(&title).body(&body).icon("alarm-clock");
+            if constant {
+                notification.timeout(notify_rust::Timeout::Never);
+            }
+            if let Err(err) = notification.show() {
+                eprintln!("failed to show a reminder: {err}");
+            }
+        });
+    }
+}
+
+/// Shows a desktop notification with its actions as buttons, and waits on a bounded,
+/// cancellable waiter thread for the one clicked, if any.
 #[cfg(windows)]
 fn show(
     title: String,
     body: String,
     actions: Vec<(&'static str, &'static str)>,
     constant: bool,
-) -> futures::channel::oneshot::Receiver<Reply> {
+) -> (futures::channel::oneshot::Receiver<Reply>, ToastCancel) {
     let (tx, rx) = futures::channel::oneshot::channel();
+    let Some(slot) = WaiterSlot::try_acquire() else {
+        show_notification_only(title, body, constant);
+        return (rx, ToastCancel::inert());
+    };
+    let (done_tx, done_rx) = mpsc::channel::<Option<Reply>>();
+    let done_slot = Arc::new(Mutex::new(Some(done_tx)));
+    let cancel = ToastCancel { slot: Arc::clone(&done_slot) };
     std::thread::spawn(move || {
-        if let Err(err) = show_windows_toast(&title, &body, &actions, constant, tx) {
+        let wait = ToastWait { tx, done_tx: done_slot, done_rx, _slot: slot };
+        if let Err(err) = show_windows_toast(&title, &body, &actions, constant, Some(wait)) {
             eprintln!("failed to show a reminder: {err:#}");
         }
     });
-    rx
+    (rx, cancel)
 }
 
 #[cfg(not(windows))]
@@ -367,9 +509,14 @@ fn show(
     body: String,
     actions: Vec<(&'static str, &'static str)>,
     constant: bool,
-) -> futures::channel::oneshot::Receiver<Reply> {
+) -> (futures::channel::oneshot::Receiver<Reply>, ToastCancel) {
     let (tx, rx) = futures::channel::oneshot::channel();
+    let Some(_slot) = WaiterSlot::try_acquire() else {
+        show_notification_only(title, body, constant);
+        return (rx, ToastCancel::inert());
+    };
     std::thread::spawn(move || {
+        let _guard = _slot;
         let mut notification = notify_rust::Notification::new();
         notification.appname("Fern").summary(&title).body(&body).icon("alarm-clock");
         // Settings → Notifications → "Constant Reminder": the notification stays until dismissed.
@@ -397,25 +544,43 @@ fn show(
             Err(err) => eprintln!("failed to show a reminder: {err}"),
         }
     });
-    rx
+    (rx, ToastCancel::inert())
 }
 
 /// The day the daily notification was last shown.
 const DAILY_SHOWN: &str = "daily_notification_shown";
 
-/// The original's "Daily Notifications": once a day at its time, today's open tasks in one
-/// notification.
-fn show_daily(store: &Store, settings: fern_core::Notifications, now: NaiveDateTime, cx: &mut gpui::AsyncApp) {
-    let last = store.setting(DAILY_SHOWN).ok().flatten().and_then(|d| chrono::NaiveDate::parse_from_str(&d, "%Y-%m-%d").ok());
+/// Checks whether the daily summary notification is due, records today as shown, and returns
+/// today's open task titles. Runs on a background thread when a WAL `DbPath` is available.
+fn collect_daily_titles(
+    store: &Store,
+    settings: fern_core::Notifications,
+    now: NaiveDateTime,
+) -> Option<Vec<String>> {
+    let last = store
+        .setting(DAILY_SHOWN)
+        .ok()
+        .flatten()
+        .and_then(|d| chrono::NaiveDate::parse_from_str(&d, "%Y-%m-%d").ok());
     if !settings.daily_due(now, last) {
-        return;
+        return None;
     }
-    store.set_setting(DAILY_SHOWN, &now.date().format("%Y-%m-%d").to_string()).ok();
+    set_setting_with_retry(store, DAILY_SHOWN, &now.date().format("%Y-%m-%d").to_string());
     let tasks = store.tasks_in(&fern_core::View::Today, now.date()).unwrap_or_default();
     let open: Vec<String> = tasks.into_iter().filter(|t| !t.is_closed()).map(|t| t.title).collect();
-    let (title, body) = cx.update(|cx| daily_text(&open, i18n::t(cx)));
-    // Nothing to answer: a click on it only opens the app where the system does that.
-    drop(show(title, body, Vec::new(), settings.constant));
+    Some(open)
+}
+
+/// Writes a setting, retrying briefly on transient SQLite busy errors from concurrent WAL writes.
+fn set_setting_with_retry(store: &Store, key: &str, value: &str) {
+    for attempt in 0..4 {
+        if store.set_setting(key, value).is_ok() {
+            return;
+        }
+        if attempt < 3 {
+            std::thread::sleep(Duration::from_millis(25 * (attempt + 1)));
+        }
+    }
 }
 
 /// The daily notification's title and body: how many tasks today, and the first few.
@@ -433,12 +598,14 @@ fn daily_text(titles: &[String], strings: &i18n::Strings) -> (String, String) {
 
 fn spawn_reply_listener(
     reply: futures::channel::oneshot::Receiver<Reply>,
+    _cancel: Option<ToastCancel>,
     notice: Notice,
     window: AnyWindowHandle,
     this: gpui::WeakEntity<AppView>,
     cx: &gpui::AsyncApp,
 ) {
     cx.spawn(async move |cx| {
+        let _cancel = _cancel;
         let Ok(reply) = reply.await else { return };
         cx.update(|cx| {
             window
@@ -451,41 +618,114 @@ fn spawn_reply_listener(
     .detach();
 }
 
+struct PollResult {
+    settings: fern_core::Notifications,
+    daily_titles: Option<Vec<String>>,
+    notices: Vec<Notice>,
+}
+
+fn poll_once(store: &Store, last: NaiveDateTime, now: NaiveDateTime) -> PollResult {
+    let settings = store.preferences().unwrap_or_default().notifications;
+    let daily_titles = collect_daily_titles(store, settings, now);
+    let notices = fired(store, last, now);
+    set_setting_with_retry(store, CHECKED_AT, &now.format(STAMP_FORMAT).to_string());
+    PollResult { settings, daily_titles, notices }
+}
+
+fn open_or_reuse_bg_store(bg_store: Option<Store>, db_path: &Path) -> Option<Store> {
+    bg_store.or_else(|| Store::open(db_path).ok())
+}
+
 /// Starts checking for reminders: collects the ones missed since the last run, then shows new
-/// ones as desktop notifications.
+/// ones as desktop notifications. All periodic SQLite polling runs off the foreground UI thread.
 pub fn start(store: Rc<Store>, window: AnyWindowHandle, cx: &mut Context<AppView>) {
     // UI screenshots run the app with demo data; they must not notify on the real desktop.
     if std::env::var_os("FERN_DEV_STATE").is_some() {
         return;
     }
+    let db_path = cx.try_global::<crate::DbPath>().map(|p| p.0.clone());
     cx.spawn(async move |this, cx| {
         let now = Local::now().naive_local();
-        let checked_at = store
-            .setting(CHECKED_AT)
-            .ok()
-            .flatten()
-            .and_then(|stamp| NaiveDateTime::parse_from_str(&stamp, STAMP_FORMAT).ok());
         let mut last = now;
-        if let Some(checked_at) = checked_at {
-            let missed = fired(&store, checked_at, now);
-            if this.update(cx, |this, cx| this.add_notices(missed, cx)).is_err() {
-                return;
-            }
+        let mut bg_store: Option<Store> = None;
+
+        // Collect missed reminders off the UI thread when backed by an on-disk WAL DB.
+        let missed = if let Some(path) = db_path.clone() {
+            let (returned_store, missed) = cx
+                .background_spawn(async move {
+                    let bg = open_or_reuse_bg_store(None, &path);
+                    let missed = if let Some(ref s) = bg {
+                        let checked_at = s
+                            .setting(CHECKED_AT)
+                            .ok()
+                            .flatten()
+                            .and_then(|stamp| NaiveDateTime::parse_from_str(&stamp, STAMP_FORMAT).ok());
+                        let missed = checked_at.map(|after| fired(s, after, now)).unwrap_or_default();
+                        set_setting_with_retry(s, CHECKED_AT, &now.format(STAMP_FORMAT).to_string());
+                        missed
+                    } else {
+                        Vec::new()
+                    };
+                    (bg, missed)
+                })
+                .await;
+            bg_store = returned_store;
+            missed
+        } else {
+            let checked_at = store
+                .setting(CHECKED_AT)
+                .ok()
+                .flatten()
+                .and_then(|stamp| NaiveDateTime::parse_from_str(&stamp, STAMP_FORMAT).ok());
+            let missed = checked_at.map(|after| fired(&store, after, now)).unwrap_or_default();
+            store.set_setting(CHECKED_AT, &now.format(STAMP_FORMAT).to_string()).ok();
+            missed
+        };
+        if !missed.is_empty() && this.update(cx, |this, cx| this.add_notices(missed, cx)).is_err() {
+            return;
         }
+
         loop {
-            store.set_setting(CHECKED_AT, &last.format(STAMP_FORMAT).to_string()).ok();
             cx.background_executor().timer(CHECK_EVERY).await;
+            // Exit promptly if AppView has been dropped instead of leaking the loop forever.
+            if this.upgrade().is_none() {
+                break;
+            }
             let now = Local::now().naive_local();
-            let settings = store.preferences().unwrap_or_default().notifications;
-            show_daily(&store, settings, now, cx);
-            let notices = fired(&store, last, now);
+            let poll = if let Some(path) = db_path.clone() {
+                let taken_store = bg_store.take();
+                let prev = last;
+                let (returned_store, poll) = cx
+                    .background_spawn(async move {
+                        let bg = open_or_reuse_bg_store(taken_store, &path);
+                        let poll = bg.as_ref().map(|s| poll_once(s, prev, now));
+                        (bg, poll)
+                    })
+                    .await;
+                bg_store = returned_store;
+                match poll {
+                    Some(poll) => poll,
+                    None => continue,
+                }
+            } else {
+                poll_once(&store, last, now)
+            };
             last = now;
-            if notices.is_empty() {
+
+            if this.upgrade().is_none() {
+                break;
+            }
+            if let Some(open_titles) = poll.daily_titles {
+                let (title, body) = cx.update(|cx| daily_text(&open_titles, i18n::t(cx)));
+                // Fire-and-forget: never blocks an OS thread waiting for a reply.
+                show_notification_only(title, body, poll.settings.constant);
+            }
+            if poll.notices.is_empty() {
                 continue;
             }
             // With desktop reminders off, reminders only go to the bell.
-            if !settings.desktop {
-                if this.update(cx, |this, cx| this.add_notices(notices, cx)).is_err() {
+            if !poll.settings.desktop {
+                if this.update(cx, |this, cx| this.add_notices(poll.notices, cx)).is_err() {
                     break;
                 }
                 continue;
@@ -493,12 +733,12 @@ pub fn start(store: Rc<Store>, window: AnyWindowHandle, cx: &mut Context<AppView
             type ShownNotice = (Notice, String, Vec<(&'static str, &'static str)>);
             let shown: Vec<ShownNotice> = cx.update(|cx| {
                 let strings = i18n::t(cx);
-                notices
+                poll.notices
                     .into_iter()
                     .map(|mut n| {
-                        n.constant = settings.constant || n.constant;
+                        n.constant = poll.settings.constant || n.constant;
                         let due = task_rows::due_label(n.at.date(), Some(n.at.time()), now.date(), strings).0;
-                        let buttons = actions(&store, n.target).iter().map(|a| (a.key(), a.label(strings))).collect();
+                        let buttons = n.actions().iter().map(|a| (a.key(), a.label(strings))).collect();
                         (n, due, buttons)
                     })
                     .collect()
@@ -515,12 +755,16 @@ pub fn start(store: Rc<Store>, window: AnyWindowHandle, cx: &mut Context<AppView
             }
             for (notice, due, buttons) in shown {
                 let constant = notice.constant;
-                let reply = show(notice.title.clone(), due.clone(), buttons.clone(), constant);
-                spawn_reply_listener(reply, notice.clone(), window, this.clone(), cx);
+                let (reply, initial_cancel) = show(notice.title.clone(), due.clone(), buttons.clone(), constant);
                 if constant {
+                    spawn_reply_listener(reply, None, notice.clone(), window, this.clone(), cx);
                     let store = Rc::clone(&store);
+                    let repeat_db_path = db_path.clone();
                     let this = this.clone();
                     cx.spawn(async move |cx| {
+                        // Hold only the latest repeat's cancel guard: each repeat drops the
+                        // previous toast waiter so at most 1 OS thread stays alive per alert.
+                        let mut _active_cancel = initial_cancel;
                         for _ in 0..ANNOYING_MAX_REPEATS {
                             cx.background_executor().timer(Duration::from_secs(ANNOYING_REPEAT_SECS)).await;
                             let active = matches!(
@@ -531,20 +775,33 @@ pub fn start(store: Rc<Store>, window: AnyWindowHandle, cx: &mut Context<AppView
                                 break;
                             }
                             if let Target::Task(id) = notice.target {
-                                let still_open = store
-                                    .task(id)
-                                    .ok()
-                                    .flatten()
-                                    .is_some_and(|t| !t.is_closed() && !t.is_deleted() && t.snoozed_until.is_none());
+                                let still_open = if let Some(path) = repeat_db_path.clone() {
+                                    cx.background_spawn(async move {
+                                        Store::open(&path)
+                                            .ok()
+                                            .and_then(|s| s.task(id).ok().flatten())
+                                            .is_some_and(|t| !t.is_closed() && !t.is_deleted() && t.snoozed_until.is_none())
+                                    })
+                                    .await
+                                } else {
+                                    store
+                                        .task(id)
+                                        .ok()
+                                        .flatten()
+                                        .is_some_and(|t| !t.is_closed() && !t.is_deleted() && t.snoozed_until.is_none())
+                                };
                                 if !still_open {
                                     break;
                                 }
                             }
-                            let repeat_reply = show(notice.title.clone(), due.clone(), buttons.clone(), true);
-                            spawn_reply_listener(repeat_reply, notice.clone(), window, this.clone(), cx);
+                            let (repeat_reply, repeat_cancel) = show(notice.title.clone(), due.clone(), buttons.clone(), true);
+                            _active_cancel = repeat_cancel;
+                            spawn_reply_listener(repeat_reply, None, notice.clone(), window, this.clone(), cx);
                         }
                     })
                     .detach();
+                } else {
+                    spawn_reply_listener(reply, Some(initial_cancel), notice, window, this.clone(), cx);
                 }
             }
         }
@@ -560,7 +817,7 @@ mod tests {
 
     fn notice(title: &str, hour: u32) -> Notice {
         let at = NaiveDate::from_ymd_opt(2026, 10, 18).unwrap().and_hms_opt(hour, 0, 0).unwrap();
-        Notice { target: Target::Task(uuid::Uuid::now_v7()), title: title.into(), at, constant: false }
+        Notice { target: Target::Task(uuid::Uuid::now_v7()), title: title.into(), at, constant: false, has_goal: false }
     }
 
     #[test]
@@ -599,6 +856,8 @@ mod tests {
         store.set_habit_reminders(habit.id, &[chrono::NaiveTime::from_hms_opt(9, 30, 0).unwrap()]).unwrap();
         let notices = fired(&store, at(9), at(10));
         assert_eq!(notices.iter().map(|n| n.target).collect::<Vec<_>>(), [Target::Habit(habit.id)]);
+        assert!(!notices[0].has_goal);
+        assert_eq!(notices[0].actions(), [NoticeAction::Snooze, NoticeAction::CheckIn]);
         store.toggle_checkin(habit.id, day).unwrap();
         assert!(fired(&store, at(9), at(10)).is_empty(), "a habit done today is not reminded");
     }
@@ -627,11 +886,26 @@ mod tests {
         // A snoozed habit reminder and a snoozed task reminder both fire again when their time comes.
         let at = NaiveDate::from_ymd_opt(2026, 10, 18).unwrap().and_hms_opt(9, 0, 0).unwrap();
         store.snooze_habit(read.id, at + chrono::Duration::minutes(SNOOZE_MINUTES)).unwrap();
+        store.snooze_habit(water.id, at + chrono::Duration::minutes(SNOOZE_MINUTES)).unwrap();
         store.snooze_task(task.id, at + chrono::Duration::minutes(5)).unwrap();
         store.set_task_constant_reminder(task.id, true).unwrap();
         let notices = fired(&store, at, at + chrono::Duration::minutes(20));
         assert!(notices.iter().any(|n| n.target == Target::Task(task.id) && n.constant));
-        assert!(notices.iter().any(|n| n.target == Target::Habit(read.id)));
+        assert!(notices.iter().any(|n| n.target == Target::Habit(read.id) && !n.has_goal));
+        let water_notice = notices.iter().find(|n| n.target == Target::Habit(water.id)).unwrap();
+        assert!(water_notice.has_goal);
+        assert_eq!(water_notice.actions(), [NoticeAction::Snooze, NoticeAction::Record, NoticeAction::PlusOne]);
+    }
+
+    #[test]
+    fn waiter_slots_are_bounded_and_released_on_drop() {
+        let mut held = Vec::new();
+        for _ in 0..MAX_TOAST_WAITERS {
+            held.push(WaiterSlot::try_acquire().expect("slot should be available"));
+        }
+        assert!(WaiterSlot::try_acquire().is_none(), "exceeding MAX_TOAST_WAITERS must fail");
+        held.pop();
+        assert!(WaiterSlot::try_acquire().is_some(), "dropping a slot must free it");
     }
 
     #[test]

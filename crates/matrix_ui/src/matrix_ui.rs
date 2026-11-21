@@ -1094,7 +1094,16 @@ impl MatrixView {
         let has_location = task.location.as_deref().is_some_and(|l| !l.trim().is_empty());
         let has_children = !self.show_subtasks && !self.child_subtasks(id).is_empty();
         let expanded = has_children && self.expanded_parents.contains(&(quadrant, id));
-        let has_subtasks = task.checklist.is_some() || self.tasks.iter().any(|t| t.parent_id == Some(id));
+        let all_subtasks: Vec<&Task> = self
+            .tasks
+            .iter()
+            .filter(|t| t.parent_id == Some(id) && !t.is_deleted() && !t.is_wont_do())
+            .collect();
+        let subtask_progress = (!all_subtasks.is_empty()).then(|| {
+            let done_subs = all_subtasks.iter().filter(|t| t.is_completed()).count();
+            (done_subs, all_subtasks.len())
+        });
+        let checklist_progress = task.checklist;
         let has_reminder = !task.reminders.is_empty();
         let dragged = DraggedTask { id, title: task.title.clone().into() };
         let tags: Vec<AnyElement> =
@@ -1207,8 +1216,21 @@ impl MatrixView {
                     .when(has_location, |el| {
                         el.child(Icon::new(IconName::MapPin).size(IconSize::XSmall).color(Color::Muted))
                     })
-                    .when(has_subtasks, |el| {
-                        el.child(Icon::new(IconName::ListTree).size(IconSize::XSmall).color(Color::Muted))
+                    .when_some(checklist_progress, |el, (done_items, total)| {
+                        el.child(
+                            h_flex()
+                                .gap_0p5()
+                                .child(Icon::new(IconName::ListChecks).size(IconSize::XSmall).color(Color::Muted))
+                                .child(Label::new(format!("{done_items}/{total}")).size(LabelSize::XSmall).color(Color::Muted)),
+                        )
+                    })
+                    .when_some(subtask_progress, |el, (done_subs, total_subs)| {
+                        el.child(
+                            h_flex()
+                                .gap_0p5()
+                                .child(Icon::new(IconName::ListTree).size(IconSize::XSmall).color(Color::Muted))
+                                .child(Label::new(format!("{done_subs}/{total_subs}")).size(LabelSize::XSmall).color(Color::Muted)),
+                        )
                     })
                     .when(has_reminder, |el| {
                         el.child(

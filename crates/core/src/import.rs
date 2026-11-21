@@ -215,6 +215,14 @@ pub fn reminder_minutes(trigger: &str, all_day: bool) -> Option<i64> {
     Some(if all_day { 9 * 60 - offset } else { -offset })
 }
 
+fn is_inbox_name(name: &str) -> bool {
+    let trimmed = name.trim();
+    trimmed.is_empty()
+        || trimmed.eq_ignore_ascii_case("inbox")
+        || trimmed == "收集箱"
+        || trimmed.to_lowercase() == "входящие"
+}
+
 fn local(time: DateTime<FixedOffset>) -> NaiveDateTime {
     time.with_timezone(&Local).naive_local()
 }
@@ -254,7 +262,7 @@ impl Store {
         imported_columns.sort_by_key(|item| item.column_order);
         // Resolve lists in file order, then sections in their explicit column order below.
         for item in &backup {
-            if item.list.is_empty() || item.list.eq_ignore_ascii_case("inbox") { continue; }
+            if is_inbox_name(&item.list) { continue; }
             let folder = if item.folder.is_empty() { None } else {
                 let key = item.folder.to_lowercase();
                 Some(match folders.get(&key) {
@@ -274,7 +282,7 @@ impl Store {
             }
         }
         let list_for = |item: &BackupTask| {
-            if item.list.is_empty() || item.list.eq_ignore_ascii_case("inbox") { return None; }
+            if is_inbox_name(&item.list) { return None; }
             let folder = folders.get(&item.folder.to_lowercase()).copied();
             lists.get(&(folder, item.list.to_lowercase())).copied()
         };
@@ -464,6 +472,23 @@ mod tests {
 
         let today = NaiveDate::from_ymd_opt(2026, 10, 18).unwrap();
         assert_eq!(store.tasks_in(&View::Inbox, today)?.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn localized_inbox_names_import_into_inbox() -> Result<()> {
+        let csv = "\
+\"List Name\",\"Title\"
+\"Входящие\",\"Позвонить\"
+\"收集箱\",\"买菜\"
+\"Work\",\"Review\"
+";
+        let store = Store::open_in_memory()?;
+        let summary = store.import_ticktick(csv)?;
+        assert_eq!(summary, ImportSummary { tasks: 3, lists: 1 });
+        let tasks = store.tasks()?;
+        assert_eq!(tasks.iter().filter(|t| t.list_id.is_none()).count(), 2);
+        assert_eq!(store.lists()?.len(), 1);
         Ok(())
     }
 }

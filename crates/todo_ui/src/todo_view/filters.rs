@@ -73,6 +73,7 @@ fn chip(
     selected: bool,
     cx: &App,
 ) -> gpui::Stateful<gpui::Div> {
+    let colors = cx.theme().colors();
     div()
         .id(id.into())
         .min_h(px(28.))
@@ -82,12 +83,16 @@ fn chip(
         .items_center()
         .rounded(px(6.))
         .cursor_pointer()
-        .bg(if selected {
-            cx.theme().colors().accent.opacity(0.25)
-        } else {
-            cx.theme().colors().element_hover
+        .when(selected, |el| {
+            el.bg(colors.accent.opacity(0.22))
+                .hover(|s| s.bg(colors.accent.opacity(0.32)))
         })
-        .hover(|s| s.bg(cx.theme().colors().element_hover))
+        .when(!selected, |el| {
+            el.bg(colors.surface_background)
+                .border_1()
+                .border_color(colors.border)
+                .hover(|s| s.bg(colors.element_hover))
+        })
         .child(Label::new(label).size(LabelSize::Small).color(if selected {
             Color::Accent
         } else {
@@ -110,6 +115,10 @@ impl TodoView {
                 edit.error = None;
             }
             cx.notify();
+        })
+        .detach();
+        cx.subscribe(&input, |this, _, _: &Submitted, cx| {
+            this.save_filter_inner(None, cx);
         })
         .detach();
         input
@@ -237,6 +246,9 @@ impl TodoView {
         cx.notify();
     }
     fn save_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.save_filter_inner(Some(window), cx);
+    }
+    fn save_filter_inner(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
         let Some(edit) = self.filter_edit.as_mut() else {
             return;
         };
@@ -245,7 +257,9 @@ impl TodoView {
             Ok(_) => {
                 edit.preview = false;
                 edit.error = Some(i18n::t(cx).filter_name_error);
-                window.focus(&edit.name.focus_handle(cx), cx);
+                if let Some(window) = window {
+                    window.focus(&edit.name.focus_handle(cx), cx);
+                }
                 cx.notify();
                 return;
             }
@@ -279,7 +293,7 @@ impl TodoView {
             cx.notify();
         }
     }
-    fn render_filter_preview(&self, edit: &FilterEdit, cx: &mut Context<Self>) -> AnyElement {
+    fn render_filter_preview(&self, edit: &FilterEdit, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let strings = i18n::t(cx);
         let theme = cx.theme().clone();
         let today = Self::today();
@@ -393,9 +407,11 @@ impl TodoView {
                 .items_center()
                 .rounded(px(6.))
                 .cursor_pointer()
-                .when(primary, |el| el.bg(theme.colors().accent))
+                .when(primary, |el| el.bg(theme.colors().accent).hover(|s| s.opacity(0.9)))
                 .when(!primary, |el| {
-                    el.border_1().border_color(theme.colors().border)
+                    el.border_1()
+                        .border_color(theme.colors().border)
+                        .hover(|s| s.bg(theme.colors().element_hover))
                 })
                 .child(Label::new(label).size(LabelSize::Small).when(primary, |label| label.color(Color::OnAccent)))
         };
@@ -410,7 +426,7 @@ impl TodoView {
             .child(
                 v_flex()
                     .id("filter-preview-dialog")
-                    .w(px(560.))
+                    .w(px(560.).min(window.viewport_size().width - px(32.)))
                     .p_4()
                     .gap_2()
                     .rounded(px(10.))
@@ -820,7 +836,7 @@ impl TodoView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         if edit.preview {
-            return self.render_filter_preview(edit, cx);
+            return self.render_filter_preview(edit, window, cx);
         }
         let strings = i18n::t(cx);
         let theme = cx.theme().clone();

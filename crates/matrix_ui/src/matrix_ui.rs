@@ -1364,7 +1364,7 @@ impl MatrixView {
                             .child(Label::new(strings.today))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.task_menu = None;
-                                let _ = this.store.set_due(id, Some(today), task.due_time);
+                                let _ = this.store.move_dates(id, today);
                                 desktop_common::data_version::data_changed(cx.entity_id(), cx);
                                 this.reload(cx);
                             })),
@@ -1376,7 +1376,7 @@ impl MatrixView {
                             .child(Label::new(strings.tomorrow))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.task_menu = None;
-                                let _ = this.store.set_due(id, Some(today + Duration::days(1)), task.due_time);
+                                let _ = this.store.move_dates(id, today + Duration::days(1));
                                 desktop_common::data_version::data_changed(cx.entity_id(), cx);
                                 this.reload(cx);
                             })),
@@ -1415,6 +1415,7 @@ impl MatrixView {
                                 cx.notify();
                             })),
                     )
+                    .child(div().my_1().child(Divider::horizontal()))
                     .child(
                         ListItem::new("mctx-delete")
                             .height(px(30.))

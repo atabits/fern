@@ -285,6 +285,30 @@ pub fn render(
             })
             .child(item)
     };
+    let calendar_day_badge = |text: String, color: Hsla| -> AnyElement {
+        v_flex()
+            .w(px(16.))
+            .h(px(16.))
+            .rounded(px(3.5))
+            .border_1()
+            .border_color(color.opacity(0.85))
+            .overflow_hidden()
+            .child(div().w_full().h(px(3.)).bg(color.opacity(0.85)))
+            .child(
+                div()
+                    .flex_1()
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_size(px(8.5))
+                    .line_height(px(10.))
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .text_color(color)
+                    .child(text),
+            )
+            .into_any_element()
+    };
     let smart = |view: View, label: &'static str, icon: IconName, count: Option<usize>| {
         // Every smart list but the Inbox can be hidden from its "…", as in the original.
         let menu = match view {
@@ -295,11 +319,16 @@ pub fn render(
             View::Summary => Some(SmartList::Summary),
             _ => None,
         };
+        let leading = match view {
+            View::Today => calendar_day_badge(Local::now().date_naive().day().to_string(), colors.list_text),
+            View::Next7Days => calendar_day_badge("7".to_owned(), colors.list_text),
+            _ => Icon::new(icon).color(colors.list_text).into_any_element(),
+        };
         item(
             format!("view-{label}"),
             view,
             label.into(),
-            Icon::new(icon).color(colors.list_text).into_any_element(),
+            leading,
             count,
             None,
             menu,

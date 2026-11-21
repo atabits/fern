@@ -5024,6 +5024,15 @@ impl Store {
         })
     }
 
+    pub fn batch_move_dates(&self, ids: &[Id], date: NaiveDate) -> Result<()> {
+        self.in_tx(|| {
+            for &id in ids {
+                self.move_dates(id, date)?;
+            }
+            Ok(())
+        })
+    }
+
     pub fn batch_set_priority(&self, ids: &[Id], priority: Priority) -> Result<()> {
         self.in_tx(|| {
             for &id in ids {

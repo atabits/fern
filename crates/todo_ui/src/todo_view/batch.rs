@@ -373,21 +373,21 @@ impl TodoView {
                                 .child(
                                     action_chip("batch-due-today", IconName::Sun, strings.today, false, Some(Color::Accent))
                                         .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.run_batch(false, cx, move |store, ids| store.batch_set_due(ids, Some(today), None));
+                                            this.run_batch(false, cx, move |store, ids| store.batch_move_dates(ids, today));
                                         })),
                                 )
                                 .child(
                                     action_chip("batch-due-tomorrow", IconName::Sunrise, strings.tomorrow, false, None)
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             let date = today + Duration::days(1);
-                                            this.run_batch(false, cx, move |store, ids| store.batch_set_due(ids, Some(date), None));
+                                            this.run_batch(false, cx, move |store, ids| store.batch_move_dates(ids, date));
                                         })),
                                 )
                                 .child(
                                     action_chip("batch-due-week", IconName::CalendarPlus, strings.next_week, false, None)
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             let date = today + Duration::days(7);
-                                            this.run_batch(false, cx, move |store, ids| store.batch_set_due(ids, Some(date), None));
+                                            this.run_batch(false, cx, move |store, ids| store.batch_move_dates(ids, date));
                                         })),
                                 )
                                 .child(
@@ -698,7 +698,7 @@ impl TodoView {
                 .child(
                     bar_btn("batch-bar-today", IconName::Sun, strings.today, Color::Icon)
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.run_batch(false, cx, move |store, ids| store.batch_set_due(ids, Some(today), None));
+                            this.run_batch(false, cx, move |store, ids| store.batch_move_dates(ids, today));
                         })),
                 )
                 .child(

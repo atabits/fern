@@ -2002,7 +2002,10 @@ impl TodoView {
         let today = Self::today();
         if self.is_multi_selecting() {
             let date = days.map(|d| today + Duration::days(d));
-            self.run_batch(false, cx, move |store, ids| store.batch_set_due(ids, date, None));
+            self.run_batch(false, cx, move |store, ids| match date {
+                Some(d) => store.batch_move_dates(ids, d),
+                None => store.batch_set_due(ids, None, None),
+            });
             return;
         }
         self.edit_selected(cx, move |store, task| {

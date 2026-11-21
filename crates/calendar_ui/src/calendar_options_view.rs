@@ -78,9 +78,15 @@ impl CalendarOptionsDialog {
     }
 
     fn header(&self, title: &'static str, cx: &mut Context<Self>) -> impl IntoElement {
+        let strings = i18n::t(cx);
         h_flex()
             .child(div().flex_1().text_size(px(16.)).font_weight(FontWeight::SEMIBOLD).child(title))
-            .child(IconButton::new("calendar-options-x", IconName::X).icon_color(Color::Muted).on_click(cx.listener(|_, _, _, cx| cx.emit(OptionsEvent::Closed))))
+            .child(
+                IconButton::new("calendar-options-x", IconName::X)
+                    .icon_color(Color::Muted)
+                    .tooltip(ui::Tooltip::text(strings.close))
+                    .on_click(cx.listener(|_, _, _, cx| cx.emit(OptionsEvent::Closed))),
+            )
     }
 
     fn render_main(&self, strings: &'static Strings, cx: &mut Context<Self>) -> Div {
@@ -91,7 +97,9 @@ impl CalendarOptionsDialog {
                 .id(id)
                 .h(px(40.))
                 .px_4()
+                .rounded(px(6.))
                 .cursor_pointer()
+                .hover(|s| s.bg(theme.colors().ghost_element_hover))
                 .child(div().flex_1().child(Label::new(label)))
                 .child(Icon::new(IconName::ChevronRight).size(IconSize::XSmall).color(Color::Muted))
                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -104,7 +112,9 @@ impl CalendarOptionsDialog {
                 .id(id)
                 .h(px(40.))
                 .px_4()
+                .rounded(px(6.))
                 .cursor_pointer()
+                .hover(|s| s.bg(theme.colors().ghost_element_hover))
                 .child(div().flex_1().child(Label::new(label)))
                 .child(Switch::new().toggle_state(on))
                 .on_click(cx.listener(move |this, _, _, cx| this.change(cx, flip)))

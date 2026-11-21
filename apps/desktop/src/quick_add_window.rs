@@ -63,6 +63,7 @@ pub struct QuickAddWindow {
     parsed_repeat: bool,
     parsed_tags: Vec<String>,
     parsed_priority: Option<Priority>,
+    parsed_list: Option<Id>,
     batch_lines: Vec<String>,
     priority: Priority,
     /// `None` means Inbox; `Some(id)` targets a specific list.
@@ -114,6 +115,7 @@ impl QuickAddWindow {
             parsed_repeat: false,
             parsed_tags: Vec::new(),
             parsed_priority: None,
+            parsed_list: None,
             batch_lines: Vec::new(),
             priority: Priority::None,
             list_id: None,
@@ -129,6 +131,10 @@ impl QuickAddWindow {
         self.parsed_repeat = parsed.repeat.is_some();
         self.parsed_tags = parsed.tags;
         self.parsed_priority = parsed.priority.filter(|p| *p != Priority::None);
+        self.parsed_list = parsed
+            .list
+            .and_then(|name| self.lists.iter().find(|l| l.name == name))
+            .map(|l| l.id);
         self.input.update(cx, |input, cx| input.set_highlights(parsed.spans, cx));
     }
 
@@ -228,7 +234,8 @@ impl Render for QuickAddWindow {
                 .on_click(cx.listener(move |this, _, _, cx| this.toggle_date(date, cx)))
         };
 
-        let (list_label, list_icon, list_color) = match self.list_id.and_then(|id| self.lists.iter().find(|l| l.id == id)) {
+        let effective_list = self.list_id.or(self.parsed_list);
+        let (list_label, list_icon, list_color) = match effective_list.and_then(|id| self.lists.iter().find(|l| l.id == id)) {
             Some(list) => (
                 SharedString::from(list.name.clone()),
                 IconName::List,

@@ -127,7 +127,7 @@ pub fn reload(assets: &dyn AssetSource, cx: &mut App) -> Result<Vec<String>> {
 }
 
 /// Actions shown in the shortcut list, in order; text editing keys are left out.
-pub const LISTED_ACTIONS: [&str; 28] = [
+pub const LISTED_ACTIONS: [&str; 30] = [
     "fern::NewTask",
     "fern::Search",
     "fern::ToggleSidebar",
@@ -135,6 +135,8 @@ pub const LISTED_ACTIONS: [&str; 28] = [
     "fern::ShowToday",
     "fern::ShowTomorrow",
     "fern::ShowNext7Days",
+    "fern::SyncNow",
+    "fern::Undo",
     "fern::ShowShortcuts",
     "fern::OpenSettings",
     "fern::Quit",

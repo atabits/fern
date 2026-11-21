@@ -251,6 +251,7 @@ pub fn render(
                                 .right(px(10.))
                                 .invisible()
                                 .group_hover(group.clone(), |s| s.visible())
+                                .tooltip(Tooltip::text(strings.more))
                                 .child(
                                     Icon::new(IconName::Ellipsis)
                                         .size(IconSize::Small)
@@ -718,6 +719,7 @@ pub fn render(
                         div()
                             .id("tags-menu")
                             .group("tags-menu")
+                            .tooltip(Tooltip::text(strings.more))
                             .child(
                                 Icon::new(IconName::Ellipsis)
                                     .size(IconSize::Small)
@@ -1122,8 +1124,8 @@ fn mini_calendar(
                 .flex_none()
                 .size(px(26.))
                 .cursor_pointer()
-                .hover(|s| s.bg(colors.list_hover))
-                .when(filled, |el| el.bg(colors.accent))
+                .when(!filled, |el| el.hover(|s| s.bg(colors.list_hover)))
+                .when(filled, |el| el.bg(colors.accent).hover(|s| s.opacity(0.9)))
                 .tooltip(Tooltip::text(calendar::format_date(date, strings)))
                 .on_click(move |_, window, cx| on_select(View::Day(date), window, cx))
                 .items_center()
@@ -1174,6 +1176,7 @@ fn mini_calendar(
                 .rounded_br(px(4.))
                 .bg(colors.list_hover)
                 .cursor_pointer()
+                .tooltip(Tooltip::text(if mini.expanded { strings.habit_collapse } else { strings.habit_expand }))
                 .child(
                     Icon::new(if mini.expanded { IconName::ChevronDown } else { IconName::ChevronUp })
                         .color(colors.list_text_muted)
@@ -1198,9 +1201,9 @@ fn mini_calendar(
             .child(
                 h_flex()
                     .child(div().flex_1().child(Label::new(calendar::month_title(mini.month, strings)).color(colors.list_text).size(LabelSize::Small)))
-                    .child(arrows("mini-back", IconName::ChevronLeft, MiniAction::Shift(-1)))
+                    .child(arrows("mini-back", IconName::ChevronLeft, MiniAction::Shift(-1)).tooltip(Tooltip::text("←")))
                     .child(arrows("mini-this-month", IconName::Circle, MiniAction::ThisMonth).tooltip(Tooltip::text(strings.today)))
-                    .child(arrows("mini-forward", IconName::ChevronRight, MiniAction::Shift(1))),
+                    .child(arrows("mini-forward", IconName::ChevronRight, MiniAction::Shift(1)).tooltip(Tooltip::text("→"))),
             )
             .child(weekdays)
             .children(calendar::month_grid(mini.month).chunks(7).map(|week| {

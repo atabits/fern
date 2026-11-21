@@ -216,6 +216,7 @@ impl FocusReview {
             focus.review_window = None;
             focus.message = None;
             focus.reload(cx);
+            desktop_common::data_version::data_changed(cx.entity_id(), cx);
             Ok(())
         });
         match result {
@@ -226,10 +227,12 @@ impl FocusReview {
 }
 
 impl Render for FocusReview {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let strings = i18n::t(cx);
         let colors = cx.theme().colors().clone();
         let can_save = self.selected_duration(cx).is_some();
+        let hours_focused = self.hours.focus_handle(cx).is_focused(window);
+        let minutes_focused = self.minutes.focus_handle(cx).is_focused(window);
         v_flex().size_full().p_5().gap_3().bg(colors.background).text_color(colors.text)
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
                 if event.keystroke.key == "tab" {
@@ -245,30 +248,71 @@ impl Render for FocusReview {
                 strings.focus_review_limit
             } else {
                 strings.focus_review_paused
-            }).size(LabelSize::Small))
+            }).size(LabelSize::Small).color(Color::Muted))
             .child(h_flex().gap_3()
                 .child(v_flex().flex_1().gap_2()
-                    .child(Label::new(strings.focus_review_hours).size(LabelSize::Small))
-                    .child(div().p_2().rounded(px(6.)).border_1().border_color(colors.border).child(self.hours.clone())))
+                    .child(Label::new(strings.focus_review_hours).size(LabelSize::Small).color(Color::Muted))
+                    .child(
+                        div()
+                            .p_2()
+                            .rounded(px(6.))
+                            .bg(colors.surface_background)
+                            .border_1()
+                            .border_color(if hours_focused { colors.accent } else { colors.border })
+                            .child(self.hours.clone()),
+                    ))
                 .child(v_flex().flex_1().gap_2()
-                    .child(Label::new(strings.focus_review_minutes).size(LabelSize::Small))
-                    .child(div().p_2().rounded(px(6.)).border_1().border_color(colors.border).child(self.minutes.clone()))))
+                    .child(Label::new(strings.focus_review_minutes).size(LabelSize::Small).color(Color::Muted))
+                    .child(
+                        div()
+                            .p_2()
+                            .rounded(px(6.))
+                            .bg(colors.surface_background)
+                            .border_1()
+                            .border_color(if minutes_focused { colors.accent } else { colors.border })
+                            .child(self.minutes.clone()),
+                    )))
             .child(Label::new(format!("{} – {}", clock(MIN_FOCUS_MS), clock(self.maximum))).size(LabelSize::Small).color(Color::Muted))
-            .when_some(self.error, |el, error| el.child(Label::new(error).size(LabelSize::Small)))
+            .when_some(self.error, |el, error| el.child(Label::new(error).size(LabelSize::Small).color(Color::Error)))
             .child(div().flex_1())
             .child(h_flex().gap_2()
-                .child(div().id("focus-review-discard").px_3().py_2().rounded(px(6.)).cursor_pointer().hover(|el| el.bg(colors.element_hover))
-                    .child(Label::new(strings.focus_discard))
-                    .on_click(cx.listener(|this, _, window, cx| this.discard(window, cx))))
+                .child(
+                    div()
+                        .id("focus-review-discard")
+                        .px_3()
+                        .py_2()
+                        .rounded(px(6.))
+                        .cursor_pointer()
+                        .hover(|el| el.bg(Color::Error.color(cx).opacity(0.1)))
+                        .child(Label::new(strings.focus_discard).color(Color::Error))
+                        .on_click(cx.listener(|this, _, window, cx| this.discard(window, cx))),
+                )
                 .child(div().flex_1())
-                .when(!self.limited, |el| el.child(div().id("focus-review-cancel").px_3().py_2().rounded(px(6.)).cursor_pointer().hover(|el| el.bg(colors.element_hover))
-                    .child(Label::new(strings.focus_continue))
-                    .on_click(cx.listener(|this, _, window, cx| this.cancel(window, cx)))))
-                .child(div().id("focus-review-save").px_3().py_2().rounded(px(6.)).bg(colors.accent)
-                    .when(can_save, |el| el.cursor_pointer())
-                    .when(!can_save, |el| el.opacity(0.5))
-                    .child(Label::new(strings.save).color(Color::OnAccent))
-                    .when(can_save, |el| el.on_click(cx.listener(|this, _, window, cx| this.save(window, cx))))))
+                .when(!self.limited, |el| {
+                    el.child(
+                        div()
+                            .id("focus-review-cancel")
+                            .px_3()
+                            .py_2()
+                            .rounded(px(6.))
+                            .cursor_pointer()
+                            .hover(|el| el.bg(colors.element_hover))
+                            .child(Label::new(strings.focus_continue))
+                            .on_click(cx.listener(|this, _, window, cx| this.cancel(window, cx))),
+                    )
+                })
+                .child(
+                    div()
+                        .id("focus-review-save")
+                        .px_3()
+                        .py_2()
+                        .rounded(px(6.))
+                        .bg(colors.accent)
+                        .when(can_save, |el| el.cursor_pointer().hover(|s| s.opacity(0.9)))
+                        .when(!can_save, |el| el.opacity(0.5))
+                        .child(Label::new(strings.save).color(Color::OnAccent))
+                        .when(can_save, |el| el.on_click(cx.listener(|this, _, window, cx| this.save(window, cx)))),
+                ))
     }
 }
 

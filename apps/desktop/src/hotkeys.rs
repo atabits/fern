@@ -10,7 +10,9 @@
 //! a shortcut another app holds is shown as taken.
 
 use std::rc::Rc;
-use std::sync::{Arc, Condvar, Mutex};
+#[cfg(windows)]
+use std::sync::Condvar;
+use std::sync::{Arc, Mutex};
 
 use fern_core::Store;
 use gpui::{App, Global, Keystroke, WindowHandle};
@@ -163,12 +165,14 @@ struct Shared {
     /// The thread to wake when the bindings change or when shutting down.
     thread: Option<u32>,
     /// Set once the listener thread has unregistered all hotkeys and exited.
+    #[cfg(windows)]
     stopped: bool,
 }
 
 struct GlobalHotkeys {
     store: Rc<Store>,
     shared: Arc<Mutex<Shared>>,
+    #[cfg(windows)]
     stopped_cv: Arc<Condvar>,
 }
 
@@ -281,8 +285,14 @@ pub fn init(window: WindowHandle<AppView>, store: Rc<Store>, cx: &mut App) {
         }
     });
     let shared = Arc::new(Mutex::new(Shared { bindings, ..Default::default() }));
+    #[cfg(windows)]
     let stopped_cv = Arc::new(Condvar::new());
-    cx.set_global(GlobalHotkeys { store, shared: shared.clone(), stopped_cv: stopped_cv.clone() });
+    cx.set_global(GlobalHotkeys {
+        store,
+        shared: shared.clone(),
+        #[cfg(windows)]
+        stopped_cv: stopped_cv.clone(),
+    });
     // Debug builds: `FERN_DEV_STATE=quick-add-window` opens Quick Add, as its shortcut would.
     #[cfg(debug_assertions)]
     if std::env::var("FERN_DEV_STATE").is_ok_and(|state| state.contains("quick-add-window")) {
@@ -291,7 +301,7 @@ pub fn init(window: WindowHandle<AppView>, store: Rc<Store>, cx: &mut App) {
     #[cfg(windows)]
     start(window, shared, stopped_cv, cx);
     #[cfg(not(windows))]
-    let _ = (window, shared, stopped_cv);
+    let _ = (window, shared);
 }
 
 #[cfg(windows)]

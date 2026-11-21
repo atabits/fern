@@ -1894,6 +1894,30 @@ impl FocusView {
     fn bind_focus_root<E: InteractiveElement>(&self, el: E, cx: &mut Context<Self>) -> E {
         el.track_focus(&self.focus_handle)
             .key_context("Focus")
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                let m = &event.keystroke.modifiers;
+                if event.keystroke.key == "space"
+                    && !m.control
+                    && !m.alt
+                    && !m.platform
+                    && !m.shift
+                    && this.focus_handle.is_focused(window)
+                    && this.stats.is_none()
+                    && this.open_record.is_none()
+                    && this.timer_draft.is_none()
+                    && this.picker.is_none()
+                    && !this.finish_prompt
+                    && !this.confirm_batch_delete
+                    && this.review_window.is_none()
+                {
+                    if this.running.is_some() {
+                        this.toggle_pause(cx);
+                    } else {
+                        this.start_next(cx);
+                    }
+                    cx.stop_propagation();
+                }
+            }))
             .on_action(cx.listener(|this, _: &crate::actions::DismissTransient, _, cx| {
                 if !this.dismiss_transient(cx) {
                     cx.propagate();

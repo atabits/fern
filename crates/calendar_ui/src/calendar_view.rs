@@ -2496,6 +2496,7 @@ impl CalendarView {
                         .in_progress(task.is_in_progress())
                         .dismissed(wont_do)
                         .lines(task.checklist.is_some())
+                        .tint(task_rows::priority_color(task.priority, &theme))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             cx.stop_propagation();
                             this.toggle_task_completed(id, !completed && !wont_do, cx);
@@ -2526,6 +2527,11 @@ impl CalendarView {
                 .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(|_, _, cx| cx.stop_propagation())
         };
+        let strings = i18n::t(cx);
+        let tip: SharedString = match task.due_time {
+            Some(time) => format!("{} {}", calendar::format_time(time, strings), title).into(),
+            None => title.clone().into(),
+        };
         let body = h_flex()
             .id(SharedString::from(format!("calendar-task-body-{id}")))
             .flex_1()
@@ -2533,15 +2539,22 @@ impl CalendarView {
             .h_full()
             .items_center()
             .gap_1()
+            .tooltip(ui::Tooltip::text(tip))
             .when(horizontal_resize, |el| {
                 el.on_drag(dragged.clone(), |d, _, _, cx| cx.new(|_| d.clone()))
             })
             .child(marker)
             .child(
-                Label::new(title)
-                    .size(LabelSize::XSmall)
-                    .color(if done { Color::Muted } else { Color::Default })
-                    .truncate(),
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .when(done, |el| el.line_through())
+                    .child(
+                        Label::new(title)
+                            .size(LabelSize::XSmall)
+                            .color(if done { Color::Muted } else { Color::Default })
+                            .truncate(),
+                    ),
             );
         h_flex()
             .id(SharedString::from(format!("calendar-task-{id}")))

@@ -677,6 +677,9 @@ impl MatrixView {
         if let Err(err) = self.store.set_completed(id, !completed) {
             eprintln!("failed to toggle completion: {err:#}");
         } else {
+            if !completed {
+                desktop_common::sound::play_complete(&self.store);
+            }
             desktop_common::data_version::data_changed(cx.entity_id(), cx);
         }
         self.reload(cx);

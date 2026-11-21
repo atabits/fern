@@ -14,6 +14,7 @@ pub mod paths;
 pub mod portable;
 pub mod report_image;
 pub mod resize;
+pub mod sound;
 pub mod sticky_opener;
 pub mod sticky_settings;
 pub mod sticky_windows;

@@ -2493,6 +2493,7 @@ impl TodoView {
                     let label = i18n::t(cx).undo_completed.replace("{title}", &task.title);
                     self.offer_undo(action, label, cx);
                     crate::completion_mark::record(id, cx);
+                    desktop_common::sound::play_complete(&self.store);
                 }
             }
             _ => {

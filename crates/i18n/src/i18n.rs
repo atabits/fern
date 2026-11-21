@@ -638,6 +638,7 @@ pub struct Strings {
     pub notification_items: [(&'static str, &'static str); 3],
     #[cfg(windows)]
     pub minimize_to_tray: &'static str,
+    pub completion_sound: &'static str,
     pub tray_focus: &'static str,
     pub tray_start_pomo: &'static str,
     pub tray_stopwatch: &'static str,
@@ -1616,6 +1617,7 @@ pub static EN: Strings = Strings {
     ],
     #[cfg(windows)]
     minimize_to_tray: "Minimize to notification area",
+    completion_sound: "Completion sound",
     tray_focus: "Focus",
     tray_start_pomo: "Start Pomo",
     tray_stopwatch: "Stopwatch",
@@ -2566,6 +2568,7 @@ pub static ZH_CN: Strings = Strings {
     ],
     #[cfg(windows)]
     minimize_to_tray: "最小化到通知区域",
+    completion_sound: "完成音效",
     tray_focus: "专注",
     tray_start_pomo: "开始番茄",
     tray_stopwatch: "正计时",
@@ -3517,6 +3520,7 @@ pub static RU: Strings = Strings {
     ],
     #[cfg(windows)]
     minimize_to_tray: "Сворачивать в область уведомлений",
+    completion_sound: "Звук завершения",
     tray_focus: "Сфокусироваться",
     tray_start_pomo: "Запустить Pomo",
     tray_stopwatch: "Секундомер",

@@ -1726,6 +1726,26 @@ impl SettingsWindow {
                     })
                     .collect::<Vec<_>>(),
                 ));
+                let sound_enabled = desktop_common::sound::enabled(&self.store);
+                let body = body.child(group().child(
+                    h_flex()
+                        .id("completion-sound")
+                        .h(px(ROW_HEIGHT))
+                        .px_4()
+                        .gap_2()
+                        .cursor_pointer()
+                        .child(Checkbox::new("completion-sound-checkbox").accent().toggle_state(sound_enabled))
+                        .child(Label::new(strings.completion_sound))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            let next = !desktop_common::sound::enabled(&this.store);
+                            if let Err(err) = desktop_common::sound::set_enabled(&this.store, next) {
+                                eprintln!("failed to save the completion sound setting: {err:#}");
+                            } else if next {
+                                desktop_common::sound::play_complete(&this.store);
+                            }
+                            cx.notify();
+                        })),
+                ));
                 #[cfg(windows)]
                 let body = {
                     let enabled = crate::tray::enabled(&self.store);

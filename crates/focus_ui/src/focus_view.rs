@@ -547,6 +547,7 @@ impl FocusView {
                 .map(|r| (r.task.clone(), r.timer.length_ms));
             self.finish_at(now, true, cx);
             if self.running.is_some() { return; }
+            desktop_common::sound::play_focus_done(&self.store);
             if let Some(continuation) = continuation {
                 self.continuation = Some(continuation);
                 self.completed_in_chain += 1;

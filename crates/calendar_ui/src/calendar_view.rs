@@ -1079,6 +1079,9 @@ impl CalendarView {
             eprintln!("failed to toggle calendar task: {err:#}");
             return;
         }
+        if completed && !task.is_wont_do() {
+            desktop_common::sound::play_complete(&self.store);
+        }
         crate::data_version::data_changed(cx.entity_id(), cx);
         self.card_updated(cx);
     }

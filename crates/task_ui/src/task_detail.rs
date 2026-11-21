@@ -443,9 +443,10 @@ impl TaskDetail {
                     .map(|t| t.with_timezone(&Local).naive_local())
                     .map(|t| format!("{} {}", crate::calendar::format_date(t.date(), strings), crate::calendar::format_time(t.time(), strings)))
                     .unwrap_or_default();
+                let group_name = SharedString::from(format!("comment-row-{id}"));
                 h_flex()
                     .id(SharedString::from(format!("comment-{id}")))
-                    .group("comment")
+                    .group(group_name.clone())
                     .items_start()
                     .gap_2()
                     .p_2()
@@ -460,7 +461,7 @@ impl TaskDetail {
                             .child(Label::new(when).size(LabelSize::XSmall).color(Color::Muted)),
                     )
                     .child(
-                        div().when(!crate::touch::active(), |el| el.invisible()).group_hover("comment", |s| s.visible()).child(
+                        div().when(!crate::touch::active(), |el| el.invisible()).group_hover(group_name, |s| s.visible()).child(
                             IconButton::new(SharedString::from(format!("comment-delete-{id}")), IconName::X)
                                 .icon_size(IconSize::XSmall)
                                 .icon_color(Color::Muted)
@@ -2024,6 +2025,8 @@ impl TaskDetail {
         let can_edit = self.session.task.as_ref().is_some_and(|t| !t.is_deleted());
         let total = self.session.subtasks.len();
         let done_count = self.session.subtasks.iter().filter(|s| s.is_completed()).count();
+        let today = Local::now().date_naive();
+        let countdown_dates = self.session.store.preferences().map(|p| p.countdown_dates).unwrap_or(false);
         v_flex()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .when(total > 0, |el| el.child(Self::render_progress_bar(done_count, total, &theme)))
@@ -2031,6 +2034,9 @@ impl TaskDetail {
                 let id = subtask.id;
                 let done = subtask.is_completed();
                 let group_name = SharedString::from(format!("subtask-row-{id}"));
+                let due = subtask
+                    .due_date
+                    .map(|date| task_rows::row_due_label(date, subtask.due_time, today, strings, countdown_dates));
                 div().group(group_name.clone()).child(
                     ListItem::new(SharedString::from(format!("subtask-{id}")))
                         .height(px(30.))
@@ -2065,6 +2071,13 @@ impl TaskDetail {
                             h_flex()
                                 .gap_1()
                                 .items_center()
+                                .when_some(due, |el, (label, overdue)| {
+                                    el.child(
+                                        Label::new(label)
+                                            .size(LabelSize::XSmall)
+                                            .color(if overdue && !done { Color::Error } else { Color::Muted }),
+                                    )
+                                })
                                 .when(can_edit, |el| {
                                     el.child(
                                         div()

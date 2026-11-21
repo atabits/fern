@@ -1159,9 +1159,15 @@ impl AppView {
                             })),
                     ),
             );
-            let labels = [strings.global_quick_add, strings.global_show_hide, strings.global_focus_mini];
+            let labels = [
+                strings.global_quick_add,
+                strings.global_show_hide,
+                strings.global_focus_mini,
+                strings.global_pin_window,
+            ];
             for (i, (binding, taken)) in crate::hotkeys::bindings(cx).into_iter().enumerate() {
                 let recording = self.recording_hotkey == Some(i);
+                let has_binding = binding.is_some();
                 let text = if recording {
                     strings.press_shortcut.to_owned()
                 } else {
@@ -1170,7 +1176,7 @@ impl AppView {
                 body = body.child(
                     h_flex()
                         .h(px(32.))
-                        .gap_2()
+                        .gap_1p5()
                         .child(div().flex_1().child(Label::new(labels[i]).size(LabelSize::Small)))
                         .when(taken && !recording, |el| el.child(Label::new(strings.shortcut_taken).size(LabelSize::XSmall).color(Color::Error)))
                         .child(
@@ -1190,7 +1196,20 @@ impl AppView {
                                     window.focus(&this.shortcuts_focus, cx);
                                     cx.notify();
                                 })),
-                        ),
+                        )
+                        .when(has_binding && !recording, |el| {
+                            el.child(
+                                IconButton::new(SharedString::from(format!("global-shortcut-clear-{i}")), IconName::X)
+                                    .icon_size(IconSize::XSmall)
+                                    .icon_color(Color::Muted)
+                                    .tooltip(Tooltip::text(strings.clear))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.recording_hotkey = None;
+                                        crate::hotkeys::set(i, None, cx);
+                                        cx.notify();
+                                    })),
+                            )
+                        }),
                 );
             }
         }

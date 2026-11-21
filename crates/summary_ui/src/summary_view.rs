@@ -765,6 +765,7 @@ impl SummaryView {
                     .child(side(1, "more-priority", strings.summary_priority, priority_items, priority_bounds, cx)),
             )
         });
+        let hover_bg = cx.theme().colors().ghost_element_hover;
         h_flex()
             .h(px(40.))
             .px_4()
@@ -773,8 +774,12 @@ impl SummaryView {
                 h_flex()
                     .id("summary-more")
                     .relative()
+                    .px_1p5()
+                    .py_0p5()
                     .gap_1()
                     .max_w(px(170.))
+                    .rounded(px(5.))
+                    .hover(move |s| s.bg(hover_bg))
                     .cursor_pointer()
                     .child(Label::new(value).color(Color::Muted).truncate())
                     .child(Icon::new(IconName::ChevronsUpDown).size(IconSize::XSmall).color(Color::Muted))
@@ -917,6 +922,7 @@ impl SummaryView {
                                             .rounded(px(6.))
                                             .border_1()
                                             .border_color(colors.border)
+                                            .hover(|s| s.bg(colors.element_hover))
                                             .cursor_pointer()
                                             .child(Label::new(strings.cancel).size(LabelSize::Small))
                                             .on_click(cx.listener(|this, _, _, cx| {
@@ -933,6 +939,7 @@ impl SummaryView {
                                             .items_center()
                                             .rounded(px(6.))
                                             .bg(colors.accent)
+                                            .hover(|s| s.opacity(0.9))
                                             .cursor_pointer()
                                             .child(Label::new(strings.confirm).size(LabelSize::Small).color(Color::OnAccent))
                                             .on_click(cx.listener(|this, _, _, cx| this.confirm_custom(cx))),
@@ -1227,6 +1234,7 @@ impl Render for SummaryView {
                         .id("summary-overwrite-backdrop")
                         .absolute()
                         .inset_0()
+                        .occlude()
                         .bg(gpui::black().opacity(0.35))
                         .flex()
                         .items_center()
@@ -1290,15 +1298,12 @@ impl Render for SummaryView {
                                                 .py_1()
                                                 .rounded(px(6.))
                                                 .bg(colors.accent)
-                                                .text_size(px(13.))
-                                                .font_weight(FontWeight::MEDIUM)
-                                                .text_color(gpui::white())
                                                 .hover(|s| s.opacity(0.9))
                                                 .cursor_pointer()
                                                 .on_click(cx.listener(move |this, _, _, cx| {
                                                     this.apply_options(next.clone(), cx);
                                                 }))
-                                                .child(strings.confirm),
+                                                .child(Label::new(strings.confirm).size(LabelSize::Small).weight(FontWeight::MEDIUM).color(Color::OnAccent)),
                                         ),
                                 ),
                         ),

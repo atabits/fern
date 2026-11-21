@@ -1256,6 +1256,10 @@ impl MatrixView {
                         el.child(Icon::new(IconName::Repeat).size(IconSize::XSmall).color(Color::Accent))
                     })
                     .when_some(due, |el, (label, overdue)| {
+                        let due_tip = match (countdown_dates, task.due_date) {
+                            (true, Some(d)) => format!("{} · {}", desktop_common::calendar::format_date(d, strings), strings.show_countdown_mode),
+                            _ => strings.show_countdown_mode.to_owned(),
+                        };
                         el.child(
                             div()
                                 .id(SharedString::from(format!("matrix-due-toggle-{quadrant}-{id}")))
@@ -1263,6 +1267,7 @@ impl MatrixView {
                                 .rounded(px(4.))
                                 .cursor_pointer()
                                 .hover(|s| s.bg(theme.colors().element_hover))
+                                .tooltip(Tooltip::text(due_tip))
                                 .child(
                                     Label::new(label)
                                         .size(LabelSize::Small)
@@ -1279,6 +1284,8 @@ impl MatrixView {
                                     cx.stop_propagation();
                                     if let Err(err) = this.store.update_preferences(|p| p.countdown_dates = !p.countdown_dates) {
                                         eprintln!("failed to toggle countdown dates: {err:#}");
+                                    } else {
+                                        desktop_common::data_version::data_changed(cx.entity_id(), cx);
                                     }
                                     cx.notify();
                                 })),
@@ -1660,7 +1667,21 @@ impl MatrixView {
                             el.pt_8()
                                 .items_center()
                                 .justify_center()
-                                .child(Label::new(strings.no_tasks).color(Color::Muted))
+                                .gap_2()
+                                .child(Label::new(strings.no_tasks).size(LabelSize::Small).color(Color::Muted))
+                                .child(
+                                    h_flex()
+                                        .id(SharedString::from(format!("matrix-empty-add-{quadrant}")))
+                                        .px_2p5()
+                                        .py_1()
+                                        .gap_1()
+                                        .rounded(px(6.))
+                                        .cursor_pointer()
+                                        .hover(|s| s.bg(theme.colors().element_hover))
+                                        .child(Icon::new(IconName::Plus).size(IconSize::XSmall).color(Color::Accent))
+                                        .child(Label::new(strings.add_task).size(LabelSize::XSmall).color(Color::Accent))
+                                        .on_click(cx.listener(move |this, _, window, cx| this.start_add(quadrant, window, cx))),
+                                )
                         })
                         .children(content),
                 )

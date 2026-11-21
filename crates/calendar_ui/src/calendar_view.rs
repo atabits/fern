@@ -2312,6 +2312,7 @@ impl CalendarView {
                         IconButton::new("month-picker-prev-year", IconName::ChevronLeft)
                             .size(px(24.))
                             .icon_size(IconSize::Small)
+                            .tooltip(ui::Tooltip::text((picker_year - 1).max(1910).to_string()))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 if let Some(year) = this.month_picker_open.as_mut() {
                                     *year = (*year - 1).max(1910);
@@ -2323,6 +2324,7 @@ impl CalendarView {
                         IconButton::new("month-picker-this-year", IconName::Circle)
                             .size(px(24.))
                             .icon_size(IconSize::Custom(px(8.)))
+                            .tooltip(ui::Tooltip::text(today.year().to_string()))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.month_picker_open = Some(today.year());
                                 cx.notify();
@@ -2332,6 +2334,7 @@ impl CalendarView {
                         IconButton::new("month-picker-next-year", IconName::ChevronRight)
                             .size(px(24.))
                             .icon_size(IconSize::Small)
+                            .tooltip(ui::Tooltip::text((picker_year + 1).min(2099).to_string()))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 if let Some(year) = this.month_picker_open.as_mut() {
                                     *year = (*year + 1).min(2099);
@@ -3504,6 +3507,7 @@ impl Render for CalendarView {
                                 .size(px(28.))
                                 .icon_size(IconSize::Small)
                                 .when(!self.can_shift(-1), |el| el.icon_color(Color::Placeholder))
+                                .tooltip(ui::Tooltip::text("←"))
                                 .on_click(cx.listener(|this, _, _, cx| this.shift(-1, cx))),
                         ),
                     )
@@ -3528,6 +3532,7 @@ impl Render for CalendarView {
                                 .size(px(28.))
                                 .icon_size(IconSize::Small)
                                 .when(!self.can_shift(1), |el| el.icon_color(Color::Placeholder))
+                                .tooltip(ui::Tooltip::text("→"))
                                 .on_click(cx.listener(|this, _, _, cx| this.shift(1, cx))),
                         ),
                     ),

@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -945,15 +945,28 @@ const SNOOZE_FORMAT: &str = "%Y-%m-%dT%H:%M:%S";
 
 pub struct Store {
     pub(crate) conn: Connection,
+    attachments_dir: Option<PathBuf>,
 }
 
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        Self::init(Connection::open(path)?)
+        let attachments_dir = path.as_ref().parent().map(|parent| parent.join("attachments"));
+        Self::init(Connection::open(path)?, attachments_dir)
     }
 
     pub fn open_in_memory() -> Result<Self> {
-        Self::init(Connection::open_in_memory()?)
+        Self::init(Connection::open_in_memory()?, None)
+    }
+
+    /// Overrides the attachment folder used when purging tasks/lists unlinks orphaned files.
+    pub fn with_attachments_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.attachments_dir = Some(dir.into());
+        self
+    }
+
+    /// The attachment folder associated with this store, if any.
+    pub fn attachments_dir(&self) -> Option<&Path> {
+        self.attachments_dir.as_deref()
     }
 
     /// Runs `f` inside a transaction, or a nested `SAVEPOINT` when already inside an outer
@@ -1000,7 +1013,7 @@ impl Store {
         Ok(())
     }
 
-    fn init(conn: Connection) -> Result<Self> {
+    fn init(conn: Connection, attachments_dir: Option<PathBuf>) -> Result<Self> {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         // With WAL, a commit waits for the disk only at checkpoints; a power cut can lose the
         // last changes but never corrupts the file.
@@ -1009,7 +1022,7 @@ impl Store {
         // The views run the same queries on every change; parse each once.
         conn.set_prepared_statement_cache_capacity(64);
         Self::migrate(&conn)?;
-        Ok(Self { conn })
+        Ok(Self { conn, attachments_dir })
     }
 
     fn migrate(conn: &Connection) -> Result<()> {
@@ -1362,10 +1375,7 @@ impl Store {
 
     /// Creates the task, tags and checklist atomically so a failed submission can be retried.
     pub fn create_task(&self, draft: TaskDraft, top: bool) -> Result<Task> {
-        let tx = self.conn.unchecked_transaction()?;
-        let task = self.insert_task_draft(draft, top)?;
-        tx.commit()?;
-        Ok(task)
+        self.in_tx(|| self.insert_task_draft(draft, top))
     }
 
     fn insert_task_draft(&self, mut draft: TaskDraft, top: bool) -> Result<Task> {
@@ -1399,8 +1409,7 @@ impl Store {
             return self.create_task(draft, top);
         }
         std::fs::create_dir_all(dir)?;
-        let tx = self.conn.unchecked_transaction()?;
-        let result = (|| -> Result<Task> {
+        let result = self.in_tx(|| {
             let task = self.insert_task_draft(draft, top)?;
             for prepared in attachments.iter() {
                 let attachment = prepared.metadata();
@@ -1412,9 +1421,8 @@ impl Store {
             for prepared in attachments.iter_mut() {
                 prepared.publish(dir)?;
             }
-            tx.commit()?;
             Ok(task)
-        })();
+        });
         for prepared in attachments {
             if result.is_ok() {
                 prepared.keep_publication();
@@ -1642,58 +1650,73 @@ impl Store {
             && let Some(task) = self.task(id)?
             && let (Some(repeat), Some(due)) = (task.repeat.clone(), task.due_date)
         {
+            let today = chrono::Local::now().date_naive();
             let holidays = if repeat.skip_holidays {
-                self.holiday_dates(due, due + Duration::days(400))?
+                let anchor = if repeat.from_completion { today } else { due };
+                self.holiday_dates(anchor, anchor + Duration::days(400))?
             } else {
                 HashSet::new()
             };
-            if let Some(next) = repeat.next_for_with_holidays(due, chrono::Local::now().date_naive(), |d| holidays.contains(&d)) {
-                let tx = self.conn.unchecked_transaction()?;
-                let copy = Uuid::now_v7();
-                tx.execute(
-                    &format!(
-                        "INSERT INTO tasks ({TASK_COLUMNS})
-                         SELECT ?2, parent_id, kind, title, notes, priority, due_date, due_time,
-                                ?3, created_at, list_id, NULL, NULL, NULL, NULL, end_date, end_time, ?3, NULL,
-                                section_id, estimate, NULL, location, timezone, is_floating, NULL, 0
-                         FROM tasks WHERE id = ?1"
-                    ),
-                    params![id.to_string(), copy.to_string(), now_ms()],
-                )?;
-                tx.execute(
-                    "INSERT INTO task_tags (task_id, tag) SELECT ?2, tag FROM task_tags WHERE task_id = ?1",
-                    params![id.to_string(), copy.to_string()],
-                )?;
-                // The completed occurrence owns a snapshot of the checklist. Besides preserving
-                // its history, this lets Undo restore the exact checked state transactionally.
-                let items = {
-                    let mut statement = tx.prepare("SELECT id, title, sort_order, completed_at, created_at FROM checklist_items WHERE task_id = ?1")?;
-                    statement.query_map([id.to_string()], |row| Ok((
-                        row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?,
-                        row.get::<_, Option<i64>>(3)?, row.get::<_, i64>(4)?,
-                    )))?
-                        .collect::<rusqlite::Result<Vec<_>>>()?
-                };
-                for (source_id, title, order, completed_at, created_at) in items {
-                    let copy_id = Uuid::now_v7().to_string();
-                    tx.execute("INSERT INTO checklist_items (id, task_id, title, sort_order, completed_at, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                        params![copy_id, copy.to_string(), title, order, completed_at, created_at])?;
-                    tx.execute("INSERT INTO repeat_checklist_copies (copy_id, source_id) VALUES (?1, ?2)",
-                        params![copy_id, source_id])?;
-                }
-                // A duration moves with its start.
-                let end = task.end_date.map(|end| (end + (next - due)).format(DATE_FORMAT).to_string());
-                let next_repeat = repeat.forgetting_curve.then(|| repeat.advance().to_string());
-                tx.execute(
-                    "UPDATE tasks SET due_date = ?2, end_date = ?3, snoozed_until = NULL, in_progress_at = NULL,
-                            repeat = COALESCE(?4, repeat) WHERE id = ?1",
-                    params![id.to_string(), next.format(DATE_FORMAT).to_string(), end, next_repeat],
-                )?;
-                tx.execute(
-                    "UPDATE checklist_items SET completed_at = NULL WHERE task_id = ?1",
-                    [id.to_string()],
-                )?;
-                tx.commit()?;
+            if let Some(next) = repeat.next_for_with_holidays(due, today, |d| holidays.contains(&d)) {
+                let copy = self.in_tx(|| {
+                    let copy = Uuid::now_v7();
+                    self.conn.execute(
+                        &format!(
+                            "INSERT INTO tasks ({TASK_COLUMNS})
+                             SELECT ?2, parent_id, kind, title, notes, priority, due_date, due_time,
+                                    ?3, created_at, list_id, NULL, NULL, NULL, NULL, end_date, end_time, ?3, NULL,
+                                    section_id, estimate, NULL, location, timezone, is_floating, NULL, 0
+                             FROM tasks WHERE id = ?1"
+                        ),
+                        params![id.to_string(), copy.to_string(), now_ms()],
+                    )?;
+                    self.conn.execute(
+                        "INSERT INTO task_tags (task_id, tag) SELECT ?2, tag FROM task_tags WHERE task_id = ?1",
+                        params![id.to_string(), copy.to_string()],
+                    )?;
+                    // The completed occurrence owns a snapshot of the checklist. Besides preserving
+                    // its history, this lets Undo restore the exact checked state transactionally.
+                    let items = {
+                        let mut statement = self.conn.prepare(
+                            "SELECT id, title, sort_order, completed_at, created_at FROM checklist_items WHERE task_id = ?1",
+                        )?;
+                        statement
+                            .query_map([id.to_string()], |row| {
+                                Ok((
+                                    row.get::<_, String>(0)?,
+                                    row.get::<_, String>(1)?,
+                                    row.get::<_, i64>(2)?,
+                                    row.get::<_, Option<i64>>(3)?,
+                                    row.get::<_, i64>(4)?,
+                                ))
+                            })?
+                            .collect::<rusqlite::Result<Vec<_>>>()?
+                    };
+                    for (source_id, title, order, completed_at, created_at) in items {
+                        let copy_id = Uuid::now_v7().to_string();
+                        self.conn.execute(
+                            "INSERT INTO checklist_items (id, task_id, title, sort_order, completed_at, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                            params![copy_id, copy.to_string(), title, order, completed_at, created_at],
+                        )?;
+                        self.conn.execute(
+                            "INSERT INTO repeat_checklist_copies (copy_id, source_id) VALUES (?1, ?2)",
+                            params![copy_id, source_id],
+                        )?;
+                    }
+                    // A duration moves with its start.
+                    let end = task.end_date.map(|end| (end + (next - due)).format(DATE_FORMAT).to_string());
+                    let next_repeat = repeat.forgetting_curve.then(|| repeat.advance().to_string());
+                    self.conn.execute(
+                        "UPDATE tasks SET due_date = ?2, end_date = ?3, snoozed_until = NULL, in_progress_at = NULL,
+                                repeat = COALESCE(?4, repeat) WHERE id = ?1",
+                        params![id.to_string(), next.format(DATE_FORMAT).to_string(), end, next_repeat],
+                    )?;
+                    self.conn.execute(
+                        "UPDATE checklist_items SET completed_at = NULL WHERE task_id = ?1",
+                        [id.to_string()],
+                    )?;
+                    Ok(copy)
+                })?;
                 return Ok((Some(copy), Vec::new()));
             }
         }
@@ -1781,25 +1804,37 @@ impl Store {
         end: Option<NaiveDate>,
         repeat: Option<&Recurrence>,
     ) -> Result<()> {
-        let tx = self.conn.unchecked_transaction()?;
-        tx.execute(
-            "UPDATE checklist_items AS original SET completed_at = copied.completed_at
-             FROM repeat_checklist_copies AS mapping JOIN checklist_items AS copied ON copied.id = mapping.copy_id
-             WHERE original.id = mapping.source_id AND original.task_id = ?1 AND copied.task_id = ?2",
-            params![id.to_string(), copy.to_string()],
-        )?;
-        tx.execute("DELETE FROM tasks WHERE id = ?1", [copy.to_string()])?;
-        tx.execute(
-            "UPDATE tasks SET due_date = ?2, end_date = ?3, repeat = COALESCE(?4, repeat) WHERE id = ?1",
-            params![
-                id.to_string(),
-                due.map(|d| d.format(DATE_FORMAT).to_string()),
-                end.map(|d| d.format(DATE_FORMAT).to_string()),
-                repeat.map(ToString::to_string),
-            ],
-        )?;
-        tx.commit()?;
-        Ok(())
+        self.in_tx(|| {
+            let parent_alive: bool = self
+                .conn
+                .query_row(
+                    "SELECT 1 FROM tasks WHERE id = ?1 AND deleted_at IS NULL",
+                    [id.to_string()],
+                    |_| Ok(true),
+                )
+                .optional()?
+                .unwrap_or(false);
+            if !parent_alive {
+                return Ok(());
+            }
+            self.conn.execute(
+                "UPDATE checklist_items AS original SET completed_at = copied.completed_at
+                 FROM repeat_checklist_copies AS mapping JOIN checklist_items AS copied ON copied.id = mapping.copy_id
+                 WHERE original.id = mapping.source_id AND original.task_id = ?1 AND copied.task_id = ?2",
+                params![id.to_string(), copy.to_string()],
+            )?;
+            self.conn.execute("DELETE FROM tasks WHERE id = ?1", [copy.to_string()])?;
+            self.conn.execute(
+                "UPDATE tasks SET due_date = ?2, end_date = ?3, repeat = COALESCE(?4, repeat) WHERE id = ?1",
+                params![
+                    id.to_string(),
+                    due.map(|d| d.format(DATE_FORMAT).to_string()),
+                    end.map(|d| d.format(DATE_FORMAT).to_string()),
+                    repeat.map(ToString::to_string),
+                ],
+            )?;
+            Ok(())
+        })
     }
 
     /// Sets or clears the repeat rule. A repeating task needs a due date; `today` is used when
@@ -2058,16 +2093,17 @@ impl Store {
         let name = name.trim();
         anyhow::ensure!(!name.is_empty(), "a section needs a name");
         let section = crate::model::ListSection { id: Uuid::now_v7(), list_id: list, name: name.to_owned() };
-        let mut order: Vec<Id> = self.list_sections(list)?.into_iter().map(|s| s.id).collect();
-        let at = index.unwrap_or(order.len()).min(order.len());
-        order.insert(at, section.id);
-        let tx = self.conn.unchecked_transaction()?;
-        tx.execute(
-            "INSERT INTO list_sections (id, list_id, name, created_at) VALUES (?1, ?2, ?3, ?4)",
-            params![section.id.to_string(), list.map(|l| l.to_string()), section.name, now_ms()],
-        )?;
-        self.write_sort_order("list_sections", &order)?;
-        tx.commit()?;
+        self.in_tx(|| {
+            let mut order: Vec<Id> = self.list_sections(list)?.into_iter().map(|s| s.id).collect();
+            let at = index.unwrap_or(order.len()).min(order.len());
+            order.insert(at, section.id);
+            self.conn.execute(
+                "INSERT INTO list_sections (id, list_id, name, created_at) VALUES (?1, ?2, ?3, ?4)",
+                params![section.id.to_string(), list.map(|l| l.to_string()), section.name, now_ms()],
+            )?;
+            self.write_sort_order("list_sections", &order)?;
+            Ok(())
+        })?;
         Ok(section)
     }
 
@@ -2544,10 +2580,7 @@ impl Store {
     /// Replaces the task's tags; unknown tags are created.
     /// Tags match case-insensitively in Rust, because SQLite's `NOCASE` only folds ASCII.
     pub fn set_tags(&self, id: Id, tags: &[String]) -> Result<()> {
-        let tx = self.conn.unchecked_transaction()?;
-        self.replace_task_tags(id, tags)?;
-        tx.commit()?;
-        Ok(())
+        self.in_tx(|| self.replace_task_tags(id, tags))
     }
 
     fn sanitize_tag_name(raw: &str) -> String {
@@ -2867,16 +2900,28 @@ impl Store {
         })
     }
 
-    /// A tag and its sub-tags, lowercased: a parent tag's view shows its sub-tags' tasks too.
+    /// A tag and all its descendant sub-tags (transitively, cycle-safe), lowercased: a parent tag's
+    /// view shows its sub-tags' tasks too.
     fn tag_family(&self, tag: &str) -> Result<HashSet<String>> {
-        let tag = tag.to_lowercase();
-        Ok(self
-            .tags()?
-            .into_iter()
-            .filter(|t| t.name.to_lowercase() == tag || t.parent.as_ref().is_some_and(|p| p.to_lowercase() == tag))
-            .map(|t| t.name.to_lowercase())
-            .chain(std::iter::once(tag.clone()))
-            .collect())
+        let root = tag.to_lowercase();
+        let mut children: HashMap<String, Vec<String>> = HashMap::new();
+        for t in self.tags()? {
+            if let Some(parent) = t.parent {
+                children.entry(parent.to_lowercase()).or_default().push(t.name.to_lowercase());
+            }
+        }
+        let mut family = HashSet::from([root.clone()]);
+        let mut stack = vec![root];
+        while let Some(cur) = stack.pop() {
+            if let Some(kids) = children.get(&cur) {
+                for kid in kids {
+                    if family.insert(kid.clone()) {
+                        stack.push(kid.clone());
+                    }
+                }
+            }
+        }
+        Ok(family)
     }
 
     /// The lists in their order, archived ones included (see `List::archived`).
@@ -3229,11 +3274,11 @@ impl Store {
 
     /// The original's Ungroup: the folder goes, its lists stay, out of any folder.
     pub fn ungroup_list_folder(&self, id: Id) -> Result<()> {
-        let tx = self.conn.unchecked_transaction()?;
-        tx.execute("UPDATE lists SET folder_id = NULL WHERE folder_id = ?1", [id.to_string()])?;
-        tx.execute("DELETE FROM list_folders WHERE id = ?1", [id.to_string()])?;
-        tx.commit()?;
-        Ok(())
+        self.in_tx(|| {
+            self.conn.execute("UPDATE lists SET folder_id = NULL WHERE folder_id = ?1", [id.to_string()])?;
+            self.conn.execute("DELETE FROM list_folders WHERE id = ?1", [id.to_string()])?;
+            Ok(())
+        })
     }
 
     /// Lists whose tasks stay out of the smart lists: archived ones and those set not to show.
@@ -3254,9 +3299,30 @@ impl Store {
         Ok(())
     }
 
-    /// Deletes the list together with its tasks.
+    /// Deletes the list together with its tasks and unlinks orphaned attachment files when an
+    /// attachment directory is configured on this store.
     pub fn delete_list(&self, id: Id) -> Result<()> {
-        self.conn.execute("DELETE FROM lists WHERE id = ?1", [id.to_string()])?;
+        self.delete_list_with_dir(id, None)
+    }
+
+    /// Deletes the list together with its tasks, pruning `sync_uploaded` and unlinking orphaned
+    /// attachment files in `dir` (or the store's default attachment directory).
+    pub fn delete_list_with_dir(&self, id: Id, dir: Option<&Path>) -> Result<()> {
+        let removed_files = self.in_tx(|| {
+            let files = self.collect_attachment_files_for_query(
+                "WITH RECURSIVE sub(id) AS (
+                     SELECT id FROM tasks WHERE list_id = ?1
+                     UNION
+                     SELECT t.id FROM tasks t JOIN sub ON t.parent_id = sub.id
+                 )
+                 SELECT a.id || '-' || a.name FROM task_attachments a JOIN sub ON a.task_id = sub.id",
+                params![id.to_string()],
+            )?;
+            self.conn.execute("DELETE FROM lists WHERE id = ?1", [id.to_string()])?;
+            self.prune_sync_uploaded(&files)?;
+            Ok(files)
+        })?;
+        self.unlink_attachment_files(&removed_files, dir);
         Ok(())
     }
 
@@ -3505,34 +3571,34 @@ impl Store {
             .query_row("SELECT url FROM calendar_subscriptions WHERE id = ?1", params![id.to_string()], |r| r.get(0))
             .optional()?;
         let url_changed = prev_url.as_deref() != Some(url);
-        let tx = self.conn.unchecked_transaction()?;
-        tx.execute(
-            "UPDATE calendar_subscriptions
-             SET name = ?2, color = ?4, hidden = ?5, kind = 'caldav',
-                 provider = ?6, username = ?7, password = ?8, writable = ?9,
-                 feed = CASE WHEN url = ?3 THEN feed ELSE '' END,
-                 fetched_at = CASE WHEN url = ?3 THEN fetched_at ELSE NULL END,
-                 sync_token = CASE WHEN url = ?3 THEN sync_token ELSE NULL END,
-                 error = CASE WHEN url = ?3 THEN error ELSE NULL END,
-                 url = ?3
-             WHERE id = ?1",
-            params![
-                id.to_string(),
-                name.trim(),
-                url,
-                color,
-                hidden,
-                provider.code(),
-                username.trim(),
-                password,
-                i64::from(writable),
-            ],
-        )?;
-        if url_changed {
-            tx.execute("DELETE FROM calendar_events WHERE subscription_id = ?1", params![id.to_string()])?;
-        }
-        tx.commit()?;
-        Ok(())
+        self.in_tx(|| {
+            self.conn.execute(
+                "UPDATE calendar_subscriptions
+                 SET name = ?2, color = ?4, hidden = ?5, kind = 'caldav',
+                     provider = ?6, username = ?7, password = ?8, writable = ?9,
+                     feed = CASE WHEN url = ?3 THEN feed ELSE '' END,
+                     fetched_at = CASE WHEN url = ?3 THEN fetched_at ELSE NULL END,
+                     sync_token = CASE WHEN url = ?3 THEN sync_token ELSE NULL END,
+                     error = CASE WHEN url = ?3 THEN error ELSE NULL END,
+                     url = ?3
+                 WHERE id = ?1",
+                params![
+                    id.to_string(),
+                    name.trim(),
+                    url,
+                    color,
+                    hidden,
+                    provider.code(),
+                    username.trim(),
+                    password,
+                    i64::from(writable),
+                ],
+            )?;
+            if url_changed {
+                self.conn.execute("DELETE FROM calendar_events WHERE subscription_id = ?1", params![id.to_string()])?;
+            }
+            Ok(())
+        })
     }
 
     pub fn delete_subscription(&self, id: Id) -> Result<()> {
@@ -3591,50 +3657,50 @@ impl Store {
 
     /// Queues or updates a local CalDAV event edit (`dirty = Upsert`) and refreshes the combined feed.
     pub fn upsert_local_calendar_event(&self, subscription_id: Id, uid: &str, href: &str, ics: &str) -> Result<()> {
-        let tx = self.conn.unchecked_transaction()?;
-        tx.execute(
-            "INSERT INTO calendar_events (subscription_id, uid, href, etag, ics, dirty, updated_at)
-             VALUES (?1, ?2, ?3, NULL, ?4, 1, ?5)
-             ON CONFLICT(subscription_id, uid) DO UPDATE SET
-                 href = CASE WHEN excluded.href != '' THEN excluded.href ELSE calendar_events.href END,
-                 ics = excluded.ics,
-                 dirty = 1,
-                 updated_at = excluded.updated_at",
-            params![subscription_id.to_string(), uid, href, ics, now_ms()],
-        )?;
-        rebuild_caldav_feed(&tx, subscription_id)?;
-        tx.commit()?;
-        Ok(())
+        self.in_tx(|| {
+            self.conn.execute(
+                "INSERT INTO calendar_events (subscription_id, uid, href, etag, ics, dirty, updated_at)
+                 VALUES (?1, ?2, ?3, NULL, ?4, 1, ?5)
+                 ON CONFLICT(subscription_id, uid) DO UPDATE SET
+                     href = CASE WHEN excluded.href != '' THEN excluded.href ELSE calendar_events.href END,
+                     ics = excluded.ics,
+                     dirty = 1,
+                     updated_at = excluded.updated_at",
+                params![subscription_id.to_string(), uid, href, ics, now_ms()],
+            )?;
+            rebuild_caldav_feed(&self.conn, subscription_id)?;
+            Ok(())
+        })
     }
 
     /// Marks a CalDAV event for remote deletion (or drops it immediately if never pushed).
     pub fn mark_calendar_event_deleted(&self, subscription_id: Id, uid: &str) -> Result<bool> {
-        let existing: Option<(Option<String>, i64)> = self
-            .conn
-            .query_row(
-                "SELECT etag, dirty FROM calendar_events WHERE subscription_id = ?1 AND uid = ?2",
-                params![subscription_id.to_string(), uid],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
-        let Some((etag, dirty)) = existing else {
-            return Ok(false);
-        };
-        let tx = self.conn.unchecked_transaction()?;
-        if etag.is_none() && dirty == crate::ical::EventDirty::Upsert.to_i64() {
-            tx.execute(
-                "DELETE FROM calendar_events WHERE subscription_id = ?1 AND uid = ?2",
-                params![subscription_id.to_string(), uid],
-            )?;
-        } else {
-            tx.execute(
-                "UPDATE calendar_events SET dirty = 2, updated_at = ?3 WHERE subscription_id = ?1 AND uid = ?2",
-                params![subscription_id.to_string(), uid, now_ms()],
-            )?;
-        }
-        rebuild_caldav_feed(&tx, subscription_id)?;
-        tx.commit()?;
-        Ok(true)
+        self.in_tx(|| {
+            let existing: Option<(Option<String>, i64)> = self
+                .conn
+                .query_row(
+                    "SELECT etag, dirty FROM calendar_events WHERE subscription_id = ?1 AND uid = ?2",
+                    params![subscription_id.to_string(), uid],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            let Some((etag, dirty)) = existing else {
+                return Ok(false);
+            };
+            if etag.is_none() && dirty == crate::ical::EventDirty::Upsert.to_i64() {
+                self.conn.execute(
+                    "DELETE FROM calendar_events WHERE subscription_id = ?1 AND uid = ?2",
+                    params![subscription_id.to_string(), uid],
+                )?;
+            } else {
+                self.conn.execute(
+                    "UPDATE calendar_events SET dirty = 2, updated_at = ?3 WHERE subscription_id = ?1 AND uid = ?2",
+                    params![subscription_id.to_string(), uid, now_ms()],
+                )?;
+            }
+            rebuild_caldav_feed(&self.conn, subscription_id)?;
+            Ok(true)
+        })
     }
 
     /// Marks a dirty local event as synced cleanly after `PUT`.
@@ -3649,14 +3715,14 @@ impl Store {
 
     /// Removes a deleted event record after remote `DELETE` succeeds.
     pub fn remove_caldav_event(&self, subscription_id: Id, uid: &str) -> Result<()> {
-        let tx = self.conn.unchecked_transaction()?;
-        tx.execute(
-            "DELETE FROM calendar_events WHERE subscription_id = ?1 AND uid = ?2 AND dirty = 2",
-            params![subscription_id.to_string(), uid],
-        )?;
-        rebuild_caldav_feed(&tx, subscription_id)?;
-        tx.commit()?;
-        Ok(())
+        self.in_tx(|| {
+            self.conn.execute(
+                "DELETE FROM calendar_events WHERE subscription_id = ?1 AND uid = ?2 AND dirty = 2",
+                params![subscription_id.to_string(), uid],
+            )?;
+            rebuild_caldav_feed(&self.conn, subscription_id)?;
+            Ok(())
+        })
     }
 
     /// Replaces clean remote CalDAV events from a remote fetch while keeping any still-dirty local edits.
@@ -3667,42 +3733,42 @@ impl Store {
         remote: &[crate::ical::StoredEvent],
         sync_token: Option<&str>,
     ) -> Result<bool> {
-        let still_matches: Option<String> = self
-            .conn
-            .query_row(
-                "SELECT url FROM calendar_subscriptions WHERE id = ?1",
-                params![subscription_id.to_string()],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if still_matches.as_deref() != Some(url) {
-            return Ok(false);
-        }
+        self.in_tx(|| {
+            let still_matches: Option<String> = self
+                .conn
+                .query_row(
+                    "SELECT url FROM calendar_subscriptions WHERE id = ?1",
+                    params![subscription_id.to_string()],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if still_matches.as_deref() != Some(url) {
+                return Ok(false);
+            }
 
-        let tx = self.conn.unchecked_transaction()?;
-        let now = now_ms();
-        tx.execute("DELETE FROM calendar_events WHERE subscription_id = ?1 AND dirty = 0", params![subscription_id.to_string()])?;
-        for ev in remote {
-            tx.execute(
-                "INSERT INTO calendar_events (subscription_id, uid, href, etag, ics, dirty, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)
-                 ON CONFLICT(subscription_id, uid) DO UPDATE SET
-                     href = excluded.href,
-                     etag = excluded.etag,
-                     ics = excluded.ics,
-                     dirty = 0,
-                     updated_at = excluded.updated_at
-                 WHERE calendar_events.dirty = 0",
-                params![subscription_id.to_string(), ev.uid, ev.href, ev.etag, ev.ics, now],
+            let now = now_ms();
+            self.conn.execute("DELETE FROM calendar_events WHERE subscription_id = ?1 AND dirty = 0", params![subscription_id.to_string()])?;
+            for ev in remote {
+                self.conn.execute(
+                    "INSERT INTO calendar_events (subscription_id, uid, href, etag, ics, dirty, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)
+                     ON CONFLICT(subscription_id, uid) DO UPDATE SET
+                         href = excluded.href,
+                         etag = excluded.etag,
+                         ics = excluded.ics,
+                         dirty = 0,
+                         updated_at = excluded.updated_at
+                     WHERE calendar_events.dirty = 0",
+                    params![subscription_id.to_string(), ev.uid, ev.href, ev.etag, ev.ics, now],
+                )?;
+            }
+            rebuild_caldav_feed(&self.conn, subscription_id)?;
+            self.conn.execute(
+                "UPDATE calendar_subscriptions SET fetched_at = ?2, error = NULL, sync_token = ?3 WHERE id = ?1 AND url = ?4",
+                params![subscription_id.to_string(), now, sync_token, url],
             )?;
-        }
-        rebuild_caldav_feed(&tx, subscription_id)?;
-        tx.execute(
-            "UPDATE calendar_subscriptions SET fetched_at = ?2, error = NULL, sync_token = ?3 WHERE id = ?1 AND url = ?4",
-            params![subscription_id.to_string(), now, sync_token, url],
-        )?;
-        tx.commit()?;
-        Ok(true)
+            Ok(true)
+        })
     }
 
     pub fn countdowns(&self) -> Result<Vec<Countdown>> {
@@ -3889,12 +3955,102 @@ impl Store {
 
     /// Removes an attachment and its copy in `dir`.
     pub fn delete_attachment(&self, attachment: &Attachment, dir: &std::path::Path) -> Result<()> {
-        self.conn.execute("DELETE FROM task_attachments WHERE id = ?1", [attachment.id.to_string()])?;
+        let storage_name = format!("{}-{}", attachment.id, attachment.name);
+        self.in_tx(|| {
+            self.conn.execute("DELETE FROM task_attachments WHERE id = ?1", [attachment.id.to_string()])?;
+            self.prune_sync_uploaded(std::slice::from_ref(&storage_name))?;
+            Ok(())
+        })?;
         let file = attachment.path(dir);
-        if file.exists() {
-            std::fs::remove_file(file)?;
+        if let Err(err) = std::fs::remove_file(file)
+            && err.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(err.into());
         }
         Ok(())
+    }
+
+    fn collect_attachment_files_for_query<P: rusqlite::Params>(&self, sql: &str, params: P) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare_cached(sql)?;
+        let files = stmt.query_map(params, |row| row.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
+        Ok(files)
+    }
+
+    fn prune_sync_uploaded(&self, files: &[String]) -> Result<()> {
+        if files.is_empty() {
+            return Ok(());
+        }
+        let mut stmt = self.conn.prepare_cached("DELETE FROM sync_uploaded WHERE name = ?1")?;
+        for file in files {
+            stmt.execute([file])?;
+        }
+        Ok(())
+    }
+
+    fn unlink_attachment_files(&self, files: &[String], dir: Option<&Path>) {
+        let Some(dir) = dir.or(self.attachments_dir.as_deref()) else {
+            return;
+        };
+        for name in files {
+            if name.is_empty() || name.contains(['/', '\\', '\0']) {
+                continue;
+            }
+            let _ = std::fs::remove_file(dir.join(name));
+        }
+    }
+
+    /// Removes unreferenced files in `dir` (keeping files referenced by `task_attachments` or
+    /// `countdowns.background`, and skipping subdirectories like `.pending`) and prunes stale
+    /// `sync_uploaded` rows. Returns how many orphan files were deleted from disk.
+    pub fn gc_orphan_attachments(&self, dir: &Path) -> Result<usize> {
+        let mut live: HashSet<String> = HashSet::new();
+        {
+            let mut stmt = self.conn.prepare_cached("SELECT id || '-' || name FROM task_attachments")?;
+            for row in stmt.query_map([], |r| r.get::<_, String>(0))? {
+                live.insert(row?);
+            }
+        }
+        {
+            let mut stmt = self.conn.prepare_cached("SELECT background FROM countdowns WHERE background IS NOT NULL")?;
+            for row in stmt.query_map([], |r| r.get::<_, String>(0))? {
+                live.insert(row?);
+            }
+        }
+
+        // Prune stale sync_uploaded entries no longer referenced in SQLite.
+        let stale_uploaded: Vec<String> = {
+            let mut stmt = self.conn.prepare_cached("SELECT name FROM sync_uploaded")?;
+            stmt.query_map([], |r| r.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .filter(|name| !live.contains(name))
+                .collect()
+        };
+        if !stale_uploaded.is_empty() {
+            self.in_tx(|| self.prune_sync_uploaded(&stale_uploaded))?;
+        }
+
+        if !dir.is_dir() {
+            return Ok(0);
+        }
+        let mut removed = 0usize;
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if !live.contains(&name) {
+                match std::fs::remove_file(entry.path()) {
+                    Ok(()) => removed += 1,
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(err) => return Err(err.into()),
+                }
+            }
+        }
+        Ok(removed)
     }
 
     pub fn delete_countdown(&self, id: Id) -> Result<()> {
@@ -4910,12 +5066,13 @@ impl Store {
 
     /// The Focus Record's "Batch Management" Delete: these records go.
     pub fn delete_focus_sessions(&self, ids: &[Id]) -> Result<()> {
-        let tx = self.conn.unchecked_transaction()?;
-        for id in ids {
-            tx.execute("DELETE FROM focus_sessions WHERE id = ?1", [id.to_string()])?;
-        }
-        tx.commit()?;
-        Ok(())
+        self.in_tx(|| {
+            let mut stmt = self.conn.prepare_cached("DELETE FROM focus_sessions WHERE id = ?1")?;
+            for id in ids {
+                stmt.execute([id.to_string()])?;
+            }
+            Ok(())
+        })
     }
 
     /// The Focus Record's "Delete All".
@@ -4999,15 +5156,57 @@ impl Store {
         })
     }
 
-    /// Deletes the task and its subtasks permanently.
+    /// Deletes the task and its subtasks permanently, unlinking orphaned attachment files when an
+    /// attachment directory is configured on this store.
     pub fn purge_task(&self, id: Id) -> Result<()> {
-        self.conn.execute("DELETE FROM tasks WHERE id = ?1", [id.to_string()])?;
+        self.purge_task_with_dir(id, None)
+    }
+
+    /// Deletes the task and its subtasks permanently, pruning `sync_uploaded` and unlinking
+    /// orphaned attachment files in `dir` (or the store's default attachment directory).
+    pub fn purge_task_with_dir(&self, id: Id, dir: Option<&Path>) -> Result<()> {
+        let removed_files = self.in_tx(|| {
+            let files = self.collect_attachment_files_for_query(
+                "WITH RECURSIVE sub(id) AS (
+                     SELECT ?1
+                     UNION
+                     SELECT t.id FROM tasks t JOIN sub ON t.parent_id = sub.id
+                 )
+                 SELECT a.id || '-' || a.name FROM task_attachments a JOIN sub ON a.task_id = sub.id",
+                params![id.to_string()],
+            )?;
+            self.conn.execute("DELETE FROM tasks WHERE id = ?1", [id.to_string()])?;
+            self.prune_sync_uploaded(&files)?;
+            Ok(files)
+        })?;
+        self.unlink_attachment_files(&removed_files, dir);
         Ok(())
     }
 
-    /// Permanently deletes everything in the trash.
+    /// Permanently deletes everything in the trash, unlinking orphaned attachment files when an
+    /// attachment directory is configured on this store.
     pub fn empty_trash(&self) -> Result<()> {
-        self.conn.execute("DELETE FROM tasks WHERE deleted_at IS NOT NULL", [])?;
+        self.empty_trash_with_dir(None)
+    }
+
+    /// Permanently deletes everything in the trash, pruning `sync_uploaded` and unlinking
+    /// orphaned attachment files in `dir` (or the store's default attachment directory).
+    pub fn empty_trash_with_dir(&self, dir: Option<&Path>) -> Result<()> {
+        let removed_files = self.in_tx(|| {
+            let files = self.collect_attachment_files_for_query(
+                "WITH RECURSIVE sub(id) AS (
+                     SELECT id FROM tasks WHERE deleted_at IS NOT NULL
+                     UNION
+                     SELECT t.id FROM tasks t JOIN sub ON t.parent_id = sub.id
+                 )
+                 SELECT a.id || '-' || a.name FROM task_attachments a JOIN sub ON a.task_id = sub.id",
+                [],
+            )?;
+            self.conn.execute("DELETE FROM tasks WHERE deleted_at IS NOT NULL", [])?;
+            self.prune_sync_uploaded(&files)?;
+            Ok(files)
+        })?;
+        self.unlink_attachment_files(&removed_files, dir);
         Ok(())
     }
 
@@ -5151,20 +5350,24 @@ impl Store {
     }
 
     pub fn batch_duplicate(&self, ids: &[Id]) -> Result<Vec<Task>> {
-        let mut created = Vec::with_capacity(ids.len());
-        for &id in ids {
-            if let Ok(copy) = self.duplicate_task(id) {
-                created.push(copy);
+        self.in_tx(|| {
+            let mut created = Vec::with_capacity(ids.len());
+            for &id in ids {
+                if self.task(id)?.is_some() {
+                    created.push(self.duplicate_task(id)?);
+                }
             }
-        }
-        Ok(created)
+            Ok(created)
+        })
     }
 
     pub fn batch_set_kind(&self, ids: &[Id], kind: Kind) -> Result<()> {
-        for &id in ids {
-            self.set_kind(id, kind)?;
-        }
-        Ok(())
+        self.in_tx(|| {
+            for &id in ids {
+                self.set_kind(id, kind)?;
+            }
+            Ok(())
+        })
     }
 
     /// Merges multiple selected tasks into the first task: subsequent tasks (and their checklist
@@ -5203,7 +5406,7 @@ impl Store {
                     }
                 }
                 for tag in other.tags {
-                    if !tags.iter().any(|existing| existing.eq_ignore_ascii_case(&tag)) {
+                    if !tags.iter().any(|existing| existing.to_lowercase() == tag.to_lowercase()) {
                         tags.push(tag);
                         tags_changed = true;
                     }
@@ -5350,7 +5553,7 @@ fn task_from_row(row: &Row) -> rusqlite::Result<Task> {
     })
 }
 
-fn rebuild_caldav_feed(tx: &rusqlite::Transaction<'_>, subscription_id: Id) -> Result<()> {
+fn rebuild_caldav_feed(tx: &Connection, subscription_id: Id) -> Result<()> {
     let mut stmt = tx.prepare(
         "SELECT ics FROM calendar_events WHERE subscription_id = ?1 AND dirty != 2 ORDER BY uid",
     )?;
@@ -5449,7 +5652,7 @@ mod tests {
             "INSERT INTO tasks VALUES ('0192f000-0000-7000-8000-000000000001', 'legacy', NULL, 1)",
             [],
         )?;
-        let store = Store::init(conn)?;
+        let store = Store::init(conn, None)?;
         let task = &store.tasks()?[0];
         assert_eq!(
             (task.title.as_str(), task.kind, task.priority),
@@ -5965,7 +6168,7 @@ mod tests {
             "INSERT INTO lists (id, name, created_at) VALUES ('l', 'Home', 0);
              INSERT INTO list_sections (id, list_id, name, created_at) VALUES ('s', 'l', 'Kitchen', 0);",
         )?;
-        let store = Store { conn };
+        let store = Store { conn, attachments_dir: None };
         let task = store.add_task("Dishes")?;
         store.conn.execute("UPDATE tasks SET list_id = 'l', section_id = 's' WHERE id = ?1", [task.id.to_string()])?;
         Store::migrate(&store.conn)?;
@@ -7480,6 +7683,153 @@ mod tests {
 
         store.batch_set_kind(&[a.id, b.id], Kind::Task)?;
         assert_eq!(store.task(a.id)?.unwrap().kind, Kind::Task);
+        Ok(())
+    }
+
+    #[test]
+    fn purge_empty_trash_and_delete_list_unlink_attachments_and_prune_sync_uploaded() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let db_path = dir.path().join("tasks.db");
+        let attachments_dir = dir.path().join("attachments");
+        let source = dir.path().join("doc.txt");
+        std::fs::write(&source, "hello attachment")?;
+
+        let store = Store::open(&db_path)?;
+        assert_eq!(store.attachments_dir(), Some(attachments_dir.as_path()));
+
+        // 1. purge_task unlinks both parent and subtask attachment files and prunes sync_uploaded.
+        let parent = store.add_task("Parent")?;
+        let child = store.add_subtask(parent.id, "Child")?;
+        let att_parent = store.add_attachment(parent.id, &source, &attachments_dir)?;
+        let att_child = store.add_attachment(child.id, &source, &attachments_dir)?;
+        let name_parent = format!("{}-{}", att_parent.id, att_parent.name);
+        let name_child = format!("{}-{}", att_child.id, att_child.name);
+        store.mark_files_synced(&[name_parent.clone(), name_child.clone()])?;
+        assert!(att_parent.path(&attachments_dir).exists());
+        assert!(att_child.path(&attachments_dir).exists());
+
+        store.purge_task(parent.id)?;
+        assert!(!att_parent.path(&attachments_dir).exists());
+        assert!(!att_child.path(&attachments_dir).exists());
+        let uploaded_count: i64 = store.conn.query_row("SELECT COUNT(*) FROM sync_uploaded", [], |r| r.get(0))?;
+        assert_eq!(uploaded_count, 0);
+
+        // 2. empty_trash unlinks attachments of trashed tasks.
+        let trashed = store.add_task("Trashed")?;
+        let att_trashed = store.add_attachment(trashed.id, &source, &attachments_dir)?;
+        let name_trashed = format!("{}-{}", att_trashed.id, att_trashed.name);
+        store.mark_files_synced(std::slice::from_ref(&name_trashed))?;
+        store.delete_task(trashed.id)?;
+        assert!(att_trashed.path(&attachments_dir).exists(), "soft delete keeps file for restore");
+        store.empty_trash()?;
+        assert!(!att_trashed.path(&attachments_dir).exists());
+        let uploaded_count: i64 = store.conn.query_row("SELECT COUNT(*) FROM sync_uploaded", [], |r| r.get(0))?;
+        assert_eq!(uploaded_count, 0);
+
+        // 3. delete_list unlinks attachments of tasks belonging to that list.
+        let list = store.create_list("Project")?;
+        let in_list = store.add_task("In list")?;
+        store.set_list(in_list.id, Some(list.id))?;
+        let att_list = store.add_attachment(in_list.id, &source, &attachments_dir)?;
+        let name_list = format!("{}-{}", att_list.id, att_list.name);
+        store.mark_files_synced(std::slice::from_ref(&name_list))?;
+        store.delete_list(list.id)?;
+        assert!(!att_list.path(&attachments_dir).exists());
+        let uploaded_count: i64 = store.conn.query_row("SELECT COUNT(*) FROM sync_uploaded", [], |r| r.get(0))?;
+        assert_eq!(uploaded_count, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn gc_orphan_attachments_cleans_unreferenced_files_and_keeps_live_files_and_countdowns() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let attachments_dir = dir.path().join("attachments");
+        let source = dir.path().join("live.txt");
+        let photo = dir.path().join("bg.jpg");
+        std::fs::write(&source, "live")?;
+        std::fs::write(&photo, "jpg")?;
+
+        let store = Store::open_in_memory()?.with_attachments_dir(&attachments_dir);
+        let task = store.add_task("Keep")?;
+        let att = store.add_attachment(task.id, &source, &attachments_dir)?;
+        let countdown = store.add_countdown("Trip", d(2026, 12, 1), CountdownKind::Countdown)?;
+        let bg = store.set_countdown_background(countdown.id, Some(&photo), &attachments_dir)?.unwrap();
+
+        // Create an orphan file, a .pending staging dir, and a stale sync_uploaded entry.
+        let orphan = attachments_dir.join("orphan-file.txt");
+        std::fs::write(&orphan, "stale")?;
+        std::fs::create_dir_all(attachments_dir.join(".pending"))?;
+        std::fs::write(attachments_dir.join(".pending").join("staged.txt"), "staging")?;
+        store.mark_files_synced(&[format!("{}-{}", att.id, att.name), bg.clone(), "orphan-file.txt".into()])?;
+
+        let removed = store.gc_orphan_attachments(&attachments_dir)?;
+        assert_eq!(removed, 1);
+        assert!(!orphan.exists());
+        assert!(att.path(&attachments_dir).exists());
+        assert!(attachments_dir.join(&bg).exists());
+        assert!(attachments_dir.join(".pending").join("staged.txt").exists());
+        let remaining: Vec<String> = store
+            .conn
+            .prepare("SELECT name FROM sync_uploaded ORDER BY name")?
+            .query_map([], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        assert_eq!(remaining.len(), 2);
+        assert!(!remaining.contains(&"orphan-file.txt".to_owned()));
+        Ok(())
+    }
+
+    #[test]
+    fn tag_family_traverses_multi_level_descendants_and_guards_cycles() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        // Insert a 3-level hierarchy Work -> Backend -> Rust directly (as synced data could carry).
+        store.conn.execute("INSERT INTO tags (name, parent, created_at) VALUES ('Work', NULL, 1)", [])?;
+        store.conn.execute("INSERT INTO tags (name, parent, created_at) VALUES ('Backend', 'Work', 2)", [])?;
+        store.conn.execute("INSERT INTO tags (name, parent, created_at) VALUES ('Rust', 'Backend', 3)", [])?;
+        let task = store.add_task("Write compiler")?;
+        store.set_tags(task.id, &["Rust".into()])?;
+
+        let found = store.tasks_in(&View::Tag("Work".into()), d(2026, 10, 18))?;
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, task.id);
+
+        // Cycle guard: A -> B -> A must terminate cleanly.
+        store.conn.execute("INSERT INTO tags (name, parent, created_at) VALUES ('CycleA', 'CycleB', 4)", [])?;
+        store.conn.execute("INSERT INTO tags (name, parent, created_at) VALUES ('CycleB', 'CycleA', 5)", [])?;
+        let fam = store.tag_family("CycleA")?;
+        assert!(fam.contains("cyclea") && fam.contains("cycleb"));
+        Ok(())
+    }
+
+    #[test]
+    fn nested_in_tx_works_across_store_mutations_and_rolls_back() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let res: Result<()> = store.in_tx(|| {
+            let task = store.create_task(TaskDraft { title: "Nested".into(), ..Default::default() }, true)?;
+            store.set_tags(task.id, &["nested".into()])?;
+            let folder = store.add_list_folder("F")?;
+            store.ungroup_list_folder(folder.id)?;
+            store.insert_list_section(None, "Sec", None)?;
+            store.batch_duplicate(&[task.id])?;
+            store.batch_set_kind(&[task.id], Kind::Note)?;
+            anyhow::bail!("abort outer transaction")
+        });
+        assert!(res.is_err());
+        assert!(store.tasks()?.is_empty());
+        assert!(store.list_sections(None)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn undo_repeat_preserves_completed_copy_if_parent_was_purged() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let task = store.add_task("Daily standup")?;
+        store.set_due(task.id, Some(d(2026, 10, 18)), None)?;
+        store.set_repeat(task.id, Some(Recurrence::new(crate::Frequency::Daily, 1)), d(2026, 10, 18))?;
+        let copy = store.complete(task.id, true)?.expect("repeating task creates completed copy");
+        store.purge_task(task.id)?;
+        // Undoing after parent was purged must NOT delete the completed history record.
+        store.undo_repeat(task.id, copy, Some(d(2026, 10, 18)), None, None)?;
+        assert!(store.task(copy)?.is_some());
         Ok(())
     }
 }

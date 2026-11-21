@@ -1991,12 +1991,12 @@ impl Render for AppView {
                     cx,
                 ))
                 .child(match self.section {
-                Section::Tasks | Section::Search => div().flex_1().h_full().child(self.todo.clone()),
-                Section::Calendar => div().flex_1().h_full().child(self.calendar.clone()),
-                Section::Matrix => div().flex_1().h_full().child(self.matrix.clone()),
-                Section::Countdown => div().flex_1().h_full().child(self.countdown.clone()),
-                Section::Habits => div().flex_1().h_full().child(self.habits.clone()),
-                    Section::Pomodoro => div().flex_1().h_full().child(self.focus.clone()),
+                    Section::Tasks | Section::Search => div().flex_1().min_w_0().h_full().child(self.todo.clone()),
+                    Section::Calendar => div().flex_1().min_w_0().h_full().child(self.calendar.clone()),
+                    Section::Matrix => div().flex_1().min_w_0().h_full().child(self.matrix.clone()),
+                    Section::Countdown => div().flex_1().min_w_0().h_full().child(self.countdown.clone()),
+                    Section::Habits => div().flex_1().min_w_0().h_full().child(self.habits.clone()),
+                    Section::Pomodoro => div().flex_1().min_w_0().h_full().child(self.focus.clone()),
                 })
             })
             .when(self.shortcuts_open, |el| el.child(self.render_shortcuts(cx)))

@@ -929,8 +929,8 @@ impl FocusView {
                 .justify_center()
                 .rounded(px(6.))
                 .cursor_pointer()
-                .when(primary, |el| el.bg(theme.colors().accent))
-                .when(!primary, |el| el.border_1().border_color(theme.colors().border))
+                .when(primary, |el| el.bg(theme.colors().accent).hover(|s| s.opacity(0.9)))
+                .when(!primary, |el| el.border_1().border_color(theme.colors().border).hover(|s| s.bg(theme.colors().element_hover)))
                 .child(Label::new(label).size(LabelSize::Small).when(primary, |label| label.color(Color::OnAccent)))
         };
         let fields = if which == 0 {
@@ -1292,8 +1292,8 @@ impl FocusView {
                 .justify_center()
                 .rounded(px(6.))
                 .cursor_pointer()
-                .when(primary, |el| el.bg(theme.colors().accent))
-                .when(!primary, |el| el.border_1().border_color(theme.colors().border))
+                .when(primary, |el| el.bg(theme.colors().accent).hover(|s| s.opacity(0.9)))
+                .when(!primary, |el| el.border_1().border_color(theme.colors().border).hover(|s| s.bg(theme.colors().element_hover)))
                 .child(Label::new(label).size(LabelSize::Small).when(primary, |label| label.color(Color::OnAccent)))
         };
         let close = cx.listener(|this, _, _, cx| {
@@ -1558,8 +1558,8 @@ impl FocusView {
                 .justify_center()
                 .rounded(px(6.))
                 .cursor_pointer()
-                .when(primary, |el| el.bg(theme.colors().accent))
-                .when(!primary, |el| el.border_1().border_color(theme.colors().border))
+                .when(primary, |el| el.bg(theme.colors().accent).hover(|s| s.opacity(0.9)))
+                .when(!primary, |el| el.border_1().border_color(theme.colors().border).hover(|s| s.bg(theme.colors().element_hover)))
                 .child(Label::new(label).size(LabelSize::Small).when(primary, |label| label.color(Color::OnAccent)))
         };
         popover(cx)
@@ -3812,8 +3812,8 @@ impl FocusView {
                 .justify_center()
                 .rounded_full()
                 .cursor_pointer()
-                .when(primary, |el| el.bg(theme.colors().accent))
-                .when(!primary, |el| el.border_1().border_color(theme.colors().border))
+                .when(primary, |el| el.bg(theme.colors().accent).hover(|s| s.opacity(0.9)))
+                .when(!primary, |el| el.border_1().border_color(theme.colors().border).hover(|s| s.bg(theme.colors().element_hover)))
                 .child(Label::new(text).when(primary, |label| label.color(Color::OnAccent)))
         };
         // The picked task, timer or habit names the session until it starts.
@@ -3873,9 +3873,13 @@ impl FocusView {
                         .child(
                             div()
                                 .relative()
-                                .child(IconButton::new("focus-page-more", IconName::Ellipsis).on_click(cx.listener(|this, _, _, cx| {
-                                    this.set_record_menu(Some(RecordMenu::HeaderMore), cx)
-                                })))
+                                .child(
+                                    IconButton::new("focus-page-more", IconName::Ellipsis)
+                                        .tooltip(Tooltip::text(strings.more))
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.set_record_menu(Some(RecordMenu::HeaderMore), cx)
+                                        })),
+                                )
                                 .when_some(
                                     self.record_menu.filter(|m| matches!(m, RecordMenu::HeaderMore | RecordMenu::Settings)),
                                     |el, menu| el.child(PopoverAttachment::new(Placement::BelowRight, self.render_record_menu(menu, cx))),
@@ -3896,10 +3900,16 @@ impl FocusView {
                                 h_flex()
                                     .id("focus-page-pick")
                                     .gap_0p5()
-                                    .cursor_pointer()
+                                    .px_2()
+                                    .py_1()
+                                    .rounded(px(6.))
+                                    .when(!running, |el| {
+                                        el.cursor_pointer()
+                                            .hover(|s| s.bg(theme.colors().ghost_element_hover))
+                                            .on_click(cx.listener(|this, _, window, cx| this.open_picker(false, window, cx)))
+                                    })
                                     .child(Label::new(label).size(LabelSize::Small).color(Color::Muted))
-                                    .child(Icon::new(IconName::ChevronRight).size(IconSize::XSmall).color(Color::Muted))
-                                    .when(!running, |el| el.on_click(cx.listener(|this, _, window, cx| this.open_picker(false, window, cx)))),
+                                    .when(!running, |el| el.child(Icon::new(IconName::ChevronRight).size(IconSize::XSmall).color(Color::Muted))),
                             )
                             .children(picker_here),
                     )
@@ -3935,8 +3945,11 @@ impl FocusView {
                     .child(div().w(px(24.)).child(Label::new(hour.to_string()).size(LabelSize::XSmall).color(Color::Muted)))
                     .child(div().flex_1().h(px(1.)).bg(theme.colors().border_variant))
             }))
-            .children(fern_core::focus::day_blocks(&self.sessions, today).into_iter().filter(|(_, to, _)| *to > first * 60).map(|(from, to, session)| {
+            .children(fern_core::focus::day_blocks(&self.sessions, today).into_iter().filter(|(_, to, _)| *to > first * 60).enumerate().map(|(i, (from, to, session))| {
+                let dur = format_minutes(to.saturating_sub(from) as i64);
+                let tip = format!("{} · {:02}:{:02}–{:02}:{:02} ({dur})", session.title, from / 60, from % 60, to / 60, to % 60);
                 div()
+                    .id(SharedString::from(format!("focus-page-block-{i}")))
                     .absolute()
                     .top(top(from.max(first * 60)))
                     .left(px(32.))
@@ -3945,9 +3958,11 @@ impl FocusView {
                     .px_2()
                     .rounded(px(4.))
                     .bg(theme.colors().accent.opacity(0.25))
+                    .hover(|s| s.bg(theme.colors().accent.opacity(0.38)))
                     .border_l_2()
                     .border_color(theme.colors().accent)
                     .overflow_hidden()
+                    .tooltip(Tooltip::text(tip))
                     .child(Label::new(session.title.clone()).size(LabelSize::XSmall))
             }))
             .child(
@@ -3978,6 +3993,7 @@ impl FocusView {
                             .child(
                                 IconButton::new("focus-page-eye", IconName::Eye)
                                     .icon_color(Color::Muted)
+                                    .tooltip(Tooltip::text(strings.focus))
                                     .on_click(cx.listener(|this, _, window, cx| this.open_picker(true, window, cx))),
                             )
                             .children(picker_eye),

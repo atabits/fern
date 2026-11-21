@@ -45,25 +45,28 @@ fn reorder_enabled_rail(
 }
 
 pub struct AppView {
-    store: Rc<Store>,
+    pub(crate) store: Rc<Store>,
     section: Section,
-    todo: gpui::Entity<TodoView>,
-    calendar: gpui::Entity<CalendarView>,
-    matrix: gpui::Entity<MatrixView>,
-    countdown: gpui::Entity<CountdownView>,
-    habits: gpui::Entity<HabitView>,
-    focus: gpui::Entity<FocusView>,
+    pub(crate) todo: gpui::Entity<TodoView>,
+    pub(crate) calendar: gpui::Entity<CalendarView>,
+    pub(crate) matrix: gpui::Entity<MatrixView>,
+    pub(crate) countdown: gpui::Entity<CountdownView>,
+    pub(crate) habits: gpui::Entity<HabitView>,
+    pub(crate) focus: gpui::Entity<FocusView>,
     title_bar: gpui::Entity<TitleBar>,
-    search: Option<gpui::Entity<SearchModal>>,
-    account_menu_open: bool,
+    pub(crate) search: Option<gpui::Entity<SearchModal>>,
+    pub(crate) account_menu_open: bool,
     notices: Notices,
     notices_open: bool,
     active_alerts: Vec<Notice>,
     sync: crate::sync::SyncStatus,
     /// Cached `store.sync_config().is_some()` so `render` never queries SQLite every frame.
-    has_sync_config: bool,
+    pub(crate) has_sync_config: bool,
+    /// Cached `tray::always_on_top` so `render_account_menu` never queries SQLite every frame.
+    #[cfg(windows)]
+    always_on_top: bool,
     /// Settings → Features: the sections shown in the sidebar.
-    features: fern_core::Features,
+    pub(crate) features: fern_core::Features,
     /// Order of icons in the narrow left navigation rail.
     rail_order: Vec<fern_core::RailSection>,
     /// Scroll handle for the left navigation rail (needed so drag slot calculation accounts for scroll).
@@ -72,11 +75,11 @@ pub struct AppView {
     dragging_rail: Option<Section>,
     rail_drag_origin: Option<Vec<fern_core::RailSection>>,
     /// The "Shortcuts" panel on the right, while open.
-    shortcuts_open: bool,
+    pub(crate) shortcuts_open: bool,
     /// The system-wide shortcut being recorded in the Shortcuts panel, and the panel's focus.
     recording_hotkey: Option<crate::hotkeys::Hotkey>,
     shortcuts_focus: gpui::FocusHandle,
-    settings: Option<gpui::WindowHandle<SettingsWindow>>,
+    pub(crate) settings: Option<gpui::WindowHandle<SettingsWindow>>,
     update_notice: Option<Rc<ReleaseNotes>>,
     /// The Statistics page opened from the account menu, which covers the whole window.
     statistics_open: bool,
@@ -103,6 +106,20 @@ impl AppView {
                             window.remove_window();
                         }
                     });
+                } else if let Some(settings) = target.downcast::<SettingsWindow>() {
+                    let _ = settings.update(cx, |settings, window, cx| settings.close(window, cx));
+                } else if target.downcast::<crate::sticky_note::StickyNote>().is_some() {
+                    // StickyNote handles CloseWindow itself (calling `forget(cx)`) when focused.
+                    // If Ctrl+W bubbles here while unfocused, request a native close so
+                    // `on_window_should_close` runs instead of `remove_window()` resurrecting it.
+                    #[cfg(windows)]
+                    let _ = target.update(cx, |_, window, _| {
+                        if let Some(hwnd) = desktop_common::sticky_windows::win32_window_handle(window) {
+                            use windows::Win32::Foundation::{LPARAM, WPARAM};
+                            use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_CLOSE};
+                            let _ = unsafe { PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)) };
+                        }
+                    });
                 } else {
                     let _ = target.update(cx, |_, window, _| window.remove_window());
                 }
@@ -118,8 +135,12 @@ impl AppView {
                     can_quit
                 }).unwrap_or(true);
                 if can_quit {
+                    crate::hotkeys::shutdown(cx);
                     #[cfg(windows)]
-                    crate::tray::prepare_quit();
+                    {
+                        crate::tray::prepare_quit();
+                        crate::single_instance::release();
+                    }
                     cx.quit();
                 }
             });
@@ -238,6 +259,8 @@ impl AppView {
         let store_features = initial_prefs.features;
         let rail_order = initial_prefs.rail_order;
         let has_sync_config = store.sync_config().ok().flatten().is_some();
+        #[cfg(windows)]
+        let always_on_top = crate::tray::TrayPrefs::current(&store, cx).always_on_top;
         let update_notice = release_notes::take_update_notice(&store, first_start).unwrap_or_else(|err| {
             eprintln!("failed to read the update notification: {err:#}");
             None
@@ -245,6 +268,12 @@ impl AppView {
         let title_bar = cx.new(TitleBar::new);
         cx.subscribe_in(&title_bar, window, |this, _, ShowReleaseNotes(notes), window, cx| {
             this.open_settings(Some(notes.clone()), window, cx);
+        })
+        .detach();
+        #[cfg(windows)]
+        cx.observe_global::<crate::tray::TrayPrefs>(|this, cx| {
+            this.always_on_top = cx.global::<crate::tray::TrayPrefs>().always_on_top;
+            cx.notify();
         })
         .detach();
         // Mutated only by the debug-build dev state below.
@@ -266,6 +295,8 @@ impl AppView {
             active_alerts: Vec::new(),
             sync: crate::sync::SyncStatus::Off,
             has_sync_config,
+            #[cfg(windows)]
+            always_on_top,
             features: store_features,
             rail_order,
             rail_scroll: gpui::ScrollHandle::new(),
@@ -292,314 +323,8 @@ impl AppView {
             }
         })
         .detach();
-        cx.observe_keystrokes(|this, event, window, cx| {
-            if event.keystroke.key == "escape" && this.cancel_rail_drag(window, cx) {
-                cx.notify();
-            }
-        })
-        .detach();
         #[cfg(debug_assertions)]
-        if let Ok(state) = std::env::var("FERN_DEV_STATE") {
-            if state.contains("section=calendar") {
-                this.select(Section::Calendar, window, cx);
-            }
-            if state.contains("calendar=week") {
-                this.calendar.update(cx, |c, cx| c.set_mode(crate::calendar_view::CalendarMode::Week, cx));
-            }
-            if state.contains("calendar=day") {
-                this.calendar.update(cx, |c, cx| c.set_mode(crate::calendar_view::CalendarMode::Day, cx));
-            }
-            if state.contains("calendar=multi") {
-                this.calendar.update(cx, |c, cx| c.set_mode(crate::calendar_view::CalendarMode::MultiDay(3), cx));
-            }
-            if state.contains("calendar=year") {
-                this.calendar.update(cx, |c, cx| c.set_mode(crate::calendar_view::CalendarMode::Year, cx));
-            }
-            // `year-day=2026-10-24` opens that day's card in the Year view.
-            if let Some(day) = state.split(';').find_map(|part| part.strip_prefix("year-day=")).and_then(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok()) {
-                this.calendar.update(cx, |c, cx| c.dev_year_day(day, cx));
-            }
-            if state.contains("calendar=multi-week") {
-                this.calendar.update(cx, |c, cx| c.set_mode(crate::calendar_view::CalendarMode::MultiWeek(5), cx));
-            }
-            if state.contains("calendar=agenda") {
-                this.calendar.update(cx, |c, cx| c.set_mode(crate::calendar_view::CalendarMode::Agenda, cx));
-            }
-            if state.contains("calendar-menu=open") {
-                this.calendar.update(cx, |c, cx| c.dev_open_menu(cx));
-            }
-            // `matrix=header-menu|add` opens the Matrix's "…" or quadrant I's new task field.
-            if let Some(what) = state.split(';').find_map(|part| part.strip_prefix("matrix=")) {
-                this.matrix.update(cx, |view, cx| view.dev_header(what, window, cx));
-            }
-            if state.contains("section=matrix") {
-                this.select(Section::Matrix, window, cx);
-            }
-            // `matrix-menu=<1-4>` / `matrix-edit=<1-4>`: a quadrant's "…" menu or "Edit Matrix".
-            for (prefix, edit) in [("matrix-menu=", false), ("matrix-edit=", true)] {
-                if let Some(n) = state.split(';').find_map(|part| part.strip_prefix(prefix)).and_then(|n| n.parse::<usize>().ok()) {
-                    this.matrix.update(cx, |view, cx| view.dev_open(n.clamp(1, 4) - 1, edit, cx));
-                }
-            }
-            // `countdown=<name>><YYYY-MM-DD>><countdown|anniversary|holiday>[><emoji>|<#color>]`, repeatable.
-            for spec in state.split(';').filter_map(|part| part.strip_prefix("countdown=")) {
-                let parts: Vec<&str> = spec.split('>').collect();
-                if let [name, date, kind, ..] = parts[..]
-                    && let Ok(date) = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
-                {
-                    let kind = fern_core::CountdownKind::parse(kind);
-                    // A fourth part, `<emoji>|<#color>`, sets its icon.
-                    let look = parts.get(3).map(|look| look.split_once('|').unwrap_or((look, "")));
-                    this.countdown.update(cx, |view, cx| view.dev_add(name, date, kind, look, cx));
-                    this.calendar.update(cx, |view, cx| view.reload(cx));
-                }
-            }
-            // `countdown-age=<name part>`: that birthday with "Show Age" on.
-            if let Some(name) = state.split(';').find_map(|part| part.strip_prefix("countdown-age="))
-                && let Some(countdown) = this.store.countdowns().unwrap_or_default().into_iter().find(|c| c.name.contains(name))
-            {
-                this.store.set_countdown_show_age(countdown.id, true).ok();
-                this.countdown.update(cx, |view, cx| view.reload(cx));
-            }
-            // `countdown-bg=<name part>><picture path>`: that countdown's background picture.
-            if let Some(spec) = state.split(';').find_map(|part| part.strip_prefix("countdown-bg=")) {
-                let (name, path) = spec.split_once('>').unwrap_or((spec, ""));
-                if let Some(countdown) = this.store.countdowns().unwrap_or_default().into_iter().find(|c| c.name.contains(name))
-                    && let Ok(dir) = crate::attachments_dir()
-                {
-                    this.store.set_countdown_background(countdown.id, Some(std::path::Path::new(path)), &dir).ok();
-                    this.countdown.update(cx, |view, cx| view.reload(cx));
-                }
-            }
-            // `countdown-pin=<name part>`: that countdown pinned.
-            if let Some(name) = state.split(';').find_map(|part| part.strip_prefix("countdown-pin="))
-                && let Some(countdown) = this.store.countdowns().unwrap_or_default().into_iter().find(|c| c.name.contains(name))
-            {
-                this.store.set_countdown_pinned(countdown.id, true).ok();
-                this.countdown.update(cx, |view, cx| view.reload(cx));
-            }
-            // `countdown-menu=<name part>` / `countdown-edit=<name part>`: a card's "…" menu or its
-            // edit popover.
-            for (prefix, edit) in [("countdown-menu=", false), ("countdown-edit=", true)] {
-                if let Some(name) = state.split(';').find_map(|part| part.strip_prefix(prefix)) {
-                    this.countdown.update(cx, |view, cx| view.dev_open(name, edit, window, cx));
-                }
-            }
-            // `agenda-countdown=<name part>` opens that countdown's card in the Agenda.
-            if let Some(needle) = state.split(';').find_map(|part| part.strip_prefix("calendar-context=")) {
-                this.calendar.update(cx, |view, cx| view.dev_context(needle, cx));
-            }
-            if let Some(what) = state.split(';').find_map(|part| part.strip_prefix("calendar-more=")) {
-                this.calendar.update(cx, |view, cx| view.dev_more(what, cx));
-            }
-            // `calendar-card=<title part>` opens that task's card in the calendar.
-            if let Some(needle) = state.split(';').find_map(|part| part.strip_prefix("calendar-card=")) {
-                this.calendar.update(cx, |view, cx| view.dev_card(needle, cx));
-            }
-            if let Some(name) = state.split(';').find_map(|part| part.strip_prefix("agenda-countdown=")) {
-                this.calendar.update(cx, |view, cx| view.dev_open_countdown(name, cx));
-            }
-            // `habit=<name>><days ago,…>`, repeatable.
-            for spec in state.split(';').filter_map(|part| part.strip_prefix("habit=")) {
-                let (name, days) = spec.split_once('>').unwrap_or((spec, ""));
-                let days: Vec<i64> = days.split(',').filter_map(|d| d.parse().ok()).collect();
-                this.habits.update(cx, |view, cx| view.dev_add(name, &days, cx));
-            }
-            // `habit-select=<name>` opens a habit's details panel; `habit-do=<command>` (see
-            // `HabitView::dev_apply`) acts on the selected habit. They run in order.
-            for part in state.split(';') {
-                if let Some(name) = part.strip_prefix("habit-select=") {
-                    this.habits.update(cx, |view, cx| view.dev_select(name, cx));
-                } else if let Some(command) = part.strip_prefix("habit-do=") {
-                    this.habits.update(cx, |view, cx| view.dev_apply(command, window, cx));
-                }
-            }
-            // `focus=<title>><minutes ago>><minutes>`, repeatable.
-            for spec in state.split(';').filter_map(|part| part.strip_prefix("focus=")) {
-                let parts: Vec<&str> = spec.split('>').collect();
-                // A fourth part `sw` records it as a stopwatch session.
-                if let [title, ago, minutes, ..] = parts[..]
-                    && let (Ok(ago), Ok(minutes)) = (ago.parse(), minutes.parse())
-                {
-                    let stopwatch = parts.get(3) == Some(&"sw");
-                    this.focus.update(cx, |view, cx| view.dev_record(title, ago, minutes, stopwatch, cx));
-                }
-            }
-            // The calendar shows the habits and focus records added above.
-            this.calendar.update(cx, |view, cx| view.reload(cx));
-            // `focus-timer=<name>[><emoji>[>#color]]`, repeatable: a timer in the Pomodoro list;
-            // `focus-timer-add` opens "Add Timer", `focus-timer-add=icons` with its icon picker.
-            for spec in state.split(';').filter_map(|part| part.strip_prefix("focus-timer=")) {
-                let mut parts = spec.split('>');
-                let mut timer = fern_core::focus::FocusTimer::new(parts.next().unwrap_or_default());
-                timer.icon = parts.next().map(str::to_owned);
-                timer.color = parts.next().map(str::to_owned);
-                this.store.save_focus_timer(&timer).ok();
-                this.focus.update(cx, |view, cx| view.reload(cx));
-            }
-            if state.contains("focus-timer-add") {
-                let icons = state.contains("focus-timer-add=icons");
-                this.focus.update(cx, |view, cx| view.dev_add_timer(icons, window, cx));
-            }
-            if let Some(menu) = state.split(';').find_map(|part| part.strip_prefix("focus-menu=")) {
-                this.focus.update(cx, |view, cx| view.dev_menu(menu, window, cx));
-            }
-            // `focus-task=<title part>`: what "Start Focus" in a task's menu does.
-            if let Some(needle) = state.split(';').find_map(|part| part.strip_prefix("focus-task="))
-                && let Some(task) = this.store.tasks().unwrap_or_default().into_iter().find(|t| t.title.contains(needle))
-            {
-                this.select(Section::Pomodoro, window, cx);
-                this.focus.update(cx, |focus, cx| focus.start(Some((task.id, task.title)), cx));
-            }
-            if state.contains("section=focus") {
-                this.select(Section::Pomodoro, window, cx);
-            }
-            if state.contains("section=habits") {
-                this.select(Section::Habits, window, cx);
-            }
-            if state.contains("section=countdown") {
-                this.select(Section::Countdown, window, cx);
-            }
-            // `countdown-header=title|more`: the header's "Countdown ▾" or "…" menu.
-            if let Some(menu) = state.split(';').find_map(|part| part.strip_prefix("countdown-header=")) {
-                this.countdown.update(cx, |view, cx| view.dev_header_menu(menu == "more", cx));
-            }
-            if state.contains("countdown-add-menu") {
-                this.countdown.update(cx, |view, cx| view.dev_add_menu(cx));
-            }
-            if state.contains("countdown-draft") {
-                this.countdown.update(cx, |view, cx| view.start_new(window, cx));
-            }
-            // `countdown-add=<kind>`: a new countdown of that kind, as the "+" menu starts it.
-            if let Some(kind) = state.split(';').find_map(|part| part.strip_prefix("countdown-add=")) {
-                let kind = fern_core::CountdownKind::parse(kind);
-                this.countdown.update(cx, |view, cx| view.start_new_kind(kind, window, cx));
-            }
-            // `countdown-draft=reminder|calc|counting|show|month`: the dialog with that dropdown open.
-            if let Some(row) = state.split(';').find_map(|part| part.strip_prefix("countdown-draft=")) {
-                this.countdown.update(cx, |view, cx| view.dev_open_row(row, cx));
-                // `countdown-draft=custom`: the Reminder's Custom form.
-                if row == "custom" {
-                    this.countdown.update(cx, |view, cx| view.open_custom_reminder(window, cx));
-                }
-            }
-            // `attach=<task title part>><file path>`: a file attached to that task.
-            for spec in state.split(';').filter_map(|part| part.strip_prefix("attach=")) {
-                if let Some((needle, file)) = spec.split_once('>')
-                    && let Some(task) = this.store.tasks().unwrap_or_default().into_iter().find(|t| t.title.contains(needle))
-                    && let Ok(dir) = crate::attachments_dir()
-                {
-                    this.store.add_attachment(task.id, std::path::Path::new(file), &dir).ok();
-                    this.todo.update(cx, |todo, cx| todo.reload(cx));
-                }
-            }
-            // `notice=<task title or habit name part>><hours ago>`: a fired reminder for the bell; `notices=open`.
-            for spec in state.split(';').filter_map(|part| part.strip_prefix("notice=")) {
-                let (needle, ago) = spec.split_once('>').unwrap_or((spec, "0"));
-                let at = chrono::Local::now().naive_local() - chrono::Duration::hours(ago.parse().unwrap_or(0));
-                if let Some(task) = this.store.tasks().unwrap_or_default().into_iter().find(|t| t.title.contains(needle)) {
-                    this.add_notices(vec![Notice { target: Target::Task(task.id), title: task.title, at, constant: task.constant_reminder, has_goal: false }], cx);
-                } else if let Some(habit) = this.store.habits().unwrap_or_default().into_iter().find(|h| h.name.contains(needle)) {
-                    this.add_notices(vec![Notice { target: Target::Habit(habit.id), title: habit.name, at, constant: habit.constant_reminder, has_goal: habit.goal.is_some() }], cx);
-                }
-            }
-            // `theme=light|dark|system`, saved like a pick in the Settings.
-            if let Some(mode) = state.split(';').find_map(|part| part.strip_prefix("theme=")).and_then(fern_core::ThemeMode::from_code) {
-                let mut preferences = this.store.preferences().unwrap_or_default();
-                preferences.theme.mode = mode;
-                this.store.save_theme_selection(&preferences.theme).ok();
-                settings_window::apply(&preferences, window, cx);
-            }
-            // `visibility=<smart list>><show|if_not_empty|hide>`, repeatable: Settings → Smart List.
-            for spec in state.split(';').filter_map(|part| part.strip_prefix("visibility=")) {
-                let (list, visibility) = spec.split_once('>').unwrap_or((spec, ""));
-                if let (Some(list), Some(visibility)) = (
-                    fern_core::SmartList::ALL.into_iter().find(|l| l.code() == list),
-                    fern_core::Visibility::from_code(visibility),
-                ) {
-                    let mut preferences = this.store.preferences().unwrap_or_default();
-                    preferences.set_visibility(list, visibility);
-                    this.store.save_preferences(&preferences).ok();
-                    this.todo.update(cx, |todo, cx| todo.reload(cx));
-                }
-            }
-            // `hour12` and `week-numbers`: Settings → Time Format set to 12 hours, and week numbers on.
-            let flag = |name: &str| state.split(';').any(|part| part == name);
-            if flag("hour12") || flag("week-numbers") || flag("overdue-last") || flag("no-mini-calendar") {
-                let defaults = this.store.preferences().unwrap_or_default();
-                let mut preferences = fern_core::Preferences {
-                    hour12: flag("hour12") || defaults.hour12,
-                    week_numbers: flag("week-numbers") || defaults.week_numbers,
-                    ..defaults
-                };
-                preferences.task_defaults.overdue_last |= flag("overdue-last");
-                preferences.mini_calendar &= !flag("no-mini-calendar");
-                this.store.save_preferences(&preferences).ok();
-                settings_window::apply(&preferences, window, cx);
-                this.todo.update(cx, |todo, cx| todo.reload(cx));
-            }
-            // `features-off=matrix,countdown`: those sections turned off in Settings → Features.
-            if let Some(off) = state.split(';').find_map(|part| part.strip_prefix("features-off=")) {
-                let mut preferences = this.store.preferences().unwrap_or_default();
-                for name in off.split(',') {
-                    match name {
-                        "calendar" => preferences.features.calendar = false,
-                        "matrix" => preferences.features.matrix = false,
-                        "habits" => preferences.features.habits = false,
-                        "focus" => preferences.features.focus = false,
-                        "countdown" => preferences.features.countdown = false,
-                        _ => {}
-                    }
-                }
-                this.store.save_preferences(&preferences).ok();
-                this.features = preferences.features;
-            }
-            // `sync-config=<server>|<token>`: Settings → Sync filled in.
-            if let Some(spec) = state.split(';').find_map(|part| part.strip_prefix("sync-config=")) {
-                let (server, token) = spec.split_once('|').unwrap_or((spec, ""));
-                let config = fern_core::sync::SyncConfig { server: server.to_owned(), token: token.to_owned() };
-                this.store.set_sync_config(&config).ok();
-            }
-            // `settings=<page>[><menu>]` opens the Settings window (see `SettingsWindow::dev_open`).
-            if let Some(spec) = state.split(';').find_map(|part| part.strip_prefix("settings=")) {
-                let spec = spec.to_owned();
-                cx.defer_in(window, move |this, window, cx| {
-                    this.open_settings(None, window, cx);
-                    if let Some(settings) = this.settings {
-                        let _ = settings.update(cx, |settings, _, cx| settings.dev_open(&spec, cx));
-                    }
-                });
-            }
-            if state.contains("statistics=open") {
-                this.open_statistics(cx);
-            }
-            // `statistics=task` / `statistics=focus`: the page on its Task (by day) or Focus tab.
-            for (key, menu) in [("statistics=task", "stats-task-day"), ("statistics=focus", "stats-focus")] {
-                if state.contains(key) {
-                    this.open_statistics(cx);
-                    this.focus.update(cx, |view, cx| view.dev_menu(menu, window, cx));
-                }
-            }
-            if state.contains("account-menu=open") {
-                this.account_menu_open = true;
-            }
-            if state.contains("shortcuts=open") {
-                this.shortcuts_open = true;
-            }
-            if state.contains("notices=open") {
-                this.set_notices_open(true, cx);
-            }
-            if let Some(query) = state.split(';').find_map(|part| part.strip_prefix("search-popover=")) {
-                this.open_search(window, cx);
-                if let Some(search) = &this.search {
-                    search.update(cx, |search, cx| search.set_query(query, cx));
-                }
-                // `search-filter=task[>lists|tags|date|priority]` picks the Task chip and a dropdown.
-                if let (Some(search), Some(spec)) = (&this.search, state.split(';').find_map(|part| part.strip_prefix("search-filter="))) {
-                    search.update(cx, |search, cx| search.dev_filter(spec, cx));
-                }
-            }
-        }
+        crate::dev_state::apply(&mut this, window, cx);
         this
     }
 
@@ -618,7 +343,7 @@ impl AppView {
         false
     }
 
-    fn select(&mut self, section: Section, window: &mut Window, cx: &mut Context<Self>) -> bool {
+    pub(crate) fn select(&mut self, section: Section, window: &mut Window, cx: &mut Context<Self>) -> bool {
         // Search is a popover over the current screen, as in the original.
         if section == Section::Search {
             self.open_search(window, cx);
@@ -735,7 +460,7 @@ impl AppView {
         }
     }
 
-    fn open_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn open_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let search = cx.new(|cx| SearchModal::new(self.store.clone(), cx));
         cx.subscribe_in(&search, window, |this, _, event, window, cx| {
             this.search = None;
@@ -826,7 +551,7 @@ impl AppView {
     fn render_account_menu(&self, cx: &mut Context<Self>) -> AnyElement {
         let strings = i18n::t(cx);
         #[cfg(windows)]
-        let topmost = crate::tray::always_on_top(&self.store);
+        let topmost = self.always_on_top;
         popover(cx)
             .min_w(px(196.))
             .on_mouse_down_out(cx.listener(|this, _, _, cx| this.set_account_menu(false, cx)))
@@ -877,7 +602,7 @@ impl AppView {
             .into_any_element()
     }
 
-    fn open_statistics(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn open_statistics(&mut self, cx: &mut Context<Self>) {
         self.account_menu_open = false;
         self.statistics_open = true;
         self.focus.update(cx, |focus, cx| focus.open_stats_overview(cx));
@@ -905,7 +630,7 @@ impl AppView {
         cx.notify();
     }
 
-    fn open_settings(&mut self, notes: Option<Rc<ReleaseNotes>>, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn open_settings(&mut self, notes: Option<Rc<ReleaseNotes>>, window: &mut Window, cx: &mut Context<Self>) {
         self.account_menu_open = false;
         if notes.is_some() {
             self.search = None;
@@ -1024,23 +749,63 @@ impl AppView {
     }
 
     fn open_user_keymap(&mut self, cx: &mut Context<Self>) {
-        match crate::keymap::ensure_user_keymap_file() {
-            Ok(path) => cx.open_with_system(&path),
-            Err(err) => {
-                let message = format!("{err:#}");
-                eprintln!("keymap: {message}");
-                crate::keymap::set_errors(vec![message], cx);
-                cx.notify();
-            }
-        }
+        let task = cx.background_spawn(async move { crate::keymap::ensure_user_keymap_file() });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |_, cx| match result {
+                Ok(path) => cx.open_with_system(&path),
+                Err(err) => {
+                    let message = format!("{err:#}");
+                    eprintln!("keymap: {message}");
+                    crate::keymap::set_errors(vec![message], cx);
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn reload_keymap(&mut self, cx: &mut Context<Self>) {
-        match crate::keymap::reload(&assets::Assets, cx) {
-            Ok(errors) => errors.iter().for_each(|err| eprintln!("keymap: {err}")),
-            Err(err) => eprintln!("failed to reload the keymap: {err:#}"),
-        }
-        cx.notify();
+        let task = cx.background_spawn(async move {
+            let mut read_errors = Vec::new();
+            let user_keymap = match crate::keymap::user_keymap_path() {
+                Ok(path) => match std::fs::read_to_string(&path) {
+                    Ok(contents) => Some(contents),
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(err) => {
+                        read_errors.push(format!("{}: {err}", crate::keymap::USER_KEYMAP_FILE));
+                        None
+                    }
+                },
+                Err(err) => {
+                    read_errors.push(format!("{}: {err}", crate::keymap::USER_KEYMAP_FILE));
+                    None
+                }
+            };
+            (user_keymap, read_errors)
+        });
+        cx.spawn(async move |this, cx| {
+            let (user_keymap, mut read_errors) = task.await;
+            this.update(cx, |_, cx| {
+                cx.clear_key_bindings();
+                match crate::keymap::load_with_user(&assets::Assets, user_keymap.as_deref(), cx) {
+                    Ok(mut errors) => {
+                        read_errors.append(&mut errors);
+                        read_errors.iter().for_each(|err| eprintln!("keymap: {err}"));
+                        crate::keymap::set_errors(read_errors, cx);
+                    }
+                    Err(err) => {
+                        eprintln!("failed to reload the keymap: {err:#}");
+                        read_errors.push(err.to_string());
+                        crate::keymap::set_errors(read_errors, cx);
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn dismiss_any_transient(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
@@ -1330,14 +1095,33 @@ impl AppView {
         if std::env::var_os("FERN_DEV_STATE").is_some() {
             return;
         }
+        let db_path = cx.try_global::<crate::DbPath>().map(|p| p.0.clone());
         cx.spawn(async move |this, cx| {
             let mut since_pull = std::time::Duration::ZERO;
             let mut first = true;
             loop {
-                let Ok(due) = this.update(cx, |this, _| {
-                    first || since_pull >= crate::sync::PULL_EVERY || this.store.has_unsent_changes().unwrap_or(false)
-                }) else {
-                    break;
+                let due = if first || since_pull >= crate::sync::PULL_EVERY {
+                    if this.upgrade().is_none() {
+                        break;
+                    }
+                    true
+                } else if let Some(path) = db_path.clone() {
+                    if this.upgrade().is_none() {
+                        break;
+                    }
+                    cx.background_executor()
+                        .spawn(async move {
+                            Store::open(&path)
+                                .ok()
+                                .and_then(|s| s.has_unsent_changes().ok())
+                                .unwrap_or(false)
+                        })
+                        .await
+                } else {
+                    match this.update(cx, |this, _| this.store.has_unsent_changes().unwrap_or(false)) {
+                        Ok(has) => has,
+                        Err(_) => break,
+                    }
                 };
                 if due {
                     since_pull = std::time::Duration::ZERO;
@@ -1409,26 +1193,55 @@ impl AppView {
     }
 
     /// After a sync, sends the attached files the server lacks and fetches the missing ones.
+    /// Statting attachments (`files_to_sync`) and HTTP transfers both run off the UI thread.
     fn sync_files(&mut self, config: fern_core::sync::SyncConfig, cx: &mut Context<Self>) {
-        let (dir, upload, download) = match crate::attachments_dir().and_then(|dir| {
-            let (upload, download) = self.store.files_to_sync(&dir)?;
-            Ok((dir, upload, download))
-        }) {
-            Ok(files) => files,
+        let dir = match crate::attachments_dir() {
+            Ok(dir) => dir,
             Err(err) => {
                 self.complete_sync(Err(err), cx);
                 return;
             }
         };
-        if upload.is_empty() && download.is_empty() {
-            self.complete_sync(Ok(()), cx);
-            return;
-        }
         let transfer_config = config.clone();
-        let transfer = cx.background_spawn(async move { crate::sync::transfer_files(&transfer_config, &dir, &upload, &download) });
+        let transfer = if let Some(db_path) = cx.try_global::<crate::DbPath>().map(|p| p.0.clone()) {
+            cx.background_spawn(async move {
+                let bg_store = Store::open(&db_path)?;
+                let (upload, download) = bg_store.files_to_sync(&dir)?;
+                if upload.is_empty() && download.is_empty() {
+                    return Ok(None);
+                }
+                Ok(Some(crate::sync::transfer_files(&transfer_config, &dir, &upload, &download)))
+            })
+        } else {
+            let (upload, download) = match self.store.files_to_sync(&dir) {
+                Ok(files) => files,
+                Err(err) => {
+                    self.complete_sync(Err(err), cx);
+                    return;
+                }
+            };
+            if upload.is_empty() && download.is_empty() {
+                self.complete_sync(Ok(()), cx);
+                return;
+            }
+            cx.background_spawn(async move {
+                Ok(Some(crate::sync::transfer_files(&transfer_config, &dir, &upload, &download)))
+            })
+        };
         cx.spawn(async move |this, cx| {
             let outcome = transfer.await;
             this.update(cx, |this, cx| {
+                let outcome = match outcome {
+                    Ok(Some(outcome)) => outcome,
+                    Ok(None) => {
+                        this.complete_sync(Ok(()), cx);
+                        return;
+                    }
+                    Err(err) => {
+                        this.complete_sync(Err(err), cx);
+                        return;
+                    }
+                };
                 if outcome.downloaded {
                     this.reload_all(cx);
                 }
@@ -1525,7 +1338,7 @@ impl AppView {
     }
 
     /// Opening the list marks the notifications read, which clears the badge.
-    fn set_notices_open(&mut self, open: bool, cx: &mut Context<Self>) {
+    pub(crate) fn set_notices_open(&mut self, open: bool, cx: &mut Context<Self>) {
         self.notices_open = open;
         if open {
             self.notices.mark_read();
@@ -2357,7 +2170,10 @@ mod tests {
         use fern_core::RailSection;
         use gpui::{Modifiers, MouseButton, point, size};
 
-        cx.update(theme::init);
+        cx.update(|cx| {
+            theme::init(cx);
+            assert!(crate::keymap::load_default(&assets::Assets, cx).unwrap().is_empty());
+        });
         let store = Rc::new(Store::open_in_memory().unwrap());
         let (app, cx) = cx.add_window_view(|window, cx| AppView::new(store.clone(), true, window, cx));
         cx.simulate_resize(size(px(1200.), px(700.)));

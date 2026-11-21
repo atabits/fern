@@ -4,6 +4,8 @@
 #[cfg(test)]
 mod feature_regressions;
 mod app_view;
+#[cfg(debug_assertions)]
+mod dev_state;
 
 pub(crate) use desktop_common::{
     actions, calendar, export, keymap, portable, subscriptions, sync, text_input, touch,

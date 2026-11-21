@@ -270,7 +270,7 @@ impl SettingsWindow {
         .detach();
     }
 
-    fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.closing {
             return;
         }

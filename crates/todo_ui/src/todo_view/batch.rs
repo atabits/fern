@@ -234,8 +234,14 @@ impl TodoView {
                 .rounded(px(6.))
                 .border_1()
                 .border_color(if active { theme.colors().accent } else { theme.colors().border })
-                .bg(if active { theme.colors().accent.opacity(0.12) } else { theme.colors().surface_background })
-                .hover(|s| s.bg(theme.colors().element_hover))
+                .when(active, |el| {
+                    el.bg(theme.colors().accent.opacity(0.14))
+                        .hover(|s| s.bg(theme.colors().accent.opacity(0.22)))
+                })
+                .when(!active, |el| {
+                    el.bg(theme.colors().surface_background)
+                        .hover(|s| s.bg(theme.colors().element_hover))
+                })
                 .cursor_pointer()
                 .child(
                     h_flex()
@@ -605,7 +611,7 @@ impl TodoView {
                                 .px_3()
                                 .py_1()
                                 .rounded(px(6.))
-                                .hover(|s| s.bg(theme.colors().element_hover))
+                                .hover(|s| s.bg(theme.status().error.opacity(0.12)))
                                 .cursor_pointer()
                                 .child(
                                     h_flex()

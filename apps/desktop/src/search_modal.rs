@@ -5,7 +5,7 @@ use std::rc::Rc;
 
 use chrono::Local;
 use fern_core::search::{DateRange, TagRule, TaskFilter};
-use fern_core::{Habit, Id, List, Priority, Store, Tag, Task, View};
+use fern_core::{Habit, Id, Kind, List, Priority, Store, Tag, Task, View};
 use gpui::{Entity, EventEmitter, FocusHandle, Focusable, FontWeight, HighlightStyle, StyledText};
 use ui::prelude::*;
 use ui::{Placement, PopoverAttachment, popover};
@@ -539,14 +539,17 @@ impl Render for SearchModal {
                             h_flex()
                                 .h(px(24.))
                                 .gap_2()
-                                .child(
+                                .child(if task.kind == Kind::Note {
+                                    Icon::new(IconName::FileText).size(IconSize::Small).color(Color::Muted).into_any_element()
+                                } else {
                                     Checkbox::new(SharedString::from(format!("search-checkbox-{id}")))
                                         .size(px(14.))
                                         .toggle_state(task.is_completed())
                                         .in_progress(task.is_in_progress())
                                         .dismissed(task.is_wont_do())
-                                        .tint(task_rows::priority_color(task.priority, &theme)),
-                                )
+                                        .tint(task_rows::priority_color(task.priority, &theme))
+                                        .into_any_element()
+                                })
                                 .child(
                                     div()
                                         .flex_1()
@@ -623,39 +626,51 @@ impl Render for SearchModal {
         } else {
             Vec::new()
         };
-        let named_rows = |items: Vec<(SharedString, IconName, Hsla, View)>, row_index: &mut usize, cx: &mut Context<Self>| -> Vec<AnyElement> {
-            items
-                .into_iter()
-                .map(|(name, icon, color, view)| {
-                    let is_selected = has_query && *row_index == selected_index;
-                    *row_index += 1;
-                    ListItem::new(SharedString::from(format!("search-{name}-{icon:?}")))
+        let tag_rows = if self.shows(Filter::Tags) {
+            self.tags
+                .iter()
+                .map(|t| {
+                    let is_selected = has_query && row_index == selected_index;
+                    row_index += 1;
+                    let view = View::Tag(t.name.clone());
+                    ListItem::new(SharedString::from(format!("search-tag-{}", t.name)))
                         .height(px(30.))
                         .toggle_state(is_selected)
-                        .start_slot(Icon::new(icon).color(color))
-                        .child(div().text_size(px(13.)).child(self.highlighted(&name, &query, cx)))
+                        .start_slot(Icon::new(IconName::Tag).color(lists_panel::color(t.color.as_deref(), cx)))
+                        .child(div().text_size(px(13.)).child(self.highlighted(&t.name, &query, cx)))
                         .on_click(cx.listener(move |_, _, _, cx| cx.emit(SearchEvent::OpenView(view.clone()))))
                         .into_any_element()
                 })
                 .collect()
-        };
-        let tag_rows = if self.shows(Filter::Tags) {
-            let items = self
-                .tags
-                .iter()
-                .map(|t| (t.name.clone().into(), IconName::Tag, lists_panel::color(t.color.as_deref(), cx), View::Tag(t.name.clone())))
-                .collect();
-            named_rows(items, &mut row_index, cx)
         } else {
             Vec::new()
         };
         let list_rows = if self.shows(Filter::Lists) {
-            let items = self
-                .lists
+            self.lists
                 .iter()
-                .map(|l| (l.name.clone().into(), IconName::List, lists_panel::color(l.color.as_deref(), cx), View::List(l.id)))
-                .collect();
-            named_rows(items, &mut row_index, cx)
+                .map(|l| {
+                    let is_selected = has_query && row_index == selected_index;
+                    row_index += 1;
+                    let view = View::List(l.id);
+                    let start: AnyElement = match l.icon.as_deref().filter(|s| !s.is_empty()) {
+                        Some(emoji) => div().w(px(16.)).flex().justify_center().text_size(px(13.)).child(emoji.to_owned()).into_any_element(),
+                        None => {
+                            let icon = if l.kind == Kind::Note { IconName::FileText } else { IconName::List };
+                            Icon::new(icon).color(lists_panel::color(l.color.as_deref(), cx)).into_any_element()
+                        }
+                    };
+                    ListItem::new(SharedString::from(format!("search-list-result-{}", l.id)))
+                        .height(px(30.))
+                        .toggle_state(is_selected)
+                        .start_slot(start)
+                        .child(div().text_size(px(13.)).child(self.highlighted(&l.name, &query, cx)))
+                        .when(l.archived, |item| {
+                            item.end_slot(Label::new(strings.habit_archived).size(LabelSize::XSmall).color(Color::Muted))
+                        })
+                        .on_click(cx.listener(move |_, _, _, cx| cx.emit(SearchEvent::OpenView(view.clone()))))
+                        .into_any_element()
+                })
+                .collect()
         } else {
             Vec::new()
         };

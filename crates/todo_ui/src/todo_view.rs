@@ -214,6 +214,8 @@ pub struct TodoView {
     title_edit: Option<(Id, Entity<TextInput>, gpui::Subscription)>,
     /// The "Undo" toast after completing or deleting a task, with its timer.
     undo: Option<(crate::undo::UndoAction, String, gpui::Task<()>)>,
+    /// The last undone action, available for Redo (Ctrl+Shift+Z / Ctrl+Y).
+    redo: Option<(crate::undo::UndoAction, String)>,
     /// Saved filters with their task counts, for the lists column.
     filters: Vec<(fern_core::SmartFilter, usize)>,
     /// Settings → Smart List, read on reload.
@@ -493,6 +495,7 @@ impl TodoView {
             summary,
             filter_edit: None,
             undo: None,
+            redo: None,
             detail,
             card_detail,
             card: None,
@@ -2306,6 +2309,7 @@ impl TodoView {
             .on_action(cx.listener(Self::toggle_all_subtasks))
             .on_action(cx.listener(Self::add_subtask_selected))
             .on_action(cx.listener(|this, _: &crate::actions::Undo, _, cx| this.apply_undo(cx)))
+            .on_action(cx.listener(|this, _: &crate::actions::Redo, _, cx| this.apply_redo(cx)))
     }
 
     fn render_empty_state(&self, strings: &'static Strings, theme: &theme::Theme, px_fallback: Pixels) -> AnyElement {
@@ -2559,15 +2563,27 @@ impl TodoView {
             })
             .ok();
         });
+        self.redo = None;
         self.undo = Some((action, label, timer));
         cx.notify();
     }
 
     fn apply_undo(&mut self, cx: &mut Context<Self>) {
-        if let Some((action, _, _)) = self.undo.take() {
+        if let Some((action, label, _)) = self.undo.take() {
             let result = action.apply(&self.store);
             if self.check(result).is_some() {
                 self.completing.retain(|_, pending| pending.undo != action);
+                self.redo = Some((action, label));
+            }
+            self.reload(cx);
+        }
+    }
+
+    fn apply_redo(&mut self, cx: &mut Context<Self>) {
+        if let Some((action, label)) = self.redo.take() {
+            let result = action.redo(&self.store);
+            if let Some(Some(new_undo)) = self.check(result) {
+                self.offer_undo(new_undo, label, cx);
             }
             self.reload(cx);
         }

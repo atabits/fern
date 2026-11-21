@@ -43,6 +43,8 @@
       "tab e": "task_list::ToggleAllSubtasks",
       "shift-enter": "task_list::AddSubtask",
       "secondary-z": "task_list::Undo",
+      "secondary-shift-z": "task_list::Redo",
+      "secondary-y": "task_list::Redo",
       "alt-0": "task_list::PriorityNone",
       "alt-1": "task_list::PriorityLow",
       "alt-2": "task_list::PriorityMedium",

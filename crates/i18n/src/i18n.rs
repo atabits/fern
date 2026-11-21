@@ -483,7 +483,7 @@ pub struct Strings {
     pub reload_keymap: &'static str,
     pub keymap_errors: &'static str,
     /// Labels of `keymap::LISTED_ACTIONS`, in order.
-    pub shortcut_labels: [&'static str; 30],
+    pub shortcut_labels: [&'static str; 31],
     pub shortcut_groups: [&'static str; 4],
     /// Quick add syntax: (what, example).
     pub quick_add_help: [(&'static str, &'static str); 4],
@@ -1485,9 +1485,9 @@ pub static EN: Strings = Strings {
     keymap_errors: "keymap.json errors",
     shortcut_labels: [
         "Add task", "Search", "Toggle sidebar", "Go to Inbox", "Go to Today", "Go to Tomorrow", "Go to Next 7 Days",
-        "Sync now", "Undo", "Shortcuts", "Settings", "Quit", "Dismiss the active menu or dialog", "Minimize window", "Next task", "Previous task", "Complete task", "Delete task", "Pin task", "Set date",
+        "Sync now", "Shortcuts", "Settings", "Quit", "Dismiss the active menu or dialog", "Minimize window", "Next task", "Previous task", "Complete task", "Delete task", "Pin task", "Set date",
         "Clear date", "Set today", "Set tomorrow", "Set next week", "No priority", "Low priority",
-        "Medium priority", "High priority", "Expand / Collapse all subtasks", "Add subtask",
+        "Medium priority", "High priority", "Expand / Collapse all subtasks", "Add subtask", "Undo", "Redo",
     ],
     shortcut_groups: ["General", "Task List", "Quick Add", "Edit Tasks"],
     quick_add_help: [
@@ -2456,9 +2456,9 @@ pub static ZH_CN: Strings = Strings {
     keymap_errors: "keymap.json 错误",
     shortcut_labels: [
         "新增任务", "搜索", "切换侧边栏", "跳转到收件箱", "跳转到今日", "跳转到明天", "跳转到未来7天",
-        "立即同步", "撤销", "快捷键设置", "设置", "退出", "关闭当前菜单或对话框", "最小化窗口", "下一个任务", "上一个任务", "完成任务", "删除任务", "置顶任务", "设置日期",
+        "立即同步", "快捷键设置", "设置", "退出", "关闭当前菜单或对话框", "最小化窗口", "下一个任务", "上一个任务", "完成任务", "删除任务", "置顶任务", "设置日期",
         "清除日期", "设为今天", "设为明天", "设为下周", "无优先级", "低优先级",
-        "中优先级", "高优先级", "展开 / 折叠所有子任务", "新增子任务",
+        "中优先级", "高优先级", "展开 / 折叠所有子任务", "新增子任务", "撤销", "重做",
     ],
     shortcut_groups: ["通用", "任务列表", "快速新增", "编辑任务"],
     quick_add_help: [
@@ -3427,10 +3427,10 @@ pub static RU: Strings = Strings {
     keymap_errors: "Ошибки в keymap.json",
     shortcut_labels: [
         "Новая задача", "Поиск", "Скрыть/показать панель", "Входящие", "Сегодня", "Завтра", "Следующие 7 дней",
-        "Синхронизировать", "Отменить действие", "Горячие клавиши", "Настройки", "Выйти", "Закрыть открытое меню или диалог", "Свернуть окно", "Следующая задача", "Предыдущая задача", "Выполнить задачу", "Удалить задачу",
+        "Синхронизировать", "Горячие клавиши", "Настройки", "Выйти", "Закрыть открытое меню или диалог", "Свернуть окно", "Следующая задача", "Предыдущая задача", "Выполнить задачу", "Удалить задачу",
         "Закрепить задачу", "Выбрать дату", "Убрать дату", "На сегодня", "На завтра", "На следующую неделю",
         "Без приоритета", "Низкий приоритет", "Средний приоритет", "Высокий приоритет",
-        "Развернуть / свернуть все подзадачи", "Добавить подзадачу",
+        "Развернуть / свернуть все подзадачи", "Добавить подзадачу", "Отменить действие", "Повторить действие",
     ],
     shortcut_groups: ["Общие", "Список задач", "Быстрое добавление", "Правка задач"],
     quick_add_help: [

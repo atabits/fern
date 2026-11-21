@@ -51,6 +51,7 @@ actions!(
         ToggleAllSubtasks,
         AddSubtask,
         Undo,
+        Redo,
     ]
 );
 

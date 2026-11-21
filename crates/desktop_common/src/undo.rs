@@ -27,6 +27,20 @@ impl UndoAction {
             Self::ReopenRepeat { id, copy, due, end, repeat } => store.undo_repeat(*id, *copy, *due, *end, repeat.as_ref()),
         }
     }
+
+    /// Re-applies the original completion or deletion after an undo, returning a fresh `UndoAction`.
+    pub fn redo(&self, store: &Store) -> Result<Option<Self>> {
+        match self {
+            Self::Reopen { id, .. } | Self::ReopenRepeat { id, .. } => {
+                let Some(task) = store.task(*id)? else { return Ok(None) };
+                Ok(Some(complete(store, &task)?))
+            }
+            Self::Restore(id) => {
+                store.delete_task(*id)?;
+                Ok(Some(Self::Restore(*id)))
+            }
+        }
+    }
 }
 
 /// Completes a task and returns how to undo it; `task` is its state before.
@@ -62,6 +76,12 @@ mod tests {
         undo.apply(&store).unwrap();
         assert_eq!(store.task(task.id).unwrap().unwrap().due_date, Some(day));
         assert_eq!(store.tasks().unwrap().iter().filter(|t| t.is_completed()).count(), 0);
+
+        let redone = undo.redo(&store).unwrap().unwrap();
+        assert!(matches!(redone, UndoAction::ReopenRepeat { .. }));
+        assert_eq!(store.tasks().unwrap().iter().filter(|t| t.is_completed()).count(), 1);
+        redone.apply(&store).unwrap();
+        assert_eq!(store.task(task.id).unwrap().unwrap().due_date, Some(day));
     }
 
     #[test]

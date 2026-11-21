@@ -967,8 +967,8 @@ impl CountdownView {
                     .justify_center()
                     .rounded(px(6.))
                     .cursor_pointer()
-                    .when(primary, |el| el.bg(theme.colors().accent))
-                    .when(!primary, |el| el.border_1().border_color(theme.colors().border))
+                    .when(primary, |el| el.bg(theme.colors().accent).hover(|s| s.opacity(0.9)))
+                    .when(!primary, |el| el.border_1().border_color(theme.colors().border).hover(|s| s.bg(theme.colors().element_hover)))
                     .child(Label::new(label).size(LabelSize::Small).when(primary, |label| label.color(Color::OnAccent)))
             };
             v_flex()
@@ -986,7 +986,7 @@ impl CountdownView {
                         .rounded(px(6.))
                         .cursor_pointer()
                         .when(on, |el| el.bg(theme.colors().element_selected))
-                        .when(!on, |el| el.border_1().border_color(theme.colors().border))
+                        .when(!on, |el| el.border_1().border_color(theme.colors().border).hover(|s| s.bg(theme.colors().element_hover)))
                         .child(Label::new(*label).size(LabelSize::Small))
                         .on_click(set(Box::new(move |d| {
                             if let Some(custom) = d.custom.as_mut() {
@@ -1176,6 +1176,7 @@ impl CountdownView {
                         .border_1()
                         .border_color(if on { theme.colors().accent } else { theme.colors().border })
                         .cursor_pointer()
+                        .hover(|s| s.bg(theme.colors().element_hover))
                         .child(div().flex_1().min_w_0().child(Label::new(text).truncate()))
                         .child(Icon::new(IconName::ChevronDown).size(IconSize::XSmall).color(Color::Muted))
                         .on_click(cx.listener(move |this, _, _, cx| {
@@ -1274,8 +1275,8 @@ impl CountdownView {
                 .justify_center()
                 .rounded(px(6.))
                 .cursor_pointer()
-                .when(primary, |el| el.bg(theme.colors().accent))
-                .when(!primary, |el| el.border_1().border_color(theme.colors().border))
+                .when(primary, |el| el.bg(theme.colors().accent).hover(|s| s.opacity(0.9)))
+                .when(!primary, |el| el.border_1().border_color(theme.colors().border).hover(|s| s.bg(theme.colors().element_hover)))
                 .child(Label::new(label).size(LabelSize::Small).when(primary, |label| label.color(Color::OnAccent)))
         };
         let show_age = draft.show_age;
@@ -1330,10 +1331,15 @@ impl CountdownView {
             .child(
                 h_flex()
                     .child(div().flex_1().child(Label::new(if draft.editing.is_some() { strings.countdown_edit } else { strings.countdown_new }).weight(FontWeight::BOLD)))
-                    .child(IconButton::new("countdown-x", IconName::X).icon_color(Color::Muted).on_click(cx.listener(|this, _, _, cx| {
-                        this.draft = None;
-                        cx.notify();
-                    }))),
+                    .child(
+                        IconButton::new("countdown-x", IconName::X)
+                            .icon_color(Color::Muted)
+                            .tooltip(Tooltip::text(strings.close))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.draft = None;
+                                cx.notify();
+                            })),
+                    ),
             )
             .child(
                 h_flex()
@@ -1357,6 +1363,7 @@ impl CountdownView {
                                     .child(
                                         IconButton::new("countdown-presets", IconName::Bookmark)
                                             .icon_color(Color::Muted)
+                                            .tooltip(Tooltip::text(strings.templates))
                                             .on_click(set(Box::new(|d| {
                                                 d.open = if d.open == Some(DraftRow::Presets) { None } else { Some(DraftRow::Presets) };
                                             }))),

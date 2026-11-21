@@ -460,6 +460,17 @@ impl TodoView {
                                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                                     .on_click(|_, _, cx| cx.stop_propagation())
                             };
+                            let bar_tooltip: SharedString = match (task.due_date, task.end_date) {
+                                (Some(start), Some(end)) if end > start => format!(
+                                    "{} ({} – {})",
+                                    task.title,
+                                    task_rows::short_date(start, strings),
+                                    task_rows::short_date(end, strings),
+                                )
+                                .into(),
+                                (Some(start), _) => format!("{} ({})", task.title, task_rows::short_date(start, strings)).into(),
+                                _ => task.title.clone().into(),
+                            };
                             let middle = h_flex()
                                 .id(SharedString::from(format!("timeline-body-{i}-{id}")))
                                 .flex_1()
@@ -469,6 +480,7 @@ impl TodoView {
                                 .gap_1()
                                 .items_center()
                                 .cursor_grab()
+                                .tooltip(Tooltip::text(bar_tooltip))
                                 .on_drag(dragged, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
                                 .on_click(cx.listener(move |this, _, _, cx| this.select(id, cx)))
                                 .when(task.kind != Kind::Note, |el| {
@@ -494,7 +506,13 @@ impl TodoView {
                                 .when_some(sec_time_label, |el, tz_txt| {
                                     el.child(Label::new(tz_txt).size(LabelSize::XSmall).color(Color::Muted))
                                 })
-                                .child(Label::new(task.title).truncate());
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .when(completed, |el| el.line_through())
+                                        .child(Label::new(task.title).truncate()),
+                                );
                             h_flex()
                                 .id(SharedString::from(format!("timeline-{i}-{id}")))
                                 .absolute()

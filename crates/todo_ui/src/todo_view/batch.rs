@@ -222,6 +222,7 @@ impl TodoView {
         let all_in_progress = !selected_tasks.is_empty() && selected_tasks.iter().all(|t| t.is_in_progress());
         let all_wont_do = !selected_tasks.is_empty() && selected_tasks.iter().all(|t| t.is_wont_do());
         let all_pinned = !selected_tasks.is_empty() && selected_tasks.iter().all(|t| t.pinned_at.is_some());
+        let all_notes = !selected_tasks.is_empty() && selected_tasks.iter().all(|t| t.kind == Kind::Note);
         let today = Self::today();
 
         let action_chip = |id: &'static str, icon: IconName, label: &'static str, active: bool, tint: Option<Color>| {
@@ -335,6 +336,25 @@ impl TodoView {
                                         crate::data_version::data_changed(cx.entity_id(), cx);
                                     }
                                 })),
+                        )
+                        .child(
+                            action_chip("batch-duplicate", IconName::Copy, strings.duplicate, false, None)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.run_batch(false, cx, |store, ids| store.batch_duplicate(ids).map(|_| ()));
+                                })),
+                        )
+                        .child(
+                            action_chip(
+                                "batch-convert-kind",
+                                if all_notes { IconName::SquareCheck } else { IconName::FileText },
+                                if all_notes { strings.convert_to_task } else { strings.convert_to_note },
+                                false,
+                                None,
+                            )
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                let target = if all_notes { Kind::Task } else { Kind::Note };
+                                this.run_batch(false, cx, move |store, ids| store.batch_set_kind(ids, target));
+                            })),
                         ),
                 )
                 // Due dates.

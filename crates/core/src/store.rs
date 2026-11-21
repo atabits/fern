@@ -5102,6 +5102,23 @@ impl Store {
         })
     }
 
+    pub fn batch_duplicate(&self, ids: &[Id]) -> Result<Vec<Task>> {
+        let mut created = Vec::with_capacity(ids.len());
+        for &id in ids {
+            if let Ok(copy) = self.duplicate_task(id) {
+                created.push(copy);
+            }
+        }
+        Ok(created)
+    }
+
+    pub fn batch_set_kind(&self, ids: &[Id], kind: Kind) -> Result<()> {
+        for &id in ids {
+            self.set_kind(id, kind)?;
+        }
+        Ok(())
+    }
+
     /// Merges multiple selected tasks into the first task: subsequent tasks (and their checklist
     /// items) become checklist items on the first task, their tags and notes are merged in, and
     /// the absorbed tasks are moved to the Trash.
@@ -7376,6 +7393,25 @@ mod tests {
 
         assert!(store.task(b.id)?.unwrap().is_deleted());
         assert!(store.task(c.id)?.unwrap().is_deleted());
+        Ok(())
+    }
+
+    #[test]
+    fn batch_duplicate_and_convert_kind() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let a = store.add_task("Alpha")?;
+        let b = store.add_task("Beta")?;
+
+        let copies = store.batch_duplicate(&[a.id, b.id])?;
+        assert_eq!(copies.len(), 2);
+        assert_eq!(store.tasks()?.len(), 4);
+
+        store.batch_set_kind(&[a.id, b.id], Kind::Note)?;
+        assert_eq!(store.task(a.id)?.unwrap().kind, Kind::Note);
+        assert_eq!(store.task(b.id)?.unwrap().kind, Kind::Note);
+
+        store.batch_set_kind(&[a.id, b.id], Kind::Task)?;
+        assert_eq!(store.task(a.id)?.unwrap().kind, Kind::Task);
         Ok(())
     }
 }

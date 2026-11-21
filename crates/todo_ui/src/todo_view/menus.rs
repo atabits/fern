@@ -744,7 +744,12 @@ impl TodoView {
                         cx,
                     ),
                     div().my_1().child(Divider::horizontal()).into_any_element(),
-                    item("list-menu-delete", IconName::Trash, strings.delete, ListAction::Delete, cx),
+                    ListItem::new("list-menu-delete")
+                        .height(px(34.))
+                        .start_slot(Icon::new(IconName::Trash).color(Color::Error))
+                        .child(Label::new(strings.delete).color(Color::Error))
+                        .on_click(cx.listener(|this, _, window, cx| this.list_action(ListAction::Delete, window, cx)))
+                        .into_any_element(),
                 ]
             }
             ListMenuTarget::Tag(tag) => {
@@ -767,7 +772,14 @@ impl TodoView {
                     items.push(text("tag-menu-subtag", strings.add_subtag, ListAction::AddSubtag, cx));
                 }
                 items.push(text("tag-menu-merge", strings.merge_tags, ListAction::Merge, cx));
-                items.push(text("tag-menu-delete", strings.delete, ListAction::Delete, cx));
+                items.push(div().my_1().child(Divider::horizontal()).into_any_element());
+                items.push(
+                    ListItem::new("tag-menu-delete")
+                        .height(px(34.))
+                        .child(Label::new(strings.delete).color(Color::Error))
+                        .on_click(cx.listener(|this, _, window, cx| this.list_action(ListAction::Delete, window, cx)))
+                        .into_any_element(),
+                );
                 items
             }
             ListMenuTarget::TagsHeading => {

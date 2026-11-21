@@ -332,6 +332,19 @@ fn parse_date(words: &[String], today: NaiveDate) -> Option<(NaiveDate, usize)> 
         }
         _ => {}
     }
+    if let Some(rest) = first.strip_prefix("下周")
+        && let Some(weekday) = parse_weekday(&format!("周{rest}"))
+    {
+        let days_to_next_mon = 7 - today.weekday().num_days_from_monday() as i64;
+        return Some((today + Duration::days(days_to_next_mon + weekday.num_days_from_monday() as i64), 1));
+    }
+    if first == "day"
+        && words.len() >= 3
+        && words[1] == "after"
+        && words[2] == "tomorrow"
+    {
+        return Some((today + Duration::days(2), 3));
+    }
     if matches!(first, "this" | "эти" | "этих")
         && words.len() >= 2
         && matches!(words[1].as_str(), "weekend" | "выходные" | "выходных")
@@ -341,7 +354,7 @@ fn parse_date(words: &[String], today: NaiveDate) -> Option<(NaiveDate, usize)> 
             .rem_euclid(7);
         return Some((today + Duration::days(ahead), 2));
     }
-    if matches!(first, "next" | "следующая" | "следующую" | "следующей" | "следующий" | "следующем")
+    if matches!(first, "next" | "следующая" | "следующую" | "следующей" | "следующий" | "следующем" | "следующее")
         && words.len() >= 2
     {
         if matches!(words[1].as_str(), "week" | "неделя" | "неделю" | "неделе") {
@@ -352,6 +365,10 @@ fn parse_date(words: &[String], today: NaiveDate) -> Option<(NaiveDate, usize)> 
         }
         if matches!(words[1].as_str(), "year" | "год" | "году") {
             return today.checked_add_months(Months::new(12)).map(|d| (d, 2));
+        }
+        if let Some(weekday) = parse_weekday(&words[1]) {
+            let days_to_next_mon = 7 - today.weekday().num_days_from_monday() as i64;
+            return Some((today + Duration::days(days_to_next_mon + weekday.num_days_from_monday() as i64), 2));
         }
     }
     if let Some(weekday) = parse_weekday(first) {
@@ -767,5 +784,25 @@ mod tests {
 
         let p = parse_quick_add("Deploy !! !p1", today(), &lists);
         assert_eq!(p.priority, Some(Priority::High));
+    }
+
+    #[test]
+    fn recognizes_next_weekday_and_day_after_tomorrow() {
+        // today() is Sunday 2026-10-18, so next week starts Monday 2026-10-19.
+        let p = parse_quick_add("Standup next mon", today(), &[]);
+        assert_eq!(p.title, "Standup");
+        assert_eq!(p.due_date, NaiveDate::from_ymd_opt(2026, 10, 19));
+
+        let p = parse_quick_add("Релиз следующую пятницу", today(), &[]);
+        assert_eq!(p.title, "Релиз");
+        assert_eq!(p.due_date, NaiveDate::from_ymd_opt(2026, 10, 23));
+
+        let p = parse_quick_add("复盘 下周三", today(), &[]);
+        assert_eq!(p.title, "复盘");
+        assert_eq!(p.due_date, NaiveDate::from_ymd_opt(2026, 10, 21));
+
+        let p = parse_quick_add("Doctor day after tomorrow", today(), &[]);
+        assert_eq!(p.title, "Doctor");
+        assert_eq!(p.due_date, NaiveDate::from_ymd_opt(2026, 10, 20));
     }
 }

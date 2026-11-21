@@ -731,9 +731,11 @@ impl CalendarView {
             .justify_center()
             .m(px(0.5))
             .cursor_pointer()
-            .when(count > 0, |el| {
-                el.tooltip(ui::Tooltip::text(format!("{} · {count}", calendar::format_date(date, strings))))
-            })
+            .tooltip(ui::Tooltip::text(if count > 0 {
+                format!("{} · {count}", calendar::format_date(date, strings))
+            } else {
+                calendar::format_date(date, strings)
+            }))
             .when(heatmap, |el| {
                 el.when(is_open || is_today || level > 0, |el| el.bg(background))
                     .hover(move |style| style.bg(hovered))
@@ -748,6 +750,7 @@ impl CalendarView {
                 if let Err(error) = id.and_then(|id| this.store.move_dates(id, date)) {
                     eprintln!("failed to schedule the dropped task: {error:#}");
                 }
+                desktop_common::data_version::data_changed(cx.entity_id(), cx);
                 this.reload(cx);
             }))
             .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {

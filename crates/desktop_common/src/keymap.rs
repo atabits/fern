@@ -1,9 +1,8 @@
-//! Loads key bindings from a JSON keymap, in the format Zed uses:
-//! a list of sections, each with an optional key `context` and `bindings` from keystrokes to
-//! action names.
+//! Loads, resolves, and edits JSON/JSONC keymaps: a list of sections, each with an optional
+//! `context` predicate and `bindings` from keystrokes to action names (or `null` to unbind).
 
-use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use anyhow::{Context as _, Result};
@@ -11,7 +10,7 @@ use gpui::{
     Action as _, App, AssetSource, Global, KeyBinding, KeyBindingContextPredicate,
     KeyBindingMetaIndex, Keystroke, NoAction,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Precedence layers matching GPUI's `KeyBindingMetaIndex` convention (lower index wins).
 const USER_META: KeyBindingMetaIndex = KeyBindingMetaIndex(0);
@@ -20,7 +19,8 @@ const DEFAULT_META: KeyBindingMetaIndex = KeyBindingMetaIndex(1);
 pub const DEFAULT_KEYMAP_PATH: &str = "keymaps/default.json";
 pub const USER_KEYMAP_FILE: &str = "keymap.json";
 pub const USER_KEYMAP_TEMPLATE: &str = r#"// Fern user keymap — overrides the built-in default bindings.
-// After saving, click "Reload keymap" in the Shortcuts panel (Ctrl+/).
+// Shortcuts changed in Settings → Shortcuts are saved here automatically.
+// After editing this file manually, click "Reload keymap" in Settings → Shortcuts.
 //
 // Example:
 // [
@@ -39,11 +39,129 @@ pub const USER_KEYMAP_TEMPLATE: &str = r#"// Fern user keymap — overrides the 
 // ]
 //
 // Common contexts: Workspace, Tasks, TaskList, Calendar, CalendarYear,
-// Matrix, Habits, Focus, Countdown, Settings, TextInput.
+// Matrix, Habits, Focus, Countdown, StickyNote, Settings, TextInput.
 // Set a key to null to unbind it in that context.
 [
 ]
 "#;
+
+/// Visual sections in Settings → Shortcuts, in display order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShortcutSection {
+    General,
+    NewTask,
+    EditTask,
+    Navigation,
+    SwitchView,
+    Focus,
+    StickyNote,
+}
+
+/// Specification for one customizable in-app shortcut row in Settings → Shortcuts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShortcutSpec {
+    pub action: &'static str,
+    pub section: ShortcutSection,
+    /// Primary GPUI context where direct bindings edited from the UI are stored.
+    pub context: Option<&'static str>,
+    /// Optional built-in two-key chord displayed on the left of "or" (e.g. `("Workspace && !TextInput", "g t")`).
+    pub fixed_chord: Option<(&'static str, &'static str)>,
+    /// Whether UI shortcut recording accepts unmodified single keys (e.g. `Space`, `D`, `1`).
+    pub allow_unmodified: bool,
+}
+
+pub const SHORTCUT_COUNT: usize = 56;
+
+/// All customizable in-app shortcuts in Settings → Shortcuts, matching `i18n::Strings::shortcut_labels` 1:1.
+pub const SHORTCUT_SPECS: [ShortcutSpec; SHORTCUT_COUNT] = [
+    // General (0..10)
+    ShortcutSpec { action: "fern::SyncNow", section: ShortcutSection::General, context: Some("Workspace"), fixed_chord: None, allow_unmodified: false },
+    ShortcutSpec { action: "fern::DismissTransient", section: ShortcutSection::General, context: None, fixed_chord: None, allow_unmodified: false },
+    ShortcutSpec { action: "task_list::Undo", section: ShortcutSection::General, context: Some("TaskList"), fixed_chord: None, allow_unmodified: false },
+    ShortcutSpec { action: "task_list::Redo", section: ShortcutSection::General, context: Some("TaskList"), fixed_chord: None, allow_unmodified: false },
+    ShortcutSpec { action: "fern::PrintList", section: ShortcutSection::General, context: Some("Workspace"), fixed_chord: None, allow_unmodified: false },
+    ShortcutSpec { action: "fern::PrintDetail", section: ShortcutSection::General, context: Some("Workspace"), fixed_chord: None, allow_unmodified: false },
+    ShortcutSpec { action: "fern::Search", section: ShortcutSection::General, context: Some("Workspace"), fixed_chord: None, allow_unmodified: false },
+    ShortcutSpec { action: "fern::ShowShortcuts", section: ShortcutSection::General, context: Some("Workspace"), fixed_chord: None, allow_unmodified: false },
+    ShortcutSpec { action: "fern::MinimizeWindow", section: ShortcutSection::General, context: Some("Workspace && !TextInput"), fixed_chord: None, allow_unmodified: false },
+    ShortcutSpec { action: "fern::Quit", section: ShortcutSection::General, context: None, fixed_chord: None, allow_unmodified: false },
+    // New Task (10..16)
+    ShortcutSpec { action: "fern::NewTask", section: ShortcutSection::NewTask, context: Some("Workspace"), fixed_chord: None, allow_unmodified: false },
+    ShortcutSpec { action: "task_list::AddSubtask", section: ShortcutSection::NewTask, context: Some("TaskList"), fixed_chord: None, allow_unmodified: true },
+    ShortcutSpec { action: "task_list::ToggleAllGroups", section: ShortcutSection::NewTask, context: Some("TaskList"), fixed_chord: None, allow_unmodified: true },
+    ShortcutSpec { action: "task_list::ToggleAllSubtasks", section: ShortcutSection::NewTask, context: Some("TaskList"), fixed_chord: None, allow_unmodified: true },
+    ShortcutSpec { action: "task_list::SelectNext", section: ShortcutSection::NewTask, context: Some("TaskList"), fixed_chord: None, allow_unmodified: true },
+    ShortcutSpec { action: "task_list::SelectPrevious", section: ShortcutSection::NewTask, context: Some("TaskList"), fixed_chord: None, allow_unmodified: true },
+    // Edit Task (16..29)
+    ShortcutSpec { action: "task_list::ToggleComplete", section: ShortcutSection::EditTask, context: Some("TaskList"), fixed_chord: None, allow_unmodified: true },
+    ShortcutSpec { action: "task_list::PinTask", section: ShortcutSection::EditTask, context: Some("TaskList"), fixed_chord: None, allow_unmodified: true },
+    ShortcutSpec { action: "task_list::DeleteTask", section: ShortcutSection::EditTask, context: Some("TaskList"), fixed_chord: None, allow_unmodified: true },
+    ShortcutSpec { action: "task_list::SetDate", section: ShortcutSection::EditTask, context: Some("TaskList"), fixed_chord: None, allow_unmodified: true },
+    ShortcutSpec { action: "task_list::ClearDate", section: ShortcutSection::EditTask, context: Some("TaskList"), fixed_chord: None, allow_unmodified: true },
+    ShortcutSpec { action: "task_list::SetToday", section: ShortcutSection::EditTask, context: Some("TaskList"), fixed_chord: None, allow_unmodified: true },
+    ShortcutSpec { action: "task_list::SetTomorrow", section: ShortcutSection::EditTask, context: Some("TaskList"), fixed_chord: None, allow_unmodified: true },
+    ShortcutSpec { action: "task_list::SetNextWeek", section: ShortcutSection::EditTask, context: Some("TaskList"), fixed_chord: None, allow_unmodified: true },
+    ShortcutSpec { action: "task_list::PriorityNone", section: ShortcutSection::EditTask, context: Some("TaskList"), fixed_chord: None, allow_unmodified: true },
+    ShortcutSpec { action: "task_list::PriorityLow", section: ShortcutSection::EditTask, context: Some("TaskList"), fixed_chord: None, allow_unmodified: true },
+    ShortcutSpec { action: "task_list::PriorityMedium", section: ShortcutSection::EditTask, context: Some("TaskList"), fixed_chord: None, allow_unmodified: true },
+    ShortcutSpec { action: "task_list::PriorityHigh", section: ShortcutSection::EditTask, context: Some("TaskList"), fixed_chord: None, allow_unmodified: true },
+    ShortcutSpec { action: "task_list::OpenAsSticky", section: ShortcutSection::EditTask, context: Some("TaskList"), fixed_chord: None, allow_unmodified: true },
+    // Navigation (29..39)
+    ShortcutSpec { action: "fern::ToggleSidebar", section: ShortcutSection::Navigation, context: Some("Workspace"), fixed_chord: None, allow_unmodified: false },
+    ShortcutSpec { action: "fern::OpenSettings", section: ShortcutSection::Navigation, context: Some("Workspace"), fixed_chord: Some(("Workspace && !TextInput", "g s")), allow_unmodified: false },
+    ShortcutSpec { action: "fern::ShowAll", section: ShortcutSection::Navigation, context: Some("Workspace"), fixed_chord: Some(("Workspace && !TextInput", "g a")), allow_unmodified: false },
+    ShortcutSpec { action: "fern::ShowInbox", section: ShortcutSection::Navigation, context: Some("Workspace"), fixed_chord: Some(("Workspace && !TextInput", "g i")), allow_unmodified: false },
+    ShortcutSpec { action: "fern::ShowToday", section: ShortcutSection::Navigation, context: Some("Workspace"), fixed_chord: Some(("Workspace && !TextInput", "g t")), allow_unmodified: false },
+    ShortcutSpec { action: "fern::ShowTomorrow", section: ShortcutSection::Navigation, context: Some("Workspace"), fixed_chord: Some(("Workspace && !TextInput", "g r")), allow_unmodified: false },
+    ShortcutSpec { action: "fern::ShowNext7Days", section: ShortcutSection::Navigation, context: Some("Workspace"), fixed_chord: Some(("Workspace && !TextInput", "g n")), allow_unmodified: false },
+    ShortcutSpec { action: "fern::ShowCompleted", section: ShortcutSection::Navigation, context: Some("Workspace"), fixed_chord: Some(("Workspace && !TextInput", "g c")), allow_unmodified: false },
+    ShortcutSpec { action: "fern::ShowWontDo", section: ShortcutSection::Navigation, context: Some("Workspace"), fixed_chord: Some(("Workspace && !TextInput", "g w")), allow_unmodified: false },
+    ShortcutSpec { action: "fern::ShowTrash", section: ShortcutSection::Navigation, context: Some("Workspace"), fixed_chord: Some(("Workspace && !TextInput", "g g")), allow_unmodified: false },
+    // Switch Views (39..48)
+    ShortcutSpec { action: "task_list::ViewList", section: ShortcutSection::SwitchView, context: Some("TaskList"), fixed_chord: Some(("TaskList && !TextInput", "v l")), allow_unmodified: true },
+    ShortcutSpec { action: "task_list::ViewKanban", section: ShortcutSection::SwitchView, context: Some("TaskList"), fixed_chord: Some(("TaskList && !TextInput", "v k")), allow_unmodified: true },
+    ShortcutSpec { action: "task_list::ViewTimeline", section: ShortcutSection::SwitchView, context: Some("TaskList"), fixed_chord: Some(("TaskList && !TextInput", "v t")), allow_unmodified: true },
+    ShortcutSpec { action: "calendar::DayView", section: ShortcutSection::SwitchView, context: Some("Calendar"), fixed_chord: None, allow_unmodified: true },
+    ShortcutSpec { action: "calendar::WeekView", section: ShortcutSection::SwitchView, context: Some("Calendar"), fixed_chord: None, allow_unmodified: true },
+    ShortcutSpec { action: "calendar::MonthView", section: ShortcutSection::SwitchView, context: Some("Calendar"), fixed_chord: None, allow_unmodified: true },
+    ShortcutSpec { action: "calendar::YearView", section: ShortcutSection::SwitchView, context: Some("Calendar"), fixed_chord: None, allow_unmodified: true },
+    ShortcutSpec { action: "calendar::AgendaView", section: ShortcutSection::SwitchView, context: Some("Calendar"), fixed_chord: None, allow_unmodified: true },
+    ShortcutSpec { action: "calendar::CalendarToday", section: ShortcutSection::SwitchView, context: Some("Calendar"), fixed_chord: None, allow_unmodified: true },
+    // Focus (48..50)
+    ShortcutSpec { action: "focus::TogglePause", section: ShortcutSection::Focus, context: None, fixed_chord: None, allow_unmodified: false },
+    ShortcutSpec { action: "focus::StartStop", section: ShortcutSection::Focus, context: None, fixed_chord: None, allow_unmodified: false },
+    // Sticky Note (50..56)
+    ShortcutSpec { action: "sticky::TogglePin", section: ShortcutSection::StickyNote, context: Some("StickyNote"), fixed_chord: None, allow_unmodified: true },
+    ShortcutSpec { action: "sticky::ToggleColor", section: ShortcutSection::StickyNote, context: Some("StickyNote"), fixed_chord: None, allow_unmodified: true },
+    ShortcutSpec { action: "sticky::ToggleCollapse", section: ShortcutSection::StickyNote, context: Some("StickyNote"), fixed_chord: None, allow_unmodified: true },
+    ShortcutSpec { action: "sticky::AlignTop", section: ShortcutSection::StickyNote, context: Some("StickyNote"), fixed_chord: None, allow_unmodified: true },
+    ShortcutSpec { action: "sticky::AlignLeft", section: ShortcutSection::StickyNote, context: Some("StickyNote"), fixed_chord: None, allow_unmodified: true },
+    ShortcutSpec { action: "sticky::AlignRight", section: ShortcutSection::StickyNote, context: Some("StickyNote"), fixed_chord: None, allow_unmodified: true },
+];
+
+/// Resolved runtime display state for one row in `SHORTCUT_SPECS`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedShortcut {
+    pub index: usize,
+    pub spec: ShortcutSpec,
+    /// Formatted parts of an active `fixed_chord`, e.g. `Some(("G", "T"))` for `"g t"`.
+    pub fixed_chord_parts: Option<(String, String)>,
+    /// Active direct shortcut labels (excluding `fixed_chord`), e.g. `["Ctrl+S"]` or `["D", "1"]`.
+    pub keys: Vec<String>,
+    /// Indices into `SHORTCUT_SPECS` of other actions bound to the same key in an overlapping context.
+    pub conflicts: Vec<usize>,
+}
+
+impl ResolvedShortcut {
+    /// Joins direct shortcut labels for display inside a pill box.
+    pub fn display_direct(&self) -> Option<String> {
+        if self.keys.is_empty() {
+            return None;
+        }
+        let sep = if self.keys.iter().any(|k| k.contains('/')) { " · " } else { " / " };
+        Some(self.keys.join(sep))
+    }
+}
 
 #[derive(Default)]
 struct KeymapErrors(Vec<String>);
@@ -51,7 +169,7 @@ struct KeymapErrors(Vec<String>);
 impl Global for KeymapErrors {}
 
 #[derive(Default)]
-struct CachedShortcuts(Vec<(&'static str, Vec<String>)>);
+struct CachedShortcuts(Vec<ResolvedShortcut>);
 
 impl Global for CachedShortcuts {}
 
@@ -64,14 +182,24 @@ pub fn set_errors(errors: Vec<String>, cx: &mut App) {
     cx.set_global(KeymapErrors(errors));
 }
 
-/// Cached display list of active shortcuts from the last keymap load/reload (no disk I/O).
-pub fn cached_shortcuts(cx: &App) -> &[(&'static str, Vec<String>)] {
+/// Cached resolved shortcut rows from the last keymap load/reload (no disk I/O).
+pub fn cached_resolved_shortcuts(cx: &App) -> &[ResolvedShortcut] {
     cx.try_global::<CachedShortcuts>()
         .map_or(&[], |state| state.0.as_slice())
 }
 
 pub fn user_keymap_path() -> Result<PathBuf> {
     Ok(crate::paths::data_dir()?.join(USER_KEYMAP_FILE))
+}
+
+/// Reads `<data_dir>/keymap.json` if present (`Ok(None)` when absent). Intended for background I/O.
+pub fn read_user_keymap_file() -> Result<Option<String>> {
+    let path = user_keymap_path()?;
+    match std::fs::read_to_string(&path) {
+        Ok(contents) => Ok(Some(contents)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err).with_context(|| format!("cannot read {}", path.display())),
+    }
 }
 
 /// Ensures `<data_dir>/keymap.json` exists with a valid empty JSON array if absent, returning its path.
@@ -81,31 +209,52 @@ pub fn ensure_user_keymap_file() -> Result<PathBuf> {
     Ok(path)
 }
 
-fn ensure_user_keymap_file_at(path: &std::path::Path) -> Result<()> {
+fn ensure_user_keymap_file_at(path: &Path) -> Result<()> {
     if !path.exists() {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("cannot create {}", parent.display()))?;
-        }
-        std::fs::write(path, USER_KEYMAP_TEMPLATE)
-            .with_context(|| format!("cannot create {}", path.display()))?;
+        write_file_creating_parents(path, USER_KEYMAP_TEMPLATE)?;
     }
     Ok(())
+}
+
+fn write_file_creating_parents(path: &Path, contents: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("cannot create {}", parent.display()))?;
+    }
+    std::fs::write(path, contents)
+        .with_context(|| format!("cannot write {}", path.display()))
+}
+
+/// Resets `<data_dir>/keymap.json` back to the clean default template (clearing custom overrides).
+pub fn reset_user_keymap_file() -> Result<()> {
+    let path = user_keymap_path()?;
+    write_file_creating_parents(&path, USER_KEYMAP_TEMPLATE)
+}
+
+/// Updates one action's direct binding in `<data_dir>/keymap.json` (background-safe) and returns
+/// the new file contents so the caller can immediately reload GPUI bindings on the foreground thread.
+pub fn write_action_shortcut_to_file(
+    default_source: &str,
+    action: &str,
+    new_key: Option<&str>,
+) -> Result<String> {
+    let path = user_keymap_path()?;
+    let existing = match std::fs::read_to_string(&path) {
+        Ok(contents) => Some(contents),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => return Err(err).with_context(|| format!("cannot read {}", path.display())),
+    };
+    let updated = update_user_keymap_source(default_source, existing.as_deref(), action, new_key)?;
+    write_file_creating_parents(&path, &updated)?;
+    Ok(updated)
 }
 
 /// Clears active bindings and reloads `default.json` plus optional `<data_dir>/keymap.json`,
 /// storing any parse or action errors and the resolved shortcut list in app state.
 pub fn reload(assets: &dyn AssetSource, cx: &mut App) -> Result<Vec<String>> {
     let mut read_errors = Vec::new();
-    let user_keymap = match user_keymap_path() {
-        Ok(path) => match std::fs::read_to_string(&path) {
-            Ok(contents) => Some(contents),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
-            Err(err) => {
-                read_errors.push(format!("{USER_KEYMAP_FILE}: {err}"));
-                None
-            }
-        },
+    let user_keymap = match read_user_keymap_file() {
+        Ok(contents) => contents,
         Err(err) => {
             read_errors.push(format!("{USER_KEYMAP_FILE}: {err}"));
             None
@@ -126,54 +275,146 @@ pub fn reload(assets: &dyn AssetSource, cx: &mut App) -> Result<Vec<String>> {
     }
 }
 
-/// Actions shown in the shortcut list, in order; text editing keys are left out.
-pub const LISTED_ACTIONS: [&str; 31] = [
-    "fern::NewTask",
-    "fern::Search",
-    "fern::ToggleSidebar",
-    "fern::ShowInbox",
-    "fern::ShowToday",
-    "fern::ShowTomorrow",
-    "fern::ShowNext7Days",
-    "fern::SyncNow",
-    "fern::ShowShortcuts",
-    "fern::OpenSettings",
-    "fern::Quit",
-    "fern::DismissTransient",
-    "fern::MinimizeWindow",
-    "task_list::SelectNext",
-    "task_list::SelectPrevious",
-    "task_list::ToggleComplete",
-    "task_list::DeleteTask",
-    "task_list::PinTask",
-    "task_list::SetDate",
-    "task_list::ClearDate",
-    "task_list::SetToday",
-    "task_list::SetTomorrow",
-    "task_list::SetNextWeek",
-    "task_list::PriorityNone",
-    "task_list::PriorityLow",
-    "task_list::PriorityMedium",
-    "task_list::PriorityHigh",
-    "task_list::ToggleAllSubtasks",
-    "task_list::AddSubtask",
-    "task_list::Undo",
-    "task_list::Redo",
-];
-
-/// The keys bound to each listed action, as they read on screen ("Ctrl+N", "↓"), in the order
-/// of `LISTED_ACTIONS`.
-#[cfg(test)]
-pub fn shortcut_list(source: &str) -> Result<Vec<(&'static str, Vec<String>)>> {
-    shortcut_list_with_user(source, None)
+/// Normalized comparison key for a GPUI keystroke sequence (resolves `secondary-*` to the active
+/// platform modifier so `"secondary-s"` equals `"ctrl-s"` on Windows/Linux and `"cmd-s"` on macOS).
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct CanonicalKeystroke {
+    control: bool,
+    alt: bool,
+    shift: bool,
+    platform: bool,
+    function: bool,
+    key: String,
 }
 
-/// The keys bound to each listed action after applying optional user `keymap.json` overrides and
-/// `null` unbindings on top of the default keymap.
-pub fn shortcut_list_with_user(
+fn canonicalize_sequence(raw: &str) -> Option<Vec<CanonicalKeystroke>> {
+    let mut seq = Vec::new();
+    for token in raw.split_whitespace() {
+        let ks = Keystroke::parse(token).ok()?;
+        seq.push(CanonicalKeystroke {
+            control: ks.modifiers.control,
+            alt: ks.modifiers.alt,
+            shift: ks.modifiers.shift,
+            platform: ks.modifiers.platform,
+            function: ks.modifiers.function,
+            key: ks.key.to_lowercase(),
+        });
+    }
+    (!seq.is_empty()).then_some(seq)
+}
+
+fn same_keystroke_sequence(a: &str, b: &str) -> bool {
+    match (canonicalize_sequence(a), canonicalize_sequence(b)) {
+        (Some(ca), Some(cb)) => ca == cb,
+        _ => a.trim() == b.trim(),
+    }
+}
+
+/// Formats a captured GPUI `Keystroke` into canonical keymap JSON syntax when suitable for binding.
+///
+/// Bare modifiers are ignored (return `None` so recording keeps listening). Unmodified `escape`,
+/// `backspace`, and `delete` also return `None` because callers handle them as cancel / clear.
+pub fn record_keystroke(ks: &Keystroke, allow_unmodified: bool) -> Option<String> {
+    let key = ks.key.to_lowercase();
+    if key.is_empty()
+        || matches!(
+            key.as_str(),
+            "control"
+                | "ctrl"
+                | "shift"
+                | "alt"
+                | "option"
+                | "platform"
+                | "meta"
+                | "super"
+                | "command"
+                | "cmd"
+                | "win"
+                | "capslock"
+                | "numlock"
+                | "scrolllock"
+        )
+    {
+        return None;
+    }
+
+    let m = &ks.modifiers;
+    let has_primary_mod = m.control || m.alt || m.platform;
+    let has_any_mod = has_primary_mod || m.shift;
+
+    // Unmodified Escape cancels recording; unmodified Backspace/Delete clears the binding.
+    if !has_any_mod && matches!(key.as_str(), "escape" | "backspace" | "delete") {
+        return None;
+    }
+
+    let is_function_key = key
+        .strip_prefix('f')
+        .and_then(|n| n.parse::<u32>().ok())
+        .is_some_and(|n| (1..=12).contains(&n));
+
+    let is_named_nav = matches!(
+        key.as_str(),
+        "enter"
+            | "tab"
+            | "space"
+            | "delete"
+            | "backspace"
+            | "up"
+            | "down"
+            | "left"
+            | "right"
+            | "home"
+            | "end"
+            | "pageup"
+            | "pagedown"
+    );
+
+    let is_single_allowed = key.len() == 1
+        && key
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '?');
+
+    let allowed = has_primary_mod
+        || is_function_key
+        || (m.shift && is_named_nav)
+        || (allow_unmodified && !has_any_mod && (is_named_nav || is_single_allowed));
+
+    if !allowed {
+        return None;
+    }
+
+    let mut parts: Vec<&str> = Vec::new();
+    if m.control {
+        parts.push("ctrl");
+    }
+    if m.alt {
+        parts.push("alt");
+    }
+    if m.shift && key != "?" {
+        parts.push("shift");
+    }
+    if m.platform {
+        parts.push(if cfg!(target_os = "macos") { "cmd" } else { "win" });
+    }
+    parts.push(&key);
+    let formatted = parts.join("-");
+    Keystroke::parse(&formatted).ok()?;
+    Some(formatted)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct EffectiveEntry {
+    context: Option<String>,
+    raw_keys: String,
+    canonical: Option<Vec<CanonicalKeystroke>>,
+    action: Option<String>,
+}
+
+fn resolve_effective_entries(
     default_source: &str,
     user_source: Option<&str>,
-) -> Result<Vec<(&'static str, Vec<String>)>> {
+) -> Result<Vec<EffectiveEntry>> {
     let cleaned_default = theme::strip_jsonc(default_source).context("invalid keymap JSONC")?;
     let mut sections: Vec<KeymapSection> =
         serde_json::from_str(&cleaned_default).context("invalid keymap JSON")?;
@@ -185,36 +426,334 @@ pub fn shortcut_list_with_user(
         sections.extend(user_sections);
     }
 
-    let mut effective: Vec<(Option<String>, String, Option<String>)> = Vec::new();
+    let mut effective: Vec<EffectiveEntry> = Vec::new();
     for section in sections {
-        let context = section.context.map(|c| c.trim().to_owned());
-        for (keys, action) in section.bindings {
-            if context.is_none() {
-                effective.retain(|(_, existing_keys, _)| *existing_keys != keys);
+        let context = section.context.map(|c| c.trim().to_owned()).filter(|c| !c.is_empty());
+        for (raw_keys, action) in section.bindings {
+            let canonical = canonicalize_sequence(&raw_keys);
+            if context.is_none() && action.is_none() {
+                effective.retain(|entry| !entries_same_key(entry, &raw_keys, &canonical));
             } else {
-                effective.retain(|(existing_ctx, existing_keys, _)| {
-                    !(existing_ctx == &context && *existing_keys == keys)
+                effective.retain(|entry| {
+                    !(entry.context == context && entries_same_key(entry, &raw_keys, &canonical))
                 });
             }
-            effective.push((context.clone(), keys, action));
+            effective.push(EffectiveEntry { context: context.clone(), raw_keys, canonical, action });
+        }
+    }
+    Ok(effective)
+}
+
+fn entries_same_key(
+    entry: &EffectiveEntry,
+    raw_keys: &str,
+    canonical: &Option<Vec<CanonicalKeystroke>>,
+) -> bool {
+    match (&entry.canonical, canonical) {
+        (Some(a), Some(b)) => a == b,
+        _ => entry.raw_keys == raw_keys,
+    }
+}
+
+/// Returns whether two GPUI context strings can be active at the same time in a user window.
+fn contexts_overlap(a: Option<&str>, b: Option<&str>) -> bool {
+    let (Some(a), Some(b)) = (a, b) else {
+        return true;
+    };
+    if a == b {
+        return true;
+    }
+    fn root(ctx: &str) -> &str {
+        ctx.split("&&").next().unwrap_or(ctx).trim()
+    }
+    let ra = root(a);
+    let rb = root(b);
+    if ra == rb {
+        return true;
+    }
+    let in_main_workspace = |r: &str| {
+        matches!(
+            r,
+            "Workspace" | "Tasks" | "TaskList" | "TaskDetail" | "Calendar" | "CalendarYear" | "Habits" | "Matrix" | "Focus" | "Countdown"
+        )
+    };
+    (ra == "Workspace" && in_main_workspace(rb)) || (rb == "Workspace" && in_main_workspace(ra))
+}
+
+fn is_fixed_chord_match(spec: &ShortcutSpec, entry: &EffectiveEntry) -> bool {
+    let Some((fixed_ctx, fixed_keys)) = spec.fixed_chord else {
+        return false;
+    };
+    entry.context.as_deref() == Some(fixed_ctx) && same_keystroke_sequence(&entry.raw_keys, fixed_keys)
+}
+
+/// Resolves every row in `SHORTCUT_SPECS` after applying optional user `keymap.json` overrides,
+/// including active fixed chords, direct bindings, and cross-action conflicts.
+pub fn resolve_shortcuts_with_user(
+    default_source: &str,
+    user_source: Option<&str>,
+) -> Result<Vec<ResolvedShortcut>> {
+    let effective = resolve_effective_entries(default_source, user_source)?;
+
+    // Track active listed entries for conflict detection: (spec_index, context, canonical_keys).
+    let mut active_listed: Vec<(usize, Option<&str>, &Vec<CanonicalKeystroke>)> = Vec::new();
+    let mut resolved: Vec<ResolvedShortcut> = SHORTCUT_SPECS
+        .iter()
+        .enumerate()
+        .map(|(index, &spec)| {
+            let mut fixed_chord_active = false;
+            let mut keys = Vec::new();
+            for entry in &effective {
+                if entry.action.as_deref() != Some(spec.action) {
+                    continue;
+                }
+                if let Some(canonical) = &entry.canonical {
+                    active_listed.push((index, entry.context.as_deref(), canonical));
+                }
+                if is_fixed_chord_match(&spec, entry) {
+                    fixed_chord_active = true;
+                    continue;
+                }
+                let display = display_keys(&entry.raw_keys);
+                if !keys.contains(&display) {
+                    keys.push(display);
+                }
+            }
+            let fixed_chord_parts = fixed_chord_active
+                .then(|| spec.fixed_chord.and_then(|(_, raw)| split_chord_display(raw)))
+                .flatten();
+            ResolvedShortcut {
+                index,
+                spec,
+                fixed_chord_parts,
+                keys,
+                conflicts: Vec::new(),
+            }
+        })
+        .collect();
+
+    // Detect conflicts between distinct listed actions that share a keystroke in overlapping contexts.
+    for i in 0..active_listed.len() {
+        let (idx_a, ctx_a, key_a) = active_listed[i];
+        let act_a = SHORTCUT_SPECS[idx_a].action;
+        for &(idx_b, ctx_b, key_b) in &active_listed[(i + 1)..] {
+            if idx_a == idx_b || key_a != key_b {
+                continue;
+            }
+            let act_b = SHORTCUT_SPECS[idx_b].action;
+            // `DismissTransient` intentionally propagates to `MinimizeWindow` when nothing transient is open.
+            let is_dismiss_minimize = (act_a == "fern::DismissTransient"
+                && act_b == "fern::MinimizeWindow")
+                || (act_b == "fern::DismissTransient" && act_a == "fern::MinimizeWindow");
+            if is_dismiss_minimize {
+                continue;
+            }
+            if contexts_overlap(ctx_a, ctx_b) {
+                if !resolved[idx_a].conflicts.contains(&idx_b) {
+                    resolved[idx_a].conflicts.push(idx_b);
+                }
+                if !resolved[idx_b].conflicts.contains(&idx_a) {
+                    resolved[idx_b].conflicts.push(idx_a);
+                }
+            }
         }
     }
 
-    Ok(LISTED_ACTIONS
-        .iter()
-        .map(|action| {
-            let mut keys = Vec::new();
-            for (_, keystroke, bound_action) in &effective {
-                if bound_action.as_deref() == Some(*action) {
-                    let display = display_keys(keystroke);
-                    if !keys.contains(&display) {
-                        keys.push(display);
-                    }
+    Ok(resolved)
+}
+
+/// Splits a two-key chord like `"g t"` into `("G", "T")` so callers can localize `"G then T"`.
+fn split_chord_display(raw: &str) -> Option<(String, String)> {
+    let mut parts = raw.split_whitespace();
+    let first = display_single_keystroke(parts.next()?);
+    let second = display_single_keystroke(parts.next()?);
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((first, second))
+}
+
+/// Extracts any leading whitespace and `//` / `/* ... */` comments before the JSON array `[`.
+fn extract_leading_comments(source: &str) -> &str {
+    let bytes = source.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b' ' | b'\t' | b'\r' | b'\n' => i += 1,
+            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'/' => {
+                i += 2;
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
                 }
             }
-            (*action, keys)
-        })
-        .collect())
+            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
+                i += 2;
+                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = (i + 2).min(bytes.len());
+            }
+            _ => break,
+        }
+    }
+    &source[..i]
+}
+
+/// Updates one action's direct binding in user `keymap.json` source while preserving:
+/// - leading JSONC header comments,
+/// - all other user sections and overrides,
+/// - built-in fixed chords (`g t`, `v l`, etc.).
+///
+/// Returns an error without modifying anything if `user_source` contains invalid JSON/JSONC.
+pub fn update_user_keymap_source(
+    default_source: &str,
+    user_source: Option<&str>,
+    action: &str,
+    new_key: Option<&str>,
+) -> Result<String> {
+    let spec = SHORTCUT_SPECS
+        .iter()
+        .copied()
+        .find(|s| s.action == action)
+        .with_context(|| format!("unknown shortcut action: {action}"))?;
+
+    let cleaned_default = theme::strip_jsonc(default_source).context("invalid default keymap JSONC")?;
+    let default_sections: Vec<KeymapSection> =
+        serde_json::from_str(&cleaned_default).context("invalid default keymap JSON")?;
+
+    // Collect all default direct bindings `(context, raw_key)` for this action (excluding fixed_chord).
+    let mut default_direct: Vec<(Option<String>, String)> = Vec::new();
+    for section in &default_sections {
+        let ctx = section.context.as_deref().map(str::trim).filter(|c| !c.is_empty()).map(str::to_owned);
+        for (raw_key, bound) in &section.bindings {
+            if bound.as_deref() != Some(action) {
+                continue;
+            }
+            if let Some((fixed_ctx, fixed_key)) = spec.fixed_chord
+                && ctx.as_deref() == Some(fixed_ctx)
+                && same_keystroke_sequence(raw_key, fixed_key)
+            {
+                continue;
+            }
+            default_direct.push((ctx.clone(), raw_key.clone()));
+        }
+    }
+
+    let (header, mut user_sections) = match user_source {
+        Some(src) if !src.trim().is_empty() => {
+            let header = extract_leading_comments(src);
+            let cleaned = theme::strip_jsonc(src)
+                .with_context(|| format!("{USER_KEYMAP_FILE}: invalid JSONC"))?;
+            let sections: Vec<KeymapSection> = if cleaned.trim().is_empty() {
+                Vec::new()
+            } else {
+                serde_json::from_str(&cleaned)
+                    .with_context(|| format!("{USER_KEYMAP_FILE}: invalid JSON"))?
+            };
+            (header, sections)
+        }
+        _ => (extract_leading_comments(USER_KEYMAP_TEMPLATE), Vec::new()),
+    };
+
+    // Contexts affected by this action's direct bindings.
+    let mut target_contexts: BTreeSet<Option<String>> = BTreeSet::new();
+    target_contexts.insert(spec.context.map(str::to_owned));
+    for (ctx, _) in &default_direct {
+        target_contexts.insert(ctx.clone());
+    }
+
+    // Remove existing user overrides for this action's direct bindings (both `Some(action)` and
+    // previous `null` unbindings of its default keys), leaving fixed chords & other actions untouched.
+    for section in &mut user_sections {
+        let sec_ctx = section.context.as_deref().map(str::trim).filter(|c| !c.is_empty()).map(str::to_owned);
+        section.bindings.retain(|raw_key, bound| {
+            if let Some((fixed_ctx, fixed_key)) = spec.fixed_chord
+                && sec_ctx.as_deref() == Some(fixed_ctx)
+                && same_keystroke_sequence(raw_key, fixed_key)
+            {
+                return true;
+            }
+            if bound.as_deref() == Some(action) {
+                return false;
+            }
+            if bound.is_none()
+                && default_direct
+                    .iter()
+                    .any(|(def_ctx, def_key)| {
+                        (sec_ctx.is_none() || *def_ctx == sec_ctx)
+                            && same_keystroke_sequence(raw_key, def_key)
+                    })
+            {
+                return false;
+            }
+            true
+        });
+    }
+
+    let mut set_binding = |ctx: Option<String>, key: String, val: Option<String>| {
+        if let Some(section) = user_sections.iter_mut().find(|s| {
+            s.context.as_deref().map(str::trim).filter(|c| !c.is_empty()) == ctx.as_deref()
+        }) {
+            section.bindings.insert(key, val);
+        } else {
+            let mut bindings = BTreeMap::new();
+            bindings.insert(key, val);
+            user_sections.push(KeymapSection { context: ctx, bindings });
+        }
+    };
+
+    match new_key {
+        None => {
+            // Unbind every built-in direct key for this action.
+            for (def_ctx, def_key) in &default_direct {
+                set_binding(def_ctx.clone(), def_key.clone(), None);
+            }
+        }
+        Some(new_key) => {
+            let mut already_bound_in_primary = false;
+            for (def_ctx, def_key) in &default_direct {
+                if same_keystroke_sequence(def_key, new_key) {
+                    if def_ctx.as_deref() == spec.context {
+                        already_bound_in_primary = true;
+                    }
+                } else {
+                    set_binding(def_ctx.clone(), def_key.clone(), None);
+                }
+            }
+            // Write the new key in the primary context (and mirror to any sibling window contexts
+            // like `StickyNote` that share this action in `default.json`).
+            if !already_bound_in_primary {
+                set_binding(
+                    spec.context.map(str::to_owned),
+                    new_key.to_owned(),
+                    Some(action.to_owned()),
+                );
+            }
+            for ctx in &target_contexts {
+                if ctx.as_deref() == spec.context
+                    || ctx.as_deref() == Some("Workspace && !TextInput")
+                {
+                    continue;
+                }
+                let already_there = default_direct.iter().any(|(def_ctx, def_key)| {
+                    def_ctx == ctx && same_keystroke_sequence(def_key, new_key)
+                });
+                if !already_there {
+                    set_binding(ctx.clone(), new_key.to_owned(), Some(action.to_owned()));
+                }
+            }
+        }
+    }
+
+    user_sections.retain(|s| !s.bindings.is_empty());
+
+    let json = serde_json::to_string_pretty(&user_sections)
+        .context("failed to serialize keymap sections")?;
+    let mut out = String::with_capacity(header.len() + json.len() + 1);
+    out.push_str(header);
+    out.push_str(&json);
+    out.push('\n');
+    Ok(out)
 }
 
 fn format_key_name(key: &str) -> String {
@@ -283,9 +822,9 @@ pub fn display_keys(keystroke: &str) -> String {
     chords.join(", ")
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct KeymapSection {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     context: Option<String>,
     #[serde(default)]
     bindings: BTreeMap<String, Option<String>>,
@@ -317,8 +856,8 @@ pub fn load_with_user(
             Err(err) => errors.push(format!("{USER_KEYMAP_FILE}: {err}")),
         }
     }
-    if let Ok(shortcuts) = shortcut_list_with_user(default_str, trimmed_user) {
-        cx.set_global(CachedShortcuts(shortcuts));
+    if let Ok(resolved) = resolve_shortcuts_with_user(default_str, trimmed_user) {
+        cx.set_global(CachedShortcuts(resolved));
     }
     Ok(errors)
 }
@@ -371,30 +910,51 @@ fn load_with_meta(source: &str, meta: KeyBindingMetaIndex, cx: &mut App) -> Resu
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn shortcut_list_reads_the_keymap() {
-        let list = super::shortcut_list(include_str!("../../../assets/keymaps/default.json")).unwrap();
-        assert_eq!(list.len(), super::LISTED_ACTIONS.len());
-        let keys = |action: &str| list.iter().find(|(a, _)| *a == action).unwrap().1.clone();
-        assert!(!keys("fern::NewTask").is_empty());
-        assert_eq!(keys("fern::DismissTransient"), ["Esc"]);
-        let mut next = keys("task_list::SelectNext");
-        next.sort();
-        assert_eq!(next, ["J", "↓"]);
-        assert_eq!(keys("task_list::PinTask"), ["Tab, P"]);
-        if cfg!(target_os = "macos") {
-            assert_eq!(super::display_keys("secondary-shift-p"), "⇧⌘P");
-            assert_eq!(super::display_keys("ctrl-shift-m"), "⌃⇧M");
-            assert_eq!(super::display_keys("secondary--"), "⌘-");
-        } else {
-            assert_eq!(super::display_keys("secondary-shift-p"), "Ctrl+Shift+P");
-            assert_eq!(super::display_keys("ctrl-shift-m"), "Ctrl+Shift+M");
-            assert_eq!(super::display_keys("secondary--"), "Ctrl+-");
-        }
-    }
-
     use super::*;
     use gpui::TestAppContext;
+
+    const DEFAULT_JSON: &str = include_str!("../../../assets/keymaps/default.json");
+
+    #[test]
+    fn resolved_shortcuts_read_defaults_without_conflicts() {
+        let list = resolve_shortcuts_with_user(DEFAULT_JSON, None).unwrap();
+        assert_eq!(list.len(), SHORTCUT_SPECS.len());
+        assert_eq!(SHORTCUT_SPECS.len(), fern_i18n::Locale::En.strings().shortcut_labels.len());
+        let find = |action: &str| list.iter().find(|r| r.spec.action == action).unwrap();
+
+        assert!(!find("fern::NewTask").keys.is_empty());
+        assert_eq!(find("fern::DismissTransient").keys, ["Esc"]);
+        let mut next = find("task_list::SelectNext").keys.clone();
+        next.sort();
+        assert_eq!(next, ["J", "↓"]);
+        assert_eq!(find("task_list::PinTask").keys, ["Tab, P"]);
+        assert_eq!(
+            find("fern::ShowToday").fixed_chord_parts,
+            Some(("G".to_owned(), "T".to_owned()))
+        );
+        assert_eq!(
+            find("task_list::ViewKanban").fixed_chord_parts,
+            Some(("V".to_owned(), "K".to_owned()))
+        );
+        assert_eq!(find("sticky::TogglePin").keys, ["F12"]);
+        for row in &list {
+            assert!(
+                row.conflicts.is_empty(),
+                "default keymap should not have conflicts, got {:?} for {}",
+                row.conflicts,
+                row.spec.action
+            );
+        }
+        if cfg!(target_os = "macos") {
+            assert_eq!(display_keys("secondary-shift-p"), "⇧⌘P");
+            assert_eq!(display_keys("ctrl-shift-m"), "⌃⇧M");
+            assert_eq!(display_keys("secondary--"), "⌘-");
+        } else {
+            assert_eq!(display_keys("secondary-shift-p"), "Ctrl+Shift+P");
+            assert_eq!(display_keys("ctrl-shift-m"), "Ctrl+Shift+M");
+            assert_eq!(display_keys("secondary--"), "Ctrl+-");
+        }
+    }
 
     #[gpui::test]
     fn default_keymap_loads_without_errors(cx: &mut TestAppContext) {
@@ -445,14 +1005,157 @@ mod tests {
             assert!(broken_errors[0].contains(USER_KEYMAP_FILE));
         });
 
-        let default_json = include_str!("../../../assets/keymaps/default.json");
-        let list = shortcut_list_with_user(default_json, Some(user_keymap)).unwrap();
-        let keys = |action: &str| list.iter().find(|(a, _)| *a == action).unwrap().1.clone();
-        assert_eq!(keys("fern::MinimizeWindow"), ["Esc"]);
-        assert_eq!(keys("fern::DismissTransient"), ["Esc"]);
-        assert!(keys("fern::Quit").is_empty());
-        assert!(keys("fern::NewTask").contains(&display_keys("ctrl-shift-m")));
-        assert_eq!(keys("task_list::ToggleComplete"), ["Tab, M"]);
+        let list = resolve_shortcuts_with_user(DEFAULT_JSON, Some(user_keymap)).unwrap();
+        let find = |action: &str| list.iter().find(|r| r.spec.action == action).unwrap();
+        assert_eq!(find("fern::MinimizeWindow").keys, ["Esc"]);
+        assert_eq!(find("fern::DismissTransient").keys, ["Esc"]);
+        assert!(find("fern::MinimizeWindow").conflicts.is_empty());
+        assert!(find("fern::Quit").keys.is_empty());
+        assert!(find("fern::NewTask").keys.contains(&display_keys("ctrl-shift-m")));
+        assert_eq!(find("task_list::ToggleComplete").keys, ["Tab, M"]);
+    }
+
+    #[test]
+    fn update_user_keymap_preserves_comments_other_rules_and_fixed_chords() {
+        let existing = r#"// Personal header comment
+[
+  {
+    "context": "Workspace && !TextInput",
+    "bindings": {
+      "escape": "fern::MinimizeWindow"
+    }
+  }
+]
+"#;
+        // Rebind ShowToday direct slot without touching `g t` or the custom MinimizeWindow rule.
+        let updated = update_user_keymap_source(
+            DEFAULT_JSON,
+            Some(existing),
+            "fern::ShowToday",
+            Some("ctrl-alt-2"),
+        )
+        .unwrap();
+        assert!(updated.starts_with("// Personal header comment\n"));
+        let resolved = resolve_shortcuts_with_user(DEFAULT_JSON, Some(&updated)).unwrap();
+        let find = |action: &str| resolved.iter().find(|r| r.spec.action == action).unwrap();
+        assert_eq!(find("fern::MinimizeWindow").keys, ["Esc"]);
+        assert_eq!(
+            find("fern::ShowToday").fixed_chord_parts,
+            Some(("G".to_owned(), "T".to_owned()))
+        );
+        assert_eq!(find("fern::ShowToday").keys, [display_keys("ctrl-alt-2")]);
+
+        // Clearing ShowToday direct slot unbinds default direct key while keeping `g t`.
+        let cleared =
+            update_user_keymap_source(DEFAULT_JSON, Some(&updated), "fern::ShowToday", None)
+                .unwrap();
+        let resolved_cleared = resolve_shortcuts_with_user(DEFAULT_JSON, Some(&cleared)).unwrap();
+        let today = resolved_cleared
+            .iter()
+            .find(|r| r.spec.action == "fern::ShowToday")
+            .unwrap();
+        assert_eq!(today.fixed_chord_parts, Some(("G".to_owned(), "T".to_owned())));
+        assert!(today.keys.is_empty());
+
+        // Setting ShowToday back to its platform default removes the Workspace override cleanly.
+        let default_key = if cfg!(target_os = "macos") { "cmd-2" } else { "ctrl-2" };
+        let restored = update_user_keymap_source(
+            DEFAULT_JSON,
+            Some(&cleared),
+            "fern::ShowToday",
+            Some(default_key),
+        )
+        .unwrap();
+        assert!(!restored.contains("ShowToday"));
+        assert!(restored.contains("fern::MinimizeWindow"));
+
+        // Broken user JSON is never silently overwritten.
+        assert!(
+            update_user_keymap_source(DEFAULT_JSON, Some("{broken"), "fern::SyncNow", Some("ctrl-r"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn conflict_detection_flags_overlapping_contexts_only() {
+        let conflicting = r#"[
+            {
+                "context": "Workspace",
+                "bindings": {
+                    "secondary-s": "fern::PrintList"
+                }
+            },
+            {
+                "context": "StickyNote",
+                "bindings": {
+                    "secondary-n": "sticky::TogglePin"
+                }
+            }
+        ]"#;
+        // Note: binding secondary-s in Workspace replaces SyncNow in effective resolution; to create
+        // a real conflict between two distinct active actions, bind PrintList globally to secondary-n
+        // while NewTask is bound in Workspace.
+        let overlap = r#"[
+            {
+                "bindings": {
+                    "secondary-n": "fern::PrintList"
+                }
+            },
+            {
+                "context": "Workspace",
+                "bindings": {
+                    "secondary-n": "fern::NewTask"
+                }
+            },
+            {
+                "context": "StickyNote",
+                "bindings": {
+                    "secondary-n": "sticky::TogglePin"
+                }
+            }
+        ]"#;
+        let _ = conflicting;
+        let list = resolve_shortcuts_with_user(DEFAULT_JSON, Some(overlap)).unwrap();
+        let idx = |action: &str| SHORTCUT_SPECS.iter().position(|s| s.action == action).unwrap();
+        let print_idx = idx("fern::PrintList");
+        let new_task_idx = idx("fern::NewTask");
+        let sticky_idx = idx("sticky::TogglePin");
+        assert!(list[print_idx].conflicts.contains(&new_task_idx));
+        assert!(list[new_task_idx].conflicts.contains(&print_idx));
+        // StickyNote overlaps with global `None` (PrintList), but NOT with Workspace (NewTask).
+        assert!(!list[sticky_idx].conflicts.contains(&new_task_idx));
+    }
+
+    #[test]
+    fn record_keystroke_handles_modifiers_function_keys_and_rejections() {
+        assert_eq!(
+            record_keystroke(&Keystroke::parse("ctrl-shift-p").unwrap(), false).as_deref(),
+            Some("ctrl-shift-p")
+        );
+        assert_eq!(
+            record_keystroke(&Keystroke::parse("alt-delete").unwrap(), false).as_deref(),
+            Some("alt-delete")
+        );
+        assert_eq!(
+            record_keystroke(&Keystroke::parse("f12").unwrap(), false).as_deref(),
+            Some("f12")
+        );
+        assert_eq!(
+            record_keystroke(&Keystroke::parse("shift-enter").unwrap(), false).as_deref(),
+            Some("shift-enter")
+        );
+        // Unmodified Escape / Backspace / Delete are reserved for cancel / clear.
+        assert_eq!(record_keystroke(&Keystroke::parse("escape").unwrap(), true), None);
+        assert_eq!(record_keystroke(&Keystroke::parse("backspace").unwrap(), true), None);
+        assert_eq!(record_keystroke(&Keystroke::parse("delete").unwrap(), true), None);
+        // Bare letters rejected in Workspace, accepted in allow_unmodified contexts.
+        assert_eq!(record_keystroke(&Keystroke::parse("a").unwrap(), false), None);
+        assert_eq!(record_keystroke(&Keystroke::parse("a").unwrap(), true).as_deref(), Some("a"));
+        assert_eq!(record_keystroke(&Keystroke::parse("space").unwrap(), false), None);
+        assert_eq!(
+            record_keystroke(&Keystroke::parse("space").unwrap(), true).as_deref(),
+            Some("space")
+        );
     }
 
     #[test]
@@ -462,7 +1165,7 @@ mod tests {
         ensure_user_keymap_file_at(&path).unwrap();
         let created = std::fs::read_to_string(&path).unwrap();
         assert_eq!(created, USER_KEYMAP_TEMPLATE);
-        assert!(shortcut_list_with_user(include_str!("../../../assets/keymaps/default.json"), Some(&created)).is_ok());
+        assert!(resolve_shortcuts_with_user(DEFAULT_JSON, Some(&created)).is_ok());
 
         let commented = r#"
             // Comment before array
@@ -476,9 +1179,12 @@ mod tests {
               }
             ]
         "#;
-        let list = shortcut_list_with_user(include_str!("../../../assets/keymaps/default.json"), Some(commented)).unwrap();
-        let minimize = list.iter().find(|(a, _)| *a == "fern::MinimizeWindow").unwrap().1.clone();
-        assert_eq!(minimize, ["Esc"]);
+        let list = resolve_shortcuts_with_user(DEFAULT_JSON, Some(commented)).unwrap();
+        let minimize = list
+            .iter()
+            .find(|r| r.spec.action == "fern::MinimizeWindow")
+            .unwrap();
+        assert_eq!(minimize.keys, ["Esc"]);
 
         let custom = r#"[{"bindings": {"escape": "fern::MinimizeWindow"}}]"#;
         std::fs::write(&path, custom).unwrap();

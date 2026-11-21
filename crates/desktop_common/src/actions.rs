@@ -11,10 +11,16 @@ actions!(
         Search,
         SyncNow,
         ToggleSidebar,
+        ShowAll,
         ShowInbox,
         ShowToday,
         ShowTomorrow,
         ShowNext7Days,
+        ShowCompleted,
+        ShowWontDo,
+        ShowTrash,
+        PrintList,
+        PrintDetail,
         ShowShortcuts,
         OpenSettings,
         DismissTransient,
@@ -48,11 +54,23 @@ actions!(
         PriorityLow,
         PriorityMedium,
         PriorityHigh,
+        ToggleAllGroups,
         ToggleAllSubtasks,
         AddSubtask,
+        OpenAsSticky,
+        ViewList,
+        ViewKanban,
+        ViewTimeline,
         Undo,
         Redo,
     ]
+);
+
+actions!(focus, [TogglePause, StartStop]);
+
+actions!(
+    sticky,
+    [TogglePin, ToggleColor, ToggleCollapse, AlignTop, AlignLeft, AlignRight]
 );
 
 actions!(

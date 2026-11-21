@@ -8,7 +8,10 @@ use fern_core::{Id, Store};
 use gpui::{App, Bounds, Entity, FocusHandle, FontWeight, Global, MouseButton, Pixels, TitlebarOptions, WindowBounds, WindowControlArea, WindowDecorations, WindowHandle, WindowKind, WindowOptions, point, size};
 use ui::prelude::*;
 
-use crate::actions::DismissTransient;
+use crate::actions::{
+    AlignLeft, AlignRight, AlignTop, DismissTransient, PrintDetail, ToggleCollapse, ToggleColor,
+    TogglePin,
+};
 use crate::i18n;
 use crate::sticky_settings::{PALETTE, StickySettings};
 use crate::task_detail::{OpenTask, TaskDetail, TaskUpdated};
@@ -144,6 +147,7 @@ fn open_note(store: Rc<Store>, id: Id, activate: bool, cx: &mut App) {
 pub struct StickyNote {
     store: Rc<Store>,
     detail: Entity<TaskDetail>,
+    focus_handle: FocusHandle,
     /// Linux and macOS: a press on the bar turns into a window move once the mouse moves.
     should_move: bool,
     /// Kept over the other windows by its pin (Windows).
@@ -213,7 +217,7 @@ impl StickyNote {
             true
         });
         let mut this = Self {
-            store, detail, should_move: false, pinned: note.pinned, settings, title: SharedString::default(),
+            store, detail, focus_handle: cx.focus_handle(), should_move: false, pinned: note.pinned, settings, title: SharedString::default(),
             saved_task: None, color: note.color.filter(|color| *color < PALETTE.len()),
             #[cfg(windows)]
             taskbar: win32_window_handle(window).map(|hwnd| taskbar::TaskbarButton::new(hwnd, settings.hide_from_taskbar, cx)),
@@ -247,6 +251,23 @@ impl StickyNote {
         }
         self.remember(window, cx);
     }
+
+    fn toggle_pin(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.pinned = !self.pinned;
+        #[cfg(windows)]
+        set_topmost(_window, self.pinned);
+        self.remember(_window, cx);
+        cx.notify();
+    }
+
+    #[cfg(windows)]
+    fn align_edge(&mut self, edge: sizing::ScreenEdge, window: &mut Window, cx: &mut Context<Self>) {
+        sizing::align_to_edge(window, edge);
+        self.remember(window, cx);
+    }
+
+    #[cfg(not(windows))]
+    fn align_edge(&mut self, _edge: u8, _window: &mut Window, _cx: &mut Context<Self>) {}
 
     fn toggle_compact(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.compact = !self.compact;
@@ -457,9 +478,35 @@ impl Render for StickyNote {
         v_flex()
             .id("sticky-window")
             .group("sticky-window")
+            .track_focus(&self.focus_handle)
+            .key_context("StickyNote")
             .on_action(cx.listener(|this, _: &desktop_common::actions::CloseWindow, window, cx| {
                 this.forget(cx);
                 window.defer(cx, |window, _| window.remove_window());
+            }))
+            .on_action(cx.listener(|this, _: &TogglePin, window, cx| this.toggle_pin(window, cx)))
+            .on_action(cx.listener(|this, _: &ToggleColor, window, cx| this.toggle_palette(window, cx)))
+            .on_action(cx.listener(|this, _: &ToggleCollapse, window, cx| this.toggle_compact(window, cx)))
+            .on_action(cx.listener(|this, _: &PrintDetail, _, cx| {
+                this.detail.update(cx, |detail, cx| detail.print_current(cx));
+            }))
+            .on_action(cx.listener(|this, _: &AlignTop, window, cx| {
+                #[cfg(windows)]
+                this.align_edge(sizing::ScreenEdge::Top, window, cx);
+                #[cfg(not(windows))]
+                this.align_edge(0, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &AlignLeft, window, cx| {
+                #[cfg(windows)]
+                this.align_edge(sizing::ScreenEdge::Left, window, cx);
+                #[cfg(not(windows))]
+                this.align_edge(1, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &AlignRight, window, cx| {
+                #[cfg(windows)]
+                this.align_edge(sizing::ScreenEdge::Right, window, cx);
+                #[cfg(not(windows))]
+                this.align_edge(2, window, cx);
             }))
             .size_full()
             .overflow_hidden()
@@ -543,13 +590,7 @@ impl Render for StickyNote {
                                 .icon_color(Color::Custom(foreground))
                                 .hover_color(foreground.opacity(0.12))
                                 .tooltip(popup::tooltip(if self.pinned { strings.unpin } else { strings.pin }))
-                                .on_click(cx.listener(|this, _, _window, cx| {
-                                    this.pinned = !this.pinned;
-                                    #[cfg(windows)]
-                                    set_topmost(_window, this.pinned);
-                                    this.remember(_window, cx);
-                                    cx.notify();
-                                })),
+                                .on_click(cx.listener(|this, _, window, cx| this.toggle_pin(window, cx))),
                         ))
                         .child(
                         IconButton::new("sticky-compact", if self.compact { IconName::ChevronDown } else { IconName::ChevronUp })

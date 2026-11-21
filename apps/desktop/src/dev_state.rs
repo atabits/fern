@@ -327,7 +327,9 @@ pub(crate) fn apply(this: &mut AppView, window: &mut Window, cx: &mut Context<Ap
         this.account_menu_open = true;
     }
     if state.contains("shortcuts=open") {
-        this.shortcuts_open = true;
+        cx.defer_in(window, |this, window, cx| {
+            this.open_settings_page(settings_window::Page::Shortcuts, window, cx);
+        });
     }
     if state.contains("notices=open") {
         this.set_notices_open(true, cx);

@@ -823,6 +823,22 @@ impl FocusView {
         cx.notify();
     }
 
+    pub fn toggle_pause_or_start(&mut self, cx: &mut Context<Self>) {
+        if self.running.is_some() {
+            self.toggle_pause(cx);
+        } else {
+            self.start_next(cx);
+        }
+    }
+
+    pub fn start_or_end(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.running.is_some() {
+            self.request_finish(window, cx);
+        } else {
+            self.start_next(cx);
+        }
+    }
+
     /// Stops the timer and records focus of at least five minutes (normal local capability).
     pub fn finish(&mut self, cx: &mut Context<Self>) {
         if self.finish_prompt { return; }
@@ -2089,6 +2105,12 @@ impl FocusView {
                     }
                     cx.stop_propagation();
                 }
+            }))
+            .on_action(cx.listener(|this, _: &crate::actions::TogglePause, _, cx| {
+                this.toggle_pause_or_start(cx);
+            }))
+            .on_action(cx.listener(|this, _: &crate::actions::StartStop, window, cx| {
+                this.start_or_end(window, cx);
             }))
             .on_action(cx.listener(|this, _: &crate::actions::DismissTransient, _, cx| {
                 if !this.dismiss_transient(cx) {

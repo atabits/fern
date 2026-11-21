@@ -85,6 +85,12 @@ impl Render for FocusMini {
             .size_full()
             .track_focus(&self.focus_handle)
             .key_context("FocusMini")
+            .on_action(cx.listener(|this, _: &crate::actions::TogglePause, _, cx| {
+                this.focus.update(cx, |focus, cx| focus.toggle_pause_or_start(cx));
+            }))
+            .on_action(cx.listener(|this, _: &crate::actions::StartStop, window, cx| {
+                this.focus.update(cx, |focus, cx| focus.start_or_end(window, cx));
+            }))
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
                 if event.keystroke.modifiers.modified() {
                     return;

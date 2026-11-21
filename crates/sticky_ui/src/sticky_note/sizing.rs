@@ -1,14 +1,55 @@
 //! Native sizing and caption gestures for sticky notes on Windows.
 
 use gpui::Window;
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
+};
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
-    HTCAPTION, MINMAXINFO, WM_GETMINMAXINFO, WM_NCDESTROY, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN,
+    GetWindowRect, HTCAPTION, MINMAXINFO, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SetWindowPos,
+    WM_GETMINMAXINFO, WM_NCDESTROY, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN,
 };
 
 use super::{COMPACT_HEIGHT, MIN_EXPANDED_HEIGHT, win32_window_handle};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ScreenEdge {
+    Top,
+    Left,
+    Right,
+}
+
+/// Snaps the sticky note window to an edge of its monitor's work area without changing its size.
+pub(super) fn align_to_edge(window: &Window, edge: ScreenEdge) {
+    let Some(hwnd) = win32_window_handle(window) else {
+        return;
+    };
+    let mut rect = RECT::default();
+    if unsafe { GetWindowRect(hwnd, &mut rect) }.is_err() {
+        return;
+    }
+    let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+    if monitor.is_invalid() {
+        return;
+    }
+    let mut info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    if !unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+        return;
+    }
+    let work = info.rcWork;
+    let width = rect.right - rect.left;
+    let (x, y) = match edge {
+        ScreenEdge::Top => (rect.left, work.top),
+        ScreenEdge::Left => (work.left, rect.top),
+        ScreenEdge::Right => (work.right - width, rect.top),
+    };
+    let _ = unsafe { SetWindowPos(hwnd, None, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE) };
+}
 
 const SUBCLASS_ID: usize = 0xFE7D;
 

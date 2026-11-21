@@ -17,8 +17,32 @@
       "secondary-2": "fern::ShowToday",
       "secondary-3": "fern::ShowTomorrow",
       "secondary-4": "fern::ShowNext7Days",
+      "secondary-alt-p": "fern::PrintDetail",
       "secondary-/": "fern::ShowShortcuts",
       "secondary-,": "fern::OpenSettings"
+    }
+  },
+  {
+    "context": "Workspace && !TextInput",
+    "bindings": {
+      "?": "fern::ShowShortcuts",
+      "g s": "fern::OpenSettings",
+      "g a": "fern::ShowAll",
+      "g i": "fern::ShowInbox",
+      "g t": "fern::ShowToday",
+      "g r": "fern::ShowTomorrow",
+      "g n": "fern::ShowNext7Days",
+      "g c": "fern::ShowCompleted",
+      "g w": "fern::ShowWontDo",
+      "g g": "fern::ShowTrash"
+    }
+  },
+  {
+    "context": "TaskList && !TextInput",
+    "bindings": {
+      "v l": "task_list::ViewList",
+      "v k": "task_list::ViewKanban",
+      "v t": "task_list::ViewTimeline"
     }
   },
   {
@@ -124,6 +148,18 @@
       "space": "matrix::ToggleMatrixTask",
       "enter": "matrix::OpenMatrixTask",
       "delete": "matrix::DeleteMatrixTask"
+    }
+  },
+  {
+    "context": "StickyNote",
+    "bindings": {
+      "f12": "sticky::TogglePin",
+      "secondary-shift-c": "sticky::ToggleColor",
+      "secondary-e": "sticky::ToggleCollapse",
+      "alt-up": "sticky::AlignTop",
+      "alt-left": "sticky::AlignLeft",
+      "alt-right": "sticky::AlignRight",
+      "secondary-alt-p": "fern::PrintDetail"
     }
   },
   {

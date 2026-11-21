@@ -14,9 +14,10 @@ use crate::drag::{
 use ui::{HorizontalScrollbar, Placement, PopoverAttachment, SubmenuItem, VerticalScrollbar, popover};
 
 use crate::actions::{
-    AddSubtask, ClearDate, DeleteTask, DismissTransient, ExtendSelectionNext, ExtendSelectionPrevious, PinTask,
-    PriorityHigh, PriorityLow, PriorityMedium, PriorityNone, SelectAllTasks, SelectNext, SelectPrevious, SetDate,
-    SetNextWeek, SetToday, SetTomorrow, ToggleAllSubtasks, ToggleComplete, ToggleInProgress,
+    AddSubtask, ClearDate, DeleteTask, DismissTransient, ExtendSelectionNext, ExtendSelectionPrevious,
+    OpenAsSticky, PinTask, PriorityHigh, PriorityLow, PriorityMedium, PriorityNone, SelectAllTasks,
+    SelectNext, SelectPrevious, SetDate, SetNextWeek, SetToday, SetTomorrow, ToggleAllGroups,
+    ToggleAllSubtasks, ToggleComplete, ToggleInProgress, ViewKanban, ViewList, ViewTimeline,
 };
 use crate::i18n::{self, CurrentLocale, Strings};
 use crate::list_dialog::{DialogEvent, FolderDialog, ListDialog};
@@ -1705,7 +1706,7 @@ impl TodoView {
         cx.notify();
     }
 
-    fn print_list(&mut self, cx: &mut Context<Self>) {
+    pub fn print_list(&mut self, cx: &mut Context<Self>) {
         self.header_menu_open = false;
         let strings = i18n::t(cx);
         let title = self.view_title(strings);
@@ -1722,6 +1723,14 @@ impl TodoView {
         })
         .detach();
         cx.notify();
+    }
+
+    pub fn print_selected_detail(&mut self, cx: &mut Context<Self>) {
+        if self.card.is_some() {
+            self.card_detail.update(cx, |detail, cx| detail.print_current(cx));
+        } else {
+            self.detail.update(cx, |detail, cx| detail.print_current(cx));
+        }
     }
 
     fn view_title(&self, strings: &Strings) -> SharedString {
@@ -2478,8 +2487,25 @@ impl TodoView {
             .on_action(cx.listener(|this, _: &PriorityLow, _, cx| this.set_selected_priority(Priority::Low, cx)))
             .on_action(cx.listener(|this, _: &PriorityMedium, _, cx| this.set_selected_priority(Priority::Medium, cx)))
             .on_action(cx.listener(|this, _: &PriorityHigh, _, cx| this.set_selected_priority(Priority::High, cx)))
+            .on_action(cx.listener(Self::toggle_all_groups))
             .on_action(cx.listener(Self::toggle_all_subtasks))
             .on_action(cx.listener(Self::add_subtask_selected))
+            .on_action(cx.listener(Self::open_selected_as_sticky))
+            .on_action(cx.listener(|this, _: &ViewList, _, cx| {
+                if this.title_edit.is_none() {
+                    this.set_layout(false, false, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ViewKanban, _, cx| {
+                if this.title_edit.is_none() && this.supports_board_layouts() {
+                    this.set_layout(true, false, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ViewTimeline, _, cx| {
+                if this.title_edit.is_none() && this.supports_board_layouts() {
+                    this.set_layout(false, true, cx);
+                }
+            }))
             .on_action(cx.listener(|this, _: &crate::actions::Undo, _, cx| this.apply_undo(cx)))
             .on_action(cx.listener(|this, _: &crate::actions::Redo, _, cx| this.apply_redo(cx)))
     }
@@ -2996,6 +3022,61 @@ impl TodoView {
             }
         }
         cx.notify();
+    }
+
+    fn supports_board_layouts(&self) -> bool {
+        !matches!(self.view, View::Trash | View::Completed | View::WontDo | View::Search(_))
+    }
+
+    fn toggle_all_groups(&mut self, _: &ToggleAllGroups, _: &mut Window, cx: &mut Context<Self>) {
+        if self.title_edit.is_some() {
+            return;
+        }
+        let strings = i18n::t(cx);
+        let rows = self.rows_with(strings, &self.collapsed_tasks, &HashSet::new());
+        let mut sections: Vec<Section> = Vec::new();
+        let mut days: Vec<String> = Vec::new();
+        for row in rows {
+            match row {
+                Row::Section { section, .. } => {
+                    if !sections.contains(&section) {
+                        sections.push(section);
+                    }
+                }
+                Row::Day { label, .. } => {
+                    if !days.contains(&label) {
+                        days.push(label);
+                    }
+                }
+                Row::Task { .. } => {}
+            }
+        }
+        if sections.is_empty() && days.is_empty() {
+            return;
+        }
+        let any_expanded = sections.iter().any(|s| !self.collapsed_sections.contains(s))
+            || days.iter().any(|d| !self.collapsed_days.contains(d));
+        if any_expanded {
+            self.collapsed_sections.extend(sections);
+            self.collapsed_days.extend(days);
+        } else {
+            for s in sections {
+                self.collapsed_sections.remove(&s);
+            }
+            for d in days {
+                self.collapsed_days.remove(&d);
+            }
+        }
+        cx.notify();
+    }
+
+    fn open_selected_as_sticky(&mut self, _: &OpenAsSticky, _: &mut Window, cx: &mut Context<Self>) {
+        if self.title_edit.is_some() || matches!(self.view, View::Trash) {
+            return;
+        }
+        if let Some(id) = self.selected {
+            desktop_common::open_sticky_note(self.store.clone(), id, cx);
+        }
     }
 
     fn toggle_all_subtasks(&mut self, _: &ToggleAllSubtasks, _: &mut Window, cx: &mut Context<Self>) {
@@ -3933,7 +4014,7 @@ impl Render for TodoView {
                     .pr(px(16.))
                     .child(
                         IconButton::new("toggle-sidebar", IconName::PanelLeft)
-                            .tooltip(Tooltip::text(strings.shortcut_labels[2]))
+                            .tooltip(Tooltip::text(strings.toggle_sidebar))
                             .on_click(cx.listener(|this, _, _, cx| this.toggle_lists(cx))),
                     )
                     .child(

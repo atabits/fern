@@ -24,7 +24,7 @@ use crate::release_notes::{ReleaseNotes, action_button};
 use crate::updater::Status;
 
 use desktop_common::layout::TITLE_BAR_SHADOW as SHADOW;
-pub use desktop_common::layout::{header_inset, title_bar_height as height};
+pub use desktop_common::layout::title_bar_height as height;
 
 /// The radius of the window's corners with client-side decorations.
 const ROUNDING: Pixels = px(10.);

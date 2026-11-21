@@ -21,6 +21,8 @@ use crate::release_notes::{self, ReleaseNotes, action_button};
 use crate::subscriptions::{ChinaHolidaySource, ChinaHolidayStatus};
 #[path = "appearance_view.rs"]
 mod appearance_view;
+#[path = "shortcuts_settings_view.rs"]
+mod shortcuts_settings_view;
 #[path = "sticky_settings_view.rs"]
 mod sticky_settings_view;
 
@@ -51,6 +53,7 @@ pub enum Page {
     /// The original's Integrations: calendars subscribed to by address.
     Integrations,
     Sticky,
+    Shortcuts,
     About,
 }
 
@@ -79,8 +82,6 @@ pub enum SettingsEvent {
     /// A preference was saved and other windows should reflect it immediately.
     Changed,
     Dismissed,
-    /// The "Shortcuts" page, which is the Shortcuts panel.
-    ShowShortcuts,
 }
 
 pub struct SettingsWindow {
@@ -126,6 +127,8 @@ pub struct SettingsWindow {
     subscription_discovering: bool,
     subscription_discovered: Vec<crate::subscriptions::DiscoveredCalendar>,
     subscription_discover_error: Option<String>,
+    recording_shortcut: Option<shortcuts_settings_view::RecordingTarget>,
+    confirm_reset_shortcuts: bool,
     _updates: Option<gpui::Subscription>,
     _feeds: Option<gpui::Subscription>,
 }
@@ -142,6 +145,7 @@ impl Focusable for SettingsWindow {
 pub fn open(
     store: Rc<Store>,
     notes: Option<Rc<ReleaseNotes>>,
+    initial_page: Option<Page>,
     parent: &Window,
     cx: &mut App,
 ) -> anyhow::Result<WindowHandle<SettingsWindow>> {
@@ -171,6 +175,9 @@ pub fn open(
             if let Some(notes) = notes {
                 view.show_release_notes(notes, window, cx);
             } else {
+                if let Some(page) = initial_page {
+                    view.set_page(page, cx);
+                }
                 window.focus(&view.focus_handle, cx);
             }
             view
@@ -291,6 +298,8 @@ impl SettingsWindow {
             subscription_discovering: false,
             subscription_discovered: Vec::new(),
             subscription_discover_error: None,
+            recording_shortcut: None,
+            confirm_reset_shortcuts: false,
             _updates: updates,
             _feeds: feeds,
         }
@@ -356,13 +365,25 @@ impl SettingsWindow {
     }
 
     pub fn set_page(&mut self, page: Page, cx: &mut Context<Self>) {
-        if self.page != page {
+        let changed = self.page != page;
+        if changed {
             self.page_scroll.set_offset(point(px(0.), px(0.)));
         }
         self.page = page;
         self.menu = None;
         self.release_notes = None;
+        self.recording_shortcut = None;
+        self.confirm_reset_shortcuts = false;
+        #[cfg(not(test))]
+        if changed && page == Page::Shortcuts {
+            self.reload_keymap(cx);
+        }
         cx.notify();
+    }
+
+    #[cfg(test)]
+    pub fn current_page(&self) -> Page {
+        self.page
     }
 
     pub fn show_release_notes(&mut self, notes: Rc<ReleaseNotes>, window: &mut Window, cx: &mut Context<Self>) {
@@ -377,7 +398,12 @@ impl SettingsWindow {
     }
 
     pub fn dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.menu.is_some() {
+        if self.confirm_reset_shortcuts {
+            self.confirm_reset_shortcuts = false;
+            cx.notify();
+        } else if self.recording_shortcut.take().is_some() {
+            cx.notify();
+        } else if self.menu.is_some() {
             self.set_menu(None, cx);
         } else if self.release_notes.is_some() {
             self.back_to_about(window, cx);
@@ -572,6 +598,7 @@ impl SettingsWindow {
             "sync" => Page::Sync,
             "integrations" => Page::Integrations,
             "sticky" => Page::Sticky,
+            "shortcuts" => Page::Shortcuts,
             "features" => Page::Features,
             "notifications" => Page::Notifications,
             _ => Page::DateTime,
@@ -792,13 +819,7 @@ impl SettingsWindow {
                         .child(
                             div()
                                 .debug_selector(|| "settings-shortcuts".to_owned())
-                                .child(
-                                    item("settings-shortcuts", IconName::Keyboard, strings.settings_pages[4], false)
-                                        .on_click(cx.listener(|_, _, window, cx| {
-                                            cx.emit(SettingsEvent::ShowShortcuts);
-                                            window.defer(cx, |window, _| window.remove_window());
-                                        })),
-                                ),
+                                .child(page("settings-shortcuts", IconName::Keyboard, 4, Page::Shortcuts)),
                         )
                         .child(div().h(px(12.)))
                         .child(page("settings-about", IconName::Info, 5, Page::About)),
@@ -2066,6 +2087,7 @@ impl SettingsWindow {
             }
             Page::Integrations => body.children(self.render_integrations(cx)).into_any_element(),
             Page::Sticky => body.child(self.render_sticky(cx)).into_any_element(),
+            Page::Shortcuts => return self.render_shortcuts_page(cx),
             Page::About => {
                 let row = |label: &'static str, value: &'static str| {
                     h_flex()
@@ -2197,6 +2219,9 @@ impl Render for SettingsWindow {
             .track_focus(&self.focus_handle)
             .tab_group()
             .key_context("Settings")
+            .capture_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                this.handle_shortcut_key_down(event, cx);
+            }))
             .on_action(cx.listener(|this, _: &DismissSettings, window, cx| {
                 this.dismiss(window, cx);
             }))
@@ -2241,7 +2266,8 @@ impl Render for SettingsWindow {
                             }),
                     )
                     .child(page),
-            );
+            )
+            .children(self.render_reset_shortcuts_confirm(cx));
         crate::title_bar::window_frame(root, window, cx)
     }
 }
@@ -2405,5 +2431,57 @@ mod tests {
         assert_eq!(after[0].kind, fern_core::ical::CalendarKind::CalDav);
         assert_eq!(after[0].provider, fern_core::ical::CalendarProvider::Fastmail);
         assert_eq!(after[0].password, "app-secret");
+    }
+
+    #[gpui::test]
+    fn shortcuts_page_records_cancels_with_escape_and_confirms_reset(cx: &mut gpui::TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        cx.update(|cx| {
+            theme::init(cx);
+            assert!(crate::keymap::load_default(&assets::Assets, cx).unwrap().is_empty());
+            cx.set_global(CurrentLocale(Locale::En));
+        });
+        let (settings, cx) = cx.add_window_view(|window, cx| {
+            let mut settings = SettingsWindow::new(store, cx);
+            settings.set_page(Page::Shortcuts, cx);
+            window.focus(&settings.focus_handle, cx);
+            settings
+        });
+        cx.simulate_resize(gpui::size(px(900.), px(720.)));
+
+        // Shortcuts page and sticky Reset button are rendered.
+        assert!(cx.debug_bounds("settings-shortcuts-page").is_some());
+        let first_pill = cx.debug_bounds("shortcut-action-0").unwrap();
+        let reset_btn = cx.debug_bounds("shortcuts-reset-all").unwrap();
+
+        // Clicking an action pill enters recording mode; Escape cancels it without closing Settings.
+        cx.simulate_click(first_pill.center(), gpui::Modifiers::default());
+        cx.update(|_, cx| {
+            assert_eq!(
+                settings.read(cx).recording_shortcut,
+                Some(shortcuts_settings_view::RecordingTarget::Action(0))
+            );
+        });
+        cx.simulate_keystrokes("escape");
+        cx.update(|_, cx| {
+            assert_eq!(settings.read(cx).recording_shortcut, None);
+            assert!(!settings.read(cx).closing);
+        });
+
+        // Clicking Reset opens the confirmation modal; Escape dismisses it without closing Settings.
+        cx.simulate_click(reset_btn.center(), gpui::Modifiers::default());
+        cx.update(|_, cx| assert!(settings.read(cx).confirm_reset_shortcuts));
+        cx.simulate_keystrokes("escape");
+        cx.update(|_, cx| {
+            assert!(!settings.read(cx).confirm_reset_shortcuts);
+            assert!(!settings.read(cx).closing);
+        });
+
+        // Keymap parse errors surface cleanly in the banner at the top of Page::Shortcuts.
+        cx.update(|_, cx| {
+            crate::keymap::set_errors(vec!["keymap.json: test error".to_owned()], cx);
+            settings.update(cx, |_, cx| cx.notify());
+        });
+        assert!(cx.debug_bounds("shortcuts-keymap-errors").is_some());
     }
 }

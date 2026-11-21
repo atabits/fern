@@ -609,6 +609,14 @@ impl TaskDetail {
             .into_any_element()
     }
 
+    pub fn print_current(&mut self, cx: &mut Context<Self>) {
+        if let Some(task) = self.session.task.clone() {
+            let checklist = self.session.store.checklist(task.id).unwrap_or_default();
+            let html = crate::print::task_html(&task, &checklist, Local::now().date_naive(), i18n::t(cx));
+            crate::print::open_in_background("task", html, cx);
+        }
+    }
+
     fn sync_attachments(&mut self) {
         if let Some(draft) = &self.session.draft {
             self.session.attachments = draft.attachments.iter().map(|prepared| prepared.metadata().clone()).collect();
@@ -1679,11 +1687,7 @@ impl TaskDetail {
             .child(div().py_1().child(Divider::horizontal()))
             .child(self.close_side_menu_on_hover(item("more-print", IconName::Printer, strings.print).on_click(cx.listener(|this, _, _, cx| {
                 this.close_popup(cx);
-                if let Some(task) = this.session.task.clone() {
-                    let checklist = this.session.store.checklist(task.id).unwrap_or_default();
-                    let html = crate::print::task_html(&task, &checklist, Local::now().date_naive(), i18n::t(cx));
-                    crate::print::open_in_background("task", html, cx);
-                }
+                this.print_current(cx);
             })), cx))
             .child(div().my_1().child(Divider::horizontal()))
             .child(self.close_side_menu_on_hover(
@@ -3805,6 +3809,9 @@ impl Render for TaskDetail {
                     this.apply_due(window, cx);
                 }
                 this.finish_draft(cx);
+            }))
+            .on_action(cx.listener(|this, _: &crate::actions::PrintDetail, _, cx| {
+                this.print_current(cx);
             }))
             .on_action(cx.listener(|this, _: &DismissTransient, window, cx| {
                 if !this.dismiss_popup(window, cx) {

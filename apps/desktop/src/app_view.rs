@@ -6,8 +6,9 @@ use ui::prelude::*;
 use ui::{Placement, PopoverAttachment, popover};
 
 use crate::actions::{
-    CloseWindow, DismissTransient, MinimizeWindow, NewTask, OpenSettings, Quit, Search, ShowInbox,
-    ShowNext7Days, ShowShortcuts, ShowToday, ShowTomorrow, SyncNow, ToggleSidebar,
+    CloseWindow, DismissTransient, MinimizeWindow, NewTask, OpenSettings, PrintDetail, PrintList,
+    Quit, Search, ShowAll, ShowCompleted, ShowInbox, ShowNext7Days, ShowShortcuts, ShowToday,
+    ShowTomorrow, ShowTrash, ShowWontDo, StartStop, SyncNow, TogglePause, ToggleSidebar,
 };
 use crate::calendar_view::{self, CalendarView};
 use crate::countdown_view::CountdownView;
@@ -74,11 +75,6 @@ pub struct AppView {
     /// The rail icon currently being dragged, and the order before the drag started (for Escape).
     dragging_rail: Option<Section>,
     rail_drag_origin: Option<Vec<fern_core::RailSection>>,
-    /// The "Shortcuts" panel on the right, while open.
-    pub(crate) shortcuts_open: bool,
-    /// The system-wide shortcut being recorded in the Shortcuts panel, and the panel's focus.
-    recording_hotkey: Option<crate::hotkeys::Hotkey>,
-    shortcuts_focus: gpui::FocusHandle,
     pub(crate) settings: Option<gpui::WindowHandle<SettingsWindow>>,
     update_notice: Option<Rc<ReleaseNotes>>,
     /// The Statistics page opened from the account menu, which covers the whole window.
@@ -302,9 +298,6 @@ impl AppView {
             rail_scroll: gpui::ScrollHandle::new(),
             dragging_rail: None,
             rail_drag_origin: None,
-            shortcuts_open: false,
-            recording_hotkey: None,
-            shortcuts_focus: cx.focus_handle(),
             settings: None,
             update_notice,
             statistics_open: false,
@@ -571,10 +564,8 @@ impl AppView {
                 ListItem::new("account-shortcuts")
                     .start_slot(Icon::new(IconName::Keyboard).color(Color::Icon))
                     .child(Label::new(strings.shortcuts))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.account_menu_open = false;
-                        this.shortcuts_open = true;
-                        cx.notify();
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.open_settings_page(settings_window::Page::Shortcuts, window, cx);
                     })),
             )
             .when(cfg!(windows), |el| {
@@ -631,6 +622,25 @@ impl AppView {
     }
 
     pub(crate) fn open_settings(&mut self, notes: Option<Rc<ReleaseNotes>>, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_settings_at(notes, None, window, cx);
+    }
+
+    pub(crate) fn open_settings_page(
+        &mut self,
+        page: settings_window::Page,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_settings_at(None, Some(page), window, cx);
+    }
+
+    fn open_settings_at(
+        &mut self,
+        notes: Option<Rc<ReleaseNotes>>,
+        initial_page: Option<settings_window::Page>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.account_menu_open = false;
         if notes.is_some() {
             self.search = None;
@@ -640,6 +650,9 @@ impl AppView {
                 if let Some(notes) = notes.clone() {
                     settings.show_release_notes(notes, settings_window, cx);
                 } else {
+                    if let Some(page) = initial_page {
+                        settings.set_page(page, cx);
+                    }
                     settings_window.focus(&settings.focus_handle(cx), cx);
                 }
                 settings_window.activate_window();
@@ -650,7 +663,7 @@ impl AppView {
             }
             self.settings = None;
         }
-        let handle = match settings_window::open(self.store.clone(), notes, window, cx) {
+        let handle = match settings_window::open(self.store.clone(), notes, initial_page, window, cx) {
             Ok(handle) => handle,
             Err(err) => {
                 eprintln!("failed to open Settings: {err:#}");
@@ -663,12 +676,6 @@ impl AppView {
                 SettingsEvent::Dismissed => {
                     this.settings = None;
                     cx.notify();
-                }
-                SettingsEvent::ShowShortcuts => {
-                    this.settings = None;
-                    this.shortcuts_open = true;
-                    cx.notify();
-                    window.activate_window();
                 }
             })
             .detach();
@@ -740,74 +747,6 @@ impl AppView {
         }
     }
 
-    fn toggle_shortcuts(&mut self, cx: &mut Context<Self>) {
-        self.shortcuts_open = !self.shortcuts_open;
-        if !self.shortcuts_open {
-            self.recording_hotkey = None;
-        }
-        cx.notify();
-    }
-
-    fn open_user_keymap(&mut self, cx: &mut Context<Self>) {
-        let task = cx.background_spawn(async move { crate::keymap::ensure_user_keymap_file() });
-        cx.spawn(async move |this, cx| {
-            let result = task.await;
-            this.update(cx, |_, cx| match result {
-                Ok(path) => cx.open_with_system(&path),
-                Err(err) => {
-                    let message = format!("{err:#}");
-                    eprintln!("keymap: {message}");
-                    crate::keymap::set_errors(vec![message], cx);
-                    cx.notify();
-                }
-            })
-            .ok();
-        })
-        .detach();
-    }
-
-    fn reload_keymap(&mut self, cx: &mut Context<Self>) {
-        let task = cx.background_spawn(async move {
-            let mut read_errors = Vec::new();
-            let user_keymap = match crate::keymap::user_keymap_path() {
-                Ok(path) => match std::fs::read_to_string(&path) {
-                    Ok(contents) => Some(contents),
-                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
-                    Err(err) => {
-                        read_errors.push(format!("{}: {err}", crate::keymap::USER_KEYMAP_FILE));
-                        None
-                    }
-                },
-                Err(err) => {
-                    read_errors.push(format!("{}: {err}", crate::keymap::USER_KEYMAP_FILE));
-                    None
-                }
-            };
-            (user_keymap, read_errors)
-        });
-        cx.spawn(async move |this, cx| {
-            let (user_keymap, mut read_errors) = task.await;
-            this.update(cx, |_, cx| {
-                cx.clear_key_bindings();
-                match crate::keymap::load_with_user(&assets::Assets, user_keymap.as_deref(), cx) {
-                    Ok(mut errors) => {
-                        read_errors.append(&mut errors);
-                        read_errors.iter().for_each(|err| eprintln!("keymap: {err}"));
-                        crate::keymap::set_errors(read_errors, cx);
-                    }
-                    Err(err) => {
-                        eprintln!("failed to reload the keymap: {err:#}");
-                        read_errors.push(err.to_string());
-                        crate::keymap::set_errors(read_errors, cx);
-                    }
-                }
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
-    }
-
     fn dismiss_any_transient(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         if self.cancel_rail_drag(window, cx) {
             return true;
@@ -818,14 +757,6 @@ impl AppView {
         }
         if self.notices_open {
             self.set_notices_open(false, cx);
-            return true;
-        }
-        if self.shortcuts_open {
-            if self.recording_hotkey.take().is_some() {
-                cx.notify();
-            } else {
-                self.toggle_shortcuts(cx);
-            }
             return true;
         }
         if self.search.take().is_some() {
@@ -877,216 +808,6 @@ impl AppView {
         }
         #[cfg(not(test))]
         window.minimize_window();
-    }
-
-    /// The original's Shortcuts panel: the keymap's bindings by group, and quick add syntax.
-    fn render_shortcuts(&self, cx: &mut Context<Self>) -> AnyElement {
-        let strings = i18n::t(cx);
-        let theme = cx.theme().clone();
-        let list = crate::keymap::cached_shortcuts(cx).to_vec();
-        let chip = |text: String| {
-            div()
-                .px_2()
-                .h(px(22.))
-                .flex()
-                .items_center()
-                .rounded(px(4.))
-                .border_1()
-                .border_color(theme.colors().border)
-                .child(Label::new(text).size(LabelSize::XSmall).color(Color::Muted))
-        };
-        let row = |label: &'static str, keys: Vec<String>| {
-            h_flex()
-                .h(px(32.))
-                .child(div().flex_1().child(Label::new(label).size(LabelSize::Small)))
-                .child(h_flex().gap_1().children(keys.into_iter().map(chip)))
-        };
-        let heading = |text: &'static str| div().pt_3().pb_1().child(Label::new(text).weight(gpui::FontWeight::SEMIBOLD));
-        let keymap_errors = crate::keymap::errors(cx).to_vec();
-        let mut body = v_flex()
-            .when(!keymap_errors.is_empty(), |el| {
-                el.child(
-                    v_flex()
-                        .debug_selector(|| "shortcuts-keymap-errors".to_owned())
-                        .mb_2()
-                        .p_2()
-                        .gap_1()
-                        .rounded(px(6.))
-                        .border_1()
-                        .border_color(theme.status().error.opacity(0.4))
-                        .bg(theme.status().error.opacity(0.08))
-                        .child(
-                            Label::new(strings.keymap_errors)
-                                .size(LabelSize::Small)
-                                .weight(gpui::FontWeight::SEMIBOLD)
-                                .color(Color::Error),
-                        )
-                        .children(keymap_errors.into_iter().map(|err| {
-                            Label::new(err).size(LabelSize::XSmall).color(Color::Error)
-                        })),
-                )
-            })
-            .child(heading(strings.shortcut_groups[0]));
-        for (i, (action, keys)) in list.into_iter().enumerate() {
-            if action.starts_with("task_list::") && i > 0 && list_group_start(i) {
-                body = body.child(heading(strings.shortcut_groups[1]));
-            }
-            if action == "task_list::PinTask" {
-                body = body.child(heading(strings.shortcut_groups[3]));
-            }
-            if !keys.is_empty() {
-                body = body.child(row(strings.shortcut_labels[i], keys));
-            }
-        }
-        // The system-wide ones, which work while another app is in front (see `hotkeys`).
-        // Each is changed by clicking it and pressing the new keys, as in the original's Settings.
-        if cfg!(windows) {
-            body = body.child(
-                h_flex()
-                    .pt_4()
-                    .pb_1()
-                    .items_center()
-                    .child(div().flex_1().child(Label::new(strings.global_shortcuts).size(LabelSize::Small).color(Color::Muted)))
-                    .child(
-                        div()
-                            .id("global-shortcuts-reset")
-                            .px_1p5()
-                            .py_0p5()
-                            .rounded(px(4.))
-                            .cursor_pointer()
-                            .hover(|s| s.bg(theme.colors().element_hover))
-                            .child(Label::new(strings.habit_reset).size(LabelSize::XSmall).color(Color::Accent))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.recording_hotkey = None;
-                                crate::hotkeys::reset_defaults(cx);
-                                cx.notify();
-                            })),
-                    ),
-            );
-            for (hotkey, binding, taken) in crate::hotkeys::bindings(cx) {
-                let i = hotkey.index();
-                let recording = self.recording_hotkey == Some(hotkey);
-                let has_binding = binding.is_some();
-                let text = if recording {
-                    strings.press_shortcut.to_owned()
-                } else {
-                    binding.map_or_else(|| strings.shortcut_off.to_owned(), |b| b.label())
-                };
-                body = body.child(
-                    h_flex()
-                        .h(px(32.))
-                        .gap_1p5()
-                        .child(div().flex_1().child(Label::new(hotkey.label(strings)).size(LabelSize::Small)))
-                        .when(taken && !recording, |el| el.child(Label::new(strings.shortcut_taken).size(LabelSize::XSmall).color(Color::Error)))
-                        .child(
-                            div()
-                                .id(("global-shortcut", i))
-                                .px_2()
-                                .h(px(22.))
-                                .flex()
-                                .items_center()
-                                .rounded(px(4.))
-                                .border_1()
-                                .border_color(if recording { theme.colors().accent } else { theme.colors().border })
-                                .cursor_pointer()
-                                .child(Label::new(text).size(LabelSize::XSmall).color(if recording { Color::Accent } else { Color::Muted }))
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.recording_hotkey = Some(hotkey);
-                                    window.focus(&this.shortcuts_focus, cx);
-                                    cx.notify();
-                                })),
-                        )
-                        .when(has_binding && !recording, |el| {
-                            el.child(
-                                IconButton::new(SharedString::from(format!("global-shortcut-clear-{i}")), IconName::X)
-                                    .icon_size(IconSize::XSmall)
-                                    .icon_color(Color::Muted)
-                                    .tooltip(Tooltip::text(strings.clear))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.recording_hotkey = None;
-                                        crate::hotkeys::set(hotkey, None, cx);
-                                        cx.notify();
-                                    })),
-                            )
-                        }),
-                );
-            }
-        }
-        body = body.child(heading(strings.shortcut_groups[2]));
-        for (what, example) in strings.quick_add_help {
-            body = body.child(row(what, vec![example.to_owned()]));
-        }
-        v_flex()
-            .id("shortcuts-panel")
-            .track_focus(&self.shortcuts_focus)
-            .on_action(cx.listener(|this, _: &DismissTransient, _, cx| {
-                if this.recording_hotkey.take().is_some() {
-                    cx.notify();
-                } else {
-                    cx.propagate();
-                }
-            }))
-            // While a system-wide shortcut is recorded, the keys pressed set it: Escape keeps
-            // the old one, Backspace turns it off.
-            .capture_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
-                let Some(hotkey) = this.recording_hotkey else { return };
-                cx.stop_propagation();
-                match event.keystroke.key.as_str() {
-                    "escape" => {}
-                    "backspace" | "delete" => crate::hotkeys::set(hotkey, None, cx),
-                    _ => match crate::hotkeys::Binding::from_keystroke(&event.keystroke) {
-                        Some(binding) => crate::hotkeys::set(hotkey, Some(binding), cx),
-                        // A modifier alone, or a key that cannot be one: keep listening.
-                        None => return,
-                    },
-                }
-                this.recording_hotkey = None;
-                cx.notify();
-            }))
-            .absolute()
-            .top_0()
-            .right_0()
-            .bottom_0()
-            .w(px(380.))
-            .bg(theme.colors().elevated_surface_background)
-            .border_l_1()
-            .border_color(theme.colors().border)
-            .shadow_lg()
-            .child(
-                h_flex()
-                    .mt(title_bar::header_inset())
-                    .h(px(48.))
-                    .px_4()
-                    .gap_1()
-                    .child(div().flex_1().child(Label::new(strings.shortcuts).size(LabelSize::Large)))
-                    .child(
-                        IconButton::new("edit-keymap", IconName::FileText)
-                            .icon_color(Color::Muted)
-                            .tip(strings.edit_keymap, ui::TipSide::Below)
-                            .on_click(cx.listener(|this, _, _, cx| this.open_user_keymap(cx))),
-                    )
-                    .child(
-                        IconButton::new("reload-keymap", IconName::RefreshCw)
-                            .icon_color(Color::Muted)
-                            .tip(strings.reload_keymap, ui::TipSide::Below)
-                            .on_click(cx.listener(|this, _, _, cx| this.reload_keymap(cx))),
-                    )
-                    .child(
-                        IconButton::new("close-shortcuts", IconName::X)
-                            .icon_color(Color::Muted)
-                            .tip(strings.close, ui::TipSide::Below)
-                            .on_click(cx.listener(|this, _, _, cx| this.toggle_shortcuts(cx))),
-                    ),
-            )
-            .child(
-                v_scroll(
-                    "shortcut-list-scroll",
-                    v_flex().id("shortcut-list").px_4().pb_4().child(body),
-                )
-                .flex_1()
-                .min_h_0(),
-            )
-            .into_any_element()
     }
 
     /// Syncs on start, whenever there are local changes to send, and every few minutes to fetch
@@ -1771,8 +1492,11 @@ impl Render for AppView {
             .on_action(cx.listener(Self::search))
             .on_action(cx.listener(|this, _: &SyncNow, _, cx| this.sync_now(cx)))
             .on_action(cx.listener(Self::toggle_sidebar))
-            .on_action(cx.listener(|this, _: &ShowShortcuts, _, cx| this.toggle_shortcuts(cx)))
+            .on_action(cx.listener(|this, _: &ShowShortcuts, window, cx| {
+                this.open_settings_page(settings_window::Page::Shortcuts, window, cx)
+            }))
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| this.open_settings(None, window, cx)))
+            .on_action(cx.listener(|this, _: &ShowAll, window, cx| this.show_view(fern_core::View::All, window, cx)))
             .on_action(cx.listener(|this, _: &ShowInbox, window, cx| this.show_view(fern_core::View::Inbox, window, cx)))
             .on_action(cx.listener(|this, _: &ShowToday, window, cx| this.show_view(fern_core::View::Today, window, cx)))
             .on_action(cx.listener(|this, _: &ShowTomorrow, window, cx| {
@@ -1780,6 +1504,31 @@ impl Render for AppView {
             }))
             .on_action(cx.listener(|this, _: &ShowNext7Days, window, cx| {
                 this.show_view(fern_core::View::Next7Days, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ShowCompleted, window, cx| {
+                this.show_view(fern_core::View::Completed, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ShowWontDo, window, cx| {
+                this.show_view(fern_core::View::WontDo, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ShowTrash, window, cx| {
+                this.show_view(fern_core::View::Trash, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &PrintList, _, cx| {
+                if matches!(this.section, Section::Tasks | Section::Search) {
+                    this.todo.update(cx, |todo, cx| todo.print_list(cx));
+                }
+            }))
+            .on_action(cx.listener(|this, _: &PrintDetail, _, cx| {
+                if matches!(this.section, Section::Tasks | Section::Search) {
+                    this.todo.update(cx, |todo, cx| todo.print_selected_detail(cx));
+                }
+            }))
+            .on_action(cx.listener(|this, _: &TogglePause, _, cx| {
+                this.focus.update(cx, |focus, cx| focus.toggle_pause_or_start(cx));
+            }))
+            .on_action(cx.listener(|this, _: &StartStop, window, cx| {
+                this.focus.update(cx, |focus, cx| focus.start_or_end(window, cx));
             }))
             .items_start()
             .bg(theme.colors().background)
@@ -1813,7 +1562,6 @@ impl Render for AppView {
                     Section::Pomodoro => div().flex_1().min_w_0().h_full().child(self.focus.clone()),
                 })
             })
-            .when(self.shortcuts_open, |el| el.child(self.render_shortcuts(cx)))
             .when_some(self.search.clone(), |el, search| {
                 el.child(div().absolute().top(px(160.)).left_0().right_0().flex().justify_center().child(search))
             });
@@ -1846,11 +1594,6 @@ impl Render for AppView {
             });
         title_bar::window_frame(root, window, cx)
     }
-}
-
-/// Where the task list's shortcuts start in `keymap::LISTED_ACTIONS`.
-fn list_group_start(index: usize) -> bool {
-    crate::keymap::LISTED_ACTIONS.iter().position(|a| a.starts_with("task_list::")) == Some(index)
 }
 
 #[cfg(all(test, debug_assertions))]
@@ -1932,11 +1675,11 @@ mod tests {
             assert_eq!(app.read(cx).minimized_count, 0);
         });
 
-        // 2. When an overlay (Shortcuts) is open, Esc closes it instead of minimizing.
-        cx.update(|_, cx| app.update(cx, |app, cx| app.toggle_shortcuts(cx)));
+        // 2. When a transient overlay (notices popover) is open, Esc closes it instead of minimizing.
+        cx.update(|_, cx| app.update(cx, |app, cx| app.set_notices_open(true, cx)));
         cx.simulate_keystrokes("escape");
         cx.update(|_, cx| {
-            assert!(!app.read(cx).shortcuts_open);
+            assert!(!app.read(cx).notices_open);
             assert_eq!(app.read(cx).minimized_count, 0);
         });
 
@@ -2092,26 +1835,40 @@ mod tests {
             assert_eq!(cx.windows().len(), 2);
         });
 
-        // Clicking Shortcuts in Settings closes Settings and opens the Shortcuts panel in main.
+        // Clicking Shortcuts in Settings switches to Page::Shortcuts inside the Settings window.
         let shortcuts_item = settings_cx.debug_bounds("settings-shortcuts").unwrap();
         settings_cx.simulate_click(shortcuts_item.center(), gpui::Modifiers::default());
         cx.update(|_, cx| {
+            assert!(app.read(cx).settings.is_some());
+            assert_eq!(cx.windows().len(), 2);
+            let page = first.read_with(cx, |settings, _| settings.current_page()).unwrap();
+            assert_eq!(page, settings_window::Page::Shortcuts);
+        });
+        assert!(settings_cx.debug_bounds("settings-shortcuts-page").is_some());
+
+        // Closing Settings via native close clears AppView::settings.
+        assert!(settings_cx.simulate_close());
+        // `simulate_close` only runs `on_window_should_close`; mirror the OS removing the window.
+        first.update(&mut settings_cx, |_, window, _| window.remove_window()).unwrap();
+        cx.update(|_, cx| {
             assert!(app.read(cx).settings.is_none());
-            assert!(app.read(cx).shortcuts_open);
             assert_eq!(cx.windows().len(), 1);
         });
 
-        // Reopen Settings and verify native close clears AppView::settings.
-        let reopened = cx.update(|window, cx| {
+        // ShowShortcuts opens Settings directly on Page::Shortcuts.
+        let shortcuts_win = cx.update(|window, cx| {
             app.update(cx, |app, cx| {
-                app.open_settings(None, window, cx);
+                app.open_settings_page(settings_window::Page::Shortcuts, window, cx);
                 app.settings.unwrap()
             })
         });
-        let mut reopened_cx = gpui::VisualTestContext::from_window(reopened.into(), cx);
+        cx.update(|_, cx| {
+            let page = shortcuts_win.read_with(cx, |settings, _| settings.current_page()).unwrap();
+            assert_eq!(page, settings_window::Page::Shortcuts);
+        });
+        let mut reopened_cx = gpui::VisualTestContext::from_window(shortcuts_win.into(), cx);
         assert!(reopened_cx.simulate_close());
-        // `simulate_close` only runs `on_window_should_close`; mirror the OS removing the window.
-        reopened.update(&mut reopened_cx, |_, window, _| window.remove_window()).unwrap();
+        shortcuts_win.update(&mut reopened_cx, |_, window, _| window.remove_window()).unwrap();
         cx.update(|_, cx| {
             assert!(app.read(cx).settings.is_none());
             assert_eq!(cx.windows().len(), 1);

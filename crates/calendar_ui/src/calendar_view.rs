@@ -4135,6 +4135,11 @@ impl Render for CalendarView {
             .on_action(cx.listener(|this, _: &NextYear, _, cx| this.shift_year_using_keys(1, cx)))
             .on_action(cx.listener(|this, _: &CalendarToday, _, cx| this.go_to_today(cx)))
             .on_action(cx.listener(|this, _: &PrintYear, _, cx| this.print_year(cx)))
+            .on_action(cx.listener(|this, _: &crate::actions::PrintList, _, cx| {
+                if this.mode == CalendarMode::Year {
+                    this.print_year(cx);
+                }
+            }))
             .on_action(cx.listener(Self::dismiss_transient))
             .when(self.timed_resize.is_some(), |el| {
                 el.on_mouse_move(cx.listener(|this, ev: &gpui::MouseMoveEvent, _, cx| this.update_timed_resize(ev.position.y, cx)))

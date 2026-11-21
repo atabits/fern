@@ -75,6 +75,9 @@ impl Render for FocusMini {
         let now = chrono::Local::now().timestamp_millis();
         let (clock, label, running, paused) = self.focus.read(cx).clock_state(now, strings);
         let progress = self.focus.read(cx).clock_progress(now);
+        let noise = self.focus.read(cx).white_noise();
+        let active_noise = noise != desktop_common::sound::WhiteNoise::Off;
+        let noise_name = strings.focus_white_noise_names[noise.index()];
         let button = |id: &'static str, icon: IconName| IconButton::new(id, icon).size(px(28.)).icon_size(IconSize::Small);
         v_flex()
             .relative()
@@ -143,6 +146,15 @@ impl Render for FocusMini {
                                 .on_click(cx.listener(|this, _, window, cx| this.focus.update(cx, |focus, cx| focus.request_finish(window, cx)))),
                         )
                     })
+                    .child(
+                        button("focus-mini-noise", IconName::Bell)
+                            .icon_color(if active_noise { Color::Accent } else { Color::Muted })
+                            .tooltip(Tooltip::text(format!("{}: {noise_name}", strings.focus_white_noise)))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.focus.update(cx, |focus, cx| focus.cycle_white_noise(cx));
+                                cx.notify();
+                            })),
+                    )
                     .when(cfg!(windows), |el| {
                         el.child(
                             button("focus-mini-pin", if self.pinned { IconName::PinOff } else { IconName::Pin })

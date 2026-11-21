@@ -575,6 +575,19 @@ impl FocusView {
         self.running.as_ref().map(|r| (format_clock(r.timer.display(now_ms())), r.timer.is_paused()))
     }
 
+    pub(crate) fn white_noise(&self) -> desktop_common::sound::WhiteNoise {
+        desktop_common::sound::white_noise(&self.store)
+    }
+
+    pub(crate) fn cycle_white_noise(&mut self, cx: &mut Context<Self>) {
+        let next = self.white_noise().next();
+        if let Err(err) = desktop_common::sound::set_white_noise(&self.store, next) {
+            eprintln!("failed to save white noise setting: {err:#}");
+        }
+        self.sync_ambient_sound();
+        cx.notify();
+    }
+
     /// The clock as shown at `now`, what it is for (the task, the habit or the break), and
     /// whether a session runs and is paused; the timer bar, the page and the mini window show it.
     pub fn clock_state(&self, now: i64, strings: &'static i18n::Strings) -> (String, SharedString, bool, bool) {

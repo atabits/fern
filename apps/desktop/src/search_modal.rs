@@ -421,6 +421,10 @@ impl SearchModal {
     fn open_selected(&mut self, cx: &mut Context<Self>) {
         let mut events = self.visible_events();
         if events.is_empty() {
+            let query = self.query(cx);
+            if !query.is_empty() {
+                cx.emit(SearchEvent::CreateTask(query));
+            }
             return;
         }
         let index = self.selected.min(events.len() - 1);
@@ -822,7 +826,7 @@ impl Render for SearchModal {
                 .flex_1()
                 .min_h(px(180.)),
             )
-            .when(has_query && !nothing, |el| {
+            .child({
                 let kbd = |text: &'static str| {
                     div()
                         .px_1p5()
@@ -834,15 +838,18 @@ impl Render for SearchModal {
                         .text_color(theme.colors().text_muted)
                         .child(text)
                 };
-                el.child(Divider::horizontal()).child(
-                    h_flex()
-                        .px_1()
-                        .gap_3()
-                        .items_center()
-                        .child(h_flex().gap_1().child(kbd("↑↓")).child(kbd("Enter")))
-                        .child(div().flex_1())
-                        .child(kbd("Esc")),
-                )
+                v_flex()
+                    .gap_2()
+                    .child(Divider::horizontal())
+                    .child(
+                        h_flex()
+                            .px_1()
+                            .gap_3()
+                            .items_center()
+                            .child(h_flex().gap_1().child(kbd("↑↓")).child(kbd("Enter")))
+                            .child(div().flex_1())
+                            .child(kbd("Esc")),
+                    )
             })
     }
 }

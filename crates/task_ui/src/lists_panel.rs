@@ -1061,7 +1061,8 @@ fn mini_calendar(
     let day_cell = |date: NaiveDate, faded: bool| {
         let is_today = date == today;
         let selected = *active == View::Day(date);
-        let busy = mini.expanded && mini.busy.contains(&date);
+        let filled = selected || (is_today && !matches!(active, View::Day(_)));
+        let busy = mini.busy.contains(&date);
         let on_select = on_select.clone();
         // Columns of equal width that may be narrower than the circle (the column is), so the
         // letters stay over the numbers.
@@ -1073,17 +1074,17 @@ fn mini_calendar(
                 .size(px(26.))
                 .cursor_pointer()
                 .hover(|s| s.bg(colors.list_hover))
-                .when(selected, |el| el.bg(colors.accent))
+                .when(filled, |el| el.bg(colors.accent))
                 .on_click(move |_, window, cx| on_select(View::Day(date), window, cx))
                 .items_center()
                 .justify_center()
                 .rounded_full()
-                .when(is_today && !selected, |el| el.bg(colors.list_hover))
+                .when(is_today && !filled, |el| el.bg(colors.list_hover))
                 .child(
                     Label::new(date.day().to_string())
                         .centered()
                         .size(LabelSize::Small)
-                        .color(if selected {
+                        .color(if filled {
                             Color::OnAccent
                         } else if is_today {
                             Color::Accent
@@ -1093,11 +1094,11 @@ fn mini_calendar(
                             Color::Custom(colors.list_text)
                         }),
                 )
-                .when(busy, |el| el.child(div().absolute().bottom(px(2.)).size(px(3.)).rounded_full().bg(if selected { colors.icon_on_accent } else { colors.accent }))),
+                .when(busy, |el| el.child(div().absolute().bottom(px(2.)).size(px(3.)).rounded_full().bg(if filled { colors.icon_on_accent } else { colors.accent }))),
         )
     };
-    let weekdays = h_flex().children(crate::calendar::weekday_labels(&strings.weekdays_narrow).iter().map(|day| {
-        div().flex_1().min_w_0().flex().justify_center().child(Label::new(*day).size(LabelSize::Small).color(colors.list_text_muted))
+    let weekdays = h_flex().children(crate::calendar::weekday_labels(&strings.weekdays_short).iter().map(|day| {
+        div().flex_1().min_w_0().flex().justify_center().child(Label::new(*day).size(LabelSize::XSmall).color(colors.list_text_muted))
     }));
     let toggle = on_mini.clone();
     // The hover tab hanging down from the top border: "^" expands, "v" collapses.

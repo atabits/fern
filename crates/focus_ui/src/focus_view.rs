@@ -4665,12 +4665,12 @@ mod tests {
             view.update(cx, |view, cx| {
                 assert_eq!(view.white_noise(), WhiteNoise::Off);
                 view.cycle_white_noise(cx);
-                assert_eq!(view.white_noise(), WhiteNoise::Rain);
+                assert_eq!(view.white_noise(), WhiteNoise::Ticking);
             });
             // Direct DB write without DataVersion leaves cache untouched (proving render/getter
             // does not query SQLite).
-            set_white_noise(&store, WhiteNoise::Ocean).unwrap();
-            assert_eq!(view.read(cx).white_noise(), WhiteNoise::Rain);
+            set_white_noise(&store, WhiteNoise::Off).unwrap();
+            assert_eq!(view.read(cx).white_noise(), WhiteNoise::Ticking);
             // Emitting DataVersion from another entity refreshes the cached white noise preset
             // once GPUI flushes global observer effects.
             desktop_common::data_version::data_changed(other.entity_id(), cx);
@@ -4679,7 +4679,7 @@ mod tests {
         let _ = other;
         cx.run_until_parked();
         cx.update(|cx| {
-            assert_eq!(view.read(cx).white_noise(), WhiteNoise::Ocean);
+            assert_eq!(view.read(cx).white_noise(), WhiteNoise::Off);
         });
     }
 }

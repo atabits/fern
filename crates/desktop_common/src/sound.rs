@@ -10,27 +10,21 @@ const WHITE_NOISE_SETTING: &str = "focus_white_noise";
 pub enum WhiteNoise {
     #[default]
     Off,
-    Rain,
-    Ocean,
     Ticking,
 }
 
 impl WhiteNoise {
-    pub const ALL: [Self; 4] = [Self::Off, Self::Rain, Self::Ocean, Self::Ticking];
+    pub const ALL: [Self; 2] = [Self::Off, Self::Ticking];
 
     pub fn key(self) -> &'static str {
         match self {
             Self::Off => "off",
-            Self::Rain => "rain",
-            Self::Ocean => "ocean",
             Self::Ticking => "ticking",
         }
     }
 
     pub fn from_key(key: &str) -> Self {
         match key {
-            "rain" => Self::Rain,
-            "ocean" => Self::Ocean,
             "ticking" => Self::Ticking,
             _ => Self::Off,
         }
@@ -38,9 +32,7 @@ impl WhiteNoise {
 
     pub fn next(self) -> Self {
         match self {
-            Self::Off => Self::Rain,
-            Self::Rain => Self::Ocean,
-            Self::Ocean => Self::Ticking,
+            Self::Off => Self::Ticking,
             Self::Ticking => Self::Off,
         }
     }
@@ -48,9 +40,7 @@ impl WhiteNoise {
     pub fn index(self) -> usize {
         match self {
             Self::Off => 0,
-            Self::Rain => 1,
-            Self::Ocean => 2,
-            Self::Ticking => 3,
+            Self::Ticking => 1,
         }
     }
 }
@@ -327,45 +317,9 @@ fn synthesize_ambient(preset: WhiteNoise) -> Vec<u8> {
     wav.extend_from_slice(&data_bytes.to_le_bytes());
 
     let mut samples = vec![0.0f32; num_samples];
-    // Deterministic xorshift64 PRNG so noise is reproducible with zero dependencies.
-    let mut state: u64 = 0x5EED_CAFE_BABE_1234;
-    let mut next_white = || -> f32 {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        ((state as f64 / u64::MAX as f64) * 2.0 - 1.0) as f32
-    };
 
     match preset {
         WhiteNoise::Off => {}
-        WhiteNoise::Rain => {
-            // Soft Paul Kellet pink-noise approximation.
-            let (mut b0, mut b1, mut b2) = (0.0f32, 0.0f32, 0.0f32);
-            for s in &mut samples {
-                let w = next_white();
-                b0 = 0.99765 * b0 + w * 0.099046;
-                b1 = 0.96300 * b1 + w * 0.2965164;
-                b2 = 0.57000 * b2 + w * 1.0526913;
-                *s = (b0 + b1 + b2 + w * 0.1848) * 0.045;
-            }
-            // Crossfade loop seam over 0.25s for seamless playback.
-            let fade = (SAMPLE_RATE as usize) / 4;
-            for i in 0..fade {
-                let alpha = i as f32 / fade as f32;
-                let tail = samples[num_samples - fade + i];
-                samples[i] = samples[i] * alpha + tail * (1.0 - alpha);
-            }
-        }
-        WhiteNoise::Ocean => {
-            // Brown noise gently modulated by a 4-second sinusoidal wave envelope.
-            let mut acc = 0.0f32;
-            for (i, s) in samples.iter_mut().enumerate() {
-                acc = (acc + next_white() * 0.04).clamp(-1.0, 1.0) * 0.995;
-                let phase = std::f32::consts::TAU * (i as f32 / num_samples as f32);
-                let wave = 0.55 + 0.45 * (0.5 - 0.5 * phase.cos());
-                *s = acc * wave * 0.22;
-            }
-        }
         WhiteNoise::Ticking => {
             // Warm wooden mechanical clock tick once per second.
             let sr = SAMPLE_RATE as f32;
@@ -390,12 +344,8 @@ fn synthesize_ambient(preset: WhiteNoise) -> Vec<u8> {
 #[cfg(all(windows, not(test)))]
 fn white_noise_wav(preset: WhiteNoise) -> &'static [u8] {
     use std::sync::OnceLock;
-    static RAIN: OnceLock<Vec<u8>> = OnceLock::new();
-    static OCEAN: OnceLock<Vec<u8>> = OnceLock::new();
     static TICKING: OnceLock<Vec<u8>> = OnceLock::new();
     match preset {
-        WhiteNoise::Rain => RAIN.get_or_init(|| synthesize_ambient(WhiteNoise::Rain)),
-        WhiteNoise::Ocean => OCEAN.get_or_init(|| synthesize_ambient(WhiteNoise::Ocean)),
         WhiteNoise::Ticking => TICKING.get_or_init(|| synthesize_ambient(WhiteNoise::Ticking)),
         WhiteNoise::Off => &[],
     }
@@ -468,12 +418,14 @@ mod tests {
     fn white_noise_defaults_off_and_persists() {
         let store = Store::open_in_memory().unwrap();
         assert_eq!(white_noise(&store), WhiteNoise::Off);
-        set_white_noise(&store, WhiteNoise::Rain).unwrap();
-        assert_eq!(white_noise(&store), WhiteNoise::Rain);
-        set_white_noise(&store, WhiteNoise::Ocean).unwrap();
-        assert_eq!(white_noise(&store), WhiteNoise::Ocean);
         set_white_noise(&store, WhiteNoise::Ticking).unwrap();
         assert_eq!(white_noise(&store), WhiteNoise::Ticking);
+        set_white_noise(&store, WhiteNoise::Off).unwrap();
+        assert_eq!(white_noise(&store), WhiteNoise::Off);
+
+        // Removed/unknown presets gracefully fall back to Off.
+        assert_eq!(WhiteNoise::from_key("rain"), WhiteNoise::Off);
+        assert_eq!(WhiteNoise::from_key("ocean"), WhiteNoise::Off);
     }
 
     #[test]
@@ -482,12 +434,10 @@ mod tests {
         assert_eq!(&wav[0..4], b"RIFF");
         assert_eq!(&wav[8..12], b"WAVE");
         assert!(wav.len() > 44);
-        for preset in [WhiteNoise::Rain, WhiteNoise::Ocean, WhiteNoise::Ticking] {
-            let amb = synthesize_ambient(preset);
-            assert_eq!(&amb[0..4], b"RIFF");
-            assert_eq!(&amb[8..12], b"WAVE");
-            assert!(amb.len() > 44);
-        }
+        let amb = synthesize_ambient(WhiteNoise::Ticking);
+        assert_eq!(&amb[0..4], b"RIFF");
+        assert_eq!(&amb[8..12], b"WAVE");
+        assert!(amb.len() > 44);
     }
 
     #[test]
@@ -496,8 +446,8 @@ mod tests {
         let mut state = AudioState::default();
 
         assert_eq!(
-            state.handle(AudioCommand::SetWhiteNoise(WhiteNoise::Rain), now),
-            AudioEffect::LoopWhiteNoise(WhiteNoise::Rain)
+            state.handle(AudioCommand::SetWhiteNoise(WhiteNoise::Ticking), now),
+            AudioEffect::LoopWhiteNoise(WhiteNoise::Ticking)
         );
         assert!(state.resume_at.is_none());
 
@@ -510,12 +460,12 @@ mod tests {
 
         // Periodic sync ticks for the same preset do not cut off the chime.
         assert_eq!(
-            state.handle(AudioCommand::SetWhiteNoise(WhiteNoise::Rain), now),
+            state.handle(AudioCommand::SetWhiteNoise(WhiteNoise::Ticking), now),
             AudioEffect::None
         );
 
         // Once the chime finishes, white noise resumes automatically.
-        assert_eq!(state.on_timeout(), AudioEffect::LoopWhiteNoise(WhiteNoise::Rain));
+        assert_eq!(state.on_timeout(), AudioEffect::LoopWhiteNoise(WhiteNoise::Ticking));
         assert!(state.resume_at.is_none());
 
         // Stopping white noise during a chime cancels pending resume.

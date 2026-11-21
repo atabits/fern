@@ -1522,8 +1522,8 @@ impl MatrixView {
         v_flex()
             .id(SharedString::from(format!("quadrant-{numeral}")))
             .flex_1()
-            .min_w(px(300.))
-            .min_h(px(180.))
+            .min_w_0()
+            .min_h(px(140.))
             .h_full()
             .px(px(14.))
             .py_2()
@@ -1999,8 +1999,8 @@ impl Render for MatrixView {
                     .pt(px(8.))
                     .pb(px(16.))
                     .gap(px(16.))
-                    .child(h_flex().flex_1().min_h_0().items_stretch().gap(px(16.)).child(q0).child(q1))
-                    .child(h_flex().flex_1().min_h_0().items_stretch().gap(px(16.)).child(q2).child(q3)),
+                    .child(h_flex().flex_1().min_w_0().min_h_0().items_stretch().gap(px(16.)).child(q0).child(q1))
+                    .child(h_flex().flex_1().min_w_0().min_h_0().items_stretch().gap(px(16.)).child(q2).child(q3)),
             )
             .children(task_ctx)
             .children(floating_detail)

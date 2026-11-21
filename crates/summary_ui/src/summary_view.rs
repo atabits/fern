@@ -36,12 +36,32 @@ enum Menu {
     Fields,
 }
 
+/// Cached summary report & filter metadata so `SummaryView::render()` performs zero SQLite reads.
+struct CachedSummary {
+    report: Report,
+    lists: Vec<List>,
+    tags: Vec<fern_core::Tag>,
+    templates: Vec<fern_core::summary::SummaryTemplate>,
+    today: NaiveDate,
+    locale: i18n::Locale,
+}
+
 pub struct SummaryView {
     store: Rc<Store>,
     options: SummaryOptions,
     menu: Option<Menu>,
     /// "Copied" shows on the button after a copy.
     copied: bool,
+    /// Pending timer that clears `copied`, stored so rapid copies cancel the previous timer.
+    copied_reset: Option<gpui::Task<()>>,
+    /// Cached generated report, lists, tags, and templates.
+    cache: Option<CachedSummary>,
+    /// Set whenever options, templates, locale, or `DataVersion` change.
+    cache_dirty: bool,
+    /// Lazily registers global `DataVersion` and `CurrentLocale` observers on first context access.
+    observers_registered: bool,
+    #[cfg(test)]
+    rebuild_count: usize,
     /// Where "Save as → Image" wrote the picture, or why it could not.
     saved: Option<String>,
     /// The "Save as" menu, while open.
@@ -68,6 +88,7 @@ pub struct SummaryView {
 }
 
 /// A rendered summary: the period's heading and each group's heading and lines.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Report {
     pub heading: String,
     pub groups: Vec<(String, Vec<String>)>,
@@ -194,6 +215,12 @@ impl SummaryView {
             options,
             menu: None,
             copied: false,
+            copied_reset: None,
+            cache: None,
+            cache_dirty: true,
+            observers_registered: false,
+            #[cfg(test)]
+            rebuild_count: 0,
             saved: None,
             custom: None,
             save_menu: false,
@@ -206,6 +233,45 @@ impl SummaryView {
             editing: false,
             heading_menu: false,
         }
+    }
+
+    pub fn reload(&mut self, cx: &mut Context<Self>) {
+        self.invalidate_cache(cx);
+    }
+
+    fn ensure_observers(&mut self, cx: &mut Context<Self>) {
+        if self.observers_registered {
+            return;
+        }
+        self.observers_registered = true;
+        cx.observe_global::<desktop_common::data_version::DataVersion>(|this, cx| {
+            if desktop_common::data_version::changed_elsewhere(cx.entity_id(), cx) {
+                this.invalidate_cache(cx);
+            }
+        })
+        .detach();
+        cx.observe_global::<i18n::CurrentLocale>(|this, cx| {
+            this.invalidate_cache(cx);
+        })
+        .detach();
+    }
+
+    fn invalidate_cache(&mut self, cx: &mut Context<Self>) {
+        self.cache_dirty = true;
+        if !self.editing && !self.has_manual_edits(cx) {
+            self.editor = None;
+            self.editor_initial.clear();
+        }
+        cx.notify();
+    }
+
+    fn refresh_templates(&mut self, cx: &mut Context<Self>) {
+        if let Some(cache) = self.cache.as_mut() {
+            cache.templates = self.store.summary_templates().unwrap_or_default();
+        } else {
+            self.cache_dirty = true;
+        }
+        cx.notify();
     }
 
     /// "Custom" in the Date menu: Start and End fields with Cancel and Confirm.
@@ -245,10 +311,15 @@ impl SummaryView {
 
     fn save_template(&mut self, name: String, cx: &mut Context<Self>) {
         match self.store.save_summary_template(&name, &self.options) {
-            Ok(_) => self.naming = None,
-            Err(err) => eprintln!("failed to save the summary template: {err:#}"),
+            Ok(_) => {
+                self.naming = None;
+                self.refresh_templates(cx);
+            }
+            Err(err) => {
+                eprintln!("failed to save the summary template: {err:#}");
+                cx.notify();
+            }
         }
-        cx.notify();
     }
 
     fn confirm_custom(&mut self, cx: &mut Context<Self>) {
@@ -294,21 +365,28 @@ impl SummaryView {
         self.copy_menu = false;
         self.copied = true;
         cx.notify();
-        cx.spawn(async move |this, cx| {
+        // Store the timer task so rapid copies cancel any previous reset timer.
+        self.copied_reset = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(std::time::Duration::from_secs(2)).await;
             this.update(cx, |this, cx| {
                 this.copied = false;
+                this.copied_reset = None;
                 cx.notify();
             })
             .ok();
-        })
-        .detach();
+        }));
     }
 
-    fn has_manual_edits(&self, cx: &Context<Self>) -> bool {
+    fn has_manual_edits(&self, cx: &App) -> bool {
         self.editor
             .as_ref()
             .is_some_and(|editor| editor.read(cx).text() != self.editor_initial)
+    }
+
+    fn edited_markdown(&self, cx: &App) -> Option<String> {
+        let editor = self.editor.as_ref()?;
+        let text = editor.read(cx).text();
+        (text != self.editor_initial).then(|| text.to_owned())
     }
 
     fn apply_options(&mut self, options: SummaryOptions, cx: &mut Context<Self>) {
@@ -317,12 +395,13 @@ impl SummaryView {
             eprintln!("failed to save the summary options: {err:#}");
         }
         self.copied = false;
+        self.copied_reset = None;
         // A report made with other options replaces the edited one.
         self.editor = None;
         self.editor_initial.clear();
         self.editing = false;
         self.pending_options = None;
-        cx.notify();
+        self.invalidate_cache(cx);
     }
 
     fn update(&mut self, cx: &mut Context<Self>, change: impl FnOnce(&mut SummaryOptions)) {
@@ -345,9 +424,15 @@ impl SummaryView {
     fn toggle_editing(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.editing {
             self.editing = false;
+            // Drop an untouched editor snapshot so re-entering edit mode after data/options
+            // changes rebuilds from the fresh cached report instead of showing stale text.
+            if !self.has_manual_edits(cx) {
+                self.editor = None;
+                self.editor_initial.clear();
+            }
         } else {
             if self.editor.is_none() {
-                let markdown = self.current_report(cx).markdown();
+                let markdown = self.ensure_cache(cx).report.markdown();
                 self.editor_initial = markdown.clone();
                 self.editor = Some(cx.new(|cx| {
                     let mut input = TextInput::new(Mode::MultiLine, "", cx);
@@ -361,6 +446,7 @@ impl SummaryView {
             self.editing = true;
         }
         self.copied = false;
+        self.copied_reset = None;
         cx.notify();
     }
 
@@ -383,6 +469,7 @@ impl SummaryView {
         });
         window.focus(&editor.focus_handle(cx), cx);
         self.copied = false;
+        self.copied_reset = None;
         cx.notify();
     }
 
@@ -428,9 +515,11 @@ impl SummaryView {
         };
         if menu == "next" {
             self.options.next_period = true;
+            self.cache_dirty = true;
         }
         if menu == "habits" {
             self.options.habits = true;
+            self.cache_dirty = true;
         }
         if menu == "more-tag" {
             self.menu = Some(Menu::More);
@@ -439,15 +528,30 @@ impl SummaryView {
         if menu == "save" {
             self.save_menu = true;
         }
-        // `summary=image:<path>`: what "Save as → Image" writes, to a given file.
+        // `summary=image:<path>`: what "Save as → Image" writes, to a given file (off the UI thread).
         if let Some(path) = menu.strip_prefix("image:") {
-            let report = self.current_report(cx);
-            if let Ok(png) = crate::report_image::png(&report.heading, &report.groups) {
-                std::fs::write(path, png).ok();
-            }
+            let path = path.to_owned();
+            let (export, _, _) = self.export_snapshot(cx);
+            let task = cx.background_executor().spawn(async move {
+                let png = crate::report_image::png(&export.heading, &export.groups)
+                    .map_err(|err| err.to_string())?;
+                std::fs::write(&path, png).map_err(|err| err.to_string())
+            });
+            cx.spawn(async move |this, cx| {
+                if let Err(err) = task.await {
+                    eprintln!("failed to export summary image: {err}");
+                    this.update(cx, |this, cx| {
+                        this.saved = Some(err);
+                        cx.notify();
+                    })
+                    .ok();
+                }
+            })
+            .detach();
         }
         if let Some(name) = menu.strip_prefix("template:") {
             self.store.save_summary_template(name, &self.options).ok();
+            self.refresh_templates(cx);
         }
         if menu == "template-new" {
             self.start_template(window, cx);
@@ -455,31 +559,79 @@ impl SummaryView {
         cx.notify();
     }
 
-    fn current_report(&self, cx: &App) -> Report {
-        let strings = i18n::t(cx);
+    fn ensure_cache(&mut self, cx: &mut Context<Self>) -> &CachedSummary {
+        self.ensure_observers(cx);
         let today = Local::now().date_naive();
-        let tasks = self.store.tasks().unwrap_or_default();
-        let lists = self.store.lists().unwrap_or_default();
-        let groups = summarize(&tasks, &self.options, today, calendar::week_start());
-        let mut report = report(&groups, &self.options, &lists, today, strings);
-        let sessions = if self.options.fields.contains(&Field::Focus) {
-            self.store.focus_sessions().unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-        summary_fields::decorate(&mut report, &groups, &self.options, &tasks, &sessions);
-        // The Lists filter's "Habit": each habit's check-ins in the period.
-        let habits = self.store.habits().unwrap_or_default();
-        let checkins = self.store.all_habit_done_dates().unwrap_or_default();
-        let rows = fern_core::summary::habit_checkins(&habits, &checkins, &self.options, today, calendar::week_start());
-        if !rows.is_empty() {
-            let lines = rows
-                .into_iter()
-                .map(|(habit, days)| strings.summary_habit_line.replace("{name}", &habit.name).replace("{n}", &days.to_string()))
-                .collect();
-            report.groups.push((strings.summary_habits.to_owned(), lines));
+        let locale = cx.try_global::<i18n::CurrentLocale>().map_or(i18n::Locale::En, |l| l.0);
+        let needs_rebuild = self.cache_dirty
+            || self
+                .cache
+                .as_ref()
+                .is_none_or(|c| c.today != today || c.locale != locale);
+        if needs_rebuild {
+            let strings = i18n::t(cx);
+            let tasks = self.store.tasks().unwrap_or_default();
+            let lists = self.store.lists().unwrap_or_default();
+            let tags = self.store.tags().unwrap_or_default();
+            let templates = self.store.summary_templates().unwrap_or_default();
+            let groups = summarize(&tasks, &self.options, today, calendar::week_start());
+            let mut report = report(&groups, &self.options, &lists, today, strings);
+            let sessions = if self.options.fields.contains(&Field::Focus) {
+                self.store.focus_sessions().unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            summary_fields::decorate(&mut report, &groups, &self.options, &tasks, &sessions);
+            // The Lists filter's "Habit": each habit's check-ins in the period.
+            if self.options.habits {
+                let habits = self.store.habits().unwrap_or_default();
+                let checkins = self.store.all_habit_done_dates().unwrap_or_default();
+                let rows = fern_core::summary::habit_checkins(&habits, &checkins, &self.options, today, calendar::week_start());
+                if !rows.is_empty() {
+                    let lines = rows
+                        .into_iter()
+                        .map(|(habit, days)| strings.summary_habit_line.replace("{name}", &habit.name).replace("{n}", &days.to_string()))
+                        .collect();
+                    report.groups.push((strings.summary_habits.to_owned(), lines));
+                }
+            }
+            // Keep an untouched editor in sync with rebuilt data (never overwrite manual edits).
+            if let Some(editor) = self.editor.clone()
+                && !self.has_manual_edits(cx)
+            {
+                if self.editing {
+                    let markdown = report.markdown();
+                    self.editor_initial = markdown.clone();
+                    editor.update(cx, |input, cx| input.set_text(markdown, cx));
+                } else {
+                    self.editor = None;
+                    self.editor_initial.clear();
+                }
+            }
+            self.cache = Some(CachedSummary { report, lists, tags, templates, today, locale });
+            self.cache_dirty = false;
+            #[cfg(test)]
+            {
+                self.rebuild_count += 1;
+            }
         }
-        report
+        self.cache.as_ref().expect("summary cache populated")
+    }
+
+    /// Builds the exportable `(Report, markdown, mailto)` from the cached report and any manual
+    /// editor modifications, ensuring PNG, PDF, Copy, and Email always export the same content.
+    fn export_snapshot(&mut self, cx: &mut Context<Self>) -> (Report, String, String) {
+        let strings = i18n::t(cx);
+        let edited = self.edited_markdown(cx);
+        let report = &self.ensure_cache(cx).report;
+        let subject = format!("{} {}", strings.summary, report.heading);
+        let markdown = edited.clone().unwrap_or_else(|| report.markdown());
+        let mailto = match &edited {
+            Some(text) => format!("mailto:?subject={}&body={}", percent_encode(&subject), percent_encode(text)),
+            None => report.mailto(&subject),
+        };
+        let export = summary_fields::export_report(subject, report.groups.clone(), edited.as_deref());
+        (export, markdown, mailto)
     }
 
     /// A Filter or Display Options row whose value opens a dropdown.
@@ -551,14 +703,18 @@ impl SummaryView {
     fn render_templates(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let strings = i18n::t(cx);
         let colors = cx.theme().colors().clone();
-        let templates = self.store.summary_templates().unwrap_or_default();
+        let templates = self
+            .cache
+            .as_ref()
+            .map(|c| c.templates.as_slice())
+            .unwrap_or(&[]);
         v_flex()
             .gap_2()
             .child(
                 h_flex()
                     .flex_wrap()
                     .gap_1p5()
-                    .children(templates.into_iter().map(|template| {
+                    .children(templates.iter().map(|template| {
                         let selected = template.options == self.options;
                         let (id, options) = (template.id, template.options.clone());
                         let group = SharedString::from(format!("template-{id}"));
@@ -574,7 +730,7 @@ impl SummaryView {
                             .border_color(if selected { colors.accent } else { colors.border })
                             .cursor_pointer()
                             .hover(|s| s.bg(colors.ghost_element_hover))
-                            .child(Label::new(template.name).size(LabelSize::Small).color(if selected { Color::Accent } else { Color::Default }))
+                            .child(Label::new(template.name.clone()).size(LabelSize::Small).color(if selected { Color::Accent } else { Color::Default }))
                             .child(
                                 div().when(!crate::touch::active(), |el| el.invisible()).group_hover(group, |s| s.visible()).child(
                                     IconButton::new(SharedString::from(format!("delete-template-{id}")), IconName::X)
@@ -588,7 +744,7 @@ impl SummaryView {
                                             if let Err(err) = this.store.delete_summary_template(id) {
                                                 eprintln!("failed to delete the summary template: {err:#}");
                                             }
-                                            cx.notify();
+                                            this.refresh_templates(cx);
                                         })),
                                 ),
                             )
@@ -678,14 +834,18 @@ impl SummaryView {
             item.when(selected, |item| item.end_slot(Icon::new(IconName::Check).size(IconSize::Small).color(Color::Accent)))
         };
         let dropdown = open.then(|| {
-            let tags = self.store.tags().unwrap_or_default();
+            let tags = self
+                .cache
+                .as_ref()
+                .map(|c| c.tags.as_slice())
+                .unwrap_or(&[]);
             let tag_items = std::iter::once(
                 check(options.tags.is_none(), ListItem::new("more-tag-all").child(Label::new(strings.summary_all_tags)))
                     .on_click(cx.listener(|this, _, _, cx| this.update(cx, |o| o.tags = None)))
                     .into_any_element(),
             )
-            .chain(tags.into_iter().map(|tag| {
-                let name = tag.name;
+            .chain(tags.iter().map(|tag| {
+                let name = tag.name.clone();
                 let selected = options.tags.as_ref().is_some_and(|t| t.contains(&name));
                 check(selected, ListItem::new(SharedString::from(format!("more-tag-{name}"))).child(Label::new(format!("#{name}"))))
                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -809,7 +969,11 @@ impl SummaryView {
             custom,
             Box::new(|this, window, cx| this.open_custom(window, cx)),
         ));
-        let lists = self.store.lists().unwrap_or_default();
+        let lists = self
+            .cache
+            .as_ref()
+            .map(|c| c.lists.as_slice())
+            .unwrap_or(&[]);
         let list_label = match &options.lists {
             None if options.habits => format!("{}, {}", strings.summary_all_lists, strings.summary_habits),
             None => strings.summary_all_lists.to_owned(),
@@ -988,18 +1152,11 @@ impl Render for SummaryView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let strings = i18n::t(cx);
         let colors = cx.theme().colors().clone();
-        let report = self.current_report(cx);
+        self.ensure_cache(cx);
+        let report = self.cache.as_ref().expect("summary cache populated").report.clone();
         let empty = report.groups.is_empty();
-        // An edited report is what Copy and Send Email take.
-        let edited = self.editor.as_ref().map(|editor| editor.read(cx).text().to_owned());
-        let markdown = edited.clone().unwrap_or_else(|| report.markdown());
-        let subject = format!("{} {}", strings.summary, report.heading);
-        let mailto = match &edited {
-            Some(text) => format!("mailto:?subject={}&body={}", percent_encode(&subject), percent_encode(text)),
-            None => report.mailto(&subject),
-        };
-        let export_report = summary_fields::export_report(format!("{} {}", strings.summary, report.heading), report.groups.clone(), edited.as_deref());
-        let (report_heading, report_groups) = (export_report.heading, export_report.groups);
+        let edited = self.edited_markdown(cx);
+        let has_manual_edits = edited.is_some();
 
         let editor = self.editor.clone().filter(|_| self.editing);
         let body = v_flex()
@@ -1031,10 +1188,16 @@ impl Render for SummaryView {
                         .child(editor),
                 )
             })
-            .when(editor.is_none() && edited.is_some(), |el| el.child(crate::task_detail::render_markdown(&markdown, None, cx)))
-            .when(editor.is_none() && edited.is_none(), |el| el.child(div().text_size(px(20.)).font_weight(FontWeight::SEMIBOLD).pb_1().child(report.heading.clone())))
-            .when(editor.is_none() && edited.is_none() && empty, |el| el.child(Label::new(strings.summary_empty).color(Color::Muted)))
-            .children(report.groups.into_iter().filter(|_| editor.is_none() && edited.is_none()).map(|(title, lines)| {
+            .when_some(edited.filter(|_| editor.is_none()), |el, text| {
+                el.child(crate::task_detail::render_markdown(&text, None, cx))
+            })
+            .when(editor.is_none() && !has_manual_edits, |el| {
+                el.child(div().text_size(px(20.)).font_weight(FontWeight::SEMIBOLD).pb_1().child(report.heading.clone()))
+            })
+            .when(editor.is_none() && !has_manual_edits && empty, |el| {
+                el.child(Label::new(strings.summary_empty).color(Color::Muted))
+            })
+            .children(report.groups.into_iter().filter(|_| editor.is_none() && !has_manual_edits).map(|(title, lines)| {
                 v_flex()
                     .pt_1()
                     .child(div().pb_1().text_size(px(17.)).font_weight(FontWeight::SEMIBOLD).child(title))
@@ -1068,7 +1231,7 @@ impl Render for SummaryView {
                             .px_4()
                             .gap_2()
                             .child(div().flex_1().text_size(px(20.)).font_weight(FontWeight::SEMIBOLD).child(strings.summary))
-                            .when(self.has_manual_edits(cx), |el| {
+                            .when(has_manual_edits, |el| {
                                 el.child(
                                     h_flex()
                                         .id("summary-reset-edits")
@@ -1105,9 +1268,6 @@ impl Render for SummaryView {
                         .children(self.saved.clone().map(|message| {
                             div().flex_1().min_w_0().child(Label::new(message).size(LabelSize::XSmall).color(Color::Muted).truncate())
                         })).child({
-                            let heading = report_heading.clone();
-                            let groups = report_groups.clone();
-                            let mail = mailto;
                             let menu = self.save_menu.then(|| {
                                 PopoverAttachment::new(
                                     Placement::AboveRight,
@@ -1121,32 +1281,34 @@ impl Render for SummaryView {
                                             ListItem::new("save-pdf")
                                                 .start_slot(Icon::new(IconName::FileText).color(Color::Error))
                                                 .child(Label::new(strings.summary_pdf))
-                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                .on_click(cx.listener(|this, _, _, cx| {
                                                     this.save_menu = false;
-                                                    let html = crate::print::report_html(&heading, &groups);
+                                                    let (export, _, _) = this.export_snapshot(cx);
+                                                    let html = crate::print::report_html(&export.heading, &export.groups);
                                                     if let Err(err) = crate::print::open("summary", &html) {
                                                         eprintln!("failed to open the summary for printing: {err:#}");
                                                     }
                                                     cx.notify();
                                                 })),
                                         )
-                                        .child({
-                                            let (heading, groups) = (report_heading.clone(), report_groups.clone());
+                                        .child(
                                             ListItem::new("save-image")
                                                 .start_slot(Icon::new(IconName::Image).color(Color::Warning))
                                                 .child(Label::new(strings.summary_image))
-                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                .on_click(cx.listener(|this, _, _, cx| {
                                                     this.save_menu = false;
-                                                    this.save_png(heading.clone(), groups.clone(), cx);
+                                                    let (export, _, _) = this.export_snapshot(cx);
+                                                    this.save_png(export.heading, export.groups, cx);
                                                     cx.notify();
-                                                }))
-                                        })
+                                                })),
+                                        )
                                         .child(
                                             ListItem::new("save-email")
                                                 .start_slot(Icon::new(IconName::Mail).color(Color::Accent))
                                                 .child(Label::new(strings.summary_send_email))
-                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                .on_click(cx.listener(|this, _, _, cx| {
                                                     this.save_menu = false;
+                                                    let (_, _, mail) = this.export_snapshot(cx);
                                                     cx.open_url(&mail);
                                                     cx.notify();
                                                 })),
@@ -1171,8 +1333,6 @@ impl Render for SummaryView {
                                 }))
                                 .children(menu)
                         }).child({
-                            let md_text = markdown.clone();
-                            let plain_text = markdown::plain_text(&markdown);
                             let copy_popover = self.copy_menu.then(|| {
                                 PopoverAttachment::new(
                                     Placement::AboveRight,
@@ -1186,16 +1346,18 @@ impl Render for SummaryView {
                                             ListItem::new("summary-copy-markdown")
                                                 .start_slot(Icon::new(IconName::FileText).color(Color::Muted))
                                                 .child(Label::new(strings.copy_markdown))
-                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                    this.copy_text(md_text.clone(), cx);
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    let (_, md_text, _) = this.export_snapshot(cx);
+                                                    this.copy_text(md_text, cx);
                                                 })),
                                         )
                                         .child(
                                             ListItem::new("summary-copy-plain")
                                                 .start_slot(Icon::new(IconName::Copy).color(Color::Muted))
                                                 .child(Label::new(strings.copy_plain_text))
-                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                    this.copy_text(plain_text.clone(), cx);
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    let (_, md_text, _) = this.export_snapshot(cx);
+                                                    this.copy_text(markdown::plain_text(&md_text), cx);
                                                 })),
                                         ),
                                 )
@@ -1230,83 +1392,18 @@ impl Render for SummaryView {
             .child(self.render_options(cx))
             .when_some(self.pending_options.clone(), |el, next| {
                 el.child(
-                    div()
-                        .id("summary-overwrite-backdrop")
-                        .absolute()
-                        .inset_0()
-                        .occlude()
-                        .bg(gpui::black().opacity(0.35))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .on_click(cx.listener(|this, _, _, cx| {
+                    ConfirmDialog::new("summary-overwrite", strings.summary_overwrite_title)
+                        .width(px(360.))
+                        .description(strings.summary_overwrite_message)
+                        .cancel_label(strings.cancel)
+                        .confirm_label(strings.confirm)
+                        .on_cancel(cx.listener(|this, _, _, cx| {
                             this.pending_options = None;
                             cx.notify();
                         }))
-                        .child(
-                            v_flex()
-                                .id("summary-overwrite-modal")
-                                .w(px(360.))
-                                .p_5()
-                                .gap_3()
-                                .rounded(px(12.))
-                                .bg(colors.elevated_surface_background)
-                                .border_1()
-                                .border_color(colors.border)
-                                .shadow_lg()
-                                .on_click(|_, _, cx| cx.stop_propagation())
-                                .child(
-                                    div()
-                                        .text_size(px(16.))
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(colors.text)
-                                        .child(strings.summary_overwrite_title),
-                                )
-                                .child(
-                                    div()
-                                        .text_size(px(13.))
-                                        .text_color(colors.text_muted)
-                                        .child(strings.summary_overwrite_message),
-                                )
-                                .child(
-                                    h_flex()
-                                        .justify_end()
-                                        .gap_2()
-                                        .pt_1()
-                                        .child(
-                                            div()
-                                                .id("summary-overwrite-cancel")
-                                                .px_3()
-                                                .py_1()
-                                                .rounded(px(6.))
-                                                .border_1()
-                                                .border_color(colors.border)
-                                                .text_size(px(13.))
-                                                .text_color(colors.text)
-                                                .hover(|s| s.bg(colors.element_hover))
-                                                .cursor_pointer()
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.pending_options = None;
-                                                    cx.notify();
-                                                }))
-                                                .child(strings.cancel),
-                                        )
-                                        .child(
-                                            div()
-                                                .id("summary-overwrite-confirm")
-                                                .px_3()
-                                                .py_1()
-                                                .rounded(px(6.))
-                                                .bg(colors.accent)
-                                                .hover(|s| s.opacity(0.9))
-                                                .cursor_pointer()
-                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                    this.apply_options(next.clone(), cx);
-                                                }))
-                                                .child(Label::new(strings.confirm).size(LabelSize::Small).weight(FontWeight::MEDIUM).color(Color::OnAccent)),
-                                        ),
-                                ),
-                        ),
+                        .on_confirm(cx.listener(move |this, _, _, cx| {
+                            this.apply_options(next.clone(), cx);
+                        })),
                 )
             })
     }
@@ -1337,5 +1434,135 @@ mod tests {
         assert_eq!(report.markdown(), format!("# {day}\n\n## Completed\n- [x] [{day}] Ship it #work\n"));
         assert!(report.mailto("Summary").starts_with("mailto:?subject=Summary&body=%23%20"));
         assert_eq!(percent_encode("a b&c"), "a%20b%26c");
+    }
+
+    #[gpui::test]
+    fn summary_view_caches_report_and_invalidates_on_options_and_data_version(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext;
+        cx.update(|cx| {
+            theme::init(cx);
+            cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+        });
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let t1 = store.add_task("First shipped task").unwrap();
+        store.set_completed(t1.id, true).unwrap();
+
+        let (view, cx) = cx.add_window_view(|_, _| SummaryView::new(store.clone()));
+        cx.run_until_parked();
+
+        // Initial render builds cache once.
+        view.read_with(cx, |v, _| {
+            assert_eq!(v.rebuild_count, 1);
+            assert!(v.cache.as_ref().unwrap().report.markdown().contains("First shipped task"));
+        });
+
+        // Repeated re-renders (hover/menu/notify) reuse the cached report with zero DB rebuilds.
+        view.update(cx, |v, cx| {
+            v.save_menu = true;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        view.update(cx, |v, cx| {
+            v.save_menu = false;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |v, _| assert_eq!(v.rebuild_count, 1));
+
+        // Changing options invalidates and rebuilds once.
+        view.update(cx, |v, cx| v.update(cx, |o| o.period = Period::Today));
+        cx.run_until_parked();
+        view.read_with(cx, |v, _| assert_eq!(v.rebuild_count, 2));
+
+        // External DataVersion change invalidates cache and picks up newly completed task.
+        let t2 = store.add_task("Second shipped task").unwrap();
+        store.set_completed(t2.id, true).unwrap();
+        let other = cx.update(|_, cx| cx.new(|_| ()));
+        cx.update(|_, cx| desktop_common::data_version::data_changed(other.entity_id(), cx));
+        cx.run_until_parked();
+
+        view.read_with(cx, |v, _| {
+            assert_eq!(v.rebuild_count, 3);
+            assert!(v.cache.as_ref().unwrap().report.markdown().contains("Second shipped task"));
+        });
+    }
+
+    #[gpui::test]
+    fn edited_report_is_exported_and_untouched_editor_refreshes_on_reload(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext;
+        cx.update(|cx| {
+            theme::init(cx);
+            cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+        });
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let t1 = store.add_task("Alpha task").unwrap();
+        store.set_completed(t1.id, true).unwrap();
+
+        let (view, cx) = cx.add_window_view(|_, _| SummaryView::new(store.clone()));
+        cx.run_until_parked();
+
+        // Enter edit mode, make NO edits, and exit edit mode.
+        view.update_in(cx, |v, window, cx| {
+            v.toggle_editing(window, cx);
+            assert!(v.editing);
+            v.toggle_editing(window, cx);
+            assert!(!v.editing);
+            assert!(v.editor.is_none(), "untouched editor must be cleared on exit");
+        });
+
+        // Complete a new task externally and emit DataVersion.
+        let t2 = store.add_task("Beta task").unwrap();
+        store.set_completed(t2.id, true).unwrap();
+        let other = cx.update(|_, cx| cx.new(|_| ()));
+        cx.update(|_, cx| desktop_common::data_version::data_changed(other.entity_id(), cx));
+        cx.run_until_parked();
+
+        // Re-entering edit mode must show fresh data (including Beta task), not a stale snapshot.
+        view.update_in(cx, |v, window, cx| {
+            v.toggle_editing(window, cx);
+            let editor = v.editor.as_ref().unwrap();
+            assert!(editor.read(cx).text().contains("Beta task"));
+
+            // Now manually edit the report and verify export_snapshot uses the edited content
+            // for PNG/PDF groups, markdown, and mailto.
+            let custom_md = "# Custom Summary\n- Hand-edited highlight";
+            editor.update(cx, |input, cx| input.set_text(custom_md.to_owned(), cx));
+            let (export, md, mailto) = v.export_snapshot(cx);
+            assert_eq!(md, custom_md);
+            assert_eq!(export.groups, vec![(String::new(), vec!["# Custom Summary".to_owned(), "- Hand-edited highlight".to_owned()])]);
+            assert!(mailto.contains(&percent_encode("Hand-edited highlight")));
+        });
+    }
+
+    #[gpui::test]
+    fn rapid_copies_cancel_previous_copied_badge_timer(cx: &mut gpui::TestAppContext) {
+        use std::time::Duration;
+        cx.update(|cx| {
+            theme::init(cx);
+            cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+        });
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let (view, cx) = cx.add_window_view(|_, _| SummaryView::new(store));
+        cx.run_until_parked();
+
+        view.update(cx, |v, cx| v.copy_text("first".into(), cx));
+        cx.run_until_parked();
+        view.read_with(cx, |v, _| assert!(v.copied));
+
+        // After 1.5s, copy again -> cancels first 2s timer.
+        cx.executor().advance_clock(Duration::from_millis(1500));
+        cx.run_until_parked();
+        view.update(cx, |v, cx| v.copy_text("second".into(), cx));
+        cx.run_until_parked();
+
+        // Advance 1s (2.5s since first copy, 1s since second) -> badge must STILL be shown.
+        cx.executor().advance_clock(Duration::from_millis(1000));
+        cx.run_until_parked();
+        view.read_with(cx, |v, _| assert!(v.copied, "first timer should have been cancelled"));
+
+        // Advance past the second timer's 2s deadline -> badge clears.
+        cx.executor().advance_clock(Duration::from_millis(1100));
+        cx.run_until_parked();
+        view.read_with(cx, |v, _| assert!(!v.copied));
     }
 }

@@ -1210,6 +1210,7 @@ impl TodoView {
                                 .size(px(22.))
                                 .icon_size(IconSize::Small)
                                 .icon_color(Color::Muted)
+                                .tooltip(Tooltip::text(strings.more))
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.column_menu = if this.column_menu.is_some_and(|(open, _)| open == id) { None } else { Some((id, false)) };
                                     cx.notify();
@@ -1326,12 +1327,23 @@ impl TodoView {
                     .items(lists),
             )
             .when(self.sections.len() > 1, |el| {
-                el.child(item("section-delete", IconName::Trash, strings.delete).on_click(cx.listener(move |this, _, _, cx| {
-                    this.column_menu = None;
-                    let result = this.store.delete_list_section(section);
-                    this.check(result);
-                    this.reload(cx);
-                })))
+                let section_name = self
+                    .sections
+                    .iter()
+                    .find(|s| s.id == section)
+                    .map(|s| s.name.clone())
+                    .unwrap_or_default();
+                el.child(
+                    ListItem::new("section-delete")
+                        .height(px(34.))
+                        .start_slot(Icon::new(IconName::Trash).color(Color::Error))
+                        .child(Label::new(strings.delete).color(Color::Error))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.column_menu = None;
+                            this.confirm_delete = Some(super::ConfirmDeleteTarget::Section(section, section_name.clone()));
+                            cx.notify();
+                        })),
+                )
             })
             .into_any_element()
     }

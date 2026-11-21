@@ -94,6 +94,7 @@ pub(super) enum ConfirmDeleteTarget {
     List(Id, String),
     Tag(String),
     Filter(Id, String),
+    Section(Id, String),
     BatchPurge(usize),
 }
 
@@ -2898,6 +2899,10 @@ impl TodoView {
                     return;
                 }
             }
+            ConfirmDeleteTarget::Section(id, _) => {
+                let result = self.store.delete_list_section(id);
+                self.check(result);
+            }
             ConfirmDeleteTarget::BatchPurge(_) => {
                 self.run_batch(true, cx, |store, ids| store.batch_purge(ids));
                 return;
@@ -4263,6 +4268,10 @@ impl Render for TodoView {
                     ConfirmDeleteTarget::Filter(_, name) => (
                         format!("{} \"{name}\"?", strings.delete_filter),
                         strings.confirm_delete_filter_hint,
+                    ),
+                    ConfirmDeleteTarget::Section(_, name) => (
+                        format!("{} \"{name}\"?", strings.delete),
+                        strings.confirm_delete_section_hint,
                     ),
                     ConfirmDeleteTarget::BatchPurge(count) => (
                         format!(

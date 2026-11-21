@@ -10,7 +10,7 @@ use gpui::{EventEmitter, Focusable, FontWeight};
 use ui::prelude::*;
 use ui::{Placement, PopoverAttachment, Switch, popover};
 
-use crate::actions::{AgendaView, CalendarToday, DayView, DismissTransient, MonthView, NewTask, NextYear, PreviousYear, PrintYear, WeekView, YearView};
+use crate::actions::{AgendaView, CalendarToday, DayView, DismissTransient, MonthView, NewTask, NextPeriod, NextYear, PreviousPeriod, PreviousYear, PrintYear, WeekView, YearView};
 use crate::calendar::{self, week_axis};
 use crate::drag::{DraggedEvent, DraggedTask, ResizeEdge, ResizedTask};
 use crate::i18n;
@@ -3473,6 +3473,8 @@ impl Render for CalendarView {
             .on_action(cx.listener(|this, _: &MonthView, _, cx| this.set_mode(CalendarMode::Month, cx)))
             .on_action(cx.listener(|this, _: &AgendaView, _, cx| this.set_mode(CalendarMode::Agenda, cx)))
             .on_action(cx.listener(|this, _: &YearView, _, cx| this.set_mode(CalendarMode::Year, cx)))
+            .on_action(cx.listener(|this, _: &PreviousPeriod, _, cx| this.shift(-1, cx)))
+            .on_action(cx.listener(|this, _: &NextPeriod, _, cx| this.shift(1, cx)))
             .on_action(cx.listener(|this, _: &PreviousYear, _, cx| this.shift_year_using_keys(-1, cx)))
             .on_action(cx.listener(|this, _: &NextYear, _, cx| this.shift_year_using_keys(1, cx)))
             .on_action(cx.listener(|this, _: &CalendarToday, _, cx| this.go_to_today(cx)))

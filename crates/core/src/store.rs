@@ -884,6 +884,23 @@ const MIGRATIONS: &[&str] = &[
         INSERT INTO sync_log (entity, key, at) VALUES ('matrix_profiles', OLD.id, CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER));
     END;
     ",
+    // Per-(entity, key) high-water mark updated on both local writes (via sync_log) and applied
+    // remote changes so stale offline edits can never overwrite newer applied remote state.
+    "
+    CREATE TABLE sync_watermarks (
+        entity TEXT NOT NULL,
+        key    TEXT NOT NULL,
+        at     INTEGER NOT NULL,
+        PRIMARY KEY (entity, key)
+    );
+    INSERT INTO sync_watermarks (entity, key, at)
+        SELECT entity, key, MAX(at) FROM sync_log GROUP BY entity, key;
+    CREATE TRIGGER sync_watermarks_from_log AFTER INSERT ON sync_log
+    BEGIN
+        INSERT INTO sync_watermarks (entity, key, at) VALUES (NEW.entity, NEW.key, NEW.at)
+        ON CONFLICT(entity, key) DO UPDATE SET at = MAX(sync_watermarks.at, excluded.at);
+    END;
+    ",
 ];
 
 #[cfg(test)]
@@ -2533,6 +2550,10 @@ impl Store {
         Ok(())
     }
 
+    fn sanitize_tag_name(raw: &str) -> String {
+        raw.chars().filter(|c| !c.is_ascii_control()).collect::<String>().trim().to_owned()
+    }
+
     fn replace_task_tags(&self, id: Id, tags: &[String]) -> Result<()> {
         let mut existing: Vec<String> = self
             .conn
@@ -2541,7 +2562,8 @@ impl Store {
             .collect::<Result<_, _>>()?;
         let id = id.to_string();
         self.conn.execute("DELETE FROM task_tags WHERE task_id = ?1", [&id])?;
-        for tag in tags.iter().map(|t| t.trim()).filter(|t| !t.is_empty()) {
+        for tag in tags.iter().map(|t| Self::sanitize_tag_name(t)).filter(|t| !t.is_empty()) {
+            let tag = tag.as_str();
             let name = match existing.iter().find(|e| e.to_lowercase() == tag.to_lowercase()) {
                 Some(name) => name.clone(),
                 None => {
@@ -2615,6 +2637,7 @@ impl Store {
     pub fn add_tag(&self, name: &str, color: Option<&str>, parent: Option<&str>) -> Result<()> {
         let name = name.trim().trim_start_matches('#').trim();
         anyhow::ensure!(!name.is_empty(), "a tag needs a name");
+        anyhow::ensure!(!name.chars().any(|c| c.is_ascii_control()), "tag name cannot contain control characters");
         anyhow::ensure!(!self.tags()?.iter().any(|t| t.name.to_lowercase() == name.to_lowercase()), "the tag already exists");
         self.check_parent(None, parent)?;
         self.conn.execute(
@@ -2629,6 +2652,7 @@ impl Store {
     pub fn update_tag(&self, name: &str, new_name: &str, color: Option<&str>, parent: Option<&str>) -> Result<()> {
         let new_name = new_name.trim().trim_start_matches('#').trim();
         anyhow::ensure!(!new_name.is_empty(), "a tag needs a name");
+        anyhow::ensure!(!new_name.chars().any(|c| c.is_ascii_control()), "tag name cannot contain control characters");
         self.check_parent(Some(name), parent)?;
         self.in_tx(|| {
             if new_name != name {
@@ -5052,10 +5076,11 @@ impl Store {
     }
 
     pub fn batch_add_tag(&self, ids: &[Id], tag: &str) -> Result<()> {
-        let tag = tag.trim();
+        let tag = Self::sanitize_tag_name(tag);
         if tag.is_empty() {
             return Ok(());
         }
+        let tag = tag.as_str();
         self.in_tx(|| {
             for &id in ids {
                 let Some(task) = self.task(id)? else { continue };
@@ -5070,10 +5095,11 @@ impl Store {
     }
 
     pub fn batch_remove_tag(&self, ids: &[Id], tag: &str) -> Result<()> {
-        let tag = tag.trim();
+        let tag = Self::sanitize_tag_name(tag);
         if tag.is_empty() {
             return Ok(());
         }
+        let tag = tag.as_str();
         self.in_tx(|| {
             for &id in ids {
                 let Some(task) = self.task(id)? else { continue };

@@ -78,12 +78,15 @@ fn parse_quick_add_context(input: &str, today: NaiveDate, lists: &[String], reco
         let word = lower[i].as_str();
 
         if recognition.tags
-            && let Some(tag) = words[i].strip_prefix('#').filter(|t| !t.is_empty())
+            && let Some(raw_tag) = words[i].strip_prefix('#')
         {
-            if !parsed.tags.iter().any(|t: &String| t.to_lowercase() == tag.to_lowercase()) {
-                parsed.tags.push(tag.to_owned());
+            let tag: String = raw_tag.chars().filter(|c| !c.is_ascii_control()).collect();
+            if !tag.is_empty() {
+                if !parsed.tags.iter().any(|t: &String| t.to_lowercase() == tag.to_lowercase()) {
+                    parsed.tags.push(tag);
+                }
+                used[i] = recognition.remove_tag_text;
             }
-            used[i] = recognition.remove_tag_text;
         } else if let Some(list) = word
             .strip_prefix('^')
             .or_else(|| word.strip_prefix('~'))
@@ -143,7 +146,12 @@ fn parse_quick_add_context(input: &str, today: NaiveDate, lists: &[String], reco
     // Recognized words are those marked used, and kept date words; tags kept in the title too.
     let starts: Vec<usize> = words.iter().map(|w| w.as_ptr() as usize - input.as_ptr() as usize).collect();
     let recognized = |i: usize| {
-        used[i] || dates_used[i] || (recognition.tags && words[i].len() > 1 && words[i].starts_with('#'))
+        used[i]
+            || dates_used[i]
+            || (recognition.tags
+                && words[i]
+                    .strip_prefix('#')
+                    .is_some_and(|t| t.chars().any(|c| !c.is_ascii_control())))
     };
     for i in 0..words.len() {
         if !recognized(i) {

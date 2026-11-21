@@ -7,9 +7,11 @@
 //! that way are not logged again, so they do not bounce back. A server only has to keep the
 //! latest change of every row and hand out the ones a device has not seen.
 
+use std::collections::{HashMap, HashSet};
+
 use anyhow::{Context as _, Result, bail};
 use rusqlite::types::{Value, ValueRef};
-use rusqlite::{OptionalExtension as _, params_from_iter};
+use rusqlite::{OptionalExtension as _, params, params_from_iter};
 use serde_json::{Map, Value as Json};
 
 use crate::store::Store;
@@ -135,16 +137,16 @@ impl Store {
     /// and everything it has is received.
     pub fn set_sync_config(&self, config: &SyncConfig) -> Result<()> {
         let server = config.server.trim();
-        let tx = self.conn.unchecked_transaction()?;
-        if self.setting(SYNC_SERVER)?.unwrap_or_default() != server {
-            self.set_setting(SYNC_SENT, "0")?;
-            self.set_setting(SYNC_SEEN, "0")?;
-            self.conn.execute("DELETE FROM sync_uploaded", [])?;
-        }
-        self.set_setting(SYNC_SERVER, server)?;
-        self.set_setting(SYNC_TOKEN, config.token.trim())?;
-        tx.commit()?;
-        Ok(())
+        self.in_tx(|| {
+            if self.setting(SYNC_SERVER)?.unwrap_or_default() != server {
+                self.set_setting(SYNC_SENT, "0")?;
+                self.set_setting(SYNC_SEEN, "0")?;
+                self.conn.execute("DELETE FROM sync_uploaded", [])?;
+            }
+            self.set_setting(SYNC_SERVER, server)?;
+            self.set_setting(SYNC_TOKEN, config.token.trim())?;
+            Ok(())
+        })
     }
 
     /// This device's id for the server, made once.
@@ -187,11 +189,13 @@ impl Store {
             .map(Change::from_json)
             .collect::<Result<Vec<_>>>()?;
         let position = answer["position"].as_i64().context("the server's answer has no position")?;
-        let applied = self.apply_changes(&received)?;
-        self.set_setting(SYNC_SENT, &request.sent.to_string())?;
-        self.set_setting(SYNC_SEEN, &position.to_string())?;
-        self.compact_sync_log()?;
-        Ok(applied)
+        self.in_tx(|| {
+            let applied = self.apply_changes(&received)?;
+            self.set_setting(SYNC_SENT, &request.sent.to_string())?;
+            self.set_setting(SYNC_SEEN, &position.to_string())?;
+            self.compact_sync_log()?;
+            Ok(applied)
+        })
     }
 }
 
@@ -269,7 +273,8 @@ impl Store {
 
     fn sync_row(&self, entity: &str, key: &str) -> Result<Option<Map<String, Json>>> {
         let keys = keys_of(entity)?;
-        let parts: Vec<&str> = key.split(KEY_SEPARATOR).collect();
+        let parts: Vec<&str> = key.splitn(keys.len(), KEY_SEPARATOR).collect();
+        anyhow::ensure!(parts.len() == keys.len(), "malformed sync key for {entity}");
         let condition: Vec<String> = keys.iter().enumerate().map(|(i, k)| format!("{k} = ?{}", i + 1)).collect();
         let mut stmt = self.conn.prepare_cached(&format!("SELECT * FROM {entity} WHERE {}", condition.join(" AND ")))?;
         let names: Vec<String> = stmt.column_names().into_iter().map(str::to_owned).collect();
@@ -299,63 +304,93 @@ impl Store {
     /// Applies changes from another device. A row changed here later than the incoming change
     /// keeps its local state. Applied changes are not logged, so they are not sent back.
     pub fn apply_changes(&self, changes: &[Change]) -> Result<usize> {
-        let tx = self.conn.unchecked_transaction()?;
-        // Rows may arrive before the rows they point to.
-        tx.execute_batch("PRAGMA defer_foreign_keys = ON; INSERT INTO sync_applying VALUES (1);")?;
-        let mut ordered: Vec<&Change> = changes.iter().collect();
-        let rank = |entity: &str| SYNCED.iter().position(|(name, _)| *name == entity).unwrap_or(usize::MAX);
-        ordered.sort_by_key(|change| (change.row.is_none(), rank(&change.entity)));
-        let mut applied = 0;
-        for change in ordered {
-            let keys = keys_of(&change.entity)?;
-            let local: Option<i64> = tx
-                .query_row(
-                    "SELECT MAX(at) FROM sync_log WHERE entity = ?1 AND key = ?2",
-                    [&change.entity, &change.key],
-                    |row| row.get(0),
-                )
-                .optional()?
-                .flatten();
-            if local.is_some_and(|at| at > change.at) {
-                continue;
-            }
-            let parts: Vec<&str> = change.key.split(KEY_SEPARATOR).collect();
-            match &change.row {
-                Some(row) => {
-                    let filter_row;
-                    let row = if change.entity == "filters" {
-                        filter_row = decode_filter_row(row)?;
-                        &filter_row
-                    } else {
-                        row
-                    };
-                    let columns: Vec<&String> = row.keys().filter(|c| is_identifier(c)).collect();
-                    let placeholders: Vec<String> = (1..=columns.len()).map(|i| format!("?{i}")).collect();
-                    let updates: Vec<String> = columns
-                        .iter()
-                        .filter(|c| !keys.contains(&c.as_str()))
-                        .map(|c| format!("{c} = excluded.{c}"))
-                        .collect();
-                    let on_conflict = if updates.is_empty() { "DO NOTHING".to_owned() } else { format!("DO UPDATE SET {}", updates.join(", ")) };
-                    let sql = format!(
-                        "INSERT INTO {} ({}) VALUES ({}) ON CONFLICT({}) {on_conflict}",
-                        change.entity,
-                        columns.iter().map(|c| c.as_str()).collect::<Vec<_>>().join(", "),
-                        placeholders.join(", "),
-                        keys.join(", "),
-                    );
-                    tx.execute(&sql, params_from_iter(columns.iter().map(|c| to_sql(&row[c.as_str()]))))?;
+        self.in_tx(|| {
+            // Rows may arrive before the rows they point to.
+            self.conn.execute_batch("PRAGMA defer_foreign_keys = ON; INSERT INTO sync_applying VALUES (1);")?;
+            let mut ordered: Vec<&Change> = changes.iter().collect();
+            let rank = |entity: &str| SYNCED.iter().position(|(name, _)| *name == entity).unwrap_or(usize::MAX);
+            ordered.sort_by_key(|change| (change.row.is_none(), rank(&change.entity)));
+            let mut table_columns: HashMap<&str, HashSet<String>> = HashMap::new();
+            let mut applied = 0;
+            for change in ordered {
+                let keys = keys_of(&change.entity)?;
+                let local: Option<i64> = self
+                    .conn
+                    .prepare_cached(
+                        "SELECT MAX(at) FROM (
+                             SELECT MAX(at) AS at FROM sync_log WHERE entity = ?1 AND key = ?2
+                             UNION ALL
+                             SELECT at FROM sync_watermarks WHERE entity = ?1 AND key = ?2
+                         )",
+                    )?
+                    .query_row([&change.entity, &change.key], |row| row.get(0))
+                    .optional()?
+                    .flatten();
+                if local.is_some_and(|at| at > change.at) {
+                    continue;
                 }
-                None => {
-                    let condition: Vec<String> = keys.iter().enumerate().map(|(i, k)| format!("{k} = ?{}", i + 1)).collect();
-                    tx.execute(&format!("DELETE FROM {} WHERE {}", change.entity, condition.join(" AND ")), params_from_iter(parts))?;
+                let parts: Vec<&str> = change.key.splitn(keys.len(), KEY_SEPARATOR).collect();
+                anyhow::ensure!(parts.len() == keys.len(), "malformed sync key for {}", change.entity);
+                match &change.row {
+                    Some(row) => {
+                        let filter_row;
+                        let row = if change.entity == "filters" {
+                            filter_row = decode_filter_row(row)?;
+                            &filter_row
+                        } else {
+                            row
+                        };
+                        let valid_cols = match table_columns.get(change.entity.as_str()) {
+                            Some(cols) => cols,
+                            None => {
+                                let mut stmt = self.conn.prepare(&format!("PRAGMA table_info({})", change.entity))?;
+                                let cols: HashSet<String> =
+                                    stmt.query_map([], |r| r.get::<_, String>(1))?.collect::<Result<_, _>>()?;
+                                table_columns.entry(change.entity.as_str()).or_insert(cols)
+                            }
+                        };
+                        let columns: Vec<&String> =
+                            row.keys().filter(|c| is_identifier(c) && valid_cols.contains(c.as_str())).collect();
+                        if columns.is_empty() || !keys.iter().all(|k| columns.iter().any(|c| c.as_str() == *k)) {
+                            continue;
+                        }
+                        let placeholders: Vec<String> = (1..=columns.len()).map(|i| format!("?{i}")).collect();
+                        let updates: Vec<String> = columns
+                            .iter()
+                            .filter(|c| !keys.contains(&c.as_str()))
+                            .map(|c| format!("{c} = excluded.{c}"))
+                            .collect();
+                        let on_conflict = if updates.is_empty() {
+                            "DO NOTHING".to_owned()
+                        } else {
+                            format!("DO UPDATE SET {}", updates.join(", "))
+                        };
+                        let sql = format!(
+                            "INSERT INTO {} ({}) VALUES ({}) ON CONFLICT({}) {on_conflict}",
+                            change.entity,
+                            columns.iter().map(|c| c.as_str()).collect::<Vec<_>>().join(", "),
+                            placeholders.join(", "),
+                            keys.join(", "),
+                        );
+                        self.conn.execute(&sql, params_from_iter(columns.iter().map(|c| to_sql(&row[c.as_str()]))))?;
+                    }
+                    None => {
+                        let condition: Vec<String> = keys.iter().enumerate().map(|(i, k)| format!("{k} = ?{}", i + 1)).collect();
+                        self.conn.execute(
+                            &format!("DELETE FROM {} WHERE {}", change.entity, condition.join(" AND ")),
+                            params_from_iter(parts),
+                        )?;
+                    }
                 }
+                self.conn.prepare_cached(
+                    "INSERT INTO sync_watermarks (entity, key, at) VALUES (?1, ?2, ?3)
+                     ON CONFLICT(entity, key) DO UPDATE SET at = MAX(sync_watermarks.at, excluded.at)",
+                )?.execute(params![&change.entity, &change.key, change.at])?;
+                applied += 1;
             }
-            applied += 1;
-        }
-        tx.execute_batch("DELETE FROM sync_applying;")?;
-        tx.commit()?;
-        Ok(applied)
+            self.conn.execute_batch("DELETE FROM sync_applying;")?;
+            Ok(applied)
+        })
     }
 }
 
@@ -624,5 +659,149 @@ mod tests {
         store.apply_changes(&[odd]).unwrap();
         assert_eq!(store.lists().unwrap().len(), 1, "odd column names are skipped");
         assert!(store.tasks().is_ok());
+    }
+
+    #[test]
+    fn stale_offline_edit_does_not_resurrect_over_newer_remote_edit() -> Result<()> {
+        let a = Store::open_in_memory()?;
+        let b = Store::open_in_memory()?;
+        let c = Store::open_in_memory()?;
+
+        let task = a.add_task("v1 from A")?;
+        let key = task.id.to_string();
+        // Normalize A's local edit timestamp to 1000.
+        a.conn.execute("UPDATE sync_log SET at = 1000 WHERE entity = 'tasks' AND key = ?1", [&key])?;
+        a.conn.execute("UPDATE sync_watermarks SET at = 1000 WHERE entity = 'tasks' AND key = ?1", [&key])?;
+
+        // Relay initial task to B and C.
+        relay(&a, 0, &b);
+        relay(&a, 0, &c);
+
+        // B edits at t=2000; A pulls B's newer edit.
+        b.set_title(task.id, "v2 from B")?;
+        let (mut b_changes, _) = b.changes_since(0)?;
+        for ch in &mut b_changes {
+            ch.at = 2000;
+        }
+        assert_eq!(a.apply_changes(&b_changes)?, 1);
+        assert_eq!(a.task(task.id)?.unwrap().title, "v2 from B");
+        // Applied remote edit must NOT be re-logged to sync_log.
+        assert_eq!(a.changes_since(a.sync_position()?)?.0.len(), 0);
+
+        // Offline device C delivers an older edit at t=1500 (newer than A's local t=1000, older than B's t=2000).
+        c.set_title(task.id, "stale from C")?;
+        let (mut c_changes, _) = c.changes_since(0)?;
+        for ch in &mut c_changes {
+            ch.at = 1500;
+        }
+        assert_eq!(a.apply_changes(&c_changes)?, 0);
+        assert_eq!(a.task(task.id)?.unwrap().title, "v2 from B", "stale edit must not overwrite newer remote edit");
+
+        // A genuinely newer edit at t=3000 still wins.
+        for ch in &mut c_changes {
+            ch.at = 3000;
+        }
+        assert_eq!(a.apply_changes(&c_changes)?, 1);
+        assert_eq!(a.task(task.id)?.unwrap().title, "stale from C");
+        Ok(())
+    }
+
+    #[test]
+    fn apply_changes_is_forward_compatible_with_future_columns_and_empty_rows() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let id = uuid::Uuid::now_v7().to_string();
+        let mut row = Map::new();
+        row.insert("id".into(), Json::from(id.clone()));
+        row.insert("name".into(), Json::from("Future List"));
+        row.insert("created_at".into(), Json::from(12345));
+        row.insert("future_ai_priority_score".into(), Json::from(99));
+        row.insert("another_v2_column".into(), Json::from("hello"));
+        let future_change = Change { entity: "lists".into(), key: id.clone(), at: 500, row: Some(row) };
+
+        // Empty row or row with only unknown columns is skipped cleanly without SQL errors.
+        let empty_change = Change {
+            entity: "lists".into(),
+            key: uuid::Uuid::now_v7().to_string(),
+            at: 500,
+            row: Some(Map::new()),
+        };
+        let mut only_unknown = Map::new();
+        only_unknown.insert("future_only".into(), Json::from(1));
+        let unknown_only_change = Change {
+            entity: "lists".into(),
+            key: uuid::Uuid::now_v7().to_string(),
+            at: 500,
+            row: Some(only_unknown),
+        };
+
+        let applied = store.apply_changes(&[future_change, empty_change, unknown_only_change])?;
+        assert_eq!(applied, 1);
+        let lists = store.lists()?;
+        assert_eq!(lists.len(), 1);
+        assert_eq!(lists[0].name, "Future List");
+        Ok(())
+    }
+
+    #[test]
+    fn key_separator_in_tags_is_blocked_and_splitn_survives_legacy_rows() -> Result<()> {
+        let laptop = Store::open_in_memory()?;
+        let phone = Store::open_in_memory()?;
+
+        // Direct tag creation / rename rejects U+001F and other ASCII control chars.
+        assert!(laptop.add_tag("bad\u{1f}tag", None, None).is_err());
+        assert!(laptop.add_tag("bad\x07tag", None, None).is_err());
+        laptop.add_tag("clean", None, None)?;
+        assert!(laptop.update_tag("clean", "bad\u{1f}rename", None, None).is_err());
+
+        // set_tags and quick_add strip ASCII control characters.
+        let task = laptop.add_task("Tagged")?;
+        laptop.set_tags(task.id, &["alpha\u{1f}beta".into(), "\u{1f}".into()])?;
+        assert_eq!(laptop.task(task.id)?.unwrap().tags, ["alphabeta"]);
+        let parsed = crate::parse_quick_add("Buy milk #gro\u{1f}ceries", chrono::NaiveDate::from_ymd_opt(2026, 10, 18).unwrap(), &[]);
+        assert_eq!(parsed.tags, ["groceries"]);
+
+        // Even if a pre-existing DB already holds a tag containing U+001F, splitn(keys.len()) keeps sync working.
+        laptop.conn.execute("INSERT INTO tags (name, created_at) VALUES (?1, 1)", ["legacy\u{1f}tag"])?;
+        laptop.conn.execute(
+            "INSERT INTO task_tags (task_id, tag) VALUES (?1, ?2)",
+            rusqlite::params![task.id.to_string(), "legacy\u{1f}tag"],
+        )?;
+        let (changes, _) = laptop.changes_since(0)?;
+        assert!(changes.iter().any(|c| c.entity == "task_tags" && c.key.ends_with("legacy\u{1f}tag")));
+        phone.apply_changes(&changes)?;
+        assert!(phone.task(task.id)?.unwrap().tags.contains(&"legacy\u{1f}tag".to_owned()));
+        Ok(())
+    }
+
+    #[test]
+    fn finish_sync_is_atomic_when_apply_fails() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let task = store.add_task("Local")?;
+        let request = store.sync_request()?;
+        let good_list_id = uuid::Uuid::now_v7().to_string();
+        let bad_answer = serde_json::json!({
+            "position": 42,
+            "changes": [
+                {
+                    "entity": "lists",
+                    "key": good_list_id,
+                    "at": 100,
+                    "row": { "id": good_list_id, "name": "Partial", "created_at": 100 }
+                },
+                {
+                    "entity": "not_a_synced_table",
+                    "key": "x",
+                    "at": 100,
+                    "row": null
+                }
+            ]
+        });
+        assert!(store.finish_sync(&request, &bad_answer).is_err());
+        // Neither the partial list nor the cursors should be persisted.
+        assert!(store.lists()?.is_empty());
+        assert!(store.has_unsent_changes()?);
+        assert_eq!(store.sync_request()?.body["since"], 0);
+        assert!(store.task(task.id)?.is_some());
+        Ok(())
     }
 }

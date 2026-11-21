@@ -606,6 +606,7 @@ impl SummaryView {
                     ),
             )
             .children(self.naming.clone().map(|input| {
+                let can_save = !input.read(cx).text().trim().is_empty();
                 v_flex()
                     .gap_1p5()
                     .child(Label::new(strings.summary_template_hint).size(LabelSize::XSmall).color(Color::Muted))
@@ -624,6 +625,7 @@ impl SummaryView {
                                     .rounded(px(6.))
                                     .border_1()
                                     .border_color(colors.border)
+                                    .hover(|s| s.bg(colors.element_hover))
                                     .cursor_pointer()
                                     .child(Label::new(strings.close).size(LabelSize::Small))
                                     .on_click(cx.listener(|this, _, _, cx| {
@@ -639,13 +641,15 @@ impl SummaryView {
                                     .flex()
                                     .items_center()
                                     .rounded(px(6.))
-                                    .bg(colors.accent)
-                                    .cursor_pointer()
+                                    .bg(colors.accent.opacity(if can_save { 1. } else { 0.5 }))
+                                    .when(can_save, |el| el.cursor_pointer().hover(|s| s.opacity(0.9)))
                                     .child(Label::new(strings.save).size(LabelSize::Small).color(Color::OnAccent))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        let name = input.read(cx).text().to_owned();
-                                        this.save_template(name, cx);
-                                    })),
+                                    .when(can_save, |el| {
+                                        el.on_click(cx.listener(move |this, _, _, cx| {
+                                            let name = input.read(cx).text().to_owned();
+                                            this.save_template(name, cx);
+                                        }))
+                                    }),
                             ),
                     )
             }))

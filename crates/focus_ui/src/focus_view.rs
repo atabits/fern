@@ -27,6 +27,7 @@ mod focus_review;
 const POMO_SETTING: (&str, i64, i64, i64) = ("focus_pomo_minutes", 25, 5, 180);
 const SHORT_BREAK_SETTING: (&str, i64, i64, i64) = ("focus_short_break_minutes", 5, 1, 60);
 const LONG_BREAK_SETTING: (&str, i64, i64, i64) = ("focus_long_break_minutes", 15, 1, 60);
+const DAILY_GOAL_SETTING: (&str, i64, i64, i64) = ("focus_daily_goal_minutes", 0, 0, 720);
 /// "pomo" or "stopwatch".
 const MODE_SETTING: &str = "focus_mode";
 
@@ -1622,6 +1623,26 @@ impl FocusView {
                     .child(row("pomo", strings.focus_pomo_duration, POMO_SETTING, cx))
                     .child(row("short-break", strings.focus_short_break, SHORT_BREAK_SETTING, cx))
                     .child(row("long-break", strings.focus_long_break, LONG_BREAK_SETTING, cx))
+                    .child({
+                        let goal = self.minutes(DAILY_GOAL_SETTING);
+                        let value = if goal == 0 {
+                            strings.focus_goal_off.to_owned()
+                        } else {
+                            fern_core::format_minutes(goal)
+                        };
+                        h_flex()
+                            .gap_2()
+                            .child(div().flex_1().child(Label::new(strings.focus_daily_goal).size(LabelSize::Small)))
+                            .child(
+                                IconButton::new("daily-goal-less", IconName::Minus)
+                                    .on_click(cx.listener(|this, _, _, cx| this.set_minutes(DAILY_GOAL_SETTING, -15, cx))),
+                            )
+                            .child(div().min_w(px(44.)).flex().justify_center().child(Label::new(value).size(LabelSize::Small)))
+                            .child(
+                                IconButton::new("daily-goal-more", IconName::Plus)
+                                    .on_click(cx.listener(|this, _, _, cx| this.set_minutes(DAILY_GOAL_SETTING, 15, cx))),
+                            )
+                    })
                     .child(self.render_automation(cx))
                     .into_any_element()
             }
@@ -3068,14 +3089,71 @@ impl FocusView {
                         }))
                 })))
         };
+        let daily_goal = self.minutes(DAILY_GOAL_SETTING);
         let duration = |minutes: i64| fern_core::focus::duration_parts(minutes).into_iter().map(|(n, u)| (n, Some(u))).collect::<Vec<_>>();
+        let today_focus_card = {
+            let parts = duration(stats.today_minutes);
+            let pct = (daily_goal > 0).then(|| ((stats.today_minutes.max(0) * 100) / daily_goal).min(999));
+            let fill_frac = if daily_goal > 0 {
+                (stats.today_minutes.max(0) as f32 / daily_goal as f32).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let reached = daily_goal > 0 && stats.today_minutes >= daily_goal;
+            v_flex()
+                .flex_1()
+                .h(px(73.))
+                .px_3()
+                .py_2()
+                .gap_0p5()
+                .rounded(px(8.))
+                .bg(theme.colors().surface_background)
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .child(div().flex_1().min_w_0().child(Label::new(strings.focus_today_focus).size(LabelSize::Small).color(Color::Muted).truncate()))
+                        .when_some(pct, |el, pct| {
+                            el.child(
+                                Label::new(format!("{pct}%"))
+                                    .size(LabelSize::XSmall)
+                                    .weight(FontWeight::SEMIBOLD)
+                                    .color(if reached { Color::Custom(theme.status().success) } else { Color::Accent }),
+                            )
+                        }),
+                )
+                .child(h_flex().items_end().children(parts.into_iter().map(|(number, unit)| {
+                    h_flex()
+                        .items_end()
+                        .child(div().text_size(px(26.)).line_height(px(32.)).font_weight(FontWeight::SEMIBOLD).child(number.to_string()))
+                        .children(unit.map(|u| {
+                            div().text_size(px(14.)).line_height(px(14.)).mb(px(6.)).mx_0p5().font_weight(FontWeight::SEMIBOLD).child(u.to_string())
+                        }))
+                })))
+                .when(daily_goal > 0, |el| {
+                    el.child(
+                        div()
+                            .w_full()
+                            .h(px(3.))
+                            .rounded_full()
+                            .bg(theme.colors().border_variant)
+                            .overflow_hidden()
+                            .child(
+                                div()
+                                    .h_full()
+                                    .w(gpui::relative(fill_frac))
+                                    .rounded_full()
+                                    .bg(if reached { theme.status().success } else { theme.colors().accent }),
+                            ),
+                    )
+                })
+        };
         v_flex()
             .gap_2()
             .child(
                 h_flex()
                     .gap_2()
                     .child(card(strings.focus_today_pomo, vec![(stats.today_count as i64, None)]))
-                    .child(card(strings.focus_today_focus, duration(stats.today_minutes))),
+                    .child(today_focus_card),
             )
             .child(
                 h_flex()

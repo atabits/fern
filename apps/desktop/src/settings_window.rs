@@ -203,14 +203,24 @@ impl SettingsWindow {
         let updates = crate::updater::updater(cx).map(|updater| cx.observe(&updater, |_, _, cx| cx.notify()));
         let feeds = crate::subscriptions::feeds(cx).map(|feeds| cx.observe(&feeds, |_, _, cx| cx.notify()));
         let plain = |placeholder: &'static str, cx: &mut Context<Self>| {
-            cx.new(|cx| crate::text_input::TextInput::new(crate::text_input::Mode::SingleLine, placeholder, cx))
+            let input = cx.new(|cx| crate::text_input::TextInput::new(crate::text_input::Mode::SingleLine, placeholder, cx));
+            cx.subscribe(&input, |this: &mut Self, _, _: &crate::text_input::Submitted, cx| {
+                this.save_subscription_form(cx);
+            })
+            .detach();
+            input
         };
         let subscription_name = plain(i18n::t(cx).subscription_name_placeholder, cx);
         let subscription_url = plain("https://…/calendar.ics", cx);
+        cx.subscribe(&subscription_url, |_, _, _: &crate::text_input::Changed, cx| cx.notify()).detach();
         let subscription_username = plain("", cx);
         let subscription_password = cx.new(|cx| {
             crate::text_input::TextInput::new(crate::text_input::Mode::SingleLine, "", cx).masked()
         });
+        cx.subscribe(&subscription_password, |this: &mut Self, _, _: &crate::text_input::Submitted, cx| {
+            this.save_subscription_form(cx);
+        })
+        .detach();
         let installed_notes = release_notes::installed(&store).map(Rc::new);
         Self {
             store,
@@ -306,6 +316,10 @@ impl SettingsWindow {
             self.set_menu(None, cx);
         } else if self.release_notes.is_some() {
             self.back_to_about(window, cx);
+        } else if self.subscription_form.is_some() {
+            self.subscription_form = None;
+            window.focus(&self.focus_handle, cx);
+            cx.notify();
         } else {
             self.close(window, cx);
         }
@@ -873,17 +887,18 @@ impl SettingsWindow {
     }
 
     fn save_subscription_form(&mut self, cx: &mut Context<Self>) {
+        let url = self.subscription_url.read(cx).text().to_owned();
+        if url.trim().is_empty() {
+            return;
+        }
         let Some((id, color)) = self.subscription_form.take() else { return };
         let name = self.subscription_name.read(cx).text().to_owned();
-        let url = self.subscription_url.read(cx).text().to_owned();
         let kind = self.subscription_kind;
         let provider = self.subscription_provider;
         let username = self.subscription_username.read(cx).text().to_owned();
         let password = self.subscription_password.read(cx).text().to_owned();
         let writable = self.subscription_writable;
-        if let Some(feeds) = crate::subscriptions::feeds(cx)
-            && !url.trim().is_empty()
-        {
+        if let Some(feeds) = crate::subscriptions::feeds(cx) {
             feeds.update(cx, |feeds, cx| match (id, kind) {
                 (Some(id), fern_core::ical::CalendarKind::CalDav) => {
                     let hidden = feeds.calendars().iter().find(|c| c.subscription.id == id).is_some_and(|c| c.subscription.hidden);
@@ -1136,6 +1151,7 @@ impl SettingsWindow {
                 .child(div().flex_1().min_w_0().overflow_hidden().h(px(28.)).px_2().flex().items_center().rounded(px(6.)).bg(colors.background).child(input))
         };
         let form = self.subscription_form.as_ref().map(|(_, color)| {
+            let has_url = !self.subscription_url.read(cx).text().trim().is_empty();
             let swatches = h_flex().gap_1p5().children(std::iter::once(None).chain(crate::lists_panel::LIST_COLORS.iter().map(|c| Some(*c))).map(|swatch| {
                 let selected = color.as_deref() == swatch;
                 let fill = crate::lists_panel::parse_color(swatch).unwrap_or(colors.accent);
@@ -1146,6 +1162,7 @@ impl SettingsWindow {
                     .cursor_pointer()
                     .bg(fill.opacity(if swatch.is_none() { 0.35 } else { 1. }))
                     .when(selected, |el| el.border_2().border_color(colors.text))
+                    .when(!selected, |el| el.hover(|s| s.border_2().border_color(colors.border)))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if let Some((_, color)) = &mut this.subscription_form {
                             *color = swatch.map(str::to_owned);
@@ -1220,6 +1237,7 @@ impl SettingsWindow {
                                             .border_1()
                                             .border_color(if active { colors.accent } else { colors.border })
                                             .when(active, |el| el.bg(colors.accent.opacity(0.14)))
+                                            .when(!active, |el| el.hover(|s| s.bg(colors.ghost_element_hover)))
                                             .cursor_pointer()
                                             .child(Label::new(label).size(LabelSize::XSmall).color(if active { Color::Accent } else { Color::Default }))
                                             .on_click(cx.listener(move |this, _, _, cx| {
@@ -1272,6 +1290,7 @@ impl SettingsWindow {
                                         false,
                                         &colors,
                                     )
+                                    .when(!has_url || self.subscription_discovering, |el| el.opacity(0.45).cursor_default())
                                     .on_click(cx.listener(|this, _, _, cx| this.discover_caldav(cx))),
                                 )
                                 .when_some(self.subscription_discover_error.as_ref(), |el, err| {
@@ -1299,6 +1318,7 @@ impl SettingsWindow {
                                             .border_1()
                                             .border_color(if selected { colors.accent } else { colors.border })
                                             .when(selected, |el| el.bg(colors.accent.opacity(0.12)))
+                                            .when(!selected, |el| el.hover(|s| s.bg(colors.ghost_element_hover)))
                                             .cursor_pointer()
                                             .child(Icon::new(IconName::CalendarPlus).size(IconSize::XSmall).color(Color::Muted))
                                             .child(Label::new(cal.name.clone()).size(LabelSize::XSmall))
@@ -1325,7 +1345,11 @@ impl SettingsWindow {
                             this.subscription_form = None;
                             cx.notify();
                         })))
-                        .child(form_button("subscription-save", strings.ok, true, &colors).on_click(cx.listener(|this, _, _, cx| this.save_subscription_form(cx)))),
+                        .child(
+                            form_button("subscription-save", strings.ok, true, &colors)
+                                .when(!has_url, |el| el.opacity(0.45).cursor_default())
+                                .on_click(cx.listener(|this, _, _, cx| this.save_subscription_form(cx))),
+                        ),
                 )
                 .into_any_element()
         });

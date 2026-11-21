@@ -24,6 +24,10 @@ const CHECK_EVERY: Duration = Duration::from_secs(6 * 60 * 60);
 /// "off" when the user turned automatic checks off in Settings → About.
 const SETTING: &str = "auto_update";
 const MAX_DOWNLOAD: u64 = 512 * 1024 * 1024;
+const CHECK_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const CHECK_GLOBAL_TIMEOUT: Duration = Duration::from_secs(30);
+const DOWNLOAD_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+const DOWNLOAD_GLOBAL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub enum Status {
@@ -44,20 +48,36 @@ pub struct Updater {
     install: Option<Install>,
     status: Status,
     staged: Option<PathBuf>,
+    restarting: bool,
 }
 
 struct GlobalUpdater(Entity<Updater>);
 
 impl Global for GlobalUpdater {}
 
+/// Optional hook registered by the main window to flush drafts and close child windows before
+/// restarting for an update.
+struct BeforeRestartHook(Rc<dyn Fn(&mut App)>);
+
+impl Global for BeforeRestartHook {}
+
+pub fn set_before_restart_hook(hook: impl Fn(&mut App) + 'static, cx: &mut App) {
+    cx.set_global(BeforeRestartHook(Rc::new(hook)));
+}
+
 /// Starts the checks, unless this is a development build.
 pub fn init(store: Rc<Store>, cx: &mut App) {
     let install = Install::current();
-    if let Some(install) = &install {
-        install.clean_up();
+    if let Some(install_for_cleanup) = install.clone() {
+        let bg = cx.background_executor().clone();
+        cx.background_executor()
+            .spawn(async move {
+                install_for_cleanup.clean_up_async(&bg).await;
+            })
+            .detach();
     }
     let updater = cx.new(|cx| {
-        let mut updater = Updater { store, install, status: Status::Idle, staged: None };
+        let mut updater = Updater { store, install, status: Status::Idle, staged: None, restarting: false };
         updater.start(cx);
         updater
     });
@@ -160,6 +180,9 @@ impl Updater {
     /// "Restart to Update": puts the downloaded version in place, starts it and quits; "Update
     /// to …" without a download opens the release's page.
     pub fn restart_to_update(&mut self, cx: &mut Context<Self>) {
+        if self.restarting {
+            return;
+        }
         let notes = match &self.status {
             Status::Ready(notes) | Status::Available(notes) => notes,
             _ => return,
@@ -171,18 +194,53 @@ impl Updater {
             cx.open_url(&notes.url);
             return;
         }
-        let (Some(install), Some(staged)) = (&self.install, &self.staged) else {
+        let (Some(install), Some(staged)) = (self.install.clone(), self.staged.clone()) else {
             return;
         };
-        match install.apply(staged) {
-            Ok(()) => cx.quit(),
-            Err(err) => {
-                eprintln!("failed to install the update: {err:#}");
-                self.staged = None;
-                self.status = Status::Failed(format!("{err:#}"));
-                cx.notify();
-            }
-        }
+        self.restarting = true;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let install_for_stage = install.clone();
+            let staged_for_stage = staged.clone();
+            let staged_result = cx
+                .background_executor()
+                .spawn(async move { install_for_stage.stage_replace(&staged_for_stage) })
+                .await;
+            this.update(cx, |this, cx| match staged_result {
+                Ok(()) => {
+                    if let Some(hook) = cx.try_global::<BeforeRestartHook>().map(|h| h.0.clone()) {
+                        hook(cx);
+                    }
+                    // Release global hotkeys, tray icon, and single-instance mutex BEFORE
+                    // spawning the new process so it does not hit hotkey lockout or forward back.
+                    crate::hotkeys::shutdown(cx);
+                    #[cfg(windows)]
+                    {
+                        crate::tray::prepare_quit();
+                        crate::single_instance::release();
+                    }
+                    match install.launch(&staged) {
+                        Ok(()) => cx.quit(),
+                        Err(err) => {
+                            eprintln!("failed to launch the updated app: {err:#}");
+                            this.restarting = false;
+                            this.staged = None;
+                            this.status = Status::Failed(format!("{err:#}"));
+                            cx.notify();
+                        }
+                    }
+                }
+                Err(err) => {
+                    eprintln!("failed to install the update: {err:#}");
+                    this.restarting = false;
+                    this.staged = None;
+                    this.status = Status::Failed(format!("{err:#}"));
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 }
 
@@ -254,14 +312,23 @@ impl Install {
         })
     }
 
-    /// Removes what the last update left behind.
-    fn clean_up(&self) {
+    /// Removes what the last update left behind, retrying briefly on Windows Portable while
+    /// the previous process finishes exiting and releases `fern.exe.old`.
+    async fn clean_up_async(&self, bg: &gpui::BackgroundExecutor) {
         if let Ok(dir) = updates_dir() {
             std::fs::remove_dir_all(dir).ok();
         }
         match self {
             Install::WindowsPortable(exe) => {
-                std::fs::remove_file(old_path(exe)).ok();
+                let old = old_path(exe);
+                for attempt in 0..12 {
+                    match std::fs::remove_file(&old) {
+                        Ok(()) => break,
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => break,
+                        Err(_) if attempt < 11 => bg.timer(Duration::from_millis(250)).await,
+                        Err(_) => break,
+                    }
+                }
             }
             Install::MacApp(app) => {
                 let old = old_path(app);
@@ -273,17 +340,11 @@ impl Install {
         }
     }
 
-    /// Puts the downloaded version in place and starts it (the installer starts it itself).
-    fn apply(&self, staged: &Path) -> Result<()> {
+    /// Replaces the on-disk installation with `staged` without spawning the new process yet.
+    /// Blocking: run off the UI thread.
+    fn stage_replace(&self, staged: &Path) -> Result<()> {
         match self {
-            Install::WindowsInstaller { all_users } => {
-                let scope = if *all_users { "/ALLUSERS" } else { "/CURRENTUSER" };
-                command(staged)
-                    .args(["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/RELAUNCH=1", scope])
-                    .spawn()
-                    .context("cannot start the installer")?;
-                return Ok(());
-            }
+            Install::WindowsInstaller { .. } => Ok(()),
             Install::WindowsPortable(exe) => {
                 // Windows cannot overwrite a running program, but it can rename it.
                 let old = old_path(exe);
@@ -293,7 +354,7 @@ impl Install {
                     std::fs::rename(&old, exe).ok();
                     return Err(anyhow!(err).context(format!("cannot write {}", exe.display())));
                 }
-                command(exe).spawn()?;
+                Ok(())
             }
             Install::MacApp(app) => {
                 anyhow::ensure!(!mac_bundle_has_profiles(app), "move the portable profile outside the app bundle before updating");
@@ -308,16 +369,42 @@ impl Install {
                     bail!("cannot write {}", app.display());
                 }
                 std::fs::remove_dir_all(&old).ok();
-                // `-n`: a new instance, since this one is still running.
+                Ok(())
+            }
+            Install::AppImage(path) | Install::Tarball(path) => replace_file(staged, path),
+            Install::Managed => bail!("the package manager updates this installation"),
+        }
+    }
+
+    /// Launches the newly staged binary or installer.
+    fn launch(&self, staged: &Path) -> Result<()> {
+        match self {
+            Install::WindowsInstaller { all_users } => {
+                let scope = if *all_users { "/ALLUSERS" } else { "/CURRENTUSER" };
+                command(staged)
+                    .args(["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/RELAUNCH=1", scope])
+                    .spawn()
+                    .context("cannot start the installer")?;
+            }
+            Install::WindowsPortable(exe) => {
+                command(exe).spawn()?;
+            }
+            Install::MacApp(app) => {
+                // `-n`: a new instance, since this one is still exiting.
                 Command::new("open").arg("-n").arg(app).spawn()?;
             }
             Install::AppImage(path) | Install::Tarball(path) => {
-                replace_file(staged, path)?;
                 Command::new(path).spawn()?;
             }
             Install::Managed => bail!("the package manager updates this installation"),
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn apply(&self, staged: &Path) -> Result<()> {
+        self.stage_replace(staged)?;
+        self.launch(staged)
     }
 }
 
@@ -405,9 +492,36 @@ fn user_agent() -> String {
     format!("fern/{CURRENT_VERSION}")
 }
 
+fn windows_system_tar() -> PathBuf {
+    let system_root = std::env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+    let candidate = system_root.join("System32").join("tar.exe");
+    if candidate.exists() { candidate } else { PathBuf::from("tar") }
+}
+
+fn check_agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .timeout_connect(Some(CHECK_CONNECT_TIMEOUT))
+        .timeout_global(Some(CHECK_GLOBAL_TIMEOUT))
+        .build()
+        .into()
+}
+
+fn download_agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .timeout_connect(Some(CHECK_CONNECT_TIMEOUT))
+        .timeout_recv_response(Some(DOWNLOAD_RESPONSE_TIMEOUT))
+        .timeout_global(Some(DOWNLOAD_GLOBAL_TIMEOUT))
+        .build()
+        .into()
+}
+
 /// Asks GitHub for the latest published release. Blocking: run it off the UI thread.
 fn find_update(install: &Install) -> Result<Found> {
-    let mut response = ureq::get(LATEST_RELEASE)
+    let agent = check_agent();
+    let mut response = agent
+        .get(LATEST_RELEASE)
         .header("Accept", "application/vnd.github+json")
         .header("User-Agent", &user_agent())
         .call()
@@ -447,8 +561,10 @@ fn download_and_stage(install: &Install, version: &str, asset: &Asset) -> Result
     match install {
         Install::WindowsInstaller { .. } => Ok(file),
         Install::WindowsPortable(_) => {
-            // Windows 10 and later have bsdtar, which unpacks ZIP files too.
-            run(command("tar").arg("-xf").arg(&file).arg("-C").arg(&dir))?;
+            // Invoke Windows' built-in bsdtar directly so GNU tar (Git/MSYS2/Cygwin) on PATH
+            // cannot intercept `.zip` extraction.
+            let tar = windows_system_tar();
+            run(command(tar).arg("-xf").arg(&file).arg("-C").arg(&dir))?;
             Ok(unpacked("fern.exe"))
         }
         Install::Tarball(_) => {
@@ -486,7 +602,8 @@ fn download(asset: &Asset, path: &Path) -> Result<()> {
         .and_then(|digest| digest.strip_prefix("sha256:"))
         .with_context(|| format!("GitHub lists no SHA-256 for {}", asset.name))?
         .to_lowercase();
-    let mut response = ureq::get(&asset.browser_download_url).header("User-Agent", &user_agent()).call()?;
+    let agent = download_agent();
+    let mut response = agent.get(&asset.browser_download_url).header("User-Agent", &user_agent()).call()?;
     let mut reader = response.body_mut().with_config().limit(MAX_DOWNLOAD).reader();
     let mut file = std::fs::File::create(path).with_context(|| format!("cannot create {}", path.display()))?;
     let mut hasher = Sha256::new();
@@ -623,6 +740,7 @@ mod tests {
                 install: Some(Install::Tarball("fern".into())),
                 status: Status::Ready(Rc::new(notes)),
                 staged: None,
+                restarting: false,
             });
             cx.set_global(GlobalUpdater(updater));
         });

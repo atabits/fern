@@ -1829,7 +1829,7 @@ impl SettingsWindow {
                                     .child(Switch::new().toggle_state(enabled))
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         let enabled = crate::tray::enabled(&this.store);
-                                        if let Err(err) = crate::tray::set_enabled(&this.store, !enabled) {
+                                        if let Err(err) = crate::tray::set_enabled(&this.store, !enabled, cx) {
                                             eprintln!("failed to save the notification area setting: {err:#}");
                                         }
                                         cx.notify();
@@ -1845,7 +1845,7 @@ impl SettingsWindow {
                                     .child(Switch::new().toggle_state(topmost))
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         let next = !crate::tray::always_on_top(&this.store);
-                                        if let Err(err) = crate::tray::set_always_on_top(&this.store, next) {
+                                        if let Err(err) = crate::tray::set_always_on_top(&this.store, next, cx) {
                                             eprintln!("failed to save always_on_top setting: {err:#}");
                                         }
                                         cx.notify();

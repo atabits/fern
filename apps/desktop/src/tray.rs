@@ -5,8 +5,8 @@ use std::rc::Rc;
 
 use fern_core::Store;
 use futures::StreamExt as _;
-use futures::channel::mpsc::UnboundedSender;
-use gpui::{App, Window, WindowHandle};
+use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender};
+use gpui::{App, Global, Window, WindowHandle};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -33,12 +33,42 @@ const TOPMOST_SETTING: &str = "always_on_top";
 const SUBCLASS_ID: usize = 0xFE7B;
 const TRAY_INPUT: u32 = WM_APP + 1;
 const HIDE_MINIMIZED: u32 = WM_APP + 2;
+const OPEN_CONTEXT_MENU: u32 = WM_APP + 3;
 const NIN_KEYSELECT: u32 = NIN_SELECT | 1;
 
 const CMD_START_POMO: usize = 1001;
 const CMD_START_STOPWATCH: usize = 1002;
 const CMD_ALWAYS_ON_TOP: usize = 1003;
 const CMD_QUIT: usize = 1004;
+
+/// Cached tray preferences stored as a GPUI Global so `render()` never queries SQLite
+/// and tray/hotkey toggles keep Settings and Account Menu in sync.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TrayPrefs {
+    pub minimize_to_tray: bool,
+    pub always_on_top: bool,
+}
+
+impl Global for TrayPrefs {}
+
+impl TrayPrefs {
+    pub fn load(store: &Store) -> Self {
+        Self {
+            minimize_to_tray: enabled(store),
+            always_on_top: always_on_top(store),
+        }
+    }
+
+    pub fn current(store: &Store, cx: &mut App) -> Self {
+        if let Some(prefs) = cx.try_global::<Self>() {
+            *prefs
+        } else {
+            let prefs = Self::load(store);
+            cx.set_global(prefs);
+            prefs
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 struct State {
@@ -49,7 +79,9 @@ struct State {
     v4: bool,
     always_on_top: bool,
     quitting: bool,
+    menu_open: bool,
     taskbar_created: u32,
+    activate_instance: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -73,10 +105,11 @@ impl TrayLabels {
     }
 }
 
-enum TrayAction {
+pub enum TrayAction {
     StartPomo,
     StartStopwatch,
     ToggleAlwaysOnTop,
+    Activate,
     Quit,
 }
 
@@ -88,25 +121,21 @@ thread_local! {
     static LAST_TIP: RefCell<String> = const { RefCell::new(String::new()) };
 }
 
+fn clear_tip_cache() {
+    LAST_TIP.with(|last| last.borrow_mut().clear());
+}
+
 /// Updates the Windows tray icon hover tooltip (e.g. to show a running Focus timer).
 pub fn set_tooltip(tip: &str) {
-    let changed = LAST_TIP.with(|last| {
-        let mut last = last.borrow_mut();
-        if *last == tip {
-            false
-        } else {
-            last.clear();
-            last.push_str(tip);
-            true
-        }
-    });
-    if !changed {
-        return;
-    }
+    // Check icon state before mutating LAST_TIP so early calls cannot poison the cache.
     let Some(state) = STATE.get() else {
         return;
     };
     if !state.icon_added {
+        return;
+    }
+    let unchanged = LAST_TIP.with(|last| *last.borrow() == tip);
+    if unchanged {
         return;
     }
     let mut data = NOTIFYICONDATAW {
@@ -120,8 +149,12 @@ pub fn set_tooltip(tip: &str) {
     for (slot, unit) in data.szTip.iter_mut().take(max).zip(tip.encode_utf16()) {
         *slot = unit;
     }
-    unsafe {
-        let _ = Shell_NotifyIconW(NIM_MODIFY, &data);
+    if unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) }.as_bool() {
+        LAST_TIP.with(|last| {
+            let mut last = last.borrow_mut();
+            last.clear();
+            last.push_str(tip);
+        });
     }
 }
 
@@ -129,12 +162,16 @@ pub fn enabled(store: &Store) -> bool {
     store.setting(SETTING).ok().flatten().as_deref() == Some("1")
 }
 
-pub fn set_enabled(store: &Store, enabled: bool) -> anyhow::Result<()> {
-    store.set_setting(SETTING, if enabled { "1" } else { "0" })?;
+pub fn set_enabled(store: &Store, is_enabled: bool, cx: &mut App) -> anyhow::Result<()> {
+    store.set_setting(SETTING, if is_enabled { "1" } else { "0" })?;
     if let Some(mut state) = STATE.get() {
-        state.enabled = enabled;
+        state.enabled = is_enabled;
         STATE.set(Some(state));
     }
+    let mut prefs = TrayPrefs::current(store, cx);
+    prefs.minimize_to_tray = is_enabled;
+    cx.set_global(prefs);
+    cx.refresh_windows();
     Ok(())
 }
 
@@ -142,13 +179,17 @@ pub fn always_on_top(store: &Store) -> bool {
     store.setting(TOPMOST_SETTING).ok().flatten().as_deref() == Some("1")
 }
 
-pub fn set_always_on_top(store: &Store, topmost: bool) -> anyhow::Result<()> {
+pub fn set_always_on_top(store: &Store, topmost: bool, cx: &mut App) -> anyhow::Result<()> {
     store.set_setting(TOPMOST_SETTING, if topmost { "1" } else { "0" })?;
     if let Some(mut state) = STATE.get() {
         state.always_on_top = topmost;
         STATE.set(Some(state));
         apply_topmost(state.hwnd, topmost);
     }
+    let mut prefs = TrayPrefs::current(store, cx);
+    prefs.always_on_top = topmost;
+    cx.set_global(prefs);
+    cx.refresh_windows();
     Ok(())
 }
 
@@ -175,6 +216,18 @@ pub fn hide_to_tray() -> bool {
     true
 }
 
+/// Hides the main window into the system tray only if "Minimize to tray" is enabled.
+/// Returns `false` when disabled, uninitialized, or quitting so callers can minimize normally.
+pub fn hide_to_tray_if_enabled() -> bool {
+    let Some(state) = STATE.get() else {
+        return false;
+    };
+    if !state.enabled || state.quitting {
+        return false;
+    }
+    hide_to_tray()
+}
+
 /// Marks the app as quitting and removes the tray icon so the window can close cleanly.
 pub fn prepare_quit() {
     if let Some(mut state) = STATE.get() {
@@ -199,7 +252,15 @@ pub fn update_labels(strings: &'static Strings) {
     LABELS.with(|labels| *labels.borrow_mut() = TrayLabels::from_strings(strings));
 }
 
-pub fn init(window: &Window, store: &Store, cx: &App) {
+/// Creates and registers the tray action channel BEFORE `init()` adds the tray icon,
+/// so early tray clicks during startup are queued rather than dropped.
+pub fn prepare_channel() -> UnboundedReceiver<TrayAction> {
+    let (tx, rx) = futures::channel::mpsc::unbounded();
+    SENDER.with(|slot| *slot.borrow_mut() = Some(tx));
+    rx
+}
+
+pub fn init(window: &Window, store: &Store, cx: &mut App) {
     let Ok(handle) = HasWindowHandle::window_handle(window) else {
         return;
     };
@@ -212,26 +273,35 @@ pub fn init(window: &Window, store: &Store, cx: &App) {
         return;
     }
     update_labels(i18n::t(cx));
-    let topmost = always_on_top(store);
-    if topmost {
+    let prefs = TrayPrefs::load(store);
+    cx.set_global(prefs);
+    if prefs.always_on_top {
         apply_topmost(hwnd, true);
     }
     let (icon_added, v4) = add_icon(hwnd);
+    if let Ok(dir) = crate::data_dir() {
+        crate::single_instance::register_window(&dir, hwnd);
+    }
     STATE.set(Some(State {
         hwnd,
-        enabled: enabled(store),
+        enabled: prefs.minimize_to_tray,
         hidden_in_tray: false,
         icon_added,
         v4,
-        always_on_top: topmost,
+        always_on_top: prefs.always_on_top,
         quitting: false,
+        menu_open: false,
         taskbar_created: unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) },
+        activate_instance: crate::single_instance::activate_message(),
     }));
 }
 
-pub fn connect(main_window: WindowHandle<AppView>, store: Rc<Store>, cx: &mut App) {
-    let (tx, mut rx) = futures::channel::mpsc::unbounded();
-    SENDER.with(|slot| *slot.borrow_mut() = Some(tx));
+pub fn connect(
+    mut rx: UnboundedReceiver<TrayAction>,
+    main_window: WindowHandle<AppView>,
+    store: Rc<Store>,
+    cx: &mut App,
+) {
     cx.observe_global::<CurrentLocale>(|cx| update_labels(i18n::t(cx))).detach();
     cx.spawn(async move |cx| {
         while let Some(action) = rx.next().await {
@@ -243,10 +313,24 @@ pub fn connect(main_window: WindowHandle<AppView>, store: Rc<Store>, cx: &mut Ap
                     let _ = main_window.update(cx, |view, _, cx| view.start_focus_from_tray(true, cx));
                 }
                 TrayAction::ToggleAlwaysOnTop => {
-                    let next = !always_on_top(&store);
-                    if let Err(err) = set_always_on_top(&store, next) {
-                        eprintln!("failed to save always_on_top setting: {err:#}");
-                    }
+                    cx.update(|cx| {
+                        let next = !TrayPrefs::current(&store, cx).always_on_top;
+                        if let Err(err) = set_always_on_top(&store, next, cx) {
+                            eprintln!("failed to save always_on_top setting: {err:#}");
+                        }
+                    });
+                }
+                TrayAction::Activate => {
+                    let link = crate::data_dir()
+                        .ok()
+                        .and_then(|dir| crate::single_instance::take_pending_link(&dir));
+                    let _ = main_window.update(cx, |view, window, cx| {
+                        restore_main_window();
+                        window.activate_window();
+                        if let Some(task_id) = link {
+                            view.open_task(task_id, window, cx);
+                        }
+                    });
                 }
                 TrayAction::Quit => {
                     cx.update(|cx| {
@@ -281,6 +365,8 @@ fn icon_data(hwnd: HWND) -> NOTIFYICONDATAW {
 
 /// Adds the tray icon and returns `(added, version_4_active)`.
 fn add_icon(hwnd: HWND) -> (bool, bool) {
+    // Reset cached tooltip because the recreated icon starts with the default "Fern" tip.
+    clear_tip_cache();
     // build.rs embeds Fern's icon as resource 1. LoadIconW returns a shared handle.
     let icon = unsafe {
         GetModuleHandleW(PCWSTR::null())
@@ -304,6 +390,7 @@ fn add_icon(hwnd: HWND) -> (bool, bool) {
 }
 
 fn remove_icon() {
+    clear_tip_cache();
     if let Some(mut state) = STATE.get()
         && state.icon_added
     {
@@ -328,7 +415,7 @@ fn to_wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-fn show_context_menu(hwnd: HWND, state: State) {
+fn show_context_menu(hwnd: HWND, is_always_on_top: bool) {
     let labels = LABELS.with(|l| *l.borrow());
     let Ok(menu) = (unsafe { CreatePopupMenu() }) else { return };
     let Ok(focus_menu) = (unsafe { CreatePopupMenu() }) else {
@@ -349,7 +436,7 @@ fn show_context_menu(hwnd: HWND, state: State) {
             let _ = DestroyMenu(focus_menu);
         }
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-        let topmost_flag = if state.always_on_top { MF_CHECKED } else { MF_UNCHECKED };
+        let topmost_flag = if is_always_on_top { MF_CHECKED } else { MF_UNCHECKED };
         let _ = AppendMenuW(menu, MF_STRING | topmost_flag, CMD_ALWAYS_ON_TOP, PCWSTR(always_on_top.as_ptr()));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         let _ = AppendMenuW(menu, MF_STRING, CMD_QUIT, PCWSTR(quit.as_ptr()));
@@ -381,12 +468,16 @@ fn show_context_menu(hwnd: HWND, state: State) {
         _ => None,
     };
     if let Some(action) = action {
-        SENDER.with(|slot| {
-            if let Some(tx) = slot.borrow().as_ref() {
-                let _ = tx.unbounded_send(action);
-            }
-        });
+        send_action(action);
     }
+}
+
+fn send_action(action: TrayAction) {
+    SENDER.with(|slot| {
+        if let Some(tx) = slot.borrow().as_ref() {
+            let _ = tx.unbounded_send(action);
+        }
+    });
 }
 
 unsafe extern "system" fn subclass_proc(
@@ -435,6 +526,20 @@ unsafe extern "system" fn subclass_proc(
                 }
                 return LRESULT(0);
             }
+            OPEN_CONTEXT_MENU => {
+                if !state.menu_open && !state.quitting {
+                    state.menu_open = true;
+                    let topmost = state.always_on_top;
+                    STATE.set(Some(state));
+                    show_context_menu(hwnd, topmost);
+                    // Re-read fresh state after modal TrackPopupMenu returns so we never clobber updates.
+                    if let Some(mut latest) = STATE.get() {
+                        latest.menu_open = false;
+                        STATE.set(Some(latest));
+                    }
+                }
+                return LRESULT(0);
+            }
             TRAY_INPUT if state.icon_added => {
                 // Version 4 carries the event in the low word.
                 let event = lparam.0 as u32 & 0xffff;
@@ -452,8 +557,10 @@ unsafe extern "system" fn subclass_proc(
                     state.hidden_in_tray = false;
                     STATE.set(Some(state));
                     restore(hwnd);
-                } else if is_context {
-                    show_context_menu(hwnd, state);
+                } else if is_context && !state.menu_open {
+                    // Post a custom message so modal TrackPopupMenu does not run re-entrantly
+                    // inside the shell notification callback.
+                    let _ = unsafe { PostMessageW(Some(hwnd), OPEN_CONTEXT_MENU, WPARAM(0), LPARAM(0)) };
                 }
                 return LRESULT(0);
             }
@@ -463,6 +570,7 @@ unsafe extern "system" fn subclass_proc(
             }
             WM_NCDESTROY => {
                 STATE.set(None);
+                clear_tip_cache();
                 SENDER.with(|slot| *slot.borrow_mut() = None);
                 if state.icon_added {
                     let _ = unsafe { Shell_NotifyIconW(NIM_DELETE, &icon_data(hwnd)) };
@@ -470,6 +578,7 @@ unsafe extern "system" fn subclass_proc(
                 let _ = unsafe { RemoveWindowSubclass(hwnd, Some(subclass_proc), SUBCLASS_ID) };
             }
             msg if state.taskbar_created != 0 && msg == state.taskbar_created => {
+                clear_tip_cache();
                 let (added, v4) = add_icon(hwnd);
                 state.icon_added = added;
                 state.v4 = v4;
@@ -481,6 +590,13 @@ unsafe extern "system" fn subclass_proc(
                 } else {
                     STATE.set(Some(state));
                 }
+            }
+            msg if state.activate_instance != 0 && msg == state.activate_instance => {
+                state.hidden_in_tray = false;
+                STATE.set(Some(state));
+                restore(hwnd);
+                send_action(TrayAction::Activate);
+                return LRESULT(0);
             }
             _ => {}
         }

@@ -30,12 +30,15 @@ mod reminders;
 mod search_modal;
 mod settings_window;
 mod sidebar;
+#[cfg(windows)]
+mod single_instance;
 mod title_bar;
 #[cfg(windows)]
 mod tray;
 mod updater;
 mod user_themes;
 
+use std::path::Path;
 use std::rc::Rc;
 
 use anyhow::{Context as _, Result};
@@ -47,12 +50,11 @@ use assets::Assets;
 use crate::i18n::{CurrentLocale, Locale};
 
 /// Opens the data, and whether it was just created: the first start.
-fn open_store() -> Result<(Store, bool)> {
-    let dir = data_dir()?;
-    std::fs::create_dir_all(&dir).with_context(|| format!("cannot create {}", dir.display()))?;
+fn open_store(dir: &Path) -> Result<(Store, bool)> {
+    std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
     let path = dir.join("tasks.db");
     let first_start = !path.exists();
-    let mut store = Store::open(path)?;
+    let mut store = Store::open(&path)?;
     let pending = pending_restore_path()?;
     if pending.exists() {
         match store.restore_from(&pending, attachments_dir().ok().as_deref()) {
@@ -78,7 +80,16 @@ fn add_welcome_tasks(store: &Store, strings: &i18n::Strings) -> Result<()> {
 }
 
 fn main() -> Result<()> {
-    let (store, first_start) = open_store()?;
+    // `fern fern://task/<id>` opens that task ("Copy Link").
+    let link = std::env::args().skip(1).find_map(|arg| fern_core::link::parse_task_link(&arg));
+    let dir = data_dir()?;
+    #[cfg(windows)]
+    let _instance_guard = match single_instance::acquire(&dir, link)? {
+        Some(guard) => guard,
+        None => return Ok(()),
+    };
+
+    let (store, first_start) = open_store(&dir)?;
     let store = Rc::new(store);
     let locale = store
         .setting("locale")?
@@ -119,6 +130,9 @@ fn main() -> Result<()> {
         #[cfg(windows)]
         let store_for_tray = store.clone();
         let store_for_themes = store.clone();
+        // Prepare the tray channel before creating the window/icon so early clicks are never dropped.
+        #[cfg(windows)]
+        let tray_rx = tray::prepare_channel();
         let main_window = cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -135,8 +149,6 @@ fn main() -> Result<()> {
                 touch::init(window, cx);
                 #[cfg(windows)]
                 tray::init(window, &store, cx);
-                // `fern fern://task/<id>` opens that task ("Copy Link").
-                let link = std::env::args().skip(1).find_map(|arg| fern_core::link::parse_task_link(&arg));
                 cx.new(|cx| {
                     let mut view = AppView::new(store, first_start, window, cx);
                     if let Some(task) = link {
@@ -147,13 +159,21 @@ fn main() -> Result<()> {
             },
         )
         .expect("failed to open the main window");
+        #[cfg(windows)]
+        tray::connect(tray_rx, main_window, store_for_tray, cx);
         AppView::register_window_actions(main_window, cx);
+        updater::set_before_restart_hook(
+            move |cx| {
+                let _ = main_window.update(cx, |view, window, cx| {
+                    view.prepare_for_restart(window, cx);
+                });
+            },
+            cx,
+        );
         user_themes::watch(store_for_themes, main_window.into(), cx);
         cx.set_global(desktop_common::StickyOpener(Rc::new(sticky_note::open)));
         sticky_note::restore(store_for_hotkeys.clone(), cx);
         hotkeys::init(main_window, store_for_hotkeys, cx);
-        #[cfg(windows)]
-        tray::connect(main_window, store_for_tray, cx);
         cx.activate(true);
     });
     Ok(())

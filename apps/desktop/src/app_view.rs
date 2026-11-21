@@ -74,7 +74,7 @@ pub struct AppView {
     /// The "Shortcuts" panel on the right, while open.
     shortcuts_open: bool,
     /// The system-wide shortcut being recorded in the Shortcuts panel, and the panel's focus.
-    recording_hotkey: Option<usize>,
+    recording_hotkey: Option<crate::hotkeys::Hotkey>,
     shortcuts_focus: gpui::FocusHandle,
     settings: Option<gpui::WindowHandle<SettingsWindow>>,
     update_notice: Option<Rc<ReleaseNotes>>,
@@ -603,6 +603,11 @@ impl AppView {
         this
     }
 
+    pub fn prepare_for_restart(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let _ = self.prepare_to_leave_calendar(window, cx);
+        self.close_settings(cx);
+    }
+
     fn prepare_to_leave_calendar(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         if self.section != Section::Calendar
             || self.calendar.update(cx, |calendar, cx| calendar.finish_task_before_navigation(cx))
@@ -857,7 +862,7 @@ impl AppView {
                             .when(topmost, |item| item.end_slot(Icon::new(IconName::Check).size(IconSize::Small).color(Color::Accent)))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.account_menu_open = false;
-                                if let Err(err) = crate::tray::set_always_on_top(&this.store, !topmost) {
+                                if let Err(err) = crate::tray::set_always_on_top(&this.store, !topmost, cx) {
                                     eprintln!("failed to toggle always_on_top: {err:#}");
                                 }
                                 cx.notify();
@@ -1193,14 +1198,9 @@ impl AppView {
                             })),
                     ),
             );
-            let labels = [
-                strings.global_quick_add,
-                strings.global_show_hide,
-                strings.global_focus_mini,
-                strings.global_pin_window,
-            ];
-            for (i, (binding, taken)) in crate::hotkeys::bindings(cx).into_iter().enumerate() {
-                let recording = self.recording_hotkey == Some(i);
+            for (hotkey, binding, taken) in crate::hotkeys::bindings(cx) {
+                let i = hotkey.index();
+                let recording = self.recording_hotkey == Some(hotkey);
                 let has_binding = binding.is_some();
                 let text = if recording {
                     strings.press_shortcut.to_owned()
@@ -1211,7 +1211,7 @@ impl AppView {
                     h_flex()
                         .h(px(32.))
                         .gap_1p5()
-                        .child(div().flex_1().child(Label::new(labels[i]).size(LabelSize::Small)))
+                        .child(div().flex_1().child(Label::new(hotkey.label(strings)).size(LabelSize::Small)))
                         .when(taken && !recording, |el| el.child(Label::new(strings.shortcut_taken).size(LabelSize::XSmall).color(Color::Error)))
                         .child(
                             div()
@@ -1226,7 +1226,7 @@ impl AppView {
                                 .cursor_pointer()
                                 .child(Label::new(text).size(LabelSize::XSmall).color(if recording { Color::Accent } else { Color::Muted }))
                                 .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.recording_hotkey = Some(i);
+                                    this.recording_hotkey = Some(hotkey);
                                     window.focus(&this.shortcuts_focus, cx);
                                     cx.notify();
                                 })),
@@ -1239,7 +1239,7 @@ impl AppView {
                                     .tooltip(Tooltip::text(strings.clear))
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.recording_hotkey = None;
-                                        crate::hotkeys::set(i, None, cx);
+                                        crate::hotkeys::set(hotkey, None, cx);
                                         cx.notify();
                                     })),
                             )
@@ -1264,13 +1264,13 @@ impl AppView {
             // While a system-wide shortcut is recorded, the keys pressed set it: Escape keeps
             // the old one, Backspace turns it off.
             .capture_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
-                let Some(index) = this.recording_hotkey else { return };
+                let Some(hotkey) = this.recording_hotkey else { return };
                 cx.stop_propagation();
                 match event.keystroke.key.as_str() {
                     "escape" => {}
-                    "backspace" | "delete" => crate::hotkeys::set(index, None, cx),
+                    "backspace" | "delete" => crate::hotkeys::set(hotkey, None, cx),
                     _ => match crate::hotkeys::Binding::from_keystroke(&event.keystroke) {
-                        Some(binding) => crate::hotkeys::set(index, Some(binding), cx),
+                        Some(binding) => crate::hotkeys::set(hotkey, Some(binding), cx),
                         // A modifier alone, or a key that cannot be one: keep listening.
                         None => return,
                     },

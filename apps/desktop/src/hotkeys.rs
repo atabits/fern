@@ -2,24 +2,81 @@
 //! is in front. Windows only, where `RegisterHotKey` makes them; GPUI has no such shortcuts.
 //!
 //! - Quick Add (Ctrl+Shift+A at first): a small field over every window (see `quick_add_window`).
-//! - Show / Hide (Ctrl+Shift+E at first): shows the main window, or hides it (minimized) when it
-//!   is in front.
+//! - Show / Hide (Ctrl+Shift+E at first): shows the main window, or hides it (to tray when enabled,
+//!   otherwise minimized) when it is in front.
+//! - Focus Mini & Pin Window: off by default, configurable in the Shortcuts panel.
 //!
 //! Each can be changed or turned off from the Shortcuts panel, as in the original's Settings;
 //! a shortcut another app holds is shown as taken.
 
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 use fern_core::Store;
 use gpui::{App, Global, Keystroke, WindowHandle};
 
 use crate::app_view::AppView;
 
-/// The shortcuts, in the order the panel lists them.
+/// System-wide shortcuts, in the order the Shortcuts panel lists them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Hotkey {
+    QuickAdd = 0,
+    ShowHide = 1,
+    FocusMini = 2,
+    PinWindow = 3,
+}
+
 pub const COUNT: usize = 4;
-const DEFAULTS: [&str; COUNT] = ["ctrl-shift-a", "ctrl-shift-e", "off", "off"];
-const SETTINGS: [&str; COUNT] = ["hotkey_quick_add", "hotkey_show_hide", "hotkey_focus_mini", "hotkey_pin_window"];
+
+impl Hotkey {
+    pub const ALL: [Self; COUNT] = [
+        Self::QuickAdd,
+        Self::ShowHide,
+        Self::FocusMini,
+        Self::PinWindow,
+    ];
+
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+
+    #[cfg(any(windows, test))]
+    const fn win32_id(self) -> i32 {
+        (self as i32) + 1
+    }
+
+    #[cfg(any(windows, test))]
+    fn from_win32_id(id: usize) -> Option<Self> {
+        Self::ALL.get(id.checked_sub(1)?).copied()
+    }
+
+    const fn setting_key(self) -> &'static str {
+        match self {
+            Self::QuickAdd => "hotkey_quick_add",
+            Self::ShowHide => "hotkey_show_hide",
+            Self::FocusMini => "hotkey_focus_mini",
+            Self::PinWindow => "hotkey_pin_window",
+        }
+    }
+
+    const fn default_setting(self) -> &'static str {
+        match self {
+            Self::QuickAdd => "ctrl-shift-a",
+            Self::ShowHide => "ctrl-shift-e",
+            Self::FocusMini => "off",
+            Self::PinWindow => "off",
+        }
+    }
+
+    pub fn label(self, strings: &'static crate::i18n::Strings) -> &'static str {
+        match self {
+            Self::QuickAdd => strings.global_quick_add,
+            Self::ShowHide => strings.global_show_hide,
+            Self::FocusMini => strings.global_focus_mini,
+            Self::PinWindow => strings.global_pin_window,
+        }
+    }
+}
 
 /// A key with its modifiers, kept as GPUI writes keystrokes ("ctrl-shift-a").
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -103,93 +160,165 @@ impl Binding {
 struct Shared {
     bindings: [Option<Binding>; COUNT],
     taken: [bool; COUNT],
-    /// The thread to wake when the bindings change.
+    /// The thread to wake when the bindings change or when shutting down.
     thread: Option<u32>,
+    /// Set once the listener thread has unregistered all hotkeys and exited.
+    stopped: bool,
 }
 
 struct GlobalHotkeys {
     store: Rc<Store>,
     shared: Arc<Mutex<Shared>>,
+    stopped_cv: Arc<Condvar>,
 }
 
 impl Global for GlobalHotkeys {}
 
 /// Each shortcut as set (`None` when off) and whether another app holds it.
-pub fn bindings(cx: &App) -> [(Option<Binding>, bool); COUNT] {
-    let Some(global) = cx.try_global::<GlobalHotkeys>() else { return Default::default() };
+pub fn bindings(cx: &App) -> [(Hotkey, Option<Binding>, bool); COUNT] {
+    let Some(global) = cx.try_global::<GlobalHotkeys>() else {
+        return std::array::from_fn(|i| (Hotkey::ALL[i], None, false));
+    };
     let shared = global.shared.lock().unwrap_or_else(|e| e.into_inner());
-    std::array::from_fn(|i| (shared.bindings[i].clone(), shared.taken[i]))
+    std::array::from_fn(|i| (Hotkey::ALL[i], shared.bindings[i].clone(), shared.taken[i]))
 }
 
-/// Changes a shortcut (`None` turns it off), keeps it in the store and registers it anew.
-pub fn set(index: usize, binding: Option<Binding>, cx: &mut App) {
-    let Some(global) = cx.try_global::<GlobalHotkeys>() else { return };
-    let value = binding.as_ref().map_or_else(|| "off".to_owned(), Binding::to_setting);
-    if let Err(err) = global.store.set_setting(SETTINGS[index], &value) {
-        eprintln!("failed to save the shortcut: {err:#}");
-    }
-    let thread = {
-        let mut shared = global.shared.lock().unwrap_or_else(|e| e.into_inner());
-        shared.bindings[index] = binding;
-        shared.taken[index] = false;
-        shared.thread
-    };
-    #[cfg(windows)]
+#[cfg(windows)]
+fn wake_listener(thread: Option<u32>) {
     if let Some(thread) = thread {
         use windows::Win32::Foundation::{LPARAM, WPARAM};
         use windows::Win32::UI::WindowsAndMessaging::{PostThreadMessageW, WM_APP};
         unsafe { PostThreadMessageW(thread, WM_APP, WPARAM(0), LPARAM(0)) }.ok();
     }
+}
+
+/// Changes a shortcut (`None` turns it off), keeps it in the store and registers it anew.
+pub fn set(hotkey: Hotkey, binding: Option<Binding>, cx: &mut App) {
+    let Some(global) = cx.try_global::<GlobalHotkeys>() else { return };
+    let value = binding.as_ref().map_or_else(|| "off".to_owned(), Binding::to_setting);
+    if let Err(err) = global.store.set_setting(hotkey.setting_key(), &value) {
+        eprintln!("failed to save the shortcut: {err:#}");
+    }
+    let thread = {
+        let mut shared = global.shared.lock().unwrap_or_else(|e| e.into_inner());
+        let idx = hotkey.index();
+        shared.bindings[idx] = binding;
+        shared.taken[idx] = false;
+        shared.thread
+    };
+    #[cfg(windows)]
+    wake_listener(thread);
     #[cfg(not(windows))]
     let _ = thread;
     cx.refresh_windows();
 }
 
-/// Restores all system-wide shortcuts to their built-in defaults.
+/// Restores all system-wide shortcuts to their built-in defaults in a single batched update.
 pub fn reset_defaults(cx: &mut App) {
-    for (i, default) in DEFAULTS.iter().enumerate() {
-        let binding = (*default != "off").then(|| Binding::parse(default)).flatten();
-        set(i, binding, cx);
+    let Some(global) = cx.try_global::<GlobalHotkeys>() else { return };
+    let defaults: [Option<Binding>; COUNT] = std::array::from_fn(|i| {
+        let hotkey = Hotkey::ALL[i];
+        let default = hotkey.default_setting();
+        if let Err(err) = global.store.set_setting(hotkey.setting_key(), default) {
+            eprintln!("failed to save the shortcut: {err:#}");
+        }
+        (default != "off").then(|| Binding::parse(default)).flatten()
+    });
+    let thread = {
+        let mut shared = global.shared.lock().unwrap_or_else(|e| e.into_inner());
+        shared.bindings = defaults;
+        shared.taken = [false; COUNT];
+        shared.thread
+    };
+    #[cfg(windows)]
+    wake_listener(thread);
+    #[cfg(not(windows))]
+    let _ = thread;
+    cx.refresh_windows();
+}
+
+/// Unregisters all global hotkeys synchronously (up to a short timeout) before spawning a
+/// replacement instance on update so the new process does not hit `taken = true`.
+pub fn shutdown(cx: &App) {
+    let Some(global) = cx.try_global::<GlobalHotkeys>() else { return };
+    #[cfg(windows)]
+    {
+        use std::time::{Duration, Instant};
+        use windows::Win32::Foundation::{LPARAM, WPARAM};
+        use windows::Win32::UI::WindowsAndMessaging::{PostThreadMessageW, WM_QUIT};
+
+        let mut shared = global.shared.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(thread) = shared.thread else { return };
+        if shared.stopped {
+            return;
+        }
+        let _ = unsafe { PostThreadMessageW(thread, WM_QUIT, WPARAM(0), LPARAM(0)) };
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while !shared.stopped {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else { break };
+            let (guard, timeout) = global
+                .stopped_cv
+                .wait_timeout(shared, remaining)
+                .unwrap_or_else(|e| e.into_inner());
+            shared = guard;
+            if timeout.timed_out() {
+                break;
+            }
+        }
     }
+    #[cfg(not(windows))]
+    let _ = global;
 }
 
 /// Registers the shortcuts for the main window.
 pub fn init(window: WindowHandle<AppView>, store: Rc<Store>, cx: &mut App) {
-    let bindings = std::array::from_fn(|i| match store.setting(SETTINGS[i]).ok().flatten() {
-        Some(value) if value == "off" => None,
-        Some(value) => Binding::parse(&value),
-        None => Binding::parse(DEFAULTS[i]),
+    let bindings = std::array::from_fn(|i| {
+        let hotkey = Hotkey::ALL[i];
+        match store.setting(hotkey.setting_key()).ok().flatten() {
+            Some(value) if value == "off" => None,
+            Some(value) => Binding::parse(&value),
+            None => Binding::parse(hotkey.default_setting()),
+        }
     });
     let shared = Arc::new(Mutex::new(Shared { bindings, ..Default::default() }));
-    cx.set_global(GlobalHotkeys { store, shared: shared.clone() });
+    let stopped_cv = Arc::new(Condvar::new());
+    cx.set_global(GlobalHotkeys { store, shared: shared.clone(), stopped_cv: stopped_cv.clone() });
     // Debug builds: `FERN_DEV_STATE=quick-add-window` opens Quick Add, as its shortcut would.
     #[cfg(debug_assertions)]
     if std::env::var("FERN_DEV_STATE").is_ok_and(|state| state.contains("quick-add-window")) {
         cx.defer(move |cx| crate::quick_add_window::open(window, cx));
     }
     #[cfg(windows)]
-    start(window, shared, cx);
+    start(window, shared, stopped_cv, cx);
     #[cfg(not(windows))]
-    let _ = (window, shared);
+    let _ = (window, shared, stopped_cv);
 }
 
 #[cfg(windows)]
-fn start(window: WindowHandle<AppView>, shared: Arc<Mutex<Shared>>, cx: &mut App) {
+fn start(
+    window: WindowHandle<AppView>,
+    shared: Arc<Mutex<Shared>>,
+    stopped_cv: Arc<Condvar>,
+    cx: &mut App,
+) {
     use futures::StreamExt as _;
 
     let (tx, mut rx) = futures::channel::mpsc::unbounded();
-    std::thread::Builder::new().name("hotkeys".into()).spawn(move || listen(shared, tx)).ok();
+    std::thread::Builder::new()
+        .name("hotkeys".into())
+        .spawn(move || listen(shared, stopped_cv, tx))
+        .ok();
     cx.spawn(async move |cx| {
         while let Some(event) = rx.next().await {
             let handled = match event {
-                Event::Pressed(0) => {
+                Event::Pressed(Hotkey::QuickAdd) => {
                     cx.update(|cx| crate::quick_add_window::open(window, cx));
                     Ok(())
                 }
-                Event::Pressed(1) => window
+                Event::Pressed(Hotkey::ShowHide) => window
                     .update(cx, |_, window, _| {
                         if window.is_window_active() {
-                            if !crate::tray::hide_to_tray() {
+                            if !crate::tray::hide_to_tray_if_enabled() {
                                 window.minimize_window();
                             }
                         } else {
@@ -198,14 +327,14 @@ fn start(window: WindowHandle<AppView>, shared: Arc<Mutex<Shared>>, cx: &mut App
                         }
                     })
                     .map_err(|_| ()),
-                Event::Pressed(2) => window
+                Event::Pressed(Hotkey::FocusMini) => window
                     .update(cx, |view, _, cx| view.toggle_focus_mini(cx))
                     .map_err(|_| ()),
-                Event::Pressed(_) => {
+                Event::Pressed(Hotkey::PinWindow) => {
                     cx.update(|cx| {
                         if let Some(store) = cx.try_global::<GlobalHotkeys>().map(|g| g.store.clone()) {
-                            let next = !crate::tray::always_on_top(&store);
-                            if let Err(err) = crate::tray::set_always_on_top(&store, next) {
+                            let next = !crate::tray::TrayPrefs::current(&store, cx).always_on_top;
+                            if let Err(err) = crate::tray::set_always_on_top(&store, next, cx) {
                                 eprintln!("failed to toggle always_on_top: {err:#}");
                             }
                         }
@@ -228,55 +357,112 @@ fn start(window: WindowHandle<AppView>, shared: Arc<Mutex<Shared>>, cx: &mut App
 
 #[cfg(windows)]
 enum Event {
-    Pressed(usize),
+    Pressed(Hotkey),
     Registered,
 }
 
 /// The shortcuts' thread: registers them, passes each press on, and registers them anew when
-/// they change, until the app ends.
+/// they change, until `WM_QUIT` or the app ends.
 #[cfg(windows)]
-fn listen(shared: Arc<Mutex<Shared>>, tx: futures::channel::mpsc::UnboundedSender<Event>) {
+fn listen(
+    shared: Arc<Mutex<Shared>>,
+    stopped_cv: Arc<Condvar>,
+    tx: futures::channel::mpsc::UnboundedSender<Event>,
+) {
     use windows::Win32::System::Threading::GetCurrentThreadId;
     use windows::Win32::UI::Input::KeyboardAndMouse::{
-        HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, MOD_WIN, RegisterHotKey, UnregisterHotKey,
+        HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, MOD_WIN, RegisterHotKey,
+        UnregisterHotKey,
     };
-    use windows::Win32::UI::WindowsAndMessaging::{GetMessageW, MSG, PM_NOREMOVE, PeekMessageW, WM_APP, WM_HOTKEY, WM_USER};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetMessageW, MSG, PM_NOREMOVE, PeekMessageW, WM_APP, WM_HOTKEY, WM_USER,
+    };
 
+    let unregister_all = || {
+        for hotkey in Hotkey::ALL {
+            unsafe { UnregisterHotKey(None, hotkey.win32_id()) }.ok();
+        }
+    };
     let register = |shared: &Mutex<Shared>| {
         let mut shared = shared.lock().unwrap_or_else(|e| e.into_inner());
-        for i in 0..COUNT {
-            unsafe { UnregisterHotKey(None, i as i32 + 1) }.ok();
-            let Some(binding) = shared.bindings[i].clone() else { continue };
-            let Some(key) = binding.virtual_key() else { continue };
+        for hotkey in Hotkey::ALL {
+            let idx = hotkey.index();
+            unsafe { UnregisterHotKey(None, hotkey.win32_id()) }.ok();
+            let Some(binding) = shared.bindings[idx].clone() else {
+                shared.taken[idx] = false;
+                continue;
+            };
+            let Some(key) = binding.virtual_key() else {
+                shared.taken[idx] = false;
+                continue;
+            };
             let mut modifiers = MOD_NOREPEAT;
-            for (on, flag) in [(binding.ctrl, MOD_CONTROL), (binding.alt, MOD_ALT), (binding.shift, MOD_SHIFT), (binding.win, MOD_WIN)] {
+            for (on, flag) in [
+                (binding.ctrl, MOD_CONTROL),
+                (binding.alt, MOD_ALT),
+                (binding.shift, MOD_SHIFT),
+                (binding.win, MOD_WIN),
+            ] {
                 if on {
                     modifiers |= flag;
                 }
             }
             // Thread-wide (no window): WM_HOTKEY comes to this thread's queue.
-            shared.taken[i] = unsafe { RegisterHotKey(None, i as i32 + 1, HOT_KEY_MODIFIERS(modifiers.0), key) }.is_err();
+            shared.taken[idx] =
+                unsafe { RegisterHotKey(None, hotkey.win32_id(), HOT_KEY_MODIFIERS(modifiers.0), key) }
+                    .is_err();
         }
     };
+
     // The queue exists once the thread has asked for a message; only then can it be woken.
     let mut msg = MSG::default();
     let _ = unsafe { PeekMessageW(&mut msg, None, WM_USER, WM_USER, PM_NOREMOVE) };
     shared.lock().unwrap_or_else(|e| e.into_inner()).thread = Some(unsafe { GetCurrentThreadId() });
     register(&shared);
-    if tx.unbounded_send(Event::Registered).is_err() {
-        return;
-    }
-    while unsafe { GetMessageW(&mut msg, None, 0, 0) }.as_bool() {
-        let event = match msg.message {
-            WM_HOTKEY => Event::Pressed(msg.wParam.0.wrapping_sub(1)),
-            WM_APP => {
-                register(&shared);
-                Event::Registered
+    if tx.unbounded_send(Event::Registered).is_ok() {
+        // `GetMessageW` returns > 0 for messages, 0 for WM_QUIT, and -1 on error.
+        while unsafe { GetMessageW(&mut msg, None, 0, 0) }.0 > 0 {
+            let event = match msg.message {
+                WM_HOTKEY => {
+                    let Some(hotkey) = Hotkey::from_win32_id(msg.wParam.0) else { continue };
+                    Event::Pressed(hotkey)
+                }
+                WM_APP => {
+                    register(&shared);
+                    Event::Registered
+                }
+                _ => continue,
+            };
+            if tx.unbounded_send(event).is_err() {
+                break;
             }
-            _ => continue,
-        };
-        if tx.unbounded_send(event).is_err() {
-            break;
         }
+    }
+    unregister_all();
+    let mut guard = shared.lock().unwrap_or_else(|e| e.into_inner());
+    guard.stopped = true;
+    guard.thread = None;
+    stopped_cv.notify_all();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hotkey_win32_ids_roundtrip_and_reject_out_of_bounds() {
+        assert_eq!(Hotkey::from_win32_id(0), None);
+        for hotkey in Hotkey::ALL {
+            assert_eq!(Hotkey::from_win32_id(hotkey.win32_id() as usize), Some(hotkey));
+        }
+        assert_eq!(Hotkey::from_win32_id(COUNT + 1), None);
+    }
+
+    #[test]
+    fn binding_parses_and_formats_labels() {
+        let binding = Binding::parse("ctrl-shift-a").unwrap();
+        assert_eq!(binding.label(), "Ctrl+Shift+A");
+        assert_eq!(binding.to_setting(), "ctrl-shift-a");
+        assert!(Binding::parse("off").is_none());
     }
 }

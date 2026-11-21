@@ -1054,6 +1054,9 @@ impl MatrixView {
             lists_panel::color(self.tags.iter().find(|t| t.name == name).and_then(|t| t.color.as_deref()), cx)
         };
         let due = task.due_date.map(|date| task_rows::due_label(date, task.due_time, today, strings));
+        let has_notes = !is_note && !task.notes.trim().is_empty();
+        let has_subtasks = task.checklist.is_some() || self.tasks.iter().any(|t| t.parent_id == Some(id));
+        let has_reminder = !task.reminders.is_empty();
         let dragged = DraggedTask { id, title: task.title.clone().into() };
         let tags: Vec<AnyElement> =
             task.tags.iter().map(|tag| Chip::new(tag.clone(), tag_color(tag)).into_any_element()).collect();
@@ -1133,6 +1136,15 @@ impl MatrixView {
                     )
                     .children(tags)
                     .child(Label::new(list_name.clone()).size(LabelSize::Small).color(Color::Muted))
+                    .when(has_notes, |el| {
+                        el.child(Icon::new(IconName::FileText).size(IconSize::XSmall).color(Color::Muted))
+                    })
+                    .when(has_subtasks, |el| {
+                        el.child(Icon::new(IconName::ListTree).size(IconSize::XSmall).color(Color::Muted))
+                    })
+                    .when(has_reminder, |el| {
+                        el.child(Icon::new(IconName::AlarmClock).size(IconSize::XSmall).color(Color::Muted))
+                    })
                     .when(task.repeat.is_some(), |el| {
                         el.child(Icon::new(IconName::Repeat).size(IconSize::XSmall).color(Color::Accent))
                     })

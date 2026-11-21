@@ -1323,7 +1323,38 @@ impl FocusView {
                             .bg(theme.colors().element_hover)
                             .child(draft.minutes.clone()),
                     )
-                    .child(Label::new(strings.timer_mins)),
+                    .child(Label::new(strings.timer_mins))
+                    .when(!timer.stopwatch, |row| {
+                        let current_mins = draft.minutes.read(cx).text().trim().parse::<i64>().ok();
+                        row.children([15_i64, 25, 45, 60].into_iter().map(|mins| {
+                            let active = current_mins == Some(mins);
+                            div()
+                                .id(SharedString::from(format!("timer-preset-{mins}")))
+                                .px_2()
+                                .py_0p5()
+                                .rounded(px(5.))
+                                .cursor_pointer()
+                                .bg(if active {
+                                    theme.colors().accent.opacity(0.18)
+                                } else {
+                                    theme.colors().element_hover
+                                })
+                                .hover(|s| s.bg(theme.colors().accent.opacity(0.24)))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if let Some(draft) = this.timer_draft.as_ref() {
+                                        draft.minutes.update(cx, |input, cx| {
+                                            input.set_text(mins.to_string(), cx);
+                                        });
+                                    }
+                                    cx.notify();
+                                }))
+                                .child(
+                                    Label::new(mins.to_string())
+                                        .size(LabelSize::XSmall)
+                                        .color(if active { Color::Accent } else { Color::Muted }),
+                                )
+                        }))
+                    }),
             )
             .child(
                 h_flex()

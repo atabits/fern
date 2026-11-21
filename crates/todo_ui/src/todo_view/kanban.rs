@@ -2257,6 +2257,7 @@ impl TodoView {
                                                         .size(px(20.))
                                                         .icon_size(IconSize::XSmall)
                                                         .icon_color(Color::Muted)
+                                                        .tooltip(Tooltip::text(strings.close))
                                                         .on_click(cx.listener(|this, _, _, cx| {
                                                             cx.stop_propagation();
                                                             let _ = this.store.set_setting(&format!("kanban:hide_new_section:{}", this.view_key()), "1");

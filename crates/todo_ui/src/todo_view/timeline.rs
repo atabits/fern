@@ -568,6 +568,7 @@ impl TodoView {
             let id = task.id;
             let color = tag_color(&task);
             let dragged = DraggedTask { id, title: task.title.clone().into() };
+            let tip_title: SharedString = task.title.clone().into();
             h_flex()
                 .id(SharedString::from(format!("arrange-{id}")))
                 .ml(px(depth as f32 * 14.))
@@ -576,6 +577,7 @@ impl TodoView {
                 .rounded(px(3.))
                 .bg(color.opacity(0.7))
                 .cursor_grab()
+                .tooltip(Tooltip::text(tip_title))
                 .on_drag(dragged, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
                 .gap_1()
                 .when(task.kind == Kind::Note, |el| el.child(Icon::new(IconName::FileText).size(IconSize::XSmall)))
@@ -595,25 +597,37 @@ impl TodoView {
             if count == 0 {
                 continue;
             }
+            let collapse_key = format!("arrange:{label}");
+            let collapsed = self.collapsed_days.contains(&collapse_key);
+            let toggle_key = collapse_key.clone();
             items.push(
                 h_flex()
+                    .id(SharedString::from(collapse_key))
                     .pt_2()
                     .pb_1()
+                    .px_1()
                     .gap_1()
-                    .child(Icon::new(IconName::ChevronDown).size(IconSize::XSmall).color(Color::Muted))
+                    .rounded(px(4.))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme.colors().ghost_element_hover))
+                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_day(toggle_key.clone(), cx)))
+                    .child(Icon::new(if collapsed { IconName::ChevronRight } else { IconName::ChevronDown }).size(IconSize::XSmall).color(Color::Muted))
                     .child(Label::new(label).size(LabelSize::Small).weight(FontWeight::SEMIBOLD))
                     .child(Label::new(count.to_string()).size(LabelSize::XSmall).color(Color::Muted))
                     .into_any_element(),
             );
-            for (task, subtasks) in undated {
-                if task.due_date.is_none() {
-                    items.push(bar(task, 0, cx));
-                }
-                for subtask in subtasks {
-                    items.push(bar(subtask, 1, cx));
+            if !collapsed {
+                for (task, subtasks) in undated {
+                    if task.due_date.is_none() {
+                        items.push(bar(task, 0, cx));
+                    }
+                    for subtask in subtasks {
+                        items.push(bar(subtask, 1, cx));
+                    }
                 }
             }
         }
+        let no_undated = items.is_empty();
         v_scroll(
             "todo-arrange-tasks-scroll",
             v_flex()
@@ -624,11 +638,27 @@ impl TodoView {
                 .child(
                     h_flex()
                         .child(div().flex_1().child(Label::new(strings.arrange_tasks).weight(FontWeight::SEMIBOLD)))
-                        .child(IconButton::new("arrange-close", IconName::X).size(px(22.)).icon_size(IconSize::Small).on_click(cx.listener(|this, _, _, cx| {
-                            this.arrange_open = false;
-                            cx.notify();
-                        }))),
+                        .child(
+                            IconButton::new("arrange-close", IconName::X)
+                                .size(px(22.))
+                                .icon_size(IconSize::Small)
+                                .tooltip(Tooltip::text(strings.close))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.arrange_open = false;
+                                    cx.notify();
+                                })),
+                        ),
                 )
+                .when(no_undated, |el| {
+                    el.child(
+                        div()
+                            .pt_6()
+                            .px_2()
+                            .flex()
+                            .justify_center()
+                            .child(Label::new(strings.no_tasks).size(LabelSize::Small).color(Color::Muted)),
+                    )
+                })
                 .children(items),
         )
         .w(px(220.))

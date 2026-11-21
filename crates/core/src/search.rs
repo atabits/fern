@@ -81,7 +81,10 @@ impl TaskFilter {
         }
         match self.date.days(today, week_start) {
             None => true,
-            Some((from, until)) => task.due_date.is_some_and(|due| due >= from && due <= until),
+            Some((from, until)) => task.due_date.is_some_and(|due| {
+                let end = task.end_date.unwrap_or(due).max(due);
+                due <= until && end >= from
+            }),
         }
     }
 }
@@ -126,6 +129,18 @@ mod tests {
         assert_eq!(found(&TaskFilter { date: DateRange::NextWeek, ..Default::default() }), ["Report"]);
         assert_eq!(found(&TaskFilter { priorities: vec![Priority::None], ..Default::default() }), ["Milk"]);
         assert!(TaskFilter::default().is_empty());
+
+        // A multi-day duration task overlapping This Week matches This Week.
+        let trip = store.add_task("Trip")?;
+        store.set_due(trip.id, Some(d(10, 10)), None)?;
+        store.set_due_end(trip.id, Some((d(10, 20), None)))?;
+        let tasks = store.tasks()?;
+        let matched: Vec<_> = tasks
+            .iter()
+            .filter(|t| TaskFilter { date: DateRange::ThisWeek, ..Default::default() }.matches(t, today, Weekday::Mon))
+            .map(|t| t.title.as_str())
+            .collect();
+        assert_eq!(matched, ["Trip"]);
         Ok(())
     }
 }

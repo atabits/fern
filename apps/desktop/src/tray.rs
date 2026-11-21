@@ -11,7 +11,7 @@ use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Shell::{
-    DefSubclassProc, NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIM_ADD, NIM_DELETE,
+    DefSubclassProc, NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
     NIM_SETVERSION, NIN_SELECT, NOTIFYICON_VERSION_4, NOTIFYICONDATAW, RemoveWindowSubclass,
     SetWindowSubclass, Shell_NotifyIconW,
 };
@@ -85,6 +85,44 @@ thread_local! {
     static STATE: Cell<Option<State>> = const { Cell::new(None) };
     static LABELS: RefCell<TrayLabels> = RefCell::new(TrayLabels::from_strings(i18n::Locale::En.strings()));
     static SENDER: RefCell<Option<UnboundedSender<TrayAction>>> = const { RefCell::new(None) };
+    static LAST_TIP: RefCell<String> = const { RefCell::new(String::new()) };
+}
+
+/// Updates the Windows tray icon hover tooltip (e.g. to show a running Focus timer).
+pub fn set_tooltip(tip: &str) {
+    let changed = LAST_TIP.with(|last| {
+        let mut last = last.borrow_mut();
+        if *last == tip {
+            false
+        } else {
+            last.clear();
+            last.push_str(tip);
+            true
+        }
+    });
+    if !changed {
+        return;
+    }
+    let Some(state) = STATE.get() else {
+        return;
+    };
+    if !state.icon_added {
+        return;
+    }
+    let mut data = NOTIFYICONDATAW {
+        cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+        hWnd: state.hwnd,
+        uID: 1,
+        uFlags: NIF_TIP | NIF_SHOWTIP,
+        ..Default::default()
+    };
+    let max = data.szTip.len() - 1;
+    for (slot, unit) in data.szTip.iter_mut().take(max).zip(tip.encode_utf16()) {
+        *slot = unit;
+    }
+    unsafe {
+        let _ = Shell_NotifyIconW(NIM_MODIFY, &data);
+    }
 }
 
 pub fn enabled(store: &Store) -> bool {

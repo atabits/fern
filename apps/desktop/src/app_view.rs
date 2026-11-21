@@ -215,7 +215,20 @@ impl AppView {
         })
         .detach();
         let focus = cx.new(|cx| FocusView::new(store.clone(), cx));
-        cx.observe(&focus, |_, _, cx| cx.notify()).detach();
+        cx.observe(&focus, |_, focus, cx| {
+            #[cfg(windows)]
+            {
+                let tip = match focus.read(cx).running_clock() {
+                    Some((clock, true)) => format!("Fern — {clock} (Paused)"),
+                    Some((clock, false)) => format!("Fern — {clock}"),
+                    None => "Fern".to_owned(),
+                };
+                crate::tray::set_tooltip(&tip);
+            }
+            let _ = focus;
+            cx.notify();
+        })
+        .detach();
         cx.subscribe(&focus, |this, _, crate::focus_view::StatsClosed, cx| {
             this.statistics_open = false;
             cx.notify();

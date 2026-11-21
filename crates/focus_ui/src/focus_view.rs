@@ -1748,10 +1748,14 @@ impl FocusView {
                     .child({
                         let current = desktop_common::sound::white_noise(&self.store);
                         let label = strings.focus_white_noise_names[current.index()];
+                        let hover_bg = cx.theme().colors().ghost_element_hover;
                         h_flex()
                             .id("focus-white-noise-setting")
                             .min_h(px(30.))
+                            .px_1()
+                            .rounded(px(5.))
                             .gap_2()
+                            .hover(move |s| s.bg(hover_bg))
                             .cursor_pointer()
                             .child(div().flex_1().child(Label::new(strings.focus_white_noise).size(LabelSize::Small)))
                             .child(
@@ -4273,6 +4277,9 @@ impl Render for FocusView {
                             .id("focus-bar-open")
                             .flex_1()
                             .min_w_0()
+                            .px_1p5()
+                            .rounded(px(6.))
+                            .hover(|s| s.bg(theme.colors().ghost_element_hover))
                             .cursor_pointer()
                             .child(Label::new(label).size(LabelSize::XSmall).color(Color::Muted).truncate())
                             .child(div().text_size(px(20.)).child(clock))
@@ -4284,6 +4291,7 @@ impl Render for FocusView {
                     .when(running, |el| {
                         el.child(
                             IconButton::new("focus-stop", IconName::Square)
+                                .tooltip(Tooltip::text(strings.focus_end))
                                 .on_click(cx.listener(|this, _, window, cx| this.request_finish(window, cx))),
                         )
                     })

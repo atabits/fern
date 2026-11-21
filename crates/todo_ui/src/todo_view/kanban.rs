@@ -1019,6 +1019,13 @@ impl TodoView {
             let entry = self.kanban_quick_adds.entry(key.clone()).or_insert_with(|| {
                 let input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.add_task, cx));
                 let key_for_sub = key;
+                cx.subscribe(&input, |this, input, _: &Changed, cx| {
+                    let text = input.read(cx).text().to_owned();
+                    let list_names: Vec<String> = this.lists.iter().map(|l| l.name.clone()).collect();
+                    let parsed = fern_core::parse_quick_add_with(&text, Self::today(), &list_names, this.preferences.recognition);
+                    input.update(cx, |input, cx| input.set_highlights(parsed.spans, cx));
+                })
+                .detach();
                 cx.subscribe(&input, move |this, input, Submitted(text), cx| {
                     if !text.trim().is_empty() {
                         input.update(cx, |input, cx| input.set_text("", cx));
@@ -1044,6 +1051,13 @@ impl TodoView {
     pub(super) fn start_column_add(&mut self, column: usize, target: DropTarget, window: &mut Window, cx: &mut Context<Self>) {
         let strings = i18n::t(cx);
         let input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.add_task, cx));
+        cx.subscribe(&input, |this, input, _: &Changed, cx| {
+            let text = input.read(cx).text().to_owned();
+            let list_names: Vec<String> = this.lists.iter().map(|l| l.name.clone()).collect();
+            let parsed = fern_core::parse_quick_add_with(&text, Self::today(), &list_names, this.preferences.recognition);
+            input.update(cx, |input, cx| input.set_highlights(parsed.spans, cx));
+        })
+        .detach();
         cx.subscribe_in(&input, window, move |this, input, Submitted(text), window, cx| {
             if !text.trim().is_empty() {
                 input.update(cx, |input, cx| input.clear(window, cx));

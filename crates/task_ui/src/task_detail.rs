@@ -3806,6 +3806,9 @@ impl Render for TaskDetail {
                 .justify_center()
                 .child(
                     v_flex()
+                        .w_full()
+                        .min_w_0()
+                        .px_6()
                         .items_center()
                         .gap_3()
                         .child(
@@ -3820,7 +3823,14 @@ impl Render for TaskDetail {
                                 .justify_center()
                                 .child(Icon::new(IconName::SquareCheck).size(IconSize::Large).color(Color::Muted)),
                         )
-                        .child(Label::new(strings.select_task).size(LabelSize::Small).color(Color::Muted)),
+                        .child(
+                            div()
+                                .w_full()
+                                .text_center()
+                                .text_size(px(13.))
+                                .text_color(theme.colors().text_muted)
+                                .child(strings.select_task),
+                        ),
                 );
         };
         let done = task.is_completed();

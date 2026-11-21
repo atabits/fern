@@ -52,7 +52,7 @@ pub(super) fn reload(shared: &Arc<Mutex<Shared>>) {
 }
 
 pub(super) fn shutdown(shared: &Arc<Mutex<Shared>>, stopped_cv: &Arc<Condvar>) {
-    let mut guard = shared.lock().unwrap_or_else(|e| e.into_inner());
+    let guard = shared.lock().unwrap_or_else(|e| e.into_inner());
     let Some(win) = guard.wake_window else { return };
     if guard.stopped {
         return;

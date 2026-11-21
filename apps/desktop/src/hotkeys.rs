@@ -53,10 +53,12 @@ impl Hotkey {
         self as usize
     }
 
+    #[cfg(any(windows, target_os = "macos", test))]
     pub(super) const fn id(self) -> u32 {
         (self as u32) + 1
     }
 
+    #[cfg(any(windows, target_os = "macos", test))]
     pub(super) fn from_id(id: usize) -> Option<Self> {
         Self::ALL.get(id.checked_sub(1)?).copied()
     }

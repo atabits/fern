@@ -2751,9 +2751,16 @@ impl FocusView {
                 )
                 .into_any_element(),
             };
+            let tip = match progress {
+                fern_core::DayProgress::Needless => crate::calendar::format_date(*date, strings),
+                fern_core::DayProgress::AllUndone => format!("{} · {}", crate::calendar::format_date(*date, strings), strings.habit_unachieved),
+                fern_core::DayProgress::Fraction(frac) => format!("{} · {}%", crate::calendar::format_date(*date, strings), (frac * 100.0).round() as u32),
+            };
             v_flex()
+                .id(SharedString::from(format!("stats-habit-week-{date}")))
                 .items_center()
                 .gap_1()
+                .tooltip(Tooltip::text(tip))
                 .child(ring)
                 .child(Label::new(strings.weekdays_short[date.weekday().num_days_from_monday() as usize]).size(LabelSize::XSmall).color(Color::Muted))
         }));

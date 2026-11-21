@@ -28,7 +28,13 @@ impl MatrixView {
                 .py_0p5()
                 .rounded(px(4.))
                 .cursor_pointer()
-                .bg(if on { theme.colors().accent } else { theme.colors().element_hover })
+                .when(on, |el| el.bg(theme.colors().accent).hover(|s| s.opacity(0.9)))
+                .when(!on, |el| {
+                    el.bg(theme.colors().surface_background)
+                        .border_1()
+                        .border_color(theme.colors().border)
+                        .hover(|s| s.bg(theme.colors().element_hover))
+                })
                 .child(Label::new(label).size(LabelSize::XSmall).when(on, |l| l.color(Color::OnAccent)))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     if let Some((_, rule)) = this.editing.as_mut() {
@@ -164,9 +170,16 @@ impl MatrixView {
                 .items_center()
                 .rounded(px(6.))
                 .when(!disabled, |el| el.cursor_pointer())
-                .when(disabled, |el| el.opacity(0.45))
-                .when(primary, |el| el.bg(theme.colors().accent))
-                .when(!primary, |el| el.border_1().border_color(theme.colors().border))
+                .when(disabled, |el| el.opacity(0.45).cursor_default())
+                .when(primary, |el| {
+                    el.bg(theme.colors().accent)
+                        .when(!disabled, |el| el.hover(|s| s.opacity(0.9)))
+                })
+                .when(!primary, |el| {
+                    el.border_1()
+                        .border_color(theme.colors().border)
+                        .when(!disabled, |el| el.hover(|s| s.bg(theme.colors().element_hover)))
+                })
                 .child(Label::new(label).size(LabelSize::Small).when(primary, |label| label.color(Color::OnAccent)))
         };
 
@@ -195,9 +208,14 @@ impl MatrixView {
                         h_flex()
                             .justify_between()
                             .child(Label::new(strings.edit_matrix).size(LabelSize::Large).weight(FontWeight::SEMIBOLD))
-                            .child(IconButton::new("matrix-edit-x", IconName::X).on_click(cx.listener(|this, _, _, cx| {
-                                this.finish_edit(None, cx);
-                            }))),
+                            .child(
+                                IconButton::new("matrix-edit-x", IconName::X)
+                                    .icon_color(Color::Muted)
+                                    .tooltip(Tooltip::text(strings.close))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.finish_edit(None, cx);
+                                    })),
+                            ),
                     )
                     // Name row + emoji picker
                     .child(
@@ -281,11 +299,22 @@ impl MatrixView {
                                 el.child(Label::new(strings.matrix_invalid_name).size(LabelSize::XSmall).color(Color::Error))
                             }),
                     )
-                    .child(row(strings.filter_lists, list_chips))
-                    .child(row(strings.tags, tag_chips))
-                    .child(row(strings.filter_date, date_chips))
-                    .child(row(strings.filter_priority, priority_chips))
-                    .child(row(strings.matrix_kind_label, kind_chips))
+                    .child(
+                        v_scroll(
+                            "matrix-edit-rows",
+                            v_flex()
+                                .id("matrix-edit-rows-inner")
+                                .gap_3()
+                                .child(row(strings.filter_lists, list_chips))
+                                .child(row(strings.tags, tag_chips))
+                                .child(row(strings.filter_date, date_chips))
+                                .child(row(strings.filter_priority, priority_chips))
+                                .child(row(strings.matrix_kind_label, kind_chips)),
+                        )
+                        .min_h_0()
+                        .max_h(px(380.))
+                        .compact(),
+                    )
                     .child(
                         h_flex()
                             .gap_2()
@@ -293,6 +322,10 @@ impl MatrixView {
                             .child(
                                 div()
                                     .id("matrix-restore")
+                                    .px_2()
+                                    .py_1()
+                                    .rounded(px(4.))
+                                    .hover(|s| s.bg(theme.colors().element_hover))
                                     .cursor_pointer()
                                     .child(Label::new(strings.restore).size(LabelSize::Small).color(Color::Accent))
                                     .on_click(cx.listener(|this, _, _, cx| this.finish_edit(Some(false), cx))),

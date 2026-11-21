@@ -26,7 +26,7 @@ use crate::resize::{self, DraggedEdge, Panel};
 use crate::task_detail::{OpenTask, StartFocus, TaskDetail, TaskUpdated};
 use crate::task_menu;
 use crate::task_rows::{self, ClosedRange, DropTarget, GroupBy, Row, Section, SortBy};
-use crate::text_input::{Cancelled, Changed, Mode, Submitted, TextInput};
+use crate::text_input::{Cancelled, Changed, Mode, MultiLinePasted, Submitted, TextInput};
 
 /// The details' width by default and the narrowest its edge drags to; the task list keeps at
 /// least `LIST_MIN_WIDTH`, which also bounds how wide the details get.
@@ -147,6 +147,8 @@ pub struct TodoView {
     search_input: Entity<TextInput>,
     header_menu_open: bool,
     confirm_empty_trash: bool,
+    /// Lines pasted into Quick Add awaiting confirmation for Batch Add Tasks.
+    batch_add_pending: Option<Vec<String>>,
     /// Filters of the Completed and Won't Do views; `None` lists means all lists.
     closed_range: ClosedRange,
     closed_lists: Option<Vec<Option<Id>>>,
@@ -275,9 +277,14 @@ impl TodoView {
         let strings = i18n::t(cx);
         let summary = cx.new(|_| crate::summary_view::SummaryView::new(store.clone()));
         let mini_expanded = store.setting("mini_expanded").ok().flatten().as_deref() == Some("1");
-        let input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.add_task, cx));
+        let input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.add_task, cx).intercept_multiline_paste());
         cx.subscribe_in(&input, window, |this, _, Submitted(text), window, cx| this.submit_new_task(text, window, cx))
             .detach();
+        cx.subscribe(&input, |this, _, MultiLinePasted(lines), cx| {
+            this.batch_add_pending = Some(lines.clone());
+            cx.notify();
+        })
+        .detach();
         // As the user types, the recognized date, tags and list are highlighted and the date is
         // shown at the end of the field, as in the original.
         cx.subscribe(&input, |this, _, _: &Changed, cx| this.update_quick_add_hint(cx)).detach();
@@ -420,6 +427,7 @@ impl TodoView {
             search_input,
             header_menu_open: false,
             confirm_empty_trash: false,
+            batch_add_pending: None,
             closed_range: ClosedRange::All,
             closed_lists: None,
             closed_menu: None,
@@ -1832,6 +1840,7 @@ impl TodoView {
             self.suggestions_open.take().is_some(),
             std::mem::take(&mut self.header_menu_open),
             std::mem::take(&mut self.confirm_empty_trash),
+            self.batch_add_pending.take().is_some(),
             std::mem::take(&mut self.postpone_menu),
             std::mem::take(&mut self.scale_menu_open),
             std::mem::take(&mut self.templates_open),
@@ -2821,6 +2830,38 @@ impl TodoView {
         let result = self.store.empty_trash();
         self.check(result);
         self.reload(cx);
+    }
+
+    fn confirm_batch_add(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(lines) = self.batch_add_pending.take() else {
+            return;
+        };
+        let mut shared_draft = self.add_draft.clone();
+        shared_draft.files.clear();
+        for line in lines {
+            self.add_draft = shared_draft.clone();
+            self.submit_new_task(&line, window, cx);
+        }
+        self.add_draft = Default::default();
+        cx.notify();
+    }
+
+    fn paste_batch_as_one(&mut self, cx: &mut Context<Self>) {
+        let Some(lines) = self.batch_add_pending.take() else {
+            return;
+        };
+        let joined = lines.join(" ");
+        self.input.update(cx, |input, cx| {
+            let existing = input.text().to_owned();
+            let combined = if existing.is_empty() {
+                joined
+            } else {
+                format!("{existing} {joined}")
+            };
+            input.set_text(combined, cx);
+        });
+        self.update_quick_add_hint(cx);
+        cx.notify();
     }
 
     /// Views where new tasks cannot be added.
@@ -4071,6 +4112,123 @@ impl Render for TodoView {
                                                 .hover(|s| s.bg(theme.status().error.opacity(0.9)))
                                                 .child(Label::new(strings.empty_trash).size(LabelSize::Small).color(Color::OnAccent))
                                                 .on_click(cx.listener(|this, _, _, cx| this.empty_trash(cx))),
+                                        ),
+                                ),
+                        ),
+                )
+            })
+            .when_some(self.batch_add_pending.clone(), |el, lines| {
+                let count = lines.len();
+                let preview: Vec<String> = lines.iter().take(5).cloned().collect();
+                let extra = count.saturating_sub(preview.len());
+                let desc = strings.batch_add_tasks_desc.replace("{n}", &count.to_string());
+                let add_label = format!("{} ({count})", strings.add);
+                el.child(
+                    div()
+                        .id("batch-add-backdrop")
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .bg(gpui::black().opacity(0.45))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.batch_add_pending = None;
+                                cx.notify();
+                            }),
+                        )
+                        .child(
+                            v_flex()
+                                .id("batch-add-modal")
+                                .w(px(380.))
+                                .p_4()
+                                .gap_3()
+                                .rounded(px(10.))
+                                .bg(theme.colors().elevated_surface_background)
+                                .border_1()
+                                .border_color(theme.colors().border)
+                                .shadow_lg()
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .child(Label::new(strings.batch_add_tasks).size(LabelSize::Large).weight(FontWeight::SEMIBOLD))
+                                .child(Label::new(desc).size(LabelSize::Small).color(Color::Muted))
+                                .child(
+                                    v_flex()
+                                        .p_2()
+                                        .gap_1()
+                                        .rounded(px(6.))
+                                        .bg(theme.colors().surface_background)
+                                        .border_1()
+                                        .border_color(theme.colors().border_variant)
+                                        .children(preview.into_iter().map(|line| {
+                                            h_flex()
+                                                .gap_1p5()
+                                                .child(div().w(px(4.)).h(px(4.)).rounded_full().bg(theme.colors().accent))
+                                                .child(Label::new(line).size(LabelSize::XSmall).truncate())
+                                        }))
+                                        .when(extra > 0, |list| {
+                                            list.child(
+                                                Label::new(format!("+{extra}"))
+                                                    .size(LabelSize::XSmall)
+                                                    .color(Color::Muted),
+                                            )
+                                        }),
+                                )
+                                .child(
+                                    h_flex()
+                                        .pt_1()
+                                        .gap_2()
+                                        .justify_end()
+                                        .child(
+                                            div()
+                                                .id("batch-add-cancel")
+                                                .debug_selector(|| "batch-add-cancel".to_owned())
+                                                .px_3()
+                                                .h(px(30.))
+                                                .flex()
+                                                .items_center()
+                                                .rounded(px(6.))
+                                                .border_1()
+                                                .border_color(theme.colors().border)
+                                                .cursor_pointer()
+                                                .hover(|s| s.bg(theme.colors().element_hover))
+                                                .child(Label::new(strings.cancel).size(LabelSize::Small))
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.batch_add_pending = None;
+                                                    cx.notify();
+                                                })),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("batch-add-as-one")
+                                                .debug_selector(|| "batch-add-as-one".to_owned())
+                                                .px_3()
+                                                .h(px(30.))
+                                                .flex()
+                                                .items_center()
+                                                .rounded(px(6.))
+                                                .border_1()
+                                                .border_color(theme.colors().border)
+                                                .cursor_pointer()
+                                                .hover(|s| s.bg(theme.colors().element_hover))
+                                                .child(Label::new(strings.batch_add_as_one).size(LabelSize::Small))
+                                                .on_click(cx.listener(|this, _, _, cx| this.paste_batch_as_one(cx))),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("batch-add-confirm")
+                                                .debug_selector(|| "batch-add-confirm".to_owned())
+                                                .px_3()
+                                                .h(px(30.))
+                                                .flex()
+                                                .items_center()
+                                                .rounded(px(6.))
+                                                .bg(theme.colors().accent)
+                                                .cursor_pointer()
+                                                .hover(|s| s.bg(theme.colors().accent.opacity(0.9)))
+                                                .child(Label::new(add_label).size(LabelSize::Small).color(Color::OnAccent))
+                                                .on_click(cx.listener(|this, _, window, cx| this.confirm_batch_add(window, cx))),
                                         ),
                                 ),
                         ),

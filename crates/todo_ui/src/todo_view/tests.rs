@@ -1500,3 +1500,36 @@ fn empty_trash_requires_confirmation_before_purging(cx: &mut TestAppContext) {
     assert!(cx.debug_bounds("confirm-empty-trash-modal").is_none());
     assert!(store.task(task.id).unwrap().is_none(), "confirming permanently purges trash");
 }
+
+#[gpui::test]
+fn batch_add_multiline_paste_creates_multiple_tasks(cx: &mut gpui::TestAppContext) {
+    let store = Rc::new(Store::open_in_memory().unwrap());
+    cx.update(|cx| {
+        theme::init(cx);
+        cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+        crate::keymap::load_default(&assets::Assets, cx).unwrap();
+    });
+    let (view, cx) = cx.add_window_view(|window, cx| TodoView::new(store.clone(), window, cx));
+    cx.simulate_resize(gpui::size(px(1200.), px(700.)));
+    cx.run_until_parked();
+
+    cx.update(|window, cx| {
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string("Buy milk\nCall dentist\n\nSend report".into()));
+        let input = view.read(cx).input.clone();
+        window.focus(&input.focus_handle(cx), cx);
+        window.dispatch_action(Box::new(crate::text_input::Paste), cx);
+    });
+    cx.run_until_parked();
+
+    assert!(cx.debug_bounds("batch-add-confirm").is_some(), "multi-line paste opens batch add modal");
+    let confirm = cx.debug_bounds("batch-add-confirm").unwrap().center();
+    cx.simulate_click(confirm, Modifiers::default());
+    cx.run_until_parked();
+
+    assert!(cx.debug_bounds("batch-add-confirm").is_none());
+    let titles: Vec<String> = store.tasks().unwrap().into_iter().map(|t| t.title).collect();
+    assert_eq!(titles.len(), 3);
+    assert!(titles.contains(&"Buy milk".to_owned()));
+    assert!(titles.contains(&"Call dentist".to_owned()));
+    assert!(titles.contains(&"Send report".to_owned()));
+}

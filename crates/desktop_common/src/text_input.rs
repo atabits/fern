@@ -55,8 +55,12 @@ impl EventEmitter<Submitted> for TextInput {}
 /// Escape was pressed.
 pub struct Cancelled;
 
+/// Multi-line text (2+ non-empty lines) was pasted into a single-line input that opted in.
+pub struct MultiLinePasted(pub Vec<String>);
+
 impl EventEmitter<Changed> for TextInput {}
 impl EventEmitter<Cancelled> for TextInput {}
+impl EventEmitter<MultiLinePasted> for TextInput {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
@@ -93,6 +97,9 @@ pub struct TextInput {
     /// A password field: the text shows as "*", one per byte so that every offset stays the
     /// same, and it cannot be copied.
     masked: bool,
+    /// When true on a single-line input, pasting 2+ non-empty lines emits [`MultiLinePasted`]
+    /// instead of flattening newlines into spaces (used for Batch Add Tasks).
+    intercept_multiline_paste: bool,
     /// Hides the touch keyboard this input opened once it loses focus.
     keyboard_blur: Option<Subscription>,
 }
@@ -182,6 +189,7 @@ impl TextInput {
             cancellable: true,
             highlights: Vec::new(),
             masked: false,
+            intercept_multiline_paste: false,
             keyboard_blur: None,
         }
     }
@@ -189,6 +197,12 @@ impl TextInput {
     /// Lets the containing view handle Escape when this field has no edit to cancel.
     pub fn without_cancel(mut self) -> Self {
         self.cancellable = false;
+        self
+    }
+
+    /// Emits [`MultiLinePasted`] instead of flattening newlines when 2+ lines are pasted.
+    pub fn intercept_multiline_paste(mut self) -> Self {
+        self.intercept_multiline_paste = true;
         self
     }
 
@@ -432,6 +446,18 @@ impl TextInput {
 
     fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+            if self.mode == Mode::SingleLine && self.intercept_multiline_paste {
+                let lines: Vec<String> = text
+                    .lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty())
+                    .map(str::to_owned)
+                    .collect();
+                if lines.len() >= 2 {
+                    cx.emit(MultiLinePasted(lines));
+                    return;
+                }
+            }
             let text = if self.mode == Mode::MultiLine {
                 text
             } else {

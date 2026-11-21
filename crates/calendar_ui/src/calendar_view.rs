@@ -2380,9 +2380,16 @@ impl CalendarView {
                         .when(date != today && self.selected_day == Some(date), |el| {
                             el.bg(theme.colors().element_selected)
                         })
-                        .on_click(cx.listener(move |this, _, _, cx| {
+                        .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
                             cx.stop_propagation();
-                            this.select_day(date, cx);
+                            if event.click_count() >= 2 {
+                                this.anchor = date;
+                                this.month = calendar::month_start(date);
+                                this.selected_day = Some(date);
+                                this.set_mode(CalendarMode::Day, cx);
+                            } else {
+                                this.select_day(date, cx);
+                            }
                         }))
                         // As in the original, the days of the months around are muted.
                         .child(Label::new(number).centered().weight(FontWeight::SEMIBOLD).color(

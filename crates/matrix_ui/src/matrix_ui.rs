@@ -210,6 +210,7 @@ pub struct MatrixView {
     cache: [QuadrantCache; 4],
     /// Collapsed group keys `(quadrant, label)` (and `(quadrant, "__completed__")` for Completed).
     collapsed_groups: HashSet<(usize, String)>,
+    expanded_parents: HashSet<(usize, Id)>,
     /// Currently selected task for keyboard navigation.
     selected_task: Option<Id>,
     /// Floating task detail card (lazily initialized on first task click so `new` needs no `Window`).
@@ -265,6 +266,7 @@ impl MatrixView {
             manual_order: std::array::from_fn(|_| Vec::new()),
             cache: std::array::from_fn(|_| QuadrantCache::default()),
             collapsed_groups: HashSet::new(),
+            expanded_parents: HashSet::new(),
             selected_task: None,
             detail: None,
             detail_task: None,
@@ -1043,7 +1045,38 @@ impl MatrixView {
         }
     }
 
-    fn render_task(&self, task: &Task, quadrant: usize, today: NaiveDate, list_name: &SharedString, cx: &mut Context<Self>) -> AnyElement {
+    fn child_subtasks(&self, parent_id: Id) -> Vec<&Task> {
+        self.tasks
+            .iter()
+            .filter(|t| {
+                t.parent_id == Some(parent_id)
+                    && !t.is_deleted()
+                    && !t.is_wont_do()
+                    && (self.show_completed || !t.is_completed())
+            })
+            .collect()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push_task_tree(
+        &self,
+        task: &Task,
+        quadrant: usize,
+        today: NaiveDate,
+        list_name: &impl Fn(Option<Id>) -> SharedString,
+        depth: usize,
+        out: &mut Vec<AnyElement>,
+        cx: &mut Context<Self>,
+    ) {
+        out.push(self.render_task(task, quadrant, today, &list_name(task.list_id), depth, cx));
+        if !self.show_subtasks && depth < 4 && self.expanded_parents.contains(&(quadrant, task.id)) {
+            for child in self.child_subtasks(task.id) {
+                self.push_task_tree(child, quadrant, today, list_name, depth + 1, out, cx);
+            }
+        }
+    }
+
+    fn render_task(&self, task: &Task, quadrant: usize, today: NaiveDate, list_name: &SharedString, depth: usize, cx: &mut Context<Self>) -> AnyElement {
         let strings = i18n::t(cx);
         let theme = cx.theme().clone();
         let id = task.id;
@@ -1059,6 +1092,8 @@ impl MatrixView {
             .map(|date| task_rows::row_due_label(date, task.due_time, today, strings, countdown_dates));
         let has_notes = !is_note && !task.notes.trim().is_empty();
         let has_location = task.location.as_deref().is_some_and(|l| !l.trim().is_empty());
+        let has_children = !self.show_subtasks && !self.child_subtasks(id).is_empty();
+        let expanded = has_children && self.expanded_parents.contains(&(quadrant, id));
         let has_subtasks = task.checklist.is_some() || self.tasks.iter().any(|t| t.parent_id == Some(id));
         let has_reminder = !task.reminders.is_empty();
         let dragged = DraggedTask { id, title: task.title.clone().into() };
@@ -1070,8 +1105,9 @@ impl MatrixView {
             .debug_selector(move || format!("matrix-task-{id}"))
             .h(px(40.))
             .flex_none()
-            .gap(px(10.))
-            .px_2()
+            .gap(px(8.))
+            .pl(px(8. + depth as f32 * 22.))
+            .pr_2()
             .rounded(px(6.))
             .cursor_pointer()
             .when(selected, |el| el.bg(theme.colors().element_selected))
@@ -1100,6 +1136,31 @@ impl MatrixView {
                     cx.notify();
                 }),
             )
+            .when(has_children, |el| {
+                el.child(
+                    div()
+                        .id(SharedString::from(format!("matrix-expand-q{quadrant}-{id}")))
+                        .w(px(16.))
+                        .h(px(16.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(4.))
+                        .hover(|s| s.bg(theme.colors().element_hover))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            if !this.expanded_parents.remove(&(quadrant, id)) {
+                                this.expanded_parents.insert((quadrant, id));
+                            }
+                            cx.notify();
+                        }))
+                        .child(
+                            Icon::new(if expanded { IconName::ChevronDown } else { IconName::ChevronRight })
+                                .size(IconSize::XSmall)
+                                .color(Color::Muted),
+                        ),
+                )
+            })
             .child(if is_note {
                 div()
                     .w(px(16.))
@@ -1369,7 +1430,7 @@ impl MatrixView {
             }
             if !collapsed {
                 for task in tasks {
-                    content.push(self.render_task(task, quadrant, today, &list_name(task.list_id), cx));
+                    self.push_task_tree(task, quadrant, today, &list_name, 0, &mut content, cx);
                 }
             }
         }
@@ -1408,7 +1469,7 @@ impl MatrixView {
             );
             if !collapsed {
                 for task in &cache.completed {
-                    content.push(self.render_task(task, quadrant, today, &list_name(task.list_id), cx));
+                    self.push_task_tree(task, quadrant, today, &list_name, 0, &mut content, cx);
                 }
             }
         }

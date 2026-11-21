@@ -61,6 +61,8 @@ pub struct QuickAddWindow {
     picked_date: Option<NaiveDate>,
     parsed_due: Option<(NaiveDate, Option<NaiveTime>)>,
     parsed_repeat: bool,
+    parsed_tags: Vec<String>,
+    parsed_priority: Option<Priority>,
     batch_lines: Vec<String>,
     priority: Priority,
     /// `None` means Inbox; `Some(id)` targets a specific list.
@@ -110,6 +112,8 @@ impl QuickAddWindow {
             picked_date: None,
             parsed_due: None,
             parsed_repeat: false,
+            parsed_tags: Vec::new(),
+            parsed_priority: None,
             batch_lines: Vec::new(),
             priority: Priority::None,
             list_id: None,
@@ -123,6 +127,8 @@ impl QuickAddWindow {
         let parsed = fern_core::parse_quick_add_with(&text, today, &list_names, self.recognition);
         self.parsed_due = parsed.due_date.map(|d| (d, parsed.due_time));
         self.parsed_repeat = parsed.repeat.is_some();
+        self.parsed_tags = parsed.tags;
+        self.parsed_priority = parsed.priority.filter(|p| *p != Priority::None);
         self.input.update(cx, |input, cx| input.set_highlights(parsed.spans, cx));
     }
 
@@ -234,7 +240,18 @@ impl Render for QuickAddWindow {
             ),
         };
 
-        let priority_color = task_rows::priority_color(self.priority, &theme).unwrap_or(theme.colors().icon_muted);
+        let effective_priority = if self.priority != Priority::None {
+            self.priority
+        } else {
+            self.parsed_priority.unwrap_or(Priority::None)
+        };
+        let priority_color = task_rows::priority_color(effective_priority, &theme).unwrap_or(theme.colors().icon_muted);
+        let priority_tip = match effective_priority {
+            Priority::High => strings.priority_high,
+            Priority::Medium => strings.priority_medium,
+            Priority::Low => strings.priority_low,
+            Priority::None => strings.filter_priority,
+        };
 
         v_flex()
             .size_full()
@@ -272,6 +289,15 @@ impl Render for QuickAddWindow {
                                 .child(Label::new(label).size(LabelSize::XSmall).color(Color::Accent)),
                         )
                     })
+                    .children(self.parsed_tags.iter().take(3).map(|tag| {
+                        h_flex()
+                            .flex_none()
+                            .px_1p5()
+                            .h(px(22.))
+                            .rounded(px(5.))
+                            .bg(theme.colors().element_hover)
+                            .child(Label::new(format!("#{tag}")).size(LabelSize::XSmall).color(Color::Muted))
+                    }))
                     .when(batch_count > 0, |el| {
                         el.child(
                             h_flex()
@@ -322,7 +348,7 @@ impl Render for QuickAddWindow {
                             .size(px(24.))
                             .icon_size(IconSize::Small)
                             .icon_color(priority_color)
-                            .tooltip(Tooltip::text(strings.filter_priority))
+                            .tooltip(Tooltip::text(priority_tip))
                             .on_click(cx.listener(|this, _, _, cx| this.cycle_priority(cx))),
                     )
                     .child(

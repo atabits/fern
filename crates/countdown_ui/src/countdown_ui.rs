@@ -214,6 +214,8 @@ pub struct CountdownView {
     draft: Option<Draft>,
     /// The card whose "…" menu is open.
     card_menu: Option<Id>,
+    /// Countdown pending deletion confirmation: (id, name).
+    confirm_delete: Option<(Id, String)>,
     /// The "+" menu of kinds, as in the original.
     add_menu: bool,
     /// The title's "Countdown ▾" menu (Active / Archived) and the header's "…" menu, while open.
@@ -255,6 +257,7 @@ impl CountdownView {
             days_only: HashSet::new(),
             draft: None,
             card_menu: None,
+            confirm_delete: None,
             add_menu: false,
             title_menu: false,
             header_menu: false,
@@ -670,15 +673,17 @@ impl CountdownView {
                                             this.reload(cx);
                                         }))
                                 })
-                                .child(
+                                .child({
+                                    let name = countdown.name.clone();
                                     ListItem::new("countdown-delete")
-                                        .start_slot(Icon::new(IconName::Trash).color(Color::Icon))
-                                        .child(Label::new(strings.delete))
+                                        .start_slot(Icon::new(IconName::Trash).color(Color::Error))
+                                        .child(Label::new(strings.delete).color(Color::Error))
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             this.card_menu = None;
-                                            this.delete(id, cx)
-                                        })),
-                                )
+                                            this.confirm_delete = Some((id, name.clone()));
+                                            cx.notify();
+                                        }))
+                                })
                                 .into_any_element(),
                         ))
                     }),
@@ -1419,6 +1424,7 @@ impl CountdownView {
             || std::mem::take(&mut self.add_menu)
             || std::mem::take(&mut self.header_menu)
             || self.card_menu.take().is_some()
+            || self.confirm_delete.take().is_some()
             || self.draft.take().is_some()
         {
             cx.notify();
@@ -1623,6 +1629,84 @@ impl Render for CountdownView {
                 .min_h_0(),
             )
             .children(modal)
+            .when_some(self.confirm_delete.clone(), |el, (id, name)| {
+                el.child(
+                    div()
+                        .id("countdown-delete-backdrop")
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .bg(gpui::black().opacity(0.45))
+                        .on_mouse_down(
+                            gpui::MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.confirm_delete = None;
+                                cx.notify();
+                            }),
+                        )
+                        .child(
+                            v_flex()
+                                .id("countdown-delete-modal")
+                                .debug_selector(|| "countdown-delete-modal".to_owned())
+                                .w(px(340.))
+                                .p_4()
+                                .gap_3()
+                                .rounded(px(10.))
+                                .bg(theme.colors().elevated_surface_background)
+                                .border_1()
+                                .border_color(theme.colors().border)
+                                .shadow_lg()
+                                .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .child(Label::new(strings.confirm_delete_countdown).size(LabelSize::Large).weight(FontWeight::SEMIBOLD))
+                                .child(Label::new(name).size(LabelSize::Small).color(Color::Muted).truncate())
+                                .child(
+                                    h_flex()
+                                        .pt_1()
+                                        .gap_2()
+                                        .justify_end()
+                                        .child(
+                                            div()
+                                                .id("countdown-delete-cancel")
+                                                .debug_selector(|| "countdown-delete-cancel".to_owned())
+                                                .px_3()
+                                                .h(px(30.))
+                                                .flex()
+                                                .items_center()
+                                                .rounded(px(6.))
+                                                .border_1()
+                                                .border_color(theme.colors().border)
+                                                .cursor_pointer()
+                                                .hover(|s| s.bg(theme.colors().element_hover))
+                                                .child(Label::new(strings.cancel).size(LabelSize::Small))
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.confirm_delete = None;
+                                                    cx.notify();
+                                                })),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("countdown-delete-confirm")
+                                                .debug_selector(|| "countdown-delete-confirm".to_owned())
+                                                .px_3()
+                                                .h(px(30.))
+                                                .flex()
+                                                .items_center()
+                                                .rounded(px(6.))
+                                                .bg(theme.status().error)
+                                                .cursor_pointer()
+                                                .hover(|s| s.bg(theme.status().error.opacity(0.9)))
+                                                .child(Label::new(strings.delete).size(LabelSize::Small).color(Color::OnAccent))
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.confirm_delete = None;
+                                                    this.delete(id, cx);
+                                                })),
+                                        ),
+                                ),
+                        ),
+                )
+            })
     }
 }
 

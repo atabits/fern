@@ -394,6 +394,7 @@ pub struct Strings {
     pub countdown_days_since: &'static str,
     pub countdown_switch_hint: &'static str,
     pub countdown_empty: &'static str,
+    pub confirm_delete_countdown: &'static str,
     /// Unit letters for years, months, days in countdown cards.
     pub unit_letters: [&'static str; 3],
     /// A countdown's date under its numbers, as a `task_rows::format_day` template; `None` for
@@ -1399,6 +1400,7 @@ pub static EN: Strings = Strings {
     countdown_days_since: "Days since",
     countdown_switch_hint: "Tap the date to switch formats.",
     countdown_empty: "No countdowns yet",
+    confirm_delete_countdown: "Delete this countdown?",
     unit_letters: ["Y", "M", "D"],
     countdown_date: None,
     dotted_dates: false,
@@ -2364,6 +2366,7 @@ pub static ZH_CN: Strings = Strings {
     countdown_days_since: "已过去",
     countdown_switch_hint: "点击日期切换显示格式",
     countdown_empty: "暂无倒数日",
+    confirm_delete_countdown: "确定要删除这个倒数日吗？",
     unit_letters: ["年", "月", "日"],
     countdown_date: None,
     dotted_dates: false,
@@ -3325,6 +3328,7 @@ pub static RU: Strings = Strings {
     countdown_days_since: "Дней с",
     countdown_switch_hint: "Нажмите на дату, чтобы сменить формат.",
     countdown_empty: "Пока нет отсчётов",
+    confirm_delete_countdown: "Удалить этот обратный отсчёт?",
     unit_letters: ["л", "мес", "д"],
     // As the Russian original: "Дней до 1 янв 2027 г.".
     countdown_date: Some("{d} {mon} {yyyy} г."),

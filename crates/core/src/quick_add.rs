@@ -191,6 +191,21 @@ fn parse_repeat(words: &[String]) -> Option<(Recurrence, Option<Weekday>, usize)
     if let Some(frequency) = single(&words[0]) {
         return Some((Recurrence::new(frequency, 1), None, 1));
     }
+    if matches!(words[0].as_str(), "biweekly" | "fortnightly" | "每两周") {
+        return Some((Recurrence::new(Frequency::Weekly, 2), None, 1));
+    }
+    if words[0] == "每周末" {
+        let mut r = Recurrence::new(Frequency::Weekly, 1);
+        r.weekdays = 0b0110_0000;
+        return Some((r, Some(Weekday::Sat), 1));
+    }
+    if let Some(rest) = words[0].strip_prefix("每")
+        && let Some(weekday) = parse_weekday(rest)
+    {
+        let mut r = Recurrence::new(Frequency::Weekly, 1);
+        r.weekdays = 1u8 << weekday.num_days_from_monday();
+        return Some((r, Some(weekday), 1));
+    }
     if matches!(words[0].as_str(), "weekdays" | "workdays" | "工作日") {
         let mut r = Recurrence::new(Frequency::Weekly, 1);
         r.weekdays = 0b0001_1111;
@@ -201,6 +216,11 @@ fn parse_repeat(words: &[String]) -> Option<(Recurrence, Option<Weekday>, usize)
         r.weekdays = 0b0001_1111;
         return Some((r, None, 2));
     }
+    if words[0] == "по" && words.len() >= 2 && matches!(words[1].as_str(), "выходным" | "выходные") {
+        let mut r = Recurrence::new(Frequency::Weekly, 1);
+        r.weekdays = 0b0110_0000;
+        return Some((r, Some(Weekday::Sat), 2));
+    }
     if !matches!(words[0].as_str(), "every" | "каждый" | "каждую" | "каждое" | "каждые") || words.len() < 2 {
         return None;
     }
@@ -210,15 +230,24 @@ fn parse_repeat(words: &[String]) -> Option<(Recurrence, Option<Weekday>, usize)
         let len = if words.len() >= 3 && matches!(words[2].as_str(), "день" | "day") { 3 } else { 2 };
         return Some((r, None, len));
     }
+    if matches!(words[1].as_str(), "weekend" | "выходные") {
+        let mut r = Recurrence::new(Frequency::Weekly, 1);
+        r.weekdays = 0b0110_0000;
+        return Some((r, Some(Weekday::Sat), 2));
+    }
     if let Some(weekday) = parse_weekday(&words[1]) {
         let mut r = Recurrence::new(Frequency::Weekly, 1);
         r.weekdays = 1u8 << weekday.num_days_from_monday();
         return Some((r, Some(weekday), 2));
     }
-    let (interval, unit, len) = match words[1].parse::<u32>() {
-        Ok(n) if words.len() >= 3 => (n, words[2].as_str(), 3),
-        Ok(_) => return None,
-        Err(_) => (1, words[1].as_str(), 2),
+    let (interval, unit, len) = if words[1] == "other" && words.len() >= 3 {
+        (2, words[2].as_str(), 3)
+    } else {
+        match words[1].parse::<u32>() {
+            Ok(n) if words.len() >= 3 => (n, words[2].as_str(), 3),
+            Ok(_) => return None,
+            Err(_) => (1, words[1].as_str(), 2),
+        }
     };
     let frequency = if unit.starts_with("day") || unit.starts_with("дн") || unit.starts_with("ден") {
         Frequency::Daily
@@ -693,5 +722,28 @@ mod tests {
         assert_eq!(parse_quick_add("汇报 3天后", today(), &[]).due_date, Some(d(2026, 10, 21)));
         assert_eq!(parse_quick_add("复盘 2周后", today(), &[]).due_date, Some(d(2026, 11, 1)));
         assert_eq!(parse_quick_add("体检 1个月后", today(), &[]).due_date, Some(d(2026, 11, 18)));
+    }
+
+    #[test]
+    fn recognizes_extended_repeat_phrases() {
+        let p = parse_quick_add("Water plants every other day", today(), &[]);
+        assert_eq!(p.title, "Water plants");
+        assert_eq!(p.repeat, Some(Recurrence::new(Frequency::Daily, 2)));
+
+        let p = parse_quick_add("Payroll biweekly", today(), &[]);
+        assert_eq!(p.title, "Payroll");
+        assert_eq!(p.repeat, Some(Recurrence::new(Frequency::Weekly, 2)));
+
+        let p = parse_quick_add("Clean house every weekend", today(), &[]);
+        assert_eq!(p.title, "Clean house");
+        assert_eq!(p.repeat.as_ref().map(|r| (r.frequency, r.weekdays)), Some((Frequency::Weekly, 0b0110_0000)));
+
+        let p = parse_quick_add("Уборка по выходным", today(), &[]);
+        assert_eq!(p.title, "Уборка");
+        assert_eq!(p.repeat.as_ref().map(|r| r.weekdays), Some(0b0110_0000));
+
+        let p = parse_quick_add("周会 每周一", today(), &[]);
+        assert_eq!(p.title, "周会");
+        assert_eq!(p.repeat.as_ref().map(|r| (r.frequency, r.weekdays)), Some((Frequency::Weekly, 1 << 0)));
     }
 }

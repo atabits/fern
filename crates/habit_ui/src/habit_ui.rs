@@ -1701,11 +1701,12 @@ impl Render for HabitView {
                                 .gap_1()
                                 .rounded_full()
                                 .bg(theme.colors().accent.opacity(0.16))
-                                .child(Label::new(day.format("%b %d").to_string()).size(LabelSize::XSmall).color(Color::Accent))
+                                .child(Label::new(calendar::short_date(day, strings)).size(LabelSize::XSmall).color(Color::Accent))
                                 .child(
                                     div()
                                         .id("habit-date-chip-clear")
                                         .cursor_pointer()
+                                        .tooltip(Tooltip::text(strings.clear))
                                         .child(Icon::new(IconName::X).size(IconSize::XSmall).color(Color::Accent))
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             this.selected_date = None;
@@ -1721,6 +1722,7 @@ impl Render for HabitView {
                     )
                     .child(
                         IconButton::new("habit-add", IconName::Plus)
+                            .tooltip(Tooltip::text(strings.habit_add_title))
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.open_create_modal(HabitSection::Others, window, cx);
                             })),
@@ -1728,12 +1730,14 @@ impl Render for HabitView {
                     .child(
                         div()
                             .relative()
-                            .child(IconButton::new("habit-more", IconName::Ellipsis).on_click(cx.listener(
-                                |this, _, _, cx| {
-                                    this.header_more = Some(HeaderMore::Menu);
-                                    cx.notify();
-                                },
-                            )))
+                            .child(
+                                IconButton::new("habit-more", IconName::Ellipsis)
+                                    .tooltip(Tooltip::text(strings.more))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.header_more = Some(HeaderMore::Menu);
+                                        cx.notify();
+                                    })),
+                            )
                             .when_some(self.header_more, |el, more| {
                                 el.child(PopoverAttachment::new(Placement::BelowRight, self.render_header_more(more, cx)))
                             }),
@@ -1751,14 +1755,53 @@ impl Render for HabitView {
                         .px(px(22.))
                         .pb_6()
                         .when(sections_ui.is_empty(), |el| {
-                            el.child(div().pt_8().child(
-                                Label::new(if self.show_archived {
-                                    strings.habit_no_archived
-                                } else {
-                                    strings.habit_empty
-                                })
-                                .color(Color::Muted),
-                            ))
+                            el.child(
+                                v_flex()
+                                    .w_full()
+                                    .py(px(56.))
+                                    .items_center()
+                                    .justify_center()
+                                    .gap_3()
+                                    .child(
+                                        div()
+                                            .size(px(52.))
+                                            .rounded_full()
+                                            .bg(theme.colors().surface_background)
+                                            .border_1()
+                                            .border_color(theme.colors().border_variant)
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .child(Icon::new(IconName::FernHabit).size(IconSize::Large).color(Color::Muted)),
+                                    )
+                                    .child(
+                                        Label::new(if self.show_archived {
+                                            strings.habit_no_archived
+                                        } else {
+                                            strings.habit_empty
+                                        })
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted),
+                                    )
+                                    .when(!self.show_archived && self.selected_date.is_none(), |col| {
+                                        col.child(
+                                            h_flex()
+                                                .id("habit-empty-add")
+                                                .h(px(32.))
+                                                .px_3p5()
+                                                .gap_1p5()
+                                                .rounded(px(6.))
+                                                .bg(theme.colors().accent)
+                                                .hover(|s| s.opacity(0.9))
+                                                .cursor_pointer()
+                                                .child(Icon::new(IconName::Plus).size(IconSize::Small).color(Color::IconOnAccent))
+                                                .child(Label::new(strings.habit_add_title).size(LabelSize::Small).color(Color::OnAccent))
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    this.open_create_modal(HabitSection::Others, window, cx);
+                                                })),
+                                        )
+                                    }),
+                            )
                         })
                         .child(v_flex().gap_3().children(sections_ui)),
                 )
@@ -1779,7 +1822,24 @@ impl Render for HabitView {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .child(Label::new(strings.habit_select).color(Color::Muted))
+                    .child(
+                        v_flex()
+                            .items_center()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .size(px(52.))
+                                    .rounded_full()
+                                    .bg(theme.colors().surface_background)
+                                    .border_1()
+                                    .border_color(theme.colors().border_variant)
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(Icon::new(IconName::FernHabit).size(IconSize::Large).color(Color::Muted)),
+                            )
+                            .child(Label::new(strings.habit_select).size(LabelSize::Small).color(Color::Muted)),
+                    )
                     .into_any_element(),
             })
             .child(resize::handle(

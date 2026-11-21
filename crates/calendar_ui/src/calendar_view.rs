@@ -3020,6 +3020,24 @@ impl CalendarView {
                                     .bg(tint.opacity(0.12))
                                     .hover(|s| s.bg(tint.opacity(0.2)))
                                     .cursor_pointer()
+                                    .when(!countdown, |el| {
+                                        el.child(
+                                            div()
+                                                .flex_none()
+                                                .flex()
+                                                .items_center()
+                                                .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                                .child(
+                                                    Checkbox::new(SharedString::from(format!("agenda-check-{date}-{i}")))
+                                                        .size(px(14.))
+                                                        .tint(task_rows::priority_color(item.priority, &theme))
+                                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                                            cx.stop_propagation();
+                                                            this.toggle_task_completed(id, true, cx);
+                                                        })),
+                                                ),
+                                        )
+                                    })
                                     .child(div().flex_1().min_w_0().child(Label::new(if item.title.trim().is_empty() { strings.untitled.to_owned() } else { item.title }).truncate()))
                                     .on_click(cx.listener(move |this, _, window, cx| {
                                         if countdown {

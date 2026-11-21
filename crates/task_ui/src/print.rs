@@ -18,39 +18,70 @@ h1{font-size:22px}ul{list-style:none;padding:0}li{padding:6px 0;border-bottom:1p
 .done{color:#999;text-decoration:line-through}.notes{white-space:pre-wrap;color:#444}\
 .sub{margin-left:1.6em}";
 
-fn task_line(task: &Task, today: NaiveDate, strings: &Strings, nested: bool) -> String {
+fn task_line(task: &Task, today: NaiveDate, strings: &Strings, depth: usize) -> String {
     let done = task.is_completed();
+    let wont_do = task.is_wont_do();
+    let is_note = task.kind == fern_core::Kind::Note;
     let mut meta = Vec::new();
     if let Some(date) = task.due_date {
         meta.push(task_rows::due_label(date, task.due_time, today, strings).0);
     }
+    match task.priority {
+        fern_core::Priority::High => meta.push(strings.priority_high.to_owned()),
+        fern_core::Priority::Medium => meta.push(strings.priority_medium.to_owned()),
+        fern_core::Priority::Low => meta.push(strings.priority_low.to_owned()),
+        fern_core::Priority::None => {}
+    }
     meta.extend(task.tags.iter().map(|t| format!("#{t}")));
+    let indent = if depth == 0 {
+        String::new()
+    } else {
+        format!(" style=\"margin-left:{:.1}em\"", depth as f32 * 1.6)
+    };
+    let box_glyph = if is_note {
+        "•"
+    } else if wont_do {
+        "☒"
+    } else if done {
+        "☑"
+    } else {
+        "☐"
+    };
+    let strike = done || wont_do;
     format!(
         "<li{}><span class=\"box\">{}</span><span{}>{}</span>{}</li>",
-        if nested { " class=\"sub\"" } else { "" },
-        if done { "☑" } else { "☐" },
-        if done { " class=\"done\"" } else { "" },
+        indent,
+        box_glyph,
+        if strike { " class=\"done\"" } else { "" },
         escape(if task.title.is_empty() { strings.untitled } else { &task.title }),
         if meta.is_empty() { String::new() } else { format!("<span class=\"meta\">{}</span>", escape(&meta.join(" · "))) },
     )
 }
 
-/// A list page: its title and tasks, subtasks indented under their parents.
+fn push_tree(parent_id: fern_core::Id, tasks: &[Task], today: NaiveDate, strings: &Strings, depth: usize, body: &mut String) {
+    if depth > 8 {
+        return;
+    }
+    for sub in tasks.iter().filter(|t| t.parent_id == Some(parent_id)) {
+        body.push_str(&task_line(sub, today, strings, depth));
+        push_tree(sub.id, tasks, today, strings, depth + 1, body);
+    }
+}
+
+/// A list page: its title and tasks, subtasks indented recursively under their parents.
 pub fn list_html(title: &str, tasks: &[Task], today: NaiveDate, strings: &Strings) -> String {
     let ids: std::collections::HashSet<_> = tasks.iter().map(|t| t.id).collect();
     let mut body = String::new();
     for task in tasks.iter().filter(|t| t.parent_id.is_none_or(|p| !ids.contains(&p))) {
-        body.push_str(&task_line(task, today, strings, false));
-        for sub in tasks.iter().filter(|t| t.parent_id == Some(task.id)) {
-            body.push_str(&task_line(sub, today, strings, true));
-        }
+        body.push_str(&task_line(task, today, strings, 0));
+        push_tree(task.id, tasks, today, strings, 1, &mut body);
     }
     page(title, &format!("<ul>{body}</ul>"))
 }
 
 /// A task page: title, date and tags, notes and checklist.
 pub fn task_html(task: &Task, checklist: &[ChecklistItem], today: NaiveDate, strings: &Strings) -> String {
-    let mut body = format!("<ul>{}</ul>", task_line(task, today, strings, false));
+    let mut body = format!("<ul>{}</ul>", task_line(task, today, strings, 0));
     if !task.notes.trim().is_empty() {
         body.push_str(&format!("<p class=\"notes\">{}</p>", escape(&task.notes)));
     }
@@ -66,7 +97,8 @@ pub fn task_html(task: &Task, checklist: &[ChecklistItem], today: NaiveDate, str
         }
         body.push_str("</ul>");
     }
-    page(&task.title, &body)
+    let heading = if task.title.trim().is_empty() { strings.untitled } else { &task.title };
+    page(heading, &body)
 }
 
 /// The Summary's report: a section per group with its lines, for "Save as → PDF".
@@ -185,14 +217,17 @@ mod tests {
         let today = NaiveDate::from_ymd_opt(2026, 10, 18).unwrap();
         let parent = store.add_task("Fix <the> tap").unwrap();
         let child = store.add_subtask(parent.id, "buy a washer").unwrap();
+        let grandchild = store.add_subtask(child.id, "check size").unwrap();
         store.set_completed(child.id, true).unwrap();
+        store.set_wont_do(grandchild.id, true).unwrap();
         store.set_notes(parent.id, "Kitchen & bath").unwrap();
         store.add_checklist_item(parent.id, "turn off water", None).unwrap();
         let tasks = store.tasks().unwrap();
 
         let list = list_html("Home", &tasks, today, &EN);
         assert!(list.contains("<h1>Home</h1>") && list.contains("Fix &lt;the&gt; tap"));
-        assert!(list.contains("class=\"sub\"><span class=\"box\">☑</span><span class=\"done\">buy a washer"));
+        assert!(list.contains("margin-left:1.6em\"><span class=\"box\">☑</span><span class=\"done\">buy a washer"));
+        assert!(list.contains("margin-left:3.2em\"><span class=\"box\">☒</span><span class=\"done\">check size"));
 
         let parent = store.task(parent.id).unwrap().unwrap();
         let page = task_html(&parent, &store.checklist(parent.id).unwrap(), today, &EN);

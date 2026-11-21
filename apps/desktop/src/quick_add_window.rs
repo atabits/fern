@@ -60,6 +60,7 @@ pub struct QuickAddWindow {
     recognition: Recognition,
     picked_date: Option<NaiveDate>,
     parsed_due: Option<(NaiveDate, Option<NaiveTime>)>,
+    parsed_repeat: bool,
     priority: Priority,
     /// `None` means Inbox; `Some(id)` targets a specific list.
     list_id: Option<Id>,
@@ -99,17 +100,20 @@ impl QuickAddWindow {
             recognition,
             picked_date: None,
             parsed_due: None,
+            parsed_repeat: false,
             priority: Priority::None,
             list_id: None,
         }
     }
 
-    fn update_parsed_due(&mut self, cx: &App) {
-        let text = self.input.read(cx).text();
+    fn update_parsed_due(&mut self, cx: &mut Context<Self>) {
+        let text = self.input.read(cx).text().to_owned();
         let today = Local::now().date_naive();
         let list_names: Vec<String> = self.lists.iter().map(|l| l.name.clone()).collect();
-        let parsed = fern_core::parse_quick_add_with(text, today, &list_names, self.recognition);
+        let parsed = fern_core::parse_quick_add_with(&text, today, &list_names, self.recognition);
         self.parsed_due = parsed.due_date.map(|d| (d, parsed.due_time));
+        self.parsed_repeat = parsed.repeat.is_some();
+        self.input.update(cx, |input, cx| input.set_highlights(parsed.spans, cx));
     }
 
     fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -234,7 +238,20 @@ impl Render for QuickAddWindow {
                                 .rounded(px(5.))
                                 .bg(theme.colors().accent.opacity(0.12))
                                 .child(Icon::new(IconName::CalendarDays).size(IconSize::XSmall).color(Color::Accent))
+                                .when(self.parsed_repeat, |el| {
+                                    el.child(Icon::new(IconName::Repeat).size(IconSize::XSmall).color(Color::Accent))
+                                })
                                 .child(Label::new(label).size(LabelSize::XSmall).color(Color::Accent)),
+                        )
+                    })
+                    .when(shown_due.is_none() && self.parsed_repeat, |el| {
+                        el.child(
+                            h_flex()
+                                .h(px(22.))
+                                .px_1p5()
+                                .rounded(px(4.))
+                                .bg(theme.colors().accent.opacity(0.12))
+                                .child(Icon::new(IconName::Repeat).size(IconSize::XSmall).color(Color::Accent)),
                         )
                     }),
             )

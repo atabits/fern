@@ -133,12 +133,11 @@ impl Countdown {
     /// as day 1 of the days since it.
     pub fn span(&self, today: NaiveDate) -> Span {
         let counted = if self.count_up { self.date } else { self.next_date(today) };
-        let mut span = span(today, counted);
-        if self.plus_one_day && span.past {
-            span.total_days += 1;
-            span.days += 1;
+        if self.plus_one_day && counted < today {
+            span(today + chrono::Duration::days(1), counted)
+        } else {
+            span(today, counted)
         }
-        span
     }
 
     /// For a birthday, the age turned on its next date (0 before the day of birth).
@@ -432,6 +431,10 @@ mod tests {
         assert_eq!(wedding.span(d(2026, 10, 18)).total_days, 10);
         wedding.plus_one_day = true;
         assert_eq!(wedding.span(d(2026, 10, 18)).total_days, 11);
+        // Month/year boundary rollover with +1 day: 2025-10-19 to 2026-10-18 + 1 day = 1 year, 0 months, 0 days.
+        wedding.date = d(2025, 10, 19);
+        let rolled = wedding.span(d(2026, 10, 18));
+        assert_eq!((rolled.years, rolled.months, rolled.days), (1, 0, 0));
 
         // A birthday counting up: the time since the birth, not to the next birthday.
         let mut born = list[0].clone();

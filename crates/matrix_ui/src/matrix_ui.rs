@@ -1529,10 +1529,11 @@ impl MatrixView {
             .on_drop(cx.listener(move |this, dragged: &DraggedQuadrant, _, cx| {
                 this.swap_quadrants(dragged.quadrant, quadrant, cx);
             }))
-            .child(
+            .child({
+                let header_group = SharedString::from(format!("quadrant-header-{quadrant}"));
                 h_flex()
                     .id(SharedString::from(format!("quadrant-header-{numeral}")))
-                    .group("quadrant-header")
+                    .group(header_group.clone())
                     .h(px(36.))
                     .gap_1p5()
                     .cursor_grab()
@@ -1577,13 +1578,14 @@ impl MatrixView {
                     .child(
                         div()
                             .opacity(if touch::active() { 1. } else { 0. })
-                            .group_hover("quadrant-header", |s| s.opacity(1.))
+                            .group_hover(header_group.clone(), |s| s.opacity(1.))
                             .child(
                                 IconButton::new(SharedString::from(format!("quadrant-add-{quadrant}")), IconName::Plus)
                                     .size(px(22.))
                                     .icon_size(IconSize::Small)
                                     .icon_color(Color::Muted)
                                     .hover_icon_color(Color::Icon)
+                                    .tooltip(Tooltip::text(strings.add_task))
                                     .on_click(cx.listener(move |this, _, window, cx| this.start_add(quadrant, window, cx))),
                             ),
                     )
@@ -1591,13 +1593,14 @@ impl MatrixView {
                         div()
                             .relative()
                             .opacity(if self.menu == Some(quadrant) || touch::active() { 1. } else { 0. })
-                            .group_hover("quadrant-header", |s| s.opacity(1.))
+                            .group_hover(header_group, |s| s.opacity(1.))
                             .child(
                                 IconButton::new(SharedString::from(format!("quadrant-more-{quadrant}")), IconName::Ellipsis)
                                     .size(px(22.))
                                     .icon_size(IconSize::Small)
                                     .icon_color(Color::Muted)
                                     .hover_icon_color(Color::Icon)
+                                    .tooltip(Tooltip::text(strings.more))
                                     .on_click(cx.listener(move |this, _, window, cx| {
                                         this.menu = if this.menu == Some(quadrant) { None } else { Some(quadrant) };
                                         this.menu_row = None;
@@ -1625,8 +1628,8 @@ impl MatrixView {
                                         .into_any_element(),
                                 ))
                             }),
-                    ),
-            )
+                    )
+            })
             .child(
                 v_scroll(
                     SharedString::from(format!("quadrant-tasks-scroll-{numeral}")),

@@ -4,7 +4,7 @@
 use std::{collections::{BTreeMap, HashSet}, rc::Rc, time::Duration};
 
 use chrono::{Datelike, Local, NaiveDate, NaiveTime};
-use desktop_common::text_input::{Mode, TextInput};
+use desktop_common::text_input::{Changed, Mode, Submitted, TextInput};
 use fern_core::{CalendarOptions, ColorBy, Id, Priority, Store, Task};
 use gpui::{EventEmitter, Focusable, FontWeight};
 use ui::prelude::*;
@@ -187,6 +187,7 @@ struct EventEditor {
     start_time: gpui::Entity<TextInput>,
     end_time: gpui::Entity<TextInput>,
     all_day: bool,
+    _subs: Vec<gpui::Subscription>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1548,6 +1549,24 @@ impl CalendarView {
         self.reload(cx);
     }
 
+    fn event_editor_subs(
+        inputs: &[&gpui::Entity<TextInput>],
+        title: &gpui::Entity<TextInput>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<gpui::Subscription> {
+        let mut subs = Vec::with_capacity(inputs.len() + 1);
+        for input in inputs {
+            subs.push(cx.subscribe_in(input, window, |this, _, _: &Submitted, window, cx| {
+                this.save_event_editor(window, cx);
+            }));
+        }
+        subs.push(cx.subscribe(title, |_, _, _: &Changed, cx| {
+            cx.notify();
+        }));
+        subs
+    }
+
     fn open_new_event_editor(&mut self, date: NaiveDate, window: &mut Window, cx: &mut Context<Self>) {
         let Some(sub_id) = crate::subscriptions::feeds(cx)
             .and_then(|feeds| feeds.read(cx).writable_calendars().first().map(|c| c.id))
@@ -1561,6 +1580,7 @@ impl CalendarView {
         let date_in = cx.new(|cx| TextInput::new(Mode::SingleLine, &date_str, cx).without_cancel());
         let start_in = cx.new(|cx| TextInput::new(Mode::SingleLine, "09:00", cx).without_cancel());
         let end_in = cx.new(|cx| TextInput::new(Mode::SingleLine, "10:00", cx).without_cancel());
+        let _subs = Self::event_editor_subs(&[&title, &location, &date_in, &start_in, &end_in], &title, window, cx);
         window.focus(&title.focus_handle(cx), cx);
         self.open_event = None;
         self.event_editor = Some(EventEditor {
@@ -1574,6 +1594,7 @@ impl CalendarView {
             start_time: start_in,
             end_time: end_in,
             all_day: false,
+            _subs,
         });
         cx.notify();
     }
@@ -1588,6 +1609,7 @@ impl CalendarView {
         let date_in = cx.new(|cx| TextInput::new(Mode::SingleLine, &date_str, cx).without_cancel());
         let start_in = cx.new(|cx| TextInput::new(Mode::SingleLine, &start_str, cx).without_cancel());
         let end_in = cx.new(|cx| TextInput::new(Mode::SingleLine, &end_str, cx).without_cancel());
+        let _subs = Self::event_editor_subs(&[&title, &location, &date_in, &start_in, &end_in], &title, window, cx);
         window.focus(&title.focus_handle(cx), cx);
         self.open_event = None;
         self.event_editor = Some(EventEditor {
@@ -1601,25 +1623,32 @@ impl CalendarView {
             start_time: start_in,
             end_time: end_in,
             all_day: event.start_time.is_none(),
+            _subs,
         });
         cx.notify();
     }
 
     fn save_event_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(editor) = self.event_editor.take() else { return };
-        let title = editor.title.read(cx).text().trim().to_owned();
+        let Some(editor_ref) = self.event_editor.as_ref() else { return };
+        let title = editor_ref.title.read(cx).text().trim().to_owned();
         if title.is_empty() {
-            window.focus(&self.focus_handle, cx);
+            window.focus(&editor_ref.title.focus_handle(cx), cx);
             cx.notify();
             return;
         }
-        let date = NaiveDate::parse_from_str(editor.date.read(cx).text().trim(), "%Y-%m-%d")
-            .unwrap_or_else(|_| Local::now().date_naive());
+        let Some(editor) = self.event_editor.take() else { return };
+        let today = Local::now().date_naive();
+        let strings = i18n::t(cx);
+        let date_raw = editor.date.read(cx).text().trim();
+        let date = NaiveDate::parse_from_str(date_raw, "%Y-%m-%d")
+            .ok()
+            .or_else(|| calendar::parse_date(date_raw, today, strings))
+            .unwrap_or(today);
         let parse_hhmm = |s: &str| {
             let s = s.trim();
-            NaiveTime::parse_from_str(s, "%H:%M")
-                .or_else(|_| NaiveTime::parse_from_str(s, "%H:%M:%S"))
-                .ok()
+            calendar::parse_time(s)
+                .or_else(|| NaiveTime::parse_from_str(s, "%H:%M").ok())
+                .or_else(|| NaiveTime::parse_from_str(s, "%H:%M:%S").ok())
         };
         let (start_time, end_time) = if editor.all_day {
             (None, None)
@@ -1696,6 +1725,7 @@ impl CalendarView {
         let strings = i18n::t(cx);
         let theme = cx.theme().clone();
         let title_label = if editor.uid.is_some() { strings.cal_edit_event } else { strings.cal_new_event };
+        let can_save = !editor.title.read(cx).text().trim().is_empty();
         let field = |label: &'static str, input: gpui::Entity<TextInput>, height: f32| {
             v_flex()
                 .gap_1()
@@ -1742,11 +1772,15 @@ impl CalendarView {
                         .child(
                             h_flex()
                                 .child(div().flex_1().child(Label::new(title_label).weight(FontWeight::SEMIBOLD)))
-                                .child(IconButton::new("event-editor-close", IconName::X).on_click(cx.listener(|this, _, window, cx| {
-                                    this.event_editor = None;
-                                    window.focus(&this.focus_handle, cx);
-                                    cx.notify();
-                                }))),
+                                .child(
+                                    IconButton::new("event-editor-close", IconName::X)
+                                        .tooltip(Tooltip::text(strings.close))
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.event_editor = None;
+                                            window.focus(&this.focus_handle, cx);
+                                            cx.notify();
+                                        })),
+                                ),
                         )
                         .child(field(strings.cal_event_title, editor.title.clone(), 30.))
                         .child(
@@ -1805,8 +1839,8 @@ impl CalendarView {
                                         .items_center()
                                         .rounded(px(6.))
                                         .bg(theme.colors().accent)
-                                        .cursor_pointer()
-                                        .hover(|s| s.opacity(0.9))
+                                        .when(can_save, |el| el.cursor_pointer().hover(|s| s.opacity(0.9)))
+                                        .when(!can_save, |el| el.opacity(0.45).cursor_default())
                                         .child(Label::new(strings.save).size(LabelSize::Small).color(Color::OnAccent))
                                         .on_click(cx.listener(|this, _, window, cx| this.save_event_editor(window, cx))),
                                 ),

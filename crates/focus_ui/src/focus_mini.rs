@@ -84,20 +84,26 @@ impl Render for FocusMini {
             .relative()
             .size_full()
             .track_focus(&self.focus_handle)
-            .on_key_down(cx.listener(move |this, event: &gpui::KeyDownEvent, window, cx| {
+            .key_context("FocusMini")
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                if event.keystroke.modifiers.modified() {
+                    return;
+                }
                 match event.keystroke.key.as_str() {
                     "space" => {
                         this.focus.update(cx, |focus, cx| {
-                            if running {
+                            if focus.is_running() {
                                 focus.toggle_pause(cx);
                             } else {
                                 focus.start_next(cx);
                             }
                         });
+                        cx.stop_propagation();
                     }
                     "escape" => {
                         cx.set_global(OpenFocusMini(None));
                         window.remove_window();
+                        cx.stop_propagation();
                     }
                     _ => {}
                 }

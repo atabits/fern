@@ -69,6 +69,8 @@ pub(super) struct FocusReview {
     limited: bool,
     resolved: bool,
     error: Option<&'static str>,
+    hours_correction: Option<GpuiTask<()>>,
+    minutes_correction: Option<GpuiTask<()>>,
 }
 
 impl FocusReview {
@@ -97,7 +99,19 @@ impl FocusReview {
             true
         });
         cx.on_release(|this, cx| this.restore(cx)).detach();
-        Self { focus, title, hours, minutes, maximum, paused, limited, resolved: false, error: None }
+        Self {
+            focus,
+            title,
+            hours,
+            minutes,
+            maximum,
+            paused,
+            limited,
+            resolved: false,
+            error: None,
+            hours_correction: None,
+            minutes_correction: None,
+        }
     }
 
     fn selected_duration(&self, cx: &App) -> Option<i64> {
@@ -116,7 +130,8 @@ impl FocusReview {
     fn correct_field(&mut self, hours: bool, window: &Window, cx: &mut Context<Self>) {
         self.error = None;
         cx.notify();
-        cx.spawn_in(window, async move |this, cx| {
+        // Store the debounce task per field so rapid edits cancel any in-flight timer instead of racing.
+        let task = cx.spawn_in(window, async move |this, cx| {
             cx.background_executor().timer(Duration::from_millis(FIELD_CORRECTION_DELAY_MS)).await;
             let wait_for_minimum = this.update_in(cx, |this, window, cx| {
                 if this.resolved { return false; }
@@ -153,12 +168,19 @@ impl FocusReview {
                     cx.notify();
                 }).ok();
             }
-        }).detach();
+        });
+        if hours {
+            self.hours_correction = Some(task);
+        } else {
+            self.minutes_correction = Some(task);
+        }
     }
 
     fn restore(&mut self, cx: &mut App) {
         if self.resolved { return; }
         self.resolved = true;
+        self.hours_correction = None;
+        self.minutes_correction = None;
         self.focus.update(cx, |focus, cx| {
             focus.finish_prompt = false;
             focus.review_window = None;
@@ -177,6 +199,8 @@ impl FocusReview {
     pub(super) fn discard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.resolved { return; }
         self.resolved = true;
+        self.hours_correction = None;
+        self.minutes_correction = None;
         self.focus.update(cx, |focus, cx| {
             focus.running = None;
             focus.continuation = None;
@@ -220,7 +244,12 @@ impl FocusReview {
             Ok(())
         });
         match result {
-            Ok(()) => { self.resolved = true; window.remove_window(); }
+            Ok(()) => {
+                self.resolved = true;
+                self.hours_correction = None;
+                self.minutes_correction = None;
+                window.remove_window();
+            }
             Err(error) => { self.error = Some(error); cx.notify(); }
         }
     }
@@ -233,9 +262,16 @@ impl Render for FocusReview {
         let can_save = self.selected_duration(cx).is_some();
         let hours_focused = self.hours.focus_handle(cx).is_focused(window);
         let minutes_focused = self.minutes.focus_handle(cx).is_focused(window);
-        v_flex().size_full().p_5().gap_3().bg(colors.background).text_color(colors.text)
+        v_flex()
+            .size_full()
+            .p_5()
+            .gap_3()
+            .bg(colors.background)
+            .text_color(colors.text)
+            .key_context("FocusReview")
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
-                if event.keystroke.key == "tab" {
+                let m = &event.keystroke.modifiers;
+                if event.keystroke.key == "tab" && !m.control && !m.alt && !m.platform {
                     let hours = this.hours.focus_handle(cx);
                     let minutes = this.minutes.focus_handle(cx);
                     window.focus(if hours.is_focused(window) { &minutes } else { &hours }, cx);
@@ -526,6 +562,54 @@ mod tests {
         for value in ["0:04", "1:01", "-1:00", "1:60", "1:00:00", "::", "1.5:00", "999999999999999:00", "1:999999999999999", "12:01", "13:00"] {
             assert_eq!(duration(value, 3_601_000), None, "{value}");
         }
+    }
+
+    #[gpui::test]
+    fn rapid_minute_edits_cancel_previous_debounce_timer(cx: &mut TestAppContext) {
+        cx.update(|cx| { theme::init(cx); cx.set_global(i18n::CurrentLocale(i18n::Locale::En)); });
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let handle = cx.add_window(|_, cx| FocusView::new(store.clone(), cx));
+        let review = handle.update(cx, |focus, window, cx| {
+            focus.start_for(None, "Debounce test".to_owned(), true, cx);
+            let now = now_ms();
+            focus.running.as_mut().unwrap().timer = FocusTimer::stopwatch(now - 7_506_000);
+            focus.running.as_mut().unwrap().timer.pause(now);
+            focus.request_finish(window, cx);
+            focus.review_window.unwrap()
+        }).unwrap();
+        // Set hours to 0 and type "1" into minutes (below 5m minimum -> arms 1000ms debounce).
+        review.update(cx, |review, window, cx| {
+            review.hours.update(cx, |input, cx| input.edit("0".into(), 1..1, window, cx));
+        }).unwrap();
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(20));
+        cx.run_until_parked();
+        review.update(cx, |review, window, cx| {
+            review.minutes.update(cx, |input, cx| input.edit("1".into(), 1..1, window, cx));
+        }).unwrap();
+        cx.run_until_parked();
+        // Let the 10ms check pass and 600ms of the 1000ms timer elapse.
+        cx.executor().advance_clock(Duration::from_millis(610));
+        cx.run_until_parked();
+        // Edit minutes again ("2"): this must cancel the first timer and reset the 1000ms window.
+        review.update(cx, |review, window, cx| {
+            review.minutes.update(cx, |input, cx| input.edit("2".into(), 1..1, window, cx));
+        }).unwrap();
+        cx.run_until_parked();
+        // Advance 500ms (past the first timer's 1010ms deadline, but before the second timer's).
+        cx.executor().advance_clock(Duration::from_millis(500));
+        cx.run_until_parked();
+        review.update(cx, |review, _, cx| {
+            assert_eq!(review.minutes.read(cx).text(), "2");
+        }).unwrap();
+        // Now finish the second timer's remaining window -> rewrites to "5".
+        cx.executor().advance_clock(Duration::from_millis(600));
+        cx.run_until_parked();
+        review.update(cx, |review, window, cx| {
+            assert_eq!(review.minutes.read(cx).text(), "5");
+            review.discard(window, cx);
+        }).unwrap();
+        handle.update(cx, |_, window, _| window.remove_window()).unwrap();
     }
 
     #[test]

@@ -13,7 +13,10 @@ use gpui::{Entity, Focusable as _, FontWeight, ScrollHandle, Task as GpuiTask};
 use ui::{Donut, Placement, PopoverAttachment, popover};
 use ui::prelude::*;
 
-use crate::focus_timer::{BreakKind, DEFAULT_LONG_BREAK_EVERY, FocusCycle, FocusTimer, MIN_FOCUS_MS, format_clock, pomo_length_ms};
+use crate::focus_timer::{
+    BreakKind, DEFAULT_LONG_BREAK_EVERY, FocusCycle, FocusTimer, MIN_FOCUS_MS, format_clock,
+    format_stopwatch_clock, pomo_length_ms,
+};
 use crate::habit_view::{HABIT_EMOJI, icon_avatar};
 use crate::i18n::{self, Strings};
 use crate::text_input::{Mode, TextInput};
@@ -28,8 +31,61 @@ const POMO_SETTING: (&str, i64, i64, i64) = ("focus_pomo_minutes", 25, 5, 180);
 const SHORT_BREAK_SETTING: (&str, i64, i64, i64) = ("focus_short_break_minutes", 5, 1, 60);
 const LONG_BREAK_SETTING: (&str, i64, i64, i64) = ("focus_long_break_minutes", 15, 1, 60);
 const DAILY_GOAL_SETTING: (&str, i64, i64, i64) = ("focus_daily_goal_minutes", 0, 0, 720);
+const LONG_BREAK_EVERY_SETTING: (&str, i64, i64, i64) =
+    ("focus_long_break_every", DEFAULT_LONG_BREAK_EVERY as i64, 1, 60);
+const AUTO_COUNT_SETTING: (&str, i64, i64, i64) = ("focus_auto_count", 4, 2, 10);
 /// "pomo" or "stopwatch".
 const MODE_SETTING: &str = "focus_mode";
+
+/// Cached Focus settings so `render()`, `clock_state()`, and 1Hz ticks perform zero SQLite reads.
+#[derive(Clone, Copy, Debug)]
+struct FocusSettings {
+    pomo_minutes: i64,
+    short_break_minutes: i64,
+    long_break_minutes: i64,
+    daily_goal_minutes: i64,
+    long_break_every: i64,
+    auto_count: i64,
+    auto_break: bool,
+    auto_next: bool,
+    stopwatch_mode: bool,
+    white_noise: desktop_common::sound::WhiteNoise,
+}
+
+impl FocusSettings {
+    fn read_clamped(store: &Store, (key, default, min, max): (&str, i64, i64, i64)) -> i64 {
+        store
+            .setting(key)
+            .ok()
+            .flatten()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+            .clamp(min, max)
+    }
+
+    fn load(store: &Store) -> Self {
+        Self {
+            pomo_minutes: Self::read_clamped(store, POMO_SETTING),
+            short_break_minutes: Self::read_clamped(store, SHORT_BREAK_SETTING),
+            long_break_minutes: Self::read_clamped(store, LONG_BREAK_SETTING),
+            daily_goal_minutes: Self::read_clamped(store, DAILY_GOAL_SETTING),
+            long_break_every: Self::read_clamped(store, LONG_BREAK_EVERY_SETTING),
+            auto_count: Self::read_clamped(store, AUTO_COUNT_SETTING),
+            auto_break: store.setting("focus_auto_break").ok().flatten().as_deref() == Some("1"),
+            auto_next: store.setting("focus_auto_next").ok().flatten().as_deref() == Some("1"),
+            stopwatch_mode: store.setting(MODE_SETTING).ok().flatten().as_deref() == Some("stopwatch"),
+            white_noise: desktop_common::sound::white_noise(store),
+        }
+    }
+}
+
+/// Resolves a local datetime mapping to Unix epoch milliseconds without silently dropping DST
+/// fall-back ambiguous times (`earliest()` returns `Some` for both `Single` and `Ambiguous`).
+fn resolve_local_datetime<Tz: chrono::TimeZone>(
+    mapped: chrono::LocalResult<chrono::DateTime<Tz>>,
+) -> Option<i64> {
+    mapped.earliest().map(|dt| dt.timestamp_millis())
+}
 
 fn now_ms() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
@@ -66,6 +122,11 @@ type FocusTask = FocusTarget;
 pub struct FocusView {
     store: Rc<Store>,
     focus_handle: gpui::FocusHandle,
+    /// Cached settings (timer lengths, automation flags, mode, white noise) refreshed on
+    /// mutation and `reload()`/`DataVersion` so `render()` and 1Hz ticks never hit SQLite.
+    settings: FocusSettings,
+    /// Last `(active, preset)` sent to the ambient sound worker so unchanged renders are a no-op.
+    last_ambient: (bool, desktop_common::sound::WhiteNoise),
     tasks: Vec<Task>,
     sessions: Vec<FocusSession>,
     /// What the Statistics page reads, loaded with the view rather than on every frame.
@@ -302,6 +363,15 @@ fn line_chart(
         })))
 }
 
+/// Cached picker data populated when the picker opens, reloads, or switches task view, so
+/// `render_picker()` performs zero SQLite queries per frame.
+struct PickerCache {
+    lists: Vec<fern_core::List>,
+    tasks: Vec<Task>,
+    timers: Vec<fern_core::focus::FocusTimer>,
+    habits: Vec<(fern_core::Habit, HashSet<NaiveDate>)>,
+}
+
 /// The focus page's picker, opened from "Focus >" or the eye over the hours: the original's
 /// Task, Timer and Habit tabs over a search field.
 struct Picker {
@@ -310,6 +380,7 @@ struct Picker {
     at_eye: bool,
     /// The Task tab's "Today >" list of views, while open.
     views_open: bool,
+    cache: PickerCache,
 }
 
 /// What the focus page's Start focuses on.
@@ -365,9 +436,18 @@ impl FocusView {
         let strings = i18n::t(cx);
         let add_title = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.focus_record_title, cx));
         let add_start = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.focus_record_start, cx));
+        let settings = FocusSettings::load(&store);
+        cx.observe_global::<desktop_common::data_version::DataVersion>(|this, cx| {
+            if desktop_common::data_version::changed_elsewhere(cx.entity_id(), cx) {
+                this.reload(cx);
+            }
+        })
+        .detach();
         let mut this = Self {
             store,
             focus_handle: cx.focus_handle(),
+            settings,
+            last_ambient: (false, desktop_common::sound::WhiteNoise::Off),
             tasks: Vec::new(),
             sessions: Vec::new(),
             stats_data: StatsData::default(),
@@ -408,6 +488,7 @@ impl FocusView {
 
     pub fn reload(&mut self, cx: &mut Context<Self>) {
         let today = Local::now().date_naive();
+        self.settings = FocusSettings::load(&self.store);
         self.tasks = self.store.tasks_in(&View::Today, today).unwrap_or_default();
         self.sessions = self.store.focus_sessions().unwrap_or_default();
         self.timers = self.store.focus_timers(self.archived_tab).unwrap_or_default();
@@ -431,15 +512,64 @@ impl FocusView {
                 .collect(),
             habit_records,
         };
+        if self.picker.is_some() {
+            let cache = self.load_picker_cache(today);
+            if let Some(picker) = self.picker.as_mut() {
+                picker.cache = cache;
+            }
+        }
+        self.sync_ambient_sound();
         cx.notify();
     }
 
+    fn load_picker_cache(&self, today: NaiveDate) -> PickerCache {
+        let tasks = if self.picker_view == View::Today {
+            self.tasks.clone()
+        } else {
+            self.store.tasks_in(&self.picker_view, today).unwrap_or_default()
+        };
+        let timers = if !self.archived_tab {
+            self.timers.clone()
+        } else {
+            self.store.focus_timers(false).unwrap_or_default()
+        };
+        PickerCache {
+            lists: self.stats_data.lists.iter().filter(|l| !l.archived).cloned().collect(),
+            tasks,
+            timers,
+            habits: self
+                .stats_data
+                .habits
+                .iter()
+                .filter(|(h, _)| !h.archived)
+                .cloned()
+                .collect(),
+        }
+    }
+
     fn minutes(&self, (key, default, min, max): (&str, i64, i64, i64)) -> i64 {
-        self.store.setting(key).ok().flatten().and_then(|v| v.parse().ok()).unwrap_or(default).clamp(min, max)
+        match key {
+            "focus_pomo_minutes" => self.settings.pomo_minutes,
+            "focus_short_break_minutes" => self.settings.short_break_minutes,
+            "focus_long_break_minutes" => self.settings.long_break_minutes,
+            "focus_daily_goal_minutes" => self.settings.daily_goal_minutes,
+            "focus_long_break_every" => self.settings.long_break_every,
+            "focus_auto_count" => self.settings.auto_count,
+            _ => FocusSettings::read_clamped(&self.store, (key, default, min, max)),
+        }
     }
 
     fn set_minutes(&mut self, (key, default, min, max): (&str, i64, i64, i64), delta: i64, cx: &mut Context<Self>) {
         let value = (self.minutes((key, default, min, max)) + delta).clamp(min, max);
+        match key {
+            "focus_pomo_minutes" => self.settings.pomo_minutes = value,
+            "focus_short_break_minutes" => self.settings.short_break_minutes = value,
+            "focus_long_break_minutes" => self.settings.long_break_minutes = value,
+            "focus_daily_goal_minutes" => self.settings.daily_goal_minutes = value,
+            "focus_long_break_every" => self.settings.long_break_every = value,
+            "focus_auto_count" => self.settings.auto_count = value,
+            _ => {}
+        }
         if let Err(err) = self.store.set_setting(key, &value.to_string()) {
             eprintln!("failed to save the focus setting: {err:#}");
         }
@@ -552,10 +682,11 @@ impl FocusView {
     }
 
     fn stopwatch_mode(&self) -> bool {
-        self.store.setting(MODE_SETTING).ok().flatten().as_deref() == Some("stopwatch")
+        self.settings.stopwatch_mode
     }
 
     fn set_stopwatch_mode(&mut self, stopwatch: bool, cx: &mut Context<Self>) {
+        self.settings.stopwatch_mode = stopwatch;
         if let Err(err) = self.store.set_setting(MODE_SETTING, if stopwatch { "stopwatch" } else { "pomo" }) {
             eprintln!("failed to save the focus mode: {err:#}");
         }
@@ -575,6 +706,7 @@ impl FocusView {
             }
         });
         self.running = Some(Running { timer, task, on_break, _ticker: ticker });
+        self.sync_ambient_sound();
         cx.notify();
     }
 
@@ -600,8 +732,9 @@ impl FocusView {
                 if !self.automatic("focus_auto_break") { timer.pause(now); }
                 self.start_timer(None, Some(kind), timer, cx);
             } else if self.automatic("focus_auto_next")
-                && self.completed_in_chain < self.minutes(("focus_auto_count", 4, 2, 10)) as usize
+                && self.completed_in_chain < self.minutes(AUTO_COUNT_SETTING) as usize
                 && let Some((task, length)) = self.continuation.take() {
+                // `start_timer` increments `self.cycle` whenever `on_break.is_none()`.
                 self.start_timer(task, None, FocusTimer::start(now, length), cx);
             } else {
                 self.continuation = None;
@@ -610,23 +743,33 @@ impl FocusView {
         cx.notify();
     }
 
+    pub(crate) fn is_running(&self) -> bool {
+        self.running.is_some()
+    }
+
     /// When a focus timer is running, returns its formatted clock string and paused flag for the
     /// sidebar badge.
     pub fn running_clock(&self) -> Option<(String, bool)> {
-        self.running.as_ref().map(|r| (format_clock(r.timer.display(now_ms())), r.timer.is_paused()))
+        let now = now_ms();
+        self.running.as_ref().map(|r| (r.timer.format_display(now), r.timer.is_paused()))
     }
 
     pub(crate) fn white_noise(&self) -> desktop_common::sound::WhiteNoise {
-        desktop_common::sound::white_noise(&self.store)
+        self.settings.white_noise
     }
 
-    pub(crate) fn cycle_white_noise(&mut self, cx: &mut Context<Self>) {
-        let next = self.white_noise().next();
-        if let Err(err) = desktop_common::sound::set_white_noise(&self.store, next) {
+    fn set_white_noise(&mut self, preset: desktop_common::sound::WhiteNoise, cx: &mut Context<Self>) {
+        self.settings.white_noise = preset;
+        if let Err(err) = desktop_common::sound::set_white_noise(&self.store, preset) {
             eprintln!("failed to save white noise setting: {err:#}");
         }
         self.sync_ambient_sound();
         cx.notify();
+    }
+
+    pub(crate) fn cycle_white_noise(&mut self, cx: &mut Context<Self>) {
+        let next = self.settings.white_noise.next();
+        self.set_white_noise(next, cx);
     }
 
     /// The clock as shown at `now`, what it is for (the task, the habit or the break), and
@@ -634,7 +777,7 @@ impl FocusView {
     pub fn clock_state(&self, now: i64, strings: &'static i18n::Strings) -> (String, SharedString, bool, bool) {
         match &self.running {
             Some(r) => (
-                format_clock(r.timer.display(now)),
+                r.timer.format_display(now),
                 match r.on_break {
                     Some(BreakKind::Short) => SharedString::new_static(strings.focus_short_break),
                     Some(BreakKind::Long) => SharedString::new_static(strings.focus_long_break),
@@ -644,7 +787,11 @@ impl FocusView {
                 r.timer.is_paused(),
             ),
             None => (
-                format_clock(if self.stopwatch_mode() { 0 } else { self.minutes(POMO_SETTING) * 60_000 }),
+                if self.stopwatch_mode() {
+                    format_stopwatch_clock(0)
+                } else {
+                    format_clock(self.minutes(POMO_SETTING) * 60_000)
+                },
                 SharedString::new_static(strings.focus),
                 false,
                 false,
@@ -656,6 +803,9 @@ impl FocusView {
     /// stopwatch mode or when idle.
     pub fn clock_progress(&self, now: i64) -> Option<f32> {
         let running = self.running.as_ref()?;
+        if running.timer.is_stopwatch() {
+            return None;
+        }
         let length = running.timer.length_ms;
         if length <= 0 {
             return None;
@@ -727,17 +877,23 @@ impl FocusView {
         let start = crate::due_picker::parse_time(self.add_start.read(cx).text());
         let (Some(start), false) = (start, title.is_empty()) else { return };
         let today = Local::now().date_naive();
-        let started = today.and_time(start).and_local_timezone(Local).single().map(|t| t.timestamp_millis());
-        if let Some(started) = started {
-            let ended = started + self.add_minutes * 60_000;
-            if let Err(err) = self.store.add_focus_session(None, &title, started, ended) {
-                eprintln!("failed to add the focus record: {err:#}");
-            }
+        let local_dt = today.and_time(start);
+        // Resolve DST fall-back ambiguity via earliest/latest, and handle spring-forward gaps
+        // cleanly instead of silently discarding the user's session.
+        let started = resolve_local_datetime(local_dt.and_local_timezone(Local)).or_else(|| {
+            resolve_local_datetime((local_dt + chrono::Duration::hours(1)).and_local_timezone(Local))
+        });
+        let Some(started) = started else { return };
+        let ended = started + self.add_minutes * 60_000;
+        if let Err(err) = self.store.add_focus_session(None, &title, started, ended) {
+            eprintln!("failed to add the focus record: {err:#}");
+            return;
         }
         self.add_title.update(cx, |input, cx| input.set_text("", cx));
         self.add_start.update(cx, |input, cx| input.set_text("", cx));
         self.record_menu = None;
         self.reload(cx);
+        desktop_common::data_version::data_changed(cx.entity_id(), cx);
     }
 
     /// Opens a focus record's dialog, its note in the field.
@@ -1748,7 +1904,7 @@ impl FocusView {
                             )
                     })
                     .child({
-                        let current = desktop_common::sound::white_noise(&self.store);
+                        let current = self.white_noise();
                         let label = strings.focus_white_noise_names[current.index()];
                         let hover_bg = cx.theme().colors().ghost_element_hover;
                         h_flex()
@@ -1780,13 +1936,8 @@ impl FocusView {
                                         ),
                                     ),
                             )
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                let next = current.next();
-                                if let Err(err) = desktop_common::sound::set_white_noise(&this.store, next) {
-                                    eprintln!("failed to save white noise setting: {err:#}");
-                                }
-                                this.sync_ambient_sound();
-                                cx.notify();
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.cycle_white_noise(cx);
                             }))
                     })
                     .child(self.render_automation(cx))
@@ -2759,7 +2910,7 @@ impl FocusView {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .child(Icon::new(IconName::Check).size(IconSize::Small).color(Color::Custom(gpui::white())))
+                    .child(Icon::new(IconName::Check).size(IconSize::Small).color(Color::IconOnAccent))
                     .into_any_element(),
                 fern_core::DayProgress::Fraction(frac) => desktop_common::habit_helpers::progress_ring(
                     px(36.),
@@ -3598,7 +3749,8 @@ impl FocusView {
         })
         .detach();
         window.focus(&search.focus_handle(cx), cx);
-        self.picker = Some(Picker { search, at_eye, views_open: false });
+        let cache = self.load_picker_cache(Local::now().date_naive());
+        self.picker = Some(Picker { search, at_eye, views_open: false, cache });
         cx.notify();
     }
 
@@ -3622,14 +3774,20 @@ impl FocusView {
     }
 
     /// The picker's list: today's tasks and due habits, the active timers, or the active habits,
-    /// narrowed by the search.
+    /// narrowed by the search. Reads exclusively from `picker.cache` (zero SQLite queries).
     fn render_picker(&self, picker: &Picker, cx: &mut Context<Self>) -> AnyElement {
         use fern_core::focus::matches_search;
         let strings = i18n::t(cx);
         let theme = cx.theme().clone();
         let query = picker.search.read(cx).text().to_owned();
         let today = Local::now().date_naive();
-        let habits: Vec<fern_core::Habit> = self.store.habits().unwrap_or_default().into_iter().filter(|h| !h.archived && matches_search(&h.name, &query)).collect();
+        let habits: Vec<(&fern_core::Habit, &HashSet<NaiveDate>)> = picker
+            .cache
+            .habits
+            .iter()
+            .filter(|(h, _)| matches_search(&h.name, &query))
+            .map(|(h, done)| (h, done))
+            .collect();
         // As in the original, the picked one has a filled circle and stays lit.
         let picked = self.next.as_ref().map(|n| n.title().to_owned());
         let item = |id: SharedString, title: String, next: NextFocus, cx: &mut Context<Self>| {
@@ -3654,7 +3812,7 @@ impl FocusView {
             (View::Inbox, SharedString::new_static(strings.inbox)),
         ]
         .into_iter()
-        .chain(self.store.lists().unwrap_or_default().into_iter().filter(|l| !l.archived).map(|l| (View::List(l.id), l.name.into())))
+        .chain(picker.cache.lists.iter().map(|l| (View::List(l.id), l.name.clone().into())))
         .collect();
         let view_name = views.iter().find(|(v, _)| *v == self.picker_view).map_or(SharedString::new_static(strings.today), |(_, n)| n.clone());
         match self.picker_tab {
@@ -3667,8 +3825,14 @@ impl FocusView {
                             .child(Label::new(name).size(LabelSize::Small).color(if on { Color::Accent } else { Color::Default }))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.picker_view = view.clone();
+                                let tasks = if this.picker_view == View::Today {
+                                    this.tasks.clone()
+                                } else {
+                                    this.store.tasks_in(&this.picker_view, Local::now().date_naive()).unwrap_or_default()
+                                };
                                 if let Some(picker) = this.picker.as_mut() {
                                     picker.views_open = false;
+                                    picker.cache.tasks = tasks;
                                 }
                                 cx.notify();
                             }))
@@ -3695,21 +3859,15 @@ impl FocusView {
                         }))
                         .into_any_element(),
                 );
-                let listed = if self.picker_view == View::Today {
-                    self.tasks.clone()
-                } else {
-                    self.store.tasks_in(&self.picker_view, today).unwrap_or_default()
-                };
-                for task in listed.iter().filter(|t| matches_search(&t.title, &query)) {
+                for task in picker.cache.tasks.iter().filter(|t| matches_search(&t.title, &query)) {
                     items.push(item(format!("pick-task-{}", task.id).into(), task.title.clone(), NextFocus::Task(task.id, task.title.clone()), cx));
                 }
                 // As in the original, the habits due today follow Today's tasks.
-                let done_map = self.store.all_habit_done_dates().unwrap_or_default();
-                let empty_done = HashSet::new();
                 let week_start = crate::calendar::week_start();
                 let due: Vec<&fern_core::Habit> = habits
                     .iter()
-                    .filter(|h| self.picker_view == View::Today && h.is_due_on(today, done_map.get(&h.id).unwrap_or(&empty_done), week_start))
+                    .filter(|(h, done)| self.picker_view == View::Today && h.is_due_on(today, done, week_start))
+                    .map(|(h, _)| *h)
                     .collect();
                 if !due.is_empty() {
                     items.push(div().px_2().pt_1().child(Label::new(strings.focus_picker_tabs[2]).size(LabelSize::XSmall).color(Color::Muted)).into_any_element());
@@ -3719,13 +3877,12 @@ impl FocusView {
                 }
             }
             1 => {
-                let timers = self.store.focus_timers(false).unwrap_or_default();
-                for timer in timers.into_iter().filter(|t| matches_search(&t.name, &query)) {
-                    items.push(item(format!("pick-timer-{}", timer.id).into(), timer.name.clone(), NextFocus::Timer(timer), cx));
+                for timer in picker.cache.timers.iter().filter(|t| matches_search(&t.name, &query)) {
+                    items.push(item(format!("pick-timer-{}", timer.id).into(), timer.name.clone(), NextFocus::Timer(timer.clone()), cx));
                 }
             }
             _ => {
-                for habit in &habits {
+                for (habit, _) in &habits {
                     items.push(item(format!("pick-habit-{}", habit.id).into(), habit.name.clone(), NextFocus::Habit(habit.id, habit.name.clone()), cx));
                 }
             }
@@ -4029,7 +4186,7 @@ impl FocusView {
     fn render_white_noise_button(&self, id: &'static str, cx: &mut Context<Self>) -> impl IntoElement {
         let strings = i18n::t(cx);
         let theme = cx.theme().clone();
-        let noise = desktop_common::sound::white_noise(&self.store);
+        let noise = self.white_noise();
         let active_noise = noise != desktop_common::sound::WhiteNoise::Off;
         let name = strings.focus_white_noise_names[noise.index()];
         h_flex()
@@ -4050,23 +4207,21 @@ impl FocusView {
             .when(active_noise, |el| {
                 el.child(Label::new(name).size(LabelSize::XSmall).color(Color::Accent))
             })
-            .on_click(cx.listener(move |this, _, _, cx| {
-                let next = noise.next();
-                if let Err(err) = desktop_common::sound::set_white_noise(&this.store, next) {
-                    eprintln!("failed to save white noise setting: {err:#}");
-                }
-                this.sync_ambient_sound();
-                cx.notify();
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.cycle_white_noise(cx);
             }))
     }
 
-    fn sync_ambient_sound(&self) {
+    fn sync_ambient_sound(&mut self) {
         let active = self
             .running
             .as_ref()
             .is_some_and(|r| !r.timer.is_paused() && r.on_break.is_none());
-        let preset = desktop_common::sound::white_noise(&self.store);
-        desktop_common::sound::sync_white_noise(active, preset);
+        let desired = (active, self.settings.white_noise);
+        if desired != self.last_ambient {
+            self.last_ambient = desired;
+            desktop_common::sound::sync_white_noise(active, self.settings.white_noise);
+        }
     }
 }
 
@@ -4221,62 +4376,21 @@ impl Render for FocusView {
                         .children(timer_rows)
                         .when(!self.archived_tab && rows.is_empty() && self.timers.is_empty(), |el| {
                             el.child(
-                                v_flex()
-                                    .w_full()
-                                    .py(px(48.))
-                                    .items_center()
-                                    .justify_center()
-                                    .gap_3()
-                                    .child(
-                                        div()
-                                            .size(px(48.))
-                                            .rounded_full()
-                                            .bg(theme.colors().surface_background)
-                                            .border_1()
-                                            .border_color(theme.colors().border_variant)
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .child(Icon::new(IconName::CircleDot).size(IconSize::Large).color(Color::Muted)),
-                                    )
-                                    .child(Label::new(strings.focus_no_tasks).size(LabelSize::Small).color(Color::Muted))
-                                    .child(
-                                        h_flex()
-                                            .id("focus-empty-add-timer")
-                                            .px_3()
-                                            .h(px(30.))
-                                            .gap_1p5()
-                                            .rounded(px(6.))
-                                            .bg(theme.colors().accent)
-                                            .hover(|s| s.opacity(0.9))
-                                            .cursor_pointer()
-                                            .child(Icon::new(IconName::Plus).size(IconSize::XSmall).color(Color::IconOnAccent))
-                                            .child(Label::new(strings.add_timer).size(LabelSize::Small).color(Color::OnAccent))
-                                            .on_click(cx.listener(|this, _, window, cx| this.open_timer(None, window, cx))),
+                                div().w_full().py_6().child(
+                                    EmptyState::new(IconName::CircleDot, strings.focus_no_tasks).action(
+                                        "focus-empty-add-timer",
+                                        strings.add_timer,
+                                        cx.listener(|this, _, window, cx| this.open_timer(None, window, cx)),
                                     ),
+                                ),
                             )
                         })
                         .when(self.archived_tab && self.timers.is_empty(), |el| {
                             el.child(
-                                v_flex()
+                                div()
                                     .w_full()
-                                    .py(px(48.))
-                                    .items_center()
-                                    .justify_center()
-                                    .gap_3()
-                                    .child(
-                                        div()
-                                            .size(px(48.))
-                                            .rounded_full()
-                                            .bg(theme.colors().surface_background)
-                                            .border_1()
-                                            .border_color(theme.colors().border_variant)
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .child(Icon::new(IconName::Archive).size(IconSize::Large).color(Color::Muted)),
-                                    )
-                                    .child(Label::new(strings.nothing_found).size(LabelSize::Small).color(Color::Muted)),
+                                    .py_6()
+                                    .child(EmptyState::new(IconName::Archive, strings.nothing_found)),
                             )
                         })
                         .when(!self.archived_tab && !self.timers.is_empty() && !rows.is_empty(), |el| el.child(div().my_1().child(Divider::horizontal())))
@@ -4369,25 +4483,10 @@ impl Render for FocusView {
                         .pr(px(14.))
                         .when(record.is_empty(), |el| {
                             el.child(
-                                v_flex()
+                                div()
                                     .w_full()
-                                    .py(px(40.))
-                                    .items_center()
-                                    .justify_center()
-                                    .gap_3()
-                                    .child(
-                                        div()
-                                            .size(px(48.))
-                                            .rounded_full()
-                                            .bg(theme.colors().surface_background)
-                                            .border_1()
-                                            .border_color(theme.colors().border_variant)
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .child(Icon::new(IconName::Timer).size(IconSize::Large).color(Color::Muted)),
-                                    )
-                                    .child(Label::new(strings.focus_no_record).size(LabelSize::Small).color(Color::Muted)),
+                                    .py_4()
+                                    .child(EmptyState::new(IconName::Timer, strings.focus_no_record)),
                             )
                         })
                         .children(record),
@@ -4406,94 +4505,27 @@ impl Render for FocusView {
             .children(self.render_modal(cx))
             .when(self.confirm_batch_delete, |el| {
                 let strings = i18n::t(cx);
-                let theme = cx.theme().clone();
                 el.child(
-                    div()
-                        .id("focus-batch-delete-backdrop")
-                        .absolute()
-                        .inset_0()
-                        .occlude()
-                        .bg(gpui::black().opacity(0.35))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .on_click(cx.listener(|this, _, _, cx| {
+                    ConfirmDialog::new("focus-batch-delete", strings.focus_batch_delete_title)
+                        .width(px(360.))
+                        .description(strings.focus_batch_delete_message)
+                        .cancel_label(strings.cancel)
+                        .confirm_label(strings.delete)
+                        .destructive(true)
+                        .on_cancel(cx.listener(|this, _, _, cx| {
                             this.confirm_batch_delete = false;
                             cx.notify();
                         }))
-                        .child(
-                            v_flex()
-                                .id("focus-batch-delete-modal")
-                                .w(px(360.))
-                                .p_5()
-                                .gap_3()
-                                .rounded(px(12.))
-                                .bg(theme.colors().elevated_surface_background)
-                                .border_1()
-                                .border_color(theme.colors().border)
-                                .shadow_lg()
-                                .on_click(|_, _, cx| cx.stop_propagation())
-                                .child(
-                                    div()
-                                        .text_size(px(16.))
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(theme.colors().text)
-                                        .child(strings.focus_batch_delete_title),
-                                )
-                                .child(
-                                    div()
-                                        .text_size(px(13.))
-                                        .text_color(theme.colors().text_muted)
-                                        .child(strings.focus_batch_delete_message),
-                                )
-                                .child(
-                                    h_flex()
-                                        .justify_end()
-                                        .gap_2()
-                                        .pt_1()
-                                        .child(
-                                            div()
-                                                .id("focus-batch-delete-cancel")
-                                                .px_3()
-                                                .py_1()
-                                                .rounded(px(6.))
-                                                .border_1()
-                                                .border_color(theme.colors().border)
-                                                .text_size(px(13.))
-                                                .text_color(theme.colors().text)
-                                                .hover(|s| s.bg(theme.colors().element_hover))
-                                                .cursor_pointer()
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.confirm_batch_delete = false;
-                                                    cx.notify();
-                                                }))
-                                                .child(strings.cancel),
-                                        )
-                                        .child(
-                                            div()
-                                                .id("focus-batch-delete-confirm")
-                                                .px_3()
-                                                .py_1()
-                                                .rounded(px(6.))
-                                                .bg(theme.status().error)
-                                                .text_size(px(13.))
-                                                .font_weight(FontWeight::MEDIUM)
-                                                .text_color(gpui::white())
-                                                .hover(|s| s.opacity(0.9))
-                                                .cursor_pointer()
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.confirm_batch_delete = false;
-                                                    let ids: Vec<Id> = this.batch.drain().collect();
-                                                    if let Err(err) = this.store.delete_focus_sessions(&ids) {
-                                                        eprintln!("failed to delete the records: {err:#}");
-                                                    }
-                                                    this.set_record_menu(None, cx);
-                                                    this.reload(cx);
-                                                }))
-                                                .child(strings.delete),
-                                        ),
-                                ),
-                        ),
+                        .on_confirm(cx.listener(|this, _, _, cx| {
+                            this.confirm_batch_delete = false;
+                            let ids: Vec<Id> = this.batch.drain().collect();
+                            if let Err(err) = this.store.delete_focus_sessions(&ids) {
+                                eprintln!("failed to delete the records: {err:#}");
+                            }
+                            this.set_record_menu(None, cx);
+                            this.reload(cx);
+                            desktop_common::data_version::data_changed(cx.entity_id(), cx);
+                        })),
                 )
             })
             .into_any_element()
@@ -4578,5 +4610,76 @@ mod tests {
         assert_eq!(parts, [("14".into(), true), (" Tasks   ".into(), false), ("3".into(), true), (" Days".into(), false)]);
         let ru = summary_parts("Задач: {tasks}", &counts);
         assert_eq!(ru, [("Задач: ".into(), false), ("14".into(), true)]);
+    }
+
+    #[test]
+    fn resolve_local_datetime_handles_single_ambiguous_and_none() {
+        use chrono::{FixedOffset, LocalResult, TimeZone};
+        let tz_early = FixedOffset::east_opt(2 * 3600).unwrap();
+        let tz_late = FixedOffset::east_opt(3600).unwrap();
+        let early = tz_early.with_ymd_and_hms(2026, 10, 25, 2, 30, 0).single().unwrap();
+        let late = tz_late.with_ymd_and_hms(2026, 10, 25, 2, 30, 0).single().unwrap();
+
+        assert_eq!(resolve_local_datetime(LocalResult::Single(early)), Some(early.timestamp_millis()));
+        assert_eq!(
+            resolve_local_datetime(LocalResult::Ambiguous(early, late)),
+            Some(early.timestamp_millis())
+        );
+        assert_eq!(resolve_local_datetime::<FixedOffset>(LocalResult::None), None);
+    }
+
+    #[gpui::test]
+    fn clock_progress_is_none_for_stopwatch_and_bounded_for_pomo(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext;
+        cx.update(|cx| {
+            let store = Rc::new(Store::open_in_memory().unwrap());
+            let view = cx.new(|cx| FocusView::new(store.clone(), cx));
+            view.update(cx, |view, cx| {
+                // Idle -> None
+                assert_eq!(view.clock_progress(now_ms()), None);
+
+                // Stopwatch -> None (never renders a dead 0% progress bar)
+                view.start_mode(true, cx);
+                let start = view.running.as_ref().unwrap().timer.started_at;
+                assert_eq!(view.clock_progress(start + 60_000), None);
+                assert_eq!(view.clock_state(start + 500, i18n::t(cx)).0, "00:00");
+
+                // Pomodoro -> Some(0.0..=1.0)
+                view.finish(cx);
+                view.start_mode(false, cx);
+                let timer = view.running.as_ref().unwrap().timer;
+                let progress = view.clock_progress(timer.started_at + timer.length_ms / 2).unwrap();
+                assert!((progress - 0.5).abs() < 0.01, "expected ~0.5, got {progress}");
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn white_noise_is_cached_and_refreshed_on_cycle_and_data_version(cx: &mut gpui::TestAppContext) {
+        use desktop_common::sound::{WhiteNoise, set_white_noise};
+        use gpui::AppContext;
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let (view, other) = cx.update(|cx| {
+            let view = cx.new(|cx| FocusView::new(store.clone(), cx));
+            let other = cx.new(|_| ());
+            view.update(cx, |view, cx| {
+                assert_eq!(view.white_noise(), WhiteNoise::Off);
+                view.cycle_white_noise(cx);
+                assert_eq!(view.white_noise(), WhiteNoise::Rain);
+            });
+            // Direct DB write without DataVersion leaves cache untouched (proving render/getter
+            // does not query SQLite).
+            set_white_noise(&store, WhiteNoise::Ocean).unwrap();
+            assert_eq!(view.read(cx).white_noise(), WhiteNoise::Rain);
+            // Emitting DataVersion from another entity refreshes the cached white noise preset
+            // once GPUI flushes global observer effects.
+            desktop_common::data_version::data_changed(other.entity_id(), cx);
+            (view, other)
+        });
+        let _ = other;
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert_eq!(view.read(cx).white_noise(), WhiteNoise::Ocean);
+        });
     }
 }

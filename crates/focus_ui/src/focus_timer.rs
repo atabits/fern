@@ -27,30 +27,47 @@ impl FocusTimer {
         if self.is_stopwatch() { self.elapsed(now) } else { self.remaining(now) }
     }
 
+    /// Formats the timer for display: countdown rounds partial seconds up so `00:00` only
+    /// appears when finished, while a stopwatch floors elapsed seconds so `t = 1ms` shows `00:00`.
+    pub fn format_display(&self, now: i64) -> String {
+        if self.is_stopwatch() {
+            format_stopwatch_clock(self.elapsed(now))
+        } else {
+            format_clock(self.remaining(now))
+        }
+    }
+
     pub fn is_paused(&self) -> bool {
         self.paused_at.is_some()
     }
 
     pub fn pause(&mut self, now: i64) {
         if self.paused_at.is_none() {
-            self.paused_at = Some(now);
+            // Guard against backward wall-clock jumps so pausing before `started_at + paused_total`
+            // cannot later inflate `paused_total` on resume.
+            let floor = self.started_at.saturating_add(self.paused_total);
+            self.paused_at = Some(now.max(floor));
         }
     }
 
     pub fn resume(&mut self, now: i64) {
         if let Some(paused_at) = self.paused_at.take() {
-            self.paused_total += now - paused_at;
+            // Guard against backward `SystemTime` jumps while paused so `paused_total` never shrinks.
+            let delta = now.saturating_sub(paused_at).max(0);
+            self.paused_total = self.paused_total.saturating_add(delta);
         }
     }
 
     /// Focused time so far, excluding pauses.
     pub fn elapsed(&self, now: i64) -> i64 {
         let end = self.paused_at.unwrap_or(now);
-        (end - self.started_at - self.paused_total).clamp(0, self.length_ms)
+        end.saturating_sub(self.started_at)
+            .saturating_sub(self.paused_total)
+            .clamp(0, self.length_ms)
     }
 
     pub fn remaining(&self, now: i64) -> i64 {
-        self.length_ms - self.elapsed(now)
+        self.length_ms.saturating_sub(self.elapsed(now))
     }
 
     pub fn finished(&self, now: i64) -> bool {
@@ -60,7 +77,9 @@ impl FocusTimer {
     /// Scheduled completion, including pauses, even when a tick arrives late.
     /// FocusTimer's completion callback, RVA 0x005af1dc.
     pub fn completed_at(&self) -> i64 {
-        self.started_at + self.paused_total + self.length_ms
+        self.started_at
+            .saturating_add(self.paused_total)
+            .saturating_add(self.length_ms)
     }
 }
 
@@ -94,7 +113,7 @@ pub fn pomo_length_ms(minutes: i64) -> i64 {
 
 impl FocusCycle {
     fn idle_too_long(&self, now: i64) -> bool {
-        self.last_completed_at.is_none_or(|last| now - last > CYCLE_IDLE_MS)
+        self.last_completed_at.is_none_or(|last| now.saturating_sub(last) > CYCLE_IDLE_MS)
     }
 
     pub fn start(&mut self, now: i64, stopwatch: bool, interval: usize) {
@@ -122,9 +141,17 @@ impl FocusCycle {
     }
 }
 
-/// "25:00", "04:05".
+/// Formats countdown milliseconds as `"25:00"` / `"04:05"`, rounding partial seconds up so
+/// `"00:00"` only appears once remaining time reaches zero.
 pub fn format_clock(ms: i64) -> String {
-    let seconds = (ms.max(0) + 999) / 1000;
+    let seconds = ms.max(0).saturating_add(999) / 1000;
+    format!("{:02}:{:02}", seconds / 60, seconds % 60)
+}
+
+/// Formats elapsed stopwatch milliseconds as `"00:00"` / `"04:04"`, flooring partial seconds
+/// so count-up display never jumps ahead by +1s at `t = 1ms`.
+pub fn format_stopwatch_clock(ms: i64) -> String {
+    let seconds = ms.max(0) / 1000;
     format!("{:02}:{:02}", seconds / 60, seconds % 60)
 }
 
@@ -233,5 +260,52 @@ mod tests {
         assert_eq!(format_clock(25 * MIN), "25:00");
         assert_eq!(format_clock(4 * MIN + 4_001), "04:05");
         assert_eq!(format_clock(0), "00:00");
+        assert_eq!(format_clock(-5_000), "00:00");
+    }
+
+    #[test]
+    fn stopwatch_clock_format_floors_without_rounding_up() {
+        assert_eq!(format_stopwatch_clock(0), "00:00");
+        assert_eq!(format_stopwatch_clock(1), "00:00");
+        assert_eq!(format_stopwatch_clock(999), "00:00");
+        assert_eq!(format_stopwatch_clock(1_000), "00:01");
+        assert_eq!(format_stopwatch_clock(4 * MIN + 4_999), "04:04");
+        assert_eq!(format_stopwatch_clock(-5_000), "00:00");
+
+        let watch = FocusTimer::stopwatch(10_000);
+        assert_eq!(watch.format_display(10_001), "00:00");
+        assert_eq!(watch.format_display(11_500), "00:01");
+
+        let pomo = FocusTimer::start(10_000, 25 * MIN);
+        assert_eq!(pomo.format_display(10_001), "25:00");
+        assert_eq!(pomo.format_display(11_000), "24:59");
+    }
+
+    #[test]
+    fn backward_clock_jump_never_corrupts_pause_or_elapsed() {
+        // 1. Backward jump while paused must not make `paused_total` negative or inflate elapsed.
+        let mut timer = FocusTimer::start(100 * MIN, 25 * MIN);
+        timer.pause(110 * MIN);
+        assert_eq!(timer.elapsed(110 * MIN), 10 * MIN);
+        // System clock jumps backward by 5 minutes before resume.
+        timer.resume(105 * MIN);
+        assert_eq!(timer.paused_total, 0);
+        // Once clock catches back up, elapsed is never inflated by a negative pause total.
+        assert_eq!(timer.elapsed(110 * MIN), 10 * MIN);
+        assert_eq!(timer.remaining(110 * MIN), 15 * MIN);
+
+        // 2. Backward jump while running never yields negative elapsed or remaining > length.
+        let running = FocusTimer::start(100 * MIN, 25 * MIN);
+        assert_eq!(running.elapsed(90 * MIN), 0);
+        assert_eq!(running.remaining(90 * MIN), 25 * MIN);
+
+        // 3. Backward jump before pause floors `paused_at` at `started_at + paused_total`,
+        // preventing an inflated pause delta when the clock jumps forward before resume.
+        let mut early_pause = FocusTimer::start(100 * MIN, 25 * MIN);
+        early_pause.pause(95 * MIN);
+        assert_eq!(early_pause.elapsed(95 * MIN), 0);
+        early_pause.resume(102 * MIN);
+        assert_eq!(early_pause.paused_total, 2 * MIN);
+        assert_eq!(early_pause.elapsed(105 * MIN), 3 * MIN);
     }
 }

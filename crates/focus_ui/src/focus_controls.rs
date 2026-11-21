@@ -26,11 +26,29 @@ impl FocusView {
     }
 
     pub(super) fn interval(&self) -> usize {
-        self.minutes(("focus_long_break_every", DEFAULT_LONG_BREAK_EVERY as i64, 1, 60)) as usize
+        self.minutes(LONG_BREAK_EVERY_SETTING) as usize
     }
 
     pub(super) fn automatic(&self, key: &str) -> bool {
-        self.store.setting(key).ok().flatten().as_deref() == Some("1")
+        match key {
+            "focus_auto_break" => self.settings.auto_break,
+            "focus_auto_next" => self.settings.auto_next,
+            _ => self.store.setting(key).ok().flatten().as_deref() == Some("1"),
+        }
+    }
+
+    pub(super) fn set_automatic(&mut self, key: &str, enabled: bool, cx: &mut Context<Self>) {
+        match key {
+            "focus_auto_break" => self.settings.auto_break = enabled,
+            "focus_auto_next" => self.settings.auto_next = enabled,
+            _ => {}
+        }
+        let value = if enabled { "1" } else { "0" };
+        if let Err(err) = self.store.set_setting(key, value) {
+            eprintln!("failed to save the focus setting: {err:#}");
+            self.message = Some(i18n::t(cx).focus_settings_save_failed.to_owned());
+        }
+        cx.notify();
     }
 
     pub(super) fn render_automation(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -49,19 +67,15 @@ impl FocusView {
                 .child(div().flex_1().child(Label::new(title).size(LabelSize::Small)))
                 .child(Switch::new().toggle_state(self.automatic(key)))
                 .on_click(cx.listener(move |this, _, _, cx| {
-                    let value = if this.automatic(key) { "0" } else { "1" };
-                    if let Err(err) = this.store.set_setting(key, value) {
-                        eprintln!("failed to save the focus setting: {err:#}");
-                        this.message = Some(i18n::t(cx).focus_settings_save_failed.to_owned());
-                    }
-                    cx.notify();
+                    let next = !this.automatic(key);
+                    this.set_automatic(key, next, cx);
                 }))
         };
         v_flex().gap_2()
-            .child(number("long-break-every", strings.focus_long_break_every, ("focus_long_break_every", 4, 1, 60), cx))
+            .child(number("long-break-every", strings.focus_long_break_every, LONG_BREAK_EVERY_SETTING, cx))
             .child(toggle("focus_auto_break", strings.focus_auto_break, cx))
             .child(toggle("focus_auto_next", strings.focus_auto_next, cx))
-            .child(number("auto-pomo-count", strings.focus_auto_count, ("focus_auto_count", 4, 2, 10), cx))
+            .child(number("auto-pomo-count", strings.focus_auto_count, AUTO_COUNT_SETTING, cx))
             .into_any_element()
     }
 
@@ -356,6 +370,42 @@ mod tests {
                 assert!(view.running.is_none());
                 assert_eq!(store.focus_sessions().unwrap().len(), 2);
                 assert!(store.focus_sessions().unwrap().iter().all(|s| s.task_id == Some(task.id)));
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn auto_next_chain_triggers_long_break_after_four_pomodoros(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let store = Rc::new(Store::open_in_memory().unwrap());
+            for (key, value) in [
+                ("focus_auto_break", "1"),
+                ("focus_auto_next", "1"),
+                ("focus_auto_count", "4"),
+                ("focus_long_break_every", "4"),
+            ] {
+                store.set_setting(key, value).unwrap();
+            }
+            let view = cx.new(|cx| FocusView::new(store.clone(), cx));
+            view.update(cx, |view, cx| {
+                view.start(None, cx);
+                for n in 1..=4 {
+                    // Complete Pomodoro #n -> should enter Short break for 1..=3, Long break for 4.
+                    complete_current(view, cx);
+                    let expected = if n == 4 { BreakKind::Long } else { BreakKind::Short };
+                    let running = view.running.as_ref().expect("break should start");
+                    assert_eq!(running.on_break, Some(expected), "after pomodoro #{n}");
+                    assert!(!running.timer.is_paused());
+                    // Complete break #n -> auto-chains Pomodoro #(n+1) for 1..=3, stops after 4.
+                    complete_current(view, cx);
+                    if n < 4 {
+                        let next = view.running.as_ref().expect("next pomodoro should auto-start");
+                        assert_eq!(next.on_break, None, "pomodoro #{} should run", n + 1);
+                    } else {
+                        assert!(view.running.is_none(), "chain should stop at auto_count=4");
+                    }
+                }
+                assert_eq!(store.focus_sessions().unwrap().len(), 4);
             });
         });
     }

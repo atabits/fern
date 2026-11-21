@@ -3297,12 +3297,17 @@ impl TodoView {
                             if closed_view {
                                 due_label.into_any_element()
                             } else {
+                                let due_tip = match (self.preferences.countdown_dates, task.due_date) {
+                                    (true, Some(d)) => format!("{} · {}", crate::calendar::format_date(d, strings), strings.show_countdown_mode),
+                                    _ => strings.show_countdown_mode.to_owned(),
+                                };
                                 div()
                                     .id(SharedString::from(format!("due-toggle-{id}")))
                                     .px_1()
                                     .rounded(px(4.))
                                     .cursor_pointer()
                                     .hover(|s| s.bg(theme.colors().element_hover))
+                                    .tooltip(Tooltip::text(due_tip))
                                     .child(due_label)
                                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                                     .on_click(cx.listener(|this, _, _, cx| {

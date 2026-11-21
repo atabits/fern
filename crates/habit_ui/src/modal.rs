@@ -479,7 +479,7 @@ impl HabitView {
         };
         let start_label = edit
             .start_date
-            .map(|d| d.format("%Y-%m-%d").to_string())
+            .map(|d| desktop_common::calendar::format_date(d, strings))
             .unwrap_or_else(|| strings.habit_forever.to_owned());
         let goal_days_label = edit
             .goal_days

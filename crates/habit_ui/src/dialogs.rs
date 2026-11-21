@@ -628,8 +628,12 @@ impl HabitView {
                                         .gap_2()
                                         .child(Label::new(format!("#{}", modal.cycles.len() - i)).size(LabelSize::Small).color(Color::Accent))
                                         .child(
-                                            Label::new(format!("{} — {}", c.start.format("%Y-%m-%d"), c.end.format("%Y-%m-%d")))
-                                                .size(LabelSize::Small),
+                                            Label::new(format!(
+                                                "{} — {}",
+                                                desktop_common::calendar::format_date(c.start, strings),
+                                                desktop_common::calendar::format_date(c.end, strings),
+                                            ))
+                                            .size(LabelSize::Small),
                                         ),
                                 )
                                 .child(

@@ -1589,6 +1589,12 @@ impl Render for HabitView {
                         .into_any_element(),
                     };
 
+                    let day_tip = match progress {
+                        DayProgress::Needless => calendar::format_date(date, strings),
+                        DayProgress::AllUndone => format!("{} · {}", calendar::format_date(date, strings), strings.habit_unachieved),
+                        DayProgress::Fraction(frac) => format!("{} · {}%", calendar::format_date(date, strings), (frac * 100.0).round() as u32),
+                    };
+
                     v_flex()
                         .id(SharedString::from(format!("week-day-{date}")))
                         .flex_1()
@@ -1599,6 +1605,7 @@ impl Render for HabitView {
                         .cursor_pointer()
                         .when(is_selected, |el| el.bg(theme.colors().accent.opacity(0.14)))
                         .hover(|s| s.bg(theme.colors().element_hover))
+                        .tooltip(Tooltip::text(day_tip))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.selected_date = if this.selected_date == Some(date) { None } else { Some(date) };
                             cx.notify();

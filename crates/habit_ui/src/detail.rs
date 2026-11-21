@@ -76,6 +76,11 @@ impl HabitView {
 
         let streak_val = if show_best_streak { stats.best_streak } else { stats.streak };
         let streak_label = if show_best_streak { strings.habit_best_streak } else { strings.habit_current_streak };
+        let alt_streak_tip = if show_best_streak {
+            format!("{}: {}", strings.habit_current_streak, stats.streak)
+        } else {
+            format!("{}: {}", strings.habit_best_streak, stats.best_streak)
+        };
         let streak_card = v_flex()
             .id("habit-streak-toggle")
             .flex_1()
@@ -87,6 +92,7 @@ impl HabitView {
             .bg(theme.colors().surface_background)
             .cursor_pointer()
             .hover(|s| s.bg(theme.colors().element_hover))
+            .tooltip(Tooltip::text(alt_streak_tip))
             .on_click(cx.listener(|this, _, _, cx| {
                 let next = !this.flag(STREAK_BEST_SETTING, false);
                 this.set_flag(STREAK_BEST_SETTING, next, cx);

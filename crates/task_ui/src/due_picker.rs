@@ -85,14 +85,29 @@ impl DueDraft {
     pub fn start_duration(&mut self, now: NaiveDateTime, minutes: i64) {
         self.tab = DueTab::Duration;
         self.menu = None;
-        let date = *self.date.get_or_insert(now.date());
+        let had_date = self.date.is_some();
+        let mut date = *self.date.get_or_insert(now.date());
         if self.end_date.is_none() {
             if self.time.is_none() {
-                let next_hour = (now.hour() + 1) % 24;
-                self.time = NaiveTime::from_hms_opt(next_hour, 0, 0);
+                if now.hour() == 23 {
+                    if !had_date {
+                        date += Duration::days(1);
+                        self.date = Some(date);
+                    }
+                    self.time = NaiveTime::from_hms_opt(0, 0, 0);
+                } else {
+                    self.time = NaiveTime::from_hms_opt(now.hour() + 1, 0, 0);
+                }
             }
-            self.end_date = Some(date);
-            self.end_time = self.time.map(|t| t + Duration::minutes(minutes));
+            if let Some(start_time) = self.time {
+                let (end_time, overflow_secs) = start_time.overflowing_add_signed(Duration::minutes(minutes));
+                let extra_days = overflow_secs.div_euclid(86_400);
+                self.end_date = Some(date + Duration::days(extra_days));
+                self.end_time = Some(end_time);
+            } else {
+                self.end_date = Some(date);
+                self.end_time = None;
+            }
         }
     }
 
@@ -126,9 +141,27 @@ impl DueDraft {
     }
 
     pub fn pick_range_time(&mut self, time: NaiveTime) {
+        let same_day = self.date.is_some() && self.date == self.end_date;
         match self.range_field {
-            Some(RangeField::EndTime) => self.end_time = Some(time),
-            _ => self.time = Some(time),
+            Some(RangeField::EndTime) => {
+                if same_day && let Some(start) = self.time && time < start {
+                    self.end_time = Some(start);
+                } else {
+                    self.end_time = Some(time);
+                }
+            }
+            _ => {
+                self.time = Some(time);
+                if same_day && self.end_time.is_some_and(|end| end < time) {
+                    let (next_end, overflow_secs) = time.overflowing_add_signed(Duration::minutes(60));
+                    if overflow_secs > 0
+                        && let Some(d) = self.date
+                    {
+                        self.end_date = Some(d + Duration::days(overflow_secs.div_euclid(86_400)));
+                    }
+                    self.end_time = Some(next_end);
+                }
+            }
         }
         self.range_field = None;
     }
@@ -752,5 +785,45 @@ mod tests {
         assert!(timezone_options("tokyo").iter().any(|(name, _)| name == "Asia/Tokyo"));
         assert_eq!(short_timezone_label(None, true, &EN).as_deref(), Some(EN.timezone_floating));
         assert!(short_timezone_label(Some("America/New_York"), false, &EN).unwrap().starts_with("New York (UTC"));
+    }
+
+    #[test]
+    fn duration_handles_midnight_overflow_and_keeps_end_after_start() {
+        // Task at 23:30 with 60-min duration advances end_date to the next day.
+        let today = d(2026, 10, 18);
+        let mut draft = DueDraft {
+            date: Some(today),
+            time: NaiveTime::from_hms_opt(23, 30, 0),
+            month: today,
+            ..Default::default()
+        };
+        draft.start_duration(today.and_hms_opt(22, 0, 0).unwrap(), 60);
+        assert_eq!(draft.end_date, Some(d(2026, 10, 19)));
+        assert_eq!(draft.end_time, NaiveTime::from_hms_opt(0, 30, 0));
+
+        // Empty draft at 23:15 starts at 00:00 the next day.
+        let mut late = DueDraft { month: today, ..Default::default() };
+        late.start_duration(today.and_hms_opt(23, 15, 0).unwrap(), 60);
+        assert_eq!(late.date, Some(d(2026, 10, 19)));
+        assert_eq!(late.time, NaiveTime::from_hms_opt(0, 0, 0));
+        assert_eq!(late.end_date, Some(d(2026, 10, 19)));
+        assert_eq!(late.end_time, NaiveTime::from_hms_opt(1, 0, 0));
+
+        // Moving start time past end time on the same day pushes end time forward.
+        let mut same = DueDraft {
+            date: Some(today),
+            time: NaiveTime::from_hms_opt(9, 0, 0),
+            end_date: Some(today),
+            end_time: NaiveTime::from_hms_opt(10, 0, 0),
+            range_field: Some(RangeField::StartTime),
+            ..Default::default()
+        };
+        same.pick_range_time(NaiveTime::from_hms_opt(14, 0, 0).unwrap());
+        assert_eq!(same.end_time, NaiveTime::from_hms_opt(15, 0, 0));
+
+        // Picking an end time earlier than start time on the same day clamps to start time.
+        same.range_field = Some(RangeField::EndTime);
+        same.pick_range_time(NaiveTime::from_hms_opt(12, 0, 0).unwrap());
+        assert_eq!(same.end_time, NaiveTime::from_hms_opt(14, 0, 0));
     }
 }

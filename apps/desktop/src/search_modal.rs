@@ -60,6 +60,8 @@ pub struct SearchModal {
     custom_from: Entity<TextInput>,
     custom_until: Entity<TextInput>,
     custom_open: bool,
+    /// Index of the keyboard-highlighted row across visible results.
+    selected: usize,
 }
 
 impl EventEmitter<SearchEvent> for SearchModal {}
@@ -76,7 +78,7 @@ impl SearchModal {
         let input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.search_placeholder, cx));
         cx.subscribe(&input, |this, _, _: &Changed, cx| this.refresh(cx)).detach();
         cx.subscribe(&input, |_, _, _: &Cancelled, cx| cx.emit(SearchEvent::Dismissed)).detach();
-        cx.subscribe(&input, |this, _, _: &Submitted, cx| this.open_first(cx)).detach();
+        cx.subscribe(&input, |this, _, _: &Submitted, cx| this.open_selected(cx)).detach();
         let all_lists = store.lists().unwrap_or_default();
         let custom_from = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.range_from, cx));
         let custom_until = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.range_until, cx));
@@ -95,6 +97,7 @@ impl SearchModal {
             custom_from,
             custom_until,
             custom_open: false,
+            selected: 0,
         }
     }
 
@@ -121,6 +124,7 @@ impl SearchModal {
         self.habits = self.store.habits().unwrap_or_default().into_iter().filter(|h| matches(&h.name)).collect();
         self.tags = self.store.tags().unwrap_or_default().into_iter().filter(|t| matches(&t.name)).collect();
         self.lists = self.all_lists.iter().filter(|l| matches(&l.name)).cloned().collect();
+        self.selected = 0;
         cx.notify();
     }
 
@@ -383,24 +387,43 @@ impl SearchModal {
         self.filter == Filter::All || self.filter == filter
     }
 
-    fn open_first(&mut self, cx: &mut Context<Self>) {
-        if self.shows(Filter::Tasks)
-            && let Some(task) = self.tasks.first()
-        {
-            cx.emit(SearchEvent::OpenTask(task.id));
-        } else if self.shows(Filter::Habits)
-            && let Some(habit) = self.habits.first()
-        {
-            cx.emit(SearchEvent::OpenHabit(habit.id));
-        } else if self.shows(Filter::Tags)
-            && let Some(tag) = self.tags.first()
-        {
-            cx.emit(SearchEvent::OpenView(View::Tag(tag.name.clone())));
-        } else if self.shows(Filter::Lists)
-            && let Some(list) = self.lists.first()
-        {
-            cx.emit(SearchEvent::OpenView(View::List(list.id)));
+    fn visible_events(&self) -> Vec<SearchEvent> {
+        let mut events = Vec::new();
+        if self.shows(Filter::Tasks) {
+            events.extend(self.tasks.iter().take(TASK_LIMIT).map(|t| SearchEvent::OpenTask(t.id)));
         }
+        if self.shows(Filter::Habits) {
+            events.extend(self.habits.iter().map(|h| SearchEvent::OpenHabit(h.id)));
+        }
+        if self.shows(Filter::Tags) {
+            events.extend(self.tags.iter().map(|t| SearchEvent::OpenView(View::Tag(t.name.clone()))));
+        }
+        if self.shows(Filter::Lists) {
+            events.extend(self.lists.iter().map(|l| SearchEvent::OpenView(View::List(l.id))));
+        }
+        events
+    }
+
+    fn move_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let count = self.visible_events().len();
+        if count == 0 {
+            self.selected = 0;
+            return;
+        }
+        let next = (self.selected as isize + delta).rem_euclid(count as isize) as usize;
+        if self.selected != next {
+            self.selected = next;
+            cx.notify();
+        }
+    }
+
+    fn open_selected(&mut self, cx: &mut Context<Self>) {
+        let mut events = self.visible_events();
+        if events.is_empty() {
+            return;
+        }
+        let index = self.selected.min(events.len() - 1);
+        cx.emit(events.swap_remove(index));
     }
 
     fn highlighted(&self, text: &str, query: &str, cx: &App) -> StyledText {
@@ -479,16 +502,23 @@ impl Render for SearchModal {
             Vec::new()
         };
 
+        let today = Local::now().date_naive();
+        let mut row_index = 0usize;
+        let selected_index = self.selected;
+
         let task_rows: Vec<AnyElement> = if self.shows(Filter::Tasks) {
             self.tasks
                 .iter()
                 .take(TASK_LIMIT)
                 .map(|task| {
+                    let is_selected = has_query && row_index == selected_index;
+                    row_index += 1;
                     let id = task.id;
                     let list = task
                         .list_id
                         .and_then(|id| self.all_lists.iter().find(|l| l.id == id))
                         .map_or(SharedString::new_static(strings.inbox), |l| l.name.clone().into());
+                    let due = task.due_date.map(|date| task_rows::due_label(date, task.due_time, today, strings));
                     let title_matches = !task_rows::match_ranges(&task.title, &query).is_empty();
                     let note = (!title_matches).then(|| task_rows::snippet(&task.notes, &query, 30)).flatten();
                     let location_match = task
@@ -503,6 +533,7 @@ impl Render for SearchModal {
                         .py_1()
                         .rounded(px(6.))
                         .cursor_pointer()
+                        .when(is_selected, |el| el.bg(theme.colors().ghost_element_selected))
                         .hover(|s| s.bg(theme.colors().ghost_element_hover))
                         .child(
                             h_flex()
@@ -512,7 +543,9 @@ impl Render for SearchModal {
                                     Checkbox::new(SharedString::from(format!("search-checkbox-{id}")))
                                         .size(px(14.))
                                         .toggle_state(task.is_completed())
-                                        .in_progress(task.is_in_progress()),
+                                        .in_progress(task.is_in_progress())
+                                        .dismissed(task.is_wont_do())
+                                        .tint(task_rows::priority_color(task.priority, &theme)),
                                 )
                                 .child(
                                     div()
@@ -523,6 +556,13 @@ impl Render for SearchModal {
                                         .when(task.is_completed(), |el| el.text_color(theme.colors().text_muted))
                                         .child(self.highlighted(&task.title, &query, cx)),
                                 )
+                                .when_some(due, |el, (label, overdue)| {
+                                    el.child(
+                                        Label::new(label)
+                                            .size(LabelSize::XSmall)
+                                            .color(if overdue && !task.is_completed() { Color::Error } else { Color::Accent }),
+                                    )
+                                })
                                 .child(Label::new(list).size(LabelSize::XSmall).color(Color::Muted)),
                         )
                         .when_some(note, |el, note| {
@@ -561,12 +601,37 @@ impl Render for SearchModal {
         };
         let more = self.shows(Filter::Tasks) && self.tasks.len() > TASK_LIMIT;
 
-        let named_rows = |items: Vec<(SharedString, IconName, Hsla, View)>, cx: &mut Context<Self>| -> Vec<AnyElement> {
+        let habit_rows: Vec<AnyElement> = if self.shows(Filter::Habits) {
+            self.habits
+                .iter()
+                .map(|habit| {
+                    let is_selected = has_query && row_index == selected_index;
+                    row_index += 1;
+                    let id = habit.id;
+                    ListItem::new(SharedString::from(format!("search-habit-{id}")))
+                        .height(px(30.))
+                        .toggle_state(is_selected)
+                        .start_slot(desktop_common::habit_helpers::avatar(habit, px(18.), cx))
+                        .child(div().text_size(px(13.)).child(self.highlighted(&habit.name, &query, cx)))
+                        .when(habit.archived, |item| {
+                            item.end_slot(Label::new(strings.habit_archived).size(LabelSize::XSmall).color(Color::Muted))
+                        })
+                        .on_click(cx.listener(move |_, _, _, cx| cx.emit(SearchEvent::OpenHabit(id))))
+                        .into_any_element()
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let named_rows = |items: Vec<(SharedString, IconName, Hsla, View)>, row_index: &mut usize, cx: &mut Context<Self>| -> Vec<AnyElement> {
             items
                 .into_iter()
                 .map(|(name, icon, color, view)| {
+                    let is_selected = has_query && *row_index == selected_index;
+                    *row_index += 1;
                     ListItem::new(SharedString::from(format!("search-{name}-{icon:?}")))
                         .height(px(30.))
+                        .toggle_state(is_selected)
                         .start_slot(Icon::new(icon).color(color))
                         .child(div().text_size(px(13.)).child(self.highlighted(&name, &query, cx)))
                         .on_click(cx.listener(move |_, _, _, cx| cx.emit(SearchEvent::OpenView(view.clone()))))
@@ -580,7 +645,7 @@ impl Render for SearchModal {
                 .iter()
                 .map(|t| (t.name.clone().into(), IconName::Tag, lists_panel::color(t.color.as_deref(), cx), View::Tag(t.name.clone())))
                 .collect();
-            named_rows(items, cx)
+            named_rows(items, &mut row_index, cx)
         } else {
             Vec::new()
         };
@@ -590,26 +655,7 @@ impl Render for SearchModal {
                 .iter()
                 .map(|l| (l.name.clone().into(), IconName::List, lists_panel::color(l.color.as_deref(), cx), View::List(l.id)))
                 .collect();
-            named_rows(items, cx)
-        } else {
-            Vec::new()
-        };
-        let habit_rows: Vec<AnyElement> = if self.shows(Filter::Habits) {
-            self.habits
-                .iter()
-                .map(|habit| {
-                    let id = habit.id;
-                    ListItem::new(SharedString::from(format!("search-habit-{id}")))
-                        .height(px(30.))
-                        .start_slot(desktop_common::habit_helpers::avatar(habit, px(18.), cx))
-                        .child(div().text_size(px(13.)).child(self.highlighted(&habit.name, &query, cx)))
-                        .when(habit.archived, |item| {
-                            item.end_slot(Label::new(strings.habit_archived).size(LabelSize::XSmall).color(Color::Muted))
-                        })
-                        .on_click(cx.listener(move |_, _, _, cx| cx.emit(SearchEvent::OpenHabit(id))))
-                        .into_any_element()
-                })
-                .collect()
+            named_rows(items, &mut row_index, cx)
         } else {
             Vec::new()
         };
@@ -626,6 +672,22 @@ impl Render for SearchModal {
             .border_color(theme.colors().border)
             .shadow_lg()
             .text_color(theme.colors().text)
+            .capture_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                if this.menu.is_some() {
+                    return;
+                }
+                match event.keystroke.key.as_str() {
+                    "down" => {
+                        this.move_selection(1, cx);
+                        cx.stop_propagation();
+                    }
+                    "up" => {
+                        this.move_selection(-1, cx);
+                        cx.stop_propagation();
+                    }
+                    _ => {}
+                }
+            }))
             .on_mouse_down_out(cx.listener(|_, _, _, cx| cx.emit(SearchEvent::Dismissed)))
             .child(
                 h_flex()
@@ -719,5 +781,48 @@ impl Render for SearchModal {
                 .flex_1()
                 .min_h(px(180.)),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[gpui::test]
+    fn keyboard_navigation_selects_and_opens_matching_results(cx: &mut gpui::TestAppContext) {
+        cx.update(theme::init);
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let first = store.add_task("Alpha review").unwrap();
+        let second = store.add_task("Alpha deploy").unwrap();
+        let opened: Rc<std::cell::RefCell<Option<Id>>> = Rc::new(std::cell::RefCell::new(None));
+        let opened_slot = opened.clone();
+
+        let (modal, cx) = cx.add_window_view(|_window, cx| {
+            let entity = cx.entity();
+            cx.subscribe(&entity, move |_, _, event: &SearchEvent, _| {
+                if let SearchEvent::OpenTask(id) = event {
+                    *opened_slot.borrow_mut() = Some(*id);
+                }
+            })
+            .detach();
+            SearchModal::new(store, cx)
+        });
+        cx.update(|_, cx| {
+            modal.update(cx, |modal, cx| {
+                modal.set_query("Alpha", cx);
+                assert_eq!(modal.selected, 0);
+                modal.move_selection(1, cx);
+                assert_eq!(modal.selected, 1);
+                modal.move_selection(1, cx);
+                assert_eq!(modal.selected, 0, "selection wraps at end");
+                modal.move_selection(-1, cx);
+                assert_eq!(modal.selected, 1, "selection wraps from start");
+                modal.open_selected(cx);
+            });
+        });
+        cx.run_until_parked();
+        let expected = cx.update(|_, cx| modal.read(cx).tasks[1].id);
+        assert!(expected == first.id || expected == second.id);
+        assert_eq!(*opened.borrow(), Some(expected));
     }
 }

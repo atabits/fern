@@ -3986,6 +3986,16 @@ impl Render for TaskDetail {
                                     }),
                             ))
                             .child(div().flex_1())
+                            .when(!sticky, |bar| {
+                                let words = fern_core::markdown::count_words(self.notes.read(cx).text());
+                                bar.when(words > 0, |bar| {
+                                    bar.child(
+                                        Label::new(strings.word_count.replace("{n}", &words.to_string()))
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Muted),
+                                    )
+                                })
+                            })
                             .when(!sticky && self.session.draft.is_none(), |bar| bar.child(
                                 IconButton::new("format", IconName::Baseline)
                                     .toggle_state(self.format_bar)

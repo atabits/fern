@@ -442,6 +442,35 @@ pub fn format_task_plain_text(
     out
 }
 
+/// Counts words in text, treating each CJK ideograph as a word and splitting other scripts on
+/// whitespace (accurate across English, Russian, and Chinese).
+pub fn count_words(text: &str) -> usize {
+    let mut count = 0usize;
+    let mut in_word = false;
+    for ch in text.chars() {
+        let is_cjk = matches!(
+            ch as u32,
+            0x4E00..=0x9FFF | 0x3400..=0x4DBF | 0x3040..=0x30FF | 0xAC00..=0xD7AF
+        );
+        if is_cjk {
+            if in_word {
+                count += 1;
+                in_word = false;
+            }
+            count += 1;
+        } else if ch.is_alphanumeric() {
+            in_word = true;
+        } else if in_word {
+            count += 1;
+            in_word = false;
+        }
+    }
+    if in_word {
+        count += 1;
+    }
+    count
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -553,5 +582,15 @@ mod tests {
         assert!(plain.starts_with("Ship v1.0\n2026-11-21 14:30 #release"));
         assert!(plain.contains("Review notes and docs"));
         assert!(plain.contains("[x] Run tests\n[ ] Tag build"));
+    }
+
+    #[test]
+    fn word_counter_handles_latin_cyrillic_and_cjk() {
+        assert_eq!(count_words(""), 0);
+        assert_eq!(count_words("   ---   "), 0);
+        assert_eq!(count_words("Hello world"), 2);
+        assert_eq!(count_words("Привет, мир! 2026"), 3);
+        assert_eq!(count_words("你好世界"), 4);
+        assert_eq!(count_words("Hello 世界 test"), 4);
     }
 }

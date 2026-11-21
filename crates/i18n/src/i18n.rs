@@ -459,6 +459,8 @@ pub struct Strings {
     pub copy_link: &'static str,
     pub copy_markdown: &'static str,
     pub copy_plain_text: &'static str,
+    /// Word count shown in the task/note detail footer; `{n}` is the count.
+    pub word_count: &'static str,
     /// The task menu's item that opens the task in a window of its own over the others.
     pub open_sticky_note: &'static str,
     pub sticky_notes: &'static str,
@@ -1444,6 +1446,7 @@ pub static EN: Strings = Strings {
     copy_link: "Copy Link",
     copy_markdown: "Copy as Markdown",
     copy_plain_text: "Copy as Plain Text",
+    word_count: "{n} words",
     open_sticky_note: "Open as Sticky Note",
     sticky_notes: "Sticky Notes",
     sticky_opacity: "Opacity",
@@ -2399,6 +2402,7 @@ pub static ZH_CN: Strings = Strings {
     copy_link: "复制链接",
     copy_markdown: "复制为 Markdown",
     copy_plain_text: "复制为纯文本",
+    word_count: "{n} 字",
     open_sticky_note: "作为便签打开",
     sticky_notes: "便签",
     sticky_opacity: "不透明度",
@@ -3354,6 +3358,7 @@ pub static RU: Strings = Strings {
     copy_link: "Копировать ссылку",
     copy_markdown: "Копировать как Markdown",
     copy_plain_text: "Копировать как текст",
+    word_count: "Слов: {n}",
     open_sticky_note: "Открыть как заметку на экране",
     sticky_notes: "Закреплённые заметки",
     sticky_opacity: "Непрозрачность",

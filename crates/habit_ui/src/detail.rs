@@ -76,20 +76,35 @@ impl HabitView {
 
         let streak_val = if show_best_streak { stats.best_streak } else { stats.streak };
         let streak_label = if show_best_streak { strings.habit_best_streak } else { strings.habit_current_streak };
-        let streak_card = stat_card(
-            IconName::Flame,
-            status_colors.warning,
-            streak_label,
-            streak_val.to_string(),
-            day_unit_str(streak_val as i64, strings).into(),
-        )
-        .id("habit-streak-toggle")
-        .cursor_pointer()
-        .hover(|s| s.bg(theme.colors().element_hover))
-        .on_click(cx.listener(|this, _, _, cx| {
-            let next = !this.flag(STREAK_BEST_SETTING, false);
-            this.set_flag(STREAK_BEST_SETTING, next, cx);
-        }));
+        let streak_card = v_flex()
+            .id("habit-streak-toggle")
+            .flex_1()
+            .h(px(68.))
+            .px_3()
+            .justify_center()
+            .gap_0p5()
+            .rounded(px(8.))
+            .bg(theme.colors().surface_background)
+            .cursor_pointer()
+            .hover(|s| s.bg(theme.colors().element_hover))
+            .on_click(cx.listener(|this, _, _, cx| {
+                let next = !this.flag(STREAK_BEST_SETTING, false);
+                this.set_flag(STREAK_BEST_SETTING, next, cx);
+            }))
+            .child(
+                h_flex()
+                    .gap_1()
+                    .child(Icon::new(IconName::Flame).size(IconSize::Small).color(Color::Custom(status_colors.warning)))
+                    .child(Label::new(streak_label).size(LabelSize::Small).truncate())
+                    .child(Icon::new(IconName::ArrowDownUp).size(IconSize::XSmall).color(Color::Muted)),
+            )
+            .child(
+                h_flex()
+                    .items_end()
+                    .gap_1()
+                    .child(div().text_size(px(20.)).line_height(px(24.)).font_weight(FontWeight::MEDIUM).child(streak_val.to_string()))
+                    .child(div().pb(px(3.)).child(Label::new(day_unit_str(streak_val as i64, strings)).size(LabelSize::Small).color(Color::Muted))),
+            );
 
         let weekdays = h_flex().children(calendar::weekday_labels(&strings.weekdays_short).iter().map(|day| {
             div().flex_1().flex().justify_center().child(Label::new(*day).size(LabelSize::Small).color(Color::Muted))

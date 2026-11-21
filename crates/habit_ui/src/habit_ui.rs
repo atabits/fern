@@ -466,6 +466,7 @@ impl HabitView {
         let Some(habit) = self.habits.iter().find(|h| h.id == habit_id).cloned() else {
             return;
         };
+        desktop_common::sound::play_complete(&self.store);
         // Check if this check-in just completed a Goal Days cycle.
         if let Some(target) = habit.goal_days
             && target > 0

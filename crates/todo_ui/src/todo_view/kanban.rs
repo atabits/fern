@@ -1164,8 +1164,15 @@ impl TodoView {
                                     .children(fern_core::DefaultDate::ALL.iter().zip(strings.default_dates).map(|(&choice, name)| {
                                         ListItem::new(SharedString::from(format!("kanban-postpone-{name}")))
                                             .child(Label::new(name))
-                                            .on_click(cx.listener(move |this, _, _, cx| this.postpone_overdue(choice.date(Self::today()), cx)))
-                                    })),
+                                            .on_click(cx.listener(move |this, _, _, cx| this.postpone_overdue(Some(choice.date(Self::today())), cx)))
+                                    }))
+                                    .child(Divider::horizontal())
+                                    .child(
+                                        ListItem::new("kanban-postpone-clear")
+                                            .start_slot(Icon::new(IconName::CalendarX).size(IconSize::XSmall).color(Color::Muted))
+                                            .child(Label::new(strings.clear).color(Color::Muted))
+                                            .on_click(cx.listener(|this, _, _, cx| this.postpone_overdue(None, cx))),
+                                    ),
                             ))
                         }),
                 )

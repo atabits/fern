@@ -1540,8 +1540,15 @@ impl TodoView {
                                     .children(fern_core::DefaultDate::ALL.iter().zip(strings.default_dates).map(|(&choice, name)| {
                                         ListItem::new(SharedString::from(format!("postpone-{name}")))
                                             .child(Label::new(name))
-                                            .on_click(cx.listener(move |this, _, _, cx| this.postpone_overdue(choice.date(Self::today()), cx)))
-                                    })),
+                                            .on_click(cx.listener(move |this, _, _, cx| this.postpone_overdue(Some(choice.date(Self::today())), cx)))
+                                    }))
+                                    .child(Divider::horizontal())
+                                    .child(
+                                        ListItem::new("postpone-clear")
+                                            .start_slot(Icon::new(IconName::CalendarX).size(IconSize::XSmall).color(Color::Muted))
+                                            .child(Label::new(strings.clear).color(Color::Muted))
+                                            .on_click(cx.listener(|this, _, _, cx| this.postpone_overdue(None, cx))),
+                                    ),
                             ))
                         }),
                 )
@@ -1549,8 +1556,8 @@ impl TodoView {
             .into_any_element()
     }
 
-    /// Moves every overdue task in view to `day`, keeping its time.
-    fn postpone_overdue(&mut self, day: NaiveDate, cx: &mut Context<Self>) {
+    /// Moves every overdue task in view to `day` (keeping its time), or clears their due dates when `None`.
+    pub(super) fn postpone_overdue(&mut self, day: Option<NaiveDate>, cx: &mut Context<Self>) {
         self.postpone_menu = false;
         let today = Self::today();
         let overdue: Vec<_> = self
@@ -1560,9 +1567,10 @@ impl TodoView {
             .map(|t| (t.id, t.due_time))
             .collect();
         for (id, time) in overdue {
-            let result = self.store.set_due(id, Some(day), time);
+            let result = self.store.set_due(id, day, day.and(time));
             self.check(result);
         }
+        crate::data_version::data_changed(cx.entity_id(), cx);
         self.reload(cx);
     }
 

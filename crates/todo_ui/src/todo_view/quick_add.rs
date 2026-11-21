@@ -238,6 +238,7 @@ impl TodoView {
         let spans = parsed.spans.clone();
         self.input.update(cx, |input, cx| input.set_highlights(spans, cx));
         self.quick_add_due = parsed.due_date.map(|date| (date, parsed.due_time));
+        self.quick_add_repeat = parsed.repeat.is_some();
         cx.notify();
     }
 

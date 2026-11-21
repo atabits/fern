@@ -222,6 +222,7 @@ pub struct TodoView {
     preferences: fern_core::Preferences,
     /// The date quick add recognized in the field so far, shown at its end.
     quick_add_due: Option<(NaiveDate, Option<chrono::NaiveTime>)>,
+    quick_add_repeat: bool,
     /// The mini calendar: expanded to a month, which month, and the days with open tasks.
     mini_expanded: bool,
     mini_month: NaiveDate,
@@ -487,6 +488,7 @@ impl TodoView {
             filters: Vec::new(),
             preferences: Default::default(),
             quick_add_due: None,
+            quick_add_repeat: false,
             mini_expanded,
             mini_month: crate::calendar::month_start(Self::today()),
             busy_days: HashSet::new(),
@@ -3816,12 +3818,19 @@ impl Render for TodoView {
                             Some((end, end_time)) => crate::due_picker::range_label(date, time, end, end_time, strings),
                             None => label,
                         };
+                        let has_repeat = self.quick_add_repeat || self.add_draft.repeat.is_some();
                         h_flex()
                             .flex_none()
                             .gap_1()
                             .child(Icon::new(IconName::CalendarDays).size(IconSize::Small).color(Color::Accent))
+                            .when(has_repeat, |el| {
+                                el.child(Icon::new(IconName::Repeat).size(IconSize::XSmall).color(Color::Accent))
+                            })
                             .child(Label::new(label).size(LabelSize::Small).color(Color::Accent))
                     }))
+                    .when(self.shown_add_due().is_none() && (self.quick_add_repeat || self.add_draft.repeat.is_some()), |el| {
+                        el.child(Icon::new(IconName::Repeat).size(IconSize::Small).color(Color::Accent))
+                    })
                     .child(
                         div()
                             .relative()

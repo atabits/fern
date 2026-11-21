@@ -17,6 +17,8 @@ use crate::text_input::{Cancelled, Changed, Mode, Submitted, TextInput};
 
 /// How many tasks the popover lists before "View more".
 const TASK_LIMIT: usize = 5;
+/// Delay before querying SQLite while the user is actively typing.
+const SEARCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(120);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Filter {
@@ -53,6 +55,8 @@ pub struct SearchModal {
     tags: Vec<Tag>,
     lists: Vec<List>,
     all_lists: Vec<List>,
+    all_tags: Vec<Tag>,
+    search_task: Option<gpui::Task<()>>,
     /// The Task filter's choices, the open dropdown, and the choices being made in it (applied
     /// with OK, as the original's), with the Custom dates' fields.
     task_filter: TaskFilter,
@@ -77,10 +81,17 @@ impl SearchModal {
     pub fn new(store: Rc<Store>, cx: &mut Context<Self>) -> Self {
         let strings = i18n::t(cx);
         let input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.search_placeholder, cx));
-        cx.subscribe(&input, |this, _, _: &Changed, cx| this.refresh(cx)).detach();
+        cx.subscribe(&input, |this, _, _: &Changed, cx| this.schedule_refresh(cx)).detach();
         cx.subscribe(&input, |_, _, _: &Cancelled, cx| cx.emit(SearchEvent::Dismissed)).detach();
         cx.subscribe(&input, |this, _, _: &Submitted, cx| this.open_selected(cx)).detach();
         let all_lists = store.lists().unwrap_or_default();
+        let all_tags = store.tags().unwrap_or_default();
+        cx.observe_global::<desktop_common::data_version::DataVersion>(|this, cx| {
+            this.all_lists = this.store.lists().unwrap_or_default();
+            this.all_tags = this.store.tags().unwrap_or_default();
+            cx.notify();
+        })
+        .detach();
         let custom_from = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.range_from, cx));
         let custom_until = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.range_until, cx));
         Self {
@@ -92,6 +103,8 @@ impl SearchModal {
             tags: Vec::new(),
             lists: Vec::new(),
             all_lists,
+            all_tags,
+            search_task: None,
             task_filter: TaskFilter::default(),
             menu: None,
             draft: TaskFilter::default(),
@@ -113,7 +126,15 @@ impl SearchModal {
         self.input.read(cx).text().trim().to_owned()
     }
 
+    fn schedule_refresh(&mut self, cx: &mut Context<Self>) {
+        self.search_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(SEARCH_DEBOUNCE).await;
+            this.update(cx, |this, cx| this.refresh(cx)).ok();
+        }));
+    }
+
     fn refresh(&mut self, cx: &mut Context<Self>) {
+        self.search_task = None;
         let query = self.query(cx);
         let today = Local::now().date_naive();
         self.tasks = self.store.tasks_in(&View::Search(query.clone()), today).unwrap_or_default();
@@ -123,7 +144,7 @@ impl SearchModal {
         }
         let matches = |name: &str| !task_rows::match_ranges(name, &query).is_empty();
         self.habits = self.store.habits().unwrap_or_default().into_iter().filter(|h| matches(&h.name)).collect();
-        self.tags = self.store.tags().unwrap_or_default().into_iter().filter(|t| matches(&t.name)).collect();
+        self.tags = self.all_tags.iter().filter(|t| matches(&t.name)).cloned().collect();
         self.lists = self.all_lists.iter().filter(|l| matches(&l.name)).cloned().collect();
         self.selected = 0;
         cx.notify();
@@ -247,8 +268,8 @@ impl SearchModal {
                             .into_any_element(),
                     );
                 }
-                for tag in self.store.tags().unwrap_or_default() {
-                    let name = tag.name;
+                for tag in &self.all_tags {
+                    let name = tag.name.clone();
                     let on = matches!(&draft.tags, TagRule::Any(tags) if tags.contains(&name));
                     items.push(
                         row(SharedString::from(format!("search-tag-{name}")), Some(Icon::new(IconName::Tag)), name.clone().into(), on)
@@ -427,6 +448,29 @@ impl SearchModal {
         }
     }
 
+    fn toggle_task_completion(&mut self, task: &Task, cx: &mut Context<Self>) {
+        let done = task.is_completed();
+        let wont_do = task.is_wont_do();
+        let completing = !done && !wont_do;
+        let result = if completing {
+            desktop_common::undo::complete(&self.store, task).map(|_| ())
+        } else if wont_do {
+            self.store.set_wont_do(task.id, false)
+        } else {
+            self.store.set_completed(task.id, false)
+        };
+        if let Err(err) = result {
+            eprintln!("failed to toggle task from search: {err:#}");
+            return;
+        }
+        if completing {
+            desktop_common::completion_mark::record(task.id, cx);
+            desktop_common::sound::play_complete(&self.store);
+        }
+        desktop_common::data_version::data_changed(cx.entity_id(), cx);
+        self.refresh(cx);
+    }
+
     fn open_selected(&mut self, cx: &mut Context<Self>) {
         let mut events = self.visible_events();
         if events.is_empty() {
@@ -557,23 +601,17 @@ impl Render for SearchModal {
                                     Icon::new(IconName::FileText).size(IconSize::Small).color(Color::Muted).into_any_element()
                                 } else {
                                     let done = task.is_completed();
+                                    let wont_do = task.is_wont_do();
+                                    let task_snapshot = task.clone();
                                     Checkbox::new(SharedString::from(format!("search-checkbox-{id}")))
                                         .size(px(14.))
                                         .toggle_state(done)
                                         .in_progress(task.is_in_progress())
-                                        .dismissed(task.is_wont_do())
+                                        .dismissed(wont_do)
                                         .tint(task_rows::priority_color(task.priority, &theme))
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             cx.stop_propagation();
-                                            if !done {
-                                                desktop_common::sound::play_complete(&this.store);
-                                            }
-                                            if let Err(err) = this.store.set_completed(id, !done) {
-                                                eprintln!("failed to toggle task from search: {err:#}");
-                                            } else {
-                                                desktop_common::data_version::data_changed(cx.entity_id(), cx);
-                                                this.refresh(cx);
-                                            }
+                                            this.toggle_task_completion(&task_snapshot, cx);
                                         }))
                                         .into_any_element()
                                 })
@@ -921,5 +959,30 @@ mod tests {
         let expected = cx.update(|_, cx| modal.read(cx).tasks[1].id);
         assert!(expected == first.id || expected == second.id);
         assert_eq!(*opened.borrow(), Some(expected));
+    }
+
+    #[gpui::test]
+    fn completing_repeating_task_from_search_advances_recurrence(cx: &mut gpui::TestAppContext) {
+        cx.update(theme::init);
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 10, 18).unwrap();
+        let task = store.add_task("Weekly sync").unwrap();
+        store.set_due(task.id, Some(day), None).unwrap();
+        store
+            .set_repeat(task.id, Some(fern_core::Recurrence::new(fern_core::Frequency::Weekly, 1)), day)
+            .unwrap();
+        let before = store.task(task.id).unwrap().unwrap();
+
+        let (modal, cx) = cx.add_window_view(|_window, cx| SearchModal::new(store.clone(), cx));
+        cx.update(|_, cx| {
+            modal.update(cx, |modal, cx| {
+                modal.toggle_task_completion(&before, cx);
+            });
+        });
+        let updated = store.task(task.id).unwrap().unwrap();
+        assert!(!updated.is_completed(), "repeating task must stay open for its next occurrence");
+        assert_eq!(updated.due_date, Some(day + chrono::Duration::days(7)));
+        let completed_copies = store.tasks().unwrap().into_iter().filter(|t| t.is_completed()).count();
+        assert_eq!(completed_copies, 1);
     }
 }

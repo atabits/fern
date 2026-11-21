@@ -60,14 +60,14 @@ impl SettingsWindow {
                             .on_click(cx.listener(|this, _, _, cx| this.update_sticky(cx, |s| s.hide_from_taskbar = !s.hide_from_taskbar))))
                         .child(div().px_4().pb_2().child(Label::new(strings.sticky_task_view_hint).size(LabelSize::Small).color(Color::Muted)))),
             ))
-            .children(self.backup_message.clone().map(|message| Label::new(message).color(Color::Error)))
+            .children(self.sticky_error.clone().map(|message| Label::new(message).color(Color::Error)))
             .into_any_element()
     }
 
     fn update_sticky(&mut self, cx: &mut Context<Self>, change: impl FnOnce(&mut StickySettings)) {
         let mut settings = StickySettings::current(&self.store, cx);
         change(&mut settings);
-        self.backup_message = match settings.save(&self.store) {
+        self.sticky_error = match settings.save(&self.store) {
             Ok(()) => {
                 cx.set_global(settings);
                 None

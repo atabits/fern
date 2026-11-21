@@ -30,6 +30,7 @@ pub const WIDTH: f32 = 840.;
 pub const HEIGHT: f32 = 680.;
 const MIN_WIDTH: f32 = 640.;
 const MIN_HEIGHT: f32 = 400.;
+const SYNC_SAVE_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(400);
 
 type SelectPick = Box<dyn Fn(&mut SettingsWindow, &mut Window, &mut Context<SettingsWindow>)>;
 type SelectOption = (SharedString, bool, SelectPick);
@@ -95,11 +96,23 @@ pub struct SettingsWindow {
     should_move: bool,
     /// The outcome of the last backup or import.
     backup_message: Option<String>,
+    /// Error saving Sticky Note preferences (kept separate from backup/import messages).
+    sticky_error: Option<String>,
+    /// Cached lookups so `render()` never runs synchronous SQLite queries per frame.
+    cached_tags: Vec<fern_core::Tag>,
+    cached_lists: Vec<fern_core::List>,
+    sound_enabled: bool,
+    #[cfg(windows)]
+    minimize_to_tray: bool,
+    #[cfg(windows)]
+    always_on_top: bool,
     installed_notes: Option<Rc<ReleaseNotes>>,
     release_notes: Option<Rc<ReleaseNotes>>,
-    /// Settings → Sync: the server's address and the token, saved as they are typed.
+    /// Settings → Sync: the server's address and the token, debounced on edit and flushed on submit/close.
     sync_server: Entity<crate::text_input::TextInput>,
     sync_token: Entity<crate::text_input::TextInput>,
+    sync_save_task: Option<gpui::Task<()>>,
+    sync_dirty: bool,
     /// Integrations: the subscription being added (`Some(None)`) or changed, its color, and its
     /// name and address fields.
     subscription_form: Option<(Option<fern_core::Id>, Option<String>)>,
@@ -169,23 +182,25 @@ pub fn open(
 
 /// Installs the theme and the first day of the week from `preferences`.
 pub fn apply(preferences: &Preferences, window: &Window, cx: &mut App) {
-    appearance_view::apply_theme(&preferences.theme, window, cx);
+    let refreshed = crate::user_themes::apply_theme(&preferences.theme, window, cx);
     calendar::set_week_start(preferences.week_start);
     calendar::set_hour12(preferences.hour12);
     calendar::set_date_format(preferences.date_format);
     calendar::set_week_numbers(preferences.week_numbers);
-    cx.refresh_windows();
-}
-
-/// Re-applies only the active theme selection (used on live-reload and manual reload).
-pub fn apply_theme_only(selection: &fern_core::ThemeSelection, window: &Window, cx: &mut App) {
-    appearance_view::apply_theme(selection, window, cx);
+    if !refreshed {
+        cx.refresh_windows();
+    }
 }
 
 impl SettingsWindow {
     pub fn new(store: Rc<Store>, cx: &mut Context<Self>) -> Self {
         let preferences = store.preferences().unwrap_or_default();
         let config = store.sync_config().ok().flatten().unwrap_or_default();
+        let cached_tags = store.tags().unwrap_or_default();
+        let cached_lists = store.lists().unwrap_or_default();
+        let sound_enabled = desktop_common::sound::enabled(&store);
+        #[cfg(windows)]
+        let tray_prefs = crate::tray::TrayPrefs::current(&store, cx);
         let field = |placeholder: &'static str, text: String, masked: bool, cx: &mut Context<Self>| {
             let input = cx.new(|cx| {
                 let mut input = crate::text_input::TextInput::new(crate::text_input::Mode::SingleLine, placeholder, cx);
@@ -195,13 +210,32 @@ impl SettingsWindow {
                 input.set_text(text, cx);
                 input
             });
-            cx.subscribe(&input, |this: &mut Self, _, _: &crate::text_input::Changed, cx| this.save_sync(cx)).detach();
+            cx.subscribe(&input, |this: &mut Self, _, _: &crate::text_input::Changed, cx| {
+                this.schedule_save_sync(cx);
+            })
+            .detach();
+            cx.subscribe(&input, |this: &mut Self, _, _: &crate::text_input::Submitted, cx| {
+                this.flush_sync_save(cx);
+            })
+            .detach();
             input
         };
         let sync_server = field("https://fern.example.org", config.server, false, cx);
         let sync_token = field("", config.token, true, cx);
         let updates = crate::updater::updater(cx).map(|updater| cx.observe(&updater, |_, _, cx| cx.notify()));
         let feeds = crate::subscriptions::feeds(cx).map(|feeds| cx.observe(&feeds, |_, _, cx| cx.notify()));
+        cx.observe_global::<desktop_common::data_version::DataVersion>(|this, cx| {
+            this.refresh_cached_collections(cx);
+        })
+        .detach();
+        #[cfg(windows)]
+        cx.observe_global::<crate::tray::TrayPrefs>(|this, cx| {
+            let prefs = *cx.global::<crate::tray::TrayPrefs>();
+            this.minimize_to_tray = prefs.minimize_to_tray;
+            this.always_on_top = prefs.always_on_top;
+            cx.notify();
+        })
+        .detach();
         let plain = |placeholder: &'static str, cx: &mut Context<Self>| {
             let input = cx.new(|cx| crate::text_input::TextInput::new(crate::text_input::Mode::SingleLine, placeholder, cx));
             cx.subscribe(&input, |this: &mut Self, _, _: &crate::text_input::Submitted, cx| {
@@ -232,10 +266,20 @@ impl SettingsWindow {
             closing: false,
             should_move: false,
             backup_message: None,
+            sticky_error: None,
+            cached_tags,
+            cached_lists,
+            sound_enabled,
+            #[cfg(windows)]
+            minimize_to_tray: tray_prefs.minimize_to_tray,
+            #[cfg(windows)]
+            always_on_top: tray_prefs.always_on_top,
             installed_notes,
             release_notes: None,
             sync_server,
             sync_token,
+            sync_save_task: None,
+            sync_dirty: false,
             subscription_form: None,
             subscription_name,
             subscription_url,
@@ -252,10 +296,17 @@ impl SettingsWindow {
         }
     }
 
+    fn refresh_cached_collections(&mut self, cx: &mut Context<Self>) {
+        self.cached_tags = self.store.tags().unwrap_or_default();
+        self.cached_lists = self.store.lists().unwrap_or_default();
+        cx.notify();
+    }
+
     fn attach_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let weak = cx.weak_entity();
         window.on_window_should_close(cx, move |_, cx| {
             weak.update(cx, |this, cx| {
+                this.flush_sync_save(cx);
                 if !this.closing {
                     this.closing = true;
                     cx.emit(SettingsEvent::Dismissed);
@@ -271,6 +322,7 @@ impl SettingsWindow {
     }
 
     pub(crate) fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.flush_sync_save(cx);
         if self.closing {
             return;
         }
@@ -279,7 +331,20 @@ impl SettingsWindow {
         window.defer(cx, |window, _| window.remove_window());
     }
 
-    fn save_sync(&mut self, cx: &mut Context<Self>) {
+    fn schedule_save_sync(&mut self, cx: &mut Context<Self>) {
+        self.sync_dirty = true;
+        self.sync_save_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(SYNC_SAVE_DEBOUNCE).await;
+            this.update(cx, |this, cx| this.flush_sync_save(cx)).ok();
+        }));
+    }
+
+    fn flush_sync_save(&mut self, cx: &mut Context<Self>) {
+        self.sync_save_task = None;
+        if !self.sync_dirty {
+            return;
+        }
+        self.sync_dirty = false;
         let config = fern_core::sync::SyncConfig {
             server: self.sync_server.read(cx).text().to_owned(),
             token: self.sync_token.read(cx).text().to_owned(),
@@ -346,25 +411,39 @@ impl SettingsWindow {
     }
 
     /// "Generate Backup": all data in one file, saved where the user chooses.
+    /// Runs SQLite backup + attachment bundling off the UI thread when backed by an on-disk DB.
     fn generate_backup(&mut self, cx: &mut Context<Self>) {
-        let temp = match crate::scratch_dir().map_err(anyhow::Error::from).and_then(|dir| {
-            let temp = dir.join(format!("fern-backup-{}.db", std::process::id()));
-            let attachments = crate::attachments_dir().ok();
-            self.store.backup_to(&temp, attachments.as_deref())?;
-            Ok(temp)
-        }) {
-            Ok(temp) => temp,
-            Err(err) => {
-                self.backup_message = Some(err.to_string());
-                cx.notify();
-                return;
-            }
+        let read = if let Some(db_path) = cx.try_global::<crate::DbPath>().map(|p| p.0.clone()) {
+            cx.background_spawn(async move {
+                let dir = crate::scratch_dir()?;
+                let temp = dir.join(format!("fern-backup-{}.db", std::process::id()));
+                let attachments = crate::attachments_dir().ok();
+                let bg_store = Store::open(&db_path)?;
+                bg_store.backup_to(&temp, attachments.as_deref())?;
+                let bytes = std::fs::read(&temp);
+                std::fs::remove_file(&temp).ok();
+                Ok::<Vec<u8>, anyhow::Error>(bytes?)
+            })
+        } else {
+            let temp = match crate::scratch_dir().map_err(anyhow::Error::from).and_then(|dir| {
+                let temp = dir.join(format!("fern-backup-{}.db", std::process::id()));
+                let attachments = crate::attachments_dir().ok();
+                self.store.backup_to(&temp, attachments.as_deref())?;
+                Ok(temp)
+            }) {
+                Ok(temp) => temp,
+                Err(err) => {
+                    self.backup_message = Some(err.to_string());
+                    cx.notify();
+                    return;
+                }
+            };
+            cx.background_spawn(async move {
+                let bytes = std::fs::read(&temp);
+                std::fs::remove_file(&temp).ok();
+                Ok::<Vec<u8>, anyhow::Error>(bytes?)
+            })
         };
-        let read = cx.background_spawn(async move {
-            let bytes = std::fs::read(&temp);
-            std::fs::remove_file(&temp).ok();
-            bytes
-        });
         cx.spawn(async move |this, cx| {
             let bytes = read.await;
             this.update(cx, |this, cx| match bytes {
@@ -386,14 +465,40 @@ impl SettingsWindow {
     }
 
     /// "Import Backups": a Fern backup is checked now and restored on the next start; a TickTick
-    /// backup (its CSV file) is added to the tasks here right away.
+    /// backup (its CSV file) is parsed and imported off the UI thread.
     fn import_backup(&mut self, cx: &mut Context<Self>) {
+        let db_path = cx.try_global::<crate::DbPath>().map(|p| p.0.clone());
         let chosen = cx.prompt_for_paths(gpui::PathPromptOptions { files: true, directories: false, multiple: false, prompt: None });
         cx.spawn(async move |this, cx| {
             let Some(path) = chosen.await.ok().and_then(Result::ok).flatten().and_then(|paths| paths.into_iter().next()) else {
                 return;
             };
             if path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("csv")) {
+                if let Some(db_path) = db_path {
+                    let imported = cx
+                        .background_spawn(async move {
+                            let text = std::fs::read_to_string(&path)?;
+                            let bg_store = Store::open(&db_path)?;
+                            bg_store.import_ticktick(&text)
+                        })
+                        .await;
+                    this.update(cx, |this, cx| {
+                        let strings = i18n::t(cx);
+                        this.backup_message = Some(match imported {
+                            Ok(summary) => strings
+                                .imported_from_ticktick
+                                .replace("{tasks}", &summary.tasks.to_string())
+                                .replace("{lists}", &summary.lists.to_string()),
+                            Err(err) => format!("{err:#}"),
+                        });
+                        this.refresh_cached_collections(cx);
+                        cx.emit(SettingsEvent::Changed);
+                        crate::sticky_note::data_changed(cx.entity_id(), cx);
+                        cx.notify();
+                    })
+                    .ok();
+                    return;
+                }
                 let text = cx.background_spawn(async move { std::fs::read_to_string(&path) }).await;
                 this.update(cx, |this, cx| {
                     let strings = i18n::t(cx);
@@ -405,6 +510,8 @@ impl SettingsWindow {
                             .replace("{lists}", &summary.lists.to_string()),
                         Err(err) => format!("{err:#}"),
                     });
+                    this.refresh_cached_collections(cx);
+                    cx.emit(SettingsEvent::Changed);
                     crate::sticky_note::data_changed(cx.entity_id(), cx);
                     cx.notify();
                 })
@@ -561,9 +668,8 @@ impl SettingsWindow {
                 (SharedString::from(name), priority == defaults.priority, pick)
             })
             .collect();
-        let tags = self.store.tags().unwrap_or_default();
         let tag_options = std::iter::once(None)
-            .chain(tags.into_iter().map(|t| Some(t.name)))
+            .chain(self.cached_tags.iter().map(|t| Some(t.name.clone())))
             .map(|tag| {
                 let selected = tag == defaults.tag;
                 let label = SharedString::from(tag.clone().unwrap_or_else(|| strings.none_option.to_owned()));
@@ -1565,7 +1671,7 @@ impl SettingsWindow {
                         (SharedString::from(locale.native_name()), locale == current, pick)
                     })
                     .collect();
-                let lists = self.store.lists().unwrap_or_default();
+                let lists = &self.cached_lists;
                 let default_list = self.preferences.default_list;
                 let list_name = default_list
                     .and_then(|id| lists.iter().find(|l| l.id == id))
@@ -1794,7 +1900,7 @@ impl SettingsWindow {
                     })
                     .collect::<Vec<_>>(),
                 ));
-                let sound_enabled = desktop_common::sound::enabled(&self.store);
+                let sound_enabled = self.sound_enabled;
                 let body = body.child(group().child(
                     h_flex()
                         .id("completion-sound")
@@ -1804,19 +1910,22 @@ impl SettingsWindow {
                         .child(div().flex_1().child(Label::new(strings.completion_sound)))
                         .child(Switch::new().toggle_state(sound_enabled))
                         .on_click(cx.listener(|this, _, _, cx| {
-                            let next = !desktop_common::sound::enabled(&this.store);
+                            let next = !this.sound_enabled;
                             if let Err(err) = desktop_common::sound::set_enabled(&this.store, next) {
                                 eprintln!("failed to save the completion sound setting: {err:#}");
-                            } else if next {
-                                desktop_common::sound::play_complete(&this.store);
+                            } else {
+                                this.sound_enabled = next;
+                                if next {
+                                    desktop_common::sound::play_complete(&this.store);
+                                }
                             }
                             cx.notify();
                         })),
                 ));
                 #[cfg(windows)]
                 let body = {
-                    let enabled = crate::tray::enabled(&self.store);
-                    let topmost = crate::tray::always_on_top(&self.store);
+                    let enabled = self.minimize_to_tray;
+                    let topmost = self.always_on_top;
                     body.child(
                         group()
                             .child(
@@ -1828,9 +1937,11 @@ impl SettingsWindow {
                                     .child(div().flex_1().child(Label::new(strings.minimize_to_tray)))
                                     .child(Switch::new().toggle_state(enabled))
                                     .on_click(cx.listener(|this, _, _, cx| {
-                                        let enabled = crate::tray::enabled(&this.store);
-                                        if let Err(err) = crate::tray::set_enabled(&this.store, !enabled, cx) {
+                                        let next = !this.minimize_to_tray;
+                                        if let Err(err) = crate::tray::set_enabled(&this.store, next, cx) {
                                             eprintln!("failed to save the notification area setting: {err:#}");
+                                        } else {
+                                            this.minimize_to_tray = next;
                                         }
                                         cx.notify();
                                     })),
@@ -1844,9 +1955,11 @@ impl SettingsWindow {
                                     .child(div().flex_1().child(Label::new(strings.tray_always_on_top)))
                                     .child(Switch::new().toggle_state(topmost))
                                     .on_click(cx.listener(|this, _, _, cx| {
-                                        let next = !crate::tray::always_on_top(&this.store);
+                                        let next = !this.always_on_top;
                                         if let Err(err) = crate::tray::set_always_on_top(&this.store, next, cx) {
                                             eprintln!("failed to save always_on_top setting: {err:#}");
+                                        } else {
+                                            this.always_on_top = next;
                                         }
                                         cx.notify();
                                     })),
@@ -2089,16 +2202,6 @@ impl Render for SettingsWindow {
             }))
             .on_action(cx.listener(|this, _: &CloseWindow, window, cx| {
                 this.close(window, cx);
-            }))
-            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
-                if matches!(this.page, Page::About | Page::Appearance) && event.keystroke.key == "tab" {
-                    if event.keystroke.modifiers.shift {
-                        window.focus_prev(cx);
-                    } else {
-                        window.focus_next(cx);
-                    }
-                    cx.stop_propagation();
-                }
             }))
             .size_full()
             .relative()

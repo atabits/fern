@@ -1,37 +1,15 @@
 use std::sync::Arc;
 
 use fern_core::{ThemeMode, ThemeSelection};
-use gpui::{FontWeight, Global, PromptLevel, SharedString, WeakEntity, WindowAppearance};
+use gpui::{FontWeight, PromptLevel, SharedString, WeakEntity};
 use theme::{Theme, ThemeRegistry};
 use ui::prelude::*;
 
 use super::{ROW_HEIGHT, SettingsWindow};
-use crate::{i18n, user_themes};
-
-/// An explicit "just this time" choice expires on restart or the next system appearance change.
-#[derive(Clone)]
-struct TemporaryTheme {
-    system_dark: bool,
-    dark: bool,
-    theme_id: SharedString,
-}
-
-impl Global for TemporaryTheme {}
-
-fn system_dark(window: &Window) -> bool {
-    matches!(window.appearance(), WindowAppearance::Dark | WindowAppearance::VibrantDark)
-}
-
-fn remembered(selection: &ThemeSelection, dark: bool, cx: &App) -> Arc<Theme> {
-    let id = if dark { &selection.dark } else { &selection.light };
-    ThemeRegistry::global(cx).resolve(dark, id.as_deref())
-}
-
-fn clear_temporary(cx: &mut App) {
-    if cx.has_global::<TemporaryTheme>() {
-        cx.remove_global::<TemporaryTheme>();
-    }
-}
+use crate::user_themes::{
+    self, TemporaryTheme, apply_theme, clear_temporary, remembered, set_temporary, system_dark,
+};
+use crate::i18n;
 
 fn night_swatches(
     night: &Theme,
@@ -107,23 +85,6 @@ impl Render for NightPalette {
     }
 }
 
-pub(super) fn apply_theme(selection: &ThemeSelection, window: &Window, cx: &mut App) {
-    let dark = system_dark(window);
-    let theme = match cx.try_global::<TemporaryTheme>() {
-        Some(choice) if selection.mode == ThemeMode::System && choice.system_dark == dark => {
-            ThemeRegistry::global(cx).resolve(choice.dark, Some(choice.theme_id.as_ref()))
-        }
-        _ => {
-            clear_temporary(cx);
-            remembered(selection, selection.mode.is_dark(dark), cx)
-        }
-    };
-    if !Arc::ptr_eq(cx.theme(), &theme) {
-        theme::set_arc(theme, cx);
-        cx.refresh_windows();
-    }
-}
-
 impl SettingsWindow {
     fn save_theme(
         &mut self,
@@ -150,7 +111,7 @@ impl SettingsWindow {
         }
         self.preferences.theme = selection;
         if let Some(choice) = temporary {
-            cx.set_global(choice);
+            set_temporary(choice, cx);
         } else {
             clear_temporary(cx);
         }
@@ -201,11 +162,14 @@ impl SettingsWindow {
         let system_dark = system_dark(window);
         if !fixed && selection.mode == ThemeMode::System && dark != system_dark {
             // "Just this time" leaves the saved opposite-appearance palette intact.
-            cx.set_global(TemporaryTheme {
-                system_dark,
-                dark,
-                theme_id: theme.id_shared(),
-            });
+            set_temporary(
+                TemporaryTheme {
+                    system_dark,
+                    dark,
+                    theme_id: theme.id_shared(),
+                },
+                cx,
+            );
             apply_theme(&self.preferences.theme, window, cx);
             cx.notify();
             return;

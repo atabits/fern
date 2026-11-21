@@ -1,18 +1,73 @@
-//! Loads user-defined JSONC themes from `<data_dir>/themes/` and watches for live edits.
+//! Loads user-defined JSONC themes from `<data_dir>/themes/`, applies theme selections, and
+//! watches for live edits while a window is active.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context as _, Result};
-use fern_core::Store;
-use gpui::{AnyWindowHandle, App};
+use fern_core::{Store, ThemeMode, ThemeSelection};
+use gpui::{AnyWindowHandle, App, Global, SharedString, Window, WindowAppearance};
+use theme::{ActiveTheme as _, Theme, ThemeRegistry};
 
 pub const THEMES_DIR: &str = "themes";
 pub const SAMPLE_THEME_FILE: &str = "custom-theme.json";
-const POLL_INTERVAL: Duration = Duration::from_millis(500);
+/// Poll interval while a Fern window is active (paused completely when hidden/inactive).
+const POLL_INTERVAL: Duration = Duration::from_millis(2500);
 const DEBOUNCE: Duration = Duration::from_millis(100);
+
+/// An explicit "just this time" choice expires on restart or the next system appearance change.
+#[derive(Clone)]
+pub struct TemporaryTheme {
+    pub system_dark: bool,
+    pub dark: bool,
+    pub theme_id: SharedString,
+}
+
+impl Global for TemporaryTheme {}
+
+pub fn system_dark(window: &Window) -> bool {
+    matches!(window.appearance(), WindowAppearance::Dark | WindowAppearance::VibrantDark)
+}
+
+pub fn remembered(selection: &ThemeSelection, dark: bool, cx: &App) -> Arc<Theme> {
+    let id = if dark { &selection.dark } else { &selection.light };
+    ThemeRegistry::global(cx).resolve(dark, id.as_deref())
+}
+
+pub fn set_temporary(choice: TemporaryTheme, cx: &mut App) {
+    cx.set_global(choice);
+}
+
+pub fn clear_temporary(cx: &mut App) {
+    if cx.has_global::<TemporaryTheme>() {
+        cx.remove_global::<TemporaryTheme>();
+    }
+}
+
+/// Applies `selection` to the active theme, returning `true` if the theme changed and windows
+/// were refreshed.
+pub fn apply_theme(selection: &ThemeSelection, window: &Window, cx: &mut App) -> bool {
+    let dark = system_dark(window);
+    let theme = match cx.try_global::<TemporaryTheme>() {
+        Some(choice) if selection.mode == ThemeMode::System && choice.system_dark == dark => {
+            ThemeRegistry::global(cx).resolve(choice.dark, Some(choice.theme_id.as_ref()))
+        }
+        _ => {
+            clear_temporary(cx);
+            remembered(selection, selection.mode.is_dark(dark), cx)
+        }
+    };
+    if !Arc::ptr_eq(cx.theme(), &theme) {
+        theme::set_arc(theme, cx);
+        cx.refresh_windows();
+        true
+    } else {
+        false
+    }
+}
 
 pub fn themes_dir() -> Result<PathBuf> {
     Ok(crate::data_dir()?.join(THEMES_DIR))
@@ -96,7 +151,7 @@ pub fn open_themes_dir_async(cx: &mut App) {
 fn apply_loaded(
     store: &Store,
     window: AnyWindowHandle,
-    themes: Vec<theme::Theme>,
+    themes: Vec<Theme>,
     errors: Vec<String>,
     cx: &mut App,
 ) {
@@ -110,12 +165,15 @@ fn apply_loaded(
     } else {
         cx.windows().into_iter().next()
     };
-    if let Some(target) = target {
-        let _ = target.update(cx, |_, window, cx| {
-            crate::settings_window::apply_theme_only(&selection, window, cx);
-        });
+    let mut refreshed = false;
+    if let Some(target) = target
+        && let Ok(did_refresh) = target.update(cx, |_, window, cx| apply_theme(&selection, window, cx))
+    {
+        refreshed = did_refresh;
     }
-    cx.refresh_windows();
+    if !refreshed {
+        cx.refresh_windows();
+    }
 }
 
 fn dir_fingerprint(dir: &Path) -> Vec<(OsString, u64, Option<SystemTime>)> {
@@ -147,23 +205,47 @@ pub fn watch(store: Rc<Store>, window: AnyWindowHandle, cx: &mut App) {
         let mut last_fp = bg.spawn(async move { dir_fingerprint(&initial_dir) }).await;
 
         loop {
+            bg.timer(POLL_INTERVAL).await;
+            // Exit immediately once all windows are closed, and pause FS polling while
+            // the app is minimized / hidden in the tray / unfocused.
+            enum WatchState {
+                Stop,
+                Idle,
+                Active,
+            }
+            let state = cx.update(|cx| {
+                if cx.windows().is_empty() {
+                    WatchState::Stop
+                } else if cx.active_window().is_none() {
+                    WatchState::Idle
+                } else {
+                    WatchState::Active
+                }
+            });
+            match state {
+                WatchState::Stop => break,
+                WatchState::Idle => continue,
+                WatchState::Active => {}
+            }
+
             let poll_dir = dir.clone();
             let prev_fp = last_fp.clone();
-            let bg_for_poll = bg.clone();
-            let (final_fp, themes, errors) = bg
+            let bg_for_debounce = bg.clone();
+            let changed = bg
                 .spawn(async move {
-                    loop {
-                        bg_for_poll.timer(POLL_INTERVAL).await;
-                        let next_fp = dir_fingerprint(&poll_dir);
-                        if next_fp != prev_fp {
-                            bg_for_poll.timer(DEBOUNCE).await;
-                            let final_fp = dir_fingerprint(&poll_dir);
-                            let (themes, errors) = theme::load_themes_from_dir(&poll_dir);
-                            return (final_fp, themes, errors);
-                        }
+                    let next_fp = dir_fingerprint(&poll_dir);
+                    if next_fp == prev_fp {
+                        return None;
                     }
+                    bg_for_debounce.timer(DEBOUNCE).await;
+                    let final_fp = dir_fingerprint(&poll_dir);
+                    let (themes, errors) = theme::load_themes_from_dir(&poll_dir);
+                    Some((final_fp, themes, errors))
                 })
                 .await;
+            let Some((final_fp, themes, errors)) = changed else {
+                continue;
+            };
             last_fp = final_fp;
 
             let alive = cx.update(|cx| {

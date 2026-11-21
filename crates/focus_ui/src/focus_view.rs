@@ -3626,6 +3626,7 @@ impl FocusView {
                     .when(!running, |el| el.child(self.render_mode_switch(LabelSize::Small, cx)))
                     .child(
                         h_flex().flex_1().justify_end().gap_1()
+                        .child(self.render_white_noise_button("focus-page-white-noise", cx))
                         // The original's mini window: the clock in a small window over the others.
                         .child(
                             IconButton::new("focus-page-mini", IconName::PictureInPicture2)
@@ -3757,6 +3758,40 @@ impl FocusView {
             .child(left)
             .child(right)
             .into_any_element()
+    }
+
+    fn render_white_noise_button(&self, id: &'static str, cx: &mut Context<Self>) -> impl IntoElement {
+        let strings = i18n::t(cx);
+        let theme = cx.theme().clone();
+        let noise = desktop_common::sound::white_noise(&self.store);
+        let active_noise = noise != desktop_common::sound::WhiteNoise::Off;
+        let name = strings.focus_white_noise_names[noise.index()];
+        h_flex()
+            .id(id)
+            .h(px(28.))
+            .px_2()
+            .gap_1()
+            .rounded(px(6.))
+            .cursor_pointer()
+            .when(active_noise, |el| el.bg(theme.colors().accent.opacity(0.14)))
+            .hover(|s| s.bg(theme.colors().ghost_element_hover))
+            .tooltip(Tooltip::text(format!("{}: {name}", strings.focus_white_noise)))
+            .child(
+                Icon::new(IconName::Bell)
+                    .size(IconSize::XSmall)
+                    .color(if active_noise { Color::Accent } else { Color::Muted }),
+            )
+            .when(active_noise, |el| {
+                el.child(Label::new(name).size(LabelSize::XSmall).color(Color::Accent))
+            })
+            .on_click(cx.listener(move |this, _, _, cx| {
+                let next = noise.next();
+                if let Err(err) = desktop_common::sound::set_white_noise(&this.store, next) {
+                    eprintln!("failed to save white noise setting: {err:#}");
+                }
+                this.sync_ambient_sound();
+                cx.notify();
+            }))
     }
 
     fn sync_ambient_sound(&self) {
@@ -3951,37 +3986,7 @@ impl Render for FocusView {
                     )
                     // Pomo or Stopwatch, chosen while no timer runs.
                     .when(!running, |el| el.child(self.render_mode_switch(LabelSize::XSmall, cx)))
-                    .child({
-                        let noise = desktop_common::sound::white_noise(&self.store);
-                        let active_noise = noise != desktop_common::sound::WhiteNoise::Off;
-                        let name = strings.focus_white_noise_names[noise.index()];
-                        h_flex()
-                            .id("focus-white-noise-btn")
-                            .h(px(28.))
-                            .px_2()
-                            .gap_1()
-                            .rounded(px(6.))
-                            .cursor_pointer()
-                            .when(active_noise, |el| el.bg(theme.colors().accent.opacity(0.14)))
-                            .hover(|s| s.bg(theme.colors().ghost_element_hover))
-                            .tooltip(Tooltip::text(format!("{}: {name}", strings.focus_white_noise)))
-                            .child(
-                                Icon::new(IconName::Bell)
-                                    .size(IconSize::XSmall)
-                                    .color(if active_noise { Color::Accent } else { Color::Muted }),
-                            )
-                            .when(active_noise, |el| {
-                                el.child(Label::new(name).size(LabelSize::XSmall).color(Color::Accent))
-                            })
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                let next = noise.next();
-                                if let Err(err) = desktop_common::sound::set_white_noise(&this.store, next) {
-                                    eprintln!("failed to save white noise setting: {err:#}");
-                                }
-                                this.sync_ambient_sound();
-                                cx.notify();
-                            }))
-                    })
+                    .child(self.render_white_noise_button("focus-white-noise-btn", cx))
                     .when(running, |el| {
                         el.child(
                             IconButton::new("focus-stop", IconName::Square)

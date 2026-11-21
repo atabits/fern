@@ -795,7 +795,11 @@ impl FocusView {
                         .child(
                             h_flex()
                                 .child(div().flex_1().child(Label::new(strings.focus_record).weight(FontWeight::SEMIBOLD)))
-                                .child(IconButton::new("close-record", IconName::X).on_click(cx.listener(|this, _, _, cx| this.close_record(cx)))),
+                                .child(
+                                    IconButton::new("close-record", IconName::X)
+                                        .tooltip(Tooltip::text(strings.close))
+                                        .on_click(cx.listener(|this, _, _, cx| this.close_record(cx))),
+                                ),
                         )
                         .child(
                             h_flex()
@@ -827,10 +831,14 @@ impl FocusView {
                         )
                         .child(
                             h_flex().justify_end().child(
-                                IconButton::new("delete-open-record", IconName::Trash).on_click(cx.listener(move |this, _, _, cx| {
-                                    this.open_record = None;
-                                    this.delete_record(id, cx);
-                                })),
+                                IconButton::new("delete-open-record", IconName::Trash)
+                                    .icon_color(Color::Muted)
+                                    .hover_icon_color(Color::Error)
+                                    .tooltip(Tooltip::text(strings.delete))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.open_record = None;
+                                        this.delete_record(id, cx);
+                                    })),
                             ),
                         ),
                 )
@@ -3405,9 +3413,13 @@ impl FocusView {
                     .child(
                         div()
                             .relative()
-                            .child(IconButton::new("record-add", IconName::Plus).on_click(cx.listener(|this, _, _, cx| {
-                                this.set_record_menu(Some(RecordMenu::Add), cx)
-                            })))
+                            .child(
+                                IconButton::new("record-add", IconName::Plus)
+                                    .tooltip(Tooltip::text(strings.focus_add_record))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.set_record_menu(Some(RecordMenu::Add), cx)
+                                    })),
+                            )
                             .when(self.record_menu == Some(RecordMenu::Add), |el| {
                                 el.child(PopoverAttachment::new(Placement::BelowRight, self.render_record_menu(RecordMenu::Add, cx)))
                             }),
@@ -3415,9 +3427,13 @@ impl FocusView {
                     .child(
                         div()
                             .relative()
-                            .child(IconButton::new("record-more", IconName::Ellipsis).on_click(cx.listener(|this, _, _, cx| {
-                                this.set_record_menu(Some(RecordMenu::More), cx)
-                            })))
+                            .child(
+                                IconButton::new("record-more", IconName::Ellipsis)
+                                    .tooltip(Tooltip::text(strings.more))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.set_record_menu(Some(RecordMenu::More), cx)
+                                    })),
+                            )
                             .when_some(self.record_menu.filter(|m| *m == RecordMenu::More), |el, menu| {
                                 el.child(PopoverAttachment::new(Placement::BelowRight, self.render_record_menu(menu, cx)))
                             }),
@@ -3499,7 +3515,13 @@ impl FocusView {
                             IconButton::new(SharedString::from(format!("delete-record-{session_id}")), IconName::X)
                                 .size(px(20.))
                                 .icon_size(IconSize::XSmall)
-                                .on_click(cx.listener(move |this, _, _, cx| this.delete_record(session_id, cx))),
+                                .icon_color(Color::Muted)
+                                .hover_icon_color(Color::Error)
+                                .tooltip(Tooltip::text(strings.delete))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.delete_record(session_id, cx);
+                                })),
                         ),
                     )
                     .into_any_element(),

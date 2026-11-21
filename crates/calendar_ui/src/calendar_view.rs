@@ -3,7 +3,7 @@
 
 use std::{collections::{BTreeMap, HashSet}, rc::Rc, time::Duration};
 
-use chrono::{Datelike, Local, NaiveDate, NaiveTime};
+use chrono::{Datelike, Local, NaiveDate, NaiveTime, Timelike};
 use desktop_common::text_input::{Changed, Mode, Submitted, TextInput};
 use fern_core::{CalendarOptions, ColorBy, Id, Priority, Store, Task};
 use gpui::{EventEmitter, Focusable, FontWeight};
@@ -153,6 +153,103 @@ struct ContextMenuState {
     nesting: crate::task_menu::TaskNesting,
 }
 
+const MAX_DAY_MINUTES: i32 = 23 * 60 + 59;
+const MIN_TIMED_RESIZE_MINUTES: i32 = 15;
+
+fn time_to_minutes(time: NaiveTime) -> i32 {
+    (time.hour() * 60 + time.minute()) as i32
+}
+
+fn minutes_to_time(minutes: i32) -> NaiveTime {
+    let clamped = minutes.clamp(0, MAX_DAY_MINUTES) as u32;
+    NaiveTime::from_hms_opt(clamped / 60, clamped % 60, 0).unwrap_or(NaiveTime::MIN)
+}
+
+fn task_timed_resize_edges(task: &Task, date: NaiveDate) -> (bool, bool) {
+    let Some(start_date) = task.due_date else {
+        return (false, false);
+    };
+    let end_date = task.end_date.unwrap_or(start_date).max(start_date);
+    (date == start_date, date == end_date)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct TimedInterval {
+    start: f32,
+    end: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LanePlacement {
+    lane: usize,
+    lane_count: usize,
+}
+
+/// Greedy interval-graph lane assignment per connected overlap cluster.
+/// Adjacent intervals touching at a boundary (`a.end <= b.start`) do not overlap.
+fn assign_timed_lanes(intervals: &[TimedInterval]) -> Vec<LanePlacement> {
+    const EPS: f32 = 1e-3;
+    let n = intervals.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| {
+        let ia = intervals[a];
+        let ib = intervals[b];
+        ia.start
+            .total_cmp(&ib.start)
+            .then_with(|| ib.end.total_cmp(&ia.end))
+            .then_with(|| a.cmp(&b))
+    });
+
+    let mut result = vec![LanePlacement { lane: 0, lane_count: 1 }; n];
+    let mut cluster: Vec<usize> = Vec::new();
+    let mut cluster_end = f32::NEG_INFINITY;
+
+    let finalize_cluster = |cluster: &[usize], result: &mut [LanePlacement]| {
+        if cluster.is_empty() {
+            return;
+        }
+        let mut lane_ends: Vec<f32> = Vec::new();
+        let mut assigned: Vec<(usize, usize)> = Vec::with_capacity(cluster.len());
+        for &idx in cluster {
+            let item = intervals[idx];
+            let item_end = item.end.max(item.start);
+            let lane = match lane_ends.iter().position(|&end| end <= item.start + EPS) {
+                Some(lane) => {
+                    lane_ends[lane] = item_end;
+                    lane
+                }
+                None => {
+                    let lane = lane_ends.len();
+                    lane_ends.push(item_end);
+                    lane
+                }
+            };
+            assigned.push((idx, lane));
+        }
+        let lane_count = lane_ends.len().max(1);
+        for (idx, lane) in assigned {
+            result[idx] = LanePlacement { lane, lane_count };
+        }
+    };
+
+    for idx in order {
+        let item = intervals[idx];
+        let item_end = item.end.max(item.start);
+        if !cluster.is_empty() && item.start >= cluster_end - EPS {
+            finalize_cluster(&cluster, &mut result);
+            cluster.clear();
+            cluster_end = f32::NEG_INFINITY;
+        }
+        cluster.push(idx);
+        cluster_end = cluster_end.max(item_end);
+    }
+    finalize_cluster(&cluster, &mut result);
+    result
+}
+
 #[derive(Clone, Debug)]
 struct TimedResize {
     id: Id,
@@ -167,20 +264,23 @@ struct TimedResize {
 
 impl TimedResize {
     fn snapped_range(&self) -> (NaiveTime, NaiveTime) {
-        let min_span = chrono::Duration::minutes(15);
-        let max_t = NaiveTime::from_hms_opt(23, 45, 0).unwrap_or_default();
+        let start_mins = time_to_minutes(self.orig_start);
+        let end_mins = time_to_minutes(self.orig_end);
+        let cur_mins = time_to_minutes(self.current_time);
         match self.edge {
             ResizeEdge::Start => {
                 let limit = if self.end_date.is_some_and(|d| d > self.date) {
-                    max_t
+                    23 * 60 + 45
                 } else {
-                    self.orig_end - min_span
+                    (end_mins - MIN_TIMED_RESIZE_MINUTES).max(0)
                 };
-                (self.current_time.min(limit), self.orig_end)
+                let next_start = cur_mins.clamp(0, limit);
+                (minutes_to_time(next_start), minutes_to_time(end_mins))
             }
             ResizeEdge::End => {
-                let min_end = self.orig_start + min_span;
-                (self.orig_start, self.current_time.max(min_end.min(max_t)))
+                let min_end = (start_mins + MIN_TIMED_RESIZE_MINUTES).min(MAX_DAY_MINUTES);
+                let next_end = cur_mins.clamp(min_end, MAX_DAY_MINUTES);
+                (minutes_to_time(start_mins), minutes_to_time(next_end))
             }
         }
     }
@@ -1547,6 +1647,16 @@ impl CalendarView {
         start_y: Pixels,
         cx: &mut Context<Self>,
     ) {
+        if let Some(task) = self.tasks.iter().find(|t| t.id == id) {
+            let (can_start, can_end) = task_timed_resize_edges(task, date);
+            let allowed = match edge {
+                ResizeEdge::Start => can_start,
+                ResizeEdge::End => can_end,
+            };
+            if !allowed {
+                return;
+            }
+        }
         let current_time = match edge {
             ResizeEdge::Start => orig_start,
             ResizeEdge::End => orig_end,
@@ -2829,83 +2939,123 @@ impl CalendarView {
 
         let columns = week.iter().copied().map(|date| {
             let accent = theme.colors().accent;
-            let timed: Vec<AnyElement> = self
-                .tasks
-                .iter()
-                .filter(|t| self.options.show_completed || !t.is_completed())
-                .filter_map(|t| calendar::timed_segment(t, date).map(|segment| (t, segment)))
-                .map(|(t, (orig_from, orig_to))| {
-                    let preview = self.timed_resize.as_ref().filter(|r| r.id == t.id && r.date == date);
-                    let (from, to) = preview.map_or((orig_from, orig_to), TimedResize::snapped_range);
-                    let id = t.id;
-                    let end_date = t.end_date;
-                    // A span is drawn as a block from its start to its end; a point in time as a bar.
-                    let height = (week_axis::offset(to) - week_axis::offset(from)).max(18.);
-                    div()
-                        .absolute()
-                        .top(px(week_axis::offset(from)))
-                        .left(px(2.))
-                        .right(px(2.))
-                        .h(px(height))
-                        .child(
-                            div()
-                                .relative()
-                                .size_full()
-                                .child(self.task_bar(t, Some(date), cx).size_full().items_start().pt(px(1.)))
-                                .child(
-                                    div()
-                                        .id(SharedString::from(format!("timed-resize-top-{id}-{date}")))
-                                        .absolute()
-                                        .top_0()
-                                        .left_0()
-                                        .right_0()
-                                        .h(px(5.))
-                                        .cursor_ns_resize()
-                                        .on_mouse_down(gpui::MouseButton::Left, cx.listener(move |this, ev: &gpui::MouseDownEvent, _, cx| {
-                                            cx.stop_propagation();
-                                            this.start_timed_resize(id, date, ResizeEdge::Start, orig_from, orig_to, end_date, ev.position.y, cx);
-                                        })),
-                                )
-                                .child(
-                                    div()
-                                        .id(SharedString::from(format!("timed-resize-bot-{id}-{date}")))
-                                        .absolute()
-                                        .bottom_0()
-                                        .left_0()
-                                        .right_0()
-                                        .h(px(5.))
-                                        .cursor_ns_resize()
-                                        .on_mouse_down(gpui::MouseButton::Left, cx.listener(move |this, ev: &gpui::MouseDownEvent, _, cx| {
-                                            cx.stop_propagation();
-                                            this.start_timed_resize(id, date, ResizeEdge::End, orig_from, orig_to, end_date, ev.position.y, cx);
-                                        })),
-                                ),
-                        )
-                        .into_any_element()
-                })
-                .collect();
-            // The subscribed calendars' timed events, as blocks from their start to their end.
-            let timed_events: Vec<AnyElement> = self
-                .events_on(date, cx)
+            enum TimedColumnItem<'a> {
+                Task {
+                    task: &'a Task,
+                    orig_from: NaiveTime,
+                    orig_to: NaiveTime,
+                    top: f32,
+                    height: f32,
+                },
+                Event {
+                    event: EventBar,
+                    top: f32,
+                    height: f32,
+                },
+            }
+
+            let mut column_items: Vec<TimedColumnItem<'_>> = Vec::new();
+            let mut intervals: Vec<TimedInterval> = Vec::new();
+
+            for t in self.tasks.iter().filter(|t| self.options.show_completed || !t.is_completed()) {
+                let Some((orig_from, orig_to)) = calendar::timed_segment(t, date) else { continue };
+                let preview = self.timed_resize.as_ref().filter(|r| r.id == t.id && r.date == date);
+                let (from, to) = preview.map_or((orig_from, orig_to), TimedResize::snapped_range);
+                let top = week_axis::offset(from);
+                // A span is drawn as a block from its start to its end; a point in time as a bar.
+                let height = (week_axis::offset(to) - top).max(18.);
+                intervals.push(TimedInterval { start: top, end: top + height });
+                column_items.push(TimedColumnItem::Task { task: t, orig_from, orig_to, top, height });
+            }
+
+            for event in self.events_on(date, cx) {
+                let Some(from) = (if event.start == date { event.start_time } else { Some(NaiveTime::MIN) }) else {
+                    continue;
+                };
+                let to = match event.end_time {
+                    Some(to) if event.end == date => to,
+                    _ if event.end > date => minutes_to_time(MAX_DAY_MINUTES),
+                    _ => minutes_to_time(time_to_minutes(from) + 30),
+                };
+                let top = week_axis::offset(from);
+                let height = (week_axis::offset(to) - top).max(18.);
+                intervals.push(TimedInterval { start: top, end: top + height });
+                column_items.push(TimedColumnItem::Event { event, top, height });
+            }
+
+            let placements = assign_timed_lanes(&intervals);
+            let timed_blocks: Vec<AnyElement> = column_items
                 .into_iter()
-                .filter_map(|event| {
-                    let from = if event.start == date { event.start_time? } else { chrono::NaiveTime::MIN };
-                    let to = match event.end_time {
-                        Some(to) if event.end == date => to,
-                        _ if event.end > date => chrono::NaiveTime::from_hms_opt(23, 59, 0)?,
-                        _ => from + chrono::Duration::minutes(30),
-                    };
-                    let height = (week_axis::offset(to) - week_axis::offset(from)).max(18.);
-                    Some(
-                        div()
+                .zip(placements)
+                .map(|(item, placement)| {
+                    let left_pct = placement.lane as f32 / placement.lane_count as f32;
+                    let width_pct = 1.0 / placement.lane_count as f32;
+                    let pad_left = if placement.lane == 0 { px(2.) } else { px(1.) };
+                    let pad_right = if placement.lane + 1 == placement.lane_count { px(2.) } else { px(1.) };
+                    match item {
+                        TimedColumnItem::Task { task: t, orig_from, orig_to, top, height } => {
+                            let id = t.id;
+                            let end_date = t.end_date;
+                            let (can_resize_start, can_resize_end) = task_timed_resize_edges(t, date);
+                            div()
+                                .absolute()
+                                .top(px(top))
+                                .left(gpui::relative(left_pct))
+                                .w(gpui::relative(width_pct))
+                                .h(px(height))
+                                .pl(pad_left)
+                                .pr(pad_right)
+                                .child(
+                                    div()
+                                        .relative()
+                                        .size_full()
+                                        .child(self.task_bar(t, Some(date), cx).size_full().items_start().pt(px(1.)))
+                                        .when(can_resize_start, |el| {
+                                            el.child(
+                                                div()
+                                                    .id(SharedString::from(format!("timed-resize-top-{id}-{date}")))
+                                                    .absolute()
+                                                    .top_0()
+                                                    .left_0()
+                                                    .right_0()
+                                                    .h(px(5.))
+                                                    .cursor_ns_resize()
+                                                    .on_mouse_down(gpui::MouseButton::Left, cx.listener(move |this, ev: &gpui::MouseDownEvent, _, cx| {
+                                                        cx.stop_propagation();
+                                                        this.start_timed_resize(id, date, ResizeEdge::Start, orig_from, orig_to, end_date, ev.position.y, cx);
+                                                    })),
+                                            )
+                                        })
+                                        .when(can_resize_end, |el| {
+                                            el.child(
+                                                div()
+                                                    .id(SharedString::from(format!("timed-resize-bot-{id}-{date}")))
+                                                    .absolute()
+                                                    .bottom_0()
+                                                    .left_0()
+                                                    .right_0()
+                                                    .h(px(5.))
+                                                    .cursor_ns_resize()
+                                                    .on_mouse_down(gpui::MouseButton::Left, cx.listener(move |this, ev: &gpui::MouseDownEvent, _, cx| {
+                                                        cx.stop_propagation();
+                                                        this.start_timed_resize(id, date, ResizeEdge::End, orig_from, orig_to, end_date, ev.position.y, cx);
+                                                    })),
+                                            )
+                                        }),
+                                )
+                                .into_any_element()
+                        }
+                        TimedColumnItem::Event { event, top, height } => div()
                             .absolute()
-                            .top(px(week_axis::offset(from)))
-                            .left(px(2.))
-                            .right(px(2.))
+                            .top(px(top))
+                            .left(gpui::relative(left_pct))
+                            .w(gpui::relative(width_pct))
                             .h(px(height))
-                            .child(self.event_bar(event, date, cx).h(px(height)).items_start().pt(px(1.)))
+                            .pl(pad_left)
+                            .pr(pad_right)
+                            .child(self.event_bar(event, date, cx).size_full().items_start().pt(px(1.)))
                             .into_any_element(),
-                    )
+                    }
                 })
                 .collect();
             let mut hour_lines = Vec::new();
@@ -2928,8 +3078,7 @@ impl CalendarView {
                 .drag_over::<DraggedEvent>(move |style, _, _, _| style.bg(accent.opacity(0.08)))
                 .on_drop(cx.listener(move |this, event: &DraggedEvent, _, cx| this.move_event_to_day(event, date, cx)))
                 .children(hour_lines)
-                .children(timed)
-                .children(timed_events)
+                .children(timed_blocks)
                 // The original's red line at the current time, with a dot where it starts.
                 .when(date == today && week_axis::unfolded(Local::now().time()), |el| {
                     let top = week_axis::offset(Local::now().time());
@@ -4482,5 +4631,194 @@ mod tests {
             });
             assert!(view.read(cx).events_on(next_day, cx).is_empty());
         });
+    }
+
+    #[test]
+    fn timed_lane_layout_splits_overlapping_clusters_and_keeps_adjacent_full_width() {
+        assert!(assign_timed_lanes(&[]).is_empty());
+
+        // Back-to-back intervals (touching at end == next.start) stay full width.
+        let back_to_back = assign_timed_lanes(&[
+            TimedInterval { start: 0., end: 60. },
+            TimedInterval { start: 60., end: 120. },
+        ]);
+        assert_eq!(
+            back_to_back,
+            vec![
+                LanePlacement { lane: 0, lane_count: 1 },
+                LanePlacement { lane: 0, lane_count: 1 },
+            ]
+        );
+
+        // Connected staircase cluster: A=[0, 120], B=[30, 90], C=[90, 150] -> 2 lanes (C reuses B's lane).
+        // Independent D=[200, 260] -> full width (1 lane).
+        let mixed = assign_timed_lanes(&[
+            TimedInterval { start: 0., end: 120. },
+            TimedInterval { start: 30., end: 90. },
+            TimedInterval { start: 90., end: 150. },
+            TimedInterval { start: 200., end: 260. },
+        ]);
+        assert_eq!(mixed[0], LanePlacement { lane: 0, lane_count: 2 });
+        assert_eq!(mixed[1], LanePlacement { lane: 1, lane_count: 2 });
+        assert_eq!(mixed[2], LanePlacement { lane: 1, lane_count: 2 });
+        assert_eq!(mixed[3], LanePlacement { lane: 0, lane_count: 1 });
+
+        // Three mutually overlapping intervals get 3 distinct lanes.
+        let triple = assign_timed_lanes(&[
+            TimedInterval { start: 100., end: 160. },
+            TimedInterval { start: 100., end: 220. },
+            TimedInterval { start: 110., end: 170. },
+        ]);
+        assert_eq!(triple.iter().map(|p| p.lane_count).collect::<Vec<_>>(), vec![3, 3, 3]);
+        let lanes: HashSet<usize> = triple.iter().map(|p| p.lane).collect();
+        assert_eq!(lanes.len(), 3);
+        // Longest starting at 100 gets lane 0.
+        assert_eq!(triple[1].lane, 0);
+    }
+
+    #[test]
+    fn timed_resize_clamps_near_midnight_without_wrapping() {
+        let day = NaiveDate::from_ymd_opt(2026, 11, 18).unwrap();
+        let t = |h, m| NaiveTime::from_hms_opt(h, m, 0).unwrap();
+
+        // Resizing Start when orig_end is 00:10 must clamp to 00:00, never wrap to 23:55.
+        let near_midnight_start = TimedResize {
+            id: Id::now_v7(),
+            date: day,
+            edge: ResizeEdge::Start,
+            orig_start: t(0, 0),
+            orig_end: t(0, 10),
+            end_date: None,
+            start_y: px(0.),
+            current_time: t(23, 0),
+        };
+        let (s, e) = near_midnight_start.snapped_range();
+        assert_eq!((s, e), (t(0, 0), t(0, 10)));
+        assert!(s <= e);
+
+        // Resizing End when orig_start is 23:50 must clamp to 23:59, never wrap to 00:05.
+        let near_midnight_end = TimedResize {
+            id: Id::now_v7(),
+            date: day,
+            edge: ResizeEdge::End,
+            orig_start: t(23, 50),
+            orig_end: t(23, 59),
+            end_date: None,
+            start_y: px(0.),
+            current_time: t(0, 15),
+        };
+        let (s, e) = near_midnight_end.snapped_range();
+        assert_eq!((s, e), (t(23, 50), t(23, 59)));
+        assert!(s <= e);
+
+        // Mid-day shrink enforces 15-minute minimum span.
+        let shrink_end = TimedResize {
+            id: Id::now_v7(),
+            date: day,
+            edge: ResizeEdge::End,
+            orig_start: t(10, 0),
+            orig_end: t(11, 0),
+            end_date: None,
+            start_y: px(0.),
+            current_time: t(9, 0),
+        };
+        assert_eq!(shrink_end.snapped_range(), (t(10, 0), t(10, 15)));
+
+        let shrink_start = TimedResize {
+            id: Id::now_v7(),
+            date: day,
+            edge: ResizeEdge::Start,
+            orig_start: t(10, 0),
+            orig_end: t(11, 0),
+            end_date: None,
+            start_y: px(0.),
+            current_time: t(12, 0),
+        };
+        assert_eq!(shrink_start.snapped_range(), (t(10, 45), t(11, 0)));
+    }
+
+    #[gpui::test]
+    fn multi_day_timed_resize_only_allows_real_start_and_end_edges(cx: &mut TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let mon = NaiveDate::from_ymd_opt(2026, 11, 16).unwrap();
+        let tue = NaiveDate::from_ymd_opt(2026, 11, 17).unwrap();
+        let wed = NaiveDate::from_ymd_opt(2026, 11, 18).unwrap();
+        let t = |h, m| NaiveTime::from_hms_opt(h, m, 0).unwrap();
+
+        let task = store.add_task("Multi-day deploy").unwrap();
+        store.set_due(task.id, Some(mon), Some(t(14, 0))).unwrap();
+        store.set_due_end(task.id, Some((wed, Some(t(11, 0))))).unwrap();
+
+        cx.update(theme::init);
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let mut cal = CalendarView::new(store.clone(), window, cx);
+            cal.mode = CalendarMode::Week;
+            cal.anchor = mon;
+            cal.reload(cx);
+            cal
+        });
+
+        view.update(cx, |cal, cx| {
+            // Invalid edges are rejected cleanly without starting a misleading preview.
+            cal.start_timed_resize(task.id, mon, ResizeEdge::End, t(14, 0), t(23, 59), Some(wed), px(100.), cx);
+            assert!(cal.timed_resize.is_none());
+            cal.start_timed_resize(task.id, tue, ResizeEdge::Start, t(0, 0), t(23, 59), Some(wed), px(100.), cx);
+            assert!(cal.timed_resize.is_none());
+            cal.start_timed_resize(task.id, tue, ResizeEdge::End, t(0, 0), t(23, 59), Some(wed), px(100.), cx);
+            assert!(cal.timed_resize.is_none());
+            cal.start_timed_resize(task.id, wed, ResizeEdge::Start, t(0, 0), t(11, 0), Some(wed), px(100.), cx);
+            assert!(cal.timed_resize.is_none());
+
+            // Valid Start resize on start day (Mon) moves due_time +1h and keeps Wed 11:00.
+            cal.start_timed_resize(task.id, mon, ResizeEdge::Start, t(14, 0), t(23, 59), Some(wed), px(100.), cx);
+            assert!(cal.timed_resize.is_some());
+            cal.update_timed_resize(px(100. + week_axis::HOUR_HEIGHT), cx);
+            cal.finish_timed_resize(cx);
+            let saved = store.task(task.id).unwrap().unwrap();
+            assert_eq!((saved.due_date, saved.due_time), (Some(mon), Some(t(15, 0))));
+            assert_eq!((saved.end_date, saved.end_time), (Some(wed), Some(t(11, 0))));
+
+            // Valid End resize on end day (Wed) moves end_time +1h and keeps Mon 15:00.
+            cal.start_timed_resize(task.id, wed, ResizeEdge::End, t(0, 0), t(11, 0), Some(wed), px(100.), cx);
+            assert!(cal.timed_resize.is_some());
+            cal.update_timed_resize(px(100. + week_axis::HOUR_HEIGHT), cx);
+            cal.finish_timed_resize(cx);
+            let saved = store.task(task.id).unwrap().unwrap();
+            assert_eq!((saved.due_date, saved.due_time), (Some(mon), Some(t(15, 0))));
+            assert_eq!((saved.end_date, saved.end_time), (Some(wed), Some(t(12, 0))));
+        });
+    }
+
+    #[gpui::test]
+    fn overlapping_timed_tasks_render_side_by_side_in_week_view(cx: &mut TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let day = NaiveDate::from_ymd_opt(2026, 11, 18).unwrap();
+        let t = |h, m| NaiveTime::from_hms_opt(h, m, 0).unwrap();
+
+        let first = store.add_task("Overlap A").unwrap();
+        store.set_due(first.id, Some(day), Some(t(10, 0))).unwrap();
+        store.set_due_end(first.id, Some((day, Some(t(11, 0))))).unwrap();
+
+        let second = store.add_task("Overlap B").unwrap();
+        store.set_due(second.id, Some(day), Some(t(10, 30))).unwrap();
+        store.set_due_end(second.id, Some((day, Some(t(11, 30))))).unwrap();
+
+        cx.update(theme::init);
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let mut cal = CalendarView::new(store.clone(), window, cx);
+            cal.mode = CalendarMode::Day;
+            cal.anchor = day;
+            cal.reload(cx);
+            cal
+        });
+        cx.simulate_resize(size(px(800.), px(700.)));
+        cx.run_until_parked();
+
+        let a = cx.debug_bounds(format!("calendar-task-{}", first.id).leak()).expect("first task bounds");
+        let b = cx.debug_bounds(format!("calendar-task-{}", second.id).leak()).expect("second task bounds");
+        assert!(
+            a.right() <= b.left() + px(1.) || b.right() <= a.left() + px(1.),
+            "overlapping timed tasks should sit side-by-side: a={a:?}, b={b:?}"
+        );
     }
 }

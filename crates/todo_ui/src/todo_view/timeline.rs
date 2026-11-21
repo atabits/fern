@@ -471,6 +471,26 @@ impl TodoView {
                                 .cursor_grab()
                                 .on_drag(dragged, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
                                 .on_click(cx.listener(move |this, _, _, cx| this.select(id, cx)))
+                                .when(task.kind != Kind::Note, |el| {
+                                    el.child(
+                                        div()
+                                            .flex_none()
+                                            .flex()
+                                            .items_center()
+                                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                            .child(
+                                                Checkbox::new(SharedString::from(format!("timeline-check-{i}-{id}")))
+                                                    .size(px(12.))
+                                                    .toggle_state(completed)
+                                                    .in_progress(task.is_in_progress())
+                                                    .dismissed(task.is_wont_do())
+                                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                                        cx.stop_propagation();
+                                                        this.toggle(id, !completed, cx);
+                                                    })),
+                                            ),
+                                    )
+                                })
                                 .when_some(sec_time_label, |el, tz_txt| {
                                     el.child(Label::new(tz_txt).size(LabelSize::XSmall).color(Color::Muted))
                                 })

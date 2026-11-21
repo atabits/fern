@@ -717,6 +717,7 @@ impl SettingsWindow {
                     .children(items),
             )
         });
+        let hover_bg = cx.theme().colors().element_hover;
         h_flex()
             .debug_selector(|| format!("settings-row-{menu:?}"))
             .h(px(ROW_HEIGHT))
@@ -729,7 +730,12 @@ impl SettingsWindow {
                     .id(SharedString::from(format!("settings-value-{label}")))
                     .relative()
                     .gap_1()
+                    .px_2()
+                    .py_1()
+                    .rounded(px(4.))
                     .cursor_pointer()
+                    .when(open, |el| el.bg(hover_bg))
+                    .hover(move |s| s.bg(hover_bg))
                     .child(Label::new(value).color(Color::Muted))
                     .child(Icon::new(IconName::ChevronsUpDown).size(IconSize::XSmall).color(Color::Muted))
                     .on_click(cx.listener(move |this, _, _, cx| this.set_menu((!open).then_some(menu), cx)))
@@ -1885,10 +1891,22 @@ impl SettingsWindow {
                                 .px_4()
                                 .gap_4()
                                 .child(Label::new(strings.data_folder))
-                                .child(div().flex_1().min_w_0().overflow_hidden().child(Label::new(folder).color(Color::Muted).truncate()))
+                                .child(
+                                    div()
+                                        .id("data-folder-path")
+                                        .flex_1()
+                                        .min_w_0()
+                                        .overflow_hidden()
+                                        .tooltip(Tooltip::text(folder.clone()))
+                                        .child(Label::new(folder).color(Color::Muted).truncate()),
+                                )
                                 .child(
                                     div()
                                         .id("open-data-folder")
+                                        .px_2()
+                                        .py_1()
+                                        .rounded(px(4.))
+                                        .hover(|s| s.bg(colors.element_hover))
                                         .cursor_pointer()
                                         .child(Label::new(strings.open_folder).color(Color::Accent))
                                         .on_click(|_, _, cx| {
@@ -1956,6 +1974,10 @@ impl SettingsWindow {
                                     .child(
                                         div()
                                             .id("generate-backup")
+                                            .px_2()
+                                            .py_1()
+                                            .rounded(px(4.))
+                                            .hover(|s| s.bg(colors.element_hover))
                                             .cursor_pointer()
                                             .child(Label::new(strings.generate_backup).color(Color::Accent))
                                             .on_click(cx.listener(|this, _, _, cx| this.generate_backup(cx))),
@@ -1963,6 +1985,10 @@ impl SettingsWindow {
                                     .child(
                                         div()
                                             .id("import-backup")
+                                            .px_2()
+                                            .py_1()
+                                            .rounded(px(4.))
+                                            .hover(|s| s.bg(colors.element_hover))
                                             .cursor_pointer()
                                             .child(Label::new(strings.import_backups).color(Color::Accent))
                                             .on_click(cx.listener(|this, _, _, cx| this.import_backup(cx))),
@@ -2129,8 +2155,8 @@ fn form_button(id: &'static str, label: &'static str, primary: bool, colors: &th
         .justify_center()
         .rounded(px(6.))
         .cursor_pointer()
-        .when(primary, |el| el.bg(colors.accent))
-        .when(!primary, |el| el.border_1().border_color(colors.border))
+        .when(primary, |el| el.bg(colors.accent).hover(|s| s.opacity(0.9)))
+        .when(!primary, |el| el.border_1().border_color(colors.border).hover(|s| s.bg(colors.element_hover)))
         .child(Label::new(label).size(LabelSize::Small).when(primary, |label| label.color(Color::OnAccent)))
 }
 

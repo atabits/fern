@@ -96,11 +96,21 @@ fn parse_quick_add_context(input: &str, today: NaiveDate, lists: &[String], reco
         } else if recognition.dates
             && !time_only
             && parsed.repeat.is_none()
-            && let Some((repeat, len)) = parse_repeat(&lower[i..])
+            && let Some((repeat, implied_weekday, len)) = parse_repeat(&lower[i..])
         {
             parsed.repeat = Some(repeat);
+            if let Some(wd) = implied_weekday
+                && parsed.due_date.is_none()
+            {
+                let ahead = (wd.num_days_from_monday() as i64
+                    - today.weekday().num_days_from_monday() as i64)
+                    .rem_euclid(7);
+                parsed.due_date = Some(today + Duration::days(ahead));
+            }
             if recognition.remove_date_text {
                 used[i..i + len].iter_mut().for_each(|u| *u = true);
+            } else {
+                dates_used[i..i + len].iter_mut().for_each(|u| *u = true);
             }
             i += len;
             continue;
@@ -166,22 +176,44 @@ fn mark_with_preposition(used: &mut [bool], lower: &[String], start: usize, len:
     }
 }
 
-/// A repeat rule at the start of `words` and how many words it took.
-fn parse_repeat(words: &[String]) -> Option<(Recurrence, usize)> {
+/// A repeat rule at the start of `words`, an optional implied weekday (e.g. "every monday"),
+/// and how many words it took.
+fn parse_repeat(words: &[String]) -> Option<(Recurrence, Option<Weekday>, usize)> {
     let single = |word: &str| {
         Some(match word {
-            "daily" | "ежедневно" => Frequency::Daily,
-            "weekly" | "еженедельно" => Frequency::Weekly,
-            "monthly" | "ежемесячно" => Frequency::Monthly,
-            "yearly" | "annually" | "ежегодно" => Frequency::Yearly,
+            "daily" | "ежедневно" | "每天" => Frequency::Daily,
+            "weekly" | "еженедельно" | "每周" => Frequency::Weekly,
+            "monthly" | "ежемесячно" | "每月" => Frequency::Monthly,
+            "yearly" | "annually" | "ежегодно" | "每年" => Frequency::Yearly,
             _ => return None,
         })
     };
     if let Some(frequency) = single(&words[0]) {
-        return Some((Recurrence::new(frequency, 1), 1));
+        return Some((Recurrence::new(frequency, 1), None, 1));
+    }
+    if matches!(words[0].as_str(), "weekdays" | "workdays" | "工作日") {
+        let mut r = Recurrence::new(Frequency::Weekly, 1);
+        r.weekdays = 0b0001_1111;
+        return Some((r, None, 1));
+    }
+    if words[0] == "по" && words.len() >= 2 && matches!(words[1].as_str(), "будням" | "будни") {
+        let mut r = Recurrence::new(Frequency::Weekly, 1);
+        r.weekdays = 0b0001_1111;
+        return Some((r, None, 2));
     }
     if !matches!(words[0].as_str(), "every" | "каждый" | "каждую" | "каждое" | "каждые") || words.len() < 2 {
         return None;
+    }
+    if matches!(words[1].as_str(), "weekday" | "workday" | "будний" | "рабочий") {
+        let mut r = Recurrence::new(Frequency::Weekly, 1);
+        r.weekdays = 0b0001_1111;
+        let len = if words.len() >= 3 && matches!(words[2].as_str(), "день" | "day") { 3 } else { 2 };
+        return Some((r, None, len));
+    }
+    if let Some(weekday) = parse_weekday(&words[1]) {
+        let mut r = Recurrence::new(Frequency::Weekly, 1);
+        r.weekdays = 1u8 << weekday.num_days_from_monday();
+        return Some((r, Some(weekday), 2));
     }
     let (interval, unit, len) = match words[1].parse::<u32>() {
         Ok(n) if words.len() >= 3 => (n, words[2].as_str(), 3),
@@ -199,14 +231,14 @@ fn parse_repeat(words: &[String]) -> Option<(Recurrence, usize)> {
     } else {
         return None;
     };
-    Some((Recurrence::new(frequency, interval), len))
+    Some((Recurrence::new(frequency, interval), None, len))
 }
 
 fn parse_priority(value: &str) -> Option<Priority> {
     match value {
-        "1" | "high" | "высокий" | "в" => Some(Priority::High),
-        "2" | "medium" | "средний" | "с" => Some(Priority::Medium),
-        "3" | "low" | "низкий" | "н" => Some(Priority::Low),
+        "1" | "high" | "высокий" | "в" | "高" => Some(Priority::High),
+        "2" | "medium" | "средний" | "с" | "中" => Some(Priority::Medium),
+        "3" | "low" | "низкий" | "н" | "低" => Some(Priority::Low),
         _ => None,
     }
 }
@@ -249,10 +281,17 @@ fn parse_time(word: &str) -> Option<NaiveTime> {
 fn parse_date(words: &[String], today: NaiveDate) -> Option<(NaiveDate, usize)> {
     let first = words[0].as_str();
     match first {
-        "сегодня" | "today" => return Some((today, 1)),
-        "завтра" | "tomorrow" => return Some((today + Duration::days(1), 1)),
-        "послезавтра" => return Some((today + Duration::days(2), 1)),
+        "сегодня" | "today" | "今天" => return Some((today, 1)),
+        "завтра" | "tomorrow" | "明天" => return Some((today + Duration::days(1), 1)),
+        "послезавтра" | "后天" => return Some((today + Duration::days(2), 1)),
+        "下周" => return Some((today + Duration::days(7), 1)),
         _ => {}
+    }
+    if matches!(first, "next" | "следующая" | "следующую" | "следующей")
+        && words.len() >= 2
+        && matches!(words[1].as_str(), "week" | "неделя" | "неделю" | "неделе")
+    {
+        return Some((today + Duration::days(7), 2));
     }
     if let Some(weekday) = parse_weekday(first) {
         let ahead = (weekday.num_days_from_monday() as i64
@@ -319,13 +358,13 @@ fn parse_numeric_date(word: &str, today: NaiveDate) -> Option<NaiveDate> {
 
 fn parse_weekday(word: &str) -> Option<Weekday> {
     Some(match word {
-        "пн" | "понедельник" | "mon" | "monday" => Weekday::Mon,
-        "вт" | "вторник" | "tue" | "tuesday" => Weekday::Tue,
-        "ср" | "среда" | "среду" | "wed" | "wednesday" => Weekday::Wed,
-        "чт" | "четверг" | "thu" | "thursday" => Weekday::Thu,
-        "пт" | "пятница" | "пятницу" | "fri" | "friday" => Weekday::Fri,
-        "сб" | "суббота" | "субботу" | "sat" | "saturday" => Weekday::Sat,
-        "вс" | "воскресенье" | "sun" | "sunday" => Weekday::Sun,
+        "пн" | "понедельник" | "mon" | "monday" | "周一" | "星期一" => Weekday::Mon,
+        "вт" | "вторник" | "tue" | "tuesday" | "周二" | "星期二" => Weekday::Tue,
+        "ср" | "среда" | "среду" | "wed" | "wednesday" | "周三" | "星期三" => Weekday::Wed,
+        "чт" | "четверг" | "thu" | "thursday" | "周四" | "星期四" => Weekday::Thu,
+        "пт" | "пятница" | "пятницу" | "fri" | "friday" | "周五" | "星期五" => Weekday::Fri,
+        "сб" | "суббота" | "субботу" | "sat" | "saturday" | "周六" | "星期六" => Weekday::Sat,
+        "вс" | "воскресенье" | "sun" | "sunday" | "周日" | "星期日" | "星期天" => Weekday::Sun,
         _ => return None,
     })
 }
@@ -519,5 +558,32 @@ mod tests {
         assert_eq!(p.tags, ["Home", "work"]);
         assert_eq!(parse_quick_add("x !3", today(), &[]).priority, Some(Priority::Low));
         assert_eq!(parse_quick_add("hooray!", today(), &[]).title, "hooray!");
+    }
+
+    #[test]
+    fn weekday_repeats_next_week_and_chinese_tokens() {
+        // today() is 2026-10-16 (Friday), so next Monday is 2026-10-19.
+        let p = parse_quick_add("Standup every weekday 9:00", today(), &[]);
+        assert_eq!(p.title, "Standup");
+        assert_eq!(p.repeat.as_ref().map(|r| (r.frequency, r.weekdays)), Some((Frequency::Weekly, 0b0001_1111)));
+
+        let p = parse_quick_add("Sync по будням", today(), &[]);
+        assert_eq!(p.title, "Sync");
+        assert_eq!(p.repeat.as_ref().map(|r| r.weekdays), Some(0b0001_1111));
+
+        let p = parse_quick_add("Sprint review every monday", today(), &[]);
+        assert_eq!(p.title, "Sprint review");
+        assert_eq!(p.repeat.as_ref().map(|r| (r.frequency, r.weekdays)), Some((Frequency::Weekly, 1 << 0)));
+        assert_eq!(p.due_date, Some(NaiveDate::from_ymd_opt(2026, 10, 19).unwrap()));
+
+        let p = parse_quick_add("Plan sprint next week", today(), &[]);
+        assert_eq!(p.title, "Plan sprint");
+        assert_eq!(p.due_date, Some(today() + Duration::days(7)));
+
+        let p = parse_quick_add("买菜 明天 每天 !高", today(), &[]);
+        assert_eq!(p.title, "买菜");
+        assert_eq!(p.due_date, Some(today() + Duration::days(1)));
+        assert_eq!(p.repeat, Some(Recurrence::new(Frequency::Daily, 1)));
+        assert_eq!(p.priority, Some(Priority::High));
     }
 }

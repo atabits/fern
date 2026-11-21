@@ -1621,9 +1621,33 @@ impl SettingsWindow {
                             )),
                     )
                 })
-                .child(
+                .child({
+                    let defaults_modified = self.preferences.task_defaults != fern_core::TaskDefaults::default()
+                        || self.preferences.default_list.is_some();
                     v_flex()
-                        .child(title(strings.task_default))
+                        .child(
+                            h_flex()
+                                .items_center()
+                                .child(div().flex_1().child(title(strings.task_default)))
+                                .when(defaults_modified, |el| {
+                                    el.child(
+                                        div()
+                                            .id("reset-task-defaults")
+                                            .px_2()
+                                            .py_0p5()
+                                            .rounded(px(4.))
+                                            .cursor_pointer()
+                                            .hover(|s| s.bg(colors.element_hover))
+                                            .child(Label::new(strings.habit_reset).size(LabelSize::XSmall).color(Color::Accent))
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.update(window, cx, |p| {
+                                                    p.task_defaults = fern_core::TaskDefaults::default();
+                                                    p.default_list = None;
+                                                });
+                                            })),
+                                    )
+                                }),
+                        )
                         .child(self.render_task_defaults(cx))
                         .child(div().h_3())
                         .child(group().children(self.render_priority_and_tag(cx)).child(self.select_row(
@@ -1659,8 +1683,8 @@ impl SettingsWindow {
                                 |defaults, bottom| defaults.overdue_last = bottom,
                                 cx,
                             ),
-                        ])),
-                )
+                        ]))
+                })
                 .child({
                     let on = self.preferences.mini_calendar;
                     v_flex().child(title(strings.mini_calendar)).child(

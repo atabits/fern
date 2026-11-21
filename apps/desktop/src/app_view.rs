@@ -1689,7 +1689,30 @@ impl AppView {
             .w(px(300.))
             .max_h(px(420.))
             .on_mouse_down_out(cx.listener(|this, _, _, cx| this.set_notices_open(false, cx)))
-            .child(div().px_2().py_1().child(Label::new(strings.notifications).weight(gpui::FontWeight::SEMIBOLD)))
+            .child(
+                h_flex()
+                    .px_2()
+                    .py_1()
+                    .items_center()
+                    .child(div().flex_1().child(Label::new(strings.notifications).weight(gpui::FontWeight::SEMIBOLD)))
+                    .when(!self.notices.items.is_empty(), |el| {
+                        el.child(
+                            div()
+                                .id("notices-clear-all")
+                                .px_1p5()
+                                .py_0p5()
+                                .rounded(px(4.))
+                                .cursor_pointer()
+                                .hover(|s| s.bg(theme.colors().element_hover))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.notices.items.clear();
+                                    this.notices.unread = 0;
+                                    cx.notify();
+                                }))
+                                .child(Label::new(strings.clear).size(LabelSize::XSmall).color(Color::Muted)),
+                        )
+                    }),
+            )
             .when(self.notices.items.is_empty(), |el| {
                 el.child(div().px_2().py_3().child(Label::new(strings.no_notifications).color(Color::Muted)))
             })

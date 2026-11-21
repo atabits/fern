@@ -34,6 +34,7 @@ fn frame(
 ) -> AnyElement {
     let theme = cx.theme().clone();
     let button = |id: &'static str, label: &'static str, primary: bool| {
+        let clickable = !primary || enabled;
         div()
             .id(id)
             .w(px(100.))
@@ -42,11 +43,18 @@ fn frame(
             .items_center()
             .justify_center()
             .rounded(px(6.))
-            .cursor_pointer()
+            .when(clickable, |el| el.cursor_pointer())
             .when(primary, |el| {
-                el.bg(theme.colors().accent.opacity(if enabled { 1. } else { 0.5 })).child(Label::new(label).color(Color::OnAccent))
+                el.bg(theme.colors().accent.opacity(if enabled { 1. } else { 0.5 }))
+                    .when(enabled, |el| el.hover(|s| s.opacity(0.9)))
+                    .child(Label::new(label).color(Color::OnAccent))
             })
-            .when(!primary, |el| el.border_1().border_color(theme.colors().border).child(Label::new(label)))
+            .when(!primary, |el| {
+                el.border_1()
+                    .border_color(theme.colors().border)
+                    .hover(|s| s.bg(theme.colors().element_hover))
+                    .child(Label::new(label))
+            })
     };
     div()
         .absolute()
@@ -73,7 +81,12 @@ fn frame(
                     h_flex()
                         .h(px(56.))
                         .child(div().flex_1().text_size(px(16.)).font_weight(FontWeight::SEMIBOLD).child(title))
-                        .child(IconButton::new(SharedString::from(format!("{id}-x")), IconName::X).icon_color(Color::Muted).on_click(on_close.clone())),
+                        .child(
+                            IconButton::new(SharedString::from(format!("{id}-x")), IconName::X)
+                                .icon_color(Color::Muted)
+                                .tooltip(ui::Tooltip::text(i18n::t(cx).close))
+                                .on_click(on_close.clone()),
+                        ),
                 )
                 .child(body)
                 .child(div().flex_1())
@@ -101,6 +114,7 @@ fn dropdown(id: &'static str, text: SharedString, open: bool, width: f32, cx: &A
         .border_1()
         .border_color(if open { theme.colors().accent } else { theme.colors().border })
         .cursor_pointer()
+        .hover(|s| s.bg(theme.colors().element_hover))
         .child(div().flex_1().min_w_0().child(Label::new(text).truncate()))
         .child(Icon::new(IconName::ChevronDown).size(IconSize::XSmall).color(Color::Muted))
 }

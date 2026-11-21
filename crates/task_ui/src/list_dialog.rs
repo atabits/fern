@@ -510,7 +510,9 @@ impl Render for ListDialog {
                 .tooltip(ui::Tooltip::text(tip))
                 .on_click(cx.listener(move |this, _, _, cx| this.update(cx, |this| this.layout = value)))
         };
+        let can_save = !self.name.read(cx).text().trim().is_empty();
         let button = |id: &'static str, label: &'static str, primary: bool| {
+            let enabled = !primary || can_save;
             div()
                 .id(id)
                 .h(px(30.))
@@ -519,9 +521,18 @@ impl Render for ListDialog {
                 .items_center()
                 .justify_center()
                 .rounded(px(6.))
-                .cursor_pointer()
-                .when(primary, |el| el.bg(theme.colors().accent).child(Label::new(label).color(Color::OnAccent)))
-                .when(!primary, |el| el.border_1().border_color(theme.colors().border).child(Label::new(label)))
+                .when(enabled, |el| el.cursor_pointer())
+                .when(primary, |el| {
+                    el.bg(theme.colors().accent.opacity(if can_save { 1. } else { 0.5 }))
+                        .when(can_save, |el| el.hover(|s| s.opacity(0.9)))
+                        .child(Label::new(label).color(Color::OnAccent))
+                })
+                .when(!primary, |el| {
+                    el.border_1()
+                        .border_color(theme.colors().border)
+                        .hover(|s| s.bg(theme.colors().element_hover))
+                        .child(Label::new(label))
+                })
         };
         let icon_cell = div()
             .relative()
@@ -536,6 +547,7 @@ impl Render for ListDialog {
                     .border_r_1()
                     .border_color(theme.colors().border)
                     .cursor_pointer()
+                    .hover(|s| s.bg(theme.colors().element_hover))
                     .map(|el| match &self.draft.icon {
                         Some(icon) => el.child(div().text_size(px(16.)).child(icon.clone())),
                         None => el.child(
@@ -634,6 +646,7 @@ impl Render for ListDialog {
                         div().absolute().top(px(14.)).right(px(14.)).child(
                             IconButton::new("list-dialog-x", IconName::X)
                                 .icon_color(Color::Muted)
+                                .tooltip(ui::Tooltip::text(strings.close))
                                 .on_click(cx.listener(|_, _, _, cx| cx.emit(DialogEvent::Closed))),
                         ),
                     ),
@@ -702,6 +715,7 @@ impl Render for FolderDialog {
         let theme = cx.theme().clone();
         let empty = self.name.read(cx).text().trim().is_empty();
         let button = |id: &'static str, label: &'static str, primary: bool| {
+            let enabled = !primary || !empty;
             div()
                 .id(id)
                 .w(px(100.))
@@ -710,12 +724,18 @@ impl Render for FolderDialog {
                 .items_center()
                 .justify_center()
                 .rounded(px(6.))
-                .cursor_pointer()
+                .when(enabled, |el| el.cursor_pointer())
                 .when(primary, |el| {
                     el.bg(theme.colors().accent.opacity(if empty { 0.5 } else { 1. }))
+                        .when(!empty, |el| el.hover(|s| s.opacity(0.9)))
                         .child(Label::new(label).color(Color::OnAccent))
                 })
-                .when(!primary, |el| el.border_1().border_color(theme.colors().border).child(Label::new(label)))
+                .when(!primary, |el| {
+                    el.border_1()
+                        .border_color(theme.colors().border)
+                        .hover(|s| s.bg(theme.colors().element_hover))
+                        .child(Label::new(label))
+                })
         };
         // 441 × 181, as the original's, where the list dialog is (see there).
         div()
@@ -751,6 +771,7 @@ impl Render for FolderDialog {
                             .child(
                                 IconButton::new("folder-dialog-x", IconName::X)
                                     .icon_color(Color::Muted)
+                                    .tooltip(ui::Tooltip::text(strings.close))
                                     .on_click(cx.listener(|_, _, _, cx| cx.emit(DialogEvent::Closed))),
                             ),
                     )

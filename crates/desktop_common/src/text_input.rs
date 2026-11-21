@@ -24,17 +24,25 @@ actions!(
     [
         Backspace,
         Delete,
+        DeleteWordBackward,
+        DeleteWordForward,
         Left,
         Right,
+        WordLeft,
+        WordRight,
         Up,
         Down,
         SelectLeft,
         SelectRight,
+        SelectWordLeft,
+        SelectWordRight,
         SelectUp,
         SelectDown,
         SelectAll,
         Home,
         End,
+        SelectHome,
+        SelectEnd,
         ShowCharacterPalette,
         Paste,
         Cut,
@@ -323,6 +331,16 @@ impl TextInput {
         }
     }
 
+    fn word_left(&mut self, _: &WordLeft, window: &mut Window, cx: &mut Context<Self>) {
+        let offset = self.previous_word_boundary(self.cursor_offset());
+        self.move_to(offset, window, cx);
+    }
+
+    fn word_right(&mut self, _: &WordRight, window: &mut Window, cx: &mut Context<Self>) {
+        let offset = self.next_word_boundary(self.cursor_offset());
+        self.move_to(offset, window, cx);
+    }
+
     fn up(&mut self, _: &Up, window: &mut Window, cx: &mut Context<Self>) {
         let offset = self.vertical_offset(-1.);
         self.move_to(offset, window, cx);
@@ -339,6 +357,16 @@ impl TextInput {
 
     fn select_right(&mut self, _: &SelectRight, window: &mut Window, cx: &mut Context<Self>) {
         self.select_to(self.next_boundary(self.cursor_offset()), window, cx);
+    }
+
+    fn select_word_left(&mut self, _: &SelectWordLeft, window: &mut Window, cx: &mut Context<Self>) {
+        let offset = self.previous_word_boundary(self.cursor_offset());
+        self.select_to(offset, window, cx);
+    }
+
+    fn select_word_right(&mut self, _: &SelectWordRight, window: &mut Window, cx: &mut Context<Self>) {
+        let offset = self.next_word_boundary(self.cursor_offset());
+        self.select_to(offset, window, cx);
     }
 
     fn select_up(&mut self, _: &SelectUp, window: &mut Window, cx: &mut Context<Self>) {
@@ -366,6 +394,16 @@ impl TextInput {
         self.move_to(offset, window, cx);
     }
 
+    fn select_home(&mut self, _: &SelectHome, window: &mut Window, cx: &mut Context<Self>) {
+        let offset = self.visual_line_edge(false);
+        self.select_to(offset, window, cx);
+    }
+
+    fn select_end(&mut self, _: &SelectEnd, window: &mut Window, cx: &mut Context<Self>) {
+        let offset = self.visual_line_edge(true);
+        self.select_to(offset, window, cx);
+    }
+
     fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
         if self.selected_range.is_empty() {
             let prev = self.previous_boundary(self.cursor_offset());
@@ -388,6 +426,30 @@ impl TextInput {
             self.select_to(next, window, cx)
         }
         self.replace_text_in_range(None, "", window, cx)
+    }
+
+    fn delete_word_backward(&mut self, _: &DeleteWordBackward, window: &mut Window, cx: &mut Context<Self>) {
+        if self.selected_range.is_empty() {
+            let prev = self.previous_word_boundary(self.cursor_offset());
+            if self.cursor_offset() == prev {
+                window.play_system_bell();
+                return;
+            }
+            self.select_to(prev, window, cx);
+        }
+        self.replace_text_in_range(None, "", window, cx);
+    }
+
+    fn delete_word_forward(&mut self, _: &DeleteWordForward, window: &mut Window, cx: &mut Context<Self>) {
+        if self.selected_range.is_empty() {
+            let next = self.next_word_boundary(self.cursor_offset());
+            if self.cursor_offset() == next {
+                window.play_system_bell();
+                return;
+            }
+            self.select_to(next, window, cx);
+        }
+        self.replace_text_in_range(None, "", window, cx);
     }
 
     /// Requests the platform/touch virtual keyboard when an input is opened by a tap rather than
@@ -415,6 +477,19 @@ impl TextInput {
 
         if event.modifiers.shift {
             self.select_to(self.index_for_mouse_position(event.position), window, cx);
+        } else if event.click_count == 2 {
+            let offset = self.index_for_mouse_position(event.position);
+            let range = self.word_range_at(offset);
+            self.move_to(range.start, window, cx);
+            self.select_to(range.end, window, cx);
+            self.is_selecting = false;
+        } else if event.click_count >= 3 {
+            let offset = self.index_for_mouse_position(event.position);
+            let start = self.content[..offset].rfind('\n').map_or(0, |i| i + 1);
+            let end = self.content[offset..].find('\n').map_or(self.content.len(), |i| offset + i);
+            self.move_to(start, window, cx);
+            self.select_to(end, window, cx);
+            self.is_selecting = false;
         } else {
             self.move_to(self.index_for_mouse_position(event.position), window, cx)
         }
@@ -624,6 +699,56 @@ impl TextInput {
             .grapheme_indices(true)
             .find_map(|(idx, _)| (idx > offset).then_some(idx))
             .unwrap_or(self.content.len())
+    }
+
+    fn previous_word_boundary(&self, offset: usize) -> usize {
+        let prefix = &self.content[..offset.min(self.content.len())];
+        let trimmed = prefix.trim_end_matches(|c: char| c.is_whitespace() && c != '\n');
+        if trimmed.is_empty() {
+            return 0;
+        }
+        if trimmed.ends_with('\n') && trimmed.len() == prefix.len() {
+            return trimmed.len() - 1;
+        }
+        trimmed
+            .split_word_bound_indices()
+            .rfind(|(_, piece)| !piece.chars().all(char::is_whitespace))
+            .map_or(0, |(idx, _)| idx)
+    }
+
+    fn next_word_boundary(&self, offset: usize) -> usize {
+        let offset = offset.min(self.content.len());
+        let suffix = &self.content[offset..];
+        let leading_ws = suffix
+            .char_indices()
+            .find(|(_, c)| !c.is_whitespace() || *c == '\n')
+            .map_or(suffix.len(), |(idx, _)| idx);
+        let rest = &suffix[leading_ws..];
+        if rest.is_empty() {
+            return self.content.len();
+        }
+        if rest.starts_with('\n') && leading_ws == 0 {
+            return offset + 1;
+        }
+        let first_len = rest
+            .split_word_bounds()
+            .next()
+            .map_or(rest.len(), str::len);
+        offset + leading_ws + first_len
+    }
+
+    fn word_range_at(&self, offset: usize) -> Range<usize> {
+        let offset = offset.min(self.content.len());
+        for (start, piece) in self.content.split_word_bound_indices() {
+            let end = start + piece.len();
+            if offset >= start && offset < end {
+                return start..end;
+            }
+        }
+        if let Some((start, piece)) = self.content.split_word_bound_indices().next_back() {
+            return start..start + piece.len();
+        }
+        offset..offset
     }
 }
 
@@ -1155,17 +1280,25 @@ impl Render for TextInput {
             .cursor(CursorStyle::IBeam)
             .on_action(cx.listener(Self::backspace))
             .on_action(cx.listener(Self::delete))
+            .on_action(cx.listener(Self::delete_word_backward))
+            .on_action(cx.listener(Self::delete_word_forward))
             .on_action(cx.listener(Self::left))
             .on_action(cx.listener(Self::right))
+            .on_action(cx.listener(Self::word_left))
+            .on_action(cx.listener(Self::word_right))
             .on_action(cx.listener(Self::up))
             .on_action(cx.listener(Self::down))
             .on_action(cx.listener(Self::select_left))
             .on_action(cx.listener(Self::select_right))
+            .on_action(cx.listener(Self::select_word_left))
+            .on_action(cx.listener(Self::select_word_right))
             .on_action(cx.listener(Self::select_up))
             .on_action(cx.listener(Self::select_down))
             .on_action(cx.listener(Self::select_all))
             .on_action(cx.listener(Self::home))
             .on_action(cx.listener(Self::end))
+            .on_action(cx.listener(Self::select_home))
+            .on_action(cx.listener(Self::select_end))
             .on_action(cx.listener(Self::show_character_palette))
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::cut))

@@ -51,6 +51,10 @@ pub struct SummaryView {
     /// The report as an editable document, the original's way: Markdown text that Copy and
     /// Send Email then use. New options make the report again.
     editor: Option<Entity<TextInput>>,
+    /// The generated Markdown when `editor` was opened, to detect manual edits.
+    editor_initial: String,
+    /// Pending option change awaiting confirmation when manual edits would be overwritten.
+    pending_options: Option<SummaryOptions>,
     /// Whether the editor shows (it keeps its text while hidden).
     editing: bool,
     /// The toolbar's "Heading Options" menu, while open.
@@ -197,6 +201,8 @@ impl SummaryView {
             naming: None,
             more_side: None,
             editor: None,
+            editor_initial: String::new(),
+            pending_options: None,
             editing: false,
             heading_menu: false,
         }
@@ -267,7 +273,7 @@ impl SummaryView {
     /// Closes the top-most open dropdown or inline prompt on Escape. Returns `true` if anything
     /// was dismissed so callers can stop propagation.
     pub fn dismiss_transient(&mut self, cx: &mut Context<Self>) -> bool {
-        let dismissed = if self.more_side.take().is_some() {
+        let dismissed = if self.pending_options.take().is_some() || self.more_side.take().is_some() {
             true
         } else {
             self.menu.take().is_some()
@@ -299,16 +305,40 @@ impl SummaryView {
         .detach();
     }
 
-    fn update(&mut self, cx: &mut Context<Self>, change: impl FnOnce(&mut SummaryOptions)) {
-        change(&mut self.options);
+    fn has_manual_edits(&self, cx: &Context<Self>) -> bool {
+        self.editor
+            .as_ref()
+            .is_some_and(|editor| editor.read(cx).text() != self.editor_initial)
+    }
+
+    fn apply_options(&mut self, options: SummaryOptions, cx: &mut Context<Self>) {
+        self.options = options;
         if let Err(err) = self.store.save_summary_options(&self.options) {
             eprintln!("failed to save the summary options: {err:#}");
         }
         self.copied = false;
         // A report made with other options replaces the edited one.
         self.editor = None;
+        self.editor_initial.clear();
         self.editing = false;
+        self.pending_options = None;
         cx.notify();
+    }
+
+    fn update(&mut self, cx: &mut Context<Self>, change: impl FnOnce(&mut SummaryOptions)) {
+        let mut next = self.options.clone();
+        change(&mut next);
+        if next == self.options {
+            return;
+        }
+        if self.has_manual_edits(cx) {
+            self.pending_options = Some(next);
+            self.menu = None;
+            self.more_side = None;
+            cx.notify();
+            return;
+        }
+        self.apply_options(next, cx);
     }
 
     /// The pencil in the report's header: edit the report as text, or show it again.
@@ -318,6 +348,7 @@ impl SummaryView {
         } else {
             if self.editor.is_none() {
                 let markdown = self.current_report(cx).markdown();
+                self.editor_initial = markdown.clone();
                 self.editor = Some(cx.new(|cx| {
                     let mut input = TextInput::new(Mode::MultiLine, "", cx);
                     input.set_text(markdown, cx);
@@ -997,6 +1028,7 @@ impl Render for SummaryView {
             }));
 
         h_flex()
+            .relative()
             .size_full()
             .items_start()
             .on_action(cx.listener(|this, _: &md::DismissTransient, _, cx| {
@@ -1142,6 +1174,89 @@ impl Render for SummaryView {
                     ),
             )
             .child(self.render_options(cx))
+            .when_some(self.pending_options.clone(), |el, next| {
+                el.child(
+                    div()
+                        .id("summary-overwrite-backdrop")
+                        .absolute()
+                        .inset_0()
+                        .bg(gpui::black().opacity(0.35))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.pending_options = None;
+                            cx.notify();
+                        }))
+                        .child(
+                            v_flex()
+                                .id("summary-overwrite-modal")
+                                .w(px(360.))
+                                .p_5()
+                                .gap_3()
+                                .rounded(px(12.))
+                                .bg(colors.elevated_surface_background)
+                                .border_1()
+                                .border_color(colors.border)
+                                .shadow_lg()
+                                .on_click(|_, _, cx| cx.stop_propagation())
+                                .child(
+                                    div()
+                                        .text_size(px(16.))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(colors.text)
+                                        .child(strings.summary_overwrite_title),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(13.))
+                                        .text_color(colors.text_muted)
+                                        .child(strings.summary_overwrite_message),
+                                )
+                                .child(
+                                    h_flex()
+                                        .justify_end()
+                                        .gap_2()
+                                        .pt_1()
+                                        .child(
+                                            div()
+                                                .id("summary-overwrite-cancel")
+                                                .px_3()
+                                                .py_1()
+                                                .rounded(px(6.))
+                                                .border_1()
+                                                .border_color(colors.border)
+                                                .text_size(px(13.))
+                                                .text_color(colors.text)
+                                                .hover(|s| s.bg(colors.element_hover))
+                                                .cursor_pointer()
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.pending_options = None;
+                                                    cx.notify();
+                                                }))
+                                                .child(strings.cancel),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("summary-overwrite-confirm")
+                                                .px_3()
+                                                .py_1()
+                                                .rounded(px(6.))
+                                                .bg(colors.accent)
+                                                .text_size(px(13.))
+                                                .font_weight(FontWeight::MEDIUM)
+                                                .text_color(gpui::white())
+                                                .hover(|s| s.opacity(0.9))
+                                                .cursor_pointer()
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.apply_options(next.clone(), cx);
+                                                }))
+                                                .child(strings.confirm),
+                                        ),
+                                ),
+                        ),
+                )
+            })
     }
 }
 

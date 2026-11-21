@@ -941,6 +941,7 @@ impl CalendarView {
                 .rounded(px(6.))
                 .cursor_pointer()
                 .when(i == tab, |el| el.bg(theme.colors().element_selected))
+                .when(i != tab, |el| el.hover(|s| s.bg(theme.colors().ghost_element_hover)))
                 .child(Label::new(*label).size(LabelSize::Small).color(if i == tab { Color::Default } else { Color::Muted }))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.arrange = Some(i);
@@ -980,7 +981,15 @@ impl CalendarView {
             }
         }
         if body.is_empty() {
-            body.push(div().pt_4().child(Label::new(strings.arrange_empty).size(LabelSize::Small).color(Color::Muted)).into_any_element());
+            body.push(
+                div()
+                    .pt_8()
+                    .px_2()
+                    .flex()
+                    .justify_center()
+                    .child(Label::new(strings.arrange_empty).size(LabelSize::Small).color(Color::Muted))
+                    .into_any_element(),
+            );
         }
         v_flex()
             .id("calendar-arrange")
@@ -995,10 +1004,16 @@ impl CalendarView {
             .child(
                 h_flex()
                     .child(div().flex_1().child(Label::new(strings.arrange_tasks_title).weight(FontWeight::SEMIBOLD)))
-                    .child(IconButton::new("arrange-close", IconName::X).size(px(22.)).icon_size(IconSize::Small).on_click(cx.listener(|this, _, _, cx| {
-                        this.arrange = None;
-                        cx.notify();
-                    }))),
+                    .child(
+                        IconButton::new("arrange-close", IconName::X)
+                            .size(px(22.))
+                            .icon_size(IconSize::Small)
+                            .tooltip(ui::Tooltip::text(strings.close))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.arrange = None;
+                                cx.notify();
+                            })),
+                    ),
             )
             .child(tabs)
             .child(

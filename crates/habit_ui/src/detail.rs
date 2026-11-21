@@ -404,6 +404,24 @@ impl HabitView {
                                 .child(
                                     h_flex()
                                         .gap_1()
+                                        .items_center()
+                                        .when(self.month != calendar::month_start(today), |el| {
+                                            el.child(
+                                                div()
+                                                    .id("habit-month-today")
+                                                    .px_2()
+                                                    .py_0p5()
+                                                    .rounded(px(4.))
+                                                    .bg(theme.colors().accent.opacity(0.12))
+                                                    .hover(|s| s.bg(theme.colors().accent.opacity(0.2)))
+                                                    .cursor_pointer()
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.month = calendar::month_start(Local::now().date_naive());
+                                                        cx.notify();
+                                                    }))
+                                                    .child(Label::new(strings.today).size(LabelSize::XSmall).color(Color::Accent)),
+                                            )
+                                        })
                                         .child(IconButton::new("habit-month-prev", IconName::ChevronLeft).on_click(
                                             cx.listener(|this, _, _, cx| {
                                                 this.month = calendar::add_months(this.month, -1);
@@ -506,6 +524,7 @@ impl HabitView {
                                                             IconName::Pencil,
                                                         )
                                                         .icon_size(IconSize::XSmall)
+                                                        .tooltip(ui::Tooltip::text(strings.edit))
                                                         .on_click(cx.listener(move |this, _, window, cx| {
                                                             this.open_log_modal(id, entry_date, false, window, cx);
                                                         })),
@@ -516,6 +535,8 @@ impl HabitView {
                                                             IconName::Trash,
                                                         )
                                                         .icon_size(IconSize::XSmall)
+                                                        .hover_icon_color(theme.status().error)
+                                                        .tooltip(ui::Tooltip::text(strings.delete))
                                                         .on_click(cx.listener(move |this, _, _, cx| {
                                                             this.confirm = Some(ConfirmAction::DeleteLog {
                                                                 habit_id: id,

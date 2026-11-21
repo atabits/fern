@@ -1786,22 +1786,42 @@ impl SettingsWindow {
                 #[cfg(windows)]
                 let body = {
                     let enabled = crate::tray::enabled(&self.store);
-                    body.child(group().child(
-                        h_flex()
-                            .id("minimize-to-tray")
-                            .h(px(ROW_HEIGHT))
-                            .px_4()
-                            .cursor_pointer()
-                            .child(div().flex_1().child(Label::new(strings.minimize_to_tray)))
-                            .child(Switch::new().toggle_state(enabled))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                let enabled = crate::tray::enabled(&this.store);
-                                if let Err(err) = crate::tray::set_enabled(&this.store, !enabled) {
-                                    eprintln!("failed to save the notification area setting: {err:#}");
-                                }
-                                cx.notify();
-                            })),
-                    ))
+                    let topmost = crate::tray::always_on_top(&self.store);
+                    body.child(
+                        group()
+                            .child(
+                                h_flex()
+                                    .id("minimize-to-tray")
+                                    .h(px(ROW_HEIGHT))
+                                    .px_4()
+                                    .cursor_pointer()
+                                    .child(div().flex_1().child(Label::new(strings.minimize_to_tray)))
+                                    .child(Switch::new().toggle_state(enabled))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        let enabled = crate::tray::enabled(&this.store);
+                                        if let Err(err) = crate::tray::set_enabled(&this.store, !enabled) {
+                                            eprintln!("failed to save the notification area setting: {err:#}");
+                                        }
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                h_flex()
+                                    .id("always-on-top")
+                                    .h(px(ROW_HEIGHT))
+                                    .px_4()
+                                    .cursor_pointer()
+                                    .child(div().flex_1().child(Label::new(strings.tray_always_on_top)))
+                                    .child(Switch::new().toggle_state(topmost))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        let next = !crate::tray::always_on_top(&this.store);
+                                        if let Err(err) = crate::tray::set_always_on_top(&this.store, next) {
+                                            eprintln!("failed to save always_on_top setting: {err:#}");
+                                        }
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
                 };
                 body.into_any_element()
             }

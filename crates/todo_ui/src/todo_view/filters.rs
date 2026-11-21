@@ -786,8 +786,19 @@ impl TodoView {
                     )
                     .child(div().flex_1())
                     .child(
-                        chip(id("remove"), strings.delete, false, cx).on_click(cx.listener(
-                            move |this, _, _, cx| {
+                        div()
+                            .id(id("remove"))
+                            .min_h(px(28.))
+                            .px_2()
+                            .py_1()
+                            .flex()
+                            .items_center()
+                            .rounded(px(6.))
+                            .cursor_pointer()
+                            .bg(cx.theme().colors().element_hover)
+                            .hover(|s| s.bg(cx.theme().status().error.opacity(0.14)))
+                            .child(Label::new(strings.delete).size(LabelSize::Small).color(Color::Error))
+                            .on_click(cx.listener(move |this, _, _, cx| {
                                 if let Some(edit) = this.filter_edit.as_mut() {
                                     edit.draft.rules.conditions.remove(i);
                                     edit.inputs.remove(i);
@@ -795,8 +806,7 @@ impl TodoView {
                                     edit.error = None;
                                 }
                                 cx.notify();
-                            },
-                        )),
+                            })),
                     ),
             )
             .child(content)
@@ -895,12 +905,26 @@ impl TodoView {
                     .bg(theme.colors().elevated_surface_background)
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .child(
-                        Label::new(if edit.is_new {
-                            strings.add_filter
-                        } else {
-                            strings.edit_filter
-                        })
-                        .weight(FontWeight::SEMIBOLD),
+                        h_flex()
+                            .child(
+                                div().flex_1().child(
+                                    Label::new(if edit.is_new {
+                                        strings.add_filter
+                                    } else {
+                                        strings.edit_filter
+                                    })
+                                    .weight(FontWeight::SEMIBOLD),
+                                ),
+                            )
+                            .child(
+                                IconButton::new("filter-dialog-x", IconName::X)
+                                    .icon_color(Color::Muted)
+                                    .tooltip(Tooltip::text(strings.close))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.filter_edit = None;
+                                        cx.notify();
+                                    })),
+                            ),
                     )
                     .child(
                         h_flex()
@@ -966,7 +990,18 @@ impl TodoView {
                                 }),
                             ))
                             .child(
-                                chip("filter-save", strings.save, true, cx)
+                                div()
+                                    .id("filter-save")
+                                    .min_h(px(28.))
+                                    .px_3()
+                                    .py_1()
+                                    .flex()
+                                    .items_center()
+                                    .rounded(px(6.))
+                                    .bg(theme.colors().accent)
+                                    .hover(|s| s.opacity(0.9))
+                                    .cursor_pointer()
+                                    .child(Label::new(strings.save).size(LabelSize::Small).color(Color::OnAccent))
                                     .on_click(cx.listener(|this, _, window, cx| this.save_filter(window, cx))),
                             ),
                     ),

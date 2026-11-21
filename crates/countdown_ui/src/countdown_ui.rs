@@ -1710,6 +1710,7 @@ impl Render for CountdownView {
                         .id("countdown-delete-backdrop")
                         .absolute()
                         .inset_0()
+                        .occlude()
                         .flex()
                         .items_center()
                         .justify_center()

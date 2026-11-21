@@ -340,8 +340,17 @@ impl SearchModal {
                 .justify_center()
                 .rounded(px(6.))
                 .cursor_pointer()
-                .when(primary, |el| el.bg(theme.colors().accent).child(Label::new(label).size(LabelSize::Small).color(Color::OnAccent)))
-                .when(!primary, |el| el.border_1().border_color(theme.colors().border).child(Label::new(label).size(LabelSize::Small)))
+                .when(primary, |el| {
+                    el.bg(theme.colors().accent)
+                        .hover(|s| s.opacity(0.9))
+                        .child(Label::new(label).size(LabelSize::Small).color(Color::OnAccent))
+                })
+                .when(!primary, |el| {
+                    el.border_1()
+                        .border_color(theme.colors().border)
+                        .hover(|s| s.bg(theme.colors().element_hover))
+                        .child(Label::new(label).size(LabelSize::Small))
+                })
         };
         popover(cx)
             .w(px(if menu == Menu::Date { 250. } else { 210. }))
@@ -741,6 +750,8 @@ impl Render for SearchModal {
                                 .justify_center()
                                 .cursor_pointer()
                                 .bg(theme.colors().text_muted.opacity(0.5))
+                                .hover(|s| s.bg(theme.colors().text_muted.opacity(0.75)))
+                                .tooltip(Tooltip::text(strings.clear))
                                 .child(Icon::new(IconName::X).size(IconSize::Custom(px(10.))).color(Color::Custom(theme.colors().elevated_surface_background)))
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.input.update(cx, |input, cx| input.set_text("", cx));
@@ -752,6 +763,7 @@ impl Render for SearchModal {
                     .child(
                         IconButton::new("close-search", IconName::X)
                             .icon_size(IconSize::Medium)
+                            .tooltip(Tooltip::text(strings.close))
                             .on_click(cx.listener(|_, _, _, cx| cx.emit(SearchEvent::Dismissed))),
                     ),
             )
@@ -824,6 +836,8 @@ impl Render for SearchModal {
                                     .id("search-view-more")
                                     .px_2()
                                     .py_1()
+                                    .rounded(px(4.))
+                                    .hover(|s| s.bg(theme.colors().element_hover))
                                     .cursor_pointer()
                                     .child(Label::new(strings.view_more).size(LabelSize::Small).color(Color::Accent))
                                     .on_click(cx.listener(move |this, _, _, cx| {

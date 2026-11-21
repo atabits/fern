@@ -40,6 +40,7 @@ pub enum SearchEvent {
     OpenTask(Id),
     OpenHabit(Id),
     OpenView(View),
+    CreateTask(String),
     Dismissed,
 }
 
@@ -772,7 +773,32 @@ impl Render for SearchModal {
                             el.items_center().justify_center().gap_2().child(Icon::new(icon).size(IconSize::XLarge).color(Color::Muted)).child(Label::new(hint).color(Color::Muted))
                         })
                         .when(nothing, |el| {
-                            el.items_center().justify_center().child(Label::new(strings.nothing_found).color(Color::Muted))
+                            let create_query = query.clone();
+                            el.items_center()
+                                .justify_center()
+                                .gap_3()
+                                .child(Label::new(strings.nothing_found).color(Color::Muted))
+                                .child(
+                                    h_flex()
+                                        .id("search-create-task")
+                                        .px_3()
+                                        .h(px(30.))
+                                        .gap_1p5()
+                                        .rounded(px(6.))
+                                        .bg(theme.colors().accent.opacity(0.14))
+                                        .hover(|s| s.bg(theme.colors().accent.opacity(0.22)))
+                                        .cursor_pointer()
+                                        .child(Icon::new(IconName::Plus).size(IconSize::XSmall).color(Color::Accent))
+                                        .child(
+                                            Label::new(format!("{}: \"{}\"", strings.add_task, create_query))
+                                                .size(LabelSize::Small)
+                                                .color(Color::Accent)
+                                                .truncate(),
+                                        )
+                                        .on_click(cx.listener(move |_, _, _, cx| {
+                                            cx.emit(SearchEvent::CreateTask(create_query.clone()));
+                                        })),
+                                )
                         })
                         .when(!task_rows.is_empty(), |el| el.child(Self::group_heading(strings.group_tasks)).children(task_rows))
                         .when(more, |el| {
@@ -796,6 +822,28 @@ impl Render for SearchModal {
                 .flex_1()
                 .min_h(px(180.)),
             )
+            .when(has_query && !nothing, |el| {
+                let kbd = |text: &'static str| {
+                    div()
+                        .px_1p5()
+                        .py(px(1.))
+                        .rounded(px(4.))
+                        .border_1()
+                        .border_color(theme.colors().border)
+                        .text_size(px(10.))
+                        .text_color(theme.colors().text_muted)
+                        .child(text)
+                };
+                el.child(Divider::horizontal()).child(
+                    h_flex()
+                        .px_1()
+                        .gap_3()
+                        .items_center()
+                        .child(h_flex().gap_1().child(kbd("↑↓")).child(kbd("Enter")))
+                        .child(div().flex_1())
+                        .child(kbd("Esc")),
+                )
+            })
     }
 }
 

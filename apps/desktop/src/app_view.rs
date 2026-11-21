@@ -754,6 +754,11 @@ impl AppView {
                     let view = view.clone();
                     this.show_view(view, window, cx);
                 }
+                SearchEvent::CreateTask(query) => {
+                    let query = query.clone();
+                    this.add_quick_task_with(&query, None, None, None, cx);
+                    this.select(Section::Tasks, window, cx);
+                }
                 SearchEvent::Dismissed => {}
             }
             cx.notify();

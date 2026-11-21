@@ -70,20 +70,17 @@ pub fn set_white_noise(store: &Store, preset: WhiteNoise) -> anyhow::Result<()> 
 }
 
 /// Starts or stops looping focus white noise depending on whether focus is actively running.
+///
+/// PCM synthesis and Win32 `PlaySoundW` playback run on a dedicated background audio thread so
+/// the UI thread never stalls synthesizing samples.
 pub fn sync_white_noise(active: bool, preset: WhiteNoise) {
     #[cfg(all(windows, not(test)))]
     {
-        use std::sync::atomic::{AtomicU8, Ordering};
-        static PLAYING: AtomicU8 = AtomicU8::new(0);
-        let desired = if active { preset.index() as u8 } else { 0 };
-        let prev = PLAYING.swap(desired, Ordering::SeqCst);
-        if prev == desired {
+        let desired = if active { preset } else { WhiteNoise::Off };
+        if desired == WhiteNoise::Off && AUDIO_TX.get().is_none() {
             return;
         }
-        match if active { preset } else { WhiteNoise::Off } {
-            WhiteNoise::Off => stop_wav(),
-            other => play_wav_loop(white_noise_wav(other)),
-        }
+        send_audio(AudioCommand::SetWhiteNoise(desired));
     }
     #[cfg(not(all(windows, not(test))))]
     {
@@ -108,7 +105,7 @@ pub fn set_enabled(store: &Store, on: bool) -> anyhow::Result<()> {
 pub fn play_complete(store: &Store) {
     if enabled(store) {
         #[cfg(all(windows, not(test)))]
-        play_wav(complete_wav());
+        send_audio(AudioCommand::PlayChime(Chime::Complete));
     }
 }
 
@@ -116,7 +113,132 @@ pub fn play_complete(store: &Store) {
 pub fn play_focus_done(store: &Store) {
     if enabled(store) {
         #[cfg(all(windows, not(test)))]
-        play_wav(focus_done_wav());
+        send_audio(AudioCommand::PlayChime(Chime::FocusDone));
+    }
+}
+
+#[cfg(any(all(windows, not(test)), test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Chime {
+    Complete,
+    FocusDone,
+}
+
+#[cfg(any(all(windows, not(test)), test))]
+impl Chime {
+    fn duration(self) -> std::time::Duration {
+        // Slightly longer than the synthesized chime tail (0.21s / 0.52s) so looping ambient
+        // audio resumes right after the chime finishes without clipping it.
+        match self {
+            Self::Complete => std::time::Duration::from_millis(260),
+            Self::FocusDone => std::time::Duration::from_millis(570),
+        }
+    }
+}
+
+#[cfg(any(all(windows, not(test)), test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AudioCommand {
+    SetWhiteNoise(WhiteNoise),
+    PlayChime(Chime),
+}
+
+#[cfg(any(all(windows, not(test)), test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AudioEffect {
+    None,
+    Stop,
+    LoopWhiteNoise(WhiteNoise),
+    PlayChime(Chime),
+}
+
+/// Pure single-channel playback coordinator: because Win32 `PlaySoundW` only plays one sound per
+/// process, any chime stops active looping white noise; this state machine tracks the desired
+/// ambient preset and schedules an automatic resume once the chime ends.
+#[cfg(any(all(windows, not(test)), test))]
+#[derive(Default)]
+struct AudioState {
+    desired_ambient: WhiteNoise,
+    resume_at: Option<std::time::Instant>,
+}
+
+#[cfg(any(all(windows, not(test)), test))]
+impl AudioState {
+    fn handle(&mut self, cmd: AudioCommand, now: std::time::Instant) -> AudioEffect {
+        match cmd {
+            AudioCommand::SetWhiteNoise(preset) => {
+                if preset == self.desired_ambient {
+                    return AudioEffect::None;
+                }
+                self.desired_ambient = preset;
+                self.resume_at = None;
+                match preset {
+                    WhiteNoise::Off => AudioEffect::Stop,
+                    other => AudioEffect::LoopWhiteNoise(other),
+                }
+            }
+            AudioCommand::PlayChime(chime) => {
+                if self.desired_ambient != WhiteNoise::Off {
+                    self.resume_at = Some(now + chime.duration());
+                }
+                AudioEffect::PlayChime(chime)
+            }
+        }
+    }
+
+    fn on_timeout(&mut self) -> AudioEffect {
+        self.resume_at = None;
+        match self.desired_ambient {
+            WhiteNoise::Off => AudioEffect::None,
+            other => AudioEffect::LoopWhiteNoise(other),
+        }
+    }
+}
+
+#[cfg(all(windows, not(test)))]
+static AUDIO_TX: std::sync::OnceLock<std::sync::mpsc::Sender<AudioCommand>> =
+    std::sync::OnceLock::new();
+
+#[cfg(all(windows, not(test)))]
+fn send_audio(cmd: AudioCommand) {
+    let tx = AUDIO_TX.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<AudioCommand>();
+        let _ = std::thread::Builder::new()
+            .name("fern-audio".into())
+            .spawn(move || audio_worker(rx));
+        tx
+    });
+    let _ = tx.send(cmd);
+}
+
+#[cfg(all(windows, not(test)))]
+fn audio_worker(rx: std::sync::mpsc::Receiver<AudioCommand>) {
+    use std::sync::mpsc::RecvTimeoutError;
+    use std::time::Instant;
+
+    let mut state = AudioState::default();
+    let apply = |effect: AudioEffect| match effect {
+        AudioEffect::None => {}
+        AudioEffect::Stop => stop_wav(),
+        AudioEffect::LoopWhiteNoise(preset) => play_wav_loop(white_noise_wav(preset)),
+        AudioEffect::PlayChime(Chime::Complete) => play_wav(complete_wav()),
+        AudioEffect::PlayChime(Chime::FocusDone) => play_wav(focus_done_wav()),
+    };
+
+    loop {
+        if let Some(deadline) = state.resume_at {
+            let wait = deadline.saturating_duration_since(Instant::now());
+            match rx.recv_timeout(wait) {
+                Ok(cmd) => apply(state.handle(cmd, Instant::now())),
+                Err(RecvTimeoutError::Timeout) => apply(state.on_timeout()),
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        } else {
+            match rx.recv() {
+                Ok(cmd) => apply(state.handle(cmd, Instant::now())),
+                Err(_) => break,
+            }
+        }
     }
 }
 
@@ -366,5 +488,44 @@ mod tests {
             assert_eq!(&amb[8..12], b"WAVE");
             assert!(amb.len() > 44);
         }
+    }
+
+    #[test]
+    fn chime_during_white_noise_schedules_and_resumes_loop() {
+        let now = std::time::Instant::now();
+        let mut state = AudioState::default();
+
+        assert_eq!(
+            state.handle(AudioCommand::SetWhiteNoise(WhiteNoise::Rain), now),
+            AudioEffect::LoopWhiteNoise(WhiteNoise::Rain)
+        );
+        assert!(state.resume_at.is_none());
+
+        // Chime interrupts Win32 PlaySoundW loop and schedules an automatic resume.
+        assert_eq!(
+            state.handle(AudioCommand::PlayChime(Chime::Complete), now),
+            AudioEffect::PlayChime(Chime::Complete)
+        );
+        assert!(state.resume_at.is_some());
+
+        // Periodic sync ticks for the same preset do not cut off the chime.
+        assert_eq!(
+            state.handle(AudioCommand::SetWhiteNoise(WhiteNoise::Rain), now),
+            AudioEffect::None
+        );
+
+        // Once the chime finishes, white noise resumes automatically.
+        assert_eq!(state.on_timeout(), AudioEffect::LoopWhiteNoise(WhiteNoise::Rain));
+        assert!(state.resume_at.is_none());
+
+        // Stopping white noise during a chime cancels pending resume.
+        state.handle(AudioCommand::PlayChime(Chime::FocusDone), now);
+        assert!(state.resume_at.is_some());
+        assert_eq!(
+            state.handle(AudioCommand::SetWhiteNoise(WhiteNoise::Off), now),
+            AudioEffect::Stop
+        );
+        assert!(state.resume_at.is_none());
+        assert_eq!(state.on_timeout(), AudioEffect::None);
     }
 }

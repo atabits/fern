@@ -1658,10 +1658,11 @@ impl FocusView {
             )
             .when(!archived, |el| {
                 el.child(
-                    IconButton::new("timer-play", IconName::Play)
+                    IconButton::new(SharedString::from(format!("timer-play-{id}")), IconName::Play)
                         .size(px(22.))
                         .icon_size(IconSize::Small)
                         .icon_color(Color::Accent)
+                        .tooltip(Tooltip::text(strings.focus_start))
                         .on_click(cx.listener(move |this, _, _, cx| this.start_from_timer(&played, cx))),
                 )
             })
@@ -4129,6 +4130,7 @@ impl Render for FocusView {
                                 .rounded(px(16.))
                                 .cursor_pointer()
                                 .when(on, |el| el.bg(theme.colors().element_selected))
+                                .when(!on, |el| el.hover(|s| s.bg(theme.colors().ghost_element_hover)))
                                 .child(Label::new(label).color(if on { Color::Default } else { Color::Muted }))
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.archived_tab = archived;
@@ -4136,13 +4138,21 @@ impl Render for FocusView {
                                 }))
                         }),
                     )))
-                    .child(IconButton::new("timer-add", IconName::Plus).on_click(cx.listener(|this, _, window, cx| this.open_timer(None, window, cx))))
+                    .child(
+                        IconButton::new("timer-add", IconName::Plus)
+                            .tooltip(Tooltip::text(strings.add_timer))
+                            .on_click(cx.listener(|this, _, window, cx| this.open_timer(None, window, cx))),
+                    )
                     .child(
                         div()
                             .relative()
-                            .child(IconButton::new("pomo-more", IconName::Ellipsis).on_click(cx.listener(|this, _, _, cx| {
-                                this.set_record_menu(Some(RecordMenu::HeaderMore), cx)
-                            })))
+                            .child(
+                                IconButton::new("pomo-more", IconName::Ellipsis)
+                                    .tooltip(Tooltip::text(strings.more))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.set_record_menu(Some(RecordMenu::HeaderMore), cx)
+                                    })),
+                            )
                             .when_some(
                                 self.record_menu.filter(|m| matches!(m, RecordMenu::HeaderMore | RecordMenu::Settings)),
                                 |el, menu| el.child(PopoverAttachment::new(Placement::BelowRight, self.render_record_menu(menu, cx))),

@@ -1726,10 +1726,14 @@ impl TaskDetail {
                 .child(
                     h_flex()
                         .child(div().flex_1().child(Label::new(strings.task_activities).weight(FontWeight::SEMIBOLD)))
-                        .child(IconButton::new("close-activity", IconName::X).on_click(cx.listener(|this, _, _, cx| {
-                            this.session.activity = None;
-                            cx.notify();
-                        }))),
+                        .child(
+                            IconButton::new("close-activity", IconName::X)
+                                .tooltip(Tooltip::text(strings.close))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.session.activity = None;
+                                    cx.notify();
+                                })),
+                        ),
                 )
                 .children(activity.iter().rev().map(|entry| {
                     let text = activity_text(&entry.kind, strings);
@@ -3582,8 +3586,8 @@ impl TaskDetail {
         let button = |id: &'static str, label: &'static str, primary: bool| {
             div().id(id).flex_1().h(px(28.)).flex().items_center().justify_center()
                 .rounded(px(6.)).cursor_pointer()
-                .when(primary, |el| el.bg(theme.colors().accent))
-                .when(!primary, |el| el.border_1().border_color(theme.colors().border))
+                .when(primary, |el| el.bg(theme.colors().accent).hover(|s| s.opacity(0.9)))
+                .when(!primary, |el| el.border_1().border_color(theme.colors().border).hover(|s| s.bg(theme.colors().ghost_element_hover)))
                 .child(Label::new(label).size(LabelSize::Small).when(primary, |label| label.color(Color::OnAccent)))
         };
         popover(cx)
@@ -3655,6 +3659,8 @@ impl TaskDetail {
                     .rounded_full()
                     .cursor_pointer()
                     .bg(theme.colors().accent.opacity(0.2))
+                    .hover(|s| s.bg(theme.colors().accent.opacity(0.3)))
+                    .tooltip(Tooltip::text(strings.estimation))
                     .child(Icon::new(IconName::CircleDot).size(IconSize::XSmall).color(Color::Accent))
                     .child(Label::new(text).size(LabelSize::XSmall).color(Color::Accent))
                     .on_click(cx.listener(|this, _, _, cx| this.open_popup(Popup::Estimate, cx)))
@@ -4126,6 +4132,7 @@ impl Render for TaskDetail {
                                         .size(px(20.))
                                         .icon_size(IconSize::XSmall)
                                         .icon_color(Color::Muted)
+                                        .tooltip(Tooltip::text(strings.clear))
                                         .on_click(cx.listener(|this, _, window, cx| {
                                             this.location_open = false;
                                             this.location_input.update(cx, |input, cx| input.clear(window, cx));

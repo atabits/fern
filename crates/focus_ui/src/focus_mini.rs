@@ -74,72 +74,107 @@ impl Render for FocusMini {
         let theme = cx.theme().clone();
         let now = chrono::Local::now().timestamp_millis();
         let (clock, label, running, paused) = self.focus.read(cx).clock_state(now, strings);
+        let progress = self.focus.read(cx).clock_progress(now);
         let button = |id: &'static str, icon: IconName| IconButton::new(id, icon).size(px(28.)).icon_size(IconSize::Small);
-        h_flex()
+        v_flex()
+            .relative()
             .size_full()
-            .pr_2()
-            .gap_1()
             .bg(theme.colors().background)
             .border_1()
             .border_color(theme.colors().border)
             .text_color(theme.colors().text)
             .child(
-                // The clock and its name move the window, as the title bar does; the buttons
-                // stay out of that area.
-                v_flex()
-                    .id("focus-mini-drag")
+                h_flex()
                     .flex_1()
-                    .min_w_0()
-                    .h_full()
-                    .justify_center()
-                    .pl_4()
-                    .window_control_area(WindowControlArea::Drag)
-                    .when(!cfg!(windows), |el| {
-                        el.on_mouse_down(gpui::MouseButton::Left, cx.listener(|this, _, _, _| this.should_move = true))
-                            .on_mouse_up(gpui::MouseButton::Left, cx.listener(|this, _, _, _| this.should_move = false))
-                            .on_mouse_move(cx.listener(|this, _, window, _| {
-                                if this.should_move {
-                                    this.should_move = false;
-                                    window.start_window_move();
-                                }
-                            }))
+                    .w_full()
+                    .pr_2()
+                    .gap_1()
+                    .child(
+                        // The clock and its name move the window, as the title bar does; the buttons
+                        // stay out of that area.
+                        v_flex()
+                            .id("focus-mini-drag")
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .justify_center()
+                            .pl_4()
+                            .window_control_area(WindowControlArea::Drag)
+                            .when(!cfg!(windows), |el| {
+                                el.on_mouse_down(gpui::MouseButton::Left, cx.listener(|this, _, _, _| this.should_move = true))
+                                    .on_mouse_up(gpui::MouseButton::Left, cx.listener(|this, _, _, _| this.should_move = false))
+                                    .on_mouse_move(cx.listener(|this, _, window, _| {
+                                        if this.should_move {
+                                            this.should_move = false;
+                                            window.start_window_move();
+                                        }
+                                    }))
+                            })
+                            .child(
+                                h_flex()
+                                    .gap_1p5()
+                                    .items_center()
+                                    .when(running, |el| {
+                                        el.child(
+                                            div()
+                                                .flex_none()
+                                                .size(px(6.))
+                                                .rounded_full()
+                                                .bg(if paused { theme.status().warning } else { theme.colors().accent }),
+                                        )
+                                    })
+                                    .child(Label::new(label).size(LabelSize::Small).color(Color::Muted).truncate()),
+                            )
+                            .child(div().text_size(px(30.)).line_height(px(36.)).font_weight(gpui::FontWeight::SEMIBOLD).child(clock)),
+                    )
+                    .child(
+                        button("focus-mini-play", if running && !paused { IconName::Pause } else { IconName::Play })
+                            .icon_color(Color::Accent)
+                            .tooltip(Tooltip::text(if !running { strings.focus_start } else if paused { strings.focus_continue } else { strings.focus_pause }))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.focus.update(cx, |focus, cx| if running { focus.toggle_pause(cx) } else { focus.start_next(cx) });
+                            })),
+                    )
+                    .when(running, |el| {
+                        el.child(
+                            button("focus-mini-stop", IconName::Square)
+                                .icon_color(Color::Muted)
+                                .tooltip(Tooltip::text(strings.focus_end))
+                                .on_click(cx.listener(|this, _, window, cx| this.focus.update(cx, |focus, cx| focus.request_finish(window, cx)))),
+                        )
                     })
-                    .child(Label::new(label).size(LabelSize::Small).color(Color::Muted).truncate())
-                    .child(div().text_size(px(30.)).line_height(px(36.)).font_weight(gpui::FontWeight::SEMIBOLD).child(clock)),
+                    .when(cfg!(windows), |el| {
+                        el.child(
+                            button("focus-mini-pin", if self.pinned { IconName::PinOff } else { IconName::Pin })
+                                .icon_color(if self.pinned { Color::Accent } else { Color::Muted })
+                                .tooltip(Tooltip::text(if self.pinned { strings.unpin } else { strings.pin }))
+                                .on_click(cx.listener(|this, _, _window, cx| {
+                                    this.pinned = !this.pinned;
+                                    #[cfg(windows)]
+                                    desktop_common::sticky_windows::set_topmost(_window, this.pinned);
+                                    cx.notify();
+                                })),
+                        )
+                    })
+                    .child(
+                        button("focus-mini-close", IconName::X)
+                            .icon_color(Color::Muted)
+                            .on_click(|_, window, _| window.remove_window()),
+                    ),
             )
-            .child(
-                button("focus-mini-play", if running && !paused { IconName::Pause } else { IconName::Play })
-                    .icon_color(Color::Accent)
-                    .tooltip(Tooltip::text(if !running { strings.focus_start } else if paused { strings.focus_continue } else { strings.focus_pause }))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.focus.update(cx, |focus, cx| if running { focus.toggle_pause(cx) } else { focus.start_next(cx) });
-                    })),
-            )
-            .when(running, |el| {
+            .when_some(progress, |el, ratio| {
                 el.child(
-                    button("focus-mini-stop", IconName::Square)
-                        .icon_color(Color::Muted)
-                        .tooltip(Tooltip::text(strings.focus_end))
-                        .on_click(cx.listener(|this, _, window, cx| this.focus.update(cx, |focus, cx| focus.request_finish(window, cx)))),
+                    div()
+                        .w_full()
+                        .h(px(3.))
+                        .bg(theme.colors().border_variant)
+                        .child(
+                            div()
+                                .h_full()
+                                .w(gpui::relative(ratio))
+                                .bg(if paused { theme.status().warning } else { theme.colors().accent }),
+                        ),
                 )
             })
-            .when(cfg!(windows), |el| {
-                el.child(
-                    button("focus-mini-pin", if self.pinned { IconName::PinOff } else { IconName::Pin })
-                        .icon_color(if self.pinned { Color::Accent } else { Color::Muted })
-                        .tooltip(Tooltip::text(if self.pinned { strings.unpin } else { strings.pin }))
-                        .on_click(cx.listener(|this, _, _window, cx| {
-                            this.pinned = !this.pinned;
-                            #[cfg(windows)]
-                            desktop_common::sticky_windows::set_topmost(_window, this.pinned);
-                            cx.notify();
-                        })),
-                )
-            })
-            .child(
-                button("focus-mini-close", IconName::X)
-                    .icon_color(Color::Muted)
-                    .on_click(|_, window, _| window.remove_window()),
-            )
     }
 }

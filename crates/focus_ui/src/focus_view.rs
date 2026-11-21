@@ -591,6 +591,17 @@ impl FocusView {
         }
     }
 
+    /// Fraction of the current Pomodoro or break session elapsed (`0.0..=1.0`), or `None` for
+    /// stopwatch mode or when idle.
+    pub fn clock_progress(&self, now: i64) -> Option<f32> {
+        let running = self.running.as_ref()?;
+        let length = running.timer.length_ms;
+        if length <= 0 {
+            return None;
+        }
+        Some((running.timer.elapsed(now) as f32 / length as f32).clamp(0.0, 1.0))
+    }
+
     pub fn toggle_pause(&mut self, cx: &mut Context<Self>) {
         if self.finish_prompt { return; }
         if self.stop_at_stopwatch_limit(now_ms(), cx) { return; }

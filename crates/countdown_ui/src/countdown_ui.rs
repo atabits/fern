@@ -579,6 +579,11 @@ impl CountdownView {
             .justify_center()
             .rounded(px(8.))
             .bg(theme.colors().surface_background)
+            .on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
+                if event.click_count() >= 2 {
+                    this.start_edit(id, window, cx);
+                }
+            }))
             // The card's picture behind its numbers, darkened so they stay readable.
             .when_some(background, |el, path| {
                 el.child(gpui::img(path).absolute().inset_0().size_full().rounded(px(8.)).object_fit(gpui::ObjectFit::Cover))
@@ -590,17 +595,26 @@ impl CountdownView {
                     .child(
                         badge(countdown, color, cx),
                     )
-                    .child(div().text_size(px(16.)).font_weight(FontWeight::SEMIBOLD).child(countdown.name.clone())),
+                    .child(
+                        div()
+                            .text_size(px(16.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .when(has_picture, |el| el.text_color(gpui::white()))
+                            .child(countdown.name.clone()),
+                    ),
             )
             // The original's spacing: 20 px down to the numbers, 16 px on to the dates.
             .child(
                 div()
-                    .id("countdown-numbers")
+                    .id(SharedString::from(format!("countdown-numbers-{id}")))
                     .mt(px(20.))
                     .mb(px(16.))
                     .cursor_pointer()
                     .tooltip(Tooltip::text(strings.countdown_switch_hint))
-                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_format(id, cx)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.toggle_format(id, cx);
+                    }))
                     .child(numbers),
             )
             .child(div().text_size(px(12.)).when(has_picture, |el| el.text_color(gpui::white().opacity(0.85))).when(!has_picture, |el| el.text_color(theme.colors().text_muted)).child(subtitle))
@@ -614,12 +628,13 @@ impl CountdownView {
                     .opacity(if pinned || touch::active() { 1. } else { 0. })
                     .group_hover(group.clone(), |s| s.opacity(1.))
                     .child(
-                        IconButton::new("countdown-pin", IconName::Pin)
+                        IconButton::new(SharedString::from(format!("countdown-pin-{id}")), IconName::Pin)
                             .size(px(22.))
                             .icon_size(IconSize::Small)
                             .icon_color(if pinned { Color::Accent } else { Color::Muted })
                             .tooltip(Tooltip::text(if pinned { strings.unpin } else { strings.pin }))
                             .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
                                 if let Err(err) = this.store.set_countdown_pinned(id, !pinned) {
                                     eprintln!("failed to pin the countdown: {err:#}");
                                 }
@@ -637,10 +652,11 @@ impl CountdownView {
                     .when(self.card_menu == Some(id), |el| el.opacity(1.))
                     .child(
                         // The original's "…" on a hovered card: Edit and Delete.
-                        IconButton::new("countdown-more", IconName::Ellipsis)
+                        IconButton::new(SharedString::from(format!("countdown-more-{id}")), IconName::Ellipsis)
                             .size(px(22.))
                             .icon_size(IconSize::Small)
                             .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
                                 this.card_menu = if this.card_menu == Some(id) { None } else { Some(id) };
                                 cx.notify();
                             })),

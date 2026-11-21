@@ -1376,7 +1376,8 @@ impl TodoView {
                 Ok(())
             }
             DropTarget::Complete => store.set_completed(id, true),
-            DropTarget::Due(date) => store.set_due(id, date, date.and(task.due_time)),
+            DropTarget::Due(Some(date)) => store.move_dates(id, date),
+            DropTarget::Due(None) => store.set_due(id, None, None),
             DropTarget::Priority(priority) => store.set_priority(id, priority),
             DropTarget::Tag(Some(tag)) => {
                 let mut tags: Vec<String> = task.tags.iter().skip(1).filter(|t| **t != tag).cloned().collect();

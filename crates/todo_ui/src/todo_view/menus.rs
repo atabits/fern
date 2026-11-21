@@ -201,8 +201,9 @@ impl TodoView {
                         .icon_color(Color::Accent)
                         .tooltip(Tooltip::text(strings.add_to_today))
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            let result = this.store.set_due(id, Some(Self::today()), None);
+                            let result = this.store.move_dates(id, Self::today());
                             this.check(result);
+                            desktop_common::data_version::data_changed(cx.entity_id(), cx);
                             this.reload(cx);
                         })),
                 )

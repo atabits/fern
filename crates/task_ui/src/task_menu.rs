@@ -74,7 +74,7 @@ impl TaskNesting {
 pub fn apply(store: &Store, task: &Task, action: MenuAction, today: NaiveDate) -> Option<anyhow::Result<()>> {
     let id = task.id;
     Some(match action {
-        MenuAction::Due(Some(days)) => store.set_due(id, Some(today + Duration::days(days)), None),
+        MenuAction::Due(Some(days)) => store.move_dates(id, today + Duration::days(days)),
         MenuAction::SkipRecurrence => store.skip_recurrence(id),
         MenuAction::CompleteForever => store.complete_forever(id, today),
         MenuAction::ClearDate => store.set_due(id, None, None),
@@ -312,6 +312,11 @@ mod tests {
 
         apply(&store, &task, MenuAction::Due(Some(7)), today).unwrap()?;
         assert_eq!(reload(&store).due_date, Some(today + Duration::days(7)), "next week");
+        let two_pm = chrono::NaiveTime::from_hms_opt(14, 0, 0).unwrap();
+        store.set_due(task.id, Some(today), Some(two_pm))?;
+        apply(&store, &reload(&store), MenuAction::Due(Some(1)), today).unwrap()?;
+        assert_eq!(reload(&store).due_date, Some(today + Duration::days(1)), "tomorrow");
+        assert_eq!(reload(&store).due_time, Some(two_pm), "quick reschedule keeps due time");
         apply(&store, &task, MenuAction::Priority(Priority::High), today).unwrap()?;
         assert_eq!(reload(&store).priority, Priority::High);
         apply(&store, &reload(&store), MenuAction::Pin, today).unwrap()?;

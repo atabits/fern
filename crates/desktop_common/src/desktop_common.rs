@@ -20,6 +20,7 @@ pub mod sticky_settings;
 pub mod sticky_windows;
 pub mod subscriptions;
 pub mod sync;
+pub mod task_ops;
 pub mod text_input;
 pub mod touch;
 pub mod touch_keyboard;

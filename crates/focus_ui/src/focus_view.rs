@@ -2305,6 +2305,7 @@ impl FocusView {
                         .rounded(px(16.))
                         .cursor_pointer()
                         .when(i == page.tab, |el| el.bg(theme.colors().element_selected))
+                        .when(i != page.tab, |el| el.hover(|s| s.bg(theme.colors().ghost_element_hover)))
                         .child(Label::new(*label))
                         .on_click(cx.listener(move |this, _, _, cx| this.update_stats(cx, |p| p.tab = i)))
                 }),
@@ -2320,6 +2321,7 @@ impl FocusView {
                     .items_center()
                     .rounded(px(8.))
                     .bg(theme.colors().accent)
+                    .hover(|s| s.opacity(0.9))
                     .cursor_pointer()
                     .child(Label::new(strings.done).color(Color::OnAccent))
                     .on_click(cx.listener(|this, _, _, cx| {

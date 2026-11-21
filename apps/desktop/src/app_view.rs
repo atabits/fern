@@ -1685,6 +1685,7 @@ impl AppView {
                                         .flex_1()
                                         .min_w_0()
                                         .cursor_pointer()
+                                        .tooltip(Tooltip::text(notice.title.clone()))
                                         .child(Label::new(notice.title.clone()).truncate())
                                         .on_click(cx.listener(move |this, _, window, cx| this.open_notice(target, window, cx))),
                                 )
@@ -1698,6 +1699,7 @@ impl AppView {
                                                 .icon_size(IconSize::XSmall)
                                                 .icon_color(Color::Muted)
                                                 .hover_icon_color(Color::Icon)
+                                                .tooltip(Tooltip::text(strings.dismiss))
                                                 .on_click(cx.listener(move |this, _, window, cx| {
                                                     cx.stop_propagation();
                                                     this.answer_notice(&dismiss_notice, Reply::Action(NoticeAction::Dismiss), window, cx);
@@ -1767,7 +1769,15 @@ impl AppView {
                     }),
             )
             .when(self.notices.items.is_empty(), |el| {
-                el.child(div().px_2().py_3().child(Label::new(strings.no_notifications).color(Color::Muted)))
+                el.child(
+                    v_flex()
+                        .py_6()
+                        .px_3()
+                        .items_center()
+                        .gap_2()
+                        .child(Icon::new(IconName::Bell).size(IconSize::Medium).color(Color::Muted))
+                        .child(Label::new(strings.no_notifications).size(LabelSize::Small).color(Color::Muted)),
+                )
             })
             .child(
                 v_scroll(

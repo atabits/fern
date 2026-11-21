@@ -223,6 +223,7 @@ impl Render for QuickAddWindow {
                 .cursor_pointer()
                 .when(active, |el| el.bg(theme.colors().accent.opacity(0.15)))
                 .hover(|s| s.bg(theme.colors().ghost_element_hover))
+                .tooltip(Tooltip::text(desktop_common::calendar::format_date(date, strings)))
                 .child(Label::new(label).size(LabelSize::XSmall).color(if active { Color::Accent } else { Color::Muted }))
                 .on_click(cx.listener(move |this, _, _, cx| this.toggle_date(date, cx)))
         };
@@ -317,6 +318,7 @@ impl Render for QuickAddWindow {
                                         .size(px(16.))
                                         .icon_size(IconSize::XSmall)
                                         .icon_color(Color::Accent)
+                                        .tooltip(Tooltip::text(strings.clear))
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             this.batch_lines.clear();
                                             cx.notify();
@@ -360,6 +362,7 @@ impl Render for QuickAddWindow {
                             .rounded(px(5.))
                             .cursor_pointer()
                             .hover(|s| s.bg(theme.colors().ghost_element_hover))
+                            .tooltip(Tooltip::text(list_label.clone()))
                             .child(Icon::new(list_icon).size(IconSize::XSmall).color(list_color))
                             .child(Label::new(list_label).size(LabelSize::XSmall).color(Color::Muted).truncate())
                             .on_click(cx.listener(|this, _, _, cx| this.cycle_list(cx))),
@@ -371,7 +374,7 @@ impl Render for QuickAddWindow {
                             .h(px(26.))
                             .px_3()
                             .rounded(px(5.))
-                            .cursor_pointer()
+                            .when(has_text, |el| el.cursor_pointer())
                             .bg(if has_text { theme.colors().accent } else { theme.colors().element_hover })
                             .hover(|s| {
                                 s.bg(if has_text {

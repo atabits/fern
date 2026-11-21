@@ -86,6 +86,7 @@ fn parse_quick_add_context(input: &str, today: NaiveDate, lists: &[String], reco
             used[i] = recognition.remove_tag_text;
         } else if let Some(list) = word
             .strip_prefix('^')
+            .or_else(|| word.strip_prefix('~'))
             .and_then(|name| lists.iter().find(|l| l.to_lowercase() == name))
         {
             parsed.list = Some(list.clone());
@@ -265,9 +266,9 @@ fn parse_repeat(words: &[String]) -> Option<(Recurrence, Option<Weekday>, usize)
 
 fn parse_priority(value: &str) -> Option<Priority> {
     match value {
-        "1" | "high" | "высокий" | "в" | "高" => Some(Priority::High),
-        "2" | "medium" | "средний" | "с" | "中" => Some(Priority::Medium),
-        "3" | "low" | "низкий" | "н" | "低" => Some(Priority::Low),
+        "1" | "p1" | "h" | "high" | "!!" | "высокий" | "в" | "高" => Some(Priority::High),
+        "2" | "p2" | "m" | "med" | "medium" | "!" | "средний" | "с" | "中" => Some(Priority::Medium),
+        "3" | "p3" | "l" | "low" | "низкий" | "н" | "低" => Some(Priority::Low),
         _ => None,
     }
 }
@@ -745,5 +746,26 @@ mod tests {
         let p = parse_quick_add("周会 每周一", today(), &[]);
         assert_eq!(p.title, "周会");
         assert_eq!(p.repeat.as_ref().map(|r| (r.frequency, r.weekdays)), Some((Frequency::Weekly, 1 << 0)));
+    }
+
+    #[test]
+    fn recognizes_tilde_list_and_shorthand_priorities() {
+        let lists = vec!["Work".to_owned(), "Personal".to_owned()];
+        let p = parse_quick_add("Send report ~work !!!", today(), &lists);
+        assert_eq!(p.title, "Send report");
+        assert_eq!(p.list.as_deref(), Some("Work"));
+        assert_eq!(p.priority, Some(Priority::High));
+
+        let p = parse_quick_add("Review PR !m ~personal", today(), &lists);
+        assert_eq!(p.title, "Review PR");
+        assert_eq!(p.list.as_deref(), Some("Personal"));
+        assert_eq!(p.priority, Some(Priority::Medium));
+
+        let p = parse_quick_add("Read book !l", today(), &lists);
+        assert_eq!(p.title, "Read book");
+        assert_eq!(p.priority, Some(Priority::Low));
+
+        let p = parse_quick_add("Deploy !! !p1", today(), &lists);
+        assert_eq!(p.priority, Some(Priority::High));
     }
 }

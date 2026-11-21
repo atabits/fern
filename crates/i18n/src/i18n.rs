@@ -500,6 +500,12 @@ pub struct Strings {
     pub shortcut_reset_all: &'static str,
     pub shortcut_reset_confirm_title: &'static str,
     pub shortcut_reset_confirm_body: &'static str,
+    /// Recording rule tooltips for `[modifier_or_fn, context_any, global]`.
+    pub shortcut_rule_tips: [&'static str; 3],
+    /// Live recording hints for `[modifier_or_fn, context_any, global]`.
+    pub shortcut_record_hints: [&'static str; 3],
+    /// Rejection explanations when a disallowed key is pressed for `[modifier_or_fn, context_any, global]`.
+    pub shortcut_record_rejected: [&'static str; 3],
     /// Quick add syntax: (what, example).
     pub quick_add_help: [(&'static str, &'static str); 4],
     pub undo: &'static str,
@@ -1544,8 +1550,8 @@ pub static EN: Strings = Strings {
         "Sticky Note",
     ],
     shortcut_group_hints: [
-        None,
-        Some("Shortcuts that can respond even when the app is in the background."),
+        Some("Click any shortcut to rebind it. General shortcuts require Ctrl, Alt, or Win (or F1–F12); use keymap.json for bare keys or chords."),
+        Some("Work even when the app is in the background. Require Ctrl, Alt, or Win + a letter, digit, Space, or F1–F12."),
         None,
         Some("Type these markers in the task field to quickly set date, priority, tag, or list."),
         Some("These shortcuts work when a task is selected."),
@@ -1561,6 +1567,21 @@ pub static EN: Strings = Strings {
     shortcut_reset_all: "Reset to defaults",
     shortcut_reset_confirm_title: "Reset all shortcuts?",
     shortcut_reset_confirm_body: "This restores built-in shortcuts and resets custom overrides in keymap.json.",
+    shortcut_rule_tips: [
+        "Click to set: Ctrl / Alt / Win + key, or F1–F12 (use keymap.json for bare keys or chords)",
+        "Click to set: any key or Ctrl / Alt / Shift + key (use keymap.json for chords)",
+        "Click to set: Ctrl, Alt, or Win + letter, digit, Space, or F1–F12",
+    ],
+    shortcut_record_hints: [
+        "Press Ctrl, Alt, or Win + key, or F1–F12 (edit keymap.json for single keys or chords). Esc cancels, Backspace clears.",
+        "Press any key or Ctrl / Alt / Shift + key (edit keymap.json for multi-key chords). Esc cancels, Backspace clears.",
+        "Global shortcut: press Ctrl, Alt, or Win + a letter, digit, Space, or F1–F12. Esc cancels, Backspace clears.",
+    ],
+    shortcut_record_rejected: [
+        "Single keys are reserved for typing here — hold Ctrl, Alt, or Win, press F1–F12, or configure it in keymap.json.",
+        "This key can't be recorded directly — try a Latin letter, digit, Space, F1–F12, add Ctrl / Alt / Win, or edit keymap.json.",
+        "Not allowed as a global shortcut — hold Ctrl, Alt, or Win with a Latin letter, digit, Space, or F1–F12.",
+    ],
     quick_add_help: [
         ("Set task due date", "tomorrow 9am, fri, every day"),
         ("Set task priority", "!1 !2 !3, !!!, !high"),
@@ -2571,8 +2592,8 @@ pub static ZH_CN: Strings = Strings {
         "桌面便签",
     ],
     shortcut_group_hints: [
-        None,
-        Some("即使应用在后台也能响应的快捷键。"),
+        Some("点击任意快捷键即可重新绑定。通用快捷键需配合 Ctrl、Alt、Win 或 F1–F12；单键或多键序列请在 keymap.json 中配置。"),
+        Some("即使应用在后台也能响应。需按 Ctrl、Alt 或 Win + 字母、数字、空格或 F1–F12。"),
         None,
         Some("在任务输入框中输入这些符号，即可快速设置日期、优先级、标签和清单。"),
         Some("这些快捷键仅在选中任务时生效。"),
@@ -2588,6 +2609,21 @@ pub static ZH_CN: Strings = Strings {
     shortcut_reset_all: "恢复默认设置",
     shortcut_reset_confirm_title: "恢复所有默认快捷键？",
     shortcut_reset_confirm_body: "这将恢复所有默认快捷键，并清空 keymap.json 中的自定义设置。",
+    shortcut_rule_tips: [
+        "点击设置：Ctrl / Alt / Win + 按键，或 F1–F12（单键或组合键序列请在 keymap.json 中设置）",
+        "点击设置：任意按键或 Ctrl / Alt / Shift 组合键（多键序列请在 keymap.json 中设置）",
+        "点击设置：Ctrl、Alt 或 Win + 字母、数字、空格或 F1–F12",
+    ],
+    shortcut_record_hints: [
+        "请按 Ctrl、Alt 或 Win + 按键，或 F1–F12（单键或多键序列请编辑 keymap.json）。Esc 取消，Backspace 清除。",
+        "请按任意按键或 Ctrl / Alt / Shift 组合键（多键序列请编辑 keymap.json）。Esc 取消，Backspace 清除。",
+        "全局快捷键：请按 Ctrl、Alt 或 Win + 字母、数字、空格或 F1–F12。Esc 取消，Backspace 清除。",
+    ],
+    shortcut_record_rejected: [
+        "此处的单键保留用于输入文本 — 请配合 Ctrl、Alt 或 Win，使用 F1–F12，或在 keymap.json 中配置。",
+        "无法直接录制该按键 — 请尝试英文字母、数字、空格、F1–F12、配合 Ctrl / Alt / Win，或编辑 keymap.json。",
+        "不能设为全局快捷键 — 请按住 Ctrl、Alt 或 Win 搭配英文字母、数字、空格或 F1–F12。",
+    ],
     quick_add_help: [
         ("设置任务截止日期", "明天 9:00、周五、每天"),
         ("设置任务优先级", "!1 !2 !3、!!!、!高"),
@@ -3601,8 +3637,8 @@ pub static RU: Strings = Strings {
         "Заметка",
     ],
     shortcut_group_hints: [
-        None,
-        Some("Ярлыки, которые могут реагировать даже когда приложение находится в фоновом режиме."),
+        Some("Нажмите на сочетание, чтобы изменить его. Общие сочетания требуют Ctrl, Alt, Win или F1–F12; одиночные клавиши и аккорды задаются в keymap.json."),
+        Some("Работают даже в фоновом режиме. Требуют Ctrl, Alt или Win + букву, цифру, Space или F1–F12."),
         None,
         Some("Для быстрого добавления деталей, таких как дата, приоритет, тег и список, в поле задачи можно ввести эти символы."),
         Some("Эти быстрые клавиши работают только тогда, когда выбрана задача."),
@@ -3618,6 +3654,21 @@ pub static RU: Strings = Strings {
     shortcut_reset_all: "Сбросить настройки",
     shortcut_reset_confirm_title: "Сбросить все горячие клавиши?",
     shortcut_reset_confirm_body: "Все горячие клавиши вернутся к значениям по умолчанию, а изменения в keymap.json будут сброшены.",
+    shortcut_rule_tips: [
+        "Нажмите для записи: Ctrl / Alt / Win + клавиша или F1–F12 (одиночные клавиши и аккорды — в keymap.json)",
+        "Нажмите для записи: любая клавиша или сочетание с Ctrl / Alt / Shift (аккорды — в keymap.json)",
+        "Нажмите для записи: Ctrl, Alt или Win + буква, цифра, Space или F1–F12",
+    ],
+    shortcut_record_hints: [
+        "Нажмите Ctrl, Alt или Win + клавишу либо F1–F12 (одиночные клавиши и аккорды — в keymap.json). Esc — отмена, Backspace — очистить.",
+        "Нажмите любую клавишу или сочетание с Ctrl / Alt / Shift (аккорды — в keymap.json). Esc — отмена, Backspace — очистить.",
+        "Глобальное сочетание: Ctrl, Alt или Win + буква, цифра, Space или F1–F12. Esc — отмена, Backspace — очистить.",
+    ],
+    shortcut_record_rejected: [
+        "Одиночные клавиши здесь зарезервированы для ввода текста — добавьте Ctrl, Alt или Win, используйте F1–F12 или keymap.json.",
+        "Эту клавишу нельзя записать напрямую — попробуйте латинскую букву, цифру, Space, F1–F12, сочетание с Ctrl / Alt / Win или keymap.json.",
+        "Нельзя назначить глобально — нужен Ctrl, Alt или Win вместе с латинской буквой, цифрой, Space или F1–F12.",
+    ],
     quick_add_help: [
         ("Установить срок выполнения задачи", "завтра 9:00, пт, каждый день"),
         ("Установить приоритет для задачи", "!1 !2 !3, !!!, !высокий"),

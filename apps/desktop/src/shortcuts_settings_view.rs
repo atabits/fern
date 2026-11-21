@@ -133,6 +133,7 @@ impl SettingsWindow {
 
     pub(super) fn reset_all_shortcuts(&mut self, cx: &mut Context<Self>) {
         self.recording_shortcut = None;
+        self.recording_rejected = false;
         self.confirm_reset_shortcuts = false;
         crate::hotkeys::reset_defaults(cx);
         let task = cx.background_spawn(async move { keymap::reset_user_keymap_file() });
@@ -172,11 +173,13 @@ impl SettingsWindow {
             match ks.key.as_str() {
                 "escape" => {
                     self.recording_shortcut = None;
+                    self.recording_rejected = false;
                     cx.notify();
                     return;
                 }
                 "backspace" | "delete" => {
                     self.recording_shortcut = None;
+                    self.recording_rejected = false;
                     match target {
                         RecordingTarget::Action(idx) => self.apply_action_shortcut(idx, None, cx),
                         #[cfg(windows)]
@@ -193,20 +196,36 @@ impl SettingsWindow {
             RecordingTarget::Action(idx) => {
                 let Some(spec) = SHORTCUT_SPECS.get(idx) else {
                     self.recording_shortcut = None;
+                    self.recording_rejected = false;
                     cx.notify();
                     return;
                 };
-                if let Some(config_key) = keymap::record_keystroke(ks, spec.allow_unmodified) {
-                    self.recording_shortcut = None;
-                    self.apply_action_shortcut(idx, Some(config_key), cx);
-                    cx.notify();
+                match keymap::classify_keystroke(ks, spec.allow_unmodified) {
+                    keymap::RecordOutcome::IgnoreModifier => {}
+                    keymap::RecordOutcome::Accepted(config_key) => {
+                        self.recording_shortcut = None;
+                        self.recording_rejected = false;
+                        self.apply_action_shortcut(idx, Some(config_key), cx);
+                        cx.notify();
+                    }
+                    keymap::RecordOutcome::Rejected => {
+                        self.recording_rejected = true;
+                        cx.notify();
+                    }
                 }
             }
             #[cfg(windows)]
             RecordingTarget::Global(hotkey) => {
+                if keymap::is_bare_modifier(ks) {
+                    return;
+                }
                 if let Some(binding) = crate::hotkeys::Binding::from_keystroke(ks) {
                     self.recording_shortcut = None;
+                    self.recording_rejected = false;
                     crate::hotkeys::set(hotkey, Some(binding), cx);
+                    cx.notify();
+                } else {
+                    self.recording_rejected = true;
                     cx.notify();
                 }
             }
@@ -333,6 +352,47 @@ impl SettingsWindow {
         // 8: Sticky Note
         scroll_body = scroll_body.child(render_section(ShortcutSection::StickyNote, 8, cx));
 
+        let recording_banner = self.recording_shortcut.map(|target| {
+            let (name, rule_idx) = match target {
+                RecordingTarget::Action(idx) => {
+                    let allow_unmodified = SHORTCUT_SPECS.get(idx).is_some_and(|s| s.allow_unmodified);
+                    (strings.shortcut_labels[idx], usize::from(allow_unmodified))
+                }
+                #[cfg(windows)]
+                RecordingTarget::Global(hotkey) => (hotkey.label(strings), 2),
+            };
+            let rejected = self.recording_rejected;
+            let message = if rejected {
+                strings.shortcut_record_rejected[rule_idx]
+            } else {
+                strings.shortcut_record_hints[rule_idx]
+            };
+            let accent_or_error = if rejected { error_color } else { colors.accent };
+            h_flex()
+                .flex_none()
+                .debug_selector(|| "shortcuts-recording-hint".to_owned())
+                .px_6()
+                .py_2()
+                .gap_2()
+                .items_center()
+                .border_t_1()
+                .border_color(accent_or_error.opacity(0.35))
+                .bg(accent_or_error.opacity(0.08))
+                .child(
+                    Icon::new(if rejected { IconName::Info } else { IconName::Keyboard })
+                        .size(IconSize::Small)
+                        .color(if rejected { Color::Error } else { Color::Accent }),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_size(px(12.))
+                        .text_color(if rejected { error_color } else { colors.text })
+                        .child(format!("{name}: {message}")),
+                )
+        });
+
         let footer = h_flex()
             .flex_none()
             .h(px(54.))
@@ -363,6 +423,7 @@ impl SettingsWindow {
                             .variant(ButtonVariant::Secondary)
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.recording_shortcut = None;
+                                this.recording_rejected = false;
                                 this.confirm_reset_shortcuts = true;
                                 cx.notify();
                             })),
@@ -381,6 +442,7 @@ impl SettingsWindow {
                     .child(scroll_body)
                     .child(VerticalScrollbar::for_handle("settings-page-scroll", self.page_scroll.clone())),
             )
+            .children(recording_banner)
             .child(footer)
             .into_any_element()
     }
@@ -407,6 +469,8 @@ impl SettingsWindow {
             strings.shortcut_conflict.replace("{other}", &names.join(", "))
         });
         let has_conflict = conflict_tip.is_some() && !recording;
+        let rule_tip = strings.shortcut_rule_tips[usize::from(item.spec.allow_unmodified)];
+        let pill_tooltip = conflict_tip.or_else(|| (!recording).then(|| rule_tip.to_owned()));
         let pill_text = if recording {
             strings.press_shortcut.to_owned()
         } else {
@@ -421,8 +485,9 @@ impl SettingsWindow {
             recording,
             has_binding,
             has_conflict,
-            conflict_tip,
+            pill_tooltip,
             cx.listener(move |this, _, window, cx| {
+                this.recording_rejected = false;
                 this.recording_shortcut = if this.recording_shortcut == Some(RecordingTarget::Action(idx)) {
                     None
                 } else {
@@ -434,6 +499,7 @@ impl SettingsWindow {
             cx.listener(move |this, _, _, cx| {
                 cx.stop_propagation();
                 this.recording_shortcut = None;
+                this.recording_rejected = false;
                 this.apply_action_shortcut(idx, None, cx);
                 cx.notify();
             }),
@@ -501,6 +567,8 @@ impl SettingsWindow {
                     None
                 };
                 let has_conflict = conflict_tip.is_some() && !recording;
+                let pill_tooltip =
+                    conflict_tip.or_else(|| (!recording).then(|| strings.shortcut_rule_tips[2].to_owned()));
                 let pill_text = if recording {
                     strings.press_shortcut.to_owned()
                 } else {
@@ -517,8 +585,9 @@ impl SettingsWindow {
                     recording,
                     has_binding,
                     has_conflict,
-                    conflict_tip,
+                    pill_tooltip,
                     cx.listener(move |this, _, window, cx| {
+                        this.recording_rejected = false;
                         this.recording_shortcut = if this.recording_shortcut == Some(RecordingTarget::Global(hotkey)) {
                             None
                         } else {
@@ -530,6 +599,7 @@ impl SettingsWindow {
                     cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
                         this.recording_shortcut = None;
+                        this.recording_rejected = false;
                         crate::hotkeys::set(hotkey, None, cx);
                         cx.notify();
                     }),
@@ -566,7 +636,9 @@ impl SettingsWindow {
         let colors = theme.colors();
         let error_color = theme.status().error;
 
-        let border_color = if recording {
+        let border_color = if recording && self.recording_rejected {
+            error_color
+        } else if recording {
             colors.accent
         } else if has_conflict {
             error_color
@@ -575,7 +647,9 @@ impl SettingsWindow {
         } else {
             colors.border.opacity(0.75)
         };
-        let text_color = if recording {
+        let text_color = if recording && self.recording_rejected {
+            Color::Error
+        } else if recording {
             Color::Accent
         } else if has_conflict {
             Color::Error
@@ -585,7 +659,7 @@ impl SettingsWindow {
             Color::Muted
         };
         let hover_border = if recording {
-            colors.accent
+            border_color
         } else if has_conflict {
             error_color
         } else {
@@ -609,8 +683,10 @@ impl SettingsWindow {
             .border_1()
             .border_color(border_color)
             .when(recording, |el| {
-                el.bg(colors.accent.opacity(0.10)).on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                let fill = if self.recording_rejected { error_color } else { colors.accent };
+                el.bg(fill.opacity(0.10)).on_mouse_down_out(cx.listener(|this, _, _, cx| {
                     this.recording_shortcut = None;
+                    this.recording_rejected = false;
                     cx.notify();
                 }))
             })

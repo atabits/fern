@@ -22,25 +22,145 @@ pub const USER_KEYMAP_TEMPLATE: &str = r#"// Fern user keymap — overrides the 
 // Shortcuts changed in Settings → Shortcuts are saved here automatically.
 // After editing this file manually, click "Reload keymap" in Settings → Shortcuts.
 //
-// Example:
-// [
+// Format: JSONC (comments // and /* */ are allowed) containing an array of sections:
 //   {
-//     "context": "Workspace && !TextInput",
+//     "context": "Workspace && !TextInput",   // optional; omit for app-wide binding
 //     "bindings": {
-//       "escape": "fern::MinimizeWindow"
-//     }
-//   },
-//   {
-//     "context": "TaskList",
-//     "bindings": {
-//       "space": null
+//       "escape": "fern::MinimizeWindow",     // bind a keystroke to an action
+//       "secondary-q": null                   // set to null to unbind a default key
 //     }
 //   }
-// ]
 //
-// Common contexts: Workspace, Tasks, TaskList, Calendar, CalendarYear,
-// Matrix, Habits, Focus, Countdown, StickyNote, Settings, TextInput.
-// Set a key to null to unbind it in that context.
+// Keystroke syntax:
+//   Modifiers: secondary- (Ctrl on Windows/Linux, Cmd on macOS), ctrl-, alt-, shift-, win-, cmd-
+//   Chords (sequences): space-separated keystrokes, e.g. "g t", "tab p", "v k"
+//   Special keys: escape, space, enter, tab, backspace, delete,
+//                 up, down, left, right, home, end, pageup, pagedown, f1..f12
+//
+// Contexts (support &&, ||, !):
+//   Workspace      Main window (all sections)
+//   Tasks          Tasks module (lists sidebar + task list + details)
+//   TaskList       Focused task list (not while typing in a text field)
+//   TaskDetail     Task details panel / sticky note editor
+//   TaskDraft      Calendar / quick draft editor
+//   Calendar       Calendar view (Day / Week / Month / Agenda)
+//   CalendarYear   Calendar Year view
+//   SummaryEditor  Markdown note / summary editor
+//   Habits         Habits module
+//   Matrix         Eisenhower Matrix module
+//   Focus          Focus timer page
+//   FocusMini      Floating Focus mini window
+//   Countdown      Countdown module
+//   StickyNote     Floating Sticky Note window
+//   Settings       Settings window
+//   TextInput      Any focused text input field (combine as "!TextInput" to avoid hijacking typing)
+//
+// ============================================================================
+// All available actions
+// ============================================================================
+//
+// App & Navigation (context: "Workspace", or "Workspace && !TextInput" for bare keys/chords):
+//   fern::NewTask               Focus the quick-add field to create a task
+//   fern::Search                Open command menu & search
+//   fern::SyncNow               Trigger sync with configured server
+//   fern::ToggleSidebar         Show or hide the lists sidebar
+//   fern::ShowAll               Go to "All" smart list
+//   fern::ShowInbox             Go to "Inbox"
+//   fern::ShowToday             Go to "Today"
+//   fern::ShowTomorrow          Go to "Tomorrow"
+//   fern::ShowNext7Days         Go to "Next 7 Days"
+//   fern::ShowCompleted         Go to "Completed"
+//   fern::ShowWontDo            Go to "Won't Do"
+//   fern::ShowTrash             Go to "Trash"
+//   fern::PrintList             Print the current task list (or calendar year)
+//   fern::PrintDetail           Print the selected task's details
+//   fern::ShowShortcuts         Open Settings → Shortcuts
+//   fern::OpenSettings          Open the Settings window
+//   fern::DismissTransient      Close the active menu, popover, or dialog
+//   fern::MinimizeWindow        Minimize the main window (after dismissing open popovers)
+//   fern::CloseWindow           Close the active window
+//   fern::Quit                  Quit Fern
+//
+// Task List & Editing (context: "TaskList", or "TaskList && !TextInput"):
+//   task_list::SelectNext               Select the next task
+//   task_list::SelectPrevious           Select the previous task
+//   task_list::SelectAllTasks           Select all visible tasks
+//   task_list::ExtendSelectionNext      Extend multi-selection downward
+//   task_list::ExtendSelectionPrevious  Extend multi-selection upward
+//   task_list::ToggleComplete           Mark selected task(s) complete / incomplete
+//   task_list::ToggleInProgress         Toggle "In Progress" state on selected task
+//   task_list::DeleteTask               Move selected task(s) to Trash
+//   task_list::PinTask                  Pin / unpin selected task
+//   task_list::SetDate                  Open due date picker for selected task
+//   task_list::ClearDate                Clear due date on selected task
+//   task_list::SetToday                 Set selected task due date to Today
+//   task_list::SetTomorrow              Set selected task due date to Tomorrow
+//   task_list::SetNextWeek              Set selected task due date to Next Week
+//   task_list::PriorityNone             Set priority to None
+//   task_list::PriorityLow              Set priority to Low
+//   task_list::PriorityMedium           Set priority to Medium
+//   task_list::PriorityHigh             Set priority to High
+//   task_list::ToggleAllGroups          Expand / collapse all groups and sections
+//   task_list::ToggleAllSubtasks        Expand / collapse all subtasks
+//   task_list::AddSubtask               Add a subtask under the selected task
+//   task_list::OpenAsSticky             Open the selected task as a floating Sticky Note
+//   task_list::ViewList                 Switch current list to List view
+//   task_list::ViewKanban               Switch current list to Kanban view
+//   task_list::ViewTimeline             Switch current list to Timeline view
+//   task_list::Undo                     Undo the last task action
+//   task_list::Redo                     Redo the last undone task action
+//
+// Calendar (context: "Calendar" / "CalendarYear"):
+//   calendar::DayView           Switch calendar to Day view
+//   calendar::WeekView          Switch calendar to Week view
+//   calendar::MonthView         Switch calendar to Month view
+//   calendar::YearView          Switch calendar to Year view
+//   calendar::AgendaView        Switch calendar to Agenda view
+//   calendar::PreviousPeriod    Navigate to previous day / week / month
+//   calendar::NextPeriod        Navigate to next day / week / month
+//   calendar::PreviousYear      Navigate to previous year (CalendarYear)
+//   calendar::NextYear          Navigate to next year (CalendarYear)
+//   calendar::CalendarToday     Jump back to Today
+//   calendar::PrintYear         Print the Year view (CalendarYear)
+//
+// Focus Timer (context: app-wide / "Focus" / "FocusMini"):
+//   focus::TogglePause          Pause or resume the active timer (or start next)
+//   focus::StartStop            Start a focus session or end the running one
+//
+// Sticky Note Window (context: "StickyNote"):
+//   sticky::TogglePin           Toggle always-on-top pin
+//   sticky::ToggleColor         Open / close the color palette
+//   sticky::ToggleCollapse      Collapse / expand the sticky note
+//   sticky::AlignTop            Snap window to the top edge of the screen (Windows)
+//   sticky::AlignLeft           Snap window to the left edge of the screen (Windows)
+//   sticky::AlignRight          Snap window to the right edge of the screen (Windows)
+//
+// Habits (context: "Habits"):
+//   habits::SelectNextHabit       Select the next habit
+//   habits::SelectPreviousHabit   Select the previous habit
+//   habits::CheckInSelectedHabit  Toggle check-in for the selected habit
+//   habits::NewHabit              Open the New Habit dialog
+//
+// Eisenhower Matrix (context: "Matrix"):
+//   matrix::SelectNextMatrixTask      Select the next task in the matrix
+//   matrix::SelectPreviousMatrixTask  Select the previous task in the matrix
+//   matrix::ToggleMatrixTask          Complete / reopen the selected matrix task
+//   matrix::OpenMatrixTask            Open details for the selected matrix task
+//   matrix::DeleteMatrixTask          Delete the selected matrix task
+//
+// Markdown Editor (context: "SummaryEditor"):
+//   markdown::Bold, markdown::Italic, markdown::Underline, markdown::Strike,
+//   markdown::Highlight, markdown::CheckItem, markdown::BulletedList,
+//   markdown::NumberedList, markdown::Link, markdown::Code, markdown::Quote
+//
+// Drafts & Dialogs:
+//   task_detail::SaveDraft      Save the active draft (context: "TaskDraft")
+//   settings::DismissSettings   Dismiss popup or close Settings (context: "Settings")
+//
+// Text Inputs (context: "TextInput"):
+//   Standard editing actions: text_input::Backspace, Delete, Copy, Cut, Paste,
+//   Undo, Redo, SelectAll, Left, Right, Up, Down, Home, End, Enter, Cancel, etc.
+//
 [
 ]
 "#;
@@ -83,7 +203,7 @@ pub const SHORTCUT_SPECS: [ShortcutSpec; SHORTCUT_COUNT] = [
     ShortcutSpec { action: "fern::PrintDetail", section: ShortcutSection::General, context: Some("Workspace"), fixed_chord: None, allow_unmodified: false },
     ShortcutSpec { action: "fern::Search", section: ShortcutSection::General, context: Some("Workspace"), fixed_chord: None, allow_unmodified: false },
     ShortcutSpec { action: "fern::ShowShortcuts", section: ShortcutSection::General, context: Some("Workspace"), fixed_chord: None, allow_unmodified: false },
-    ShortcutSpec { action: "fern::MinimizeWindow", section: ShortcutSection::General, context: Some("Workspace && !TextInput"), fixed_chord: None, allow_unmodified: false },
+    ShortcutSpec { action: "fern::MinimizeWindow", section: ShortcutSection::General, context: Some("Workspace && !TextInput"), fixed_chord: None, allow_unmodified: true },
     ShortcutSpec { action: "fern::Quit", section: ShortcutSection::General, context: None, fixed_chord: None, allow_unmodified: false },
     // New Task (10..16)
     ShortcutSpec { action: "fern::NewTask", section: ShortcutSection::NewTask, context: Some("Workspace"), fixed_chord: None, allow_unmodified: false },
@@ -212,6 +332,18 @@ pub fn ensure_user_keymap_file() -> Result<PathBuf> {
 fn ensure_user_keymap_file_at(path: &Path) -> Result<()> {
     if !path.exists() {
         write_file_creating_parents(path, USER_KEYMAP_TEMPLATE)?;
+        return Ok(());
+    }
+    // If the file is still an unmodified empty default template from an earlier version, refresh
+    // its commented action reference without ever touching custom bindings or user-edited headers.
+    if let Ok(existing) = std::fs::read_to_string(path)
+        && existing.starts_with("// Fern user keymap")
+        && !existing.contains("All available actions")
+        && let Ok(cleaned) = theme::strip_jsonc(&existing)
+        && let Ok(sections) = serde_json::from_str::<Vec<KeymapSection>>(&cleaned)
+        && sections.is_empty()
+    {
+        write_file_creating_parents(path, USER_KEYMAP_TEMPLATE)?;
     }
     Ok(())
 }
@@ -310,13 +442,21 @@ fn same_keystroke_sequence(a: &str, b: &str) -> bool {
     }
 }
 
-/// Formats a captured GPUI `Keystroke` into canonical keymap JSON syntax when suitable for binding.
-///
-/// Bare modifiers are ignored (return `None` so recording keeps listening). Unmodified `escape`,
-/// `backspace`, and `delete` also return `None` because callers handle them as cancel / clear.
-pub fn record_keystroke(ks: &Keystroke, allow_unmodified: bool) -> Option<String> {
+/// Result of attempting to record a keystroke in the Settings → Shortcuts UI.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RecordOutcome {
+    /// Bare modifier press (`Ctrl`, `Shift`, `Alt`, `Win`, lock keys) — stay listening silently.
+    IgnoreModifier,
+    /// Valid shortcut converted to canonical keymap JSON syntax.
+    Accepted(String),
+    /// Non-modifier key rejected by this shortcut's recording constraints.
+    Rejected,
+}
+
+/// Returns true when `ks` is a bare modifier or lock key that should not finalize shortcut recording.
+pub fn is_bare_modifier(ks: &Keystroke) -> bool {
     let key = ks.key.to_lowercase();
-    if key.is_empty()
+    key.is_empty()
         || matches!(
             key.as_str(),
             "control"
@@ -334,17 +474,24 @@ pub fn record_keystroke(ks: &Keystroke, allow_unmodified: bool) -> Option<String
                 | "numlock"
                 | "scrolllock"
         )
-    {
-        return None;
-    }
+}
 
+/// Classifies a captured GPUI `Keystroke` for recording in Settings → Shortcuts.
+///
+/// Bare modifiers yield `IgnoreModifier` so holding `Ctrl` before pressing `S` does not flash an
+/// error. Disallowed non-modifier keys yield `Rejected` so the UI can explain the constraint.
+pub fn classify_keystroke(ks: &Keystroke, allow_unmodified: bool) -> RecordOutcome {
+    if is_bare_modifier(ks) {
+        return RecordOutcome::IgnoreModifier;
+    }
+    let key = ks.key.to_lowercase();
     let m = &ks.modifiers;
     let has_primary_mod = m.control || m.alt || m.platform;
     let has_any_mod = has_primary_mod || m.shift;
 
     // Unmodified Escape cancels recording; unmodified Backspace/Delete clears the binding.
     if !has_any_mod && matches!(key.as_str(), "escape" | "backspace" | "delete") {
-        return None;
+        return RecordOutcome::Rejected;
     }
 
     let is_function_key = key
@@ -381,7 +528,7 @@ pub fn record_keystroke(ks: &Keystroke, allow_unmodified: bool) -> Option<String
         || (allow_unmodified && !has_any_mod && (is_named_nav || is_single_allowed));
 
     if !allowed {
-        return None;
+        return RecordOutcome::Rejected;
     }
 
     let mut parts: Vec<&str> = Vec::new();
@@ -399,8 +546,19 @@ pub fn record_keystroke(ks: &Keystroke, allow_unmodified: bool) -> Option<String
     }
     parts.push(&key);
     let formatted = parts.join("-");
-    Keystroke::parse(&formatted).ok()?;
-    Some(formatted)
+    if Keystroke::parse(&formatted).is_err() {
+        return RecordOutcome::Rejected;
+    }
+    RecordOutcome::Accepted(formatted)
+}
+
+/// Formats a captured GPUI `Keystroke` into canonical keymap JSON syntax when suitable for binding.
+#[cfg(test)]
+pub fn record_keystroke(ks: &Keystroke, allow_unmodified: bool) -> Option<String> {
+    match classify_keystroke(ks, allow_unmodified) {
+        RecordOutcome::Accepted(key) => Some(key),
+        RecordOutcome::IgnoreModifier | RecordOutcome::Rejected => None,
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1149,13 +1307,50 @@ mod tests {
         assert_eq!(record_keystroke(&Keystroke::parse("backspace").unwrap(), true), None);
         assert_eq!(record_keystroke(&Keystroke::parse("delete").unwrap(), true), None);
         // Bare letters rejected in Workspace, accepted in allow_unmodified contexts.
-        assert_eq!(record_keystroke(&Keystroke::parse("a").unwrap(), false), None);
+        assert_eq!(
+            classify_keystroke(&Keystroke::parse("a").unwrap(), false),
+            RecordOutcome::Rejected
+        );
         assert_eq!(record_keystroke(&Keystroke::parse("a").unwrap(), true).as_deref(), Some("a"));
-        assert_eq!(record_keystroke(&Keystroke::parse("space").unwrap(), false), None);
+        assert_eq!(
+            classify_keystroke(&Keystroke::parse("space").unwrap(), false),
+            RecordOutcome::Rejected
+        );
         assert_eq!(
             record_keystroke(&Keystroke::parse("space").unwrap(), true).as_deref(),
             Some("space")
         );
+        assert_eq!(
+            classify_keystroke(
+                &Keystroke { key: "control".to_owned(), ..Default::default() },
+                false
+            ),
+            RecordOutcome::IgnoreModifier
+        );
+    }
+
+    #[test]
+    fn user_keymap_template_documents_all_shortcut_specs_and_upgrades_empty_legacy_header() {
+        for spec in SHORTCUT_SPECS {
+            assert!(
+                USER_KEYMAP_TEMPLATE.contains(spec.action),
+                "USER_KEYMAP_TEMPLATE should document {}",
+                spec.action
+            );
+        }
+        let dir = std::env::temp_dir().join(format!("fern-keymap-upgrade-{}", fern_core::Id::now_v7()));
+        let path = dir.join(USER_KEYMAP_FILE);
+        // Old empty auto-generated template gets upgraded cleanly.
+        write_file_creating_parents(&path, "// Fern user keymap — old header\n[\n]\n").unwrap();
+        ensure_user_keymap_file_at(&path).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), USER_KEYMAP_TEMPLATE);
+
+        // User-written empty file with custom comment is never overwritten.
+        let custom_comment = "// My own notes\n[]\n";
+        std::fs::write(&path, custom_comment).unwrap();
+        ensure_user_keymap_file_at(&path).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), custom_comment);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

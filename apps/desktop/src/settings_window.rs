@@ -128,6 +128,7 @@ pub struct SettingsWindow {
     subscription_discovered: Vec<crate::subscriptions::DiscoveredCalendar>,
     subscription_discover_error: Option<String>,
     recording_shortcut: Option<shortcuts_settings_view::RecordingTarget>,
+    recording_rejected: bool,
     confirm_reset_shortcuts: bool,
     _updates: Option<gpui::Subscription>,
     _feeds: Option<gpui::Subscription>,
@@ -299,6 +300,7 @@ impl SettingsWindow {
             subscription_discovered: Vec::new(),
             subscription_discover_error: None,
             recording_shortcut: None,
+            recording_rejected: false,
             confirm_reset_shortcuts: false,
             _updates: updates,
             _feeds: feeds,
@@ -373,6 +375,7 @@ impl SettingsWindow {
         self.menu = None;
         self.release_notes = None;
         self.recording_shortcut = None;
+        self.recording_rejected = false;
         self.confirm_reset_shortcuts = false;
         #[cfg(not(test))]
         if changed && page == Page::Shortcuts {
@@ -402,6 +405,7 @@ impl SettingsWindow {
             self.confirm_reset_shortcuts = false;
             cx.notify();
         } else if self.recording_shortcut.take().is_some() {
+            self.recording_rejected = false;
             cx.notify();
         } else if self.menu.is_some() {
             self.set_menu(None, cx);
@@ -2454,19 +2458,35 @@ mod tests {
         let first_pill = cx.debug_bounds("shortcut-action-0").unwrap();
         let reset_btn = cx.debug_bounds("shortcuts-reset-all").unwrap();
 
-        // Clicking an action pill enters recording mode; Escape cancels it without closing Settings.
+        // Clicking an action pill enters recording mode and shows the rule hint bar.
         cx.simulate_click(first_pill.center(), gpui::Modifiers::default());
         cx.update(|_, cx| {
             assert_eq!(
                 settings.read(cx).recording_shortcut,
                 Some(shortcuts_settings_view::RecordingTarget::Action(0))
             );
+            assert!(!settings.read(cx).recording_rejected);
         });
+        assert!(cx.debug_bounds("shortcuts-recording-hint").is_some());
+
+        // Pressing a bare letter on a Workspace-scoped shortcut flags rejection without closing.
+        cx.simulate_keystrokes("a");
+        cx.update(|_, cx| {
+            assert_eq!(
+                settings.read(cx).recording_shortcut,
+                Some(shortcuts_settings_view::RecordingTarget::Action(0))
+            );
+            assert!(settings.read(cx).recording_rejected);
+        });
+
+        // Escape cancels recording and clears the rejection state without closing Settings.
         cx.simulate_keystrokes("escape");
         cx.update(|_, cx| {
             assert_eq!(settings.read(cx).recording_shortcut, None);
+            assert!(!settings.read(cx).recording_rejected);
             assert!(!settings.read(cx).closing);
         });
+        assert!(cx.debug_bounds("shortcuts-recording-hint").is_none());
 
         // Clicking Reset opens the confirmation modal; Escape dismisses it without closing Settings.
         cx.simulate_click(reset_btn.center(), gpui::Modifiers::default());

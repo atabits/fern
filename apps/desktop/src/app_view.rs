@@ -94,6 +94,10 @@ impl AppView {
             cx.defer(move |cx| {
                 if target == main_window.into() {
                     let _ = main_window.update(cx, |view, window, cx| {
+                        #[cfg(windows)]
+                        if crate::tray::hide_to_tray() {
+                            return;
+                        }
                         if view.prepare_to_leave_calendar(window, cx) {
                             view.close_settings(cx);
                             window.remove_window();
@@ -114,6 +118,8 @@ impl AppView {
                     can_quit
                 }).unwrap_or(true);
                 if can_quit {
+                    #[cfg(windows)]
+                    crate::tray::prepare_quit();
                     cx.quit();
                 }
             });
@@ -1673,6 +1679,13 @@ impl AppView {
             )
             .into_any_element()
     }
+
+    /// Starts a Pomodoro (`stopwatch == false`) or stopwatch (`stopwatch == true`) from the tray
+    /// without opening the main window, and opens the floating mini clock.
+    pub fn start_focus_from_tray(&mut self, stopwatch: bool, cx: &mut Context<Self>) {
+        self.focus.update(cx, |focus, cx| focus.start_mode(stopwatch, cx));
+        crate::focus_view::focus_mini::open(self.focus.clone(), cx);
+    }
 }
 
 impl Render for AppView {
@@ -2247,5 +2260,39 @@ mod tests {
         cx.run_until_parked();
         assert!(store.task(t2.id).unwrap().unwrap().is_completed());
         assert!(cx.debug_bounds("active-reminder-alerts").is_none());
+    }
+
+    #[gpui::test]
+    fn tray_focus_starts_pomo_and_stopwatch_without_switching_section(cx: &mut gpui::TestAppContext) {
+        cx.update(theme::init);
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let (app, cx) = cx.add_window_view(|window, cx| AppView::new(store, false, window, cx));
+        cx.simulate_resize(gpui::size(px(1200.), px(700.)));
+        cx.run_until_parked();
+
+        // Starting Pomo from tray starts a countdown timer while keeping the main section unchanged.
+        cx.update(|_, cx| app.update(cx, |app, cx| app.start_focus_from_tray(false, cx)));
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            let view = app.read(cx);
+            assert_eq!(view.section, Section::Tasks);
+            let now = chrono::Local::now().timestamp_millis();
+            let (_, _, running, paused) = view.focus.read(cx).clock_state(now, i18n::t(cx));
+            assert!(running);
+            assert!(!paused);
+        });
+
+        // Starting Stopwatch switches the timer to stopwatch mode and runs it.
+        cx.update(|_, cx| app.update(cx, |app, cx| app.start_focus_from_tray(true, cx)));
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            let view = app.read(cx);
+            assert_eq!(view.section, Section::Tasks);
+            let now = chrono::Local::now().timestamp_millis();
+            let (clock, _, running, paused) = view.focus.read(cx).clock_state(now, i18n::t(cx));
+            assert!(running);
+            assert!(!paused);
+            assert!(clock.starts_with("00:"), "expected stopwatch starting at 00:.., got {clock}");
+        });
     }
 }

@@ -638,6 +638,11 @@ pub struct Strings {
     pub notification_items: [(&'static str, &'static str); 3],
     #[cfg(windows)]
     pub minimize_to_tray: &'static str,
+    pub tray_focus: &'static str,
+    pub tray_start_pomo: &'static str,
+    pub tray_stopwatch: &'static str,
+    pub tray_always_on_top: &'static str,
+    pub tray_quit: &'static str,
     pub daily_time: &'static str,
     /// The daily notification's title; `{n}` is how many tasks.
     pub daily_title: &'static str,
@@ -1611,6 +1616,11 @@ pub static EN: Strings = Strings {
     ],
     #[cfg(windows)]
     minimize_to_tray: "Minimize to notification area",
+    tray_focus: "Focus",
+    tray_start_pomo: "Start Pomo",
+    tray_stopwatch: "Stopwatch",
+    tray_always_on_top: "Keep on Top",
+    tray_quit: "Quit",
     daily_time: "Time",
     daily_title: "Today: {n} tasks",
     daily_empty: "Nothing due today.",
@@ -2556,6 +2566,11 @@ pub static ZH_CN: Strings = Strings {
     ],
     #[cfg(windows)]
     minimize_to_tray: "最小化到通知区域",
+    tray_focus: "专注",
+    tray_start_pomo: "开始番茄",
+    tray_stopwatch: "正计时",
+    tray_always_on_top: "窗口置顶",
+    tray_quit: "退出",
     daily_time: "时间",
     daily_title: "今日：{n} 个任务",
     daily_empty: "今日无待办任务",
@@ -3502,6 +3517,11 @@ pub static RU: Strings = Strings {
     ],
     #[cfg(windows)]
     minimize_to_tray: "Сворачивать в область уведомлений",
+    tray_focus: "Сфокусироваться",
+    tray_start_pomo: "Запустить Pomo",
+    tray_stopwatch: "Секундомер",
+    tray_always_on_top: "Поверх всех окон",
+    tray_quit: "Выход",
     daily_time: "Время",
     daily_title: "Сегодня: задач — {n}",
     daily_empty: "На сегодня ничего нет.",

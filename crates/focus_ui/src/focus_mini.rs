@@ -1,7 +1,7 @@
 //! The original's focus mini window: the running clock and what it is for in a small window of
 //! its own, with pause, stop and a pin that keeps it over the other windows.
 
-use gpui::{Bounds, Entity, TitlebarOptions, WindowBounds, WindowControlArea, WindowDecorations, WindowOptions, size};
+use gpui::{Bounds, Entity, Global, TitlebarOptions, WindowBounds, WindowControlArea, WindowDecorations, WindowHandle, WindowOptions, size};
 use ui::prelude::*;
 
 use crate::focus_view::FocusView;
@@ -10,9 +10,19 @@ use crate::i18n;
 const WIDTH: f32 = 300.;
 const HEIGHT: f32 = 96.;
 
+#[derive(Default)]
+struct OpenFocusMini(Option<WindowHandle<FocusMini>>);
+
+impl Global for OpenFocusMini {}
+
 /// Opens the mini window of `focus`'s clock, kept over the other windows from the start, as the
-/// original's is.
+/// original's is. Reuses an already-open mini window instead of opening duplicates.
 pub fn open(focus: Entity<FocusView>, cx: &mut App) {
+    if let Some(handle) = cx.try_global::<OpenFocusMini>().and_then(|g| g.0)
+        && handle.update(cx, |_, window, _| window.activate_window()).is_ok()
+    {
+        return;
+    }
     let bounds = Bounds::centered(None, size(px(WIDTH), px(HEIGHT)), cx);
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -33,8 +43,9 @@ pub fn open(focus: Entity<FocusView>, cx: &mut App) {
             FocusMini { focus, pinned: cfg!(windows), should_move: false }
         })
     });
-    if let Err(err) = opened {
-        eprintln!("failed to open the focus mini window: {err:#}");
+    match opened {
+        Ok(handle) => cx.set_global(OpenFocusMini(Some(handle))),
+        Err(err) => eprintln!("failed to open the focus mini window: {err:#}"),
     }
 }
 

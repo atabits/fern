@@ -116,6 +116,8 @@ fn main() -> Result<()> {
         let bounds = Bounds::centered(None, size(px(1280.), px(760.)), cx);
         let (titlebar, decorations) = title_bar::window_options();
         let store_for_hotkeys = store.clone();
+        #[cfg(windows)]
+        let store_for_tray = store.clone();
         let store_for_themes = store.clone();
         let main_window = cx.open_window(
             WindowOptions {
@@ -132,7 +134,7 @@ fn main() -> Result<()> {
             |window, cx| {
                 touch::init(window, cx);
                 #[cfg(windows)]
-                tray::init(window, &store);
+                tray::init(window, &store, cx);
                 // `fern fern://task/<id>` opens that task ("Copy Link").
                 let link = std::env::args().skip(1).find_map(|arg| fern_core::link::parse_task_link(&arg));
                 cx.new(|cx| {
@@ -150,6 +152,8 @@ fn main() -> Result<()> {
         cx.set_global(desktop_common::StickyOpener(Rc::new(sticky_note::open)));
         sticky_note::restore(store_for_hotkeys.clone(), cx);
         hotkeys::init(main_window, store_for_hotkeys, cx);
+        #[cfg(windows)]
+        tray::connect(main_window, store_for_tray, cx);
         cx.activate(true);
     });
     Ok(())

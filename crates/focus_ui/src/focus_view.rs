@@ -423,6 +423,21 @@ impl FocusView {
         );
     }
 
+    /// Starts a Pomodoro (`stopwatch == false`) or stopwatch (`stopwatch == true`) without a target task.
+    pub fn start_mode(&mut self, stopwatch: bool, cx: &mut Context<Self>) {
+        if self.finish_prompt { return; }
+        self.finish(cx);
+        if self.running.is_some() { return; }
+        self.completed_in_chain = 0;
+        self.set_stopwatch_mode(stopwatch, cx);
+        let timer = if stopwatch {
+            FocusTimer::stopwatch(now_ms())
+        } else {
+            FocusTimer::start(now_ms(), pomo_length_ms(self.minutes(POMO_SETTING)))
+        };
+        self.start_timer(None, None, timer, cx);
+    }
+
     /// "Start Focus" on a habit: a Pomodoro or a stopwatch named after it, in that mode.
     pub fn start_named(&mut self, title: String, stopwatch: bool, cx: &mut Context<Self>) {
         self.start_for_habit(None, title, stopwatch, cx);

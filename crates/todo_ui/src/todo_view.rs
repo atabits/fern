@@ -1090,7 +1090,8 @@ impl TodoView {
         if let Some(counts) = self.check(self.store.counts_from(&all_tasks, today)) {
             self.counts = counts;
         }
-        let show_completed = self.view == View::Today && self.view_flag("show_completed", true);
+        let show_completed = matches!(self.view, View::Today | View::Tomorrow | View::Next7Days)
+            && self.view_flag("show_completed", true);
         if let Some(tasks) = self.check(self.store.tasks_in_from_with_today_completed(all_tasks, &self.view, today, show_completed)) {
             self.tasks = tasks;
         }
@@ -1736,7 +1737,7 @@ impl TodoView {
         self.timeline = self.view_flag("timeline", false);
         self.kanban_workflow = self.view_flag("kanban_workflow", false);
         self.header_menu_open = false;
-        if name == "show_completed" && self.view == View::Today {
+        if name == "show_completed" && matches!(self.view, View::Today | View::Tomorrow | View::Next7Days) {
             if value {
                 self.collapsed_sections.remove(&Section::Completed);
             }

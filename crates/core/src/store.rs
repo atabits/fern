@@ -1168,11 +1168,24 @@ impl Store {
                 if task.list_id.is_some_and(|l| hidden.contains(&l)) {
                     return false;
                 }
-                if show_completed && *view == View::Today && task.is_completed() {
-                    return !task.is_deleted() && !task.is_wont_do()
-                        && (task.due_date == Some(today)
-                            || task.completed_at.and_then(chrono::DateTime::from_timestamp_millis)
-                                .is_some_and(|at| at.with_timezone(&chrono::Local).date_naive() == today));
+                if show_completed && task.is_completed() && !task.is_deleted() && !task.is_wont_do() {
+                    let completed_today = task
+                        .completed_at
+                        .and_then(chrono::DateTime::from_timestamp_millis)
+                        .is_some_and(|at| at.with_timezone(&chrono::Local).date_naive() == today);
+                    match view {
+                        View::Today => {
+                            return task.due_date == Some(today) || completed_today;
+                        }
+                        View::Tomorrow => {
+                            return task.due_date == Some(today + Duration::days(1));
+                        }
+                        View::Next7Days => {
+                            return task.due_date.is_some_and(|d| d >= today && d < today + Duration::days(7))
+                                || completed_today;
+                        }
+                        _ => {}
+                    }
                 }
                 matches_view(task, view, today)
             })
@@ -5454,6 +5467,26 @@ mod tests {
         assert!(with_completed.iter().any(|task| task.id == done.id));
         assert_eq!(with_completed.len(), 3);
         assert_eq!(titles(&store.tasks_in(&View::Tomorrow, today)?), ["tomorrow"]);
+        let done_tomorrow = store.add_task("done tomorrow")?;
+        store.set_due(done_tomorrow.id, Some(today + Duration::days(1)), None)?;
+        store.complete(done_tomorrow.id, true)?;
+        assert_eq!(titles(&store.tasks_in(&View::Tomorrow, today)?), ["tomorrow"]);
+        let tomorrow_with_completed = store.tasks_in_from_with_today_completed(
+            store.tasks()?,
+            &View::Tomorrow,
+            today,
+            true,
+        )?;
+        assert!(tomorrow_with_completed.iter().any(|task| task.id == done_tomorrow.id));
+        let next7_with_completed = store.tasks_in_from_with_today_completed(
+            store.tasks()?,
+            &View::Next7Days,
+            today,
+            true,
+        )?;
+        assert!(next7_with_completed.iter().any(|task| task.id == done_tomorrow.id));
+        assert!(next7_with_completed.iter().any(|task| task.id == done.id));
+        store.purge_task(done_tomorrow.id)?;
         assert_eq!(
             titles(&store.tasks_in(&View::Next7Days, today)?),
             ["in 6 days", "tomorrow", "today", "overdue"]

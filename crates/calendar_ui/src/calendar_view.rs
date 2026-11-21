@@ -127,6 +127,7 @@ pub struct CalendarView {
     /// The "Arrange tasks" panel: the open tasks without a date, grouped by the tab's choice
     /// (lists, tags or priority), to drag onto a day.
     arrange: Option<usize>,
+    arrange_collapsed: HashSet<(usize, String)>,
     undated: Vec<Task>,
     /// The colors tasks take with Color By List or Tag.
     list_colors: std::collections::HashMap<Id, gpui::Hsla>,
@@ -380,6 +381,7 @@ impl CalendarView {
             more_menu: false,
             options_dialog: None,
             arrange: None,
+            arrange_collapsed: HashSet::new(),
             undated: Vec::new(),
             list_colors: Default::default(),
             tag_colors: Default::default(),
@@ -945,18 +947,36 @@ impl CalendarView {
                 }))
         }));
         let mut body: Vec<AnyElement> = Vec::new();
-        for (name, tasks) in groups {
+        for (index, (name, tasks)) in groups.into_iter().enumerate() {
+            let key = (tab, name.clone());
+            let collapsed = self.arrange_collapsed.contains(&key);
             body.push(
                 h_flex()
+                    .id(SharedString::from(format!("arrange-group-{tab}-{index}")))
                     .pt_2()
                     .pb_1()
                     .gap_1()
-                    .child(Icon::new(IconName::ChevronDown).size(IconSize::XSmall).color(Color::Muted))
+                    .rounded(px(4.))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme.colors().ghost_element_hover))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if !this.arrange_collapsed.remove(&key) {
+                            this.arrange_collapsed.insert(key.clone());
+                        }
+                        cx.notify();
+                    }))
+                    .child(
+                        Icon::new(if collapsed { IconName::ChevronRight } else { IconName::ChevronDown })
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
                     .child(Label::new(name).size(LabelSize::Small).weight(FontWeight::SEMIBOLD))
                     .child(Label::new(tasks.len().to_string()).size(LabelSize::XSmall).color(Color::Muted))
                     .into_any_element(),
             );
-            body.extend(tasks.into_iter().map(|t| self.task_bar(t, None, cx).h(px(20.)).into_any_element()));
+            if !collapsed {
+                body.extend(tasks.into_iter().map(|t| self.task_bar(t, None, cx).h(px(20.)).into_any_element()));
+            }
         }
         if body.is_empty() {
             body.push(div().pt_4().child(Label::new(strings.arrange_empty).size(LabelSize::Small).color(Color::Muted)).into_any_element());

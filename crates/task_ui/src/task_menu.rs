@@ -134,11 +134,20 @@ pub fn render<V: 'static>(
             .tooltip(ui::Tooltip::text(tip))
             .on_click(on_click(&act, action, cx))
     }));
-    let priority_row = h_flex().px_1().justify_between().children([Priority::High, Priority::Medium, Priority::Low, Priority::None].map(|priority| {
-        let color = task_rows::priority_color(priority, &theme).map_or(Color::Muted, Color::Custom);
-        icon_button(SharedString::from(format!("task-menu-priority-{}", priority.to_i64())), IconName::Flag, color, task.priority == priority)
-            .on_click(on_click(&act, MenuAction::Priority(priority), cx))
-    }));
+    let priority_row = h_flex().px_1().justify_between().children(
+        [
+            (Priority::High, strings.priority_high),
+            (Priority::Medium, strings.priority_medium),
+            (Priority::Low, strings.priority_low),
+            (Priority::None, strings.priority_none),
+        ]
+        .map(|(priority, tip)| {
+            let color = task_rows::priority_color(priority, &theme).map_or(Color::Muted, Color::Custom);
+            icon_button(SharedString::from(format!("task-menu-priority-{}", priority.to_i64())), IconName::Flag, color, task.priority == priority)
+                .tooltip(ui::Tooltip::text(tip))
+                .on_click(on_click(&act, MenuAction::Priority(priority), cx))
+        }),
+    );
     // While a side menu is open, hovering any other item closes it, as menus do.
     let closes_side = |key: &'static str, el: AnyElement, cx: &mut Context<V>| -> AnyElement {
         match side {
@@ -157,8 +166,10 @@ pub fn render<V: 'static>(
     let move_items: Vec<ListItem> = std::iter::once((None, SharedString::new_static(strings.inbox)))
         .chain(lists.iter().map(|l| (Some(l.id), SharedString::from(l.name.clone()))))
         .map(|(list, name)| {
+            let current = task.list_id == list;
             ListItem::new(SharedString::from(format!("task-menu-move-{list:?}")))
-                .child(Label::new(name).color(if task.list_id == list { Color::Accent } else { Color::Default }))
+                .child(Label::new(name).color(if current { Color::Accent } else { Color::Default }))
+                .when(current, |item| item.end_slot(Icon::new(IconName::Check).size(IconSize::XSmall).color(Color::Accent)))
                 .on_click(on_click(&act, MenuAction::Move(list), cx))
         })
         .collect();
@@ -240,7 +251,16 @@ pub fn render<V: 'static>(
         .when(can_convert, |el| {
             el.child(item("task-menu-convert", IconName::FileText, if note { strings.convert_to_task } else { strings.convert_to_note }, MenuAction::Convert, cx))
         })
-        .child(item("task-menu-delete", IconName::Trash, strings.delete, MenuAction::Delete, cx))
+        .child(closes_side(
+            "task-menu-delete",
+            ListItem::new("task-menu-delete")
+                .height(px(34.))
+                .start_slot(Icon::new(IconName::Trash).color(Color::Error))
+                .child(Label::new(strings.delete).color(Color::Error))
+                .on_click(on_click(&act, MenuAction::Delete, cx))
+                .into_any_element(),
+            cx,
+        ))
         .into_any_element()
 }
 

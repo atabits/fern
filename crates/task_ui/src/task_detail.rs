@@ -1675,14 +1675,22 @@ impl TaskDetail {
                     }
                 }
             })), cx))
-            .child(self.close_side_menu_on_hover(item("more-delete", IconName::Trash, strings.delete).on_click(cx.listener(|this, _, _, cx| {
-                let task = this.session.task.as_ref().map(|t| (t.id, t.title.clone()));
-                this.menu_action(cx, |store, id| store.delete_task(id));
-                if let Some((id, title)) = task {
-                    let label = i18n::t(cx).undo_deleted.replace("{title}", &title);
-                    cx.emit(Undoable(crate::undo::UndoAction::Restore(id), label));
-                }
-            })), cx));
+            .child(div().my_1().child(Divider::horizontal()))
+            .child(self.close_side_menu_on_hover(
+                ListItem::new("more-delete")
+                    .height(px(34.))
+                    .start_slot(Icon::new(IconName::Trash).color(Color::Error))
+                    .child(Label::new(strings.delete).color(Color::Error))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        let task = this.session.task.as_ref().map(|t| (t.id, t.title.clone()));
+                        this.menu_action(cx, |store, id| store.delete_task(id));
+                        if let Some((id, title)) = task {
+                            let label = i18n::t(cx).undo_deleted.replace("{title}", &title);
+                            cx.emit(Undoable(crate::undo::UndoAction::Restore(id), label));
+                        }
+                    })),
+                cx,
+            ));
         // The original's menu: 178 px wide (wider when a label needs it), a row every 34 px.
         popover(cx)
             .debug_selector(|| "task-more-popup".into())

@@ -251,6 +251,7 @@ pub fn render<V: 'static>(
         .when(can_convert, |el| {
             el.child(item("task-menu-convert", IconName::FileText, if note { strings.convert_to_task } else { strings.convert_to_note }, MenuAction::Convert, cx))
         })
+        .child(div().my_1().child(Divider::horizontal()))
         .child(closes_side(
             "task-menu-delete",
             ListItem::new("task-menu-delete")

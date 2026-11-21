@@ -2097,17 +2097,18 @@ impl TaskDetail {
             .children(self.checklist.iter().map(|row| {
                 let id = row.item.id;
                 let done = row.item.completed;
+                let row_group = SharedString::from(format!("checklist-item-{id}"));
                 h_flex()
                     .id(SharedString::from(format!("item-{id}")))
                     .debug_selector(move || format!("checklist-item-{id}"))
-                    .group("checklist-item")
+                    .group(row_group.clone())
                     .min_h(px(30.))
                     .items_start()
                     .gap_2()
                     .py_1()
                     .child(
                         div().mt(px(3.)).child(
-                            Checkbox::new("item-checkbox")
+                            Checkbox::new(SharedString::from(format!("item-checkbox-{id}")))
                                 .size(px(14.))
                                 .toggle_state(done)
                                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -2119,19 +2120,20 @@ impl TaskDetail {
                         div()
                             .flex_1()
                             .min_w_0()
-                            .when(done, |el| el.text_color(theme.colors().text_muted))
+                            .when(done, |el| el.text_color(theme.colors().text_muted).line_through())
                             .child(row.input.clone()),
                     )
                     .child(
                         div()
-                            .id("item-delete")
+                            .id(SharedString::from(format!("item-delete-{id}")))
                             .flex_none()
                             .px_1()
                             .text_color(theme.colors().text_muted)
                             .opacity(if crate::touch::active() { 1. } else { 0. })
-                            .group_hover("checklist-item", |s| s.opacity(1.))
+                            .group_hover(row_group, |s| s.opacity(1.))
                             .hover(|s| s.text_color(theme.status().error))
                             .cursor_pointer()
+                            .tooltip(Tooltip::text(strings.delete))
                             .child("✕")
                             .on_click(cx.listener(move |this, _, _, cx| this.delete_checklist_item(id, cx))),
                     )
@@ -2167,7 +2169,7 @@ impl TaskDetail {
                     ListItem::new(SharedString::from(format!("subtask-{id}")))
                         .height(px(30.))
                         .start_slot(
-                            Checkbox::new("subtask-checkbox")
+                            Checkbox::new(SharedString::from(format!("subtask-checkbox-{id}")))
                                 .size(px(14.))
                                 .toggle_state(done)
                                 .in_progress(subtask.is_in_progress())

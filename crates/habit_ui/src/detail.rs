@@ -185,6 +185,52 @@ impl HabitView {
                                         .truncate(),
                                 ),
                         )
+                        .when(!is_archived, |el| {
+                            let done_today = checked.contains(&today);
+                            el.child(
+                                h_flex()
+                                    .id("habit-detail-checkin-today")
+                                    .h(px(28.))
+                                    .px_2p5()
+                                    .gap_1()
+                                    .rounded(px(6.))
+                                    .cursor_pointer()
+                                    .bg(if done_today {
+                                        status_colors.success.opacity(0.16)
+                                    } else {
+                                        theme.colors().accent.opacity(0.14)
+                                    })
+                                    .hover(|s| {
+                                        s.bg(if done_today {
+                                            status_colors.success.opacity(0.24)
+                                        } else {
+                                            theme.colors().accent.opacity(0.22)
+                                        })
+                                    })
+                                    .child(
+                                        Icon::new(if done_today { IconName::CircleCheck } else { IconName::Check })
+                                            .size(IconSize::XSmall)
+                                            .color(if done_today {
+                                                Color::Custom(status_colors.success)
+                                            } else {
+                                                Color::Accent
+                                            }),
+                                    )
+                                    .child(
+                                        Label::new(if done_today { strings.completed } else { strings.check_in })
+                                            .size(LabelSize::XSmall)
+                                            .weight(FontWeight::MEDIUM)
+                                            .color(if done_today {
+                                                Color::Custom(status_colors.success)
+                                            } else {
+                                                Color::Accent
+                                            }),
+                                    )
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.handle_detail_calendar_click(id, today, has_goal, window, cx);
+                                    })),
+                            )
+                        })
                         .child(
                             div()
                                 .relative()

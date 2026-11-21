@@ -75,6 +75,8 @@ pub struct Feeds {
     calendars: Vec<Calendar>,
     /// The active read request for each subscription.
     reading: HashMap<Id, Id>,
+    /// Monotonic counter so stale background `.ics` parses never overwrite newer ones.
+    load_generation: u64,
     china_holiday_status: ChinaHolidayStatus,
 }
 
@@ -84,7 +86,8 @@ impl Global for GlobalFeeds {}
 
 pub fn init(store: Rc<Store>, cx: &mut App) {
     let feeds = cx.new(|cx| {
-        let mut feeds = Feeds::new(store);
+        let mut feeds = Feeds::new_empty(store);
+        feeds.reload_async(cx);
         feeds.start(cx);
         feeds
     });
@@ -95,14 +98,37 @@ pub fn feeds(cx: &App) -> Option<Entity<Feeds>> {
     cx.try_global::<GlobalFeeds>().map(|global| global.0.clone())
 }
 
+fn parse_calendars(subscriptions: Vec<Subscription>) -> Vec<Calendar> {
+    subscriptions
+        .into_iter()
+        .map(|mut subscription| {
+            let parsed = ical::parse_with_warnings(&subscription.feed);
+            if !parsed.warnings.is_empty() {
+                let warning = parsed.warnings.join("; ");
+                subscription.error = Some(match subscription.error {
+                    Some(error) => format!("{error}; {warning}"),
+                    None => warning,
+                });
+            }
+            Calendar { events: parsed.events, subscription }
+        })
+        .collect()
+}
+
 impl Feeds {
-    fn new(store: Rc<Store>) -> Self {
-        let mut feeds = Self {
+    fn new_empty(store: Rc<Store>) -> Self {
+        Self {
             store,
             calendars: Vec::new(),
             reading: HashMap::new(),
+            load_generation: 0,
             china_holiday_status: ChinaHolidayStatus::Idle,
-        };
+        }
+    }
+
+    #[cfg(test)]
+    fn new(store: Rc<Store>) -> Self {
+        let mut feeds = Self::new_empty(store);
         feeds.load();
         feeds
     }
@@ -120,25 +146,46 @@ impl Feeds {
         .detach();
     }
 
-    /// Takes the subscriptions and their feeds from the store.
+    /// Synchronously loads and parses feeds (used only by synchronous unit tests).
+    #[cfg(test)]
     fn load(&mut self) {
-        self.calendars = self
-            .store
-            .subscriptions()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|mut subscription| {
-                let parsed = ical::parse_with_warnings(&subscription.feed);
-                if !parsed.warnings.is_empty() {
-                    let warning = parsed.warnings.join("; ");
-                    subscription.error = Some(match subscription.error {
-                        Some(error) => format!("{error}; {warning}"),
-                        None => warning,
-                    });
-                }
-                Calendar { events: parsed.events, subscription }
+        let subscriptions = self.store.subscriptions().unwrap_or_default();
+        self.calendars = parse_calendars(subscriptions);
+    }
+
+    /// Reconciles subscription metadata immediately so UI lists stay responsive, then offloads
+    /// `.ics` feed parsing to the background executor so the UI thread is never blocked.
+    fn reload_async(&mut self, cx: &mut Context<Self>) {
+        let subscriptions = self.store.subscriptions().unwrap_or_default();
+        let mut existing: HashMap<Id, Vec<Event>> = self
+            .calendars
+            .drain(..)
+            .map(|c| (c.subscription.id, c.events))
+            .collect();
+        self.calendars = subscriptions
+            .iter()
+            .map(|sub| Calendar {
+                events: existing.remove(&sub.id).unwrap_or_default(),
+                subscription: sub.clone(),
             })
             .collect();
+
+        self.load_generation = self.load_generation.wrapping_add(1);
+        let generation = self.load_generation;
+        cx.spawn(async move |this, cx| {
+            let parsed = cx
+                .background_executor()
+                .spawn(async move { parse_calendars(subscriptions) })
+                .await;
+            this.update(cx, |this, cx| {
+                if this.load_generation == generation {
+                    this.calendars = parsed;
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     pub fn calendars(&self) -> &[Calendar] {
@@ -180,7 +227,18 @@ impl Feeds {
 
     /// Reads a subscription's feed (ICS pull or CalDAV two-way push/pull) off the UI thread.
     pub fn read(&mut self, id: Id, cx: &mut Context<Self>) {
-        let Some(sub) = self.calendars.iter().find(|c| c.subscription.id == id).map(|c| c.subscription.clone()) else {
+        let Some(sub) = self
+            .calendars
+            .iter()
+            .find(|c| c.subscription.id == id)
+            .map(|c| c.subscription.clone())
+            .or_else(|| {
+                self.store
+                    .subscriptions()
+                    .ok()
+                    .and_then(|subs| subs.into_iter().find(|s| s.id == id))
+            })
+        else {
             return;
         };
         if self.is_reading(id) {
@@ -194,36 +252,39 @@ impl Feeds {
             let local_events = self.store.calendar_events(id).unwrap_or_default();
             let url = sub.url.clone();
             cx.spawn(async move |this, cx| {
-                let result = cx.background_executor().spawn(async move { sync_caldav_remote(&sub, &local_events) }).await;
+                let outcome = cx
+                    .background_executor()
+                    .spawn(async move { sync_caldav_remote(&sub, &local_events) })
+                    .await;
                 this.update(cx, |this, cx| {
                     if this.reading.get(&id) != Some(&request) {
                         return;
                     }
                     this.reading.remove(&id);
-                    match result {
-                        Ok(outcome) => {
-                            for (uid, href, etag) in &outcome.upserts_pushed {
-                                if let Err(err) = this.store.mark_caldav_event_clean(id, uid, href, etag.as_deref()) {
-                                    eprintln!("failed to mark CalDAV event clean: {err:#}");
-                                }
-                            }
-                            for uid in &outcome.deletes_pushed {
-                                if let Err(err) = this.store.remove_caldav_event(id, uid) {
-                                    eprintln!("failed to remove deleted CalDAV event: {err:#}");
-                                }
-                            }
-                            if let Err(err) = this.store.replace_caldav_snapshot(id, &url, &outcome.remote, outcome.sync_token.as_deref()) {
-                                eprintln!("failed to save CalDAV snapshot: {err:#}");
-                            }
-                        }
-                        Err(err) => {
-                            let msg = format!("{err:#}");
-                            if let Err(save_err) = this.store.save_subscription_feed(id, &url, Err(&msg)) {
-                                eprintln!("failed to save CalDAV sync error: {save_err:#}");
-                            }
+                    // Always persist every push/delete that succeeded remotely before recording
+                    // any partial error, so subsequent syncs never retry with a stale ETag.
+                    for (uid, href, etag) in &outcome.upserts_pushed {
+                        if let Err(err) = this.store.mark_caldav_event_clean(id, uid, href, etag.as_deref()) {
+                            eprintln!("failed to mark CalDAV event clean: {err:#}");
                         }
                     }
-                    this.load();
+                    for uid in &outcome.deletes_pushed {
+                        if let Err(err) = this.store.remove_caldav_event(id, uid) {
+                            eprintln!("failed to remove deleted CalDAV event: {err:#}");
+                        }
+                    }
+                    if let Some(remote) = &outcome.remote
+                        && let Err(err) = this.store.replace_caldav_snapshot(id, &url, remote, outcome.sync_token.as_deref())
+                    {
+                        eprintln!("failed to save CalDAV snapshot: {err:#}");
+                    }
+                    if !outcome.errors.is_empty() {
+                        let msg = outcome.errors.join("; ");
+                        if let Err(save_err) = this.store.save_subscription_feed(id, &url, Err(&msg)) {
+                            eprintln!("failed to save CalDAV sync error: {save_err:#}");
+                        }
+                    }
+                    this.reload_async(cx);
                     cx.notify();
                 })
                 .ok();
@@ -245,7 +306,7 @@ impl Feeds {
                 if let Err(err) = this.store.save_subscription_feed(id, &url, feed.as_deref().map_err(|_| error.as_deref().unwrap_or_default())) {
                     eprintln!("failed to keep the calendar feed: {err:#}");
                 }
-                this.load();
+                this.reload_async(cx);
                 cx.notify();
             })
             .ok();
@@ -287,13 +348,14 @@ impl Feeds {
                 Ok(feed)
             }).await;
             this.update(cx, |this, cx| {
-                this.finish_china_holiday_change(previous.as_ref().map(|(id, url)| (*id, url.as_str())), source, name, result);
+                this.apply_china_holiday_change(previous.as_ref().map(|(id, url)| (*id, url.as_str())), source, name, result);
+                this.reload_async(cx);
                 cx.notify();
             }).ok();
         }).detach();
     }
 
-    fn finish_china_holiday_change(
+    fn apply_china_holiday_change(
         &mut self,
         previous: Option<(Id, &str)>,
         source: ChinaHolidaySource,
@@ -326,13 +388,24 @@ impl Feeds {
                 ChinaHolidayStatus::Failed
             }
         };
+    }
+
+    #[cfg(test)]
+    fn finish_china_holiday_change(
+        &mut self,
+        previous: Option<(Id, &str)>,
+        source: ChinaHolidaySource,
+        name: &str,
+        result: Result<String>,
+    ) {
+        self.apply_china_holiday_change(previous, source, name, result);
         self.load();
     }
 
     pub fn add(&mut self, name: &str, url: &str, color: Option<&str>, cx: &mut Context<Self>) {
         match self.store.add_subscription(name, url, color) {
             Ok(id) => {
-                self.load();
+                self.reload_async(cx);
                 self.read(id, cx);
             }
             Err(err) => eprintln!("failed to subscribe to the calendar: {err:#}"),
@@ -345,7 +418,7 @@ impl Feeds {
         if let Err(err) = self.store.update_subscription(id, name, url, color, hidden) {
             eprintln!("failed to change the subscription: {err:#}");
         }
-        self.load();
+        self.reload_async(cx);
         if moved {
             self.reading.remove(&id);
             self.read(id, cx);
@@ -359,7 +432,7 @@ impl Feeds {
         } else {
             self.reading.remove(&id);
         }
-        self.load();
+        self.reload_async(cx);
         cx.notify();
     }
 
@@ -377,7 +450,7 @@ impl Feeds {
     ) {
         match self.store.add_caldav_subscription(name, url, color, provider, username, password, writable) {
             Ok(id) => {
-                self.load();
+                self.reload_async(cx);
                 self.read(id, cx);
             }
             Err(err) => eprintln!("failed to add CalDAV calendar: {err:#}"),
@@ -405,7 +478,7 @@ impl Feeds {
         if let Err(err) = self.store.update_caldav_subscription(id, name, url, color, hidden, provider, username, password, writable) {
             eprintln!("failed to update CalDAV calendar: {err:#}");
         }
-        self.load();
+        self.reload_async(cx);
         if changed {
             self.reading.remove(&id);
             self.read(id, cx);
@@ -445,7 +518,7 @@ impl Feeds {
             .unwrap_or_else(|| caldav::event_href(&cal_url, &draft.uid));
         let ics = ical::serialize_event(draft);
         self.store.upsert_local_calendar_event(subscription_id, &draft.uid, &existing_href, &ics)?;
-        self.load();
+        self.reload_async(cx);
         cx.notify();
         self.reading.remove(&subscription_id);
         self.read(subscription_id, cx);
@@ -455,7 +528,7 @@ impl Feeds {
     /// Marks a writable CalDAV event for remote deletion and syncs immediately.
     pub fn delete_event(&mut self, subscription_id: Id, uid: &str, cx: &mut Context<Self>) -> Result<()> {
         self.store.mark_calendar_event_deleted(subscription_id, uid)?;
-        self.load();
+        self.reload_async(cx);
         cx.notify();
         self.reading.remove(&subscription_id);
         self.read(subscription_id, cx);
@@ -474,8 +547,18 @@ pub struct DiscoveredCalendar {
 struct CalDavSyncOutcome {
     upserts_pushed: Vec<(String, String, Option<String>)>,
     deletes_pushed: Vec<String>,
-    remote: Vec<StoredEvent>,
+    remote: Option<Vec<StoredEvent>>,
     sync_token: Option<String>,
+    errors: Vec<String>,
+}
+
+fn dav_agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(30)))
+        .http_status_as_error(false)
+        .allow_non_standard_methods(true)
+        .build()
+        .into()
 }
 
 /// Discovers CalDAV calendars under `url` via `PROPFIND` principal -> calendar-home-set -> calendars.
@@ -483,8 +566,10 @@ pub fn discover_caldav_calendars(url: &str, username: &str, password: &str) -> R
     let base_url = normalize_https_url(url);
     anyhow::ensure!(!base_url.is_empty(), "a CalDAV URL is required");
     let auth = caldav::auth_header(username, password);
+    let agent = dav_agent();
 
     let (status, _, body) = dav_request(
+        &agent,
         "PROPFIND",
         &base_url,
         auth.as_deref(),
@@ -518,6 +603,7 @@ pub fn discover_caldav_calendars(url: &str, username: &str, password: &str) -> R
     {
         let principal_url = caldav::resolve_href(&base_url, principal_href);
         let (p_status, _, p_body) = dav_request(
+            &agent,
             "PROPFIND",
             &principal_url,
             auth.as_deref(),
@@ -537,6 +623,7 @@ pub fn discover_caldav_calendars(url: &str, username: &str, password: &str) -> R
 
     let target_home = home_url.unwrap_or_else(|| base_url.clone());
     let (h_status, _, h_body) = dav_request(
+        &agent,
         "PROPFIND",
         &target_home,
         auth.as_deref(),
@@ -559,53 +646,105 @@ pub fn discover_caldav_calendars(url: &str, username: &str, password: &str) -> R
     Ok(listed)
 }
 
-fn sync_caldav_remote(sub: &Subscription, local_events: &[StoredEvent]) -> Result<CalDavSyncOutcome> {
-    let base_url = normalize_https_url(&sub.url);
-    let auth = caldav::auth_header(&sub.username, &sub.password);
-    let mut upserts_pushed = Vec::new();
-    let mut deletes_pushed = Vec::new();
-
-    if sub.writable {
-        for ev in local_events {
-            match ev.dirty {
-                EventDirty::Clean => {}
-                EventDirty::Upsert => {
-                    let target = if ev.href.is_empty() {
-                        caldav::event_href(&base_url, &ev.uid)
-                    } else {
-                        caldav::resolve_href(&base_url, &ev.href)
-                    };
-                    let (status, etag, _body) = dav_request(
-                        "PUT",
-                        &target,
-                        auth.as_deref(),
-                        None,
-                        Some("text/calendar; charset=utf-8"),
-                        ev.etag.as_deref(),
-                        &ev.ics,
-                    )?;
-                    anyhow::ensure!((200..300).contains(&status), "CalDAV PUT {target} returned HTTP {status}");
-                    upserts_pushed.push((ev.uid.clone(), target, etag.or_else(|| ev.etag.clone())));
-                }
-                EventDirty::Delete => {
-                    if !ev.href.is_empty() {
-                        let target = caldav::resolve_href(&base_url, &ev.href);
-                        let (status, _, _) = dav_request("DELETE", &target, auth.as_deref(), None, None, ev.etag.as_deref(), "")?;
-                        anyhow::ensure!(
-                            (200..300).contains(&status) || status == 404 || status == 410,
-                            "CalDAV DELETE {target} returned HTTP {status}"
-                        );
-                    }
-                    deletes_pushed.push(ev.uid.clone());
-                }
-            }
-        }
+fn push_caldav_upsert(
+    agent: &ureq::Agent,
+    base_url: &str,
+    auth: Option<&str>,
+    ev: &StoredEvent,
+) -> Result<(String, String, Option<String>)> {
+    let target = if ev.href.is_empty() {
+        caldav::event_href(base_url, &ev.uid)
+    } else {
+        caldav::resolve_href(base_url, &ev.href)
+    };
+    let (status, etag, _body) = dav_request(
+        agent,
+        "PUT",
+        &target,
+        auth,
+        None,
+        Some("text/calendar; charset=utf-8"),
+        ev.etag.as_deref(),
+        &ev.ics,
+    )?;
+    if (200..300).contains(&status) {
+        return Ok((ev.uid.clone(), target, etag.or_else(|| ev.etag.clone())));
     }
+    if status == 412 {
+        // Precondition Failed: refresh the server's current ETag (or detect remote deletion)
+        // and retry once so a stale ETag never permanently wedges two-way sync.
+        let (g_status, fresh_etag, _g_body) = dav_request(agent, "GET", &target, auth, None, None, None, "")?;
+        let retry_if_match = if g_status == 404 || g_status == 410 {
+            None
+        } else if (200..300).contains(&g_status) {
+            fresh_etag.as_deref()
+        } else {
+            anyhow::bail!("CalDAV PUT {target} returned HTTP 412 and refresh GET returned HTTP {g_status}");
+        };
+        let (r_status, r_etag, _r_body) = dav_request(
+            agent,
+            "PUT",
+            &target,
+            auth,
+            None,
+            Some("text/calendar; charset=utf-8"),
+            retry_if_match,
+            &ev.ics,
+        )?;
+        anyhow::ensure!(
+            (200..300).contains(&r_status),
+            "CalDAV PUT {target} failed after 412 retry with HTTP {r_status}"
+        );
+        return Ok((ev.uid.clone(), target, r_etag.or(fresh_etag)));
+    }
+    anyhow::bail!("CalDAV PUT {target} returned HTTP {status}");
+}
 
+fn push_caldav_delete(
+    agent: &ureq::Agent,
+    base_url: &str,
+    auth: Option<&str>,
+    ev: &StoredEvent,
+) -> Result<()> {
+    if ev.href.is_empty() {
+        return Ok(());
+    }
+    let target = caldav::resolve_href(base_url, &ev.href);
+    let (status, _, _) = dav_request(agent, "DELETE", &target, auth, None, None, ev.etag.as_deref(), "")?;
+    if (200..300).contains(&status) || status == 404 || status == 410 {
+        return Ok(());
+    }
+    if status == 412 {
+        let (g_status, fresh_etag, _) = dav_request(agent, "GET", &target, auth, None, None, None, "")?;
+        if g_status == 404 || g_status == 410 {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            (200..300).contains(&g_status),
+            "CalDAV DELETE {target} returned HTTP 412 and refresh GET returned HTTP {g_status}"
+        );
+        let (r_status, _, _) = dav_request(agent, "DELETE", &target, auth, None, None, fresh_etag.as_deref(), "")?;
+        anyhow::ensure!(
+            (200..300).contains(&r_status) || r_status == 404 || r_status == 410,
+            "CalDAV DELETE {target} failed after 412 retry with HTTP {r_status}"
+        );
+        return Ok(());
+    }
+    anyhow::bail!("CalDAV DELETE {target} returned HTTP {status}");
+}
+
+fn pull_caldav_remote(
+    agent: &ureq::Agent,
+    sub: &Subscription,
+    base_url: &str,
+    auth: Option<&str>,
+    local_events: &[StoredEvent],
+) -> Result<Vec<StoredEvent>> {
     let (status, _, body) = dav_request(
+        agent,
         "REPORT",
-        &base_url,
-        auth.as_deref(),
+        base_url,
+        auth,
         Some("1"),
         Some("application/xml; charset=utf-8"),
         None,
@@ -618,11 +757,11 @@ fn sync_caldav_remote(sub: &Subscription, local_events: &[StoredEvent]) -> Resul
             if res.is_collection || res.is_calendar {
                 continue;
             }
-            let resolved_href = caldav::resolve_href(&base_url, &res.href);
+            let resolved_href = caldav::resolve_href(base_url, &res.href);
             let data = if let Some(ics) = res.calendar_data {
                 ics
             } else if res.href.ends_with(".ics") {
-                let (g_status, _, g_body) = dav_request("GET", &resolved_href, auth.as_deref(), None, None, None, "")?;
+                let (g_status, _, g_body) = dav_request(agent, "GET", &resolved_href, auth, None, None, None, "")?;
                 if !(200..300).contains(&g_status) {
                     continue;
                 }
@@ -644,29 +783,36 @@ fn sync_caldav_remote(sub: &Subscription, local_events: &[StoredEvent]) -> Resul
     } else if status == 405 || status == 501 || status == 400 {
         // Fallback: PROPFIND Depth:1 + GET for servers without REPORT calendar-query.
         let (p_status, _, p_body) = dav_request(
+            agent,
             "PROPFIND",
-            &base_url,
-            auth.as_deref(),
+            base_url,
+            auth,
             Some("1"),
             Some("application/xml; charset=utf-8"),
             None,
             caldav::propfind_etags_body(),
         )?;
         anyhow::ensure!(p_status == 207 || p_status == 200, "CalDAV PROPFIND {base_url} returned HTTP {p_status}");
+        let clean_by_href: HashMap<&str, &StoredEvent> = local_events
+            .iter()
+            .filter(|e| e.dirty == EventDirty::Clean)
+            .map(|e| (e.href.as_str(), e))
+            .collect();
         for res in caldav::parse_multistatus(&p_body) {
             if res.is_collection || !res.href.ends_with(".ics") {
                 continue;
             }
-            let resolved_href = caldav::resolve_href(&base_url, &res.href);
-            let cached_same = local_events.iter().find(|e| {
-                e.dirty == EventDirty::Clean
-                    && e.href == resolved_href
-                    && e.etag.as_deref().zip(res.etag.as_deref()).is_some_and(|(a, b)| caldav::normalize_etag(a) == caldav::normalize_etag(b))
+            let resolved_href = caldav::resolve_href(base_url, &res.href);
+            let cached_same = clean_by_href.get(resolved_href.as_str()).copied().filter(|e| {
+                e.etag
+                    .as_deref()
+                    .zip(res.etag.as_deref())
+                    .is_some_and(|(a, b)| caldav::normalize_etag(a) == caldav::normalize_etag(b))
             });
             let (etag, data) = if let Some(cached) = cached_same {
                 (cached.etag.clone(), cached.ics.clone())
             } else {
-                let (g_status, g_etag, g_body) = dav_request("GET", &resolved_href, auth.as_deref(), None, None, None, "")?;
+                let (g_status, g_etag, g_body) = dav_request(agent, "GET", &resolved_href, auth, None, None, None, "")?;
                 if !(200..300).contains(&g_status) {
                     continue;
                 }
@@ -687,7 +833,42 @@ fn sync_caldav_remote(sub: &Subscription, local_events: &[StoredEvent]) -> Resul
         anyhow::bail!("CalDAV REPORT {base_url} returned HTTP {status}");
     }
 
-    Ok(CalDavSyncOutcome { upserts_pushed, deletes_pushed, remote, sync_token: None })
+    Ok(remote)
+}
+
+fn sync_caldav_remote(sub: &Subscription, local_events: &[StoredEvent]) -> CalDavSyncOutcome {
+    let base_url = normalize_https_url(&sub.url);
+    let auth = caldav::auth_header(&sub.username, &sub.password);
+    let agent = dav_agent();
+    let mut upserts_pushed = Vec::new();
+    let mut deletes_pushed = Vec::new();
+    let mut errors = Vec::new();
+
+    if sub.writable {
+        for ev in local_events {
+            match ev.dirty {
+                EventDirty::Clean => {}
+                EventDirty::Upsert => match push_caldav_upsert(&agent, &base_url, auth.as_deref(), ev) {
+                    Ok(pushed) => upserts_pushed.push(pushed),
+                    Err(err) => errors.push(format!("{err:#}")),
+                },
+                EventDirty::Delete => match push_caldav_delete(&agent, &base_url, auth.as_deref(), ev) {
+                    Ok(()) => deletes_pushed.push(ev.uid.clone()),
+                    Err(err) => errors.push(format!("{err:#}")),
+                },
+            }
+        }
+    }
+
+    let remote = match pull_caldav_remote(&agent, sub, &base_url, auth.as_deref(), local_events) {
+        Ok(events) => Some(events),
+        Err(err) => {
+            errors.push(format!("{err:#}"));
+            None
+        }
+    };
+
+    CalDavSyncOutcome { upserts_pushed, deletes_pushed, remote, sync_token: None, errors }
 }
 
 fn first_event_uid(ics: &str, fallback_href: &str) -> Option<String> {
@@ -713,7 +894,9 @@ fn normalize_https_url(url: &str) -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dav_request(
+    agent: &ureq::Agent,
     method: &str,
     url: &str,
     auth: Option<&str>,
@@ -722,12 +905,6 @@ fn dav_request(
     if_match: Option<&str>,
     body: &str,
 ) -> Result<(u16, Option<String>, String)> {
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_global(Some(Duration::from_secs(30)))
-        .http_status_as_error(false)
-        .allow_non_standard_methods(true)
-        .build()
-        .into();
     let mut builder = ureq::http::Request::builder()
         .method(method)
         .uri(url)
@@ -999,8 +1176,9 @@ mod tests {
         let sub = store.subscriptions()?.into_iter().find(|s| s.id == sub_id).unwrap();
 
         // 1. Initial pull fetches remote-1.
-        let out1 = sync_caldav_remote(&sub, &[])?;
-        store.replace_caldav_snapshot(sub_id, &sub.url, &out1.remote, None)?;
+        let out1 = sync_caldav_remote(&sub, &[]);
+        assert!(out1.errors.is_empty(), "{:?}", out1.errors);
+        store.replace_caldav_snapshot(sub_id, &sub.url, out1.remote.as_deref().unwrap(), None)?;
         assert_eq!(ical::parse(&store.subscriptions()?[0].feed).len(), 1);
 
         // 2. Local upsert + remote delete via two-way sync.
@@ -1021,19 +1199,144 @@ mod tests {
         store.mark_calendar_event_deleted(sub_id, "remote-1")?;
 
         let local = store.calendar_events(sub_id)?;
-        let out2 = sync_caldav_remote(&sub, &local)?;
+        let out2 = sync_caldav_remote(&sub, &local);
+        assert!(out2.errors.is_empty(), "{:?}", out2.errors);
         for (uid, href, etag) in &out2.upserts_pushed {
             store.mark_caldav_event_clean(sub_id, uid, href, etag.as_deref())?;
         }
         for uid in &out2.deletes_pushed {
             store.remove_caldav_event(sub_id, uid)?;
         }
-        store.replace_caldav_snapshot(sub_id, &sub.url, &out2.remote, None)?;
+        store.replace_caldav_snapshot(sub_id, &sub.url, out2.remote.as_deref().unwrap(), None)?;
 
         let final_events = ical::parse(&store.subscriptions()?[0].feed);
         assert_eq!(final_events.len(), 1);
         assert_eq!(final_events[0].uid, "local-1");
         assert!(auth_seen.lock().unwrap().iter().any(|h| h.starts_with("Basic ")));
+        let _ = handle.join();
+        Ok(())
+    }
+
+    #[test]
+    fn caldav_partial_push_preserves_succeeded_etag_when_later_op_fails() -> Result<()> {
+        let store = Rc::new(Store::open_in_memory()?);
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_ip().unwrap();
+        let cal_url = format!("http://{addr}/dav/cal/");
+
+        let handle = std::thread::spawn(move || {
+            for req in server.incoming_requests().take(3) {
+                let path = req.url().to_owned();
+                let method = req.method().as_str().to_owned();
+                match (method.as_str(), path.as_str()) {
+                    ("PUT", "/dav/cal/ok-event.ics") => {
+                        let resp = tiny_http::Response::from_string("")
+                            .with_status_code(201)
+                            .with_header(tiny_http::Header::from_bytes(&b"ETag"[..], &b"\"etag-new\""[..]).unwrap());
+                        let _ = req.respond(resp);
+                    }
+                    ("PUT", "/dav/cal/fail-event.ics") => {
+                        let _ = req.respond(tiny_http::Response::from_string("err").with_status_code(500));
+                    }
+                    ("REPORT", "/dav/cal/") => {
+                        let _ = req.respond(tiny_http::Response::from_string("err").with_status_code(500));
+                    }
+                    _ => {
+                        let _ = req.respond(tiny_http::Response::from_string("").with_status_code(404));
+                    }
+                }
+            }
+        });
+
+        let sub_id = store.add_caldav_subscription("Work", &cal_url, None, CalendarProvider::CalDav, "u", "p", true)?;
+        let sub = store.subscriptions()?.into_iter().find(|s| s.id == sub_id).unwrap();
+        let make_ics = |uid: &str| {
+            format!(
+                "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:{uid}\r\nSUMMARY:{uid}\r\nDTSTART:20261110T090000\r\nDTEND:20261110T100000\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+            )
+        };
+        store.upsert_local_calendar_event(sub_id, "ok-event", &caldav::event_href(&cal_url, "ok-event"), &make_ics("ok-event"))?;
+        store.upsert_local_calendar_event(sub_id, "fail-event", &caldav::event_href(&cal_url, "fail-event"), &make_ics("fail-event"))?;
+
+        let local = store.calendar_events(sub_id)?;
+        let outcome = sync_caldav_remote(&sub, &local);
+        assert_eq!(outcome.upserts_pushed.len(), 1);
+        assert_eq!(outcome.upserts_pushed[0].0, "ok-event");
+        assert_eq!(outcome.upserts_pushed[0].2.as_deref(), Some("\"etag-new\""));
+        assert!(outcome.remote.is_none());
+        assert_eq!(outcome.errors.len(), 2);
+
+        for (uid, href, etag) in &outcome.upserts_pushed {
+            store.mark_caldav_event_clean(sub_id, uid, href, etag.as_deref())?;
+        }
+        let after = store.calendar_events(sub_id)?;
+        let ok_ev = after.iter().find(|e| e.uid == "ok-event").unwrap();
+        let fail_ev = after.iter().find(|e| e.uid == "fail-event").unwrap();
+        assert_eq!(ok_ev.dirty, EventDirty::Clean);
+        assert_eq!(ok_ev.etag.as_deref(), Some("\"etag-new\""));
+        assert_eq!(fail_ev.dirty, EventDirty::Upsert);
+
+        let _ = handle.join();
+        Ok(())
+    }
+
+    #[test]
+    fn caldav_412_precondition_failed_recovers_via_etag_refresh() -> Result<()> {
+        let store = Rc::new(Store::open_in_memory()?);
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_ip().unwrap();
+        let cal_url = format!("http://{addr}/dav/cal/");
+
+        let handle = std::thread::spawn(move || {
+            for req in server.incoming_requests().take(4) {
+                let method = req.method().as_str().to_owned();
+                let path = req.url().to_owned();
+                let if_match = req
+                    .headers()
+                    .iter()
+                    .find(|h| h.field.equiv("If-Match"))
+                    .map(|h| h.value.to_string());
+                match (method.as_str(), path.as_str()) {
+                    ("PUT", "/dav/cal/conflict.ics") if if_match.as_deref() == Some("\"stale\"") => {
+                        let _ = req.respond(tiny_http::Response::from_string("").with_status_code(412));
+                    }
+                    ("GET", "/dav/cal/conflict.ics") => {
+                        let resp = tiny_http::Response::from_string(FEED)
+                            .with_status_code(200)
+                            .with_header(tiny_http::Header::from_bytes(&b"ETag"[..], &b"\"fresh\""[..]).unwrap());
+                        let _ = req.respond(resp);
+                    }
+                    ("PUT", "/dav/cal/conflict.ics") if if_match.as_deref() == Some("\"fresh\"") => {
+                        let resp = tiny_http::Response::from_string("")
+                            .with_status_code(204)
+                            .with_header(tiny_http::Header::from_bytes(&b"ETag"[..], &b"\"updated\""[..]).unwrap());
+                        let _ = req.respond(resp);
+                    }
+                    ("REPORT", "/dav/cal/") => {
+                        let xml = r#"<?xml version="1.0"?><d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"></d:multistatus>"#;
+                        let _ = req.respond(tiny_http::Response::from_string(xml).with_status_code(207));
+                    }
+                    _ => {
+                        let _ = req.respond(tiny_http::Response::from_string("").with_status_code(500));
+                    }
+                }
+            }
+        });
+
+        let sub_id = store.add_caldav_subscription("Work", &cal_url, None, CalendarProvider::CalDav, "u", "p", true)?;
+        let sub = store.subscriptions()?.into_iter().find(|s| s.id == sub_id).unwrap();
+        let ev = StoredEvent {
+            subscription_id: sub_id,
+            uid: "conflict".into(),
+            href: format!("{cal_url}conflict.ics"),
+            etag: Some("\"stale\"".into()),
+            ics: FEED.into(),
+            dirty: EventDirty::Upsert,
+        };
+        let outcome = sync_caldav_remote(&sub, &[ev]);
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert_eq!(outcome.upserts_pushed.len(), 1);
+        assert_eq!(outcome.upserts_pushed[0].2.as_deref(), Some("\"updated\""));
         let _ = handle.join();
         Ok(())
     }

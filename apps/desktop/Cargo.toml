@@ -43,12 +43,16 @@ ureq.workspace = true
 windows.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
+block2.workspace = true
+dispatch2.workspace = true
 objc2.workspace = true
 objc2-app-kit.workspace = true
 objc2-core-foundation.workspace = true
 objc2-foundation.workspace = true
+objc2-user-notifications.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
+async-io.workspace = true
 ksni.workspace = true
 resvg.workspace = true
 x11rb.workspace = true

@@ -52,9 +52,12 @@ todo_ui = { path = "crates/todo_ui" }
 ui = { path = "crates/ui" }
 
 anyhow = "1"
+async-io = "2"
+block2 = "0.6"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 chrono-tz = "0.10.4"
 dirs = "6"
+dispatch2 = "0.3"
 futures = "0.3"
 hex = "0.4"
 ksni = { version = "0.3", default-features = false, features = ["blocking", "async-io"] }
@@ -80,11 +83,31 @@ objc2-app-kit = { version = "0.3", features = [
 ] }
 objc2-core-foundation = "0.3"
 objc2-foundation = { version = "0.3", features = [
+    "NSArray",
+    "NSBundle",
     "NSData",
+    "NSError",
     "NSGeometry",
+    "NSNotification",
     "NSObject",
+    "NSSet",
     "NSString",
+    "NSURL",
     "objc2-core-foundation",
+] }
+objc2-user-notifications = { version = "0.3", default-features = false, features = [
+    "UNNotification",
+    "UNNotificationAction",
+    "UNNotificationCategory",
+    "UNNotificationContent",
+    "UNNotificationRequest",
+    "UNNotificationResponse",
+    "UNNotificationSettings",
+    "UNNotificationSound",
+    "UNNotificationTrigger",
+    "UNUserNotificationCenter",
+    "block2",
+    "std",
 ] }
 raw-window-handle = "0.6"
 resvg = "0.46"
@@ -104,7 +127,7 @@ sys-locale = "0.3"
 uuid = { version = "1", features = ["v7", "serde"] }
 walkdir = "2"
 winresource = "0.1"
-x11rb = "0.13"
+x11rb = { version = "0.13", features = ["randr"] }
 zip = { version = "9.5", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 windows = { version = "0.62", features = [
     "Data_Xml_Dom",

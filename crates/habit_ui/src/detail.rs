@@ -799,6 +799,10 @@ impl HabitView {
         let goal_line_color = theme.colors().text_muted.opacity(0.45);
         let track_color = theme.colors().border.opacity(0.25);
         let values_paint = values.clone();
+        let unit = habit.goal.as_ref().map(|g| g.unit.as_str()).unwrap_or("");
+        let unit_suffix = if unit.is_empty() { String::new() } else { format!(" {unit}") };
+        let goal_str = format_amount(goal_amount);
+        let hover_bg = theme.colors().element_hover.opacity(0.35);
 
         v_flex()
             .p_3()
@@ -810,17 +814,14 @@ impl HabitView {
                     .justify_between()
                     .child(Label::new(strings.habit_daily_goals).size(LabelSize::Small).weight(FontWeight::MEDIUM))
                     .child(
-                        Label::new(format!(
-                            "{} {}",
-                            format_amount(goal_amount),
-                            habit.goal.as_ref().map(|g| g.unit.as_str()).unwrap_or("")
-                        ))
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
+                        Label::new(format!("{goal_str}{unit_suffix}"))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
                     ),
             )
             .child(
                 div()
+                    .relative()
                     .h(px(110.))
                     .w_full()
                     .child(
@@ -870,7 +871,24 @@ impl HabitView {
                             },
                         )
                         .size_full(),
-                    ),
+                    )
+                    .child(h_flex().absolute().inset_0().children((0..days_in_month).map(|i| {
+                        let day = first + chrono::Duration::days(i as i64);
+                        let tip = format!(
+                            "{} · {}/{}{}",
+                            calendar::format_date(day, strings),
+                            format_amount(values[i]),
+                            goal_str,
+                            unit_suffix
+                        );
+                        div()
+                            .id(SharedString::from(format!("habit-goal-bar-{i}")))
+                            .flex_1()
+                            .h_full()
+                            .rounded(px(3.))
+                            .hover(move |s| s.bg(hover_bg))
+                            .tooltip(Tooltip::text(tip))
+                    }))),
             )
             .child(
                 h_flex().justify_between().children([1, 5, 10, 15, 20, 25, days_in_month].into_iter().map(|d| {

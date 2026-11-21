@@ -2016,15 +2016,27 @@ impl FocusView {
             crate::task_rows::short_date(page.week, strings),
             crate::task_rows::short_date(page.week + chrono::Duration::days(6), strings)
         );
-        let bars = |values: Vec<i64>, top: f32, labels: Vec<String>, highlight: Option<usize>| {
+        let bars = |values: Vec<i64>, top: f32, labels: Vec<String>, tooltips: Vec<String>, highlight: Option<usize>| {
             v_flex()
                 .gap_1()
-                .child(h_flex().h(px(CHART)).items_end().gap_1().children(values.iter().enumerate().map(|(i, v)| {
+                .child(h_flex().h(px(CHART)).gap_1().children(values.iter().enumerate().map(|(i, v)| {
                     div()
+                        .id(SharedString::from(format!("most-focused-bar-{i}")))
                         .flex_1()
-                        .h(px((CHART * *v as f32 / top).max(if *v > 0 { 2. } else { 0. })))
-                        .rounded_t(px(3.))
-                        .bg(if highlight == Some(i) { theme.colors().accent } else { theme.colors().accent.opacity(0.6) })
+                        .h_full()
+                        .flex()
+                        .flex_col()
+                        .justify_end()
+                        .rounded(px(3.))
+                        .hover(|s| s.bg(theme.colors().element_hover.opacity(0.35)))
+                        .when_some(tooltips.get(i).cloned(), |el, tip| el.tooltip(Tooltip::text(tip)))
+                        .child(
+                            div()
+                                .w_full()
+                                .h(px((CHART * *v as f32 / top).max(if *v > 0 { 2. } else { 0. })))
+                                .rounded_t(px(3.))
+                                .bg(if highlight == Some(i) { theme.colors().accent } else { theme.colors().accent.opacity(0.6) }),
+                        )
                 })))
                 .child(h_flex().gap_1().children(labels.into_iter().map(|l| {
                     div().flex_1().flex().justify_center().child(Label::new(l).size(LabelSize::XSmall).color(Color::Muted))
@@ -2102,11 +2114,35 @@ impl FocusView {
                                 div().absolute().left_0().right_0().top(px(TIMELINE * i as f32 / 6.)).h(px(1.)).bg(grid_line)
                             }))
                             .child(h_flex().size_full().children((0..7).map(|day| {
-                                div().flex_1().h_full().relative().children(blocks.iter().filter(|(d, _, _)| *d == day).map(|(_, from, to)| {
-                                    let top = TIMELINE * *from as f32 / 1440.;
-                                    let height = (TIMELINE * (to - from) as f32 / 1440.).max(2.);
-                                    div().absolute().left(px(4.)).right(px(4.)).top(px(top)).h(px(height)).rounded(px(2.)).bg(accent)
-                                }))
+                                let weekday = crate::calendar::weekday_labels(&strings.weekdays_short)[day];
+                                div().flex_1().h_full().relative().children(
+                                    blocks.iter().filter(|(d, _, _)| *d == day).enumerate().map(|(idx, (_, from, to))| {
+                                        let top = TIMELINE * *from as f32 / 1440.;
+                                        let height = (TIMELINE * (to - from) as f32 / 1440.).max(2.);
+                                        let fmt_min = |m: i64| {
+                                            let clamped = m.clamp(0, 1439) as u32;
+                                            chrono::NaiveTime::from_hms_opt(clamped / 60, clamped % 60, 0)
+                                                .map(|t| crate::calendar::format_time(t, strings))
+                                                .unwrap_or_default()
+                                        };
+                                        let tip = format!(
+                                            "{weekday} · {}–{} ({})",
+                                            fmt_min(i64::from(*from)),
+                                            fmt_min(i64::from(*to)),
+                                            format_minutes(i64::from(to.saturating_sub(*from)))
+                                        );
+                                        div()
+                                            .id(SharedString::from(format!("focus-timeline-{day}-{idx}")))
+                                            .absolute()
+                                            .left(px(4.))
+                                            .right(px(4.))
+                                            .top(px(top))
+                                            .h(px(height))
+                                            .rounded(px(2.))
+                                            .bg(accent)
+                                            .tooltip(Tooltip::text(tip))
+                                    }),
+                                )
                             }))),
                     ),
             )
@@ -2137,6 +2173,11 @@ impl FocusView {
                 hours.to_vec(),
                 hours_top,
                 (0..24).map(|h| if h % 3 == 0 { format!("{h:02}") } else { String::new() }).collect(),
+                hours
+                    .iter()
+                    .enumerate()
+                    .map(|(h, m)| format!("{} · {}", crate::calendar::format_hour(h as u32, strings), format_minutes(*m)))
+                    .collect(),
                 most,
             ));
 
@@ -2184,7 +2225,16 @@ impl FocusView {
                     .child(h_flex().gap(px(3.)).children((0..columns).map(|column| {
                         v_flex().gap(px(3.)).children((0..PER_COLUMN).map(|row| {
                             let index = column * PER_COLUMN + row;
-                            div().size(px(CELL)).rounded(px(2.)).when(index < in_year, |el| el.bg(shade(year_days[index])))
+                            div()
+                                .id(SharedString::from(format!("focus-year-cell-{index}")))
+                                .size(px(CELL))
+                                .rounded(px(2.))
+                                .when(index < in_year, |el| {
+                                    let day = first + chrono::Duration::days(index as i64);
+                                    let mins = year_days[index];
+                                    let tip = format!("{} · {}", crate::calendar::format_date(day, strings), format_minutes(mins));
+                                    el.bg(shade(mins)).tooltip(Tooltip::text(tip))
+                                })
                         }))
                     })))
                     .child(v_flex().gap_0p5().children(legend.map(|(minutes, label)| {

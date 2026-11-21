@@ -1643,6 +1643,44 @@ impl FocusView {
                                     .on_click(cx.listener(|this, _, _, cx| this.set_minutes(DAILY_GOAL_SETTING, 15, cx))),
                             )
                     })
+                    .child({
+                        let current = desktop_common::sound::white_noise(&self.store);
+                        let label = strings.focus_white_noise_names[current.index()];
+                        h_flex()
+                            .id("focus-white-noise-setting")
+                            .min_h(px(30.))
+                            .gap_2()
+                            .cursor_pointer()
+                            .child(div().flex_1().child(Label::new(strings.focus_white_noise).size(LabelSize::Small)))
+                            .child(
+                                div()
+                                    .px_2()
+                                    .py_0p5()
+                                    .rounded(px(5.))
+                                    .bg(if current != desktop_common::sound::WhiteNoise::Off {
+                                        cx.theme().colors().accent.opacity(0.15)
+                                    } else {
+                                        cx.theme().colors().element_hover
+                                    })
+                                    .child(
+                                        Label::new(label).size(LabelSize::XSmall).color(
+                                            if current != desktop_common::sound::WhiteNoise::Off {
+                                                Color::Accent
+                                            } else {
+                                                Color::Muted
+                                            },
+                                        ),
+                                    ),
+                            )
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                let next = current.next();
+                                if let Err(err) = desktop_common::sound::set_white_noise(&this.store, next) {
+                                    eprintln!("failed to save white noise setting: {err:#}");
+                                }
+                                this.sync_ambient_sound();
+                                cx.notify();
+                            }))
+                    })
                     .child(self.render_automation(cx))
                     .into_any_element()
             }
@@ -3720,10 +3758,26 @@ impl FocusView {
             .child(right)
             .into_any_element()
     }
+
+    fn sync_ambient_sound(&self) {
+        let active = self
+            .running
+            .as_ref()
+            .is_some_and(|r| !r.timer.is_paused() && r.on_break.is_none());
+        let preset = desktop_common::sound::white_noise(&self.store);
+        desktop_common::sound::sync_white_noise(active, preset);
+    }
+}
+
+impl Drop for FocusView {
+    fn drop(&mut self) {
+        desktop_common::sound::stop_white_noise();
+    }
 }
 
 impl Render for FocusView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_ambient_sound();
         if let Some(page) = self.stats {
             return self.render_stats(page, cx);
         }
@@ -3897,6 +3951,37 @@ impl Render for FocusView {
                     )
                     // Pomo or Stopwatch, chosen while no timer runs.
                     .when(!running, |el| el.child(self.render_mode_switch(LabelSize::XSmall, cx)))
+                    .child({
+                        let noise = desktop_common::sound::white_noise(&self.store);
+                        let active_noise = noise != desktop_common::sound::WhiteNoise::Off;
+                        let name = strings.focus_white_noise_names[noise.index()];
+                        h_flex()
+                            .id("focus-white-noise-btn")
+                            .h(px(28.))
+                            .px_2()
+                            .gap_1()
+                            .rounded(px(6.))
+                            .cursor_pointer()
+                            .when(active_noise, |el| el.bg(theme.colors().accent.opacity(0.14)))
+                            .hover(|s| s.bg(theme.colors().ghost_element_hover))
+                            .tooltip(Tooltip::text(format!("{}: {name}", strings.focus_white_noise)))
+                            .child(
+                                Icon::new(IconName::Bell)
+                                    .size(IconSize::XSmall)
+                                    .color(if active_noise { Color::Accent } else { Color::Muted }),
+                            )
+                            .when(active_noise, |el| {
+                                el.child(Label::new(name).size(LabelSize::XSmall).color(Color::Accent))
+                            })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                let next = noise.next();
+                                if let Err(err) = desktop_common::sound::set_white_noise(&this.store, next) {
+                                    eprintln!("failed to save white noise setting: {err:#}");
+                                }
+                                this.sync_ambient_sound();
+                                cx.notify();
+                            }))
+                    })
                     .when(running, |el| {
                         el.child(
                             IconButton::new("focus-stop", IconName::Square)

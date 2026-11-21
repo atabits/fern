@@ -38,9 +38,9 @@ pub fn open(focus: Entity<FocusView>, cx: &mut App) {
             cx.observe(&focus, |_, _, cx| cx.notify()).detach();
             #[cfg(windows)]
             desktop_common::sticky_windows::set_topmost(window, true);
-            #[cfg(not(windows))]
-            let _ = window;
-            FocusMini { focus, pinned: cfg!(windows), should_move: false }
+            let focus_handle = cx.focus_handle();
+            window.focus(&focus_handle, cx);
+            FocusMini { focus, focus_handle, pinned: cfg!(windows), should_move: false }
         })
     });
     match opened {
@@ -62,6 +62,7 @@ pub fn toggle(focus: Entity<FocusView>, cx: &mut App) {
 
 pub struct FocusMini {
     focus: Entity<FocusView>,
+    focus_handle: gpui::FocusHandle,
     /// Kept over the other windows by its pin (Windows).
     pinned: bool,
     /// Linux and macOS: a press turns into a window move once the mouse moves.
@@ -82,6 +83,22 @@ impl Render for FocusMini {
         v_flex()
             .relative()
             .size_full()
+            .track_focus(&self.focus_handle)
+            .on_key_down(cx.listener(move |this, event: &gpui::KeyDownEvent, window, cx| {
+                match event.keystroke.key.as_str() {
+                    "space" => {
+                        this.focus.update(cx, |focus, cx| {
+                            if running {
+                                focus.toggle_pause(cx);
+                            } else {
+                                focus.start_next(cx);
+                            }
+                        });
+                    }
+                    "escape" => window.remove_window(),
+                    _ => {}
+                }
+            }))
             .bg(theme.colors().background)
             .border_1()
             .border_color(theme.colors().border)
@@ -171,6 +188,7 @@ impl Render for FocusMini {
                     .child(
                         button("focus-mini-close", IconName::X)
                             .icon_color(Color::Muted)
+                            .tooltip(Tooltip::text(strings.close))
                             .on_click(|_, window, _| window.remove_window()),
                     ),
             )

@@ -820,8 +820,10 @@ impl AppView {
 
     fn render_account_menu(&self, cx: &mut Context<Self>) -> AnyElement {
         let strings = i18n::t(cx);
+        #[cfg(windows)]
+        let topmost = crate::tray::always_on_top(&self.store);
         popover(cx)
-            .min_w(px(180.))
+            .min_w(px(196.))
             .on_mouse_down_out(cx.listener(|this, _, _, cx| this.set_account_menu(false, cx)))
             .child(
                 ListItem::new("account-settings")
@@ -835,6 +837,38 @@ impl AppView {
                     .child(Label::new(strings.statistics))
                     .on_click(cx.listener(|this, _, _, cx| this.open_statistics(cx))),
             )
+            .child(
+                ListItem::new("account-shortcuts")
+                    .start_slot(Icon::new(IconName::Keyboard).color(Color::Icon))
+                    .child(Label::new(strings.shortcuts))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.account_menu_open = false;
+                        this.shortcuts_open = true;
+                        cx.notify();
+                    })),
+            )
+            .when(cfg!(windows), |el| {
+                #[cfg(windows)]
+                {
+                    el.child(div().my_1().child(Divider::horizontal())).child(
+                        ListItem::new("account-always-on-top")
+                            .start_slot(Icon::new(if topmost { IconName::PinOff } else { IconName::Pin }).color(if topmost { Color::Accent } else { Color::Icon }))
+                            .child(Label::new(strings.tray_always_on_top).color(if topmost { Color::Accent } else { Color::Default }))
+                            .when(topmost, |item| item.end_slot(Icon::new(IconName::Check).size(IconSize::Small).color(Color::Accent)))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.account_menu_open = false;
+                                if let Err(err) = crate::tray::set_always_on_top(&this.store, !topmost) {
+                                    eprintln!("failed to toggle always_on_top: {err:#}");
+                                }
+                                cx.notify();
+                            })),
+                    )
+                }
+                #[cfg(not(windows))]
+                {
+                    el
+                }
+            })
             .into_any_element()
     }
 
@@ -1831,7 +1865,7 @@ impl Render for AppView {
                 this.update(cx, |this, cx| this.start_rail_drag(section, cx)).ok();
             }
         };
-        let on_avatar = cx.listener(|this, _, _, cx| this.set_account_menu(true, cx));
+        let on_avatar = cx.listener(|this, _, _, cx| this.set_account_menu(!this.account_menu_open, cx));
         let account_menu = self.account_menu_open.then(|| {
             PopoverAttachment::new(Placement::RightTop, self.render_account_menu(cx)).into_any_element()
         });

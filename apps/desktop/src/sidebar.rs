@@ -197,6 +197,8 @@ pub fn render(
                 .items_center()
                 .justify_center()
                 .cursor_pointer()
+                .hover(|s| s.opacity(0.85))
+                .when(account_menu.is_none(), |el| el.tooltip(Tooltip::text(strings.settings)))
                 .on_click(on_avatar)
                 .child(Icon::new(IconName::User).color(colors.avatar_icon))
                 .children(account_menu),

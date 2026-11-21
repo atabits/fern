@@ -26,6 +26,8 @@ pub const PULL_EVERY: std::time::Duration = std::time::Duration::from_secs(5 * 6
 pub const PUSH_CHECK_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
 /// A request must finish reading its body within this time, even if the peer keeps sending bytes.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
+/// Maximum JSON sync response size (32 MiB) so a corrupt or hostile server cannot OOM the client.
+const MAX_SYNC_RESPONSE_BYTES: u64 = 32 * 1024 * 1024;
 
 fn sync_agent(timeout: Duration) -> ureq::Agent {
     ureq::Agent::config_builder().timeout_global(Some(timeout)).build().into()
@@ -41,12 +43,26 @@ pub fn attachment_error(error: &anyhow::Error, strings: &fern_i18n::Strings) -> 
 
 /// Sends one sync request and returns the server's answer. Blocking: run it off the UI thread.
 pub fn post(config: &SyncConfig, body: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
+    post_with_limit(&sync_agent(REQUEST_TIMEOUT), config, body, MAX_SYNC_RESPONSE_BYTES)
+}
+
+fn post_with_limit(
+    agent: &ureq::Agent,
+    config: &SyncConfig,
+    body: &serde_json::Value,
+    max_bytes: u64,
+) -> anyhow::Result<serde_json::Value> {
     let url = format!("{}/sync", config.server.trim().trim_end_matches('/'));
-    let mut response = sync_agent(REQUEST_TIMEOUT).post(&url)
+    let mut response = agent
+        .post(&url)
         .header("Authorization", &format!("Bearer {}", config.token))
         .header("Content-Type", "application/json")
         .send(body.to_string())?;
-    let text = response.body_mut().read_to_string()?;
+    let text = response
+        .body_mut()
+        .with_config()
+        .limit(max_bytes)
+        .read_to_string()?;
     Ok(serde_json::from_str(&text)?)
 }
 
@@ -399,5 +415,26 @@ mod tests {
         assert_eq!(std::fs::read(legacy.path(&phone_files)).unwrap(), b"plan");
         assert_eq!(phone.files_to_sync(&phone_files).unwrap(), (vec![], vec![]));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn post_rejects_oversized_response_body() -> anyhow::Result<()> {
+        let http = tiny_http::Server::http("127.0.0.1:0").map_err(anyhow::Error::msg)?;
+        let port = http.server_addr().to_ip().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            if let Ok(req) = http.recv() {
+                let big = format!(r#"{{"data":"{}"}}"#, "x".repeat(4096));
+                let _ = req.respond(tiny_http::Response::from_string(big));
+            }
+        });
+        let config = SyncConfig {
+            server: format!("http://127.0.0.1:{port}"),
+            token: "tok".into(),
+        };
+        let agent = sync_agent(Duration::from_secs(5));
+        let err = post_with_limit(&agent, &config, &serde_json::json!({}), 256);
+        let _ = handle.join();
+        assert!(err.is_err(), "oversized sync response must be rejected by limit");
+        Ok(())
     }
 }

@@ -4,13 +4,41 @@ use anyhow::{Context, Result, ensure};
 const REPORT_WIDTH: u32 = 1000;
 const MAX_REPORT_PIXELS: u64 = 32_000_000;
 
+/// XML 1.0 §2.2 legal character production: strips NUL, control chars (except TAB/LF/CR),
+/// and U+FFFE/U+FFFF which cause SVG XML parsing to fail.
+fn is_valid_xml_char(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{0009}' | '\u{000A}' | '\u{000D}' | '\u{0020}'..='\u{D7FF}' | '\u{E000}'..='\u{FFFD}' | '\u{10000}'..='\u{10FFFF}'
+    )
+}
+
+fn strip_illegal_xml_chars(text: &str) -> String {
+    text.chars().filter(|&ch| is_valid_xml_char(ch)).collect()
+}
+
 fn escape(text: &str) -> String {
-    text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if !is_valid_xml_char(ch) {
+            continue;
+        }
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 fn wrap(text: &str, limit: usize) -> Vec<String> {
+    let clean = strip_illegal_xml_chars(text);
     let mut lines = Vec::new();
-    for paragraph in text.lines() {
+    for paragraph in clean.lines() {
         let mut line = String::new();
         let mut count = 0;
         for word in paragraph.split_whitespace() {
@@ -108,5 +136,22 @@ mod tests {
         assert!(decoded.width() > REPORT_WIDTH);
         assert!(decoded.pixels().chunks_exact(decoded.width() as usize)
             .any(|row| row[REPORT_WIDTH as usize..].iter().any(|pixel| pixel.red() < 150)));
+    }
+
+    #[test]
+    fn image_strips_xml_illegal_control_chars() {
+        let dirty_heading = "Weekly\x00Report\x07\x08\x0B\x0C\x1F\u{FFFE}\u{FFFF}";
+        let dirty_group = "Group\x01Title\x1B";
+        let dirty_item = "Task\x00 with\x02 control\x1F chars & <tags> 'quoted'";
+        assert_eq!(escape("a\x00b\x1Fc&<>\"'"), "abc&amp;&lt;&gt;&quot;&apos;");
+        let bytes = render_png(
+            dirty_heading,
+            &[(dirty_group.into(), vec![dirty_item.into()])],
+            resvg::usvg::Options::default(),
+        )
+        .unwrap();
+        assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+        let decoded = resvg::tiny_skia::Pixmap::decode_png(&bytes).unwrap();
+        assert!(decoded.width() >= REPORT_WIDTH);
     }
 }

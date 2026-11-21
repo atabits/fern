@@ -90,6 +90,7 @@ pub struct TaskDetail {
     /// The bottom bar's "A": the Markdown toolbar for the description, and its headings menu.
     format_bar: bool,
     format_headings: bool,
+    copied_feedback: bool,
     /// The "…" menu's Start Focus side menu, while hovered open.
     focus_submenu: bool,
     title: Entity<TextInput>,
@@ -229,6 +230,7 @@ impl TaskDetail {
             comment_emoji: false,
             format_bar: false,
             format_headings: false,
+            copied_feedback: false,
             title,
             notes,
             tag_input,
@@ -361,6 +363,7 @@ impl TaskDetail {
         self.comment_emoji = false;
         self.format_headings = false;
         self.focus_submenu = false;
+        self.copied_feedback = false;
         self.session.task = task;
         self.session.popup = None;
         self.editor_window.popup_return_focus = None;
@@ -431,6 +434,21 @@ impl TaskDetail {
 
     /// The task's comments, as the original lists them under the task: the text, when it was
     /// written, and × on hover to delete it.
+    fn copy_to_clipboard(&mut self, text: String, cx: &mut Context<Self>) {
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+        self.copied_feedback = true;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(std::time::Duration::from_secs(2)).await;
+            this.update(cx, |this, cx| {
+                this.copied_feedback = false;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn toggle_markdown_check(&mut self, line_index: usize, cx: &mut Context<Self>) {
         let current = self.session.task.as_ref().map(|t| t.notes.clone()).unwrap_or_default();
         let Some((updated, checked)) = fern_core::markdown::toggle_check_line(&current, line_index) else {
@@ -1616,7 +1634,7 @@ impl TaskDetail {
             .child(self.close_side_menu_on_hover(item("more-copy-link", IconName::Link, strings.copy_link).on_click(cx.listener(|this, _, _, cx| {
                 this.close_popup(cx);
                 if let Some(task) = this.session.task.as_ref() {
-                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(fern_core::link::task_link(task.id)));
+                    this.copy_to_clipboard(fern_core::link::task_link(task.id), cx);
                 }
             })), cx))
             .child(self.close_side_menu_on_hover(item("more-copy-markdown", IconName::Code, strings.copy_markdown).on_click(cx.listener(|this, _, _, cx| {
@@ -1624,7 +1642,7 @@ impl TaskDetail {
                 if let Some(task) = this.session.task.as_ref() {
                     let checklist = this.session.store.checklist(task.id).unwrap_or_default();
                     let text = fern_core::markdown::format_task_markdown(task, &checklist, &this.session.subtasks);
-                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+                    this.copy_to_clipboard(text, cx);
                 }
             })), cx))
             .child(self.close_side_menu_on_hover(item("more-copy-plain", IconName::FileText, strings.copy_plain_text).on_click(cx.listener(|this, _, _, cx| {
@@ -1632,7 +1650,7 @@ impl TaskDetail {
                 if let Some(task) = this.session.task.as_ref() {
                     let checklist = this.session.store.checklist(task.id).unwrap_or_default();
                     let text = fern_core::markdown::format_task_plain_text(task, &checklist, &this.session.subtasks);
-                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+                    this.copy_to_clipboard(text, cx);
                 }
             })), cx))
             .when(is_note || (task.parent_id.is_none() && self.session.subtasks.is_empty()), |el| {
@@ -4188,6 +4206,18 @@ impl Render for TaskDetail {
                                     }),
                             ))
                             .child(div().flex_1())
+                            .when(self.copied_feedback, |bar| {
+                                bar.child(
+                                    h_flex()
+                                        .gap_1()
+                                        .px_2()
+                                        .py_0p5()
+                                        .rounded(px(4.))
+                                        .bg(theme.colors().accent.opacity(0.14))
+                                        .child(Icon::new(IconName::Check).size(IconSize::XSmall).color(Color::Accent))
+                                        .child(Label::new(strings.summary_copied).size(LabelSize::XSmall).color(Color::Accent)),
+                                )
+                            })
                             .when(!sticky, |bar| {
                                 let words = fern_core::markdown::count_words(self.notes.read(cx).text());
                                 bar.when(words > 0, |bar| {

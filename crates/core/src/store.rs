@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result};
 use chrono::{Duration, NaiveDate, NaiveDateTime, NaiveTime, TimeZone as _, Timelike as _};
-use rusqlite::{Connection, OptionalExtension, Row, params};
+use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
 use uuid::Uuid;
 
 use crate::attachment::PreparedAttachment;
@@ -1095,28 +1095,374 @@ const MIGRATIONS: &[&str] = &[
         );
     END;
     ",
+    // Outbox reliability (split completed/open task inserts, restore_task event, Safe Mode / pause
+    // guard, automatic growth cap) and plugin_entity_meta orphan cleanup triggers.
+    "
+    DROP TRIGGER IF EXISTS outbox_tasks_insert;
+    DROP TRIGGER IF EXISTS outbox_tasks_insert_completed;
+    DROP TRIGGER IF EXISTS outbox_tasks_completed;
+    DROP TRIGGER IF EXISTS outbox_tasks_reopened;
+    DROP TRIGGER IF EXISTS outbox_tasks_deleted;
+    DROP TRIGGER IF EXISTS outbox_tasks_restored;
+    DROP TRIGGER IF EXISTS outbox_tasks_purged;
+    DROP TRIGGER IF EXISTS outbox_tasks_updated;
+    DROP TRIGGER IF EXISTS outbox_habit_checkins_insert;
+    DROP TRIGGER IF EXISTS outbox_habit_checkins_update;
+    DROP TRIGGER IF EXISTS outbox_focus_sessions_insert;
+    DROP TRIGGER IF EXISTS outbox_focus_sessions_update;
+    DROP TRIGGER IF EXISTS outbox_cap_growth;
+
+    CREATE TRIGGER outbox_tasks_insert AFTER INSERT ON tasks
+    WHEN NEW.deleted_at IS NULL AND NEW.completed_at IS NULL
+        AND NOT EXISTS (
+            SELECT 1 FROM settings
+            WHERE (key = 'plugins_safe_mode' AND value = '1')
+               OR (key = 'plugins_outbox_paused' AND value = '1')
+        )
+    BEGIN
+        INSERT INTO plugin_outbox (event_kind, entity_id, origin_plugin, depth, at)
+        VALUES (
+            'task.created',
+            NEW.id,
+            CASE WHEN EXISTS (SELECT 1 FROM sync_applying) THEN '__sync__' ELSE (SELECT plugin_id FROM plugin_write_ctx LIMIT 1) END,
+            COALESCE((SELECT depth FROM plugin_write_ctx LIMIT 1), 0),
+            CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)
+        );
+    END;
+    CREATE TRIGGER outbox_tasks_insert_completed AFTER INSERT ON tasks
+    WHEN NEW.deleted_at IS NULL AND NEW.completed_at IS NOT NULL
+        AND NOT EXISTS (
+            SELECT 1 FROM settings
+            WHERE (key = 'plugins_safe_mode' AND value = '1')
+               OR (key = 'plugins_outbox_paused' AND value = '1')
+        )
+    BEGIN
+        INSERT INTO plugin_outbox (event_kind, entity_id, origin_plugin, depth, at)
+        VALUES (
+            'task.completed',
+            NEW.id,
+            CASE WHEN EXISTS (SELECT 1 FROM sync_applying) THEN '__sync__' ELSE (SELECT plugin_id FROM plugin_write_ctx LIMIT 1) END,
+            COALESCE((SELECT depth FROM plugin_write_ctx LIMIT 1), 0),
+            CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)
+        );
+    END;
+    CREATE TRIGGER outbox_tasks_completed AFTER UPDATE OF completed_at ON tasks
+    WHEN OLD.completed_at IS NULL AND NEW.completed_at IS NOT NULL
+        AND NOT EXISTS (
+            SELECT 1 FROM settings
+            WHERE (key = 'plugins_safe_mode' AND value = '1')
+               OR (key = 'plugins_outbox_paused' AND value = '1')
+        )
+    BEGIN
+        INSERT INTO plugin_outbox (event_kind, entity_id, origin_plugin, depth, at)
+        VALUES (
+            'task.completed',
+            NEW.id,
+            CASE WHEN EXISTS (SELECT 1 FROM sync_applying) THEN '__sync__' ELSE (SELECT plugin_id FROM plugin_write_ctx LIMIT 1) END,
+            COALESCE((SELECT depth FROM plugin_write_ctx LIMIT 1), 0),
+            CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)
+        );
+    END;
+    CREATE TRIGGER outbox_tasks_reopened AFTER UPDATE OF completed_at ON tasks
+    WHEN OLD.completed_at IS NOT NULL AND NEW.completed_at IS NULL
+        AND NOT EXISTS (
+            SELECT 1 FROM settings
+            WHERE (key = 'plugins_safe_mode' AND value = '1')
+               OR (key = 'plugins_outbox_paused' AND value = '1')
+        )
+    BEGIN
+        INSERT INTO plugin_outbox (event_kind, entity_id, origin_plugin, depth, at)
+        VALUES (
+            'task.reopened',
+            NEW.id,
+            CASE WHEN EXISTS (SELECT 1 FROM sync_applying) THEN '__sync__' ELSE (SELECT plugin_id FROM plugin_write_ctx LIMIT 1) END,
+            COALESCE((SELECT depth FROM plugin_write_ctx LIMIT 1), 0),
+            CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)
+        );
+    END;
+    CREATE TRIGGER outbox_tasks_deleted AFTER UPDATE OF deleted_at ON tasks
+    WHEN OLD.deleted_at IS NULL AND NEW.deleted_at IS NOT NULL
+        AND NOT EXISTS (
+            SELECT 1 FROM settings
+            WHERE (key = 'plugins_safe_mode' AND value = '1')
+               OR (key = 'plugins_outbox_paused' AND value = '1')
+        )
+    BEGIN
+        INSERT INTO plugin_outbox (event_kind, entity_id, origin_plugin, depth, at)
+        VALUES (
+            'task.deleted',
+            NEW.id,
+            CASE WHEN EXISTS (SELECT 1 FROM sync_applying) THEN '__sync__' ELSE (SELECT plugin_id FROM plugin_write_ctx LIMIT 1) END,
+            COALESCE((SELECT depth FROM plugin_write_ctx LIMIT 1), 0),
+            CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)
+        );
+    END;
+    CREATE TRIGGER outbox_tasks_restored AFTER UPDATE OF deleted_at ON tasks
+    WHEN OLD.deleted_at IS NOT NULL AND NEW.deleted_at IS NULL
+        AND NOT EXISTS (
+            SELECT 1 FROM settings
+            WHERE (key = 'plugins_safe_mode' AND value = '1')
+               OR (key = 'plugins_outbox_paused' AND value = '1')
+        )
+    BEGIN
+        INSERT INTO plugin_outbox (event_kind, entity_id, origin_plugin, depth, at)
+        VALUES (
+            'task.updated',
+            NEW.id,
+            CASE WHEN EXISTS (SELECT 1 FROM sync_applying) THEN '__sync__' ELSE (SELECT plugin_id FROM plugin_write_ctx LIMIT 1) END,
+            COALESCE((SELECT depth FROM plugin_write_ctx LIMIT 1), 0),
+            CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)
+        );
+    END;
+    CREATE TRIGGER outbox_tasks_purged AFTER DELETE ON tasks
+    WHEN OLD.deleted_at IS NULL
+        AND NOT EXISTS (
+            SELECT 1 FROM settings
+            WHERE (key = 'plugins_safe_mode' AND value = '1')
+               OR (key = 'plugins_outbox_paused' AND value = '1')
+        )
+    BEGIN
+        INSERT INTO plugin_outbox (event_kind, entity_id, origin_plugin, depth, at)
+        VALUES (
+            'task.deleted',
+            OLD.id,
+            CASE WHEN EXISTS (SELECT 1 FROM sync_applying) THEN '__sync__' ELSE (SELECT plugin_id FROM plugin_write_ctx LIMIT 1) END,
+            COALESCE((SELECT depth FROM plugin_write_ctx LIMIT 1), 0),
+            CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)
+        );
+    END;
+    CREATE TRIGGER outbox_tasks_updated AFTER UPDATE OF
+        title, notes, priority, due_date, due_time, end_date, end_time,
+        list_id, section_id, repeat, wont_do_at, start_date, schedule_bucket ON tasks
+    WHEN (
+            OLD.title IS NOT NEW.title
+            OR OLD.notes IS NOT NEW.notes
+            OR OLD.priority IS NOT NEW.priority
+            OR OLD.due_date IS NOT NEW.due_date
+            OR OLD.due_time IS NOT NEW.due_time
+            OR OLD.end_date IS NOT NEW.end_date
+            OR OLD.end_time IS NOT NEW.end_time
+            OR OLD.list_id IS NOT NEW.list_id
+            OR OLD.section_id IS NOT NEW.section_id
+            OR OLD.repeat IS NOT NEW.repeat
+            OR OLD.wont_do_at IS NOT NEW.wont_do_at
+            OR OLD.start_date IS NOT NEW.start_date
+            OR OLD.schedule_bucket IS NOT NEW.schedule_bucket
+        )
+        AND NOT EXISTS (
+            SELECT 1 FROM settings
+            WHERE (key = 'plugins_safe_mode' AND value = '1')
+               OR (key = 'plugins_outbox_paused' AND value = '1')
+        )
+    BEGIN
+        INSERT INTO plugin_outbox (event_kind, entity_id, origin_plugin, depth, at)
+        VALUES (
+            'task.updated',
+            NEW.id,
+            CASE WHEN EXISTS (SELECT 1 FROM sync_applying) THEN '__sync__' ELSE (SELECT plugin_id FROM plugin_write_ctx LIMIT 1) END,
+            COALESCE((SELECT depth FROM plugin_write_ctx LIMIT 1), 0),
+            CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)
+        );
+    END;
+    CREATE TRIGGER outbox_habit_checkins_insert AFTER INSERT ON habit_checkins
+    WHEN NOT EXISTS (
+        SELECT 1 FROM settings
+        WHERE (key = 'plugins_safe_mode' AND value = '1')
+           OR (key = 'plugins_outbox_paused' AND value = '1')
+    )
+    BEGIN
+        INSERT INTO plugin_outbox (event_kind, entity_id, origin_plugin, depth, at)
+        VALUES (
+            'habit.checkin',
+            NEW.habit_id || char(31) || NEW.date,
+            CASE WHEN EXISTS (SELECT 1 FROM sync_applying) THEN '__sync__' ELSE (SELECT plugin_id FROM plugin_write_ctx LIMIT 1) END,
+            COALESCE((SELECT depth FROM plugin_write_ctx LIMIT 1), 0),
+            CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)
+        );
+    END;
+    CREATE TRIGGER outbox_habit_checkins_update AFTER UPDATE ON habit_checkins
+    WHEN NOT EXISTS (
+        SELECT 1 FROM settings
+        WHERE (key = 'plugins_safe_mode' AND value = '1')
+           OR (key = 'plugins_outbox_paused' AND value = '1')
+    )
+    BEGIN
+        INSERT INTO plugin_outbox (event_kind, entity_id, origin_plugin, depth, at)
+        VALUES (
+            'habit.checkin',
+            NEW.habit_id || char(31) || NEW.date,
+            CASE WHEN EXISTS (SELECT 1 FROM sync_applying) THEN '__sync__' ELSE (SELECT plugin_id FROM plugin_write_ctx LIMIT 1) END,
+            COALESCE((SELECT depth FROM plugin_write_ctx LIMIT 1), 0),
+            CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)
+        );
+    END;
+    CREATE TRIGGER outbox_focus_sessions_insert AFTER INSERT ON focus_sessions
+    WHEN NEW.ended_at IS NOT NULL
+        AND NOT EXISTS (
+            SELECT 1 FROM settings
+            WHERE (key = 'plugins_safe_mode' AND value = '1')
+               OR (key = 'plugins_outbox_paused' AND value = '1')
+        )
+    BEGIN
+        INSERT INTO plugin_outbox (event_kind, entity_id, origin_plugin, depth, at)
+        VALUES (
+            'focus.completed',
+            NEW.id,
+            CASE WHEN EXISTS (SELECT 1 FROM sync_applying) THEN '__sync__' ELSE (SELECT plugin_id FROM plugin_write_ctx LIMIT 1) END,
+            COALESCE((SELECT depth FROM plugin_write_ctx LIMIT 1), 0),
+            CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)
+        );
+    END;
+    CREATE TRIGGER outbox_focus_sessions_update AFTER UPDATE OF ended_at ON focus_sessions
+    WHEN NEW.ended_at IS NOT NULL AND OLD.ended_at IS NOT NEW.ended_at
+        AND NOT EXISTS (
+            SELECT 1 FROM settings
+            WHERE (key = 'plugins_safe_mode' AND value = '1')
+               OR (key = 'plugins_outbox_paused' AND value = '1')
+        )
+    BEGIN
+        INSERT INTO plugin_outbox (event_kind, entity_id, origin_plugin, depth, at)
+        VALUES (
+            'focus.completed',
+            NEW.id,
+            CASE WHEN EXISTS (SELECT 1 FROM sync_applying) THEN '__sync__' ELSE (SELECT plugin_id FROM plugin_write_ctx LIMIT 1) END,
+            COALESCE((SELECT depth FROM plugin_write_ctx LIMIT 1), 0),
+            CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)
+        );
+    END;
+    CREATE TRIGGER outbox_cap_growth AFTER INSERT ON plugin_outbox
+    WHEN NEW.seq % 128 = 0
+    BEGIN
+        DELETE FROM plugin_outbox
+        WHERE seq <= (
+            SELECT seq FROM plugin_outbox ORDER BY seq DESC LIMIT 1 OFFSET 2000
+        );
+    END;
+
+    CREATE TRIGGER plugin_meta_cleanup_tasks AFTER DELETE ON tasks
+    BEGIN
+        DELETE FROM plugin_entity_meta WHERE entity_type = 'task' AND entity_id = OLD.id;
+    END;
+    CREATE TRIGGER plugin_meta_cleanup_list_tasks BEFORE DELETE ON lists
+    BEGIN
+        DELETE FROM plugin_entity_meta
+        WHERE entity_type = 'task'
+          AND entity_id IN (SELECT id FROM tasks WHERE list_id = OLD.id);
+    END;
+    CREATE TRIGGER plugin_meta_cleanup_lists AFTER DELETE ON lists
+    BEGIN
+        DELETE FROM plugin_entity_meta WHERE entity_type = 'list' AND entity_id = OLD.id;
+    END;
+    CREATE TRIGGER plugin_meta_cleanup_habits AFTER DELETE ON habits
+    BEGIN
+        DELETE FROM plugin_entity_meta WHERE entity_type = 'habit' AND entity_id = OLD.id;
+    END;
+    CREATE TRIGGER plugin_meta_cleanup_countdowns AFTER DELETE ON countdowns
+    BEGIN
+        DELETE FROM plugin_entity_meta WHERE entity_type = 'countdown' AND entity_id = OLD.id;
+    END;
+    ",
 ];
 
 /// Current SQLite schema version (`PRAGMA user_version`).
 pub const SCHEMA_VERSION: usize = MIGRATIONS.len();
 
+fn is_sqlite_busy(err: &rusqlite::Error) -> bool {
+    matches!(
+        err,
+        rusqlite::Error::SqliteFailure(e, _)
+            if matches!(e.code, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+    )
+}
+
+fn retry_sqlite_busy<T>(mut op: impl FnMut() -> rusqlite::Result<T>) -> rusqlite::Result<T> {
+    for attempt in 0..50_u32 {
+        match op() {
+            Ok(val) => return Ok(val),
+            Err(err) if is_sqlite_busy(&err) && attempt < 49 => {
+                std::thread::sleep(std::time::Duration::from_millis(
+                    10 + u64::from(attempt.min(20)) * 5,
+                ));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    op()
+}
+
 /// Applies migrations up to `target_version` on `conn`. Exposed for migration tests.
 #[doc(hidden)]
 pub fn apply_migrations_up_to(conn: &Connection, target_version: usize) -> Result<()> {
-    anyhow::ensure!(target_version <= MIGRATIONS.len(), "target schema version {target_version} exceeds {}", MIGRATIONS.len());
-    let version: usize = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    anyhow::ensure!(
+        target_version <= MIGRATIONS.len(),
+        "target schema version {target_version} exceeds {}",
+        MIGRATIONS.len()
+    );
+    let mut version: usize =
+        retry_sqlite_busy(|| conn.pragma_query_value(None, "user_version", |row| row.get(0)))?;
     anyhow::ensure!(version <= MIGRATIONS.len(), "the data comes from a newer version of Fern");
-    for (i, sql) in MIGRATIONS.iter().enumerate().take(target_version).skip(version) {
+    while version < target_version {
+        let i = version;
+        let sql = MIGRATIONS[i];
         // The historical section rebuild toggles foreign keys, which SQLite can only do
-        // outside a transaction. All other migrations advance the version atomically.
+        // outside a transaction. Disable FK before opening the IMMEDIATE transaction, then
+        // re-enable afterwards. All other contiguous migrations run together inside a single
+        // IMMEDIATE transaction so concurrent Store::open calls never race or ping-pong locks.
         if sql.contains("PRAGMA foreign_keys = OFF") {
-            conn.execute_batch(sql)?;
-            conn.pragma_update(None, "user_version", i + 1)?;
+            let prev_fk: bool = conn.pragma_query_value(None, "foreign_keys", |row| row.get(0))?;
+            conn.pragma_update(None, "foreign_keys", false)?;
+            struct RestoreFk<'a> {
+                conn: &'a Connection,
+                enable: bool,
+            }
+            impl Drop for RestoreFk<'_> {
+                fn drop(&mut self) {
+                    if self.enable {
+                        let _ = self.conn.pragma_update(None, "foreign_keys", true);
+                    }
+                }
+            }
+            let mut restore_guard = RestoreFk { conn, enable: prev_fk };
+            let (next_version, applied) = {
+                let tx = retry_sqlite_busy(|| {
+                    Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+                })?;
+                let current: usize = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
+                anyhow::ensure!(
+                    current <= MIGRATIONS.len(),
+                    "the data comes from a newer version of Fern"
+                );
+                let outcome = if current <= i {
+                    tx.execute_batch(sql)?;
+                    tx.pragma_update(None, "user_version", i + 1)?;
+                    (i + 1, true)
+                } else {
+                    (current, false)
+                };
+                tx.commit()?;
+                outcome
+            };
+            restore_guard.enable = false;
+            if prev_fk || (applied && sql.contains("PRAGMA foreign_keys = ON")) {
+                conn.pragma_update(None, "foreign_keys", true)?;
+            }
+            version = next_version;
         } else {
-            let tx = conn.unchecked_transaction()?;
-            tx.execute_batch(sql)?;
-            tx.pragma_update(None, "user_version", i + 1)?;
+            let tx = retry_sqlite_busy(|| {
+                Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+            })?;
+            let mut current: usize = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
+            anyhow::ensure!(
+                current <= MIGRATIONS.len(),
+                "the data comes from a newer version of Fern"
+            );
+            while current < target_version && !MIGRATIONS[current].contains("PRAGMA foreign_keys = OFF") {
+                tx.execute_batch(MIGRATIONS[current])?;
+                current += 1;
+                tx.pragma_update(None, "user_version", current)?;
+            }
             tx.commit()?;
+            version = current;
         }
     }
     Ok(())
@@ -1234,7 +1580,7 @@ impl Store {
     /// transaction. Automatically rolls back on error or panic.
     pub(crate) fn in_tx<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
         if self.conn.is_autocommit() {
-            let tx = self.conn.unchecked_transaction()?;
+            let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
             let result = f()?;
             tx.commit()?;
             Ok(result)
@@ -1276,7 +1622,20 @@ impl Store {
 
     fn init(conn: Connection, attachments_dir: Option<PathBuf>) -> Result<Self> {
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
+        // Switching journal_mode to WAL on a freshly created or rollback-journal DB requires an
+        // exclusive lock; concurrent Store::open calls can receive immediate SQLITE_BUSY while
+        // promoting from SHARED to EXCLUSIVE. Skip when already WAL/memory and retry briefly on BUSY.
+        retry_sqlite_busy(|| {
+            let mode: std::result::Result<String, rusqlite::Error> =
+                conn.pragma_query_value(None, "journal_mode", |row| row.get(0));
+            if matches!(
+                mode.as_deref(),
+                Ok(m) if m.eq_ignore_ascii_case("wal") || m.eq_ignore_ascii_case("memory")
+            ) {
+                return Ok(());
+            }
+            conn.pragma_update(None, "journal_mode", "WAL")
+        })?;
         // With WAL, a commit waits for the disk only at checkpoints; a power cut can lose the
         // last changes but never corrupts the file.
         conn.pragma_update(None, "synchronous", "NORMAL")?;
@@ -1936,16 +2295,16 @@ impl Store {
     pub fn complete_with_cascaded(&self, id: Id, completed: bool) -> Result<(Option<Id>, Vec<Id>)> {
         if completed
             && let Some(task) = self.task(id)?
-            && let (Some(repeat), Some(due)) = (task.repeat.clone(), task.due_date)
+            && let (Some(repeat), Some(anchor_date)) = (task.repeat.clone(), task.due_date.or(task.start_date))
         {
             let today = chrono::Local::now().date_naive();
             let holidays = if repeat.skip_holidays {
-                let anchor = if repeat.from_completion { today } else { due };
+                let anchor = if repeat.from_completion { today } else { anchor_date };
                 self.holiday_dates(anchor, anchor + Duration::days(400))?
             } else {
                 HashSet::new()
             };
-            if let Some(next) = repeat.next_for_with_holidays(due, today, |d| holidays.contains(&d)) {
+            if let Some(next) = repeat.next_for_with_holidays(anchor_date, today, |d| holidays.contains(&d)) {
                 let copy = self.in_tx(|| {
                     let copy = Uuid::now_v7();
                     self.conn.execute(
@@ -1992,13 +2351,31 @@ impl Store {
                             params![copy_id, source_id],
                         )?;
                     }
-                    // A duration moves with its start.
-                    let end = task.end_date.map(|end| (end + (next - due)).format(DATE_FORMAT).to_string());
+                    // Shift due_date, end_date, and start_date together by the same recurrence delta.
+                    let delta = next - anchor_date;
+                    let next_due = task.due_date.map(|d| (d + delta).format(DATE_FORMAT).to_string());
+                    let next_end = task.end_date.map(|end| (end + delta).format(DATE_FORMAT).to_string());
+                    let next_start = task.start_date.map(|start| (start + delta).format(DATE_FORMAT).to_string());
+                    let next_bucket = if task.start_date.is_none()
+                        && task.schedule_bucket == ScheduleBucket::Evening
+                    {
+                        ScheduleBucket::None
+                    } else {
+                        task.schedule_bucket
+                    };
                     let next_repeat = repeat.forgetting_curve.then(|| repeat.advance().to_string());
                     self.conn.execute(
-                        "UPDATE tasks SET due_date = ?2, end_date = ?3, snoozed_until = NULL, in_progress_at = NULL,
-                                repeat = COALESCE(?4, repeat) WHERE id = ?1",
-                        params![id.to_string(), next.format(DATE_FORMAT).to_string(), end, next_repeat],
+                        "UPDATE tasks SET due_date = ?2, end_date = ?3, start_date = ?4, schedule_bucket = ?5,
+                                snoozed_until = NULL, in_progress_at = NULL,
+                                repeat = COALESCE(?6, repeat) WHERE id = ?1",
+                        params![
+                            id.to_string(),
+                            next_due,
+                            next_end,
+                            next_start,
+                            next_bucket.as_str(),
+                            next_repeat,
+                        ],
                     )?;
                     self.conn.execute(
                         "UPDATE checklist_items SET completed_at = NULL WHERE task_id = ?1",
@@ -2106,6 +2483,14 @@ impl Store {
             if !parent_alive {
                 return Ok(());
             }
+            let copy_schedule: Option<(Option<String>, String)> = self
+                .conn
+                .query_row(
+                    "SELECT start_date, schedule_bucket FROM tasks WHERE id = ?1",
+                    [copy.to_string()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
             self.conn.execute(
                 "UPDATE checklist_items AS original SET completed_at = copied.completed_at
                  FROM repeat_checklist_copies AS mapping JOIN checklist_items AS copied ON copied.id = mapping.copy_id
@@ -2113,15 +2498,30 @@ impl Store {
                 params![id.to_string(), copy.to_string()],
             )?;
             self.conn.execute("DELETE FROM tasks WHERE id = ?1", [copy.to_string()])?;
-            self.conn.execute(
-                "UPDATE tasks SET due_date = ?2, end_date = ?3, repeat = COALESCE(?4, repeat) WHERE id = ?1",
-                params![
-                    id.to_string(),
-                    due.map(|d| d.format(DATE_FORMAT).to_string()),
-                    end.map(|d| d.format(DATE_FORMAT).to_string()),
-                    repeat.map(ToString::to_string),
-                ],
-            )?;
+            if let Some((start_date, schedule_bucket)) = copy_schedule {
+                self.conn.execute(
+                    "UPDATE tasks SET due_date = ?2, end_date = ?3, repeat = COALESCE(?4, repeat),
+                            start_date = ?5, schedule_bucket = ?6 WHERE id = ?1",
+                    params![
+                        id.to_string(),
+                        due.map(|d| d.format(DATE_FORMAT).to_string()),
+                        end.map(|d| d.format(DATE_FORMAT).to_string()),
+                        repeat.map(ToString::to_string),
+                        start_date,
+                        schedule_bucket,
+                    ],
+                )?;
+            } else {
+                self.conn.execute(
+                    "UPDATE tasks SET due_date = ?2, end_date = ?3, repeat = COALESCE(?4, repeat) WHERE id = ?1",
+                    params![
+                        id.to_string(),
+                        due.map(|d| d.format(DATE_FORMAT).to_string()),
+                        end.map(|d| d.format(DATE_FORMAT).to_string()),
+                        repeat.map(ToString::to_string),
+                    ],
+                )?;
+            }
             Ok(())
         })
     }
@@ -3609,9 +4009,14 @@ impl Store {
         })
     }
 
-    /// Lists whose tasks stay out of the smart lists: archived ones and those set not to show.
+    /// Lists whose tasks stay out of the smart lists: archived, completed projects, and those set not to show.
     fn hidden_lists(&self) -> Result<HashSet<Id>> {
-        Ok(self.lists()?.into_iter().filter(|l| l.archived || !l.in_smart_lists).map(|l| l.id).collect())
+        Ok(self
+            .lists()?
+            .into_iter()
+            .filter(|l| l.archived || l.completed_at.is_some() || !l.in_smart_lists)
+            .map(|l| l.id)
+            .collect())
     }
 
     pub fn rename_list(&self, id: Id, name: &str) -> Result<()> {
@@ -3645,6 +4050,16 @@ impl Store {
                  )
                  SELECT a.id || '-' || a.name FROM task_attachments a JOIN sub ON a.task_id = sub.id",
                 params![id.to_string()],
+            )?;
+            self.conn.execute(
+                "WITH RECURSIVE sub(id) AS (
+                     SELECT id FROM tasks WHERE list_id = ?1
+                     UNION
+                     SELECT t.id FROM tasks t JOIN sub ON t.parent_id = sub.id
+                 )
+                 DELETE FROM plugin_entity_meta
+                 WHERE entity_type = 'task' AND entity_id IN (SELECT id FROM sub)",
+                [id.to_string()],
             )?;
             self.conn.execute("DELETE FROM lists WHERE id = ?1", [id.to_string()])?;
             self.prune_sync_uploaded(&files)?;
@@ -5503,6 +5918,16 @@ impl Store {
                  SELECT a.id || '-' || a.name FROM task_attachments a JOIN sub ON a.task_id = sub.id",
                 params![id.to_string()],
             )?;
+            self.conn.execute(
+                "WITH RECURSIVE sub(id) AS (
+                     SELECT ?1
+                     UNION
+                     SELECT t.id FROM tasks t JOIN sub ON t.parent_id = sub.id
+                 )
+                 DELETE FROM plugin_entity_meta
+                 WHERE entity_type = 'task' AND entity_id IN (SELECT id FROM sub)",
+                [id.to_string()],
+            )?;
             self.conn.execute("DELETE FROM tasks WHERE id = ?1", [id.to_string()])?;
             self.prune_sync_uploaded(&files)?;
             Ok(files)
@@ -5528,6 +5953,16 @@ impl Store {
                      SELECT t.id FROM tasks t JOIN sub ON t.parent_id = sub.id
                  )
                  SELECT a.id || '-' || a.name FROM task_attachments a JOIN sub ON a.task_id = sub.id",
+                [],
+            )?;
+            self.conn.execute(
+                "WITH RECURSIVE sub(id) AS (
+                     SELECT id FROM tasks WHERE deleted_at IS NOT NULL
+                     UNION
+                     SELECT t.id FROM tasks t JOIN sub ON t.parent_id = sub.id
+                 )
+                 DELETE FROM plugin_entity_meta
+                 WHERE entity_type = 'task' AND entity_id IN (SELECT id FROM sub)",
                 [],
             )?;
             self.conn.execute("DELETE FROM tasks WHERE deleted_at IS NOT NULL", [])?;
@@ -8172,6 +8607,157 @@ mod tests {
         // Undoing after parent was purged must NOT delete the completed history record.
         store.undo_repeat(task.id, copy, Some(d(2026, 10, 18)), None, None)?;
         assert!(store.task(copy)?.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn completing_repeating_task_shifts_start_date_and_supports_start_date_only_recurrence() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let today = chrono::Local::now().date_naive();
+        let tomorrow = today + Duration::days(1);
+
+        // (a) Repeating task with both start_date and due_date shifts both and leaves Things Today.
+        let both = store.create_task(
+            TaskDraft {
+                title: "Daily review".into(),
+                due_date: Some(today),
+                start_date: Some(today),
+                schedule_bucket: ScheduleBucket::Evening,
+                ..Default::default()
+            },
+            true,
+        )?;
+        store.set_repeat(both.id, Some(Recurrence::new(crate::Frequency::Daily, 1)), today)?;
+        assert!(
+            store
+                .things_tasks(&crate::things::ThingsViewKind::Today, today)?
+                .iter()
+                .any(|t| t.id == both.id)
+        );
+        let copy_a = store.complete(both.id, true)?.expect("must create completed occurrence");
+        let after_a = store.task(both.id)?.unwrap();
+        assert_eq!(after_a.due_date, Some(tomorrow));
+        assert_eq!(after_a.start_date, Some(tomorrow));
+        assert_eq!(after_a.schedule_bucket, ScheduleBucket::Evening);
+        assert!(
+            !store
+                .things_tasks(&crate::things::ThingsViewKind::Today, today)?
+                .iter()
+                .any(|t| t.id == both.id),
+            "repeating task must leave Today after completion"
+        );
+        assert!(
+            store
+                .things_tasks(&crate::things::ThingsViewKind::Upcoming, today)?
+                .iter()
+                .any(|t| t.id == both.id)
+        );
+        // Undo restores start_date, due_date, and schedule_bucket.
+        store.undo_repeat(both.id, copy_a, Some(today), None, None)?;
+        let undone_a = store.task(both.id)?.unwrap();
+        assert_eq!(undone_a.due_date, Some(today));
+        assert_eq!(undone_a.start_date, Some(today));
+        assert_eq!(undone_a.schedule_bucket, ScheduleBucket::Evening);
+        assert!(store.task(copy_a)?.is_none());
+
+        // (b) Repeating task with start_date only (due_date = None) repeats instead of closing.
+        let start_only = store.create_task(
+            TaskDraft {
+                title: "Morning stretch".into(),
+                start_date: Some(today),
+                repeat: Some(Recurrence::new(crate::Frequency::Daily, 1)),
+                ..Default::default()
+            },
+            true,
+        )?;
+        let copy_b = store
+            .complete(start_only.id, true)?
+            .expect("start_date-only repeating task must repeat");
+        let after_b = store.task(start_only.id)?.unwrap();
+        assert!(!after_b.is_completed());
+        assert_eq!(after_b.due_date, None);
+        assert_eq!(after_b.start_date, Some(tomorrow));
+        let copy_b_row = store.task(copy_b)?.unwrap();
+        assert!(copy_b_row.is_completed());
+        assert_eq!(copy_b_row.start_date, Some(today));
+        store.undo_repeat(start_only.id, copy_b, None, None, None)?;
+        let undone_b = store.task(start_only.id)?.unwrap();
+        assert_eq!(undone_b.start_date, Some(today));
+        assert_eq!(undone_b.due_date, None);
+
+        // (c) Due-date-only Evening repeating task clears Evening on advance and restores on undo.
+        let due_evening = store.create_task(
+            TaskDraft {
+                title: "Evening meds".into(),
+                due_date: Some(today),
+                schedule_bucket: ScheduleBucket::Evening,
+                repeat: Some(Recurrence::new(crate::Frequency::Daily, 1)),
+                ..Default::default()
+            },
+            true,
+        )?;
+        let copy_c = store.complete(due_evening.id, true)?.expect("must repeat");
+        let after_c = store.task(due_evening.id)?.unwrap();
+        assert_eq!(after_c.due_date, Some(tomorrow));
+        assert_eq!(after_c.schedule_bucket, ScheduleBucket::None);
+        assert!(
+            !store
+                .things_tasks(&crate::things::ThingsViewKind::Today, today)?
+                .iter()
+                .any(|t| t.id == due_evening.id)
+        );
+        store.undo_repeat(due_evening.id, copy_c, Some(today), None, None)?;
+        let undone_c = store.task(due_evening.id)?.unwrap();
+        assert_eq!(undone_c.due_date, Some(today));
+        assert_eq!(undone_c.schedule_bucket, ScheduleBucket::Evening);
+        Ok(())
+    }
+
+    #[test]
+    fn hidden_lists_excludes_completed_projects_from_smart_lists() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let today = d(2026, 11, 22);
+        let project = store.add_list(&ListDraft { name: "Ship v2".into(), ..Default::default() })?;
+        let task = store.create_task(
+            TaskDraft { title: "Polish docs".into(), list_id: Some(project.id), due_date: Some(today), ..Default::default() },
+            true,
+        )?;
+        assert!(store.tasks_in(&View::All, today)?.iter().any(|t| t.id == task.id));
+        assert!(store.tasks_in(&View::Today, today)?.iter().any(|t| t.id == task.id));
+
+        store.set_list_project_fields(project.id, "", None, Some(123_456))?;
+        assert!(!store.tasks_in(&View::All, today)?.iter().any(|t| t.id == task.id));
+        assert!(!store.tasks_in(&View::Today, today)?.iter().any(|t| t.id == task.id));
+        // Direct list view still displays tasks inside the completed project.
+        assert!(store.tasks_in(&View::List(project.id), today)?.iter().any(|t| t.id == task.id));
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_store_open_migrates_fresh_db_without_racing() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("fern-migrate-race-{}", Uuid::now_v7()));
+        std::fs::create_dir_all(&dir)?;
+        let db_path = dir.join("tasks.db");
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let path = db_path.clone();
+            let b = std::sync::Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || -> Result<(usize, bool)> {
+                b.wait();
+                let store = Store::open(&path)?;
+                let ver = store.schema_version()?;
+                let fk: bool = store.conn.pragma_query_value(None, "foreign_keys", |r| r.get(0))?;
+                Ok((ver, fk))
+            }));
+        }
+        for handle in handles {
+            let (ver, fk) = handle.join().expect("thread must not panic")?;
+            assert_eq!(ver, SCHEMA_VERSION);
+            assert!(fk, "foreign_keys must remain enabled after concurrent migrations");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
         Ok(())
     }
 }

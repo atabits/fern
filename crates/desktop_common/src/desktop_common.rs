@@ -35,8 +35,8 @@ pub use paths::{
     scratch_dir,
 };
 pub use plugin_bus::{
-    PluginBus, PluginCommandSpec, PluginModalKind, PluginModalSpec, PluginNavAction,
-    PluginSearchHit, PluginSidebarViewSpec, PluginToast, TaskActionSpec, TaskBadgeSpec, ToastLevel,
-    VirtualListSpec,
+    PluginBus, PluginCommandSpec, PluginHookDecision, PluginHookFn, PluginHooksGlobal,
+    PluginModalKind, PluginModalSpec, PluginNavAction, PluginSearchHit, PluginSidebarViewSpec,
+    PluginToast, TaskActionSpec, TaskBadgeSpec, ToastLevel, VirtualListSpec, task_to_hook_json,
 };
 pub use sticky_opener::{StickyOpener, open_sticky_note};

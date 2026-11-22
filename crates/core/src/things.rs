@@ -82,21 +82,28 @@ fn matches_things_view(
                 && !in_hidden_list
                 && task.schedule_bucket != ScheduleBucket::Someday
                 && (task.start_date.is_some_and(|d| d <= today)
-                    || (task.start_date.is_none() && task.due_date.is_some_and(|d| d <= today)))
+                    || (task.start_date.is_none()
+                        && (task.due_date.is_some_and(|d| d <= today)
+                            || task.schedule_bucket == ScheduleBucket::Evening)))
         }
         ThingsViewKind::Upcoming => {
             !task.is_closed()
                 && !in_hidden_list
                 && task.schedule_bucket != ScheduleBucket::Someday
                 && (task.start_date.is_some_and(|d| d > today)
-                    || (task.start_date.is_none() && task.due_date.is_some_and(|d| d > today)))
+                    || (task.start_date.is_none()
+                        && task.schedule_bucket != ScheduleBucket::Evening
+                        && task.due_date.is_some_and(|d| d > today)))
         }
         ThingsViewKind::Anytime => {
             !task.is_closed()
                 && !in_hidden_list
                 && task.schedule_bucket != ScheduleBucket::Someday
                 && task.start_date.is_none_or(|d| d <= today)
-                && (task.list_id.is_some() || task.start_date.is_some() || task.due_date.is_some())
+                && (task.list_id.is_some()
+                    || task.start_date.is_some()
+                    || task.due_date.is_some_and(|d| d <= today)
+                    || task.schedule_bucket == ScheduleBucket::Evening)
         }
         ThingsViewKind::Someday => {
             !task.is_closed() && !in_hidden_list && task.schedule_bucket == ScheduleBucket::Someday
@@ -364,6 +371,56 @@ mod tests {
         assert_eq!(updated.notes, "Updated notes");
         assert_eq!(updated.deadline, None);
         assert_eq!(updated.completed_at, Some(5000));
+        Ok(())
+    }
+
+    #[test]
+    fn evening_without_start_date_not_orphaned_and_future_due_excluded_from_anytime() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let today = d(2026, 11, 22);
+        let tomorrow = d(2026, 11, 23);
+        let proj = store.add_list(&ListDraft { name: "Roadmap".into(), ..Default::default() })?;
+
+        // Evening bucket without start_date must appear in Today (Evening) and Anytime, never vanish.
+        let bare_evening = store.add_task("Tonight errata")?;
+        store.set_task_schedule(bare_evening.id, None, ScheduleBucket::Evening)?;
+
+        // Ungrouped task with future due_date only belongs in Upcoming, NOT Anytime.
+        let future_due_ungrouped = store.create_task(
+            TaskDraft { title: "Future deadline".into(), due_date: Some(tomorrow), ..Default::default() },
+            true,
+        )?;
+
+        // Project task with future due_date remains available in Anytime as well as Upcoming.
+        let future_due_project = store.create_task(
+            TaskDraft {
+                title: "Project milestone".into(),
+                list_id: Some(proj.id),
+                due_date: Some(tomorrow),
+                ..Default::default()
+            },
+            true,
+        )?;
+
+        let in_view = |view: ThingsViewKind, id: Id| -> Result<bool> {
+            Ok(store.things_tasks(&view, today)?.into_iter().any(|t| t.id == id))
+        };
+
+        assert!(!in_view(ThingsViewKind::Inbox, bare_evening.id)?);
+        assert!(in_view(ThingsViewKind::Today, bare_evening.id)?);
+        assert!(!in_view(ThingsViewKind::Upcoming, bare_evening.id)?);
+        assert!(in_view(ThingsViewKind::Anytime, bare_evening.id)?);
+        assert_eq!(store.things_counts(today)?.today_evening, 1);
+
+        assert!(in_view(ThingsViewKind::Upcoming, future_due_ungrouped.id)?);
+        assert!(
+            !in_view(ThingsViewKind::Anytime, future_due_ungrouped.id)?,
+            "ungrouped future-due task must not leak into Anytime"
+        );
+        assert!(!in_view(ThingsViewKind::Today, future_due_ungrouped.id)?);
+
+        assert!(in_view(ThingsViewKind::Upcoming, future_due_project.id)?);
+        assert!(in_view(ThingsViewKind::Anytime, future_due_project.id)?);
         Ok(())
     }
 }

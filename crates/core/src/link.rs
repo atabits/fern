@@ -21,7 +21,9 @@ pub fn task_link(id: Id) -> String {
 
 /// The task a link points to, if it is a Fern task link.
 pub fn parse_task_link(text: &str) -> Option<Id> {
-    text.trim().strip_prefix(TASK_PREFIX)?.trim_end_matches('/').parse().ok()
+    let without_fragment = text.trim().split('#').next()?;
+    let without_query = without_fragment.split('?').next()?;
+    without_query.strip_prefix(TASK_PREFIX)?.trim_end_matches('/').parse().ok()
 }
 
 pub fn plugin_link(plugin_id: &str, command: &str) -> String {
@@ -31,25 +33,28 @@ pub fn plugin_link(plugin_id: &str, command: &str) -> String {
 /// Parses any supported `fern://` deep link (`task` or `plugin`).
 pub fn parse_deep_link(text: &str) -> Option<DeepLink> {
     let trimmed = text.trim();
-    if let Some(id) = parse_task_link(trimmed) {
+    let without_fragment = trimmed.split('#').next().unwrap_or(trimmed);
+    if let Some(id) = parse_task_link(without_fragment) {
         return Some(DeepLink::Task(id));
     }
-    let rest = trimmed.strip_prefix(PLUGIN_PREFIX)?;
+    let rest = without_fragment.strip_prefix(PLUGIN_PREFIX)?;
     let (path, query) = match rest.split_once('?') {
         Some((p, q)) => (p, Some(q)),
         None => (rest, None),
     };
     let path = path.trim_matches('/');
-    let (plugin_id, command) = path.split_once('/')?;
-    if !is_valid_plugin_id(plugin_id) || command.is_empty() || command.contains('/') {
+    let (plugin_id, raw_command) = path.split_once('/')?;
+    if !is_valid_plugin_id(plugin_id) || raw_command.is_empty() || raw_command.contains('/') {
         return None;
     }
-    let params = query
-        .map(parse_query_params)
-        .unwrap_or_default();
+    let command = percent_decode(raw_command);
+    if command.trim().is_empty() || command.contains('/') {
+        return None;
+    }
+    let params = query.map(parse_query_params).unwrap_or_default();
     Some(DeepLink::Plugin {
         plugin_id: plugin_id.to_owned(),
-        command: percent_decode(command),
+        command,
         params,
     })
 }
@@ -131,5 +136,26 @@ mod tests {
         assert_eq!(parse_deep_link("fern://plugin/../escape/cmd"), None);
         assert_eq!(parse_deep_link("fern://plugin/com.example.gh/"), None);
         assert_eq!(parse_deep_link("fern://plugin/com.example.gh"), None);
+
+        // Fragment stripping & post-decode `/` rejection.
+        assert_eq!(parse_deep_link(&format!("{}#details", task_link(id))), Some(DeepLink::Task(id)));
+        assert_eq!(
+            parse_deep_link("fern://plugin/com.example.gh/sync#top"),
+            Some(DeepLink::Plugin {
+                plugin_id: "com.example.gh".into(),
+                command: "sync".into(),
+                params: vec![],
+            })
+        );
+        assert_eq!(
+            parse_deep_link("fern://plugin/com.example.gh/sync?full=1#frag"),
+            Some(DeepLink::Plugin {
+                plugin_id: "com.example.gh".into(),
+                command: "sync".into(),
+                params: vec![("full".into(), "1".into())],
+            })
+        );
+        assert_eq!(parse_deep_link("fern://plugin/com.example.gh/a%2Fb"), None);
+        assert_eq!(parse_deep_link("fern://plugin/com.example.gh/a%2fb?x=1"), None);
     }
 }

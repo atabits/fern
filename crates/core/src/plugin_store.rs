@@ -7,10 +7,18 @@ use crate::store::{Store, now_ms};
 
 /// Per-plugin KV storage quota (5 MiB across keys and values).
 pub const PLUGIN_KV_QUOTA_BYTES: usize = 5 * 1024 * 1024;
-/// Per-entry value cap for `plugin_entity_meta` (64 KiB).
+/// Per-entry cap for `plugin_entity_meta` (64 KiB across entity_id, key, and value).
 pub const PLUGIN_META_ENTRY_CAP_BYTES: usize = 64 * 1024;
+/// Per-plugin total storage quota for `plugin_entity_meta` (5 MiB across entity_id, key, and value).
+pub const PLUGIN_META_QUOTA_BYTES: usize = 5 * 1024 * 1024;
 /// Default tail size retained when trimming `plugin_outbox`.
 pub const DEFAULT_OUTBOX_RETENTION: usize = 500;
+/// Hard ceiling enforced automatically on undrained `plugin_outbox` growth.
+pub const PLUGIN_OUTBOX_MAX_ROWS: usize = 2000;
+/// Settings key toggled when Safe Mode disables all plugins.
+pub const PLUGIN_SAFE_MODE_SETTING_KEY: &str = "plugins_safe_mode";
+/// Settings key toggled to pause recording new rows in `plugin_outbox`.
+pub const PLUGIN_OUTBOX_PAUSED_SETTING_KEY: &str = "plugins_outbox_paused";
 /// Maximum causal plugin event propagation depth before stopping loop delivery.
 pub const MAX_EVENT_DEPTH: u32 = 4;
 
@@ -194,6 +202,17 @@ impl Store {
         Ok(())
     }
 
+    /// Atomically removes all persisted local data for `plugin_id` (`plugin_state`,
+    /// `plugin_kv`, and `plugin_entity_meta`).
+    pub fn delete_plugin_all_data(&self, plugin_id: &str) -> Result<()> {
+        self.in_tx(|| {
+            self.conn.execute("DELETE FROM plugin_state WHERE plugin_id = ?1", [plugin_id])?;
+            self.conn.execute("DELETE FROM plugin_kv WHERE plugin_id = ?1", [plugin_id])?;
+            self.conn.execute("DELETE FROM plugin_entity_meta WHERE plugin_id = ?1", [plugin_id])?;
+            Ok(())
+        })
+    }
+
     pub fn plugin_kv_get(&self, plugin_id: &str, key: &str) -> Result<Option<String>> {
         self.conn
             .prepare_cached("SELECT value FROM plugin_kv WHERE plugin_id = ?1 AND key = ?2")?
@@ -280,6 +299,21 @@ impl Store {
             .map_err(Into::into)
     }
 
+    pub fn plugin_meta_usage_bytes(&self, plugin_id: &str) -> Result<usize> {
+        let used: i64 = self
+            .conn
+            .prepare_cached(
+                "SELECT COALESCE(SUM(
+                     LENGTH(CAST(entity_id AS BLOB))
+                     + LENGTH(CAST(key AS BLOB))
+                     + LENGTH(CAST(value AS BLOB))
+                 ), 0)
+                 FROM plugin_entity_meta WHERE plugin_id = ?1",
+            )?
+            .query_row([plugin_id], |row| row.get(0))?;
+        Ok(usize::try_from(used).unwrap_or(0))
+    }
+
     pub fn plugin_meta_set(
         &self,
         plugin_id: &str,
@@ -291,19 +325,43 @@ impl Store {
         anyhow::ensure!(!plugin_id.is_empty(), "plugin_id must not be empty");
         anyhow::ensure!(!entity_type.is_empty(), "entity_type must not be empty");
         anyhow::ensure!(!entity_id.is_empty(), "entity_id must not be empty");
+        anyhow::ensure!(!key.is_empty(), "key must not be empty");
+        let entry_bytes = entity_id.len().saturating_add(key.len()).saturating_add(value.len());
         anyhow::ensure!(
-            value.len() <= PLUGIN_META_ENTRY_CAP_BYTES,
+            entry_bytes <= PLUGIN_META_ENTRY_CAP_BYTES,
             "plugin_entity_meta entry exceeds {PLUGIN_META_ENTRY_CAP_BYTES} bytes"
         );
-        self.conn.execute(
-            "INSERT INTO plugin_entity_meta (plugin_id, entity_type, entity_id, key, value, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT(plugin_id, entity_type, entity_id, key) DO UPDATE SET
-                 value = excluded.value,
-                 updated_at = excluded.updated_at",
-            params![plugin_id, entity_type, entity_id, key, value, now_ms()],
-        )?;
-        Ok(())
+        self.in_tx(|| {
+            let other_bytes: i64 = self
+                .conn
+                .prepare_cached(
+                    "SELECT COALESCE(SUM(
+                         LENGTH(CAST(entity_id AS BLOB))
+                         + LENGTH(CAST(key AS BLOB))
+                         + LENGTH(CAST(value AS BLOB))
+                     ), 0)
+                     FROM plugin_entity_meta
+                     WHERE plugin_id = ?1
+                       AND NOT (entity_type = ?2 AND entity_id = ?3 AND key = ?4)",
+                )?
+                .query_row(params![plugin_id, entity_type, entity_id, key], |row| row.get(0))?;
+            let next_total = usize::try_from(other_bytes)
+                .unwrap_or(usize::MAX)
+                .saturating_add(entry_bytes);
+            anyhow::ensure!(
+                next_total <= PLUGIN_META_QUOTA_BYTES,
+                "plugin_entity_meta quota exceeded for {plugin_id} ({next_total} > {PLUGIN_META_QUOTA_BYTES} bytes)"
+            );
+            self.conn.execute(
+                "INSERT INTO plugin_entity_meta (plugin_id, entity_type, entity_id, key, value, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(plugin_id, entity_type, entity_id, key) DO UPDATE SET
+                     value = excluded.value,
+                     updated_at = excluded.updated_at",
+                params![plugin_id, entity_type, entity_id, key, value, now_ms()],
+            )?;
+            Ok(())
+        })
     }
 
     pub fn plugin_meta_list(
@@ -458,20 +516,35 @@ impl Store {
         Ok(self.conn.execute("DELETE FROM plugin_outbox WHERE seq <= ?1", [up_to_seq])?)
     }
 
+    /// Enables or pauses recording new rows into `plugin_outbox` (for example during Safe Mode or
+    /// bulk operations). Triggers also automatically pause while `plugins_safe_mode = '1'`.
+    pub fn set_plugin_outbox_enabled(&self, enabled: bool) -> Result<()> {
+        self.set_setting(PLUGIN_OUTBOX_PAUSED_SETTING_KEY, if enabled { "0" } else { "1" })
+    }
+
+    /// Returns whether `plugin_outbox` triggers are currently recording events.
+    pub fn is_plugin_outbox_enabled(&self) -> Result<bool> {
+        let safe_mode = self.setting(PLUGIN_SAFE_MODE_SETTING_KEY)?.as_deref() == Some("1");
+        let paused = self.setting(PLUGIN_OUTBOX_PAUSED_SETTING_KEY)?.as_deref() == Some("1");
+        Ok(!safe_mode && !paused)
+    }
+
     /// Retains at most `keep_last` newest rows in `plugin_outbox` (`0` clears the entire outbox).
     pub fn trim_plugin_outbox(&self, keep_last: usize) -> Result<usize> {
         if keep_last == 0 {
             return Ok(self.conn.execute("DELETE FROM plugin_outbox", [])?);
         }
+        let offset = i64::try_from(keep_last).unwrap_or(i64::MAX);
         Ok(self.conn.execute(
             "DELETE FROM plugin_outbox
-             WHERE seq NOT IN (SELECT seq FROM plugin_outbox ORDER BY seq DESC LIMIT ?1)",
-            [keep_last as i64],
+             WHERE seq <= (SELECT seq FROM plugin_outbox ORDER BY seq DESC LIMIT 1 OFFSET ?1)",
+            [offset],
         )?)
     }
 
     /// Runs `f` inside a transaction while `plugin_write_ctx` tags all triggered outbox events
-    /// with `(plugin_id, depth)`. Always restores the previous context on completion, error, or panic.
+    /// with `(plugin_id, depth)`. Explicitly restores the previous context on the `Ok` path (failing
+    /// and rolling back the transaction if restoration fails) and best-effort cleans up on `Err`/panic.
     pub fn with_plugin_write_ctx<T>(
         &self,
         plugin_id: &str,
@@ -488,9 +561,26 @@ impl Store {
             struct CtxGuard<'a> {
                 conn: &'a rusqlite::Connection,
                 prev: Option<(String, i64)>,
+                armed: bool,
+            }
+            impl CtxGuard<'_> {
+                fn restore_now(&mut self) -> Result<()> {
+                    self.armed = false;
+                    self.conn.execute("DELETE FROM plugin_write_ctx", [])?;
+                    if let Some((pid, d)) = &self.prev {
+                        self.conn.execute(
+                            "INSERT INTO plugin_write_ctx (plugin_id, depth) VALUES (?1, ?2)",
+                            params![pid, d],
+                        )?;
+                    }
+                    Ok(())
+                }
             }
             impl Drop for CtxGuard<'_> {
                 fn drop(&mut self) {
+                    if !self.armed {
+                        return;
+                    }
                     let _ = self.conn.execute("DELETE FROM plugin_write_ctx", []);
                     if let Some((pid, d)) = &self.prev {
                         let _ = self.conn.execute(
@@ -505,8 +595,10 @@ impl Store {
                 "INSERT INTO plugin_write_ctx (plugin_id, depth) VALUES (?1, ?2)",
                 params![plugin_id, i64::from(depth)],
             )?;
-            let _guard = CtxGuard { conn: &self.conn, prev };
-            f()
+            let mut guard = CtxGuard { conn: &self.conn, prev, armed: true };
+            let result = f()?;
+            guard.restore_now()?;
+            Ok(result)
         })
     }
 }
@@ -655,6 +747,285 @@ mod tests {
         let trimmed = store.drain_plugin_outbox(50)?;
         assert_eq!(trimmed.len(), 1);
         assert_eq!(trimmed[0].event_kind, "focus.completed");
+        Ok(())
+    }
+
+    #[test]
+    fn repeating_completion_emits_task_completed_restore_emits_updated_and_trashed_sync_skipped() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 11, 22).unwrap();
+
+        let task = store.add_task("Recurring report")?;
+        store.set_due(task.id, Some(today), None)?;
+        store.set_repeat(task.id, Some(crate::Recurrence::new(crate::Frequency::Daily, 1)), today)?;
+        store.trim_plugin_outbox(0)?;
+
+        let copy = store.complete(task.id, true)?.expect("must create completed copy");
+        let events = store.drain_plugin_outbox(50)?;
+        assert!(
+            events.iter().any(|e| e.event_kind == "task.completed" && e.entity_id == copy.to_string()),
+            "completing a repeating task must emit task.completed for the completed snapshot: {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| e.event_kind == "task.updated" && e.entity_id == task.id.to_string()),
+            "completing a repeating task must emit task.updated for the rescheduled row: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| e.event_kind == "task.created"),
+            "completed repeat snapshot must not emit task.created: {events:?}"
+        );
+        store.trim_plugin_outbox(0)?;
+
+        // Restoring a task from Trash emits task.updated.
+        store.delete_task(task.id)?;
+        store.trim_plugin_outbox(0)?;
+        store.restore_task(task.id)?;
+        let restored = store.drain_plugin_outbox(50)?;
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].event_kind, "task.updated");
+        assert_eq!(restored[0].entity_id, task.id.to_string());
+        store.trim_plugin_outbox(0)?;
+
+        // Syncing an already-trashed task does not emit task.created or task.completed.
+        let trashed_id = uuid::Uuid::now_v7().to_string();
+        let req = store.sync_request()?;
+        let answer = serde_json::json!({
+            "protocol": SYNC_PROTOCOL_VERSION,
+            "position": 1,
+            "changes": [
+                Change {
+                    entity: "tasks".into(),
+                    key: trashed_id.clone(),
+                    at: 1000,
+                    row: Some(serde_json::Map::from_iter([
+                        ("id".into(), serde_json::json!(trashed_id)),
+                        ("title".into(), serde_json::json!("Already trashed")),
+                        ("created_at".into(), serde_json::json!(1000)),
+                        ("deleted_at".into(), serde_json::json!(2000)),
+                    ])),
+                }.to_json()
+            ]
+        });
+        store.finish_sync(&req, &answer)?;
+        assert!(store.drain_plugin_outbox(50)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn plugin_meta_orphans_cleaned_quotas_enforced_and_delete_all_data_wipes_plugin() -> Result<()> {
+        let store = Store::open_in_memory()?;
+
+        // 1. Orphan cleanup across task/subtask purge, empty_trash, list cascade, habit, and countdown.
+        let parent = store.add_task("Parent")?;
+        let child = store.add_subtask(parent.id, "Child")?;
+        let trashed_parent = store.add_task("Trashed Parent")?;
+        let trashed_child = store.add_subtask(trashed_parent.id, "Trashed Child")?;
+        let list = store.add_list(&crate::ListDraft { name: "Work".into(), ..Default::default() })?;
+        let list_task = store.create_task(
+            crate::TaskDraft { title: "In list".into(), list_id: Some(list.id), ..Default::default() },
+            true,
+        )?;
+        let list_sub = store.add_subtask(list_task.id, "List sub")?;
+        let habit = store.add_habit("Stretch")?;
+        let countdown = store.add_countdown(
+            "Launch",
+            chrono::NaiveDate::from_ymd_opt(2026, 12, 31).unwrap(),
+            crate::CountdownKind::Countdown,
+        )?;
+
+        store.plugin_meta_set("p1", "task", &parent.id.to_string(), "k", "1")?;
+        store.plugin_meta_set("p1", "task", &child.id.to_string(), "k", "2")?;
+        store.plugin_meta_set("p1", "task", &trashed_parent.id.to_string(), "k", "3")?;
+        store.plugin_meta_set("p1", "task", &trashed_child.id.to_string(), "k", "4")?;
+        store.plugin_meta_set("p1", "list", &list.id.to_string(), "k", "5")?;
+        store.plugin_meta_set("p1", "task", &list_task.id.to_string(), "k", "6")?;
+        store.plugin_meta_set("p1", "task", &list_sub.id.to_string(), "k", "7")?;
+        store.plugin_meta_set("p1", "habit", &habit.id.to_string(), "k", "8")?;
+        store.plugin_meta_set("p1", "countdown", &countdown.id.to_string(), "k", "9")?;
+        store.plugin_meta_set("p1", "task", "synthetic-unlinked", "k", "keep")?;
+
+        store.purge_task(parent.id)?;
+        assert!(store.plugin_meta_get("p1", "task", &parent.id.to_string(), "k")?.is_none());
+        assert!(store.plugin_meta_get("p1", "task", &child.id.to_string(), "k")?.is_none());
+
+        store.delete_task(trashed_parent.id)?;
+        store.empty_trash()?;
+        assert!(store.plugin_meta_get("p1", "task", &trashed_parent.id.to_string(), "k")?.is_none());
+        assert!(store.plugin_meta_get("p1", "task", &trashed_child.id.to_string(), "k")?.is_none());
+
+        store.delete_list(list.id)?;
+        assert!(store.plugin_meta_get("p1", "list", &list.id.to_string(), "k")?.is_none());
+        assert!(store.plugin_meta_get("p1", "task", &list_task.id.to_string(), "k")?.is_none());
+        assert!(store.plugin_meta_get("p1", "task", &list_sub.id.to_string(), "k")?.is_none());
+
+        store.delete_habit(habit.id)?;
+        assert!(store.plugin_meta_get("p1", "habit", &habit.id.to_string(), "k")?.is_none());
+
+        store.delete_countdown(countdown.id)?;
+        assert!(store.plugin_meta_get("p1", "countdown", &countdown.id.to_string(), "k")?.is_none());
+
+        // Unrelated metadata is untouched.
+        assert_eq!(store.plugin_meta_get("p1", "task", "synthetic-unlinked", "k")?.as_deref(), Some("keep"));
+
+        // 2. Per-entry key+value cap and per-plugin total quota.
+        assert!(store.plugin_meta_set("p1", "task", "e1", "", "v").is_err());
+        let big_key = "k".repeat(PLUGIN_META_ENTRY_CAP_BYTES);
+        assert!(store.plugin_meta_set("p1", "task", "e1", &big_key, "v").is_err());
+
+        let chunk = "a".repeat(60 * 1024);
+        let max_chunks = PLUGIN_META_QUOTA_BYTES / (chunk.len() + 10);
+        for i in 0..max_chunks {
+            store.plugin_meta_set("p_quota", "task", "e", &format!("k{i:04}"), &chunk)?;
+        }
+        assert!(store.plugin_meta_usage_bytes("p_quota")? > PLUGIN_META_QUOTA_BYTES - 128 * 1024);
+        // Updating an existing entry in-place stays within quota.
+        store.plugin_meta_set("p_quota", "task", "e", "k0000", &chunk)?;
+        // Exceeding total quota fails for p_quota while p_other stays isolated.
+        let mut exceeded = false;
+        for extra in 0..5 {
+            if store.plugin_meta_set("p_quota", "task", "e", &format!("over{extra}"), &chunk).is_err() {
+                exceeded = true;
+                break;
+            }
+        }
+        assert!(exceeded, "per-plugin total meta quota must reject writes beyond 5 MiB");
+        store.plugin_meta_set("p_other", "task", "e", "k0", &chunk)?;
+
+        // 3. delete_plugin_all_data atomically wipes state, KV, and meta for one plugin only.
+        store.set_plugin_enabled("p_quota", true)?;
+        store.plugin_kv_set("p_quota", "token", "abc")?;
+        store.set_plugin_enabled("p_other", true)?;
+        store.plugin_kv_set("p_other", "token", "xyz")?;
+
+        store.delete_plugin_all_data("p_quota")?;
+        assert!(store.plugin_state("p_quota")?.is_none());
+        assert!(store.plugin_kv_get("p_quota", "token")?.is_none());
+        assert_eq!(store.plugin_meta_usage_bytes("p_quota")?, 0);
+        assert!(store.plugin_state("p_other")?.is_some());
+        assert_eq!(store.plugin_kv_get("p_other", "token")?.as_deref(), Some("xyz"));
+        assert_eq!(store.plugin_meta_get("p_other", "task", "e", "k0")?.as_deref(), Some(chunk.as_str()));
+        Ok(())
+    }
+
+    #[test]
+    fn with_plugin_write_ctx_propagates_restore_failure_without_poisoning() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        // Inject a trigger that aborts cleanup DELETE only after our marker task exists.
+        store.conn.execute_batch(
+            "CREATE TEMP TRIGGER fail_ctx_cleanup BEFORE DELETE ON plugin_write_ctx
+             WHEN EXISTS (SELECT 1 FROM tasks WHERE title = 'trigger-cleanup-fail')
+             BEGIN
+                 SELECT RAISE(ABORT, 'simulated cleanup failure');
+             END;",
+        )?;
+
+        let res: Result<()> = store.with_plugin_write_ctx("com.example.poison", 1, || {
+            let _ = store.add_task("trigger-cleanup-fail")?;
+            Ok(())
+        });
+        assert!(res.is_err(), "cleanup failure must be propagated instead of swallowed");
+        // Transaction must have rolled back so plugin_write_ctx is clean and unpoisoned.
+        let leaked: i64 =
+            store.conn.query_row("SELECT COUNT(*) FROM plugin_write_ctx", [], |r| r.get(0))?;
+        assert_eq!(leaked, 0, "plugin_write_ctx must not be poisoned after failed cleanup");
+        let after = store.add_task("Clean user task")?;
+        let events = store.drain_plugin_outbox(10)?;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].entity_id, after.id.to_string());
+        assert_eq!(events[0].origin_plugin, None);
+        assert_eq!(events[0].depth, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn plugin_outbox_safe_mode_pause_trim_and_growth_cap() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        assert!(store.is_plugin_outbox_enabled()?);
+
+        // Safe Mode suppresses outbox writes.
+        store.set_setting(PLUGIN_SAFE_MODE_SETTING_KEY, "1")?;
+        assert!(!store.is_plugin_outbox_enabled()?);
+        let _ = store.add_task("In safe mode")?;
+        assert!(store.drain_plugin_outbox(50)?.is_empty());
+        store.set_setting(PLUGIN_SAFE_MODE_SETTING_KEY, "0")?;
+        assert!(store.is_plugin_outbox_enabled()?);
+
+        // Explicit outbox pause also suppresses writes.
+        store.set_plugin_outbox_enabled(false)?;
+        assert!(!store.is_plugin_outbox_enabled()?);
+        let _ = store.add_task("While paused")?;
+        assert!(store.drain_plugin_outbox(50)?.is_empty());
+        store.set_plugin_outbox_enabled(true)?;
+
+        // Trim boundary checks (keep > count, usize::MAX, exact keep, 0).
+        for i in 0..5 {
+            let _ = store.add_task(&format!("T{i}"))?;
+        }
+        assert_eq!(store.trim_plugin_outbox(usize::MAX)?, 0);
+        assert_eq!(store.trim_plugin_outbox(10)?, 0);
+        assert_eq!(store.trim_plugin_outbox(2)?, 3);
+        assert_eq!(store.drain_plugin_outbox(50)?.len(), 2);
+        assert_eq!(store.trim_plugin_outbox(0)?, 2);
+        assert!(store.drain_plugin_outbox(50)?.is_empty());
+
+        // Undrained bulk writes automatically cap growth around PLUGIN_OUTBOX_MAX_ROWS.
+        store.in_tx(|| {
+            for i in 0..(PLUGIN_OUTBOX_MAX_ROWS + 300) {
+                store.conn.execute(
+                    "INSERT INTO plugin_outbox (event_kind, entity_id, origin_plugin, depth, at)
+                     VALUES ('task.updated', ?1, NULL, 0, 1)",
+                    [format!("e{i}")],
+                )?;
+            }
+            Ok(())
+        })?;
+        let count: usize = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM plugin_outbox", [], |r| r.get::<_, i64>(0))?
+            as usize;
+        assert!(
+            count <= PLUGIN_OUTBOX_MAX_ROWS + 128,
+            "undrained outbox should stay capped near {PLUGIN_OUTBOX_MAX_ROWS}, got {count}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn wal_immediate_tx_handles_concurrent_kv_and_ctx_writes_without_busy_snapshot() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("fern-wal-immediate-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir)?;
+        let db_path = dir.join("tasks.db");
+        let _init = Store::open(&db_path)?;
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let p1 = db_path.clone();
+        let b1 = std::sync::Arc::clone(&barrier);
+        let t1 = std::thread::spawn(move || -> Result<()> {
+            let store = Store::open(&p1)?;
+            b1.wait();
+            for i in 0..40 {
+                store.plugin_kv_set("com.example.a", &format!("k{i}"), "val")?;
+            }
+            Ok(())
+        });
+
+        let p2 = db_path;
+        let b2 = std::sync::Arc::clone(&barrier);
+        let t2 = std::thread::spawn(move || -> Result<()> {
+            let store = Store::open(&p2)?;
+            b2.wait();
+            for i in 0..40 {
+                store.with_plugin_write_ctx("com.example.b", 1, || {
+                    let _ = store.add_task(&format!("Concurrent {i}"))?;
+                    Ok(())
+                })?;
+            }
+            Ok(())
+        });
+
+        t1.join().expect("kv writer thread must not panic")?;
+        t2.join().expect("ctx writer thread must not panic")?;
+        let _ = std::fs::remove_dir_all(&dir);
         Ok(())
     }
 }

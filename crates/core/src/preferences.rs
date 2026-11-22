@@ -203,6 +203,22 @@ pub enum RailItemId {
 }
 
 impl RailItemId {
+    pub fn is_valid(&self) -> bool {
+        match self {
+            Self::BuiltIn(_) => true,
+            Self::Plugin { plugin_id, view_id } => {
+                !plugin_id.is_empty()
+                    && !view_id.is_empty()
+                    && !plugin_id.contains('/')
+                    && !plugin_id.contains(',')
+                    && !view_id.contains('/')
+                    && !view_id.contains(',')
+                    && plugin_id.trim() == plugin_id
+                    && view_id.trim() == view_id
+            }
+        }
+    }
+
     pub fn code(&self) -> String {
         match self {
             Self::BuiltIn(section) => section.code().to_owned(),
@@ -214,13 +230,11 @@ impl RailItemId {
         let code = code.trim();
         if let Some(rest) = code.strip_prefix("plugin:") {
             let (plugin_id, view_id) = rest.split_once('/')?;
-            if plugin_id.is_empty() || view_id.is_empty() || view_id.contains('/') {
-                return None;
-            }
-            return Some(Self::Plugin {
+            let item = Self::Plugin {
                 plugin_id: plugin_id.to_owned(),
                 view_id: view_id.to_owned(),
-            });
+            };
+            return item.is_valid().then_some(item);
         }
         RailSection::from_code(code).map(Self::BuiltIn)
     }
@@ -233,7 +247,7 @@ fn default_rail_items() -> Vec<RailItemId> {
 fn normalize_rail_items_iter(items: impl IntoIterator<Item = RailItemId>) -> Vec<RailItemId> {
     let mut out = Vec::with_capacity(RailSection::ALL.len());
     for item in items {
-        if !out.contains(&item) {
+        if item.is_valid() && !out.contains(&item) {
             out.push(item);
         }
     }
@@ -560,25 +574,25 @@ impl Preferences {
     }
 
     pub fn move_rail_item(&mut self, dragged: &RailItemId, target: &RailItemId, after: bool) {
-        if dragged == target {
+        if dragged == target || !dragged.is_valid() || !target.is_valid() {
             return;
         }
-        self.rail_items = normalize_rail_items_iter(std::mem::take(&mut self.rail_items));
-        if !self.rail_items.contains(dragged) {
-            self.rail_items.push(dragged.clone());
-        }
-        if !self.rail_items.contains(target) {
+        let mut next = normalize_rail_items_iter(self.rail_items.iter().cloned());
+        if !next.contains(target) {
             return;
         }
-        let Some(from) = self.rail_items.iter().position(|item| item == dragged) else {
+        if !next.contains(dragged) {
+            next.push(dragged.clone());
+        }
+        let Some(from) = next.iter().position(|item| item == dragged) else {
             return;
         };
-        let moved = self.rail_items.remove(from);
-        let Some(to) = self.rail_items.iter().position(|item| item == target) else {
-            self.rail_items.insert(from, moved);
+        let moved = next.remove(from);
+        let Some(to) = next.iter().position(|item| item == target) else {
             return;
         };
-        self.rail_items.insert(to + usize::from(after), moved);
+        next.insert(to + usize::from(after), moved);
+        self.rail_items = next;
         self.rail_order = builtins_of_items(&self.rail_items);
     }
 
@@ -879,6 +893,7 @@ impl Store {
         self.in_tx(|| {
             let mut preferences = self.preferences()?;
             change(&mut preferences);
+            preferences.features.sanitize();
             self.save_preferences(&preferences)?;
             Ok(preferences)
         })
@@ -1177,6 +1192,38 @@ mod tests {
         let after_builtin_move = store.preferences()?;
         assert_eq!(after_builtin_move.rail_items[0], plugin_item);
         assert_eq!(after_builtin_move.rail_order[0], RailSection::Calendar);
+        Ok(())
+    }
+
+    #[test]
+    fn update_preferences_sanitizes_features_and_rail_item_validation_is_atomic() -> Result<()> {
+        let store = Store::open_in_memory()?;
+
+        // Turning off both task frontends sanitizes the returned Preferences to match persisted DB.
+        let returned = store.update_preferences(|p| {
+            p.features.tasks = false;
+            p.features.things = false;
+        })?;
+        assert!(returned.features.tasks);
+        assert!(!returned.features.things);
+        assert_eq!(returned.features, store.preferences()?.features);
+
+        // Commas and slashes in plugin rail IDs are rejected so CSV serialization cannot be corrupted.
+        assert!(RailItemId::from_code("plugin:com.example.a/bad,view").is_none());
+        assert!(RailItemId::from_code("plugin:com.example,a/view").is_none());
+        assert!(RailItemId::from_code("plugin:com.example.a/a/b").is_none());
+
+        // move_rail_item does not partially mutate when target is absent or an ID is invalid.
+        let mut prefs = Preferences::default();
+        let before = prefs.rail_items.clone();
+        let new_plugin = RailItemId::Plugin { plugin_id: "com.example.p".into(), view_id: "v".into() };
+        let missing_target = RailItemId::Plugin { plugin_id: "com.example.missing".into(), view_id: "x".into() };
+        prefs.move_rail_item(&new_plugin, &missing_target, false);
+        assert_eq!(prefs.rail_items, before, "missing target must leave rail_items untouched");
+
+        let comma_plugin = RailItemId::Plugin { plugin_id: "com.example.p".into(), view_id: "bad,id".into() };
+        prefs.move_rail_item(&comma_plugin, &RailItemId::BuiltIn(RailSection::Tasks), false);
+        assert_eq!(prefs.rail_items, before, "invalid comma ID must be rejected");
         Ok(())
     }
 }

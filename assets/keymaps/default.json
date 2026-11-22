@@ -38,6 +38,12 @@
     }
   },
   {
+    "context": "ThingsView",
+    "bindings": {
+      "secondary-s": "things::OpenWhen"
+    }
+  },
+  {
     "context": "TaskList && !TextInput",
     "bindings": {
       "v l": "task_list::ViewList",

@@ -1,0 +1,49 @@
+{
+  "id": "com.example.focus-planner",
+  "name": "Focus Planner",
+  "version": "0.1.0",
+  "api_version": 1,
+  "min_fern_version": "0.2.0",
+  "description": "Example TypeScript + JSX plugin built with @fern/sdk.",
+  "author": "Fern SDK",
+  "entry": "dist/index.js",
+  "permissions": [
+    "tasks:read",
+    "tasks:write",
+    "storage"
+  ],
+  "activation_events": [
+    "onView:planner",
+    "onCommand:quick_plan",
+    "onEvent:task.completed"
+  ],
+  "contributions": {
+    "sidebar": [
+      {
+        "id": "planner",
+        "title": "Focus Planner"
+      }
+    ],
+    "commands": [
+      {
+        "id": "quick_plan",
+        "title": "Focus Planner: Add High-Priority Task"
+      }
+    ]
+  },
+  "settings": [
+    {
+      "key": "default_prefix",
+      "type": "text",
+      "label": "Task Prefix",
+      "placeholder": "[Focus]",
+      "default": "[Focus]"
+    },
+    {
+      "key": "show_completed",
+      "type": "boolean",
+      "label": "Show Completed Tab by Default",
+      "default": false
+    }
+  ]
+}

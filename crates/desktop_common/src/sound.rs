@@ -196,31 +196,49 @@ fn send_audio(cmd: AudioCommand) {
 }
 
 #[cfg(not(test))]
+fn apply_effect(backend: &mut AudioBackend, effect: AudioEffect) {
+    match effect {
+        AudioEffect::None => {}
+        AudioEffect::Stop => backend.stop(),
+        AudioEffect::LoopWhiteNoise(preset) => backend.play_loop(white_noise_wav(preset)),
+        AudioEffect::PlayChime(Chime::Complete) => backend.play_once("complete", complete_wav()),
+        AudioEffect::PlayChime(Chime::FocusDone) => backend.play_once("focus_done", focus_done_wav()),
+    }
+}
+
+#[cfg(not(test))]
 fn audio_worker(rx: std::sync::mpsc::Receiver<AudioCommand>) {
     use std::sync::mpsc::RecvTimeoutError;
     use std::time::Instant;
 
     let mut state = AudioState::default();
     let mut backend = AudioBackend::new();
-    let mut apply = |effect: AudioEffect| match effect {
-        AudioEffect::None => {}
-        AudioEffect::Stop => backend.stop(),
-        AudioEffect::LoopWhiteNoise(preset) => backend.play_loop(white_noise_wav(preset)),
-        AudioEffect::PlayChime(Chime::Complete) => backend.play_once("complete", complete_wav()),
-        AudioEffect::PlayChime(Chime::FocusDone) => backend.play_once("focus_done", focus_done_wav()),
-    };
 
     loop {
-        if let Some(deadline) = state.resume_at {
+        let next_deadline = match (state.resume_at, backend.reap_deadline()) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        if let Some(deadline) = next_deadline {
             let wait = deadline.saturating_duration_since(Instant::now());
             match rx.recv_timeout(wait) {
-                Ok(cmd) => apply(state.handle(cmd, Instant::now())),
-                Err(RecvTimeoutError::Timeout) => apply(state.on_timeout()),
+                Ok(cmd) => {
+                    let now = Instant::now();
+                    backend.poll_reap(now);
+                    apply_effect(&mut backend, state.handle(cmd, now));
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    let now = Instant::now();
+                    if state.resume_at.is_some_and(|t| now >= t) {
+                        apply_effect(&mut backend, state.on_timeout());
+                    }
+                    backend.poll_reap(now);
+                }
                 Err(RecvTimeoutError::Disconnected) => break,
             }
         } else {
             match rx.recv() {
-                Ok(cmd) => apply(state.handle(cmd, Instant::now())),
+                Ok(cmd) => apply_effect(&mut backend, state.handle(cmd, Instant::now())),
                 Err(_) => break,
             }
         }
@@ -399,36 +417,54 @@ impl AudioBackend {
             PlaySoundW(core::ptr::null(), core::ptr::null_mut(), 0);
         }
     }
+
+    fn reap_deadline(&self) -> Option<std::time::Instant> {
+        None
+    }
+
+    fn poll_reap(&mut self, _now: std::time::Instant) {}
 }
 
 #[cfg(all(target_os = "macos", not(test)))]
-#[derive(Default)]
-struct AudioBackend {
-    active: Option<objc2::rc::Retained<objc2_app_kit::NSSound>>,
+thread_local! {
+    static MACOS_ACTIVE_SOUND: std::cell::RefCell<Option<objc2::rc::Retained<objc2_app_kit::NSSound>>> =
+        const { std::cell::RefCell::new(None) };
 }
+
+#[cfg(all(target_os = "macos", not(test)))]
+struct AudioBackend;
 
 #[cfg(all(target_os = "macos", not(test)))]
 impl AudioBackend {
     fn new() -> Self {
-        Self::default()
+        Self
     }
 
     fn play_data(&mut self, wav: &'static [u8], loops: bool) {
-        use objc2::AnyThread as _;
-        use objc2_app_kit::NSSound;
-        use objc2_foundation::NSData;
+        dispatch2::DispatchQueue::main().exec_async(move || {
+            objc2::rc::autoreleasepool(|_| {
+                use objc2::AnyThread as _;
+                use objc2_app_kit::NSSound;
+                use objc2_foundation::NSData;
 
-        self.stop();
-        if wav.is_empty() {
-            return;
-        }
-        let data = NSData::with_bytes(wav);
-        if let Some(sound) = NSSound::initWithData(NSSound::alloc(), &data) {
-            sound.setLoops(loops);
-            if sound.play() {
-                self.active = Some(sound);
-            }
-        }
+                MACOS_ACTIVE_SOUND.with(|slot| {
+                    let prev = slot.borrow_mut().take();
+                    if let Some(prev) = prev {
+                        prev.stop();
+                    }
+                    if wav.is_empty() {
+                        return;
+                    }
+                    let data = NSData::with_bytes(wav);
+                    if let Some(sound) = NSSound::initWithData(NSSound::alloc(), &data) {
+                        sound.setLoops(loops);
+                        if sound.play() {
+                            *slot.borrow_mut() = Some(sound);
+                        }
+                    }
+                });
+            });
+        });
     }
 
     fn play_once(&mut self, _tag: &str, wav: &'static [u8]) {
@@ -440,9 +476,35 @@ impl AudioBackend {
     }
 
     fn stop(&mut self) {
-        if let Some(sound) = self.active.take() {
-            sound.stop();
-        }
+        dispatch2::DispatchQueue::main().exec_async(|| {
+            objc2::rc::autoreleasepool(|_| {
+                MACOS_ACTIVE_SOUND.with(|slot| {
+                    let prev = slot.borrow_mut().take();
+                    if let Some(prev) = prev {
+                        prev.stop();
+                    }
+                });
+            });
+        });
+    }
+
+    fn reap_deadline(&self) -> Option<std::time::Instant> {
+        None
+    }
+
+    fn poll_reap(&mut self, _now: std::time::Instant) {}
+}
+
+#[cfg(any(all(target_os = "linux", not(test)), test))]
+fn audio_cache_dir(
+    xdg_runtime_dir: Option<&std::ffi::OsStr>,
+    temp_dir: &std::path::Path,
+    uid: u32,
+) -> std::path::PathBuf {
+    if let Some(dir) = xdg_runtime_dir.filter(|d| !d.is_empty()) {
+        std::path::PathBuf::from(dir).join("fern-audio")
+    } else {
+        temp_dir.join(format!("fern-audio-{uid}"))
     }
 }
 
@@ -450,6 +512,7 @@ impl AudioBackend {
 #[derive(Default)]
 struct AudioBackend {
     chime_child: Option<std::process::Child>,
+    chime_reap_at: Option<std::time::Instant>,
     loop_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     loop_child: Option<std::sync::Arc<std::sync::Mutex<Option<std::process::Child>>>>,
     loop_thread: Option<std::thread::JoinHandle<()>>,
@@ -488,11 +551,19 @@ fn linux_player() -> Option<LinuxPlayer> {
 
 #[cfg(all(target_os = "linux", not(test)))]
 fn cached_wav_path(tag: &str, wav: &[u8]) -> Option<std::path::PathBuf> {
-    let base = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
-        .join("fern-audio");
-    std::fs::create_dir_all(&base).ok()?;
+    use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _};
+
+    let uid = std::fs::metadata("/proc/self")
+        .ok()
+        .map(|m| m.uid())
+        .unwrap_or_else(std::process::id);
+    let xdg = std::env::var_os("XDG_RUNTIME_DIR");
+    let base = audio_cache_dir(xdg.as_deref(), &std::env::temp_dir(), uid);
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&base)
+        .ok()?;
     let path = base.join(format!("{tag}.wav"));
     if path.metadata().ok().map(|m| m.len()) != Some(wav.len() as u64) {
         std::fs::write(&path, wav).ok()?;
@@ -507,9 +578,34 @@ impl AudioBackend {
     }
 
     fn stop_chime(&mut self) {
-        if let Some(mut child) = self.chime_child.take() {
+        self.chime_reap_at = None;
+        if let Some(mut child) = self.chime_child.take()
+            && !matches!(child.try_wait(), Ok(Some(_)))
+        {
             let _ = child.kill();
             let _ = child.wait();
+        }
+    }
+
+    fn reap_deadline(&self) -> Option<std::time::Instant> {
+        self.chime_reap_at
+    }
+
+    fn poll_reap(&mut self, now: std::time::Instant) {
+        let Some(child) = self.chime_child.as_mut() else {
+            self.chime_reap_at = None;
+            return;
+        };
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => {
+                self.chime_child = None;
+                self.chime_reap_at = None;
+            }
+            Ok(None) => {
+                if self.chime_reap_at.is_none_or(|t| now >= t) {
+                    self.chime_reap_at = Some(now + std::time::Duration::from_millis(250));
+                }
+            }
         }
     }
 
@@ -554,6 +650,7 @@ impl AudioBackend {
         };
         if let Ok(child) = cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
             self.chime_child = Some(child);
+            self.chime_reap_at = Some(std::time::Instant::now() + std::time::Duration::from_millis(250));
         }
     }
 
@@ -650,6 +747,10 @@ impl AudioBackend {
     fn play_once(&mut self, _tag: &str, _wav: &'static [u8]) {}
     fn play_loop(&mut self, _wav: &'static [u8]) {}
     fn stop(&mut self) {}
+    fn reap_deadline(&self) -> Option<std::time::Instant> {
+        None
+    }
+    fn poll_reap(&mut self, _now: std::time::Instant) {}
 }
 
 #[cfg(test)]
@@ -729,5 +830,25 @@ mod tests {
         );
         assert!(state.resume_at.is_none());
         assert_eq!(state.on_timeout(), AudioEffect::None);
+    }
+
+    #[test]
+    fn linux_audio_cache_dir_scopes_tmp_fallback_by_uid() {
+        use std::ffi::OsStr;
+        use std::path::{Path, PathBuf};
+
+        let tmp = Path::new("/tmp");
+        assert_eq!(
+            audio_cache_dir(Some(OsStr::new("/run/user/1000")), tmp, 1000),
+            PathBuf::from("/run/user/1000").join("fern-audio")
+        );
+        assert_eq!(
+            audio_cache_dir(None, tmp, 1000),
+            PathBuf::from("/tmp").join("fern-audio-1000")
+        );
+        assert_eq!(
+            audio_cache_dir(Some(OsStr::new("")), tmp, 42),
+            PathBuf::from("/tmp").join("fern-audio-42")
+        );
     }
 }

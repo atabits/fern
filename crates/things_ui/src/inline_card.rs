@@ -50,6 +50,9 @@ pub struct ExpandedCardState {
     pub show_checklist: bool,
     pub tag_input: Entity<TextInput>,
     pub active_popover: Option<CardPopover>,
+    /// True when the task was freshly inserted empty via `+ New To-Do` / Magic Plus
+    /// and has not yet been mutated or given content.
+    pub created_empty: bool,
     pub _subscriptions: Vec<Subscription>,
 }
 
@@ -169,13 +172,23 @@ pub fn render_collapsed_row<V: 'static>(
             .and_then(|lid| props.list_names.get(&lid))
             .map(|name| {
                 div()
+                    .when(cfg!(test), |el| {
+                        el.debug_selector(move || format!("things-project-chip-{id}"))
+                    })
+                    .max_w(px(120.))
+                    .overflow_hidden()
                     .px_1p5()
                     .h(px(18.))
                     .flex()
                     .items_center()
                     .rounded(px(5.))
                     .bg(colors.element_hover)
-                    .child(Label::new(name.clone()).size(LabelSize::XSmall).color(Color::Muted).truncate())
+                    .child(
+                        Label::new(name.clone())
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted)
+                            .truncate(),
+                    )
             })
     };
 
@@ -183,6 +196,7 @@ pub fn render_collapsed_row<V: 'static>(
         id,
         title: display_title.clone(),
     };
+    let allow_row_drop = props.view != ThingsViewKind::Logbook && !closed;
     let group_name = SharedString::from(format!("things-row-group-{id}"));
 
     div()
@@ -199,28 +213,32 @@ pub fn render_collapsed_row<V: 'static>(
         .cursor_pointer()
         .when(props.selected, |el| el.bg(colors.element_selected))
         .when(!props.selected, |el| el.hover(|s| s.bg(colors.ghost_element_hover)))
-        .drag_over::<DraggedMagicPlus>(move |style, _, _, cx| {
-            style.border_b_2().border_color(cx.theme().colors().accent)
+        .when(allow_row_drop, |el| {
+            el.drag_over::<DraggedMagicPlus>(move |style, _, _, cx| {
+                style.border_b_2().border_color(cx.theme().colors().accent)
+            })
+            .on_drop(cx.listener(move |this, _: &DraggedMagicPlus, window, cx| {
+                magic_drop_act(this, CardAction::MagicDropAfter(id), window, cx);
+            }))
+            .drag_over::<DraggedTask>(move |style, _, _, cx| {
+                style
+                    .border_b_2()
+                    .border_color(cx.theme().colors().accent.opacity(0.75))
+            })
+            .on_drop(cx.listener(move |this, dragged: &DraggedTask, window, cx| {
+                if dragged.id != id {
+                    reorder_drop_act(
+                        this,
+                        CardAction::ReorderAfter {
+                            dragged_id: dragged.id,
+                            target_id: id,
+                        },
+                        window,
+                        cx,
+                    );
+                }
+            }))
         })
-        .on_drop(cx.listener(move |this, _: &DraggedMagicPlus, window, cx| {
-            magic_drop_act(this, CardAction::MagicDropAfter(id), window, cx);
-        }))
-        .drag_over::<DraggedTask>(move |style, _, _, cx| {
-            style.border_b_2().border_color(cx.theme().colors().accent.opacity(0.75))
-        })
-        .on_drop(cx.listener(move |this, dragged: &DraggedTask, window, cx| {
-            if dragged.id != id {
-                reorder_drop_act(
-                    this,
-                    CardAction::ReorderAfter {
-                        dragged_id: dragged.id,
-                        target_id: id,
-                    },
-                    window,
-                    cx,
-                );
-            }
-        }))
         .on_drag(drag_payload, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
         .on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
             cx.stop_propagation();
@@ -432,7 +450,8 @@ pub fn render_expanded_card<V: 'static>(
             .filter(|t| query.is_empty() || t.name.to_lowercase().contains(&query))
             .map(|tag| {
                 let name = tag.name.clone();
-                let assigned = task.tags.iter().any(|t| t.eq_ignore_ascii_case(&name));
+                let name_lower = name.to_lowercase();
+                let assigned = task.tags.iter().any(|t| t.to_lowercase() == name_lower);
                 let dot = lists_panel::color(tag.color.as_deref(), cx);
                 let toggle_act = on_action.clone();
                 ListItem::new(SharedString::from(format!("card-tag-opt-{name}")))
@@ -457,10 +476,14 @@ pub fn render_expanded_card<V: 'static>(
 
         popover(cx)
             .id("things-card-tags-popover")
+            .when(cfg!(test), |el| {
+                el.debug_selector(|| "things-card-tags-popover".to_owned())
+            })
             .w(px(228.))
             .p_2()
             .gap_1p5()
             .on_mouse_down_out(cx.listener(move |this, _, window, cx| {
+                cx.stop_propagation();
                 close_pop(this, CardAction::ClosePopover, window, cx);
             }))
             .child(
@@ -534,6 +557,7 @@ pub fn render_expanded_card<V: 'static>(
             .when_some(selector, |el, sel| {
                 el.when(cfg!(test), |el| el.debug_selector(move || sel.to_owned()))
             })
+            .max_w(px(160.))
             .h(px(26.))
             .px_2()
             .gap_1()
@@ -542,8 +566,17 @@ pub fn render_expanded_card<V: 'static>(
             .when(error, |el| el.bg(status.error.opacity(0.10)))
             .when(!error && highlighted, |el| el.bg(colors.accent.opacity(0.10)))
             .when(!error && !highlighted, |el| el.hover(|s| s.bg(colors.element_hover)))
-            .child(Icon::new(icon).size(IconSize::XSmall).color(text_color))
-            .child(Label::new(label).size(LabelSize::XSmall).color(text_color))
+            .child(
+                div()
+                    .flex_none()
+                    .child(Icon::new(icon).size(IconSize::XSmall).color(text_color)),
+            )
+            .child(
+                Label::new(label)
+                    .size(LabelSize::XSmall)
+                    .color(text_color)
+                    .truncate(),
+            )
     };
 
     let focus_title = if task.title.trim().is_empty() {
@@ -660,6 +693,8 @@ pub fn render_expanded_card<V: 'static>(
                 .gap_2()
                 .child(
                     h_flex()
+                        .flex_1()
+                        .min_w_0()
                         .flex_wrap()
                         .gap_1()
                         .child(
@@ -735,7 +770,7 @@ pub fn render_expanded_card<V: 'static>(
                                 .child(
                                     pill_button(
                                         SharedString::from(format!("things-card-move-{id}")),
-                                        None,
+                                        Some("things-card-move"),
                                         IconName::Folder,
                                         project_label,
                                         state.active_popover == Some(CardPopover::Move),
@@ -752,6 +787,9 @@ pub fn render_expanded_card<V: 'static>(
                 )
                 .child(
                     h_flex()
+                        .when(cfg!(test), |el| {
+                            el.debug_selector(|| "things-card-footer-actions".to_owned())
+                        })
                         .flex_none()
                         .gap_1()
                         .child(

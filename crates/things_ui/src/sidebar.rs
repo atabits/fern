@@ -407,22 +407,30 @@ pub fn render_sidebar<V: 'static>(
                 .border_t_1()
                 .border_color(theme_colors.border_variant)
                 .child(
-                    Button::new("things-sidebar-add", strings.things_new_project)
-                        .variant(ButtonVariant::Ghost)
-                        .size(ButtonSize::Sm)
-                        .icon(IconName::Plus)
-                        .full_width()
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            toggle_menu(this, SidebarAction::ToggleAddMenu, window, cx);
-                        })),
+                    div()
+                        .when(cfg!(test), |el| el.debug_selector(|| "things-sidebar-add".to_owned()))
+                        .child(
+                            Button::new("things-sidebar-add", strings.things_new_project)
+                                .variant(ButtonVariant::Ghost)
+                                .size(ButtonSize::Sm)
+                                .icon(IconName::Plus)
+                                .full_width()
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    toggle_menu(this, SidebarAction::ToggleAddMenu, window, cx);
+                                })),
+                        ),
                 )
                 .when(props.add_menu_open, |el| {
                     el.child(PopoverAttachment::new(
                         Placement::AboveLeft,
                         popover(cx)
                             .id("things-sidebar-add-menu")
+                            .when(cfg!(test), |el| {
+                                el.debug_selector(|| "things-sidebar-add-menu".to_owned())
+                            })
                             .min_w(px(184.))
                             .on_mouse_down_out(cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
                                 close_menu(this, SidebarAction::CloseAddMenu, window, cx);
                             }))
                             .child(

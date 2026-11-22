@@ -11,7 +11,7 @@ use task_ui::task_rows;
 use ui::prelude::*;
 use ui::{
     Button, ButtonSize, ButtonVariant, Divider, Icon, IconButton, IconName, IconSize, Label,
-    LabelSize, ListItem, Tooltip, popover,
+    LabelSize, ListItem, Tooltip, popover, v_scroll,
 };
 
 /// Target entity for a Deadline picker session.
@@ -225,7 +225,8 @@ pub fn render_when_popover<V: 'static>(
     };
 
     let is_today = state.start_date == Some(today) && state.bucket == ScheduleBucket::None;
-    let is_evening = state.start_date == Some(today) && state.bucket == ScheduleBucket::Evening;
+    let is_evening =
+        state.bucket == ScheduleBucket::Evening && state.start_date.is_none_or(|d| d <= today);
     let is_tomorrow = state.start_date == Some(tomorrow) && state.bucket == ScheduleBucket::None;
     let is_next_week = state.start_date == Some(next_week) && state.bucket == ScheduleBucket::None;
     let is_someday = state.bucket == ScheduleBucket::Someday;
@@ -257,14 +258,9 @@ pub fn render_when_popover<V: 'static>(
     let close_out = on_action.clone();
     let clear_action = on_action.clone();
 
-    popover(cx)
-        .id("things-when-popover")
-        .w(px(244.))
-        .p_2()
+    let body = v_flex()
+        .id("things-when-body")
         .gap_1p5()
-        .on_mouse_down_out(cx.listener(move |this, _, window, cx| {
-            close_out(this, WhenAction::Close, window, cx);
-        }))
         .child(preset_row(
             "when-today",
             IconName::Sun,
@@ -347,7 +343,18 @@ pub fn render_when_popover<V: 'static>(
                         );
                     })),
             )
-        })
+        });
+
+    popover(cx)
+        .id("things-when-popover")
+        .when(cfg!(test), |el| el.debug_selector(|| "things-when-popover".to_owned()))
+        .w(px(244.))
+        .p_2()
+        .on_mouse_down_out(cx.listener(move |this, _, window, cx| {
+            cx.stop_propagation();
+            close_out(this, WhenAction::Close, window, cx);
+        }))
+        .child(v_scroll("things-when-scroll", body).max_h(px(360.)).compact())
         .into_any_element()
 }
 
@@ -407,10 +414,12 @@ pub fn render_deadline_popover<V: 'static>(
 
     popover(cx)
         .id("things-deadline-popover")
+        .when(cfg!(test), |el| el.debug_selector(|| "things-deadline-popover".to_owned()))
         .w(px(244.))
         .p_2()
         .gap_1p5()
         .on_mouse_down_out(cx.listener(move |this, _, window, cx| {
+            cx.stop_propagation();
             close_out(this, DeadlineAction::Close, window, cx);
         }))
         .child(

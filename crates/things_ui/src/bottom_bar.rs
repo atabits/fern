@@ -96,21 +96,24 @@ pub fn render_move_popover<V: 'static>(
     );
 
     let standalone: Vec<&List> = active_lists.iter().copied().filter(|l| l.folder.is_none()).collect();
-    if !standalone.is_empty() || !folders.is_empty() {
+    let folder_groups: Vec<(&ListFolder, Vec<&List>)> = folders
+        .iter()
+        .filter_map(|folder| {
+            let children: Vec<&List> = active_lists
+                .iter()
+                .copied()
+                .filter(|l| l.folder == Some(folder.id))
+                .collect();
+            (!children.is_empty()).then_some((folder, children))
+        })
+        .collect();
+    if !standalone.is_empty() || !folder_groups.is_empty() {
         rows.push(div().my_1().child(Divider::horizontal()).into_any_element());
     }
     for list in standalone {
         rows.push(project_item(list, false, cx));
     }
-    for folder in folders {
-        let children: Vec<&List> = active_lists
-            .iter()
-            .copied()
-            .filter(|l| l.folder == Some(folder.id))
-            .collect();
-        if children.is_empty() {
-            continue;
-        }
+    for (folder, children) in folder_groups {
         rows.push(
             div()
                 .px_2()
@@ -132,9 +135,11 @@ pub fn render_move_popover<V: 'static>(
 
     popover(cx)
         .id("things-move-popover")
+        .when(cfg!(test), |el| el.debug_selector(|| "things-move-popover".to_owned()))
         .w(px(228.))
         .p_1p5()
         .on_mouse_down_out(cx.listener(move |this, _, window, cx| {
+            cx.stop_propagation();
             on_close(this, window, cx);
         }))
         .child(
@@ -199,6 +204,7 @@ pub fn render_bottom_bar<V: 'static>(
                 .child(
                     div()
                         .relative()
+                        .when(cfg!(test), |el| el.debug_selector(|| "things-bar-when".to_owned()))
                         .child(
                             Button::new("things-bar-when", strings.things_when)
                                 .variant(ButtonVariant::Ghost)
@@ -216,6 +222,7 @@ pub fn render_bottom_bar<V: 'static>(
                 .child(
                     div()
                         .relative()
+                        .when(cfg!(test), |el| el.debug_selector(|| "things-bar-move".to_owned()))
                         .child(
                             Button::new("things-bar-move", strings.things_move)
                                 .variant(ButtonVariant::Ghost)

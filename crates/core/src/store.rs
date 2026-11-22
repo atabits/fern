@@ -13,7 +13,7 @@ use crate::attachment::PreparedAttachment;
 use crate::countdown::{Countdown, CountdownKind};
 use crate::focus::FocusSession;
 use crate::habit::{Checkin, CheckinMode, CheckinStatus, Goal, Habit, HabitDraft, HabitSection, MAX_CUSTOM_SECTIONS, MAX_LOG_NOTE_CHARS, MAX_REMINDERS, MOODS, polish_amount};
-use crate::model::{Attachment, ChecklistItem, Id, Kind, List, ListDraft, ListFolder, Priority, Tag, Task, TaskDraft, View, ViewCounts};
+use crate::model::{Attachment, ChecklistItem, Id, Kind, List, ListDraft, ListFolder, Priority, ScheduleBucket, Tag, Task, TaskDraft, View, ViewCounts};
 use crate::recurrence::Recurrence;
 
 /// Maximum nesting depth for subtasks (`0..=4`, i.e. 5 levels total).
@@ -901,6 +901,200 @@ const MIGRATIONS: &[&str] = &[
         ON CONFLICT(entity, key) DO UPDATE SET at = MAX(sync_watermarks.at, excluded.at);
     END;
     ",
+    // Multi-frontend scheduling columns on tasks and project fields on lists (Things 3 support).
+    "
+    ALTER TABLE tasks ADD COLUMN start_date TEXT;
+    ALTER TABLE tasks ADD COLUMN schedule_bucket TEXT NOT NULL DEFAULT '';
+    ALTER TABLE lists ADD COLUMN notes TEXT NOT NULL DEFAULT '';
+    ALTER TABLE lists ADD COLUMN deadline TEXT;
+    ALTER TABLE lists ADD COLUMN completed_at INTEGER;
+    CREATE TRIGGER tasks_modified_schedule AFTER UPDATE OF start_date, schedule_bucket ON tasks
+    BEGIN
+        UPDATE tasks SET modified_at = CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) WHERE id = NEW.id;
+    END;
+    ",
+    // Local plugin state, KV, entity metadata, user scripts, write context, and event outbox.
+    "
+    CREATE TABLE plugin_state (
+        plugin_id           TEXT PRIMARY KEY,
+        enabled             INTEGER NOT NULL DEFAULT 0,
+        granted_permissions TEXT NOT NULL DEFAULT '[]',
+        manifest_hash       TEXT NOT NULL DEFAULT '',
+        settings_json       TEXT NOT NULL DEFAULT '{}',
+        consecutive_errors  INTEGER NOT NULL DEFAULT 0,
+        updated_at          INTEGER NOT NULL
+    );
+    CREATE TABLE plugin_kv (
+        plugin_id   TEXT NOT NULL,
+        key         TEXT NOT NULL,
+        value       TEXT NOT NULL,
+        updated_at  INTEGER NOT NULL,
+        PRIMARY KEY (plugin_id, key)
+    );
+    CREATE TABLE plugin_entity_meta (
+        plugin_id   TEXT NOT NULL,
+        entity_type TEXT NOT NULL,
+        entity_id   TEXT NOT NULL,
+        key         TEXT NOT NULL,
+        value       TEXT NOT NULL,
+        updated_at  INTEGER NOT NULL,
+        PRIMARY KEY (plugin_id, entity_type, entity_id, key)
+    );
+    CREATE INDEX plugin_entity_meta_lookup ON plugin_entity_meta(entity_type, entity_id);
+    CREATE TABLE user_scripts (
+        id           TEXT PRIMARY KEY,
+        name         TEXT NOT NULL,
+        enabled      INTEGER NOT NULL DEFAULT 0,
+        trigger_kind TEXT NOT NULL,
+        trigger_arg  TEXT NOT NULL DEFAULT '',
+        permissions  TEXT NOT NULL DEFAULT '[\"tasks:read\"]',
+        code         TEXT NOT NULL,
+        updated_at   INTEGER NOT NULL
+    );
+    CREATE TABLE plugin_write_ctx (
+        plugin_id TEXT NOT NULL,
+        depth     INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE plugin_outbox (
+        seq           INTEGER PRIMARY KEY AUTOINCREMENT,
+        event_kind    TEXT NOT NULL,
+        entity_id     TEXT NOT NULL,
+        origin_plugin TEXT,
+        depth         INTEGER NOT NULL DEFAULT 0,
+        at            INTEGER NOT NULL
+    );
+    CREATE TRIGGER outbox_tasks_insert AFTER INSERT ON tasks
+    BEGIN
+        INSERT INTO plugin_outbox (event_kind, entity_id, origin_plugin, depth, at)
+        VALUES (
+            'task.created',
+            NEW.id,
+            CASE WHEN EXISTS (SELECT 1 FROM sync_applying) THEN '__sync__' ELSE (SELECT plugin_id FROM plugin_write_ctx LIMIT 1) END,
+            COALESCE((SELECT depth FROM plugin_write_ctx LIMIT 1), 0),
+            CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)
+        );
+    END;
+    CREATE TRIGGER outbox_tasks_completed AFTER UPDATE OF completed_at ON tasks
+    WHEN OLD.completed_at IS NULL AND NEW.completed_at IS NOT NULL
+    BEGIN
+        INSERT INTO plugin_outbox (event_kind, entity_id, origin_plugin, depth, at)
+        VALUES (
+            'task.completed',
+            NEW.id,
+            CASE WHEN EXISTS (SELECT 1 FROM sync_applying) THEN '__sync__' ELSE (SELECT plugin_id FROM plugin_write_ctx LIMIT 1) END,
+            COALESCE((SELECT depth FROM plugin_write_ctx LIMIT 1), 0),
+            CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)
+        );
+    END;
+    CREATE TRIGGER outbox_tasks_reopened AFTER UPDATE OF completed_at ON tasks
+    WHEN OLD.completed_at IS NOT NULL AND NEW.completed_at IS NULL
+    BEGIN
+        INSERT INTO plugin_outbox (event_kind, entity_id, origin_plugin, depth, at)
+        VALUES (
+            'task.reopened',
+            NEW.id,
+            CASE WHEN EXISTS (SELECT 1 FROM sync_applying) THEN '__sync__' ELSE (SELECT plugin_id FROM plugin_write_ctx LIMIT 1) END,
+            COALESCE((SELECT depth FROM plugin_write_ctx LIMIT 1), 0),
+            CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)
+        );
+    END;
+    CREATE TRIGGER outbox_tasks_deleted AFTER UPDATE OF deleted_at ON tasks
+    WHEN OLD.deleted_at IS NULL AND NEW.deleted_at IS NOT NULL
+    BEGIN
+        INSERT INTO plugin_outbox (event_kind, entity_id, origin_plugin, depth, at)
+        VALUES (
+            'task.deleted',
+            NEW.id,
+            CASE WHEN EXISTS (SELECT 1 FROM sync_applying) THEN '__sync__' ELSE (SELECT plugin_id FROM plugin_write_ctx LIMIT 1) END,
+            COALESCE((SELECT depth FROM plugin_write_ctx LIMIT 1), 0),
+            CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)
+        );
+    END;
+    CREATE TRIGGER outbox_tasks_purged AFTER DELETE ON tasks
+    WHEN OLD.deleted_at IS NULL
+    BEGIN
+        INSERT INTO plugin_outbox (event_kind, entity_id, origin_plugin, depth, at)
+        VALUES (
+            'task.deleted',
+            OLD.id,
+            CASE WHEN EXISTS (SELECT 1 FROM sync_applying) THEN '__sync__' ELSE (SELECT plugin_id FROM plugin_write_ctx LIMIT 1) END,
+            COALESCE((SELECT depth FROM plugin_write_ctx LIMIT 1), 0),
+            CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)
+        );
+    END;
+    CREATE TRIGGER outbox_tasks_updated AFTER UPDATE OF
+        title, notes, priority, due_date, due_time, end_date, end_time,
+        list_id, section_id, repeat, wont_do_at, start_date, schedule_bucket ON tasks
+    WHEN OLD.title IS NOT NEW.title
+        OR OLD.notes IS NOT NEW.notes
+        OR OLD.priority IS NOT NEW.priority
+        OR OLD.due_date IS NOT NEW.due_date
+        OR OLD.due_time IS NOT NEW.due_time
+        OR OLD.end_date IS NOT NEW.end_date
+        OR OLD.end_time IS NOT NEW.end_time
+        OR OLD.list_id IS NOT NEW.list_id
+        OR OLD.section_id IS NOT NEW.section_id
+        OR OLD.repeat IS NOT NEW.repeat
+        OR OLD.wont_do_at IS NOT NEW.wont_do_at
+        OR OLD.start_date IS NOT NEW.start_date
+        OR OLD.schedule_bucket IS NOT NEW.schedule_bucket
+    BEGIN
+        INSERT INTO plugin_outbox (event_kind, entity_id, origin_plugin, depth, at)
+        VALUES (
+            'task.updated',
+            NEW.id,
+            CASE WHEN EXISTS (SELECT 1 FROM sync_applying) THEN '__sync__' ELSE (SELECT plugin_id FROM plugin_write_ctx LIMIT 1) END,
+            COALESCE((SELECT depth FROM plugin_write_ctx LIMIT 1), 0),
+            CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)
+        );
+    END;
+    CREATE TRIGGER outbox_habit_checkins_insert AFTER INSERT ON habit_checkins
+    BEGIN
+        INSERT INTO plugin_outbox (event_kind, entity_id, origin_plugin, depth, at)
+        VALUES (
+            'habit.checkin',
+            NEW.habit_id || char(31) || NEW.date,
+            CASE WHEN EXISTS (SELECT 1 FROM sync_applying) THEN '__sync__' ELSE (SELECT plugin_id FROM plugin_write_ctx LIMIT 1) END,
+            COALESCE((SELECT depth FROM plugin_write_ctx LIMIT 1), 0),
+            CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)
+        );
+    END;
+    CREATE TRIGGER outbox_habit_checkins_update AFTER UPDATE ON habit_checkins
+    BEGIN
+        INSERT INTO plugin_outbox (event_kind, entity_id, origin_plugin, depth, at)
+        VALUES (
+            'habit.checkin',
+            NEW.habit_id || char(31) || NEW.date,
+            CASE WHEN EXISTS (SELECT 1 FROM sync_applying) THEN '__sync__' ELSE (SELECT plugin_id FROM plugin_write_ctx LIMIT 1) END,
+            COALESCE((SELECT depth FROM plugin_write_ctx LIMIT 1), 0),
+            CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)
+        );
+    END;
+    CREATE TRIGGER outbox_focus_sessions_insert AFTER INSERT ON focus_sessions
+    WHEN NEW.ended_at IS NOT NULL
+    BEGIN
+        INSERT INTO plugin_outbox (event_kind, entity_id, origin_plugin, depth, at)
+        VALUES (
+            'focus.completed',
+            NEW.id,
+            CASE WHEN EXISTS (SELECT 1 FROM sync_applying) THEN '__sync__' ELSE (SELECT plugin_id FROM plugin_write_ctx LIMIT 1) END,
+            COALESCE((SELECT depth FROM plugin_write_ctx LIMIT 1), 0),
+            CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)
+        );
+    END;
+    CREATE TRIGGER outbox_focus_sessions_update AFTER UPDATE OF ended_at ON focus_sessions
+    WHEN NEW.ended_at IS NOT NULL AND OLD.ended_at IS NOT NEW.ended_at
+    BEGIN
+        INSERT INTO plugin_outbox (event_kind, entity_id, origin_plugin, depth, at)
+        VALUES (
+            'focus.completed',
+            NEW.id,
+            CASE WHEN EXISTS (SELECT 1 FROM sync_applying) THEN '__sync__' ELSE (SELECT plugin_id FROM plugin_write_ctx LIMIT 1) END,
+            COALESCE((SELECT depth FROM plugin_write_ctx LIMIT 1), 0),
+            CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)
+        );
+    END;
+    ",
 ];
 
 /// Current SQLite schema version (`PRAGMA user_version`).
@@ -1003,9 +1197,10 @@ const FILTER_ORDER_KEY: &str = "filter_order";
 
 const TASK_COLUMNS: &str = "id, parent_id, kind, title, notes, priority, due_date, due_time, \
                             completed_at, created_at, list_id, deleted_at, repeat, wont_do_at, reminders, end_date, end_time, modified_at, \
-                            pinned_at, section_id, estimate, in_progress_at, location, timezone, is_floating, snoozed_until, constant_reminder";
+                            pinned_at, section_id, estimate, in_progress_at, location, timezone, is_floating, snoozed_until, constant_reminder, \
+                            start_date, schedule_bucket";
 
-const DATE_FORMAT: &str = "%Y-%m-%d";
+pub(crate) const DATE_FORMAT: &str = "%Y-%m-%d";
 const TIME_FORMAT: &str = "%H:%M";
 const SNOOZE_FORMAT: &str = "%Y-%m-%dT%H:%M:%S";
 
@@ -1080,6 +1275,7 @@ impl Store {
     }
 
     fn init(conn: Connection, attachments_dir: Option<PathBuf>) -> Result<Self> {
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         // With WAL, a commit waits for the disk only at checkpoints; a power cut can lose the
         // last changes but never corrupts the file.
@@ -1550,6 +1746,8 @@ impl Store {
             section_id: None,
             reminders: draft.reminders,
             estimate: None,
+            start_date: draft.start_date,
+            schedule_bucket: draft.schedule_bucket,
             created_at: now_ms(),
         };
         let order = if top {
@@ -1557,12 +1755,18 @@ impl Store {
         } else {
             "(SELECT COALESCE(MAX(sort_order), 0) + 1024 FROM tasks)"
         };
-        if task.location.is_some() || task.timezone.is_some() || task.is_floating || task.constant_reminder {
+        if task.location.is_some()
+            || task.timezone.is_some()
+            || task.is_floating
+            || task.constant_reminder
+            || task.start_date.is_some()
+            || task.schedule_bucket != ScheduleBucket::None
+        {
             self.conn.execute(
                 &format!("INSERT INTO tasks (id, title, notes, list_id, kind, priority, due_date, due_time,
                           repeat, reminders, created_at, end_date, end_time, location, timezone, is_floating,
-                          constant_reminder, sort_order)
-                          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, {order})"),
+                          constant_reminder, start_date, schedule_bucket, sort_order)
+                          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, {order})"),
                 params![
                     task.id.to_string(), task.title, task.notes, task.list_id.map(|id| id.to_string()),
                     task.kind.as_str(), task.priority.to_i64(),
@@ -1576,6 +1780,8 @@ impl Store {
                     task.timezone,
                     task.is_floating,
                     task.constant_reminder,
+                    task.start_date.map(|date| date.format(DATE_FORMAT).to_string()),
+                    task.schedule_bucket.as_str(),
                 ],
             )?;
         } else {
@@ -1690,6 +1896,8 @@ impl Store {
                 section_id: parent_task.section_id,
                 reminders: Vec::new(),
                 estimate: None,
+                start_date: None,
+                schedule_bucket: ScheduleBucket::None,
                 created_at: now_ms(),
             };
             self.conn.execute(
@@ -1745,7 +1953,8 @@ impl Store {
                             "INSERT INTO tasks ({TASK_COLUMNS})
                              SELECT ?2, parent_id, kind, title, notes, priority, due_date, due_time,
                                     ?3, created_at, list_id, NULL, NULL, NULL, NULL, end_date, end_time, ?3, NULL,
-                                    section_id, estimate, NULL, location, timezone, is_floating, NULL, 0
+                                    section_id, estimate, NULL, location, timezone, is_floating, NULL, 0,
+                                    start_date, schedule_bucket
                              FROM tasks WHERE id = ?1"
                         ),
                         params![id.to_string(), copy.to_string(), now_ms()],
@@ -1949,7 +2158,8 @@ impl Store {
                      list_id = o.list_id, section_id = o.section_id, repeat = o.repeat,
                      reminders = o.reminders, end_date = o.end_date, end_time = o.end_time,
                      estimate = o.estimate, location = o.location, timezone = o.timezone,
-                     is_floating = o.is_floating, constant_reminder = o.constant_reminder
+                     is_floating = o.is_floating, constant_reminder = o.constant_reminder,
+                     start_date = o.start_date, schedule_bucket = o.schedule_bucket
                  FROM (SELECT * FROM tasks WHERE id = ?2) AS o WHERE tasks.id = ?1",
                 params![copy.id.to_string(), id.to_string()],
             )?;
@@ -3007,7 +3217,8 @@ impl Store {
     /// The lists in their order, archived ones included (see `List::archived`).
     pub fn lists(&self) -> Result<Vec<List>> {
         let mut stmt = self.conn.prepare_cached(
-            "SELECT l.id, l.name, l.color, COUNT(t.id), l.icon, l.folder_id, l.kind, l.in_smart_lists, l.archived_at
+            "SELECT l.id, l.name, l.color, COUNT(t.id), l.icon, l.folder_id, l.kind, l.in_smart_lists, l.archived_at,
+                    l.notes, l.deadline, l.completed_at
              FROM lists l
              LEFT JOIN tasks t ON t.list_id = l.id AND t.completed_at IS NULL
                                AND t.deleted_at IS NULL
@@ -3026,6 +3237,10 @@ impl Store {
                     kind: Kind::parse(&row.get::<_, String>(6)?),
                     in_smart_lists: row.get(7)?,
                     archived: row.get::<_, Option<i64>>(8)?.is_some(),
+                    notes: row.get(9)?,
+                    deadline: row.get::<_, Option<String>>(10)?
+                        .and_then(|d| NaiveDate::parse_from_str(&d, DATE_FORMAT).ok()),
+                    completed_at: row.get(11)?,
                 })
             })?
             .collect::<Result<_, _>>()?;
@@ -3054,7 +3269,8 @@ impl Store {
         let name = draft.name.trim();
         anyhow::ensure!(!name.is_empty(), "a list needs a name");
         self.conn.execute(
-            "UPDATE lists SET name = ?2, icon = ?3, color = ?4, folder_id = ?5, kind = ?6, in_smart_lists = ?7 WHERE id = ?1",
+            "UPDATE lists SET name = ?2, icon = ?3, color = ?4, folder_id = ?5, kind = ?6, in_smart_lists = ?7,
+                              notes = ?8, deadline = ?9, completed_at = ?10 WHERE id = ?1",
             params![
                 id.to_string(),
                 name,
@@ -3062,7 +3278,10 @@ impl Store {
                 draft.color,
                 draft.folder.map(|f| f.to_string()),
                 draft.kind.as_str(),
-                draft.in_smart_lists
+                draft.in_smart_lists,
+                draft.notes,
+                draft.deadline.map(|d| d.format(DATE_FORMAT).to_string()),
+                draft.completed_at,
             ],
         )?;
         Ok(())
@@ -5619,7 +5838,7 @@ fn matches_view(task: &Task, view: &View, today: NaiveDate) -> bool {
     }
 }
 
-fn parse_uuid(value: &str, column: usize) -> rusqlite::Result<Uuid> {
+pub(crate) fn parse_uuid(value: &str, column: usize) -> rusqlite::Result<Uuid> {
     Uuid::parse_str(value).map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(column, rusqlite::types::Type::Text, Box::new(e))
     })
@@ -5659,6 +5878,8 @@ fn task_from_row(row: &Row) -> rusqlite::Result<Task> {
         is_floating: row.get::<_, i64>(24)? != 0,
         snoozed_until: row.get::<_, Option<String>>(25)?.and_then(|s| NaiveDateTime::parse_from_str(&s, SNOOZE_FORMAT).ok()),
         constant_reminder: row.get::<_, i64>(26)? != 0,
+        start_date: row.get::<_, Option<String>>(27)?.and_then(|d| NaiveDate::parse_from_str(&d, DATE_FORMAT).ok()),
+        schedule_bucket: ScheduleBucket::parse(&row.get::<_, String>(28)?),
     })
 }
 
@@ -6200,6 +6421,7 @@ mod tests {
             folder: Some(home.id),
             kind: Kind::Note,
             in_smart_lists: true,
+            ..Default::default()
         };
         let groceries = store.add_list(&draft)?;
         assert_eq!((groceries.name.as_str(), groceries.icon.as_deref(), groceries.folder, groceries.kind), ("Groceries", Some("🛒"), Some(home.id), Kind::Note));

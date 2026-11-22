@@ -61,6 +61,34 @@ impl Kind {
     }
 }
 
+/// Optional Things-style schedule bucket (`""`, `"evening"`, or `"someday"`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScheduleBucket {
+    #[default]
+    None,
+    Evening,
+    Someday,
+}
+
+impl ScheduleBucket {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ScheduleBucket::None => "",
+            ScheduleBucket::Evening => "evening",
+            ScheduleBucket::Someday => "someday",
+        }
+    }
+
+    pub fn parse(value: &str) -> Self {
+        match value {
+            "evening" => ScheduleBucket::Evening,
+            "someday" => ScheduleBucket::Someday,
+            _ => ScheduleBucket::None,
+        }
+    }
+}
+
 /// Fields written together when creating a task from an editor or quick-add form.
 #[derive(Clone, Default)]
 pub struct TaskDraft {
@@ -82,6 +110,8 @@ pub struct TaskDraft {
     pub timezone: Option<String>,
     pub is_floating: bool,
     pub constant_reminder: bool,
+    pub start_date: Option<NaiveDate>,
+    pub schedule_bucket: ScheduleBucket,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -132,6 +162,10 @@ pub struct Task {
     pub reminders: Vec<i64>,
     /// "Estimation" from Start Focus: how much focus the task is expected to take.
     pub estimate: Option<Estimate>,
+    /// Things-style scheduled start date ("When").
+    pub start_date: Option<NaiveDate>,
+    /// Things-style schedule bucket (`None`, `Evening`, `Someday`).
+    pub schedule_bucket: ScheduleBucket,
     pub created_at: i64,
 }
 
@@ -292,6 +326,12 @@ pub struct List {
     pub in_smart_lists: bool,
     /// Archived lists leave the lists column for "Archived Lists" and the smart lists.
     pub archived: bool,
+    /// Project notes (used by Things frontend).
+    pub notes: String,
+    /// Optional project deadline (used by Things frontend).
+    pub deadline: Option<NaiveDate>,
+    /// Unix milliseconds when the project was completed (used by Things frontend).
+    pub completed_at: Option<i64>,
 }
 
 /// A comment on a task, as the original's comments.
@@ -320,11 +360,24 @@ pub struct ListDraft {
     pub folder: Option<Id>,
     pub kind: Kind,
     pub in_smart_lists: bool,
+    pub notes: String,
+    pub deadline: Option<NaiveDate>,
+    pub completed_at: Option<i64>,
 }
 
 impl Default for ListDraft {
     fn default() -> Self {
-        Self { name: String::new(), icon: None, color: None, folder: None, kind: Kind::Task, in_smart_lists: true }
+        Self {
+            name: String::new(),
+            icon: None,
+            color: None,
+            folder: None,
+            kind: Kind::Task,
+            in_smart_lists: true,
+            notes: String::new(),
+            deadline: None,
+            completed_at: None,
+        }
     }
 }
 
@@ -337,6 +390,9 @@ impl ListDraft {
             folder: list.folder,
             kind: list.kind,
             in_smart_lists: list.in_smart_lists,
+            notes: list.notes.clone(),
+            deadline: list.deadline,
+            completed_at: list.completed_at,
         }
     }
 }

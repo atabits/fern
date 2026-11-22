@@ -21,7 +21,7 @@ pub enum Section {
 impl From<RailSection> for Section {
     fn from(section: RailSection) -> Self {
         match section {
-            RailSection::Tasks => Section::Tasks,
+            RailSection::Tasks | RailSection::Things => Section::Tasks,
             RailSection::Calendar => Section::Calendar,
             RailSection::Pomodoro => Section::Pomodoro,
             RailSection::Habits => Section::Habits,
@@ -169,7 +169,7 @@ pub fn render(
     let ordered_sections: Vec<Section> = if order.is_empty() {
         Section::ALL.to_vec()
     } else {
-        order.iter().copied().map(Section::from).collect()
+        order.iter().copied().filter(|&s| s != RailSection::Things).map(Section::from).collect()
     };
 
     v_flex()

@@ -1,0 +1,33 @@
+[package]
+name = "plugin_ui"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/plugin_ui.rs"
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+desktop_common.workspace = true
+fern_core.workspace = true
+fern_i18n.workspace = true
+gpui.workspace = true
+icons.workspace = true
+plugins.workspace = true
+resvg.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+theme.workspace = true
+ui.workspace = true
+usvg.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+assets.workspace = true
+gpui = { workspace = true, features = ["test-support"] }
+tempfile.workspace = true

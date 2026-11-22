@@ -156,6 +156,7 @@ impl SidebarSection {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum RailSection {
     Tasks,
+    Things,
     Calendar,
     Pomodoro,
     Habits,
@@ -165,7 +166,7 @@ pub enum RailSection {
 }
 
 impl RailSection {
-    pub const ALL: [RailSection; 7] = [
+    pub const ALL: [RailSection; 8] = [
         RailSection::Tasks,
         RailSection::Calendar,
         RailSection::Pomodoro,
@@ -173,11 +174,13 @@ impl RailSection {
         RailSection::Search,
         RailSection::Matrix,
         RailSection::Countdown,
+        RailSection::Things,
     ];
 
     pub fn code(self) -> &'static str {
         match self {
             Self::Tasks => "tasks",
+            Self::Things => "things",
             Self::Calendar => "calendar",
             Self::Pomodoro => "focus",
             Self::Habits => "habits",
@@ -190,6 +193,99 @@ impl RailSection {
     pub fn from_code(code: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|section| section.code() == code)
     }
+}
+
+/// Unified identifier for entries in the navigation rail (built-in sections and plugin views).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum RailItemId {
+    BuiltIn(RailSection),
+    Plugin { plugin_id: String, view_id: String },
+}
+
+impl RailItemId {
+    pub fn code(&self) -> String {
+        match self {
+            Self::BuiltIn(section) => section.code().to_owned(),
+            Self::Plugin { plugin_id, view_id } => format!("plugin:{plugin_id}/{view_id}"),
+        }
+    }
+
+    pub fn from_code(code: &str) -> Option<Self> {
+        let code = code.trim();
+        if let Some(rest) = code.strip_prefix("plugin:") {
+            let (plugin_id, view_id) = rest.split_once('/')?;
+            if plugin_id.is_empty() || view_id.is_empty() || view_id.contains('/') {
+                return None;
+            }
+            return Some(Self::Plugin {
+                plugin_id: plugin_id.to_owned(),
+                view_id: view_id.to_owned(),
+            });
+        }
+        RailSection::from_code(code).map(Self::BuiltIn)
+    }
+}
+
+fn default_rail_items() -> Vec<RailItemId> {
+    RailSection::ALL.into_iter().map(RailItemId::BuiltIn).collect()
+}
+
+fn normalize_rail_items_iter(items: impl IntoIterator<Item = RailItemId>) -> Vec<RailItemId> {
+    let mut out = Vec::with_capacity(RailSection::ALL.len());
+    for item in items {
+        if !out.contains(&item) {
+            out.push(item);
+        }
+    }
+    for section in RailSection::ALL {
+        let builtin = RailItemId::BuiltIn(section);
+        if !out.contains(&builtin) {
+            out.push(builtin);
+        }
+    }
+    out
+}
+
+fn normalize_rail_items(stored: &str) -> Vec<RailItemId> {
+    normalize_rail_items_iter(
+        stored
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .filter_map(RailItemId::from_code),
+    )
+}
+
+fn sync_builtins_in_items(items: &[RailItemId], order: &[RailSection]) -> Vec<RailItemId> {
+    let normalized_items = normalize_rail_items_iter(items.iter().cloned());
+    let mut next_builtin = order.iter().copied();
+    let mut out = Vec::with_capacity(normalized_items.len());
+    for item in normalized_items {
+        match item {
+            RailItemId::BuiltIn(orig) => {
+                out.push(RailItemId::BuiltIn(next_builtin.next().unwrap_or(orig)));
+            }
+            plugin @ RailItemId::Plugin { .. } => out.push(plugin),
+        }
+    }
+    normalize_rail_items_iter(out)
+}
+
+fn builtins_of_items(items: &[RailItemId]) -> Vec<RailSection> {
+    let mut out = Vec::with_capacity(RailSection::ALL.len());
+    for item in items {
+        if let RailItemId::BuiltIn(section) = item
+            && !out.contains(section)
+        {
+            out.push(*section);
+        }
+    }
+    for section in RailSection::ALL {
+        if !out.contains(&section) {
+            out.push(section);
+        }
+    }
+    out
 }
 
 fn normalize_order<T: Copy + PartialEq>(stored: &str, defaults: &[T], parse: fn(&str) -> Option<T>) -> Vec<T> {
@@ -425,8 +521,10 @@ pub struct Preferences {
     pub smart_list_order: Vec<SmartList>,
     /// Order of the middle sections (`Lists`, `Tags`, `Filters`) in the lists column.
     pub sidebar_section_order: Vec<SidebarSection>,
-    /// Order of the icons in the narrow leftmost rail.
+    /// Order of the icons in the narrow leftmost rail (built-in sections).
     pub rail_order: Vec<RailSection>,
+    /// Unified order of all rail entries, including plugin views.
+    pub rail_items: Vec<RailItemId>,
     /// The list's View Options, as the original's: "Show Date by" Countdown ("in 3 days")
     /// rather than Task Time, and the "Pop-up" task detail layout for a narrow window rather
     /// than "Side peek".
@@ -458,6 +556,35 @@ impl Preferences {
 
     pub fn move_rail_section(&mut self, dragged: RailSection, target: RailSection, after: bool) {
         reorder_relative(&mut self.rail_order, &RailSection::ALL, dragged, target, after);
+        self.rail_items = sync_builtins_in_items(&self.rail_items, &self.rail_order);
+    }
+
+    pub fn move_rail_item(&mut self, dragged: &RailItemId, target: &RailItemId, after: bool) {
+        if dragged == target {
+            return;
+        }
+        self.rail_items = normalize_rail_items_iter(std::mem::take(&mut self.rail_items));
+        if !self.rail_items.contains(dragged) {
+            self.rail_items.push(dragged.clone());
+        }
+        if !self.rail_items.contains(target) {
+            return;
+        }
+        let Some(from) = self.rail_items.iter().position(|item| item == dragged) else {
+            return;
+        };
+        let moved = self.rail_items.remove(from);
+        let Some(to) = self.rail_items.iter().position(|item| item == target) else {
+            self.rail_items.insert(from, moved);
+            return;
+        };
+        self.rail_items.insert(to + usize::from(after), moved);
+        self.rail_order = builtins_of_items(&self.rail_items);
+    }
+
+    pub fn set_rail_items(&mut self, items: Vec<RailItemId>) {
+        self.rail_items = normalize_rail_items_iter(items);
+        self.rail_order = builtins_of_items(&self.rail_items);
     }
 }
 
@@ -480,6 +607,7 @@ impl Default for Preferences {
             smart_list_order: SmartList::TOP_DRAGGABLE.to_vec(),
             sidebar_section_order: SidebarSection::ALL.to_vec(),
             rail_order: RailSection::ALL.to_vec(),
+            rail_items: default_rail_items(),
             countdown_dates: false,
             popup_details: false,
         }
@@ -527,9 +655,11 @@ impl Notifications {
     }
 }
 
-/// The original's Features: sections that can be turned off.
+/// The original's Features: sections that can be turned off (plus opt-in task frontends).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Features {
+    pub tasks: bool,
+    pub things: bool,
     pub calendar: bool,
     pub matrix: bool,
     pub habits: bool,
@@ -539,14 +669,36 @@ pub struct Features {
 
 impl Default for Features {
     fn default() -> Self {
-        Self { calendar: true, matrix: true, habits: true, focus: true, countdown: true }
+        Self {
+            tasks: true,
+            things: false,
+            calendar: true,
+            matrix: true,
+            habits: true,
+            focus: true,
+            countdown: true,
+        }
     }
 }
 
 impl Features {
-    /// Stored as the names of the sections turned off, e.g. "matrix,countdown".
-    fn to_storage(self) -> String {
-        let off: Vec<&str> = [
+    /// Whether at least one task frontend (`Tasks` or `Things`) is enabled.
+    pub fn has_any_task_frontend(self) -> bool {
+        self.tasks || self.things
+    }
+
+    /// Ensures at least one task frontend stays enabled (falling back to `tasks = true`).
+    pub fn sanitize(&mut self) {
+        if !self.has_any_task_frontend() {
+            self.tasks = true;
+        }
+    }
+
+    /// Stored backwards-compatibly: off sections by name (`"tasks,matrix"`), plus `"+things"` when enabled.
+    fn to_storage(mut self) -> String {
+        self.sanitize();
+        let mut tokens: Vec<&str> = [
+            ("tasks", self.tasks),
             ("calendar", self.calendar),
             ("matrix", self.matrix),
             ("habits", self.habits),
@@ -557,18 +709,25 @@ impl Features {
         .filter(|(_, on)| !on)
         .map(|(name, _)| name)
         .collect();
-        off.join(",")
+        if self.things {
+            tokens.push("+things");
+        }
+        tokens.join(",")
     }
 
     fn from_storage(text: &str) -> Self {
-        let off: Vec<&str> = text.split(',').collect();
-        Self {
-            calendar: !off.contains(&"calendar"),
-            matrix: !off.contains(&"matrix"),
-            habits: !off.contains(&"habits"),
-            focus: !off.contains(&"focus"),
-            countdown: !off.contains(&"countdown"),
-        }
+        let tokens: Vec<&str> = text.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+        let mut features = Self {
+            tasks: !tokens.contains(&"tasks") && !tokens.contains(&"-tasks"),
+            things: tokens.contains(&"+things"),
+            calendar: !tokens.contains(&"calendar"),
+            matrix: !tokens.contains(&"matrix"),
+            habits: !tokens.contains(&"habits"),
+            focus: !tokens.contains(&"focus"),
+            countdown: !tokens.contains(&"countdown"),
+        };
+        features.sanitize();
+        features
     }
 }
 const DEFAULT_DATE: &str = "default_date";
@@ -673,6 +832,9 @@ impl Store {
         let rail_order = get(RAIL_ORDER)
             .map(|s| normalize_order(s, &RailSection::ALL, RailSection::from_code))
             .unwrap_or_else(|| defaults.rail_order.clone());
+        let rail_items = get(RAIL_ORDER)
+            .map(normalize_rail_items)
+            .unwrap_or_else(|| defaults.rail_items.clone());
         let mut preferences = Preferences {
             theme,
             week_start,
@@ -691,6 +853,7 @@ impl Store {
             smart_list_order,
             sidebar_section_order,
             rail_order,
+            rail_items,
             ..defaults
         };
         for list in SmartList::ALL {
@@ -759,8 +922,18 @@ impl Store {
             self.set_setting(SMART_LIST_ORDER, &smart_order.join(","))?;
             let section_order: Vec<&str> = preferences.sidebar_section_order.iter().map(|s| s.code()).collect();
             self.set_setting(SIDEBAR_SECTION_ORDER, &section_order.join(","))?;
-            let rail_order: Vec<&str> = preferences.rail_order.iter().map(|r| r.code()).collect();
-            self.set_setting(RAIL_ORDER, &rail_order.join(","))?;
+            let saved_items = self
+                .setting(RAIL_ORDER)?
+                .map(|s| normalize_rail_items(&s))
+                .unwrap_or_else(default_rail_items);
+            let saved_builtins = builtins_of_items(&saved_items);
+            let resolved_items = if preferences.rail_items == saved_items && preferences.rail_order != saved_builtins {
+                sync_builtins_in_items(&preferences.rail_items, &preferences.rail_order)
+            } else {
+                normalize_rail_items_iter(preferences.rail_items.iter().cloned())
+            };
+            let rail_codes: Vec<String> = resolved_items.iter().map(RailItemId::code).collect();
+            self.set_setting(RAIL_ORDER, &rail_codes.join(","))?;
             Ok(())
         })
     }
@@ -947,6 +1120,63 @@ mod tests {
             recovered.sidebar_section_order,
             [SidebarSection::Tags, SidebarSection::Lists, SidebarSection::Filters]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn features_task_frontends_and_rail_items_backwards_compat() -> Result<()> {
+        let store = Store::open_in_memory()?;
+
+        // Legacy storage without tasks/+things flags defaults to tasks=true, things=false.
+        store.set_setting(FEATURES, "matrix,countdown")?;
+        let loaded = store.preferences()?.features;
+        assert!(loaded.tasks);
+        assert!(!loaded.things);
+        assert!(!loaded.matrix);
+        assert!(!loaded.countdown);
+        assert!(loaded.has_any_task_frontend());
+
+        // Switching to Things-only persists cleanly and recovers if both are turned off.
+        let mut prefs = store.preferences()?;
+        prefs.features.tasks = false;
+        prefs.features.things = true;
+        store.save_preferences(&prefs)?;
+        let reloaded = store.preferences()?.features;
+        assert!(!reloaded.tasks);
+        assert!(reloaded.things);
+        assert!(reloaded.has_any_task_frontend());
+
+        let mut invalid = Features { tasks: false, things: false, ..Features::default() };
+        assert!(!invalid.has_any_task_frontend());
+        invalid.sanitize();
+        assert!(invalid.tasks);
+        assert!(invalid.has_any_task_frontend());
+
+        // RailItemId roundtrip with plugin entries and legacy rail_order compatibility.
+        let plugin_item = RailItemId::Plugin {
+            plugin_id: "com.example.github".into(),
+            view_id: "issues".into(),
+        };
+        assert_eq!(RailItemId::from_code(&plugin_item.code()), Some(plugin_item.clone()));
+        assert_eq!(RailItemId::from_code("things"), Some(RailItemId::BuiltIn(RailSection::Things)));
+
+        prefs.set_rail_items(vec![
+            plugin_item.clone(),
+            RailItemId::BuiltIn(RailSection::Things),
+            RailItemId::BuiltIn(RailSection::Tasks),
+        ]);
+        store.save_preferences(&prefs)?;
+        let loaded_prefs = store.preferences()?;
+        assert_eq!(loaded_prefs.rail_items[0], plugin_item);
+        assert_eq!(loaded_prefs.rail_items[1], RailItemId::BuiltIn(RailSection::Things));
+        assert_eq!(loaded_prefs.rail_order[0], RailSection::Things);
+        assert!(loaded_prefs.rail_items.contains(&RailItemId::BuiltIn(RailSection::Countdown)));
+
+        // Direct rail_order update preserves plugin entries in rail_items.
+        store.update_preferences(|p| p.move_rail_section(RailSection::Calendar, RailSection::Things, false))?;
+        let after_builtin_move = store.preferences()?;
+        assert_eq!(after_builtin_move.rail_items[0], plugin_item);
+        assert_eq!(after_builtin_move.rail_order[0], RailSection::Calendar);
         Ok(())
     }
 }

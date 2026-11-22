@@ -11,10 +11,13 @@ members = [
     "crates/i18n",
     "crates/icons",
     "crates/matrix_ui",
+    "crates/plugin_ui",
+    "crates/plugins",
     "crates/sticky_ui",
     "crates/summary_ui",
     "crates/task_ui",
     "crates/theme",
+    "crates/things_ui",
     "crates/todo_ui",
     "crates/ui",
     "apps/desktop",
@@ -44,10 +47,13 @@ focus_ui = { path = "crates/focus_ui" }
 habit_ui = { path = "crates/habit_ui" }
 icons = { path = "crates/icons" }
 matrix_ui = { path = "crates/matrix_ui" }
+plugin_ui = { path = "crates/plugin_ui" }
+plugins = { path = "crates/plugins" }
 sticky_ui = { path = "crates/sticky_ui" }
 summary_ui = { path = "crates/summary_ui" }
 task_ui = { path = "crates/task_ui" }
 theme = { path = "crates/theme" }
+things_ui = { path = "crates/things_ui" }
 todo_ui = { path = "crates/todo_ui" }
 ui = { path = "crates/ui" }
 
@@ -116,6 +122,7 @@ objc2-user-notifications = { version = "0.3", default-features = false, features
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac", "sha2"] }
 raw-window-handle = "0.6"
 resvg = "0.46"
+rquickjs = { version = "0.14.0", features = ["loader", "futures", "classes", "macro", "chrono"] }
 rust-embed = { version = "8", features = ["include-exclude"] }
 rusqlite = { version = "0.37", features = ["bundled", "backup"] }
 serde = { version = "1", features = ["derive"] }

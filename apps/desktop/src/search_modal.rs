@@ -4,6 +4,7 @@
 use std::rc::Rc;
 
 use chrono::Local;
+use desktop_common::plugin_bus::{PluginBus, PluginCommandSpec, PluginSearchHit};
 use fern_core::search::{DateRange, TagRule, TaskFilter};
 use fern_core::{Habit, Id, Kind, List, Priority, Store, Tag, Task, View};
 use gpui::{Entity, EventEmitter, FocusHandle, Focusable, FontWeight, HighlightStyle, StyledText};
@@ -38,11 +39,17 @@ enum Menu {
     Priority,
 }
 
+#[derive(Clone)]
 pub enum SearchEvent {
     OpenTask(Id),
     OpenHabit(Id),
     OpenView(View),
     CreateTask(String),
+    RunPluginCommand {
+        plugin_id: String,
+        command_id: String,
+        arg: Option<String>,
+    },
     Dismissed,
 }
 
@@ -54,6 +61,8 @@ pub struct SearchModal {
     habits: Vec<Habit>,
     tags: Vec<Tag>,
     lists: Vec<List>,
+    plugin_commands: Vec<PluginCommandSpec>,
+    plugin_hits: Vec<PluginSearchHit>,
     all_lists: Vec<List>,
     all_tags: Vec<Tag>,
     search_task: Option<gpui::Task<()>>,
@@ -92,6 +101,10 @@ impl SearchModal {
             cx.notify();
         })
         .detach();
+        cx.observe_global::<PluginBus>(|this, cx| {
+            this.sync_plugin_results(cx);
+        })
+        .detach();
         let custom_from = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.range_from, cx));
         let custom_until = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.range_until, cx));
         Self {
@@ -102,6 +115,8 @@ impl SearchModal {
             habits: Vec::new(),
             tags: Vec::new(),
             lists: Vec::new(),
+            plugin_commands: Vec::new(),
+            plugin_hits: Vec::new(),
             all_lists,
             all_tags,
             search_task: None,
@@ -147,7 +162,51 @@ impl SearchModal {
         self.tags = self.all_tags.iter().filter(|t| matches(&t.name)).cloned().collect();
         self.lists = self.all_lists.iter().filter(|l| matches(&l.name)).cloned().collect();
         self.selected = 0;
+        self.sync_plugin_results(cx);
+        if self.filter == Filter::All && !query.is_empty() {
+            plugin_ui::PluginHost::search_async(query, cx);
+        }
+    }
+
+    fn sync_plugin_results(&mut self, cx: &mut Context<Self>) {
+        let query = self.query(cx);
+        if self.filter != Filter::All || query.is_empty() {
+            self.plugin_commands.clear();
+            self.plugin_hits.clear();
+        } else if let Some(bus) = cx.try_global::<PluginBus>() {
+            self.plugin_commands = bus
+                .commands
+                .iter()
+                .filter(|cmd| {
+                    !task_rows::match_ranges(&cmd.title, &query).is_empty()
+                        || !task_rows::match_ranges(&cmd.plugin_name, &query).is_empty()
+                })
+                .cloned()
+                .collect();
+            self.plugin_hits = bus.search_hits.clone();
+        } else {
+            self.plugin_commands.clear();
+            self.plugin_hits.clear();
+        }
+        let count = self.visible_events().len();
+        if count == 0 {
+            self.selected = 0;
+        } else {
+            self.selected = self.selected.min(count - 1);
+        }
         cx.notify();
+    }
+
+    fn plugin_hit_event(hit: &PluginSearchHit) -> Option<SearchEvent> {
+        if let Some(task_id) = hit.task_id {
+            Some(SearchEvent::OpenTask(task_id))
+        } else {
+            hit.command_id.as_ref().map(|command_id| SearchEvent::RunPluginCommand {
+                plugin_id: hit.plugin_id.clone(),
+                command_id: command_id.clone(),
+                arg: hit.command_arg.clone(),
+            })
+        }
     }
 
     fn set_filter(&mut self, filter: Filter, cx: &mut Context<Self>) {
@@ -431,6 +490,14 @@ impl SearchModal {
         }
         if self.shows(Filter::Lists) {
             events.extend(self.lists.iter().map(|l| SearchEvent::OpenView(View::List(l.id))));
+        }
+        if self.filter == Filter::All {
+            events.extend(self.plugin_commands.iter().map(|cmd| SearchEvent::RunPluginCommand {
+                plugin_id: cmd.plugin_id.clone(),
+                command_id: cmd.command_id.clone(),
+                arg: None,
+            }));
+            events.extend(self.plugin_hits.iter().filter_map(Self::plugin_hit_event));
         }
         events
     }
@@ -750,7 +817,83 @@ impl Render for SearchModal {
         } else {
             Vec::new()
         };
-        let nothing = has_query && task_rows.is_empty() && habit_rows.is_empty() && tag_rows.is_empty() && list_rows.is_empty();
+        let command_rows = if self.filter == Filter::All {
+            self.plugin_commands
+                .iter()
+                .map(|cmd| {
+                    let is_selected = has_query && row_index == selected_index;
+                    row_index += 1;
+                    let plugin_id = cmd.plugin_id.clone();
+                    let command_id = cmd.command_id.clone();
+                    ListItem::new(SharedString::from(format!(
+                        "search-plugin-cmd-{}-{}",
+                        cmd.plugin_id, cmd.command_id
+                    )))
+                    .height(px(30.))
+                    .toggle_state(is_selected)
+                    .start_slot(Icon::new(IconName::Code).color(Color::Accent))
+                    .child(div().text_size(px(13.)).child(self.highlighted(&cmd.title, &query, cx)))
+                    .end_slot(Label::new(cmd.plugin_name.clone()).size(LabelSize::XSmall).color(Color::Muted))
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        cx.emit(SearchEvent::RunPluginCommand {
+                            plugin_id: plugin_id.clone(),
+                            command_id: command_id.clone(),
+                            arg: None,
+                        });
+                    }))
+                    .into_any_element()
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let plugin_hit_rows = if self.filter == Filter::All {
+            self.plugin_hits
+                .iter()
+                .enumerate()
+                .map(|(idx, hit)| {
+                    let event = Self::plugin_hit_event(hit);
+                    let is_selected = has_query && event.is_some() && row_index == selected_index;
+                    if event.is_some() {
+                        row_index += 1;
+                    }
+                    let mut item = ListItem::new(SharedString::from(format!(
+                        "search-plugin-hit-{}-{idx}",
+                        hit.plugin_id
+                    )))
+                    .height(px(30.))
+                    .toggle_state(is_selected)
+                    .start_slot(Icon::new(IconName::Zap).color(Color::Muted))
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .child(div().text_size(px(13.)).child(self.highlighted(&hit.title, &query, cx)))
+                            .when_some(hit.subtitle.clone(), |el, sub| {
+                                el.child(Label::new(sub).size(LabelSize::XSmall).color(Color::Muted).truncate())
+                            }),
+                    );
+                    if let Some(badge) = hit.badge.clone() {
+                        item = item.end_slot(Label::new(badge).size(LabelSize::XSmall).color(Color::Muted));
+                    }
+                    if let Some(ev) = event {
+                        item = item.on_click(cx.listener(move |_, _, _, cx| {
+                            cx.emit(ev.clone());
+                        }));
+                    }
+                    item.into_any_element()
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let nothing = has_query
+            && task_rows.is_empty()
+            && habit_rows.is_empty()
+            && tag_rows.is_empty()
+            && list_rows.is_empty()
+            && command_rows.is_empty()
+            && plugin_hit_rows.is_empty();
 
         v_flex()
             .w(px(560.))
@@ -897,7 +1040,9 @@ impl Render for SearchModal {
                         })
                         .when(!habit_rows.is_empty(), |el| el.child(Self::group_heading(strings.section_habits)).children(habit_rows))
                         .when(!tag_rows.is_empty(), |el| el.child(Self::group_heading(strings.tags)).children(tag_rows))
-                        .when(!list_rows.is_empty(), |el| el.child(Self::group_heading(strings.lists)).children(list_rows)),
+                        .when(!list_rows.is_empty(), |el| el.child(Self::group_heading(strings.lists)).children(list_rows))
+                        .when(!command_rows.is_empty(), |el| el.child(Self::group_heading(strings.plugins_commands)).children(command_rows))
+                        .when(!plugin_hit_rows.is_empty(), |el| el.child(Self::group_heading(strings.plugins)).children(plugin_hit_rows)),
                 )
                 .flex_1()
                 .min_h(px(180.)),
@@ -995,5 +1140,67 @@ mod tests {
         assert_eq!(updated.due_date, Some(day + chrono::Duration::days(7)));
         let completed_copies = store.tasks().unwrap().into_iter().filter(|t| t.is_completed()).count();
         assert_eq!(completed_copies, 1);
+    }
+
+    #[gpui::test]
+    fn plugin_commands_and_search_hits_emit_navigation_and_command_events(cx: &mut gpui::TestAppContext) {
+        cx.update(theme::init);
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let task = store.add_task("Unrelated task").unwrap();
+        cx.update(|cx| {
+            let mut bus = PluginBus::default();
+            bus.commands.push(PluginCommandSpec {
+                plugin_id: "pomo".into(),
+                command_id: "start".into(),
+                title: "Start Focus Session".into(),
+                plugin_name: "Pomo".into(),
+            });
+            bus.search_hits.push(PluginSearchHit {
+                id: "hit-1".into(),
+                plugin_id: "notes".into(),
+                provider_id: "external".into(),
+                title: "External Focus Note".into(),
+                subtitle: Some("Notes".into()),
+                badge: Some("Sync".into()),
+                task_id: Some(task.id),
+                command_id: None,
+                command_arg: None,
+            });
+            cx.set_global(bus);
+        });
+
+        let events: Rc<std::cell::RefCell<Vec<SearchEvent>>> =
+            Rc::new(std::cell::RefCell::new(Vec::new()));
+        let events_slot = events.clone();
+        let (modal, cx) = cx.add_window_view(|_window, cx| {
+            let entity = cx.entity();
+            cx.subscribe(&entity, move |_, _, event: &SearchEvent, _| {
+                events_slot.borrow_mut().push(event.clone());
+            })
+            .detach();
+            SearchModal::new(store, cx)
+        });
+
+        cx.update(|_, cx| {
+            modal.update(cx, |modal, cx| {
+                modal.set_query("Focus", cx);
+                assert_eq!(modal.visible_events().len(), 2);
+                modal.open_selected(cx);
+                modal.move_selection(1, cx);
+                modal.open_selected(cx);
+            });
+        });
+        cx.run_until_parked();
+
+        let emitted = events.borrow();
+        assert!(matches!(
+            &emitted[0],
+            SearchEvent::RunPluginCommand {
+                plugin_id,
+                command_id,
+                arg: None
+            } if plugin_id == "pomo" && command_id == "start"
+        ));
+        assert!(matches!(&emitted[1], SearchEvent::OpenTask(id) if *id == task.id));
     }
 }

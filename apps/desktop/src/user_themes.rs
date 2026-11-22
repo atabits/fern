@@ -102,6 +102,7 @@ pub fn load(cx: &mut App) {
         eprintln!("theme: {error}");
     }
     theme::reload_user_themes(themes, errors, cx);
+    plugin_ui::PluginHost::sync_plugin_themes(cx);
 }
 
 /// Reloads user themes off the UI thread and applies the active theme selection.
@@ -159,6 +160,7 @@ fn apply_loaded(
         eprintln!("theme: {error}");
     }
     theme::reload_user_themes(themes, errors, cx);
+    plugin_ui::PluginHost::sync_plugin_themes(cx);
     let selection = store.preferences().unwrap_or_default().theme;
     let target = if cx.windows().contains(&window) {
         Some(window)

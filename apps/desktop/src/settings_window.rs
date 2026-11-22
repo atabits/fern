@@ -52,6 +52,7 @@ pub enum Page {
     Sync,
     /// The original's Integrations: calendars subscribed to by address.
     Integrations,
+    Plugins,
     Sticky,
     Shortcuts,
     About,
@@ -143,6 +144,7 @@ pub struct SettingsWindow {
     recording_shortcut: Option<shortcuts_settings_view::RecordingTarget>,
     recording_rejected: bool,
     confirm_reset_shortcuts: bool,
+    plugin_settings: Entity<plugin_ui::PluginSettingsView>,
     _updates: Option<gpui::Subscription>,
     _feeds: Option<gpui::Subscription>,
 }
@@ -204,6 +206,8 @@ pub fn open(
 /// Installs the theme and the first day of the week from `preferences`.
 pub fn apply(preferences: &Preferences, window: &Window, cx: &mut App) {
     let refreshed = crate::user_themes::apply_theme(&preferences.theme, window, cx);
+    let appearance = if cx.theme().is_dark() { "dark" } else { "light" };
+    plugin_ui::PluginHost::set_appearance(None, Some(appearance.to_owned()), cx);
     calendar::set_week_start(preferences.week_start);
     calendar::set_hour12(preferences.hour12);
     calendar::set_date_format(preferences.date_format);
@@ -277,6 +281,7 @@ impl SettingsWindow {
         })
         .detach();
         let installed_notes = release_notes::installed(&store).map(Rc::new);
+        let plugin_settings = cx.new(|cx| plugin_ui::PluginSettingsView::new(store.clone(), cx));
         let mut this = Self {
             store,
             preferences,
@@ -323,11 +328,21 @@ impl SettingsWindow {
             recording_shortcut: None,
             recording_rejected: false,
             confirm_reset_shortcuts: false,
+            plugin_settings,
             _updates: updates,
             _feeds: feeds,
         };
         this.refresh_auto_backups(cx);
         this
+    }
+
+    /// Switches to Settings → Plugins and focuses the Logs tab for `plugin_id`.
+    pub fn open_plugin_logs(&mut self, plugin_id: &str, cx: &mut Context<Self>) {
+        self.set_page(Page::Plugins, cx);
+        let plugin_id = plugin_id.to_owned();
+        self.plugin_settings.update(cx, |view, cx| {
+            view.open_logs_for(&plugin_id, cx);
+        });
     }
 
     fn refresh_cached_collections(&mut self, cx: &mut Context<Self>) {
@@ -996,6 +1011,7 @@ impl SettingsWindow {
             eprintln!("failed to save the language: {err:#}");
         }
         cx.set_global(CurrentLocale(locale));
+        plugin_ui::PluginHost::set_appearance(Some(locale.code().to_owned()), None, cx);
         self.menu = None;
         cx.refresh_windows();
     }
@@ -1024,6 +1040,7 @@ impl SettingsWindow {
             "about" => Page::About,
             "sync" => Page::Sync,
             "integrations" => Page::Integrations,
+            "plugins" => Page::Plugins,
             "sticky" => Page::Sticky,
             "shortcuts" => Page::Shortcuts,
             "features" => Page::Features,
@@ -1241,6 +1258,10 @@ impl SettingsWindow {
                         .child(
                             item("settings-integrations", IconName::CalendarDays, strings.integrations, self.page == Page::Integrations)
                                 .on_click(cx.listener(|this, _, _, cx| this.set_page(Page::Integrations, cx))),
+                        )
+                        .child(
+                            item("settings-plugins", IconName::Code, strings.plugins, self.page == Page::Plugins)
+                                .on_click(cx.listener(|this, _, _, cx| this.set_page(Page::Plugins, cx))),
                         )
                         .child(div().h(px(12.)))
                         .child(
@@ -2417,6 +2438,46 @@ impl SettingsWindow {
             }
             Page::Features => {
                 let features = self.preferences.features;
+                let frontend_row = |id: &'static str,
+                                    debug_id: &'static str,
+                                    (name, hint): (&'static str, &'static str),
+                                    on: bool,
+                                    locked: bool,
+                                    toggle: fn(&mut fern_core::Features)| {
+                    v_flex()
+                        .px_4()
+                        .py_1p5()
+                        .gap_0p5()
+                        .child(
+                            h_flex()
+                                .id(id)
+                                .debug_selector(move || debug_id.to_owned())
+                                .when(!locked, |el| el.cursor_pointer())
+                                .child(div().flex_1().child(Label::new(name)))
+                                .child(
+                                    div()
+                                        .when(locked, |el| el.opacity(0.6))
+                                        .child(Switch::new().toggle_state(on)),
+                                )
+                                .when(!locked, |el| {
+                                    el.on_click(cx.listener(move |this, _, window, cx| {
+                                        this.update(window, cx, |p| {
+                                            toggle(&mut p.features);
+                                            p.features.sanitize();
+                                        });
+                                    }))
+                                }),
+                        )
+                        .child(div().text_size(px(11.)).text_color(colors.text_muted).child(hint))
+                        .when(locked, |el| {
+                            el.child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(colors.text_muted)
+                                    .child(strings.feature_last_frontend_hint),
+                            )
+                        })
+                };
                 let values = [features.calendar, features.matrix, features.habits, features.focus, features.countdown];
                 let toggles: [fn(&mut fern_core::Features); 5] = [
                     |f| f.calendar = !f.calendar,
@@ -2425,25 +2486,49 @@ impl SettingsWindow {
                     |f| f.focus = !f.focus,
                     |f| f.countdown = !f.countdown,
                 ];
-                body.child(title(strings.features)).child(group().children(
-                    strings.feature_items.into_iter().zip(values).zip(toggles).enumerate().map(|(i, (((name, hint), on), toggle))| {
-                        v_flex()
-                            .px_4()
-                            .py_1p5()
-                            .gap_0p5()
-                            .child(
-                                h_flex()
-                                    .id(SharedString::from(format!("feature-{i}")))
-                                    .debug_selector(move || format!("settings-feature-{i}"))
-                                    .cursor_pointer()
-                                    .child(div().flex_1().child(Label::new(name)))
-                                    .child(Switch::new().toggle_state(on))
-                                    .on_click(cx.listener(move |this, _, window, cx| this.update(window, cx, |p| toggle(&mut p.features)))),
-                            )
-                            .child(div().text_size(px(11.)).text_color(colors.text_muted).child(hint))
-                    }),
-                ))
-                .into_any_element()
+                body.child(title(strings.features))
+                    .child(
+                        group().children(strings.feature_items.into_iter().zip(values).zip(toggles).enumerate().map(
+                            |(i, (((name, hint), on), toggle))| {
+                                v_flex()
+                                    .px_4()
+                                    .py_1p5()
+                                    .gap_0p5()
+                                    .child(
+                                        h_flex()
+                                            .id(SharedString::from(format!("feature-{i}")))
+                                            .debug_selector(move || format!("settings-feature-{i}"))
+                                            .cursor_pointer()
+                                            .child(div().flex_1().child(Label::new(name)))
+                                            .child(Switch::new().toggle_state(on))
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                this.update(window, cx, |p| toggle(&mut p.features))
+                                            })),
+                                    )
+                                    .child(div().text_size(px(11.)).text_color(colors.text_muted).child(hint))
+                            },
+                        )),
+                    )
+                    .child(
+                        group()
+                            .child(frontend_row(
+                                "feature-tasks",
+                                "settings-feature-tasks",
+                                strings.feature_tasks_item,
+                                features.tasks,
+                                features.tasks && !features.things,
+                                |f| f.tasks = !f.tasks,
+                            ))
+                            .child(frontend_row(
+                                "feature-things",
+                                "settings-feature-things",
+                                strings.feature_things_item,
+                                features.things,
+                                features.things && !features.tasks,
+                                |f| f.things = !f.things,
+                            )),
+                    )
+                    .into_any_element()
             }
             Page::Sync => {
                 let field = |id: &'static str, label: &'static str, input: Entity<crate::text_input::TextInput>| {
@@ -2536,6 +2621,16 @@ impl SettingsWindow {
                     .into_any_element()
             }
             Page::Integrations => body.children(self.render_integrations(cx)).into_any_element(),
+            Page::Plugins => {
+                return div()
+                    .id("settings-page")
+                    .debug_selector(|| "settings-page".to_owned())
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .child(self.plugin_settings.clone())
+                    .into_any_element();
+            }
             Page::Sticky => body.child(self.render_sticky(cx)).into_any_element(),
             Page::Shortcuts => return self.render_shortcuts_page(cx),
             Page::About => {
@@ -3113,5 +3208,67 @@ mod tests {
         Store::check_backup(&restore_target).unwrap();
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[gpui::test]
+    fn features_page_prevents_disabling_last_task_frontend_and_plugins_page_renders(cx: &mut gpui::TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        cx.update(|cx| {
+            theme::init(cx);
+            cx.set_global(crate::i18n::CurrentLocale(crate::i18n::Locale::En));
+            let _ = crate::keymap::reload(&assets::Assets, cx);
+        });
+        let (settings, cx) = cx.add_window_view(|window, cx| {
+            let mut settings = SettingsWindow::new(store.clone(), cx);
+            settings.set_page(Page::Features, cx);
+            window.focus(&settings.focus_handle, cx);
+            settings
+        });
+        cx.simulate_resize(gpui::size(px(900.), px(780.)));
+        cx.run_until_parked();
+
+        // Initially Tasks is on and Things is off: clicking Tasks must keep it on.
+        let tasks_btn = cx.debug_bounds("settings-feature-tasks").unwrap();
+        cx.simulate_click(tasks_btn.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            let features = settings.read(cx).preferences.features;
+            assert!(features.tasks);
+            assert!(!features.things);
+            assert!(features.has_any_task_frontend());
+        });
+
+        // Turn Things on, then Tasks can be turned off cleanly.
+        let things_btn = cx.debug_bounds("settings-feature-things").unwrap();
+        cx.simulate_click(things_btn.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        let tasks_btn = cx.debug_bounds("settings-feature-tasks").unwrap();
+        cx.simulate_click(tasks_btn.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            let features = settings.read(cx).preferences.features;
+            assert!(!features.tasks);
+            assert!(features.things);
+        });
+
+        // Now Things is the last enabled frontend: clicking Things keeps it on.
+        let things_btn = cx.debug_bounds("settings-feature-things").unwrap();
+        cx.simulate_click(things_btn.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            let features = settings.read(cx).preferences.features;
+            assert!(!features.tasks);
+            assert!(features.things);
+        });
+
+        // Switching to Page::Plugins renders PluginSettingsView cleanly.
+        let plugins_nav = cx.debug_bounds("settings-plugins");
+        if let Some(bounds) = plugins_nav {
+            cx.simulate_click(bounds.center(), gpui::Modifiers::default());
+        } else {
+            settings.update(cx, |s, cx| s.set_page(Page::Plugins, cx));
+        }
+        cx.run_until_parked();
+        cx.update(|_, cx| assert_eq!(settings.read(cx).page, Page::Plugins));
     }
 }

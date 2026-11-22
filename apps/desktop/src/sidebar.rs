@@ -1,27 +1,73 @@
 //! The narrow sidebar with app sections, modeled on TickTick's.
 
-use fern_core::RailSection;
-use gpui::{AnyElement, ClickEvent, ScrollHandle};
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
+use desktop_common::plugin_bus::{PluginBus, PluginSidebarViewSpec};
+use fern_core::{RailItemId, RailSection};
+use gpui::{AnyElement, ClickEvent, Global, Hsla, RenderImage, ScrollHandle};
 use ui::prelude::*;
 
-use crate::drag::DraggedRailSection;
 use crate::i18n::{self, Strings};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+const RAIL_ICON_PX: u32 = 48;
+const MAX_RAIL_SVG_CACHE: usize = 128;
+
+#[derive(Default)]
+struct RailSvgCache(HashMap<(u64, u32), Arc<RenderImage>>);
+
+impl Global for RailSvgCache {}
+
+/// Payload carried while dragging a sidebar rail icon (built-in section or plugin view).
+#[derive(Clone, Debug)]
+pub struct DraggedRailItem {
+    pub item: RailItemId,
+    pub icon: IconName,
+    pub active: bool,
+}
+
+impl Render for DraggedRailItem {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = cx.theme().colors();
+        div()
+            .size(px(40.))
+            .rounded(px(8.))
+            .bg(colors.sidebar_background.opacity(0.95))
+            .border_1()
+            .border_color(colors.sidebar_border)
+            .shadow_md()
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(Icon::new(self.icon).size(IconSize::Custom(px(24.))).color(if self.active {
+                colors.sidebar_icon
+            } else {
+                colors.sidebar_icon_muted
+            }))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Section {
     Tasks,
+    Things,
     Calendar,
     Habits,
     Pomodoro,
     Search,
     Matrix,
     Countdown,
+    Plugin {
+        plugin_id: SharedString,
+        view_id: SharedString,
+    },
 }
 
 impl From<RailSection> for Section {
     fn from(section: RailSection) -> Self {
         match section {
-            RailSection::Tasks | RailSection::Things => Section::Tasks,
+            RailSection::Tasks => Section::Tasks,
+            RailSection::Things => Section::Things,
             RailSection::Calendar => Section::Calendar,
             RailSection::Pomodoro => Section::Pomodoro,
             RailSection::Habits => Section::Habits,
@@ -32,80 +78,181 @@ impl From<RailSection> for Section {
     }
 }
 
-impl From<Section> for RailSection {
-    fn from(section: Section) -> Self {
-        match section {
-            Section::Tasks => RailSection::Tasks,
-            Section::Calendar => RailSection::Calendar,
-            Section::Pomodoro => RailSection::Pomodoro,
-            Section::Habits => RailSection::Habits,
-            Section::Search => RailSection::Search,
-            Section::Matrix => RailSection::Matrix,
-            Section::Countdown => RailSection::Countdown,
+impl Section {
+    pub fn try_from_rail_item(item: &RailItemId) -> Self {
+        match item {
+            RailItemId::BuiltIn(section) => Self::from(*section),
+            RailItemId::Plugin { plugin_id, view_id } => Self::Plugin {
+                plugin_id: plugin_id.clone().into(),
+                view_id: view_id.clone().into(),
+            },
         }
     }
-}
 
-impl Section {
-    /// Whether Settings → Features leaves the section on; Tasks and Search always are.
-    pub fn enabled(self, features: fern_core::Features) -> bool {
+    /// Whether Settings → Features leaves the section on; Search and active plugin views are shown.
+    pub fn enabled(&self, features: fern_core::Features) -> bool {
         match self {
-            Section::Tasks | Section::Search => true,
+            Section::Tasks => features.tasks,
+            Section::Things => features.things,
+            Section::Search => true,
             Section::Calendar => features.calendar,
             Section::Matrix => features.matrix,
             Section::Habits => features.habits,
             Section::Pomodoro => features.focus,
             Section::Countdown => features.countdown,
+            Section::Plugin { .. } => true,
         }
     }
 
-    pub const ALL: [Section; 7] = [
-        Section::Tasks,
-        Section::Calendar,
-        Section::Pomodoro,
-        Section::Habits,
-        Section::Search,
-        Section::Matrix,
-        Section::Countdown,
-    ];
-
-    pub fn title(self, strings: &Strings) -> &'static str {
+    pub fn title(&self, strings: &Strings) -> SharedString {
         match self {
-            Section::Tasks => strings.section_tasks,
-            Section::Calendar => strings.section_calendar,
-            Section::Habits => strings.section_habits,
-            Section::Pomodoro => strings.section_pomodoro,
-            Section::Search => strings.section_search,
-            Section::Matrix => strings.section_matrix,
-            Section::Countdown => strings.section_countdown,
+            Section::Tasks => strings.section_tasks.into(),
+            Section::Things => strings.section_things.into(),
+            Section::Calendar => strings.section_calendar.into(),
+            Section::Habits => strings.section_habits.into(),
+            Section::Pomodoro => strings.section_pomodoro.into(),
+            Section::Search => strings.section_search.into(),
+            Section::Matrix => strings.section_matrix.into(),
+            Section::Countdown => strings.section_countdown.into(),
+            Section::Plugin { plugin_id, .. } => plugin_id.clone(),
         }
     }
 
-    pub fn icon(self) -> IconName {
+    pub fn icon(&self) -> IconName {
         match self {
             // Filled glyphs as in the original, drawn for Fern (`assets/icons/fern_*.svg`): a target
             // for Focus and a clock for Habit.
             Section::Tasks => IconName::FernTasks,
+            Section::Things => IconName::Layers,
             Section::Calendar => IconName::FernCalendar,
             Section::Habits => IconName::FernHabit,
             Section::Pomodoro => IconName::FernFocus,
             Section::Search => IconName::Search,
             Section::Matrix => IconName::FernMatrix,
             Section::Countdown => IconName::FernCountdown,
+            Section::Plugin { .. } => IconName::Code,
         }
     }
 
-    fn id(self) -> &'static str {
+    fn id(&self) -> SharedString {
         match self {
-            Section::Tasks => "section-tasks",
-            Section::Calendar => "section-calendar",
-            Section::Habits => "section-habits",
-            Section::Pomodoro => "section-pomodoro",
-            Section::Search => "section-search",
-            Section::Matrix => "section-matrix",
-            Section::Countdown => "section-countdown",
+            Section::Tasks => "section-tasks".into(),
+            Section::Things => "section-things".into(),
+            Section::Calendar => "section-calendar".into(),
+            Section::Habits => "section-habits".into(),
+            Section::Pomodoro => "section-pomodoro".into(),
+            Section::Search => "section-search".into(),
+            Section::Matrix => "section-matrix".into(),
+            Section::Countdown => "section-countdown".into(),
+            Section::Plugin { plugin_id, view_id } => {
+                format!("section-plugin-{plugin_id}-{view_id}").into()
+            }
         }
     }
+}
+
+#[derive(Clone)]
+struct ResolvedRailEntry {
+    item: RailItemId,
+    section: Section,
+    title: SharedString,
+    icon_svg: Option<Arc<str>>,
+}
+
+fn resolve_rail_entries(
+    order: &[RailItemId],
+    features: fern_core::Features,
+    plugin_views: &[PluginSidebarViewSpec],
+    strings: &Strings,
+) -> Vec<ResolvedRailEntry> {
+    let view_by_key: HashMap<(&str, &str), &PluginSidebarViewSpec> = plugin_views
+        .iter()
+        .map(|spec| ((spec.plugin_id.as_str(), spec.view_id.as_str()), spec))
+        .collect();
+    let mut seen_builtins = HashSet::new();
+    let mut seen_plugins = HashSet::new();
+    let mut entries = Vec::new();
+
+    for item in order {
+        match item {
+            RailItemId::BuiltIn(rail_sec) => {
+                if seen_builtins.insert(*rail_sec) {
+                    let section = Section::from(*rail_sec);
+                    if section.enabled(features) {
+                        let title = section.title(strings);
+                        entries.push(ResolvedRailEntry {
+                            item: RailItemId::BuiltIn(*rail_sec),
+                            section,
+                            title,
+                            icon_svg: None,
+                        });
+                    }
+                }
+            }
+            RailItemId::Plugin { plugin_id, view_id } => {
+                let key = (plugin_id.as_str(), view_id.as_str());
+                if let Some(spec) = view_by_key.get(&key)
+                    && seen_plugins.insert((spec.plugin_id.as_str(), spec.view_id.as_str()))
+                {
+                    entries.push(ResolvedRailEntry {
+                        item: item.clone(),
+                        section: Section::Plugin {
+                            plugin_id: spec.plugin_id.clone().into(),
+                            view_id: spec.view_id.clone().into(),
+                        },
+                        title: spec.title.clone().into(),
+                        icon_svg: spec.icon_svg.clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    for rail_sec in RailSection::ALL {
+        if seen_builtins.insert(rail_sec) {
+            let section = Section::from(rail_sec);
+            if section.enabled(features) {
+                let title = section.title(strings);
+                entries.push(ResolvedRailEntry {
+                    item: RailItemId::BuiltIn(rail_sec),
+                    section,
+                    title,
+                    icon_svg: None,
+                });
+            }
+        }
+    }
+
+    for spec in plugin_views {
+        if seen_plugins.insert((spec.plugin_id.as_str(), spec.view_id.as_str())) {
+            entries.push(ResolvedRailEntry {
+                item: RailItemId::Plugin {
+                    plugin_id: spec.plugin_id.clone(),
+                    view_id: spec.view_id.clone(),
+                },
+                section: Section::Plugin {
+                    plugin_id: spec.plugin_id.clone().into(),
+                    view_id: spec.view_id.clone().into(),
+                },
+                title: spec.title.clone().into(),
+                icon_svg: spec.icon_svg.clone(),
+            });
+        }
+    }
+
+    entries
+}
+
+/// Visible rail items in exact visual top-to-bottom order for hit-testing and reordering.
+pub fn visible_rail_items(
+    order: &[RailItemId],
+    features: fern_core::Features,
+    plugin_views: &[PluginSidebarViewSpec],
+) -> Vec<RailItemId> {
+    resolve_rail_entries(order, features, plugin_views, &i18n::EN)
+        .into_iter()
+        .map(|entry| entry.item)
+        .collect()
 }
 
 pub use desktop_common::layout::SIDEBAR_WIDTH as WIDTH;
@@ -138,10 +285,10 @@ pub struct SyncButton {
 /// `account_menu` is rendered next to the avatar while the account menu is open.
 #[allow(clippy::too_many_arguments)]
 pub fn render(
-    active: Section,
-    hovered: Option<Section>,
-    order: &[RailSection],
-    dragging: Option<Section>,
+    active: &Section,
+    hovered: Option<&Section>,
+    order: &[RailItemId],
+    dragging: Option<&Section>,
     rail_scroll: &ScrollHandle,
     on_hover: impl Fn(Section, bool, &mut App) + Clone + 'static,
     on_select: impl Fn(Section, &mut Window, &mut App) + Clone + 'static,
@@ -152,9 +299,14 @@ pub fn render(
     sync: Option<SyncButton>,
     focus_clock: Option<(String, bool)>,
     features: fern_core::Features,
-    cx: &App,
-) -> impl IntoElement {
-    let colors = cx.theme().colors();
+    cx: &mut App,
+) -> AnyElement {
+    let plugin_views = cx
+        .try_global::<PluginBus>()
+        .map(|bus| bus.sidebar_views.clone())
+        .unwrap_or_default();
+    let colors = cx.theme().colors().clone();
+    let error_color = cx.theme().status().error;
     let strings = i18n::t(cx);
     let active_drag = cx.has_active_drag();
     let dragging = dragging.filter(|_| active_drag);
@@ -166,11 +318,135 @@ pub fn render(
             .hover_icon_color(colors.sidebar_icon_hover)
             .hover_color(gpui::transparent_black())
     };
-    let ordered_sections: Vec<Section> = if order.is_empty() {
-        Section::ALL.to_vec()
-    } else {
-        order.iter().copied().filter(|&s| s != RailSection::Things).map(Section::from).collect()
-    };
+    let entries = resolve_rail_entries(order, features, &plugin_views, strings);
+    let mut rail_rows: Vec<AnyElement> = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let section = entry.section;
+        let is_active = &section == active;
+        let is_hovered = hovered == Some(&section) && !active_drag;
+        let is_dragged = dragging == Some(&section);
+        let icon_color = if is_active {
+            colors.sidebar_icon
+        } else if is_hovered {
+            colors.sidebar_icon_hover
+        } else {
+            colors.sidebar_icon_muted
+        };
+        let custom_img = entry
+            .icon_svg
+            .as_deref()
+            .filter(|_| !is_dragged)
+            .and_then(|svg| rasterize_rail_svg(svg, icon_color, cx));
+        let tooltip_el = is_hovered.then(|| side_tooltip(entry.title, cx));
+        let on_select = on_select.clone();
+        let on_hover = on_hover.clone();
+        let on_start_drag = on_start_drag.clone();
+        let section_id = section.id();
+        let section_id_dbg = section_id.clone();
+        let payload = DraggedRailItem {
+            item: entry.item,
+            icon: section.icon(),
+            active: is_active,
+        };
+        let hover_section = section.clone();
+        let click_section = section.clone();
+        let drag_section = section.clone();
+        // Each entry occupies a contiguous 50 px slot (40 px icon + 5 px top/bottom)
+        // with zero dead gaps; while dragged, it leaves a vacant slot as neighbors slide.
+        let slot = div()
+            .id(section_id)
+            .debug_selector(move || section_id_dbg.to_string())
+            .relative()
+            .flex_none()
+            .w(px(48.))
+            .h(px(SLOT_HEIGHT))
+            .on_hover(move |hovered: &bool, _, cx| {
+                on_hover(hover_section.clone(), *hovered, cx)
+            })
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .on_click(move |_, window, cx| on_select(click_section.clone(), window, cx))
+            .on_drag(payload, move |dragged, _, _, cx| {
+                on_start_drag(drag_section.clone(), cx);
+                cx.new(|_| dragged.clone())
+            })
+            .child(if is_dragged {
+                div()
+                    .size(px(40.))
+                    .rounded(px(8.))
+                    .bg(colors.sidebar_icon_muted.opacity(0.10))
+                    .into_any_element()
+            } else if section == Section::Pomodoro
+                && let Some((clock, paused)) = &focus_clock
+            {
+                v_flex()
+                    .size(px(40.))
+                    .items_center()
+                    .justify_center()
+                    .gap(px(1.))
+                    .child(
+                        Icon::new(section.icon()).size(IconSize::Custom(px(20.))).color(
+                            if is_active {
+                                colors.sidebar_icon
+                            } else if *paused {
+                                colors.sidebar_icon_muted
+                            } else {
+                                colors.accent
+                            },
+                        ),
+                    )
+                    .child(
+                        div()
+                            .px(px(3.))
+                            .rounded(px(3.))
+                            .bg(if *paused {
+                                colors.sidebar_icon_muted.opacity(0.18)
+                            } else {
+                                colors.accent.opacity(0.18)
+                            })
+                            .text_size(px(9.))
+                            .line_height(px(11.))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(if *paused {
+                                colors.sidebar_icon_muted
+                            } else {
+                                colors.accent
+                            })
+                            .child(clock.clone()),
+                    )
+                    .into_any_element()
+            } else if let Some(img) = custom_img {
+                let alpha = icon_color.to_rgb().a;
+                let mut el = gpui::img(img).size(px(24.));
+                if alpha < 0.999 {
+                    el = el.opacity(alpha);
+                }
+                div()
+                    .size(px(40.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(el)
+                    .into_any_element()
+            } else {
+                div()
+                    .size(px(40.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        Icon::new(section.icon())
+                            .size(IconSize::Custom(px(24.)))
+                            .color(icon_color),
+                    )
+                    .into_any_element()
+            })
+            .children(tooltip_el)
+            .into_any_element();
+        rail_rows.push(slot);
+    }
 
     v_flex()
         .debug_selector(|| "sidebar".to_owned())
@@ -210,97 +486,7 @@ pub fn render(
                 v_flex()
                     .id("sidebar-sections")
                     .items_center()
-                    .children(ordered_sections.into_iter().filter(|s| s.enabled(features)).map(|section| {
-                    let on_select = on_select.clone();
-                    let on_hover = on_hover.clone();
-                    let on_start_drag = on_start_drag.clone();
-                    let is_dragged = dragging == Some(section);
-                    let payload = DraggedRailSection {
-                        section: RailSection::from(section),
-                        icon: section.icon(),
-                        active: section == active,
-                    };
-                    // Each entry occupies a contiguous 50 px slot (40 px icon + 5 px top/bottom)
-                    // with zero dead gaps; while dragged, it leaves a vacant slot as neighbors slide.
-                    div()
-                        .id(section.id())
-                        .debug_selector(move || section.id().to_owned())
-                        .relative()
-                        .flex_none()
-                        .w(px(48.))
-                        .h(px(SLOT_HEIGHT))
-                        .on_hover(move |hovered: &bool, _, cx| on_hover(section, *hovered, cx))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .cursor_pointer()
-                        .on_click(move |_, window, cx| on_select(section, window, cx))
-                        .on_drag(payload, move |dragged, _, _, cx| {
-                            on_start_drag(section, cx);
-                            cx.new(|_| dragged.clone())
-                        })
-                        .child(if is_dragged {
-                            div()
-                                .size(px(40.))
-                                .rounded(px(8.))
-                                .bg(colors.sidebar_icon_muted.opacity(0.10))
-                                .into_any_element()
-                        } else if section == Section::Pomodoro
-                            && let Some((clock, paused)) = &focus_clock
-                        {
-                            v_flex()
-                                .size(px(40.))
-                                .items_center()
-                                .justify_center()
-                                .gap(px(1.))
-                                .child(
-                                    Icon::new(section.icon()).size(IconSize::Custom(px(20.))).color(
-                                        if section == active {
-                                            colors.sidebar_icon
-                                        } else if *paused {
-                                            colors.sidebar_icon_muted
-                                        } else {
-                                            colors.accent
-                                        },
-                                    ),
-                                )
-                                .child(
-                                    div()
-                                        .px(px(3.))
-                                        .rounded(px(3.))
-                                        .bg(if *paused {
-                                            colors.sidebar_icon_muted.opacity(0.18)
-                                        } else {
-                                            colors.accent.opacity(0.18)
-                                        })
-                                        .text_size(px(9.))
-                                        .line_height(px(11.))
-                                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                                        .text_color(if *paused { colors.sidebar_icon_muted } else { colors.accent })
-                                        .child(clock.clone()),
-                                )
-                                .into_any_element()
-                        } else {
-                            div()
-                                .size(px(40.))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .child(Icon::new(section.icon()).size(IconSize::Custom(px(24.))).color(
-                                    if section == active {
-                                        colors.sidebar_icon
-                                    } else if hovered == Some(section) && !active_drag {
-                                        colors.sidebar_icon_hover
-                                    } else {
-                                        colors.sidebar_icon_muted
-                                    },
-                                ))
-                                .into_any_element()
-                        })
-                        .when(hovered == Some(section) && !active_drag, |el| {
-                            el.child(side_tooltip(section.title(strings), cx))
-                        })
-                })),
+                    .children(rail_rows),
             )
             .flex_1()
             .min_h_0()
@@ -336,7 +522,7 @@ pub fn render(
                             .items_center()
                             .justify_center()
                             .rounded_full()
-                            .bg(cx.theme().status().error)
+                            .bg(error_color)
                             .text_color(gpui::white())
                             .text_size(px(9.))
                             .font_weight(gpui::FontWeight::BOLD)
@@ -350,11 +536,12 @@ pub fn render(
                 .tooltip(Tooltip::text(strings.shortcuts))
                 .on_click(|_, window, cx| window.dispatch_action(Box::new(crate::actions::ShowShortcuts), cx)),
         )
+        .into_any_element()
 }
 
 /// A tooltip at the right of a sidebar icon, level with it, shown while it is hovered, as the
 /// original's sidebar shows them.
-fn side_tooltip(text: &'static str, cx: &App) -> impl IntoElement {
+fn side_tooltip(text: impl Into<SharedString>, cx: &App) -> impl IntoElement {
     let colors = cx.theme().colors();
     div().absolute().left(px(46.)).top_0().h_full().flex().items_center().child(gpui::deferred(
         div()
@@ -368,6 +555,154 @@ fn side_tooltip(text: &'static str, cx: &App) -> impl IntoElement {
             .text_color(colors.text)
             .text_size(px(12.))
             .whitespace_nowrap()
-            .child(text),
+            .child(text.into()),
     ))
+}
+
+fn rasterize_rail_svg(
+    raw_svg: &str,
+    color: Hsla,
+    cx: &mut App,
+) -> Option<Arc<RenderImage>> {
+    let sanitized = plugins::ui_ast::sanitize_svg(raw_svg).ok()?;
+    let ink = color.to_rgb();
+    let r = (ink.r.clamp(0.0, 1.0) * 255.0).round() as u8;
+    let g = (ink.g.clamp(0.0, 1.0) * 255.0).round() as u8;
+    let b = (ink.b.clamp(0.0, 1.0) * 255.0).round() as u8;
+    let ink_rgb = u32::from_be_bytes([r, g, b, 0xFF]);
+
+    let resolved_svg = if sanitized.to_ascii_lowercase().contains("currentcolor") {
+        let hex = format!("#{r:02x}{g:02x}{b:02x}");
+        replace_ascii_case_insensitive(&sanitized, "currentcolor", &hex)
+    } else {
+        sanitized
+    };
+
+    let key = (fnv1a_64(resolved_svg.as_bytes()), ink_rgb);
+    if let Some(cached) = cx.try_global::<RailSvgCache>().and_then(|c| c.0.get(&key)).cloned() {
+        return Some(cached);
+    }
+
+    let opts = usvg::Options::default();
+    let tree = usvg::Tree::from_str(&resolved_svg, &opts).ok()?;
+    let svg_size = tree.size();
+    let sx = RAIL_ICON_PX as f32 / svg_size.width().max(1.0);
+    let sy = RAIL_ICON_PX as f32 / svg_size.height().max(1.0);
+    let scale = sx.min(sy);
+    let dx = (RAIL_ICON_PX as f32 - svg_size.width() * scale) * 0.5;
+    let dy = (RAIL_ICON_PX as f32 - svg_size.height() * scale) * 0.5;
+
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(RAIL_ICON_PX, RAIL_ICON_PX)?;
+    let transform = resvg::tiny_skia::Transform::from_scale(scale, scale).post_translate(dx, dy);
+    resvg::render(&tree, transform, &mut pixmap.as_mut());
+
+    let png = pixmap.encode_png().ok()?;
+    let gpui_img = gpui::Image::from_bytes(gpui::ImageFormat::Png, png);
+    let render_img = gpui_img.to_image_data(cx.svg_renderer()).ok()?;
+
+    if cx.try_global::<RailSvgCache>().is_none() {
+        cx.set_global(RailSvgCache::default());
+    }
+    cx.update_global::<RailSvgCache, _>(|cache, _| {
+        if cache.0.len() >= MAX_RAIL_SVG_CACHE {
+            cache.0.clear();
+        }
+        cache.0.insert(key, Arc::clone(&render_img));
+    });
+    Some(render_img)
+}
+
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for &b in bytes {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn replace_ascii_case_insensitive(haystack: &str, needle: &str, replacement: &str) -> String {
+    let lower = haystack.to_ascii_lowercase();
+    let needle_lower = needle.to_ascii_lowercase();
+    let mut out = String::with_capacity(haystack.len());
+    let mut last = 0;
+    for (idx, _) in lower.match_indices(&needle_lower) {
+        if let Some(prefix) = haystack.get(last..idx) {
+            out.push_str(prefix);
+        }
+        out.push_str(replacement);
+        last = idx + needle_lower.len();
+    }
+    if let Some(tail) = haystack.get(last..) {
+        out.push_str(tail);
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn visible_rail_items_filters_frontends_and_merges_active_plugins() {
+        let mut features = fern_core::Features {
+            tasks: true,
+            things: false,
+            ..Default::default()
+        };
+
+        let order = vec![
+            RailItemId::BuiltIn(RailSection::Tasks),
+            RailItemId::BuiltIn(RailSection::Things),
+            RailItemId::Plugin {
+                plugin_id: "disabled-plugin".into(),
+                view_id: "tab".into(),
+            },
+            RailItemId::Plugin {
+                plugin_id: "active-plugin".into(),
+                view_id: "board".into(),
+            },
+            RailItemId::BuiltIn(RailSection::Calendar),
+        ];
+        let active_plugins = vec![
+            PluginSidebarViewSpec {
+                plugin_id: "active-plugin".into(),
+                view_id: "board".into(),
+                title: "Board".into(),
+                icon_svg: None,
+            },
+            PluginSidebarViewSpec {
+                plugin_id: "new-plugin".into(),
+                view_id: "home".into(),
+                title: "Home".into(),
+                icon_svg: None,
+            },
+        ];
+
+        let visible = visible_rail_items(&order, features, &active_plugins);
+        assert!(visible.contains(&RailItemId::BuiltIn(RailSection::Tasks)));
+        assert!(!visible.contains(&RailItemId::BuiltIn(RailSection::Things)));
+        assert!(!visible.contains(&RailItemId::Plugin {
+            plugin_id: "disabled-plugin".into(),
+            view_id: "tab".into(),
+        }));
+        assert!(visible.contains(&RailItemId::Plugin {
+            plugin_id: "active-plugin".into(),
+            view_id: "board".into(),
+        }));
+        assert_eq!(
+            visible.last(),
+            Some(&RailItemId::Plugin {
+                plugin_id: "new-plugin".into(),
+                view_id: "home".into(),
+            })
+        );
+
+        // Switching to Things only hides Tasks and shows Things.
+        features.tasks = false;
+        features.things = true;
+        let visible_things = visible_rail_items(&order, features, &active_plugins);
+        assert!(!visible_things.contains(&RailItemId::BuiltIn(RailSection::Tasks)));
+        assert!(visible_things.contains(&RailItemId::BuiltIn(RailSection::Things)));
+    }
 }

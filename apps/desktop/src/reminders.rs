@@ -1052,6 +1052,21 @@ fn open_or_reuse_bg_store(bg_store: Option<Store>, db_path: &Path) -> Option<Sto
     bg_store.or_else(|| Store::open(db_path).ok())
 }
 
+fn notice_to_json(notice: &Notice) -> serde_json::Value {
+    let (kind, target_id) = match notice.target {
+        Target::Task(id) => ("task", id.to_string()),
+        Target::Habit(id) => ("habit", id.to_string()),
+        Target::Countdown(id) => ("countdown", id.to_string()),
+    };
+    serde_json::json!({
+        "kind": kind,
+        "targetId": target_id,
+        "title": notice.title,
+        "at": notice.at.format("%Y-%m-%dT%H:%M:%S").to_string(),
+        "constant": notice.constant,
+    })
+}
+
 /// Starts checking for reminders: collects the ones missed since the last run, then shows new
 /// ones as desktop notifications. All periodic SQLite polling runs off the foreground UI thread.
 pub fn start(store: Rc<Store>, window: AnyWindowHandle, cx: &mut Context<AppView>) {
@@ -1140,6 +1155,30 @@ pub fn start(store: Rc<Store>, window: AnyWindowHandle, cx: &mut Context<AppView
             }
             if poll.notices.is_empty() {
                 continue;
+            }
+            if let Some(mgr) = cx.update(|cx| {
+                let host = plugin_ui::PluginHost::global(cx)?;
+                if host.is_safe_mode() {
+                    return None;
+                }
+                let has_hook = host.plugins().iter().any(|p| {
+                    p.enabled
+                        && p.manifest
+                            .permissions
+                            .contains(&plugins::permissions::Permission::HooksIntercept)
+                });
+                has_hook.then(|| host.manager().cloned()).flatten()
+            }) {
+                let payloads: Vec<serde_json::Value> =
+                    poll.notices.iter().map(notice_to_json).collect();
+                cx.background_spawn(async move {
+                    for payload in payloads {
+                        if let Err(err) = mgr.run_on_reminder(payload) {
+                            eprintln!("plugin onReminder hook failed: {err:#}");
+                        }
+                    }
+                })
+                .detach();
             }
             // With desktop reminders off, reminders only go to the bell.
             if !poll.settings.desktop {

@@ -2,7 +2,7 @@
 //! without bringing the app forward, with live date recognition, quick date chips, priority,
 //! and list selection. Enter adds the task, Escape or a click elsewhere closes it.
 
-use chrono::{Datelike, Duration, Local, NaiveDate, NaiveTime};
+use chrono::{Datelike, Duration, Local, NaiveDate, NaiveTime, Timelike as _};
 use fern_core::{Id, List, Priority, Recognition};
 use gpui::{
     AnyWindowHandle, Bounds, Entity, Focusable as _, Global, WindowBounds, WindowHandle,
@@ -141,24 +141,35 @@ impl QuickAddWindow {
         let date = self.picked_date;
         let priority = (self.priority != Priority::None).then_some(self.priority);
         let list = self.list_id.map(Some);
-        if !self.batch_lines.is_empty() {
-            let lines = std::mem::take(&mut self.batch_lines);
-            self.main
-                .update(cx, |view, _, cx| {
-                    for line in &lines {
-                        view.add_quick_task_with(line, date, priority, list, cx);
-                    }
-                })
-                .ok();
+        let lines: Vec<String> = if !self.batch_lines.is_empty() {
+            std::mem::take(&mut self.batch_lines)
+        } else {
+            let text = self.input.read(cx).text().trim().to_owned();
+            if text.is_empty() {
+                Vec::new()
+            } else {
+                vec![text]
+            }
+        };
+        if lines.is_empty() {
             close(window, cx);
             return;
         }
-        let text = self.input.read(cx).text().trim().to_owned();
-        if !text.is_empty() {
-            self.main
-                .update(cx, |view, _, cx| view.add_quick_task_with(&text, date, priority, list, cx))
-                .ok();
+        if let Some(mgr) = active_hook_manager(cx) {
+            let main = self.main;
+            let lists = self.lists.clone();
+            let recognition = self.recognition;
+            close(window, cx);
+            run_quick_add_plugins(mgr, main, lines, date, priority, list, lists, recognition, cx);
+            return;
         }
+        self.main
+            .update(cx, |view, _, cx| {
+                for line in &lines {
+                    view.add_quick_task_with(line, date, priority, list, cx);
+                }
+            })
+            .ok();
         close(window, cx);
     }
 
@@ -400,6 +411,187 @@ impl Render for QuickAddWindow {
     }
 }
 
+fn active_hook_manager(cx: &App) -> Option<plugins::runtime::PluginManager> {
+    let host = plugin_ui::PluginHost::global(cx)?;
+    if host.is_safe_mode() {
+        return None;
+    }
+    let has_hook = host.plugins().iter().any(|p| {
+        p.enabled
+            && p.manifest
+                .permissions
+                .contains(&plugins::permissions::Permission::HooksIntercept)
+    });
+    if !has_hook {
+        return None;
+    }
+    host.manager().cloned()
+}
+
+fn extract_transformed_text(val: &serde_json::Value) -> Option<String> {
+    val.as_str()
+        .or_else(|| val.get("text").and_then(serde_json::Value::as_str))
+        .or_else(|| val.get("title").and_then(serde_json::Value::as_str))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+}
+
+fn priority_to_str(priority: Priority) -> &'static str {
+    match priority {
+        Priority::None => "none",
+        Priority::Low => "low",
+        Priority::Medium => "medium",
+        Priority::High => "high",
+    }
+}
+
+fn build_quick_add_draft_json(
+    text: &str,
+    picked_date: Option<NaiveDate>,
+    picked_priority: Option<Priority>,
+    picked_list: Option<Option<Id>>,
+    lists: &[List],
+    recognition: Recognition,
+) -> serde_json::Value {
+    let today = Local::now().date_naive();
+    let list_names: Vec<String> = lists.iter().map(|l| l.name.clone()).collect();
+    let parsed = fern_core::parse_quick_add_with(text, today, &list_names, recognition);
+    let title = if parsed.title.trim().is_empty() {
+        text.trim().to_owned()
+    } else {
+        parsed.title
+    };
+    let due_date = picked_date.or(parsed.due_date);
+    let due_time = parsed.due_time;
+    let priority = picked_priority.or(parsed.priority).unwrap_or(Priority::None);
+    let list_id = picked_list.unwrap_or_else(|| {
+        parsed
+            .list
+            .and_then(|name| lists.iter().find(|l| l.name == name).map(|l| l.id))
+    });
+    let mut obj = serde_json::Map::new();
+    obj.insert("title".to_owned(), serde_json::Value::String(title));
+    obj.insert(
+        "priority".to_owned(),
+        serde_json::Value::String(priority_to_str(priority).to_owned()),
+    );
+    if let Some(d) = due_date {
+        obj.insert("dueDate".to_owned(), serde_json::Value::String(d.format("%Y-%m-%d").to_string()));
+    }
+    if let Some(t) = due_time {
+        obj.insert(
+            "dueTime".to_owned(),
+            serde_json::Value::String(format!("{:02}:{:02}", t.hour(), t.minute())),
+        );
+    }
+    if let Some(id) = list_id {
+        obj.insert("listId".to_owned(), serde_json::Value::String(id.to_string()));
+    }
+    if !parsed.tags.is_empty() {
+        obj.insert(
+            "tags".to_owned(),
+            serde_json::Value::Array(parsed.tags.into_iter().map(serde_json::Value::String).collect()),
+        );
+    }
+    if let Some(rep) = parsed.repeat {
+        obj.insert("repeat".to_owned(), serde_json::Value::String(rep.to_string()));
+    }
+    serde_json::Value::Object(obj)
+}
+
+fn push_hook_cancel_toast(reason: &str, cx: &mut App) {
+    let msg = if reason.trim().is_empty() {
+        "Task creation cancelled by plugin".to_owned()
+    } else {
+        reason.to_owned()
+    };
+    desktop_common::plugin_bus::PluginBus::update(cx, |bus| {
+        bus.push_toast(
+            "plugins",
+            msg,
+            desktop_common::plugin_bus::ToastLevel::Warning,
+            chrono::Utc::now().timestamp_millis(),
+        );
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_quick_add_plugins(
+    mgr: plugins::runtime::PluginManager,
+    main: WindowHandle<AppView>,
+    lines: Vec<String>,
+    date: Option<NaiveDate>,
+    priority: Option<Priority>,
+    list: Option<Option<Id>>,
+    lists: Vec<List>,
+    recognition: Recognition,
+    cx: &mut App,
+) {
+    cx.spawn(async move |cx| {
+        for line in lines {
+            let mgr_c = mgr.clone();
+            let raw_line = line.clone();
+            let transform = cx
+                .background_spawn(async move { mgr_c.run_quick_add_transform(raw_line) })
+                .await;
+            let transformed = match transform {
+                Ok(plugins::runtime::HookDecision::Cancel(reason)) => {
+                    cx.update(|cx| push_hook_cancel_toast(&reason, cx));
+                    continue;
+                }
+                Ok(plugins::runtime::HookDecision::Modify(val)) => {
+                    extract_transformed_text(&val).unwrap_or(line)
+                }
+                Ok(plugins::runtime::HookDecision::Allow) => line,
+                Err(err) => {
+                    eprintln!("plugin quickAddTransform hook failed: {err:#}");
+                    line
+                }
+            };
+
+            let draft_json =
+                build_quick_add_draft_json(&transformed, date, priority, list, &lists, recognition);
+            let mgr_c = mgr.clone();
+            let before_res = cx
+                .background_spawn(async move { mgr_c.run_before_task_create(draft_json) })
+                .await;
+            match before_res {
+                Ok(plugins::runtime::HookDecision::Cancel(reason)) => {
+                    cx.update(|cx| push_hook_cancel_toast(&reason, cx));
+                }
+                Ok(plugins::runtime::HookDecision::Modify(modified_json)) => {
+                    match plugins::api::parse_task_draft(&modified_json) {
+                        Ok((draft, top)) => {
+                            let _ = main.update(cx, |view, _, cx| {
+                                view.add_plugin_task_draft(&draft, top, cx);
+                            });
+                        }
+                        Err(err) => {
+                            eprintln!("plugin beforeTaskCreate returned invalid draft: {err:#}");
+                            let _ = main.update(cx, |view, _, cx| {
+                                view.add_quick_task_with(&transformed, date, priority, list, cx);
+                            });
+                        }
+                    }
+                }
+                Ok(plugins::runtime::HookDecision::Allow) => {
+                    let _ = main.update(cx, |view, _, cx| {
+                        view.add_quick_task_with(&transformed, date, priority, list, cx);
+                    });
+                }
+                Err(err) => {
+                    eprintln!("plugin beforeTaskCreate hook failed: {err:#}");
+                    let _ = main.update(cx, |view, _, cx| {
+                        view.add_quick_task_with(&transformed, date, priority, list, cx);
+                    });
+                }
+            }
+        }
+    })
+    .detach();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -434,5 +626,42 @@ mod tests {
         assert_eq!(tasks[0].priority, Priority::High);
         assert_eq!(tasks[0].list_id, Some(work.id));
         let _ = main;
+    }
+
+    #[test]
+    fn hook_transform_and_draft_json_roundtrip_via_parse_task_draft() {
+        assert_eq!(
+            extract_transformed_text(&serde_json::json!("  Buy milk tomorrow  ")).as_deref(),
+            Some("Buy milk tomorrow")
+        );
+        assert_eq!(
+            extract_transformed_text(&serde_json::json!({ "text": "Write docs" })).as_deref(),
+            Some("Write docs")
+        );
+        assert_eq!(extract_transformed_text(&serde_json::json!("")), None);
+
+        let store = fern_core::Store::open_in_memory().unwrap();
+        let work = store
+            .add_list(&fern_core::ListDraft {
+                name: "Work".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let work_id = work.id;
+        let lists = store.lists().unwrap();
+        let due = NaiveDate::from_ymd_opt(2026, 12, 1).unwrap();
+        let json = build_quick_add_draft_json(
+            "Release v2 #docs",
+            Some(due),
+            Some(Priority::High),
+            Some(Some(work_id)),
+            &lists,
+            Recognition::default(),
+        );
+        let (draft, _) = plugins::api::parse_task_draft(&json).unwrap();
+        assert_eq!(draft.priority, Priority::High);
+        assert_eq!(draft.due_date, Some(due));
+        assert_eq!(draft.list_id, Some(work_id));
+        assert!(draft.tags.iter().any(|t| t == "docs"));
     }
 }

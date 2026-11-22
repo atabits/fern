@@ -14,7 +14,7 @@ pub(crate) use desktop_common::paths::{
     DAILY_BACKUPS, attachments_dir, backups_dir, data_dir, pending_restore_path, scratch_dir,
 };
 pub(crate) use task_ui::{
-    drag, lists_panel, task_detail, task_rows,
+    lists_panel, task_detail, task_rows,
 };
 pub(crate) use calendar_ui as calendar_view;
 pub(crate) use countdown_ui as countdown_view;
@@ -184,18 +184,90 @@ fn add_welcome_tasks(store: &Store, strings: &i18n::Strings) -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct CliOptions {
+    safe_mode: bool,
+    deep_link: Option<fern_core::link::DeepLink>,
+    deep_link_raw: Option<String>,
+}
+
+fn parse_cli_args<I, S>(args: I) -> CliOptions
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut out = CliOptions::default();
+    for arg in args {
+        let s = arg.as_ref();
+        if s == "--safe-mode" {
+            out.safe_mode = true;
+        } else if out.deep_link.is_none()
+            && let Some(link) = fern_core::link::parse_deep_link(s)
+        {
+            out.deep_link = Some(link);
+            out.deep_link_raw = Some(s.to_owned());
+        }
+    }
+    out
+}
+
+fn init_plugin_host(safe_mode: bool, db_path: PathBuf, locale: &str, cx: &mut App) {
+    use theme::ActiveTheme as _;
+    if safe_mode {
+        match (
+            desktop_common::paths::plugins_dir(),
+            desktop_common::paths::plugin_registry_cache_dir(),
+        ) {
+            (Ok(plugins_dir), Ok(registry_cache_dir)) => {
+                if let Err(err) =
+                    plugin_ui::PluginHost::init_safe_mode(plugins_dir, registry_cache_dir, cx)
+                {
+                    eprintln!("failed to initialize plugin host in safe mode: {err:#}");
+                }
+            }
+            (Err(err), _) | (_, Err(err)) => {
+                eprintln!("failed to resolve plugin directories: {err:#}");
+            }
+        }
+        return;
+    }
+    let appearance = if cx.theme().is_dark() { "dark" } else { "light" };
+    match plugin_ui::PluginHostConfig::from_desktop_paths(
+        Some(db_path),
+        false,
+        locale,
+        appearance,
+        true,
+    ) {
+        Ok(config) => {
+            if let Err(err) = plugin_ui::PluginHost::init(config, cx) {
+                eprintln!("failed to initialize plugin host: {err:#}");
+            } else {
+                plugin_ui::PluginHost::sync_plugin_themes(cx);
+            }
+        }
+        Err(err) => eprintln!("failed to configure plugin host: {err:#}"),
+    }
+}
+
 fn main() -> Result<()> {
-    // `fern fern://task/<id>` opens that task ("Copy Link").
-    let link = std::env::args().skip(1).find_map(|arg| fern_core::link::parse_task_link(&arg));
+    // `fern fern://task/<id>` or `fern fern://plugin/<id>/<cmd>` handles deep links; `--safe-mode` disables plugins.
+    let cli = parse_cli_args(std::env::args().skip(1));
     let dir = data_dir()?;
     #[cfg(windows)]
-    let _instance_guard = match single_instance::acquire(&dir, link)? {
+    let _instance_guard = match single_instance::acquire(&dir, cli.deep_link_raw.as_deref())? {
         Some(guard) => guard,
         None => return Ok(()),
     };
 
     let (store, first_start, db_path, db_health) = open_store(&dir)?;
     let store = Rc::new(store);
+    let safe_mode_setting = store
+        .setting("plugins_safe_mode")?
+        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+    let safe_mode = cli.safe_mode || safe_mode_setting;
+    let initial_link = cli.deep_link;
+    let plugin_db_path = db_path.clone();
     let locale = store
         .setting("locale")?
         .and_then(|code| Locale::from_code(&code))
@@ -229,6 +301,7 @@ fn main() -> Result<()> {
             eprintln!("failed to load the fonts: {err:#}");
         }
         cx.set_global(CurrentLocale(locale));
+        init_plugin_host(safe_mode, plugin_db_path, locale.code(), cx);
         match keymap::reload(&Assets, cx) {
             Ok(errors) => errors.iter().for_each(|err| eprintln!("keymap: {err}")),
             Err(err) => eprintln!("failed to load the keymap: {err:#}"),
@@ -260,14 +333,25 @@ fn main() -> Result<()> {
                 tray::init(window, &store, cx);
                 cx.new(|cx| {
                     let mut view = AppView::new(store, first_start, window, cx);
-                    if let Some(task) = link {
-                        view.open_task(task, window, cx);
+                    if let Some(link) = initial_link {
+                        view.open_deep_link(link, window, cx);
                     }
                     view
                 })
             },
         )
         .expect("failed to open the main window");
+        if !safe_mode {
+            plugin_ui::PluginHost::start_hot_reload_poller(cx);
+            if let Some(mgr) = plugin_ui::PluginHost::global(cx).and_then(|h| h.manager().cloned()) {
+                cx.background_spawn(async move {
+                    if let Err(err) = mgr.emit_app_ready() {
+                        eprintln!("failed to emit app.ready to plugins: {err:#}");
+                    }
+                })
+                .detach();
+            }
+        }
         tray::connect(tray_rx, main_window, store_for_tray, cx);
         AppView::register_window_actions(main_window, cx);
         updater::set_before_restart_hook(
@@ -386,5 +470,28 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
         Ok(())
+    }
+
+    #[test]
+    fn parse_cli_args_handles_safe_mode_and_deep_links() {
+        let task_id = uuid::Uuid::now_v7();
+        let task_uri = fern_core::link::task_link(task_id);
+        let parsed = parse_cli_args(["--unknown", "--safe-mode", &task_uri]);
+        assert!(parsed.safe_mode);
+        assert_eq!(parsed.deep_link, Some(fern_core::link::DeepLink::Task(task_id)));
+        assert_eq!(parsed.deep_link_raw.as_deref(), Some(task_uri.as_str()));
+
+        let plugin_uri = "fern://plugin/pomodoro/start?minutes=25";
+        let plugin_parsed = parse_cli_args([plugin_uri]);
+        assert!(!plugin_parsed.safe_mode);
+        assert_eq!(
+            plugin_parsed.deep_link,
+            Some(fern_core::link::DeepLink::Plugin {
+                plugin_id: "pomodoro".into(),
+                command: "start".into(),
+                params: vec![("minutes".into(), "25".into())],
+            })
+        );
+        assert_eq!(plugin_parsed.deep_link_raw.as_deref(), Some(plugin_uri));
     }
 }

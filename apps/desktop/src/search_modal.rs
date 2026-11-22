@@ -448,7 +448,15 @@ impl SearchModal {
         }
     }
 
+    fn is_task_read_only(&self, task: &Task) -> bool {
+        task.is_deleted()
+            || task.list_id.is_some_and(|id| self.all_lists.iter().any(|l| l.id == id && l.archived))
+    }
+
     fn toggle_task_completion(&mut self, task: &Task, cx: &mut Context<Self>) {
+        if self.is_task_read_only(task) {
+            return;
+        }
         let done = task.is_completed();
         let wont_do = task.is_wont_do();
         let completing = !done && !wont_do;
@@ -602,6 +610,7 @@ impl Render for SearchModal {
                                 } else {
                                     let done = task.is_completed();
                                     let wont_do = task.is_wont_do();
+                                    let read_only = self.is_task_read_only(task);
                                     let task_snapshot = task.clone();
                                     Checkbox::new(SharedString::from(format!("search-checkbox-{id}")))
                                         .size(px(14.))
@@ -609,10 +618,12 @@ impl Render for SearchModal {
                                         .in_progress(task.is_in_progress())
                                         .dismissed(wont_do)
                                         .tint(task_rows::priority_color(task.priority, &theme))
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            cx.stop_propagation();
-                                            this.toggle_task_completion(&task_snapshot, cx);
-                                        }))
+                                        .when(!read_only, |cb| {
+                                            cb.on_click(cx.listener(move |this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                this.toggle_task_completion(&task_snapshot, cx);
+                                            }))
+                                        })
                                         .into_any_element()
                                 })
                                 .child(

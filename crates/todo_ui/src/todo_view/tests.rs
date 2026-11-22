@@ -466,7 +466,7 @@ fn a_task_without_tags_can_open_the_picker_and_save_its_first_tag(cx: &mut TestA
 }
 
 #[gpui::test]
-fn backspace_edits_text_but_only_delete_trashes_the_selected_task(cx: &mut TestAppContext) {
+fn backspace_edits_text_and_modified_delete_trashes_the_selected_task(cx: &mut TestAppContext) {
     let store = Rc::new(Store::open_in_memory().unwrap());
     let task = store.add_task("Original").unwrap();
     cx.update(|cx| {
@@ -492,6 +492,9 @@ fn backspace_edits_text_but_only_delete_trashes_the_selected_task(cx: &mut TestA
     });
     cx.simulate_keystrokes("backspace");
     assert!(!store.task(task.id).unwrap().unwrap().is_deleted());
+    // Bare Delete does not accidentally trash tasks.
+    cx.simulate_keystrokes("delete");
+    assert!(!store.task(task.id).unwrap().unwrap().is_deleted());
 
     cx.simulate_mouse_move(title_click, None, modifiers);
     cx.simulate_click(title_click, modifiers);
@@ -500,19 +503,27 @@ fn backspace_edits_text_but_only_delete_trashes_the_selected_task(cx: &mut TestA
     assert_eq!(edited.title, "Origina");
     assert!(!edited.is_deleted());
 
-    cx.simulate_keystrokes("delete");
+    cx.simulate_keystrokes("secondary-backspace");
     assert!(store.task(task.id).unwrap().unwrap().is_deleted());
     cx.update(|_, cx| {
         assert!(view.read(cx).tasks.is_empty());
         assert_eq!(view.read(cx).selected, None);
     });
 
-    cx.update(|_, cx| view.update(cx, |view, cx| {
-        view.set_view(View::Trash, cx);
-        view.select(task.id, cx);
-        view.reload(cx);
-        assert_eq!(view.selected, Some(task.id), "Trash still shows the selected deleted task");
-    }));
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            view.set_view(View::Trash, cx);
+            view.select(task.id, cx);
+            view.reload(cx);
+            assert_eq!(view.selected, Some(task.id), "Trash still shows the selected deleted task");
+            window.focus(&view.list_focus, cx);
+        });
+    });
+    // In Trash, keyboard delete shortcut is a no-op.
+    cx.simulate_keystrokes("secondary-backspace");
+    cx.run_until_parked();
+    assert!(store.task(task.id).unwrap().is_some(), "Trash shortcut must not purge");
+    cx.update(|_, cx| assert!(view.read(cx).confirm_delete.is_none()));
 }
 
 #[gpui::test]
@@ -1711,4 +1722,181 @@ fn drag_to_completed_in_list_and_kanban_advances_repeating_task_with_undo(cx: &m
         .filter(|t| t.title == "Daily review" && t.is_completed())
         .collect();
     assert_eq!(completed_t2_copies.len(), 1, "kanban Complete drop should spawn one completed copy");
+}
+
+#[gpui::test]
+fn kanban_section_rename_keeps_focus_on_click_and_submits(cx: &mut TestAppContext) {
+    let store = Rc::new(Store::open_in_memory().unwrap());
+    let list = store.create_list("Board").unwrap();
+    let section = store.add_list_section(Some(list.id), "йцукук3").unwrap();
+
+    cx.update(|cx| {
+        theme::init(cx);
+        cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+        crate::keymap::load_default(&assets::Assets, cx).unwrap();
+    });
+    let (view, cx) = cx.add_window_view(|window, cx| {
+        let mut view = TodoView::new(store.clone(), window, cx);
+        view.set_view(View::List(list.id), cx);
+        view.set_layout(true, false, cx);
+        view
+    });
+    cx.simulate_resize(gpui::size(px(1200.), px(700.)));
+    cx.run_until_parked();
+
+    cx.update(|window, cx| {
+        view.update(cx, |v, cx| v.start_kanban_section_rename(section.id, window, cx));
+    });
+    cx.run_until_parked();
+
+    let rename_bounds = cx.debug_bounds("kanban-section-rename").expect("kanban section rename input rendered");
+    let pos = rename_bounds.center();
+    let modifiers = Modifiers::default();
+    cx.simulate_mouse_move(pos, None, modifiers);
+    cx.simulate_click(pos, modifiers);
+    cx.simulate_click(pos, modifiers);
+    cx.run_until_parked();
+
+    cx.update(|window, cx| {
+        let v = view.read(cx);
+        let (_, input) = v.section_rename.as_ref().expect("section rename stays open after clicking input");
+        assert!(input.focus_handle(cx).is_focused(window), "section rename input must keep keyboard focus");
+        assert!(v.kanban_pan.is_none(), "clicking section rename input must not start kanban panning");
+        window.dispatch_action(Box::new(crate::text_input::SelectAll), cx);
+    });
+    cx.simulate_input("Renamed");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+
+    cx.update(|_, cx| {
+        assert!(view.read(cx).section_rename.is_none(), "Enter submits and closes rename");
+    });
+    let sections = store.list_sections(Some(list.id)).unwrap();
+    assert_eq!(sections.len(), 1);
+    assert_eq!(sections[0].name, "Renamed");
+}
+
+#[gpui::test]
+fn archived_list_is_read_only_and_restores_editability_when_unarchived(cx: &mut TestAppContext) {
+    let store = Rc::new(Store::open_in_memory().unwrap());
+    let list = store.create_list("ArchiveMe").unwrap();
+    let archived_task = store.add_task("Frozen item").unwrap();
+    store.set_list(archived_task.id, Some(list.id)).unwrap();
+    let inbox_task = store.add_task("Inbox item").unwrap();
+    store.set_list_archived(list.id, true).unwrap();
+
+    cx.update(|cx| {
+        theme::init(cx);
+        cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+        crate::keymap::load_default(&assets::Assets, cx).unwrap();
+    });
+    let (view, cx) = cx.add_window_view(|window, cx| TodoView::new(store.clone(), window, cx));
+    cx.simulate_resize(gpui::size(px(1200.), px(700.)));
+    cx.update(|window, cx| view.update(cx, |v, cx| v.select_view(View::List(list.id), window, cx)));
+    cx.run_until_parked();
+
+    assert!(cx.debug_bounds("quick-add-input").is_none(), "archived list must hide quick-add");
+    cx.update(|window, cx| {
+        let v = view.read(cx);
+        assert!(v.is_current_view_archived_list());
+        assert!(v.is_read_only_view());
+        assert!(v.detail.read(cx).is_read_only());
+
+        view.update(cx, |v, cx| {
+            v.toggle(archived_task.id, true, cx);
+            v.delete(archived_task.id, cx);
+            v.start_title_edit(archived_task.id, None, window, cx);
+            assert!(v.title_edit.is_none(), "cannot inline-edit archived task");
+            v.open_context_menu(archived_task.id, gpui::point(px(200.), px(200.)), false, window, cx);
+            assert!(v.context_menu.is_none(), "archived task must not open context menu");
+            v.start_new_section(window, cx);
+            assert!(v.new_section.is_none(), "cannot add section to archived list");
+            v.drop_on_view(View::List(list.id), inbox_task.id, cx);
+        });
+    });
+    cx.run_until_parked();
+
+    let after = store.task(archived_task.id).unwrap().unwrap();
+    assert!(!after.is_completed(), "archived task completion must stay unchanged");
+    assert!(!after.is_deleted(), "archived task must not be deleted");
+    assert_eq!(
+        store.task(inbox_task.id).unwrap().unwrap().list_id,
+        None,
+        "dropping onto archived list must be rejected"
+    );
+
+    // Unarchiving restores full editability.
+    store.set_list_archived(list.id, false).unwrap();
+    cx.update(|_, cx| view.update(cx, |v, cx| v.reload(cx)));
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("quick-add-input").is_some(), "unarchived list shows quick-add");
+    cx.update(|_, cx| {
+        let v = view.read(cx);
+        assert!(!v.is_current_view_archived_list());
+        assert!(!v.is_read_only_view());
+        assert!(!v.detail.read(cx).is_read_only());
+    });
+}
+
+#[gpui::test]
+fn trash_delete_forever_requires_confirmation_and_supports_restore(cx: &mut TestAppContext) {
+    let store = Rc::new(Store::open_in_memory().unwrap());
+    let to_purge = store.add_task("Purge me").unwrap();
+    let to_restore = store.add_task("Restore me").unwrap();
+    store.delete_task(to_purge.id).unwrap();
+    store.delete_task(to_restore.id).unwrap();
+
+    cx.update(|cx| {
+        theme::init(cx);
+        cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+        crate::keymap::load_default(&assets::Assets, cx).unwrap();
+    });
+    let (view, cx) = cx.add_window_view(|window, cx| TodoView::new(store.clone(), window, cx));
+    cx.simulate_resize(gpui::size(px(1200.), px(700.)));
+    cx.update(|window, cx| view.update(cx, |v, cx| v.select_view(View::Trash, window, cx)));
+    cx.run_until_parked();
+
+    // Detail "Delete forever" / row delete in Trash opens confirmation modal instead of purging.
+    cx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.select(to_purge.id, cx);
+            v.delete(to_purge.id, cx);
+        });
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("confirm-delete-modal").is_some());
+    assert!(store.task(to_purge.id).unwrap().is_some(), "single delete forever must not purge before confirm");
+
+    // Cancel leaves task intact.
+    cx.simulate_click(gpui::point(px(10.), px(10.)), Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("confirm-delete-modal").is_none());
+    assert!(store.task(to_purge.id).unwrap().is_some());
+
+    // Trash context menu Restore brings task back without deletion.
+    cx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.open_context_menu(to_restore.id, gpui::point(px(200.), px(200.)), false, window, cx);
+            assert!(v.context_menu.is_some(), "Trash allows Restore / Delete Forever context menu");
+            v.context_action(crate::task_menu::MenuAction::Restore, window, cx);
+        });
+    });
+    cx.run_until_parked();
+    assert!(!store.task(to_restore.id).unwrap().unwrap().is_deleted());
+
+    // Trash context menu DeleteForever opens confirmation, and confirming purges permanently.
+    cx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.open_context_menu(to_purge.id, gpui::point(px(200.), px(200.)), false, window, cx);
+            v.context_action(crate::task_menu::MenuAction::DeleteForever, window, cx);
+        });
+    });
+    cx.run_until_parked();
+    let modal_bounds = cx.debug_bounds("confirm-delete-modal").unwrap();
+    assert!(store.task(to_purge.id).unwrap().is_some());
+    let confirm = gpui::point(modal_bounds.center().x + px(110.), modal_bounds.center().y + px(42.));
+    cx.simulate_click(confirm, Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("confirm-delete-modal").is_none());
+    assert!(store.task(to_purge.id).unwrap().is_none(), "confirming single delete forever purges task");
 }

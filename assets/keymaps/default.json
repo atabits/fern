@@ -56,7 +56,8 @@
       "shift-down": "task_list::ExtendSelectionNext",
       "shift-up": "task_list::ExtendSelectionPrevious",
       "space": "task_list::ToggleComplete",
-      "delete": "task_list::DeleteTask",
+      "secondary-backspace": "task_list::DeleteTask",
+      "secondary-delete": "task_list::DeleteTask",
       "tab m": "task_list::ToggleComplete",
       "tab p": "task_list::PinTask",
       "tab d": "task_list::SetDate",
@@ -147,7 +148,8 @@
       "k": "matrix::SelectPreviousMatrixTask",
       "space": "matrix::ToggleMatrixTask",
       "enter": "matrix::OpenMatrixTask",
-      "delete": "matrix::DeleteMatrixTask"
+      "secondary-backspace": "matrix::DeleteMatrixTask",
+      "secondary-delete": "matrix::DeleteMatrixTask"
     }
   },
   {

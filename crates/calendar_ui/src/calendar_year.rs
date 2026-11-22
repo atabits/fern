@@ -852,6 +852,9 @@ impl CalendarView {
             })
             .drag_over::<DraggedTask>(move |style, _, _, _| style.bg(accent.opacity(0.3)))
             .on_drop(cx.listener(move |this, dragged: &DraggedTask, window, cx| {
+                if this.is_task_read_only(dragged.id) {
+                    return;
+                }
                 let id = if window.modifiers().secondary() {
                     this.store.duplicate_task(dragged.id).map(|copy| copy.id)
                 } else {

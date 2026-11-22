@@ -96,6 +96,7 @@ pub(super) enum ConfirmDeleteTarget {
     Tag(String),
     Filter(Id, String),
     Section(Id, String),
+    PurgeTask(Id, String),
     BatchPurge(usize),
 }
 
@@ -393,6 +394,10 @@ impl TodoView {
             this.offer_undo(action.clone(), label.clone(), cx);
         })
         .detach();
+        cx.subscribe(&detail, |this, _, crate::task_detail::RequestDeleteForever(id), cx| {
+            this.request_purge_task(*id, cx);
+        })
+        .detach();
 
         let card_detail = cx.new(|cx| {
             let mut detail = TaskDetail::new(store.clone(), window, cx);
@@ -405,6 +410,10 @@ impl TodoView {
         cx.subscribe(&card_detail, |_, _, StartFocus(id, title, stopwatch), cx| cx.emit(StartFocus(*id, title.clone(), *stopwatch))).detach();
         cx.subscribe(&card_detail, |this, _, crate::task_detail::Undoable(action, label), cx| {
             this.offer_undo(action.clone(), label.clone(), cx);
+        })
+        .detach();
+        cx.subscribe(&card_detail, |this, _, crate::task_detail::RequestDeleteForever(id), cx| {
+            this.request_purge_task(*id, cx);
         })
         .detach();
 
@@ -1569,7 +1578,7 @@ impl TodoView {
                     .child(Label::new(label).weight(FontWeight::BOLD).truncate())
                     .child(Label::new(count.to_string()).size(LabelSize::Small).color(Color::Muted)),
             })
-            .when_some(section, |el, id| {
+            .when_some(section.filter(|_| !self.is_current_view_archived_list()), |el, id| {
                 el.child(div().flex_1()).child(
                     div()
                         .relative()
@@ -1749,6 +1758,9 @@ impl TodoView {
     }
 
     fn start_new_section(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_current_view_archived_list() {
+            return;
+        }
         let _ = self.store.set_setting(&format!("kanban:hide_new_section:{}", self.view_key()), "0");
         self.hide_new_section = false;
         let strings = i18n::t(cx);
@@ -1777,6 +1789,10 @@ impl TodoView {
     fn commit_new_section(&mut self, cx: &mut Context<Self>) {
         let Some(input) = self.new_section.take() else { return };
         let index = self.new_section_index.take();
+        if self.is_current_view_archived_list() {
+            cx.notify();
+            return;
+        }
         let name = input.read(cx).text().trim().to_owned();
         if !name.is_empty()
             && let Some(list) = self.section_owner()
@@ -2105,6 +2121,9 @@ impl TodoView {
     }
 
     fn toggle_selected(&mut self, _: &ToggleComplete, _: &mut Window, cx: &mut Context<Self>) {
+        if self.title_edit.is_some() || self.view == View::Trash {
+            return;
+        }
         if self.is_multi_selecting() {
             let ids = self.selected_task_ids();
             let all_completed = !ids.is_empty()
@@ -2116,6 +2135,9 @@ impl TodoView {
             return;
         }
         if let Some(id) = self.active_task_id() {
+            if self.is_task_id_read_only(id) {
+                return;
+            }
             if self.completing.contains_key(&id) {
                 self.toggle(id, false, cx);
             } else if let Some(task) = self.tasks.iter().find(|task| task.id == id) {
@@ -2126,7 +2148,13 @@ impl TodoView {
 
     /// Applies a change to the selected task, for the task edit shortcuts.
     fn edit_selected(&mut self, cx: &mut Context<Self>, change: impl FnOnce(&Store, &Task) -> anyhow::Result<()>) {
+        if self.title_edit.is_some() || self.view == View::Trash {
+            return;
+        }
         let Some(task) = self.active_task_id().and_then(|id| self.tasks.iter().find(|t| t.id == id)).cloned() else { return };
+        if self.is_task_read_only(&task) {
+            return;
+        }
         let result = change(&self.store, &task);
         self.check(result);
         self.reload(cx);
@@ -2134,6 +2162,9 @@ impl TodoView {
     }
 
     fn pin_selected(&mut self, _: &PinTask, _: &mut Window, cx: &mut Context<Self>) {
+        if self.title_edit.is_some() || self.view == View::Trash {
+            return;
+        }
         if self.is_multi_selecting() {
             let ids = self.selected_task_ids();
             let all_pinned = !ids.is_empty()
@@ -2148,6 +2179,14 @@ impl TodoView {
     }
 
     fn date_selected(&mut self, _: &SetDate, _: &mut Window, cx: &mut Context<Self>) {
+        if self.title_edit.is_some() || self.view == View::Trash {
+            return;
+        }
+        if let Some(id) = self.active_task_id()
+            && self.is_task_id_read_only(id)
+        {
+            return;
+        }
         if self.selected.is_some() {
             self.detail.update(cx, |detail, cx| detail.open_due(cx));
         } else if self.card.is_some() {
@@ -2156,6 +2195,9 @@ impl TodoView {
     }
 
     fn set_selected_due(&mut self, days: Option<i64>, cx: &mut Context<Self>) {
+        if self.title_edit.is_some() || self.view == View::Trash {
+            return;
+        }
         let today = Self::today();
         if self.is_multi_selecting() {
             let date = days.map(|d| today + Duration::days(d));
@@ -2172,6 +2214,9 @@ impl TodoView {
     }
 
     fn set_selected_priority(&mut self, priority: Priority, cx: &mut Context<Self>) {
+        if self.title_edit.is_some() || self.view == View::Trash {
+            return;
+        }
         if self.is_multi_selecting() {
             self.run_batch(false, cx, move |store, ids| store.batch_set_priority(ids, priority));
             return;
@@ -2180,11 +2225,19 @@ impl TodoView {
     }
 
     fn delete_selected(&mut self, _: &DeleteTask, _: &mut Window, cx: &mut Context<Self>) {
+        // As in the original: Trash and read-only (archived-list) tasks cannot be deleted with
+        // the keyboard shortcut; Trash requires explicit "Delete forever" with confirmation.
+        if self.title_edit.is_some() || self.view == View::Trash {
+            return;
+        }
         if self.is_multi_selecting() {
             self.run_batch(true, cx, |store, ids| store.batch_delete(ids));
             return;
         }
         let Some(id) = self.active_task_id() else { return };
+        if self.is_task_id_read_only(id) {
+            return;
+        }
         // Keep a selection so repeated presses keep working down the list.
         let ids = self.visible_task_ids(i18n::t(cx));
         let neighbor = ids
@@ -2432,6 +2485,10 @@ impl TodoView {
         let Some(task) = self.tasks.iter().find(|t| t.id == id).cloned().or_else(|| self.store.task(id).ok().flatten()) else {
             return;
         };
+        // As in the original: archived-list tasks have no context menu; Trash has Restore / Delete Forever.
+        if !task.is_deleted() && self.is_task_read_only(&task) {
+            return;
+        }
         let nesting = task_menu::TaskNesting::of(&self.store, id);
         self.context_menu = Some((task, position, nesting));
         self.context_side = None;
@@ -2672,6 +2729,9 @@ impl TodoView {
     }
 
     fn toggle(&mut self, id: Id, completed: bool, cx: &mut Context<Self>) {
+        if self.is_task_id_read_only(id) {
+            return;
+        }
         if let Some(pending) = self.completing.get(&id) {
             // A second click cancels this completion, including a repeating occurrence.
             // Repeated complete commands must not advance the recurrence again.
@@ -2768,12 +2828,34 @@ impl TodoView {
         }
     }
 
-    /// Moves a task to the trash, or deletes it for good when it is already there.
+    /// Asks for confirmation before permanently deleting a single trashed task, as in the original.
+    pub(super) fn request_purge_task(&mut self, id: Id, cx: &mut Context<Self>) {
+        let title = self
+            .tasks
+            .iter()
+            .find(|t| t.id == id)
+            .map(|t| t.title.clone())
+            .or_else(|| self.store.task(id).ok().flatten().map(|t| t.title))
+            .unwrap_or_default();
+        self.confirm_delete = Some(ConfirmDeleteTarget::PurgeTask(id, title));
+        cx.notify();
+    }
+
+    /// Moves a task to the trash, or asks for confirmation to delete it forever when already there.
+    /// Read-only archived-list tasks cannot be deleted.
     fn delete(&mut self, id: Id, cx: &mut Context<Self>) {
-        let in_trash = self.view == View::Trash;
+        let in_trash = self.view == View::Trash
+            || self.tasks.iter().find(|t| t.id == id).is_some_and(Task::is_deleted);
+        if in_trash {
+            self.request_purge_task(id, cx);
+            return;
+        }
+        if self.is_task_id_read_only(id) {
+            return;
+        }
         let title = self.tasks.iter().find(|t| t.id == id).map(|t| t.title.clone()).unwrap_or_default();
-        let result = if in_trash { self.store.purge_task(id) } else { self.store.delete_task(id) };
-        if self.check(result).is_some() && !in_trash {
+        let result = self.store.delete_task(id);
+        if self.check(result).is_some() {
             let label = i18n::t(cx).undo_deleted.replace("{title}", &title);
             self.offer_undo(crate::undo::UndoAction::Restore(id), label, cx);
         }
@@ -2807,6 +2889,12 @@ impl TodoView {
     /// a tag tags it, Today/Tomorrow set its date, Completed completes it, Trash deletes it.
     fn drop_on_view(&mut self, view: View, id: Id, cx: &mut Context<Self>) {
         self.clear_task_drag_state();
+        if self.is_task_id_read_only(id) {
+            return;
+        }
+        if matches!(view, View::List(list_id) if self.is_list_archived(list_id)) {
+            return;
+        }
         let today = Self::today();
         let existing = self.store.task(id).ok().flatten();
         let time = existing.as_ref().and_then(|t| t.due_time);
@@ -2852,7 +2940,7 @@ impl TodoView {
     }
 
     fn move_task_drag(&mut self, event: &gpui::DragMoveEvent<DraggedTask>, _: &mut Window, cx: &mut Context<Self>) {
-        if self.view == View::Trash || self.kanban || self.timeline {
+        if self.view == View::Trash || self.is_current_view_archived_list() || self.kanban || self.timeline {
             return;
         }
         let pos = event.event.position;
@@ -2932,6 +3020,9 @@ impl TodoView {
     }
 
     fn apply_task_drop(&mut self, dragged: Id, plan: task_rows::TaskDropPlan, cx: &mut Context<Self>) {
+        if self.is_current_view_archived_list() || self.is_task_id_read_only(dragged) {
+            return;
+        }
         let result = (|| -> anyhow::Result<()> {
             let Some(dragged_task) = self.store.task(dragged)? else { return Ok(()) };
             let mut advanced_repeat = false;
@@ -3075,6 +3166,9 @@ impl TodoView {
             return;
         }
         if let Some(id) = self.selected {
+            if self.is_task_id_read_only(id) {
+                return;
+            }
             desktop_common::open_sticky_note(self.store.clone(), id, cx);
         }
     }
@@ -3087,10 +3181,13 @@ impl TodoView {
     }
 
     fn add_subtask_selected(&mut self, _: &AddSubtask, window: &mut Window, cx: &mut Context<Self>) {
-        if self.title_edit.is_some() {
+        if self.title_edit.is_some() || self.view == View::Trash {
             return;
         }
         if let Some(id) = self.selected {
+            if self.is_task_id_read_only(id) {
+                return;
+            }
             self.start_detail(id, "subtask", window, cx);
         }
     }
@@ -3151,6 +3248,13 @@ impl TodoView {
                 let result = self.store.delete_list_section(id);
                 self.check(result);
             }
+            ConfirmDeleteTarget::PurgeTask(id, _) => {
+                let result = self.store.purge_task(id);
+                self.check(result);
+                if self.card == Some(id) {
+                    self.close_card(cx);
+                }
+            }
             ConfirmDeleteTarget::BatchPurge(_) => {
                 self.run_batch(true, cx, |store, ids| store.batch_purge(ids));
                 return;
@@ -3192,9 +3296,30 @@ impl TodoView {
         cx.notify();
     }
 
+    pub(super) fn is_list_archived(&self, list_id: Id) -> bool {
+        self.lists.iter().any(|l| l.id == list_id && l.archived)
+    }
+
+    pub(super) fn is_current_view_archived_list(&self) -> bool {
+        matches!(self.view, View::List(id) if self.is_list_archived(id))
+    }
+
+    /// Whether a task is read-only (in the trash or in an archived list), matching the original.
+    pub(super) fn is_task_read_only(&self, task: &Task) -> bool {
+        task.is_deleted() || task.list_id.is_some_and(|id| self.is_list_archived(id))
+    }
+
+    pub(super) fn is_task_id_read_only(&self, id: Id) -> bool {
+        if let Some(task) = self.tasks.iter().find(|t| t.id == id) {
+            return self.is_task_read_only(task);
+        }
+        self.store.is_task_read_only(id).unwrap_or(false)
+    }
+
     /// Views where new tasks cannot be added.
     fn is_read_only_view(&self) -> bool {
         matches!(self.view, View::Completed | View::WontDo | View::Trash | View::Search(_))
+            || self.is_current_view_archived_list()
     }
 
     fn render_section(
@@ -3219,7 +3344,7 @@ impl TodoView {
             .gap_1()
             .rounded(px(6.))
             .cursor_pointer()
-            .when(self.view != View::Trash, |el| {
+            .when(self.view != View::Trash && !self.is_current_view_archived_list(), |el| {
                 el.drag_over::<DraggedTask>(move |style, _, _, _| style.bg(accent.opacity(0.10)))
                     .on_drop(cx.listener(move |this, dragged: &DraggedTask, _, cx| {
                         cx.stop_propagation();
@@ -3237,7 +3362,7 @@ impl TodoView {
 
     fn start_title_edit(&mut self, id: Id, click: Option<gpui::Point<Pixels>>, window: &mut Window, cx: &mut Context<Self>) {
         self.finish_title_edit(true, cx);
-        let Some(task) = self.tasks.iter().find(|task| task.id == id && !task.is_deleted()) else { return };
+        let Some(task) = self.tasks.iter().find(|task| task.id == id && !self.is_task_read_only(task)) else { return };
         let title = task.title.clone();
         if !self.uses_board_layout() {
             self.select(id, cx);
@@ -3298,6 +3423,7 @@ impl TodoView {
         let done = task.is_completed() || self.completing.contains_key(&id);
         let details = self.show_details && !task.notes.trim().is_empty();
         let wont_do = task.is_wont_do();
+        let read_only = self.is_task_read_only(task);
         let closed_view = matches!(self.view, View::Completed | View::WontDo);
         let selected = self.is_task_selected(id);
         let group = format!("task-{id}");
@@ -3312,17 +3438,19 @@ impl TodoView {
                 .dismissed(wont_do)
                 .lines(task.checklist.is_some())
                 .tint(task_rows::priority_color(task.priority, &theme))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    if cx.has_active_drag() {
-                        return;
-                    }
-                    cx.stop_propagation();
-                    this.toggle(id, !done && !wont_do, cx);
-                }))
+                .when(!read_only, |cb| {
+                    cb.on_click(cx.listener(move |this, _, _, cx| {
+                        if cx.has_active_drag() {
+                            return;
+                        }
+                        cx.stop_propagation();
+                        this.toggle(id, !done && !wont_do, cx);
+                    }))
+                })
                 .into_any_element()
         };
         // A finger gets a wider target around the box, which does the same.
-        let marker = if crate::touch::active() && task.kind != Kind::Note {
+        let marker = if crate::touch::active() && task.kind != Kind::Note && !read_only {
             div()
                 .id("marker-target")
                 .p(px(8.))
@@ -3348,7 +3476,7 @@ impl TodoView {
             }
         });
 
-        let draggable = self.view != View::Trash && title_input.is_none();
+        let draggable = self.view != View::Trash && !read_only && title_input.is_none();
         let dragged = DraggedTask { id, title: task.title.clone().into() };
         let accent = theme.colors().accent;
         let dragging_active = cx.has_active_drag();
@@ -3403,9 +3531,12 @@ impl TodoView {
                 this.handle_row_click(id, event.modifiers(), window, cx);
             }))
             // The original's right-click menu, at the pointer; the task is selected too.
-            .on_mouse_down(MouseButton::Right, cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
-                this.open_context_menu(id, event.position, true, window, cx);
-            }))
+            // Archived-list tasks have no context menu; Trash has Restore / Delete Forever.
+            .when(!read_only || task.is_deleted(), |el| {
+                el.on_mouse_down(MouseButton::Right, cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                    this.open_context_menu(id, event.position, true, window, cx);
+                }))
+            })
             .child(
                 div()
                     .id("toggle-children")
@@ -3457,7 +3588,7 @@ impl TodoView {
                                 .color(if done || wont_do || task.title.is_empty() { Color::Muted } else { Color::Default })
                                 .truncate())
                                 .debug_selector(|| format!("task-title-{id}"))
-                                .when(!task.is_deleted(), |el| {
+                                .when(!read_only, |el| {
                                     el.cursor(gpui::CursorStyle::IBeam).on_click(cx.listener(
                                         move |this, event: &gpui::ClickEvent, window, cx| {
                                             if cx.has_active_drag() {
@@ -3612,41 +3743,44 @@ impl TodoView {
                                         .icon_size(IconSize::Small)
                                         .icon_color(Color::Muted)
                                         .hover_icon_color(theme.status().error)
-                                        .tooltip(Tooltip::text(strings.delete))
+                                        .tooltip(Tooltip::text(strings.delete_forever))
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             cx.stop_propagation();
-                                            this.delete(id, cx);
+                                            this.request_purge_task(id, cx);
                                         })),
                                 ),
                         )
                     }),
             )
-            // Keep the menu button inside the row, including in Trash and while editing.
-            .child({
+            // Keep the menu button inside the row, including in Trash and while editing,
+            // but omit it for read-only archived-list tasks (matching the original).
+            .when(!read_only || task.is_deleted(), |el| {
                 let more_group = SharedString::from(format!("row-more-{id}"));
-                div()
-                    .id("row-more")
-                    .group(more_group.clone())
-                    .absolute()
-                    .right(px(6.))
-                    .top_0()
-                    .w(px(20.))
-                    .h_full()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .opacity(0.)
-                    .group_hover(group.clone(), |s| s.opacity(1.))
-                    .child(
-                        Icon::new(IconName::Ellipsis)
-                            .size(IconSize::XSmall)
-                            .color(Color::Muted)
-                            .group_hover_color(more_group, Color::Icon),
-                    )
-                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
-                        cx.stop_propagation();
-                        this.open_context_menu(id, event.position, true, window, cx);
-                    }))
+                el.child(
+                    div()
+                        .id("row-more")
+                        .group(more_group.clone())
+                        .absolute()
+                        .right(px(6.))
+                        .top_0()
+                        .w(px(20.))
+                        .h_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .opacity(0.)
+                        .group_hover(group.clone(), |s| s.opacity(1.))
+                        .child(
+                            Icon::new(IconName::Ellipsis)
+                                .size(IconSize::XSmall)
+                                .color(Color::Muted)
+                                .group_hover_color(more_group, Color::Icon),
+                        )
+                        .on_mouse_down(MouseButton::Left, cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                            cx.stop_propagation();
+                            this.open_context_menu(id, event.position, true, window, cx);
+                        })),
+                )
             })
             // And the drag handle left of a hovered row, as the original's.
             .when(draggable, |el| {
@@ -4476,6 +4610,14 @@ impl Render for TodoView {
                         format!("{} \"{name}\"?", strings.delete),
                         strings.confirm_delete_section_hint,
                     ),
+                    ConfirmDeleteTarget::PurgeTask(_, title) => (
+                        if title.trim().is_empty() {
+                            format!("{}?", strings.delete_forever)
+                        } else {
+                            format!("{} \"{title}\"?", strings.delete_forever)
+                        },
+                        strings.confirm_delete_forever_single_hint,
+                    ),
                     ConfirmDeleteTarget::BatchPurge(count) => (
                         format!(
                             "{} ({})?",
@@ -4486,19 +4628,27 @@ impl Render for TodoView {
                     ),
                 };
                 el.child(
-                    ConfirmDialog::new("confirm-delete", title)
-                        .width(px(340.))
-                        .description(hint)
-                        .cancel_label(strings.cancel)
-                        .confirm_label(strings.delete)
-                        .destructive(true)
-                        .on_cancel(cx.listener(|this, _, _, cx| {
-                            this.confirm_delete = None;
-                            cx.notify();
-                        }))
-                        .on_confirm(cx.listener(move |this, _, _, cx| {
-                            this.execute_confirmed_delete(target.clone(), cx);
-                        })),
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .when(cfg!(test), |el| {
+                            el.debug_selector(|| "confirm-delete-modal".to_owned())
+                        })
+                        .child(
+                            ConfirmDialog::new("confirm-delete", title)
+                                .width(px(340.))
+                                .description(hint)
+                                .cancel_label(strings.cancel)
+                                .confirm_label(strings.delete)
+                                .destructive(true)
+                                .on_cancel(cx.listener(|this, _, _, cx| {
+                                    this.confirm_delete = None;
+                                    cx.notify();
+                                }))
+                                .on_confirm(cx.listener(move |this, _, _, cx| {
+                                    this.execute_confirmed_delete(target.clone(), cx);
+                                })),
+                        ),
                 )
             })
             .when_some(self.batch_add_pending.clone(), |el, lines| {

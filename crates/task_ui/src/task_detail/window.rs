@@ -52,6 +52,9 @@ impl EditorWindow {
         let detail = cx.weak_entity();
         let subscriptions = vec![
             subscribe(window, detail.clone(), title, |this, _, _: &Submitted, window, cx| {
+                if this.is_read_only() {
+                    return;
+                }
                 if this.session.draft.is_some() {
                     match this.session.popup {
                         Some(Popup::Due) => this.apply_due(window, cx),
@@ -63,12 +66,18 @@ impl EditorWindow {
                 }
             }, cx),
             subscribe(window, detail.clone(), new_item, |this, input, Submitted(text), window, cx| {
+                if this.is_read_only() {
+                    return;
+                }
                 if !text.trim().is_empty() && this.add_checklist_item(text, None, cx).is_some() {
                     input.update(cx, |input, cx| input.clear(window, cx));
                     this.sync_checklist(cx);
                 }
             }, cx),
             subscribe(window, detail.clone(), subtask, |this, input, Submitted(text), window, cx| {
+                if this.is_read_only() {
+                    return;
+                }
                 if !text.trim().is_empty() {
                     this.save(cx, |store, id| store.add_subtask(id, text).map(|_| ()));
                     input.update(cx, |input, cx| input.clear(window, cx));
@@ -76,6 +85,9 @@ impl EditorWindow {
                 }
             }, cx),
             subscribe(window, detail.clone(), comment, |this, input, Submitted(text), window, cx| {
+                if this.is_read_only() {
+                    return;
+                }
                 if let Some(task) = this.task_id() && !text.trim().is_empty() {
                     match this.session.store.add_comment(task, text) {
                         Ok(_) => {
@@ -99,6 +111,9 @@ impl EditorWindow {
 
     pub fn checklist(&self, input: &Entity<TextInput>, id: Id, cx: &mut Context<TaskDetail>) -> Subscription {
         subscribe(self.window, cx.weak_entity(), input, move |this, _, _: &Submitted, _, cx| {
+            if this.is_read_only() {
+                return;
+            }
             if let Some(created) = this.add_checklist_item("", Some(id), cx) {
                 this.editor_window.pending_focus = Some(FocusTarget::Item(created.id));
                 this.sync_checklist(cx);

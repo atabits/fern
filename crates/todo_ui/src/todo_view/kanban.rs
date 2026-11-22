@@ -484,7 +484,8 @@ impl TodoView {
             .as_ref()
             .filter(|(editing, _, _)| *editing == id)
             .map(|(_, input, _)| input.clone());
-        let draggable = self.view != View::Trash && title_input.is_none();
+        let read_only = self.is_task_read_only(task);
+        let draggable = self.view != View::Trash && !read_only && title_input.is_none();
         let dragged = DraggedTask { id, title: task.title.clone().into() };
         let dragging_active = cx.has_active_drag();
         let is_being_dragged = dragging_active && self.task_drag_origin.is_some_and(|(d, _)| d == id);
@@ -567,20 +568,22 @@ impl TodoView {
                         .animate_completion(crate::completion_mark::started(id, cx))
                         .in_progress(task.is_in_progress())
                         .tint(task_rows::priority_color(task.priority, &theme))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            if cx.has_active_drag() {
-                                return;
-                            }
-                            cx.stop_propagation();
-                            this.toggle(id, !done, cx);
-                        }));
+                        .when(!read_only, |cb| {
+                            cb.on_click(cx.listener(move |this, _, _, cx| {
+                                if cx.has_active_drag() {
+                                    return;
+                                }
+                                cx.stop_propagation();
+                                this.toggle(id, !done, cx);
+                            }))
+                        });
                     // A finger gets a wider target around the box, which does the same.
                     el.child(
                         div()
                             .id(SharedString::from(format!("card-box-{id}")))
                             .pt(px(2.))
                             .debug_selector(move || format!("kanban-checkbox-{id}"))
-                            .when(crate::touch::active(), |el| {
+                            .when(crate::touch::active() && !read_only, |el| {
                                 el.p(px(8.)).m(px(-8.)).on_click(cx.listener(move |this, _, _, cx| {
                                     if cx.has_active_drag() {
                                         return;
@@ -610,16 +613,18 @@ impl TodoView {
                     .text_size(px(14.))
                     .line_height(px(20.))
                     .text_color(if done { theme.colors().text_muted } else { theme.colors().text })
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
-                            if event.click_count > 1 {
-                                cx.stop_propagation();
-                                this.close_card(cx);
-                                this.start_title_edit(id, Some(event.position), window, cx);
-                            }
-                        }),
-                    )
+                    .when(!read_only, |el| {
+                        el.on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                                if event.click_count > 1 {
+                                    cx.stop_propagation();
+                                    this.close_card(cx);
+                                    this.start_title_edit(id, Some(event.position), window, cx);
+                                }
+                            }),
+                        )
+                    })
                     .child(if task.title.is_empty() { strings.untitled.to_owned() } else { task.title.clone() })
                     .into_any_element()
             });
@@ -783,13 +788,15 @@ impl TodoView {
                 window.focus(&this.list_focus, cx);
                 this.open_card(id, cx);
             }))
-            .on_mouse_down(
-                MouseButton::Right,
-                cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
-                    cx.stop_propagation();
-                    this.open_context_menu(id, event.position, false, window, cx);
-                }),
-            )
+            .when(!read_only || task.is_deleted(), |el| {
+                el.on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                        cx.stop_propagation();
+                        this.open_context_menu(id, event.position, false, window, cx);
+                    }),
+                )
+            })
             // As the original's, the card opens on the right of the first columns, on the left of
             // the others.
             .when(card_open_here, |el| {
@@ -1013,6 +1020,9 @@ impl TodoView {
     /// A kanban column's "+": a field at the column's top; the task it adds takes the column's
     /// value, as one dropped there.
     pub(super) fn start_column_add(&mut self, column: usize, target: DropTarget, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_current_view_archived_list() {
+            return;
+        }
         let strings = i18n::t(cx);
         let input = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.add_task, cx));
         cx.subscribe(&input, |this, input, _: &Changed, cx| {
@@ -1088,14 +1098,22 @@ impl TodoView {
                     }))
             })
             .map(|el| match renaming {
-                Some(input) => el.child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .px(px(2.))
-                        .on_mouse_down_out(cx.listener(|this, _, _, cx| this.commit_section_rename(cx)))
-                        .child(input),
-                ),
+                Some(input) => {
+                    let input_focus = input.focus_handle(cx);
+                    el.child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .px(px(2.))
+                            .debug_selector(|| "kanban-section-rename".to_owned())
+                            .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                                cx.stop_propagation();
+                                window.focus(&input_focus, cx);
+                            })
+                            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.commit_section_rename(cx)))
+                            .child(input),
+                    )
+                }
                 None => el
                     .child(
                         div()
@@ -1155,7 +1173,7 @@ impl TodoView {
                         }),
                 )
             })
-            .when_some(target.filter(|t| !matches!(t, DropTarget::Complete) && !self.kanban_quick_add), |el, target| {
+            .when_some(target.filter(|t| !matches!(t, DropTarget::Complete) && !self.kanban_quick_add && !self.is_current_view_archived_list()), |el, target| {
                 el.child(
                     IconButton::new(SharedString::from(format!("kanban-add-{column}")), IconName::Plus)
                         .size(px(22.))
@@ -1165,7 +1183,7 @@ impl TodoView {
                         .on_click(cx.listener(move |this, _, window, cx| this.start_column_add(column, target.clone(), window, cx))),
                 )
             })
-            .when_some(section, |el, id| {
+            .when_some(section.filter(|_| !self.is_current_view_archived_list()), |el, id| {
                 el.child(
                     div()
                         .relative()
@@ -1370,6 +1388,9 @@ impl TodoView {
     /// A card dropped on a kanban column takes the column's value: its section, kind, date,
     /// priority or tag, or completion. Leaving the Completed subsection reopens the task.
     pub(super) fn drop_on_column(&mut self, id: Id, target: DropTarget, cx: &mut Context<Self>) {
+        if self.is_current_view_archived_list() || self.is_task_id_read_only(id) {
+            return;
+        }
         if target == DropTarget::Complete {
             let result = (|| -> anyhow::Result<()> {
                 let Some(task) = self.store.task(id)? else { return Ok(()) };
@@ -1536,6 +1557,12 @@ impl TodoView {
     }
 
     pub(super) fn drop_task_in_kanban(&mut self, dragged: &DraggedTask, _: &mut Window, cx: &mut Context<Self>) {
+        if self.is_current_view_archived_list() || self.is_task_id_read_only(dragged.id) {
+            self.task_drop = None;
+            self.kanban_hover_col = None;
+            self.task_drag_origin = None;
+            return;
+        }
         let plan = self.task_drop.take();
         let hover_col = self.kanban_hover_col.take();
         self.task_drag_origin = None;
@@ -1763,6 +1790,7 @@ impl TodoView {
             columns.len()
         });
         let render_new_sec_input = |input: Entity<TextInput>, cx: &mut Context<Self>| {
+            let input_focus = input.focus_handle(cx);
             v_flex()
                 .w(px(col_width))
                 .flex_none()
@@ -1776,6 +1804,10 @@ impl TodoView {
                         .border_1()
                         .border_color(theme.colors().accent)
                         .bg(theme.colors().elevated_surface_background)
+                        .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                            cx.stop_propagation();
+                            window.focus(&input_focus, cx);
+                        })
                         .on_mouse_down_out(cx.listener(|this, _, _, cx| this.commit_new_section(cx)))
                         .child(input),
                 )
@@ -1862,9 +1894,13 @@ impl TodoView {
                 None
             };
             let is_temp_add = persistent_add.is_none() && self.column_add.as_ref().is_some_and(|(at, _, _)| *at == i);
-            let add_input = persistent_add.or_else(|| {
-                self.column_add.as_ref().filter(|(at, _, _)| *at == i).map(|(_, _, input)| input.clone())
-            });
+            let add_input = if self.is_current_view_archived_list() {
+                None
+            } else {
+                persistent_add.or_else(|| {
+                    self.column_add.as_ref().filter(|(at, _, _)| *at == i).map(|(_, _, input)| input.clone())
+                })
+            };
             let mut col_items: Vec<AnyElement> = Vec::new();
             let mut col_plan_rows: Vec<Row> = Vec::new();
             let mut col_row_subs: HashMap<Id, KanbanSub> = HashMap::new();
@@ -2040,7 +2076,7 @@ impl TodoView {
                             }
                         }
                     })
-                    .when_some(section_id.zip(owner), |el, (target_section, list)| {
+                    .when_some(section_id.zip(owner).filter(|_| !self.is_current_view_archived_list()), |el, (target_section, list)| {
                         el.drag_over::<DraggedColumn>(move |style, _, _, _| {
                             style.bg(accent.opacity(0.08)).border_color(accent)
                         })
@@ -2212,7 +2248,7 @@ impl TodoView {
                     .overflow_x_scroll()
                     .children(rendered_cols)
                     .children(habit_col)
-                    .when(owner.is_some() && inline_new_col_pos.is_none(), |el| {
+                    .when(owner.is_some() && inline_new_col_pos.is_none() && !self.is_current_view_archived_list(), |el| {
                         let group_id = SharedString::from("kanban-new-section-group");
                         el.map(|el| match self.new_section.clone() {
                             Some(input) => el.child(render_new_sec_input(input, cx)),

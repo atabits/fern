@@ -1392,7 +1392,14 @@ impl CalendarView {
         }
     }
 
+    pub(super) fn is_task_read_only(&self, id: Id) -> bool {
+        self.store.is_task_read_only(id).unwrap_or(false)
+    }
+
     fn toggle_task_completed(&mut self, id: Id, completed: bool, cx: &mut Context<Self>) {
+        if self.is_task_read_only(id) {
+            return;
+        }
         let Some(task) = self.store.task(id).ok().flatten() else { return };
         let result = if completed && !task.is_wont_do() {
             crate::undo::complete(&self.store, &task).map(|_| ())
@@ -1492,7 +1499,7 @@ impl CalendarView {
 
     /// Opens a task's right-click menu, snapshotting task & nesting state outside `render()`.
     fn open_context(&mut self, id: Id, position: gpui::Point<Pixels>, cx: &mut Context<Self>) {
-        if !self.finish_task_before_navigation(cx) {
+        if !self.finish_task_before_navigation(cx) || self.is_task_read_only(id) {
             return;
         }
         let Some(task) = self.store.task(id).ok().flatten() else {
@@ -1516,6 +1523,10 @@ impl CalendarView {
         }
         self.context_menu = None;
         self.context_side = None;
+        if self.is_task_read_only(id) {
+            cx.notify();
+            return;
+        }
         let Some(task) = self.store.task(id).ok().flatten() else {
             cx.notify();
             return;
@@ -1791,6 +1802,9 @@ impl CalendarView {
 
     /// Moves a dropped task to `date`, keeping its time of day.
     fn drop_on_day(&mut self, id: Id, date: NaiveDate, cx: &mut Context<Self>) {
+        if self.is_task_read_only(id) {
+            return;
+        }
         if let Err(err) = self.store.move_dates(id, date) {
             eprintln!("failed to move the task: {err:#}");
         } else {
@@ -1801,6 +1815,9 @@ impl CalendarView {
 
     /// Resizes a task's start or end date to `day`.
     fn resize_task_to_day(&mut self, resized: &ResizedTask, day: NaiveDate, cx: &mut Context<Self>) {
+        if self.is_task_read_only(resized.id) {
+            return;
+        }
         let (start, end) = match resized.edge {
             ResizeEdge::Start => (day.min(resized.end), resized.end),
             ResizeEdge::End => (resized.start, day.max(resized.start)),
@@ -1825,6 +1842,9 @@ impl CalendarView {
         start_y: Pixels,
         cx: &mut Context<Self>,
     ) {
+        if self.is_task_read_only(id) {
+            return;
+        }
         if let Some(task) = self.tasks.iter().find(|t| t.id == id) {
             let (can_start, can_end) = task_timed_resize_edges(task, date);
             let allowed = match edge {

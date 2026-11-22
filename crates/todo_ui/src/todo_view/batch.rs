@@ -54,8 +54,14 @@ impl TodoView {
     ) {
         window.focus(&self.list_focus, cx);
         let strings = i18n::t(cx);
-        if modifiers.shift {
-            let ids = self.visible_task_ids(strings);
+        // As in the original: archived-list tasks cannot be multi-selected; Trash can (for Restore / Delete Forever).
+        let can_multi_select = self.view == View::Trash || !self.is_task_id_read_only(id);
+        if modifiers.shift && can_multi_select {
+            let ids: Vec<Id> = self
+                .visible_task_ids(strings)
+                .into_iter()
+                .filter(|tid| self.view == View::Trash || !self.is_task_id_read_only(*tid))
+                .collect();
             let anchor = self.selection_anchor.or(self.selected).unwrap_or(id);
             if let (Some(a), Some(b)) = (ids.iter().position(|x| *x == anchor), ids.iter().position(|x| *x == id)) {
                 let (start, end) = if a <= b { (a, b) } else { (b, a) };
@@ -79,10 +85,11 @@ impl TodoView {
             return;
         }
 
-        if modifiers.secondary() {
+        if modifiers.secondary() && can_multi_select {
             if self.multi_selected.is_empty()
                 && let Some(prev) = self.selected
                 && prev != id
+                && (self.view == View::Trash || !self.is_task_id_read_only(prev))
             {
                 self.multi_selected.insert(prev);
             }
@@ -123,11 +130,15 @@ impl TodoView {
     }
 
     pub(super) fn select_all_visible(&mut self, _: &SelectAllTasks, window: &mut Window, cx: &mut Context<Self>) {
-        if self.view == View::Summary {
+        if self.view == View::Summary || self.is_current_view_archived_list() {
             return;
         }
         window.focus(&self.list_focus, cx);
-        let ids = self.visible_task_ids(i18n::t(cx));
+        let ids: Vec<Id> = self
+            .visible_task_ids(i18n::t(cx))
+            .into_iter()
+            .filter(|id| self.view == View::Trash || !self.is_task_id_read_only(*id))
+            .collect();
         self.batch_menu = None;
         match ids.len() {
             0 => self.clear_multi_selection(cx),
@@ -147,7 +158,14 @@ impl TodoView {
     }
 
     pub(super) fn extend_selection(&mut self, step: isize, cx: &mut Context<Self>) {
-        let ids = self.visible_task_ids(i18n::t(cx));
+        if self.is_current_view_archived_list() {
+            return;
+        }
+        let ids: Vec<Id> = self
+            .visible_task_ids(i18n::t(cx))
+            .into_iter()
+            .filter(|id| self.view == View::Trash || !self.is_task_id_read_only(*id))
+            .collect();
         if ids.is_empty() {
             return;
         }
@@ -180,7 +198,14 @@ impl TodoView {
     }
 
     pub(super) fn toggle_in_progress_selected(&mut self, _: &ToggleInProgress, _: &mut Window, cx: &mut Context<Self>) {
-        let ids = self.selected_task_ids();
+        if self.title_edit.is_some() || self.view == View::Trash {
+            return;
+        }
+        let ids: Vec<Id> = self
+            .selected_task_ids()
+            .into_iter()
+            .filter(|id| !self.is_task_id_read_only(*id))
+            .collect();
         if ids.is_empty() {
             return;
         }
@@ -197,7 +222,11 @@ impl TodoView {
         cx: &mut Context<Self>,
         op: impl FnOnce(&Store, &[Id]) -> anyhow::Result<()>,
     ) {
-        let ids = self.selected_task_ids();
+        let ids: Vec<Id> = self
+            .selected_task_ids()
+            .into_iter()
+            .filter(|id| self.view == View::Trash || !self.is_task_id_read_only(*id))
+            .collect();
         if ids.is_empty() {
             return;
         }

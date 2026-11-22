@@ -589,3 +589,37 @@ fn wire_dialog_input_handles_submit_and_cancel(cx: &mut TestAppContext) {
         assert!(dialog.cancelled);
     });
 }
+
+#[gpui::test]
+fn read_only_blocks_edits_while_allowing_selection_and_copy(cx: &mut TestAppContext) {
+    let (input, cx) = setup(cx, Mode::MultiLine);
+    cx.update(|_, cx| {
+        input.update(cx, |input, cx| {
+            input.set_text("Immutable record", cx);
+            input.set_read_only(true, cx);
+        });
+    });
+
+    cx.simulate_input(" edited");
+    cx.update(|window, cx| {
+        cx.write_to_clipboard(ClipboardItem::new_string("pasted".into()));
+        input.update(cx, |input, cx| {
+            input.backspace(&Backspace, window, cx);
+            input.delete(&Delete, window, cx);
+            input.paste(&Paste, window, cx);
+            input.enter(&Enter, window, cx);
+            input.edit("replaced".into(), 0..8, window, cx);
+            input.select_all(&SelectAll, window, cx);
+            input.cut(&Cut, window, cx);
+            assert_eq!(input.text(), "Immutable record");
+            input.copy(&Copy, window, cx);
+        });
+    });
+    cx.update(|_, cx| {
+        assert_eq!(input.read(cx).text(), "Immutable record");
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|c| c.text()).as_deref(),
+            Some("Immutable record")
+        );
+    });
+}

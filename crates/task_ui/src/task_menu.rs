@@ -40,6 +40,10 @@ pub enum MenuAction {
     StickyNote,
     Convert,
     Delete,
+    /// Brings a trashed task back to its list.
+    Restore,
+    /// Permanently deletes a trashed task (after confirmation).
+    DeleteForever,
     /// A side menu opened (0 Move to, 1 Start Focus) by hovering its item, or closed (`None`)
     /// by hovering another item.
     Side(Option<u8>),
@@ -103,6 +107,29 @@ pub fn render<V: 'static>(
     cx: &mut Context<V>,
     act: Act<V>,
 ) -> AnyElement {
+    if task.is_deleted() {
+        // As in the original's Trash context menu: only Restore and Delete Forever.
+        return popover(cx)
+            .w(px(196.))
+            .p_1()
+            .flex()
+            .flex_col()
+            .child(
+                ListItem::new("task-menu-restore")
+                    .height(px(34.))
+                    .start_slot(Icon::new(IconName::ArchiveRestore).color(Color::Icon))
+                    .child(Label::new(strings.restore))
+                    .on_click(on_click(&act, MenuAction::Restore, cx)),
+            )
+            .child(
+                ListItem::new("task-menu-delete-forever")
+                    .height(px(34.))
+                    .start_slot(Icon::new(IconName::Trash).color(Color::Error))
+                    .child(Label::new(strings.delete_forever).color(Color::Error))
+                    .on_click(on_click(&act, MenuAction::DeleteForever, cx)),
+            )
+            .into_any_element();
+    }
     let theme = cx.theme().clone();
     let heading = |label: &'static str| div().px_2().pt_1().child(Label::new(label).size(LabelSize::XSmall).color(Color::Muted));
     let icon_button = |id: SharedString, icon: IconName, color: Color, selected: bool| {

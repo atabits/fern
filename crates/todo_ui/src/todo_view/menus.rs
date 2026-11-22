@@ -876,6 +876,18 @@ impl TodoView {
             .cloned()
             .or_else(|| self.store.task(id).ok().flatten())
             .unwrap_or(cached_task);
+        if task.is_deleted() {
+            match action {
+                MenuAction::Restore => self.restore(id, cx),
+                MenuAction::DeleteForever => self.request_purge_task(id, cx),
+                _ => {}
+            }
+            cx.notify();
+            return;
+        }
+        if self.is_task_read_only(&task) {
+            return;
+        }
         if let Some(result) = task_menu::apply(&self.store, &task, action, Self::today()) {
             self.check(result);
             self.reload(cx);
@@ -1350,7 +1362,7 @@ impl TodoView {
                             .child(layout("layout-timeline", IconName::ChartGantt, timeline).on_click(cx.listener(|this, _, _, cx| this.set_layout(false, true, cx)))),
                     )
                     .child(div().my_1().child(Divider::horizontal()))
-                    .when(timeline, |el| {
+                    .when(timeline && !self.is_current_view_archived_list(), |el| {
                         el.child(
                             ListItem::new("arrange-tasks")
                                 .start_slot(Icon::new(IconName::CalendarPlus).color(Color::Icon))
@@ -1405,7 +1417,7 @@ impl TodoView {
                             })),
                     )
                     .child(div().my_1().child(Divider::horizontal()))
-                    .when(self.section_owner().is_some(), |el| {
+                    .when(self.section_owner().is_some() && !self.is_current_view_archived_list(), |el| {
                         el.child(
                             ListItem::new("add-section")
                                 .start_slot(Icon::new(IconName::Plus).color(Color::Icon))

@@ -2997,6 +2997,35 @@ impl Store {
         Ok(())
     }
 
+    /// Returns a list's display name and whether it is archived.
+    pub fn list_name_and_archived(&self, id: Id) -> Result<Option<(String, bool)>> {
+        self.conn
+            .prepare_cached("SELECT name, archived_at IS NOT NULL FROM lists WHERE id = ?1")?
+            .query_row([id.to_string()], |row| Ok((row.get(0)?, row.get(1)?)))
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Whether a list is archived (and therefore its tasks are read-only, as in the original).
+    pub fn is_list_archived(&self, id: Id) -> Result<bool> {
+        Ok(self.list_name_and_archived(id)?.is_some_and(|(_, archived)| archived))
+    }
+
+    /// Whether a task is read-only: either in the trash or inside an archived list.
+    pub fn is_task_read_only(&self, id: Id) -> Result<bool> {
+        let row: Option<(bool, bool)> = self
+            .conn
+            .prepare_cached(
+                "SELECT t.deleted_at IS NOT NULL, COALESCE(l.archived_at IS NOT NULL, 0)
+                 FROM tasks t
+                 LEFT JOIN lists l ON l.id = t.list_id
+                 WHERE t.id = ?1",
+            )?
+            .query_row([id.to_string()], |row| Ok((row.get(0)?, row.get(1)?)))
+            .optional()?;
+        Ok(row.is_some_and(|(deleted, archived)| deleted || archived))
+    }
+
     /// The original's Duplicate: a copy of the list, " copy" after its name, with copies of its
     /// open tasks (subtasks, tags and checklists included), right after it.
     pub fn duplicate_list(&self, id: Id, suffix: &str) -> Result<List> {
@@ -6107,11 +6136,22 @@ mod tests {
         assert_eq!(store.tasks_in(&View::Today, today)?.iter().map(|t| t.title.as_str()).collect::<Vec<_>>(), ["Report"]);
         assert_eq!(store.counts(today)?.all, 1);
         assert_eq!(store.tasks_in(&View::List(groceries.id), today)?.len(), 1, "the list itself still shows them");
-        // Archived lists leave the smart lists too.
+        // Archived lists leave the smart lists too, and their tasks become read-only.
+        assert!(!store.is_list_archived(work.id)?);
+        assert!(!store.is_task_read_only(report.id)?);
         store.set_list_archived(work.id, true)?;
         assert!(store.tasks_in(&View::Today, today)?.is_empty());
         assert!(store.lists()?.iter().find(|l| l.id == work.id).unwrap().archived);
+        assert!(store.is_list_archived(work.id)?);
+        assert_eq!(store.list_name_and_archived(work.id)?, Some(("Work".to_owned(), true)));
+        assert!(store.is_task_read_only(report.id)?);
         store.set_list_archived(work.id, false)?;
+        assert!(!store.is_task_read_only(report.id)?);
+        // Trashed tasks are read-only as well.
+        store.delete_task(report.id)?;
+        assert!(store.is_task_read_only(report.id)?);
+        store.restore_task(report.id)?;
+        assert!(!store.is_task_read_only(report.id)?);
 
         // Order: a list placed first comes first; Duplicate goes right after its list.
         store.place_list(work.id, None, None)?;

@@ -43,6 +43,9 @@ impl TodoView {
     }
 
     pub(super) fn resize_timeline_task(&mut self, resized: &ResizedTask, day: NaiveDate, cx: &mut Context<Self>) {
+        if self.is_task_id_read_only(resized.id) {
+            return;
+        }
         let (start, end) = match resized.edge {
             ResizeEdge::Start => (day.min(resized.end), resized.end),
             ResizeEdge::End => (resized.start, day.max(resized.start)),
@@ -285,6 +288,7 @@ impl TodoView {
         };
         // The day columns behind each row, so that weekends stay shaded all the way down; a bar
         // dropped on one moves or resizes its task there.
+        let archived_view = self.is_current_view_archived_list();
         let accent = theme.colors().accent;
         let backdrop = |row: usize, height: Pixels, cx: &mut Context<Self>| {
             h_flex().absolute().top_0().left_0().w_full().h(height).children(days.iter().map(|&date| {
@@ -295,18 +299,23 @@ impl TodoView {
                     .when(weekend(&date), |el| el.bg(theme.colors().element_hover.opacity(0.5)))
                     // Week and Month mark today with a red line, as the original does.
                     .when(scale > 0 && date == today, |el| el.border_l_2().border_color(today_line))
-                    .drag_over::<DraggedTask>(move |style, _, _, _| style.bg(accent.opacity(0.15)))
-                    .on_drop(cx.listener(move |this, dragged: &DraggedTask, _, cx| {
-                        let result = this.store.move_dates(dragged.id, date);
-                        if this.check(result).is_some() {
-                            crate::data_version::data_changed(cx.entity_id(), cx);
-                        }
-                        this.reload(cx);
-                    }))
-                    .drag_over::<ResizedTask>(move |style, _, _, _| style.bg(accent.opacity(0.18)))
-                    .on_drop(cx.listener(move |this, resized: &ResizedTask, _, cx| {
-                        this.resize_timeline_task(resized, date, cx);
-                    }))
+                    .when(!archived_view, |el| {
+                        el.drag_over::<DraggedTask>(move |style, _, _, _| style.bg(accent.opacity(0.15)))
+                            .on_drop(cx.listener(move |this, dragged: &DraggedTask, _, cx| {
+                                if this.is_task_id_read_only(dragged.id) {
+                                    return;
+                                }
+                                let result = this.store.move_dates(dragged.id, date);
+                                if this.check(result).is_some() {
+                                    crate::data_version::data_changed(cx.entity_id(), cx);
+                                }
+                                this.reload(cx);
+                            }))
+                            .drag_over::<ResizedTask>(move |style, _, _, _| style.bg(accent.opacity(0.18)))
+                            .on_drop(cx.listener(move |this, resized: &ResizedTask, _, cx| {
+                                this.resize_timeline_task(resized, date, cx);
+                            }))
+                    })
             }))
         };
         let header = v_flex()
@@ -442,6 +451,7 @@ impl TodoView {
                         .children(bars.into_iter().enumerate().map(|(n, (task, first, span))| {
                             let id = task.id;
                             let completed = task.is_completed();
+                            let read_only = self.is_task_read_only(&task);
                             let tint = self.timeline_bar_color(&task, &theme);
                             let handle_title: SharedString = task.title.clone().into();
                             let dragged = DraggedTask { id, title: handle_title.clone() };
@@ -473,10 +483,12 @@ impl TodoView {
                                     .flex_none()
                                     .w(px(6.))
                                     .h_full()
-                                    .cursor_ew_resize()
-                                    .on_drag(payload, |p, _, _, cx| cx.new(|_| p.clone()))
-                                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                                    .on_click(|_, _, cx| cx.stop_propagation())
+                                    .when(!read_only, |el| {
+                                        el.cursor_ew_resize()
+                                            .on_drag(payload, |p, _, _, cx| cx.new(|_| p.clone()))
+                                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                            .on_click(|_, _, cx| cx.stop_propagation())
+                                    })
                             };
                             let bar_tooltip: SharedString = match (task.due_date, task.end_date) {
                                 (Some(start), Some(end)) if end > start => format!(
@@ -497,9 +509,11 @@ impl TodoView {
                                 .px_1()
                                 .gap_1()
                                 .items_center()
-                                .cursor_grab()
+                                .when(!read_only, |el| {
+                                    el.cursor_grab().on_drag(dragged, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
+                                })
+                                .when(read_only, |el| el.cursor_pointer())
                                 .tooltip(Tooltip::text(bar_tooltip))
-                                .on_drag(dragged, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
                                 .on_click(cx.listener(move |this, _, _, cx| this.select(id, cx)))
                                 .when(task.kind != Kind::Note, |el| {
                                     el.child(
@@ -507,17 +521,21 @@ impl TodoView {
                                             .flex_none()
                                             .flex()
                                             .items_center()
-                                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                            .when(!read_only, |el| {
+                                                el.on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                            })
                                             .child(
                                                 Checkbox::new(SharedString::from(format!("timeline-check-{i}-{id}")))
                                                     .size(px(12.))
                                                     .toggle_state(completed)
                                                     .in_progress(task.is_in_progress())
                                                     .dismissed(task.is_wont_do())
-                                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                                        cx.stop_propagation();
-                                                        this.toggle(id, !completed, cx);
-                                                    })),
+                                                    .when(!read_only, |cb| {
+                                                        cb.on_click(cx.listener(move |this, _, _, cx| {
+                                                            cx.stop_propagation();
+                                                            this.toggle(id, !completed, cx);
+                                                        }))
+                                                    }),
                                             ),
                                     )
                                 })
@@ -566,7 +584,7 @@ impl TodoView {
             .min_h_0()
             .items_start()
             .child(timeline)
-            .when(self.arrange_open, |el| el.child(self.render_arrange(strings, cx)))
+            .when(self.arrange_open && !archived_view, |el| el.child(self.render_arrange(strings, cx)))
             .into_any_element()
     }
 
@@ -584,6 +602,7 @@ impl TodoView {
         };
         let bar = |task: Task, depth: usize, cx: &mut Context<Self>| {
             let id = task.id;
+            let read_only = self.is_task_read_only(&task);
             let color = tag_color(&task);
             let dragged = DraggedTask { id, title: task.title.clone().into() };
             let tip_title: SharedString = task.title.clone().into();
@@ -594,9 +613,11 @@ impl TodoView {
                 .px_1p5()
                 .rounded(px(3.))
                 .bg(color.opacity(0.7))
-                .cursor_grab()
+                .when(!read_only, |el| {
+                    el.cursor_grab().on_drag(dragged, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
+                })
+                .when(read_only, |el| el.cursor_pointer())
                 .tooltip(Tooltip::text(tip_title))
-                .on_drag(dragged, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
                 .gap_1()
                 .when(task.kind == Kind::Note, |el| el.child(Icon::new(IconName::FileText).size(IconSize::XSmall)))
                 .child(Label::new(task.title).size(LabelSize::XSmall).truncate())

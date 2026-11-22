@@ -153,10 +153,14 @@ pub struct Undoable(pub crate::undo::UndoAction, pub String);
 /// The user asked to focus on the task ("Start Focus").
 pub struct StartFocus(pub Id, pub String, pub bool);
 
+/// The user clicked "Delete forever" on a trashed task; the host asks for confirmation first.
+pub struct RequestDeleteForever(pub Id);
+
 impl EventEmitter<TaskUpdated> for TaskDetail {}
 impl EventEmitter<StartFocus> for TaskDetail {}
 impl EventEmitter<Undoable> for TaskDetail {}
 impl EventEmitter<OpenTask> for TaskDetail {}
+impl EventEmitter<RequestDeleteForever> for TaskDetail {}
 
 impl TaskDetail {
     pub fn new(store: Rc<Store>, window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -175,6 +179,9 @@ impl TaskDetail {
 
         let subscriptions = vec![
             cx.subscribe(&title, |this, input, _: &Changed, cx| {
+                if this.is_read_only() {
+                    return;
+                }
                 let text = input.read(cx).text().to_owned();
                 if this.edit_draft(cx, |task, _| task.title = text.clone()) {
                     this.refresh_draft_title(cx);
@@ -183,11 +190,17 @@ impl TaskDetail {
                 this.save(cx, |store, id| store.set_title(id, &text));
             }),
             cx.subscribe(&notes, |this, input, _: &Changed, cx| {
+                if this.is_read_only() {
+                    return;
+                }
                 let text = input.read(cx).text().to_owned();
                 if this.edit_draft(cx, |task, _| task.notes = text.clone()) { return; }
                 this.save(cx, |store, id| store.set_notes(id, &text));
             }),
             cx.subscribe(&location_input, |this, input, _: &Changed, cx| {
+                if this.is_read_only() {
+                    return;
+                }
                 let text = input.read(cx).text().trim().to_owned();
                 let value = (!text.is_empty()).then_some(text);
                 if this.edit_draft(cx, |task, _| task.location = value.clone()) {
@@ -347,6 +360,53 @@ impl TaskDetail {
         self.session.lists = lists;
     }
 
+    /// Whether the displayed task is read-only (in the trash or in an archived list), matching the
+    /// original's `isReadOnly` behavior.
+    pub fn is_read_only(&self) -> bool {
+        self.session.draft.is_none()
+            && self
+                .session
+                .task
+                .as_ref()
+                .is_some_and(|task| task.is_deleted() || self.session.task_in_archived_list)
+    }
+
+    fn sync_read_only(&mut self, cx: &mut Context<Self>) {
+        let (archived, archived_name) = if self.session.draft.is_some() {
+            (false, None)
+        } else if let Some(list_id) = self.session.task.as_ref().and_then(|t| t.list_id) {
+            match self.session.store.list_name_and_archived(list_id).ok().flatten() {
+                Some((name, true)) => (true, Some(name)),
+                _ => (false, None),
+            }
+        } else {
+            (false, None)
+        };
+        self.session.task_in_archived_list = archived;
+        self.session.archived_list_name = archived_name;
+        let read_only = self.is_read_only();
+        if read_only {
+            self.format_bar = false;
+            self.format_headings = false;
+            self.comment_open = false;
+            self.comment_emoji = false;
+            self.subtask_open = false;
+            self.session.popup = None;
+            self.session.tag_draft = None;
+        }
+        self.sync_read_only_inputs(cx);
+    }
+
+    fn sync_read_only_inputs(&self, cx: &mut Context<Self>) {
+        let read_only = self.is_read_only();
+        self.title.update(cx, |input, cx| input.set_read_only(read_only, cx));
+        self.notes.update(cx, |input, cx| input.set_read_only(read_only, cx));
+        self.location_input.update(cx, |input, cx| input.set_read_only(read_only, cx));
+        for row in &self.checklist {
+            row.input.update(cx, |input, cx| input.set_read_only(read_only, cx));
+        }
+    }
+
     /// Shows a task, or the empty panel for `None`.
     pub fn show(&mut self, task: Option<Task>, cx: &mut Context<Self>) {
         let task_changed = self.session.task.as_ref().map(|t| t.id) != task.as_ref().map(|t| t.id);
@@ -382,6 +442,7 @@ impl TaskDetail {
         self.session.preferences = self.session.store.preferences().unwrap_or_default();
         self.session.all_tags = self.session.store.tags().unwrap_or_default();
         self.checklist.clear();
+        self.sync_read_only(cx);
         self.sync_checklist(cx);
         self.show_checklist = !self.checklist.is_empty();
         self.sync_subtasks();
@@ -400,6 +461,9 @@ impl TaskDetail {
     /// The description toolbar's buttons: format the notes' selection as Markdown (or type the
     /// time), open the headings menu, or upload an attachment.
     fn toolbar_action(&mut self, action: ToolbarAction, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_read_only() {
+            return;
+        }
         match action {
             ToolbarAction::ToggleHeadings => self.format_headings = !self.format_headings,
             ToolbarAction::Attach => return self.upload_attachment(cx),
@@ -459,6 +523,9 @@ impl TaskDetail {
     }
 
     fn toggle_markdown_check(&mut self, line_index: usize, cx: &mut Context<Self>) {
+        if self.is_read_only() {
+            return;
+        }
         let current = self.session.task.as_ref().map(|t| t.notes.clone()).unwrap_or_default();
         let Some((updated, checked)) = fern_core::markdown::toggle_check_line(&current, line_index) else {
             return;
@@ -476,6 +543,7 @@ impl TaskDetail {
     /// Formats a task's comments section.
     fn render_comments(&self, strings: &'static Strings, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
+        let read_only = self.is_read_only();
         v_flex()
             .pt_3()
             .gap_2()
@@ -503,21 +571,26 @@ impl TaskDetail {
                             .child(Label::new(comment.text.clone()))
                             .child(Label::new(when).size(LabelSize::XSmall).color(Color::Muted)),
                     )
-                    .child(
-                        div().when(!crate::touch::active(), |el| el.invisible()).group_hover(group_name, |s| s.visible()).child(
-                            IconButton::new(SharedString::from(format!("comment-delete-{id}")), IconName::X)
-                                .icon_size(IconSize::XSmall)
-                                .icon_color(Color::Muted)
-                                .tooltip(Tooltip::text(strings.delete))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    if this.session.store.delete_comment(id).is_ok() {
-                                        cx.emit(TaskUpdated);
-                                    }
-                                    this.sync_comments();
-                                    cx.notify();
-                                })),
-                        ),
-                    )
+                    .when(!read_only, |el| {
+                        el.child(
+                            div().when(!crate::touch::active(), |el| el.invisible()).group_hover(group_name, |s| s.visible()).child(
+                                IconButton::new(SharedString::from(format!("comment-delete-{id}")), IconName::X)
+                                    .icon_size(IconSize::XSmall)
+                                    .icon_color(Color::Muted)
+                                    .tooltip(Tooltip::text(strings.delete))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        if this.is_read_only() {
+                                            return;
+                                        }
+                                        if this.session.store.delete_comment(id).is_ok() {
+                                            cx.emit(TaskUpdated);
+                                        }
+                                        this.sync_comments();
+                                        cx.notify();
+                                    })),
+                            ),
+                        )
+                    })
             }))
             .into_any_element()
     }
@@ -631,6 +704,9 @@ impl TaskDetail {
     /// "Upload Attachment": files picked in the system's dialog are copied to the app's folder.
     fn upload_attachment(&mut self, cx: &mut Context<Self>) {
         self.session.popup = None;
+        if self.is_read_only() {
+            return;
+        }
         let Some(task) = self.session.task.as_ref().filter(|task| !task.is_deleted()).map(|task| task.id) else { return };
         let chosen = cx.prompt_for_paths(gpui::PathPromptOptions { files: true, directories: false, multiple: true, prompt: None });
         cx.spawn(async move |this, cx| {
@@ -641,6 +717,9 @@ impl TaskDetail {
     }
 
     fn attach_paths(&mut self, task: Id, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        if self.task_id() == Some(task) && self.is_read_only() {
+            return;
+        }
         if self.task_id() == Some(task) {
             self.session.attachment_errors.clear();
             cx.notify();
@@ -718,6 +797,7 @@ impl TaskDetail {
     fn render_attachments(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let strings = i18n::t(cx);
+        let read_only = self.is_read_only();
         v_flex().gap_1().children(self.session.attachments.iter().map(|attachment| {
             let path = match &self.session.draft {
                 Some(draft) => draft.attachments.iter().find(|prepared| prepared.metadata().id == attachment.id).map(|prepared| prepared.path().to_owned()),
@@ -746,31 +826,36 @@ impl TaskDetail {
                 .child(Icon::new(if is_image { IconName::Image } else { IconName::Paperclip }).size(IconSize::Small).color(Color::Muted))
                 .child(div().flex_1().min_w_0().child(Label::new(attachment.name.clone()).size(LabelSize::Small).truncate()))
                 .child(Label::new(format_size(attachment.size)).size(LabelSize::XSmall).color(Color::Muted))
-                .child(
-                    IconButton::new(SharedString::from(format!("attachment-delete-{att_id}")), IconName::X)
-                        .size(px(20.))
-                        .icon_size(IconSize::XSmall)
-                        .hover_icon_color(theme.status().error)
-                        .tooltip(Tooltip::text(strings.delete))
-                        .on_click(
-                        cx.listener(move |this, _, _, cx| {
-                            cx.stop_propagation();
-                            if let Some(draft) = &mut this.session.draft {
-                                draft.attachments.retain(|prepared| prepared.metadata().id != removed.id);
+                .when(!read_only, |el| {
+                    el.child(
+                        IconButton::new(SharedString::from(format!("attachment-delete-{att_id}")), IconName::X)
+                            .size(px(20.))
+                            .icon_size(IconSize::XSmall)
+                            .hover_icon_color(theme.status().error)
+                            .tooltip(Tooltip::text(strings.delete))
+                            .on_click(
+                            cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                if this.is_read_only() {
+                                    return;
+                                }
+                                if let Some(draft) = &mut this.session.draft {
+                                    draft.attachments.retain(|prepared| prepared.metadata().id != removed.id);
+                                    this.sync_attachments();
+                                    cx.notify();
+                                    return;
+                                }
+                                let Some(dir) = &this.session.attachments_dir else { return };
+                                match this.session.store.delete_attachment(&removed, dir) {
+                                    Ok(()) => cx.emit(TaskUpdated),
+                                    Err(err) => eprintln!("failed to remove the attachment: {err:#}"),
+                                }
                                 this.sync_attachments();
                                 cx.notify();
-                                return;
-                            }
-                            let Some(dir) = &this.session.attachments_dir else { return };
-                            match this.session.store.delete_attachment(&removed, dir) {
-                                Ok(()) => cx.emit(TaskUpdated),
-                                Err(err) => eprintln!("failed to remove the attachment: {err:#}"),
-                            }
-                            this.sync_attachments();
-                            cx.notify();
-                        }),
-                    ),
-                )
+                            }),
+                        ),
+                    )
+                })
                 .on_click(move |_, _, cx| {
                     if let Some(path) = &path {
                         cx.open_with_system(path);
@@ -797,17 +882,21 @@ impl TaskDetail {
     }
 
     fn can_add_subtask(&self) -> bool {
-        self.session
-            .task
-            .as_ref()
-            .is_some_and(|task| task.kind != Kind::Note && !task.is_deleted() && self.task_depth() < fern_core::MAX_SUBTASK_DEPTH)
+        !self.is_read_only()
+            && self
+                .session
+                .task
+                .as_ref()
+                .is_some_and(|task| task.kind != Kind::Note && !task.is_deleted() && self.task_depth() < fern_core::MAX_SUBTASK_DEPTH)
     }
 
     fn can_link_parent(&self) -> bool {
-        self.session
-            .task
-            .as_ref()
-            .is_some_and(|task| task.kind != Kind::Note && !task.is_deleted())
+        !self.is_read_only()
+            && self
+                .session
+                .task
+                .as_ref()
+                .is_some_and(|task| task.kind != Kind::Note && !task.is_deleted())
     }
 
     fn reload_current_task(&mut self) {
@@ -820,24 +909,36 @@ impl TaskDetail {
     }
 
     fn unlink_current_parent(&mut self, cx: &mut Context<Self>) {
+        if self.is_read_only() {
+            return;
+        }
         self.save(cx, |store, id| store.unlink_parent(id));
         self.reload_current_task();
         cx.notify();
     }
 
     fn link_current_parent(&mut self, parent: Id, cx: &mut Context<Self>) {
+        if self.is_read_only() {
+            return;
+        }
         self.save(cx, |store, id| store.link_parent(id, parent));
         self.reload_current_task();
         cx.notify();
     }
 
     fn unlink_subtask(&mut self, subtask_id: Id, cx: &mut Context<Self>) {
+        if self.is_read_only() {
+            return;
+        }
         self.save(cx, |store, _| store.unlink_parent(subtask_id));
         self.sync_subtasks();
         cx.notify();
     }
 
     fn toggle_subtask(&mut self, id: Id, completed: bool, cx: &mut Context<Self>) {
+        if self.is_read_only() {
+            return;
+        }
         self.save(cx, |store, _| store.set_completed(id, completed));
         if completed {
             desktop_common::sound::play_complete(&self.session.store);
@@ -875,13 +976,18 @@ impl TaskDetail {
     fn checklist_row(&mut self, item: ChecklistItem, cx: &mut Context<Self>) -> ChecklistRow {
         let id = item.id;
         let title = item.title.clone();
+        let read_only = self.is_read_only();
         let input = cx.new(|cx| {
             let mut input = TextInput::new(Mode::Wrapped, "", cx).without_cancel();
             input.set_text(title, cx);
+            input.set_read_only(read_only, cx);
             input
         });
         let subscriptions = [
             cx.subscribe(&input, move |this, input, _: &Changed, cx| {
+                if this.is_read_only() {
+                    return;
+                }
                 let text = input.read(cx).text().to_owned();
                 if this.edit_draft(cx, |_, draft| {
                     if let Some(item) = draft.checklist.iter_mut().find(|item| item.id == id) { item.title = text.clone(); }
@@ -894,6 +1000,9 @@ impl TaskDetail {
     }
 
     fn toggle_checklist_item(&mut self, id: Id, completed: bool, cx: &mut Context<Self>) {
+        if self.is_read_only() {
+            return;
+        }
         if !self.edit_draft(cx, |_, draft| {
             if let Some(item) = draft.checklist.iter_mut().find(|item| item.id == id) { item.completed = completed; }
         }) {
@@ -906,6 +1015,9 @@ impl TaskDetail {
     }
 
     fn delete_checklist_item(&mut self, id: Id, cx: &mut Context<Self>) {
+        if self.is_read_only() {
+            return;
+        }
         if !self.edit_draft(cx, |_, draft| draft.checklist.retain(|item| item.id != id)) {
             self.save(cx, |store, _| store.delete_checklist_item(id));
         }
@@ -913,6 +1025,9 @@ impl TaskDetail {
     }
 
     fn uncheck_all_checklist_items(&mut self, cx: &mut Context<Self>) {
+        if self.is_read_only() {
+            return;
+        }
         let done_ids: Vec<Id> = self.checklist.iter().filter(|r| r.item.completed).map(|r| r.item.id).collect();
         if done_ids.is_empty() {
             return;
@@ -933,6 +1048,9 @@ impl TaskDetail {
     }
 
     fn clear_completed_checklist_items(&mut self, cx: &mut Context<Self>) {
+        if self.is_read_only() {
+            return;
+        }
         let done_ids: Vec<Id> = self.checklist.iter().filter(|r| r.item.completed).map(|r| r.item.id).collect();
         if done_ids.is_empty() {
             return;
@@ -949,6 +1067,9 @@ impl TaskDetail {
     }
 
     fn start_checklist(&mut self, cx: &mut Context<Self>) {
+        if self.is_read_only() {
+            return;
+        }
         self.show_checklist = true;
         self.editor_window.pending_focus = Some(FocusTarget::NewItem);
         cx.notify();
@@ -976,6 +1097,7 @@ impl TaskDetail {
                 }
                 self.location_open |= task.location.is_some();
                 self.session.task = Some(task);
+                self.sync_read_only(cx);
                 self.sync_checklist(cx);
                 self.show_checklist |= !self.checklist.is_empty();
                 self.sync_subtasks();
@@ -999,6 +1121,9 @@ impl TaskDetail {
     }
 
     fn open_popup(&mut self, popup: Popup, cx: &mut Context<Self>) {
+        if self.is_read_only() {
+            return;
+        }
         self.focus_submenu = false;
         self.editor_window.popup_return_focus = None;
         self.session.tag_draft = None;
@@ -1074,6 +1199,9 @@ impl TaskDetail {
     }
 
     fn open_popup_from_ui(&mut self, popup: Popup, window: &Window, cx: &mut Context<Self>) {
+        if self.is_read_only() {
+            return;
+        }
         let return_focus = if self.popup_input_focused(window, cx) {
             self.editor_window.popup_return_focus.clone()
         } else {
@@ -1084,6 +1212,9 @@ impl TaskDetail {
     }
 
     fn open_tags(&mut self, popup: Popup, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_read_only() {
+            return;
+        }
         self.open_popup_from_ui(popup, window, cx);
         window.focus(&self.tag_input.focus_handle(cx), cx);
     }
@@ -1097,7 +1228,7 @@ impl TaskDetail {
     /// The details' own pickers, for the task list's right-click menu: `subtask` focuses the Add
     /// Subtask field, `due`, `tags` and `link-parent` open their popovers.
     pub fn start(&mut self, what: &str, window: &mut Window, cx: &mut Context<Self>) {
-        if self.session.task.is_none() {
+        if self.session.task.is_none() || self.is_read_only() {
             return;
         }
         match what {
@@ -1116,7 +1247,7 @@ impl TaskDetail {
     }
 
     pub fn open_due(&mut self, cx: &mut Context<Self>) {
-        if self.session.task.is_some() {
+        if self.session.task.is_some() && !self.is_read_only() {
             self.open_popup(Popup::Due, cx);
         }
     }
@@ -1449,26 +1580,40 @@ impl TaskDetail {
     }
 
     fn delete_forever(&mut self, cx: &mut Context<Self>) {
-        self.save(cx, |store, id| store.purge_task(id));
+        if let Some(id) = self.task_id() {
+            cx.emit(RequestDeleteForever(id));
+        }
     }
 
     fn menu_action(&mut self, cx: &mut Context<Self>, write: impl FnOnce(&Store, Id) -> anyhow::Result<()>) {
+        if self.is_read_only() {
+            return;
+        }
         self.close_popup(cx);
         self.save(cx, write);
     }
 
     fn toggle_wont_do(&mut self, cx: &mut Context<Self>) {
+        if self.is_read_only() {
+            return;
+        }
         let wont_do = self.session.task.as_ref().is_some_and(|t| t.is_wont_do());
         self.menu_action(cx, |store, id| store.set_wont_do(id, !wont_do));
     }
 
     fn toggle_in_progress(&mut self, cx: &mut Context<Self>) {
+        if self.is_read_only() {
+            return;
+        }
         let in_progress = self.session.task.as_ref().is_some_and(|t| t.is_in_progress());
         self.menu_action(cx, |store, id| store.set_in_progress(id, !in_progress));
         self.reload_current_task();
     }
 
     fn toggle_kind(&mut self, cx: &mut Context<Self>) {
+        if self.is_read_only() {
+            return;
+        }
         let kind = match self.session.task.as_ref().map(|task| self.kind_preview(task)) {
             Some(Kind::Note) => Kind::Task,
             _ => Kind::Note,
@@ -2040,6 +2185,9 @@ impl TaskDetail {
     }
 
     fn toggle_completed(&mut self, cx: &mut Context<Self>) {
+        if self.is_read_only() {
+            return;
+        }
         let Some(task) = self.session.task.as_mut() else { return };
         let completed = !task.is_completed();
         let mut undo = None;
@@ -2090,6 +2238,7 @@ impl TaskDetail {
     fn render_checklist(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let strings = i18n::t(cx);
         let theme = cx.theme().clone();
+        let read_only = self.is_read_only();
         let total = self.checklist.len();
         let done_count = self.checklist.iter().filter(|r| r.item.completed).count();
         v_flex()
@@ -2100,7 +2249,7 @@ impl TaskDetail {
                         .gap_1()
                         .items_center()
                         .child(div().flex_1().min_w_0().child(Self::render_progress_bar(done_count, total, &theme)))
-                        .when(done_count > 0, |bar| {
+                        .when(done_count > 0 && !read_only, |bar| {
                             bar.child(
                                 IconButton::new("checklist-uncheck-all", IconName::RotateCcw)
                                     .size(px(22.))
@@ -2137,9 +2286,11 @@ impl TaskDetail {
                             Checkbox::new(SharedString::from(format!("item-checkbox-{id}")))
                                 .size(px(14.))
                                 .toggle_state(done)
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.toggle_checklist_item(id, !done, cx)
-                                })),
+                                .when(!read_only, |cb| {
+                                    cb.on_click(cx.listener(move |this, _, _, cx| {
+                                        this.toggle_checklist_item(id, !done, cx)
+                                    }))
+                                }),
                         ),
                     )
                     .child(
@@ -2149,34 +2300,38 @@ impl TaskDetail {
                             .when(done, |el| el.text_color(theme.colors().text_muted).line_through())
                             .child(row.input.clone()),
                     )
-                    .child(
-                        div()
-                            .id(SharedString::from(format!("item-delete-{id}")))
-                            .flex_none()
-                            .px_1()
-                            .text_color(theme.colors().text_muted)
-                            .opacity(if crate::touch::active() { 1. } else { 0. })
-                            .group_hover(row_group, |s| s.opacity(1.))
-                            .hover(|s| s.text_color(theme.status().error))
-                            .cursor_pointer()
-                            .tooltip(Tooltip::text(strings.delete))
-                            .child("✕")
-                            .on_click(cx.listener(move |this, _, _, cx| this.delete_checklist_item(id, cx))),
-                    )
+                    .when(!read_only, |el| {
+                        el.child(
+                            div()
+                                .id(SharedString::from(format!("item-delete-{id}")))
+                                .flex_none()
+                                .px_1()
+                                .text_color(theme.colors().text_muted)
+                                .opacity(if crate::touch::active() { 1. } else { 0. })
+                                .group_hover(row_group, |s| s.opacity(1.))
+                                .hover(|s| s.text_color(theme.status().error))
+                                .cursor_pointer()
+                                .tooltip(Tooltip::text(strings.delete))
+                                .child("✕")
+                                .on_click(cx.listener(move |this, _, _, cx| this.delete_checklist_item(id, cx))),
+                        )
+                    })
             }))
-            .child(
-                h_flex()
-                    .min_h(px(30.))
-                    .gap_2()
-                    .child(Icon::new(IconName::Plus).size(IconSize::Small))
-                    .child(div().flex_1().child(self.new_item.clone())),
-            )
+            .when(!read_only, |el| {
+                el.child(
+                    h_flex()
+                        .min_h(px(30.))
+                        .gap_2()
+                        .child(Icon::new(IconName::Plus).size(IconSize::Small))
+                        .child(div().flex_1().child(self.new_item.clone())),
+                )
+            })
     }
 
     fn render_subtasks(&self, strings: &'static Strings, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let can_add = self.can_add_subtask();
-        let can_edit = self.session.task.as_ref().is_some_and(|t| !t.is_deleted());
+        let can_edit = !self.is_read_only();
         let total = self.session.subtasks.len();
         let done_count = self.session.subtasks.iter().filter(|s| s.is_completed()).count();
         let today = Local::now().date_naive();
@@ -2201,10 +2356,12 @@ impl TaskDetail {
                                 .in_progress(subtask.is_in_progress())
                                 .dismissed(subtask.is_wont_do())
                                 .tint(task_rows::priority_color(subtask.priority, &theme))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    cx.stop_propagation();
-                                    this.toggle_subtask(id, !done, cx);
-                                })),
+                                .when(can_edit, |cb| {
+                                    cb.on_click(cx.listener(move |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.toggle_subtask(id, !done, cx);
+                                    }))
+                                }),
                         )
                         .child(
                             div()
@@ -3663,6 +3820,7 @@ impl TaskDetail {
 
     fn render_tags_row(&self, strings: &'static Strings, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
+        let read_only = self.is_read_only();
         h_flex()
             .flex_wrap()
             .gap_1()
@@ -3679,20 +3837,26 @@ impl TaskDetail {
                     .px(px(6.))
                     .gap_1()
                     .rounded_full()
-                    .cursor_pointer()
                     .bg(theme.colors().accent.opacity(0.2))
-                    .hover(|s| s.bg(theme.colors().accent.opacity(0.3)))
-                    .tooltip(Tooltip::text(strings.estimation))
+                    .when(!read_only, |el| {
+                        el.cursor_pointer()
+                            .hover(|s| s.bg(theme.colors().accent.opacity(0.3)))
+                            .tooltip(Tooltip::text(strings.estimation))
+                            .on_click(cx.listener(|this, _, _, cx| this.open_popup(Popup::Estimate, cx)))
+                    })
                     .child(Icon::new(IconName::CircleDot).size(IconSize::XSmall).color(Color::Accent))
                     .child(Label::new(text).size(LabelSize::XSmall).color(Color::Accent))
-                    .on_click(cx.listener(|this, _, _, cx| this.open_popup(Popup::Estimate, cx)))
             }))
             // As the original's, a tag is a plain chip; a click opens the tag picker, where it is
             // unticked.
             .children(self.task_tags().into_iter().map(|tag| {
                 div()
                     .id(SharedString::from(format!("tag-chip-{tag}")))
-                    .cursor_pointer()
+                    .when(!read_only, |el| {
+                        el.cursor_pointer().on_click(cx.listener(|this, _, window, cx| {
+                            this.open_tags(Popup::InlineTags, window, cx);
+                        }))
+                    })
                     .child(match self.sticky_style {
                         Some(style) => div().h(px(18.)).px(px(6.)).rounded_full()
                             .bg(gpui::rgb(style.foreground()).opacity(0.12))
@@ -3703,32 +3867,31 @@ impl TaskDetail {
                             Chip::new(tag, color).into_any_element()
                         }
                     })
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.open_tags(Popup::InlineTags, window, cx);
-                    }))
             }))
-            .child(
-                // The original's "+" after the tags: an accent-outlined circle.
-                div()
-                    .id("add-tag")
-                    .relative()
-                    .size(px(18.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded_full()
-                    .border_1()
-                    .border_color(theme.colors().accent)
-                    .cursor_pointer()
-                    .hover(|s| s.bg(theme.colors().element_hover))
-                    .child(Icon::new(IconName::Plus).size(IconSize::Custom(px(11.))).color(Color::Accent))
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.open_tags(Popup::InlineTags, window, cx);
-                    }))
-                    .when(self.sticky_style.is_none() && self.session.popup == Some(Popup::InlineTags), |el| {
-                        el.child(PopoverAttachment::new(Placement::BelowLeft, self.render_tags_popup(cx)))
-                    }),
-            )
+            .when(!read_only, |el| {
+                el.child(
+                    // The original's "+" after the tags: an accent-outlined circle.
+                    div()
+                        .id("add-tag")
+                        .relative()
+                        .size(px(18.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_full()
+                        .border_1()
+                        .border_color(theme.colors().accent)
+                        .cursor_pointer()
+                        .hover(|s| s.bg(theme.colors().element_hover))
+                        .child(Icon::new(IconName::Plus).size(IconSize::Custom(px(11.))).color(Color::Accent))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.open_tags(Popup::InlineTags, window, cx);
+                        }))
+                        .when(self.sticky_style.is_none() && self.session.popup == Some(Popup::InlineTags), |el| {
+                            el.child(PopoverAttachment::new(Placement::BelowLeft, self.render_tags_popup(cx)))
+                        }),
+                )
+            })
     }
 }
 
@@ -3896,19 +4059,21 @@ impl Render for TaskDetail {
             None => ((if kind == Kind::Note { strings.set_reminder } else { strings.due_date }).into(), muted),
         };
         let in_progress = task.is_in_progress();
+        let read_only = self.is_read_only();
         let show_location = self.location_open || task.location.is_some();
         let priority_color = task_rows::priority_color(task.priority, &theme).map_or(Color::Muted, Color::Custom);
         let list_id = self.list_preview(task);
         let list_name: SharedString = list_id
             .and_then(|id| self.session.lists.iter().find(|l| l.id == id))
             .map(|l| l.name.clone().into())
+            .or_else(|| self.session.archived_list_name.clone().map(Into::into))
             .unwrap_or_else(|| strings.inbox.into());
         let list_icon = if list_id.is_some() { IconName::List } else { IconName::Inbox };
         let task_id = task.id;
         let drop_color = theme.colors().accent.opacity(0.08);
 
         panel
-            .when(!task.is_deleted(), |el| {
+            .when(!read_only, |el| {
                 el.drag_over::<ExternalPaths>(move |style, _, _, _| style.bg(drop_color))
                     .on_drop(cx.listener(move |this, paths: &ExternalPaths, _, cx| {
                         this.attach_paths(task_id, paths.paths().to_vec(), cx);
@@ -3936,11 +4101,26 @@ impl Render for TaskDetail {
                                 .in_progress(in_progress)
                                 .lines(!self.checklist.is_empty())
                                 .tint(task_rows::priority_color(task.priority, &theme))
-                                .on_click(cx.listener(|this, _, _, cx| this.toggle_completed(cx))),
+                                .when(!read_only, |cb| {
+                                    cb.on_click(cx.listener(|this, _, _, cx| this.toggle_completed(cx)))
+                                }),
                         )
                         .child(div().w(px(1.)).h(px(14.)).bg(theme.colors().border))
                     })
-                    .child(
+                    .child(if read_only {
+                        h_flex()
+                            .id("due-date")
+                            .debug_selector(|| "task-detail-due-date".into())
+                            .gap_1p5()
+                            .px_1p5()
+                            .py_1()
+                            .rounded(px(6.))
+                            .opacity(0.75)
+                            .child(Icon::new(IconName::CalendarDays).color(due_color))
+                            .child(Label::new(due_text.clone()).color(due_color))
+                            .when(repeats, |el| el.child(Icon::new(IconName::Repeat).size(IconSize::Small).color(due_color)))
+                            .into_any_element()
+                    } else {
                         label_button("due-date", IconName::CalendarDays, due_text.clone(), due_color, button_hover)
                             .debug_selector(|| "task-detail-due-date".into())
                             .when(repeats, |el| el.child(Icon::new(IconName::Repeat).size(IconSize::Small).color(due_color)))
@@ -3950,8 +4130,9 @@ impl Render for TaskDetail {
                                     Placement::BelowLeft,
                                     self.render_due_popup(strings, window, cx),
                                 ))
-                            }),
-                    )
+                            })
+                            .into_any_element()
+                    })
                     .when(in_progress, |el| {
                         el.child(
                             h_flex()
@@ -3961,11 +4142,13 @@ impl Render for TaskDetail {
                                 .gap_1()
                                 .rounded(px(5.))
                                 .bg(theme.colors().accent.opacity(0.14))
-                                .cursor_pointer()
-                                .tooltip(Tooltip::text(strings.clear_in_progress))
                                 .child(Icon::new(IconName::Hourglass).size(IconSize::XSmall).color(Color::Accent))
                                 .child(Label::new(strings.in_progress).size(LabelSize::XSmall).color(Color::Accent))
-                                .on_click(cx.listener(|this, _, _, cx| this.toggle_in_progress(cx))),
+                                .when(!read_only, |el| {
+                                    el.cursor_pointer()
+                                        .tooltip(Tooltip::text(strings.clear_in_progress))
+                                        .on_click(cx.listener(|this, _, _, cx| this.toggle_in_progress(cx)))
+                                }),
                         )
                     })
                     .child(div().flex_1())
@@ -3973,14 +4156,22 @@ impl Render for TaskDetail {
                         div()
                             .debug_selector(|| "task-detail-priority".to_owned())
                             .relative()
-                            .child(
+                            .child(if read_only {
+                                h_flex()
+                                    .size(px(28.))
+                                    .justify_center()
+                                    .opacity(0.75)
+                                    .child(Icon::new(if kind == Kind::Note { IconName::CircleAlert } else { IconName::Flag }).color(priority_color))
+                                    .into_any_element()
+                            } else {
                                 // A note's priority shows as the original's "!" in a circle.
                                 IconButton::new("priority", if kind == Kind::Note { IconName::CircleAlert } else { IconName::Flag })
                                     .icon_color(priority_color)
                                     .tip(strings.summary_priority, TipSide::Below)
-                                    .on_click(cx.listener(|this, _, _, cx| this.open_popup(Popup::Priority, cx))),
-                            )
-                            .when(self.sticky_style.is_none() && self.session.popup == Some(Popup::Priority), |el| {
+                                    .on_click(cx.listener(|this, _, _, cx| this.open_popup(Popup::Priority, cx)))
+                                    .into_any_element()
+                            })
+                            .when(!read_only && self.sticky_style.is_none() && self.session.popup == Some(Popup::Priority), |el| {
                                 el.child(PopoverAttachment::new(
                                     Placement::BelowRight,
                                     self.render_priority_popup(strings, cx),
@@ -4001,8 +4192,10 @@ impl Render for TaskDetail {
                         .pb_6()
                         .gap_3()
                         .when(sticky, |el| el.px_3().pt_0p5().pb_2().gap_1())
-                        .on_mouse_down(MouseButton::Left, move |_, window, cx| {
-                            window.focus(&notes_focus, cx);
+                        .when(!read_only, |el| {
+                            el.on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                                window.focus(&notes_focus, cx);
+                            })
                         })
                         // A subtask names its parent over the title, as the original; a click opens it,
                         // and hovering exposes Edit and Unlink Parent Task buttons.
@@ -4032,7 +4225,7 @@ impl Render for TaskDetail {
                                         .child(Label::new(parent_title).color(Color::Muted).truncate())
                                         .child(Icon::new(IconName::ChevronRight).size(IconSize::Small).color(Color::Muted)),
                                 )
-                                .when(!task.is_deleted() && !sticky, |el| {
+                                .when(!read_only && !sticky, |el| {
                                     el.child(
                                         h_flex()
                                             .flex_none()
@@ -4088,7 +4281,7 @@ impl Render for TaskDetail {
                                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                                     .child(self.title.clone()),
                             )
-                            .when(!sticky, |title| title.child(
+                            .when(!sticky && !read_only, |title| title.child(
                                 div()
                                     .debug_selector(|| "task-detail-checklist-toggle".to_owned())
                                     .pt_0p5()
@@ -4103,7 +4296,23 @@ impl Render for TaskDetail {
                     // As in the original, the description comes first and the checklist under it.
                     // While it is not edited, the description is drawn formatted, as the original
                     // shows it; a click opens it for editing.
-                    .child(if !notes_editing && !task.notes.trim().is_empty() {
+                    .child(if read_only {
+                        if !task.notes.trim().is_empty() {
+                            div()
+                                .id("notes-formatted")
+                                .debug_selector(|| "task-notes-preview".to_owned())
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .child(render_markdown_interactive(
+                                    &task.notes,
+                                    self.sticky_style,
+                                    Rc::new(|_, _, _| {}),
+                                    cx,
+                                ))
+                                .into_any_element()
+                        } else {
+                            div().into_any_element()
+                        }
+                    } else if !notes_editing && !task.notes.trim().is_empty() {
                         div()
                             .id("notes-formatted")
                             .debug_selector(|| "task-notes-preview".to_owned())
@@ -4162,21 +4371,23 @@ impl Render for TaskDetail {
                                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                                 .child(Icon::new(IconName::MapPin).size(IconSize::Small).color(Color::Muted))
                                 .child(div().flex_1().min_w_0().text_size(px(13.)).child(self.location_input.clone()))
-                                .child(
-                                    IconButton::new("detail-location-clear", IconName::X)
-                                        .size(px(20.))
-                                        .icon_size(IconSize::XSmall)
-                                        .icon_color(Color::Muted)
-                                        .tooltip(Tooltip::text(strings.clear))
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.location_open = false;
-                                            this.location_input.update(cx, |input, cx| input.clear(window, cx));
-                                            if !this.edit_draft(cx, |task, _| task.location = None) {
-                                                this.save(cx, |store, id| store.set_location(id, None));
-                                            }
-                                            cx.notify();
-                                        })),
-                                ),
+                                .when(!read_only, |el| {
+                                    el.child(
+                                        IconButton::new("detail-location-clear", IconName::X)
+                                            .size(px(20.))
+                                            .icon_size(IconSize::XSmall)
+                                            .icon_color(Color::Muted)
+                                            .tooltip(Tooltip::text(strings.clear))
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.location_open = false;
+                                                this.location_input.update(cx, |input, cx| input.clear(window, cx));
+                                                if !this.edit_draft(cx, |task, _| task.location = None) {
+                                                    this.save(cx, |store, id| store.set_location(id, None));
+                                                }
+                                                cx.notify();
+                                            })),
+                                    )
+                                }),
                         )
                     })
                     // Tags sit under the notes, as in the original.
@@ -4203,7 +4414,7 @@ impl Render for TaskDetail {
                 el.child(div().px_5().py_1().child(Label::new(strings.attachment_preparing).color(Color::Muted)))
             })
             // The bottom bar's "A" shows the description's Markdown toolbar over it, as the original.
-            .when(self.format_bar && !task.is_deleted(), |el| {
+            .when(self.format_bar && !read_only, |el| {
                 let on_action: crate::markdown_toolbar::OnAction<Self> = Rc::new(|this, action, window, cx| this.toolbar_action(action, window, cx));
                 el.child(
                     div().px_3().pb_2().child(
@@ -4218,10 +4429,10 @@ impl Render for TaskDetail {
                     ),
                 )
             })
-            .when(self.comment_open && !task.is_deleted(), |el| el.child(self.render_comment_box(cx)))
+            .when(self.comment_open && !read_only, |el| el.child(self.render_comment_box(cx)))
             .when_some(self.session.activity.clone(), |el, activity| el.child(self.render_activity(&activity, strings, cx)))
             // Bottom bar: list ……… formatting, comments, more; for a trashed task, as in the
-            // original: Restore ……… delete forever.
+            // original: Restore ……… delete forever; for an archived-list task, read-only list label.
             .child(
                 h_flex()
                     .gap_2()
@@ -4242,6 +4453,41 @@ impl Render for TaskDetail {
                                     .tooltip(Tooltip::text(strings.delete_forever))
                                     .on_click(cx.listener(|this, _, _, cx| this.delete_forever(cx))),
                             )
+                        } else if read_only {
+                            bar.when(sticky, |bar| bar.child(
+                                div()
+                                    .id("sticky-date")
+                                    .debug_selector(|| "task-detail-due-date".into())
+                                    .flex()
+                                    .items_center()
+                                    .min_w_0()
+                                    .text_size(px(11.))
+                                    .text_color(sticky_foreground.unwrap_or(theme.colors().text).opacity(0.68))
+                                    .when(date.is_none(), |date| date.opacity(0.))
+                                    .child(div().truncate().child(due_text.clone())),
+                            ))
+                            .when(!sticky, |bar| bar.child(
+                                h_flex()
+                                    .id("list")
+                                    .debug_selector(|| "task-detail-list".to_owned())
+                                    .gap_1p5()
+                                    .px_1p5()
+                                    .py_1()
+                                    .opacity(0.75)
+                                    .child(Icon::new(list_icon).color(muted))
+                                    .child(Label::new(list_name).color(muted)),
+                            ))
+                            .child(div().flex_1())
+                            .when(!sticky, |bar| {
+                                let words = fern_core::markdown::count_words(self.notes.read(cx).text());
+                                bar.when(words > 0, |bar| {
+                                    bar.child(
+                                        Label::new(strings.word_count.replace("{n}", &words.to_string()))
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Muted),
+                                    )
+                                })
+                            })
                         } else {
                             bar.when(sticky, |bar| bar.child(
                                 div()
@@ -4478,6 +4724,112 @@ mod tests {
         assert!(store.attachments(second.id).unwrap().is_empty());
         assert!(cx.debug_bounds("task-attachment").is_none());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[gpui::test]
+    fn archived_list_and_trashed_tasks_are_read_only_and_delete_forever_requests_confirmation(
+        cx: &mut TestAppContext,
+    ) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let list = store.create_list("ArchiveList").unwrap();
+        let task = store.add_task("Archived task").unwrap();
+        store.set_list(task.id, Some(list.id)).unwrap();
+        store.set_notes(task.id, "- [ ] check me").unwrap();
+        let check_item = store.add_checklist_item(task.id, "item 1", None).unwrap();
+        store.add_comment(task.id, "read-only note").unwrap();
+        store.set_list_archived(list.id, true).unwrap();
+
+        let task = store.task(task.id).unwrap().unwrap();
+        let task_id = task.id;
+        cx.update(|cx| {
+            theme::init(cx);
+            cx.set_global(CurrentLocale(i18n::Locale::En));
+        });
+        let requested_purge = Rc::new(std::cell::RefCell::new(Vec::<Id>::new()));
+        let requested_purge_sub = requested_purge.clone();
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let mut detail = TaskDetail::new(store.clone(), window, cx);
+            // Mirror TodoView: only active (non-archived) lists are passed into TaskDetail::set_lists.
+            detail.set_lists(Vec::new());
+            detail.show(Some(task), cx);
+            detail
+        });
+        cx.update(|_, cx| {
+            cx.subscribe(&view, move |_, RequestDeleteForever(id), _| {
+                requested_purge_sub.borrow_mut().push(*id);
+            })
+            .detach();
+        });
+        cx.run_until_parked();
+
+        cx.update(|window, cx| {
+            let detail = view.read(cx);
+            assert!(detail.is_read_only(), "archived-list task must be read-only");
+            assert_eq!(detail.session.archived_list_name.as_deref(), Some("ArchiveList"));
+            assert!(detail.title.read(cx).is_read_only());
+            assert!(detail.notes.read(cx).is_read_only());
+            assert!(detail.location_input.read(cx).is_read_only());
+            assert!(
+                detail.checklist.iter().all(|row| row.input.read(cx).is_read_only()),
+                "checklist inputs must be read-only in archived list"
+            );
+
+            view.update(cx, |detail, cx| {
+                detail.toggle_completed(cx);
+                detail.open_popup(Popup::More, cx);
+                detail.open_popup_from_ui(Popup::Due, window, cx);
+                detail.start_checklist(cx);
+                detail.toggle_markdown_check(0, cx);
+                detail.toggle_checklist_item(check_item.id, true, cx);
+                assert!(!detail.has_popup(), "read-only task must not open edit popups");
+            });
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("task-detail-more").is_none(), "read-only detail hides more menu");
+        assert!(
+            cx.debug_bounds("task-detail-checklist-toggle").is_none(),
+            "read-only detail hides checklist mode toggle"
+        );
+        let stored = store.task(task_id).unwrap().unwrap();
+        assert!(!stored.is_completed(), "read-only toggle_completed must be a no-op");
+        assert_eq!(stored.notes, "- [ ] check me", "read-only markdown check toggle must be a no-op");
+        assert!(!store.checklist(task_id).unwrap()[0].completed);
+
+        // Unarchiving the list restores editability on refresh.
+        store.set_list_archived(list.id, false).unwrap();
+        let unarchived_lists = store.lists().unwrap();
+        let refreshed = store.task(task_id).unwrap();
+        cx.update(|_, cx| {
+            view.update(cx, |detail, cx| {
+                detail.set_lists(unarchived_lists);
+                detail.refresh(refreshed, cx);
+                assert!(!detail.is_read_only());
+                assert!(!detail.title.read(cx).is_read_only());
+                assert!(!detail.notes.read(cx).is_read_only());
+            });
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("task-detail-more").is_some());
+
+        // Moving to Trash makes the task read-only again, and delete_forever requests confirmation
+        // instead of purging immediately.
+        store.delete_task(task_id).unwrap();
+        let deleted = store.task(task_id).unwrap();
+        cx.update(|_, cx| {
+            view.update(cx, |detail, cx| {
+                detail.refresh(deleted, cx);
+                assert!(detail.is_read_only(), "trashed task must be read-only");
+                assert!(detail.title.read(cx).is_read_only());
+                detail.toggle_completed(cx);
+                detail.delete_forever(cx);
+            });
+        });
+        cx.run_until_parked();
+        assert_eq!(*requested_purge.borrow(), vec![task_id]);
+        assert!(
+            store.task(task_id).unwrap().is_some(),
+            "delete_forever must wait for host confirmation before purging"
+        );
     }
 }
 

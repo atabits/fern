@@ -717,7 +717,14 @@ impl MatrixView {
         cx.notify();
     }
 
+    fn is_task_read_only(&self, id: Id) -> bool {
+        self.store.is_task_read_only(id).unwrap_or(false)
+    }
+
     fn toggle_complete(&mut self, id: Id, cx: &mut Context<Self>) {
+        if self.is_task_read_only(id) {
+            return;
+        }
         let Some(task) = self
             .tasks
             .iter()
@@ -740,6 +747,9 @@ impl MatrixView {
     }
 
     fn delete_task(&mut self, id: Id, cx: &mut Context<Self>) {
+        if self.is_task_read_only(id) {
+            return;
+        }
         if let Err(err) = self.store.delete_task(id) {
             eprintln!("failed to delete task: {err:#}");
         } else {
@@ -787,6 +797,9 @@ impl MatrixView {
     /// Applies full cross-quadrant drop adjustments (priority, date, list, tag, kind) and surfaces
     /// feedback toasts when already matching or unsupported.
     fn drop_on(&mut self, id: Id, quadrant: usize, cx: &mut Context<Self>) {
+        if self.is_task_read_only(id) {
+            return;
+        }
         let Some(task) = self.tasks.iter().find(|t| t.id == id).cloned() else {
             return;
         };
@@ -1366,6 +1379,7 @@ impl MatrixView {
         let title_pomo = task.title.clone();
         let title_sw = task.title.clone();
         let is_note = task.kind == Kind::Note;
+        let read_only = self.is_task_read_only(id);
 
         div()
             .id("matrix-task-ctx")
@@ -1392,7 +1406,7 @@ impl MatrixView {
                                 cx.notify();
                             })),
                     )
-                    .when(!is_note, |el| {
+                    .when(!read_only && !is_note, |el| {
                         el.child(
                             h_flex().px_2().py_1().gap_1().children(
                                 [
@@ -1419,75 +1433,77 @@ impl MatrixView {
                             ),
                         )
                     })
-                    .child(
-                        ListItem::new("mctx-today")
-                            .height(px(30.))
-                            .start_slot(Icon::new(IconName::CalendarDays).color(Color::Muted))
-                            .child(Label::new(strings.today))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.task_menu = None;
-                                let _ = this.store.move_dates(id, today);
-                                desktop_common::data_version::data_changed(cx.entity_id(), cx);
-                                this.reload(cx);
-                            })),
-                    )
-                    .child(
-                        ListItem::new("mctx-tomorrow")
-                            .height(px(30.))
-                            .start_slot(Icon::new(IconName::Sunrise).color(Color::Muted))
-                            .child(Label::new(strings.tomorrow))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.task_menu = None;
-                                let _ = this.store.move_dates(id, today + Duration::days(1));
-                                desktop_common::data_version::data_changed(cx.entity_id(), cx);
-                                this.reload(cx);
-                            })),
-                    )
-                    .child(
-                        ListItem::new("mctx-clear-date")
-                            .height(px(30.))
-                            .start_slot(Icon::new(IconName::CalendarX).color(Color::Muted))
-                            .child(Label::new(strings.clear))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.task_menu = None;
-                                let _ = this.store.set_due(id, None, None);
-                                desktop_common::data_version::data_changed(cx.entity_id(), cx);
-                                this.reload(cx);
-                            })),
-                    )
-                    .child(
-                        ListItem::new("mctx-pomo")
-                            .height(px(30.))
-                            .start_slot(Icon::new(IconName::Timer).color(Color::Muted))
-                            .child(Label::new(strings.start_pomo))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.task_menu = None;
-                                cx.emit(StartFocus(id, title_pomo.clone(), false));
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        ListItem::new("mctx-sw")
-                            .height(px(30.))
-                            .start_slot(Icon::new(IconName::Clock).color(Color::Muted))
-                            .child(Label::new(strings.start_stopwatch))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.task_menu = None;
-                                cx.emit(StartFocus(id, title_sw.clone(), true));
-                                cx.notify();
-                            })),
-                    )
-                    .child(div().my_1().child(Divider::horizontal()))
-                    .child(
-                        ListItem::new("mctx-delete")
-                            .height(px(30.))
-                            .start_slot(Icon::new(IconName::Trash).color(Color::Error))
-                            .child(Label::new(strings.delete).color(Color::Error))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.task_menu = None;
-                                this.delete_task(id, cx);
-                            })),
-                    ),
+                    .when(!read_only, |el| {
+                        el.child(
+                            ListItem::new("mctx-today")
+                                .height(px(30.))
+                                .start_slot(Icon::new(IconName::CalendarDays).color(Color::Muted))
+                                .child(Label::new(strings.today))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.task_menu = None;
+                                    let _ = this.store.move_dates(id, today);
+                                    desktop_common::data_version::data_changed(cx.entity_id(), cx);
+                                    this.reload(cx);
+                                })),
+                        )
+                        .child(
+                            ListItem::new("mctx-tomorrow")
+                                .height(px(30.))
+                                .start_slot(Icon::new(IconName::Sunrise).color(Color::Muted))
+                                .child(Label::new(strings.tomorrow))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.task_menu = None;
+                                    let _ = this.store.move_dates(id, today + Duration::days(1));
+                                    desktop_common::data_version::data_changed(cx.entity_id(), cx);
+                                    this.reload(cx);
+                                })),
+                        )
+                        .child(
+                            ListItem::new("mctx-clear-date")
+                                .height(px(30.))
+                                .start_slot(Icon::new(IconName::CalendarX).color(Color::Muted))
+                                .child(Label::new(strings.clear))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.task_menu = None;
+                                    let _ = this.store.set_due(id, None, None);
+                                    desktop_common::data_version::data_changed(cx.entity_id(), cx);
+                                    this.reload(cx);
+                                })),
+                        )
+                        .child(
+                            ListItem::new("mctx-pomo")
+                                .height(px(30.))
+                                .start_slot(Icon::new(IconName::Timer).color(Color::Muted))
+                                .child(Label::new(strings.start_pomo))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.task_menu = None;
+                                    cx.emit(StartFocus(id, title_pomo.clone(), false));
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            ListItem::new("mctx-sw")
+                                .height(px(30.))
+                                .start_slot(Icon::new(IconName::Clock).color(Color::Muted))
+                                .child(Label::new(strings.start_stopwatch))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.task_menu = None;
+                                    cx.emit(StartFocus(id, title_sw.clone(), true));
+                                    cx.notify();
+                                })),
+                        )
+                        .child(div().my_1().child(Divider::horizontal()))
+                        .child(
+                            ListItem::new("mctx-delete")
+                                .height(px(30.))
+                                .start_slot(Icon::new(IconName::Trash).color(Color::Error))
+                                .child(Label::new(strings.delete).color(Color::Error))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.task_menu = None;
+                                    this.delete_task(id, cx);
+                                })),
+                        )
+                    }),
             )
             .into_any_element()
     }

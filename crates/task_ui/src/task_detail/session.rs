@@ -13,6 +13,10 @@ pub(super) struct TaskDetailSession {
     pub attachment_errors: Vec<String>,
     pub comments: Vec<fern_core::Comment>,
     pub task: Option<Task>,
+    /// Whether `task` lives in an archived list (making the task read-only, as in the original).
+    pub task_in_archived_list: bool,
+    /// Display name of `task`'s archived list when `lists` only holds active lists.
+    pub archived_list_name: Option<String>,
     pub task_depth: usize,
     pub draft: Option<draft::NewTask>,
     pub tag_draft: Option<TagDraft>,
@@ -41,6 +45,8 @@ impl TaskDetailSession {
             attachment_errors: Vec::new(),
             comments: Vec::new(),
             task: None,
+            task_in_archived_list: false,
+            archived_list_name: None,
             task_depth: 0,
             draft: None,
             tag_draft: None,

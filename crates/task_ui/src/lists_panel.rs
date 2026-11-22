@@ -267,7 +267,8 @@ pub fn render(
             )
             .on_click(move |_, window, cx| on_select(view.clone(), window, cx));
         let selector_id = id.clone();
-        let accepts_task_drop = !matches!(drop_view, View::All | View::Summary | View::Filter(_) | View::Search(_));
+        let accepts_task_drop = !matches!(drop_view, View::All | View::Summary | View::Filter(_) | View::Search(_))
+            && !matches!(drop_view, View::List(list_id) if lists.iter().any(|l| l.id == list_id && l.archived));
         div()
             .id(SharedString::from(format!("drop-{id}")))
             .debug_selector(move || format!("lists-item-{selector_id}"))

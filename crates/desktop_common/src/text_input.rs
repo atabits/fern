@@ -113,6 +113,8 @@ pub struct TextInput {
     /// A password field: the text shows as "*", one per Unicode scalar value, and it cannot be
     /// copied.
     masked: bool,
+    /// When true, the user can select and copy text, but cannot modify the content.
+    read_only: bool,
     /// When true on a single-line input, pasting 2+ non-empty lines emits [`MultiLinePasted`]
     /// instead of flattening newlines into spaces (used for Batch Add Tasks).
     intercept_multiline_paste: bool,
@@ -207,6 +209,7 @@ impl TextInput {
             cancellable: true,
             highlights: Vec::new(),
             masked: false,
+            read_only: false,
             intercept_multiline_paste: false,
             keyboard_blur: None,
             undo_stack: Vec::new(),
@@ -230,6 +233,22 @@ impl TextInput {
     pub fn masked(mut self) -> Self {
         self.masked = true;
         self
+    }
+
+    /// Toggles read-only mode: text can still be selected and copied, but edits are ignored.
+    pub fn set_read_only(&mut self, read_only: bool, cx: &mut Context<Self>) {
+        if self.read_only != read_only {
+            self.read_only = read_only;
+            if read_only {
+                self.marked_range = None;
+                touch_keyboard::release(&self.focus_handle);
+            }
+            cx.notify();
+        }
+    }
+
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
     }
 
     pub fn text(&self) -> &str {
@@ -278,6 +297,9 @@ impl TextInput {
 
     /// Replaces the text as an edit — it emits [`Changed`] — and selects `selection`.
     pub fn edit(&mut self, text: String, selection: Range<usize>, window: &Window, cx: &mut Context<Self>) {
+        if self.read_only {
+            return;
+        }
         self.push_undo_snapshot();
         let start = snap_char_boundary(&text, selection.start);
         let end = snap_char_boundary(&text, selection.end).max(start);
@@ -354,6 +376,9 @@ impl TextInput {
     }
 
     fn undo(&mut self, _: &Undo, window: &mut Window, cx: &mut Context<Self>) {
+        if self.read_only {
+            return;
+        }
         let Some((prev_text, prev_sel)) = self.undo_stack.pop() else {
             cx.propagate();
             return;
@@ -370,6 +395,9 @@ impl TextInput {
     }
 
     fn redo(&mut self, _: &Redo, window: &mut Window, cx: &mut Context<Self>) {
+        if self.read_only {
+            return;
+        }
         let Some((next_text, next_sel)) = self.redo_stack.pop() else {
             cx.propagate();
             return;
@@ -386,6 +414,9 @@ impl TextInput {
     }
 
     fn enter(&mut self, _: &Enter, window: &mut Window, cx: &mut Context<Self>) {
+        if self.read_only {
+            return;
+        }
         if self.mode == Mode::MultiLine {
             if self.selected_range.is_empty() && self.marked_range.is_none() {
                 let cursor = self.selected_range.end;
@@ -528,6 +559,9 @@ impl TextInput {
     }
 
     fn indent(&mut self, _: &Indent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.read_only {
+            return;
+        }
         if self.mode != Mode::MultiLine {
             cx.propagate();
             return;
@@ -539,6 +573,9 @@ impl TextInput {
     }
 
     fn outdent(&mut self, _: &Outdent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.read_only {
+            return;
+        }
         if self.mode != Mode::MultiLine {
             cx.propagate();
             return;
@@ -550,6 +587,9 @@ impl TextInput {
     }
 
     fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
+        if self.read_only {
+            return;
+        }
         if self.selected_range.is_empty() {
             let prev = self.previous_boundary(self.cursor_offset());
             if self.cursor_offset() == prev {
@@ -562,6 +602,9 @@ impl TextInput {
     }
 
     fn delete(&mut self, _: &Delete, window: &mut Window, cx: &mut Context<Self>) {
+        if self.read_only {
+            return;
+        }
         if self.selected_range.is_empty() {
             let next = self.next_boundary(self.cursor_offset());
             if self.cursor_offset() == next {
@@ -574,6 +617,9 @@ impl TextInput {
     }
 
     fn delete_word_backward(&mut self, _: &DeleteWordBackward, window: &mut Window, cx: &mut Context<Self>) {
+        if self.read_only {
+            return;
+        }
         if self.selected_range.is_empty() {
             let prev = self.previous_word_boundary(self.cursor_offset());
             if self.cursor_offset() == prev {
@@ -586,6 +632,9 @@ impl TextInput {
     }
 
     fn delete_word_forward(&mut self, _: &DeleteWordForward, window: &mut Window, cx: &mut Context<Self>) {
+        if self.read_only {
+            return;
+        }
         if self.selected_range.is_empty() {
             let next = self.next_word_boundary(self.cursor_offset());
             if self.cursor_offset() == next {
@@ -600,6 +649,9 @@ impl TextInput {
     /// Requests the platform/touch virtual keyboard when an input is opened by a tap rather than
     /// directly receiving `on_mouse_down` (for example, inline title editing).
     pub fn open_touch_keyboard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.read_only {
+            return;
+        }
         window.request_virtual_keyboard();
         if touch_keyboard::show_for_tap(window, &self.focus_handle) && self.keyboard_blur.is_none()
         {
@@ -617,6 +669,8 @@ impl TextInput {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        cx.stop_propagation();
+        window.focus(&self.focus_handle, cx);
         self.is_selecting = true;
         self.open_touch_keyboard(window, cx);
 
@@ -661,10 +715,16 @@ impl TextInput {
         window: &mut Window,
         _: &mut Context<Self>,
     ) {
+        if self.read_only {
+            return;
+        }
         window.show_character_palette();
     }
 
     fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
+        if self.read_only {
+            return;
+        }
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
             let normalized = normalize_line_endings(&text);
             if self.mode == Mode::SingleLine && self.intercept_multiline_paste {
@@ -697,6 +757,9 @@ impl TextInput {
     }
 
     fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
+        if self.read_only {
+            return;
+        }
         if !self.selected_range.is_empty() && !self.masked {
             cx.write_to_clipboard(ClipboardItem::new_string(
                 self.content[self.selected_range.clone()].to_string(),
@@ -996,6 +1059,9 @@ impl EntityInputHandler for TextInput {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.read_only {
+            return;
+        }
         let was_marked = self.marked_range.is_some();
         let range = range_utf16
             .as_ref()
@@ -1031,6 +1097,9 @@ impl EntityInputHandler for TextInput {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.read_only {
+            return;
+        }
         let was_marked = self.marked_range.is_some();
         let range = range_utf16
             .as_ref()
@@ -1369,11 +1438,13 @@ impl Element for TextElement {
         let mut selection = Vec::new();
         let mut cursor = None;
         if selected_range.is_empty() {
-            let position = layout.position_for_offset(input.display_offset(input.cursor_offset()));
-            cursor = Some(fill(
-                Bounds::new(origin + position, size(CARET_WIDTH, line_height)),
-                theme.colors().accent,
-            ));
+            if !input.read_only {
+                let position = layout.position_for_offset(input.display_offset(input.cursor_offset()));
+                cursor = Some(fill(
+                    Bounds::new(origin + position, size(CARET_WIDTH, line_height)),
+                    theme.colors().accent,
+                ));
+            }
         } else {
             let start = layout.position_for_offset(input.display_offset(selected_range.start));
             let end = layout.position_for_offset(input.display_offset(selected_range.end));

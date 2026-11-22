@@ -236,6 +236,11 @@ impl PluginSettingsView {
     }
 
     fn consume_requested_logs_plugin(&mut self, cx: &mut Context<Self>) {
+        if let Some(pid) = PluginHost::take_requested_settings_open(cx) {
+            self.tab = PluginSettingsTab::Installed;
+            self.expanded_settings = Some(pid);
+            self.expanded_logs = None;
+        }
         if let Some(pid) = PluginHost::take_requested_settings_plugin(cx) {
             self.tab = PluginSettingsTab::Installed;
             self.expanded_logs = Some(pid.clone());

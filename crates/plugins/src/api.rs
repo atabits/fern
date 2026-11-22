@@ -110,6 +110,9 @@ pub enum PluginUiEffect {
     OpenTask {
         task_id: Id,
     },
+    OpenSettings {
+        plugin_id: String,
+    },
     OpenExternal {
         url: String,
     },
@@ -2251,6 +2254,20 @@ fn install_ui<'js>(
                     .borrow_mut()
                     .push_back(PluginUiEffect::OpenTask { task_id });
                 Ok(())
+            })?,
+        )?;
+    }
+
+    {
+        let st = Rc::clone(&state);
+        obj.set(
+            "openSettings",
+            Function::new(ctx.clone(), move || {
+                st.pending_ui_effects
+                    .borrow_mut()
+                    .push_back(PluginUiEffect::OpenSettings {
+                        plugin_id: st.plugin_id.clone(),
+                    });
             })?,
         )?;
     }

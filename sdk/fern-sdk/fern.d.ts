@@ -252,6 +252,7 @@ declare module "fern" {
     openModal(title: string, viewOrNode: import("fern:ui").UiNode | (() => import("fern:ui").UiNode) | { render: () => import("fern:ui").UiNode }): void;
     closeModal(): void;
     openTask(taskId: string): void;
+    openSettings(): void;
   };
 
   export const system: {

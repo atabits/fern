@@ -1332,6 +1332,7 @@ impl Render for PluginView {
         v_flex()
             .size_full()
             .min_h_0()
+            .pt(desktop_common::layout::header_inset())
             .track_focus(&self.focus_handle)
             .bg(cx.theme().colors().background)
             .child(

@@ -145,6 +145,7 @@ pub struct PluginHost {
     loaded_plugin_theme_ids: HashSet<String>,
     plugin_theme_errors: Vec<String>,
     requested_settings_plugin: Option<String>,
+    requested_settings_open: Option<String>,
     external_data_seq: u64,
     notified_outbox_seq: u64,
     _marker: Entity<HostDataMarker>,
@@ -236,6 +237,7 @@ impl PluginHost {
             loaded_plugin_theme_ids: HashSet::new(),
             plugin_theme_errors: Vec::new(),
             requested_settings_plugin: None,
+            requested_settings_open: None,
             external_data_seq: 0,
             notified_outbox_seq: 0,
             _marker: marker,
@@ -422,6 +424,29 @@ impl PluginHost {
         PluginBus::update(cx, |bus| {
             bus.push_nav(PluginNavAction::OpenSettingsPlugins);
         });
+    }
+
+    /// Requests that [`crate::PluginSettingsView`] open directly to `plugin_id`'s settings form.
+    pub fn request_open_settings_for(plugin_id: impl Into<String>, cx: &mut App) {
+        let plugin_id = plugin_id.into();
+        if cx.has_global::<Self>() {
+            cx.update_global::<Self, _>(|host, _| {
+                host.requested_settings_open = Some(plugin_id);
+            });
+        }
+        PluginBus::update(cx, |bus| {
+            bus.push_nav(PluginNavAction::OpenSettingsPlugins);
+        });
+    }
+
+    pub fn take_requested_settings_open(cx: &mut App) -> Option<String> {
+        let has_request = cx
+            .try_global::<Self>()
+            .is_some_and(|host| host.requested_settings_open.is_some());
+        if !has_request {
+            return None;
+        }
+        cx.update_global::<Self, _>(|host, _| host.requested_settings_open.take())
     }
 
     pub fn take_requested_settings_plugin(cx: &mut App) -> Option<String> {
@@ -1134,6 +1159,9 @@ fn apply_ui_effect(effect: PluginUiEffect, cx: &mut App) {
         }
         PluginUiEffect::OpenTask { task_id } => {
             PluginBus::update(cx, |bus| bus.push_nav(PluginNavAction::OpenTask(task_id)));
+        }
+        PluginUiEffect::OpenSettings { plugin_id } => {
+            PluginHost::request_open_settings_for(plugin_id, cx);
         }
         PluginUiEffect::OpenExternal { url } => {
             let trimmed = url.trim();

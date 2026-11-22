@@ -1,0 +1,73 @@
+# Production Docker Compose stack for fern-server behind Caddy (automatic HTTPS/TLS).
+#
+# Create a `.env` file next to this compose file before starting:
+#   FERN_DOMAIN=sync.example.com
+#   FERN_TOKEN=<generate with: openssl rand -base64 32>
+#   # Optional:
+#   # FERN_GC_GRACE_HOURS=24
+#
+# Start:
+#   docker compose -f deploy/docker-compose.yml up -d --build
+
+services:
+  fern-server:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      FERN_TOKEN: ${FERN_TOKEN:?Set FERN_TOKEN (at least 16 characters) in .env}
+      FERN_LISTEN: 0.0.0.0:8650
+      FERN_DATA: /data/fern-server.db
+      FERN_GC_GRACE_HOURS: ${FERN_GC_GRACE_HOURS:-24}
+    volumes:
+      - fern_data:/data
+    networks:
+      - fern_internal
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8650/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      fern-server:
+        condition: service_healthy
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    # Automatic HTTPS via Let's Encrypt; replace `command` with a mounted Caddyfile
+    # if you want custom security headers or IP allowlists.
+    command:
+      - caddy
+      - reverse-proxy
+      - --from
+      - ${FERN_DOMAIN:?Set FERN_DOMAIN (e.g. sync.example.com) in .env}
+      - --to
+      - http://fern-server:8650
+    volumes:
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - fern_internal
+      - public
+
+networks:
+  fern_internal:
+    internal: true
+  public:
+
+volumes:
+  fern_data:
+  caddy_data:
+  caddy_config:

@@ -1,0 +1,40 @@
+[Unit]
+Description=Fern self-hosted sync server
+Documentation=https://github.com/atabits/fern/blob/main/docs/self-hosting.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+StateDirectory=fern-server
+StateDirectoryMode=0700
+EnvironmentFile=/etc/fern-server.env
+ExecStart=/usr/local/bin/fern-server --listen 127.0.0.1:8650 --data /var/lib/fern-server/fern-server.db
+Restart=on-failure
+RestartSec=5s
+
+# Hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

@@ -292,12 +292,7 @@ impl PluginManifest {
 
         let mut view_ids = HashSet::new();
         for view in &self.contributions.sidebar {
-            ensure!(!view.id.trim().is_empty(), "sidebar view id must not be empty");
-            ensure!(
-                !view.id.contains('/'),
-                "sidebar view id {:?} must not contain '/'",
-                view.id
-            );
+            validate_view_id(&view.id, "sidebar")?;
             ensure!(
                 view_ids.insert(view.id.as_str()),
                 "duplicate sidebar view id {:?}",
@@ -314,12 +309,7 @@ impl PluginManifest {
         }
 
         for page in &self.contributions.pages {
-            ensure!(!page.id.trim().is_empty(), "page view id must not be empty");
-            ensure!(
-                !page.id.contains('/'),
-                "page view id {:?} must not contain '/'",
-                page.id
-            );
+            validate_view_id(&page.id, "page")?;
             ensure!(
                 view_ids.insert(page.id.as_str()),
                 "duplicate view id {:?}",
@@ -339,9 +329,62 @@ impl PluginManifest {
         for cmd in &self.contributions.commands {
             ensure!(!cmd.id.trim().is_empty(), "command id must not be empty");
             ensure!(
+                cmd.id == cmd.id.trim(),
+                "command id {:?} must not have leading or trailing whitespace",
+                cmd.id
+            );
+            ensure!(
                 cmd_ids.insert(cmd.id.as_str()),
                 "duplicate command id {:?}",
                 cmd.id
+            );
+            ensure!(
+                !cmd.title.trim().is_empty(),
+                "command {:?} title must not be empty",
+                cmd.id
+            );
+        }
+
+        let mut sp_ids = HashSet::new();
+        for sp in &self.contributions.search_providers {
+            ensure!(
+                !sp.id.trim().is_empty(),
+                "search provider id must not be empty"
+            );
+            ensure!(
+                sp.id == sp.id.trim(),
+                "search provider id {:?} must not have leading or trailing whitespace",
+                sp.id
+            );
+            ensure!(
+                sp_ids.insert(sp.id.as_str()),
+                "duplicate search provider id {:?}",
+                sp.id
+            );
+            ensure!(
+                !sp.title.trim().is_empty(),
+                "search provider {:?} title must not be empty",
+                sp.id
+            );
+        }
+
+        let mut imp_ids = HashSet::new();
+        for imp in &self.contributions.importers {
+            ensure!(!imp.id.trim().is_empty(), "importer id must not be empty");
+            ensure!(
+                imp.id == imp.id.trim(),
+                "importer id {:?} must not have leading or trailing whitespace",
+                imp.id
+            );
+            ensure!(
+                imp_ids.insert(imp.id.as_str()),
+                "duplicate importer id {:?}",
+                imp.id
+            );
+            ensure!(
+                !imp.name.trim().is_empty(),
+                "importer {:?} name must not be empty",
+                imp.id
             );
         }
 
@@ -349,8 +392,18 @@ impl PluginManifest {
         for setting in &self.settings {
             ensure!(!setting.key.trim().is_empty(), "setting key must not be empty");
             ensure!(
+                setting.key == setting.key.trim(),
+                "setting key {:?} must not have leading or trailing whitespace",
+                setting.key
+            );
+            ensure!(
                 setting_keys.insert(setting.key.as_str()),
                 "duplicate setting key {:?}",
+                setting.key
+            );
+            ensure!(
+                !setting.label.trim().is_empty(),
+                "setting {:?} label must not be empty",
                 setting.key
             );
             if setting.kind == SettingKind::Select {
@@ -359,17 +412,78 @@ impl PluginManifest {
                     "select setting {:?} must define options",
                     setting.key
                 );
+                for opt in &setting.options {
+                    ensure!(
+                        !opt.value.trim().is_empty() && !opt.label.trim().is_empty(),
+                        "select setting {:?} has option with empty value or label",
+                        setting.key
+                    );
+                }
+            }
+            if setting.kind == SettingKind::Number {
+                if let Some(min) = setting.min {
+                    ensure!(min.is_finite(), "number setting {:?} min must be finite", setting.key);
+                }
+                if let Some(max) = setting.max {
+                    ensure!(max.is_finite(), "number setting {:?} max must be finite", setting.key);
+                }
+                if let (Some(min), Some(max)) = (setting.min, setting.max) {
+                    ensure!(
+                        min <= max,
+                        "number setting {:?} min ({min}) must be <= max ({max})",
+                        setting.key
+                    );
+                }
+                if let Some(step) = setting.step {
+                    ensure!(
+                        step.is_finite() && step > 0.0,
+                        "number setting {:?} step must be finite and > 0",
+                        setting.key
+                    );
+                }
             }
         }
 
+        let mut theme_ids = HashSet::new();
         for theme in &self.contributions.themes {
             ensure!(!theme.id.trim().is_empty(), "theme id must not be empty");
+            ensure!(
+                theme.id == theme.id.trim(),
+                "theme id {:?} must not have leading or trailing whitespace",
+                theme.id
+            );
+            ensure!(
+                theme_ids.insert(theme.id.as_str()),
+                "duplicate theme id {:?}",
+                theme.id
+            );
+            ensure!(
+                !theme.name.trim().is_empty(),
+                "theme {:?} name must not be empty",
+                theme.id
+            );
             if let Some(path) = &theme.path {
                 validate_relative_path(path)?;
             }
         }
+        let mut locale_codes = HashSet::new();
         for locale in &self.contributions.locales {
             ensure!(!locale.code.trim().is_empty(), "locale code must not be empty");
+            ensure!(
+                locale.code == locale.code.trim(),
+                "locale code {:?} must not have leading or trailing whitespace",
+                locale.code
+            );
+            ensure!(
+                locale_codes.insert(locale.code.as_str()),
+                "duplicate locale code {:?}",
+                locale.code
+            );
+            ensure!(
+                !locale.name.trim().is_empty(),
+                "locale {:?} name must not be empty",
+                locale.code
+            );
             if let Some(path) = &locale.path {
                 validate_relative_path(path)?;
             }
@@ -413,12 +527,16 @@ impl PluginManifest {
             return true;
         }
         self.activation_events.iter().any(|pattern| {
-            pattern == "*"
-                || pattern == event
-                || pattern
-                    .strip_suffix(":*")
-                    .is_some_and(|prefix| event.starts_with(prefix))
-                || (pattern == "onEvent:*" && event.starts_with("onEvent:"))
+            if pattern == "*" || pattern == event {
+                return true;
+            }
+            if pattern.ends_with(":*") {
+                // Keep the trailing ':' so `"onCommand:*"` only matches `"onCommand:<rest>"`,
+                // never `"onCommand"` or `"onCommandLine:..."`.
+                let prefix_with_colon = &pattern[..pattern.len() - 1];
+                return event.starts_with(prefix_with_colon);
+            }
+            false
         })
     }
 
@@ -439,7 +557,18 @@ impl PluginManifest {
             };
         };
 
-        let granted = PermissionSet::from_json_str(&state.granted_permissions).unwrap_or_default();
+        let granted = match PermissionSet::from_json_str(&state.granted_permissions) {
+            Ok(g) => g,
+            Err(_) => {
+                if !requested.is_empty() {
+                    return PermissionApprovalStatus::NeedsApproval {
+                        diff: PermissionSet::default().diff(&requested),
+                        is_first_install: state.manifest_hash.is_empty(),
+                    };
+                }
+                PermissionSet::default()
+            }
+        };
         let diff = granted.diff(&requested);
         if diff.is_escalation() {
             return PermissionApprovalStatus::NeedsApproval {
@@ -447,15 +576,46 @@ impl PluginManifest {
                 is_first_install: state.manifest_hash.is_empty(),
             };
         }
-        // If manifest hash changed and no permissions were ever recorded yet while requesting permissions.
-        if state.manifest_hash.is_empty() && !requested.is_empty() {
+        // Require approval if no manifest hash was ever recorded or the supplied hash is empty
+        // while permissions are requested.
+        if (state.manifest_hash.is_empty() || manifest_hash.is_empty()) && !requested.is_empty() {
             return PermissionApprovalStatus::NeedsApproval {
                 diff: PermissionSet::default().diff(&requested),
-                is_first_install: true,
+                is_first_install: state.manifest_hash.is_empty(),
             };
         }
-        let _ = manifest_hash;
+        // When a disabled or overwritten plugin's manifest hash changed while still requesting
+        // permissions, require explicit re-approval before re-enabling.
+        if !state.enabled && state.manifest_hash != manifest_hash && !requested.is_empty() {
+            return PermissionApprovalStatus::NeedsApproval {
+                diff: PermissionSet::default().diff(&requested),
+                is_first_install: false,
+            };
+        }
         PermissionApprovalStatus::Approved
+    }
+
+    /// Returns `Some(narrowed_permissions_json)` when an already-approved plugin's manifest
+    /// dropped previously granted permissions or updated its `manifest_hash`, so persisted
+    /// `granted_permissions` shrinks immediately and dropped capabilities cannot be silently
+    /// reclaimed by a future update.
+    pub fn narrowed_permissions_to_persist(
+        &self,
+        manifest_hash: &str,
+        state: Option<&PluginState>,
+    ) -> Option<String> {
+        let state = state?;
+        let requested = self.permission_set();
+        let granted = PermissionSet::from_json_str(&state.granted_permissions).ok()?;
+        let diff = granted.diff(&requested);
+        if diff.is_escalation() {
+            return None;
+        }
+        if !diff.removed.is_empty() || state.manifest_hash != manifest_hash {
+            requested.to_json_string().ok()
+        } else {
+            None
+        }
     }
 }
 
@@ -515,6 +675,23 @@ impl LoadedManifest {
             permissions,
         })
     }
+}
+
+fn validate_view_id(id: &str, kind: &str) -> Result<()> {
+    ensure!(!id.trim().is_empty(), "{kind} view id must not be empty");
+    ensure!(
+        id == id.trim(),
+        "{kind} view id {id:?} must not have leading or trailing whitespace"
+    );
+    ensure!(
+        !id.contains('/') && !id.contains('\\'),
+        "{kind} view id {id:?} must not contain path separators"
+    );
+    ensure!(
+        !matches!(id, "__modal__" | "__default__"),
+        "{kind} view id {id:?} is reserved"
+    );
+    Ok(())
 }
 
 /// Validates that `rel` is a clean relative path without parent traversal or root prefixes.
@@ -619,5 +796,167 @@ mod tests {
           }
         }"#;
         assert!(PluginManifest::parse_and_validate(dup_raw).is_err());
+    }
+
+    #[test]
+    fn rejects_reserved_or_untrimmed_view_ids_and_invalid_contributions() {
+        for bad_id in ["__modal__", "__default__", " main", "main ", "a/b", "a\\b"] {
+            let raw = serde_json::json!({
+                "id": "com.example.views",
+                "name": "Views",
+                "version": "1.0.0",
+                "api_version": 1,
+                "entry": "index.js",
+                "contributions": {
+                    "sidebar": [{ "id": bad_id, "title": "Main" }]
+                }
+            })
+            .to_string();
+            assert!(
+                PluginManifest::parse_and_validate(&raw).is_err(),
+                "expected sidebar id {bad_id:?} to be rejected"
+            );
+
+            let page_raw = serde_json::json!({
+                "id": "com.example.views",
+                "name": "Views",
+                "version": "1.0.0",
+                "api_version": 1,
+                "entry": "index.js",
+                "contributions": {
+                    "pages": [{ "id": bad_id, "title": "Page" }]
+                }
+            })
+            .to_string();
+            assert!(
+                PluginManifest::parse_and_validate(&page_raw).is_err(),
+                "expected page id {bad_id:?} to be rejected"
+            );
+        }
+
+        // Invalid numeric setting bounds (min > max or step <= 0).
+        let bad_num = r#"{
+          "id": "com.example.num",
+          "name": "Num",
+          "version": "1.0.0",
+          "api_version": 1,
+          "entry": "index.js",
+          "settings": [
+            { "key": "limit", "type": "number", "label": "Limit", "min": 10, "max": 5 }
+          ]
+        }"#;
+        assert!(PluginManifest::parse_and_validate(bad_num).is_err());
+
+        let bad_step = r#"{
+          "id": "com.example.step",
+          "name": "Step",
+          "version": "1.0.0",
+          "api_version": 1,
+          "entry": "index.js",
+          "settings": [
+            { "key": "limit", "type": "number", "label": "Limit", "step": 0 }
+          ]
+        }"#;
+        assert!(PluginManifest::parse_and_validate(bad_step).is_err());
+
+        // Duplicate search_providers / themes / locales and empty command titles are rejected.
+        let bad_cmd = r#"{
+          "id": "com.example.cmd",
+          "name": "Cmd",
+          "version": "1.0.0",
+          "api_version": 1,
+          "entry": "index.js",
+          "contributions": { "commands": [{ "id": "run", "title": "   " }] }
+        }"#;
+        assert!(PluginManifest::parse_and_validate(bad_cmd).is_err());
+
+        let dup_sp = r#"{
+          "id": "com.example.sp",
+          "name": "SP",
+          "version": "1.0.0",
+          "api_version": 1,
+          "entry": "index.js",
+          "contributions": {
+            "search_providers": [
+              { "id": "s1", "title": "One" },
+              { "id": "s1", "title": "Two" }
+            ]
+          }
+        }"#;
+        assert!(PluginManifest::parse_and_validate(dup_sp).is_err());
+    }
+
+    #[test]
+    fn activation_event_wildcard_requires_colon_boundary() {
+        let raw = r#"{
+          "id": "com.example.act",
+          "name": "Act",
+          "version": "1.0.0",
+          "api_version": 1,
+          "entry": "index.js",
+          "activation_events": ["onCommand:*", "onEvent:task:*"]
+        }"#;
+        let (manifest, _) = PluginManifest::parse_and_validate(raw).unwrap();
+        assert!(manifest.matches_activation_event("onCommand:run"));
+        assert!(!manifest.matches_activation_event("onCommand"));
+        assert!(!manifest.matches_activation_event("onCommandLine:run"));
+        assert!(manifest.matches_activation_event("onEvent:task:created"));
+        assert!(!manifest.matches_activation_event("onEvent:taskforce"));
+        assert!(!manifest.matches_activation_event("onStartup"));
+    }
+
+    #[test]
+    fn check_permission_diff_handles_hash_changes_and_shrinking_grants() {
+        let raw_v1 = r#"{
+          "id": "com.example.shrink",
+          "name": "Shrink",
+          "version": "1.0.0",
+          "api_version": 1,
+          "entry": "index.js",
+          "permissions": ["tasks:read", { "network": ["*"] }]
+        }"#;
+        let (_m1, h1) = PluginManifest::parse_and_validate(raw_v1).unwrap();
+
+        let raw_v2 = r#"{
+          "id": "com.example.shrink",
+          "name": "Shrink",
+          "version": "1.1.0",
+          "api_version": 1,
+          "entry": "index.js",
+          "permissions": ["tasks:read"]
+        }"#;
+        let (m2, h2) = PluginManifest::parse_and_validate(raw_v2).unwrap();
+
+        let enabled_state = PluginState {
+            plugin_id: "com.example.shrink".into(),
+            enabled: true,
+            granted_permissions: r#"["tasks:read",{"network":["*"]}]"#.into(),
+            manifest_hash: h1.clone(),
+            ..Default::default()
+        };
+        assert_eq!(
+            m2.check_permission_diff(&h2, Some(&enabled_state)),
+            PermissionApprovalStatus::Approved
+        );
+        let narrowed = m2
+            .narrowed_permissions_to_persist(&h2, Some(&enabled_state))
+            .expect("should shrink dropped network:* permission");
+        assert_eq!(narrowed, r#"["tasks:read"]"#);
+
+        // Once narrowed, a disabled overwritten plugin with a changed manifest_hash requires re-approval.
+        let disabled_overwritten = PluginState {
+            plugin_id: "com.example.shrink".into(),
+            enabled: false,
+            granted_permissions: r#"["tasks:read"]"#.into(),
+            manifest_hash: h1,
+            ..Default::default()
+        };
+        assert!(matches!(
+            m2.check_permission_diff(&h2, Some(&disabled_overwritten)),
+            PermissionApprovalStatus::NeedsApproval {
+                is_first_install: false,
+                ..
+            }
+        ));
     }
 }

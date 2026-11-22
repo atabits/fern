@@ -2,10 +2,11 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::net::IpAddr;
 use std::rc::Rc;
 use std::str::FromStr as _;
-use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -36,8 +37,17 @@ use crate::vault::SecretsVault;
 
 pub const LOG_RING_CAPACITY: usize = 200;
 pub const MIN_TIMER_INTERVAL_MS: u64 = 10_000;
+pub const MAX_TIMER_INTERVAL_MS: u64 = 24 * 60 * 60 * 1000;
 pub const MAX_TIMERS_PER_PLUGIN: usize = 8;
+pub const MAX_OAUTH_PER_PLUGIN: usize = 2;
+pub const MAX_OAUTH_GLOBAL: usize = 4;
 const MAX_JSON_DEPTH: usize = 64;
+const MAX_JSON_NODES: usize = 65_536;
+const MAX_JSON_ARRAY_LEN: usize = 65_536;
+const MAX_JSON_PREALLOC: usize = 1024;
+const MAX_DEFAULT_SCOPE_HANDLERS: usize = 256;
+const MAX_SCOPE_HANDLERS: usize = 4096;
+const JS_MAX_SAFE_INT_F64: f64 = 9_007_199_254_740_991.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -128,12 +138,86 @@ pub enum PromptReplyValue {
     Prompt(Option<String>),
 }
 
-pub type PromptSenders = Rc<RefCell<HashMap<u64, oneshot::Sender<PromptReplyValue>>>>;
+pub type PromptSenders = Rc<RefCell<HashMap<u64, (String, oneshot::Sender<PromptReplyValue>)>>>;
 pub type ServiceCallerFn =
-    Rc<dyn Fn(String, JsonValue) -> oneshot::Receiver<Result<JsonValue>>>;
+    Rc<dyn Fn(String, JsonValue, usize) -> oneshot::Receiver<Result<JsonValue>>>;
 pub type ServiceRegistrarFn = Rc<dyn Fn(String)>;
 pub type ViewRefresherFn = Rc<dyn Fn(String)>;
 pub type EffectEmitterFn = Arc<dyn Fn(PluginUiEffect) + Send + Sync>;
+
+#[derive(Default)]
+struct OAuthLimiterState {
+    global: usize,
+    per_plugin: HashMap<String, usize>,
+}
+
+/// Bounds concurrent detached OAuth worker threads globally and per plugin.
+#[derive(Default)]
+pub struct OAuthConcurrencyLimiter {
+    state: Mutex<OAuthLimiterState>,
+}
+
+pub struct OAuthPermit {
+    limiter: Arc<OAuthConcurrencyLimiter>,
+    plugin_id: String,
+}
+
+impl Drop for OAuthPermit {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.limiter.state.lock() {
+            guard.global = guard.global.saturating_sub(1);
+            if let Some(count) = guard.per_plugin.get_mut(&self.plugin_id) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    guard.per_plugin.remove(&self.plugin_id);
+                }
+            }
+        }
+    }
+}
+
+impl OAuthConcurrencyLimiter {
+    pub fn try_acquire(self: &Arc<Self>, plugin_id: &str) -> Result<OAuthPermit> {
+        let mut guard = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("OAuth concurrency limiter lock poisoned"))?;
+        let plugin_count = guard.per_plugin.get(plugin_id).copied().unwrap_or(0);
+        ensure!(
+            plugin_count < MAX_OAUTH_PER_PLUGIN,
+            "too many concurrent OAuth requests for plugin (max {MAX_OAUTH_PER_PLUGIN})"
+        );
+        ensure!(
+            guard.global < MAX_OAUTH_GLOBAL,
+            "too many concurrent OAuth requests across plugins (max {MAX_OAUTH_GLOBAL})"
+        );
+        guard.global += 1;
+        *guard.per_plugin.entry(plugin_id.to_owned()).or_insert(0) += 1;
+        Ok(OAuthPermit {
+            limiter: Arc::clone(self),
+            plugin_id: plugin_id.to_owned(),
+        })
+    }
+}
+
+/// RAII guard that sets `active_render_scope` and always restores the previous scope on drop.
+pub struct RenderScopeGuard {
+    api: Rc<PluginApiState>,
+    prev_scope: Option<String>,
+}
+
+impl RenderScopeGuard {
+    pub fn enter(api: Rc<PluginApiState>, scope: String) -> Self {
+        let prev_scope = api.active_render_scope.borrow_mut().replace(scope);
+        Self { api, prev_scope }
+    }
+}
+
+impl Drop for RenderScopeGuard {
+    fn drop(&mut self) {
+        *self.api.active_render_scope.borrow_mut() = self.prev_scope.take();
+    }
+}
 
 pub struct RegisteredView {
     pub render: Persistent<Function<'static>>,
@@ -165,8 +249,10 @@ pub struct PluginApiState {
     pub store: Rc<Store>,
     pub vault: SecretsVault,
     pub http_pool: Arc<HttpPool>,
+    pub oauth_limiter: Arc<OAuthConcurrencyLimiter>,
     pub write_depth: Cell<u32>,
-    pub in_batch: Cell<bool>,
+    pub active_service_depth: Cell<usize>,
+    pub batch_dirty_stack: RefCell<Vec<bool>>,
     pub data_dirty: Cell<bool>,
     pub declared_views: HashSet<String>,
     pub settings: RefCell<Map<String, JsonValue>>,
@@ -178,6 +264,7 @@ pub struct PluginApiState {
     pub handlers: RefCell<HashMap<String, HashMap<u32, Persistent<Function<'static>>>>>,
     pub next_handler_id: Cell<u32>,
     pub views: RefCell<HashMap<String, RegisteredView>>,
+    pub modal_view: RefCell<Option<(String, RegisteredView)>>,
     pub commands: RefCell<HashMap<String, Persistent<Function<'static>>>>,
     pub search_providers: RefCell<HashMap<String, Persistent<Function<'static>>>>,
     pub event_listeners: RefCell<EventListenerMap>,
@@ -227,22 +314,51 @@ impl PluginApiState {
         ctx: &Ctx<'js>,
         scope: &str,
         func: Function<'js>,
-    ) -> u32 {
+    ) -> Result<u32> {
+        let cap = if scope == "__default__" {
+            MAX_DEFAULT_SCOPE_HANDLERS
+        } else {
+            MAX_SCOPE_HANDLERS
+        };
+        let mut handlers = self.handlers.borrow_mut();
+        let scope_map = handlers.entry(scope.to_owned()).or_default();
+        ensure!(
+            scope_map.len() < cap,
+            "handler limit ({cap}) exceeded for scope {scope:?}"
+        );
         let id = self.next_handler_id.get().max(1);
         self.next_handler_id.set(id.wrapping_add(1).max(1));
         let persistent = Persistent::save(ctx, func);
-        self.handlers
-            .borrow_mut()
-            .entry(scope.to_owned())
-            .or_default()
-            .insert(id, persistent);
-        id
+        scope_map.insert(id, persistent);
+        Ok(id)
+    }
+
+    /// Moves a handler ID previously registered under `"__default__"` into `target_scope`
+    /// (e.g. `"__modal__"` when a plugin pre-built a `UiNode` before calling `fern.ui.openModal`).
+    pub fn rehome_default_handler(&self, target_scope: &str, handler_id: u32) -> Result<()> {
+        if target_scope == "__default__" {
+            return Ok(());
+        }
+        let mut handlers = self.handlers.borrow_mut();
+        let moved = handlers
+            .get_mut("__default__")
+            .and_then(|default_map| default_map.remove(&handler_id));
+        if let Some(persistent) = moved {
+            let scope_map = handlers.entry(target_scope.to_owned()).or_default();
+            ensure!(
+                scope_map.len() < MAX_SCOPE_HANDLERS,
+                "handler limit ({MAX_SCOPE_HANDLERS}) exceeded for scope {target_scope:?}"
+            );
+            scope_map.insert(handler_id, persistent);
+        }
+        Ok(())
     }
 
     /// Drops every `Persistent<Function>` handle before dropping the QuickJS `AsyncRuntime`.
     pub fn clear_persistent_handles(&self) {
         self.handlers.borrow_mut().clear();
         self.views.borrow_mut().clear();
+        self.modal_view.borrow_mut().take();
         self.commands.borrow_mut().clear();
         self.search_providers.borrow_mut().clear();
         self.event_listeners.borrow_mut().clear();
@@ -273,7 +389,8 @@ impl PluginApiState {
         ctx: &Ctx<'_>,
         f: impl FnOnce() -> Result<T>,
     ) -> rquickjs::Result<T> {
-        let res = if self.in_batch.get() {
+        let in_batch = !self.batch_dirty_stack.borrow().is_empty();
+        let res = if in_batch {
             f()
         } else {
             self.store
@@ -281,7 +398,13 @@ impl PluginApiState {
         };
         match res {
             Ok(v) => {
-                self.data_dirty.set(true);
+                if in_batch {
+                    if let Some(top) = self.batch_dirty_stack.borrow_mut().last_mut() {
+                        *top = true;
+                    }
+                } else {
+                    self.data_dirty.set(true);
+                }
                 Ok(v)
             }
             Err(err) => Err(throw_scrubbed(ctx, self, err)),
@@ -333,7 +456,9 @@ pub fn install_fern_bindings<'js>(
                 .borrow()
                 .clone()
                 .unwrap_or_else(|| "__default__".to_owned());
-            Ok(reg_state.register_handler(&ctx, &scope, func))
+            reg_state
+                .register_handler(&ctx, &scope, func)
+                .map_err(|e| throw_scrubbed(&ctx, &reg_state, e))
         })?,
     )?;
 
@@ -1034,27 +1159,49 @@ fn install_batch<'js>(
     fern: &Object<'js>,
     state: Rc<PluginApiState>,
 ) -> rquickjs::Result<()> {
+    struct BatchStackGuard {
+        state: Rc<PluginApiState>,
+        armed: bool,
+    }
+    impl BatchStackGuard {
+        fn push(state: Rc<PluginApiState>) -> Self {
+            state.batch_dirty_stack.borrow_mut().push(false);
+            Self { state, armed: true }
+        }
+        fn pop_on_commit(mut self) -> bool {
+            self.armed = false;
+            self.state.batch_dirty_stack.borrow_mut().pop().unwrap_or(false)
+        }
+    }
+    impl Drop for BatchStackGuard {
+        fn drop(&mut self) {
+            if self.armed {
+                let _ = self.state.batch_dirty_stack.borrow_mut().pop();
+            }
+        }
+    }
+
     let st = Rc::clone(&state);
     let batch_fn = Function::new(
         ctx.clone(),
         move |ctx: Ctx<'js>, func: Function<'js>| -> rquickjs::Result<Value<'js>> {
-            if st.in_batch.get() {
-                return func.call(());
-            }
             let mut result_slot: Option<Value<'js>> = None;
             let mut js_err_slot: Option<rquickjs::Error> = None;
+            let mut committed_dirty = false;
 
+            // `with_plugin_write_ctx` uses `Store::in_tx`, which begins a real SQLite
+            // transaction for the outermost batch and a `SAVEPOINT` for nested batches.
             let tx_res = st
                 .store
                 .with_plugin_write_ctx(&st.plugin_id, st.write_depth.get(), || {
-                    st.in_batch.set(true);
+                    let guard = BatchStackGuard::push(Rc::clone(&st));
                     let call_res = func.call::<_, Value<'js>>(());
-                    st.in_batch.set(false);
                     match call_res {
                         Ok(val) => {
                             if val.is_promise() {
                                 anyhow::bail!("fern.batch(fn) callback must be synchronous");
                             }
+                            committed_dirty = guard.pop_on_commit();
                             result_slot = Some(val);
                             Ok(())
                         }
@@ -1070,7 +1217,14 @@ fn install_batch<'js>(
             }
             match tx_res {
                 Ok(()) => {
-                    st.data_dirty.set(true);
+                    if committed_dirty {
+                        let mut stack = st.batch_dirty_stack.borrow_mut();
+                        if let Some(parent_dirty) = stack.last_mut() {
+                            *parent_dirty = true;
+                        } else {
+                            st.data_dirty.set(true);
+                        }
+                    }
                     Ok(result_slot.unwrap_or_else(|| Value::new_undefined(ctx)))
                 }
                 Err(err) => Err(throw_scrubbed(&ctx, &st, err)),
@@ -1336,6 +1490,42 @@ fn install_settings<'js>(
     Ok(())
 }
 
+/// Fast, non-blocking syntactic URI, host-allowlist, and literal-IP SSRF check run on `PluginWorker`.
+/// Blocking DNS resolution and connect-time IP checks happen strictly inside `HttpPool` threads.
+fn validate_http_uri_syntax(uri: &ureq::http::Uri, permissions: &PermissionSet) -> Result<()> {
+    let scheme = uri
+        .scheme_str()
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    ensure!(
+        scheme == "http" || scheme == "https",
+        "unsupported URL scheme {scheme:?}: only http and https are allowed"
+    );
+    let authority = uri
+        .authority()
+        .context("URL must contain a valid authority/host")?;
+    let host = authority.host();
+    ensure!(!host.is_empty(), "URL host must not be empty");
+    let port = authority.port_u16();
+    let effective_port = port.or(match scheme.as_str() {
+        "https" => Some(443),
+        "http" => Some(80),
+        _ => None,
+    });
+    ensure!(
+        permissions.allows_host(host, port) || permissions.allows_host(host, effective_port),
+        "network permission denied for host {host:?}"
+    );
+    let host_clean = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = host_clean.parse::<IpAddr>() {
+        ensure!(
+            !crate::http::is_ip_blocked(ip, permissions.allows_local()),
+            "SSRF protection blocked connection to {ip}"
+        );
+    }
+    Ok(())
+}
+
 fn install_http<'js>(
     ctx: &Ctx<'js>,
     fern: &Object<'js>,
@@ -1353,7 +1543,7 @@ fn install_http<'js>(
                     .trim()
                     .parse()
                     .map_err(|e| Exception::throw_message(&ctx, &format!("invalid URL: {e}")))?;
-                crate::http::validate_target_uri(&uri, &st.permissions)
+                validate_http_uri_syntax(&uri, &st.permissions)
                     .map_err(|e| throw_scrubbed(&ctx, &st, e))?;
 
                 let opts_json = match opts.0 {
@@ -1376,6 +1566,7 @@ fn install_http<'js>(
                         }
                     }
                 }
+                let interpolated_secret = headers.iter().any(|(_, v)| v.contains("${secret:"));
                 let body = match opts_json.get("body") {
                     Some(JsonValue::String(s)) => Some(s.as_bytes().to_vec()),
                     Some(JsonValue::Null) | None => None,
@@ -1409,15 +1600,30 @@ fn install_http<'js>(
                             ));
                         }
                     };
-                    let body_text = resp.body_text();
+                    let raw_body = resp.body_text();
+                    let body_text = if interpolated_secret {
+                        st_for_fut.scrub(&raw_body)
+                    } else {
+                        raw_body
+                    };
+                    let resp_url = if interpolated_secret {
+                        st_for_fut.scrub(&resp.url)
+                    } else {
+                        resp.url.clone()
+                    };
                     let mut hdr_map = Map::new();
                     for (k, v) in &resp.headers {
-                        hdr_map.insert(k.to_ascii_lowercase(), JsonValue::String(v.clone()));
+                        let val = if interpolated_secret {
+                            st_for_fut.scrub(v)
+                        } else {
+                            v.clone()
+                        };
+                        hdr_map.insert(k.to_ascii_lowercase(), JsonValue::String(val));
                     }
                     let obj = Object::new(ctx_for_fut.clone())?;
                     obj.set("ok", resp.ok())?;
                     obj.set("status", i32::from(resp.status))?;
-                    obj.set("url", resp.url)?;
+                    obj.set("url", resp_url)?;
                     obj.set("headers", json_to_js(&ctx_for_fut, &JsonValue::Object(hdr_map))?)?;
                     obj.set("body", body_text.clone())?;
                     let body_for_text = body_text.clone();
@@ -1425,11 +1631,13 @@ fn install_http<'js>(
                         "text",
                         Function::new(ctx_for_fut.clone(), move || body_for_text.clone())?,
                     )?;
+                    let st_for_json = Rc::clone(&st_for_fut);
                     obj.set(
                         "json",
                         Function::new(ctx_for_fut.clone(), move |ctx: Ctx<'js>| -> rquickjs::Result<Value<'js>> {
                             let parsed: JsonValue = serde_json::from_str(&body_text).map_err(|err| {
-                                Exception::throw_message(&ctx, &format!("invalid JSON body: {err}"))
+                                let msg = st_for_json.scrub(&format!("invalid JSON body: {err}"));
+                                Exception::throw_message(&ctx, &msg)
                             })?;
                             json_to_js(&ctx, &parsed)
                         })?,
@@ -1564,6 +1772,11 @@ fn install_oauth<'js>(
                         timeout_sec,
                     };
 
+                    let permit = st
+                        .oauth_limiter
+                        .try_acquire(&st.plugin_id)
+                        .map_err(|e| throw_scrubbed(&ctx, &st, e))?;
+
                     let (tx, rx) = oneshot::channel();
                     let plugin_id = st.plugin_id.clone();
                     let permissions = st.permissions.clone();
@@ -1574,6 +1787,7 @@ fn install_oauth<'js>(
                     if let Err(err) = thread::Builder::new()
                         .name("fern-oauth".to_owned())
                         .spawn(move || {
+                            let _permit = permit;
                             let res = run_oauth_authorize(
                                 &plugin_id,
                                 &permissions,
@@ -1680,15 +1894,26 @@ fn install_oauth<'js>(
                         save_refresh_token_as,
                     };
 
+                    let permit = st
+                        .oauth_limiter
+                        .try_acquire(&st.plugin_id)
+                        .map_err(|e| throw_scrubbed(&ctx, &st, e))?;
+
                     let (tx, rx) = oneshot::channel();
                     let plugin_id = st.plugin_id.clone();
                     let permissions = st.permissions.clone();
                     let vault = st.vault.clone();
+                    let cancel = Arc::clone(&st.shutdown_flag);
 
                     if let Err(err) = thread::Builder::new()
                         .name("fern-oauth-ref".to_owned())
                         .spawn(move || {
-                            let res = run_oauth_refresh(&plugin_id, &permissions, &vault, &req);
+                            let _permit = permit;
+                            let res = if cancel.load(Ordering::Acquire) {
+                                Err(anyhow!("OAuth refresh cancelled"))
+                            } else {
+                                run_oauth_refresh(&plugin_id, &permissions, &vault, &req)
+                            };
                             let _ = tx.send(res);
                         })
                     {
@@ -1769,13 +1994,17 @@ fn install_oauth<'js>(
     Ok(())
 }
 
-fn event_permission(kind: &str) -> Option<Permission> {
+pub(crate) fn event_permission(kind: &str) -> Option<Permission> {
     if kind.starts_with("task.") || kind == "task" {
         Some(Permission::TasksRead)
     } else if kind.starts_with("habit.") || kind == "habit" {
         Some(Permission::HabitsRead)
     } else if kind.starts_with("focus.") || kind == "focus" {
         Some(Permission::FocusRead)
+    } else if kind.starts_with("list.") || kind == "list" {
+        Some(Permission::ListsRead)
+    } else if kind.starts_with("countdown.") || kind == "countdown" {
+        Some(Permission::CountdownsRead)
     } else {
         None
     }
@@ -1869,17 +2098,28 @@ fn install_timers<'js>(
             "setInterval",
             Function::new(
                 ctx.clone(),
-                move |ctx: Ctx<'js>, id: String, ms: u64, cb: Function<'js>| -> rquickjs::Result<()> {
+                move |ctx: Ctx<'js>, id: String, ms_f64: f64, cb: Function<'js>| -> rquickjs::Result<()> {
                     let id = id.trim().to_owned();
                     if id.is_empty() {
                         return Err(Exception::throw_message(&ctx, "timer id must not be empty"));
                     }
-                    if ms < MIN_TIMER_INTERVAL_MS {
+                    if !ms_f64.is_finite()
+                        || ms_f64 < MIN_TIMER_INTERVAL_MS as f64
+                        || ms_f64 > MAX_TIMER_INTERVAL_MS as f64
+                    {
                         return Err(Exception::throw_message(
                             &ctx,
-                            &format!("timer interval must be >= {MIN_TIMER_INTERVAL_MS} ms"),
+                            &format!(
+                                "timer interval must be between {MIN_TIMER_INTERVAL_MS} ms and {MAX_TIMER_INTERVAL_MS} ms"
+                            ),
                         ));
                     }
+                    let ms = ms_f64 as u64;
+                    let next_fire = Instant::now()
+                        .checked_add(Duration::from_millis(ms))
+                        .ok_or_else(|| {
+                            Exception::throw_message(&ctx, "timer interval overflow")
+                        })?;
                     let mut timers = st.timers.borrow_mut();
                     if !timers.contains_key(&id) && timers.len() >= MAX_TIMERS_PER_PLUGIN {
                         return Err(Exception::throw_message(
@@ -1890,7 +2130,7 @@ fn install_timers<'js>(
                     let timer = RegisteredTimer {
                         id: id.clone(),
                         interval_ms: ms,
-                        next_fire: Instant::now() + Duration::from_millis(ms),
+                        next_fire,
                         callback: Persistent::save(&ctx, cb),
                     };
                     timers.insert(id, timer);
@@ -2014,7 +2254,7 @@ fn install_services<'js>(
                         }
                         _ => JsonValue::Null,
                     };
-                    let rx = (st.service_caller)(name, arg_json);
+                    let rx = (st.service_caller)(name, arg_json, st.active_service_depth.get());
                     let st_fut = Rc::clone(&st);
                     let ctx_fut = ctx.clone();
                     let promised = Promised::from(async move {
@@ -2134,15 +2374,17 @@ fn install_ui<'js>(
                     let req_id = st.next_prompt_id.get().max(1);
                     st.next_prompt_id.set(req_id + 1);
                     let (tx, rx) = oneshot::channel();
-                    st.prompt_senders.borrow_mut().insert(req_id, tx);
-                    st.pending_ui_effects
+                    st.prompt_senders
                         .borrow_mut()
-                        .push_back(PluginUiEffect::Confirm {
-                            request_id: req_id,
-                            plugin_id: st.plugin_id.clone(),
-                            title,
-                            body,
-                        });
+                        .insert(req_id, (st.plugin_id.clone(), tx));
+                    // Emit immediately so confirm() works inside `async activate()` and `UserScript`s
+                    // where `slot.runtime` is not yet registered for deferred side-effect flushing.
+                    (st.effect_emitter)(PluginUiEffect::Confirm {
+                        request_id: req_id,
+                        plugin_id: st.plugin_id.clone(),
+                        title,
+                        body,
+                    });
                     let promised = Promised::from(async move {
                         match rx.await {
                             Ok(PromptReplyValue::Confirm(ok)) => Ok::<bool, rquickjs::Error>(ok),
@@ -2169,16 +2411,17 @@ fn install_ui<'js>(
                     let req_id = st.next_prompt_id.get().max(1);
                     st.next_prompt_id.set(req_id + 1);
                     let (tx, rx) = oneshot::channel();
-                    st.prompt_senders.borrow_mut().insert(req_id, tx);
-                    st.pending_ui_effects
+                    st.prompt_senders
                         .borrow_mut()
-                        .push_back(PluginUiEffect::Prompt {
-                            request_id: req_id,
-                            plugin_id: st.plugin_id.clone(),
-                            title,
-                            placeholder: placeholder.0.flatten().unwrap_or_default(),
-                            default_value: default_value.0.flatten().unwrap_or_default(),
-                        });
+                        .insert(req_id, (st.plugin_id.clone(), tx));
+                    // Emit immediately so prompt() works inside `async activate()` and `UserScript`s.
+                    (st.effect_emitter)(PluginUiEffect::Prompt {
+                        request_id: req_id,
+                        plugin_id: st.plugin_id.clone(),
+                        title,
+                        placeholder: placeholder.0.flatten().unwrap_or_default(),
+                        default_value: default_value.0.flatten().unwrap_or_default(),
+                    });
                     let promised = Promised::from(async move {
                         match rx.await {
                             Ok(PromptReplyValue::Prompt(val)) => Ok::<Option<String>, rquickjs::Error>(val),
@@ -2199,23 +2442,65 @@ fn install_ui<'js>(
                 ctx.clone(),
                 move |ctx: Ctx<'js>, title: String, view_or_node: Value<'js>| -> rquickjs::Result<()> {
                     let modal_scope = "__modal__";
+                    // Clean up any previously mounted reactive modal view before replacing.
+                    if let Some((_, prev_view)) = st.modal_view.borrow_mut().take()
+                        && let Some(unmount_pers) = prev_view.unmount
+                        && let Ok(unmount_fn) = unmount_pers.restore(&ctx)
+                    {
+                        let _ = unmount_fn.call::<_, Value<'js>>(());
+                    }
                     st.clear_scope_handlers(modal_scope);
-                    let prev_scope = st.active_render_scope.borrow().clone();
-                    st.set_active_scope(Some(modal_scope.to_owned()));
+                    let _scope_guard = RenderScopeGuard::enter(Rc::clone(&st), modal_scope.to_owned());
 
-                    let node_val = if let Some(func) = view_or_node.as_function() {
-                        func.call::<_, Value<'js>>(())?
+                    let (node_val, pending_modal_view) = if let Some(func) = view_or_node.as_function() {
+                        let reg = RegisteredView {
+                            render: Persistent::save(&ctx, func.clone()),
+                            mount: None,
+                            unmount: None,
+                        };
+                        (func.call::<_, Value<'js>>(())?, Some((title.clone(), reg)))
                     } else if let Some(obj) = view_or_node.as_object()
                         && let Ok(render_fn) = obj.get::<_, Function>("render")
                     {
-                        render_fn.call::<_, Value<'js>>(())?
+                        let mount_fn = obj.get::<_, Option<Function>>("mount")?;
+                        let unmount_fn = obj.get::<_, Option<Function>>("unmount")?;
+                        let reg = RegisteredView {
+                            render: Persistent::save(&ctx, render_fn.clone()),
+                            mount: mount_fn.as_ref().map(|f| Persistent::save(&ctx, f.clone())),
+                            unmount: unmount_fn.as_ref().map(|f| Persistent::save(&ctx, f.clone())),
+                        };
+                        if let Some(m) = mount_fn {
+                            let _ = m.call::<_, Value<'js>>(())?;
+                        }
+                        let val = match render_fn.call::<_, Value<'js>>(()) {
+                            Ok(v) => v,
+                            Err(err) => {
+                                if let Some(u) = unmount_fn {
+                                    let _ = u.call::<_, Value<'js>>(());
+                                }
+                                st.clear_scope_handlers(modal_scope);
+                                return Err(err);
+                            }
+                        };
+                        (val, Some((title.clone(), reg)))
                     } else {
-                        view_or_node
+                        (view_or_node, None)
                     };
 
-                    let tree = js_value_to_ui_node(&ctx, node_val, &st, modal_scope);
-                    st.set_active_scope(prev_scope);
-                    let tree = tree.map_err(|e| throw_scrubbed(&ctx, &st, e))?;
+                    let tree = match js_value_to_ui_node(&ctx, node_val, &st, modal_scope) {
+                        Ok(tree) => tree,
+                        Err(e) => {
+                            if let Some((_, reg)) = pending_modal_view
+                                && let Some(unmount_pers) = reg.unmount
+                                && let Ok(unmount_fn) = unmount_pers.restore(&ctx)
+                            {
+                                let _ = unmount_fn.call::<_, Value<'js>>(());
+                            }
+                            st.clear_scope_handlers(modal_scope);
+                            return Err(throw_scrubbed(&ctx, &st, e));
+                        }
+                    };
+                    *st.modal_view.borrow_mut() = pending_modal_view;
 
                     st.pending_ui_effects
                         .borrow_mut()
@@ -2235,7 +2520,13 @@ fn install_ui<'js>(
         let st = Rc::clone(&state);
         obj.set(
             "closeModal",
-            Function::new(ctx.clone(), move || {
+            Function::new(ctx.clone(), move |ctx: Ctx<'js>| {
+                if let Some((_, prev_view)) = st.modal_view.borrow_mut().take()
+                    && let Some(unmount_pers) = prev_view.unmount
+                    && let Ok(unmount_fn) = unmount_pers.restore(&ctx)
+                {
+                    let _ = unmount_fn.call::<_, Value<'js>>(());
+                }
                 st.clear_scope_handlers("__modal__");
                 st.pending_ui_effects
                     .borrow_mut()
@@ -2344,6 +2635,18 @@ fn install_system<'js>(
     Ok(())
 }
 
+fn js_float_to_json(f: f64) -> JsonValue {
+    if !f.is_finite() {
+        return JsonValue::Null;
+    }
+    if f.fract() == 0.0 && (-JS_MAX_SAFE_INT_F64..=JS_MAX_SAFE_INT_F64).contains(&f) {
+        return JsonValue::from(f as i64);
+    }
+    serde_json::Number::from_f64(f)
+        .map(JsonValue::Number)
+        .unwrap_or(JsonValue::Null)
+}
+
 /// Converts a JS `UiNode` value (including inline closures on `onClick`/`onChange`/`onSubmit`/`onAction`)
 /// into a validated, SVG-sanitized [`UiNode`].
 pub fn js_value_to_ui_node<'js>(
@@ -2352,11 +2655,26 @@ pub fn js_value_to_ui_node<'js>(
     state: &PluginApiState,
     scope: &str,
 ) -> Result<UiNode> {
-    let json_val = js_ui_to_json(ctx, val, state, scope, 0)?;
+    let mut visited = 0usize;
+    let json_val = js_ui_to_json(ctx, val, state, scope, 0, &mut visited)?;
     let mut node: UiNode = serde_json::from_value(json_val)
         .context("view render() returned invalid UiNode tree")?;
     node.sanitize_tree()?;
     Ok(node)
+}
+
+fn is_ui_handler_prop(key: &str) -> bool {
+    matches!(
+        key,
+        "onClick"
+            | "on_click"
+            | "onChange"
+            | "on_change"
+            | "onSubmit"
+            | "on_submit"
+            | "onAction"
+            | "on_action"
+    )
 }
 
 fn js_ui_to_json<'js>(
@@ -2365,10 +2683,16 @@ fn js_ui_to_json<'js>(
     state: &PluginApiState,
     scope: &str,
     depth: usize,
+    visited: &mut usize,
 ) -> Result<JsonValue> {
+    *visited += 1;
+    ensure!(
+        *visited <= MAX_JSON_NODES,
+        "UI tree exceeds maximum node budget ({MAX_JSON_NODES})"
+    );
     ensure!(depth < MAX_JSON_DEPTH, "UI tree nesting exceeds {MAX_JSON_DEPTH}");
     if let Some(func) = val.as_function() {
-        let id = state.register_handler(ctx, scope, func.clone());
+        let id = state.register_handler(ctx, scope, func.clone())?;
         return Ok(JsonValue::from(HandlerId(id).0));
     }
     if val.is_null() || val.is_undefined() {
@@ -2381,48 +2705,57 @@ fn js_ui_to_json<'js>(
         return Ok(JsonValue::from(i));
     }
     if let Some(f) = val.as_float() {
-        return Ok(serde_json::Number::from_f64(f)
-            .map(JsonValue::Number)
-            .unwrap_or(JsonValue::Null));
+        return Ok(js_float_to_json(f));
     }
     if let Some(s) = val.as_string() {
         return Ok(JsonValue::String(s.to_string()?));
     }
     if val.is_array() {
         let arr = Array::from_value(val)?;
-        let mut out = Vec::with_capacity(arr.len());
+        let len = arr.len();
+        ensure!(
+            len <= MAX_JSON_ARRAY_LEN,
+            "UI array length {len} exceeds maximum allowed ({MAX_JSON_ARRAY_LEN})"
+        );
+        let mut out = Vec::with_capacity(len.min(MAX_JSON_PREALLOC));
         for item in arr.iter::<Value<'js>>() {
-            out.push(js_ui_to_json(ctx, item?, state, scope, depth + 1)?);
+            out.push(js_ui_to_json(ctx, item?, state, scope, depth + 1, visited)?);
         }
         return Ok(JsonValue::Array(out));
     }
     if let Some(obj) = val.as_object() {
         let mut map = Map::new();
         for prop in obj.props::<String, Value<'js>>() {
+            *visited += 1;
+            ensure!(
+                *visited <= MAX_JSON_NODES,
+                "UI tree exceeds maximum node budget ({MAX_JSON_NODES})"
+            );
             let (k, v) = prop?;
             if v.is_undefined() {
                 continue;
             }
-            if matches!(
-                k.as_str(),
-                "onClick"
-                    | "on_click"
-                    | "onChange"
-                    | "on_change"
-                    | "onSubmit"
-                    | "on_submit"
-                    | "onAction"
-                    | "on_action"
-            ) && let Some(func) = v.as_function()
-            {
-                let id = state.register_handler(ctx, scope, func.clone());
-                map.insert(k, JsonValue::from(id));
-                continue;
+            if is_ui_handler_prop(&k) {
+                if let Some(func) = v.as_function() {
+                    let id = state.register_handler(ctx, scope, func.clone())?;
+                    map.insert(k, JsonValue::from(id));
+                    continue;
+                }
+                if let Some(hid) = v.as_int().and_then(|n| u32::try_from(n).ok()).or_else(|| {
+                    v.as_float().and_then(|f| {
+                        (f.is_finite() && f.fract() == 0.0 && f >= 0.0 && f <= f64::from(u32::MAX))
+                            .then_some(f as u32)
+                    })
+                }) {
+                    state.rehome_default_handler(scope, hid)?;
+                    map.insert(k, JsonValue::from(hid));
+                    continue;
+                }
             }
             if v.is_function() {
                 continue;
             }
-            map.insert(k, js_ui_to_json(ctx, v, state, scope, depth + 1)?);
+            map.insert(k, js_ui_to_json(ctx, v, state, scope, depth + 1, visited)?);
         }
         return Ok(JsonValue::Object(map));
     }
@@ -2430,10 +2763,21 @@ fn js_ui_to_json<'js>(
 }
 
 pub fn js_to_json<'js>(ctx: &Ctx<'js>, val: Value<'js>) -> Result<JsonValue> {
-    js_to_json_inner(ctx, val, 0)
+    let mut visited = 0usize;
+    js_to_json_inner(ctx, val, 0, &mut visited)
 }
 
-fn js_to_json_inner<'js>(ctx: &Ctx<'js>, val: Value<'js>, depth: usize) -> Result<JsonValue> {
+fn js_to_json_inner<'js>(
+    ctx: &Ctx<'js>,
+    val: Value<'js>,
+    depth: usize,
+    visited: &mut usize,
+) -> Result<JsonValue> {
+    *visited += 1;
+    ensure!(
+        *visited <= MAX_JSON_NODES,
+        "JSON value exceeds maximum node budget ({MAX_JSON_NODES})"
+    );
     ensure!(depth < MAX_JSON_DEPTH, "JSON nesting exceeds {MAX_JSON_DEPTH}");
     if val.is_null() || val.is_undefined() {
         return Ok(JsonValue::Null);
@@ -2445,23 +2789,30 @@ fn js_to_json_inner<'js>(ctx: &Ctx<'js>, val: Value<'js>, depth: usize) -> Resul
         return Ok(JsonValue::from(i));
     }
     if let Some(f) = val.as_float() {
-        if let Some(n) = serde_json::Number::from_f64(f) {
-            return Ok(JsonValue::Number(n));
-        }
-        return Ok(JsonValue::Null);
+        return Ok(js_float_to_json(f));
     }
     if let Some(s) = val.as_string() {
         return Ok(JsonValue::String(s.to_string()?));
     }
     if val.is_array() {
         let arr = Array::from_value(val)?;
-        let mut out = Vec::with_capacity(arr.len());
+        let len = arr.len();
+        ensure!(
+            len <= MAX_JSON_ARRAY_LEN,
+            "array length {len} exceeds maximum allowed ({MAX_JSON_ARRAY_LEN})"
+        );
+        let mut out = Vec::with_capacity(len.min(MAX_JSON_PREALLOC));
         for item in arr.iter::<Value<'js>>() {
             let item = item?;
             if item.is_undefined() || item.is_function() {
+                *visited += 1;
+                ensure!(
+                    *visited <= MAX_JSON_NODES,
+                    "JSON value exceeds maximum node budget ({MAX_JSON_NODES})"
+                );
                 out.push(JsonValue::Null);
             } else {
-                out.push(js_to_json_inner(ctx, item, depth + 1)?);
+                out.push(js_to_json_inner(ctx, item, depth + 1, visited)?);
             }
         }
         return Ok(JsonValue::Array(out));
@@ -2472,11 +2823,16 @@ fn js_to_json_inner<'js>(ctx: &Ctx<'js>, val: Value<'js>, depth: usize) -> Resul
         }
         let mut map = Map::new();
         for prop in obj.props::<String, Value<'js>>() {
+            *visited += 1;
+            ensure!(
+                *visited <= MAX_JSON_NODES,
+                "JSON value exceeds maximum node budget ({MAX_JSON_NODES})"
+            );
             let (k, v) = prop?;
             if v.is_undefined() || v.is_function() {
                 continue;
             }
-            map.insert(k, js_to_json_inner(ctx, v, depth + 1)?);
+            map.insert(k, js_to_json_inner(ctx, v, depth + 1, visited)?);
         }
         return Ok(JsonValue::Object(map));
     }
@@ -2589,10 +2945,57 @@ fn parse_schedule_bucket(raw: &str) -> Result<ScheduleBucket> {
     }
 }
 
+fn collect_tag_family_lower(store: &Store, root_tag: &str) -> HashSet<String> {
+    let root_lower = root_tag.to_lowercase();
+    let mut family = HashSet::new();
+    family.insert(root_lower);
+    if let Ok(all_tags) = store.tags() {
+        loop {
+            let mut added = false;
+            for tag in &all_tags {
+                let name_lower = tag.name.to_lowercase();
+                if family.contains(&name_lower) {
+                    continue;
+                }
+                if tag
+                    .parent
+                    .as_deref()
+                    .is_some_and(|p| family.contains(&p.to_lowercase()))
+                {
+                    family.insert(name_lower);
+                    added = true;
+                }
+            }
+            if !added {
+                break;
+            }
+        }
+    }
+    family
+}
+
 fn load_filtered_tasks(store: &Store, filter: &JsonValue) -> Result<Vec<Task>> {
     let today = Local::now().date_naive();
-    let mut tasks = if let Some(view_name) = filter.get("view").and_then(JsonValue::as_str) {
-        let view = match view_name.trim() {
+    let view_opt = filter
+        .get("view")
+        .and_then(JsonValue::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let list_id_opt = filter
+        .get("listId")
+        .and_then(JsonValue::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(parse_uuid)
+        .transpose()?;
+    let tag_opt = filter
+        .get("tag")
+        .and_then(JsonValue::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let mut tasks = if let Some(view_name) = view_opt {
+        let view = match view_name {
             "inbox" => View::Inbox,
             "all" => View::All,
             "today" => View::Today,
@@ -2604,32 +3007,43 @@ fn load_filtered_tasks(store: &Store, filter: &JsonValue) -> Result<Vec<Task>> {
             other => bail!("unknown task view {other:?}"),
         };
         store.tasks_in(&view, today)?
-    } else if let Some(list_id_str) = filter.get("listId").and_then(JsonValue::as_str) {
-        let list_id = parse_uuid(list_id_str)?;
+    } else if let Some(list_id) = list_id_opt {
         store.tasks_in(&View::List(list_id), today)?
-    } else if let Some(tag) = filter.get("tag").and_then(JsonValue::as_str) {
+    } else if let Some(tag) = tag_opt {
         store.tasks_in(&View::Tag(tag.to_owned()), today)?
     } else {
         store.tasks()?
     };
 
+    if view_opt.is_some()
+        && let Some(list_id) = list_id_opt
+    {
+        tasks.retain(|t| t.list_id == Some(list_id));
+    }
+    if (view_opt.is_some() || list_id_opt.is_some())
+        && let Some(tag) = tag_opt
+    {
+        let family = collect_tag_family_lower(store, tag);
+        tasks.retain(|t| t.tags.iter().any(|tg| family.contains(&tg.to_lowercase())));
+    }
+
     let include_deleted = filter
         .get("includeDeleted")
         .and_then(JsonValue::as_bool)
         .unwrap_or(false);
-    if !include_deleted && filter.get("view").and_then(JsonValue::as_str) != Some("trash") {
+    if !include_deleted && view_opt != Some("trash") {
         tasks.retain(|t| !t.is_deleted());
     }
     if let Some(completed) = filter.get("completed").and_then(JsonValue::as_bool) {
         tasks.retain(|t| t.is_completed() == completed);
     }
     if let Some(search) = filter.get("search").and_then(JsonValue::as_str) {
-        let q = search.trim().to_ascii_lowercase();
+        let q = search.trim().to_lowercase();
         if !q.is_empty() {
             tasks.retain(|t| {
-                t.title.to_ascii_lowercase().contains(&q)
-                    || t.notes.to_ascii_lowercase().contains(&q)
-                    || t.tags.iter().any(|tag| tag.to_ascii_lowercase().contains(&q))
+                t.title.to_lowercase().contains(&q)
+                    || t.notes.to_lowercase().contains(&q)
+                    || t.tags.iter().any(|tag| tag.to_lowercase().contains(&q))
             });
         }
     }
@@ -3114,4 +3528,61 @@ fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oauth_concurrency_limiter_enforces_per_plugin_and_global_caps() {
+        let limiter = Arc::new(OAuthConcurrencyLimiter::default());
+        let p1 = limiter.try_acquire("com.test.a").unwrap();
+        let p2 = limiter.try_acquire("com.test.a").unwrap();
+        // 3rd concurrent request for the same plugin is rejected (MAX_OAUTH_PER_PLUGIN = 2).
+        assert!(limiter.try_acquire("com.test.a").is_err());
+
+        // Another plugin can acquire up to global limit (MAX_OAUTH_GLOBAL = 4).
+        let p3 = limiter.try_acquire("com.test.b").unwrap();
+        let p4 = limiter.try_acquire("com.test.c").unwrap();
+        assert!(limiter.try_acquire("com.test.d").is_err());
+
+        // Dropping permits releases both per-plugin and global slots.
+        drop(p1);
+        let p5 = limiter.try_acquire("com.test.a").unwrap();
+        drop((p2, p3, p4, p5));
+        assert!(limiter.try_acquire("com.test.d").is_ok());
+    }
+
+    #[test]
+    fn js_float_to_json_preserves_safe_integers_above_i32_max() {
+        // Epoch millis (`Date.now()`) is > i32::MAX but exact integer in JS safe range.
+        let epoch_ms = 1_760_000_000_123.0_f64;
+        assert_eq!(js_float_to_json(epoch_ms), JsonValue::from(1_760_000_000_123_i64));
+        assert_eq!(js_float_to_json(-9_007_199_254_740_991.0), JsonValue::from(-9_007_199_254_740_991_i64));
+        assert_eq!(js_float_to_json(0.0), JsonValue::from(0_i64));
+        assert_eq!(js_float_to_json(-0.0), JsonValue::from(0_i64));
+        // Non-integral floats stay floats.
+        assert_eq!(js_float_to_json(3.25).as_f64(), Some(3.25));
+        // NaN / Infinity serialize as null.
+        assert_eq!(js_float_to_json(f64::NAN), JsonValue::Null);
+        assert_eq!(js_float_to_json(f64::INFINITY), JsonValue::Null);
+    }
+
+    #[test]
+    fn validate_http_uri_syntax_enforces_scheme_host_and_literal_ip_without_dns() {
+        let perms = PermissionSet::new(&[Permission::Network(vec!["api.example.com".to_owned()])]);
+        let ok_uri: ureq::http::Uri = "https://api.example.com/v1/items".parse().unwrap();
+        assert!(validate_http_uri_syntax(&ok_uri, &perms).is_ok());
+
+        let denied_host: ureq::http::Uri = "https://evil.example.org/x".parse().unwrap();
+        assert!(validate_http_uri_syntax(&denied_host, &perms).is_err());
+
+        let bad_scheme: ureq::http::Uri = "ftp://api.example.com/file".parse().unwrap();
+        assert!(validate_http_uri_syntax(&bad_scheme, &perms).is_err());
+
+        let any_perms = PermissionSet::new(&[Permission::Network(vec!["127.0.0.1".to_owned()])]);
+        let loopback: ureq::http::Uri = "http://127.0.0.1:8080/secret".parse().unwrap();
+        assert!(validate_http_uri_syntax(&loopback, &any_perms).is_err());
+    }
 }

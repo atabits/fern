@@ -34,7 +34,7 @@ pub mod timeline;
 
 pub use calendar_options::{CalendarOptions, ColorBy, CountdownColor, HabitColor};
 pub use countdown::{Countdown, CountdownKind, Span, span};
-pub use filter::{Condition, ConditionValue, DateRule, Field, FilterRules, Join, SmartFilter};
+pub use filter::{Condition, ConditionValue, DateRule, Field, FilterRules, FilterStatus, Join, SmartFilter};
 pub use focus::{FocusSession, FocusStats, focus_stats, format_minutes};
 pub use habit::{
     Checkin, CheckinMode, CheckinStatus, CustomSection, CycleSummary, DayProgress, Goal, Habit, HabitCycle,

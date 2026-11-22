@@ -34,6 +34,7 @@ use ui::{
 use uuid::Uuid;
 
 use crate::host::PluginHost;
+use crate::view::{PluginView, PluginViewEvent};
 
 const SAFE_MODE_SETTING_KEY: &str = "plugins_safe_mode";
 const REGISTRIES_SETTING_KEY: &str = "plugin_registries";
@@ -70,6 +71,14 @@ struct SettingInputEntry {
     _subs: [Subscription; 2],
 }
 
+struct ActivePluginPage {
+    plugin_id: String,
+    plugin_name: String,
+    view_id: String,
+    view: Entity<PluginView>,
+    _view_sub: Subscription,
+}
+
 /// Native plugin management, user script runner, and catalog browser panel.
 pub struct PluginSettingsView {
     store: Rc<Store>,
@@ -80,6 +89,7 @@ pub struct PluginSettingsView {
     status_banner: Option<(String, bool)>,
 
     // Installed tab state
+    active_plugin_page: Option<ActivePluginPage>,
     expanded_settings: Option<String>,
     expanded_logs: Option<String>,
     plugin_logs: HashMap<String, Vec<LogEntry>>,
@@ -166,6 +176,7 @@ impl PluginSettingsView {
             tab: PluginSettingsTab::Installed,
             safe_mode_pref,
             status_banner: None,
+            active_plugin_page: None,
             expanded_settings: None,
             expanded_logs: None,
             plugin_logs: HashMap::new(),
@@ -210,10 +221,54 @@ impl PluginSettingsView {
         self.tab
     }
 
+    pub fn active_plugin_page_id(&self) -> Option<(&str, &str)> {
+        self.active_plugin_page
+            .as_ref()
+            .map(|p| (p.plugin_id.as_str(), p.view_id.as_str()))
+    }
+
+    pub fn open_plugin_page(
+        &mut self,
+        plugin_id: String,
+        plugin_name: String,
+        view_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(prev) = self.active_plugin_page.take() {
+            prev.view.update(cx, |v, cx| v.unmount(cx));
+        }
+        let pid_clone = plugin_id.clone();
+        let vid_clone = view_id.clone();
+        let view = cx.new(|cx| PluginView::new_embedded(pid_clone, vid_clone, cx));
+        let view_sub = cx.subscribe(&view, |this, _, ev: &PluginViewEvent, cx| match ev {
+            PluginViewEvent::OpenLogs { plugin_id } => {
+                this.close_plugin_page(cx);
+                this.open_logs_for(plugin_id, cx);
+            }
+        });
+        self.tab = PluginSettingsTab::Installed;
+        self.active_plugin_page = Some(ActivePluginPage {
+            plugin_id,
+            plugin_name,
+            view_id,
+            view,
+            _view_sub: view_sub,
+        });
+        cx.notify();
+    }
+
+    pub fn close_plugin_page(&mut self, cx: &mut Context<Self>) {
+        if let Some(prev) = self.active_plugin_page.take() {
+            prev.view.update(cx, |v, cx| v.unmount(cx));
+            cx.notify();
+        }
+    }
+
     pub fn set_tab(&mut self, tab: PluginSettingsTab, cx: &mut Context<Self>) {
         if self.tab == tab {
             return;
         }
+        self.close_plugin_page(cx);
         self.tab = tab;
         self.open_select_setting = None;
         if tab == PluginSettingsTab::Scripts {
@@ -229,6 +284,7 @@ impl PluginSettingsView {
     }
 
     pub fn open_logs_for(&mut self, plugin_id: &str, cx: &mut Context<Self>) {
+        self.close_plugin_page(cx);
         self.tab = PluginSettingsTab::Installed;
         self.expanded_logs = Some(plugin_id.to_owned());
         self.fetch_plugin_logs_async(plugin_id.to_owned(), cx);
@@ -237,11 +293,13 @@ impl PluginSettingsView {
 
     fn consume_requested_logs_plugin(&mut self, cx: &mut Context<Self>) {
         if let Some(pid) = PluginHost::take_requested_settings_open(cx) {
+            self.close_plugin_page(cx);
             self.tab = PluginSettingsTab::Installed;
             self.expanded_settings = Some(pid);
             self.expanded_logs = None;
         }
         if let Some(pid) = PluginHost::take_requested_settings_plugin(cx) {
+            self.close_plugin_page(cx);
             self.tab = PluginSettingsTab::Installed;
             self.expanded_logs = Some(pid.clone());
             self.fetch_plugin_logs_async(pid, cx);
@@ -258,6 +316,9 @@ impl PluginSettingsView {
         match self.store.set_setting(SAFE_MODE_SETTING_KEY, val) {
             Ok(()) => {
                 self.safe_mode_pref = next;
+                if next {
+                    self.close_plugin_page(cx);
+                }
                 match PluginHost::set_safe_mode(next, cx) {
                     Ok(()) => {
                         self.status_banner = None;
@@ -428,6 +489,14 @@ impl PluginSettingsView {
         };
         let pid = info.manifest.id.clone();
         let next_enabled = !info.enabled;
+        if !next_enabled
+            && self
+                .active_plugin_page
+                .as_ref()
+                .is_some_and(|p| p.plugin_id == pid)
+        {
+            self.close_plugin_page(cx);
+        }
         let task = cx.background_spawn(async move { mgr.set_plugin_enabled(&pid, next_enabled) });
         cx.spawn(async move |this, cx| {
             if let Err(err) = task.await {
@@ -496,6 +565,13 @@ impl PluginSettingsView {
             let _ = this.update(cx, |this, cx| {
                 match res {
                     Ok(()) => {
+                        if this
+                            .active_plugin_page
+                            .as_ref()
+                            .is_some_and(|p| p.plugin_id == plugin_id)
+                        {
+                            this.close_plugin_page(cx);
+                        }
                         if this.expanded_settings.as_deref() == Some(&plugin_id) {
                             this.expanded_settings = None;
                         }
@@ -1206,12 +1282,27 @@ impl PluginSettingsView {
             .replace("{mem}", &format_bytes(info.metrics.memory_bytes))
             .replace("{ms}", &info.metrics.last_exec_ms.to_string());
 
+        let primary_view = info
+            .manifest
+            .contributions
+            .primary_view()
+            .map(|(vid, _)| vid.to_owned());
+        let can_open_page = primary_view.is_some()
+            && info.enabled
+            && !matches!(
+                info.status,
+                PluginStatus::NeedsApproval { .. }
+                    | PluginStatus::CircuitBroken { .. }
+                    | PluginStatus::Disabled
+            );
         let has_settings = !info.manifest.settings.is_empty();
         let settings_open = self.expanded_settings.as_deref() == Some(pid.as_str());
         let logs_open = self.expanded_logs.as_deref() == Some(pid.as_str());
 
         let info_toggle = info.clone();
         let pid_toggle = pid.clone();
+        let pid_open = pid.clone();
+        let name_open = info.manifest.name.clone();
         let pid_reload = pid.clone();
         let pid_settings = pid.clone();
         let pid_logs = pid.clone();
@@ -1391,6 +1482,27 @@ impl PluginSettingsView {
             h_flex()
                 .flex_wrap()
                 .gap_2()
+                .when_some(primary_view.filter(|_| can_open_page), |row, view_id| {
+                    row.child(
+                        Button::new(
+                            ElementId::Name(SharedString::from(format!(
+                                "plugin-open-{pid_open}"
+                            ))),
+                            strings.plugins_open,
+                        )
+                        .variant(ButtonVariant::Secondary)
+                        .size(ButtonSize::Sm)
+                        .icon(IconName::SquareArrowOutUpRight)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.open_plugin_page(
+                                pid_open.clone(),
+                                name_open.clone(),
+                                view_id.clone(),
+                                cx,
+                            );
+                        })),
+                    )
+                })
                 .child(
                     Button::new(
                         ElementId::Name(SharedString::from(format!("plugin-reload-{pid_reload}"))),
@@ -2709,11 +2821,126 @@ impl PluginSettingsView {
             )
             .into_any_element()
     }
+    fn render_active_plugin_page(
+        &self,
+        page: &ActivePluginPage,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let strings = i18n::t(cx);
+        let colors = cx.theme().colors();
+        let has_settings = PluginHost::global(cx)
+            .and_then(|h| h.plugin(&page.plugin_id))
+            .is_some_and(|p| !p.manifest.settings.is_empty());
+        let pid_settings = page.plugin_id.clone();
+        let pid_logs = page.plugin_id.clone();
+        let pid_reload = page.plugin_id.clone();
+
+        v_flex()
+            .size_full()
+            .min_h_0()
+            .when(cfg!(test), |el| {
+                el.debug_selector(|| "plugin-settings-active-page".to_owned())
+            })
+            .child(
+                h_flex()
+                    .w_full()
+                    .px_6()
+                    .pt_1()
+                    .pb_2p5()
+                    .gap_2()
+                    .items_center()
+                    .justify_between()
+                    .border_b_1()
+                    .border_color(colors.border_variant)
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .min_w_0()
+                            .child(
+                                Button::new("plugin-page-back", strings.plugins_back)
+                                    .variant(ButtonVariant::Ghost)
+                                    .size(ButtonSize::Sm)
+                                    .icon(IconName::ChevronLeft)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.close_plugin_page(cx);
+                                    })),
+                            )
+                            .child(
+                                Label::new(page.plugin_name.clone())
+                                    .size(LabelSize::Default)
+                                    .weight(FontWeight::SEMIBOLD)
+                                    .truncate(),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .flex_none()
+                            .items_center()
+                            .gap_1()
+                            .when(has_settings, |row| {
+                                row.child(
+                                    Button::new("plugin-page-settings", strings.plugins_settings)
+                                        .variant(ButtonVariant::Ghost)
+                                        .size(ButtonSize::Sm)
+                                        .icon(IconName::Settings2)
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.close_plugin_page(cx);
+                                            this.tab = PluginSettingsTab::Installed;
+                                            this.expanded_settings = Some(pid_settings.clone());
+                                            this.expanded_logs = None;
+                                            cx.notify();
+                                        })),
+                                )
+                            })
+                            .child(
+                                Button::new("plugin-page-logs", strings.plugins_logs)
+                                    .variant(ButtonVariant::Ghost)
+                                    .size(ButtonSize::Sm)
+                                    .icon(IconName::FileText)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.open_logs_for(&pid_logs, cx);
+                                    })),
+                            )
+                            .child(
+                                IconButton::new("plugin-page-reload", IconName::RefreshCw)
+                                    .size(px(28.))
+                                    .icon_size(IconSize::Small)
+                                    .icon_color(Color::IconMuted)
+                                    .hover_icon_color(Color::Icon)
+                                    .tooltip(Tooltip::text(strings.plugins_reload))
+                                    .on_click(move |_, _, cx| {
+                                        PluginHost::reload_plugin_async(pid_reload.clone(), cx);
+                                    }),
+                            ),
+                    ),
+            )
+            .child(div().flex_1().min_h_0().w_full().child(page.view.clone()))
+            .into_any_element()
+    }
 }
 
 impl Render for PluginSettingsView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let strings = i18n::t(cx);
+
+        let permission_modal = self
+            .pending_permission_modal
+            .as_ref()
+            .map(|pending| self.render_permission_modal(pending, cx));
+
+        if let Some(page) = &self.active_plugin_page {
+            let page_el = self.render_active_plugin_page(page, cx);
+            return div()
+                .relative()
+                .size_full()
+                .track_focus(&self.focus_handle)
+                .when(cfg!(test), |el| {
+                    el.debug_selector(|| "plugin-settings-view".to_owned())
+                })
+                .child(page_el)
+                .children(permission_modal);
+        }
 
         let tabs = SegmentedTabs::new()
             .tab(
@@ -2743,11 +2970,6 @@ impl Render for PluginSettingsView {
             PluginSettingsTab::Scripts => self.render_scripts_tab(cx),
             PluginSettingsTab::Browse => self.render_browse_tab(cx),
         };
-
-        let permission_modal = self
-            .pending_permission_modal
-            .as_ref()
-            .map(|pending| self.render_permission_modal(pending, cx));
 
         div()
             .relative()

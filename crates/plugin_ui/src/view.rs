@@ -1078,6 +1078,7 @@ pub struct PluginView {
     focus_handle: FocusHandle,
     tree_state: UiTreeState,
     seen_plugin_revision: u64,
+    embedded: bool,
     _host_sub: Subscription,
 }
 
@@ -1093,6 +1094,25 @@ impl PluginView {
     pub fn new(
         plugin_id: impl Into<String>,
         view_id: impl Into<String>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::create(plugin_id, view_id, false, cx)
+    }
+
+    /// Creates a [`PluginView`] intended for embedding inside another container (e.g. Settings → Plugins)
+    /// without main-window titlebar top inset.
+    pub fn new_embedded(
+        plugin_id: impl Into<String>,
+        view_id: impl Into<String>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::create(plugin_id, view_id, true, cx)
+    }
+
+    fn create(
+        plugin_id: impl Into<String>,
+        view_id: impl Into<String>,
+        embedded: bool,
         cx: &mut Context<Self>,
     ) -> Self {
         let plugin_id = plugin_id.into();
@@ -1120,6 +1140,7 @@ impl PluginView {
             focus_handle: cx.focus_handle(),
             tree_state: UiTreeState::new(),
             seen_plugin_revision,
+            embedded,
             _host_sub: host_sub,
         }
     }
@@ -1356,9 +1377,11 @@ impl Render for PluginView {
         v_flex()
             .size_full()
             .min_h_0()
-            .pt(desktop_common::layout::header_inset())
+            .when(!self.embedded, |el| {
+                el.pt(desktop_common::layout::header_inset())
+                    .bg(cx.theme().colors().background)
+            })
             .track_focus(&self.focus_handle)
-            .bg(cx.theme().colors().background)
             .child(
                 v_scroll(
                     ElementId::Name(SharedString::from(format!(

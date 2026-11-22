@@ -1694,6 +1694,14 @@ async fn ensure_activated(env: &Rc<WorkerEnv>, plugin_id: &str) -> Result<()> {
         .sidebar
         .iter()
         .map(|v| v.id.clone())
+        .chain(
+            loaded
+                .manifest
+                .contributions
+                .pages
+                .iter()
+                .map(|v| v.id.clone()),
+        )
         .collect();
     let secret_keys: HashSet<String> = loaded
         .manifest

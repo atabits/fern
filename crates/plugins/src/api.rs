@@ -2057,7 +2057,9 @@ fn install_views<'js>(
                 if !st.declared_views.is_empty() && !st.declared_views.contains(id) {
                     return Err(Exception::throw_message(
                         &ctx,
-                        &format!("view {id:?} is not declared in manifest.contributions.sidebar"),
+                        &format!(
+                            "view {id:?} is not declared in manifest.contributions.sidebar or manifest.contributions.pages"
+                        ),
                     ));
                 }
                 let render: Function = spec.get("render").map_err(|_| {

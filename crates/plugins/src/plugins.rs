@@ -20,9 +20,9 @@ pub use oauth::{
 };
 pub use manifest::{
     CURRENT_API_VERSION, CommandContribution, ImporterContribution, LoadedManifest,
-    LocaleContribution, PermissionApprovalStatus, PluginContributions, PluginManifest,
-    ReservedContribution, SearchProviderContribution, SettingKind, SettingOption, SettingSpec,
-    SidebarContribution, ThemeContribution, manifest_sha256, validate_plugin_id,
+    LocaleContribution, PageContribution, PermissionApprovalStatus, PluginContributions,
+    PluginManifest, ReservedContribution, SearchProviderContribution, SettingKind, SettingOption,
+    SettingSpec, SidebarContribution, ThemeContribution, manifest_sha256, validate_plugin_id,
 };
 pub use permissions::{Permission, PermissionDiff, PermissionSet};
 pub use registry::{

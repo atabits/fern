@@ -322,6 +322,35 @@ mod tests {
             assert_eq!(settings.read(cx).active_tab(), PluginSettingsTab::Browse);
         });
 
+        // Opening a plugin's own embedded screen inside Settings → Plugins switches cleanly and returns.
+        cx.update(|_, cx| {
+            PluginHost::set_view_tree(
+                "com.test.page",
+                "sync",
+                sample_ui_tree("hello", 1),
+                cx,
+            );
+            settings.update(cx, |view, cx| {
+                view.open_plugin_page(
+                    "com.test.page".to_owned(),
+                    "Test Page Plugin".to_owned(),
+                    "sync".to_owned(),
+                    cx,
+                );
+            });
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("plugin-settings-active-page").is_some());
+        cx.update(|_, cx| {
+            assert_eq!(
+                settings.read(cx).active_plugin_page_id(),
+                Some(("com.test.page", "sync"))
+            );
+            settings.update(cx, |view, cx| view.close_plugin_page(cx));
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("plugin-settings-active-page").is_none());
+
         cx.update(|_, cx| PluginHost::shutdown(cx));
     }
 

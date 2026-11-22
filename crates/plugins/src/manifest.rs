@@ -66,6 +66,8 @@ pub struct PluginContributions {
     #[serde(default)]
     pub sidebar: Vec<SidebarContribution>,
     #[serde(default)]
+    pub pages: Vec<PageContribution>,
+    #[serde(default)]
     pub commands: Vec<CommandContribution>,
     #[serde(default)]
     pub search_providers: Vec<SearchProviderContribution>,
@@ -104,10 +106,26 @@ impl PluginContributions {
         }
         out
     }
+    /// Returns the primary interactive view (`(view_id, title)`) for opening the plugin's own screen.
+    pub fn primary_view(&self) -> Option<(&str, &str)> {
+        self.pages
+            .first()
+            .map(|p| (p.id.as_str(), p.title.as_str()))
+            .or_else(|| self.sidebar.first().map(|s| (s.id.as_str(), s.title.as_str())))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SidebarContribution {
+    pub id: String,
+    pub title: String,
+    #[serde(default)]
+    pub icon: Option<String>,
+}
+
+/// Dedicated plugin screen opened from `Settings → Plugins` without cluttering the main sidebar.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PageContribution {
     pub id: String,
     pub title: String,
     #[serde(default)]
@@ -295,6 +313,28 @@ impl PluginManifest {
             }
         }
 
+        for page in &self.contributions.pages {
+            ensure!(!page.id.trim().is_empty(), "page view id must not be empty");
+            ensure!(
+                !page.id.contains('/'),
+                "page view id {:?} must not contain '/'",
+                page.id
+            );
+            ensure!(
+                view_ids.insert(page.id.as_str()),
+                "duplicate view id {:?}",
+                page.id
+            );
+            ensure!(
+                !page.title.trim().is_empty(),
+                "page view {:?} title must not be empty",
+                page.id
+            );
+            if let Some(icon) = &page.icon {
+                validate_relative_path(icon)?;
+            }
+        }
+
         let mut cmd_ids = HashSet::new();
         for cmd in &self.contributions.commands {
             ensure!(!cmd.id.trim().is_empty(), "command id must not be empty");
@@ -452,6 +492,19 @@ impl LoadedManifest {
             }
         }
 
+        for page in &manifest.contributions.pages {
+            if let Some(icon_rel) = &page.icon {
+                let icon_path = resolve_inside_dir(&canonical_dir, icon_rel)
+                    .with_context(|| format!("invalid page icon path {icon_rel:?}"))?;
+                ensure!(icon_path.is_file(), "page icon not found: {icon_rel}");
+                let svg_raw = std::fs::read_to_string(&icon_path)
+                    .with_context(|| format!("cannot read page icon {icon_rel}"))?;
+                let sanitized = sanitize_svg(&svg_raw)
+                    .with_context(|| format!("invalid SVG in page icon {icon_rel}"))?;
+                sidebar_icons.insert(page.id.clone(), sanitized);
+            }
+        }
+
         let permissions = manifest.permission_set();
         Ok(Self {
             manifest,
@@ -537,5 +590,34 @@ mod tests {
             status,
             PermissionApprovalStatus::NeedsApproval { is_first_install: false, .. }
         ));
+
+        // Page-only plugin (no sidebar icon) validates cleanly and exposes primary_view().
+        let page_raw = r#"{
+          "id": "com.example.sync",
+          "name": "Sync Plugin",
+          "version": "1.0.0",
+          "api_version": 1,
+          "entry": "index.js",
+          "contributions": {
+            "pages": [{ "id": "sync", "title": "Sync" }]
+          }
+        }"#;
+        let (page_manifest, _) = PluginManifest::parse_and_validate(page_raw).unwrap();
+        assert!(page_manifest.contributions.sidebar.is_empty());
+        assert_eq!(page_manifest.contributions.primary_view(), Some(("sync", "Sync")));
+
+        // Duplicate view ID across sidebar and pages is rejected.
+        let dup_raw = r#"{
+          "id": "com.example.dup",
+          "name": "Dup Plugin",
+          "version": "1.0.0",
+          "api_version": 1,
+          "entry": "index.js",
+          "contributions": {
+            "sidebar": [{ "id": "main", "title": "Main" }],
+            "pages": [{ "id": "main", "title": "Main Page" }]
+          }
+        }"#;
+        assert!(PluginManifest::parse_and_validate(dup_raw).is_err());
     }
 }

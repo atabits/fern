@@ -253,7 +253,14 @@ impl PluginSettingsView {
         match self.store.set_setting(SAFE_MODE_SETTING_KEY, val) {
             Ok(()) => {
                 self.safe_mode_pref = next;
-                self.status_banner = None;
+                match PluginHost::set_safe_mode(next, cx) {
+                    Ok(()) => {
+                        self.status_banner = None;
+                    }
+                    Err(err) => {
+                        self.status_banner = Some((format!("{err:#}"), true));
+                    }
+                }
             }
             Err(err) => {
                 self.status_banner = Some((format!("{err:#}"), true));

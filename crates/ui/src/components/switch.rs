@@ -29,14 +29,19 @@ impl RenderOnce for Switch {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let colors = cx.theme().colors();
         div()
-            .w(px(30.))
+            .w(px(32.))
             .h(px(18.))
-            .p(px(2.))
+            .px(px(2.))
             .flex_none()
             .rounded_full()
             .flex()
+            .items_center()
             .when(self.on, |el| el.justify_end().bg(colors.accent))
-            .when(!self.on, |el| el.bg(colors.element_hover))
-            .child(div().size(px(14.)).rounded_full().bg(if self.on { colors.icon_on_accent } else { gpui::white() }))
+            .when(!self.on, |el| {
+                el.bg(colors.background)
+                    .border_1()
+                    .border_color(colors.border)
+            })
+            .child(div().size(px(12.)).rounded_full().bg(if self.on { colors.icon_on_accent } else { gpui::white() }))
     }
 }

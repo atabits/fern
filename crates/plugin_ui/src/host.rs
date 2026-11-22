@@ -131,6 +131,7 @@ impl Future for WaitForWake {
 
 /// Global GPUI host coordinating the plugin runtime, UI bus, view trees, themes, and registry.
 pub struct PluginHost {
+    config: PluginHostConfig,
     manager: Option<PluginManager>,
     registry_client: RegistryClient,
     plugins_dir: PathBuf,
@@ -221,6 +222,7 @@ impl PluginHost {
         }
 
         let host = Self {
+            config: config.clone(),
             manager,
             registry_client,
             plugins_dir: config.plugins_dir,
@@ -276,6 +278,29 @@ impl PluginHost {
             },
             cx,
         )
+    }
+
+    /// Live-toggles Safe Mode, spawning or shutting down [`PluginManager`] without requiring restart.
+    pub fn set_safe_mode(safe_mode: bool, cx: &mut App) -> Result<()> {
+        use anyhow::Context as _;
+        use theme::ActiveTheme as _;
+        let mut next_cfg = cx
+            .try_global::<Self>()
+            .map(|h| h.config.clone())
+            .context("plugin host is not initialized")?;
+        if next_cfg.safe_mode == safe_mode {
+            return Ok(());
+        }
+        next_cfg.safe_mode = safe_mode;
+        next_cfg.theme_appearance = if cx.theme().is_dark() {
+            "dark".to_owned()
+        } else {
+            "light".to_owned()
+        };
+        if let Some(loc) = cx.try_global::<fern_i18n::CurrentLocale>() {
+            next_cfg.locale = loc.0.code().to_owned();
+        }
+        Self::init(next_cfg, cx)
     }
 
     /// Shuts down the active [`PluginManager`] and stops async host update tasks.

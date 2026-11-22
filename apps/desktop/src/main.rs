@@ -213,28 +213,10 @@ where
 
 fn init_plugin_host(safe_mode: bool, db_path: PathBuf, locale: &str, cx: &mut App) {
     use theme::ActiveTheme as _;
-    if safe_mode {
-        match (
-            desktop_common::paths::plugins_dir(),
-            desktop_common::paths::plugin_registry_cache_dir(),
-        ) {
-            (Ok(plugins_dir), Ok(registry_cache_dir)) => {
-                if let Err(err) =
-                    plugin_ui::PluginHost::init_safe_mode(plugins_dir, registry_cache_dir, cx)
-                {
-                    eprintln!("failed to initialize plugin host in safe mode: {err:#}");
-                }
-            }
-            (Err(err), _) | (_, Err(err)) => {
-                eprintln!("failed to resolve plugin directories: {err:#}");
-            }
-        }
-        return;
-    }
     let appearance = if cx.theme().is_dark() { "dark" } else { "light" };
     match plugin_ui::PluginHostConfig::from_desktop_paths(
         Some(db_path),
-        false,
+        safe_mode,
         locale,
         appearance,
         true,
@@ -242,7 +224,7 @@ fn init_plugin_host(safe_mode: bool, db_path: PathBuf, locale: &str, cx: &mut Ap
         Ok(config) => {
             if let Err(err) = plugin_ui::PluginHost::init(config, cx) {
                 eprintln!("failed to initialize plugin host: {err:#}");
-            } else {
+            } else if !safe_mode {
                 plugin_ui::PluginHost::sync_plugin_themes(cx);
             }
         }

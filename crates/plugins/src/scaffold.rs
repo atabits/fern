@@ -180,8 +180,45 @@ pub const FERN_D_TS: &str = r#"declare module "fern" {
     onChange(cb: (nextSettings: Record<string, unknown>) => void): void;
   };
 
+  export interface OAuthTokenSummary {
+    ok: boolean;
+    tokenType: string | null;
+    scope: string | null;
+    expiresIn: number | null;
+    hasRefreshToken: boolean;
+  }
+
   export const http: {
     fetch(url: string, options?: { method?: string; headers?: Record<string, string>; body?: unknown; timeoutMs?: number }): Promise<HttpResponse>;
+  };
+
+  export const oauth: {
+    authorize(options: {
+      authorizeUrl: string;
+      tokenUrl: string;
+      clientId: string;
+      clientSecretKey?: string;
+      scopes?: string[] | string;
+      redirectHost?: "127.0.0.1" | "localhost";
+      redirectPort?: number;
+      redirectPath?: string;
+      tokenAuth?: "basic" | "body";
+      saveAccessTokenAs?: string;
+      saveRefreshTokenAs?: string | null;
+      extraAuthorizeParams?: Record<string, string>;
+      timeoutSec?: number;
+    }): Promise<OAuthTokenSummary>;
+    refresh(options: {
+      tokenUrl: string;
+      clientId: string;
+      clientSecretKey?: string;
+      refreshTokenKey?: string;
+      scopes?: string[] | string;
+      tokenAuth?: "basic" | "body";
+      saveAccessTokenAs?: string;
+      saveRefreshTokenAs?: string | null;
+    }): Promise<OAuthTokenSummary>;
+    clearTokens(keys?: string | string[]): number;
   };
 
   export const events: {
@@ -215,6 +252,7 @@ pub const FERN_D_TS: &str = r#"declare module "fern" {
 
   export const views: {
     register(viewId: string, view: { render: () => import("fern:ui").UiNode; mount?: () => void; unmount?: () => void }): void;
+    refresh(viewId: string): void;
   };
 
   export const ui: {
@@ -245,6 +283,7 @@ pub const FERN_D_TS: &str = r#"declare module "fern" {
     meta: typeof meta;
     settings: typeof settings;
     http: typeof http;
+    oauth: typeof oauth;
     events: typeof events;
     hooks: typeof hooks;
     timers: typeof timers;

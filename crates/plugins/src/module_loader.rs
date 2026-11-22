@@ -24,6 +24,7 @@ export const storage = f.storage;
 export const meta = f.meta;
 export const settings = f.settings;
 export const http = f.http;
+export const oauth = f.oauth;
 export const events = f.events;
 export const hooks = f.hooks;
 export const timers = f.timers;

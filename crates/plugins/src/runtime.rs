@@ -28,9 +28,9 @@ use serde_json::{Map, Value as JsonValue, json};
 use uuid::Uuid;
 
 use crate::api::{
-    LogEntry, LogLevel, PluginApiState, PluginHooks, PluginUiEffect, PromptReplyValue,
-    PromptSenders, ServiceCallerFn, ServiceRegistrarFn, install_fern_bindings, js_to_json,
-    js_value_to_ui_node, json_to_js, task_to_json,
+    EffectEmitterFn, LogEntry, LogLevel, PluginApiState, PluginHooks, PluginUiEffect,
+    PromptReplyValue, PromptSenders, ServiceCallerFn, ServiceRegistrarFn, ViewRefresherFn,
+    install_fern_bindings, js_to_json, js_value_to_ui_node, json_to_js, task_to_json,
 };
 use crate::http::{HTTP_POOL_THREADS, HttpPool};
 use crate::manifest::{
@@ -773,6 +773,24 @@ impl WorkerEnv {
         }
     }
 
+    fn flush_all_pending_side_effects(&self) {
+        let plugin_ids: Vec<String> = {
+            let slots = self.slots.borrow();
+            slots
+                .iter()
+                .filter_map(|(id, slot)| {
+                    let rt = slot.runtime.as_ref()?;
+                    let has_work = !rt.api.pending_ui_effects.borrow().is_empty()
+                        || rt.api.data_dirty.get();
+                    has_work.then(|| id.clone())
+                })
+                .collect()
+        };
+        for pid in plugin_ids {
+            self.flush_plugin_side_effects(&pid);
+        }
+    }
+
     fn discover_plugins(&self) -> Result<()> {
         if self.config.safe_mode {
             return Ok(());
@@ -1148,7 +1166,8 @@ fn worker_main(
             }
         }
 
-        // 3. Pump any background QuickJS microtasks/jobs on active plugins.
+        // 3. Flush any UI effects queued before an async task suspended, then pump microtasks.
+        env.flush_all_pending_side_effects();
         pump_active_plugin_jobs(&env);
 
         // 4. Fire due `fern.timers` intervals.
@@ -1660,6 +1679,25 @@ async fn ensure_activated(env: &Rc<WorkerEnv>, plugin_id: &str) -> Result<()> {
         rx
     });
 
+    let env_for_view = Rc::clone(env);
+    let pid_for_view = plugin_id.to_owned();
+    let view_refresher: ViewRefresherFn = Rc::new(move |view_id| {
+        let env_r = Rc::clone(&env_for_view);
+        let pid_r = pid_for_view.clone();
+        env_for_view.spawn_task(async move {
+            let _ = render_plugin_view(&env_r, &pid_r, &view_id, false).await;
+        });
+    });
+
+    let tx_for_eff = env.update_tx.clone();
+    let wake_for_eff = env.wake_callback.clone();
+    let effect_emitter: EffectEmitterFn = Arc::new(move |eff| {
+        let _ = tx_for_eff.send(HostUpdate::UiEffect(eff));
+        if let Some(cb) = &wake_for_eff {
+            cb();
+        }
+    });
+
     let api = Rc::new(PluginApiState {
         plugin_id: plugin_id.to_owned(),
         permissions: loaded.permissions.clone(),
@@ -1692,6 +1730,9 @@ async fn ensure_activated(env: &Rc<WorkerEnv>, plugin_id: &str) -> Result<()> {
         next_prompt_id: Rc::clone(&env.next_prompt_id),
         service_registrar,
         service_caller,
+        view_refresher,
+        effect_emitter,
+        shutdown_flag: Arc::clone(&env.shutdown_flag),
     });
 
     let start = Instant::now();
@@ -2440,6 +2481,15 @@ async fn run_user_script(
         rx
     });
 
+    let tx_for_eff = env.update_tx.clone();
+    let wake_for_eff = env.wake_callback.clone();
+    let effect_emitter: EffectEmitterFn = Arc::new(move |eff| {
+        let _ = tx_for_eff.send(HostUpdate::UiEffect(eff));
+        if let Some(cb) = &wake_for_eff {
+            cb();
+        }
+    });
+
     let api = Rc::new(PluginApiState {
         plugin_id: script_id.clone(),
         permissions: perms,
@@ -2472,6 +2522,9 @@ async fn run_user_script(
         next_prompt_id: Rc::clone(&env.next_prompt_id),
         service_registrar: Rc::new(|_| {}),
         service_caller,
+        view_refresher: Rc::new(|_| {}),
+        effect_emitter,
+        shutdown_flag: Arc::clone(&env.shutdown_flag),
     });
 
     let code = script.code.clone();

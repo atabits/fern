@@ -4,6 +4,7 @@ pub mod api;
 pub mod http;
 pub mod manifest;
 pub mod module_loader;
+pub mod oauth;
 pub mod permissions;
 pub mod registry;
 pub mod runtime;
@@ -13,6 +14,10 @@ pub mod vault;
 
 pub use api::{LogEntry, LogLevel, PluginUiEffect, PromptReplyValue, ToastLevel};
 pub use http::{HttpPool, HttpRequest, HttpResponse, execute_http_request, is_ip_blocked};
+pub use oauth::{
+    OAuthAuthorizeRequest, OAuthRefreshRequest, OAuthTokenAuth, OAuthTokenSummary,
+    build_redirect_uri, run_oauth_authorize, run_oauth_refresh,
+};
 pub use manifest::{
     CURRENT_API_VERSION, CommandContribution, ImporterContribution, LoadedManifest,
     LocaleContribution, PermissionApprovalStatus, PluginContributions, PluginManifest,

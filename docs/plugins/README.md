@@ -482,13 +482,14 @@ Import via `import fern from "fern"` (or named imports `import { tasks, storage,
 | `fern.meta` | `get(type, id, key)`, `set(type, id, key, val)`, `list(type, id)`, `delete(type, id, key)` | `type`: `"task" \| "list" \| "habit" \| "countdown" \| "day"`, 64 KiB cap per entry. `meta`. |
 | `fern.settings` | `get(key)`, `all()`, `hasSecret(key)`, `onChange(cb)` | Always available. Reading a `"secret"` key throws; use `${secret:key}` in HTTP headers. |
 | `fern.http` | `fetch(url, { method?, headers?, body?, timeoutMs? })` | Async. Returns `{ ok, status, url, headers, body, text(), json() }`. `network` / `network:local`. |
+| `fern.oauth` | `authorize(opts)`, `refresh(opts)`, `clearTokens(keys?)` | Async zero-secret OAuth 2.0 loopback login & refresh. Reads `client_secret` and writes `access_token`/`refresh_token` directly in `SecretsVault` without exposing tokens to JS. Requires `network` allowlist for authorize/token hosts. |
 | `fern.events` | `on(kind, cb)` → `unsubscribe()` | Kinds: `"task.created"`, `"task.updated"`, `"task.completed"`, `"task.reopened"`, `"task.deleted"`, `"task.*"`, `"habit.checkin"`, `"focus.completed"`, `"app.ready"`, `"*"`. Own writes are echo-suppressed; causal cascades stop at `MAX_EVENT_DEPTH = 4`. |
 | `fern.hooks` | `beforeTaskCreate(cb)`, `beforeTaskComplete(cb)`, `quickAddTransform(cb)`, `onReminder(cb)` | `hooks:intercept`. Return `false` or `{ cancel: true, reason }` to cancel, `{ draft }` / `{ value }` or modified object to mutate, or `undefined`/`null` to allow unchanged. |
 | `fern.timers` | `setInterval(id, ms, cb)`, `clearInterval(id)` | `ms >= 10_000` (10 seconds), max `8` active timers per plugin. |
 | `fern.commands` | `register(id, (arg?) => result)` | Invoked via Command Search or `fern://plugin/<id>/<command>?...`. |
 | `fern.search` | `registerProvider(id, (query) => SearchHit[])` | Returns hits `{ id?, title, subtitle?, badge?, taskId?, commandId?, commandArg? }`. |
 | `fern.services` | `provide(name, fn)`, `call(name, arg?)` | Async inter-plugin RPC (max call depth `4`). `services`. |
-| `fern.views` | `register(viewId, { render, mount?, unmount? })` | `viewId` must be declared in `manifest.contributions.sidebar`. |
+| `fern.views` | `register(viewId, { render, mount?, unmount? })`, `refresh(viewId)` | `viewId` must be declared in `manifest.contributions.sidebar`. `refresh` triggers a live re-render from timers or async tasks. |
 | `fern.ui` | `toast(msg, level?)`, `confirm(title, body)`, `prompt(title, placeholder?, defaultValue?)`, `openModal(title, viewOrNode)`, `closeModal()`, `openTask(taskId)` | `level`: `"info" \| "success" \| "warning" \| "error"`. `confirm`/`prompt` return Promises. |
 | `fern.system` | `locale()`, `themeAppearance()`, `openExternal(url)`, `clipboardWrite(text)` | `openExternal` allows only `http://` / `https://`. `clipboardWrite` requires `clipboard`. |
 | `console` | `log`, `info`, `warn`, `error`, `debug` | Ring buffer of 200 log entries per plugin; secret values are scrubbed automatically. |

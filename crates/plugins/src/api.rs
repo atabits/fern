@@ -5,6 +5,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::str::FromStr as _;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, anyhow, bail, ensure};
@@ -23,6 +25,11 @@ use serde_json::{Map, Value as JsonValue, json};
 use uuid::Uuid;
 
 use crate::http::{HttpPool, HttpRequest};
+use crate::oauth::{
+    DEFAULT_OAUTH_TIMEOUT_SEC, DEFAULT_REDIRECT_HOST, DEFAULT_REDIRECT_PATH, DEFAULT_REDIRECT_PORT,
+    OAuthAuthorizeRequest, OAuthRefreshRequest, OAuthTokenAuth, run_oauth_authorize,
+    run_oauth_refresh,
+};
 use crate::permissions::{Permission, PermissionSet};
 use crate::ui_ast::{HandlerId, UiNode};
 use crate::vault::SecretsVault;
@@ -122,6 +129,8 @@ pub type PromptSenders = Rc<RefCell<HashMap<u64, oneshot::Sender<PromptReplyValu
 pub type ServiceCallerFn =
     Rc<dyn Fn(String, JsonValue) -> oneshot::Receiver<Result<JsonValue>>>;
 pub type ServiceRegistrarFn = Rc<dyn Fn(String)>;
+pub type ViewRefresherFn = Rc<dyn Fn(String)>;
+pub type EffectEmitterFn = Arc<dyn Fn(PluginUiEffect) + Send + Sync>;
 
 pub struct RegisteredView {
     pub render: Persistent<Function<'static>>,
@@ -179,6 +188,9 @@ pub struct PluginApiState {
     pub next_prompt_id: Rc<Cell<u64>>,
     pub service_registrar: ServiceRegistrarFn,
     pub service_caller: ServiceCallerFn,
+    pub view_refresher: ViewRefresherFn,
+    pub effect_emitter: EffectEmitterFn,
+    pub shutdown_flag: Arc<AtomicBool>,
 }
 
 impl PluginApiState {
@@ -293,6 +305,7 @@ pub fn install_fern_bindings<'js>(
     install_meta(ctx, &fern, Rc::clone(&state))?;
     install_settings(ctx, &fern, Rc::clone(&state))?;
     install_http(ctx, &fern, Rc::clone(&state))?;
+    install_oauth(ctx, &fern, Rc::clone(&state))?;
     install_events(ctx, &fern, Rc::clone(&state))?;
     install_hooks(ctx, &fern, Rc::clone(&state))?;
     install_timers(ctx, &fern, Rc::clone(&state))?;
@@ -1430,6 +1443,329 @@ fn install_http<'js>(
     Ok(())
 }
 
+fn parse_oauth_scopes(val: Option<&JsonValue>) -> Vec<String> {
+    match val {
+        Some(JsonValue::Array(arr)) => arr
+            .iter()
+            .filter_map(JsonValue::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect(),
+        Some(JsonValue::String(s)) => s
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn install_oauth<'js>(
+    ctx: &Ctx<'js>,
+    fern: &Object<'js>,
+    state: Rc<PluginApiState>,
+) -> rquickjs::Result<()> {
+    let obj = Object::new(ctx.clone())?;
+
+    // authorize(opts) -> Promise<{ ok, tokenType, scope, expiresIn, hasRefreshToken }>
+    {
+        let st = Rc::clone(&state);
+        obj.set(
+            "authorize",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>, opts_val: Value<'js>| -> rquickjs::Result<Value<'js>> {
+                    let opts = js_to_json(&ctx, opts_val)
+                        .map_err(|e| throw_scrubbed(&ctx, &st, e))?;
+                    let authorize_url = opts
+                        .get("authorizeUrl")
+                        .and_then(JsonValue::as_str)
+                        .unwrap_or("")
+                        .to_owned();
+                    let token_url = opts
+                        .get("tokenUrl")
+                        .and_then(JsonValue::as_str)
+                        .unwrap_or("")
+                        .to_owned();
+                    let client_id = opts
+                        .get("clientId")
+                        .and_then(JsonValue::as_str)
+                        .unwrap_or("")
+                        .to_owned();
+                    let client_secret_key = opts
+                        .get("clientSecretKey")
+                        .and_then(JsonValue::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned);
+                    let scopes = parse_oauth_scopes(opts.get("scopes").or_else(|| opts.get("scope")));
+                    let redirect_host = opts
+                        .get("redirectHost")
+                        .and_then(JsonValue::as_str)
+                        .unwrap_or(DEFAULT_REDIRECT_HOST)
+                        .to_owned();
+                    let redirect_port = opts
+                        .get("redirectPort")
+                        .and_then(JsonValue::as_u64)
+                        .and_then(|p| u16::try_from(p).ok())
+                        .unwrap_or(DEFAULT_REDIRECT_PORT);
+                    let redirect_path = opts
+                        .get("redirectPath")
+                        .and_then(JsonValue::as_str)
+                        .unwrap_or(DEFAULT_REDIRECT_PATH)
+                        .to_owned();
+                    let token_auth = OAuthTokenAuth::parse(
+                        opts.get("tokenAuth").and_then(JsonValue::as_str),
+                    )
+                    .map_err(|e| throw_scrubbed(&ctx, &st, e))?;
+                    let save_access_token_as = opts
+                        .get("saveAccessTokenAs")
+                        .and_then(JsonValue::as_str)
+                        .unwrap_or("access_token")
+                        .to_owned();
+                    let save_refresh_token_as = match opts.get("saveRefreshTokenAs") {
+                        Some(JsonValue::Null) => None,
+                        Some(JsonValue::String(s)) if s.trim().is_empty() => None,
+                        Some(JsonValue::String(s)) => Some(s.trim().to_owned()),
+                        _ => Some("refresh_token".to_owned()),
+                    };
+                    let mut extra_authorize_params = Vec::new();
+                    if let Some(extra) = opts
+                        .get("extraAuthorizeParams")
+                        .and_then(JsonValue::as_object)
+                    {
+                        for (k, v) in extra {
+                            if let Some(vs) = v.as_str() {
+                                extra_authorize_params.push((k.clone(), vs.to_owned()));
+                            }
+                        }
+                    }
+                    let timeout_sec = opts
+                        .get("timeoutSec")
+                        .and_then(JsonValue::as_u64)
+                        .unwrap_or(DEFAULT_OAUTH_TIMEOUT_SEC);
+
+                    let req = OAuthAuthorizeRequest {
+                        authorize_url,
+                        token_url,
+                        client_id,
+                        client_secret_key,
+                        scopes,
+                        redirect_host,
+                        redirect_port,
+                        redirect_path,
+                        token_auth,
+                        save_access_token_as,
+                        save_refresh_token_as,
+                        extra_authorize_params,
+                        timeout_sec,
+                    };
+
+                    let (tx, rx) = oneshot::channel();
+                    let plugin_id = st.plugin_id.clone();
+                    let permissions = st.permissions.clone();
+                    let vault = st.vault.clone();
+                    let cancel = Arc::clone(&st.shutdown_flag);
+                    let emitter = Arc::clone(&st.effect_emitter);
+
+                    if let Err(err) = thread::Builder::new()
+                        .name("fern-oauth".to_owned())
+                        .spawn(move || {
+                            let res = run_oauth_authorize(
+                                &plugin_id,
+                                &permissions,
+                                &vault,
+                                &req,
+                                &cancel,
+                                |url| {
+                                    emitter(PluginUiEffect::OpenExternal { url });
+                                },
+                            );
+                            let _ = tx.send(res);
+                        })
+                    {
+                        return Err(Exception::throw_message(
+                            &ctx,
+                            &format!("failed to start OAuth worker: {err}"),
+                        ));
+                    }
+
+                    let st_for_fut = Rc::clone(&st);
+                    let ctx_for_fut = ctx.clone();
+                    let promised = Promised::from(async move {
+                        let summary = match rx.await {
+                            Ok(Ok(s)) => s,
+                            Ok(Err(err)) => return Err(throw_scrubbed(&ctx_for_fut, &st_for_fut, err)),
+                            Err(_) => {
+                                return Err(Exception::throw_message(
+                                    &ctx_for_fut,
+                                    "OAuth authorization cancelled",
+                                ));
+                            }
+                        };
+                        let val = json!({
+                            "ok": summary.ok,
+                            "tokenType": summary.token_type,
+                            "scope": summary.scope,
+                            "expiresIn": summary.expires_in,
+                            "hasRefreshToken": summary.has_refresh_token,
+                        });
+                        json_to_js(&ctx_for_fut, &val)
+                    });
+                    rquickjs::IntoJs::into_js(promised, &ctx)
+                },
+            )?,
+        )?;
+    }
+
+    // refresh(opts) -> Promise<{ ok, tokenType, scope, expiresIn, hasRefreshToken }>
+    {
+        let st = Rc::clone(&state);
+        obj.set(
+            "refresh",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>, opts_val: Value<'js>| -> rquickjs::Result<Value<'js>> {
+                    let opts = js_to_json(&ctx, opts_val)
+                        .map_err(|e| throw_scrubbed(&ctx, &st, e))?;
+                    let token_url = opts
+                        .get("tokenUrl")
+                        .and_then(JsonValue::as_str)
+                        .unwrap_or("")
+                        .to_owned();
+                    let client_id = opts
+                        .get("clientId")
+                        .and_then(JsonValue::as_str)
+                        .unwrap_or("")
+                        .to_owned();
+                    let client_secret_key = opts
+                        .get("clientSecretKey")
+                        .and_then(JsonValue::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned);
+                    let refresh_token_key = opts
+                        .get("refreshTokenKey")
+                        .and_then(JsonValue::as_str)
+                        .unwrap_or("refresh_token")
+                        .to_owned();
+                    let scopes = parse_oauth_scopes(opts.get("scopes").or_else(|| opts.get("scope")));
+                    let token_auth = OAuthTokenAuth::parse(
+                        opts.get("tokenAuth").and_then(JsonValue::as_str),
+                    )
+                    .map_err(|e| throw_scrubbed(&ctx, &st, e))?;
+                    let save_access_token_as = opts
+                        .get("saveAccessTokenAs")
+                        .and_then(JsonValue::as_str)
+                        .unwrap_or("access_token")
+                        .to_owned();
+                    let save_refresh_token_as = match opts.get("saveRefreshTokenAs") {
+                        Some(JsonValue::Null) => None,
+                        Some(JsonValue::String(s)) if s.trim().is_empty() => None,
+                        Some(JsonValue::String(s)) => Some(s.trim().to_owned()),
+                        _ => Some("refresh_token".to_owned()),
+                    };
+
+                    let req = OAuthRefreshRequest {
+                        token_url,
+                        client_id,
+                        client_secret_key,
+                        refresh_token_key,
+                        scopes,
+                        token_auth,
+                        save_access_token_as,
+                        save_refresh_token_as,
+                    };
+
+                    let (tx, rx) = oneshot::channel();
+                    let plugin_id = st.plugin_id.clone();
+                    let permissions = st.permissions.clone();
+                    let vault = st.vault.clone();
+
+                    if let Err(err) = thread::Builder::new()
+                        .name("fern-oauth-ref".to_owned())
+                        .spawn(move || {
+                            let res = run_oauth_refresh(&plugin_id, &permissions, &vault, &req);
+                            let _ = tx.send(res);
+                        })
+                    {
+                        return Err(Exception::throw_message(
+                            &ctx,
+                            &format!("failed to start OAuth refresh worker: {err}"),
+                        ));
+                    }
+
+                    let st_for_fut = Rc::clone(&st);
+                    let ctx_for_fut = ctx.clone();
+                    let promised = Promised::from(async move {
+                        let summary = match rx.await {
+                            Ok(Ok(s)) => s,
+                            Ok(Err(err)) => return Err(throw_scrubbed(&ctx_for_fut, &st_for_fut, err)),
+                            Err(_) => {
+                                return Err(Exception::throw_message(
+                                    &ctx_for_fut,
+                                    "OAuth refresh cancelled",
+                                ));
+                            }
+                        };
+                        let val = json!({
+                            "ok": summary.ok,
+                            "tokenType": summary.token_type,
+                            "scope": summary.scope,
+                            "expiresIn": summary.expires_in,
+                            "hasRefreshToken": summary.has_refresh_token,
+                        });
+                        json_to_js(&ctx_for_fut, &val)
+                    });
+                    rquickjs::IntoJs::into_js(promised, &ctx)
+                },
+            )?,
+        )?;
+    }
+
+    // clearTokens(keys?) -> number (deletes stored OAuth tokens from SecretsVault without reading them)
+    {
+        let st = Rc::clone(&state);
+        obj.set(
+            "clearTokens",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>, keys_opt: Opt<Value<'js>>| -> rquickjs::Result<i32> {
+                    let keys: Vec<String> = match keys_opt.0 {
+                        Some(v) if !v.is_undefined() && !v.is_null() => {
+                            let j = js_to_json(&ctx, v).map_err(|e| throw_scrubbed(&ctx, &st, e))?;
+                            match j {
+                                JsonValue::Array(arr) => arr
+                                    .into_iter()
+                                    .filter_map(|item| item.as_str().map(str::to_owned))
+                                    .collect(),
+                                JsonValue::String(s) => vec![s],
+                                _ => vec!["access_token".to_owned(), "refresh_token".to_owned()],
+                            }
+                        }
+                        _ => vec!["access_token".to_owned(), "refresh_token".to_owned()],
+                    };
+                    let mut removed = 0i32;
+                    for key in keys {
+                        if !key.trim().is_empty()
+                            && st
+                                .vault
+                                .delete(&st.plugin_id, key.trim())
+                                .map_err(|e| throw_scrubbed(&ctx, &st, e))?
+                        {
+                            removed += 1;
+                        }
+                    }
+                    Ok(removed)
+                },
+            )?,
+        )?;
+    }
+
+    fern.set("oauth", obj)?;
+    Ok(())
+}
+
 fn event_permission(kind: &str) -> Option<Permission> {
     if kind.starts_with("task.") || kind == "task" {
         Some(Permission::TasksRead)
@@ -1742,6 +2078,19 @@ fn install_views<'js>(
             },
         )?,
     )?;
+
+    {
+        let st = Rc::clone(&state);
+        obj.set(
+            "refresh",
+            Function::new(ctx.clone(), move |view_id: String| {
+                let id = view_id.trim();
+                if !id.is_empty() && st.views.borrow().contains_key(id) {
+                    (st.view_refresher)(id.to_owned());
+                }
+            })?,
+        )?;
+    }
 
     fern.set("views", obj)?;
     Ok(())
@@ -2600,6 +2949,47 @@ fn apply_task_patch(store: &Store, id: Id, patch: &JsonValue) -> Result<Task> {
     if let Some(rems) = obj.get("reminders").and_then(JsonValue::as_array) {
         let list: Vec<i64> = rems.iter().filter_map(JsonValue::as_i64).collect();
         store.set_reminders(id, &list)?;
+    }
+    if let Some(checklist_arr) = obj.get("checklist").and_then(JsonValue::as_array) {
+        let mut desired: Vec<(String, bool)> = Vec::with_capacity(checklist_arr.len());
+        for item in checklist_arr {
+            if let Some(text) = item.as_str() {
+                if !text.trim().is_empty() {
+                    desired.push((text.to_owned(), false));
+                }
+            } else if let Some(item_obj) = item.as_object()
+                && let Some(title) = item_obj.get("title").and_then(JsonValue::as_str)
+                && !title.trim().is_empty()
+            {
+                let done = item_obj
+                    .get("completed")
+                    .and_then(JsonValue::as_bool)
+                    .unwrap_or(false);
+                desired.push((title.to_owned(), done));
+            }
+        }
+        let existing_items = store.checklist(id)?;
+        let mut last_id: Option<Id> = None;
+        for (idx, (title, done)) in desired.iter().enumerate() {
+            if let Some(cur) = existing_items.get(idx) {
+                if cur.title != *title {
+                    store.set_checklist_item_title(cur.id, title)?;
+                }
+                if cur.completed != *done {
+                    store.set_checklist_item_completed(cur.id, *done)?;
+                }
+                last_id = Some(cur.id);
+            } else {
+                let added = store.add_checklist_item(id, title, last_id)?;
+                if *done {
+                    store.set_checklist_item_completed(added.id, true)?;
+                }
+                last_id = Some(added.id);
+            }
+        }
+        for stale in existing_items.iter().skip(desired.len()) {
+            store.delete_checklist_item(stale.id)?;
+        }
     }
     if let Some(parent_val) = obj.get("parentId") {
         let parent_id = match parent_val {

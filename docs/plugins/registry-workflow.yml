@@ -88,7 +88,7 @@ jobs:
                   continue
               status = parts[0]
               path = parts[-1]
-              if status.startswith("D"):
+              if status.startswith("D") or path == "plugins/.gitkeep":
                   continue
               changed.append(path)
 
@@ -120,6 +120,7 @@ jobs:
           MAX_SVG_BYTES = 256 * 1024
           CURRENT_API_VERSION = 1
           PLUGIN_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{1,63}$")
+          SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
           KNOWN_PERMISSIONS = {
               "tasks:read",
               "tasks:write",
@@ -156,10 +157,18 @@ jobs:
                   raise ValueError(f"path traversal forbidden: {rel!r}")
               return norm
 
-          def assert_public_https_url(url: str) -> str:
-              parsed = urllib.parse.urlparse(url.strip())
+          def validate_https_url_syntax(url: str, field_name: str) -> str:
+              if not isinstance(url, str) or not url.strip():
+                  raise ValueError(f"{field_name} must be a non-empty https:// URL")
+              cleaned = url.strip()
+              parsed = urllib.parse.urlparse(cleaned)
               if parsed.scheme.lower() != "https" or not parsed.hostname:
-                  raise ValueError(f"source_url must use https:// with a valid host: {url!r}")
+                  raise ValueError(f"{field_name} must use https:// with a valid host: {url!r}")
+              return cleaned
+
+          def assert_public_https_url(url: str) -> str:
+              cleaned = validate_https_url_syntax(url, "source_url")
+              parsed = urllib.parse.urlparse(cleaned)
               host = parsed.hostname
               port = parsed.port or 443
               try:
@@ -181,7 +190,7 @@ jobs:
                       or ip.is_reserved
                   ):
                       raise ValueError(f"non-public IP {ip} blocked for {host!r}")
-              return url.strip()
+              return cleaned
 
           class SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
               def redirect_request(self, req, fp, code, msg, headers, newurl):
@@ -321,17 +330,34 @@ jobs:
               raise SystemExit("plugins/ directory not found")
 
           for p in sorted(plugins_dir.iterdir()):
+              if p.name == ".gitkeep":
+                  continue
               if p.suffix != ".json" or not p.is_file():
                   raise ValueError(f"unexpected entry in plugins/: {p}")
               desc = json.loads(p.read_text(encoding="utf-8"))
+              if not isinstance(desc, dict):
+                  raise ValueError(f"{p}: descriptor must be a JSON object")
               pid = p.stem
               if not validate_plugin_id(pid) or desc.get("id") != pid:
                   raise ValueError(f"{p}: id {desc.get('id')!r} must match filename {pid!r} and ^[a-z0-9][a-z0-9._-]{{1,63}}$")
               ver = desc.get("version", "")
               if not isinstance(ver, str) or not ver.strip() or "/" in ver or ".." in ver or any(c.isspace() for c in ver):
                   raise ValueError(f"{p}: invalid version {ver!r}")
-              if not isinstance(desc.get("source_url"), str) or not desc["source_url"].strip():
-                  raise ValueError(f"{p}: missing source_url")
+              validate_https_url_syntax(desc.get("source_url", ""), f"{p}: source_url")
+              if "homepage" in desc and desc["homepage"] is not None:
+                  validate_https_url_syntax(desc["homepage"], f"{p}: homepage")
+              if "sha256" in desc and desc["sha256"] is not None:
+                  sha_val = desc["sha256"]
+                  if not isinstance(sha_val, str) or not SHA256_RE.match(sha_val.strip().lower()):
+                      raise ValueError(f"{p}: invalid sha256 checksum {sha_val!r}")
+              if "min_fern_version" in desc and desc["min_fern_version"] is not None:
+                  mfv = desc["min_fern_version"]
+                  if not isinstance(mfv, str) or not mfv.strip():
+                      raise ValueError(f"{p}: min_fern_version must be a non-empty string")
+              if "tags" in desc and desc["tags"] is not None:
+                  tags = desc["tags"]
+                  if not isinstance(tags, list) or not all(isinstance(t, str) and t.strip() for t in tags):
+                      raise ValueError(f"{p}: tags must be an array of non-empty strings")
 
           changed = json.loads(os.environ.get("CHANGED_FILES", "[]"))
           summary_rows = []
@@ -339,6 +365,8 @@ jobs:
               tmp_dir = pathlib.Path(tmp)
               for rel in changed:
                   p = pathlib.Path(rel)
+                  if p.name == ".gitkeep":
+                      continue
                   if p.parent != pathlib.Path("plugins") or p.suffix != ".json":
                       raise ValueError(f"plugin descriptors must be placed at plugins/<id>.json (got {rel})")
                   desc = json.loads(p.read_text(encoding="utf-8"))
@@ -391,6 +419,7 @@ jobs:
           python3 - <<'PY'
           import datetime
           import hashlib
+          import html
           import ipaddress
           import json
           import os
@@ -620,75 +649,166 @@ jobs:
               data = json.loads(proc.stdout)
               return any(a.get("name") == asset_name for a in data.get("assets", []))
 
+          def render_index_html(entries: list[dict], generated_at: str, repo_slug: str) -> str:
+              repo_href = f"https://github.com/{html.escape(repo_slug, quote=True)}"
+              count = len(entries)
+              count_label = f"{count} plugin indexed" if count == 1 else f"{count} plugins indexed"
+              if entries:
+                  rows = []
+                  for e in entries:
+                      rows.append(
+                          "<tr>"
+                          f"<td><strong>{html.escape(str(e['name']))}</strong></td>"
+                          f"<td><code>{html.escape(str(e['id']))}</code></td>"
+                          f"<td><code>{html.escape(str(e['version']))}</code></td>"
+                          f"<td>{html.escape(str(e.get('description', '')))}</td>"
+                          "</tr>"
+                      )
+                  plugins_block = (
+                      "<table>"
+                      "<thead><tr><th>Name</th><th>ID</th><th>Version</th><th>Description</th></tr></thead>"
+                      f"<tbody>{''.join(rows)}</tbody>"
+                      "</table>"
+                  )
+              else:
+                  plugins_block = "<p class='empty'>No plugins indexed yet. Submit the first plugin via Pull Request.</p>"
+
+              template = """<!doctype html>
+          <html lang="en">
+          <head>
+            <meta charset="utf-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <title>Fern Plugin Registry</title>
+            <style>
+              :root { color-scheme: dark; }
+              body {
+                margin: 0;
+                padding: 40px 20px;
+                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+                background: #0f1117;
+                color: #e6eaf2;
+                line-height: 1.55;
+              }
+              main { max-width: 880px; margin: 0 auto; }
+              h1 { margin: 0 0 8px; font-size: 28px; letter-spacing: -0.02em; }
+              .meta { color: #9aa4b2; font-size: 14px; margin-bottom: 24px; }
+              .links { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 28px; }
+              .btn {
+                display: inline-block;
+                padding: 8px 14px;
+                border-radius: 8px;
+                border: 1px solid #2b3242;
+                background: #171b24;
+                color: #8cb4ff;
+                text-decoration: none;
+                font-size: 14px;
+                font-weight: 500;
+              }
+              .btn:hover { border-color: #4f6d9a; background: #1c2230; }
+              table { width: 100%; border-collapse: collapse; background: #151922; border-radius: 10px; overflow: hidden; }
+              th, td { text-align: left; padding: 12px 14px; border-bottom: 1px solid #222836; font-size: 14px; }
+              th { color: #9aa4b2; font-weight: 600; background: #191e29; }
+              tr:last-child td { border-bottom: none; }
+              code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; color: #c7d2fe; }
+              .empty {
+                padding: 18px 20px;
+                border-radius: 10px;
+                background: #151922;
+                border: 1px solid #222836;
+                color: #9aa4b2;
+              }
+            </style>
+          </head>
+          <body>
+            <main>
+              <h1>Fern Plugin Registry</h1>
+              <div class="meta">__COUNT__ &middot; Updated <code>__GENERATED_AT__</code> &middot; Schema v1</div>
+              <div class="links">
+                <a class="btn" href="./registry.json">registry.json</a>
+                <a class="btn" href="__REPO_HREF__">GitHub Repository</a>
+              </div>
+              __PLUGINS_BLOCK__
+            </main>
+          </body>
+          </html>
+          """
+              return (
+                  template.replace("__COUNT__", html.escape(count_label))
+                  .replace("__GENERATED_AT__", html.escape(generated_at))
+                  .replace("__REPO_HREF__", repo_href)
+                  .replace("__PLUGINS_BLOCK__", plugins_block)
+              )
+
           repo = os.environ["GITHUB_REPOSITORY"]
           plugins_dir = pathlib.Path("plugins")
           site_dir = pathlib.Path("_site")
           site_dir.mkdir(parents=True, exist_ok=True)
 
           registry_entries = []
-          with tempfile.TemporaryDirectory() as tmp:
-              tmp_dir = pathlib.Path(tmp)
-              for p in sorted(plugins_dir.glob("*.json")):
-                  desc = json.loads(p.read_text(encoding="utf-8"))
-                  pid = p.stem
-                  if desc.get("id") != pid or not validate_plugin_id(pid):
-                      raise ValueError(f"invalid plugin descriptor {p}")
-                  ver = desc["version"]
-                  tag = f"{pid}-{ver}"
-                  zip_path = tmp_dir / f"{tag}.zip"
+          if plugins_dir.is_dir():
+              with tempfile.TemporaryDirectory() as tmp:
+                  tmp_dir = pathlib.Path(tmp)
+                  for p in sorted(plugins_dir.glob("*.json")):
+                      desc = json.loads(p.read_text(encoding="utf-8"))
+                      pid = p.stem
+                      if desc.get("id") != pid or not validate_plugin_id(pid):
+                          raise ValueError(f"invalid plugin descriptor {p}")
+                      ver = desc["version"]
+                      tag = f"{pid}-{ver}"
+                      zip_path = tmp_dir / f"{tag}.zip"
 
-                  if release_has_asset(tag, "plugin.zip"):
-                      subprocess.run(
-                          ["gh", "release", "download", tag, "-p", "plugin.zip", "-O", str(zip_path)],
-                          check=True,
-                      )
-                      sha256, size_bytes = sha256_file(zip_path)
-                  else:
-                      sha256, size_bytes = download_zip(desc["source_url"], zip_path)
-                      if desc.get("sha256") and sha256 != desc["sha256"].strip().lower():
-                          raise ValueError(f"{p}: sha256 mismatch (expected {desc['sha256']}, got {sha256})")
-                      inspect_zip_and_manifest(zip_path, pid, ver)
-                      asset_arg = f"{zip_path}#plugin.zip"
-                      view_proc = subprocess.run(["gh", "release", "view", tag], capture_output=True)
-                      if view_proc.returncode == 0:
-                          subprocess.run(["gh", "release", "upload", tag, asset_arg, "--clobber"], check=True)
-                      else:
+                      if release_has_asset(tag, "plugin.zip"):
                           subprocess.run(
-                              [
-                                  "gh",
-                                  "release",
-                                  "create",
-                                  tag,
-                                  asset_arg,
-                                  "--title",
-                                  f"{pid} v{ver}",
-                                  "--notes",
-                                  f"Mirrored archive for `{pid}` version `{ver}` (sha256 `{sha256}`).",
-                              ],
+                              ["gh", "release", "download", tag, "-p", "plugin.zip", "-O", str(zip_path)],
                               check=True,
                           )
+                          sha256, size_bytes = sha256_file(zip_path)
+                      else:
+                          sha256, size_bytes = download_zip(desc["source_url"], zip_path)
+                          if desc.get("sha256") and sha256 != desc["sha256"].strip().lower():
+                              raise ValueError(f"{p}: sha256 mismatch (expected {desc['sha256']}, got {sha256})")
+                          inspect_zip_and_manifest(zip_path, pid, ver)
+                          asset_arg = f"{zip_path}#plugin.zip"
+                          view_proc = subprocess.run(["gh", "release", "view", tag], capture_output=True)
+                          if view_proc.returncode == 0:
+                              subprocess.run(["gh", "release", "upload", tag, asset_arg, "--clobber"], check=True)
+                          else:
+                              subprocess.run(
+                                  [
+                                      "gh",
+                                      "release",
+                                      "create",
+                                      tag,
+                                      asset_arg,
+                                      "--title",
+                                      f"{pid} v{ver}",
+                                      "--notes",
+                                      f"Mirrored archive for `{pid}` version `{ver}` (sha256 `{sha256}`).",
+                                  ],
+                                  check=True,
+                              )
 
-                  manifest = inspect_zip_and_manifest(zip_path, pid, ver)
-                  entry = {
-                      "id": manifest["id"],
-                      "name": manifest["name"],
-                      "version": manifest["version"],
-                      "api_version": manifest["api_version"],
-                      "description": manifest.get("description", ""),
-                      "author": manifest.get("author", ""),
-                      "tags": desc.get("tags", []),
-                      "permissions": manifest.get("permissions", []),
-                      "download_url": f"https://github.com/{repo}/releases/download/{tag}/plugin.zip",
-                      "sha256": sha256,
-                      "size_bytes": size_bytes,
-                  }
-                  min_ver = manifest.get("min_fern_version") or desc.get("min_fern_version")
-                  if min_ver:
-                      entry["min_fern_version"] = min_ver
-                  homepage = desc.get("homepage") or manifest.get("homepage")
-                  if homepage:
-                      entry["homepage"] = homepage
-                  registry_entries.append(entry)
+                      manifest = inspect_zip_and_manifest(zip_path, pid, ver)
+                      entry = {
+                          "id": manifest["id"],
+                          "name": manifest["name"],
+                          "version": manifest["version"],
+                          "api_version": manifest["api_version"],
+                          "description": manifest.get("description", ""),
+                          "author": manifest.get("author", ""),
+                          "tags": desc.get("tags", []),
+                          "permissions": manifest.get("permissions", []),
+                          "download_url": f"https://github.com/{repo}/releases/download/{tag}/plugin.zip",
+                          "sha256": sha256,
+                          "size_bytes": size_bytes,
+                      }
+                      min_ver = manifest.get("min_fern_version") or desc.get("min_fern_version")
+                      if min_ver:
+                          entry["min_fern_version"] = min_ver
+                      homepage = desc.get("homepage") or manifest.get("homepage")
+                      if homepage:
+                          entry["homepage"] = homepage
+                      registry_entries.append(entry)
 
           generated_at = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
           index = {
@@ -696,11 +816,10 @@ jobs:
               "generated_at": generated_at,
               "plugins": registry_entries,
           }
+          (site_dir / ".nojekyll").write_text("", encoding="utf-8")
           (site_dir / "registry.json").write_text(json.dumps(index, indent=2) + "\n", encoding="utf-8")
           (site_dir / "index.html").write_text(
-              "<!doctype html><html><head><meta charset='utf-8'><title>Fern Plugin Registry</title></head>"
-              f"<body><h1>Fern Plugin Registry</h1><p>{len(registry_entries)} plugins indexed. "
-              "<a href='./registry.json'>registry.json</a></p></body></html>\n",
+              render_index_html(registry_entries, generated_at, repo),
               encoding="utf-8",
           )
           print(f"Generated registry.json with {len(registry_entries)} plugins at {generated_at}")

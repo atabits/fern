@@ -24,6 +24,29 @@ use crate::sidebar::{self, Section};
 use crate::title_bar::{self, ShowReleaseNotes, TitleBar};
 use crate::todo_view::TodoView;
 
+fn format_sync_error(err: &anyhow::Error, strings: &i18n::Strings) -> String {
+    if let Some(mismatch) = desktop_common::sync::is_incompatible_protocol(err) {
+        return strings
+            .sync_incompatible_protocol
+            .replace("{client}", &mismatch.client.to_string())
+            .replace("{server}", &mismatch.server.to_string());
+    }
+    if let Some(e2ee) = desktop_common::sync::is_e2ee_error(err) {
+        return match e2ee {
+            fern_core::e2ee::E2eeError::PassphraseRequired => {
+                strings.sync_e2ee_passphrase_required.to_owned()
+            }
+            fern_core::e2ee::E2eeError::WrongPassphrase => {
+                strings.sync_e2ee_wrong_passphrase.to_owned()
+            }
+            fern_core::e2ee::E2eeError::Malformed(_) => {
+                desktop_common::diagnostics::redact_sensitive(&format!("{err:#}"))
+            }
+        };
+    }
+    desktop_common::diagnostics::redact_sensitive(&format!("{err:#}"))
+}
+
 fn reorder_enabled_rail(
     original: &[fern_core::RailSection],
     features: fern_core::Features,
@@ -300,6 +323,7 @@ impl AppView {
             minimized_count: 0,
         };
         reminders::start(this.store.clone(), window.window_handle(), cx);
+        cx.set_global(crate::LiveSyncStatus(this.sync.clone()));
         this.start_sync(cx);
         settings_window::apply(&this.store.preferences().unwrap_or_default(), window, cx);
         // "Follow System Dark Mode" tracks the system's appearance while the app runs.
@@ -600,6 +624,9 @@ impl AppView {
         self.features = prefs.features;
         self.rail_order = prefs.rail_order;
         self.has_sync_config = self.store.sync_config().ok().flatten().is_some();
+        if !self.has_sync_config && self.sync != crate::sync::SyncStatus::Off {
+            self.set_sync_status(crate::sync::SyncStatus::Off, cx);
+        }
         if !self.section.enabled(self.features) {
             self.select(Section::Tasks, window, cx);
         }
@@ -854,26 +881,22 @@ impl AppView {
         let config = match self.store.sync_config() {
             Ok(Some(config)) => config,
             Ok(None) => {
-                self.sync = crate::sync::SyncStatus::Off;
-                cx.notify();
+                self.set_sync_status(crate::sync::SyncStatus::Off, cx);
                 return;
             }
             Err(err) => {
-                self.sync = crate::sync::SyncStatus::Failed(format!("{err:#}"));
-                cx.notify();
+                self.complete_sync(Err(err), cx);
                 return;
             }
         };
         let request = match self.store.sync_request() {
             Ok(request) => request,
             Err(err) => {
-                self.sync = crate::sync::SyncStatus::Failed(format!("{err:#}"));
-                cx.notify();
+                self.complete_sync(Err(err), cx);
                 return;
             }
         };
-        self.sync = crate::sync::SyncStatus::Running;
-        cx.notify();
+        self.set_sync_status(crate::sync::SyncStatus::Running, cx);
         let body = request.body.clone();
         let sent_config = config.clone();
         let answer = cx.background_spawn(async move { crate::sync::post(&sent_config, &body) });
@@ -881,13 +904,18 @@ impl AppView {
             let answer = answer.await;
             this.update(cx, |this, cx| {
                 if this.store.sync_config().ok().flatten().as_ref() != Some(&config) {
-                    this.sync = crate::sync::SyncStatus::Off;
-                    cx.notify();
+                    this.set_sync_status(crate::sync::SyncStatus::Off, cx);
                     return;
                 }
-                match answer.and_then(|answer| this.store.finish_sync(&request, &answer)) {
-                    Ok(received) => {
-                        if received > 0 {
+                match answer.and_then(|answer| this.store.finish_sync_detailed(&request, &answer)) {
+                    Ok(outcome) => {
+                        if outcome.conflicts_preserved > 0 {
+                            desktop_common::diagnostics::log_event(
+                                "sync",
+                                format!("preserved {} offline note conflict(s)", outcome.conflicts_preserved),
+                            );
+                        }
+                        if outcome.applied > 0 {
                             this.reload_all(cx);
                         }
                         this.sync_files(config, cx);
@@ -954,8 +982,7 @@ impl AppView {
                     this.reload_all(cx);
                 }
                 if this.store.sync_config().ok().flatten().as_ref() != Some(&config) {
-                    this.sync = crate::sync::SyncStatus::Off;
-                    cx.notify();
+                    this.set_sync_status(crate::sync::SyncStatus::Off, cx);
                     return;
                 }
                 let result = this.store.mark_files_synced(&outcome.synced).and_then(|()| {
@@ -969,9 +996,16 @@ impl AppView {
                             .and_then(|_| name.get(36..))
                             .and_then(|suffix| suffix.strip_prefix('-'))
                             .unwrap_or(name);
+                        let detail = if desktop_common::sync::is_incompatible_protocol(error).is_some()
+                            || desktop_common::sync::is_e2ee_error(error).is_some()
+                        {
+                            format_sync_error(error, strings)
+                        } else {
+                            desktop_common::diagnostics::redact_sensitive(&crate::sync::attachment_error(error, strings))
+                        };
                         strings.sync_file_failed
                             .replace("{file}", display_name)
-                            .replace("{error}", &crate::sync::attachment_error(error, strings))
+                            .replace("{error}", &detail)
                     }).collect::<Vec<_>>().join("\n");
                     Err(anyhow::anyhow!(errors))
                 });
@@ -982,12 +1016,21 @@ impl AppView {
         .detach();
     }
 
-    fn complete_sync(&mut self, result: anyhow::Result<()>, cx: &mut Context<Self>) {
-        self.sync = match result {
-            Ok(()) => crate::sync::SyncStatus::Done(chrono::Local::now().naive_local()),
-            Err(err) => crate::sync::SyncStatus::Failed(format!("{err:#}")),
-        };
+    fn set_sync_status(&mut self, status: crate::sync::SyncStatus, cx: &mut Context<Self>) {
+        self.sync = status.clone();
+        cx.set_global(crate::LiveSyncStatus(status));
         cx.notify();
+    }
+
+    fn complete_sync(&mut self, result: anyhow::Result<()>, cx: &mut Context<Self>) {
+        let status = match result {
+            Ok(()) => crate::sync::SyncStatus::Done(chrono::Local::now().naive_local()),
+            Err(err) => {
+                desktop_common::diagnostics::log_event("sync", format!("sync failed: {err:#}"));
+                crate::sync::SyncStatus::Failed(format_sync_error(&err, i18n::t(cx)))
+            }
+        };
+        self.set_sync_status(status, cx);
     }
 
     /// Re-reads every view, after changes came from another device.
@@ -2083,6 +2126,62 @@ mod tests {
             assert!(running);
             assert!(!paused);
             assert!(clock.starts_with("00:"), "expected stopwatch starting at 00:.., got {clock}");
+        });
+    }
+
+    #[test]
+    fn format_sync_error_localizes_protocol_and_e2ee_and_redacts_secrets() {
+        let mismatch = anyhow::Error::new(fern_core::sync::IncompatibleProtocol {
+            client: 2,
+            server: 5,
+            min_server: 3,
+        });
+        for locale in [i18n::Locale::En, i18n::Locale::Ru, i18n::Locale::ZhCn] {
+            let strings = locale.strings();
+            let msg = format_sync_error(&mismatch, strings);
+            assert!(msg.contains("v2") && msg.contains("v5"), "{locale:?}: {msg}");
+            assert!(!msg.contains("{client}") && !msg.contains("{server}"));
+
+            let req = anyhow::Error::new(fern_core::e2ee::E2eeError::PassphraseRequired);
+            assert_eq!(format_sync_error(&req, strings), strings.sync_e2ee_passphrase_required);
+
+            let wrong = anyhow::Error::new(fern_core::e2ee::E2eeError::WrongPassphrase);
+            assert_eq!(format_sync_error(&wrong, strings), strings.sync_e2ee_wrong_passphrase);
+        }
+
+        let leaky = anyhow::anyhow!(
+            "POST https://private.example.org:8443/sync failed: Bearer tok_secret_99 passphrase=my-pass"
+        );
+        let redacted = format_sync_error(&leaky, &i18n::EN);
+        assert!(redacted.contains("https://<redacted-host>"), "{redacted}");
+        assert!(!redacted.contains("private.example.org"), "{redacted}");
+        assert!(!redacted.contains("tok_secret_99"), "{redacted}");
+        assert!(!redacted.contains("my-pass"), "{redacted}");
+    }
+
+    #[gpui::test]
+    fn complete_sync_updates_live_sync_status_global_with_localized_error(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            theme::init(cx);
+            cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+        });
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let (app, cx) = cx.add_window_view(|window, cx| AppView::new(store, false, window, cx));
+
+        cx.update(|_, cx| {
+            app.update(cx, |app, cx| {
+                app.complete_sync(
+                    Err(anyhow::Error::new(fern_core::e2ee::E2eeError::WrongPassphrase)),
+                    cx,
+                );
+            });
+        });
+        cx.update(|_, cx| {
+            let live = &cx.global::<crate::LiveSyncStatus>().0;
+            assert_eq!(
+                live,
+                &crate::sync::SyncStatus::Failed(i18n::EN.sync_e2ee_wrong_passphrase.to_owned())
+            );
         });
     }
 }

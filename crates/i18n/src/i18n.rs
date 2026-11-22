@@ -699,10 +699,17 @@ pub struct Strings {
     pub feature_items: [(&'static str, &'static str); 5],
     pub sync_server: &'static str,
     pub sync_token: &'static str,
+    pub sync_passphrase: &'static str,
+    pub sync_passphrase_placeholder: &'static str,
+    pub sync_passphrase_hint: &'static str,
     pub sync_hint: &'static str,
     pub sync_never: &'static str,
     pub sync_done: &'static str,
     pub sync_failed: &'static str,
+    /// Protocol version mismatch; `{client}` and `{server}` are replaced.
+    pub sync_incompatible_protocol: &'static str,
+    pub sync_e2ee_passphrase_required: &'static str,
+    pub sync_e2ee_wrong_passphrase: &'static str,
     pub sync_off: &'static str,
     /// Settings → Sync: the local data folder above the optional server.
     pub data_and_sync: &'static str,
@@ -927,6 +934,23 @@ pub struct Strings {
     pub generate_backup: &'static str,
     pub import_backups: &'static str,
     pub restore_on_restart: &'static str,
+    pub auto_backups: &'static str,
+    pub auto_backups_empty: &'static str,
+    pub restore_action: &'static str,
+    pub restore_backup_confirm_title: &'static str,
+    /// `{file}` is replaced by the backup filename.
+    pub restore_backup_confirm_body: &'static str,
+    pub diagnostics: &'static str,
+    pub db_integrity: &'static str,
+    pub db_integrity_ok: &'static str,
+    pub db_integrity_issue: &'static str,
+    /// `{file}` is replaced by the preserved corrupt database filename.
+    pub db_corrupt_recovered: &'static str,
+    pub save_diagnostic_log: &'static str,
+    /// `{path}` is replaced by the saved file path.
+    pub diagnostic_log_saved: &'static str,
+    /// `{error}` is replaced by the redacted error message.
+    pub diagnostic_log_failed: &'static str,
     /// After importing a TickTick backup; `{tasks}` and `{lists}` are counts.
     pub imported_from_ticktick: &'static str,
     pub version: &'static str,
@@ -1773,10 +1797,16 @@ pub static EN: Strings = Strings {
     ],
     sync_server: "Server",
     sync_token: "Token",
+    sync_passphrase: "Passphrase",
+    sync_passphrase_placeholder: "Optional — encrypts synced data",
+    sync_passphrase_hint: "Optional end-to-end encryption. Enter the same passphrase on every device; tasks, notes, and attachments are encrypted before leaving this device. Changing it triggers a full re-sync.",
     sync_hint: "To use Fern on several devices, run your own fern-server and enter its address and token on each of them. Changes are sent as you make them, and other devices' changes arrive every few minutes. Leave the fields empty to keep Fern on this device only.",
     sync_never: "Not synced yet",
     sync_done: "Synced at {time}",
     sync_failed: "Sync failed: {error}",
+    sync_incompatible_protocol: "Sync protocol mismatch (app v{client}, server v{server}). Update Fern or fern-server.",
+    sync_e2ee_passphrase_required: "Synced data is encrypted. Enter your passphrase in Settings → Data & Sync.",
+    sync_e2ee_wrong_passphrase: "Could not decrypt synced data. Check your passphrase in Settings → Data & Sync.",
     sync_off: "Sync is off: set a server in Settings → Data & Sync",
     data_and_sync: "Data & Sync",
     integrations: "Integrations",
@@ -1977,6 +2007,19 @@ pub static EN: Strings = Strings {
     generate_backup: "Generate Backup",
     import_backups: "Import Backups",
     restore_on_restart: "The backup will replace all data the next time Fern starts.",
+    auto_backups: "Automatic Backups",
+    auto_backups_empty: "No automatic backups yet.",
+    restore_action: "Restore",
+    restore_backup_confirm_title: "Restore backup?",
+    restore_backup_confirm_body: "“{file}” will replace all current data the next time Fern starts.",
+    diagnostics: "Diagnostics",
+    db_integrity: "Database Integrity",
+    db_integrity_ok: "Healthy",
+    db_integrity_issue: "Issue detected",
+    db_corrupt_recovered: "Corrupt database preserved as {file}",
+    save_diagnostic_log: "Save Diagnostic Log",
+    diagnostic_log_saved: "Diagnostic log saved to {path}",
+    diagnostic_log_failed: "Could not save diagnostic log: {error}",
     imported_from_ticktick: "Imported from TickTick: tasks: {tasks}, new lists: {lists}.",
     version: "Version",
     license: "License",
@@ -2815,10 +2858,16 @@ pub static ZH_CN: Strings = Strings {
     ],
     sync_server: "服务端地址",
     sync_token: "令牌 Token",
+    sync_passphrase: "加密口令",
+    sync_passphrase_placeholder: "可选 — 端到端加密同步数据",
+    sync_passphrase_hint: "可选端到端加密。请在每台设备输入相同口令，任务、笔记与附件将在离开本机前加密。更改口令将触发全量重新同步。",
     sync_hint: "多设备使用 Fern，需要自行部署 fern‑server，在每台设备填入服务地址与令牌。修改会实时推送，其他设备每隔几分钟拉取更新。留空代表仅本地使用。",
     sync_never: "尚未同步",
     sync_done: "已于 {time} 完成同步",
     sync_failed: "同步失败：{error}",
+    sync_incompatible_protocol: "同步协议版本不兼容（客户端 v{client}，服务端 v{server}）。请更新 Fern 或 fern-server。",
+    sync_e2ee_passphrase_required: "同步数据已加密，请在「设置 → 数据与同步」中输入加密口令。",
+    sync_e2ee_wrong_passphrase: "无法解密同步数据，请在「设置 → 数据与同步」中检查加密口令。",
     sync_off: "同步已关闭：前往设置 → 数据与同步配置服务端",
     data_and_sync: "数据与同步",
     integrations: "外部集成",
@@ -3016,6 +3065,19 @@ pub static ZH_CN: Strings = Strings {
     generate_backup: "生成备份",
     import_backups: "导入备份",
     restore_on_restart: "重启 Fern 后备份将覆盖全部现有数据。",
+    auto_backups: "自动备份",
+    auto_backups_empty: "暂无自动备份。",
+    restore_action: "恢复",
+    restore_backup_confirm_title: "恢复备份？",
+    restore_backup_confirm_body: "下次启动 Fern 时，「{file}」将替换当前全部数据。",
+    diagnostics: "诊断信息",
+    db_integrity: "数据库完整性",
+    db_integrity_ok: "正常",
+    db_integrity_issue: "检测到异常",
+    db_corrupt_recovered: "损坏的数据库已保留为 {file}",
+    save_diagnostic_log: "保存诊断日志",
+    diagnostic_log_saved: "诊断日志已保存至 {path}",
+    diagnostic_log_failed: "无法保存诊断日志：{error}",
     imported_from_ticktick: "从滴答清单导入：任务 {tasks} 个，新建清单 {lists} 个。",
     version: "版本",
     license: "许可证",
@@ -3860,10 +3922,16 @@ pub static RU: Strings = Strings {
     ],
     sync_server: "Сервер",
     sync_token: "Токен",
+    sync_passphrase: "Кодовая фраза",
+    sync_passphrase_placeholder: "Необязательно — шифрует данные",
+    sync_passphrase_hint: "Необязательное сквозное шифрование. Введите одну и ту же фразу на всех устройствах: задачи, заметки и вложения шифруются перед отправкой. Изменение фразы запустит полную повторную синхронизацию.",
     sync_hint: "Чтобы пользоваться Fern на нескольких устройствах, запустите свой fern-server и укажите его адрес и токен на каждом из них. Изменения отправляются сразу, а изменения с других устройств приходят каждые несколько минут. Оставьте поля пустыми, чтобы Fern работал только на этом устройстве.",
     sync_never: "Ещё не синхронизировано",
     sync_done: "Синхронизировано в {time}",
     sync_failed: "Ошибка синхронизации: {error}",
+    sync_incompatible_protocol: "Несовместимая версия протокола синхронизации (клиент v{client}, сервер v{server}). Обновите Fern или fern-server.",
+    sync_e2ee_passphrase_required: "Данные синхронизации зашифрованы. Введите кодовую фразу в Настройки → Данные и синхронизация.",
+    sync_e2ee_wrong_passphrase: "Не удалось расшифровать данные синхронизации. Проверьте кодовую фразу в Настройки → Данные и синхронизация.",
     sync_off: "Синхронизация выключена: укажите сервер в Настройки → Данные и синхронизация",
     data_and_sync: "Данные и синхронизация",
     integrations: "Интеграции",
@@ -4066,6 +4134,19 @@ pub static RU: Strings = Strings {
     generate_backup: "Создать копию",
     import_backups: "Восстановить из копии",
     restore_on_restart: "Копия заменит все данные при следующем запуске Fern.",
+    auto_backups: "Автоматические копии",
+    auto_backups_empty: "Автоматических копий пока нет.",
+    restore_action: "Восстановить",
+    restore_backup_confirm_title: "Восстановить из копии?",
+    restore_backup_confirm_body: "Копия «{file}» заменит все текущие данные при следующем запуске Fern.",
+    diagnostics: "Диагностика",
+    db_integrity: "Целостность базы данных",
+    db_integrity_ok: "В порядке",
+    db_integrity_issue: "Обнаружены проблемы",
+    db_corrupt_recovered: "Повреждённая база сохранена как {file}",
+    save_diagnostic_log: "Сохранить журнал диагностики",
+    diagnostic_log_saved: "Журнал диагностики сохранён в {path}",
+    diagnostic_log_failed: "Не удалось сохранить журнал диагностики: {error}",
     imported_from_ticktick: "Импортировано из TickTick: задач — {tasks}, новых списков — {lists}.",
     version: "Версия",
     license: "Лицензия",
@@ -4326,5 +4407,18 @@ mod tests {
         assert_eq!(friday.due_date, chrono::NaiveDate::from_ymd_opt(2026, 11, 13));
         assert_eq!(friday.tags, ["居家"]);
         assert_eq!(friday.priority, Some(fern_core::Priority::High));
+    }
+
+    #[test]
+    fn recovery_sync_and_diagnostic_placeholders_exist_in_all_locales() {
+        for locale in [Locale::En, Locale::Ru, Locale::ZhCn] {
+            let s = locale.strings();
+            assert!(s.sync_incompatible_protocol.contains("{client}"), "{locale:?}");
+            assert!(s.sync_incompatible_protocol.contains("{server}"), "{locale:?}");
+            assert!(s.restore_backup_confirm_body.contains("{file}"), "{locale:?}");
+            assert!(s.db_corrupt_recovered.contains("{file}"), "{locale:?}");
+            assert!(s.diagnostic_log_saved.contains("{path}"), "{locale:?}");
+            assert!(s.diagnostic_log_failed.contains("{error}"), "{locale:?}");
+        }
     }
 }

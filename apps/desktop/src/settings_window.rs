@@ -97,6 +97,19 @@ pub struct SettingsWindow {
     should_move: bool,
     /// The outcome of the last backup or import.
     backup_message: Option<String>,
+    /// Automatic daily backups discovered off the UI thread (cached so `render()` never does fs I/O).
+    auto_backups: Vec<fern_core::store::BackupEntry>,
+    auto_backups_task: Option<gpui::Task<()>>,
+    /// Cached `PRAGMA user_version` for the Database Integrity status row.
+    schema_version: usize,
+    /// Backup waiting for confirmation before staging `restore.db` for the next launch.
+    pending_restore: Option<std::path::PathBuf>,
+    /// Outcome of the last "Save Diagnostic Log" action (`(message, is_error)`).
+    diagnostic_message: Option<(String, bool)>,
+    #[cfg(test)]
+    backups_dir_override: Option<std::path::PathBuf>,
+    #[cfg(test)]
+    restore_target_override: Option<std::path::PathBuf>,
     /// Error saving Sticky Note preferences (kept separate from backup/import messages).
     sticky_error: Option<String>,
     /// Cached lookups so `render()` never runs synchronous SQLite queries per frame.
@@ -107,9 +120,11 @@ pub struct SettingsWindow {
     always_on_top: bool,
     installed_notes: Option<Rc<ReleaseNotes>>,
     release_notes: Option<Rc<ReleaseNotes>>,
-    /// Settings → Sync: the server's address and the token, debounced on edit and flushed on submit/close.
+    /// Settings → Sync: server address, token, and optional E2EE passphrase,
+    /// debounced on edit and flushed on submit/close.
     sync_server: Entity<crate::text_input::TextInput>,
     sync_token: Entity<crate::text_input::TextInput>,
+    sync_passphrase: Entity<crate::text_input::TextInput>,
     sync_save_task: Option<gpui::Task<()>>,
     sync_dirty: bool,
     /// Integrations: the subscription being added (`Some(None)`) or changed, its color, and its
@@ -204,6 +219,7 @@ impl SettingsWindow {
         let config = store.sync_config().ok().flatten().unwrap_or_default();
         let cached_tags = store.tags().unwrap_or_default();
         let cached_lists = store.lists().unwrap_or_default();
+        let schema_version = store.schema_version().unwrap_or(fern_core::SCHEMA_VERSION);
         let sound_enabled = desktop_common::sound::enabled(&store);
         let tray_prefs = crate::tray::TrayPrefs::current(&store, cx);
         let field = |placeholder: &'static str, text: String, masked: bool, cx: &mut Context<Self>| {
@@ -227,6 +243,7 @@ impl SettingsWindow {
         };
         let sync_server = field("https://fern.example.org", config.server, false, cx);
         let sync_token = field("", config.token, true, cx);
+        let sync_passphrase = field(i18n::t(cx).sync_passphrase_placeholder, config.passphrase, true, cx);
         let updates = crate::updater::updater(cx).map(|updater| cx.observe(&updater, |_, _, cx| cx.notify()));
         let feeds = crate::subscriptions::feeds(cx).map(|feeds| cx.observe(&feeds, |_, _, cx| cx.notify()));
         cx.observe_global::<desktop_common::data_version::DataVersion>(|this, cx| {
@@ -260,7 +277,7 @@ impl SettingsWindow {
         })
         .detach();
         let installed_notes = release_notes::installed(&store).map(Rc::new);
-        Self {
+        let mut this = Self {
             store,
             preferences,
             page: Page::default(),
@@ -270,6 +287,15 @@ impl SettingsWindow {
             closing: false,
             should_move: false,
             backup_message: None,
+            auto_backups: Vec::new(),
+            auto_backups_task: None,
+            schema_version,
+            pending_restore: None,
+            diagnostic_message: None,
+            #[cfg(test)]
+            backups_dir_override: None,
+            #[cfg(test)]
+            restore_target_override: None,
             sticky_error: None,
             cached_tags,
             cached_lists,
@@ -280,6 +306,7 @@ impl SettingsWindow {
             release_notes: None,
             sync_server,
             sync_token,
+            sync_passphrase,
             sync_save_task: None,
             sync_dirty: false,
             subscription_form: None,
@@ -298,7 +325,9 @@ impl SettingsWindow {
             confirm_reset_shortcuts: false,
             _updates: updates,
             _feeds: feeds,
-        }
+        };
+        this.refresh_auto_backups(cx);
+        this
     }
 
     fn refresh_cached_collections(&mut self, cx: &mut Context<Self>) {
@@ -320,8 +349,12 @@ impl SettingsWindow {
             .ok();
             true
         });
-        cx.observe_global_in::<CurrentLocale>(window, |_, window, cx| {
-            window.set_window_title(i18n::t(cx).settings);
+        cx.observe_global_in::<CurrentLocale>(window, |this, window, cx| {
+            let strings = i18n::t(cx);
+            window.set_window_title(strings.settings);
+            this.sync_passphrase.update(cx, |input, cx| {
+                input.set_placeholder(strings.sync_passphrase_placeholder, cx);
+            });
         })
         .detach();
     }
@@ -353,7 +386,7 @@ impl SettingsWindow {
         let config = fern_core::sync::SyncConfig {
             server: self.sync_server.read(cx).text().to_owned(),
             token: self.sync_token.read(cx).text().to_owned(),
-            ..Default::default()
+            passphrase: self.sync_passphrase.read(cx).text().to_owned(),
         };
         match self.store.set_sync_config(&config) {
             Ok(()) => cx.emit(SettingsEvent::Changed),
@@ -363,15 +396,22 @@ impl SettingsWindow {
 
     pub fn set_page(&mut self, page: Page, cx: &mut Context<Self>) {
         let changed = self.page != page;
+        if changed && self.page == Page::Sync {
+            self.flush_sync_save(cx);
+        }
         if changed {
             self.page_scroll.set_offset(point(px(0.), px(0.)));
         }
         self.page = page;
         self.menu = None;
         self.release_notes = None;
+        self.pending_restore = None;
         self.recording_shortcut = None;
         self.recording_rejected = false;
         self.confirm_reset_shortcuts = false;
+        if page == Page::About {
+            self.refresh_auto_backups(cx);
+        }
         #[cfg(not(test))]
         if changed && page == Page::Shortcuts {
             self.reload_keymap(cx);
@@ -396,7 +436,9 @@ impl SettingsWindow {
     }
 
     pub fn dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.confirm_reset_shortcuts {
+        if self.pending_restore.take().is_some() {
+            cx.notify();
+        } else if self.confirm_reset_shortcuts {
             self.confirm_reset_shortcuts = false;
             cx.notify();
         } else if self.recording_shortcut.take().is_some() {
@@ -476,6 +518,7 @@ impl SettingsWindow {
                     let name = format!("fern-backup-{}.db", chrono::Local::now().format("%Y-%m-%d"));
                     crate::export::save_as(name, bytes, cx, |this, result, cx| {
                         this.backup_message = crate::export::outcome(result, i18n::t(cx));
+                        this.refresh_auto_backups(cx);
                         cx.notify();
                     });
                 }
@@ -543,24 +586,409 @@ impl SettingsWindow {
                 .ok();
                 return;
             }
-            let outcome = cx
-                .background_spawn(async move {
-                    fern_core::Store::check_backup(&path)
-                        .and_then(|()| Ok(std::fs::copy(&path, crate::pending_restore_path()?)?))
-                        .map(|_| ())
-                })
-                .await;
+            this.update(cx, |this, cx| {
+                this.pending_restore = Some(path);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn refresh_auto_backups(&mut self, cx: &mut Context<Self>) {
+        #[cfg(test)]
+        let dir = self.backups_dir_override.clone();
+        #[cfg(not(test))]
+        let dir = crate::backups_dir().ok();
+        let Some(dir) = dir else {
+            self.auto_backups.clear();
+            cx.notify();
+            return;
+        };
+        let task = cx.background_spawn(async move { fern_core::store::list_backups(&dir) });
+        self.auto_backups_task = Some(cx.spawn(async move |this, cx| {
+            let backups = task.await;
+            this.update(cx, |this, cx| {
+                this.auto_backups = backups;
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    fn confirm_restore(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.pending_restore.take() else {
+            return;
+        };
+        cx.notify();
+        self.stage_restore(path, cx);
+    }
+
+    fn stage_restore(&mut self, path: std::path::PathBuf, cx: &mut Context<Self>) {
+        #[cfg(test)]
+        let target_override = self.restore_target_override.clone();
+        let outcome = cx.background_spawn(async move {
+            fern_core::Store::check_backup(&path)?;
+            #[cfg(test)]
+            let target = match target_override {
+                Some(target) => target,
+                None => crate::pending_restore_path()?,
+            };
+            #[cfg(not(test))]
+            let target = crate::pending_restore_path()?;
+            std::fs::copy(&path, &target)?;
+            Ok::<(), anyhow::Error>(())
+        });
+        cx.spawn(async move |this, cx| {
+            let outcome = outcome.await;
             this.update(cx, |this, cx| {
                 let strings = i18n::t(cx);
                 this.backup_message = Some(match outcome {
-                    Ok(()) => strings.restore_on_restart.to_owned(),
-                    Err(err) => format!("{err}"),
+                    Ok(()) => {
+                        desktop_common::diagnostics::log_event(
+                            "db",
+                            "staged backup restore for next launch",
+                        );
+                        strings.restore_on_restart.to_owned()
+                    }
+                    Err(err) => {
+                        desktop_common::diagnostics::log_event(
+                            "db",
+                            format!("failed to stage backup restore: {err:#}"),
+                        );
+                        format!("{err}")
+                    }
                 });
                 cx.notify();
             })
             .ok();
         })
         .detach();
+    }
+
+    fn save_diagnostic_log(&mut self, cx: &mut Context<Self>) {
+        let default_dir = crate::export::default_dir();
+        let filename = format!(
+            "fern-diagnostics-{}.txt",
+            chrono::Local::now().format("%Y-%m-%d")
+        );
+        let chosen = cx.prompt_for_new_path(&default_dir, Some(&filename));
+        let db_path = cx.try_global::<crate::DbPath>().map(|p| p.0.clone());
+        #[cfg(test)]
+        let backups_dir = self.backups_dir_override.clone();
+        #[cfg(not(test))]
+        let backups_dir = crate::backups_dir().ok();
+        let db_health = cx.try_global::<desktop_common::diagnostics::DbHealth>().cloned();
+        let sync_status = cx
+            .try_global::<crate::LiveSyncStatus>()
+            .map(|s| s.0.clone())
+            .unwrap_or_default();
+        let locale_code = i18n::locale(cx).code().to_owned();
+
+        cx.spawn(async move |this, cx| {
+            let Some(path) = chosen.await.ok().and_then(Result::ok).flatten() else {
+                return;
+            };
+            let result: anyhow::Result<std::path::PathBuf> = if let Some(db_path) = db_path {
+                cx.background_spawn(async move {
+                    let bg_store = Store::open(&db_path)?;
+                    let input = desktop_common::diagnostics::DiagnosticInput {
+                        app_version: release_notes::CURRENT_VERSION,
+                        locale: &locale_code,
+                        db_path: Some(&db_path),
+                        backups_dir: backups_dir.as_deref(),
+                        sync_status: &sync_status,
+                        db_health: db_health.as_ref(),
+                    };
+                    let report =
+                        desktop_common::diagnostics::build_diagnostic_report(&bg_store, &input);
+                    std::fs::write(&path, report.as_bytes())?;
+                    Ok(path)
+                })
+                .await
+            } else {
+                let report = match this.update(cx, |this, _| {
+                    let input = desktop_common::diagnostics::DiagnosticInput {
+                        app_version: release_notes::CURRENT_VERSION,
+                        locale: &locale_code,
+                        db_path: None,
+                        backups_dir: backups_dir.as_deref(),
+                        sync_status: &sync_status,
+                        db_health: db_health.as_ref(),
+                    };
+                    desktop_common::diagnostics::build_diagnostic_report(&this.store, &input)
+                }) {
+                    Ok(report) => report,
+                    Err(_) => return,
+                };
+                cx.background_spawn(async move {
+                    std::fs::write(&path, report.as_bytes())?;
+                    Ok(path)
+                })
+                .await
+            };
+            this.update(cx, |this, cx| {
+                let strings = i18n::t(cx);
+                match result {
+                    Ok(saved_path) => {
+                        this.diagnostic_message = Some((
+                            strings
+                                .diagnostic_log_saved
+                                .replace("{path}", &saved_path.display().to_string()),
+                            false,
+                        ));
+                    }
+                    Err(err) => {
+                        desktop_common::diagnostics::log_event(
+                            "diagnostics",
+                            format!("failed to save diagnostic log: {err:#}"),
+                        );
+                        let redacted =
+                            desktop_common::diagnostics::redact_sensitive(&format!("{err:#}"));
+                        this.diagnostic_message = Some((
+                            strings.diagnostic_log_failed.replace("{error}", &redacted),
+                            true,
+                        ));
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn render_restore_backup_confirm(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let path = self.pending_restore.as_ref()?;
+        let strings = i18n::t(cx);
+        let filename = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("backup.db");
+        let description = strings.restore_backup_confirm_body.replace("{file}", filename);
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .debug_selector(|| "confirm-restore-backup".to_owned())
+                .child(
+                    ConfirmDialog::new(
+                        "confirm-restore-backup",
+                        strings.restore_backup_confirm_title,
+                    )
+                    .description(description)
+                    .cancel_label(strings.cancel)
+                    .confirm_label(strings.restore_action)
+                    .destructive(true)
+                    .on_cancel(cx.listener(|this, _, _, cx| {
+                        this.pending_restore = None;
+                        cx.notify();
+                    }))
+                    .on_confirm(cx.listener(|this, _, _, cx| {
+                        this.confirm_restore(cx);
+                    })),
+                )
+                .into_any_element(),
+        )
+    }
+
+    fn render_auto_backups(&self, cx: &mut Context<Self>) -> AnyElement {
+        let strings = i18n::t(cx);
+        let colors = cx.theme().colors().clone();
+        let group = v_flex().py_1p5().rounded(px(8.)).bg(colors.surface_background);
+        let content = if self.auto_backups.is_empty() {
+            group.child(
+                h_flex()
+                    .debug_selector(|| "settings-auto-backups-empty".to_owned())
+                    .h(px(ROW_HEIGHT))
+                    .px_4()
+                    .child(
+                        Label::new(strings.auto_backups_empty)
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    ),
+            )
+        } else {
+            group.children(self.auto_backups.iter().enumerate().map(|(idx, entry)| {
+                let primary = entry
+                    .date
+                    .map(|date| calendar::format_date(date, strings))
+                    .unwrap_or_else(|| entry.filename.clone());
+                let size_label = format_bytes(entry.size_bytes);
+                let filename = entry.filename.clone();
+                let path = entry.path.clone();
+                h_flex()
+                    .id(SharedString::from(format!("auto-backup-{idx}")))
+                    .debug_selector(move || format!("auto-backup-{idx}"))
+                    .h(px(ROW_HEIGHT))
+                    .px_4()
+                    .gap_3()
+                    .child(
+                        h_flex()
+                            .id(SharedString::from(format!("auto-backup-info-{idx}")))
+                            .flex_1()
+                            .min_w_0()
+                            .gap_2()
+                            .tooltip(Tooltip::text(filename))
+                            .child(Label::new(primary).truncate())
+                            .child(
+                                Label::new(size_label)
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("auto-backup-restore-{idx}")))
+                            .debug_selector(move || format!("auto-backup-restore-{idx}"))
+                            .px_2()
+                            .py_1()
+                            .rounded(px(4.))
+                            .hover(|s| s.bg(colors.element_hover))
+                            .cursor_pointer()
+                            .child(Label::new(strings.restore_action).color(Color::Accent))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.pending_restore = Some(path.clone());
+                                cx.notify();
+                            })),
+                    )
+            }))
+        };
+        v_flex()
+            .debug_selector(|| "settings-auto-backups".to_owned())
+            .child(div().pb_3().child(Label::new(strings.auto_backups).weight(FontWeight::MEDIUM)))
+            .child(content)
+            .into_any_element()
+    }
+
+    fn render_db_integrity_row(&self, cx: &Context<Self>) -> AnyElement {
+        let strings = i18n::t(cx);
+        let warning = cx.theme().status().warning;
+        let db_health = cx.try_global::<desktop_common::diagnostics::DbHealth>();
+        let healthy = db_health.is_none_or(|health| health.healthy);
+        let status_text = if healthy {
+            format!("{} (v{})", strings.db_integrity_ok, self.schema_version)
+        } else {
+            format!("{} (v{})", strings.db_integrity_issue, self.schema_version)
+        };
+        let detail = db_health.filter(|health| !health.healthy).and_then(|health| {
+            if let Some(backup) = &health.recovered_corrupt_backup {
+                let file = backup
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("tasks.db.corrupt");
+                Some(strings.db_corrupt_recovered.replace("{file}", file))
+            } else if !health.messages.is_empty() {
+                Some(
+                    health
+                        .messages
+                        .iter()
+                        .map(|m| desktop_common::diagnostics::redact_sensitive(m))
+                        .collect::<Vec<_>>()
+                        .join("; "),
+                )
+            } else {
+                None
+            }
+        });
+        v_flex()
+            .debug_selector(|| "settings-db-integrity".to_owned())
+            .when(healthy, |el| el.px_4().py_2())
+            .when(!healthy, |el| {
+                el.mx_2()
+                    .my_1()
+                    .px_2p5()
+                    .py_2()
+                    .rounded(px(6.))
+                    .bg(warning.opacity(0.10))
+                    .border_1()
+                    .border_color(warning.opacity(0.35))
+            })
+            .gap_1()
+            .child(
+                h_flex()
+                    .min_h(px(24.))
+                    .gap_3()
+                    .child(div().flex_1().min_w_0().child(Label::new(strings.db_integrity).truncate()))
+                    .child(
+                        h_flex()
+                            .flex_none()
+                            .gap_1p5()
+                            .items_center()
+                            .child(
+                                Icon::new(if healthy {
+                                    IconName::CircleCheck
+                                } else {
+                                    IconName::CircleAlert
+                                })
+                                .size(IconSize::Small)
+                                .color(if healthy { Color::Success } else { Color::Warning }),
+                            )
+                            .child(
+                                Label::new(status_text)
+                                    .size(LabelSize::Small)
+                                    .color(if healthy { Color::Muted } else { Color::Warning }),
+                            ),
+                    ),
+            )
+            .when_some(detail, |el, detail| {
+                el.child(
+                    div()
+                        .debug_selector(|| "settings-db-integrity-detail".to_owned())
+                        .text_size(px(11.))
+                        .text_color(warning)
+                        .child(detail),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn render_diagnostics(&self, cx: &mut Context<Self>) -> AnyElement {
+        let strings = i18n::t(cx);
+        let theme = cx.theme().clone();
+        let colors = theme.colors().clone();
+        v_flex()
+            .child(div().pb_3().child(Label::new(strings.diagnostics).weight(FontWeight::MEDIUM)))
+            .child(
+                v_flex()
+                    .py_1p5()
+                    .rounded(px(8.))
+                    .bg(colors.surface_background)
+                    .child(self.render_db_integrity_row(cx))
+                    .child(
+                        h_flex()
+                            .min_h(px(ROW_HEIGHT))
+                            .px_4()
+                            .py_1p5()
+                            .child(
+                                action_button("save-diagnostic-log", cx)
+                                    .debug_selector(|| "save-diagnostic-log".to_owned())
+                                    .border_color(colors.border)
+                                    .child(
+                                        Icon::new(IconName::FileText)
+                                            .size(IconSize::Small)
+                                            .color(Color::Muted),
+                                    )
+                                    .child(
+                                        Label::new(strings.save_diagnostic_log)
+                                            .size(LabelSize::Small)
+                                            .weight(FontWeight::MEDIUM),
+                                    )
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.save_diagnostic_log(cx);
+                                    })),
+                            ),
+                    ),
+            )
+            .children(self.diagnostic_message.as_ref().map(|(message, is_error)| {
+                div()
+                    .pt_1p5()
+                    .px_1()
+                    .text_size(px(11.))
+                    .text_color(if *is_error { theme.status().error } else { colors.text_muted })
+                    .child(message.clone())
+            }))
+            .into_any_element()
     }
 
     fn set_locale(&mut self, locale: Locale, cx: &mut Context<Self>) {
@@ -2018,14 +2446,15 @@ impl SettingsWindow {
                 .into_any_element()
             }
             Page::Sync => {
-                let field = |label: &'static str, input: Entity<crate::text_input::TextInput>| {
+                let field = |id: &'static str, label: &'static str, input: Entity<crate::text_input::TextInput>| {
                     h_flex()
                         .h(px(40.))
                         .px_4()
                         .gap_4()
-                        .child(div().w(px(80.)).child(Label::new(label)))
+                        .child(div().w(px(110.)).flex_none().child(Label::new(label).truncate()))
                         .child(
                             div()
+                                .debug_selector(move || id.to_owned())
                                 .flex_1()
                                 .min_w_0()
                                 .overflow_hidden()
@@ -2074,13 +2503,36 @@ impl SettingsWindow {
                         ),
                     )
                     .child(div().pt_2().pb_4().px_1().text_size(px(12.)).text_color(colors.text_muted).child(strings.data_hint))
-                    .child(title(strings.sync_optional))
                     .child(
-                        group()
-                            .child(field(strings.sync_server, self.sync_server.clone()))
-                            .child(field(strings.sync_token, self.sync_token.clone())),
+                        v_flex()
+                            .gap_1p5()
+                            .child(title(strings.sync_optional))
+                            .child(
+                                group()
+                                    .child(field("sync-server-input", strings.sync_server, self.sync_server.clone()))
+                                    .child(field("sync-token-input", strings.sync_token, self.sync_token.clone()))
+                                    .child(field(
+                                        "sync-passphrase-input",
+                                        strings.sync_passphrase,
+                                        self.sync_passphrase.clone(),
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .pt_1()
+                                    .px_1()
+                                    .text_size(px(12.))
+                                    .text_color(colors.text_muted)
+                                    .child(strings.sync_passphrase_hint),
+                            )
+                            .child(
+                                div()
+                                    .px_1()
+                                    .text_size(px(12.))
+                                    .text_color(colors.text_muted)
+                                    .child(strings.sync_hint),
+                            ),
                     )
-                    .child(div().pt_2().px_1().text_size(px(12.)).text_color(colors.text_muted).child(strings.sync_hint))
                     .into_any_element()
             }
             Page::Integrations => body.children(self.render_integrations(cx)).into_any_element(),
@@ -2156,6 +2608,8 @@ impl SettingsWindow {
                             div().pt_1p5().px_1().text_size(px(11.)).text_color(colors.text_muted).child(message)
                         })),
                 )
+                .child(self.render_auto_backups(cx))
+                .child(self.render_diagnostics(cx))
                 .into_any_element()
             }
         };
@@ -2265,7 +2719,8 @@ impl Render for SettingsWindow {
                     )
                     .child(page),
             )
-            .children(self.render_reset_shortcuts_confirm(cx));
+            .children(self.render_reset_shortcuts_confirm(cx))
+            .children(self.render_restore_backup_confirm(cx));
         crate::title_bar::window_frame(root, window, cx)
     }
 }
@@ -2292,6 +2747,22 @@ fn visibility_label(list: SmartList, visibility: Visibility, strings: &i18n::Str
         Visibility::IfNotEmpty if list == SmartList::Tags => strings.visibility_names[3],
         Visibility::IfNotEmpty => strings.visibility_names[1],
         Visibility::Hide => strings.visibility_names[2],
+    }
+}
+
+/// Formats a byte count into a compact human-readable string (e.g. `124 KB`, `1.4 MB`).
+fn format_bytes(bytes: u64) -> String {
+    const MB: f64 = 1024.0 * 1024.0;
+    const GB: f64 = 1024.0 * 1024.0 * 1024.0;
+    let b = bytes as f64;
+    if b >= GB {
+        format!("{:.1} GB", b / GB)
+    } else if b >= MB {
+        format!("{:.1} MB", b / MB)
+    } else if bytes >= 1024 {
+        format!("{} KB", (bytes + 512) / 1024)
+    } else {
+        format!("{bytes} B")
     }
 }
 
@@ -2497,5 +2968,150 @@ mod tests {
             settings.update(cx, |_, cx| cx.notify());
         });
         assert!(cx.debug_bounds("shortcuts-keymap-errors").is_some());
+    }
+
+    #[test]
+    fn format_bytes_produces_human_readable_units() {
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(512), "512 B");
+        assert_eq!(format_bytes(1024), "1 KB");
+        assert_eq!(format_bytes(127_000), "124 KB");
+        assert_eq!(format_bytes(1_468_006), "1.4 MB");
+        assert_eq!(format_bytes(2_147_483_648), "2.0 GB");
+    }
+
+    #[gpui::test]
+    fn sync_page_saves_and_reloads_e2ee_passphrase(cx: &mut gpui::TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        cx.update(|cx| {
+            theme::init(cx);
+            assert!(crate::keymap::load_default(&assets::Assets, cx).unwrap().is_empty());
+            cx.set_global(CurrentLocale(Locale::En));
+        });
+        let (settings, cx) = cx.add_window_view(|window, cx| {
+            let mut settings = SettingsWindow::new(store.clone(), cx);
+            settings.set_page(Page::Sync, cx);
+            window.focus(&settings.focus_handle, cx);
+            settings
+        });
+        cx.simulate_resize(gpui::size(px(900.), px(720.)));
+        cx.run_until_parked();
+
+        assert!(cx.debug_bounds("sync-server-input").is_some());
+        assert!(cx.debug_bounds("sync-token-input").is_some());
+        let pass_bounds = cx.debug_bounds("sync-passphrase-input").unwrap();
+
+        // Populate server and token, then enter passphrase via real user input + Enter submit.
+        settings.update(cx, |s, cx| {
+            s.sync_server.update(cx, |i, cx| i.set_text("https://sync.example.org", cx));
+            s.sync_token.update(cx, |i, cx| i.set_text("tok-123", cx));
+        });
+        cx.simulate_click(pass_bounds.center(), gpui::Modifiers::default());
+        cx.simulate_input("correct-horse-battery-staple");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+
+        let saved = store.sync_config().unwrap().expect("sync config must be saved");
+        assert_eq!(saved.server, "https://sync.example.org");
+        assert_eq!(saved.token, "tok-123");
+        assert_eq!(saved.passphrase, "correct-horse-battery-staple");
+
+        // Reopening SettingsWindow reloads the persisted E2EE passphrase.
+        let reloaded = cx.update(|_, cx| cx.new(|cx| SettingsWindow::new(store.clone(), cx)));
+        cx.update(|_, cx| {
+            assert_eq!(
+                reloaded.read(cx).sync_passphrase.read(cx).text(),
+                "correct-horse-battery-staple"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn about_page_renders_auto_backups_db_health_and_restore_confirmation(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let tmp = std::env::temp_dir().join(format!("fern-settings-about-{}", uuid::Uuid::now_v7()));
+        let backups_dir = tmp.join("backups");
+        let restore_target = tmp.join("restore.db");
+        std::fs::create_dir_all(&backups_dir).unwrap();
+
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        store.add_task("Important task").unwrap();
+        let older_backup = backups_dir.join("fern-2026-11-20.db");
+        let newer_backup = backups_dir.join("fern-2026-11-21.db");
+        store.backup_to(&older_backup, None).unwrap();
+        store.backup_to(&newer_backup, None).unwrap();
+
+        cx.update(|cx| {
+            theme::init(cx);
+            assert!(crate::keymap::load_default(&assets::Assets, cx).unwrap().is_empty());
+            cx.set_global(CurrentLocale(Locale::En));
+        });
+        let (settings, cx) = cx.add_window_view(|window, cx| {
+            let mut settings = SettingsWindow::new(store.clone(), cx);
+            settings.backups_dir_override = Some(backups_dir.clone());
+            settings.restore_target_override = Some(restore_target.clone());
+            settings.set_page(Page::About, cx);
+            window.focus(&settings.focus_handle, cx);
+            settings
+        });
+        cx.simulate_resize(gpui::size(px(900.), px(780.)));
+        cx.run_until_parked();
+
+        // Auto-backups list, DB integrity row, and Save Diagnostic Log button render cleanly.
+        assert!(cx.debug_bounds("settings-auto-backups").is_some());
+        assert!(cx.debug_bounds("auto-backup-0").is_some());
+        assert!(cx.debug_bounds("auto-backup-1").is_some());
+        assert!(cx.debug_bounds("settings-db-integrity").is_some());
+        assert!(cx.debug_bounds("settings-db-integrity-detail").is_none());
+        assert!(cx.debug_bounds("save-diagnostic-log").is_some());
+
+        // Unhealthy DbHealth surfaces warning detail.
+        cx.update(|_, cx| {
+            cx.set_global(desktop_common::diagnostics::DbHealth {
+                healthy: false,
+                messages: vec!["corrupt database preserved as tasks.db.corrupt-20261121-101500".to_owned()],
+                recovered_corrupt_backup: Some(tmp.join("tasks.db.corrupt-20261121-101500")),
+            });
+            settings.update(cx, |_, cx| cx.notify());
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("settings-db-integrity-detail").is_some());
+
+        // Clicking Restore on the newest auto-backup opens the confirmation modal.
+        let restore_btn = cx.debug_bounds("auto-backup-restore-0").unwrap();
+        cx.simulate_click(restore_btn.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            assert_eq!(settings.read(cx).pending_restore.as_ref(), Some(&newer_backup));
+        });
+        assert!(cx.debug_bounds("confirm-restore-backup").is_some());
+
+        // Pressing Escape dismisses confirmation without closing Settings.
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            assert!(settings.read(cx).pending_restore.is_none());
+            assert!(!settings.read(cx).closing);
+        });
+        assert!(cx.debug_bounds("confirm-restore-backup").is_none());
+
+        // Clicking Restore again and confirming stages restore.db off the UI thread.
+        let restore_btn = cx.debug_bounds("auto-backup-restore-0").unwrap();
+        cx.simulate_click(restore_btn.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        settings.update(cx, |s, cx| s.confirm_restore(cx));
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            assert!(settings.read(cx).pending_restore.is_none());
+            assert_eq!(
+                settings.read(cx).backup_message.as_deref(),
+                Some(i18n::EN.restore_on_restart)
+            );
+        });
+        assert!(restore_target.exists(), "confirmed restore must stage restore.db");
+        Store::check_backup(&restore_target).unwrap();
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

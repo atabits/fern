@@ -1,6 +1,6 @@
 use super::*;
 use crate::filter_draft::{InputError, Inputs};
-use fern_core::{Condition, ConditionValue as Value, DateRule, Field, Join, SmartFilter};
+use fern_core::{Condition, ConditionValue as Value, DateRule, Field, FilterStatus, Join, SmartFilter};
 
 pub(super) struct FilterInputs {
     keywords: Entity<TextInput>,
@@ -51,6 +51,7 @@ fn field_name(field: Field, strings: &Strings) -> &'static str {
         Field::Priority => strings.filter_priority,
         Field::Include => strings.filter_include,
         Field::Type => strings.filter_type,
+        Field::Status => strings.filter_status,
     }
 }
 fn input_error(error: InputError, strings: &Strings) -> &'static str {
@@ -347,15 +348,19 @@ impl TodoView {
                         .gap_2()
                         .border_b_1()
                         .border_color(theme.colors().border_variant)
-                        .child(
-                            Icon::new(if task.kind == Kind::Note {
-                                IconName::FileText
-                            } else {
-                                IconName::Square
-                            })
-                            .size(IconSize::Small)
-                            .color(Color::Muted),
-                        )
+                        .child(if task.kind == Kind::Note {
+                            Icon::new(IconName::FileText)
+                                .size(IconSize::Small)
+                                .color(Color::Muted)
+                        } else if task.is_in_progress() {
+                            Icon::new(IconName::Hourglass)
+                                .size(IconSize::Small)
+                                .color(Color::Accent)
+                        } else {
+                            Icon::new(IconName::Square)
+                                .size(IconSize::Small)
+                                .color(Color::Muted)
+                        })
                         .child(
                             div().flex_1().min_w_0().child(
                                 Label::new(task.title.clone())
@@ -685,6 +690,26 @@ impl TodoView {
                         chip(id(&format!("type-{n}")), label, *selected == kind, cx).on_click(
                             cx.listener(move |this, _, _, cx| {
                                 this.update_condition(i, cx, |c| c.value = Value::Type(kind))
+                            }),
+                        )
+                    }),
+                )
+                .into_any_element(),
+            Value::Status(selected) => h_flex()
+                .flex_wrap()
+                .gap_1()
+                .children(
+                    [
+                        (None, strings.filter_all),
+                        (Some(FilterStatus::Todo), strings.filter_statuses[0]),
+                        (Some(FilterStatus::InProgress), strings.filter_statuses[1]),
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(n, (status, label))| {
+                        chip(id(&format!("status-{n}")), label, *selected == status, cx).on_click(
+                            cx.listener(move |this, _, _, cx| {
+                                this.update_condition(i, cx, |c| c.value = Value::Status(status))
                             }),
                         )
                     }),
@@ -1044,5 +1069,78 @@ mod tests {
             assert_eq!(edit.error, Some(i18n::EN.filter_name_error));
         });
         assert!(store.filters().unwrap().is_empty());
+    }
+
+    #[gpui::test]
+    fn status_filter_creation_and_legacy_editor_migration(cx: &mut TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let _todo = store.add_task("Not started").unwrap();
+        let active = store.add_task("Working on it").unwrap();
+        store.set_in_progress(active.id, true).unwrap();
+        cx.update(|cx| {
+            theme::init(cx);
+            cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| TodoView::new(store.clone(), window, cx));
+
+        // Open new filter dialog, set Status = In Progress, save, and verify filtered tasks.
+        cx.update(|window, cx| {
+            view.update(cx, |todo, cx| {
+                todo.open_filter_edit(None, window, cx);
+                let edit = todo.filter_edit.as_mut().expect("filter dialog is open");
+                edit.name.update(cx, |input, cx| input.set_text("In Progress", cx));
+                let status_idx = edit
+                    .draft
+                    .rules
+                    .conditions
+                    .iter()
+                    .position(|c| c.value.field() == Field::Status)
+                    .expect("normal filter includes Status field");
+                todo.update_condition(status_idx, cx, |c| {
+                    c.value = Value::Status(Some(FilterStatus::InProgress));
+                });
+                todo.save_filter(window, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        let saved_id = cx.update(|_, cx| {
+            let todo = view.read(cx);
+            assert!(todo.filter_edit.is_none());
+            assert_eq!(todo.filters.len(), 1);
+            assert_eq!(todo.filters[0].1, 1);
+            let id = todo.filters[0].0.id;
+            assert_eq!(todo.view, View::Filter(id));
+            let visible: Vec<Id> = todo.tasks.iter().map(|t| t.id).collect();
+            assert_eq!(visible, [active.id]);
+            id
+        });
+        assert_eq!(store.filters().unwrap()[0].id, saved_id);
+
+        // Opening an older 6-condition normal filter fills in the missing Status row.
+        let legacy = SmartFilter {
+            name: "Older filter".into(),
+            rules: fern_core::FilterRules {
+                version: 1,
+                advanced: false,
+                conditions: vec![
+                    Condition::empty(Field::Lists),
+                    Condition::empty(Field::Tags),
+                    Condition::empty(Field::Date),
+                    Condition::empty(Field::Priority),
+                    Condition::empty(Field::Include),
+                    Condition::empty(Field::Type),
+                ],
+            },
+            ..SmartFilter::new()
+        };
+        cx.update(|window, cx| {
+            view.update(cx, |todo, cx| {
+                todo.open_filter_edit(Some(legacy), window, cx);
+                let edit = todo.filter_edit.as_ref().expect("filter dialog is open");
+                assert_eq!(edit.draft.rules.conditions.len(), Field::ALL.len());
+                assert!(edit.draft.rules.conditions.iter().any(|c| c.value == Value::Status(None)));
+            });
+        });
     }
 }

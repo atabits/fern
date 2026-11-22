@@ -253,6 +253,13 @@ impl DateRule {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FilterStatus {
+    Todo,
+    InProgress,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Field {
     Lists,
@@ -261,15 +268,17 @@ pub enum Field {
     Priority,
     Include,
     Type,
+    Status,
 }
 impl Field {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Lists,
         Self::Tags,
         Self::Date,
         Self::Priority,
         Self::Include,
         Self::Type,
+        Self::Status,
     ];
     pub fn key(self) -> &'static str {
         match self {
@@ -279,6 +288,7 @@ impl Field {
             Self::Priority => "priority",
             Self::Include => "include",
             Self::Type => "type",
+            Self::Status => "status",
         }
     }
     fn from_key(s: &str) -> Option<Self> {
@@ -305,6 +315,7 @@ pub enum ConditionValue {
     Priority(Vec<Priority>),
     Include(String),
     Type(Option<Kind>),
+    Status(Option<FilterStatus>),
 }
 impl ConditionValue {
     pub fn field(&self) -> Field {
@@ -315,6 +326,7 @@ impl ConditionValue {
             Self::Priority(_) => Field::Priority,
             Self::Include(_) => Field::Include,
             Self::Type(_) => Field::Type,
+            Self::Status(_) => Field::Status,
         }
     }
     pub fn empty(field: Field) -> Self {
@@ -328,6 +340,7 @@ impl ConditionValue {
             Field::Priority => Self::Priority(vec![]),
             Field::Include => Self::Include(String::new()),
             Field::Type => Self::Type(None),
+            Field::Status => Self::Status(None),
         }
     }
     pub fn is_empty(&self) -> bool {
@@ -338,6 +351,7 @@ impl ConditionValue {
             Self::Priority(v) => v.is_empty(),
             Self::Include(s) => s.trim().is_empty(),
             Self::Type(k) => k.is_none(),
+            Self::Status(s) => s.is_none(),
         }
     }
     fn validate(&self) -> Result<()> {
@@ -417,6 +431,11 @@ impl Condition {
                 }
             }
             ConditionValue::Type(k) => k.is_none_or(|k| k == task.kind),
+            ConditionValue::Status(status) => match status {
+                None => true,
+                Some(FilterStatus::Todo) => !task.is_in_progress(),
+                Some(FilterStatus::InProgress) => task.is_in_progress(),
+            },
         };
         met != self.not
     }
@@ -603,7 +622,7 @@ fn part_not(s: &str) -> (&str, bool) {
     s.strip_suffix('!').map_or((s, false), |s| (s, true))
 }
 
-pub fn examples() -> [SmartFilter; 3] {
+pub fn examples() -> [SmartFilter; 4] {
     use ConditionValue::*;
     let make = |conditions| SmartFilter {
         rules: FilterRules {
@@ -636,6 +655,7 @@ pub fn examples() -> [SmartFilter; 3] {
             Condition::new(Date(vec![DateRule::NoDate])),
             Condition::new(Type(Some(Kind::Task))),
         ]),
+        make(vec![Condition::new(Status(Some(FilterStatus::InProgress)))]),
     ]
 }
 

@@ -472,3 +472,128 @@ fn negated_note_type_does_not_enable_past_dated_notes_in_date_rules() -> Result<
     assert!(positive.matches(&past_note, today, Weekday::Mon));
     Ok(())
 }
+
+#[test]
+fn status_filter_matches_in_progress_todo_combined_and_syncs() -> Result<()> {
+    let store = Store::open_in_memory()?;
+    let today = date("2026-11-13");
+
+    let todo_task = store.add_task("Backlog item")?;
+    let active_task = store.add_task("Active item")?;
+    store.set_in_progress(active_task.id, true)?;
+    let active_high = store.add_task("Urgent active item")?;
+    store.set_in_progress(active_high.id, true)?;
+    store.set_priority(active_high.id, Priority::High)?;
+
+    let completed = store.add_task("Done item")?;
+    store.set_in_progress(completed.id, true)?;
+    store.set_completed(completed.id, true)?;
+
+    let wont_do = store.add_task("Dropped item")?;
+    store.set_in_progress(wont_do.id, true)?;
+    store.set_wont_do(wont_do.id, true)?;
+
+    let trashed = store.add_task("Trashed item")?;
+    store.set_in_progress(trashed.id, true)?;
+    store.delete_task(trashed.id)?;
+
+    let tasks = store.tasks()?;
+    let matched_ids = |f: &SmartFilter| -> std::collections::HashSet<Id> {
+        f.preview(&tasks, today, Weekday::Mon)
+            .into_iter()
+            .map(|t| t.id)
+            .collect()
+    };
+    let set = |ids: &[Id]| ids.iter().copied().collect::<std::collections::HashSet<Id>>();
+
+    let in_progress = filter(vec![ConditionValue::Status(Some(FilterStatus::InProgress))]);
+    assert_eq!(matched_ids(&in_progress), set(&[active_task.id, active_high.id]));
+
+    let todo_only = filter(vec![ConditionValue::Status(Some(FilterStatus::Todo))]);
+    assert_eq!(matched_ids(&todo_only), set(&[todo_task.id]));
+
+    let all_open = filter(vec![ConditionValue::Status(None)]);
+    assert_eq!(
+        matched_ids(&all_open),
+        set(&[todo_task.id, active_task.id, active_high.id])
+    );
+
+    let combined = filter(vec![
+        ConditionValue::Status(Some(FilterStatus::InProgress)),
+        ConditionValue::Priority(vec![Priority::High]),
+    ]);
+    assert_eq!(matched_ids(&combined), set(&[active_high.id]));
+
+    let negated = SmartFilter {
+        name: "Not in progress".into(),
+        rules: FilterRules {
+            advanced: true,
+            conditions: vec![Condition {
+                not: true,
+                ..Condition::new(ConditionValue::Status(Some(FilterStatus::InProgress)))
+            }],
+            ..FilterRules::default()
+        },
+        ..SmartFilter::new()
+    };
+    assert_eq!(matched_ids(&negated), set(&[todo_task.id]));
+
+    // Mode conversions preserve the Status condition losslessly.
+    let mut rules = FilterRules::default();
+    rules
+        .conditions
+        .iter_mut()
+        .find(|c| c.value.field() == Field::Status)
+        .unwrap()
+        .value = ConditionValue::Status(Some(FilterStatus::InProgress));
+    rules.set_advanced(true)?;
+    assert_eq!(
+        rules.conditions,
+        [Condition::new(ConditionValue::Status(Some(
+            FilterStatus::InProgress
+        )))]
+    );
+    rules.set_advanced(false)?;
+    assert_eq!(rules.conditions.len(), Field::ALL.len());
+    assert!(rules.conditions.iter().any(|c| {
+        c.value == ConditionValue::Status(Some(FilterStatus::InProgress))
+    }));
+
+    // Built-in "In Progress tasks" example preset matches in-progress tasks.
+    assert_eq!(matched_ids(&examples()[3]), set(&[active_task.id, active_high.id]));
+
+    // Storage and sync round-trip.
+    store.save_filter(&in_progress)?;
+    assert_eq!(store.filters()?, std::slice::from_ref(&in_progress));
+    let replica = Store::open_in_memory()?;
+    replica.apply_changes(&store.changes_since(0)?.0)?;
+    assert_eq!(replica.filters()?, std::slice::from_ref(&in_progress));
+    let replica_ids: std::collections::HashSet<Id> = replica
+        .tasks_in(&View::Filter(in_progress.id), today)?
+        .into_iter()
+        .map(|t| t.id)
+        .collect();
+    assert_eq!(replica_ids, set(&[active_task.id, active_high.id]));
+
+    // Existing 6-field normal filter JSON (without Status) remains valid.
+    let old_normal = FilterRules::from_storage(
+        r#"{"version":1,"advanced":false,"conditions":[
+            {"join":"and","not":false,"value":{"field":"lists","value":[]}},
+            {"join":"and","not":false,"value":{"field":"tags","value":{"names":[],"untagged":false}}},
+            {"join":"and","not":false,"value":{"field":"date","value":[]}},
+            {"join":"and","not":false,"value":{"field":"priority","value":[]}},
+            {"join":"and","not":false,"value":{"field":"include","value":""}},
+            {"join":"and","not":false,"value":{"field":"type","value":null}}
+        ]}"#,
+    )?;
+    let old_filter = SmartFilter {
+        name: "Legacy Normal".into(),
+        rules: old_normal,
+        ..SmartFilter::new()
+    };
+    assert_eq!(
+        matched_ids(&old_filter),
+        set(&[todo_task.id, active_task.id, active_high.id])
+    );
+    Ok(())
+}

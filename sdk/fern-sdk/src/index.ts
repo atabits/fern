@@ -1,4 +1,5 @@
 /// <reference path="../fern.d.ts" />
+import fern from "fern";
 import * as ui from "fern:ui";
 import type { UiNode } from "fern:ui";
 import {
@@ -204,7 +205,7 @@ type CleanupFn = () => void;
 export type SetStateAction<T> = T | ((prev: T) => T);
 export type StateSetter<T> = (action: SetStateAction<T>) => void;
 export type EffectCallback = () => void | CleanupFn;
-export type ViewRenderFn = () => UiNode | null | undefined | void;
+export type ViewRenderFn = () => UiNode | boolean | null | undefined | void;
 
 interface StateHookSlot<T = unknown> {
   kind: "state";
@@ -246,6 +247,8 @@ interface ViewHookContext {
   dirty: boolean;
   isRendering: boolean;
   isFlushingEffects: boolean;
+  mounted: boolean;
+  generation: number;
   onInvalidate?: () => void;
 }
 
@@ -317,6 +320,7 @@ function claimSlot<S extends HookSlot>(
 export function useState<T>(initialValue: T | (() => T)): [T, StateSetter<T>] {
   const ctx = currentContext("useState");
   const slot = claimSlot<StateHookSlot<T>>(ctx, "state", () => {
+    const slotGeneration = ctx.generation;
     const resolved =
       typeof initialValue === "function"
         ? (initialValue as () => T)()
@@ -325,6 +329,9 @@ export function useState<T>(initialValue: T | (() => T)): [T, StateSetter<T>] {
       kind: "state",
       value: resolved,
       setter: (action: SetStateAction<T>) => {
+        if (!ctx.mounted || ctx.generation !== slotGeneration) {
+          return;
+        }
         const next =
           typeof action === "function"
             ? (action as (prev: T) => T)(created.value)
@@ -397,12 +404,15 @@ export function useCallback<T extends (...args: never[]) => unknown>(
   return useMemo(() => callback, deps);
 }
 
-function finalizeRootNode(raw: UiNode | null | undefined | void): UiNode {
+function finalizeRootNode(raw: UiNode | boolean | null | undefined | void): UiNode {
   if (!raw || typeof raw !== "object") {
     return ui.vstack({ gap: 0 }, []);
   }
   const fragChildren = unwrapFragment(raw);
   if (fragChildren) {
+    if (fragChildren.length === 0) {
+      return ui.vstack({ gap: 0 }, []);
+    }
     if (fragChildren.length === 1) {
       return fragChildren[0];
     }
@@ -412,18 +422,34 @@ function finalizeRootNode(raw: UiNode | null | undefined | void): UiNode {
 }
 
 function cleanupAllEffects(ctx: ViewHookContext): void {
+  let firstError: unknown;
+  let hasError = false;
   for (const slot of ctx.hooks) {
     if (slot.kind === "effect" && slot.cleanup) {
       const cleanup = slot.cleanup;
       slot.cleanup = undefined;
-      cleanup();
+      try {
+        cleanup();
+      } catch (err) {
+        if (!hasError) {
+          firstError = err;
+          hasError = true;
+        }
+      }
     }
+  }
+  if (hasError) {
+    throw firstError;
   }
 }
 
 /**
  * Wraps a functional JSX component using `useState` / `useEffect` into a Fern view object
- * (`{ render, mount, unmount }`) compatible with `fern.views.register(...)` and `fern.ui.openModal(...)`.
+ * (`{ render, mount, unmount }`) for `fern.views.register(...)` (sidebar views and plugin pages).
+ *
+ * Note: `fern.ui.openModal(...)` renders a one-shot `UiNode` tree and does not drive `mount()` /
+ * `unmount()` or automatic re-renders. For reactive modals with proper `useEffect` cleanup,
+ * use `openModalView(...)` / `closeModalView()`.
  */
 export function defineView(
   component: ViewRenderFn,
@@ -436,19 +462,31 @@ export function defineView(
     dirty: false,
     isRendering: false,
     isFlushingEffects: false,
+    mounted: false,
+    generation: 0,
     onInvalidate: options?.onInvalidate,
   };
 
   return {
     mount() {
-      cleanupAllEffects(ctx);
-      ctx.hooks = [];
-      ctx.pendingEffects = [];
-      ctx.dirty = false;
+      ctx.mounted = false;
+      ctx.generation += 1;
+      try {
+        cleanupAllEffects(ctx);
+      } finally {
+        ctx.hooks = [];
+        ctx.pendingEffects = [];
+        ctx.dirty = false;
+        ctx.mounted = true;
+      }
     },
 
     render(): UiNode {
-      let result: UiNode | null | undefined | void;
+      if (!ctx.mounted) {
+        ctx.generation += 1;
+        ctx.mounted = true;
+      }
+      let result: UiNode | boolean | null | undefined | void;
 
       for (let pass = 0; pass < MAX_RENDER_PASSES; pass += 1) {
         ctx.dirty = false;
@@ -469,6 +507,9 @@ export function defineView(
           ctx.isFlushingEffects = true;
           try {
             for (const item of effects) {
+              if (!ctx.mounted) {
+                break;
+              }
               if (item.slot.cleanup) {
                 const prevCleanup = item.slot.cleanup;
                 item.slot.cleanup = undefined;
@@ -477,7 +518,11 @@ export function defineView(
               const nextCleanup = item.effect();
               item.slot.deps = item.deps;
               if (typeof nextCleanup === "function") {
-                item.slot.cleanup = nextCleanup;
+                if (ctx.mounted) {
+                  item.slot.cleanup = nextCleanup;
+                } else {
+                  nextCleanup();
+                }
               }
             }
           } finally {
@@ -485,7 +530,7 @@ export function defineView(
           }
         }
 
-        if (!ctx.dirty) {
+        if (!ctx.dirty || !ctx.mounted) {
           return finalizeRootNode(result);
         }
       }
@@ -496,10 +541,110 @@ export function defineView(
     },
 
     unmount() {
-      cleanupAllEffects(ctx);
-      ctx.hooks = [];
-      ctx.pendingEffects = [];
-      ctx.dirty = false;
+      ctx.mounted = false;
+      ctx.generation += 1;
+      try {
+        cleanupAllEffects(ctx);
+      } finally {
+        ctx.hooks = [];
+        ctx.pendingEffects = [];
+        ctx.dirty = false;
+      }
     },
+  };
+}
+
+export interface ModalControls {
+  /** Unmounts the modal's hooks/effects and closes the host modal. */
+  close: () => void;
+}
+
+export interface ModalHandle {
+  /** Re-renders and pushes the latest modal tree to the host. */
+  refresh: () => void;
+  /** Unmounts the modal's hooks/effects and closes the host modal. */
+  close: () => void;
+}
+
+let activeModalSession: { close: (notifyHost?: boolean) => void } | null = null;
+
+/**
+ * Closes any modal opened with `openModalView()`, running all `useEffect` cleanups
+ * before dismissing the host modal.
+ */
+export function closeModalView(): void {
+  if (activeModalSession) {
+    activeModalSession.close(true);
+  } else {
+    fern.ui.closeModal();
+  }
+}
+
+/**
+ * Opens a reactive modal backed by `useState` / `useEffect` hooks.
+ *
+ * State updates automatically re-push the updated tree via `fern.ui.openModal(...)` so the
+ * modal never stays stale, and calling `controls.close()`, `closeModalView()`, or opening
+ * another modal automatically runs all `useEffect` cleanups so subscriptions never leak.
+ */
+export function openModalView(
+  title: string,
+  component: (controls: ModalControls) => UiNode | boolean | null | undefined | void,
+): ModalHandle {
+  if (activeModalSession) {
+    activeModalSession.close(false);
+  }
+
+  let closed = false;
+  let view!: ViewDefinition;
+
+  const pushRender = (): void => {
+    if (closed) {
+      return;
+    }
+    const tree = view.render();
+    if (!closed) {
+      fern.ui.openModal(title, tree);
+    }
+  };
+
+  const close = (notifyHost = true): void => {
+    if (closed) {
+      return;
+    }
+    closed = true;
+    if (activeModalSession === session) {
+      activeModalSession = null;
+    }
+    try {
+      view.unmount();
+    } finally {
+      if (notifyHost) {
+        fern.ui.closeModal();
+      }
+    }
+  };
+
+  const controls: ModalControls = { close: () => close(true) };
+  view = defineView(() => component(controls), {
+    onInvalidate: () => {
+      pushRender();
+    },
+  });
+
+  const session = { close };
+  activeModalSession = session;
+
+  try {
+    view.mount();
+    pushRender();
+  } catch (err) {
+    close(false);
+    throw err;
+  }
+
+  return {
+    refresh: pushRender,
+    close: () => close(true),
   };
 }

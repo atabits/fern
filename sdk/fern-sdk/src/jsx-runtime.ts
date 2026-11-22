@@ -327,7 +327,7 @@ function pickDefined(
 /** JSX Fragment (`<>...</>`). Unwraps cleanly inside parent containers and falls back to `vstack` at root. */
 export function Fragment(props: { children?: FernChildren }): UiNode {
   const flat = normalizeChildren(props?.children);
-  const node = ui.vstack({ gap: 8 }, flat);
+  const node = ui.vstack({ gap: flat.length === 0 ? 0 : 8 }, flat);
   fragmentRegistry.set(node, flat);
   return node;
 }
@@ -498,7 +498,7 @@ const INTRINSIC_BUILDERS: Record<string, NodeBuilder> = {
 
 export type ComponentFunction<P = Record<string, unknown>> = (
   props: P,
-) => UiNode | null | undefined | void;
+) => UiNode | boolean | null | undefined | void;
 
 export type ElementType = keyof JSX.IntrinsicElements | ComponentFunction<any>;
 
@@ -516,8 +516,8 @@ export function jsx(
 
   if (typeof type === "function") {
     const rendered = type(mergedProps);
-    if (rendered === null || rendered === undefined) {
-      return ui.vstack({ gap: 0 }, []);
+    if (rendered === null || rendered === undefined || typeof rendered === "boolean") {
+      return Fragment({ children: [] });
     }
     return rendered;
   }

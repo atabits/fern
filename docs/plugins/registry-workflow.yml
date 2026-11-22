@@ -7,22 +7,24 @@
 #       "id": "com.example.my-plugin",
 #       "version": "1.0.0",
 #       "source_url": "https://github.com/example/my-plugin/releases/download/v1.0.0/plugin.zip",
-#       "sha256": "optional-64-char-lowercase-hex",
+#       "sha256": "required-64-char-lowercase-hex",
 #       "homepage": "https://github.com/example/my-plugin",
 #       "tags": ["productivity"]
 #     }
 #
 # On Pull Requests:
-#   - Validates `plugins/<id>.json` descriptors and downloads each changed `.zip`
-#   - Enforces archive size <= 10 MiB and unpacked size <= 32 MiB
-#   - Rejects zip-slip path traversals and symlinks
-#   - Validates `manifest.json` (`api_version: 1`, id regex, entry file, permissions, SVG icons, settings)
-#   - Computes SHA-256 and verifies optional submitter-supplied `sha256`
+#   - Validates all `plugins/<id>.json` descriptors (including required `sha256`, no extra keys, no nulls)
+#   - Downloads each changed `.zip` with DNS-pinned HTTPS SSRF protection (no DNS-rebinding TOCTOU)
+#   - Enforces archive size <= 10 MiB, unpacked size <= 32 MiB, JS files <= 2 MiB, and <= 4096 entries
+#   - Rejects zip-slip path traversals, symlinks, and reused `<id>-<version>` tags with mismatched SHA-256
+#   - Validates `manifest.json` (`api_version: 1`, id/version, entry, permissions, sidebar + pages views/SVGs,
+#     commands, themes, locales, and settings labels/options)
 #
 # On `main`:
 #   - Mirrors validated `.zip` archives as `plugin.zip` assets on GitHub Releases (`<id>-<version>`)
-#   - Generates `registry.json` (`schema_version: 1`) pointing at the immutable Release mirrors
-#   - Publishes `registry.json` to GitHub Pages (`https://atabits.github.io/fern-plugins/registry.json`)
+#   - Verifies `sha256` on both newly mirrored and already-mirrored releases
+#   - Generates `registry.json` (`schema_version: 1`) with non-null strings/arrays and URL-encoded `download_url`
+#   - Publishes `registry.json`, `index.html`, and `plugin-descriptor.schema.json` to GitHub Pages
 
 name: Fern Plugin Registry
 
@@ -30,12 +32,14 @@ on:
   pull_request:
     branches: [main]
     paths:
-      - "plugins/*.json"
+      - "plugins/**"
+      - "schema/**"
       - ".github/workflows/**"
   push:
     branches: [main]
     paths:
-      - "plugins/*.json"
+      - "plugins/**"
+      - "schema/**"
       - ".github/workflows/**"
   workflow_dispatch:
 
@@ -46,6 +50,939 @@ concurrency:
   group: fern-registry-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+env:
+  FERN_REGISTRY_SCRIPT: |
+    import datetime
+    import hashlib
+    import html
+    import http.client
+    import ipaddress
+    import json
+    import os
+    import pathlib
+    import posixpath
+    import re
+    import socket
+    import ssl
+    import subprocess
+    import sys
+    import tempfile
+    import urllib.parse
+    import zipfile
+
+    MAX_ZIP_BYTES = 10 * 1024 * 1024
+    MAX_UNPACKED_BYTES = 32 * 1024 * 1024
+    MAX_ZIP_ENTRIES = 4096
+    MAX_MODULE_BYTES = 2 * 1024 * 1024
+    MAX_SVG_BYTES = 256 * 1024
+    MAX_REDIRECTS = 5
+    CURRENT_API_VERSION = 1
+
+    PLUGIN_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{1,63}$")
+    VERSION_RE = re.compile(r"^[0-9A-Za-z][0-9A-Za-z._+-]{0,63}$")
+    SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+    DESCRIPTOR_ALLOWED_KEYS = frozenset({
+        "id",
+        "version",
+        "source_url",
+        "sha256",
+        "homepage",
+        "min_fern_version",
+        "tags",
+    })
+    KNOWN_PERMISSIONS = frozenset({
+        "tasks:read",
+        "tasks:write",
+        "lists:read",
+        "lists:write",
+        "tags:read",
+        "tags:write",
+        "habits:read",
+        "habits:write",
+        "focus:read",
+        "countdowns:read",
+        "countdowns:write",
+        "storage",
+        "meta",
+        "notifications",
+        "clipboard",
+        "network:local",
+        "hooks:intercept",
+        "services",
+    })
+    KNOWN_SETTING_TYPES = frozenset({"text", "number", "boolean", "select", "secret"})
+    RESERVED_VIEW_IDS = frozenset({"__modal__", "__default__"})
+    BLOCKED_IPV6_TRANSITION_NETS = (
+        ipaddress.ip_network("64:ff9b::/96"),
+        ipaddress.ip_network("64:ff9b:1::/48"),
+        ipaddress.ip_network("2002::/16"),
+        ipaddress.ip_network("2001::/32"),
+    )
+    FORBIDDEN_SVG_MARKERS = ("<!doctype", "<!entity", "<script", "<foreignobject")
+
+
+    def validate_plugin_id(pid: object) -> bool:
+        return isinstance(pid, str) and bool(PLUGIN_ID_RE.match(pid)) and ".." not in pid
+
+
+    def validate_version(ver: object) -> bool:
+        return (
+            isinstance(ver, str)
+            and ver == ver.strip()
+            and bool(VERSION_RE.match(ver))
+            and ".." not in ver
+        )
+
+
+    def validate_rel_path(rel: object) -> str:
+        if not isinstance(rel, str) or not rel.strip():
+            raise ValueError(f"empty relative path: {rel!r}")
+        raw = rel.strip()
+        if raw.startswith("/") or "\\" in raw or ":" in raw or "\x00" in raw:
+            raise ValueError(f"unsafe relative path: {rel!r}")
+        norm = posixpath.normpath(raw)
+        if norm in ("", ".", "..") or norm.startswith("../") or "/../" in norm:
+            raise ValueError(f"path traversal forbidden: {rel!r}")
+        return norm
+
+
+    def is_public_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+        if isinstance(ip, ipaddress.IPv6Address):
+            if ip.ipv4_mapped is not None:
+                return is_public_ip(ip.ipv4_mapped)
+            if ip.sixtofour is not None or ip.teredo is not None:
+                return False
+            if any(ip in net for net in BLOCKED_IPV6_TRANSITION_NETS):
+                return False
+        return (
+            ip.is_global
+            and not ip.is_private
+            and not ip.is_loopback
+            and not ip.is_link_local
+            and not ip.is_multicast
+            and not ip.is_unspecified
+            and not ip.is_reserved
+        )
+
+
+    def validate_https_url_syntax(url: object, field_name: str) -> str:
+        if not isinstance(url, str) or not url.strip():
+            raise ValueError(f"{field_name} must be a non-empty https:// URL")
+        cleaned = url.strip()
+        if any(ch.isspace() or ord(ch) < 32 for ch in cleaned):
+            raise ValueError(f"{field_name} contains whitespace or control characters: {url!r}")
+        parsed = urllib.parse.urlparse(cleaned)
+        if parsed.scheme.lower() != "https" or not parsed.hostname:
+            raise ValueError(f"{field_name} must use https:// with a valid host: {url!r}")
+        if parsed.username is not None or parsed.password is not None:
+            raise ValueError(f"{field_name} must not embed credentials: {url!r}")
+        try:
+            port = parsed.port
+        except ValueError as exc:
+            raise ValueError(f"{field_name} has invalid port: {url!r}") from exc
+        if port is not None and not (1 <= port <= 65535):
+            raise ValueError(f"{field_name} port out of range: {url!r}")
+        host = parsed.hostname.lower().rstrip(".")
+        if host == "localhost" or host.endswith(".localhost"):
+            raise ValueError(f"{field_name} must not target localhost: {url!r}")
+        try:
+            literal_ip = ipaddress.ip_address(host.split("%", 1)[0])
+        except ValueError:
+            literal_ip = None
+        if literal_ip is not None and not is_public_ip(literal_ip):
+            raise ValueError(f"{field_name} must not target non-public IP {literal_ip}")
+        return cleaned
+
+
+    def resolve_public_https_url(
+        url: str,
+    ) -> tuple[urllib.parse.ParseResult, str, int, list[tuple[int, str]]]:
+        cleaned = validate_https_url_syntax(url, "source_url")
+        parsed = urllib.parse.urlparse(cleaned)
+        host = parsed.hostname
+        assert host is not None
+        port = parsed.port or 443
+        try:
+            infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        except socket.gaierror as exc:
+            raise ValueError(f"DNS resolution failed for {host!r}: {exc}") from exc
+        if not infos:
+            raise ValueError(f"no DNS records for {host!r}")
+        pinned: list[tuple[int, str]] = []
+        seen: set[tuple[int, str]] = set()
+        for family, _, _, _, sockaddr in infos:
+            ip_str = sockaddr[0].split("%", 1)[0]
+            ip = ipaddress.ip_address(ip_str)
+            if not is_public_ip(ip):
+                raise ValueError(f"non-public IP {ip} blocked for {host!r}")
+            pair = (family, ip_str)
+            if pair not in seen:
+                seen.add(pair)
+                pinned.append(pair)
+        return parsed, host, port, pinned
+
+
+    class PinnedHTTPSConnection(http.client.HTTPSConnection):
+        """HTTPSConnection that connects strictly to pre-validated IP(s) with SNI for host."""
+
+        def __init__(
+            self,
+            host: str,
+            port: int,
+            pinned_addrs: list[tuple[int, str]],
+            timeout: float = 30,
+            context: ssl.SSLContext | None = None,
+        ) -> None:
+            super().__init__(host, port=port, timeout=timeout, context=context)
+            self._pinned_addrs = pinned_addrs
+
+        def connect(self) -> None:
+            last_err: OSError | None = None
+            for family, ip_str in self._pinned_addrs:
+                raw_sock: socket.socket | None = None
+                try:
+                    raw_sock = socket.socket(family, socket.SOCK_STREAM)
+                    raw_sock.settimeout(self.timeout)
+                    raw_sock.connect((ip_str, self.port))
+                    self.sock = self._context.wrap_socket(raw_sock, server_hostname=self.host)
+                    return
+                except OSError as exc:
+                    if raw_sock is not None:
+                        try:
+                            raw_sock.close()
+                        except OSError:
+                            pass
+                    last_err = exc
+            raise OSError(f"failed to connect to {self.host}:{self.port} via pinned IP(s): {last_err}")
+
+
+    def download_zip(url: str, dest: pathlib.Path) -> tuple[str, int]:
+        current = url
+        ssl_ctx = ssl.create_default_context()
+        for _ in range(MAX_REDIRECTS + 1):
+            parsed, host, port, pinned_addrs = resolve_public_https_url(current)
+            target = parsed.path or "/"
+            if parsed.query:
+                target = f"{target}?{parsed.query}"
+            conn = PinnedHTTPSConnection(
+                host,
+                port=port,
+                pinned_addrs=pinned_addrs,
+                timeout=30,
+                context=ssl_ctx,
+            )
+            try:
+                conn.request(
+                    "GET",
+                    target,
+                    headers={
+                        "User-Agent": "fern-plugins-ci/1.0",
+                        "Accept-Encoding": "identity",
+                    },
+                )
+                resp = conn.getresponse()
+                if resp.status in (301, 302, 303, 307, 308):
+                    location = resp.getheader("Location")
+                    if not location:
+                        raise ValueError(f"redirect HTTP {resp.status} missing Location for {current}")
+                    current = urllib.parse.urljoin(current, location)
+                    continue
+                if resp.status < 200 or resp.status >= 300:
+                    raise ValueError(f"download returned HTTP {resp.status} for {current}")
+                hasher = hashlib.sha256()
+                total = 0
+                with dest.open("wb") as out:
+                    while True:
+                        chunk = resp.read(65536)
+                        if not chunk:
+                            break
+                        total += len(chunk)
+                        if total > MAX_ZIP_BYTES:
+                            raise ValueError(f"archive exceeds {MAX_ZIP_BYTES} bytes (10 MiB)")
+                        hasher.update(chunk)
+                        out.write(chunk)
+                return hasher.hexdigest(), total
+            finally:
+                conn.close()
+        raise ValueError(f"too many redirects (>{MAX_REDIRECTS}) downloading {url}")
+
+
+    def sha256_file(path: pathlib.Path) -> tuple[str, int]:
+        h = hashlib.sha256()
+        size = 0
+        with path.open("rb") as f:
+            while True:
+                chunk = f.read(65536)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > MAX_ZIP_BYTES:
+                    raise ValueError(f"archive exceeds {MAX_ZIP_BYTES} bytes (10 MiB)")
+                h.update(chunk)
+        return h.hexdigest(), size
+
+
+    def validate_svg_bytes(svg_bytes: bytes, label: str) -> None:
+        if len(svg_bytes) > MAX_SVG_BYTES:
+            raise ValueError(f"{label} exceeds {MAX_SVG_BYTES} bytes (256 KiB)")
+        try:
+            text = svg_bytes.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"{label} is not valid UTF-8") from exc
+        lower = text.lower()
+        if "<svg" not in lower:
+            raise ValueError(f"{label} missing <svg element")
+        for marker in FORBIDDEN_SVG_MARKERS:
+            if marker in lower:
+                raise ValueError(f"{label} contains forbidden SVG construct {marker!r}")
+
+
+    def inspect_zip_and_manifest(
+        zip_path: pathlib.Path,
+        expected_id: str,
+        expected_version: str,
+    ) -> dict:
+        entries: dict[str, bytes] = {}
+        dirs: set[str] = set()
+        total_unpacked = 0
+
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            infos = zf.infolist()
+            if len(infos) > MAX_ZIP_ENTRIES:
+                raise ValueError(f"archive contains {len(infos)} entries (max {MAX_ZIP_ENTRIES})")
+            for info in infos:
+                mode = (info.external_attr >> 16) & 0o170000
+                if mode == 0o120000:
+                    raise ValueError(f"symlink forbidden in archive: {info.filename!r}")
+                if mode not in (0, 0o100000, 0o040000):
+                    raise ValueError(f"unsupported file mode {oct(mode)} in archive: {info.filename!r}")
+                if "\\" in info.filename or info.filename.startswith("/") or ":" in info.filename or "\x00" in info.filename:
+                    raise ValueError(f"unsafe zip entry path: {info.filename!r}")
+                if info.filename.endswith("/"):
+                    norm_dir = posixpath.normpath(info.filename.rstrip("/"))
+                    if norm_dir not in ("", "."):
+                        validate_rel_path(norm_dir)
+                        dirs.add(norm_dir)
+                    continue
+                clean = validate_rel_path(info.filename)
+                with zf.open(info, "r") as stream:
+                    chunks = []
+                    while True:
+                        buf = stream.read(65536)
+                        if not buf:
+                            break
+                        total_unpacked += len(buf)
+                        if total_unpacked > MAX_UNPACKED_BYTES:
+                            raise ValueError(f"unpacked archive exceeds {MAX_UNPACKED_BYTES} bytes (32 MiB)")
+                        chunks.append(buf)
+                    entries[clean] = b"".join(chunks)
+
+        if "manifest.json" in entries:
+            prefix = ""
+        else:
+            top_levels = {p.split("/", 1)[0] for p in entries} | {d.split("/", 1)[0] for d in dirs}
+            top_files = [p for p in entries if "/" not in p]
+            if len(top_levels) == 1 and not top_files:
+                root_dir = next(iter(top_levels))
+                if f"{root_dir}/manifest.json" in entries:
+                    prefix = f"{root_dir}/"
+                else:
+                    raise ValueError("archive missing manifest.json")
+            else:
+                raise ValueError("archive missing manifest.json at archive root")
+
+        def read_archive_file(rel: object) -> bytes:
+            key = prefix + validate_rel_path(rel)
+            if key not in entries:
+                raise ValueError(f"referenced archive file missing: {rel!r}")
+            return entries[key]
+
+        manifest = json.loads(entries[f"{prefix}manifest.json"].decode("utf-8"))
+        if not isinstance(manifest, dict):
+            raise ValueError("manifest.json must be a JSON object")
+
+        api_ver = manifest.get("api_version")
+        if isinstance(api_ver, bool) or api_ver != CURRENT_API_VERSION:
+            raise ValueError(f"api_version must be {CURRENT_API_VERSION}, got {api_ver!r}")
+        if manifest.get("id") != expected_id or not validate_plugin_id(expected_id):
+            raise ValueError(f"manifest id {manifest.get('id')!r} does not match {expected_id!r}")
+        if not isinstance(manifest.get("name"), str) or not manifest["name"].strip():
+            raise ValueError("manifest name must be non-empty")
+        if manifest.get("version") != expected_version or not validate_version(expected_version):
+            raise ValueError(f"manifest version {manifest.get('version')!r} does not match {expected_version!r}")
+
+        for str_field in ("description", "author"):
+            if str_field in manifest and not isinstance(manifest[str_field], str):
+                raise ValueError(f"manifest.{str_field} must be a string (not {type(manifest[str_field]).__name__})")
+        if "min_fern_version" in manifest:
+            mfv = manifest["min_fern_version"]
+            if not isinstance(mfv, str) or not mfv.strip():
+                raise ValueError("manifest.min_fern_version must be a non-empty string")
+        if "homepage" in manifest:
+            validate_https_url_syntax(manifest["homepage"], "manifest.homepage")
+
+        entry_rel = manifest.get("entry")
+        entry_bytes = read_archive_file(entry_rel)
+        if len(entry_bytes) > MAX_MODULE_BYTES:
+            raise ValueError(f"entry file {entry_rel!r} exceeds {MAX_MODULE_BYTES} bytes (2 MiB)")
+        for rel_path, content in entries.items():
+            lower_path = rel_path.lower()
+            if (lower_path.endswith(".js") or lower_path.endswith(".mjs")) and len(content) > MAX_MODULE_BYTES:
+                raise ValueError(f"JS module {rel_path!r} exceeds {MAX_MODULE_BYTES} bytes (2 MiB)")
+
+        if "permissions" in manifest:
+            perms = manifest["permissions"]
+            if not isinstance(perms, list):
+                raise ValueError("manifest.permissions must be a list")
+            for perm in perms:
+                if isinstance(perm, str):
+                    if perm not in KNOWN_PERMISSIONS:
+                        raise ValueError(f"unknown permission {perm!r}")
+                elif isinstance(perm, dict) and set(perm.keys()) == {"network"} and isinstance(perm["network"], list):
+                    for host in perm["network"]:
+                        if (
+                            not isinstance(host, str)
+                            or not host.strip()
+                            or any(c.isspace() or ord(c) < 32 for c in host)
+                            or "/" in host
+                        ):
+                            raise ValueError(f"invalid network permission pattern: {host!r}")
+                else:
+                    raise ValueError(f"invalid permission entry: {perm!r}")
+
+        if "activation_events" in manifest:
+            acts = manifest["activation_events"]
+            if not isinstance(acts, list) or not all(isinstance(a, str) and a.strip() for a in acts):
+                raise ValueError("manifest.activation_events must be a list of non-empty strings")
+
+        contributions = manifest.get("contributions", {})
+        if not isinstance(contributions, dict):
+            raise ValueError("manifest.contributions must be a JSON object")
+
+        view_ids: set[str] = set()
+        for kind in ("sidebar", "pages"):
+            raw_views = contributions.get(kind, [])
+            if not isinstance(raw_views, list):
+                raise ValueError(f"manifest.contributions.{kind} must be a list")
+            for view in raw_views:
+                if not isinstance(view, dict):
+                    raise ValueError(f"manifest.contributions.{kind} entries must be objects")
+                vid = view.get("id")
+                if (
+                    not isinstance(vid, str)
+                    or not vid.strip()
+                    or vid != vid.strip()
+                    or "/" in vid
+                    or vid in RESERVED_VIEW_IDS
+                    or vid in view_ids
+                ):
+                    raise ValueError(f"invalid or duplicate {kind} view id: {vid!r}")
+                view_ids.add(vid)
+                title = view.get("title")
+                if not isinstance(title, str) or not title.strip():
+                    raise ValueError(f"{kind} view {vid!r} missing non-empty title")
+                if "icon" in view and view["icon"] is not None:
+                    icon_rel = view["icon"]
+                    svg_bytes = read_archive_file(icon_rel)
+                    validate_svg_bytes(svg_bytes, f"{kind} icon {icon_rel!r}")
+
+        if "commands" in contributions:
+            commands = contributions["commands"]
+            if not isinstance(commands, list):
+                raise ValueError("manifest.contributions.commands must be a list")
+            cmd_ids: set[str] = set()
+            for cmd in commands:
+                if not isinstance(cmd, dict):
+                    raise ValueError("manifest.contributions.commands entries must be objects")
+                cid = cmd.get("id")
+                if not isinstance(cid, str) or not cid.strip() or cid != cid.strip() or cid in cmd_ids:
+                    raise ValueError(f"invalid or duplicate command id: {cid!r}")
+                cmd_ids.add(cid)
+                ctitle = cmd.get("title")
+                if not isinstance(ctitle, str) or not ctitle.strip():
+                    raise ValueError(f"command {cid!r} missing non-empty title")
+
+        if "search_providers" in contributions:
+            providers = contributions["search_providers"]
+            if not isinstance(providers, list):
+                raise ValueError("manifest.contributions.search_providers must be a list")
+            sp_ids: set[str] = set()
+            for sp in providers:
+                if not isinstance(sp, dict):
+                    raise ValueError("manifest.contributions.search_providers entries must be objects")
+                sp_id = sp.get("id")
+                if not isinstance(sp_id, str) or not sp_id.strip() or sp_id in sp_ids:
+                    raise ValueError(f"invalid or duplicate search_provider id: {sp_id!r}")
+                sp_ids.add(sp_id)
+                if not isinstance(sp.get("title"), str) or not sp["title"].strip():
+                    raise ValueError(f"search_provider {sp_id!r} missing non-empty title")
+                if "prefix" in sp and sp["prefix"] is not None and not isinstance(sp["prefix"], str):
+                    raise ValueError(f"search_provider {sp_id!r} prefix must be a string")
+
+        if "themes" in contributions:
+            themes = contributions["themes"]
+            if not isinstance(themes, list):
+                raise ValueError("manifest.contributions.themes must be a list")
+            theme_ids: set[str] = set()
+            for theme in themes:
+                if not isinstance(theme, dict):
+                    raise ValueError("manifest.contributions.themes entries must be objects")
+                tid = theme.get("id")
+                if not isinstance(tid, str) or not tid.strip() or tid in theme_ids:
+                    raise ValueError(f"invalid or duplicate theme id: {tid!r}")
+                theme_ids.add(tid)
+                if not isinstance(theme.get("name"), str) or not theme["name"].strip():
+                    raise ValueError(f"theme {tid!r} missing non-empty name")
+                if "path" in theme and theme["path"] is not None:
+                    tbytes = read_archive_file(theme["path"])
+                    json.loads(tbytes.decode("utf-8"))
+
+        if "locales" in contributions:
+            locales = contributions["locales"]
+            if not isinstance(locales, list):
+                raise ValueError("manifest.contributions.locales must be a list")
+            locale_codes: set[str] = set()
+            for loc in locales:
+                if not isinstance(loc, dict):
+                    raise ValueError("manifest.contributions.locales entries must be objects")
+                code = loc.get("code")
+                if not isinstance(code, str) or not code.strip() or code in locale_codes:
+                    raise ValueError(f"invalid or duplicate locale code: {code!r}")
+                locale_codes.add(code)
+                if not isinstance(loc.get("name"), str) or not loc["name"].strip():
+                    raise ValueError(f"locale {code!r} missing non-empty name")
+                if "path" in loc and loc["path"] is not None:
+                    lbytes = read_archive_file(loc["path"])
+                    json.loads(lbytes.decode("utf-8"))
+
+        if "importers" in contributions:
+            importers = contributions["importers"]
+            if not isinstance(importers, list):
+                raise ValueError("manifest.contributions.importers must be a list")
+            for imp in importers:
+                if not isinstance(imp, dict):
+                    raise ValueError("manifest.contributions.importers entries must be objects")
+                if not isinstance(imp.get("id"), str) or not imp["id"].strip():
+                    raise ValueError("importer missing non-empty id")
+                if not isinstance(imp.get("name"), str) or not imp["name"].strip():
+                    raise ValueError(f"importer {imp.get('id')!r} missing non-empty name")
+                if "extensions" in imp:
+                    exts = imp["extensions"]
+                    if not isinstance(exts, list) or not all(isinstance(e, str) and e.strip() for e in exts):
+                        raise ValueError(f"importer {imp.get('id')!r} extensions must be a list of strings")
+
+        if "settings" in manifest:
+            settings = manifest["settings"]
+            if not isinstance(settings, list):
+                raise ValueError("manifest.settings must be a list")
+            setting_keys: set[str] = set()
+            for spec in settings:
+                if not isinstance(spec, dict):
+                    raise ValueError("manifest.settings entries must be objects")
+                skey = spec.get("key")
+                if not isinstance(skey, str) or not skey.strip() or skey in setting_keys:
+                    raise ValueError(f"invalid or duplicate setting key: {skey!r}")
+                setting_keys.add(skey)
+                slabel = spec.get("label")
+                if not isinstance(slabel, str) or not slabel.strip():
+                    raise ValueError(f"setting {skey!r} missing non-empty label")
+                skind = spec.get("type")
+                if skind not in KNOWN_SETTING_TYPES:
+                    raise ValueError(f"invalid setting type {skind!r} for {skey!r}")
+                if "options" in spec and spec["options"] is not None:
+                    opts = spec["options"]
+                    if not isinstance(opts, list):
+                        raise ValueError(f"setting {skey!r} options must be a list")
+                    for opt in opts:
+                        if isinstance(opt, str):
+                            if not opt.strip():
+                                raise ValueError(f"setting {skey!r} has empty string option")
+                        elif isinstance(opt, dict):
+                            if (
+                                set(opt.keys()) != {"label", "value"}
+                                or not isinstance(opt.get("label"), str)
+                                or not opt["label"].strip()
+                                or not isinstance(opt.get("value"), str)
+                            ):
+                                raise ValueError(f"setting {skey!r} has invalid option object: {opt!r}")
+                        else:
+                            raise ValueError(f"setting {skey!r} has invalid option entry: {opt!r}")
+                if skind == "select":
+                    opts = spec.get("options")
+                    if not isinstance(opts, list) or len(opts) == 0:
+                        raise ValueError(f"select setting {skey!r} must define non-empty options")
+
+        return manifest
+
+
+    def validate_descriptor(path: pathlib.Path, plugins_dir: pathlib.Path = pathlib.Path("plugins")) -> dict:
+        if path.parent != plugins_dir or path.suffix != ".json" or not path.is_file():
+            raise ValueError(f"plugin descriptors must be top-level files at plugins/<id>.json (got {path})")
+        desc = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(desc, dict):
+            raise ValueError(f"{path}: descriptor must be a JSON object")
+        extra_keys = sorted(set(desc.keys()) - DESCRIPTOR_ALLOWED_KEYS)
+        if extra_keys:
+            raise ValueError(f"{path}: unknown descriptor field(s): {', '.join(extra_keys)}")
+
+        pid = path.stem
+        if not validate_plugin_id(pid) or desc.get("id") != pid:
+            raise ValueError(
+                f"{path}: id {desc.get('id')!r} must match filename {pid!r} and ^[a-z0-9][a-z0-9._-]{{1,63}}$"
+            )
+        ver = desc.get("version")
+        if not validate_version(ver):
+            raise ValueError(
+                f"{path}: invalid version {ver!r} (must match ^[0-9A-Za-z][0-9A-Za-z._+-]{{0,63}}$ without '..')"
+            )
+        validate_https_url_syntax(desc.get("source_url"), f"{path}: source_url")
+
+        if "sha256" not in desc:
+            raise ValueError(f"{path}: sha256 is required (64-char lowercase hex)")
+        sha_val = desc["sha256"]
+        if not isinstance(sha_val, str) or not SHA256_RE.match(sha_val):
+            raise ValueError(f"{path}: sha256 must be a 64-character lowercase hex string, got {sha_val!r}")
+
+        if "homepage" in desc:
+            validate_https_url_syntax(desc["homepage"], f"{path}: homepage")
+        if "min_fern_version" in desc:
+            mfv = desc["min_fern_version"]
+            if not isinstance(mfv, str) or not mfv.strip():
+                raise ValueError(f"{path}: min_fern_version must be a non-empty string")
+        if "tags" in desc:
+            tags = desc["tags"]
+            if not isinstance(tags, list) or not all(isinstance(t, str) and t.strip() for t in tags):
+                raise ValueError(f"{path}: tags must be an array of non-empty strings")
+            if len(tags) != len(set(tags)):
+                raise ValueError(f"{path}: tags must not contain duplicates")
+        return desc
+
+
+    def validate_all_descriptors(plugins_dir: pathlib.Path) -> list[tuple[pathlib.Path, dict]]:
+        if not plugins_dir.is_dir():
+            raise SystemExit("plugins/ directory not found")
+        results: list[tuple[pathlib.Path, dict]] = []
+        for entry in sorted(plugins_dir.rglob("*")):
+            if entry == plugins_dir / ".gitkeep":
+                continue
+            if entry.is_dir():
+                raise ValueError(f"subdirectories are forbidden under plugins/: {entry}")
+            if entry.parent != plugins_dir or entry.suffix != ".json":
+                raise ValueError(f"unexpected file under plugins/: {entry}")
+            results.append((entry, validate_descriptor(entry, plugins_dir)))
+        return results
+
+
+    def release_has_asset(tag: str, asset_name: str) -> bool:
+        proc = subprocess.run(
+            ["gh", "release", "view", tag, "--json", "assets"],
+            capture_output=True,
+            text=True,
+        )
+        if proc.returncode != 0:
+            return False
+        data = json.loads(proc.stdout)
+        return any(a.get("name") == asset_name for a in data.get("assets", []))
+
+
+    def md_code_cell(val: str) -> str:
+        cleaned = str(val).replace("\r", " ").replace("\n", " ").replace("|", "\\|")
+        runs = re.findall(r"`+", cleaned)
+        fence = "`" * (max((len(r) for r in runs), default=0) + 1)
+        if cleaned.startswith("`") or cleaned.endswith("`") or cleaned.startswith(" ") or cleaned.endswith(" "):
+            return f"{fence} {cleaned} {fence}"
+        return f"{fence}{cleaned}{fence}"
+
+
+    def render_index_html(
+        entries: list[dict],
+        generated_at: str,
+        repo_slug: str,
+        has_schema: bool = False,
+    ) -> str:
+        repo_href = f"https://github.com/{html.escape(repo_slug, quote=True)}"
+        count = len(entries)
+        count_label = f"{count} plugin indexed" if count == 1 else f"{count} plugins indexed"
+        if entries:
+            rows = []
+            for e in entries:
+                rows.append(
+                    "<tr>"
+                    f"<td><strong>{html.escape(str(e['name']))}</strong></td>"
+                    f"<td><code>{html.escape(str(e['id']))}</code></td>"
+                    f"<td><code>{html.escape(str(e['version']))}</code></td>"
+                    f"<td>{html.escape(str(e.get('description') or ''))}</td>"
+                    "</tr>"
+                )
+            plugins_block = (
+                "<table>"
+                "<thead><tr><th>Name</th><th>ID</th><th>Version</th><th>Description</th></tr></thead>"
+                f"<tbody>{''.join(rows)}</tbody>"
+                "</table>"
+            )
+        else:
+            plugins_block = "<p class='empty'>No plugins indexed yet. Submit the first plugin via Pull Request.</p>"
+
+        schema_link = (
+            '<a class="btn" href="./plugin-descriptor.schema.json">Descriptor Schema</a>'
+            if has_schema
+            else ""
+        )
+
+        template = """<!doctype html>
+    <html lang="en">
+    <head>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <title>Fern Plugin Registry</title>
+      <style>
+        :root { color-scheme: dark; }
+        body {
+          margin: 0;
+          padding: 40px 20px;
+          font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+          background: #0f1117;
+          color: #e6eaf2;
+          line-height: 1.55;
+        }
+        main { max-width: 880px; margin: 0 auto; }
+        h1 { margin: 0 0 8px; font-size: 28px; letter-spacing: -0.02em; }
+        .meta { color: #9aa4b2; font-size: 14px; margin-bottom: 24px; }
+        .links { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 28px; }
+        .btn {
+          display: inline-block;
+          padding: 8px 14px;
+          border-radius: 8px;
+          border: 1px solid #2b3242;
+          background: #171b24;
+          color: #8cb4ff;
+          text-decoration: none;
+          font-size: 14px;
+          font-weight: 500;
+        }
+        .btn:hover { border-color: #4f6d9a; background: #1c2230; }
+        table { width: 100%; border-collapse: collapse; background: #151922; border-radius: 10px; overflow: hidden; }
+        th, td { text-align: left; padding: 12px 14px; border-bottom: 1px solid #222836; font-size: 14px; }
+        th { color: #9aa4b2; font-weight: 600; background: #191e29; }
+        tr:last-child td { border-bottom: none; }
+        code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; color: #c7d2fe; }
+        .empty {
+          padding: 18px 20px;
+          border-radius: 10px;
+          background: #151922;
+          border: 1px solid #222836;
+          color: #9aa4b2;
+        }
+      </style>
+    </head>
+    <body>
+      <main>
+        <h1>Fern Plugin Registry</h1>
+        <div class="meta">__COUNT__ &middot; Updated <code>__GENERATED_AT__</code> &middot; Schema v1</div>
+        <div class="links">
+          <a class="btn" href="./registry.json">registry.json</a>
+          __SCHEMA_LINK__
+          <a class="btn" href="__REPO_HREF__">GitHub Repository</a>
+        </div>
+        __PLUGINS_BLOCK__
+      </main>
+    </body>
+    </html>
+    """
+        return (
+            template.replace("__COUNT__", html.escape(count_label))
+            .replace("__GENERATED_AT__", html.escape(generated_at))
+            .replace("__SCHEMA_LINK__", schema_link)
+            .replace("__REPO_HREF__", repo_href)
+            .replace("__PLUGINS_BLOCK__", plugins_block)
+        )
+
+
+    def build_registry_entry(
+        desc: dict,
+        manifest: dict,
+        repo: str,
+        tag: str,
+        sha256: str,
+        size_bytes: int,
+    ) -> dict:
+        encoded_tag = urllib.parse.quote(tag, safe="")
+        entry = {
+            "id": manifest["id"],
+            "name": manifest["name"],
+            "version": manifest["version"],
+            "api_version": manifest["api_version"],
+            "description": manifest.get("description") or "",
+            "author": manifest.get("author") or "",
+            "tags": desc.get("tags") or [],
+            "permissions": manifest.get("permissions") or [],
+            "download_url": f"https://github.com/{repo}/releases/download/{encoded_tag}/plugin.zip",
+            "sha256": sha256,
+            "size_bytes": size_bytes,
+        }
+        min_ver = manifest.get("min_fern_version") or desc.get("min_fern_version")
+        if min_ver:
+            entry["min_fern_version"] = min_ver
+        homepage = desc.get("homepage") or manifest.get("homepage")
+        if homepage:
+            entry["homepage"] = homepage
+        return entry
+
+
+    def run_validate_pr() -> None:
+        schema_path = pathlib.Path("schema/plugin-descriptor.schema.json")
+        if schema_path.is_file():
+            json.loads(schema_path.read_text(encoding="utf-8"))
+
+        validated = dict(validate_all_descriptors(pathlib.Path("plugins")))
+        changed = json.loads(os.environ.get("CHANGED_FILES", "[]"))
+        summary_rows = []
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = pathlib.Path(tmp)
+            for rel in changed:
+                p = pathlib.Path(rel)
+                if p.name == ".gitkeep":
+                    continue
+                if p not in validated:
+                    desc = validate_descriptor(p)
+                else:
+                    desc = validated[p]
+                pid = desc["id"]
+                ver = desc["version"]
+                expected_sha = desc["sha256"]
+                tag = f"{pid}-{ver}"
+
+                zip_path = tmp_dir / f"{pid}.zip"
+                sha256, size_bytes = download_zip(desc["source_url"], zip_path)
+                if sha256 != expected_sha:
+                    raise ValueError(f"{rel}: sha256 mismatch (expected {expected_sha}, got {sha256})")
+
+                if os.environ.get("GH_TOKEN") and release_has_asset(tag, "plugin.zip"):
+                    existing_zip = tmp_dir / f"{pid}.existing.zip"
+                    subprocess.run(
+                        ["gh", "release", "download", tag, "-p", "plugin.zip", "-O", str(existing_zip)],
+                        check=True,
+                    )
+                    existing_sha, _ = sha256_file(existing_zip)
+                    if existing_sha != expected_sha:
+                        raise ValueError(
+                            f"{rel}: release tag {tag!r} already exists with sha256 {existing_sha}, "
+                            f"which differs from descriptor sha256 {expected_sha}; bump version instead"
+                        )
+
+                manifest = inspect_zip_and_manifest(zip_path, pid, ver)
+                summary_rows.append((pid, ver, size_bytes, sha256, manifest.get("permissions") or []))
+                print(f"Validated {pid}@{ver}: {size_bytes} bytes, sha256={sha256}")
+
+        summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+        if summary_path and summary_rows:
+            with open(summary_path, "a", encoding="utf-8") as sf:
+                sf.write("### Validated Plugin Submissions\n\n")
+                sf.write("| Plugin ID | Version | Size (bytes) | SHA-256 | Permissions |\n")
+                sf.write("| --- | --- | ---: | --- | --- |\n")
+                for pid, ver, sz, sha, perms in summary_rows:
+                    sf.write(
+                        f"| {md_code_cell(pid)} | {md_code_cell(ver)} | {int(sz)} "
+                        f"| {md_code_cell(sha)} | {md_code_cell(json.dumps(perms))} |\n"
+                    )
+
+
+    def run_publish_registry() -> None:
+        repo = os.environ["GITHUB_REPOSITORY"]
+        plugins_dir = pathlib.Path("plugins")
+        site_dir = pathlib.Path("_site")
+        site_dir.mkdir(parents=True, exist_ok=True)
+
+        validated = validate_all_descriptors(plugins_dir)
+        registry_entries = []
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = pathlib.Path(tmp)
+            for p, desc in validated:
+                pid = desc["id"]
+                ver = desc["version"]
+                expected_sha = desc["sha256"]
+                tag = f"{pid}-{ver}"
+                zip_path = tmp_dir / f"{pid}-{ver}.zip"
+
+                if release_has_asset(tag, "plugin.zip"):
+                    subprocess.run(
+                        ["gh", "release", "download", tag, "-p", "plugin.zip", "-O", str(zip_path)],
+                        check=True,
+                    )
+                    sha256, size_bytes = sha256_file(zip_path)
+                    if sha256 != expected_sha:
+                        raise ValueError(
+                            f"{p}: mirrored release {tag!r} sha256 mismatch "
+                            f"(descriptor expects {expected_sha}, release asset has {sha256}); "
+                            "bump version to publish a new archive"
+                        )
+                    manifest = inspect_zip_and_manifest(zip_path, pid, ver)
+                else:
+                    sha256, size_bytes = download_zip(desc["source_url"], zip_path)
+                    if sha256 != expected_sha:
+                        raise ValueError(f"{p}: sha256 mismatch (expected {expected_sha}, got {sha256})")
+                    manifest = inspect_zip_and_manifest(zip_path, pid, ver)
+                    asset_arg = f"{zip_path}#plugin.zip"
+                    view_proc = subprocess.run(["gh", "release", "view", tag], capture_output=True)
+                    if view_proc.returncode == 0:
+                        subprocess.run(["gh", "release", "upload", tag, asset_arg, "--clobber"], check=True)
+                    else:
+                        subprocess.run(
+                            [
+                                "gh",
+                                "release",
+                                "create",
+                                tag,
+                                asset_arg,
+                                "--title",
+                                f"{pid} v{ver}",
+                                "--notes",
+                                f"Mirrored archive for `{pid}` version `{ver}` (sha256 `{sha256}`).",
+                            ],
+                            check=True,
+                        )
+
+                registry_entries.append(
+                    build_registry_entry(desc, manifest, repo, tag, sha256, size_bytes)
+                )
+
+        generated_at = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        index = {
+            "schema_version": 1,
+            "generated_at": generated_at,
+            "plugins": registry_entries,
+        }
+
+        schema_src = pathlib.Path("schema/plugin-descriptor.schema.json")
+        has_schema = schema_src.is_file()
+        if has_schema:
+            schema_text = schema_src.read_text(encoding="utf-8")
+            json.loads(schema_text)
+            (site_dir / "plugin-descriptor.schema.json").write_text(schema_text, encoding="utf-8")
+
+        (site_dir / ".nojekyll").write_text("", encoding="utf-8")
+        (site_dir / "registry.json").write_text(json.dumps(index, indent=2) + "\n", encoding="utf-8")
+        (site_dir / "index.html").write_text(
+            render_index_html(registry_entries, generated_at, repo, has_schema=has_schema),
+            encoding="utf-8",
+        )
+        print(f"Generated registry.json with {len(registry_entries)} plugins at {generated_at}")
+
+
+    def main(argv: list[str]) -> None:
+        if len(argv) < 2 or argv[1] not in ("validate-pr", "publish-registry"):
+            raise SystemExit("usage: fern_registry.py <validate-pr|publish-registry>")
+        if argv[1] == "validate-pr":
+            run_validate_pr()
+        else:
+            run_publish_registry()
+
+
+    if __name__ == "__main__":
+        main(sys.argv)
+
 jobs:
   validate-pr:
     name: Validate Plugin PR
@@ -55,12 +992,12 @@ jobs:
       contents: read
     steps:
       - name: Checkout PR
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.13"
 
@@ -100,296 +1037,10 @@ jobs:
       - name: Validate changed plugin archives and all descriptors
         env:
           CHANGED_FILES: ${{ steps.changed.outputs.files }}
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
-          python3 - <<'PY'
-          import hashlib
-          import ipaddress
-          import json
-          import os
-          import pathlib
-          import posixpath
-          import re
-          import socket
-          import tempfile
-          import urllib.parse
-          import urllib.request
-          import zipfile
-
-          MAX_ZIP_BYTES = 10 * 1024 * 1024
-          MAX_UNPACKED_BYTES = 32 * 1024 * 1024
-          MAX_SVG_BYTES = 256 * 1024
-          CURRENT_API_VERSION = 1
-          PLUGIN_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{1,63}$")
-          SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
-          KNOWN_PERMISSIONS = {
-              "tasks:read",
-              "tasks:write",
-              "lists:read",
-              "lists:write",
-              "tags:read",
-              "tags:write",
-              "habits:read",
-              "habits:write",
-              "focus:read",
-              "countdowns:read",
-              "countdowns:write",
-              "storage",
-              "meta",
-              "notifications",
-              "clipboard",
-              "network:local",
-              "hooks:intercept",
-              "services",
-          }
-          KNOWN_SETTING_TYPES = {"text", "number", "boolean", "select", "secret"}
-
-          def validate_plugin_id(pid: str) -> bool:
-              return isinstance(pid, str) and bool(PLUGIN_ID_RE.match(pid)) and ".." not in pid
-
-          def validate_rel_path(rel: str) -> str:
-              if not isinstance(rel, str) or not rel.strip():
-                  raise ValueError(f"empty relative path: {rel!r}")
-              raw = rel.strip()
-              if raw.startswith("/") or "\\" in raw or ":" in raw or "\x00" in raw:
-                  raise ValueError(f"unsafe relative path: {rel!r}")
-              norm = posixpath.normpath(raw)
-              if norm in ("", ".", "..") or norm.startswith("../") or "/../" in norm:
-                  raise ValueError(f"path traversal forbidden: {rel!r}")
-              return norm
-
-          def validate_https_url_syntax(url: str, field_name: str) -> str:
-              if not isinstance(url, str) or not url.strip():
-                  raise ValueError(f"{field_name} must be a non-empty https:// URL")
-              cleaned = url.strip()
-              parsed = urllib.parse.urlparse(cleaned)
-              if parsed.scheme.lower() != "https" or not parsed.hostname:
-                  raise ValueError(f"{field_name} must use https:// with a valid host: {url!r}")
-              return cleaned
-
-          def assert_public_https_url(url: str) -> str:
-              cleaned = validate_https_url_syntax(url, "source_url")
-              parsed = urllib.parse.urlparse(cleaned)
-              host = parsed.hostname
-              port = parsed.port or 443
-              try:
-                  infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
-              except socket.gaierror as exc:
-                  raise ValueError(f"DNS resolution failed for {host!r}: {exc}") from exc
-              if not infos:
-                  raise ValueError(f"no DNS records for {host!r}")
-              for _, _, _, _, sockaddr in infos:
-                  ip_str = sockaddr[0].split("%", 1)[0]
-                  ip = ipaddress.ip_address(ip_str)
-                  if (
-                      not ip.is_global
-                      or ip.is_private
-                      or ip.is_loopback
-                      or ip.is_link_local
-                      or ip.is_multicast
-                      or ip.is_unspecified
-                      or ip.is_reserved
-                  ):
-                      raise ValueError(f"non-public IP {ip} blocked for {host!r}")
-              return cleaned
-
-          class SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
-              def redirect_request(self, req, fp, code, msg, headers, newurl):
-                  resolved = urllib.parse.urljoin(req.full_url, newurl)
-                  assert_public_https_url(resolved)
-                  return super().redirect_request(req, fp, code, msg, headers, newurl)
-
-          def download_zip(url: str, dest: pathlib.Path) -> tuple[str, int]:
-              current = assert_public_https_url(url)
-              opener = urllib.request.build_opener(SafeRedirectHandler())
-              req = urllib.request.Request(current, headers={"User-Agent": "fern-plugins-ci/1.0"})
-              hasher = hashlib.sha256()
-              total = 0
-              with opener.open(req, timeout=30) as resp, dest.open("wb") as out:
-                  if resp.status < 200 or resp.status >= 300:
-                      raise ValueError(f"download returned HTTP {resp.status} for {url}")
-                  while True:
-                      chunk = resp.read(65536)
-                      if not chunk:
-                          break
-                      total += len(chunk)
-                      if total > MAX_ZIP_BYTES:
-                          raise ValueError(f"archive exceeds {MAX_ZIP_BYTES} bytes (10 MiB)")
-                      hasher.update(chunk)
-                      out.write(chunk)
-              return hasher.hexdigest(), total
-
-          def inspect_zip_and_manifest(zip_path: pathlib.Path, expected_id: str, expected_version: str) -> dict:
-              entries: dict[str, bytes] = {}
-              dirs: set[str] = set()
-              total_unpacked = 0
-
-              with zipfile.ZipFile(zip_path, "r") as zf:
-                  for info in zf.infolist():
-                      mode = (info.external_attr >> 16) & 0o170000
-                      if mode == 0o120000:
-                          raise ValueError(f"symlink forbidden in archive: {info.filename!r}")
-                      if mode not in (0, 0o100000, 0o040000):
-                          raise ValueError(f"unsupported file mode {oct(mode)} in archive: {info.filename!r}")
-                      if "\\" in info.filename or info.filename.startswith("/") or ":" in info.filename or "\x00" in info.filename:
-                          raise ValueError(f"unsafe zip entry path: {info.filename!r}")
-                      if info.filename.endswith("/"):
-                          norm_dir = posixpath.normpath(info.filename.rstrip("/"))
-                          if norm_dir not in ("", "."):
-                              validate_rel_path(norm_dir)
-                              dirs.add(norm_dir)
-                          continue
-                      clean = validate_rel_path(info.filename)
-                      with zf.open(info, "r") as stream:
-                          chunks = []
-                          while True:
-                              buf = stream.read(65536)
-                              if not buf:
-                                  break
-                              total_unpacked += len(buf)
-                              if total_unpacked > MAX_UNPACKED_BYTES:
-                                  raise ValueError(f"unpacked archive exceeds {MAX_UNPACKED_BYTES} bytes (32 MiB)")
-                              chunks.append(buf)
-                          entries[clean] = b"".join(chunks)
-
-              if "manifest.json" in entries:
-                  prefix = ""
-              else:
-                  top_levels = {p.split("/", 1)[0] for p in entries} | {d.split("/", 1)[0] for d in dirs}
-                  top_files = [p for p in entries if "/" not in p]
-                  if len(top_levels) == 1 and not top_files:
-                      root_dir = next(iter(top_levels))
-                      if f"{root_dir}/manifest.json" in entries:
-                          prefix = f"{root_dir}/"
-                      else:
-                          raise ValueError("archive missing manifest.json")
-                  else:
-                      raise ValueError("archive missing manifest.json at archive root")
-
-              def read_archive_file(rel: str) -> bytes:
-                  key = prefix + validate_rel_path(rel)
-                  if key not in entries:
-                      raise ValueError(f"referenced archive file missing: {rel!r}")
-                  return entries[key]
-
-              manifest = json.loads(entries[f"{prefix}manifest.json"].decode("utf-8"))
-              api_ver = manifest.get("api_version")
-              if isinstance(api_ver, bool) or api_ver != CURRENT_API_VERSION:
-                  raise ValueError(f"api_version must be {CURRENT_API_VERSION}, got {api_ver!r}")
-              if manifest.get("id") != expected_id or not validate_plugin_id(manifest.get("id", "")):
-                  raise ValueError(f"manifest id {manifest.get('id')!r} does not match {expected_id!r}")
-              if not isinstance(manifest.get("name"), str) or not manifest["name"].strip():
-                  raise ValueError("manifest name must be non-empty")
-              if manifest.get("version") != expected_version or not isinstance(expected_version, str) or not expected_version.strip():
-                  raise ValueError(f"manifest version {manifest.get('version')!r} does not match {expected_version!r}")
-
-              read_archive_file(manifest.get("entry", ""))
-
-              for perm in manifest.get("permissions", []):
-                  if isinstance(perm, str):
-                      if perm not in KNOWN_PERMISSIONS:
-                          raise ValueError(f"unknown permission {perm!r}")
-                  elif isinstance(perm, dict) and set(perm.keys()) == {"network"} and isinstance(perm["network"], list):
-                      for host in perm["network"]:
-                          if not isinstance(host, str) or not host.strip() or any(c.isspace() for c in host) or "/" in host:
-                              raise ValueError(f"invalid network permission pattern: {host!r}")
-                  else:
-                      raise ValueError(f"invalid permission entry: {perm!r}")
-
-              sidebar_ids = set()
-              for view in manifest.get("contributions", {}).get("sidebar", []):
-                  vid = view.get("id", "")
-                  if not isinstance(vid, str) or not vid.strip() or "/" in vid or vid in sidebar_ids:
-                      raise ValueError(f"invalid or duplicate sidebar id: {vid!r}")
-                  sidebar_ids.add(vid)
-                  if not isinstance(view.get("title"), str) or not view["title"].strip():
-                      raise ValueError(f"sidebar view {vid!r} missing title")
-                  if view.get("icon"):
-                      svg_bytes = read_archive_file(view["icon"])
-                      if len(svg_bytes) > MAX_SVG_BYTES:
-                          raise ValueError(f"sidebar icon {view['icon']!r} exceeds {MAX_SVG_BYTES} bytes")
-                      svg_lower = svg_bytes.decode("utf-8", errors="replace").lower()
-                      if "<svg" not in svg_lower:
-                          raise ValueError(f"sidebar icon {view['icon']!r} missing <svg")
-
-              setting_keys = set()
-              for spec in manifest.get("settings", []):
-                  skey = spec.get("key", "")
-                  if not isinstance(skey, str) or not skey.strip() or skey in setting_keys:
-                      raise ValueError(f"invalid or duplicate setting key: {skey!r}")
-                  setting_keys.add(skey)
-                  skind = spec.get("type")
-                  if skind not in KNOWN_SETTING_TYPES:
-                      raise ValueError(f"invalid setting type {skind!r}")
-                  if skind == "select" and not spec.get("options"):
-                      raise ValueError(f"select setting {skey!r} must define non-empty options")
-
-              return manifest
-
-          plugins_dir = pathlib.Path("plugins")
-          if not plugins_dir.is_dir():
-              raise SystemExit("plugins/ directory not found")
-
-          for p in sorted(plugins_dir.iterdir()):
-              if p.name == ".gitkeep":
-                  continue
-              if p.suffix != ".json" or not p.is_file():
-                  raise ValueError(f"unexpected entry in plugins/: {p}")
-              desc = json.loads(p.read_text(encoding="utf-8"))
-              if not isinstance(desc, dict):
-                  raise ValueError(f"{p}: descriptor must be a JSON object")
-              pid = p.stem
-              if not validate_plugin_id(pid) or desc.get("id") != pid:
-                  raise ValueError(f"{p}: id {desc.get('id')!r} must match filename {pid!r} and ^[a-z0-9][a-z0-9._-]{{1,63}}$")
-              ver = desc.get("version", "")
-              if not isinstance(ver, str) or not ver.strip() or "/" in ver or ".." in ver or any(c.isspace() for c in ver):
-                  raise ValueError(f"{p}: invalid version {ver!r}")
-              validate_https_url_syntax(desc.get("source_url", ""), f"{p}: source_url")
-              if "homepage" in desc and desc["homepage"] is not None:
-                  validate_https_url_syntax(desc["homepage"], f"{p}: homepage")
-              if "sha256" in desc and desc["sha256"] is not None:
-                  sha_val = desc["sha256"]
-                  if not isinstance(sha_val, str) or not SHA256_RE.match(sha_val.strip().lower()):
-                      raise ValueError(f"{p}: invalid sha256 checksum {sha_val!r}")
-              if "min_fern_version" in desc and desc["min_fern_version"] is not None:
-                  mfv = desc["min_fern_version"]
-                  if not isinstance(mfv, str) or not mfv.strip():
-                      raise ValueError(f"{p}: min_fern_version must be a non-empty string")
-              if "tags" in desc and desc["tags"] is not None:
-                  tags = desc["tags"]
-                  if not isinstance(tags, list) or not all(isinstance(t, str) and t.strip() for t in tags):
-                      raise ValueError(f"{p}: tags must be an array of non-empty strings")
-
-          changed = json.loads(os.environ.get("CHANGED_FILES", "[]"))
-          summary_rows = []
-          with tempfile.TemporaryDirectory() as tmp:
-              tmp_dir = pathlib.Path(tmp)
-              for rel in changed:
-                  p = pathlib.Path(rel)
-                  if p.name == ".gitkeep":
-                      continue
-                  if p.parent != pathlib.Path("plugins") or p.suffix != ".json":
-                      raise ValueError(f"plugin descriptors must be placed at plugins/<id>.json (got {rel})")
-                  desc = json.loads(p.read_text(encoding="utf-8"))
-                  pid = desc["id"]
-                  ver = desc["version"]
-                  zip_path = tmp_dir / f"{pid}.zip"
-                  sha256, size_bytes = download_zip(desc["source_url"], zip_path)
-                  expected_sha = desc.get("sha256")
-                  if expected_sha and sha256 != expected_sha.strip().lower():
-                      raise ValueError(f"{rel}: sha256 mismatch (expected {expected_sha}, got {sha256})")
-                  manifest = inspect_zip_and_manifest(zip_path, pid, ver)
-                  summary_rows.append((pid, ver, size_bytes, sha256, manifest.get("permissions", [])))
-                  print(f"Validated {pid}@{ver}: {size_bytes} bytes, sha256={sha256}")
-
-          summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
-          if summary_path and summary_rows:
-              with open(summary_path, "a", encoding="utf-8") as sf:
-                  sf.write("### Validated Plugin Submissions\n\n")
-                  sf.write("| Plugin ID | Version | Size (bytes) | SHA-256 | Permissions |\n")
-                  sf.write("| --- | --- | ---: | --- | --- |\n")
-                  for pid, ver, sz, sha, perms in summary_rows:
-                      sf.write(f"| `{pid}` | `{ver}` | {sz} | `{sha}` | `{json.dumps(perms)}` |\n")
-          PY
+          python3 -c 'import os; exec(compile(os.environ["FERN_REGISTRY_SCRIPT"], "fern_registry.py", "exec"), {"__name__": "__main__"})' validate-pr
 
   publish-registry:
     name: Mirror Releases & Publish Registry
@@ -404,10 +1055,10 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - name: Checkout main
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.13"
 
@@ -416,423 +1067,16 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
-          python3 - <<'PY'
-          import datetime
-          import hashlib
-          import html
-          import ipaddress
-          import json
-          import os
-          import pathlib
-          import posixpath
-          import re
-          import socket
-          import subprocess
-          import tempfile
-          import urllib.parse
-          import urllib.request
-          import zipfile
-
-          MAX_ZIP_BYTES = 10 * 1024 * 1024
-          MAX_UNPACKED_BYTES = 32 * 1024 * 1024
-          MAX_SVG_BYTES = 256 * 1024
-          CURRENT_API_VERSION = 1
-          PLUGIN_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{1,63}$")
-          KNOWN_PERMISSIONS = {
-              "tasks:read",
-              "tasks:write",
-              "lists:read",
-              "lists:write",
-              "tags:read",
-              "tags:write",
-              "habits:read",
-              "habits:write",
-              "focus:read",
-              "countdowns:read",
-              "countdowns:write",
-              "storage",
-              "meta",
-              "notifications",
-              "clipboard",
-              "network:local",
-              "hooks:intercept",
-              "services",
-          }
-          KNOWN_SETTING_TYPES = {"text", "number", "boolean", "select", "secret"}
-
-          def validate_plugin_id(pid: str) -> bool:
-              return isinstance(pid, str) and bool(PLUGIN_ID_RE.match(pid)) and ".." not in pid
-
-          def validate_rel_path(rel: str) -> str:
-              if not isinstance(rel, str) or not rel.strip():
-                  raise ValueError(f"empty relative path: {rel!r}")
-              raw = rel.strip()
-              if raw.startswith("/") or "\\" in raw or ":" in raw or "\x00" in raw:
-                  raise ValueError(f"unsafe relative path: {rel!r}")
-              norm = posixpath.normpath(raw)
-              if norm in ("", ".", "..") or norm.startswith("../") or "/../" in norm:
-                  raise ValueError(f"path traversal forbidden: {rel!r}")
-              return norm
-
-          def assert_public_https_url(url: str) -> str:
-              parsed = urllib.parse.urlparse(url.strip())
-              if parsed.scheme.lower() != "https" or not parsed.hostname:
-                  raise ValueError(f"source_url must use https://: {url!r}")
-              infos = socket.getaddrinfo(parsed.hostname, parsed.port or 443, type=socket.SOCK_STREAM)
-              if not infos:
-                  raise ValueError(f"no DNS records for {parsed.hostname!r}")
-              for _, _, _, _, sockaddr in infos:
-                  ip = ipaddress.ip_address(sockaddr[0].split("%", 1)[0])
-                  if (
-                      not ip.is_global
-                      or ip.is_private
-                      or ip.is_loopback
-                      or ip.is_link_local
-                      or ip.is_multicast
-                      or ip.is_unspecified
-                      or ip.is_reserved
-                  ):
-                      raise ValueError(f"non-public IP {ip} blocked for {parsed.hostname!r}")
-              return url.strip()
-
-          class SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
-              def redirect_request(self, req, fp, code, msg, headers, newurl):
-                  assert_public_https_url(urllib.parse.urljoin(req.full_url, newurl))
-                  return super().redirect_request(req, fp, code, msg, headers, newurl)
-
-          def download_zip(url: str, dest: pathlib.Path) -> tuple[str, int]:
-              opener = urllib.request.build_opener(SafeRedirectHandler())
-              req = urllib.request.Request(assert_public_https_url(url), headers={"User-Agent": "fern-plugins-ci/1.0"})
-              hasher = hashlib.sha256()
-              total = 0
-              with opener.open(req, timeout=30) as resp, dest.open("wb") as out:
-                  if resp.status < 200 or resp.status >= 300:
-                      raise ValueError(f"HTTP {resp.status} downloading {url}")
-                  while True:
-                      chunk = resp.read(65536)
-                      if not chunk:
-                          break
-                      total += len(chunk)
-                      if total > MAX_ZIP_BYTES:
-                          raise ValueError(f"archive exceeds {MAX_ZIP_BYTES} bytes")
-                      hasher.update(chunk)
-                      out.write(chunk)
-              return hasher.hexdigest(), total
-
-          def sha256_file(path: pathlib.Path) -> tuple[str, int]:
-              h = hashlib.sha256()
-              size = 0
-              with path.open("rb") as f:
-                  while True:
-                      chunk = f.read(65536)
-                      if not chunk:
-                          break
-                      size += len(chunk)
-                      if size > MAX_ZIP_BYTES:
-                          raise ValueError(f"archive exceeds {MAX_ZIP_BYTES} bytes")
-                      h.update(chunk)
-              return h.hexdigest(), size
-
-          def inspect_zip_and_manifest(zip_path: pathlib.Path, expected_id: str, expected_version: str) -> dict:
-              entries: dict[str, bytes] = {}
-              dirs: set[str] = set()
-              total_unpacked = 0
-              with zipfile.ZipFile(zip_path, "r") as zf:
-                  for info in zf.infolist():
-                      mode = (info.external_attr >> 16) & 0o170000
-                      if mode == 0o120000:
-                          raise ValueError(f"symlink forbidden in archive: {info.filename!r}")
-                      if mode not in (0, 0o100000, 0o040000):
-                          raise ValueError(f"unsupported file mode {oct(mode)} in archive: {info.filename!r}")
-                      if "\\" in info.filename or info.filename.startswith("/") or ":" in info.filename or "\x00" in info.filename:
-                          raise ValueError(f"unsafe zip entry path: {info.filename!r}")
-                      if info.filename.endswith("/"):
-                          norm_dir = posixpath.normpath(info.filename.rstrip("/"))
-                          if norm_dir not in ("", "."):
-                              validate_rel_path(norm_dir)
-                              dirs.add(norm_dir)
-                          continue
-                      clean = validate_rel_path(info.filename)
-                      with zf.open(info, "r") as stream:
-                          chunks = []
-                          while True:
-                              buf = stream.read(65536)
-                              if not buf:
-                                  break
-                              total_unpacked += len(buf)
-                              if total_unpacked > MAX_UNPACKED_BYTES:
-                                  raise ValueError(f"unpacked archive exceeds {MAX_UNPACKED_BYTES} bytes")
-                              chunks.append(buf)
-                          entries[clean] = b"".join(chunks)
-
-              if "manifest.json" in entries:
-                  prefix = ""
-              else:
-                  top_levels = {p.split("/", 1)[0] for p in entries} | {d.split("/", 1)[0] for d in dirs}
-                  top_files = [p for p in entries if "/" not in p]
-                  if len(top_levels) == 1 and not top_files:
-                      root_dir = next(iter(top_levels))
-                      if f"{root_dir}/manifest.json" in entries:
-                          prefix = f"{root_dir}/"
-                      else:
-                          raise ValueError("archive missing manifest.json")
-                  else:
-                      raise ValueError("archive missing manifest.json at archive root")
-
-              def read_archive_file(rel: str) -> bytes:
-                  key = prefix + validate_rel_path(rel)
-                  if key not in entries:
-                      raise ValueError(f"referenced archive file missing: {rel!r}")
-                  return entries[key]
-
-              manifest = json.loads(entries[f"{prefix}manifest.json"].decode("utf-8"))
-              api_ver = manifest.get("api_version")
-              if isinstance(api_ver, bool) or api_ver != CURRENT_API_VERSION:
-                  raise ValueError(f"unsupported api_version: {api_ver!r}")
-              if manifest.get("id") != expected_id or not validate_plugin_id(expected_id):
-                  raise ValueError(f"manifest id mismatch: {manifest.get('id')!r} != {expected_id!r}")
-              if not isinstance(manifest.get("name"), str) or not manifest["name"].strip():
-                  raise ValueError("manifest name must be non-empty")
-              if manifest.get("version") != expected_version:
-                  raise ValueError(f"manifest version mismatch: {manifest.get('version')!r} != {expected_version!r}")
-
-              read_archive_file(manifest.get("entry", ""))
-
-              for perm in manifest.get("permissions", []):
-                  if isinstance(perm, str):
-                      if perm not in KNOWN_PERMISSIONS:
-                          raise ValueError(f"unknown permission {perm!r}")
-                  elif isinstance(perm, dict) and set(perm.keys()) == {"network"} and isinstance(perm["network"], list):
-                      for host in perm["network"]:
-                          if not isinstance(host, str) or not host.strip() or any(c.isspace() for c in host) or "/" in host:
-                              raise ValueError(f"invalid network permission pattern: {host!r}")
-                  else:
-                      raise ValueError(f"invalid permission entry: {perm!r}")
-
-              sidebar_ids = set()
-              for view in manifest.get("contributions", {}).get("sidebar", []):
-                  vid = view.get("id", "")
-                  if not isinstance(vid, str) or not vid.strip() or "/" in vid or vid in sidebar_ids:
-                      raise ValueError(f"invalid or duplicate sidebar id: {vid!r}")
-                  sidebar_ids.add(vid)
-                  if not isinstance(view.get("title"), str) or not view["title"].strip():
-                      raise ValueError(f"sidebar view {vid!r} missing title")
-                  if view.get("icon"):
-                      svg_bytes = read_archive_file(view["icon"])
-                      if len(svg_bytes) > MAX_SVG_BYTES:
-                          raise ValueError(f"sidebar icon {view['icon']!r} exceeds {MAX_SVG_BYTES} bytes")
-                      if "<svg" not in svg_bytes.decode("utf-8", errors="replace").lower():
-                          raise ValueError(f"sidebar icon {view['icon']!r} missing <svg")
-
-              setting_keys = set()
-              for spec in manifest.get("settings", []):
-                  skey = spec.get("key", "")
-                  if not isinstance(skey, str) or not skey.strip() or skey in setting_keys:
-                      raise ValueError(f"invalid or duplicate setting key: {skey!r}")
-                  setting_keys.add(skey)
-                  skind = spec.get("type")
-                  if skind not in KNOWN_SETTING_TYPES:
-                      raise ValueError(f"invalid setting type {skind!r}")
-                  if skind == "select" and not spec.get("options"):
-                      raise ValueError(f"select setting {skey!r} must define non-empty options")
-
-              return manifest
-
-          def release_has_asset(tag: str, asset_name: str) -> bool:
-              proc = subprocess.run(
-                  ["gh", "release", "view", tag, "--json", "assets"],
-                  capture_output=True,
-                  text=True,
-              )
-              if proc.returncode != 0:
-                  return False
-              data = json.loads(proc.stdout)
-              return any(a.get("name") == asset_name for a in data.get("assets", []))
-
-          def render_index_html(entries: list[dict], generated_at: str, repo_slug: str) -> str:
-              repo_href = f"https://github.com/{html.escape(repo_slug, quote=True)}"
-              count = len(entries)
-              count_label = f"{count} plugin indexed" if count == 1 else f"{count} plugins indexed"
-              if entries:
-                  rows = []
-                  for e in entries:
-                      rows.append(
-                          "<tr>"
-                          f"<td><strong>{html.escape(str(e['name']))}</strong></td>"
-                          f"<td><code>{html.escape(str(e['id']))}</code></td>"
-                          f"<td><code>{html.escape(str(e['version']))}</code></td>"
-                          f"<td>{html.escape(str(e.get('description', '')))}</td>"
-                          "</tr>"
-                      )
-                  plugins_block = (
-                      "<table>"
-                      "<thead><tr><th>Name</th><th>ID</th><th>Version</th><th>Description</th></tr></thead>"
-                      f"<tbody>{''.join(rows)}</tbody>"
-                      "</table>"
-                  )
-              else:
-                  plugins_block = "<p class='empty'>No plugins indexed yet. Submit the first plugin via Pull Request.</p>"
-
-              template = """<!doctype html>
-          <html lang="en">
-          <head>
-            <meta charset="utf-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1">
-            <title>Fern Plugin Registry</title>
-            <style>
-              :root { color-scheme: dark; }
-              body {
-                margin: 0;
-                padding: 40px 20px;
-                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-                background: #0f1117;
-                color: #e6eaf2;
-                line-height: 1.55;
-              }
-              main { max-width: 880px; margin: 0 auto; }
-              h1 { margin: 0 0 8px; font-size: 28px; letter-spacing: -0.02em; }
-              .meta { color: #9aa4b2; font-size: 14px; margin-bottom: 24px; }
-              .links { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 28px; }
-              .btn {
-                display: inline-block;
-                padding: 8px 14px;
-                border-radius: 8px;
-                border: 1px solid #2b3242;
-                background: #171b24;
-                color: #8cb4ff;
-                text-decoration: none;
-                font-size: 14px;
-                font-weight: 500;
-              }
-              .btn:hover { border-color: #4f6d9a; background: #1c2230; }
-              table { width: 100%; border-collapse: collapse; background: #151922; border-radius: 10px; overflow: hidden; }
-              th, td { text-align: left; padding: 12px 14px; border-bottom: 1px solid #222836; font-size: 14px; }
-              th { color: #9aa4b2; font-weight: 600; background: #191e29; }
-              tr:last-child td { border-bottom: none; }
-              code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; color: #c7d2fe; }
-              .empty {
-                padding: 18px 20px;
-                border-radius: 10px;
-                background: #151922;
-                border: 1px solid #222836;
-                color: #9aa4b2;
-              }
-            </style>
-          </head>
-          <body>
-            <main>
-              <h1>Fern Plugin Registry</h1>
-              <div class="meta">__COUNT__ &middot; Updated <code>__GENERATED_AT__</code> &middot; Schema v1</div>
-              <div class="links">
-                <a class="btn" href="./registry.json">registry.json</a>
-                <a class="btn" href="__REPO_HREF__">GitHub Repository</a>
-              </div>
-              __PLUGINS_BLOCK__
-            </main>
-          </body>
-          </html>
-          """
-              return (
-                  template.replace("__COUNT__", html.escape(count_label))
-                  .replace("__GENERATED_AT__", html.escape(generated_at))
-                  .replace("__REPO_HREF__", repo_href)
-                  .replace("__PLUGINS_BLOCK__", plugins_block)
-              )
-
-          repo = os.environ["GITHUB_REPOSITORY"]
-          plugins_dir = pathlib.Path("plugins")
-          site_dir = pathlib.Path("_site")
-          site_dir.mkdir(parents=True, exist_ok=True)
-
-          registry_entries = []
-          if plugins_dir.is_dir():
-              with tempfile.TemporaryDirectory() as tmp:
-                  tmp_dir = pathlib.Path(tmp)
-                  for p in sorted(plugins_dir.glob("*.json")):
-                      desc = json.loads(p.read_text(encoding="utf-8"))
-                      pid = p.stem
-                      if desc.get("id") != pid or not validate_plugin_id(pid):
-                          raise ValueError(f"invalid plugin descriptor {p}")
-                      ver = desc["version"]
-                      tag = f"{pid}-{ver}"
-                      zip_path = tmp_dir / f"{tag}.zip"
-
-                      if release_has_asset(tag, "plugin.zip"):
-                          subprocess.run(
-                              ["gh", "release", "download", tag, "-p", "plugin.zip", "-O", str(zip_path)],
-                              check=True,
-                          )
-                          sha256, size_bytes = sha256_file(zip_path)
-                      else:
-                          sha256, size_bytes = download_zip(desc["source_url"], zip_path)
-                          if desc.get("sha256") and sha256 != desc["sha256"].strip().lower():
-                              raise ValueError(f"{p}: sha256 mismatch (expected {desc['sha256']}, got {sha256})")
-                          inspect_zip_and_manifest(zip_path, pid, ver)
-                          asset_arg = f"{zip_path}#plugin.zip"
-                          view_proc = subprocess.run(["gh", "release", "view", tag], capture_output=True)
-                          if view_proc.returncode == 0:
-                              subprocess.run(["gh", "release", "upload", tag, asset_arg, "--clobber"], check=True)
-                          else:
-                              subprocess.run(
-                                  [
-                                      "gh",
-                                      "release",
-                                      "create",
-                                      tag,
-                                      asset_arg,
-                                      "--title",
-                                      f"{pid} v{ver}",
-                                      "--notes",
-                                      f"Mirrored archive for `{pid}` version `{ver}` (sha256 `{sha256}`).",
-                                  ],
-                                  check=True,
-                              )
-
-                      manifest = inspect_zip_and_manifest(zip_path, pid, ver)
-                      entry = {
-                          "id": manifest["id"],
-                          "name": manifest["name"],
-                          "version": manifest["version"],
-                          "api_version": manifest["api_version"],
-                          "description": manifest.get("description", ""),
-                          "author": manifest.get("author", ""),
-                          "tags": desc.get("tags", []),
-                          "permissions": manifest.get("permissions", []),
-                          "download_url": f"https://github.com/{repo}/releases/download/{tag}/plugin.zip",
-                          "sha256": sha256,
-                          "size_bytes": size_bytes,
-                      }
-                      min_ver = manifest.get("min_fern_version") or desc.get("min_fern_version")
-                      if min_ver:
-                          entry["min_fern_version"] = min_ver
-                      homepage = desc.get("homepage") or manifest.get("homepage")
-                      if homepage:
-                          entry["homepage"] = homepage
-                      registry_entries.append(entry)
-
-          generated_at = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-          index = {
-              "schema_version": 1,
-              "generated_at": generated_at,
-              "plugins": registry_entries,
-          }
-          (site_dir / ".nojekyll").write_text("", encoding="utf-8")
-          (site_dir / "registry.json").write_text(json.dumps(index, indent=2) + "\n", encoding="utf-8")
-          (site_dir / "index.html").write_text(
-              render_index_html(registry_entries, generated_at, repo),
-              encoding="utf-8",
-          )
-          print(f"Generated registry.json with {len(registry_entries)} plugins at {generated_at}")
-          PY
+          python3 -c 'import os; exec(compile(os.environ["FERN_REGISTRY_SCRIPT"], "fern_registry.py", "exec"), {"__name__": "__main__"})' publish-registry
 
       - name: Configure GitHub Pages
-        uses: actions/configure-pages@v5
+        uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5.0.0
 
       - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v3
+        uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3.0.1
         with:
           path: _site
 
       - name: Deploy to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4.0.5

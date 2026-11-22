@@ -1,5 +1,6 @@
 //! Linux system tray backend using freedesktop / KDE `StatusNotifierItem` (`ksni` over `zbus`).
 
+use std::sync::mpsc::{self, Sender, TryRecvError};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -31,7 +32,11 @@ impl Tray for FernTray {
     }
 
     fn icon_name(&self) -> String {
-        "fern-tasks".into()
+        if self.icon.is_empty() {
+            "fern-tasks".into()
+        } else {
+            String::new()
+        }
     }
 
     fn icon_pixmap(&self) -> Vec<Icon> {
@@ -106,9 +111,16 @@ impl Tray for FernTray {
     }
 }
 
+enum TrayUpdate {
+    SetTooltip(String),
+    SetAlwaysOnTop(bool),
+    UpdateLabels(TrayLabels),
+}
+
 struct Shared {
     sender: Option<UnboundedSender<TrayAction>>,
     handle: Option<Handle<FernTray>>,
+    update_tx: Option<Sender<TrayUpdate>>,
     x11_window: Option<u32>,
     enabled: bool,
     always_on_top: bool,
@@ -122,6 +134,7 @@ impl Default for Shared {
         Self {
             sender: None,
             handle: None,
+            update_tx: None,
             x11_window: None,
             enabled: false,
             always_on_top: false,
@@ -196,23 +209,75 @@ pub(super) fn init(window: &Window, prefs: TrayPrefs, labels: TrayLabels) {
             };
             match tray.spawn() {
                 Ok(handle) => {
-                    let (quitting, latest_labels, latest_topmost, latest_tip) = {
+                    let (update_tx, update_rx) = mpsc::channel::<TrayUpdate>();
+                    let initial = {
                         let mut guard = shared.lock().unwrap_or_else(|e| e.into_inner());
                         if guard.quitting {
-                            (true, guard.labels, guard.always_on_top, guard.last_tip.clone())
+                            None
                         } else {
                             guard.handle = Some(handle.clone());
-                            (false, guard.labels, guard.always_on_top, guard.last_tip.clone())
+                            guard.update_tx = Some(update_tx);
+                            Some((guard.labels, guard.always_on_top, guard.last_tip.clone()))
                         }
                     };
-                    if quitting {
+                    let Some((latest_labels, latest_topmost, latest_tip)) = initial else {
                         handle.shutdown();
-                    } else {
-                        let _ = handle.update(move |t| {
+                        return;
+                    };
+                    if handle
+                        .update(move |t| {
                             t.labels = latest_labels;
                             t.always_on_top = latest_topmost;
                             t.tooltip = latest_tip;
-                        });
+                        })
+                        .is_some()
+                    {
+                        // Single persistent worker loop applying D-Bus tray updates strictly in
+                        // order and coalescing consecutive tooltip ticks so slow D-Bus never piles up.
+                        let mut next_msg: Option<TrayUpdate> = None;
+                        'worker: loop {
+                            let first = match next_msg.take() {
+                                Some(msg) => msg,
+                                None => match update_rx.recv() {
+                                    Ok(msg) => msg,
+                                    Err(_) => break,
+                                },
+                            };
+                            if handle.is_closed() {
+                                break;
+                            }
+                            let update = match first {
+                                TrayUpdate::SetTooltip(mut tip) => {
+                                    loop {
+                                        match update_rx.try_recv() {
+                                            Ok(TrayUpdate::SetTooltip(newer)) => tip = newer,
+                                            Ok(other) => {
+                                                next_msg = Some(other);
+                                                break;
+                                            }
+                                            Err(TryRecvError::Empty) => break,
+                                            Err(TryRecvError::Disconnected) => break 'worker,
+                                        }
+                                    }
+                                    TrayUpdate::SetTooltip(tip)
+                                }
+                                other => other,
+                            };
+                            let applied = match update {
+                                TrayUpdate::SetTooltip(tip) => handle.update(move |tray| tray.tooltip = tip),
+                                TrayUpdate::SetAlwaysOnTop(topmost) => {
+                                    handle.update(move |tray| tray.always_on_top = topmost)
+                                }
+                                TrayUpdate::UpdateLabels(labels) => handle.update(move |tray| tray.labels = labels),
+                            };
+                            if applied.is_none() {
+                                break;
+                            }
+                        }
+                    }
+                    let mut guard = shared.lock().unwrap_or_else(|e| e.into_inner());
+                    if guard.handle.as_ref().is_some_and(|h| h.is_closed()) {
+                        guard.update_tx = None;
                     }
                 }
                 Err(err) => {
@@ -222,29 +287,15 @@ pub(super) fn init(window: &Window, prefs: TrayPrefs, labels: TrayLabels) {
         });
 }
 
-fn spawn_tray_update(f: impl FnOnce(&mut FernTray) + Send + 'static) {
-    let handle = state().lock().unwrap_or_else(|e| e.into_inner()).handle.clone();
-    if let Some(handle) = handle {
-        std::thread::spawn(move || {
-            let _ = handle.update(f);
-        });
-    }
-}
-
 pub(super) fn set_tooltip(tip: &str) {
-    let changed = {
-        let mut guard = state().lock().unwrap_or_else(|e| e.into_inner());
-        if guard.last_tip == tip || guard.handle.is_none() {
-            false
-        } else {
-            guard.last_tip.clear();
-            guard.last_tip.push_str(tip);
-            true
-        }
-    };
-    if changed {
-        let tip = tip.to_owned();
-        spawn_tray_update(move |tray| tray.tooltip = tip);
+    let mut guard = state().lock().unwrap_or_else(|e| e.into_inner());
+    if guard.last_tip == tip {
+        return;
+    }
+    guard.last_tip.clear();
+    guard.last_tip.push_str(tip);
+    if let Some(tx) = guard.update_tx.as_ref() {
+        let _ = tx.send(TrayUpdate::SetTooltip(tip.to_owned()));
     }
 }
 
@@ -256,23 +307,29 @@ pub(super) fn set_always_on_top(topmost: bool) {
     let x11_window = {
         let mut guard = state().lock().unwrap_or_else(|e| e.into_inner());
         guard.always_on_top = topmost;
+        if let Some(tx) = guard.update_tx.as_ref() {
+            let _ = tx.send(TrayUpdate::SetAlwaysOnTop(topmost));
+        }
         guard.x11_window
     };
     if let Some(id) = x11_window {
         desktop_common::sticky_windows::x11_set_topmost(id, topmost);
     }
-    spawn_tray_update(move |tray| tray.always_on_top = topmost);
 }
 
 pub(super) fn update_labels(labels: TrayLabels) {
-    state().lock().unwrap_or_else(|e| e.into_inner()).labels = labels;
-    spawn_tray_update(move |tray| tray.labels = labels);
+    let mut guard = state().lock().unwrap_or_else(|e| e.into_inner());
+    guard.labels = labels;
+    if let Some(tx) = guard.update_tx.as_ref() {
+        let _ = tx.send(TrayUpdate::UpdateLabels(labels));
+    }
 }
 
 pub(super) fn hide_to_tray() -> bool {
     let (quitting, has_tray, x11_window) = {
         let guard = state().lock().unwrap_or_else(|e| e.into_inner());
-        (guard.quitting, guard.handle.is_some(), guard.x11_window)
+        let has_tray = guard.handle.as_ref().is_some_and(|h| !h.is_closed());
+        (guard.quitting, has_tray, guard.x11_window)
     };
     if quitting || !has_tray {
         return false;
@@ -297,6 +354,7 @@ pub(super) fn prepare_quit() {
         let mut guard = state().lock().unwrap_or_else(|e| e.into_inner());
         guard.quitting = true;
         guard.sender = None;
+        guard.update_tx = None;
         guard.handle.take()
     };
     if let Some(handle) = handle {

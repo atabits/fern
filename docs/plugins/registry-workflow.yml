@@ -904,7 +904,9 @@ env:
                 ver = desc["version"]
                 expected_sha = desc["sha256"]
                 tag = f"{pid}-{ver}"
-                zip_path = tmp_dir / f"{pid}-{ver}.zip"
+                plugin_tmp = tmp_dir / tag
+                plugin_tmp.mkdir(parents=True, exist_ok=True)
+                zip_path = plugin_tmp / "plugin.zip"
 
                 if release_has_asset(tag, "plugin.zip"):
                     subprocess.run(
@@ -924,7 +926,7 @@ env:
                     if sha256 != expected_sha:
                         raise ValueError(f"{p}: sha256 mismatch (expected {expected_sha}, got {sha256})")
                     manifest = inspect_zip_and_manifest(zip_path, pid, ver)
-                    asset_arg = f"{zip_path}#plugin.zip"
+                    asset_arg = str(zip_path)
                     view_proc = subprocess.run(["gh", "release", "view", tag], capture_output=True)
                     if view_proc.returncode == 0:
                         subprocess.run(["gh", "release", "upload", tag, asset_arg, "--clobber"], check=True)

@@ -353,6 +353,7 @@ impl SettingsWindow {
         let config = fern_core::sync::SyncConfig {
             server: self.sync_server.read(cx).text().to_owned(),
             token: self.sync_token.read(cx).text().to_owned(),
+            ..Default::default()
         };
         match self.store.set_sync_config(&config) {
             Ok(()) => cx.emit(SettingsEvent::Changed),

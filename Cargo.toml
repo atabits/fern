@@ -53,13 +53,17 @@ ui = { path = "crates/ui" }
 
 anyhow = "1"
 async-io = "2"
+base64 = "0.22"
 block2 = "0.6"
+chacha20poly1305 = "0.10"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 chrono-tz = "0.10.4"
 dirs = "6"
 dispatch2 = "0.3"
 futures = "0.3"
+getrandom = "0.2"
 hex = "0.4"
+hmac = "0.12"
 ksni = { version = "0.3", default-features = false, features = ["blocking", "async-io"] }
 notify-rust = "4"
 objc2 = "0.6"
@@ -109,6 +113,7 @@ objc2-user-notifications = { version = "0.3", default-features = false, features
     "block2",
     "std",
 ] }
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac", "sha2"] }
 raw-window-handle = "0.6"
 resvg = "0.46"
 rust-embed = { version = "8", features = ["include-exclude"] }

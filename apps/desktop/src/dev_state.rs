@@ -299,7 +299,11 @@ pub(crate) fn apply(this: &mut AppView, window: &mut Window, cx: &mut Context<Ap
     // `sync-config=<server>|<token>`: Settings → Sync filled in.
     if let Some(spec) = state.split(';').find_map(|part| part.strip_prefix("sync-config=")) {
         let (server, token) = spec.split_once('|').unwrap_or((spec, ""));
-        let config = fern_core::sync::SyncConfig { server: server.to_owned(), token: token.to_owned() };
+        let config = fern_core::sync::SyncConfig {
+            server: server.to_owned(),
+            token: token.to_owned(),
+            ..Default::default()
+        };
         this.store.set_sync_config(&config).ok();
         this.has_sync_config = !config.server.trim().is_empty() && !config.token.trim().is_empty();
     }

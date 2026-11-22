@@ -8,16 +8,77 @@
 //! latest change of every row and hand out the ones a device has not seen.
 
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 
 use anyhow::{Context as _, Result, bail};
 use rusqlite::types::{Value, ValueRef};
 use rusqlite::{OptionalExtension as _, params, params_from_iter};
 use serde_json::{Map, Value as Json};
+use sha2::{Digest as _, Sha256};
 
+use crate::e2ee::{self, E2eeError, E2eeKey};
 use crate::store::Store;
+
+/// Current sync protocol version spoken by this client.
+pub const SYNC_PROTOCOL_VERSION: u32 = 2;
+/// Oldest sync protocol version this client is compatible with.
+pub const MIN_SYNC_PROTOCOL_VERSION: u32 = 1;
+
+/// Returned when the sync server speaks a protocol version outside this client's supported range.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IncompatibleProtocol {
+    pub client: u32,
+    pub server: u32,
+    pub min_server: u32,
+}
+
+impl fmt::Display for IncompatibleProtocol {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "incompatible sync protocol: client supports {MIN_SYNC_PROTOCOL_VERSION}..={client}, server reported {server} (min {min_server})",
+            client = self.client,
+            server = self.server,
+            min_server = self.min_server,
+        )
+    }
+}
+
+impl std::error::Error for IncompatibleProtocol {}
 
 /// The sync server stores an attachment key as one file-name component.
 pub const MAX_FILE_KEY_BYTES: usize = 255;
+
+/// Canonical server storage key for an attachment or countdown background file name.
+pub fn file_key(name: &str) -> String {
+    let encoded = encode_file_key(name, true);
+    if encoded.len() <= MAX_FILE_KEY_BYTES {
+        encoded
+    } else {
+        // Escaping UTF-8 can exceed the server's component limit even for a valid local name.
+        // The names already contain unique IDs. Only the storage key changes; sync metadata and
+        // downloaded file names retain the original name. This works with older servers too.
+        format!("~sha256-{:x}", Sha256::digest(name.as_bytes()))
+    }
+}
+
+/// Percent-encodes a file name for use as a sync server `/files/<key>` path segment.
+pub fn encode_file_key(name: &str, legacy_punctuation: bool) -> String {
+    use std::fmt::Write as _;
+    let mut encoded = String::with_capacity(name.len());
+    for byte in name.bytes() {
+        let unreserved = byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~');
+        // Preserve the legacy keys for URL punctuation such as '+', '(' and ')'. ':' is
+        // escaped as it has special meaning in native Windows paths.
+        let punctuation = b"!$&'()*+,;=@[]{}".contains(&byte);
+        if unreserved || (legacy_punctuation && punctuation) {
+            encoded.push(char::from(byte));
+        } else {
+            let _ = write!(encoded, "%{byte:02X}");
+        }
+    }
+    encoded
+}
 
 /// The synced tables, parents before children, with their key columns.
 pub const SYNCED: &[(&str, &[&str])] = &[
@@ -106,15 +167,31 @@ fn is_identifier(name: &str) -> bool {
     !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-/// Where this device syncs to: the server's address and the token.
+/// Where this device syncs to: the server's address, the token, and optional E2EE passphrase.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SyncConfig {
     pub server: String,
     pub token: String,
+    pub passphrase: String,
+}
+
+impl SyncConfig {
+    /// Whether both a server URL and bearer token are configured.
+    pub fn is_configured(&self) -> bool {
+        !self.server.trim().is_empty() && !self.token.trim().is_empty()
+    }
+}
+
+/// Summary returned by a detailed sync application.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SyncOutcome {
+    pub applied: usize,
+    pub conflicts_preserved: usize,
 }
 
 const SYNC_SERVER: &str = "sync_server";
 const SYNC_TOKEN: &str = "sync_token";
+const SYNC_PASSPHRASE: &str = "sync_passphrase";
 const SYNC_DEVICE: &str = "sync_device";
 const SYNC_SENT: &str = "sync_sent";
 const SYNC_SEEN: &str = "sync_seen";
@@ -125,26 +202,48 @@ pub struct SyncRequest {
     sent: i64,
 }
 
+fn change_file_key(entity: &str, row: &Map<String, Json>) -> Option<String> {
+    match entity {
+        "task_attachments" => {
+            if let Some(stored) = row.get("stored_name").and_then(Json::as_str).filter(|s| !s.is_empty()) {
+                return Some(file_key(stored));
+            }
+            let id = row.get("id").and_then(Json::as_str)?;
+            let name = row.get("name").and_then(Json::as_str)?;
+            Some(file_key(&format!("{id}-{name}")))
+        }
+        "countdowns" => {
+            let bg = row.get("background").and_then(Json::as_str).filter(|s| !s.is_empty())?;
+            Some(file_key(bg))
+        }
+        _ => None,
+    }
+}
+
 impl Store {
     /// The sync settings, if a server is set.
     pub fn sync_config(&self) -> Result<Option<SyncConfig>> {
         let server = self.setting(SYNC_SERVER)?.unwrap_or_default();
         let token = self.setting(SYNC_TOKEN)?.unwrap_or_default();
-        Ok((!server.trim().is_empty()).then_some(SyncConfig { server, token }))
+        let passphrase = self.setting(SYNC_PASSPHRASE)?.unwrap_or_default();
+        Ok((!server.trim().is_empty()).then_some(SyncConfig { server, token, passphrase }))
     }
 
-    /// Sets the server and token. A different server starts over: everything here is sent to it,
-    /// and everything it has is received.
+    /// Sets the server, token, and optional E2EE passphrase. A different server or passphrase
+    /// starts over: everything here is sent again, and everything the server has is received.
     pub fn set_sync_config(&self, config: &SyncConfig) -> Result<()> {
         let server = config.server.trim();
         self.in_tx(|| {
-            if self.setting(SYNC_SERVER)?.unwrap_or_default() != server {
+            let server_changed = self.setting(SYNC_SERVER)?.unwrap_or_default() != server;
+            let passphrase_changed = self.setting(SYNC_PASSPHRASE)?.unwrap_or_default() != config.passphrase;
+            if server_changed || passphrase_changed {
                 self.set_setting(SYNC_SENT, "0")?;
                 self.set_setting(SYNC_SEEN, "0")?;
                 self.conn.execute("DELETE FROM sync_uploaded", [])?;
             }
             self.set_setting(SYNC_SERVER, server)?;
             self.set_setting(SYNC_TOKEN, config.token.trim())?;
+            self.set_setting(SYNC_PASSPHRASE, &config.passphrase)?;
             Ok(())
         })
     }
@@ -171,10 +270,37 @@ impl Store {
     /// The next sync's request: this device's unsent changes and what it has seen.
     pub fn sync_request(&self) -> Result<SyncRequest> {
         let (changes, sent) = self.changes_since(self.sync_number(SYNC_SENT)?)?;
+        let passphrase = self.setting(SYNC_PASSPHRASE)?.unwrap_or_default();
+        let e2ee_key = if passphrase.is_empty() {
+            None
+        } else {
+            Some(E2eeKey::from_passphrase(&passphrase)?)
+        };
+        let mut wire_changes = Vec::with_capacity(changes.len());
+        for change in changes {
+            let fk = change.row.as_ref().and_then(|row| change_file_key(&change.entity, row));
+            let row = match (&e2ee_key, change.row) {
+                (Some(key), Some(row)) => Some(key.encrypt_row(&change.entity, &change.key, &row)?),
+                (_, row) => row,
+            };
+            let mut obj = Map::with_capacity(5);
+            obj.insert("entity".into(), Json::from(change.entity));
+            obj.insert("key".into(), Json::from(change.key));
+            obj.insert("at".into(), Json::from(change.at));
+            obj.insert("row".into(), match row {
+                Some(map) => Json::Object(map),
+                None => Json::Null,
+            });
+            if let Some(fk) = fk {
+                obj.insert("file_key".into(), Json::from(fk));
+            }
+            wire_changes.push(Json::Object(obj));
+        }
         let body = serde_json::json!({
+            "protocol": SYNC_PROTOCOL_VERSION,
             "device": self.sync_device()?,
             "since": self.sync_number(SYNC_SEEN)?,
-            "changes": changes.iter().map(Change::to_json).collect::<Vec<_>>(),
+            "changes": wire_changes,
         });
         Ok(SyncRequest { body, sent })
     }
@@ -182,6 +308,28 @@ impl Store {
     /// Applies the server's answer to `request` and remembers how far both sides got. Returns
     /// how many changes came in.
     pub fn finish_sync(&self, request: &SyncRequest, answer: &Json) -> Result<usize> {
+        Ok(self.finish_sync_detailed(request, answer)?.applied)
+    }
+
+    /// Applies the server's answer to `request` and returns both the applied change count and
+    /// how many offline note conflicts were preserved.
+    pub fn finish_sync_detailed(&self, request: &SyncRequest, answer: &Json) -> Result<SyncOutcome> {
+        if let Some(server_proto) = answer.get("protocol").and_then(Json::as_u64) {
+            let server_proto = u32::try_from(server_proto).unwrap_or(u32::MAX);
+            let min_server = answer
+                .get("min_protocol")
+                .and_then(Json::as_u64)
+                .and_then(|v| u32::try_from(v).ok())
+                .unwrap_or(MIN_SYNC_PROTOCOL_VERSION);
+            if !(MIN_SYNC_PROTOCOL_VERSION..=SYNC_PROTOCOL_VERSION).contains(&server_proto) {
+                return Err(IncompatibleProtocol {
+                    client: SYNC_PROTOCOL_VERSION,
+                    server: server_proto,
+                    min_server,
+                }
+                .into());
+            }
+        }
         let received = answer["changes"]
             .as_array()
             .context("the server's answer has no changes")?
@@ -190,11 +338,11 @@ impl Store {
             .collect::<Result<Vec<_>>>()?;
         let position = answer["position"].as_i64().context("the server's answer has no position")?;
         self.in_tx(|| {
-            let applied = self.apply_changes(&received)?;
+            let outcome = self.apply_changes_detailed(&received)?;
             self.set_setting(SYNC_SENT, &request.sent.to_string())?;
             self.set_setting(SYNC_SEEN, &position.to_string())?;
             self.compact_sync_log()?;
-            Ok(applied)
+            Ok(outcome)
         })
     }
 }
@@ -304,14 +452,27 @@ impl Store {
     /// Applies changes from another device. A row changed here later than the incoming change
     /// keeps its local state. Applied changes are not logged, so they are not sent back.
     pub fn apply_changes(&self, changes: &[Change]) -> Result<usize> {
+        Ok(self.apply_changes_detailed(changes)?.applied)
+    }
+
+    /// Applies changes from another device and returns both the applied change count and the
+    /// number of offline note conflicts preserved.
+    pub fn apply_changes_detailed(&self, changes: &[Change]) -> Result<SyncOutcome> {
         self.in_tx(|| {
             // Rows may arrive before the rows they point to.
             self.conn.execute_batch("PRAGMA defer_foreign_keys = ON; INSERT INTO sync_applying VALUES (1);")?;
+            let sync_sent = self.sync_number(SYNC_SENT)?;
+            let passphrase = self.setting(SYNC_PASSPHRASE)?.unwrap_or_default();
+            let mut e2ee_key: Option<E2eeKey> = None;
+
             let mut ordered: Vec<&Change> = changes.iter().collect();
             let rank = |entity: &str| SYNCED.iter().position(|(name, _)| *name == entity).unwrap_or(usize::MAX);
             ordered.sort_by_key(|change| (change.row.is_none(), rank(&change.entity)));
             let mut table_columns: HashMap<&str, HashSet<String>> = HashMap::new();
             let mut applied = 0;
+            let mut conflicts_preserved = 0;
+            let mut conflict_relogs: Vec<(String, i64)> = Vec::new();
+
             for change in ordered {
                 let keys = keys_of(&change.entity)?;
                 let local: Option<i64> = self
@@ -332,14 +493,42 @@ impl Store {
                 let parts: Vec<&str> = change.key.splitn(keys.len(), KEY_SEPARATOR).collect();
                 anyhow::ensure!(parts.len() == keys.len(), "malformed sync key for {}", change.entity);
                 match &change.row {
-                    Some(row) => {
-                        let filter_row;
-                        let row = if change.entity == "filters" {
-                            filter_row = decode_filter_row(row)?;
-                            &filter_row
+                    Some(raw_row) => {
+                        let decrypted_row;
+                        let plain_row = if e2ee::is_encrypted_row(raw_row) {
+                            let key = match &e2ee_key {
+                                Some(k) => k,
+                                None => {
+                                    if passphrase.is_empty() {
+                                        return Err(E2eeError::PassphraseRequired.into());
+                                    }
+                                    e2ee_key.insert(E2eeKey::from_passphrase(&passphrase)?)
+                                }
+                            };
+                            decrypted_row = key.decrypt_row(&change.entity, &change.key, raw_row)?;
+                            &decrypted_row
                         } else {
-                            row
+                            raw_row
                         };
+
+                        let filter_row;
+                        let conflict_row;
+                        let row = if change.entity == "filters" {
+                            filter_row = decode_filter_row(plain_row)?;
+                            &filter_row
+                        } else if change.entity == "tasks" {
+                            if let Some(merged) = self.preserve_task_note_conflict(&change.key, sync_sent, plain_row)? {
+                                conflict_row = merged;
+                                conflicts_preserved += 1;
+                                conflict_relogs.push((change.key.clone(), change.at));
+                                &conflict_row
+                            } else {
+                                plain_row
+                            }
+                        } else {
+                            plain_row
+                        };
+
                         let valid_cols = match table_columns.get(change.entity.as_str()) {
                             Some(cols) => cols,
                             None => {
@@ -389,8 +578,58 @@ impl Store {
                 applied += 1;
             }
             self.conn.execute_batch("DELETE FROM sync_applying;")?;
-            Ok(applied)
+            if !conflict_relogs.is_empty() {
+                let mut relog = self
+                    .conn
+                    .prepare_cached("INSERT INTO sync_log (entity, key, at) VALUES ('tasks', ?1, ?2)")?;
+                let now_ms = chrono::Utc::now().timestamp_millis();
+                for (task_key, remote_at) in conflict_relogs {
+                    relog.execute(params![task_key, now_ms.max(remote_at + 1)])?;
+                }
+            }
+            Ok(SyncOutcome { applied, conflicts_preserved })
         })
+    }
+
+    fn preserve_task_note_conflict(
+        &self,
+        task_key: &str,
+        sync_sent: i64,
+        incoming: &Map<String, Json>,
+    ) -> Result<Option<Map<String, Json>>> {
+        let has_unsent_local: bool = self
+            .conn
+            .prepare_cached("SELECT 1 FROM sync_log WHERE entity = 'tasks' AND key = ?1 AND seq > ?2 LIMIT 1")?
+            .query_row(params![task_key, sync_sent], |_| Ok(true))
+            .optional()?
+            .unwrap_or(false);
+        if !has_unsent_local {
+            return Ok(None);
+        }
+        let Some(local_notes): Option<String> = self
+            .conn
+            .prepare_cached("SELECT notes FROM tasks WHERE id = ?1")?
+            .query_row([task_key], |row| row.get(0))
+            .optional()?
+        else {
+            return Ok(None);
+        };
+        let Some(remote_notes) = incoming.get("notes").and_then(Json::as_str) else {
+            return Ok(None);
+        };
+        if local_notes.trim().is_empty()
+            || remote_notes.trim().is_empty()
+            || local_notes == remote_notes
+            || remote_notes.contains(&local_notes)
+            || local_notes.contains(remote_notes)
+        {
+            return Ok(None);
+        }
+        let timestamp = chrono::Utc::now().format("%Y-%m-%d %H:%M UTC");
+        let merged = format!("{remote_notes}\n\n---\nSync conflict ({timestamp}):\n\n{local_notes}");
+        let mut updated = incoming.clone();
+        updated.insert("notes".into(), Json::from(merged));
+        Ok(Some(updated))
     }
 }
 
@@ -480,7 +719,12 @@ mod tests {
     fn sync_settings_and_requests() -> Result<()> {
         let store = Store::open_in_memory()?;
         assert_eq!(store.sync_config()?, None);
-        let config = SyncConfig { server: " https://fern.example.org ".into(), token: "t0ken".into() };
+        let config = SyncConfig {
+            server: " https://fern.example.org ".into(),
+            token: "t0ken".into(),
+            ..Default::default()
+        };
+        assert!(config.is_configured());
         store.set_sync_config(&config)?;
         assert_eq!(store.sync_config()?.unwrap().server, "https://fern.example.org");
         let device = store.sync_device()?;
@@ -489,6 +733,7 @@ mod tests {
         store.add_task("Water the plants")?;
         assert!(store.has_unsent_changes()?);
         let request = store.sync_request()?;
+        assert_eq!(request.body["protocol"], SYNC_PROTOCOL_VERSION);
         assert_eq!(request.body["device"], device.as_str());
         assert_eq!(request.body["changes"].as_array().unwrap().len(), 1);
 
@@ -499,7 +744,11 @@ mod tests {
         assert!(store.finish_sync(&request, &serde_json::json!({ "oops": true })).is_err());
 
         // Another server starts over.
-        store.set_sync_config(&SyncConfig { server: "https://other.example.org".into(), token: "x".into() })?;
+        store.set_sync_config(&SyncConfig {
+            server: "https://other.example.org".into(),
+            token: "x".into(),
+            ..Default::default()
+        })?;
         assert!(store.has_unsent_changes()?);
         Ok(())
     }
@@ -544,7 +793,11 @@ mod tests {
         relay(&laptop, 0, &phone);
         assert_eq!(phone.attachments(task.id)?, [attachment]);
         assert_eq!(phone.files_to_sync(&phone_dir)?, (vec![], vec![file.clone()]));
-        laptop.set_sync_config(&SyncConfig { server: "https://other.example.org".into(), token: "new".into() })?;
+        laptop.set_sync_config(&SyncConfig {
+            server: "https://other.example.org".into(),
+            token: "new".into(),
+            ..Default::default()
+        })?;
         assert_eq!(laptop.files_to_sync(&laptop_dir)?, (vec![file], vec![]));
         std::fs::remove_dir_all(&dir)?;
         Ok(())
@@ -802,6 +1055,186 @@ mod tests {
         assert!(store.has_unsent_changes()?);
         assert_eq!(store.sync_request()?.body["since"], 0);
         assert!(store.task(task.id)?.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn protocol_version_mismatch_is_rejected() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let request = store.sync_request()?;
+        assert_eq!(request.body["protocol"], SYNC_PROTOCOL_VERSION);
+
+        // Server reporting future protocol version is rejected with IncompatibleProtocol.
+        let future_answer = serde_json::json!({
+            "protocol": 99,
+            "min_protocol": 5,
+            "position": 1,
+            "changes": []
+        });
+        let err = store.finish_sync(&request, &future_answer).unwrap_err();
+        let incompat = err.downcast_ref::<IncompatibleProtocol>().expect("expected IncompatibleProtocol");
+        assert_eq!(incompat.client, SYNC_PROTOCOL_VERSION);
+        assert_eq!(incompat.server, 99);
+        assert_eq!(incompat.min_server, 5);
+
+        // Server reporting protocol 0 (below MIN_SYNC_PROTOCOL_VERSION) is rejected.
+        let old_answer = serde_json::json!({
+            "protocol": 0,
+            "position": 1,
+            "changes": []
+        });
+        assert!(store.finish_sync(&request, &old_answer).unwrap_err().is::<IncompatibleProtocol>());
+
+        // Protocol v1 and v2 are both accepted.
+        store.finish_sync(&request, &serde_json::json!({ "protocol": 1, "position": 1, "changes": [] }))?;
+        store.finish_sync(&request, &serde_json::json!({ "protocol": 2, "position": 2, "changes": [] }))?;
+        Ok(())
+    }
+
+    #[test]
+    fn e2ee_sync_between_two_stores_and_wrong_passphrase_rejected() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("fern-e2ee-sync-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(dir.join("secret.txt"), "top secret file")?;
+
+        let laptop = Store::open_in_memory()?;
+        let phone = Store::open_in_memory()?;
+        let intruder = Store::open_in_memory()?;
+        let no_pass = Store::open_in_memory()?;
+
+        let cfg_ok = SyncConfig {
+            server: "https://sync.example.org".into(),
+            token: "tok".into(),
+            passphrase: "correct-vault-passphrase".into(),
+        };
+        let cfg_wrong = SyncConfig {
+            passphrase: "wrong-vault-passphrase".into(),
+            ..cfg_ok.clone()
+        };
+        laptop.set_sync_config(&cfg_ok)?;
+        phone.set_sync_config(&cfg_ok)?;
+        intruder.set_sync_config(&cfg_wrong)?;
+
+        let task = laptop.add_task("Confidential meeting")?;
+        laptop.set_notes(task.id, "Bring encrypted ledger")?;
+        let att = laptop.add_attachment(task.id, &dir.join("secret.txt"), &dir.join("laptop"))?;
+        let stored_name = att.path(&dir.join("laptop")).file_name().unwrap().to_string_lossy().into_owned();
+
+        let req = laptop.sync_request()?;
+        let wire_changes = req.body["changes"].as_array().unwrap();
+        assert_eq!(wire_changes.len(), 2);
+
+        // Verify every wire row is encrypted and does not leak plaintext title/notes.
+        let wire_str = req.body.to_string();
+        assert!(!wire_str.contains("Confidential meeting"));
+        assert!(!wire_str.contains("Bring encrypted ledger"));
+
+        // Verify task_attachments change carries plaintext file_key outside encrypted row.
+        let att_change = wire_changes.iter().find(|c| c["entity"] == "task_attachments").unwrap();
+        assert_eq!(att_change["file_key"], file_key(&stored_name));
+        assert!(e2ee::is_encrypted_row(att_change["row"].as_object().unwrap()));
+
+        let server_answer = serde_json::json!({
+            "protocol": SYNC_PROTOCOL_VERSION,
+            "position": 10,
+            "changes": wire_changes,
+        });
+
+        // Device without passphrase gets PassphraseRequired.
+        let no_pass_req = no_pass.sync_request()?;
+        let err = no_pass.finish_sync(&no_pass_req, &server_answer).unwrap_err();
+        assert_eq!(err.downcast_ref::<E2eeError>(), Some(&E2eeError::PassphraseRequired));
+
+        // Device with wrong passphrase gets WrongPassphrase.
+        let intruder_req = intruder.sync_request()?;
+        let err = intruder.finish_sync(&intruder_req, &server_answer).unwrap_err();
+        assert_eq!(err.downcast_ref::<E2eeError>(), Some(&E2eeError::WrongPassphrase));
+
+        // Device with matching passphrase decrypts cleanly.
+        let phone_req = phone.sync_request()?;
+        let outcome = phone.finish_sync_detailed(&phone_req, &server_answer)?;
+        assert_eq!(outcome.applied, 2);
+        assert_eq!(outcome.conflicts_preserved, 0);
+        let synced_task = phone.task(task.id)?.unwrap();
+        assert_eq!(synced_task.title, "Confidential meeting");
+        assert_eq!(synced_task.notes, "Bring encrypted ledger");
+        assert_eq!(phone.attachments(task.id)?, [att]);
+
+        std::fs::remove_dir_all(&dir).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn offline_concurrent_note_edit_preserves_both_and_converges() -> Result<()> {
+        let a = Store::open_in_memory()?;
+        let b = Store::open_in_memory()?;
+
+        // Initial task synced to both devices.
+        let task = a.add_task("Architecture RFC")?;
+        a.set_notes(task.id, "Initial outline")?;
+        let req_a0 = a.sync_request()?;
+        let initial_changes = req_a0.body["changes"].clone();
+        a.finish_sync(&req_a0, &serde_json::json!({ "position": 1, "changes": [] }))?;
+        let req_b0 = b.sync_request()?;
+        b.finish_sync(&req_b0, &serde_json::json!({ "position": 1, "changes": initial_changes }))?;
+
+        // Both devices go offline and edit the same task's notes concurrently.
+        a.set_notes(task.id, "Offline notes from device A")?;
+        a.conn.execute(
+            "UPDATE sync_log SET at = 1000 WHERE entity = 'tasks' AND key = ?1",
+            [task.id.to_string()],
+        )?;
+        a.conn.execute(
+            "UPDATE sync_watermarks SET at = 1000 WHERE entity = 'tasks' AND key = ?1",
+            [task.id.to_string()],
+        )?;
+
+        b.set_notes(task.id, "Offline notes from device B")?;
+        b.conn.execute(
+            "UPDATE sync_log SET at = 2000 WHERE entity = 'tasks' AND key = ?1",
+            [task.id.to_string()],
+        )?;
+        b.conn.execute(
+            "UPDATE sync_watermarks SET at = 2000 WHERE entity = 'tasks' AND key = ?1",
+            [task.id.to_string()],
+        )?;
+
+        // Device B syncs first; server records B's version (at=2000).
+        let req_b1 = b.sync_request()?;
+        let b_wire_changes = req_b1.body["changes"].clone();
+        b.finish_sync(&req_b1, &serde_json::json!({ "position": 2, "changes": [] }))?;
+
+        // Device A comes online and syncs; B's version wins LWW (2000 > 1000),
+        // but A preserves its own offline notes in a conflict section and re-logs the task.
+        let req_a1 = a.sync_request()?;
+        let outcome_a = a.finish_sync_detailed(
+            &req_a1,
+            &serde_json::json!({ "position": 2, "changes": b_wire_changes }),
+        )?;
+        assert_eq!(outcome_a.applied, 1);
+        assert_eq!(outcome_a.conflicts_preserved, 1);
+
+        let merged_on_a = a.task(task.id)?.unwrap().notes;
+        assert!(merged_on_a.contains("Offline notes from device B"));
+        assert!(merged_on_a.contains("Offline notes from device A"));
+        assert!(merged_on_a.contains("Sync conflict ("));
+        assert!(a.has_unsent_changes()?, "merged note must be queued to sync back");
+
+        // Next sync: A pushes the merged note, B pulls it, and both converge with zero conflicts.
+        let req_a2 = a.sync_request()?;
+        let merged_wire_changes = req_a2.body["changes"].clone();
+        a.finish_sync(&req_a2, &serde_json::json!({ "position": 3, "changes": [] }))?;
+        assert!(!a.has_unsent_changes()?);
+
+        let req_b2 = b.sync_request()?;
+        let outcome_b = b.finish_sync_detailed(
+            &req_b2,
+            &serde_json::json!({ "position": 3, "changes": merged_wire_changes }),
+        )?;
+        assert_eq!(outcome_b.applied, 1);
+        assert_eq!(outcome_b.conflicts_preserved, 0);
+        assert_eq!(b.task(task.id)?.unwrap().notes, merged_on_a);
+        assert!(!b.has_unsent_changes()?);
         Ok(())
     }
 }

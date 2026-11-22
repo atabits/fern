@@ -903,6 +903,82 @@ const MIGRATIONS: &[&str] = &[
     ",
 ];
 
+/// Current SQLite schema version (`PRAGMA user_version`).
+pub const SCHEMA_VERSION: usize = MIGRATIONS.len();
+
+/// Applies migrations up to `target_version` on `conn`. Exposed for migration tests.
+#[doc(hidden)]
+pub fn apply_migrations_up_to(conn: &Connection, target_version: usize) -> Result<()> {
+    anyhow::ensure!(target_version <= MIGRATIONS.len(), "target schema version {target_version} exceeds {}", MIGRATIONS.len());
+    let version: usize = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    anyhow::ensure!(version <= MIGRATIONS.len(), "the data comes from a newer version of Fern");
+    for (i, sql) in MIGRATIONS.iter().enumerate().take(target_version).skip(version) {
+        // The historical section rebuild toggles foreign keys, which SQLite can only do
+        // outside a transaction. All other migrations advance the version atomically.
+        if sql.contains("PRAGMA foreign_keys = OFF") {
+            conn.execute_batch(sql)?;
+            conn.pragma_update(None, "user_version", i + 1)?;
+        } else {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(sql)?;
+            tx.pragma_update(None, "user_version", i + 1)?;
+            tx.commit()?;
+        }
+    }
+    Ok(())
+}
+
+/// Summary row counts for the primary user-facing tables.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TableCounts {
+    pub tasks: usize,
+    pub lists: usize,
+    pub habits: usize,
+    pub attachments: usize,
+    pub countdowns: usize,
+}
+
+/// A daily backup file (`fern-*.db`) discovered in a backups directory.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BackupEntry {
+    pub path: PathBuf,
+    pub filename: String,
+    pub date: Option<NaiveDate>,
+    pub size_bytes: u64,
+}
+
+/// Lists `fern-*.db` backup files in `dir`, sorted newest-first by date and filename.
+pub fn list_backups(dir: &Path) -> Vec<BackupEntry> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut backups = Vec::new();
+    for entry in entries.flatten() {
+        let Ok(meta) = entry.metadata() else { continue };
+        if !meta.is_file() {
+            continue;
+        }
+        let Some(filename) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !filename.starts_with("fern-") || !filename.ends_with(".db") {
+            continue;
+        }
+        let stem = &filename["fern-".len()..filename.len() - ".db".len()];
+        let date = stem
+            .get(..10)
+            .and_then(|s| NaiveDate::parse_from_str(s, DATE_FORMAT).ok());
+        backups.push(BackupEntry {
+            path: entry.path(),
+            filename,
+            date,
+            size_bytes: meta.len(),
+        });
+    }
+    backups.sort_by(|a, b| b.date.cmp(&a.date).then_with(|| b.filename.cmp(&a.filename)));
+    backups
+}
+
 #[cfg(test)]
 pub(crate) fn init_legacy_db_before_filter_rules(path: &Path) -> Result<Connection> {
     let version = MIGRATIONS
@@ -911,17 +987,7 @@ pub(crate) fn init_legacy_db_before_filter_rules(path: &Path) -> Result<Connecti
         .expect("filter rules migration must exist");
     let conn = Connection::open(path)?;
     conn.pragma_update(None, "foreign_keys", true)?;
-    for (i, sql) in MIGRATIONS.iter().enumerate().take(version) {
-        if sql.contains("PRAGMA foreign_keys = OFF") {
-            conn.execute_batch(sql)?;
-            conn.pragma_update(None, "user_version", (i + 1) as u32)?;
-        } else {
-            let tx = conn.unchecked_transaction()?;
-            tx.execute_batch(sql)?;
-            tx.pragma_update(None, "user_version", (i + 1) as u32)?;
-            tx.commit()?;
-        }
-    }
+    apply_migrations_up_to(&conn, version)?;
     Ok(conn)
 }
 
@@ -1026,22 +1092,36 @@ impl Store {
     }
 
     fn migrate(conn: &Connection) -> Result<()> {
-        let version: usize = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        anyhow::ensure!(version <= MIGRATIONS.len(), "the data comes from a newer version of Fern");
-        for (i, sql) in MIGRATIONS.iter().enumerate().skip(version) {
-            // The historical section rebuild toggles foreign keys, which SQLite can only do
-            // outside a transaction. All other migrations advance the version atomically.
-            if sql.contains("PRAGMA foreign_keys = OFF") {
-                conn.execute_batch(sql)?;
-                conn.pragma_update(None, "user_version", i + 1)?;
-            } else {
-                let tx = conn.unchecked_transaction()?;
-                tx.execute_batch(sql)?;
-                tx.pragma_update(None, "user_version", i + 1)?;
-                tx.commit()?;
-            }
-        }
-        Ok(())
+        apply_migrations_up_to(conn, MIGRATIONS.len())
+    }
+
+    /// Runs `PRAGMA integrity_check(10)` and returns the resulting messages (`["ok"]` when healthy).
+    pub fn integrity_check(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare("PRAGMA integrity_check(10)")?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Returns the database's current `PRAGMA user_version`.
+    pub fn schema_version(&self) -> Result<usize> {
+        Ok(self.conn.pragma_query_value(None, "user_version", |row| row.get(0))?)
+    }
+
+    /// Returns row counts for the primary user-facing tables.
+    pub fn table_counts(&self) -> Result<TableCounts> {
+        let count = |table: &str| -> Result<usize> {
+            let n: i64 = self.conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))?;
+            Ok(usize::try_from(n).unwrap_or(0))
+        };
+        Ok(TableCounts {
+            tasks: count("tasks")?,
+            lists: count("lists")?,
+            habits: count("habits")?,
+            attachments: count("task_attachments")?,
+            countdowns: count("countdowns")?,
+        })
     }
 
     /// Whether `path` is a Fern backup this version can restore.

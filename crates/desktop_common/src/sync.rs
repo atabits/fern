@@ -194,7 +194,7 @@ mod tests {
         let token = "attachment-compatibility-test";
         let server = fern_server::Server::open(&dir.join("server.db"))?;
         std::thread::spawn(move || fern_server::serve(&http, server, token));
-        let config = SyncConfig { server: format!("http://127.0.0.1:{port}"), token: token.to_owned() };
+        let config = SyncConfig { server: format!("http://127.0.0.1:{port}"), token: token.to_owned(), ..Default::default() };
         let agent = sync_agent(REQUEST_TIMEOUT);
         let legacy_url = |key: &str| format!("{}/files/{key}", config.server);
         let auth = format!("Bearer {token}");
@@ -234,7 +234,7 @@ mod tests {
         use std::net::TcpListener;
 
         let listener = TcpListener::bind("127.0.0.1:0")?;
-        let config = SyncConfig { server: format!("http://{}", listener.local_addr()?), token: "test".into() };
+        let config = SyncConfig { server: format!("http://{}", listener.local_addr()?), token: "test".into(), ..Default::default() };
         let (release, wait) = std::sync::mpsc::channel();
         let server = std::thread::spawn(move || -> std::io::Result<()> {
             let (mut stalled, _) = listener.accept()?;
@@ -278,7 +278,7 @@ mod tests {
         let port = http.server_addr().to_ip().unwrap().port();
         let token = "a-token-for-the-test-only";
         std::thread::spawn(move || fern_server::serve(&http, fern_server::Server::open_in_memory().unwrap(), token));
-        let config = SyncConfig { server: format!("http://127.0.0.1:{port}/"), token: token.to_owned() };
+        let config = SyncConfig { server: format!("http://127.0.0.1:{port}/"), token: token.to_owned(), ..Default::default() };
 
         let sync = |store: &Store| {
             let request = store.sync_request().unwrap();
@@ -308,6 +308,7 @@ mod tests {
         let config = SyncConfig {
             server: format!("http://127.0.0.1:{port}"),
             token: "filter-test".into(),
+            ..Default::default()
         };
         let sync = |store: &Store| -> anyhow::Result<_> {
             let request = store.sync_request()?;
@@ -365,7 +366,7 @@ mod tests {
         let token = "a-token-for-the-test-only";
         let server = fern_server::Server::open(&dir.join("server.db")).unwrap();
         std::thread::spawn(move || fern_server::serve(&http, server, token));
-        let config = SyncConfig { server: format!("http://127.0.0.1:{port}"), token: token.to_owned() };
+        let config = SyncConfig { server: format!("http://127.0.0.1:{port}"), token: token.to_owned(), ..Default::default() };
 
         let sync = |store: &Store, files: &std::path::Path| {
             let request = store.sync_request().unwrap();
@@ -430,6 +431,7 @@ mod tests {
         let config = SyncConfig {
             server: format!("http://127.0.0.1:{port}"),
             token: "tok".into(),
+            ..Default::default()
         };
         let agent = sync_agent(Duration::from_secs(5));
         let err = post_with_limit(&agent, &config, &serde_json::json!({}), 256);

@@ -24,8 +24,8 @@ mod tests {
         TestAppContext, div, point, px, size,
     };
     use plugins::ui_ast::{
-        HandlerId, UiButtonSize, UiButtonVariant, UiNode, UiSelectOption, UiTextSize,
-        UiTreePayload, UiWeight,
+        HandlerId, UiAlign, UiButtonSize, UiButtonVariant, UiJustify, UiNode, UiSelectOption,
+        UiTextSize, UiTreePayload, UiWeight,
     };
 
     use super::*;
@@ -321,6 +321,148 @@ mod tests {
         cx.update(|_, cx| {
             assert_eq!(settings.read(cx).active_tab(), PluginSettingsTab::Browse);
         });
+
+        cx.update(|_, cx| PluginHost::shutdown(cx));
+    }
+
+    #[gpui::test]
+    fn hstack_with_vstack_and_badge_does_not_collapse_text_width(cx: &mut TestAppContext) {
+        let _tmp = setup_host(cx);
+        let payload = UiTreePayload {
+            plugin_id: "com.test.header".to_owned(),
+            view_id: "sync".to_owned(),
+            root: UiNode::VStack {
+                gap: Some(16.0),
+                padding: Some(24.0),
+                align: None,
+                children: vec![
+                    UiNode::HStack {
+                        gap: None,
+                        padding: None,
+                        align: Some(UiAlign::Center),
+                        justify: Some(UiJustify::Between),
+                        wrap: false,
+                        children: vec![
+                            UiNode::VStack {
+                                gap: Some(4.0),
+                                padding: None,
+                                align: None,
+                                children: vec![
+                                    UiNode::Heading {
+                                        text: "TickTick".to_owned(),
+                                        level: 1,
+                                    },
+                                    UiNode::Text {
+                                        text: "Two-way sync of lists and tasks between Fern and TickTick."
+                                            .to_owned(),
+                                        muted: true,
+                                        weight: None,
+                                        color: None,
+                                        size: None,
+                                    },
+                                ],
+                            },
+                            UiNode::Badge {
+                                label: "Ready to sign in".to_owned(),
+                                color: Some("#22c55e".to_owned()),
+                            },
+                        ],
+                    },
+                    UiNode::HStack {
+                        gap: None,
+                        padding: None,
+                        align: Some(UiAlign::Center),
+                        justify: Some(UiJustify::Between),
+                        wrap: true,
+                        children: vec![
+                            UiNode::VStack {
+                                gap: Some(2.0),
+                                padding: None,
+                                align: None,
+                                children: vec![
+                                    UiNode::Heading {
+                                        text: "TickTick".to_owned(),
+                                        level: 1,
+                                    },
+                                    UiNode::Text {
+                                        text: "Last sync: 17:42".to_owned(),
+                                        muted: true,
+                                        weight: None,
+                                        color: None,
+                                        size: Some(UiTextSize::Sm),
+                                    },
+                                ],
+                            },
+                            UiNode::HStack {
+                                gap: Some(8.0),
+                                padding: None,
+                                align: Some(UiAlign::Center),
+                                justify: None,
+                                wrap: false,
+                                children: vec![
+                                    UiNode::Badge {
+                                        label: "Connected".to_owned(),
+                                        color: Some("#22c55e".to_owned()),
+                                    },
+                                    UiNode::Button {
+                                        label: "Sync Now".to_owned(),
+                                        variant: UiButtonVariant::Primary,
+                                        size: UiButtonSize::Md,
+                                        icon: None,
+                                        disabled: false,
+                                        loading: false,
+                                        on_click: Some(HandlerId(1)),
+                                    },
+                                ],
+                            },
+                        ],
+                    },
+                ],
+            },
+        };
+        cx.update(|cx| {
+            PluginHost::set_view_tree("com.test.header", "sync", payload, cx);
+        });
+
+        let (_view, cx) = cx.add_window_view(|_, cx| PluginView::new("com.test.header", "sync", cx));
+        cx.simulate_resize(size(px(800.), px(640.)));
+        cx.run_until_parked();
+
+        // node_counter order: 0 = root VStack, 1 = onboarding HStack, 2 = onboarding title VStack,
+        // 3 = connected HStack, 4 = connected title VStack, 5 = connected actions HStack.
+        let onboarding_row = cx
+            .debug_bounds("plugin-hstack-1")
+            .expect("onboarding header hstack bounds");
+        let onboarding_col = cx
+            .debug_bounds("plugin-vstack-2")
+            .expect("onboarding title vstack bounds");
+        let connected_row = cx
+            .debug_bounds("plugin-hstack-3")
+            .expect("connected header hstack bounds");
+        let connected_col = cx
+            .debug_bounds("plugin-vstack-4")
+            .expect("connected title vstack bounds");
+
+        assert!(
+            onboarding_col.size.width > px(400.),
+            "onboarding title column collapsed: {:?}",
+            onboarding_col
+        );
+        assert!(
+            onboarding_row.size.height < px(110.),
+            "onboarding header wrapped vertically: {:?}",
+            onboarding_row
+        );
+        assert!(
+            connected_col.size.width > px(350.),
+            "connected title column collapsed: {:?}",
+            connected_col
+        );
+        assert!(
+            connected_row.size.height < px(110.),
+            "connected header wrapped vertically: {:?}",
+            connected_row
+        );
 
         cx.update(|_, cx| PluginHost::shutdown(cx));
     }

@@ -646,11 +646,13 @@ struct LoadedRuntime {
     ctx: AsyncContext,
     api: Rc<PluginApiState>,
     gate: Arc<ExecGate>,
+    cancel_flag: Arc<AtomicBool>,
     module_ns: Option<Persistent<rquickjs::Object<'static>>>,
 }
 
 impl LoadedRuntime {
     fn shutdown_drop(mut self) {
+        self.cancel_flag.store(true, Ordering::Release);
         self.module_ns.take();
         self.api.clear_persistent_handles();
         drop(self.ctx);
@@ -725,6 +727,7 @@ struct WorkerEnv {
     service_depth: Rc<Cell<usize>>,
     slots: Rc<RefCell<BTreeMap<String, PluginSlot>>>,
     tasks: Rc<RefCell<FuturesUnordered<LocalTask>>>,
+    pending_tasks: Rc<RefCell<Vec<LocalTask>>>,
     shutdown_flag: Arc<AtomicBool>,
     worker_epoch: Instant,
     update_tx: mpsc::Sender<HostUpdate>,
@@ -740,7 +743,7 @@ impl WorkerEnv {
     }
 
     fn spawn_task(&self, fut: impl std::future::Future<Output = ()> + 'static) {
-        self.tasks.borrow_mut().push(Box::pin(fut));
+        self.pending_tasks.borrow_mut().push(Box::pin(fut));
     }
 
     fn plugin_infos(&self) -> Vec<PluginInfo> {
@@ -1075,6 +1078,7 @@ fn worker_main(
             service_depth: Rc::new(Cell::new(0)),
             slots: Rc::new(RefCell::new(BTreeMap::new())),
             tasks: Rc::new(RefCell::new(FuturesUnordered::new())),
+            pending_tasks: Rc::new(RefCell::new(Vec::new())),
             shutdown_flag,
             worker_epoch: Instant::now(),
             update_tx,
@@ -1152,16 +1156,24 @@ fn worker_main(
         }
 
         // 2. Drive spawned async plugin tasks.
+        // Drain newly spawned tasks from `pending_tasks` before each poll so callbacks
+        // invoked inside a polled task (e.g. `fern.views.refresh`, `fern.services.call`)
+        // never re-entrantly borrow `env.tasks`.
         loop {
             let poll_res = {
                 let mut tasks = env.tasks.borrow_mut();
+                for task in env.pending_tasks.borrow_mut().drain(..) {
+                    tasks.push(task);
+                }
                 if tasks.is_empty() {
                     break;
                 }
                 tasks.poll_next_unpin(&mut task_cx)
             };
+            let has_new = !env.pending_tasks.borrow().is_empty();
             match poll_res {
                 Poll::Ready(Some(())) => continue,
+                Poll::Ready(None) | Poll::Pending if has_new => continue,
                 Poll::Ready(None) | Poll::Pending => break,
             }
         }
@@ -1181,7 +1193,7 @@ fn worker_main(
         }
 
         // 6. Sleep until next command, async wakeup, timer, or hot-reload tick.
-        if !wake.woken.swap(false, Ordering::AcqRel) {
+        if !wake.woken.swap(false, Ordering::AcqRel) && env.pending_tasks.borrow().is_empty() {
             let timeout = next_wakeup_delay(&env, next_hot_reload);
             thread::park_timeout(timeout);
         }
@@ -1190,6 +1202,7 @@ fn worker_main(
     // Clean shutdown within <=300ms budget.
     env.http_pool.close_nonblocking();
     env.prompt_senders.borrow_mut().clear();
+    env.pending_tasks.borrow_mut().clear();
     env.tasks.borrow_mut().clear();
     let active_ids: Vec<String> = env.slots.borrow().keys().cloned().collect();
     let deadline = Instant::now() + Duration::from_millis(240);
@@ -1292,14 +1305,11 @@ fn handle_worker_cmd(env: &Rc<WorkerEnv>, cmd: WorkerCmd) {
             value,
             reply,
         } => {
-            let res = match value {
-                Some(v) => env.vault.set(&plugin_id, &key, &v),
-                None => env.vault.delete(&plugin_id, &key).map(|_| ()),
-            };
-            if res.is_ok() {
-                env.emit(HostUpdate::RegistryChanged(env.plugin_infos()));
-            }
-            let _ = reply.send(res);
+            let env_c = Rc::clone(env);
+            env.spawn_task(async move {
+                let res = set_plugin_secret(&env_c, &plugin_id, &key, value).await;
+                let _ = reply.send(res);
+            });
         }
         WorkerCmd::GetLogs { plugin_id, reply } => {
             let slots = env.slots.borrow();
@@ -1578,6 +1588,39 @@ async fn update_plugin_settings(
         next
     };
 
+    notify_settings_listeners(env, plugin_id, resolved).await;
+    env.emit(HostUpdate::RegistryChanged(env.plugin_infos()));
+    Ok(())
+}
+
+async fn set_plugin_secret(
+    env: &Rc<WorkerEnv>,
+    plugin_id: &str,
+    key: &str,
+    value: Option<String>,
+) -> Result<()> {
+    match value {
+        Some(v) => env.vault.set(plugin_id, key, &v)?,
+        None => {
+            env.vault.delete(plugin_id, key)?;
+        }
+    }
+    let resolved = env
+        .slots
+        .borrow()
+        .get(plugin_id)
+        .map(|s| s.settings_values.clone())
+        .unwrap_or_default();
+    notify_settings_listeners(env, plugin_id, resolved).await;
+    env.emit(HostUpdate::RegistryChanged(env.plugin_infos()));
+    Ok(())
+}
+
+async fn notify_settings_listeners(
+    env: &Rc<WorkerEnv>,
+    plugin_id: &str,
+    resolved: Map<String, JsonValue>,
+) {
     // Notify registered `fern.settings.onChange` callbacks if runtime is active.
     let maybe_rt = {
         let slots = env.slots.borrow();
@@ -1599,10 +1642,8 @@ async fn update_plugin_settings(
             Ok(())
         })
         .await;
+        env.flush_plugin_side_effects(plugin_id);
     }
-
-    env.emit(HostUpdate::RegistryChanged(env.plugin_infos()));
-    Ok(())
 }
 
 async fn ensure_activated(env: &Rc<WorkerEnv>, plugin_id: &str) -> Result<()> {
@@ -1698,6 +1739,7 @@ async fn ensure_activated(env: &Rc<WorkerEnv>, plugin_id: &str) -> Result<()> {
         }
     });
 
+    let cancel_flag = Arc::new(AtomicBool::new(false));
     let api = Rc::new(PluginApiState {
         plugin_id: plugin_id.to_owned(),
         permissions: loaded.permissions.clone(),
@@ -1732,7 +1774,7 @@ async fn ensure_activated(env: &Rc<WorkerEnv>, plugin_id: &str) -> Result<()> {
         service_caller,
         view_refresher,
         effect_emitter,
-        shutdown_flag: Arc::clone(&env.shutdown_flag),
+        shutdown_flag: Arc::clone(&cancel_flag),
     });
 
     let start = Instant::now();
@@ -1767,6 +1809,7 @@ async fn ensure_activated(env: &Rc<WorkerEnv>, plugin_id: &str) -> Result<()> {
                         ctx,
                         api,
                         gate,
+                        cancel_flag,
                         module_ns: Some(module_ns),
                     });
                 }
@@ -1776,6 +1819,7 @@ async fn ensure_activated(env: &Rc<WorkerEnv>, plugin_id: &str) -> Result<()> {
             Ok(())
         }
         Err(err) => {
+            cancel_flag.store(true, Ordering::Release);
             let msg = format!("{err:#}");
             api.clear_persistent_handles();
             drop(ctx);
@@ -2797,9 +2841,25 @@ fn format_caught_error<'js>(ctx: &Ctx<'js>, err: rquickjs::Error) -> String {
             }
         }
         CaughtError::Value(val) => {
-            val.as_string()
-                .and_then(|s| s.to_string().ok())
-                .unwrap_or_else(|| format!("{val:?}"))
+            if let Some(s) = val.as_string().and_then(|s| s.to_string().ok()) {
+                return s;
+            }
+            if val.type_of() == rquickjs::Type::Unknown {
+                return "Internal plugin host error while executing JS callback".to_owned();
+            }
+            if let Some(obj) = val.as_object()
+                && let Ok(msg) = obj.get::<_, String>("message")
+                && !msg.trim().is_empty()
+            {
+                return msg;
+            }
+            if matches!(val.type_of(), rquickjs::Type::Object | rquickjs::Type::Array)
+                && let Ok(Some(json_str)) = ctx.json_stringify(val.clone())
+                && let Ok(s) = json_str.to_string()
+            {
+                return s;
+            }
+            format!("{val:?}")
         }
     }
 }
@@ -2828,7 +2888,7 @@ mod tests {
 
     use super::*;
     use crate::scaffold::generate_sample_plugin;
-    use crate::ui_ast::UiNode;
+    use crate::ui_ast::{HandlerId, UiNode};
 
     struct TestEnv {
         _tmp: TempDir,
@@ -3289,6 +3349,157 @@ mod tests {
             shutdown_elapsed <= SHUTDOWN_BUDGET,
             "shutdown exceeded 300ms budget: {shutdown_elapsed:?}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn view_refresh_from_settings_change_and_async_click_never_panics() -> Result<()> {
+        let env = TestEnv::new()?;
+        env.write_plugin(
+            "com.test.refresh",
+            r#"{
+                "id": "com.test.refresh",
+                "name": "Refresh Test",
+                "version": "0.1.0",
+                "api_version": 1,
+                "entry": "index.js",
+                "permissions": ["storage"],
+                "settings": [
+                    { "key": "client_id", "type": "text", "label": "Client ID", "default": "" },
+                    { "key": "client_secret", "type": "secret", "label": "Client Secret" }
+                ],
+                "contributions": {
+                    "sidebar": [{ "id": "sync", "title": "Sync" }]
+                }
+            }"#,
+            &[(
+                "index.js",
+                r#"
+                import fern from "fern";
+                import * as ui from "fern:ui";
+
+                let inProgress = false;
+                let done = false;
+
+                export function activate() {
+                    fern.views.register("sync", {
+                        render() {
+                            const cid = String(fern.settings.get("client_id") || "");
+                            const hasSec = fern.settings.hasSecret("client_secret");
+                            const status = done
+                                ? "done"
+                                : inProgress
+                                  ? "working"
+                                  : cid && hasSec
+                                    ? "ready"
+                                    : "setup";
+                            return ui.vstack([
+                                ui.heading(status, 1),
+                                ui.button({
+                                    label: "Go",
+                                    onClick: async () => {
+                                        inProgress = true;
+                                        fern.views.refresh("sync");
+                                        const ok = await fern.ui.confirm("Go?", "Proceed");
+                                        inProgress = false;
+                                        done = Boolean(ok);
+                                        fern.views.refresh("sync");
+                                    }
+                                })
+                            ]);
+                        }
+                    });
+                    fern.settings.onChange(() => {
+                        fern.views.refresh("sync");
+                    });
+                }
+                "#,
+            )],
+        )?;
+
+        let (mgr, rx) = PluginManager::spawn(env.engine_config())?;
+        mgr.approve_permissions("com.test.refresh")?;
+
+        let extract_heading_and_btn = |tree: &UiTreePayload| -> Result<(String, HandlerId)> {
+            match &tree.root {
+                UiNode::VStack { children, .. } => {
+                    let heading = match &children[0] {
+                        UiNode::Heading { text, .. } => text.clone(),
+                        other => bail!("expected Heading, got {other:?}"),
+                    };
+                    let btn = match &children[1] {
+                        UiNode::Button { on_click: Some(id), .. } => *id,
+                        other => bail!("expected Button, got {other:?}"),
+                    };
+                    Ok((heading, btn))
+                }
+                other => bail!("expected VStack, got {other:?}"),
+            }
+        };
+
+        // 1. Initially in setup state.
+        let initial = mgr.mount_view("com.test.refresh", "sync")?;
+        let (h0, _) = extract_heading_and_btn(&initial)?;
+        assert_eq!(h0, "setup");
+
+        // 2. Updating client_id triggers settings.onChange -> fern.views.refresh("sync") inside task poll.
+        let mut settings = Map::new();
+        settings.insert("client_id".to_owned(), JsonValue::String("cid-123".to_owned()));
+        mgr.update_settings("com.test.refresh", settings)?;
+
+        // 3. Saving secret also notifies settings.onChange -> view transitions to "ready" automatically.
+        mgr.set_secret("com.test.refresh", "client_secret", "sec-xyz")?;
+        let ready_tree = loop {
+            match rx.recv_timeout(Duration::from_secs(3))? {
+                HostUpdate::ViewRendered(p) if p.view_id == "sync" => {
+                    let (h, _) = extract_heading_and_btn(&p)?;
+                    if h == "ready" {
+                        break p;
+                    }
+                }
+                HostUpdate::ViewError { error, .. } => bail!("unexpected view error: {error}"),
+                _ => continue,
+            }
+        };
+        let (_, btn_id) = extract_heading_and_btn(&ready_tree)?;
+
+        // 4. Async onClick calls fern.views.refresh("sync") BEFORE awaiting fern.ui.confirm(...).
+        let mgr_c = mgr.clone();
+        let click_thread = std::thread::spawn(move || {
+            mgr_c.dispatch_ui_event("com.test.refresh", UiEvent::click("sync", btn_id))
+        });
+
+        let mut saw_working = false;
+        let mut prompt_id = None;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while (!saw_working || prompt_id.is_none()) && Instant::now() < deadline {
+            match rx.recv_timeout(Duration::from_millis(500)) {
+                Ok(HostUpdate::ViewRendered(p)) if p.view_id == "sync" => {
+                    let (h, _) = extract_heading_and_btn(&p)?;
+                    if h == "working" {
+                        saw_working = true;
+                    }
+                }
+                Ok(HostUpdate::UiEffect(PluginUiEffect::Confirm { request_id, .. })) => {
+                    prompt_id = Some(request_id);
+                }
+                Ok(HostUpdate::ViewError { error, .. }) => bail!("unexpected view error: {error}"),
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        assert!(saw_working, "expected mid-async fern.views.refresh to render 'working'");
+        let req_id = prompt_id.ok_or_else(|| anyhow!("expected confirm prompt"))?;
+
+        mgr.resolve_prompt(req_id, PromptReplyValue::Confirm(true))?;
+        let final_tree = click_thread
+            .join()
+            .map_err(|_| anyhow!("click thread panicked"))??
+            .ok_or_else(|| anyhow!("expected final rerendered tree"))?;
+        let (h_final, _) = extract_heading_and_btn(&final_tree)?;
+        assert_eq!(h_final, "done");
+
+        mgr.shutdown();
         Ok(())
     }
 }

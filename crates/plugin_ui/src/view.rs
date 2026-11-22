@@ -134,6 +134,7 @@ impl UiTreeState {
         let element = self.render_node(
             &payload.root,
             &payload.view_id,
+            false,
             &event_sink,
             &notify_sink,
             cx,
@@ -264,6 +265,7 @@ impl UiTreeState {
         &mut self,
         node: &UiNode,
         view_id: &str,
+        in_row: bool,
         sink: &UiEventSink,
         notify_sink: &UiNotifySink,
         cx: &mut App,
@@ -275,14 +277,23 @@ impl UiTreeState {
                 align,
                 children,
             } => {
-                let mut el = v_flex().gap(px(gap.unwrap_or(8.0).max(0.0)));
+                let vstack_idx = self.node_counter;
+                self.node_counter += 1;
+                let mut el = v_flex()
+                    .min_w_0()
+                    .when(in_row, |el| el.flex_1())
+                    .when(!in_row, |el| el.w_full())
+                    .when(cfg!(test), |el| {
+                        el.debug_selector(move || format!("plugin-vstack-{vstack_idx}"))
+                    })
+                    .gap(px(gap.unwrap_or(8.0).max(0.0)));
                 if let Some(p) = padding {
                     el = el.p(px(p.max(0.0)));
                 }
                 el = apply_align_div(el, *align);
                 let rendered: Vec<AnyElement> = children
                     .iter()
-                    .map(|c| self.render_node(c, view_id, sink, notify_sink, cx))
+                    .map(|c| self.render_node(c, view_id, false, sink, notify_sink, cx))
                     .collect();
                 el.children(rendered).into_any_element()
             }
@@ -294,7 +305,16 @@ impl UiTreeState {
                 wrap,
                 children,
             } => {
-                let mut el = h_flex().gap(px(gap.unwrap_or(8.0).max(0.0)));
+                let hstack_idx = self.node_counter;
+                self.node_counter += 1;
+                let mut el = h_flex()
+                    .min_w_0()
+                    .when(!in_row, |el| el.w_full())
+                    .when(in_row && !*wrap, |el| el.flex_none())
+                    .when(cfg!(test), |el| {
+                        el.debug_selector(move || format!("plugin-hstack-{hstack_idx}"))
+                    })
+                    .gap(px(gap.unwrap_or(8.0).max(0.0)));
                 if let Some(p) = padding {
                     el = el.p(px(p.max(0.0)));
                 }
@@ -319,7 +339,7 @@ impl UiTreeState {
                 }
                 let rendered: Vec<AnyElement> = children
                     .iter()
-                    .map(|c| self.render_node(c, view_id, sink, notify_sink, cx))
+                    .map(|c| self.render_node(c, view_id, true, sink, notify_sink, cx))
                     .collect();
                 el.children(rendered).into_any_element()
             }
@@ -330,7 +350,7 @@ impl UiTreeState {
             } => {
                 let rendered: Vec<AnyElement> = children
                     .iter()
-                    .map(|c| self.render_node(c, view_id, sink, notify_sink, cx))
+                    .map(|c| self.render_node(c, view_id, false, sink, notify_sink, cx))
                     .collect();
                 div()
                     .w_full()
@@ -352,10 +372,10 @@ impl UiTreeState {
                     ElementId::Name(SharedString::from(format!("plugin-scroll-vp-{key}")));
                 let mut inner_items = Vec::new();
                 if let Some(c) = child {
-                    inner_items.push(self.render_node(c, view_id, sink, notify_sink, cx));
+                    inner_items.push(self.render_node(c, view_id, false, sink, notify_sink, cx));
                 }
                 for c in children {
-                    inner_items.push(self.render_node(c, view_id, sink, notify_sink, cx));
+                    inner_items.push(self.render_node(c, view_id, false, sink, notify_sink, cx));
                 }
                 let viewport = v_flex().id(viewport_id).w_full().gap_2().children(inner_items);
                 let mut scroll = v_scroll(scroll_id, viewport).track_scroll(&handle).w_full();
@@ -375,10 +395,11 @@ impl UiTreeState {
                 let colors = cx.theme().colors().clone();
                 let rendered: Vec<AnyElement> = children
                     .iter()
-                    .map(|c| self.render_node(c, view_id, sink, notify_sink, cx))
+                    .map(|c| self.render_node(c, view_id, false, sink, notify_sink, cx))
                     .collect();
                 v_flex()
-                    .w_full()
+                    .when(in_row, |el| el.flex_1())
+                    .when(!in_row, |el| el.w_full())
                     .min_w_0()
                     .rounded(px(8.))
                     .bg(colors.surface_background)
@@ -414,10 +435,11 @@ impl UiTreeState {
             } => {
                 let rendered: Vec<AnyElement> = children
                     .iter()
-                    .map(|c| self.render_node(c, view_id, sink, notify_sink, cx))
+                    .map(|c| self.render_node(c, view_id, false, sink, notify_sink, cx))
                     .collect();
                 v_flex()
-                    .w_full()
+                    .when(in_row, |el| el.flex_1())
+                    .when(!in_row, |el| el.w_full())
                     .min_w_0()
                     .gap_2()
                     .child(
@@ -454,8 +476,8 @@ impl UiTreeState {
                     _ => 14.,
                 };
                 div()
-                    .w_full()
                     .min_w_0()
+                    .when(in_row, |el| el.flex_1())
                     .text_size(px(font_px))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(colors.text)
@@ -492,6 +514,7 @@ impl UiTreeState {
                 };
                 div()
                     .min_w_0()
+                    .when(in_row, |el| el.flex_1())
                     .text_size(px(font_px))
                     .font_weight(font_weight)
                     .text_color(resolved_color)
@@ -739,7 +762,8 @@ impl UiTreeState {
                 );
                 let colors = cx.theme().colors();
                 div()
-                    .w_full()
+                    .when(in_row, |el| el.flex_1())
+                    .when(!in_row, |el| el.w_full())
                     .min_w_0()
                     .h(px(30.))
                     .px_2p5()

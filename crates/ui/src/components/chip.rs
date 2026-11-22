@@ -36,6 +36,7 @@ impl RenderOnce for Chip {
             .flex()
             .items_center()
             .gap_1()
+            .whitespace_nowrap()
             .rounded_full()
             .bg(self.color.opacity(0.3))
             .text_color(text)

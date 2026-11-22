@@ -356,6 +356,7 @@ impl SettingsWindow {
         window.on_window_should_close(cx, move |_, cx| {
             weak.update(cx, |this, cx| {
                 this.flush_sync_save(cx);
+                this.plugin_settings.update(cx, |view, cx| view.close_plugin_page(cx));
                 if !this.closing {
                     this.closing = true;
                     cx.emit(SettingsEvent::Dismissed);
@@ -374,8 +375,20 @@ impl SettingsWindow {
         .detach();
     }
 
+    pub(crate) fn is_closing(&self) -> bool {
+        self.closing
+    }
+
+    pub(crate) fn close_now(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.flush_sync_save(cx);
+        self.plugin_settings.update(cx, |view, cx| view.close_plugin_page(cx));
+        self.closing = true;
+        window.remove_window();
+    }
+
     pub(crate) fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.flush_sync_save(cx);
+        self.plugin_settings.update(cx, |view, cx| view.close_plugin_page(cx));
         if self.closing {
             return;
         }
@@ -414,6 +427,9 @@ impl SettingsWindow {
         if changed && self.page == Page::Sync {
             self.flush_sync_save(cx);
         }
+        if changed && self.page == Page::Plugins {
+            self.plugin_settings.update(cx, |view, cx| view.close_plugin_page(cx));
+        }
         if changed {
             self.page_scroll.set_offset(point(px(0.), px(0.)));
         }
@@ -450,8 +466,29 @@ impl SettingsWindow {
         window.focus(&self.focus_handle, cx);
     }
 
+    fn dismiss_plugin_settings_escape(&mut self, cx: &mut Context<Self>) -> bool {
+        // TODO(land-all): Replace body with `self.plugin_settings.update(cx, |view, cx| view.handle_escape(cx))`
+        // once `plugin-ui-fix`'s `PluginSettingsView::handle_escape` merges so permission modals
+        // are dismissed before embedded plugin pages.
+        self.plugin_settings.update(cx, |view, cx| {
+            if view.active_plugin_page_id().is_some() {
+                view.close_plugin_page(cx);
+                true
+            } else {
+                false
+            }
+        })
+    }
+
     pub fn dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.pending_restore.take().is_some() {
+        if let Some(modal) = cx
+            .try_global::<desktop_common::plugin_bus::PluginBus>()
+            .and_then(|bus| bus.active_modal.clone())
+        {
+            crate::app_view::dismiss_plugin_modal(&modal, cx);
+            window.focus(&self.focus_handle, cx);
+            cx.notify();
+        } else if self.pending_restore.take().is_some() {
             cx.notify();
         } else if self.confirm_reset_shortcuts {
             self.confirm_reset_shortcuts = false;
@@ -465,6 +502,9 @@ impl SettingsWindow {
             self.back_to_about(window, cx);
         } else if self.subscription_form.is_some() {
             self.subscription_form = None;
+            window.focus(&self.focus_handle, cx);
+            cx.notify();
+        } else if self.page == Page::Plugins && self.dismiss_plugin_settings_escape(cx) {
             window.focus(&self.focus_handle, cx);
             cx.notify();
         } else {
@@ -2815,7 +2855,8 @@ impl Render for SettingsWindow {
                     .child(page),
             )
             .children(self.render_reset_shortcuts_confirm(cx))
-            .children(self.render_restore_backup_confirm(cx));
+            .children(self.render_restore_backup_confirm(cx))
+            .child(plugin_ui::render_plugin_overlays(window, cx));
         crate::title_bar::window_frame(root, window, cx)
     }
 }
@@ -3270,5 +3311,77 @@ mod tests {
         }
         cx.run_until_parked();
         cx.update(|_, cx| assert_eq!(settings.read(cx).page, Page::Plugins));
+    }
+
+    #[gpui::test]
+    fn settings_window_mounts_plugin_overlays_and_escape_dismisses_modal_and_page_first(
+        app_cx: &mut gpui::TestAppContext,
+    ) {
+        use desktop_common::plugin_bus::{PluginBus, PluginModalKind, PluginModalSpec};
+
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        app_cx.update(|cx| {
+            theme::init(cx);
+            assert!(crate::keymap::load_default(&assets::Assets, cx).unwrap().is_empty());
+            cx.set_global(CurrentLocale(Locale::En));
+        });
+        let (settings, cx) = app_cx.add_window_view(|window, cx| {
+            let mut settings = SettingsWindow::new(store, cx);
+            settings.set_page(Page::Plugins, cx);
+            window.focus(&settings.focus_handle, cx);
+            settings
+        });
+        cx.simulate_resize(gpui::size(px(900.), px(720.)));
+
+        // Open an embedded plugin page AND a plugin confirm modal.
+        cx.update(|_, cx| {
+            settings.update(cx, |s, cx| {
+                s.plugin_settings.update(cx, |ps, cx| {
+                    ps.open_plugin_page("demo".into(), "Demo".into(), "main".into(), cx);
+                });
+            });
+            PluginBus::update(cx, |bus| {
+                bus.open_modal(PluginModalSpec {
+                    plugin_id: "demo".into(),
+                    view_id: "main".into(),
+                    title: "Confirm sync".into(),
+                    kind: PluginModalKind::Confirm {
+                        body: "Proceed?".into(),
+                        request_id: 42,
+                    },
+                });
+            });
+        });
+        cx.run_until_parked();
+
+        // First Escape closes the plugin modal without closing the embedded page or Settings.
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            assert!(cx.global::<PluginBus>().active_modal.is_none());
+            assert_eq!(
+                settings.read(cx).plugin_settings.read(cx).active_plugin_page_id(),
+                Some(("demo", "main"))
+            );
+            assert!(!settings.read(cx).is_closing());
+        });
+
+        // Second Escape closes the embedded plugin page without closing Settings.
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            assert_eq!(
+                settings.read(cx).plugin_settings.read(cx).active_plugin_page_id(),
+                None
+            );
+            assert!(!settings.read(cx).is_closing());
+        });
+
+        // Third Escape closes and removes the Settings window.
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        app_cx.update(|cx| {
+            assert!(cx.windows().is_empty(), "third Escape must close SettingsWindow");
+        });
     }
 }

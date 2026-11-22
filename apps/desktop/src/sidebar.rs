@@ -14,7 +14,7 @@ const RAIL_ICON_PX: u32 = 48;
 const MAX_RAIL_SVG_CACHE: usize = 128;
 
 #[derive(Default)]
-struct RailSvgCache(HashMap<(u64, u32), Arc<RenderImage>>);
+struct RailSvgCache(HashMap<(u64, u32), Option<Arc<RenderImage>>>);
 
 impl Global for RailSvgCache {}
 
@@ -23,12 +23,22 @@ impl Global for RailSvgCache {}
 pub struct DraggedRailItem {
     pub item: RailItemId,
     pub icon: IconName,
+    pub icon_svg: Option<Arc<str>>,
     pub active: bool,
 }
 
 impl Render for DraggedRailItem {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let colors = cx.theme().colors();
+        let colors = cx.theme().colors().clone();
+        let icon_color = if self.active {
+            colors.sidebar_icon
+        } else {
+            colors.sidebar_icon_muted
+        };
+        let custom_img = self
+            .icon_svg
+            .as_deref()
+            .and_then(|svg| rasterize_rail_svg(svg, icon_color, cx));
         div()
             .size(px(40.))
             .rounded(px(8.))
@@ -39,11 +49,19 @@ impl Render for DraggedRailItem {
             .flex()
             .items_center()
             .justify_center()
-            .child(Icon::new(self.icon).size(IconSize::Custom(px(24.))).color(if self.active {
-                colors.sidebar_icon
+            .child(if let Some(img) = custom_img {
+                let alpha = icon_color.to_rgb().a;
+                let mut el = gpui::img(img).size(px(24.));
+                if alpha < 0.999 {
+                    el = el.opacity(alpha);
+                }
+                el.into_any_element()
             } else {
-                colors.sidebar_icon_muted
-            }))
+                Icon::new(self.icon)
+                    .size(IconSize::Custom(px(24.)))
+                    .color(icon_color)
+                    .into_any_element()
+            })
     }
 }
 
@@ -145,7 +163,7 @@ impl Section {
             Section::Matrix => "section-matrix".into(),
             Section::Countdown => "section-countdown".into(),
             Section::Plugin { plugin_id, view_id } => {
-                format!("section-plugin-{plugin_id}-{view_id}").into()
+                format!("section-plugin-{}:{plugin_id}/{view_id}", plugin_id.len()).into()
             }
         }
     }
@@ -346,6 +364,7 @@ pub fn render(
         let payload = DraggedRailItem {
             item: entry.item,
             icon: section.icon(),
+            icon_svg: entry.icon_svg.clone(),
             active: is_active,
         };
         let hover_section = section.clone();
@@ -559,18 +578,24 @@ fn side_tooltip(text: impl Into<SharedString>, cx: &App) -> impl IntoElement {
     ))
 }
 
-fn rasterize_rail_svg(
+fn usvg_safe_options() -> usvg::Options<'static> {
+    usvg::Options {
+        image_href_resolver: usvg::ImageHrefResolver {
+            resolve_data: Box::new(|_, _, _| None),
+            resolve_string: Box::new(|_, _| None),
+        },
+        ..Default::default()
+    }
+}
+
+fn rasterize_rail_svg_uncached(
     raw_svg: &str,
-    color: Hsla,
+    r: u8,
+    g: u8,
+    b: u8,
     cx: &mut App,
 ) -> Option<Arc<RenderImage>> {
     let sanitized = plugins::ui_ast::sanitize_svg(raw_svg).ok()?;
-    let ink = color.to_rgb();
-    let r = (ink.r.clamp(0.0, 1.0) * 255.0).round() as u8;
-    let g = (ink.g.clamp(0.0, 1.0) * 255.0).round() as u8;
-    let b = (ink.b.clamp(0.0, 1.0) * 255.0).round() as u8;
-    let ink_rgb = u32::from_be_bytes([r, g, b, 0xFF]);
-
     let resolved_svg = if sanitized.to_ascii_lowercase().contains("currentcolor") {
         let hex = format!("#{r:02x}{g:02x}{b:02x}");
         replace_ascii_case_insensitive(&sanitized, "currentcolor", &hex)
@@ -578,12 +603,7 @@ fn rasterize_rail_svg(
         sanitized
     };
 
-    let key = (fnv1a_64(resolved_svg.as_bytes()), ink_rgb);
-    if let Some(cached) = cx.try_global::<RailSvgCache>().and_then(|c| c.0.get(&key)).cloned() {
-        return Some(cached);
-    }
-
-    let opts = usvg::Options::default();
+    let opts = usvg_safe_options();
     let tree = usvg::Tree::from_str(&resolved_svg, &opts).ok()?;
     let svg_size = tree.size();
     let sx = RAIL_ICON_PX as f32 / svg_size.width().max(1.0);
@@ -598,8 +618,28 @@ fn rasterize_rail_svg(
 
     let png = pixmap.encode_png().ok()?;
     let gpui_img = gpui::Image::from_bytes(gpui::ImageFormat::Png, png);
-    let render_img = gpui_img.to_image_data(cx.svg_renderer()).ok()?;
+    gpui_img.to_image_data(cx.svg_renderer()).ok()
+}
 
+fn rasterize_rail_svg(
+    raw_svg: &str,
+    color: Hsla,
+    cx: &mut App,
+) -> Option<Arc<RenderImage>> {
+    let ink = color.to_rgb();
+    let r = (ink.r.clamp(0.0, 1.0) * 255.0).round() as u8;
+    let g = (ink.g.clamp(0.0, 1.0) * 255.0).round() as u8;
+    let b = (ink.b.clamp(0.0, 1.0) * 255.0).round() as u8;
+    let ink_rgb = u32::from_be_bytes([r, g, b, 0xFF]);
+
+    // Key the cache on the raw SVG + resolved ink BEFORE sanitizing so per-frame renders never
+    // repeat sanitization/allocations, and negative-cache invalid SVGs as `None`.
+    let key = (fnv1a_64(raw_svg.as_bytes()), ink_rgb);
+    if let Some(cached) = cx.try_global::<RailSvgCache>().and_then(|c| c.0.get(&key)).cloned() {
+        return cached;
+    }
+
+    let render_img = rasterize_rail_svg_uncached(raw_svg, r, g, b, cx);
     if cx.try_global::<RailSvgCache>().is_none() {
         cx.set_global(RailSvgCache::default());
     }
@@ -607,9 +647,9 @@ fn rasterize_rail_svg(
         if cache.0.len() >= MAX_RAIL_SVG_CACHE {
             cache.0.clear();
         }
-        cache.0.insert(key, Arc::clone(&render_img));
+        cache.0.insert(key, render_img.clone());
     });
-    Some(render_img)
+    render_img
 }
 
 fn fnv1a_64(bytes: &[u8]) -> u64 {
@@ -704,5 +744,46 @@ mod tests {
         let visible_things = visible_rail_items(&order, features, &active_plugins);
         assert!(!visible_things.contains(&RailItemId::BuiltIn(RailSection::Tasks)));
         assert!(visible_things.contains(&RailItemId::BuiltIn(RailSection::Things)));
+    }
+
+    #[test]
+    fn plugin_section_ids_do_not_collide_on_hyphens() {
+        let a = Section::Plugin {
+            plugin_id: "a-b".into(),
+            view_id: "c".into(),
+        };
+        let b = Section::Plugin {
+            plugin_id: "a".into(),
+            view_id: "b-c".into(),
+        };
+        assert_ne!(a.id(), b.id());
+    }
+
+    #[test]
+    fn usvg_safe_options_disables_external_and_data_image_resolvers() {
+        let opts = usvg_safe_options();
+        assert!((opts.image_href_resolver.resolve_string)("C:\\Windows\\win.ini", &opts).is_none());
+        assert!((opts.image_href_resolver.resolve_string)("\\\\attacker\\share\\a.png", &opts).is_none());
+        assert!((opts.image_href_resolver.resolve_data)("image/svg+xml", Arc::new(Vec::new()), &opts).is_none());
+    }
+
+    #[gpui::test]
+    fn rail_svg_cache_negative_caches_invalid_svg_and_caches_valid_svg(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            theme::init(cx);
+            let ink = cx.theme().colors().sidebar_icon;
+            let invalid = "not-valid-svg";
+            assert!(rasterize_rail_svg(invalid, ink, cx).is_none());
+            // Negative entry must be cached so subsequent frames skip sanitization/parsing.
+            let cache_len_after_invalid = cx.global::<RailSvgCache>().0.len();
+            assert_eq!(cache_len_after_invalid, 1);
+            assert!(rasterize_rail_svg(invalid, ink, cx).is_none());
+            assert_eq!(cx.global::<RailSvgCache>().0.len(), 1);
+
+            let valid = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8" fill="currentColor"/></svg>"#;
+            let first = rasterize_rail_svg(valid, ink, cx).expect("valid SVG rasterizes");
+            let second = rasterize_rail_svg(valid, ink, cx).expect("cached SVG hits");
+            assert!(Arc::ptr_eq(&first, &second), "second frame must hit RailSvgCache without re-rasterizing");
+        });
     }
 }

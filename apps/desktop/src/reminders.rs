@@ -1052,6 +1052,14 @@ fn open_or_reuse_bg_store(bg_store: Option<Store>, db_path: &Path) -> Option<Sto
     bg_store.or_else(|| Store::open(db_path).ok())
 }
 
+fn apply_constant_override(notices: &mut [Notice], global_constant: bool) {
+    if global_constant {
+        for notice in notices {
+            notice.constant = true;
+        }
+    }
+}
+
 fn notice_to_json(notice: &Notice) -> serde_json::Value {
     let (kind, target_id) = match notice.target {
         Target::Task(id) => ("task", id.to_string()),
@@ -1156,21 +1164,11 @@ pub fn start(store: Rc<Store>, window: AnyWindowHandle, cx: &mut Context<AppView
             if poll.notices.is_empty() {
                 continue;
             }
-            if let Some(mgr) = cx.update(|cx| {
-                let host = plugin_ui::PluginHost::global(cx)?;
-                if host.is_safe_mode() {
-                    return None;
-                }
-                let has_hook = host.plugins().iter().any(|p| {
-                    p.enabled
-                        && p.manifest
-                            .permissions
-                            .contains(&plugins::permissions::Permission::HooksIntercept)
-                });
-                has_hook.then(|| host.manager().cloned()).flatten()
-            }) {
+            let mut notices = poll.notices;
+            apply_constant_override(&mut notices, poll.settings.constant);
+            if let Some(mgr) = cx.update(|cx| crate::quick_add_window::active_hook_manager(cx)) {
                 let payloads: Vec<serde_json::Value> =
-                    poll.notices.iter().map(notice_to_json).collect();
+                    notices.iter().map(notice_to_json).collect();
                 cx.background_spawn(async move {
                     for payload in payloads {
                         if let Err(err) = mgr.run_on_reminder(payload) {
@@ -1182,7 +1180,7 @@ pub fn start(store: Rc<Store>, window: AnyWindowHandle, cx: &mut Context<AppView
             }
             // With desktop reminders off, reminders only go to the bell.
             if !poll.settings.desktop {
-                if this.update(cx, |this, cx| this.add_notices(poll.notices, cx)).is_err() {
+                if this.update(cx, |this, cx| this.add_notices(notices, cx)).is_err() {
                     break;
                 }
                 continue;
@@ -1190,10 +1188,9 @@ pub fn start(store: Rc<Store>, window: AnyWindowHandle, cx: &mut Context<AppView
             type ShownNotice = (Notice, String, Vec<(&'static str, &'static str)>);
             let shown: Vec<ShownNotice> = cx.update(|cx| {
                 let strings = i18n::t(cx);
-                poll.notices
+                notices
                     .into_iter()
-                    .map(|mut n| {
-                        n.constant = poll.settings.constant || n.constant;
+                    .map(|n| {
                         let due = task_rows::due_label(n.at.date(), Some(n.at.time()), now.date(), strings).0;
                         let buttons = n.actions().iter().map(|a| (a.key(), a.label(strings))).collect();
                         (n, due, buttons)
@@ -1375,5 +1372,16 @@ mod tests {
 
         let urgent = build_toast_xml("Pay rent", "Now", &[("complete", "Done")], true);
         assert!(urgent.contains(r#"scenario="reminder""#));
+    }
+
+    #[test]
+    fn on_reminder_payload_reflects_global_constant_override() {
+        let mut notices = vec![notice("Standup", 9)];
+        assert!(!notices[0].constant);
+        apply_constant_override(&mut notices, false);
+        assert_eq!(notice_to_json(&notices[0])["constant"], serde_json::json!(false));
+        apply_constant_override(&mut notices, true);
+        assert!(notices[0].constant);
+        assert_eq!(notice_to_json(&notices[0])["constant"], serde_json::json!(true));
     }
 }

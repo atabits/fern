@@ -211,6 +211,23 @@ where
     out
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn parse_open_urls<I, S>(urls: I) -> Vec<fern_core::link::DeepLink>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    urls.into_iter()
+        .filter_map(|raw| fern_core::link::parse_deep_link(raw.as_ref()))
+        .collect()
+}
+
+fn apply_initial_theme(selection: &fern_core::ThemeSelection, system_dark: bool, cx: &mut App) {
+    let dark = selection.mode.is_dark(system_dark);
+    let resolved = user_themes::remembered(selection, dark, cx);
+    theme::set_arc(resolved, cx);
+}
+
 fn init_plugin_host(safe_mode: bool, db_path: PathBuf, locale: &str, cx: &mut App) {
     use theme::ActiveTheme as _;
     let appearance = if cx.theme().is_dark() { "dark" } else { "light" };
@@ -224,8 +241,6 @@ fn init_plugin_host(safe_mode: bool, db_path: PathBuf, locale: &str, cx: &mut Ap
         Ok(config) => {
             if let Err(err) = plugin_ui::PluginHost::init(config, cx) {
                 eprintln!("failed to initialize plugin host: {err:#}");
-            } else if !safe_mode {
-                plugin_ui::PluginHost::sync_plugin_themes(cx);
             }
         }
         Err(err) => eprintln!("failed to configure plugin host: {err:#}"),
@@ -271,19 +286,43 @@ fn main() -> Result<()> {
     app.on_reopen(|_cx| {
         tray::restore_main_window();
     });
+    #[cfg(target_os = "macos")]
+    let (open_urls_tx, open_urls_rx) = futures::channel::mpsc::unbounded::<Vec<String>>();
+    #[cfg(target_os = "macos")]
+    app.on_open_urls(move |urls| {
+        let _ = open_urls_tx.unbounded_send(urls);
+    });
     app.run(move |cx: &mut App| {
+        cx.on_app_quit(|cx| {
+            hotkeys::shutdown(cx);
+            plugin_ui::PluginHost::shutdown(cx);
+            tray::prepare_quit();
+            #[cfg(windows)]
+            single_instance::release();
+            async {}
+        })
+        .detach();
         cx.set_global(DbPath(db_path));
         cx.set_global(db_health);
         cx.set_global(LiveSyncStatus::default());
         ui::init_label_metrics(text_system, cx);
         theme::init(cx);
         user_themes::load(cx);
+        let initial_theme_selection = store.preferences().unwrap_or_default().theme;
+        let system_dark = matches!(
+            cx.window_appearance(),
+            gpui::WindowAppearance::Dark | gpui::WindowAppearance::VibrantDark
+        );
+        apply_initial_theme(&initial_theme_selection, system_dark, cx);
         cx.set_http_client(http::UreqHttpClient::new());
         if let Err(err) = Assets.load_fonts(cx) {
             eprintln!("failed to load the fonts: {err:#}");
         }
         cx.set_global(CurrentLocale(locale));
         init_plugin_host(safe_mode, plugin_db_path, locale.code(), cx);
+        // TODO(land-all): Register desktop_common's PluginHooksGlobal bridge here after `core-fix`
+        // merges so `todo_ui` / `things_ui` / `task_ui` invoke `beforeTaskCreate` /
+        // `beforeTaskComplete` / `quickAddTransform` through the shared bridge.
         match keymap::reload(&Assets, cx) {
             Ok(errors) => errors.iter().for_each(|err| eprintln!("keymap: {err}")),
             Err(err) => eprintln!("failed to load the keymap: {err:#}"),
@@ -323,17 +362,35 @@ fn main() -> Result<()> {
             },
         )
         .expect("failed to open the main window");
-        if !safe_mode {
-            plugin_ui::PluginHost::start_hot_reload_poller(cx);
-            if let Some(mgr) = plugin_ui::PluginHost::global(cx).and_then(|h| h.manager().cloned()) {
-                cx.background_spawn(async move {
-                    if let Err(err) = mgr.emit_app_ready() {
-                        eprintln!("failed to emit app.ready to plugins: {err:#}");
-                    }
-                })
-                .detach();
-            }
+        if !safe_mode
+            && let Some(mgr) = plugin_ui::PluginHost::global(cx).and_then(|h| h.manager().cloned())
+        {
+            cx.background_spawn(async move {
+                if let Err(err) = mgr.emit_app_ready() {
+                    eprintln!("failed to emit app.ready to plugins: {err:#}");
+                }
+            })
+            .detach();
         }
+        #[cfg(target_os = "macos")]
+        cx.spawn(async move |cx| {
+            use futures::StreamExt as _;
+            let mut open_urls_rx = open_urls_rx;
+            while let Some(urls) = open_urls_rx.next().await {
+                let links = parse_open_urls(urls);
+                if links.is_empty() {
+                    continue;
+                }
+                let _ = main_window.update(cx, |view, window, cx| {
+                    tray::restore_main_window();
+                    window.activate_window();
+                    for link in links {
+                        view.open_deep_link(link, window, cx);
+                    }
+                });
+            }
+        })
+        .detach();
         tray::connect(tray_rx, main_window, store_for_tray, cx);
         AppView::register_window_actions(main_window, cx);
         updater::set_before_restart_hook(
@@ -475,5 +532,50 @@ mod tests {
             })
         );
         assert_eq!(plugin_parsed.deep_link_raw.as_deref(), Some(plugin_uri));
+    }
+
+    #[test]
+    fn parse_open_urls_extracts_all_valid_deep_links() {
+        let task_id = uuid::Uuid::now_v7();
+        let task_uri = fern_core::link::task_link(task_id);
+        let links = parse_open_urls([
+            "https://example.com/ignored",
+            task_uri.as_str(),
+            "fern://plugin/sync/now?force=1",
+        ]);
+        assert_eq!(links.len(), 2);
+        assert_eq!(links[0], fern_core::link::DeepLink::Task(task_id));
+        assert_eq!(
+            links[1],
+            fern_core::link::DeepLink::Plugin {
+                plugin_id: "sync".into(),
+                command: "now".into(),
+                params: vec![("force".into(), "1".into())],
+            }
+        );
+    }
+
+    #[gpui::test]
+    fn apply_initial_theme_resolves_dark_and_light_before_plugin_host(cx: &mut gpui::TestAppContext) {
+        use theme::ActiveTheme as _;
+
+        cx.update(|cx| {
+            theme::init(cx);
+            let dark_sel = fern_core::ThemeSelection {
+                mode: fern_core::ThemeMode::Dark,
+                ..Default::default()
+            };
+            apply_initial_theme(&dark_sel, false, cx);
+            assert!(cx.theme().is_dark(), "explicit Dark mode must resolve dark at startup");
+
+            let system_sel = fern_core::ThemeSelection {
+                mode: fern_core::ThemeMode::System,
+                ..Default::default()
+            };
+            apply_initial_theme(&system_sel, true, cx);
+            assert!(cx.theme().is_dark(), "System mode with dark OS must resolve dark");
+            apply_initial_theme(&system_sel, false, cx);
+            assert!(!cx.theme().is_dark(), "System mode with light OS must resolve light");
+        });
     }
 }

@@ -1,6 +1,6 @@
 //! Declarative [`UiNode`] GPUI renderer and [`PluginView`] entity.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -35,6 +35,7 @@ use crate::host::PluginHost;
 
 const INPUT_DEBOUNCE: Duration = Duration::from_millis(150);
 const MAX_SVG_CACHE_ENTRIES: usize = 128;
+const MAX_SVG_CACHE_BYTES: usize = 32 * 1024 * 1024;
 
 /// Callback invoked whenever an interactive [`UiNode`] widget emits a [`UiEvent`].
 pub type UiEventSink = Rc<dyn Fn(UiEvent, &mut App)>;
@@ -51,9 +52,34 @@ pub enum PluginViewEvent {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct SvgCacheKey {
     content_hash: u64,
+    content_len: usize,
     width_px: u32,
     height_px: u32,
     ink_rgba: u32,
+}
+
+#[derive(Default)]
+struct SvgCache {
+    entries: HashMap<SvgCacheKey, Option<Arc<RenderImage>>>,
+    total_bytes: usize,
+}
+
+impl SvgCache {
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.total_bytes = 0;
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LayoutCtx {
+    /// Inside a vertical container (`VStack`, `Card`, `Section`, `Scroll`, `Grid`, or root).
+    Column,
+    /// Inside a width-constrained `HStack` (`w_full()` or `flex_1()`).
+    RowConstrained,
+    /// Inside an auto-sized `HStack` (`flex_none()`): children must NOT use `flex_1()`,
+    /// because `flex-basis: 0%` inside an auto-width row collapses them to `0px`.
+    RowAuto,
 }
 
 struct InputCallbacks {
@@ -68,10 +94,17 @@ struct InputSlot {
     entity: Entity<TextInput>,
     revision: u64,
     mode: Mode,
+    placeholder: String,
     read_only: bool,
     shared: Rc<RefCell<InputCallbacks>>,
     used: bool,
     _subs: [Subscription; 2],
+}
+
+impl Drop for InputSlot {
+    fn drop(&mut self) {
+        self.shared.borrow_mut().debounce_task = None;
+    }
 }
 
 /// Stateful GPUI widget state for a rendered declarative [`UiTreePayload`] tree.
@@ -80,10 +113,14 @@ struct InputSlot {
 /// persists [`ScrollHandle`] instances by `Scroll.key`, and caches rasterized SVG [`RenderImage`]s.
 pub struct UiTreeState {
     inputs: HashMap<String, InputSlot>,
-    scrolls: HashMap<String, ScrollHandle>,
+    scrolls: HashMap<String, (ScrollHandle, bool)>,
     open_select: Rc<RefCell<Option<String>>>,
-    svg_cache: HashMap<SvgCacheKey, Arc<RenderImage>>,
+    svg_cache: SvgCache,
     node_counter: usize,
+    #[cfg(test)]
+    test_text_counter: usize,
+    #[cfg(test)]
+    test_card_counter: usize,
 }
 
 impl Default for UiTreeState {
@@ -98,8 +135,12 @@ impl UiTreeState {
             inputs: HashMap::new(),
             scrolls: HashMap::new(),
             open_select: Rc::new(RefCell::new(None)),
-            svg_cache: HashMap::new(),
+            svg_cache: SvgCache::default(),
             node_counter: 0,
+            #[cfg(test)]
+            test_text_counter: 0,
+            #[cfg(test)]
+            test_card_counter: 0,
         }
     }
 
@@ -110,12 +151,16 @@ impl UiTreeState {
         self.svg_cache.clear();
     }
 
+    pub(crate) fn close_select(&mut self) -> bool {
+        self.open_select.borrow_mut().take().is_some()
+    }
+
     pub fn input_entity(&self, key: &str) -> Option<&Entity<TextInput>> {
         self.inputs.get(key).map(|slot| &slot.entity)
     }
 
     pub fn scroll_handle(&self, key: &str) -> Option<&ScrollHandle> {
-        self.scrolls.get(key)
+        self.scrolls.get(key).map(|(handle, _)| handle)
     }
 
     /// Renders `payload` into GPUI elements while syncing stateful inputs, scroll handles, and SVG cache.
@@ -129,18 +174,28 @@ impl UiTreeState {
         for slot in self.inputs.values_mut() {
             slot.used = false;
         }
+        for (_, used) in self.scrolls.values_mut() {
+            *used = false;
+        }
         self.node_counter = 0;
+        #[cfg(test)]
+        {
+            self.test_text_counter = 0;
+            self.test_card_counter = 0;
+        }
 
         let element = self.render_node(
             &payload.root,
             &payload.view_id,
-            false,
+            LayoutCtx::Column,
             &event_sink,
             &notify_sink,
             cx,
         );
 
         self.inputs.retain(|_, slot| slot.used);
+        self.scrolls
+            .retain(|key, (_, used)| *used || key == "__plugin_root__");
         element
     }
 
@@ -150,7 +205,12 @@ impl UiTreeState {
     }
 
     fn ensure_scroll(&mut self, key: &str) -> ScrollHandle {
-        self.scrolls.entry(key.to_owned()).or_default().clone()
+        let entry = self
+            .scrolls
+            .entry(key.to_owned())
+            .or_insert_with(|| (ScrollHandle::new(), true));
+        entry.1 = true;
+        entry.0.clone()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -181,9 +241,17 @@ impl UiTreeState {
             }
             if slot.revision != revision {
                 slot.revision = revision;
+                slot.shared.borrow_mut().debounce_task = None;
                 let text = value.to_owned();
                 slot.entity.update(cx, |input, cx| {
                     input.set_text(text, cx);
+                });
+            }
+            if slot.placeholder != placeholder {
+                slot.placeholder = placeholder.to_owned();
+                let next_ph = slot.placeholder.clone();
+                slot.entity.update(cx, |input, cx| {
+                    input.set_placeholder(next_ph, cx);
                 });
             }
             if slot.read_only != disabled {
@@ -216,9 +284,13 @@ impl UiTreeState {
 
         let shared_changed = Rc::clone(&shared);
         let sub_changed = cx.subscribe(&entity, move |emitter, _: &Changed, cx| {
-            let shared_inner = Rc::clone(&shared_changed);
+            // Use Weak so the pending debounce task cannot form an Rc cycle with InputCallbacks.
+            let weak_shared = Rc::downgrade(&shared_changed);
             let task = cx.spawn(async move |cx| {
                 cx.background_executor().timer(INPUT_DEBOUNCE).await;
+                let Some(shared_inner) = weak_shared.upgrade() else {
+                    return;
+                };
                 cx.update(|cx| {
                     let (vid, hid, sink_fn) = {
                         let cb = shared_inner.borrow();
@@ -235,12 +307,22 @@ impl UiTreeState {
 
         let shared_submit = Rc::clone(&shared);
         let sub_submit = cx.subscribe(&entity, move |_, ev: &Submitted, cx| {
-            let (vid, hid, sink_fn) = {
+            let (vid, on_submit_hid, on_change_hid, had_pending, sink_fn) = {
                 let mut cb = shared_submit.borrow_mut();
-                cb.debounce_task = None;
-                (cb.view_id.clone(), cb.on_submit, Rc::clone(&cb.sink))
+                let had_pending = cb.debounce_task.take().is_some();
+                (
+                    cb.view_id.clone(),
+                    cb.on_submit,
+                    cb.on_change,
+                    had_pending,
+                    Rc::clone(&cb.sink),
+                )
             };
-            if let Some(handler_id) = hid {
+            if let Some(handler_id) = on_submit_hid {
+                sink_fn(UiEvent::with_value(vid, handler_id, ev.0.clone()), cx);
+            } else if had_pending
+                && let Some(handler_id) = on_change_hid
+            {
                 sink_fn(UiEvent::with_value(vid, handler_id, ev.0.clone()), cx);
             }
         });
@@ -251,6 +333,7 @@ impl UiTreeState {
                 entity: entity.clone(),
                 revision,
                 mode,
+                placeholder: placeholder.to_owned(),
                 read_only: disabled,
                 shared,
                 used: true,
@@ -265,7 +348,7 @@ impl UiTreeState {
         &mut self,
         node: &UiNode,
         view_id: &str,
-        in_row: bool,
+        layout_ctx: LayoutCtx,
         sink: &UiEventSink,
         notify_sink: &UiNotifySink,
         cx: &mut App,
@@ -281,8 +364,7 @@ impl UiTreeState {
                 self.node_counter += 1;
                 let mut el = v_flex()
                     .min_w_0()
-                    .when(in_row, |el| el.flex_1())
-                    .when(!in_row, |el| el.w_full())
+                    .map(|el| apply_block_width(el, layout_ctx))
                     .when(cfg!(test), |el| {
                         el.debug_selector(move || format!("plugin-vstack-{vstack_idx}"))
                     })
@@ -293,7 +375,7 @@ impl UiTreeState {
                 el = apply_align_div(el, *align);
                 let rendered: Vec<AnyElement> = children
                     .iter()
-                    .map(|c| self.render_node(c, view_id, false, sink, notify_sink, cx))
+                    .map(|c| self.render_node(c, view_id, LayoutCtx::Column, sink, notify_sink, cx))
                     .collect();
                 el.children(rendered).into_any_element()
             }
@@ -307,10 +389,16 @@ impl UiTreeState {
             } => {
                 let hstack_idx = self.node_counter;
                 self.node_counter += 1;
-                let mut el = h_flex()
-                    .min_w_0()
-                    .when(!in_row, |el| el.w_full())
-                    .when(in_row && !*wrap, |el| el.flex_none())
+                let (el_base, child_ctx) = match layout_ctx {
+                    LayoutCtx::Column => (h_flex().min_w_0().w_full(), LayoutCtx::RowConstrained),
+                    LayoutCtx::RowConstrained if *wrap => {
+                        (h_flex().min_w_0().flex_1(), LayoutCtx::RowConstrained)
+                    }
+                    LayoutCtx::RowConstrained | LayoutCtx::RowAuto => {
+                        (h_flex().min_w_0().flex_none(), LayoutCtx::RowAuto)
+                    }
+                };
+                let mut el = el_base
                     .when(cfg!(test), |el| {
                         el.debug_selector(move || format!("plugin-hstack-{hstack_idx}"))
                     })
@@ -339,7 +427,7 @@ impl UiTreeState {
                 }
                 let rendered: Vec<AnyElement> = children
                     .iter()
-                    .map(|c| self.render_node(c, view_id, true, sink, notify_sink, cx))
+                    .map(|c| self.render_node(c, view_id, child_ctx, sink, notify_sink, cx))
                     .collect();
                 el.children(rendered).into_any_element()
             }
@@ -350,10 +438,11 @@ impl UiTreeState {
             } => {
                 let rendered: Vec<AnyElement> = children
                     .iter()
-                    .map(|c| self.render_node(c, view_id, false, sink, notify_sink, cx))
+                    .map(|c| self.render_node(c, view_id, LayoutCtx::Column, sink, notify_sink, cx))
                     .collect();
                 div()
-                    .w_full()
+                    .min_w_0()
+                    .map(|el| apply_block_width(el, layout_ctx))
                     .grid()
                     .grid_cols((*cols).max(1))
                     .gap(px(gap.unwrap_or(8.0).max(0.0)))
@@ -372,19 +461,66 @@ impl UiTreeState {
                     ElementId::Name(SharedString::from(format!("plugin-scroll-vp-{key}")));
                 let mut inner_items = Vec::new();
                 if let Some(c) = child {
-                    inner_items.push(self.render_node(c, view_id, false, sink, notify_sink, cx));
+                    inner_items.push(self.render_node(
+                        c,
+                        view_id,
+                        LayoutCtx::Column,
+                        sink,
+                        notify_sink,
+                        cx,
+                    ));
                 }
                 for c in children {
-                    inner_items.push(self.render_node(c, view_id, false, sink, notify_sink, cx));
+                    inner_items.push(self.render_node(
+                        c,
+                        view_id,
+                        LayoutCtx::Column,
+                        sink,
+                        notify_sink,
+                        cx,
+                    ));
                 }
-                let viewport = v_flex().id(viewport_id).w_full().gap_2().children(inner_items);
-                let mut scroll = v_scroll(scroll_id, viewport).track_scroll(&handle).w_full();
                 if let Some(mh) = max_height {
-                    scroll = scroll.max_h(px(mh.max(24.0)));
+                    let viewport = v_flex()
+                        .id(viewport_id)
+                        .w_full()
+                        .gap_2()
+                        .when(cfg!(test), |el| {
+                            let sel = format!("plugin-scroll-{key}");
+                            el.debug_selector(move || sel)
+                        })
+                        .children(inner_items);
+                    let mut scroll = v_scroll(scroll_id, viewport)
+                        .track_scroll(&handle)
+                        .min_w_0()
+                        .max_h(px(mh.max(24.0)));
+                    scroll = match layout_ctx {
+                        LayoutCtx::Column => scroll.w_full(),
+                        LayoutCtx::RowConstrained => scroll.flex_1(),
+                        LayoutCtx::RowAuto => scroll,
+                    };
+                    scroll.into_any_element()
                 } else {
-                    scroll = scroll.flex_1().min_h_0();
+                    // Inside auto-height containers (like PluginView/PluginOverlayView's outer
+                    // v_scroll body), `.flex_1().min_h_0()` collapses to 0px in Taffy. Render
+                    // at natural content height so the outer view scrolls cleanly.
+                    let mut body = v_flex()
+                        .id(scroll_id)
+                        .min_w_0()
+                        .gap_2()
+                        .children(inner_items);
+                    body = match layout_ctx {
+                        LayoutCtx::Column => body.w_full(),
+                        LayoutCtx::RowConstrained => body.flex_1(),
+                        LayoutCtx::RowAuto => body,
+                    };
+                    #[cfg(test)]
+                    let body = {
+                        let sel = format!("plugin-scroll-{key}");
+                        body.debug_selector(move || sel)
+                    };
+                    body.into_any_element()
                 }
-                scroll.into_any_element()
             }
             UiNode::Card {
                 title,
@@ -393,13 +529,18 @@ impl UiTreeState {
                 children,
             } => {
                 let colors = cx.theme().colors().clone();
+                #[cfg(test)]
+                let card_idx = {
+                    let idx = self.test_card_counter;
+                    self.test_card_counter += 1;
+                    idx
+                };
                 let rendered: Vec<AnyElement> = children
                     .iter()
-                    .map(|c| self.render_node(c, view_id, false, sink, notify_sink, cx))
+                    .map(|c| self.render_node(c, view_id, LayoutCtx::Column, sink, notify_sink, cx))
                     .collect();
-                v_flex()
-                    .when(in_row, |el| el.flex_1())
-                    .when(!in_row, |el| el.w_full())
+                let card = v_flex()
+                    .map(|el| apply_block_width(el, layout_ctx))
                     .min_w_0()
                     .rounded(px(8.))
                     .bg(colors.surface_background)
@@ -425,8 +566,10 @@ impl UiTreeState {
                                 }),
                         )
                     })
-                    .children(rendered)
-                    .into_any_element()
+                    .children(rendered);
+                #[cfg(test)]
+                let card = card.debug_selector(move || format!("plugin-card-{card_idx}"));
+                card.into_any_element()
             }
             UiNode::Section {
                 title,
@@ -435,11 +578,10 @@ impl UiTreeState {
             } => {
                 let rendered: Vec<AnyElement> = children
                     .iter()
-                    .map(|c| self.render_node(c, view_id, false, sink, notify_sink, cx))
+                    .map(|c| self.render_node(c, view_id, LayoutCtx::Column, sink, notify_sink, cx))
                     .collect();
                 v_flex()
-                    .when(in_row, |el| el.flex_1())
-                    .when(!in_row, |el| el.w_full())
+                    .map(|el| apply_block_width(el, layout_ctx))
                     .min_w_0()
                     .gap_2()
                     .child(
@@ -477,7 +619,7 @@ impl UiTreeState {
                 };
                 div()
                     .min_w_0()
-                    .when(in_row, |el| el.flex_1())
+                    .when(layout_ctx != LayoutCtx::Column, |el| el.flex_shrink(1.0))
                     .text_size(px(font_px))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(colors.text)
@@ -512,22 +654,34 @@ impl UiTreeState {
                     UiWeight::Semibold => FontWeight::SEMIBOLD,
                     UiWeight::Bold => FontWeight::BOLD,
                 };
-                div()
+                #[cfg(test)]
+                let text_idx = {
+                    let idx = self.test_text_counter;
+                    self.test_text_counter += 1;
+                    idx
+                };
+                let el = div()
                     .min_w_0()
-                    .when(in_row, |el| el.flex_1())
+                    .when(layout_ctx != LayoutCtx::Column, |el| el.flex_shrink(1.0))
                     .text_size(px(font_px))
                     .font_weight(font_weight)
                     .text_color(resolved_color)
-                    .child(text.clone())
-                    .into_any_element()
+                    .child(text.clone());
+                #[cfg(test)]
+                let el = el.debug_selector(move || format!("plugin-text-{text_idx}"));
+                el.into_any_element()
             }
-            UiNode::Markdown { content } => render_markdown_node(content, cx),
+            UiNode::Markdown { content } => {
+                let md_idx = self.node_counter;
+                self.node_counter += 1;
+                render_markdown_node(content, md_idx, layout_ctx, cx)
+            }
             UiNode::KeyValue {
                 label,
                 value,
                 muted,
             } => h_flex()
-                .w_full()
+                .map(|el| apply_block_width(el, layout_ctx))
                 .min_w_0()
                 .justify_between()
                 .gap_3()
@@ -566,7 +720,8 @@ impl UiTreeState {
                     .and_then(|c| resolve_ui_color(c, cx))
                     .unwrap_or(colors.accent);
                 v_flex()
-                    .w_full()
+                    .map(|el| apply_block_width(el, layout_ctx))
+                    .min_w_0()
                     .gap_1()
                     .when_some(label.clone(), |col, lbl| {
                         col.child(
@@ -762,9 +917,7 @@ impl UiTreeState {
                 );
                 let colors = cx.theme().colors();
                 div()
-                    .when(in_row, |el| el.flex_1())
-                    .when(!in_row, |el| el.w_full())
-                    .min_w_0()
+                    .map(|el| apply_input_width(el, layout_ctx))
                     .h(px(30.))
                     .px_2p5()
                     .flex()
@@ -807,8 +960,7 @@ impl UiTreeState {
                 let colors = cx.theme().colors();
                 let height_px = (f32::from((*rows).clamp(2, 24)) * 20.0 + 12.0).clamp(52.0, 480.0);
                 div()
-                    .w_full()
-                    .min_w_0()
+                    .map(|el| apply_input_width(el, layout_ctx))
                     .h(px(height_px))
                     .p_2()
                     .overflow_hidden()
@@ -876,9 +1028,30 @@ impl UiTreeState {
                             .into_any_element()
                         })
                         .collect();
+                    let open_ref_out = Rc::clone(&open_ref);
+                    let notify_out = Rc::clone(notify_sink);
+                    let scroll_id = ElementId::Name(SharedString::from(format!(
+                        "plugin-select-scroll-{key}"
+                    )));
+                    let vp_id = ElementId::Name(SharedString::from(format!(
+                        "plugin-select-vp-{key}"
+                    )));
                     Some(PopoverAttachment::new(
                         Placement::BelowLeft,
-                        popover(cx).min_w(px(160.)).max_w(px(280.)).children(items),
+                        popover(cx)
+                            .min_w(px(160.))
+                            .max_w(px(280.))
+                            .on_mouse_down_out(move |_, _, cx| {
+                                *open_ref_out.borrow_mut() = None;
+                                notify_out(cx);
+                                cx.stop_propagation();
+                            })
+                            .child(
+                                v_scroll(scroll_id, v_flex().id(vp_id).w_full().children(items))
+                                    .compact()
+                                    .max_h(px(260.))
+                                    .w_full(),
+                            ),
                     ))
                 } else {
                     None
@@ -997,7 +1170,12 @@ impl UiTreeState {
                 options,
                 on_change,
             } => {
-                let prefix = key.as_deref().unwrap_or("seg");
+                let seg_idx = self.node_counter;
+                self.node_counter += 1;
+                let prefix = match key.as_deref() {
+                    Some(k) => format!("k-{k}"),
+                    None => format!("seg-{seg_idx}"),
+                };
                 let mut tabs = SegmentedTabs::new();
                 for (idx, opt) in options.iter().enumerate() {
                     let tab_id = ElementId::Name(SharedString::from(format!(
@@ -1078,6 +1256,7 @@ pub struct PluginView {
     focus_handle: FocusHandle,
     tree_state: UiTreeState,
     seen_plugin_revision: u64,
+    mounted: Cell<bool>,
     embedded: bool,
     _host_sub: Subscription,
 }
@@ -1109,6 +1288,30 @@ impl PluginView {
         Self::create(plugin_id, view_id, true, cx)
     }
 
+    fn should_mount_target(plugin_id: &str, view_id: &str, cx: &App) -> bool {
+        PluginHost::global(cx).is_some_and(|h| {
+            if h.is_safe_mode() {
+                return false;
+            }
+            match h.plugin(plugin_id) {
+                Some(info) => {
+                    info.enabled
+                        && !matches!(
+                            info.status,
+                            PluginStatus::Disabled
+                                | PluginStatus::NeedsApproval { .. }
+                                | PluginStatus::CircuitBroken { .. }
+                        )
+                }
+                // Preserve synthetic test trees where the plugin is not registered on the host.
+                None => {
+                    h.view_tree(plugin_id, view_id).is_none()
+                        && h.view_error(plugin_id, view_id).is_none()
+                }
+            }
+        })
+    }
+
     fn create(
         plugin_id: impl Into<String>,
         view_id: impl Into<String>,
@@ -1125,11 +1328,12 @@ impl PluginView {
             cx.notify();
         });
 
-        let should_mount = PluginHost::global(cx).is_some_and(|h| {
-            !h.is_safe_mode()
-                && h.view_tree(&plugin_id, &view_id).is_none()
-                && h.view_error(&plugin_id, &view_id).is_none()
-        });
+        cx.on_release(|this: &mut PluginView, cx| {
+            this.unmount(cx);
+        })
+        .detach();
+
+        let should_mount = Self::should_mount_target(&plugin_id, &view_id, cx);
         if should_mount {
             PluginHost::mount_view_async(plugin_id.clone(), view_id.clone(), cx);
         }
@@ -1140,6 +1344,7 @@ impl PluginView {
             focus_handle: cx.focus_handle(),
             tree_state: UiTreeState::new(),
             seen_plugin_revision,
+            mounted: Cell::new(should_mount),
             embedded,
             _host_sub: host_sub,
         }
@@ -1169,22 +1374,24 @@ impl PluginView {
         if self.plugin_id == next_plugin && self.view_id == next_view {
             return;
         }
-        PluginHost::unmount_view_async(self.plugin_id.clone(), self.view_id.clone(), cx);
+        self.unmount(cx);
         self.plugin_id = next_plugin;
         self.view_id = next_view;
         self.tree_state.clear();
         self.seen_plugin_revision = PluginHost::global(cx)
             .map_or(0, |h| h.plugin_revision(&self.plugin_id));
-        if PluginHost::global(cx).is_some_and(|h| {
-            !h.is_safe_mode() && h.view_tree(&self.plugin_id, &self.view_id).is_none()
-        }) {
+        let should_mount = Self::should_mount_target(&self.plugin_id, &self.view_id, cx);
+        if should_mount {
+            self.mounted.set(true);
             PluginHost::mount_view_async(self.plugin_id.clone(), self.view_id.clone(), cx);
         }
         cx.notify();
     }
 
     pub fn unmount(&self, cx: &mut App) {
-        PluginHost::unmount_view_async(self.plugin_id.clone(), self.view_id.clone(), cx);
+        if self.mounted.replace(false) {
+            PluginHost::unmount_view_async(self.plugin_id.clone(), self.view_id.clone(), cx);
+        }
     }
 
     fn on_host_updated(&mut self, cx: &mut Context<Self>) {
@@ -1194,10 +1401,21 @@ impl PluginView {
         let rev = host.plugin_revision(&self.plugin_id);
         if rev != self.seen_plugin_revision {
             self.seen_plugin_revision = rev;
-            let enabled = host
-                .plugin(&self.plugin_id)
-                .is_some_and(|p| p.enabled);
-            if enabled && !host.is_safe_mode() {
+            let can_mount = !host.is_safe_mode()
+                && host.plugin(&self.plugin_id).is_some_and(|p| {
+                    p.enabled
+                        && !matches!(
+                            p.status,
+                            PluginStatus::Disabled
+                                | PluginStatus::NeedsApproval { .. }
+                                | PluginStatus::CircuitBroken { .. }
+                        )
+                });
+            let already_current =
+                host.view_revision(&self.plugin_id, &self.view_id) == Some(rev)
+                    || host.is_view_mounting(&self.plugin_id, &self.view_id);
+            if can_mount && !already_current {
+                self.mounted.set(true);
                 PluginHost::mount_view_async(self.plugin_id.clone(), self.view_id.clone(), cx);
             }
         }
@@ -1224,35 +1442,14 @@ impl PluginView {
                 row.child(
                     Button::new("plugin-fallback-reset", strings.plugins_reset_enable)
                         .variant(ButtonVariant::Primary)
-                        .on_click(move |_, _, cx| {
-                            if let Some(mgr) =
-                                PluginHost::global(cx).and_then(|h| h.manager().cloned())
-                            {
-                                let pid = reset_pid.clone();
-                                let vid = reset_vid.clone();
-                                let res_pid = reset_pid.clone();
-                                let res_vid = reset_vid.clone();
-                                let task = cx.background_spawn(async move {
-                                    mgr.reset_and_enable_plugin(&pid)?;
-                                    mgr.mount_view(&pid, &vid)
-                                });
-                                cx.spawn(async move |cx| {
-                                    let res = task.await;
-                                    cx.update(|cx| match res {
-                                        Ok(tree) => PluginHost::set_view_tree(
-                                            res_pid, res_vid, tree, cx,
-                                        ),
-                                        Err(err) => PluginHost::set_view_error(
-                                            res_pid,
-                                            res_vid,
-                                            format!("{err:#}"),
-                                            cx,
-                                        ),
-                                    });
-                                })
-                                .detach();
-                            }
-                        }),
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.mounted.set(true);
+                            PluginHost::reset_and_mount_view_async(
+                                reset_pid.clone(),
+                                reset_vid.clone(),
+                                cx,
+                            );
+                        })),
                 )
             })
             .child(
@@ -1263,11 +1460,14 @@ impl PluginView {
                         ButtonVariant::Primary
                     })
                     .icon(IconName::RefreshCw)
-                    .on_click(move |_, _, cx| {
-                        PluginHost::clear_view_error(&reload_pid, &reload_vid, cx);
-                        PluginHost::reload_plugin_async(reload_pid.clone(), cx);
-                        PluginHost::mount_view_async(reload_pid.clone(), reload_vid.clone(), cx);
-                    }),
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.mounted.set(true);
+                        PluginHost::reload_and_mount_view_async(
+                            reload_pid.clone(),
+                            reload_vid.clone(),
+                            cx,
+                        );
+                    })),
             )
             .child(
                 Button::new("plugin-fallback-logs", strings.plugins_open_logs)
@@ -1320,8 +1520,11 @@ impl Render for PluginView {
 
         let payload = PluginHost::global(cx)
             .and_then(|h| h.view_tree(&self.plugin_id, &self.view_id).cloned());
-        let view_error = PluginHost::global(cx)
-            .and_then(|h| h.view_error(&self.plugin_id, &self.view_id).map(str::to_owned));
+        let view_error = PluginHost::global(cx).and_then(|h| {
+            h.view_error(&self.plugin_id, &self.view_id)
+                .or_else(|| h.view_error(&self.plugin_id, ""))
+                .map(str::to_owned)
+        });
         let plugin_status = PluginHost::global(cx)
             .and_then(|h| h.plugin(&self.plugin_id))
             .map(|p| p.status.clone());
@@ -1332,7 +1535,10 @@ impl Render for PluginView {
 
         match plugin_status {
             Some(PluginStatus::Disabled) => {
-                return self.render_error_fallback(strings.plugins_disable.to_owned(), cx);
+                return self.render_error_fallback(
+                    crate::status_disabled_label(i18n::locale(cx)).to_owned(),
+                    cx,
+                );
             }
             Some(PluginStatus::NeedsApproval { .. }) => {
                 return self
@@ -1395,6 +1601,22 @@ impl Render for PluginView {
                 .min_h_0(),
             )
             .into_any_element()
+    }
+}
+
+fn apply_block_width<E: Styled>(el: E, layout_ctx: LayoutCtx) -> E {
+    match layout_ctx {
+        LayoutCtx::Column => el.w_full(),
+        LayoutCtx::RowConstrained => el.flex_1(),
+        LayoutCtx::RowAuto => el,
+    }
+}
+
+fn apply_input_width<E: Styled>(el: E, layout_ctx: LayoutCtx) -> E {
+    match layout_ctx {
+        LayoutCtx::Column => el.w_full().min_w_0(),
+        LayoutCtx::RowConstrained => el.flex_1().min_w_0(),
+        LayoutCtx::RowAuto => el.min_w(px(140.)),
     }
 }
 
@@ -1487,7 +1709,12 @@ pub(crate) fn resolve_icon_name(raw: Option<&str>) -> IconName {
     }
 }
 
-fn render_markdown_node(content: &str, cx: &App) -> AnyElement {
+fn render_markdown_node(
+    content: &str,
+    md_idx: usize,
+    layout_ctx: LayoutCtx,
+    cx: &App,
+) -> AnyElement {
     let theme = cx.theme();
     let accent = theme.colors().text_accent;
     let muted = theme.colors().text_muted;
@@ -1533,7 +1760,7 @@ fn render_markdown_node(content: &str, cx: &App) -> AnyElement {
     };
 
     v_flex()
-        .w_full()
+        .map(|el| apply_block_width(el, layout_ctx))
         .min_w_0()
         .text_size(px(14.))
         .line_height(px(20.))
@@ -1552,10 +1779,19 @@ fn render_markdown_node(content: &str, cx: &App) -> AnyElement {
             let ranges = links.iter().map(|(range, _)| range.clone()).collect();
             let styled_text = build_styled(block.text, block.runs);
             let layout = styled_text.layout().clone();
-            let interactive = InteractiveText::new(("plugin-md-block", ix), styled_text)
+            let block_id = ElementId::Name(SharedString::from(format!(
+                "plugin-md-block-{md_idx}-{ix}"
+            )));
+            let body_id = ElementId::Name(SharedString::from(format!(
+                "plugin-md-body-{md_idx}-{ix}"
+            )));
+            let check_id = ElementId::Name(SharedString::from(format!(
+                "plugin-md-check-{md_idx}-{ix}"
+            )));
+            let interactive = InteractiveText::new(block_id, styled_text)
                 .on_click(ranges, |_, _, _| {});
             let body = div()
-                .id(("plugin-md-body", ix))
+                .id(body_id)
                 .flex_1()
                 .min_w_0()
                 .child(interactive)
@@ -1606,7 +1842,7 @@ fn render_markdown_node(content: &str, cx: &App) -> AnyElement {
                     .child(
                         div()
                             .pt(px(3.))
-                            .child(Checkbox::new(("plugin-md-check", ix)).size(px(14.)).toggle_state(done)),
+                            .child(Checkbox::new(check_id).size(px(14.)).toggle_state(done)),
                     )
                     .child(body.when(done, |el| el.line_through().text_color(muted)))
                     .into_any_element(),
@@ -1629,7 +1865,7 @@ fn render_svg_node(
     raw_content: &str,
     width: f32,
     height: f32,
-    cache: &mut HashMap<SvgCacheKey, Arc<RenderImage>>,
+    cache: &mut SvgCache,
     cx: &mut App,
 ) -> AnyElement {
     let w = if width.is_finite() {
@@ -1658,62 +1894,86 @@ fn render_svg_node(
         .into_any_element()
 }
 
+pub(crate) fn safe_usvg_options() -> usvg::Options<'static> {
+    usvg::Options {
+        image_href_resolver: usvg::ImageHrefResolver {
+            resolve_data: Box::new(|_, _, _| None),
+            resolve_string: Box::new(|_, _| None),
+        },
+        ..usvg::Options::default()
+    }
+}
+
 fn rasterize_svg_cached(
     raw_content: &str,
     width: f32,
     height: f32,
-    cache: &mut HashMap<SvgCacheKey, Arc<RenderImage>>,
+    cache: &mut SvgCache,
     cx: &mut App,
 ) -> Option<Arc<RenderImage>> {
-    let sanitized = sanitize_svg(raw_content).ok()?;
     let ink = cx.theme().colors().icon.to_rgb();
     let r = (ink.r.clamp(0.0, 1.0) * 255.0).round() as u8;
     let g = (ink.g.clamp(0.0, 1.0) * 255.0).round() as u8;
     let b = (ink.b.clamp(0.0, 1.0) * 255.0).round() as u8;
     let ink_rgba = u32::from_be_bytes([r, g, b, 0xFF]);
 
-    let resolved_svg = if sanitized.to_ascii_lowercase().contains("currentcolor") {
-        let hex = format!("#{r:02x}{g:02x}{b:02x}");
-        replace_ascii_case_insensitive(&sanitized, "currentcolor", &hex)
-    } else {
-        sanitized
-    };
-
     let px_w = (width * 2.0).round().clamp(2.0, 2048.0) as u32;
     let px_h = (height * 2.0).round().clamp(2.0, 2048.0) as u32;
     let key = SvgCacheKey {
-        content_hash: fnv1a_64(resolved_svg.as_bytes()),
+        content_hash: fnv1a_64(raw_content.as_bytes()),
+        content_len: raw_content.len(),
         width_px: px_w,
         height_px: px_h,
         ink_rgba,
     };
 
-    if let Some(cached) = cache.get(&key) {
-        return Some(Arc::clone(cached));
+    if let Some(cached) = cache.entries.get(&key) {
+        return cached.clone();
     }
 
-    let opts = usvg::Options::default();
-    let tree = usvg::Tree::from_str(&resolved_svg, &opts).ok()?;
-    let svg_size = tree.size();
-    let sx = px_w as f32 / svg_size.width().max(1.0);
-    let sy = px_h as f32 / svg_size.height().max(1.0);
-    let scale = sx.min(sy);
-    let dx = (px_w as f32 - svg_size.width() * scale) * 0.5;
-    let dy = (px_h as f32 - svg_size.height() * scale) * 0.5;
+    let rendered = (|| -> Option<Arc<RenderImage>> {
+        let sanitized = sanitize_svg(raw_content).ok()?;
+        let resolved_svg = if sanitized.to_ascii_lowercase().contains("currentcolor") {
+            let hex = format!("#{r:02x}{g:02x}{b:02x}");
+            replace_ascii_case_insensitive(&sanitized, "currentcolor", &hex)
+        } else {
+            sanitized
+        };
 
-    let mut pixmap = resvg::tiny_skia::Pixmap::new(px_w, px_h)?;
-    let transform = resvg::tiny_skia::Transform::from_scale(scale, scale).post_translate(dx, dy);
-    resvg::render(&tree, transform, &mut pixmap.as_mut());
+        let opts = safe_usvg_options();
+        let tree = usvg::Tree::from_str(&resolved_svg, &opts).ok()?;
+        let svg_size = tree.size();
+        let sx = px_w as f32 / svg_size.width().max(1.0);
+        let sy = px_h as f32 / svg_size.height().max(1.0);
+        let scale = sx.min(sy);
+        let dx = (px_w as f32 - svg_size.width() * scale) * 0.5;
+        let dy = (px_h as f32 - svg_size.height() * scale) * 0.5;
 
-    let png = pixmap.encode_png().ok()?;
-    let gpui_img = gpui::Image::from_bytes(gpui::ImageFormat::Png, png);
-    let render_img = gpui_img.to_image_data(cx.svg_renderer()).ok()?;
+        let mut pixmap = resvg::tiny_skia::Pixmap::new(px_w, px_h)?;
+        let transform =
+            resvg::tiny_skia::Transform::from_scale(scale, scale).post_translate(dx, dy);
+        resvg::render(&tree, transform, &mut pixmap.as_mut());
 
-    if cache.len() >= MAX_SVG_CACHE_ENTRIES {
+        let png = pixmap.encode_png().ok()?;
+        let gpui_img = gpui::Image::from_bytes(gpui::ImageFormat::Png, png);
+        gpui_img.to_image_data(cx.svg_renderer()).ok()
+    })();
+
+    let entry_bytes = if rendered.is_some() {
+        (px_w as usize)
+            .saturating_mul(px_h as usize)
+            .saturating_mul(4)
+    } else {
+        0
+    };
+    if cache.entries.len() >= MAX_SVG_CACHE_ENTRIES
+        || cache.total_bytes.saturating_add(entry_bytes) > MAX_SVG_CACHE_BYTES
+    {
         cache.clear();
     }
-    cache.insert(key, Arc::clone(&render_img));
-    Some(render_img)
+    cache.total_bytes = cache.total_bytes.saturating_add(entry_bytes);
+    cache.entries.insert(key, rendered.clone());
+    rendered
 }
 
 fn fnv1a_64(bytes: &[u8]) -> u64 {

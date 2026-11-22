@@ -1,29 +1,31 @@
 //! Native GPUI plugin settings panel (`Installed`, `Scripts`, `Browse`).
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
 
 use chrono::{DateTime, Local, TimeZone as _};
+use desktop_common::actions::DismissSettings;
 use desktop_common::data_version::data_changed;
 use desktop_common::text_input::{Changed, Mode, Submitted, TextInput};
 use fern_core::Store;
-use fern_core::plugin_store::UserScript;
+use fern_core::plugin_store::{PluginState, UserScript};
 use fern_i18n::{self as i18n, Locale};
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
     AnyElement, App, Context, ElementId, Entity, FocusHandle, Focusable, FontWeight,
-    InteractiveElement, IntoElement, ParentElement, PathPromptOptions, Render, ScrollHandle,
-    SharedString, StatefulInteractiveElement, Styled, Subscription, Window, div, px,
+    InteractiveElement, IntoElement, KeyDownEvent, ParentElement, PathPromptOptions, Render,
+    ScrollHandle, SharedString, StatefulInteractiveElement, Styled, Subscription, Window, div, px,
 };
 use icons::IconName;
 use plugins::manifest::{SettingKind, SettingSpec};
-use plugins::registry::DEFAULT_REGISTRY_URL;
+use plugins::registry::{DEFAULT_REGISTRY_URL, RegistryClient};
 use plugins::{
     LogEntry, LogLevel, Permission, PermissionApprovalStatus, PermissionSet, PluginInfo,
     PluginStatus, RegistryPluginEntry, RegistrySource, ScriptRunResult, generate_sample_plugin,
 };
-use serde_json::Value as JsonValue;
+use serde_json::{Map as JsonMap, Value as JsonValue};
 use theme::ActiveTheme as _;
 use ui::prelude::*;
 use ui::{
@@ -50,12 +52,19 @@ pub enum PluginSettingsTab {
 }
 
 #[derive(Clone)]
+struct PendingZipOverwrite {
+    zip_path: PathBuf,
+    existing_state: Option<PluginState>,
+}
+
+#[derive(Clone)]
 struct PermissionPromptState {
     plugin_id: String,
     plugin_name: String,
     version: String,
     added_permissions: Vec<Permission>,
     is_first_install: bool,
+    pending_zip_overwrite: Option<PendingZipOverwrite>,
 }
 
 #[derive(Clone)]
@@ -69,6 +78,11 @@ struct SettingInputEntry {
     last_synced: String,
     save_task: Option<gpui::Task<()>>,
     _subs: [Subscription; 2],
+}
+
+struct SecretInputEntry {
+    input: Entity<TextInput>,
+    placeholder: String,
 }
 
 struct ActivePluginPage {
@@ -94,7 +108,11 @@ pub struct PluginSettingsView {
     expanded_logs: Option<String>,
     plugin_logs: HashMap<String, Vec<LogEntry>>,
     setting_inputs: HashMap<(String, String), SettingInputEntry>,
-    secret_inputs: HashMap<(String, String), Entity<TextInput>>,
+    secret_inputs: HashMap<(String, String), SecretInputEntry>,
+    in_flight_secrets: HashSet<(String, String)>,
+    pending_setting_overrides: HashMap<String, JsonMap<String, JsonValue>>,
+    setting_update_in_flight: HashSet<String>,
+    setting_update_dirty: HashSet<String>,
     open_select_setting: Option<(String, String)>,
     pending_permission_modal: Option<PermissionPromptState>,
     sample_counter: u32,
@@ -110,6 +128,7 @@ pub struct PluginSettingsView {
     script_code_input: Entity<TextInput>,
     script_code_scroll: ScrollHandle,
     script_running: bool,
+    script_run_seq: u64,
     script_result: Option<ScriptRunResult>,
 
     // Browse tab state
@@ -118,9 +137,12 @@ pub struct PluginSettingsView {
     registry_errors: Vec<String>,
     browse_loading: bool,
     browse_auto_refreshed: bool,
+    browse_generation: u64,
+    browse_fetch_seq: u64,
+    browse_completed_fetch_seq: u64,
     browse_search_input: Entity<TextInput>,
     registry_url_input: Entity<TextInput>,
-    installing_plugin_id: Option<String>,
+    installing_plugin_ids: HashSet<String>,
 
     _host_sub: Subscription,
 }
@@ -133,11 +155,13 @@ impl Focusable for PluginSettingsView {
 
 impl PluginSettingsView {
     pub fn new(store: Rc<Store>, cx: &mut Context<Self>) -> Self {
-        let safe_mode_pref = store
+        let stored_safe_mode = store
             .setting(SAFE_MODE_SETTING_KEY)
             .ok()
             .flatten()
             .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+        let host_safe_mode = PluginHost::global(cx).is_some_and(|h| h.is_safe_mode());
+        let safe_mode_pref = stored_safe_mode || host_safe_mode;
         let scripts = store.user_scripts().unwrap_or_default();
         let registries = load_registries_from_store(&store);
 
@@ -162,6 +186,9 @@ impl PluginSettingsView {
         .detach();
 
         let host_sub = cx.observe_global::<PluginHost>(|this, cx| {
+            if let Some(host) = PluginHost::global(cx) {
+                this.safe_mode_pref = host.is_safe_mode();
+            }
             this.consume_requested_logs_plugin(cx);
             if let Some(pid) = this.expanded_logs.clone() {
                 this.fetch_plugin_logs_async(pid, cx);
@@ -182,6 +209,10 @@ impl PluginSettingsView {
             plugin_logs: HashMap::new(),
             setting_inputs: HashMap::new(),
             secret_inputs: HashMap::new(),
+            in_flight_secrets: HashSet::new(),
+            pending_setting_overrides: HashMap::new(),
+            setting_update_in_flight: HashSet::new(),
+            setting_update_dirty: HashSet::new(),
             open_select_setting: None,
             pending_permission_modal: None,
             sample_counter: 1,
@@ -195,15 +226,19 @@ impl PluginSettingsView {
             script_code_input,
             script_code_scroll: ScrollHandle::new(),
             script_running: false,
+            script_run_seq: 0,
             script_result: None,
             registries,
             catalog_items: Vec::new(),
             registry_errors: Vec::new(),
             browse_loading: false,
             browse_auto_refreshed: false,
+            browse_generation: 0,
+            browse_fetch_seq: 0,
+            browse_completed_fetch_seq: 0,
             browse_search_input,
             registry_url_input,
-            installing_plugin_id: None,
+            installing_plugin_ids: HashSet::new(),
             _host_sub: host_sub,
         };
 
@@ -213,7 +248,6 @@ impl PluginSettingsView {
             view.reset_new_script_editor(cx);
         }
         view.consume_requested_logs_plugin(cx);
-        view.load_cached_registries(cx);
         view
     }
 
@@ -225,6 +259,49 @@ impl PluginSettingsView {
         self.active_plugin_page
             .as_ref()
             .map(|p| (p.plugin_id.as_str(), p.view_id.as_str()))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_pending_permission_modal(&self) -> bool {
+        self.pending_permission_modal.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_cached_inputs_for(&self, plugin_id: &str) -> bool {
+        self.setting_inputs.keys().any(|(p, _)| p == plugin_id)
+            || self.secret_inputs.keys().any(|(p, _)| p == plugin_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn update_plugin_setting_value_for_test(
+        &mut self,
+        plugin_id: &str,
+        key: &str,
+        value: JsonValue,
+        cx: &mut Context<Self>,
+    ) {
+        self.update_plugin_setting_value(plugin_id, key, value, cx);
+    }
+
+    /// Handles an Escape press inside [`PluginSettingsView`].
+    ///
+    /// Dismisses transient UI in priority order (`pending_permission_modal` -> open `Select`
+    /// popover -> `active_plugin_page`) and returns `true` if handled so the parent Settings
+    /// window stays open.
+    pub fn handle_escape(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.pending_permission_modal.take().is_some() {
+            cx.notify();
+            return true;
+        }
+        if self.open_select_setting.take().is_some() {
+            cx.notify();
+            return true;
+        }
+        if self.active_plugin_page.is_some() {
+            self.close_plugin_page(cx);
+            return true;
+        }
+        false
     }
 
     pub fn open_plugin_page(
@@ -274,7 +351,7 @@ impl PluginSettingsView {
         if tab == PluginSettingsTab::Scripts {
             self.scripts = self.store.user_scripts().unwrap_or_default();
         } else if tab == PluginSettingsTab::Browse {
-            self.load_cached_registries(cx);
+            self.load_cached_registries_async(cx);
             if !cfg!(test) && !self.browse_auto_refreshed {
                 self.browse_auto_refreshed = true;
                 self.refresh_registries(cx);
@@ -324,6 +401,12 @@ impl PluginSettingsView {
                         self.status_banner = None;
                     }
                     Err(err) => {
+                        self.safe_mode_pref =
+                            PluginHost::global(cx).is_some_and(|h| h.is_safe_mode());
+                        let _ = self.store.set_setting(
+                            SAFE_MODE_SETTING_KEY,
+                            if self.safe_mode_pref { "1" } else { "0" },
+                        );
                         self.status_banner = Some((format!("{err:#}"), true));
                     }
                 }
@@ -376,11 +459,9 @@ impl PluginSettingsView {
     }
 
     fn install_from_zip_dialog(&mut self, cx: &mut Context<Self>) {
-        let Some(client) = PluginHost::global(cx).map(|h| h.registry_client().clone()) else {
+        if PluginHost::global(cx).is_none() {
             return;
-        };
-        let mgr = PluginHost::global(cx).and_then(|h| h.manager().cloned());
-        let store = Rc::clone(&self.store);
+        }
         let chosen = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
@@ -398,38 +479,158 @@ impl PluginSettingsView {
             else {
                 return;
             };
-            let existing = store.all_plugin_states().ok().unwrap_or_default();
-            let outcome = cx
+            let _ = this.update(cx, |this, cx| {
+                this.install_from_zip_path(path, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Validates a local `.zip` archive in an isolated staging directory before touching
+    /// `plugins_dir/<id>`. Any overwrite or manifest hash change requires explicit re-approval
+    /// before swapping files or running code.
+    pub(crate) fn install_from_zip_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let Some((client, plugins_dir)) = PluginHost::global(cx)
+            .map(|h| (h.registry_client().clone(), h.plugins_dir().clone()))
+        else {
+            return;
+        };
+        let mgr = PluginHost::global(cx).and_then(|h| h.manager().cloned());
+        let path_for_inspect = path.clone();
+        let plugins_dir_inspect = plugins_dir.clone();
+
+        cx.spawn(async move |this, cx| {
+            // Stage-inspect the zip in an isolated temp dir so we know its manifest ID, hash,
+            // and permissions BEFORE overwriting `plugins_dir/<id>`.
+            let preview_res = cx
                 .background_spawn(async move {
-                    // Best effort pass of None; reload_all evaluates DB state against manifest.
-                    let _ = existing;
-                    let out = client.install_from_zip_file(&path, None)?;
-                    if let Some(mgr) = mgr {
-                        let _ = mgr.reload_all()?;
+                    std::fs::create_dir_all(&plugins_dir_inspect)?;
+                    let inspect_dir = plugins_dir_inspect
+                        .join(format!(".zip-inspect-{}", Uuid::now_v7()));
+                    std::fs::create_dir_all(&inspect_dir)?;
+                    struct InspectCleanup(PathBuf);
+                    impl Drop for InspectCleanup {
+                        fn drop(&mut self) {
+                            let _ = std::fs::remove_dir_all(&self.0);
+                        }
                     }
-                    Ok::<_, anyhow::Error>(out)
+                    let _cleanup = InspectCleanup(inspect_dir.clone());
+                    let staging_client = RegistryClient::new(&inspect_dir, &inspect_dir);
+                    staging_client.install_from_zip_file(&path_for_inspect, None)
+                })
+                .await;
+
+            let preview = match preview_res {
+                Ok(out) => out,
+                Err(err) => {
+                    let _ = this.update(cx, |this, cx| {
+                        this.status_banner = Some((format!("{err:#}"), true));
+                        cx.notify();
+                    });
+                    return;
+                }
+            };
+
+            let decision = this.update(cx, |this, cx| {
+                let existing_state = this.store.plugin_state(&preview.manifest.id).ok().flatten();
+                let target_exists = plugins_dir.join(&preview.manifest.id).exists();
+                let is_overwrite = target_exists || existing_state.is_some();
+                let hash_changed = existing_state
+                    .as_ref()
+                    .is_some_and(|st| st.manifest_hash != preview.manifest_hash);
+                let diff_status = preview
+                    .manifest
+                    .check_permission_diff(&preview.manifest_hash, existing_state.as_ref());
+
+                if is_overwrite || hash_changed {
+                    // Never overwrite or run unapproved local-ZIP code over an existing plugin
+                    // before the user explicitly confirms and re-approves permissions.
+                    let shown_permissions = match &diff_status {
+                        PermissionApprovalStatus::NeedsApproval { diff, .. }
+                            if !diff.added.is_empty() =>
+                        {
+                            diff.added.clone()
+                        }
+                        _ => preview.manifest.permissions.clone(),
+                    };
+                    this.pending_permission_modal = Some(PermissionPromptState {
+                        plugin_id: preview.manifest.id.clone(),
+                        plugin_name: preview.manifest.name.clone(),
+                        version: preview.manifest.version.clone(),
+                        added_permissions: shown_permissions,
+                        is_first_install: false,
+                        pending_zip_overwrite: Some(PendingZipOverwrite {
+                            zip_path: path.clone(),
+                            existing_state,
+                        }),
+                    });
+                    cx.notify();
+                    return false;
+                }
+
+                // Fresh install: guarantee plugin starts disabled until approved/enabled.
+                let _ = this.store.set_plugin_enabled(&preview.manifest.id, false);
+                true
+            });
+
+            if !matches!(decision, Ok(true)) {
+                return;
+            }
+
+            let install_res = cx
+                .background_spawn(async move {
+                    let out = client.install_from_zip_file(&path, None)?;
+                    let infos = if let Some(mgr) = mgr {
+                        Some(mgr.reload_all()?)
+                    } else {
+                        None
+                    };
+                    Ok::<_, anyhow::Error>((out, infos))
                 })
                 .await;
 
             let _ = this.update(cx, |this, cx| {
-                match outcome {
-                    Ok(out) => {
+                match install_res {
+                    Ok((out, infos)) => {
                         this.status_banner = Some((
                             format!("{} v{}", out.manifest.name, out.manifest.version),
                             false,
                         ));
-                        if let PermissionApprovalStatus::NeedsApproval {
-                            diff,
-                            is_first_install,
-                        } = out.approval_status
-                        {
-                            this.pending_permission_modal = Some(PermissionPromptState {
-                                plugin_id: out.manifest.id,
-                                plugin_name: out.manifest.name,
-                                version: out.manifest.version,
-                                added_permissions: diff.added,
+                        let reloaded_status = infos
+                            .as_ref()
+                            .and_then(|list| list.iter().find(|p| p.manifest.id == out.manifest.id))
+                            .map(|p| &p.status);
+                        match reloaded_status {
+                            Some(PluginStatus::NeedsApproval {
+                                added_permissions,
                                 is_first_install,
-                            });
+                            }) => {
+                                this.pending_permission_modal = Some(PermissionPromptState {
+                                    plugin_id: out.manifest.id,
+                                    plugin_name: out.manifest.name,
+                                    version: out.manifest.version,
+                                    added_permissions: added_permissions.clone(),
+                                    is_first_install: *is_first_install,
+                                    pending_zip_overwrite: None,
+                                });
+                            }
+                            None => {
+                                if let PermissionApprovalStatus::NeedsApproval {
+                                    diff,
+                                    is_first_install,
+                                } = out.approval_status
+                                {
+                                    this.pending_permission_modal = Some(PermissionPromptState {
+                                        plugin_id: out.manifest.id,
+                                        plugin_name: out.manifest.name,
+                                        version: out.manifest.version,
+                                        added_permissions: diff.added,
+                                        is_first_install,
+                                        pending_zip_overwrite: None,
+                                    });
+                                }
+                            }
+                            _ => {}
                         }
                     }
                     Err(err) => {
@@ -475,6 +676,7 @@ impl PluginSettingsView {
                 version: info.manifest.version.clone(),
                 added_permissions: added_permissions.clone(),
                 is_first_install: *is_first_install,
+                pending_zip_overwrite: None,
             });
             cx.notify();
             return;
@@ -513,6 +715,61 @@ impl PluginSettingsView {
         let Some(pending) = self.pending_permission_modal.take() else {
             return;
         };
+        if let Some(zip_overwrite) = pending.pending_zip_overwrite {
+            let Some(client) = PluginHost::global(cx).map(|h| h.registry_client().clone()) else {
+                cx.notify();
+                return;
+            };
+            let mgr = PluginHost::global(cx).and_then(|h| h.manager().cloned());
+            let pid = pending.plugin_id;
+            if self
+                .active_plugin_page
+                .as_ref()
+                .is_some_and(|p| p.plugin_id == pid)
+            {
+                self.close_plugin_page(cx);
+            }
+            // Disable in DB before swapping files so overwritten code never auto-activates if interrupted.
+            let _ = self.store.set_plugin_enabled(&pid, false);
+            let _ = self.store.set_plugin_permissions(&pid, "[]", "");
+            let pid_bg = pid.clone();
+            let task = cx.background_spawn(async move {
+                if let Some(mgr) = &mgr {
+                    let _ = mgr.set_plugin_enabled(&pid_bg, false);
+                }
+                let out = client.install_from_zip_file(
+                    &zip_overwrite.zip_path,
+                    zip_overwrite.existing_state.as_ref(),
+                )?;
+                if let Some(mgr) = &mgr {
+                    let _ = mgr.reload_all()?;
+                    mgr.approve_permissions(&pid_bg)?;
+                }
+                Ok::<_, anyhow::Error>(out)
+            });
+            cx.spawn(async move |this, cx| {
+                let res = task.await;
+                let _ = this.update(cx, |this, cx| {
+                    match res {
+                        Ok(out) => {
+                            this.clear_plugin_ui_caches(&pid);
+                            this.status_banner = Some((
+                                format!("{} v{}", out.manifest.name, out.manifest.version),
+                                false,
+                            ));
+                        }
+                        Err(err) => {
+                            this.status_banner = Some((format!("{err:#}"), true));
+                        }
+                    }
+                    cx.notify();
+                });
+            })
+            .detach();
+            cx.notify();
+            return;
+        }
+
         let Some(mgr) = PluginHost::global(cx).and_then(|h| h.manager().cloned()) else {
             cx.notify();
             return;
@@ -547,15 +804,50 @@ impl PluginSettingsView {
         .detach();
     }
 
-    fn uninstall_plugin(&mut self, plugin_id: String, cx: &mut Context<Self>) {
+    fn clear_plugin_ui_caches(&mut self, plugin_id: &str) {
+        self.setting_inputs.retain(|(p, _), _| p != plugin_id);
+        self.secret_inputs.retain(|(p, _), _| p != plugin_id);
+        self.in_flight_secrets.retain(|(p, _)| p != plugin_id);
+        self.pending_setting_overrides.remove(plugin_id);
+        self.setting_update_in_flight.remove(plugin_id);
+        self.setting_update_dirty.remove(plugin_id);
+        if self
+            .open_select_setting
+            .as_ref()
+            .is_some_and(|(p, _)| p == plugin_id)
+        {
+            self.open_select_setting = None;
+        }
+        if self
+            .pending_permission_modal
+            .as_ref()
+            .is_some_and(|m| m.plugin_id == plugin_id)
+        {
+            self.pending_permission_modal = None;
+        }
+    }
+
+    pub(crate) fn uninstall_plugin(&mut self, plugin_id: String, cx: &mut Context<Self>) {
         let Some(client) = PluginHost::global(cx).map(|h| h.registry_client().clone()) else {
             return;
         };
+        if self
+            .active_plugin_page
+            .as_ref()
+            .is_some_and(|p| p.plugin_id == plugin_id)
+        {
+            self.close_plugin_page(cx);
+        }
         let mgr = PluginHost::global(cx).and_then(|h| h.manager().cloned());
         let pid = plugin_id.clone();
         let task = cx.background_spawn(async move {
+            if let Some(mgr) = &mgr {
+                let _ = mgr.set_plugin_enabled(&pid, false);
+                // INTEGRATION(land-all): once `runtime-fix` merges, wire `mgr.purge_plugin_data(&pid)?;`
+                // here to wipe `SecretsVault` entries alongside DB state/KV/entity metadata on the worker.
+            }
             client.uninstall_plugin(&pid)?;
-            if let Some(mgr) = mgr {
+            if let Some(mgr) = &mgr {
                 let _ = mgr.reload_all()?;
             }
             Ok::<_, anyhow::Error>(())
@@ -565,13 +857,13 @@ impl PluginSettingsView {
             let _ = this.update(cx, |this, cx| {
                 match res {
                     Ok(()) => {
-                        if this
-                            .active_plugin_page
-                            .as_ref()
-                            .is_some_and(|p| p.plugin_id == plugin_id)
-                        {
-                            this.close_plugin_page(cx);
-                        }
+                        // Purge persisted plugin DB state, KV, and entity metadata (also covers Safe Mode
+                        // where `mgr` is None). `land-all` wires `mgr.purge_plugin_data(&pid)` above for
+                        // `SecretsVault` revocation.
+                        let _ = this.store.delete_plugin_state(&plugin_id);
+                        let _ = this.store.plugin_kv_clear(&plugin_id);
+                        let _ = this.store.plugin_meta_clear(&plugin_id);
+                        this.clear_plugin_ui_caches(&plugin_id);
                         if this.expanded_settings.as_deref() == Some(&plugin_id) {
                             this.expanded_settings = None;
                         }
@@ -624,6 +916,13 @@ impl PluginSettingsView {
         .detach();
     }
 
+    fn effective_setting_value<'a>(&'a self, info: &'a PluginInfo, key: &str) -> Option<&'a JsonValue> {
+        self.pending_setting_overrides
+            .get(&info.manifest.id)
+            .and_then(|map| map.get(key))
+            .or_else(|| info.settings_values.get(key))
+    }
+
     fn update_plugin_setting_value(
         &mut self,
         plugin_id: &str,
@@ -631,23 +930,82 @@ impl PluginSettingsView {
         value: JsonValue,
         cx: &mut Context<Self>,
     ) {
+        if PluginHost::global(cx)
+            .and_then(|h| h.manager())
+            .is_none()
+        {
+            return;
+        }
+        self.pending_setting_overrides
+            .entry(plugin_id.to_owned())
+            .or_default()
+            .insert(key.to_owned(), value);
+        cx.notify();
+        self.flush_plugin_settings(plugin_id, cx);
+    }
+
+    fn flush_plugin_settings(&mut self, plugin_id: &str, cx: &mut Context<Self>) {
+        if self.setting_update_in_flight.contains(plugin_id) {
+            self.setting_update_dirty.insert(plugin_id.to_owned());
+            return;
+        }
         let Some(mgr) = PluginHost::global(cx).and_then(|h| h.manager().cloned()) else {
             return;
         };
-        let mut settings = PluginHost::global(cx)
+        let mut merged = PluginHost::global(cx)
             .and_then(|h| h.plugin(plugin_id))
             .map(|p| p.settings_values.clone())
             .unwrap_or_default();
-        settings.insert(key.to_owned(), value);
+        let sent_overrides = self
+            .pending_setting_overrides
+            .get(plugin_id)
+            .cloned()
+            .unwrap_or_default();
+        for (k, v) in &sent_overrides {
+            merged.insert(k.clone(), v.clone());
+        }
         let pid = plugin_id.to_owned();
-        let task = cx.background_spawn(async move { mgr.update_settings(&pid, settings) });
+        let merged_for_host = merged.clone();
+        self.setting_update_in_flight.insert(pid.clone());
+        let pid_bg = pid.clone();
+        let task = cx.background_spawn(async move { mgr.update_settings(&pid_bg, merged) });
         cx.spawn(async move |this, cx| {
-            if let Err(err) = task.await {
-                let _ = this.update(cx, |this, cx| {
-                    this.status_banner = Some((format!("{err:#}"), true));
-                    cx.notify();
-                });
-            }
+            let res = task.await;
+            let _ = this.update(cx, |this, cx| {
+                this.setting_update_in_flight.remove(&pid);
+                match res {
+                    Ok(()) => {
+                        PluginHost::apply_local_settings(&pid, merged_for_host, cx);
+                        if let Some(pending) = this.pending_setting_overrides.get_mut(&pid) {
+                            for (k, v) in &sent_overrides {
+                                if pending.get(k) == Some(v) {
+                                    pending.remove(k);
+                                }
+                            }
+                            if pending.is_empty() {
+                                this.pending_setting_overrides.remove(&pid);
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        if let Some(pending) = this.pending_setting_overrides.get_mut(&pid) {
+                            for (k, v) in &sent_overrides {
+                                if pending.get(k) == Some(v) {
+                                    pending.remove(k);
+                                }
+                            }
+                            if pending.is_empty() {
+                                this.pending_setting_overrides.remove(&pid);
+                            }
+                        }
+                        this.status_banner = Some((format!("{err:#}"), true));
+                    }
+                }
+                if this.setting_update_dirty.remove(&pid) {
+                    this.flush_plugin_settings(&pid, cx);
+                }
+                cx.notify();
+            });
         })
         .detach();
     }
@@ -754,21 +1112,38 @@ impl PluginSettingsView {
         cx: &mut Context<Self>,
     ) -> Entity<TextInput> {
         let map_key = (plugin_id.to_owned(), spec.key.clone());
-        if let Some(ent) = self.secret_inputs.get(&map_key) {
-            return ent.clone();
-        }
-        let ph = if is_present {
+        let desired_ph = if is_present {
             strings.plugins_secret_placeholder.to_owned()
         } else {
             spec.placeholder.clone().unwrap_or_default()
         };
-        let input = cx.new(|cx| TextInput::new(Mode::SingleLine, ph, cx).masked());
-        self.secret_inputs.insert(map_key, input.clone());
+        if let Some(entry) = self.secret_inputs.get_mut(&map_key) {
+            if entry.placeholder != desired_ph {
+                entry.placeholder = desired_ph.clone();
+                entry
+                    .input
+                    .update(cx, |inp, cx| inp.set_placeholder(desired_ph, cx));
+            }
+            return entry.input.clone();
+        }
+        let ph_for_input = desired_ph.clone();
+        let input = cx.new(|cx| TextInput::new(Mode::SingleLine, ph_for_input, cx).masked());
+        self.secret_inputs.insert(
+            map_key,
+            SecretInputEntry {
+                input: input.clone(),
+                placeholder: desired_ph,
+            },
+        );
         input
     }
 
     fn save_secret_setting(&mut self, plugin_id: String, key: String, cx: &mut Context<Self>) {
-        let Some(input) = self.secret_inputs.get(&(plugin_id.clone(), key.clone())).cloned() else {
+        let map_key = (plugin_id.clone(), key.clone());
+        if self.in_flight_secrets.contains(&map_key) {
+            return;
+        }
+        let Some(input) = self.secret_inputs.get(&map_key).map(|e| e.input.clone()) else {
             return;
         };
         let val = input.read(cx).text().to_owned();
@@ -778,31 +1153,55 @@ impl PluginSettingsView {
         let Some(mgr) = PluginHost::global(cx).and_then(|h| h.manager().cloned()) else {
             return;
         };
-        input.update(cx, |inp, cx| inp.set_text("", cx));
+        self.in_flight_secrets.insert(map_key.clone());
+        cx.notify();
         let task = cx.background_spawn(async move { mgr.set_secret(&plugin_id, &key, &val) });
         cx.spawn(async move |this, cx| {
-            if let Err(err) = task.await {
-                let _ = this.update(cx, |this, cx| {
-                    this.status_banner = Some((format!("{err:#}"), true));
-                    cx.notify();
-                });
-            }
+            let res = task.await;
+            let _ = this.update(cx, |this, cx| {
+                this.in_flight_secrets.remove(&map_key);
+                match res {
+                    Ok(()) => {
+                        let placeholder = i18n::t(cx).plugins_secret_placeholder.to_owned();
+                        if let Some(entry) = this.secret_inputs.get_mut(&map_key) {
+                            entry.placeholder = placeholder.clone();
+                            entry.input.update(cx, |inp, cx| {
+                                inp.set_text("", cx);
+                                inp.set_placeholder(placeholder, cx);
+                            });
+                        }
+                        this.status_banner = None;
+                    }
+                    Err(err) => {
+                        this.status_banner = Some((format!("{err:#}"), true));
+                    }
+                }
+                cx.notify();
+            });
         })
         .detach();
     }
 
     fn delete_secret_setting(&mut self, plugin_id: String, key: String, cx: &mut Context<Self>) {
+        let map_key = (plugin_id.clone(), key.clone());
+        if self.in_flight_secrets.contains(&map_key) {
+            return;
+        }
         let Some(mgr) = PluginHost::global(cx).and_then(|h| h.manager().cloned()) else {
             return;
         };
+        self.in_flight_secrets.insert(map_key.clone());
+        cx.notify();
         let task = cx.background_spawn(async move { mgr.delete_secret(&plugin_id, &key) });
         cx.spawn(async move |this, cx| {
-            if let Err(err) = task.await {
-                let _ = this.update(cx, |this, cx| {
+            let res = task.await;
+            let _ = this.update(cx, |this, cx| {
+                this.in_flight_secrets.remove(&map_key);
+                if let Err(err) = res {
                     this.status_banner = Some((format!("{err:#}"), true));
-                    cx.notify();
-                });
-            }
+                }
+                cx.notify();
+            });
         })
         .detach();
     }
@@ -834,6 +1233,8 @@ impl PluginSettingsView {
             .update(cx, |inp, cx| inp.set_text(arg, cx));
         self.script_code_input
             .update(cx, |inp, cx| inp.set_text(code, cx));
+        self.script_run_seq = self.script_run_seq.wrapping_add(1);
+        self.script_running = false;
         self.script_result = None;
         cx.notify();
     }
@@ -853,6 +1254,8 @@ impl PluginSettingsView {
                 cx,
             );
         });
+        self.script_run_seq = self.script_run_seq.wrapping_add(1);
+        self.script_running = false;
         self.script_result = None;
         cx.notify();
     }
@@ -932,6 +1335,8 @@ impl PluginSettingsView {
             return;
         };
         let draft = self.build_draft_script(cx);
+        self.script_run_seq = self.script_run_seq.wrapping_add(1);
+        let run_seq = self.script_run_seq;
         self.script_running = true;
         self.script_result = None;
         cx.notify();
@@ -940,12 +1345,17 @@ impl PluginSettingsView {
         cx.spawn(async move |this, cx| {
             let res = task.await;
             let _ = this.update(cx, |this, cx| {
+                if let Ok(run_res) = &res
+                    && run_res.data_changed
+                {
+                    data_changed(cx.entity_id(), cx);
+                }
+                if this.script_run_seq != run_seq {
+                    return;
+                }
                 this.script_running = false;
                 match res {
                     Ok(run_res) => {
-                        if run_res.data_changed {
-                            data_changed(cx.entity_id(), cx);
-                        }
                         this.script_result = Some(run_res);
                     }
                     Err(err) => {
@@ -962,22 +1372,45 @@ impl PluginSettingsView {
     // Browse tab actions
     // -------------------------------------------------------------------------
 
-    fn load_cached_registries(&mut self, cx: &mut Context<Self>) {
+    fn load_cached_registries_async(&mut self, cx: &mut Context<Self>) {
         let Some(client) = PluginHost::global(cx).map(|h| h.registry_client().clone()) else {
             return;
         };
-        let mut items = Vec::new();
-        for src in self.registries.iter().filter(|s| s.enabled) {
-            if let Ok(Some(cached)) = client.load_cached_index(&src.url) {
-                for entry in cached.index.plugins {
-                    items.push(CatalogItem {
-                        source_url: src.url.clone(),
-                        entry,
-                    });
+        let enabled_urls: Vec<String> = self
+            .registries
+            .iter()
+            .filter(|s| s.enabled)
+            .map(|s| s.url.clone())
+            .collect();
+        let generation = self.browse_generation;
+        let fetch_seq = self.browse_fetch_seq;
+
+        let task = cx.background_spawn(async move {
+            let mut items = Vec::new();
+            for url in enabled_urls {
+                if let Ok(Some(cached)) = client.load_cached_index(&url) {
+                    for entry in cached.index.plugins {
+                        items.push(CatalogItem {
+                            source_url: url.clone(),
+                            entry,
+                        });
+                    }
                 }
             }
-        }
-        self.catalog_items = items;
+            items
+        });
+        cx.spawn(async move |this, cx| {
+            let items = task.await;
+            let _ = this.update(cx, |this, cx| {
+                if this.browse_generation == generation
+                    && this.browse_completed_fetch_seq <= fetch_seq
+                {
+                    this.catalog_items = items;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     pub fn refresh_registries(&mut self, cx: &mut Context<Self>) {
@@ -985,6 +1418,9 @@ impl PluginSettingsView {
             return;
         };
         let sources = self.registries.clone();
+        self.browse_fetch_seq = self.browse_fetch_seq.wrapping_add(1);
+        let generation = self.browse_generation;
+        let fetch_seq = self.browse_fetch_seq;
         self.browse_loading = true;
         self.registry_errors.clear();
         cx.notify();
@@ -993,7 +1429,11 @@ impl PluginSettingsView {
         cx.spawn(async move |this, cx| {
             let results = task.await;
             let _ = this.update(cx, |this, cx| {
+                if this.browse_generation != generation || this.browse_fetch_seq != fetch_seq {
+                    return;
+                }
                 this.browse_loading = false;
+                this.browse_completed_fetch_seq = fetch_seq;
                 let mut items = Vec::new();
                 let mut errors = Vec::new();
                 for (url, res) in results {
@@ -1042,6 +1482,7 @@ impl PluginSettingsView {
                 name: None,
                 enabled: true,
             });
+            self.browse_generation = self.browse_generation.wrapping_add(1);
             self.save_registries();
         }
         self.registry_url_input
@@ -1055,8 +1496,11 @@ impl PluginSettingsView {
         if self.registries.is_empty() {
             self.registries.push(RegistrySource::default());
         }
+        self.browse_generation = self.browse_generation.wrapping_add(1);
+        self.browse_fetch_seq = self.browse_fetch_seq.wrapping_add(1);
+        self.browse_loading = false;
         self.save_registries();
-        self.load_cached_registries(cx);
+        self.load_cached_registries_async(cx);
         cx.notify();
     }
 
@@ -1064,10 +1508,12 @@ impl PluginSettingsView {
         let Some(client) = PluginHost::global(cx).map(|h| h.registry_client().clone()) else {
             return;
         };
+        let pid = entry.id.clone();
+        if !self.installing_plugin_ids.insert(pid.clone()) {
+            return;
+        }
         let mgr = PluginHost::global(cx).and_then(|h| h.manager().cloned());
         let existing_state = self.store.plugin_state(&entry.id).ok().flatten();
-        let pid = entry.id.clone();
-        self.installing_plugin_id = Some(pid);
         cx.notify();
 
         let task = cx.background_spawn(async move {
@@ -1081,7 +1527,7 @@ impl PluginSettingsView {
         cx.spawn(async move |this, cx| {
             let res = task.await;
             let _ = this.update(cx, |this, cx| {
-                this.installing_plugin_id = None;
+                this.installing_plugin_ids.remove(&pid);
                 match res {
                     Ok(out) => {
                         this.status_banner = Some((
@@ -1099,6 +1545,7 @@ impl PluginSettingsView {
                                 version: out.manifest.version,
                                 added_permissions: diff.added,
                                 is_first_install,
+                                pending_zip_overwrite: None,
                             });
                         }
                     }
@@ -1269,7 +1716,7 @@ impl PluginSettingsView {
         let (status_label, status_color) = match &info.status {
             PluginStatus::Active => (ex.status_active, status_colors.success),
             PluginStatus::Idle => (ex.status_idle, status_colors.info),
-            PluginStatus::Disabled => (strings.plugins_disable, colors.text_muted),
+            PluginStatus::Disabled => (crate::status_disabled_label(i18n::locale(cx)), colors.text_muted),
             PluginStatus::NeedsApproval { .. } => {
                 (strings.plugins_permissions_approve, status_colors.warning)
             }
@@ -1386,6 +1833,7 @@ impl PluginSettingsView {
                 version: info.manifest.version.clone(),
                 added_permissions: added_permissions.clone(),
                 is_first_install: *is_first_install,
+                pending_zip_overwrite: None,
             };
             card = card.child(
                 h_flex()
@@ -1605,9 +2053,8 @@ impl PluginSettingsView {
         for spec in &info.manifest.settings {
             let row = match spec.kind {
                 SettingKind::Text => {
-                    let current = info
-                        .settings_values
-                        .get(&spec.key)
+                    let current = self
+                        .effective_setting_value(info, &spec.key)
                         .and_then(JsonValue::as_str)
                         .unwrap_or("")
                         .to_owned();
@@ -1630,16 +2077,11 @@ impl PluginSettingsView {
                     )
                 }
                 SettingKind::Number => {
-                    let num = info
-                        .settings_values
-                        .get(&spec.key)
+                    let num = self
+                        .effective_setting_value(info, &spec.key)
                         .and_then(JsonValue::as_f64)
                         .unwrap_or(0.0);
-                    let current_str = if (num.fract()).abs() < f64::EPSILON {
-                        format!("{}", num as i64)
-                    } else {
-                        format!("{num}")
-                    };
+                    let current_str = format_number_clean(num);
                     let input = self.ensure_setting_input(&pid, spec, &current_str, cx);
                     let step = spec.step.unwrap_or(1.0);
                     let min_v = spec.min;
@@ -1665,12 +2107,21 @@ impl PluginSettingsView {
                                 )
                                 .size(px(28.))
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    let next = clamp_number(num - step, min_v, max_v);
+                                    let current = inp_dec
+                                        .read(cx)
+                                        .text()
+                                        .trim()
+                                        .parse::<f64>()
+                                        .ok()
+                                        .filter(|v| v.is_finite())
+                                        .unwrap_or(num);
+                                    let next = clamp_number(current - step, min_v, max_v);
                                     let text = format_number_clean(next);
                                     inp_dec.update(cx, |inp, cx| inp.set_text(text.clone(), cx));
                                     if let Some(entry) =
                                         this.setting_inputs.get_mut(&(pid_dec.clone(), key_dec.clone()))
                                     {
+                                        entry.save_task = None;
                                         entry.last_synced = text;
                                     }
                                     if let Some(n) = serde_json::Number::from_f64(next) {
@@ -1708,12 +2159,21 @@ impl PluginSettingsView {
                                 )
                                 .size(px(28.))
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    let next = clamp_number(num + step, min_v, max_v);
+                                    let current = inp_inc
+                                        .read(cx)
+                                        .text()
+                                        .trim()
+                                        .parse::<f64>()
+                                        .ok()
+                                        .filter(|v| v.is_finite())
+                                        .unwrap_or(num);
+                                    let next = clamp_number(current + step, min_v, max_v);
                                     let text = format_number_clean(next);
                                     inp_inc.update(cx, |inp, cx| inp.set_text(text.clone(), cx));
                                     if let Some(entry) =
                                         this.setting_inputs.get_mut(&(pid_inc.clone(), key_inc.clone()))
                                     {
+                                        entry.save_task = None;
                                         entry.last_synced = text;
                                     }
                                     if let Some(n) = serde_json::Number::from_f64(next) {
@@ -1730,9 +2190,8 @@ impl PluginSettingsView {
                     )
                 }
                 SettingKind::Boolean => {
-                    let checked = info
-                        .settings_values
-                        .get(&spec.key)
+                    let checked = self
+                        .effective_setting_value(info, &spec.key)
                         .and_then(JsonValue::as_bool)
                         .unwrap_or(false);
                     let pid_b = pid.clone();
@@ -1757,9 +2216,8 @@ impl PluginSettingsView {
                     )
                 }
                 SettingKind::Select => {
-                    let current_val = info
-                        .settings_values
-                        .get(&spec.key)
+                    let current_val = self
+                        .effective_setting_value(info, &spec.key)
                         .and_then(JsonValue::as_str)
                         .unwrap_or("")
                         .to_owned();
@@ -1808,9 +2266,30 @@ impl PluginSettingsView {
                                 .into_any_element()
                             })
                             .collect();
+                        let scroll_id = ElementId::Name(SharedString::from(format!(
+                            "set-sel-scroll-{pid}-{}",
+                            spec.key
+                        )));
+                        let vp_id = ElementId::Name(SharedString::from(format!(
+                            "set-sel-vp-{pid}-{}",
+                            spec.key
+                        )));
                         Some(PopoverAttachment::new(
                             Placement::BelowRight,
-                            popover(cx).min_w(px(160.)).children(items),
+                            popover(cx)
+                                .min_w(px(160.))
+                                .max_w(px(280.))
+                                .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                                    this.open_select_setting = None;
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                }))
+                                .child(
+                                    v_scroll(scroll_id, v_flex().id(vp_id).w_full().children(items))
+                                        .compact()
+                                        .max_h(px(260.))
+                                        .w_full(),
+                                ),
                         ))
                     } else {
                         None
@@ -1862,6 +2341,9 @@ impl PluginSettingsView {
                         .get(&spec.key)
                         .copied()
                         .unwrap_or(false);
+                    let secret_busy = self
+                        .in_flight_secrets
+                        .contains(&(pid.clone(), spec.key.clone()));
                     let input = self.ensure_secret_input(&pid, spec, is_present, strings, cx);
                     let pid_save = pid.clone();
                     let key_save = spec.key.clone();
@@ -1897,6 +2379,7 @@ impl PluginSettingsView {
                                 )
                                 .variant(ButtonVariant::Secondary)
                                 .size(ButtonSize::Sm)
+                                .disabled(secret_busy)
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.save_secret_setting(
                                         pid_save.clone(),
@@ -1915,6 +2398,7 @@ impl PluginSettingsView {
                                         IconName::Trash,
                                     )
                                     .size(px(28.))
+                                    .disabled(secret_busy)
                                     .tooltip(Tooltip::text(ex.clear_secret))
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.delete_secret_setting(
@@ -2464,8 +2948,13 @@ impl PluginSettingsView {
                                         if let Some(s) = this.registries.get_mut(idx) {
                                             s.enabled = !s.enabled;
                                         }
+                                        this.browse_generation =
+                                            this.browse_generation.wrapping_add(1);
+                                        this.browse_fetch_seq =
+                                            this.browse_fetch_seq.wrapping_add(1);
+                                        this.browse_loading = false;
                                         this.save_registries();
-                                        this.load_cached_registries(cx);
+                                        this.load_cached_registries_async(cx);
                                         cx.notify();
                                     }))
                                     .child(Switch::new().toggle_state(src.enabled)),
@@ -2560,16 +3049,20 @@ impl PluginSettingsView {
         } else {
             filtered
                 .into_iter()
-                .map(|item| {
+                .enumerate()
+                .map(|(cat_idx, item)| {
                     let e = item.entry;
                     let installed_ver = installed_versions.get(&e.id).cloned();
-                    let is_busy = self.installing_plugin_id.as_deref() == Some(e.id.as_str());
+                    let is_busy = self.installing_plugin_ids.contains(&e.id);
                     let entry_for_install = e.clone();
                     let pid_remove = e.id.clone();
 
                     let action_btn = match installed_ver.as_deref() {
                         None => Button::new(
-                            ElementId::Name(SharedString::from(format!("cat-inst-{}", e.id))),
+                            ElementId::Name(SharedString::from(format!(
+                                "cat-inst-{cat_idx}-{}",
+                                e.id
+                            ))),
                             strings.plugins_registry_install,
                         )
                         .variant(ButtonVariant::Primary)
@@ -2584,7 +3077,7 @@ impl PluginSettingsView {
                             .child(
                                 Button::new(
                                     ElementId::Name(SharedString::from(format!(
-                                        "cat-upd-{}",
+                                        "cat-upd-{cat_idx}-{}",
                                         e.id
                                     ))),
                                     strings.plugins_registry_update,
@@ -2599,7 +3092,7 @@ impl PluginSettingsView {
                             .child(
                                 Button::new(
                                     ElementId::Name(SharedString::from(format!(
-                                        "cat-rem-{}",
+                                        "cat-rem-{cat_idx}-{}",
                                         e.id
                                     ))),
                                     strings.plugins_uninstall,
@@ -2620,7 +3113,7 @@ impl PluginSettingsView {
                             .child(
                                 Button::new(
                                     ElementId::Name(SharedString::from(format!(
-                                        "cat-rem-{}",
+                                        "cat-rem-{cat_idx}-{}",
                                         e.id
                                     ))),
                                     strings.plugins_uninstall,
@@ -2935,6 +3428,19 @@ impl Render for PluginSettingsView {
                 .relative()
                 .size_full()
                 .track_focus(&self.focus_handle)
+                .on_action(cx.listener(|this, _: &DismissSettings, _, cx| {
+                    if !this.handle_escape(cx) {
+                        cx.propagate();
+                    }
+                }))
+                .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                    if event.keystroke.key == "escape"
+                        && !event.keystroke.modifiers.modified()
+                        && this.handle_escape(cx)
+                    {
+                        cx.stop_propagation();
+                    }
+                }))
                 .when(cfg!(test), |el| {
                     el.debug_selector(|| "plugin-settings-view".to_owned())
                 })
@@ -2975,6 +3481,19 @@ impl Render for PluginSettingsView {
             .relative()
             .size_full()
             .track_focus(&self.focus_handle)
+            .on_action(cx.listener(|this, _: &DismissSettings, _, cx| {
+                if !this.handle_escape(cx) {
+                    cx.propagate();
+                }
+            }))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                if event.keystroke.key == "escape"
+                    && !event.keystroke.modifiers.modified()
+                    && this.handle_escape(cx)
+                {
+                    cx.stop_propagation();
+                }
+            }))
             .when(cfg!(test), |el| {
                 el.debug_selector(|| "plugin-settings-view".to_owned())
             })
@@ -3206,7 +3725,7 @@ impl ExtraLabels {
             Locale::Ru => Self {
                 status_active: "Активен",
                 status_idle: "Ожидание",
-                status_broken: "Отключён",
+                status_broken: "Остановлен",
                 status_error: "Ошибка",
                 clear_secret: "Удалить секрет",
                 no_logs: "Логов пока нет.",

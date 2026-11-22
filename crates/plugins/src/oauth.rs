@@ -22,7 +22,7 @@ use crate::permissions::PermissionSet;
 use crate::vault::SecretsVault;
 
 pub const DEFAULT_REDIRECT_HOST: &str = "127.0.0.1";
-pub const DEFAULT_REDIRECT_PORT: u16 = 48123;
+pub const DEFAULT_REDIRECT_PORT: u16 = 18481;
 pub const DEFAULT_REDIRECT_PATH: &str = "/callback";
 pub const DEFAULT_OAUTH_TIMEOUT_SEC: u64 = 180;
 const MAX_CALLBACK_REQ_BYTES: usize = 16 * 1024;
@@ -671,7 +671,7 @@ mod tests {
     fn percent_encode_and_query_decode_roundtrip() {
         let encoded = encode_form_pairs(&[
             ("scope", "tasks:read tasks:write".to_owned()),
-            ("redirect_uri", "http://127.0.0.1:48123/callback".to_owned()),
+            ("redirect_uri", "http://127.0.0.1:18481/callback".to_owned()),
         ]);
         let parsed = parse_query_params(&encoded);
         assert_eq!(
@@ -680,7 +680,7 @@ mod tests {
                 ("scope".to_owned(), "tasks:read tasks:write".to_owned()),
                 (
                     "redirect_uri".to_owned(),
-                    "http://127.0.0.1:48123/callback".to_owned()
+                    "http://127.0.0.1:18481/callback".to_owned()
                 ),
             ]
         );

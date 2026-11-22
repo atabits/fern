@@ -20,8 +20,9 @@ use anyhow::Result;
 use desktop_common::data_version::{DataVersion, changed_elsewhere, data_changed};
 use desktop_common::paths;
 use desktop_common::plugin_bus::{
-    PluginBus, PluginCommandSpec, PluginModalKind, PluginModalSpec, PluginNavAction,
-    PluginSearchHit, PluginSidebarViewSpec, ToastLevel as BusToastLevel,
+    PluginBus, PluginCommandSpec, PluginHookDecision, PluginHooksGlobal, PluginModalKind,
+    PluginModalSpec, PluginNavAction, PluginSearchHit, PluginSidebarViewSpec,
+    ToastLevel as BusToastLevel,
 };
 use gpui::{
     App, AppContext as _, BorrowAppContext as _, ClipboardItem, Entity, EntityId, Global,
@@ -30,8 +31,8 @@ use gpui::{
 use plugins::manifest::resolve_inside_dir;
 use plugins::ui_ast::{UiEvent, UiTreePayload};
 use plugins::{
-    HostUpdate, PluginEngineConfig, PluginInfo, PluginManager, PluginStatus, PluginUiEffect,
-    PromptReplyValue, RegistryClient, ToastLevel as PluginToastLevel,
+    HookDecision, HostUpdate, PluginEngineConfig, PluginInfo, PluginManager, PluginStatus,
+    PluginUiEffect, PromptReplyValue, RegistryClient, ToastLevel as PluginToastLevel,
 };
 use theme::{Theme, ThemeRegistry};
 
@@ -212,12 +213,76 @@ pub struct PluginHost {
     notified_outbox_seq: AtomicU64,
     search_seq: AtomicU64,
     modal_generation: AtomicU64,
+    hooks_active: Arc<AtomicBool>,
     _marker: Entity<HostDataMarker>,
     marker_id: EntityId,
     wake_signal: Arc<WakeSignal>,
     #[cfg(test)]
     test_update_rx: RefCell<Option<mpsc::Receiver<HostUpdate>>>,
     _data_sub: Subscription,
+}
+
+fn has_active_hook_plugins(safe_mode: bool, has_manager: bool, plugins: &[PluginInfo]) -> bool {
+    !safe_mode
+        && has_manager
+        && plugins.iter().any(|info| {
+            info.enabled
+                && !matches!(
+                    info.status,
+                    PluginStatus::Disabled
+                        | PluginStatus::NeedsApproval { .. }
+                        | PluginStatus::CircuitBroken { .. }
+                        | PluginStatus::Error(_)
+                )
+                && info
+                    .manifest
+                    .permissions
+                    .iter()
+                    .any(|perm| matches!(perm, plugins::Permission::HooksIntercept))
+        })
+}
+
+fn map_hook_decision(decision: HookDecision) -> PluginHookDecision {
+    match decision {
+        HookDecision::Allow => PluginHookDecision::Allow,
+        HookDecision::Modify(val) => PluginHookDecision::Modify(val),
+        HookDecision::Cancel(reason) => PluginHookDecision::Cancel(reason),
+    }
+}
+
+fn sync_hooks_global(
+    mgr: Option<&PluginManager>,
+    hooks_active: Arc<AtomicBool>,
+    cx: &mut App,
+) {
+    let Some(mgr) = mgr else {
+        hooks_active.store(false, Ordering::Release);
+        PluginHooksGlobal::clear_global(cx);
+        return;
+    };
+    let mgr_create = mgr.clone();
+    let mgr_complete = mgr.clone();
+    let mgr_quick_add = mgr.clone();
+    let hooks = PluginHooksGlobal::new(
+        Arc::new(move |draft| {
+            mgr_create
+                .run_before_task_create(draft)
+                .map(map_hook_decision)
+        }),
+        Arc::new(move |task| {
+            mgr_complete
+                .run_before_task_complete(task)
+                .map(map_hook_decision)
+        }),
+        Arc::new(move |raw| {
+            let text = raw.as_str().unwrap_or_default().to_owned();
+            mgr_quick_add
+                .run_quick_add_transform(text)
+                .map(map_hook_decision)
+        }),
+    )
+    .with_active_check(Arc::new(move || hooks_active.load(Ordering::Acquire)));
+    PluginHooksGlobal::set_global(hooks, cx);
 }
 
 impl Global for PluginHost {}
@@ -265,6 +330,11 @@ impl PluginHost {
         for info in &initial_plugins {
             plugin_revisions.insert(info.manifest.id.clone(), 1);
         }
+        let hooks_active = Arc::new(AtomicBool::new(has_active_hook_plugins(
+            config.safe_mode,
+            manager.is_some(),
+            &initial_plugins,
+        )));
 
         Self {
             plugins_dir: config.plugins_dir.clone(),
@@ -293,6 +363,7 @@ impl PluginHost {
             notified_outbox_seq: AtomicU64::new(0),
             search_seq: AtomicU64::new(0),
             modal_generation: AtomicU64::new(0),
+            hooks_active,
             _marker: marker,
             marker_id,
             wake_signal,
@@ -361,6 +432,7 @@ impl PluginHost {
                         cx,
                     );
                     cx.set_global(fallback);
+                    PluginHooksGlobal::clear_global(cx);
                     sync_bus_contributions(&[], cx);
                     Self::sync_plugin_themes(cx);
                     return Err(err);
@@ -378,12 +450,15 @@ impl PluginHost {
             Arc::clone(&wake_signal),
             cx,
         );
+        let hooks_active = Arc::clone(&host.hooks_active);
+        let mgr_for_hooks = host.manager.clone();
         #[cfg(test)]
         {
             *host.test_update_rx.borrow_mut() = update_rx;
         }
 
         cx.set_global(host);
+        sync_hooks_global(mgr_for_hooks.as_ref(), hooks_active, cx);
         sync_bus_contributions(&initial_plugins, cx);
         Self::sync_plugin_themes(cx);
 
@@ -470,6 +545,7 @@ impl PluginHost {
     /// Shuts down the active [`PluginManager`] and stops async host update tasks.
     pub fn shutdown(cx: &mut App) {
         dismiss_active_modal_on_shutdown(cx);
+        PluginHooksGlobal::clear_global(cx);
         if cx.has_global::<Self>() {
             cx.update_global::<Self, _>(|host, _| {
                 host.shutdown_inner();
@@ -478,10 +554,18 @@ impl PluginHost {
     }
 
     fn shutdown_inner(&mut self) {
+        self.hooks_active.store(false, Ordering::Release);
         self.wake_signal.close();
         if let Some(mgr) = self.manager.take() {
             mgr.shutdown();
         }
+    }
+
+    pub(crate) fn secrets_paths(&self) -> (PathBuf, PathBuf) {
+        (
+            self.config.secrets_vault_path.clone(),
+            self.config.secrets_key_path.clone(),
+        )
     }
 
     pub fn global(cx: &App) -> Option<&Self> {
@@ -1752,6 +1836,10 @@ fn apply_registry_changed(infos: Vec<PluginInfo>, cx: &mut App) {
             host.pending_hot_reload
                 .retain(|pid| alive.contains(pid.as_str()));
             should_sync_themes = host.loaded_theme_signature.as_ref() != Some(&next_theme_sig);
+            host.hooks_active.store(
+                has_active_hook_plugins(host.safe_mode, host.manager.is_some(), &infos),
+                Ordering::Release,
+            );
             host.plugins = infos.clone();
         });
     }

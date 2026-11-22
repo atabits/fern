@@ -37,6 +37,9 @@ pub use paths::{
 pub use plugin_bus::{
     PluginBus, PluginCommandSpec, PluginHookDecision, PluginHookFn, PluginHooksGlobal,
     PluginModalKind, PluginModalSpec, PluginNavAction, PluginSearchHit, PluginSidebarViewSpec,
-    PluginToast, TaskActionSpec, TaskBadgeSpec, ToastLevel, VirtualListSpec, task_to_hook_json,
+    PluginToast, TaskActionSpec, TaskBadgeSpec, ToastLevel, VirtualListSpec,
+    extract_transformed_quick_add, format_hook_cancel_message, parse_task_draft_from_hook_json,
+    push_hook_cancel_toast, run_before_task_complete_hook, task_draft_to_hook_json,
+    task_to_hook_json,
 };
 pub use sticky_opener::{StickyOpener, open_sticky_note};

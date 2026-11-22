@@ -2,7 +2,6 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::net::IpAddr;
 use std::rc::Rc;
 use std::str::FromStr as _;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -25,11 +24,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value as JsonValue, json};
 use uuid::Uuid;
 
-use crate::http::{HttpPool, HttpRequest};
+use crate::http::{HttpPool, HttpRequest, validate_target_uri_syntax};
 use crate::oauth::{
     DEFAULT_OAUTH_TIMEOUT_SEC, DEFAULT_REDIRECT_HOST, DEFAULT_REDIRECT_PATH, DEFAULT_REDIRECT_PORT,
-    OAuthAuthorizeRequest, OAuthRefreshRequest, OAuthTokenAuth, run_oauth_authorize,
-    run_oauth_refresh,
+    OAuthAuthorizeOptions, OAuthAuthorizeRequest, OAuthRefreshRequest, OAuthTokenAuth,
+    run_oauth_authorize_with_options, run_oauth_refresh,
 };
 use crate::permissions::{Permission, PermissionSet};
 use crate::ui_ast::{HandlerId, UiNode};
@@ -1490,42 +1489,6 @@ fn install_settings<'js>(
     Ok(())
 }
 
-/// Fast, non-blocking syntactic URI, host-allowlist, and literal-IP SSRF check run on `PluginWorker`.
-/// Blocking DNS resolution and connect-time IP checks happen strictly inside `HttpPool` threads.
-fn validate_http_uri_syntax(uri: &ureq::http::Uri, permissions: &PermissionSet) -> Result<()> {
-    let scheme = uri
-        .scheme_str()
-        .map(str::to_ascii_lowercase)
-        .unwrap_or_default();
-    ensure!(
-        scheme == "http" || scheme == "https",
-        "unsupported URL scheme {scheme:?}: only http and https are allowed"
-    );
-    let authority = uri
-        .authority()
-        .context("URL must contain a valid authority/host")?;
-    let host = authority.host();
-    ensure!(!host.is_empty(), "URL host must not be empty");
-    let port = authority.port_u16();
-    let effective_port = port.or(match scheme.as_str() {
-        "https" => Some(443),
-        "http" => Some(80),
-        _ => None,
-    });
-    ensure!(
-        permissions.allows_host(host, port) || permissions.allows_host(host, effective_port),
-        "network permission denied for host {host:?}"
-    );
-    let host_clean = host.trim_start_matches('[').trim_end_matches(']');
-    if let Ok(ip) = host_clean.parse::<IpAddr>() {
-        ensure!(
-            !crate::http::is_ip_blocked(ip, permissions.allows_local()),
-            "SSRF protection blocked connection to {ip}"
-        );
-    }
-    Ok(())
-}
-
 fn install_http<'js>(
     ctx: &Ctx<'js>,
     fern: &Object<'js>,
@@ -1543,7 +1506,7 @@ fn install_http<'js>(
                     .trim()
                     .parse()
                     .map_err(|e| Exception::throw_message(&ctx, &format!("invalid URL: {e}")))?;
-                validate_http_uri_syntax(&uri, &st.permissions)
+                validate_target_uri_syntax(&uri, &st.permissions)
                     .map_err(|e| throw_scrubbed(&ctx, &st, e))?;
 
                 let opts_json = match opts.0 {
@@ -1755,6 +1718,7 @@ fn install_oauth<'js>(
                         .get("timeoutSec")
                         .and_then(JsonValue::as_u64)
                         .unwrap_or(DEFAULT_OAUTH_TIMEOUT_SEC);
+                    let pkce = opts.get("pkce").and_then(JsonValue::as_bool).unwrap_or(false);
 
                     let req = OAuthAuthorizeRequest {
                         authorize_url,
@@ -1771,6 +1735,7 @@ fn install_oauth<'js>(
                         extra_authorize_params,
                         timeout_sec,
                     };
+                    let auth_options = OAuthAuthorizeOptions { pkce };
 
                     let permit = st
                         .oauth_limiter
@@ -1788,11 +1753,12 @@ fn install_oauth<'js>(
                         .name("fern-oauth".to_owned())
                         .spawn(move || {
                             let _permit = permit;
-                            let res = run_oauth_authorize(
+                            let res = run_oauth_authorize_with_options(
                                 &plugin_id,
                                 &permissions,
                                 &vault,
                                 &req,
+                                &auth_options,
                                 &cancel,
                                 |url| {
                                     emitter(PluginUiEffect::OpenExternal { url });
@@ -3573,16 +3539,16 @@ mod tests {
     fn validate_http_uri_syntax_enforces_scheme_host_and_literal_ip_without_dns() {
         let perms = PermissionSet::new(&[Permission::Network(vec!["api.example.com".to_owned()])]);
         let ok_uri: ureq::http::Uri = "https://api.example.com/v1/items".parse().unwrap();
-        assert!(validate_http_uri_syntax(&ok_uri, &perms).is_ok());
+        assert!(validate_target_uri_syntax(&ok_uri, &perms).is_ok());
 
         let denied_host: ureq::http::Uri = "https://evil.example.org/x".parse().unwrap();
-        assert!(validate_http_uri_syntax(&denied_host, &perms).is_err());
+        assert!(validate_target_uri_syntax(&denied_host, &perms).is_err());
 
         let bad_scheme: ureq::http::Uri = "ftp://api.example.com/file".parse().unwrap();
-        assert!(validate_http_uri_syntax(&bad_scheme, &perms).is_err());
+        assert!(validate_target_uri_syntax(&bad_scheme, &perms).is_err());
 
         let any_perms = PermissionSet::new(&[Permission::Network(vec!["127.0.0.1".to_owned()])]);
         let loopback: ureq::http::Uri = "http://127.0.0.1:8080/secret".parse().unwrap();
-        assert!(validate_http_uri_syntax(&loopback, &any_perms).is_err());
+        assert!(validate_target_uri_syntax(&loopback, &any_perms).is_err());
     }
 }

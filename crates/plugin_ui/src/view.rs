@@ -1535,10 +1535,7 @@ impl Render for PluginView {
 
         match plugin_status {
             Some(PluginStatus::Disabled) => {
-                return self.render_error_fallback(
-                    crate::status_disabled_label(i18n::locale(cx)).to_owned(),
-                    cx,
-                );
+                return self.render_error_fallback(strings.plugins_disabled.to_owned(), cx);
             }
             Some(PluginStatus::NeedsApproval { .. }) => {
                 return self

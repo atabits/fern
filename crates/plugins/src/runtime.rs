@@ -1825,11 +1825,7 @@ async fn purge_plugin_data_async(env: &Rc<WorkerEnv>, plugin_id: &str) -> Result
     env.slots.borrow_mut().remove(pid);
     env.activating.borrow_mut().remove(pid);
     env.vault.delete_plugin(pid)?;
-    // Note: once `core-fix`'s `Store::delete_plugin_all_data` merges, these 3 calls can be
-    // consolidated into a single transaction helper if desired.
-    env.store.delete_plugin_state(pid)?;
-    env.store.plugin_kv_clear(pid)?;
-    env.store.plugin_meta_clear(pid)?;
+    env.store.delete_plugin_all_data(pid)?;
     env.emit(HostUpdate::RegistryChanged(env.plugin_infos()));
     Ok(())
 }

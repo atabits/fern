@@ -12,7 +12,7 @@ use gpui::prelude::FluentBuilder as _;
 use gpui::{
     AnyElement, AnyWindowHandle, App, Context, ElementId, Entity, FocusHandle, Focusable,
     FontWeight, Global, InteractiveElement, IntoElement, KeyDownEvent, ParentElement, Render,
-    SharedString, Styled, Subscription, Window, div, px,
+    SharedString, Styled, Subscription, WeakEntity, Window, div, px,
 };
 use icons::IconName;
 use plugins::PromptReplyValue;
@@ -28,23 +28,31 @@ use crate::host::{PluginHost, resolve_displaced_modal, schedule_toast_expiry};
 use crate::view::{UiNotifySink, UiTreeState};
 
 #[derive(Default)]
-struct OverlayWindows(Vec<AnyWindowHandle>);
+struct OverlayWindows(Vec<(AnyWindowHandle, Option<WeakEntity<PluginOverlayView>>)>);
 
 impl Global for OverlayWindows {}
 
-fn register_overlay_window(handle: AnyWindowHandle, cx: &mut App) {
+fn register_overlay_window(
+    handle: AnyWindowHandle,
+    view: Option<WeakEntity<PluginOverlayView>>,
+    cx: &mut App,
+) {
     let open = cx.windows();
     let mounted = cx.default_global::<OverlayWindows>();
-    mounted.0.retain(|h| open.contains(h));
-    if !mounted.0.contains(&handle) {
-        mounted.0.push(handle);
+    mounted.0.retain(|(h, _)| open.contains(h));
+    if let Some((_, existing)) = mounted.0.iter_mut().find(|(h, _)| *h == handle) {
+        if view.is_some() {
+            *existing = view;
+        }
+    } else {
+        mounted.0.push((handle, view));
     }
 }
 
 fn unregister_overlay_window(handle: AnyWindowHandle, cx: &mut App) {
     if cx.has_global::<OverlayWindows>() {
         cx.update_global::<OverlayWindows, _>(|mounted, _| {
-            mounted.0.retain(|h| *h != handle);
+            mounted.0.retain(|(h, _)| *h != handle);
         });
     }
 }
@@ -56,7 +64,7 @@ fn should_render_overlays_in_window(window: &Window, cx: &App) -> bool {
         .try_global::<OverlayWindows>()
         .map(|m| {
             m.0.iter()
-                .copied()
+                .map(|(h, _)| *h)
                 .filter(|h| open.contains(h))
                 .collect()
         })
@@ -108,6 +116,7 @@ struct ActivePromptState {
 /// Stateful GPUI overlay view rendering active plugin modals and the floating toast stack.
 pub struct PluginOverlayView {
     focus_handle: FocusHandle,
+    previous_focus: Option<FocusHandle>,
     focused_modal_sig: Option<ModalFocusSig>,
     prompt: Option<ActivePromptState>,
     modal_tree_key: Option<(String, String)>,
@@ -152,7 +161,7 @@ impl PluginOverlayView {
         });
         let activation_sub = window.map(|win| {
             let handle = win.window_handle();
-            register_overlay_window(handle, cx);
+            register_overlay_window(handle, Some(cx.weak_entity()), cx);
             cx.on_release(move |_, cx| {
                 unregister_overlay_window(handle, cx);
             })
@@ -163,6 +172,7 @@ impl PluginOverlayView {
         });
         Self {
             focus_handle: cx.focus_handle(),
+            previous_focus: None,
             focused_modal_sig: None,
             prompt: None,
             modal_tree_key: None,
@@ -440,6 +450,9 @@ impl Render for PluginOverlayView {
         if !should_render_overlays_in_window(window, cx) {
             self.focused_modal_sig = None;
             self.prompt = None;
+            if let Some(prev) = self.previous_focus.take() {
+                window.focus(&prev, cx);
+            }
             return div().into_any_element();
         }
 
@@ -472,6 +485,11 @@ impl Render for PluginOverlayView {
         if let Some(spec) = &active_modal {
             let sig = modal_focus_sig(spec, modal_gen);
             if self.focused_modal_sig.as_ref() != Some(&sig) {
+                if self.previous_focus.is_none() {
+                    self.previous_focus = window
+                        .focused(cx)
+                        .filter(|handle| *handle != self.focus_handle);
+                }
                 self.focused_modal_sig = Some(sig);
                 if !matches!(spec.kind, PluginModalKind::Prompt { .. }) {
                     window.focus(&self.focus_handle, cx);
@@ -479,6 +497,9 @@ impl Render for PluginOverlayView {
             }
         } else {
             self.focused_modal_sig = None;
+            if let Some(prev) = self.previous_focus.take() {
+                window.focus(&prev, cx);
+            }
         }
 
         if active_modal.is_none() && toasts.is_empty() {
@@ -529,6 +550,40 @@ impl Render for PluginOverlayView {
     }
 }
 
+/// Handles Escape for an active plugin modal: closes any open `Select` popover inside a
+/// `View` modal first, otherwise dismisses the modal itself via [`dismiss_active_plugin_modal`].
+pub fn handle_plugin_modal_escape(cx: &mut App) -> bool {
+    let is_view_modal = match PluginBus::global(cx).and_then(|bus| bus.active_modal.as_ref()) {
+        Some(modal) => matches!(modal.kind, PluginModalKind::View { .. }),
+        None => return false,
+    };
+    if is_view_modal {
+        let views: Vec<WeakEntity<PluginOverlayView>> = cx
+            .try_global::<OverlayWindows>()
+            .map(|mounted| {
+                mounted
+                    .0
+                    .iter()
+                    .filter_map(|(_, v)| v.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        for weak in views {
+            if let Ok(true) = weak.update(cx, |view, cx| {
+                if view.modal_tree_state.close_select() {
+                    cx.notify();
+                    true
+                } else {
+                    false
+                }
+            }) {
+                return true;
+            }
+        }
+    }
+    dismiss_active_plugin_modal(cx)
+}
+
 /// Dismisses any active plugin modal, cleanly resolving pending `Confirm`/`Prompt` promises
 /// and unmounting `"__modal__"` view handlers.
 pub fn dismiss_active_plugin_modal(cx: &mut App) -> bool {
@@ -570,10 +625,10 @@ fn resolve_and_close_prompt(request_id: u64, reply: PromptReplyValue, cx: &mut A
 /// Renders active plugin modals (`View`, `Confirm`, `Prompt`) and the toast stack above the
 /// currently active window (or primary mounted fallback window when none is active).
 pub fn render_plugin_overlays(window: &mut Window, cx: &mut App) -> AnyElement {
-    register_overlay_window(window.window_handle(), cx);
     let view = window.use_keyed_state("plugin-overlays-root", cx, |window, cx| {
         PluginOverlayView::new_in_window(window, cx)
     });
+    register_overlay_window(window.window_handle(), Some(view.downgrade()), cx);
     view.into_any_element()
 }
 

@@ -6,17 +6,12 @@ pub mod settings_view;
 pub mod view;
 
 pub use host::{PluginHost, PluginHostConfig, collect_plugin_themes};
-pub use modal::{PluginOverlayView, dismiss_active_plugin_modal, render_plugin_overlays};
+pub use modal::{
+    PluginOverlayView, dismiss_active_plugin_modal, handle_plugin_modal_escape,
+    render_plugin_overlays,
+};
 pub use settings_view::{PluginSettingsTab, PluginSettingsView};
 pub use view::{PluginView, PluginViewEvent, UiTreeState};
-
-pub(crate) fn status_disabled_label(locale: fern_i18n::Locale) -> &'static str {
-    match locale {
-        fern_i18n::Locale::En => "Disabled",
-        fern_i18n::Locale::Ru => "Отключён",
-        fern_i18n::Locale::ZhCn => "已禁用",
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -1334,6 +1329,8 @@ mod tests {
             .plugin_meta_set(plugin_id, "task", "t1", "m", "v")
             .unwrap();
 
+        let vault_path_check = vault_path.clone();
+        let key_path_check = key_path.clone();
         cx.update(|cx| {
             theme::init(cx);
             cx.set_global(CurrentLocale(Locale::En));
@@ -1354,6 +1351,8 @@ mod tests {
             .unwrap();
             let mgr = PluginHost::global(cx).unwrap().manager().unwrap().clone();
             mgr.approve_permissions(plugin_id).unwrap();
+            mgr.set_secret(plugin_id, "api_token", "top-secret-token")
+                .unwrap();
             PluginHost::drain_updates_for_test(cx);
         });
         cx.run_until_parked();
@@ -1438,6 +1437,11 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "uninstall must clear plugin_entity_meta"
+        );
+        let vault = plugins::SecretsVault::open(&vault_path_check, &key_path_check).unwrap();
+        assert!(
+            vault.get(plugin_id, "api_token").unwrap().is_none(),
+            "uninstall must revoke plugin secrets in SecretsVault"
         );
         cx.update(|_, cx| {
             assert!(

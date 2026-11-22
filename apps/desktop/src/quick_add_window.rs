@@ -549,25 +549,8 @@ fn build_quick_add_draft_json(
     serde_json::Value::Object(obj)
 }
 
-fn format_hook_cancel_message(reason: &str, strings: &i18n::Strings) -> String {
-    let trimmed = reason.trim();
-    if trimmed.is_empty() {
-        format!("{}: {}", strings.plugins, strings.cancel)
-    } else {
-        trimmed.to_owned()
-    }
-}
-
-pub(crate) fn push_hook_cancel_toast(reason: &str, cx: &mut App) {
-    let msg = format_hook_cancel_message(reason, i18n::t(cx));
-    desktop_common::plugin_bus::PluginBus::update(cx, |bus| {
-        bus.push_toast(
-            "plugins",
-            msg,
-            desktop_common::plugin_bus::ToastLevel::Warning,
-            chrono::Utc::now().timestamp_millis(),
-        );
-    });
+pub(crate) fn push_hook_cancel_toast(reason: &str, fallback: &str, cx: &mut App) {
+    desktop_common::plugin_bus::push_hook_cancel_toast(reason, fallback, cx);
 }
 
 /// Runs `beforeTaskComplete` off the UI thread; invokes `on_done(true, cx)` unless a plugin cancels
@@ -584,7 +567,7 @@ pub(crate) fn run_before_task_complete(
         let res = bg_task.await;
         cx.update(|cx| match res {
             Ok(plugins::runtime::HookDecision::Cancel(reason)) => {
-                push_hook_cancel_toast(&reason, cx);
+                push_hook_cancel_toast(&reason, i18n::t(cx).plugins_task_complete_cancelled, cx);
                 on_done(false, cx);
             }
             Ok(
@@ -625,7 +608,9 @@ pub(crate) fn run_quick_add_plugins(
                 .await;
             let transformed = match transform {
                 Ok(plugins::runtime::HookDecision::Cancel(reason)) => {
-                    cx.update(|cx| push_hook_cancel_toast(&reason, cx));
+                    cx.update(|cx| {
+                        push_hook_cancel_toast(&reason, i18n::t(cx).plugins_task_create_cancelled, cx);
+                    });
                     continue;
                 }
                 Ok(plugins::runtime::HookDecision::Modify(val)) => {
@@ -646,7 +631,9 @@ pub(crate) fn run_quick_add_plugins(
                 .await;
             match before_res {
                 Ok(plugins::runtime::HookDecision::Cancel(reason)) => {
-                    cx.update(|cx| push_hook_cancel_toast(&reason, cx));
+                    cx.update(|cx| {
+                        push_hook_cancel_toast(&reason, i18n::t(cx).plugins_task_create_cancelled, cx);
+                    });
                 }
                 Ok(plugins::runtime::HookDecision::Modify(modified_json)) => {
                     match plugins::api::parse_task_draft(&modified_json) {
@@ -851,10 +838,27 @@ mod tests {
     fn hook_cancel_toast_uses_localized_fallback_when_reason_empty() {
         for locale in [i18n::Locale::En, i18n::Locale::Ru, i18n::Locale::ZhCn] {
             let strings = locale.strings();
-            let fallback = format_hook_cancel_message("   ", strings);
-            assert!(fallback.contains(strings.plugins), "{locale:?}: {fallback}");
-            assert!(fallback.contains(strings.cancel), "{locale:?}: {fallback}");
-            assert_eq!(format_hook_cancel_message("Custom reason", strings), "Custom reason");
+            assert_eq!(
+                desktop_common::plugin_bus::format_hook_cancel_message(
+                    "   ",
+                    strings.plugins_task_create_cancelled
+                ),
+                strings.plugins_task_create_cancelled
+            );
+            assert_eq!(
+                desktop_common::plugin_bus::format_hook_cancel_message(
+                    "   ",
+                    strings.plugins_task_complete_cancelled
+                ),
+                strings.plugins_task_complete_cancelled
+            );
+            assert_eq!(
+                desktop_common::plugin_bus::format_hook_cancel_message(
+                    "Custom reason",
+                    strings.plugins_task_create_cancelled
+                ),
+                "Custom reason"
+            );
         }
     }
 }

@@ -144,6 +144,7 @@ pub struct CalendarView {
     focus_sessions: Vec<fern_core::FocusSession>,
     timed_resize: Option<TimedResize>,
     event_editor: Option<EventEditor>,
+    pending_complete: HashSet<Id>,
 }
 
 struct ContextMenuState {
@@ -694,6 +695,7 @@ impl CalendarView {
             focus_sessions: Vec::new(),
             timed_resize: None,
             event_editor: None,
+            pending_complete: HashSet::new(),
         };
         this.reload(cx);
         this
@@ -1396,13 +1398,15 @@ impl CalendarView {
         self.store.is_task_read_only(id).unwrap_or(false)
     }
 
-    fn toggle_task_completed(&mut self, id: Id, completed: bool, cx: &mut Context<Self>) {
-        if self.is_task_read_only(id) {
-            return;
-        }
-        let Some(task) = self.store.task(id).ok().flatten() else { return };
+    fn finish_toggle_task_completed(
+        &mut self,
+        task: &Task,
+        completed: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let id = task.id;
         let result = if completed && !task.is_wont_do() {
-            crate::undo::complete(&self.store, &task).map(|_| ())
+            crate::undo::complete(&self.store, task).map(|_| ())
         } else if task.is_wont_do() {
             self.store.set_wont_do(id, false)
         } else {
@@ -1417,6 +1421,43 @@ impl CalendarView {
         }
         crate::data_version::data_changed(cx.entity_id(), cx);
         self.card_updated(cx);
+    }
+
+    fn toggle_task_completed(&mut self, id: Id, completed: bool, cx: &mut Context<Self>) {
+        if self.is_task_read_only(id) {
+            return;
+        }
+        let Some(task) = self.store.task(id).ok().flatten() else { return };
+        if completed
+            && !task.is_wont_do()
+            && desktop_common::plugin_bus::PluginHooksGlobal::global(cx)
+                .is_some_and(|h| h.is_active())
+        {
+            if !self.pending_complete.insert(id) {
+                return;
+            }
+            let weak = cx.weak_entity();
+            desktop_common::plugin_bus::run_before_task_complete_hook(
+                &task,
+                cx,
+                move |allowed, cx| {
+                    let _ = weak.update(cx, |this, cx| {
+                        this.pending_complete.remove(&id);
+                        if !allowed || this.is_task_read_only(id) {
+                            cx.notify();
+                            return;
+                        }
+                        if let Some(current) = this.store.task(id).ok().flatten()
+                            && !current.is_closed()
+                        {
+                            this.finish_toggle_task_completed(&current, true, cx);
+                        }
+                    });
+                },
+            );
+            return;
+        }
+        self.finish_toggle_task_completed(&task, completed, cx);
     }
 
     /// The card's task changed: the calendar shows the change, and the card closes when the task

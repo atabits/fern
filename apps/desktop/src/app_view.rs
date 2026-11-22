@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use desktop_common::plugin_bus::{PluginBus, PluginModalKind, PluginModalSpec, PluginNavAction, PluginSidebarViewSpec};
+use desktop_common::plugin_bus::{PluginBus, PluginNavAction, PluginSidebarViewSpec};
 use fern_core::{RailItemId, Store, link::DeepLink};
 use gpui::Focusable as _;
 use plugin_ui::{PluginHost, PluginView, PluginViewEvent, render_plugin_overlays};
@@ -51,27 +51,12 @@ fn format_sync_error(err: &anyhow::Error, strings: &i18n::Strings) -> String {
     desktop_common::diagnostics::redact_sensitive(&format!("{err:#}"))
 }
 
-/// Closes an active plugin modal on `PluginBus`, resolving any pending `Confirm`/`Prompt`
-/// promise so awaited JS calls never hang.
-pub(crate) fn dismiss_plugin_modal(modal: &PluginModalSpec, cx: &mut App) {
-    match &modal.kind {
-        PluginModalKind::Confirm { request_id, .. } => {
-            PluginHost::resolve_prompt_async(
-                *request_id,
-                plugins::api::PromptReplyValue::Confirm(false),
-                cx,
-            );
-        }
-        PluginModalKind::Prompt { request_id, .. } => {
-            PluginHost::resolve_prompt_async(
-                *request_id,
-                plugins::api::PromptReplyValue::Prompt(None),
-                cx,
-            );
-        }
-        PluginModalKind::View { .. } => {}
-    }
-    PluginBus::update(cx, |bus| bus.close_modal());
+/// Handles Escape for an active plugin modal: closes any open `Select` popover inside a `View`
+/// modal first, otherwise dismisses the modal via `plugin_ui::dismiss_active_plugin_modal`
+/// (resolving pending `Confirm`/`Prompt` promises, unmounting `"__modal__"` handlers, and
+/// bumping `modal_generation`).
+pub(crate) fn dismiss_plugin_modal(cx: &mut App) -> bool {
+    plugin_ui::handle_plugin_modal_escape(cx)
 }
 
 fn is_plugin_view_reachable(
@@ -416,11 +401,8 @@ impl AppView {
         let _modal_escape_sub = cx.intercept_keystrokes(|event, _window, cx| {
             if event.keystroke.key == "escape"
                 && !event.keystroke.modifiers.modified()
-                && let Some(modal) = cx
-                    .try_global::<PluginBus>()
-                    .and_then(|bus| bus.active_modal.clone())
+                && dismiss_plugin_modal(cx)
             {
-                dismiss_plugin_modal(&modal, cx);
                 cx.stop_propagation();
             }
         });
@@ -816,7 +798,7 @@ impl AppView {
                 && self.select(Section::Things, window, cx)
             {
                 self.things
-                    .update(cx, |things, cx| things.select_view(target_view, cx));
+                    .update(cx, |things, cx| things.select_view(target_view, window, cx));
             }
         }
     }
@@ -1221,11 +1203,7 @@ impl AppView {
     }
 
     fn dismiss_any_transient(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        if let Some(modal) = cx
-            .try_global::<PluginBus>()
-            .and_then(|bus| bus.active_modal.clone())
-        {
-            dismiss_plugin_modal(&modal, cx);
+        if dismiss_plugin_modal(cx) {
             return true;
         }
         if self.cancel_rail_drag(window, cx) {
@@ -2941,6 +2919,7 @@ mod tests {
 
         // Open a plugin modal while notices popover is also open -> Escape closes modal first.
         cx.update(|_, cx| {
+            use desktop_common::plugin_bus::{PluginModalKind, PluginModalSpec};
             app.update(cx, |app, cx| app.set_notices_open(true, cx));
             PluginBus::update(cx, |bus| {
                 bus.open_modal(PluginModalSpec {

@@ -300,6 +300,8 @@ pub struct TodoView {
     context_side: Option<u8>,
     error: Option<String>,
     add_attachment_error: Option<String>,
+    pending_complete: HashSet<Id>,
+    submitting_task: bool,
 }
 
 impl TodoView {
@@ -555,6 +557,8 @@ impl TodoView {
             context_side: None,
             error: None,
             add_attachment_error: None,
+            pending_complete: HashSet::new(),
+            submitting_task: false,
         };
         this.reload_inner(false, false, cx);
         #[cfg(debug_assertions)]
@@ -2728,6 +2732,16 @@ impl TodoView {
         cx.notify();
     }
 
+    fn finish_complete_task(&mut self, task: &Task, cx: &mut Context<Self>) {
+        let result = crate::undo::complete(&self.store, task);
+        if let Some(action) = self.check(result) {
+            let label = i18n::t(cx).undo_completed.replace("{title}", &task.title);
+            self.offer_undo(action, label, cx);
+            crate::completion_mark::record(task.id, cx);
+            desktop_common::sound::play_complete(&self.store);
+        }
+    }
+
     fn toggle(&mut self, id: Id, completed: bool, cx: &mut Context<Self>) {
         if self.is_task_id_read_only(id) {
             return;
@@ -2752,13 +2766,41 @@ impl TodoView {
         match task {
             // Completing offers Undo, also for a repeating task, which moves to its next date.
             Some(task) if completed && !wont_do => {
-                let result = crate::undo::complete(&self.store, &task);
-                if let Some(action) = self.check(result) {
-                    let label = i18n::t(cx).undo_completed.replace("{title}", &task.title);
-                    self.offer_undo(action, label, cx);
-                    crate::completion_mark::record(id, cx);
-                    desktop_common::sound::play_complete(&self.store);
+                if desktop_common::plugin_bus::PluginHooksGlobal::global(cx)
+                    .is_some_and(|h| h.is_active())
+                {
+                    if !self.pending_complete.insert(id) {
+                        return;
+                    }
+                    let weak = cx.weak_entity();
+                    desktop_common::plugin_bus::run_before_task_complete_hook(
+                        &task,
+                        cx,
+                        move |allowed, cx| {
+                            let _ = weak.update(cx, |this, cx| {
+                                this.pending_complete.remove(&id);
+                                if !allowed || this.is_task_id_read_only(id) {
+                                    cx.notify();
+                                    return;
+                                }
+                                let current = this
+                                    .tasks
+                                    .iter()
+                                    .find(|t| t.id == id)
+                                    .cloned()
+                                    .or_else(|| this.store.task(id).ok().flatten());
+                                if let Some(current) = current
+                                    && !current.is_closed()
+                                {
+                                    this.finish_complete_task(&current, cx);
+                                    this.reload(cx);
+                                }
+                            });
+                        },
+                    );
+                    return;
                 }
+                self.finish_complete_task(&task, cx);
             }
             _ => {
                 let result =

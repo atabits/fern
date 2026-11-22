@@ -10,7 +10,8 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use chrono::{Datelike, Duration, Local, NaiveDate};
-use desktop_common::actions::{DismissTransient, NewTask, Search, SyncNow};
+use desktop_common::actions::{DismissTransient, NewTask, OpenWhen, Search, SyncNow};
+use desktop_common::plugin_bus::{PluginHooksGlobal, run_before_task_complete_hook};
 use desktop_common::text_input::{Changed, Mode, Submitted, TextInput};
 use desktop_common::{calendar, colors, completion_mark, data_version, layout, task_ops};
 pub use fern_core::things::{ProjectProgress, ThingsCounts, ThingsViewKind};
@@ -116,6 +117,7 @@ pub struct ThingsView {
     list_dialog: Option<Entity<ListDialog>>,
     folder_dialog: Option<Entity<FolderDialog>>,
     tag_dialog: Option<Entity<TagDialog>>,
+    pending_complete: HashSet<Id>,
 }
 
 impl Focusable for ThingsView {
@@ -154,6 +156,7 @@ impl ThingsView {
             list_dialog: None,
             folder_dialog: None,
             tag_dialog: None,
+            pending_complete: HashSet::new(),
         };
         this.reload(cx);
         cx.observe_global::<data_version::DataVersion>(|this, cx| {
@@ -525,10 +528,8 @@ impl ThingsView {
                 .update(cx, |i, cx| i.set_placeholder(strings.type_in_tag, cx));
         }
         if let Some((_, wp)) = &self.when_picker {
-            // TODO(land-all): switch to `strings.things_date_placeholder` once `core-fix` lands.
-            let date_placeholder = calendar::format_date(Self::today(), strings);
             wp.date_input
-                .update(cx, |i, cx| i.set_placeholder(date_placeholder, cx));
+                .update(cx, |i, cx| i.set_placeholder(strings.things_date_placeholder, cx));
         }
     }
 
@@ -791,11 +792,14 @@ impl ThingsView {
         }
     }
 
-    fn toggle_task_complete(&mut self, id: Id, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(task) = self.tasks.iter().find(|t| t.id == id).cloned() else {
-            return;
-        };
-        let done = !task.is_closed();
+    fn finish_toggle_task_complete(
+        &mut self,
+        task: &Task,
+        done: bool,
+        window: Option<&mut Window>,
+        cx: &mut Context<Self>,
+    ) {
+        let id = task.id;
         let was_expanded = self.expanded.is_some();
         let completing_expanded =
             done && self.expanded.as_ref().is_some_and(|e| e.task_id == id);
@@ -809,12 +813,64 @@ impl ThingsView {
         if done {
             completion_mark::record(id, cx);
         }
-        if task_ops::toggle_task_completion(&self.store, &task, done, cx.entity_id(), cx).is_ok() {
+        if task_ops::toggle_task_completion(&self.store, task, done, cx.entity_id(), cx).is_ok() {
             self.reload(cx);
-            if was_expanded && self.expanded.is_none() {
+            if was_expanded
+                && self.expanded.is_none()
+                && let Some(window) = window
+            {
                 window.focus(&self.focus_handle, cx);
             }
         }
+    }
+
+    fn toggle_task_complete(&mut self, id: Id, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(task) = self.tasks.iter().find(|t| t.id == id).cloned() else {
+            return;
+        };
+        let done = !task.is_closed();
+        if done
+            && !task.is_wont_do()
+            && PluginHooksGlobal::global(cx).is_some_and(|h| h.is_active())
+        {
+            if !self.pending_complete.insert(id) {
+                return;
+            }
+            let weak = cx.weak_entity();
+            let window_handle = window.window_handle();
+            run_before_task_complete_hook(&task, cx, move |allowed, cx| {
+                let mut should_refocus = None;
+                let _ = weak.update(cx, |this, cx| {
+                    this.pending_complete.remove(&id);
+                    if !allowed {
+                        cx.notify();
+                        return;
+                    }
+                    let current = this
+                        .tasks
+                        .iter()
+                        .find(|t| t.id == id)
+                        .cloned()
+                        .or_else(|| this.store.task(id).ok().flatten());
+                    if let Some(current) = current
+                        && !current.is_closed()
+                    {
+                        let was_expanded = this.expanded.is_some();
+                        this.finish_toggle_task_complete(&current, true, None, cx);
+                        if was_expanded && this.expanded.is_none() {
+                            should_refocus = Some(this.focus_handle.clone());
+                        }
+                    }
+                });
+                if let Some(handle) = should_refocus {
+                    let _ = window_handle.update(cx, |_, window, cx| {
+                        window.focus(&handle, cx);
+                    });
+                }
+            });
+            return;
+        }
+        self.finish_toggle_task_complete(&task, done, Some(window), cx);
     }
 
     fn delete_task(&mut self, id: Id, window: &mut Window, cx: &mut Context<Self>) {
@@ -975,8 +1031,7 @@ impl ThingsView {
             .start_date
             .map(|d| calendar::format_date(d, strings))
             .unwrap_or_default();
-        // TODO(land-all): switch to `strings.things_date_placeholder` once `core-fix` lands.
-        let date_placeholder = calendar::format_date(today, strings);
+        let date_placeholder = strings.things_date_placeholder;
 
         let date_input = cx.new(|cx| {
             let mut ti = TextInput::new(Mode::SingleLine, date_placeholder, cx).without_cancel();
@@ -2068,8 +2123,7 @@ impl ThingsView {
             ThingsViewKind::Someday => (IconName::Archive, strings.things_empty_someday),
             ThingsViewKind::Logbook => (IconName::CircleCheck, strings.things_empty_logbook),
             ThingsViewKind::Project(_) => (IconName::CircleDot, strings.things_empty_project),
-            // TODO(land-all): switch to `strings.things_empty_area` once `core-fix` lands.
-            ThingsViewKind::Area(_) => (IconName::Folder, strings.no_tasks),
+            ThingsViewKind::Area(_) => (IconName::Folder, strings.things_empty_area),
         }
     }
 
@@ -2452,8 +2506,7 @@ impl ThingsView {
 
             let empty_drop_slot = (group.tasks.is_empty() && show_when_empty).then(|| {
                 let slot_label = if is_evening_group {
-                    // TODO(land-all): switch to `strings.things_drop_evening_hint` once `core-fix` lands.
-                    strings.things_today_evening
+                    strings.things_drop_evening_hint
                 } else if is_today_day_group {
                     strings.things_today
                 } else if matches!(self.view, ThingsViewKind::Area(_)) {
@@ -2769,7 +2822,14 @@ impl Render for ThingsView {
                     cx.stop_propagation();
                 }
             }))
-            // TODO(land-all): also wire `.on_action::<desktop_common::actions::OpenWhen>` once `core-fix` lands.
+            .on_action(cx.listener(|this, _: &OpenWhen, window, cx| {
+                if this.has_open_modal() {
+                    return;
+                }
+                if !this.open_when_for_active_task(window, cx) {
+                    cx.propagate();
+                }
+            }))
             .on_action(cx.listener(|this, _: &SyncNow, window, cx| {
                 if this.has_open_modal() {
                     return;
@@ -3876,6 +3936,77 @@ mod tests {
                     _ => panic!("expected Schedule drop on Upcoming month group"),
                 }
             });
+        });
+    }
+
+    #[gpui::test]
+    fn before_task_complete_hook_blocks_things_completion_and_toasts(cx: &mut TestAppContext) {
+        use std::sync::Arc;
+        use desktop_common::plugin_bus::{PluginBus, PluginHookDecision, PluginHooksGlobal};
+
+        cx.update(|cx| {
+            theme::init(cx);
+            cx.set_global(CurrentLocale(i18n::Locale::En));
+            let hooks = PluginHooksGlobal::new(
+                Arc::new(|_| Ok(PluginHookDecision::Allow)),
+                Arc::new(|task| {
+                    if task.get("title").and_then(|v| v.as_str()) == Some("Blocked task") {
+                        Ok(PluginHookDecision::Cancel("Cannot finish yet".into()))
+                    } else {
+                        Ok(PluginHookDecision::Allow)
+                    }
+                }),
+                Arc::new(|_| Ok(PluginHookDecision::Allow)),
+            );
+            PluginHooksGlobal::set_global(hooks, cx);
+        });
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let today = ThingsView::today();
+        let blocked = store
+            .create_task(
+                TaskDraft {
+                    title: "Blocked task".into(),
+                    start_date: Some(today),
+                    ..Default::default()
+                },
+                false,
+            )
+            .unwrap();
+        let allowed = store
+            .create_task(
+                TaskDraft {
+                    title: "Allowed task".into(),
+                    start_date: Some(today),
+                    ..Default::default()
+                },
+                false,
+            )
+            .unwrap();
+
+        let (view, cx) = cx.add_window_view(|window, cx| ThingsView::new(store.clone(), window, cx));
+        cx.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                v.toggle_task_complete(blocked.id, window, cx);
+                v.toggle_task_complete(allowed.id, window, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        assert!(
+            !store.task(blocked.id).unwrap().unwrap().is_completed(),
+            "beforeTaskComplete Cancel must prevent completion in ThingsView"
+        );
+        assert!(
+            store.task(allowed.id).unwrap().unwrap().is_completed(),
+            "beforeTaskComplete Allow must complete task in ThingsView"
+        );
+        cx.update(|_, cx| {
+            let bus = PluginBus::global(cx).expect("PluginBus must record cancel toast");
+            assert!(
+                bus.toasts.iter().any(|t| t.message == "Cannot finish yet"),
+                "expected warning toast with hook cancel reason"
+            );
+            PluginHooksGlobal::clear_global(cx);
         });
     }
 }

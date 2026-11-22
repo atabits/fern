@@ -319,10 +319,8 @@ fn main() -> Result<()> {
             eprintln!("failed to load the fonts: {err:#}");
         }
         cx.set_global(CurrentLocale(locale));
+        // Initializes PluginHost and registers desktop_common's PluginHooksGlobal bridge.
         init_plugin_host(safe_mode, plugin_db_path, locale.code(), cx);
-        // TODO(land-all): Register desktop_common's PluginHooksGlobal bridge here after `core-fix`
-        // merges so `todo_ui` / `things_ui` / `task_ui` invoke `beforeTaskCreate` /
-        // `beforeTaskComplete` / `quickAddTransform` through the shared bridge.
         match keymap::reload(&Assets, cx) {
             Ok(errors) => errors.iter().for_each(|err| eprintln!("keymap: {err}")),
             Err(err) => eprintln!("failed to load the keymap: {err:#}"),

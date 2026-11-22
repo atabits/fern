@@ -839,12 +839,16 @@ impl PluginSettingsView {
             self.close_plugin_page(cx);
         }
         let mgr = PluginHost::global(cx).and_then(|h| h.manager().cloned());
+        let secrets_paths = PluginHost::global(cx).map(PluginHost::secrets_paths);
         let pid = plugin_id.clone();
         let task = cx.background_spawn(async move {
             if let Some(mgr) = &mgr {
-                let _ = mgr.set_plugin_enabled(&pid, false);
-                // INTEGRATION(land-all): once `runtime-fix` merges, wire `mgr.purge_plugin_data(&pid)?;`
-                // here to wipe `SecretsVault` entries alongside DB state/KV/entity metadata on the worker.
+                mgr.purge_plugin_data(&pid)?;
+            } else if let Some((vault_path, key_path)) = secrets_paths
+                && vault_path.exists()
+            {
+                let vault = plugins::SecretsVault::open(&vault_path, &key_path)?;
+                vault.delete_plugin(&pid)?;
             }
             client.uninstall_plugin(&pid)?;
             if let Some(mgr) = &mgr {
@@ -857,12 +861,8 @@ impl PluginSettingsView {
             let _ = this.update(cx, |this, cx| {
                 match res {
                     Ok(()) => {
-                        // Purge persisted plugin DB state, KV, and entity metadata (also covers Safe Mode
-                        // where `mgr` is None). `land-all` wires `mgr.purge_plugin_data(&pid)` above for
-                        // `SecretsVault` revocation.
-                        let _ = this.store.delete_plugin_state(&plugin_id);
-                        let _ = this.store.plugin_kv_clear(&plugin_id);
-                        let _ = this.store.plugin_meta_clear(&plugin_id);
+                        // Also ensures DB cleanup when uninstalling in Safe Mode (`mgr` is None).
+                        let _ = this.store.delete_plugin_all_data(&plugin_id);
                         this.clear_plugin_ui_caches(&plugin_id);
                         if this.expanded_settings.as_deref() == Some(&plugin_id) {
                             this.expanded_settings = None;
@@ -1716,7 +1716,7 @@ impl PluginSettingsView {
         let (status_label, status_color) = match &info.status {
             PluginStatus::Active => (ex.status_active, status_colors.success),
             PluginStatus::Idle => (ex.status_idle, status_colors.info),
-            PluginStatus::Disabled => (crate::status_disabled_label(i18n::locale(cx)), colors.text_muted),
+            PluginStatus::Disabled => (strings.plugins_disabled, colors.text_muted),
             PluginStatus::NeedsApproval { .. } => {
                 (strings.plugins_permissions_approve, status_colors.warning)
             }

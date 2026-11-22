@@ -1,11 +1,14 @@
 //! Shared GPUI global event/UI bus between `plugin_ui` and `apps/desktop`.
 
 use std::collections::VecDeque;
+use std::str::FromStr as _;
 use std::sync::Arc;
 
-use anyhow::Result;
-use fern_core::{Id, Priority, ScheduleBucket, Task};
-use gpui::{App, Global};
+use anyhow::{Context as _, Result, anyhow, bail, ensure};
+use chrono::{NaiveDate, NaiveTime, Timelike as _};
+use fern_core::{Id, Kind, Priority, Recurrence, ScheduleBucket, Task, TaskDraft};
+use fern_i18n as i18n;
+use gpui::{App, AppContext as _, Global};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -342,6 +345,343 @@ pub fn task_to_hook_json(task: &Task) -> serde_json::Value {
     })
 }
 
+/// Formats a plugin hook cancel message, falling back to `fallback` when `reason` is empty.
+pub fn format_hook_cancel_message(reason: &str, fallback: &str) -> String {
+    let trimmed = reason.trim();
+    if trimmed.is_empty() {
+        fallback.to_owned()
+    } else {
+        trimmed.to_owned()
+    }
+}
+
+/// Shows a warning toast on [`PluginBus`] when a plugin hook cancels an operation, falling back
+/// to a localized message when the plugin provided an empty reason.
+pub fn push_hook_cancel_toast(reason: &str, fallback: &str, cx: &mut App) {
+    let msg = format_hook_cancel_message(reason, fallback);
+    PluginBus::update(cx, |bus| {
+        bus.push_toast(
+            "plugins",
+            msg,
+            ToastLevel::Warning,
+            chrono::Utc::now().timestamp_millis(),
+        );
+    });
+}
+
+/// Runs active `beforeTaskComplete` plugin hooks off the UI thread, calling `on_done(true, cx)`
+/// when allowed (or synchronously when no active hook bridge is registered) and `on_done(false, cx)`
+/// after posting a warning toast when cancelled.
+pub fn run_before_task_complete_hook(
+    task: &Task,
+    cx: &mut App,
+    on_done: impl FnOnce(bool, &mut App) + 'static,
+) {
+    let Some(hooks) = PluginHooksGlobal::global(cx).filter(PluginHooksGlobal::is_active) else {
+        on_done(true, cx);
+        return;
+    };
+    let task_json = task_to_hook_json(task);
+    let bg_task = cx.background_spawn(async move { hooks.run_before_task_complete(task_json) });
+    cx.spawn(async move |cx| {
+        let res = bg_task.await;
+        cx.update(|cx| match res {
+            Ok(PluginHookDecision::Cancel(reason)) => {
+                let fallback = i18n::t(cx).plugins_task_complete_cancelled;
+                push_hook_cancel_toast(&reason, fallback, cx);
+                on_done(false, cx);
+            }
+            Ok(PluginHookDecision::Allow | PluginHookDecision::Modify(_)) => {
+                on_done(true, cx);
+            }
+            Err(err) => {
+                eprintln!("plugin beforeTaskComplete hook failed: {err:#}");
+                on_done(true, cx);
+            }
+        });
+    })
+    .detach();
+}
+
+/// Extracts a transformed quick-add string returned by a `quickAddTransform` plugin hook.
+pub fn extract_transformed_quick_add(val: &serde_json::Value) -> Option<String> {
+    if let Some(s) = val.as_str() {
+        let trimmed = s.trim();
+        return (!trimmed.is_empty()).then(|| trimmed.to_owned());
+    }
+    if let Some(obj) = val.as_object() {
+        for key in ["text", "input"] {
+            if let Some(s) = obj.get(key).and_then(serde_json::Value::as_str) {
+                let trimmed = s.trim();
+                if !trimmed.is_empty() {
+                    return Some(trimmed.to_owned());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Serializes a [`TaskDraft`] + `top` insertion hint into the canonical JSON shape expected by
+/// `beforeTaskCreate` plugin hooks.
+pub fn task_draft_to_hook_json(draft: &TaskDraft, top: bool) -> serde_json::Value {
+    let priority = match draft.priority {
+        Priority::None => "none",
+        Priority::Low => "low",
+        Priority::Medium => "medium",
+        Priority::High => "high",
+    };
+    let bucket = match draft.schedule_bucket {
+        ScheduleBucket::None => "none",
+        ScheduleBucket::Evening => "evening",
+        ScheduleBucket::Someday => "someday",
+    };
+    let mut obj = serde_json::Map::new();
+    obj.insert("title".to_owned(), serde_json::Value::String(draft.title.clone()));
+    if !draft.notes.is_empty() {
+        obj.insert("notes".to_owned(), serde_json::Value::String(draft.notes.clone()));
+    }
+    obj.insert("kind".to_owned(), serde_json::Value::String(draft.kind.as_str().to_owned()));
+    obj.insert("priority".to_owned(), serde_json::Value::String(priority.to_owned()));
+    obj.insert("scheduleBucket".to_owned(), serde_json::Value::String(bucket.to_owned()));
+    obj.insert("top".to_owned(), serde_json::Value::Bool(top));
+    if let Some(id) = draft.list_id {
+        obj.insert("listId".to_owned(), serde_json::Value::String(id.to_string()));
+    }
+    if let Some(id) = draft.section_id {
+        obj.insert("sectionId".to_owned(), serde_json::Value::String(id.to_string()));
+    }
+    if let Some(d) = draft.due_date {
+        obj.insert("dueDate".to_owned(), serde_json::Value::String(d.format("%Y-%m-%d").to_string()));
+    }
+    if let Some(t) = draft.due_time {
+        obj.insert("dueTime".to_owned(), serde_json::Value::String(format!("{:02}:{:02}", t.hour(), t.minute())));
+    }
+    if let Some(d) = draft.end_date {
+        obj.insert("endDate".to_owned(), serde_json::Value::String(d.format("%Y-%m-%d").to_string()));
+    }
+    if let Some(t) = draft.end_time {
+        obj.insert("endTime".to_owned(), serde_json::Value::String(format!("{:02}:{:02}", t.hour(), t.minute())));
+    }
+    if let Some(d) = draft.start_date {
+        obj.insert("startDate".to_owned(), serde_json::Value::String(d.format("%Y-%m-%d").to_string()));
+    }
+    if let Some(rep) = &draft.repeat {
+        obj.insert("repeat".to_owned(), serde_json::Value::String(rep.to_string()));
+    }
+    if !draft.reminders.is_empty() {
+        obj.insert(
+            "reminders".to_owned(),
+            serde_json::Value::Array(draft.reminders.iter().copied().map(serde_json::Value::from).collect()),
+        );
+    }
+    if !draft.tags.is_empty() {
+        obj.insert(
+            "tags".to_owned(),
+            serde_json::Value::Array(draft.tags.iter().cloned().map(serde_json::Value::String).collect()),
+        );
+    }
+    if !draft.checklist.is_empty() {
+        obj.insert(
+            "checklist".to_owned(),
+            serde_json::Value::Array(
+                draft
+                    .checklist
+                    .iter()
+                    .map(|(title, completed)| serde_json::json!({ "title": title, "completed": completed }))
+                    .collect(),
+            ),
+        );
+    }
+    if let Some(loc) = &draft.location {
+        obj.insert("location".to_owned(), serde_json::Value::String(loc.clone()));
+    }
+    if let Some(tz) = &draft.timezone {
+        obj.insert("timezone".to_owned(), serde_json::Value::String(tz.clone()));
+    }
+    if draft.is_floating {
+        obj.insert("isFloating".to_owned(), serde_json::Value::Bool(true));
+    }
+    if draft.constant_reminder {
+        obj.insert("constantReminder".to_owned(), serde_json::Value::Bool(true));
+    }
+    serde_json::Value::Object(obj)
+}
+
+fn parse_hook_date(s: &str) -> Result<NaiveDate> {
+    NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d")
+        .with_context(|| format!("invalid date {s:?}, expected YYYY-MM-DD"))
+}
+
+fn parse_hook_time(s: &str) -> Result<NaiveTime> {
+    let trimmed = s.trim();
+    NaiveTime::parse_from_str(trimmed, "%H:%M")
+        .or_else(|_| NaiveTime::parse_from_str(trimmed, "%H:%M:%S"))
+        .with_context(|| format!("invalid time {s:?}, expected HH:MM"))
+}
+
+fn parse_hook_priority(v: &serde_json::Value) -> Result<Priority> {
+    if let Some(s) = v.as_str() {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "none" | "" => Ok(Priority::None),
+            "low" => Ok(Priority::Low),
+            "medium" | "med" => Ok(Priority::Medium),
+            "high" => Ok(Priority::High),
+            other => bail!("invalid priority {other:?}"),
+        }
+    } else if let Some(n) = v.as_i64() {
+        Ok(Priority::from_i64(n))
+    } else {
+        bail!("priority must be a string or integer")
+    }
+}
+
+/// Parses a plugin-modified `beforeTaskCreate` JSON payload into `(TaskDraft, top)`.
+pub fn parse_task_draft_from_hook_json(
+    input: &serde_json::Value,
+    default_top: bool,
+) -> Result<(TaskDraft, bool)> {
+    if let Some(title) = input.as_str() {
+        let trimmed = title.trim();
+        ensure!(!trimmed.is_empty(), "task title must not be empty");
+        return Ok((
+            TaskDraft {
+                title: trimmed.to_owned(),
+                ..Default::default()
+            },
+            default_top,
+        ));
+    }
+    let obj = input
+        .as_object()
+        .context("task draft must be a string or object")?;
+    let title = obj
+        .get("title")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .context("task title must not be empty")?
+        .to_owned();
+
+    let mut draft = TaskDraft {
+        title,
+        ..Default::default()
+    };
+    if let Some(notes) = obj.get("notes").and_then(serde_json::Value::as_str) {
+        draft.notes = notes.to_owned();
+    }
+    if let Some(list_id) = obj.get("listId").and_then(serde_json::Value::as_str)
+        && !list_id.trim().is_empty()
+    {
+        draft.list_id = Some(
+            list_id
+                .trim()
+                .parse::<Id>()
+                .with_context(|| format!("invalid listId {list_id:?}"))?,
+        );
+    }
+    if let Some(section_id) = obj.get("sectionId").and_then(serde_json::Value::as_str)
+        && !section_id.trim().is_empty()
+    {
+        draft.section_id = Some(
+            section_id
+                .trim()
+                .parse::<Id>()
+                .with_context(|| format!("invalid sectionId {section_id:?}"))?,
+        );
+    }
+    if let Some(kind) = obj.get("kind").and_then(serde_json::Value::as_str) {
+        draft.kind = Kind::parse(kind);
+    }
+    if let Some(prio) = obj.get("priority")
+        && !prio.is_null()
+    {
+        draft.priority = parse_hook_priority(prio)?;
+    }
+    if let Some(d) = obj.get("dueDate").and_then(serde_json::Value::as_str)
+        && !d.trim().is_empty()
+    {
+        draft.due_date = Some(parse_hook_date(d)?);
+    }
+    if let Some(t) = obj.get("dueTime").and_then(serde_json::Value::as_str)
+        && !t.trim().is_empty()
+    {
+        draft.due_time = Some(parse_hook_time(t)?);
+    }
+    if let Some(d) = obj.get("endDate").and_then(serde_json::Value::as_str)
+        && !d.trim().is_empty()
+    {
+        draft.end_date = Some(parse_hook_date(d)?);
+    }
+    if let Some(t) = obj.get("endTime").and_then(serde_json::Value::as_str)
+        && !t.trim().is_empty()
+    {
+        draft.end_time = Some(parse_hook_time(t)?);
+    }
+    if let Some(d) = obj.get("startDate").and_then(serde_json::Value::as_str)
+        && !d.trim().is_empty()
+    {
+        draft.start_date = Some(parse_hook_date(d)?);
+    }
+    if let Some(b) = obj.get("scheduleBucket").and_then(serde_json::Value::as_str) {
+        draft.schedule_bucket = match b.trim().to_ascii_lowercase().as_str() {
+            "none" | "" => ScheduleBucket::None,
+            "evening" => ScheduleBucket::Evening,
+            "someday" => ScheduleBucket::Someday,
+            other => bail!("invalid scheduleBucket {other:?}"),
+        };
+    }
+    if let Some(rep) = obj.get("repeat").and_then(serde_json::Value::as_str)
+        && !rep.trim().is_empty()
+    {
+        draft.repeat = Some(
+            Recurrence::from_str(rep).map_err(|e| anyhow!("invalid repeat rule: {e}"))?,
+        );
+    }
+    if let Some(tags) = obj.get("tags").and_then(serde_json::Value::as_array) {
+        draft.tags = tags
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .collect();
+    }
+    if let Some(checklist) = obj.get("checklist").and_then(serde_json::Value::as_array) {
+        for item in checklist {
+            if let Some(text) = item.as_str() {
+                draft.checklist.push((text.to_owned(), false));
+            } else if let Some(item_obj) = item.as_object()
+                && let Some(title) = item_obj.get("title").and_then(serde_json::Value::as_str)
+            {
+                let done = item_obj
+                    .get("completed")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                draft.checklist.push((title.to_owned(), done));
+            }
+        }
+    }
+    if let Some(loc) = obj.get("location").and_then(serde_json::Value::as_str) {
+        draft.location = Some(loc.to_owned());
+    }
+    if let Some(tz) = obj.get("timezone").and_then(serde_json::Value::as_str) {
+        draft.timezone = Some(tz.to_owned());
+    }
+    if let Some(fl) = obj.get("isFloating").and_then(serde_json::Value::as_bool) {
+        draft.is_floating = fl;
+    }
+    if let Some(cr) = obj.get("constantReminder").and_then(serde_json::Value::as_bool) {
+        draft.constant_reminder = cr;
+    }
+    if let Some(rems) = obj.get("reminders").and_then(serde_json::Value::as_array) {
+        draft.reminders = rems.iter().filter_map(serde_json::Value::as_i64).collect();
+    }
+    let top = obj
+        .get("top")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(default_top);
+    Ok((draft, top))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -414,5 +754,31 @@ mod tests {
         assert_eq!(json["title"], "Hook payload");
         assert_eq!(json["scheduleBucket"], "none");
         assert_eq!(json["completed"], false);
+
+        // Verify task_draft_to_hook_json <-> parse_task_draft_from_hook_json round-trip.
+        let draft = TaskDraft {
+            title: "Draft payload".into(),
+            notes: "Details".into(),
+            priority: Priority::High,
+            due_date: NaiveDate::from_ymd_opt(2026, 12, 5),
+            due_time: NaiveTime::from_hms_opt(14, 30, 0),
+            start_date: NaiveDate::from_ymd_opt(2026, 12, 1),
+            schedule_bucket: ScheduleBucket::Evening,
+            tags: vec!["ops".into()],
+            reminders: vec![0, 15],
+            ..Default::default()
+        };
+        let draft_json = task_draft_to_hook_json(&draft, false);
+        let (parsed, top) = parse_task_draft_from_hook_json(&draft_json, true).unwrap();
+        assert!(!top);
+        assert_eq!(parsed.title, "Draft payload");
+        assert_eq!(parsed.notes, "Details");
+        assert_eq!(parsed.priority, Priority::High);
+        assert_eq!(parsed.due_date, draft.due_date);
+        assert_eq!(parsed.due_time, draft.due_time);
+        assert_eq!(parsed.start_date, draft.start_date);
+        assert_eq!(parsed.schedule_bucket, ScheduleBucket::Evening);
+        assert_eq!(parsed.tags, vec!["ops".to_owned()]);
+        assert_eq!(parsed.reminders, vec![0, 15]);
     }
 }

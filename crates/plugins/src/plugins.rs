@@ -15,8 +15,9 @@ pub mod vault;
 pub use api::{LogEntry, LogLevel, PluginUiEffect, PromptReplyValue, ToastLevel};
 pub use http::{HttpPool, HttpRequest, HttpResponse, execute_http_request, is_ip_blocked};
 pub use oauth::{
-    OAuthAuthorizeRequest, OAuthRefreshRequest, OAuthTokenAuth, OAuthTokenSummary,
-    build_redirect_uri, run_oauth_authorize, run_oauth_refresh,
+    OAuthAuthorizeOptions, OAuthAuthorizeRequest, OAuthRefreshRequest, OAuthTokenAuth,
+    OAuthTokenSummary, build_redirect_uri, run_oauth_authorize, run_oauth_authorize_with_options,
+    run_oauth_refresh,
 };
 pub use manifest::{
     CURRENT_API_VERSION, CommandContribution, ImporterContribution, LoadedManifest,

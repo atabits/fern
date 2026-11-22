@@ -467,25 +467,11 @@ impl SettingsWindow {
     }
 
     fn dismiss_plugin_settings_escape(&mut self, cx: &mut Context<Self>) -> bool {
-        // TODO(land-all): Replace body with `self.plugin_settings.update(cx, |view, cx| view.handle_escape(cx))`
-        // once `plugin-ui-fix`'s `PluginSettingsView::handle_escape` merges so permission modals
-        // are dismissed before embedded plugin pages.
-        self.plugin_settings.update(cx, |view, cx| {
-            if view.active_plugin_page_id().is_some() {
-                view.close_plugin_page(cx);
-                true
-            } else {
-                false
-            }
-        })
+        self.plugin_settings.update(cx, |view, cx| view.handle_escape(cx))
     }
 
     pub fn dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(modal) = cx
-            .try_global::<desktop_common::plugin_bus::PluginBus>()
-            .and_then(|bus| bus.active_modal.clone())
-        {
-            crate::app_view::dismiss_plugin_modal(&modal, cx);
+        if crate::app_view::dismiss_plugin_modal(cx) {
             window.focus(&self.focus_handle, cx);
             cx.notify();
         } else if self.pending_restore.take().is_some() {

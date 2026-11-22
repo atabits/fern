@@ -1362,6 +1362,174 @@ const MIGRATIONS: &[&str] = &[
         DELETE FROM plugin_entity_meta WHERE entity_type = 'countdown' AND entity_id = OLD.id;
     END;
     ",
+    // Ensure tag, checklist, reminder, and parent edits emit `task.updated` into `plugin_outbox`
+    // (and checklist deletions refresh `tasks.modified_at`).
+    "
+    DROP TRIGGER IF EXISTS outbox_tasks_updated;
+    DROP TRIGGER IF EXISTS outbox_task_tags_insert;
+    DROP TRIGGER IF EXISTS outbox_task_tags_update;
+    DROP TRIGGER IF EXISTS outbox_task_tags_delete;
+    DROP TRIGGER IF EXISTS outbox_checklist_insert;
+    DROP TRIGGER IF EXISTS outbox_checklist_update;
+    DROP TRIGGER IF EXISTS outbox_checklist_delete;
+    DROP TRIGGER IF EXISTS checklist_deleted;
+
+    CREATE TRIGGER checklist_deleted AFTER DELETE ON checklist_items
+    WHEN EXISTS (SELECT 1 FROM tasks WHERE id = OLD.task_id)
+    BEGIN
+        UPDATE tasks SET modified_at = CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) WHERE id = OLD.task_id;
+    END;
+
+    CREATE TRIGGER outbox_tasks_updated AFTER UPDATE OF
+        title, notes, priority, due_date, due_time, end_date, end_time,
+        list_id, section_id, parent_id, repeat, reminders, wont_do_at, start_date, schedule_bucket ON tasks
+    WHEN (
+            OLD.title IS NOT NEW.title
+            OR OLD.notes IS NOT NEW.notes
+            OR OLD.priority IS NOT NEW.priority
+            OR OLD.due_date IS NOT NEW.due_date
+            OR OLD.due_time IS NOT NEW.due_time
+            OR OLD.end_date IS NOT NEW.end_date
+            OR OLD.end_time IS NOT NEW.end_time
+            OR OLD.list_id IS NOT NEW.list_id
+            OR OLD.section_id IS NOT NEW.section_id
+            OR OLD.parent_id IS NOT NEW.parent_id
+            OR OLD.repeat IS NOT NEW.repeat
+            OR OLD.reminders IS NOT NEW.reminders
+            OR OLD.wont_do_at IS NOT NEW.wont_do_at
+            OR OLD.start_date IS NOT NEW.start_date
+            OR OLD.schedule_bucket IS NOT NEW.schedule_bucket
+        )
+        AND NOT EXISTS (
+            SELECT 1 FROM settings
+            WHERE (key = 'plugins_safe_mode' AND value = '1')
+               OR (key = 'plugins_outbox_paused' AND value = '1')
+        )
+    BEGIN
+        INSERT INTO plugin_outbox (event_kind, entity_id, origin_plugin, depth, at)
+        VALUES (
+            'task.updated',
+            NEW.id,
+            CASE WHEN EXISTS (SELECT 1 FROM sync_applying) THEN '__sync__' ELSE (SELECT plugin_id FROM plugin_write_ctx LIMIT 1) END,
+            COALESCE((SELECT depth FROM plugin_write_ctx LIMIT 1), 0),
+            CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)
+        );
+    END;
+
+    CREATE TRIGGER outbox_task_tags_insert AFTER INSERT ON task_tags
+    WHEN EXISTS (SELECT 1 FROM tasks WHERE id = NEW.task_id AND deleted_at IS NULL)
+        AND NOT EXISTS (
+            SELECT 1 FROM settings
+            WHERE (key = 'plugins_safe_mode' AND value = '1')
+               OR (key = 'plugins_outbox_paused' AND value = '1')
+        )
+    BEGIN
+        INSERT INTO plugin_outbox (event_kind, entity_id, origin_plugin, depth, at)
+        VALUES (
+            'task.updated',
+            NEW.task_id,
+            CASE WHEN EXISTS (SELECT 1 FROM sync_applying) THEN '__sync__' ELSE (SELECT plugin_id FROM plugin_write_ctx LIMIT 1) END,
+            COALESCE((SELECT depth FROM plugin_write_ctx LIMIT 1), 0),
+            CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)
+        );
+    END;
+
+    CREATE TRIGGER outbox_task_tags_update AFTER UPDATE OF tag ON task_tags
+    WHEN OLD.tag IS NOT NEW.tag
+        AND EXISTS (SELECT 1 FROM tasks WHERE id = NEW.task_id AND deleted_at IS NULL)
+        AND NOT EXISTS (
+            SELECT 1 FROM settings
+            WHERE (key = 'plugins_safe_mode' AND value = '1')
+               OR (key = 'plugins_outbox_paused' AND value = '1')
+        )
+    BEGIN
+        INSERT INTO plugin_outbox (event_kind, entity_id, origin_plugin, depth, at)
+        VALUES (
+            'task.updated',
+            NEW.task_id,
+            CASE WHEN EXISTS (SELECT 1 FROM sync_applying) THEN '__sync__' ELSE (SELECT plugin_id FROM plugin_write_ctx LIMIT 1) END,
+            COALESCE((SELECT depth FROM plugin_write_ctx LIMIT 1), 0),
+            CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)
+        );
+    END;
+
+    CREATE TRIGGER outbox_task_tags_delete AFTER DELETE ON task_tags
+    WHEN EXISTS (SELECT 1 FROM tasks WHERE id = OLD.task_id AND deleted_at IS NULL)
+        AND NOT EXISTS (
+            SELECT 1 FROM settings
+            WHERE (key = 'plugins_safe_mode' AND value = '1')
+               OR (key = 'plugins_outbox_paused' AND value = '1')
+        )
+    BEGIN
+        INSERT INTO plugin_outbox (event_kind, entity_id, origin_plugin, depth, at)
+        VALUES (
+            'task.updated',
+            OLD.task_id,
+            CASE WHEN EXISTS (SELECT 1 FROM sync_applying) THEN '__sync__' ELSE (SELECT plugin_id FROM plugin_write_ctx LIMIT 1) END,
+            COALESCE((SELECT depth FROM plugin_write_ctx LIMIT 1), 0),
+            CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)
+        );
+    END;
+
+    CREATE TRIGGER outbox_checklist_insert AFTER INSERT ON checklist_items
+    WHEN EXISTS (SELECT 1 FROM tasks WHERE id = NEW.task_id AND deleted_at IS NULL)
+        AND NOT EXISTS (
+            SELECT 1 FROM settings
+            WHERE (key = 'plugins_safe_mode' AND value = '1')
+               OR (key = 'plugins_outbox_paused' AND value = '1')
+        )
+    BEGIN
+        INSERT INTO plugin_outbox (event_kind, entity_id, origin_plugin, depth, at)
+        VALUES (
+            'task.updated',
+            NEW.task_id,
+            CASE WHEN EXISTS (SELECT 1 FROM sync_applying) THEN '__sync__' ELSE (SELECT plugin_id FROM plugin_write_ctx LIMIT 1) END,
+            COALESCE((SELECT depth FROM plugin_write_ctx LIMIT 1), 0),
+            CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)
+        );
+    END;
+
+    CREATE TRIGGER outbox_checklist_update AFTER UPDATE OF title, completed_at, sort_order ON checklist_items
+    WHEN (
+            OLD.title IS NOT NEW.title
+            OR OLD.completed_at IS NOT NEW.completed_at
+            OR OLD.sort_order IS NOT NEW.sort_order
+        )
+        AND EXISTS (SELECT 1 FROM tasks WHERE id = NEW.task_id AND deleted_at IS NULL)
+        AND NOT EXISTS (
+            SELECT 1 FROM settings
+            WHERE (key = 'plugins_safe_mode' AND value = '1')
+               OR (key = 'plugins_outbox_paused' AND value = '1')
+        )
+    BEGIN
+        INSERT INTO plugin_outbox (event_kind, entity_id, origin_plugin, depth, at)
+        VALUES (
+            'task.updated',
+            NEW.task_id,
+            CASE WHEN EXISTS (SELECT 1 FROM sync_applying) THEN '__sync__' ELSE (SELECT plugin_id FROM plugin_write_ctx LIMIT 1) END,
+            COALESCE((SELECT depth FROM plugin_write_ctx LIMIT 1), 0),
+            CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)
+        );
+    END;
+
+    CREATE TRIGGER outbox_checklist_delete AFTER DELETE ON checklist_items
+    WHEN EXISTS (SELECT 1 FROM tasks WHERE id = OLD.task_id AND deleted_at IS NULL)
+        AND NOT EXISTS (
+            SELECT 1 FROM settings
+            WHERE (key = 'plugins_safe_mode' AND value = '1')
+               OR (key = 'plugins_outbox_paused' AND value = '1')
+        )
+    BEGIN
+        INSERT INTO plugin_outbox (event_kind, entity_id, origin_plugin, depth, at)
+        VALUES (
+            'task.updated',
+            OLD.task_id,
+            CASE WHEN EXISTS (SELECT 1 FROM sync_applying) THEN '__sync__' ELSE (SELECT plugin_id FROM plugin_write_ctx LIMIT 1) END,
+            COALESCE((SELECT depth FROM plugin_write_ctx LIMIT 1), 0),
+            CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)
+        );
+    END;
+    ",
 ];
 
 /// Current SQLite schema version (`PRAGMA user_version`).

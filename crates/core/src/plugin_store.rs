@@ -1028,4 +1028,102 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         Ok(())
     }
+
+    #[test]
+    fn plugin_outbox_emits_task_updated_for_tags_checklists_reminders_and_parent() -> Result<()> {
+        let store = Store::open_in_memory()?;
+        let parent = store.add_task("Parent")?;
+        let task = store.add_task("Tagged task")?;
+        store.trim_plugin_outbox(0)?;
+
+        // 1. Adding and removing tags emit task.updated.
+        store.set_tags(task.id, &["дом".into()])?;
+        let evs = store.drain_plugin_outbox(20)?;
+        assert!(
+            evs.iter().any(|e| e.event_kind == "task.updated" && e.entity_id == task.id.to_string()),
+            "set_tags add must emit task.updated: {evs:?}"
+        );
+        store.trim_plugin_outbox(0)?;
+
+        store.batch_add_tag(&[task.id], "работа")?;
+        let evs = store.drain_plugin_outbox(20)?;
+        assert!(
+            evs.iter().any(|e| e.event_kind == "task.updated" && e.entity_id == task.id.to_string()),
+            "batch_add_tag must emit task.updated: {evs:?}"
+        );
+        store.trim_plugin_outbox(0)?;
+
+        store.batch_remove_tag(&[task.id], "работа")?;
+        let evs = store.drain_plugin_outbox(20)?;
+        assert!(
+            evs.iter().any(|e| e.event_kind == "task.updated" && e.entity_id == task.id.to_string()),
+            "batch_remove_tag must emit task.updated: {evs:?}"
+        );
+        store.trim_plugin_outbox(0)?;
+
+        // Renaming a tag emits task.updated for affected tasks.
+        store.update_tag("дом", "квартира", None, None)?;
+        let evs = store.drain_plugin_outbox(20)?;
+        assert!(
+            evs.iter().any(|e| e.event_kind == "task.updated" && e.entity_id == task.id.to_string()),
+            "update_tag rename must emit task.updated: {evs:?}"
+        );
+        store.trim_plugin_outbox(0)?;
+
+        // 2. Reminders and parent_id changes emit task.updated.
+        store.set_reminders(task.id, &[15])?;
+        let evs = store.drain_plugin_outbox(20)?;
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].event_kind, "task.updated");
+        store.trim_plugin_outbox(0)?;
+
+        store.link_parent(task.id, parent.id)?;
+        let evs = store.drain_plugin_outbox(20)?;
+        assert!(
+            evs.iter().any(|e| e.event_kind == "task.updated" && e.entity_id == task.id.to_string()),
+            "link_parent must emit task.updated: {evs:?}"
+        );
+        store.trim_plugin_outbox(0)?;
+
+        // 3. Checklist insert / update / delete emit task.updated.
+        let item = store.add_checklist_item(task.id, "Step 1", None)?;
+        let evs = store.drain_plugin_outbox(20)?;
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].event_kind, "task.updated");
+        store.trim_plugin_outbox(0)?;
+
+        store.set_checklist_item_completed(item.id, true)?;
+        let evs = store.drain_plugin_outbox(20)?;
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].event_kind, "task.updated");
+        store.trim_plugin_outbox(0)?;
+
+        store.delete_checklist_item(item.id)?;
+        let evs = store.drain_plugin_outbox(20)?;
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].event_kind, "task.updated");
+        store.trim_plugin_outbox(0)?;
+
+        // 4. Purging a task with tags/checklist emits task.deleted, not spurious task.updated.
+        store.add_checklist_item(task.id, "Cleanup check", None)?;
+        store.trim_plugin_outbox(0)?;
+        store.purge_task(task.id)?;
+        let evs = store.drain_plugin_outbox(20)?;
+        assert!(
+            evs.iter().any(|e| e.event_kind == "task.deleted" && e.entity_id == task.id.to_string()),
+            "purge_task must emit task.deleted: {evs:?}"
+        );
+        assert!(
+            !evs.iter().any(|e| e.event_kind == "task.updated" && e.entity_id == task.id.to_string()),
+            "cascade delete on purge_task must not emit spurious task.updated: {evs:?}"
+        );
+
+        // 5. Safe Mode suppresses tag outbox events too.
+        let t2 = store.add_task("Safe mode tag task")?;
+        store.trim_plugin_outbox(0)?;
+        store.set_setting(PLUGIN_SAFE_MODE_SETTING_KEY, "1")?;
+        store.set_tags(t2.id, &["muted".into()])?;
+        assert!(store.drain_plugin_outbox(20)?.is_empty());
+        Ok(())
+    }
 }

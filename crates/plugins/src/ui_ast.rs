@@ -5,6 +5,11 @@ use serde::{Deserialize, Serialize};
 
 /// Maximum permitted raw SVG payload size (256 KiB).
 pub const MAX_SVG_BYTES: usize = 256 * 1024;
+const MAX_SVG_NODES: u32 = 4096;
+const MAX_SVG_DEPTH: usize = 64;
+const SVG_NS: &str = "http://www.w3.org/2000/svg";
+const XLINK_NS: &str = "http://www.w3.org/1999/xlink";
+const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
 
 /// Opaque callback identifier mapped to a JS closure inside the plugin's worker context.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -436,339 +441,351 @@ impl UiNode {
 
 /// Validates and sanitizes an untrusted SVG string before it reaches `usvg`/`resvg`.
 ///
-/// Rejects payloads over [`MAX_SVG_BYTES`] (256 KiB) and strips `<!ENTITY>` / `<!DOCTYPE>`,
-/// `<script>` / `<foreignObject>`, inline `on*` event attributes, external `<image>` / `<feImage>`,
-/// and `javascript:` URIs.
+/// Parses strictly with `roxmltree` (`allow_dtd: false`) and rebuilds clean SVG XML using local
+/// XML element/attribute names:
+/// - Rejects payloads over [`MAX_SVG_BYTES`] (256 KiB), gzip/SVGZ magic bytes, NUL/control bytes,
+///   DTDs (`<!DOCTYPE>`/`<!ENTITY>`), XML processing instructions, non-`<svg>` roots, and
+///   excessive nesting/node counts.
+/// - Strips comments, foreign-namespace elements/attributes, `<script>`, `<foreignObject>`,
+///   `<image>`, `<feImage>`, `<style>`, `<animate*>`, `<set>`, `<a>`, all `on*` event attributes,
+///   any `href`/`xlink:href`/`src` attribute not starting with `#`, and any external `url(...)`.
 pub fn sanitize_svg(raw: &str) -> Result<String> {
     ensure!(
         raw.len() <= MAX_SVG_BYTES,
         "SVG exceeds maximum size of {MAX_SVG_BYTES} bytes"
     );
-    let cleaned = strip_dangerous_svg_constructs(raw);
-    let lower = cleaned.to_ascii_lowercase();
-    if !lower.contains("<svg") {
-        bail!("SVG content missing <svg root element");
+    let trimmed = raw.strip_prefix('\u{feff}').unwrap_or(raw).trim();
+    ensure!(!trimmed.is_empty(), "SVG content is empty");
+    ensure!(
+        !trimmed.as_bytes().starts_with(&[0x1f, 0x8b]),
+        "compressed SVGZ payloads are forbidden"
+    );
+    ensure!(
+        !trimmed
+            .bytes()
+            .any(|b| b < 0x20 && !matches!(b, b'\t' | b'\n' | b'\r')),
+        "SVG contains forbidden control bytes"
+    );
+
+    let doc = roxmltree::Document::parse_with_options(
+        trimmed,
+        roxmltree::ParsingOptions {
+            allow_dtd: false,
+            nodes_limit: MAX_SVG_NODES,
+            ..roxmltree::ParsingOptions::default()
+        },
+    )
+    .map_err(|err| anyhow::anyhow!("invalid or disallowed SVG XML: {err}"))?;
+
+    if doc.descendants().any(|n| n.is_pi()) {
+        bail!("XML processing instructions are forbidden in SVG");
     }
-    Ok(cleaned)
+
+    let root = doc.root_element();
+    ensure!(
+        root.tag_name().name() == "svg",
+        "SVG content missing <svg> root element"
+    );
+    ensure!(
+        is_allowed_svg_ns(root.tag_name().namespace()),
+        "SVG root element uses a disallowed XML namespace"
+    );
+
+    let mut uses_xlink = false;
+    let mut root_attrs = String::new();
+    write_sanitized_attributes(root, &mut root_attrs, &mut uses_xlink);
+
+    let mut body = String::new();
+    for child in root.children() {
+        write_sanitized_node(child, 1, &mut body, &mut uses_xlink)?;
+    }
+
+    let mut out = String::with_capacity(trimmed.len().min(MAX_SVG_BYTES));
+    out.push_str("<svg xmlns=\"http://www.w3.org/2000/svg\"");
+    if uses_xlink {
+        out.push_str(" xmlns:xlink=\"http://www.w3.org/1999/xlink\"");
+    }
+    out.push_str(&root_attrs);
+    if body.is_empty() {
+        out.push_str("/>");
+    } else {
+        out.push('>');
+        out.push_str(&body);
+        out.push_str("</svg>");
+    }
+
+    ensure!(
+        out.len() <= MAX_SVG_BYTES,
+        "sanitized SVG exceeds maximum size of {MAX_SVG_BYTES} bytes"
+    );
+    Ok(out)
 }
 
-fn strip_dangerous_svg_constructs(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let bytes = input.as_bytes();
+fn is_allowed_svg_ns(ns: Option<&str>) -> bool {
+    matches!(ns, None | Some(SVG_NS))
+}
+
+fn is_safe_xml_ident(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+}
+
+fn is_forbidden_svg_element(local_lower: &str) -> bool {
+    local_lower.starts_with("animate")
+        || matches!(
+            local_lower,
+            "script"
+                | "foreignobject"
+                | "image"
+                | "feimage"
+                | "style"
+                | "set"
+                | "discard"
+                | "mpath"
+                | "handler"
+                | "a"
+                | "iframe"
+                | "object"
+                | "embed"
+                | "audio"
+                | "video"
+                | "canvas"
+                | "applet"
+                | "link"
+                | "meta"
+                | "base"
+                | "metadata"
+        )
+}
+
+fn is_safe_fragment_href(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    let Some(id) = trimmed.strip_prefix('#') else {
+        return false;
+    };
+    !id.is_empty()
+        && id.len() <= 256
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':'))
+}
+
+fn has_only_safe_urls(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    if lower.contains("javascript:")
+        || lower.contains("vbscript:")
+        || lower.contains("data:")
+        || lower.contains("file:")
+        || lower.contains("\\\\")
+    {
+        return false;
+    }
+
+    let bytes = lower.as_bytes();
     let mut i = 0;
-
     while i < bytes.len() {
-        if bytes[i] != b'<' {
-            let ch_len = utf8_char_len(bytes[i]);
-            let end = (i + ch_len).min(bytes.len());
-            out.push_str(&input[i..end]);
-            i = end;
-            continue;
-        }
-
-        let rest = &input[i..];
-        let rest_lower_prefix = prefix_ascii_lower(rest, 32);
-
-        // Strip <!ENTITY ...> and <!DOCTYPE ...> (including [...] internal subset).
-        if rest_lower_prefix.starts_with("<!entity")
-            || rest_lower_prefix.starts_with("<!doctype")
-        {
-            i += skip_declaration(rest);
-            continue;
-        }
-
-        // Strip dangerous block tags (<script>, <foreignObject>).
-        if let Some(tag_len) = match_block_tag_start(&rest_lower_prefix, "script")
-            .or_else(|| match_block_tag_start(&rest_lower_prefix, "foreignobject"))
-        {
-            let tag_name = if rest_lower_prefix.starts_with("<script") {
-                "script"
-            } else {
-                "foreignobject"
-            };
-            let _ = tag_len;
-            i += skip_element_block(rest, tag_name);
-            continue;
-        }
-
-        // Strip external <image ...> / <feImage ...> tags.
-        if match_tag_name_start(&rest_lower_prefix, "image")
-            || match_tag_name_start(&rest_lower_prefix, "feimage")
-        {
-            let tag_end = find_tag_end(rest);
-            let tag_slice = &rest[..tag_end];
-            if tag_has_external_ref(tag_slice) {
-                let tag_name = if match_tag_name_start(&rest_lower_prefix, "image") {
-                    "image"
-                } else {
-                    "feimage"
+        if bytes[i..].starts_with(b"url") {
+            let prev_ok = i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'-' || bytes[i - 1] == b'_');
+            let mut j = i + 3;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if prev_ok && j < bytes.len() && bytes[j] == b'(' {
+                let Some(rel_close) = lower[j + 1..].find(')') else {
+                    return false;
                 };
-                if tag_slice.trim_end().ends_with("/>") {
-                    i += tag_end;
-                } else {
-                    i += skip_element_block(rest, tag_name);
+                let inner = value[j + 1..j + 1 + rel_close].trim();
+                let unquoted = inner
+                    .strip_prefix('"')
+                    .and_then(|s| s.strip_suffix('"'))
+                    .or_else(|| inner.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+                    .unwrap_or(inner)
+                    .trim();
+                if !is_safe_fragment_href(unquoted) {
+                    return false;
                 }
+                i = j + 1 + rel_close + 1;
                 continue;
             }
         }
-
-        // Normal tag: strip any `on*=` attributes and `javascript:`/`vbscript:` href/src attributes.
-        let tag_end = find_tag_end(rest);
-        let tag_slice = &rest[..tag_end];
-        out.push_str(&sanitize_tag_attributes(tag_slice));
-        i += tag_end;
-    }
-
-    out
-}
-
-fn utf8_char_len(first_byte: u8) -> usize {
-    match first_byte {
-        0..=0x7F => 1,
-        0xC2..=0xDF => 2,
-        0xE0..=0xEF => 3,
-        0xF0..=0xF4 => 4,
-        _ => 1,
-    }
-}
-
-fn prefix_ascii_lower(s: &str, max_bytes: usize) -> String {
-    let mut out = String::new();
-    for ch in s.chars() {
-        if out.len() >= max_bytes {
-            break;
-        }
-        out.push(ch.to_ascii_lowercase());
-    }
-    out
-}
-
-fn match_tag_name_start(lower_prefix: &str, tag: &str) -> bool {
-    let Some(after) = lower_prefix.strip_prefix('<') else {
-        return false;
-    };
-    let Some(tail) = after.strip_prefix(tag) else {
-        return false;
-    };
-    tail.is_empty()
-        || tail.starts_with(|c: char| c.is_ascii_whitespace() || c == '>' || c == '/')
-}
-
-fn match_block_tag_start(lower_prefix: &str, tag: &str) -> Option<usize> {
-    if match_tag_name_start(lower_prefix, tag) {
-        Some(tag.len() + 1)
-    } else {
-        None
-    }
-}
-
-fn skip_declaration(rest: &str) -> usize {
-    let bytes = rest.as_bytes();
-    let mut i = 0;
-    let mut quote: Option<u8> = None;
-    let mut bracket_depth = 0usize;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if let Some(q) = quote {
-            if b == q {
-                quote = None;
-            }
-        } else {
-            match b {
-                b'"' | b'\'' => quote = Some(b),
-                b'[' => bracket_depth += 1,
-                b']' => bracket_depth = bracket_depth.saturating_sub(1),
-                b'>' if bracket_depth == 0 => return i + 1,
-                _ => {}
-            }
-        }
         i += 1;
     }
-    bytes.len()
+    true
 }
 
-fn find_tag_end(rest: &str) -> usize {
-    let bytes = rest.as_bytes();
-    let mut i = 0;
-    let mut quote: Option<u8> = None;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if let Some(q) = quote {
-            if b == q {
-                quote = None;
-            }
-        } else if b == b'"' || b == b'\'' {
-            quote = Some(b);
-        } else if b == b'>' {
-            return i + 1;
-        }
-        i += 1;
+fn is_safe_inline_style(value: &str) -> bool {
+    if value.contains('\\') || value.contains("/*") {
+        return false;
     }
-    bytes.len()
-}
-
-fn skip_element_block(rest: &str, tag_name_lower: &str) -> usize {
-    let open_end = find_tag_end(rest);
-    if rest[..open_end].trim_end().ends_with("/>") {
-        return open_end;
-    }
-    let close_needle = format!("</{tag_name_lower}");
-    let mut i = open_end;
-    while i < rest.len() {
-        let tail = &rest[i..];
-        if let Some(pos) = tail.find('<') {
-            i += pos;
-            let candidate = prefix_ascii_lower(&rest[i..], close_needle.len() + 4);
-            if let Some(after) = candidate.strip_prefix(&close_needle)
-                && (after.is_empty()
-                    || after.starts_with(|c: char| c.is_ascii_whitespace() || c == '>'))
-            {
-                let close_end = find_tag_end(&rest[i..]);
-                return i + close_end;
-            }
-            i += 1;
-        } else {
-            return rest.len();
-        }
-    }
-    rest.len()
-}
-
-fn tag_has_external_ref(tag: &str) -> bool {
-    let attrs = parse_tag_attributes(tag);
-    attrs.into_iter().any(|(_, name, val)| {
-        let name_lower = name.to_ascii_lowercase();
-        if matches!(name_lower.as_str(), "href" | "xlink:href" | "src") {
-            let v = val.trim().to_ascii_lowercase();
-            !(v.is_empty() || v.starts_with('#') || v.starts_with("data:image/"))
-                || v.starts_with("data:image/svg")
-        } else {
-            false
-        }
-    })
-}
-
-fn sanitize_tag_attributes(tag: &str) -> String {
-    if !tag.contains('=') {
-        return tag.to_owned();
-    }
-    let bytes = tag.as_bytes();
-    let Some(first_ws) = bytes.iter().position(|b| b.is_ascii_whitespace()) else {
-        return tag.to_owned();
-    };
-    let head = &tag[..first_ws];
-    let self_closing = tag.trim_end().ends_with("/>");
-
-    let mut out = String::from(head);
-    for (_, name, raw_val_with_quotes) in parse_tag_attributes_raw(tag) {
-        let name_lower = name.to_ascii_lowercase();
-        if name_lower.starts_with("on") && name_lower.len() > 2 {
-            continue;
-        }
-        let unquoted = unquote_attr(raw_val_with_quotes).trim().to_ascii_lowercase();
-        if matches!(name_lower.as_str(), "href" | "xlink:href" | "src")
-            && (unquoted.starts_with("javascript:")
-                || unquoted.starts_with("vbscript:")
-                || unquoted.starts_with("data:text/html")
-                || unquoted.starts_with("http://")
-                || unquoted.starts_with("https://")
-                || unquoted.starts_with("//")
-                || unquoted.starts_with("file://"))
-        {
-            continue;
-        }
-        out.push(' ');
-        out.push_str(name);
-        if !raw_val_with_quotes.is_empty() {
-            out.push('=');
-            out.push_str(raw_val_with_quotes);
-        }
-    }
-    if self_closing {
-        out.push_str("/>");
-    } else if tag.trim_end().ends_with('>') {
-        out.push('>');
-    }
-    out
-}
-
-fn unquote_attr(val: &str) -> &str {
-    let trimmed = val.trim();
-    if (trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2)
-        || (trimmed.starts_with('\'') && trimmed.ends_with('\'') && trimmed.len() >= 2)
+    let lower = value.to_ascii_lowercase();
+    if lower.contains("@import")
+        || lower.contains("expression")
+        || lower.contains("behavior")
+        || lower.contains("-moz-binding")
     {
-        &trimmed[1..trimmed.len() - 1]
-    } else {
-        trimmed
+        return false;
+    }
+    has_only_safe_urls(value)
+}
+
+fn write_sanitized_node(
+    node: roxmltree::Node<'_, '_>,
+    depth: usize,
+    out: &mut String,
+    uses_xlink: &mut bool,
+) -> Result<()> {
+    ensure!(
+        depth <= MAX_SVG_DEPTH,
+        "SVG nesting exceeds maximum depth of {MAX_SVG_DEPTH}"
+    );
+    match node.node_type() {
+        roxmltree::NodeType::Comment | roxmltree::NodeType::Root => Ok(()),
+        roxmltree::NodeType::PI => bail!("XML processing instructions are forbidden in SVG"),
+        roxmltree::NodeType::Text => {
+            if let Some(text) = node.text() {
+                push_escaped_xml_text(out, text);
+            }
+            Ok(())
+        }
+        roxmltree::NodeType::Element => {
+            if !is_allowed_svg_ns(node.tag_name().namespace()) {
+                return Ok(());
+            }
+            let local = node.tag_name().name();
+            if !is_safe_xml_ident(local) {
+                return Ok(());
+            }
+            let local_lower = local.to_ascii_lowercase();
+            if is_forbidden_svg_element(&local_lower) {
+                return Ok(());
+            }
+
+            let mut attrs = String::new();
+            write_sanitized_attributes(node, &mut attrs, uses_xlink);
+
+            let mut children_buf = String::new();
+            for child in node.children() {
+                write_sanitized_node(child, depth + 1, &mut children_buf, uses_xlink)?;
+            }
+
+            out.push('<');
+            out.push_str(local);
+            out.push_str(&attrs);
+            if children_buf.is_empty() {
+                out.push_str("/>");
+            } else {
+                out.push('>');
+                out.push_str(&children_buf);
+                out.push_str("</");
+                out.push_str(local);
+                out.push('>');
+            }
+            Ok(())
+        }
     }
 }
 
-fn parse_tag_attributes(tag: &str) -> Vec<(usize, &str, String)> {
-    parse_tag_attributes_raw(tag)
-        .into_iter()
-        .map(|(pos, name, raw)| (pos, name, unquote_attr(raw).to_owned()))
-        .collect()
-}
-
-fn parse_tag_attributes_raw(tag: &str) -> Vec<(usize, &str, &str)> {
-    let bytes = tag.as_bytes();
-    let Some(mut i) = bytes.iter().position(|b| b.is_ascii_whitespace()) else {
-        return Vec::new();
-    };
-    let end = if tag.trim_end().ends_with("/>") {
-        tag.rfind("/>").unwrap_or(bytes.len())
-    } else if tag.trim_end().ends_with('>') {
-        tag.rfind('>').unwrap_or(bytes.len())
-    } else {
-        bytes.len()
-    };
-
-    let mut attrs = Vec::new();
-    while i < end {
-        while i < end && bytes[i].is_ascii_whitespace() {
-            i += 1;
-        }
-        if i >= end {
-            break;
-        }
-        let name_start = i;
-        while i < end && !bytes[i].is_ascii_whitespace() && bytes[i] != b'=' {
-            i += 1;
-        }
-        let name = &tag[name_start..i];
-        if name.is_empty() {
-            i += 1;
+fn write_sanitized_attributes(
+    node: roxmltree::Node<'_, '_>,
+    out: &mut String,
+    uses_xlink: &mut bool,
+) {
+    let mut emitted_names: Vec<String> = Vec::new();
+    for attr in node.attributes() {
+        let local = attr.name();
+        if !is_safe_xml_ident(local) {
             continue;
         }
-        while i < end && bytes[i].is_ascii_whitespace() {
-            i += 1;
+        let local_lower = local.to_ascii_lowercase();
+        if local_lower.starts_with("on") {
+            continue;
         }
-        if i < end && bytes[i] == b'=' {
-            i += 1;
-            while i < end && bytes[i].is_ascii_whitespace() {
-                i += 1;
+        let val = attr.value();
+
+        let (emitted_name, emitted_val) = match attr.namespace() {
+            None | Some(SVG_NS) => {
+                if local_lower == "href" || local_lower == "src" {
+                    let trimmed = val.trim();
+                    if !is_safe_fragment_href(trimmed) {
+                        continue;
+                    }
+                    (local.to_owned(), trimmed)
+                } else if local_lower == "style" {
+                    if !is_safe_inline_style(val) {
+                        continue;
+                    }
+                    (local.to_owned(), val)
+                } else {
+                    if !has_only_safe_urls(val) {
+                        continue;
+                    }
+                    (local.to_owned(), val)
+                }
             }
-            let val_start = i;
-            if i < end && (bytes[i] == b'"' || bytes[i] == b'\'') {
-                let q = bytes[i];
-                i += 1;
-                while i < end && bytes[i] != q {
-                    i += 1;
+            Some(XLINK_NS) => {
+                if local_lower != "href" {
+                    continue;
                 }
-                if i < end {
-                    i += 1;
+                let trimmed = val.trim();
+                if !is_safe_fragment_href(trimmed) {
+                    continue;
                 }
-            } else {
-                while i < end && !bytes[i].is_ascii_whitespace() {
-                    i += 1;
-                }
+                *uses_xlink = true;
+                ("xlink:href".to_owned(), trimmed)
             }
-            attrs.push((name_start, name, &tag[val_start..i]));
-        } else {
-            attrs.push((name_start, name, ""));
+            Some(XML_NS) => {
+                if !matches!(local_lower.as_str(), "space" | "lang" | "id") {
+                    continue;
+                }
+                if !has_only_safe_urls(val) {
+                    continue;
+                }
+                (format!("xml:{local}"), val)
+            }
+            Some(_) => continue,
+        };
+
+        if emitted_names.iter().any(|existing| existing == &emitted_name) {
+            continue;
+        }
+        emitted_names.push(emitted_name.clone());
+
+        out.push(' ');
+        out.push_str(&emitted_name);
+        out.push_str("=\"");
+        push_escaped_xml_attr(out, emitted_val);
+        out.push('"');
+    }
+}
+
+fn push_escaped_xml_text(out: &mut String, text: &str) {
+    for ch in text.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            _ => out.push(ch),
         }
     }
-    attrs
+}
+
+fn push_escaped_xml_attr(out: &mut String, val: &str) {
+    for ch in val.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(ch),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -776,24 +793,86 @@ mod tests {
     use super::*;
 
     #[test]
-    fn svg_sanitizer_strips_xss_xxe_and_external_images_and_caps_size() {
-        let dirty = r#"<!DOCTYPE svg [<!ENTITY xxe SYSTEM "file:///etc/passwd">]>
-            <svg xmlns="http://www.w3.org/2000/svg" onload="alert(1)" viewBox="0 0 24 24">
-                <script>alert('xss')</script>
-                <image href="https://evil.example.com/track.png" width="10" height="10"/>
-                <circle cx="12" cy="12" r="8" onclick="evil()" fill="currentColor"/>
+    fn svg_sanitizer_rejects_dtd_pi_svgz_and_strips_prefixed_xss_unc_and_data_refs() {
+        // DTD / XXE must be rejected outright by roxmltree allow_dtd: false.
+        let dtd_svg = r#"<!DOCTYPE svg [<!ENTITY xxe SYSTEM "file:///etc/passwd">]>
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/></svg>"#;
+        assert!(sanitize_svg(dtd_svg).is_err());
+
+        // XML processing instruction (other than XML declaration) must be rejected.
+        let pi_svg = r#"<?xml-stylesheet type="text/xsl" href="http://evil/x.xsl"?>
+            <svg xmlns="http://www.w3.org/2000/svg"><circle cx="5" cy="5" r="4"/></svg>"#;
+        assert!(sanitize_svg(pi_svg).is_err());
+
+        // XML declaration is fine for standard SVG icons.
+        let xml_decl_svg = r#"<?xml version="1.0" encoding="UTF-8"?>
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+                <path d="M21 12a9 9 0 1 1-4.5-7.8"/>
             </svg>"#;
+        let clean_decl = sanitize_svg(xml_decl_svg).unwrap();
+        assert!(clean_decl.contains("<path d=\"M21 12a9 9 0 1 1-4.5-7.8\"/>"));
+
+        // Prefixed <s:image>, custom XLink prefix x:href, UNC paths, raw local paths, data: SVGZ,
+        // comment quote-desync, <style>, <animate*>, <set>, <foreignObject>, and on* attrs.
+        let dirty = r##"<!-- unpaired quote " -->
+            <s:svg xmlns:s="http://www.w3.org/2000/svg" xmlns:x="http://www.w3.org/1999/xlink" onload="alert(1)" viewBox="0 0 24 24">
+                <!-- " --><s:script>alert('xss')</s:script>
+                <s:foreignObject><div xmlns="http://www.w3.org/1999/xhtml">html</div></s:foreignObject>
+                <s:style>@import url("http://evil.example/a.css");</s:style>
+                <s:image x:href="\\evil.host\share\leak.png" width="10" height="10"/>
+                <s:image href="C:\Windows\win.ini" width="10" height="10"/>
+                <s:image href="/etc/passwd" width="10" height="10"/>
+                <s:image href="data:image/svg+xml;base64,H4sIAAAAAAAA" width="10" height="10"/>
+                <s:feImage x:href="data:text/plain;base64,H4sIAAAAAAAA"/>
+                <s:use x:href="\\evil.host\share\x.svg#id"/>
+                <s:use href="&#106;avascript:alert(1)"/>
+                <s:use x:href="#ok_grad"/>
+                <s:animate attributeName="x" from="0" to="10"/>
+                <s:set attributeName="fill" to="red"/>
+                <s:defs>
+                    <s:linearGradient id="ok_grad"><s:stop offset="0" stop-color="#45C686"/></s:linearGradient>
+                </s:defs>
+                <s:circle cx="12" cy="12" r="8" onclick="evil()" fill="url(#ok_grad)"/>
+                <s:rect x="0" y="0" width="4" height="4" fill="url(http://evil.example/g.svg#x)"/>
+            </s:svg>"##;
         let clean = sanitize_svg(dirty).unwrap();
         let lower = clean.to_ascii_lowercase();
-        assert!(!lower.contains("<!entity"));
-        assert!(!lower.contains("<!doctype"));
-        assert!(!lower.contains("<script"));
+        assert!(!lower.contains("<!--"));
+        assert!(!lower.contains("script"));
+        assert!(!lower.contains("foreignobject"));
+        assert!(!lower.contains("<style"));
+        assert!(!lower.contains("<image"));
+        assert!(!lower.contains("feimage"));
+        assert!(!lower.contains("animate"));
+        assert!(!lower.contains("<set"));
         assert!(!lower.contains("onload"));
         assert!(!lower.contains("onclick"));
-        assert!(!lower.contains("evil.example.com"));
+        assert!(!lower.contains("evil.host"));
+        assert!(!lower.contains("win.ini"));
+        assert!(!lower.contains("/etc/passwd"));
+        assert!(!lower.contains("data:"));
+        assert!(!lower.contains("javascript:"));
+        assert!(!lower.contains("evil.example"));
+        assert!(clean.contains("xlink:href=\"#ok_grad\""));
+        assert!(clean.contains("fill=\"url(#ok_grad)\""));
         assert!(lower.contains("<circle"));
 
+        // Raw local/UNC path, data URI, and control/SVGZ bytes must fail outright.
+        assert!(sanitize_svg(r"\\evil.host\share\icon.svg").is_err());
+        assert!(sanitize_svg("data:image/svg+xml,<svg/>").is_err());
+        assert!(sanitize_svg("\x1f\x08\x00<svg/>").is_err());
+
+        // Size cap enforcement.
         let oversized = format!("<svg>{}</svg>", "a".repeat(MAX_SVG_BYTES + 1));
         assert!(sanitize_svg(&oversized).is_err());
+
+        // Real TickTick icon renders cleanly.
+        let ticktick = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M21 12a9 9 0 1 1-4.5-7.8" />
+          <path d="M9 12.2l2.6 2.6L21 5.4" />
+        </svg>"#;
+        let clean_tt = sanitize_svg(ticktick).unwrap();
+        assert!(clean_tt.contains("M21 12a9 9 0 1 1-4.5-7.8"));
+        assert!(clean_tt.contains("M9 12.2l2.6 2.6L21 5.4"));
     }
 }

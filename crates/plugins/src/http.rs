@@ -3,7 +3,7 @@
 
 use std::collections::VecDeque;
 use std::io::Read as _;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -14,8 +14,9 @@ use ureq::config::Config;
 use ureq::http::Uri;
 use ureq::unversioned::resolver::{DefaultResolver, ResolvedSocketAddrs, Resolver};
 use ureq::unversioned::transport::{DefaultConnector, NextTimeout};
+use zeroize::Zeroizing;
 
-use crate::permissions::PermissionSet;
+use crate::permissions::{PermissionSet, normalize_host};
 use crate::vault::SecretsVault;
 
 pub const MAX_REDIRECTS: usize = 5;
@@ -63,15 +64,26 @@ pub fn is_ip_blocked(ip: IpAddr, allow_local: bool) -> bool {
     }
 }
 
+pub(crate) fn is_loopback_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_loopback(),
+        IpAddr::V6(v6) => {
+            v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+        }
+    }
+}
+
 fn is_v4_blocked(ip: Ipv4Addr, allow_local: bool) -> bool {
     let o = ip.octets();
     // Always block unspecified (0.0.0.0/8), link-local/metadata (169.254.0.0/16),
-    // multicast (224.0.0.0/4), broadcast, reserved (>=240), and documentation ranges.
+    // multicast (224.0.0.0/4), broadcast, reserved (>=240), IETF protocol assignments
+    // (192.0.0.0/24), and documentation ranges.
     if o[0] == 0
         || ip.is_link_local()
         || ip.is_multicast()
         || ip.is_broadcast()
         || o[0] >= 240
+        || (o[0] == 192 && o[1] == 0 && o[2] == 0)
         || (o[0] == 192 && o[1] == 0 && o[2] == 2)
         || (o[0] == 198 && o[1] == 51 && o[2] == 100)
         || (o[0] == 203 && o[1] == 0 && o[2] == 113)
@@ -103,10 +115,33 @@ fn is_v6_blocked(ip: Ipv6Addr, allow_local: bool) -> bool {
         );
         return is_v4_blocked(v4, allow_local);
     }
+    // Always block IPv6 transition/tunnel/special ranges that can embed arbitrary IPv4 targets:
+    // - Well-known NAT64 (64:ff9b::/96) and local-use NAT64 (64:ff9b:1::/48)
+    // - IPv4-translated SIIT (::ffff:0:0:0/96)
+    // - 6to4 (2002::/16) and Teredo (2001::/32)
+    // - Deprecated site-local (fec0::/10) and discard-only (100::/64)
+    let is_nat64_well_known = seg[0..6] == [0x0064, 0xff9b, 0, 0, 0, 0];
+    let is_nat64_local = seg[0] == 0x0064 && seg[1] == 0xff9b && seg[2] == 0x0001;
+    let is_ipv4_translated = seg[0..6] == [0, 0, 0, 0, 0xffff, 0];
+    let is_6to4 = seg[0] == 0x2002;
+    let is_teredo = seg[0] == 0x2001 && seg[1] == 0x0000;
+    let is_site_local = (seg[0] & 0xffc0) == 0xfec0;
+    let is_discard = seg[0] == 0x0100 && seg[1] == 0 && seg[2] == 0 && seg[3] == 0;
     // Always block unspecified (::), multicast (ff00::/8), link-local (fe80::/10), doc (2001:db8::/32).
     let is_link_local = (seg[0] & 0xffc0) == 0xfe80;
     let is_doc = seg[0] == 0x2001 && seg[1] == 0x0db8;
-    if ip.is_unspecified() || ip.is_multicast() || is_link_local || is_doc {
+    if ip.is_unspecified()
+        || ip.is_multicast()
+        || is_link_local
+        || is_doc
+        || is_nat64_well_known
+        || is_nat64_local
+        || is_ipv4_translated
+        || is_6to4
+        || is_teredo
+        || is_site_local
+        || is_discard
+    {
         return true;
     }
     let is_ula = (seg[0] & 0xfe00) == 0xfc00;
@@ -116,8 +151,18 @@ fn is_v6_blocked(ip: Ipv6Addr, allow_local: bool) -> bool {
     false
 }
 
-/// Validates URI scheme, host permission, and resolved IP addresses (anti-SSRF).
-pub fn validate_target_uri(uri: &Uri, permissions: &PermissionSet) -> Result<(String, Option<u16>)> {
+fn is_localhost_hostname(host: &str) -> bool {
+    let norm = normalize_host(host);
+    norm == "localhost" || norm.ends_with(".localhost")
+}
+
+/// Fast, non-blocking syntactic validation of URI scheme, authority, host permission, and literal
+/// IP SSRF rules. Does NOT perform blocking DNS resolution (DNS + resolved-IP SSRF checks run on
+/// the `HttpPool` worker thread inside [`SsrfSafeResolver`] under `CONNECT_TIMEOUT`).
+pub fn validate_target_uri_syntax(
+    uri: &Uri,
+    permissions: &PermissionSet,
+) -> Result<(String, Option<u16>)> {
     let scheme = uri
         .scheme_str()
         .map(str::to_ascii_lowercase)
@@ -129,6 +174,10 @@ pub fn validate_target_uri(uri: &Uri, permissions: &PermissionSet) -> Result<(St
     let authority = uri
         .authority()
         .context("URL must contain a valid authority/host")?;
+    ensure!(
+        !authority.as_str().contains('@'),
+        "URLs containing embedded userinfo (@) are forbidden"
+    );
     let host = authority.host();
     ensure!(!host.is_empty(), "URL host must not be empty");
     let port = authority.port_u16();
@@ -144,7 +193,8 @@ pub fn validate_target_uri(uri: &Uri, permissions: &PermissionSet) -> Result<(St
     );
 
     let allow_local = permissions.allows_local();
-    let lookup_port = effective_port.unwrap_or(80);
+    let explicitly_allowed = permissions.allows_explicit_host(host, port)
+        || permissions.allows_explicit_host(host, effective_port);
     let host_clean = host.trim_start_matches('[').trim_end_matches(']');
 
     if let Ok(ip) = host_clean.parse::<IpAddr>() {
@@ -152,17 +202,10 @@ pub fn validate_target_uri(uri: &Uri, permissions: &PermissionSet) -> Result<(St
             !is_ip_blocked(ip, allow_local),
             "SSRF protection blocked connection to {ip}"
         );
-    } else {
-        let addrs: Vec<SocketAddr> = (host_clean, lookup_port)
-            .to_socket_addrs()
-            .with_context(|| format!("DNS lookup failed for {host}"))?
-            .collect();
-        ensure!(!addrs.is_empty(), "DNS lookup returned no addresses for {host}");
-        for addr in &addrs {
+        if !explicitly_allowed {
             ensure!(
-                !is_ip_blocked(addr.ip(), allow_local),
-                "SSRF protection blocked resolved IP {} for host {host}",
-                addr.ip()
+                is_loopback_ip(ip),
+                "SSRF protection requires loopback IP for network:local host {host:?}, blocked {ip}"
             );
         }
     }
@@ -170,11 +213,53 @@ pub fn validate_target_uri(uri: &Uri, permissions: &PermissionSet) -> Result<(St
     Ok((host.to_owned(), effective_port))
 }
 
-/// `ureq` resolver that re-checks resolved socket addresses at connect time to prevent DNS rebinding.
+/// Validates URI scheme, host permission, and literal-IP SSRF rules without blocking on DNS.
+///
+/// Resolved DNS addresses are strictly checked at connect time inside [`SsrfSafeResolver`]
+/// on the bounded [`HttpPool`] thread so `PluginWorker` never stalls on slow DNS lookups.
+pub fn validate_target_uri(uri: &Uri, permissions: &PermissionSet) -> Result<(String, Option<u16>)> {
+    validate_target_uri_syntax(uri, permissions)
+}
+
+pub(crate) fn target_requires_loopback_only(uri: &Uri, permissions: &PermissionSet) -> bool {
+    let Some(authority) = uri.authority() else {
+        return true;
+    };
+    let host = authority.host();
+    if is_localhost_hostname(host) {
+        return true;
+    }
+    let scheme = uri
+        .scheme_str()
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    let port = authority.port_u16();
+    let effective_port = port.or(match scheme.as_str() {
+        "https" => Some(443),
+        "http" => Some(80),
+        _ => None,
+    });
+    !(permissions.allows_explicit_host(host, port)
+        || permissions.allows_explicit_host(host, effective_port))
+}
+
+/// `ureq` resolver that re-checks resolved socket addresses at connect time to prevent DNS rebinding
+/// and `*.localhost` non-loopback bypasses.
 #[derive(Debug)]
-struct SsrfSafeResolver {
+pub(crate) struct SsrfSafeResolver {
     allow_local: bool,
+    loopback_only: bool,
     inner: DefaultResolver,
+}
+
+impl SsrfSafeResolver {
+    pub(crate) fn new(allow_local: bool, loopback_only: bool) -> Self {
+        Self {
+            allow_local,
+            loopback_only,
+            inner: DefaultResolver::default(),
+        }
+    }
 }
 
 impl Resolver for SsrfSafeResolver {
@@ -184,6 +269,8 @@ impl Resolver for SsrfSafeResolver {
         config: &Config,
         timeout: NextTimeout,
     ) -> std::result::Result<ResolvedSocketAddrs, ureq::Error> {
+        let host_forces_loopback = uri.host().is_some_and(is_localhost_hostname);
+        let require_loopback = self.loopback_only || host_forces_loopback;
         let resolved = self.inner.resolve(uri, config, timeout)?;
         let mut filtered: ResolvedSocketAddrs = self.empty();
         for &addr in &resolved {
@@ -191,6 +278,15 @@ impl Resolver for SsrfSafeResolver {
                 return Err(ureq::Error::Other(Box::new(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
                     format!("SSRF protection blocked IP {}", addr.ip()),
+                ))));
+            }
+            if require_loopback && !is_loopback_ip(addr.ip()) {
+                return Err(ureq::Error::Other(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!(
+                        "SSRF protection blocked non-loopback IP {} for loopback-only host",
+                        addr.ip()
+                    ),
                 ))));
             }
             filtered.push(addr);
@@ -209,6 +305,16 @@ pub fn execute_http_request(
     permissions: &PermissionSet,
     vault: Option<&SecretsVault>,
     req: &HttpRequest,
+) -> Result<HttpResponse> {
+    execute_http_request_with_redirects(plugin_id, permissions, vault, req, MAX_REDIRECTS)
+}
+
+pub(crate) fn execute_http_request_with_redirects(
+    plugin_id: &str,
+    permissions: &PermissionSet,
+    vault: Option<&SecretsVault>,
+    req: &HttpRequest,
+    max_redirects: usize,
 ) -> Result<HttpResponse> {
     let total_budget = req
         .timeout_ms
@@ -238,14 +344,17 @@ pub fn execute_http_request(
     let mut current_body = req.body.clone();
 
     // Interpolate `${secret:key}` in headers up front and track which headers carried secrets.
-    let mut prepared_headers: Vec<(String, String, bool)> = Vec::with_capacity(req.headers.len());
+    let mut interpolated_any_secret = false;
+    let mut prepared_headers: Vec<(String, Zeroizing<String>, bool)> =
+        Vec::with_capacity(req.headers.len());
     for (name, raw_val) in &req.headers {
         let had_secret = raw_val.contains("${secret:");
         let interpolated = if had_secret {
+            interpolated_any_secret = true;
             let v = vault.context("secrets vault unavailable for header interpolation")?;
-            v.interpolate_secrets(plugin_id, raw_val)?
+            Zeroizing::new(v.interpolate_secrets(plugin_id, raw_val)?)
         } else {
-            raw_val.clone()
+            Zeroizing::new(raw_val.clone())
         };
         let is_sensitive = had_secret
             || name.eq_ignore_ascii_case("authorization")
@@ -255,13 +364,16 @@ pub fn execute_http_request(
     }
 
     let initial_origin = origin_key(&current_uri);
+    let mut same_origin = true;
+    let mut body_stripped_by_redirect = false;
     let allow_local = permissions.allows_local();
 
-    for hop in 0..=MAX_REDIRECTS {
+    for hop in 0..=max_redirects {
         let remaining = deadline.saturating_duration_since(Instant::now());
         ensure!(!remaining.is_zero(), "HTTP request timed out");
 
-        validate_target_uri(&current_uri, permissions)?;
+        validate_target_uri_syntax(&current_uri, permissions)?;
+        let loopback_only = target_requires_loopback_only(&current_uri, permissions);
 
         let config = Config::builder()
             .max_redirects(0)
@@ -270,19 +382,18 @@ pub fn execute_http_request(
             .timeout_connect(Some(CONNECT_TIMEOUT.min(remaining)))
             .timeout_global(Some(remaining))
             .build();
-        let resolver = SsrfSafeResolver {
-            allow_local,
-            inner: DefaultResolver::default(),
-        };
+        let resolver = SsrfSafeResolver::new(allow_local, loopback_only);
         let agent = ureq::Agent::with_parts(config, DefaultConnector::default(), resolver);
 
-        let same_origin = origin_key(&current_uri) == initial_origin;
         let mut builder = ureq::http::Request::builder()
             .method(current_method.as_str())
             .uri(&current_uri)
             .header("User-Agent", format!("fern-plugin/{}", env!("CARGO_PKG_VERSION")));
         for (name, val, sensitive) in &prepared_headers {
             if *sensitive && !same_origin {
+                continue;
+            }
+            if body_stripped_by_redirect && is_body_header(name) {
                 continue;
             }
             builder = builder.header(name.as_str(), val.as_str());
@@ -310,8 +421,11 @@ pub fn execute_http_request(
 
         let status = response.status().as_u16();
         if matches!(status, 301 | 302 | 303 | 307 | 308) {
-            if hop >= MAX_REDIRECTS {
-                bail!("HTTP request exceeded maximum of {MAX_REDIRECTS} redirects");
+            if max_redirects == 0 {
+                bail!("HTTP redirects are forbidden for this request (received HTTP {status})");
+            }
+            if hop >= max_redirects {
+                bail!("HTTP request exceeded maximum of {max_redirects} redirects");
             }
             let location = response
                 .headers()
@@ -319,15 +433,27 @@ pub fn execute_http_request(
                 .and_then(|v| v.to_str().ok())
                 .context("HTTP redirect response missing valid Location header")?;
             let next_uri = resolve_redirect_uri(&current_uri, location)?;
-            if status == 303 || ((status == 301 || status == 302) && current_method == "POST") {
+            ensure_no_scheme_downgrade(&current_uri, &next_uri)?;
+
+            // Sticky cross-origin latch: once a redirect chain leaves `initial_origin`,
+            // credentials and request bodies are never re-attached even if redirected back.
+            same_origin &= origin_key(&next_uri) == initial_origin;
+
+            let method_changes =
+                status == 303 || ((status == 301 || status == 302) && current_method == "POST");
+            if method_changes {
                 current_method = "GET".to_owned();
                 current_body = None;
+                body_stripped_by_redirect = true;
+            } else if !same_origin {
+                current_body = None;
+                body_stripped_by_redirect = true;
             }
             current_uri = next_uri;
             continue;
         }
 
-        let headers: Vec<(String, String)> = response
+        let mut headers: Vec<(String, String)> = response
             .headers()
             .iter()
             .filter_map(|(k, v)| {
@@ -357,6 +483,22 @@ pub fn execute_http_request(
             "HTTP response body exceeds {MAX_RESPONSE_BYTES} bytes limit"
         );
 
+        // If any `${secret:...}` placeholder was sent in request headers, scrub reflected secrets
+        // from response headers and body so a reflecting endpoint cannot exfiltrate them to JS
+        // (while leaving non-UTF-8 binary responses byte-for-byte intact when no secret is reflected).
+        if interpolated_any_secret
+            && let Some(v) = vault
+        {
+            for (_, val) in &mut headers {
+                *val = v.scrub_secrets(plugin_id, val);
+            }
+            let text = String::from_utf8_lossy(&buf);
+            let scrubbed = v.scrub_secrets(plugin_id, &text);
+            if scrubbed.as_str() != text.as_ref() {
+                buf = scrubbed.into_bytes();
+            }
+        }
+
         return Ok(HttpResponse {
             status,
             url: current_uri.to_string(),
@@ -365,7 +507,30 @@ pub fn execute_http_request(
         });
     }
 
-    bail!("HTTP request exceeded maximum of {MAX_REDIRECTS} redirects")
+    bail!("HTTP request exceeded maximum of {max_redirects} redirects")
+}
+
+fn ensure_no_scheme_downgrade(current_uri: &Uri, next_uri: &Uri) -> Result<()> {
+    let cur_scheme = current_uri
+        .scheme_str()
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    let next_scheme = next_uri
+        .scheme_str()
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    ensure!(
+        !(cur_scheme == "https" && next_scheme == "http"),
+        "HTTP redirect blocked: HTTPS to HTTP downgrade is forbidden"
+    );
+    Ok(())
+}
+
+fn is_body_header(name: &str) -> bool {
+    name.eq_ignore_ascii_case("content-length")
+        || name.eq_ignore_ascii_case("content-type")
+        || name.eq_ignore_ascii_case("content-encoding")
+        || name.eq_ignore_ascii_case("transfer-encoding")
 }
 
 fn origin_key(uri: &Uri) -> (String, String, u16) {
@@ -381,7 +546,7 @@ fn origin_key(uri: &Uri) -> (String, String, u16) {
     (scheme, host, port)
 }
 
-fn resolve_redirect_uri(base: &Uri, location: &str) -> Result<Uri> {
+pub(crate) fn resolve_redirect_uri(base: &Uri, location: &str) -> Result<Uri> {
     let loc = location.trim();
     ensure!(!loc.is_empty(), "empty redirect Location header");
     if loc.contains("://") {
@@ -633,6 +798,232 @@ mod tests {
         assert_eq!(ok.body_text(), "ok");
 
         drop(server);
+        Ok(())
+    }
+
+    #[test]
+    fn ssrf_blocks_ipv6_transition_prefixes_and_192_0_0_24() -> Result<()> {
+        for addr in [
+            "64:ff9b::169.254.169.254",
+            "64:ff9b::127.0.0.1",
+            "64:ff9b::8.8.8.8",
+            "64:ff9b:1::1",
+            "::ffff:0:127.0.0.1",
+            "::ffff:0:169.254.169.254",
+            "2002:7f00:0001::1",
+            "2002:0a00:0001::1",
+            "2001:0000:4136:e378:8000:63bf:3fff:fdd2",
+            "fec0::1",
+            "100::1",
+            "192.0.0.1",
+            "192.0.0.170",
+        ] {
+            let ip: IpAddr = addr.parse()?;
+            assert!(is_ip_blocked(ip, false), "should block {addr} (public)");
+            assert!(is_ip_blocked(ip, true), "should block {addr} (even with allow_local)");
+        }
+        // Public IPv6 and public IPv4 remain permitted.
+        assert!(!is_ip_blocked("2606:4700:4700::1111".parse()?, false));
+        assert!(!is_ip_blocked("1.1.1.1".parse()?, false));
+
+        // validate_target_uri must be purely syntactic + literal-IP (no blocking DNS on worker).
+        let perms = PermissionSet::new(&[Permission::Network(vec!["nonexistent.invalid".into()])]);
+        let uri: Uri = "https://nonexistent.invalid/api".parse()?;
+        assert!(validate_target_uri(&uri, &perms).is_ok());
+
+        // Embedded userinfo `@` must be rejected.
+        let userinfo_uri: Uri = "https://user:pass@nonexistent.invalid/api".parse()?;
+        assert!(validate_target_uri(&userinfo_uri, &perms).is_err());
+
+        // HTTPS -> HTTP downgrade redirects must be rejected.
+        let https_uri: Uri = "https://api.example.com/start".parse()?;
+        let http_uri: Uri = "http://api.example.com/downgraded".parse()?;
+        let https_next: Uri = "https://api.example.com/next".parse()?;
+        assert!(ensure_no_scheme_downgrade(&https_uri, &http_uri).is_err());
+        assert!(ensure_no_scheme_downgrade(&https_uri, &https_next).is_ok());
+        assert!(ensure_no_scheme_downgrade(&http_uri, &https_next).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn sticky_cross_origin_redirect_strips_credentials_and_body_and_reflect_scrubs() -> Result<()> {
+        // Two distinct local origins (A and B on different ports).
+        let listener_a = TcpListener::bind("127.0.0.1:0")?;
+        let addr_a = listener_a.local_addr()?;
+        let listener_b = TcpListener::bind("127.0.0.1:0")?;
+        let addr_b = listener_b.local_addr()?;
+
+        let seen_b = Arc::new(Mutex::new(String::new()));
+        let seen_a_final = Arc::new(Mutex::new(String::new()));
+
+        let seen_b_c = Arc::clone(&seen_b);
+        let srv_b = thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener_b.accept() {
+                let mut buf = [0u8; 4096];
+                let n = sock.read(&mut buf).unwrap_or(0);
+                *seen_b_c.lock().unwrap() = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let resp = format!(
+                    "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{addr_a}/final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                let _ = sock.write_all(resp.as_bytes());
+            }
+        });
+
+        let seen_a_final_c = Arc::clone(&seen_a_final);
+        let srv_a = thread::spawn(move || {
+            for _ in 0..5 {
+                let Ok((mut sock, _)) = listener_a.accept() else {
+                    break;
+                };
+                let mut buf = [0u8; 4096];
+                let n = sock.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+                if req.starts_with("POST /start") {
+                    let resp = format!(
+                        "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{addr_b}/bounce\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    let _ = sock.write_all(resp.as_bytes());
+                } else if req.starts_with("POST /final") || req.starts_with("GET /final") {
+                    *seen_a_final_c.lock().unwrap() = req;
+                    let _ = sock.write_all(
+                        b"HTTP/1.1 200 OK\r\nX-Echo: secret-token-xyz\r\nContent-Length: 23\r\nConnection: close\r\n\r\nechoed=secret-token-xyz",
+                    );
+                } else if req.starts_with("GET /binary-clean") {
+                    let bin_body: &[u8] = b"\x89PNG\r\n\x1a\n\xff\xfe\x00\x01";
+                    let hdr = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        bin_body.len()
+                    );
+                    let _ = sock.write_all(hdr.as_bytes());
+                    let _ = sock.write_all(bin_body);
+                } else if req.starts_with("GET /binary-leak") {
+                    let leak_body: &[u8] = b"\xff\xfesecret-token-xyz";
+                    let hdr = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        leak_body.len()
+                    );
+                    let _ = sock.write_all(hdr.as_bytes());
+                    let _ = sock.write_all(leak_body);
+                } else if req.starts_with("GET /no-redir") {
+                    let resp = format!(
+                        "HTTP/1.1 302 Found\r\nLocation: http://{addr_a}/final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    let _ = sock.write_all(resp.as_bytes());
+                }
+            }
+        });
+
+        let dir = tempfile::tempdir()?;
+        let vault = SecretsVault::open(dir.path().join("v.vault"), dir.path().join("v.key"))?;
+        vault.set("p1", "tok", "secret-token-xyz")?;
+
+        let perms = PermissionSet::new(&[
+            Permission::Network(vec![
+                format!("127.0.0.1:{}", addr_a.port()),
+                format!("127.0.0.1:{}", addr_b.port()),
+            ]),
+            Permission::NetworkLocal,
+        ]);
+
+        // A -> B -> A redirect with 307: credentials and body must be stripped at B AND stay stripped back at A!
+        let resp = execute_http_request(
+            "p1",
+            &perms,
+            Some(&vault),
+            &HttpRequest {
+                method: "POST".into(),
+                url: format!("http://{addr_a}/start"),
+                headers: vec![
+                    ("Authorization".into(), "Bearer ${secret:tok}".into()),
+                    ("Cookie".into(), "sid=abc".into()),
+                    ("Content-Type".into(), "application/x-www-form-urlencoded".into()),
+                ],
+                body: Some(b"refresh_token=super-sensitive-body".to_vec()),
+                timeout_ms: Some(3000),
+            },
+        )?;
+        assert_eq!(resp.status, 200);
+
+        // Reflected secret in response body & header must be scrubbed because `${secret:...}` was sent.
+        assert!(!resp.body_text().contains("secret-token-xyz"), "{}", resp.body_text());
+        assert!(resp.body_text().contains("***"));
+        assert!(
+            resp.headers
+                .iter()
+                .all(|(_, v)| !v.contains("secret-token-xyz")),
+            "{:?}",
+            resp.headers
+        );
+
+        let b_req = seen_b.lock().unwrap().to_ascii_lowercase();
+        assert!(!b_req.contains("authorization:"), "B saw auth: {b_req}");
+        assert!(!b_req.contains("cookie:"), "B saw cookie: {b_req}");
+        assert!(!b_req.contains("super-sensitive-body"), "B saw body: {b_req}");
+
+        let a_final = seen_a_final.lock().unwrap().to_ascii_lowercase();
+        assert!(
+            !a_final.contains("authorization:"),
+            "A->B->A re-attached auth: {a_final}"
+        );
+        assert!(
+            !a_final.contains("cookie:"),
+            "A->B->A re-attached cookie: {a_final}"
+        );
+        assert!(
+            !a_final.contains("super-sensitive-body"),
+            "A->B->A re-attached body: {a_final}"
+        );
+
+        // Binary non-UTF-8 response with NO reflected secret stays byte-for-byte intact.
+        let clean_bin = execute_http_request(
+            "p1",
+            &perms,
+            Some(&vault),
+            &HttpRequest {
+                method: "GET".into(),
+                url: format!("http://{addr_a}/binary-clean"),
+                headers: vec![("Authorization".into(), "Bearer ${secret:tok}".into())],
+                body: None,
+                timeout_ms: Some(2000),
+            },
+        )?;
+        assert_eq!(clean_bin.body, b"\x89PNG\r\n\x1a\n\xff\xfe\x00\x01");
+
+        // Invalid-UTF-8 response that DOES reflect a secret is still scrubbed.
+        let leaked_bin = execute_http_request(
+            "p1",
+            &perms,
+            Some(&vault),
+            &HttpRequest {
+                method: "GET".into(),
+                url: format!("http://{addr_a}/binary-leak"),
+                headers: vec![("Authorization".into(), "Bearer ${secret:tok}".into())],
+                body: None,
+                timeout_ms: Some(2000),
+            },
+        )?;
+        assert!(!leaked_bin.body_text().contains("secret-token-xyz"));
+        assert!(leaked_bin.body_text().contains("***"));
+
+        // Zero redirects allowed rejects 302 immediately.
+        let no_redir_err = execute_http_request_with_redirects(
+            "p1",
+            &perms,
+            Some(&vault),
+            &HttpRequest {
+                method: "GET".into(),
+                url: format!("http://{addr_a}/no-redir"),
+                headers: vec![],
+                body: None,
+                timeout_ms: Some(2000),
+            },
+            0,
+        )
+        .unwrap_err();
+        assert!(no_redir_err.to_string().contains("redirects are forbidden"), "{no_redir_err}");
+
+        let _ = srv_b.join();
+        let _ = srv_a.join();
         Ok(())
     }
 }

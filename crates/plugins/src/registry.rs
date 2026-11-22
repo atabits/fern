@@ -1,28 +1,37 @@
 //! Multi-registry client with ETag caching, SHA-256 verification, zip-slip-safe
 //! archive extraction, atomic swap, local `.zip` install, and permission diff detection.
 
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read as _, Write as _};
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, anyhow, bail, ensure};
 use fern_core::plugin_store::PluginState;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
+use ureq::config::Config;
+use ureq::http::Uri;
+use ureq::unversioned::transport::DefaultConnector;
 use uuid::Uuid;
 use zip::ZipArchive;
 
+use crate::http::{
+    MAX_REDIRECTS, SsrfSafeResolver, is_ip_blocked, is_loopback_ip, resolve_redirect_uri,
+};
 use crate::manifest::{
     CURRENT_API_VERSION, LoadedManifest, PermissionApprovalStatus, PluginManifest,
     validate_plugin_id,
 };
-use crate::permissions::Permission;
+use crate::permissions::{Permission, PermissionSet, is_loopback_host_literal, normalize_host};
 
 pub const DEFAULT_REGISTRY_URL: &str = "https://atabits.github.io/fern-plugins/registry.json";
 pub const MAX_REGISTRY_INDEX_BYTES: usize = 5 * 1024 * 1024;
 pub const MAX_PLUGIN_ZIP_BYTES: usize = 10 * 1024 * 1024;
 pub const MAX_PLUGIN_UNPACKED_BYTES: u64 = 32 * 1024 * 1024;
+pub const MAX_PLUGIN_ZIP_ENTRIES: usize = 1024;
+pub const MAX_PLUGIN_ZIP_DEPTH: usize = 16;
 const REGISTRY_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REGISTRY_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -104,6 +113,8 @@ pub struct InstallOutcome {
 pub struct RegistryClient {
     plugins_dir: PathBuf,
     cache_dir: PathBuf,
+    #[cfg(test)]
+    allow_insecure_local_http: bool,
 }
 
 impl RegistryClient {
@@ -111,6 +122,25 @@ impl RegistryClient {
         Self {
             plugins_dir: plugins_dir.into(),
             cache_dir: cache_dir.into(),
+            #[cfg(test)]
+            allow_insecure_local_http: false,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_insecure_local_http_for_tests(mut self) -> Self {
+        self.allow_insecure_local_http = true;
+        self
+    }
+
+    fn allow_local_http(&self) -> bool {
+        #[cfg(test)]
+        {
+            self.allow_insecure_local_http
+        }
+        #[cfg(not(test))]
+        {
+            false
         }
     }
 
@@ -150,19 +180,16 @@ impl RegistryClient {
 
     /// Fetches a `registry.json` index using conditional `If-None-Match` (`ETag`) caching.
     pub fn fetch_index(&self, url: &str) -> Result<CachedRegistryIndex> {
-        validate_registry_url(url)?;
+        let allow_local = self.allow_local_http();
+        validate_registry_url(url, allow_local)?;
         let cached = self.load_cached_index(url).ok().flatten();
-        let agent = registry_agent();
-        let mut req = agent
-            .get(url.trim())
-            .header("Accept", "application/json")
-            .header("User-Agent", format!("fern/{}", env!("CARGO_PKG_VERSION")));
+
+        let mut extra_headers: Vec<(&str, &str)> = vec![("Accept", "application/json")];
         if let Some(etag) = cached.as_ref().and_then(|c| c.etag.as_deref()) {
-            req = req.header("If-None-Match", etag);
+            extra_headers.push(("If-None-Match", etag));
         }
 
-        let mut response = req
-            .call()
+        let mut response = registry_get_with_redirects(url, &extra_headers, allow_local)
             .with_context(|| format!("failed to fetch plugin registry {url}"))?;
         let status = response.status().as_u16();
         if status == 304 {
@@ -233,7 +260,8 @@ impl RegistryClient {
             .collect()
     }
 
-    /// Downloads a plugin `.zip` from a registry entry, verifies SHA-256, extracts safely, and swaps atomically.
+    /// Downloads a plugin `.zip` from a registry entry, verifies SHA-256 and catalog permissions,
+    /// extracts safely, and swaps atomically.
     pub fn install_from_registry(
         &self,
         entry: &RegistryPluginEntry,
@@ -250,7 +278,8 @@ impl RegistryClient {
             entry.id,
             entry.api_version
         );
-        validate_registry_url(&entry.download_url)?;
+        let allow_local = self.allow_local_http();
+        validate_registry_url(&entry.download_url, allow_local)?;
         let expected_sha = entry.sha256.trim().to_ascii_lowercase();
         ensure!(
             expected_sha.len() == 64 && expected_sha.bytes().all(|b| b.is_ascii_hexdigit()),
@@ -258,11 +287,7 @@ impl RegistryClient {
             entry.id
         );
 
-        let agent = registry_agent();
-        let mut response = agent
-            .get(entry.download_url.trim())
-            .header("User-Agent", format!("fern/{}", env!("CARGO_PKG_VERSION")))
-            .call()
+        let mut response = registry_get_with_redirects(&entry.download_url, &[], allow_local)
             .with_context(|| format!("failed to download plugin archive {}", entry.download_url))?;
         let status = response.status().as_u16();
         ensure!(
@@ -288,29 +313,37 @@ impl RegistryClient {
             entry.id
         );
 
-        self.install_zip_bytes(
+        let catalog_permissions = PermissionSet::new(&entry.permissions);
+        self.install_zip_bytes_inner(
             &zip_bytes,
             Some(&entry.id),
             Some(&entry.version),
+            Some(&catalog_permissions),
             existing_state,
         )
     }
 
-    /// Installs a plugin from a local `.zip` file on disk with zip-slip protection and permission diff check.
+    /// Installs a plugin from a local `.zip` file on disk with bounded atomic read (no TOCTOU),
+    /// zip-slip protection, and permission diff check.
     pub fn install_from_zip_file(
         &self,
         zip_path: &Path,
         existing_state: Option<&PluginState>,
     ) -> Result<InstallOutcome> {
-        let meta = fs::metadata(zip_path)
+        let file = File::open(zip_path)
+            .with_context(|| format!("cannot open zip file {}", zip_path.display()))?;
+        let meta = file
+            .metadata()
             .with_context(|| format!("cannot stat zip file {}", zip_path.display()))?;
         ensure!(meta.is_file(), "zip path is not a regular file");
+        let mut zip_bytes = Vec::new();
+        file.take(MAX_PLUGIN_ZIP_BYTES as u64 + 1)
+            .read_to_end(&mut zip_bytes)
+            .with_context(|| format!("cannot read zip file {}", zip_path.display()))?;
         ensure!(
-            meta.len() <= MAX_PLUGIN_ZIP_BYTES as u64,
+            zip_bytes.len() <= MAX_PLUGIN_ZIP_BYTES,
             "plugin archive exceeds {MAX_PLUGIN_ZIP_BYTES} bytes limit"
         );
-        let zip_bytes = fs::read(zip_path)
-            .with_context(|| format!("cannot read zip file {}", zip_path.display()))?;
         self.install_zip_bytes(&zip_bytes, None, None, existing_state)
     }
 
@@ -320,6 +353,17 @@ impl RegistryClient {
         zip_bytes: &[u8],
         expected_id: Option<&str>,
         expected_version: Option<&str>,
+        existing_state: Option<&PluginState>,
+    ) -> Result<InstallOutcome> {
+        self.install_zip_bytes_inner(zip_bytes, expected_id, expected_version, None, existing_state)
+    }
+
+    fn install_zip_bytes_inner(
+        &self,
+        zip_bytes: &[u8],
+        expected_id: Option<&str>,
+        expected_version: Option<&str>,
+        max_permissions: Option<&PermissionSet>,
         existing_state: Option<&PluginState>,
     ) -> Result<InstallOutcome> {
         ensure!(
@@ -360,6 +404,14 @@ impl RegistryClient {
                 "archive manifest version {:?} does not match expected {:?}",
                 loaded.manifest.version,
                 exp_ver
+            );
+        }
+        if let Some(allowed) = max_permissions {
+            let diff = allowed.diff(&loaded.permissions);
+            ensure!(
+                !diff.is_escalation(),
+                "archive manifest requests permissions not declared in registry catalog: {:?}",
+                diff.added
             );
         }
 
@@ -415,28 +467,158 @@ impl RegistryClient {
     }
 }
 
-fn validate_registry_url(url: &str) -> Result<()> {
+fn validate_registry_url(url: &str, allow_local_http: bool) -> Result<Uri> {
     let trimmed = url.trim();
-    let lower = trimmed.to_ascii_lowercase();
     ensure!(
-        lower.starts_with("https://") || lower.starts_with("http://"),
-        "registry URL must use https:// or http://"
+        !trimmed.contains('#'),
+        "registry URL must not contain a fragment (#)"
     );
-    Ok(())
+    let uri: Uri = trimmed
+        .parse()
+        .with_context(|| format!("invalid registry URL {url:?}"))?;
+    let scheme = uri
+        .scheme_str()
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    let authority = uri
+        .authority()
+        .context("registry URL must contain a valid host")?;
+    ensure!(
+        !authority.as_str().contains('@'),
+        "registry URL must not contain embedded userinfo (@)"
+    );
+    let host = authority.host();
+    ensure!(!host.is_empty(), "registry URL host must not be empty");
+
+    if scheme == "https" {
+        // Public HTTPS only (no private/loopback/link-local literal IPs or localhost unless local test mode).
+        let host_clean = normalize_host(host);
+        if !allow_local_http {
+            ensure!(
+                !is_loopback_host_literal(&host_clean) && !host_clean.ends_with(".localhost"),
+                "SSRF protection blocked loopback registry host {host:?}"
+            );
+        }
+        if let Ok(ip) = host_clean.parse::<IpAddr>() {
+            ensure!(
+                !is_ip_blocked(ip, allow_local_http),
+                "SSRF protection blocked registry IP {ip}"
+            );
+        }
+        Ok(uri)
+    } else if scheme == "http" && allow_local_http {
+        ensure!(
+            is_loopback_host_literal(host),
+            "registry URL over http:// is only allowed for loopback test servers"
+        );
+        let host_clean = normalize_host(host);
+        if let Ok(ip) = host_clean.parse::<IpAddr>() {
+            ensure!(
+                is_loopback_ip(ip),
+                "SSRF protection blocked non-loopback test registry IP {ip}"
+            );
+        }
+        Ok(uri)
+    } else {
+        bail!("registry URL must use https:// (got scheme {scheme:?})")
+    }
 }
 
-fn registry_agent() -> ureq::Agent {
-    ureq::Agent::config_builder()
-        .http_status_as_error(false)
-        .timeout_connect(Some(REGISTRY_CONNECT_TIMEOUT))
-        .timeout_global(Some(REGISTRY_TOTAL_TIMEOUT))
-        .build()
-        .into()
+fn registry_origin_key(uri: &Uri) -> (String, String, u16) {
+    let scheme = uri
+        .scheme_str()
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    let host = uri
+        .host()
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    let port = uri.port_u16().unwrap_or(if scheme == "https" { 443 } else { 80 });
+    (scheme, host, port)
+}
+
+fn registry_get_with_redirects(
+    url: &str,
+    extra_headers: &[(&str, &str)],
+    allow_local_http: bool,
+) -> Result<ureq::http::Response<ureq::Body>> {
+    let deadline = Instant::now() + REGISTRY_TOTAL_TIMEOUT;
+    let mut current_uri = validate_registry_url(url, allow_local_http)?;
+    let initial_origin = registry_origin_key(&current_uri);
+    let mut same_origin = true;
+
+    for hop in 0..=MAX_REDIRECTS {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        ensure!(!remaining.is_zero(), "registry request timed out");
+
+        let cur_scheme = current_uri
+            .scheme_str()
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_default();
+        let loopback_only = allow_local_http && cur_scheme == "http";
+
+        let config = Config::builder()
+            .max_redirects(0)
+            .http_status_as_error(false)
+            .proxy(None)
+            .timeout_connect(Some(REGISTRY_CONNECT_TIMEOUT.min(remaining)))
+            .timeout_global(Some(remaining))
+            .build();
+        let resolver = SsrfSafeResolver::new(allow_local_http, loopback_only);
+        let agent = ureq::Agent::with_parts(config, DefaultConnector::default(), resolver);
+
+        let mut builder = ureq::http::Request::builder()
+            .method("GET")
+            .uri(&current_uri)
+            .header("User-Agent", format!("fern/{}", env!("CARGO_PKG_VERSION")));
+        if same_origin {
+            for (k, v) in extra_headers {
+                builder = builder.header(*k, *v);
+            }
+        }
+        let req = builder
+            .body(())
+            .context("failed to build registry HTTP request")?;
+        let response = agent.run(req)?;
+        let status = response.status().as_u16();
+        if matches!(status, 301 | 302 | 303 | 307 | 308) {
+            if hop >= MAX_REDIRECTS {
+                bail!("registry request exceeded maximum of {MAX_REDIRECTS} redirects");
+            }
+            let location = response
+                .headers()
+                .get("location")
+                .and_then(|v| v.to_str().ok())
+                .context("registry redirect missing valid Location header")?;
+            let next_uri = resolve_redirect_uri(&current_uri, location)?;
+            let next_str = next_uri.to_string();
+            let validated_next = validate_registry_url(&next_str, allow_local_http)?;
+            let next_scheme = validated_next
+                .scheme_str()
+                .map(str::to_ascii_lowercase)
+                .unwrap_or_default();
+            ensure!(
+                !(cur_scheme == "https" && next_scheme == "http"),
+                "registry redirect blocked: HTTPS to HTTP downgrade is forbidden"
+            );
+            same_origin &= registry_origin_key(&validated_next) == initial_origin;
+            current_uri = validated_next;
+            continue;
+        }
+        return Ok(response);
+    }
+
+    bail!("registry request exceeded maximum of {MAX_REDIRECTS} redirects")
 }
 
 fn extract_zip_safely(zip_bytes: &[u8], dest_dir: &Path) -> Result<()> {
     let cursor = std::io::Cursor::new(zip_bytes);
     let mut archive = ZipArchive::new(cursor).context("invalid ZIP archive")?;
+    ensure!(
+        archive.len() <= MAX_PLUGIN_ZIP_ENTRIES,
+        "plugin archive exceeds maximum of {MAX_PLUGIN_ZIP_ENTRIES} entries (got {})",
+        archive.len()
+    );
     let mut total_unpacked: u64 = 0;
 
     for i in 0..archive.len() {
@@ -454,6 +636,11 @@ fn extract_zip_safely(zip_bytes: &[u8], dest_dir: &Path) -> Result<()> {
         if rel_path.as_os_str().is_empty() {
             continue;
         }
+        ensure!(
+            rel_path.components().count() <= MAX_PLUGIN_ZIP_DEPTH,
+            "zip entry exceeds maximum path depth of {MAX_PLUGIN_ZIP_DEPTH}: {:?}",
+            entry.name()
+        );
         let out_path = dest_dir.join(&rel_path);
         if entry.is_dir() {
             fs::create_dir_all(&out_path)?;
@@ -477,7 +664,6 @@ fn extract_zip_safely(zip_bytes: &[u8], dest_dir: &Path) -> Result<()> {
             );
             file.write_all(&buf[..n])?;
         }
-        file.sync_all()?;
     }
     Ok(())
 }
@@ -545,9 +731,12 @@ fn write_atomic_text(path: &Path, content: &str) -> Result<()> {
         Uuid::now_v7()
     ));
     {
-        let mut f = File::create(&tmp)?;
-        f.write_all(content.as_bytes())?;
-        f.sync_all()?;
+        let mut f = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+        if let Err(err) = f.write_all(content.as_bytes()).and_then(|()| f.sync_all()) {
+            drop(f);
+            let _ = fs::remove_file(&tmp);
+            return Err(err.into());
+        }
     }
     if let Err(err) = fs::rename(&tmp, path) {
         let _ = fs::remove_file(&tmp);
@@ -583,7 +772,7 @@ mod tests {
         let tmp = tempfile::tempdir()?;
         let plugins_dir = tmp.path().join("plugins");
         let cache_dir = tmp.path().join("cache");
-        let client = RegistryClient::new(&plugins_dir, &cache_dir);
+        let client = RegistryClient::new(&plugins_dir, &cache_dir).with_insecure_local_http_for_tests();
 
         // 1. Zip-slip rejection.
         let evil_zip_path = tmp.path().join("evil.zip");
@@ -741,6 +930,141 @@ mod tests {
         }
 
         let _ = srv.join();
+        Ok(())
+    }
+
+    #[test]
+    fn registry_requires_https_blocks_ssrf_checks_catalog_permissions_and_caps_zip() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let plugins_dir = tmp.path().join("plugins");
+        let cache_dir = tmp.path().join("cache");
+
+        // 1. Default production RegistryClient rejects plaintext http:// and private/loopback HTTPS IPs.
+        let strict_client = RegistryClient::new(&plugins_dir, &cache_dir);
+        assert!(strict_client.fetch_index("http://registry.example.com/registry.json").is_err());
+        assert!(strict_client.fetch_index("http://127.0.0.1:8080/registry.json").is_err());
+        assert!(strict_client.fetch_index("https://127.0.0.1/registry.json").is_err());
+        assert!(strict_client.fetch_index("https://169.254.169.254/latest/meta-data/").is_err());
+        assert!(strict_client.fetch_index("https://10.0.0.1/registry.json").is_err());
+
+        // 2. Archive requesting more permissions than declared in catalog entry must be rejected.
+        let escalated_zip = build_plugin_zip(&[
+            (
+                "manifest.json",
+                br#"{
+                    "api_version": 1,
+                    "id": "com.test.sneaky",
+                    "name": "Sneaky",
+                    "version": "1.0.0",
+                    "entry": "index.js",
+                    "permissions": ["tasks:read", "tasks:write"]
+                }"#,
+            ),
+            ("index.js", b"export function activate() {}\n"),
+        ])?;
+        let escalated_sha = hex::encode(Sha256::digest(&escalated_zip));
+
+        // Local mock server serving (a) escalated zip and (b) SSRF redirect to metadata IP.
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let zip_srv = escalated_zip;
+        let srv = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                let mut buf = [0u8; 2048];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                if req.starts_with("GET /sneaky.zip") {
+                    let hdr = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/zip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        zip_srv.len()
+                    );
+                    let _ = stream.write_all(hdr.as_bytes());
+                    let _ = stream.write_all(&zip_srv);
+                } else {
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 302 Found\r\nLocation: http://169.254.169.254/latest/meta-data/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
+                }
+            }
+        });
+
+        let test_client = RegistryClient::new(&plugins_dir, &cache_dir).with_insecure_local_http_for_tests();
+        let entry = RegistryPluginEntry {
+            id: "com.test.sneaky".to_owned(),
+            name: "Sneaky".to_owned(),
+            version: "1.0.0".to_owned(),
+            api_version: CURRENT_API_VERSION,
+            min_fern_version: None,
+            description: String::new(),
+            author: String::new(),
+            homepage: None,
+            tags: Vec::new(),
+            permissions: vec![Permission::TasksRead], // Catalog claims tasks:read ONLY!
+            download_url: format!("http://{addr}/sneaky.zip"),
+            sha256: escalated_sha,
+            size_bytes: 0,
+        };
+        let perm_err = test_client.install_from_registry(&entry, None).unwrap_err();
+        assert!(
+            format!("{perm_err:#}").contains("not declared in registry catalog"),
+            "{perm_err:#}"
+        );
+        assert!(
+            !plugins_dir.join("com.test.sneaky").exists(),
+            "rejected archive must not be installed on disk"
+        );
+
+        // Redirect to 169.254.169.254 must be blocked.
+        let ssrf_err = test_client
+            .fetch_index(&format!("http://{addr}/ssrf-redir"))
+            .unwrap_err();
+        assert!(
+            format!("{ssrf_err:#}").contains("loopback")
+                || format!("{ssrf_err:#}").contains("SSRF")
+                || format!("{ssrf_err:#}").contains("https://"),
+            "{ssrf_err:#}"
+        );
+        let _ = srv.join();
+
+        // 3. ZIP entry-count bomb (> MAX_PLUGIN_ZIP_ENTRIES) and excessive depth (> MAX_PLUGIN_ZIP_DEPTH) must fail.
+        {
+            let mut cursor = std::io::Cursor::new(Vec::new());
+            {
+                let mut writer = zip::ZipWriter::new(&mut cursor);
+                let opts = SimpleFileOptions::default();
+                for i in 0..=MAX_PLUGIN_ZIP_ENTRIES {
+                    writer.start_file(format!("f{i}.txt"), opts)?;
+                }
+                writer.finish()?;
+            }
+            let bomb_err = strict_client
+                .install_zip_bytes(cursor.get_ref(), None, None, None)
+                .unwrap_err();
+            assert!(format!("{bomb_err:#}").contains("exceeds maximum"), "{bomb_err:#}");
+        }
+        {
+            let deep_path = format!("{}leaf.js", "d/".repeat(MAX_PLUGIN_ZIP_DEPTH + 1));
+            let deep_zip = build_plugin_zip(&[(deep_path.as_str(), b"export {};")])?;
+            let depth_err = strict_client
+                .install_zip_bytes(&deep_zip, None, None, None)
+                .unwrap_err();
+            assert!(format!("{depth_err:#}").contains("maximum path depth"), "{depth_err:#}");
+        }
+
+        // 4. Oversized local zip file is rejected cleanly without unbounded read.
+        let big_path = tmp.path().join("big.zip");
+        {
+            let f = File::create(&big_path)?;
+            f.set_len(MAX_PLUGIN_ZIP_BYTES as u64 + 64)?;
+        }
+        let big_err = strict_client
+            .install_from_zip_file(&big_path, None)
+            .unwrap_err();
+        assert!(format!("{big_err:#}").contains("exceeds"), "{big_err:#}");
+
         Ok(())
     }
 }

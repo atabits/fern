@@ -341,17 +341,25 @@ impl PermissionSet {
         &self.network_hosts
     }
 
+    /// Checks whether `(host, port)` is explicitly permitted by `network: [...]` host patterns
+    /// (excluding implicit loopback access granted solely by `network:local`).
+    pub fn allows_explicit_host(&self, host: &str, port: Option<u16>) -> bool {
+        let host_norm = normalize_host(host);
+        if host_norm.is_empty() {
+            return false;
+        }
+        self.network_hosts
+            .iter()
+            .any(|pattern| host_pattern_matches(pattern, &host_norm, port))
+    }
+
     /// Checks whether `(host, port)` is permitted by `network` rules (or loopback `network:local`).
     pub fn allows_host(&self, host: &str, port: Option<u16>) -> bool {
         let host_norm = normalize_host(host);
         if host_norm.is_empty() {
             return false;
         }
-        if self
-            .network_hosts
-            .iter()
-            .any(|pattern| host_pattern_matches(pattern, &host_norm, port))
-        {
+        if self.allows_explicit_host(&host_norm, port) {
             return true;
         }
         self.allows_local() && is_loopback_host_literal(&host_norm)
@@ -492,11 +500,19 @@ fn host_pattern_matches(pattern: &str, host: &str, port: Option<u16>) -> bool {
     pat_host == host
 }
 
-fn is_loopback_host_literal(host: &str) -> bool {
+/// Returns `true` strictly for exact `"localhost"` or literal loopback IP addresses (`127.0.0.0/8`, `::1`).
+///
+/// Subdomains such as `exfil.localhost` are intentionally NOT matched implicitly by `network:local`
+/// to prevent non-RFC-6761 resolvers from bypassing the host allowlist.
+pub fn is_loopback_host_literal(host: &str) -> bool {
     let h = normalize_host(host);
     h == "localhost"
-        || h.ends_with(".localhost")
-        || h.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
+        || h.parse::<std::net::IpAddr>().is_ok_and(|ip| match ip {
+            std::net::IpAddr::V4(v4) => v4.is_loopback(),
+            std::net::IpAddr::V6(v6) => {
+                v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+            }
+        })
 }
 
 #[cfg(test)]
@@ -530,5 +546,17 @@ mod tests {
         let diff = granted.diff(&escalated);
         assert!(diff.is_escalation());
         assert!(diff.added.contains(&Permission::TasksWrite));
+    }
+
+    #[test]
+    fn network_local_blocks_subdomain_localhost_bypass() {
+        let local_only = PermissionSet::new(&[Permission::NetworkLocal]);
+        assert!(local_only.allows_host("localhost", Some(18481)));
+        assert!(local_only.allows_host("127.0.0.1", Some(18481)));
+        assert!(local_only.allows_host("::1", Some(18481)));
+        assert!(!local_only.allows_explicit_host("localhost", Some(18481)));
+        assert!(!local_only.allows_host("exfil.localhost", Some(80)));
+        assert!(!local_only.allows_host("a.b.localhost", Some(443)));
+        assert!(!local_only.allows_host("192.168.1.10", Some(80)));
     }
 }

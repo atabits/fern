@@ -4360,6 +4360,7 @@ dependencies = [
  "futures",
  "getrandom 0.2.17",
  "hex",
+ "roxmltree 0.21.1",
  "rquickjs",
  "rusqlite",
  "serde",
@@ -4368,6 +4369,8 @@ dependencies = [
  "tempfile",
  "ureq",
  "uuid",
+ "windows 0.62.2",
+ "zeroize",
  "zip",
 ]
 

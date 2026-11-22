@@ -4,6 +4,7 @@ pub mod colors;
 pub mod completion_mark;
 pub mod countdown_helpers;
 pub mod data_version;
+pub mod diagnostics;
 pub mod emoji;
 pub mod export;
 pub mod habit_helpers;

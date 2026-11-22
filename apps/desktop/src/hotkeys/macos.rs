@@ -24,6 +24,7 @@ const K_EVENT_HOT_KEY_PRESSED: u32 = 5;
 const K_EVENT_PARAM_DIRECT_OBJECT: u32 = u32::from_be_bytes(*b"----");
 const TYPE_EVENT_HOT_KEY_ID: u32 = u32::from_be_bytes(*b"hkid");
 const FERN_SIGNATURE: u32 = u32::from_be_bytes(*b"FERN");
+const EVENT_NOT_HANDLED_ERR: OSStatus = -9874;
 
 const CMD_KEY: u32 = 1 << 8;
 const SHIFT_KEY: u32 = 1 << 9;
@@ -58,7 +59,7 @@ unsafe extern "C" {
     fn InstallEventHandler(
         target: EventTargetRef,
         handler: EventHandlerUPP,
-        num_types: u32,
+        num_types: usize,
         list: *const EventTypeSpec,
         user_data: *mut c_void,
         out_ref: *mut EventHandlerRef,
@@ -115,13 +116,20 @@ unsafe extern "C" fn hotkey_callback(
         && hk_id.signature == FERN_SIGNATURE
         && let Some(hotkey) = Hotkey::from_id(hk_id.id as usize)
     {
-        MAC_STATE.with(|slot| {
-            if let Some(state) = slot.borrow().as_ref() {
-                let _ = state.tx.unbounded_send(Event::Pressed(hotkey));
+        let dispatched = MAC_STATE.with(|slot| {
+            if let Ok(borrow) = slot.try_borrow()
+                && let Some(state) = borrow.as_ref()
+            {
+                state.tx.unbounded_send(Event::Pressed(hotkey)).is_ok()
+            } else {
+                false
             }
         });
+        if dispatched {
+            return 0;
+        }
     }
-    0
+    EVENT_NOT_HANDLED_ERR
 }
 
 pub(super) fn start(shared: Arc<Mutex<Shared>>, _stopped_cv: Arc<Condvar>, tx: UnboundedSender<Event>) {
@@ -166,18 +174,24 @@ pub(super) fn reload(shared: &Arc<Mutex<Shared>>) {
     MAC_STATE.with(|slot| {
         let mut borrow = slot.borrow_mut();
         let Some(state) = borrow.as_mut() else { return };
+        // Pass 1: unregister all existing bindings first so swapping chords or
+        // resetting defaults never self-conflicts with `eventHotKeyExistsErr`.
+        for hk_ref in &mut state.refs {
+            if let Some(handle) = hk_ref.take() {
+                unsafe { UnregisterEventHotKey(handle) };
+            }
+        }
         let mut guard = shared.lock().unwrap_or_else(|e| e.into_inner());
+        let shared = &mut *guard;
+        // Pass 2: register all active bindings from the updated table.
         for hotkey in Hotkey::ALL {
             let idx = hotkey.index();
-            if let Some(hk_ref) = state.refs[idx].take() {
-                unsafe { UnregisterEventHotKey(hk_ref) };
-            }
-            let Some(binding) = guard.bindings[idx].clone() else {
-                guard.taken[idx] = false;
+            let Some(binding) = shared.bindings[idx].as_ref() else {
+                shared.taken[idx] = false;
                 continue;
             };
             let Some(code) = binding.mac_key_code() else {
-                guard.taken[idx] = false;
+                shared.taken[idx] = false;
                 continue;
             };
             let mut mods = 0u32;
@@ -201,9 +215,9 @@ pub(super) fn reload(shared: &Arc<Mutex<Shared>>) {
             let status = unsafe { RegisterEventHotKey(code, mods, hk_id, target, 0, &mut hk_ref) };
             if status == 0 && !hk_ref.is_null() {
                 state.refs[idx] = Some(hk_ref);
-                guard.taken[idx] = false;
+                shared.taken[idx] = false;
             } else {
-                guard.taken[idx] = true;
+                shared.taken[idx] = true;
             }
         }
         let _ = state.tx.unbounded_send(Event::Registered);
@@ -211,18 +225,17 @@ pub(super) fn reload(shared: &Arc<Mutex<Shared>>) {
 }
 
 pub(super) fn shutdown(shared: &Arc<Mutex<Shared>>, stopped_cv: &Arc<Condvar>) {
-    MAC_STATE.with(|slot| {
-        if let Some(mut state) = slot.borrow_mut().take() {
-            for hk_ref in state.refs.iter_mut() {
-                if let Some(handle) = hk_ref.take() {
-                    unsafe { UnregisterEventHotKey(handle) };
-                }
-            }
-            if !state.handler.is_null() {
-                unsafe { RemoveEventHandler(state.handler) };
+    let state = MAC_STATE.with(|slot| slot.borrow_mut().take());
+    if let Some(mut state) = state {
+        for hk_ref in &mut state.refs {
+            if let Some(handle) = hk_ref.take() {
+                unsafe { UnregisterEventHotKey(handle) };
             }
         }
-    });
+        if !state.handler.is_null() {
+            unsafe { RemoveEventHandler(state.handler) };
+        }
+    }
     let mut guard = shared.lock().unwrap_or_else(|e| e.into_inner());
     guard.stopped = true;
     stopped_cv.notify_all();

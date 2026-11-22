@@ -2,17 +2,21 @@
 
 use std::cell::RefCell;
 
+use dispatch2::DispatchQueue;
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender};
 use gpui::Window;
 use objc2::rc::Retained;
-use objc2::runtime::AnyObject;
+use objc2::runtime::{AnyObject, Sel};
 use objc2::{AnyThread as _, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
     NSApplication, NSControlStateValueOff, NSControlStateValueOn, NSFloatingWindowLevel, NSImage,
     NSMenu, NSMenuItem, NSNormalWindowLevel, NSStatusBar, NSStatusItem, NSVariableStatusItemLength,
-    NSWindow,
+    NSWindow, NSWindowButton, NSWindowDidMiniaturizeNotification,
 };
-use objc2_foundation::{NSData, NSInteger, NSObject, NSObjectProtocol, NSSize, NSString};
+use objc2_foundation::{
+    NSData, NSInteger, NSNotification, NSNotificationCenter, NSObject, NSObjectProtocol, NSSize,
+    NSString,
+};
 
 use super::{TrayAction, TrayLabels, TrayPrefs};
 
@@ -46,8 +50,72 @@ define_class!(
             };
             if let Some(action) = action {
                 SENDER.with(|slot| {
-                    if let Some(tx) = slot.borrow().as_ref() {
+                    if let Ok(borrow) = slot.try_borrow()
+                        && let Some(tx) = borrow.as_ref()
+                    {
                         let _ = tx.unbounded_send(action);
+                    }
+                });
+            }
+        }
+
+        #[unsafe(method(onMinimizeButton:))]
+        fn on_minimize_button(&self, _: Option<&AnyObject>) {
+            let action = STATE.with(|slot| {
+                let Ok(borrow) = slot.try_borrow() else { return None };
+                let state = borrow.as_ref()?;
+                Some((state.window.clone(), state.enabled && !state.quitting))
+            });
+            if let Some((window, hide_to_tray)) = action {
+                if hide_to_tray {
+                    window.orderOut(None);
+                } else {
+                    window.performMiniaturize(None);
+                }
+            }
+        }
+
+        #[unsafe(method(onWindowDidMiniaturize:))]
+        fn on_window_did_miniaturize(&self, _: Option<&NSNotification>) {
+            let should_defer = STATE.with(|slot| {
+                let Ok(mut borrow) = slot.try_borrow_mut() else { return false };
+                let Some(state) = borrow.as_mut() else { return false };
+                if !state.enabled || state.quitting || state.hiding_from_minimize {
+                    return false;
+                }
+                state.hiding_from_minimize = true;
+                true
+            });
+            if should_defer {
+                // Defer to the next main-queue turn so we never mutate window state
+                // re-entrantly inside AppKit's notification delivery stack.
+                DispatchQueue::main().exec_async(|| {
+                    let window = STATE.with(|slot| {
+                        let Ok(mut borrow) = slot.try_borrow_mut() else { return None };
+                        let state = borrow.as_mut()?;
+                        if !state.hiding_from_minimize {
+                            return None;
+                        }
+                        if !state.enabled || state.quitting {
+                            state.hiding_from_minimize = false;
+                            return None;
+                        }
+                        Some(state.window.clone())
+                    });
+                    if let Some(window) = window {
+                        if window.isMiniaturized() {
+                            // Deminiaturize first so AppKit removes the Dock mini-tile
+                            // instead of leaving an orphaned Dock entry after `orderOut`.
+                            window.deminiaturize(None);
+                        }
+                        window.orderOut(None);
+                        STATE.with(|slot| {
+                            if let Ok(mut borrow) = slot.try_borrow_mut()
+                                && let Some(state) = borrow.as_mut()
+                            {
+                                state.hiding_from_minimize = false;
+                            }
+                        });
                     }
                 });
             }
@@ -55,14 +123,23 @@ define_class!(
     }
 );
 
+struct MinimizeButtonBinding {
+    target: Option<Retained<AnyObject>>,
+    action: Option<Sel>,
+}
+
 struct State {
     window: Retained<NSWindow>,
+    orig_minimize_binding: Option<MinimizeButtonBinding>,
     status_item: Retained<NSStatusItem>,
-    target: Retained<FernTrayTarget>,
+    // Declared before `target` so `NSMenu` (whose items weakly target `FernTrayTarget`)
+    // always drops before `target` is released.
     menu: Retained<NSMenu>,
+    target: Retained<FernTrayTarget>,
     enabled: bool,
     always_on_top: bool,
     quitting: bool,
+    hiding_from_minimize: bool,
     labels: TrayLabels,
     last_tip: String,
 }
@@ -70,6 +147,30 @@ struct State {
 thread_local! {
     static STATE: RefCell<Option<State>> = const { RefCell::new(None) };
     static SENDER: RefCell<Option<UnboundedSender<TrayAction>>> = const { RefCell::new(None) };
+}
+
+fn sync_minimize_button(state: &State) {
+    let Some(binding) = state.orig_minimize_binding.as_ref() else {
+        return;
+    };
+    let Some(button) = state.window.standardWindowButton(NSWindowButton::MiniaturizeButton) else {
+        return;
+    };
+    if state.enabled && !state.quitting {
+        let target_obj: &AnyObject = &state.target;
+        // SAFETY: `state.target` implements `onMinimizeButton:` and is detached
+        // in `set_enabled(false)` and `prepare_quit()` before `target` drops.
+        unsafe {
+            button.setTarget(Some(target_obj));
+            button.setAction(Some(sel!(onMinimizeButton:)));
+        }
+    } else {
+        // SAFETY: Restores the button's original AppKit target and selector captured in `init()`.
+        unsafe {
+            button.setTarget(binding.target.as_deref());
+            button.setAction(binding.action);
+        }
+    }
 }
 
 fn make_item(
@@ -87,7 +188,7 @@ fn make_item(
         )
     };
     item.setTag(tag);
-    let target_obj: &AnyObject = unsafe { &*(target as *const FernTrayTarget as *const AnyObject) };
+    let target_obj: &AnyObject = target;
     unsafe { item.setTarget(Some(target_obj)) };
     item
 }
@@ -164,18 +265,45 @@ pub(super) fn init(window: &Window, prefs: TrayPrefs, labels: TrayLabels) {
     rebuild_menu(&menu, &target, labels, prefs.always_on_top, mtm);
     status_item.setMenu(Some(&menu));
 
-    STATE.with(|slot| {
-        *slot.borrow_mut() = Some(State {
-            window: ns_window,
-            status_item,
-            target,
-            menu,
-            enabled: prefs.minimize_to_tray,
-            always_on_top: prefs.always_on_top,
-            quitting: false,
-            labels,
-            last_tip: "Fern".to_owned(),
+    let orig_minimize_binding = ns_window
+        .standardWindowButton(NSWindowButton::MiniaturizeButton)
+        .map(|button| MinimizeButtonBinding {
+            target: button.target(),
+            action: button.action(),
         });
+
+    let target_obj: &AnyObject = &target;
+    let window_obj: &AnyObject = &ns_window;
+    // SAFETY: `target` implements `onWindowDidMiniaturize:` and is unregistered in
+    // `prepare_quit()` before dropping.
+    unsafe {
+        NSNotificationCenter::defaultCenter().addObserver_selector_name_object(
+            target_obj,
+            sel!(onWindowDidMiniaturize:),
+            Some(NSWindowDidMiniaturizeNotification),
+            Some(window_obj),
+        );
+    }
+
+    let state = State {
+        window: ns_window,
+        orig_minimize_binding,
+        status_item,
+        menu,
+        target,
+        enabled: prefs.minimize_to_tray,
+        always_on_top: prefs.always_on_top,
+        quitting: false,
+        hiding_from_minimize: false,
+        labels,
+        last_tip: "Fern".to_owned(),
+    };
+    if state.enabled {
+        sync_minimize_button(&state);
+    }
+
+    STATE.with(|slot| {
+        *slot.borrow_mut() = Some(state);
     });
 }
 
@@ -206,6 +334,10 @@ pub(super) fn set_enabled(is_enabled: bool) {
     STATE.with(|slot| {
         if let Some(state) = slot.borrow_mut().as_mut() {
             state.enabled = is_enabled;
+            if !is_enabled {
+                state.hiding_from_minimize = false;
+            }
+            sync_minimize_button(state);
         }
     });
 }
@@ -232,51 +364,65 @@ pub(super) fn update_labels(labels: TrayLabels) {
 }
 
 pub(super) fn hide_to_tray() -> bool {
-    STATE.with(|slot| {
-        let borrow = slot.borrow();
-        let Some(state) = borrow.as_ref() else { return false };
-        if state.quitting {
-            return false;
-        }
-        state.window.orderOut(None);
-        true
-    })
+    let window = STATE.with(|slot| {
+        let Ok(borrow) = slot.try_borrow() else { return None };
+        let state = borrow.as_ref()?;
+        (!state.quitting).then(|| state.window.clone())
+    });
+    let Some(window) = window else { return false };
+    window.orderOut(None);
+    true
 }
 
 pub(super) fn hide_to_tray_if_enabled() -> bool {
-    STATE.with(|slot| {
-        let borrow = slot.borrow();
-        let Some(state) = borrow.as_ref() else { return false };
-        if !state.enabled || state.quitting {
-            return false;
-        }
-        state.window.orderOut(None);
-        true
-    })
+    let window = STATE.with(|slot| {
+        let Ok(borrow) = slot.try_borrow() else { return None };
+        let state = borrow.as_ref()?;
+        (state.enabled && !state.quitting).then(|| state.window.clone())
+    });
+    let Some(window) = window else { return false };
+    window.orderOut(None);
+    true
 }
 
 pub(super) fn restore_main_window() -> bool {
     let Some(mtm) = MainThreadMarker::new() else { return false };
-    STATE.with(|slot| {
-        let borrow = slot.borrow();
-        let Some(state) = borrow.as_ref() else { return false };
-        let app = NSApplication::sharedApplication(mtm);
-        app.unhide(None);
-        app.activate();
-        if state.window.isMiniaturized() {
-            state.window.deminiaturize(None);
-        }
-        state.window.makeKeyAndOrderFront(None);
-        true
-    })
+    let window = STATE.with(|slot| {
+        let Ok(mut borrow) = slot.try_borrow_mut() else { return None };
+        let state = borrow.as_mut()?;
+        state.hiding_from_minimize = false;
+        Some(state.window.clone())
+    });
+    let Some(window) = window else { return false };
+    let app = NSApplication::sharedApplication(mtm);
+    app.unhide(None);
+    // `activateIgnoringOtherApps(true)` works on macOS 12+ (`activate` is 14+ only)
+    // and reliably brings the window to front from global hotkeys.
+    #[allow(deprecated)]
+    app.activateIgnoringOtherApps(true);
+    if window.isMiniaturized() {
+        window.deminiaturize(None);
+    }
+    window.makeKeyAndOrderFront(None);
+    true
 }
 
 pub(super) fn prepare_quit() {
-    STATE.with(|slot| {
-        if let Some(mut state) = slot.borrow_mut().take() {
-            state.quitting = true;
-            NSStatusBar::systemStatusBar().removeStatusItem(&state.status_item);
+    let state = STATE.with(|slot| slot.borrow_mut().take());
+    if let Some(mut state) = state {
+        let was_enabled = state.enabled;
+        state.quitting = true;
+        if was_enabled {
+            sync_minimize_button(&state);
         }
-    });
+        let target_obj: &AnyObject = &state.target;
+        // SAFETY: `state.target` was registered as an observer in `init()`.
+        unsafe {
+            NSNotificationCenter::defaultCenter().removeObserver(target_obj);
+        }
+        state.status_item.setMenu(None);
+        state.menu.removeAllItems();
+        NSStatusBar::systemStatusBar().removeStatusItem(&state.status_item);
+    }
     SENDER.with(|slot| *slot.borrow_mut() = None);
 }

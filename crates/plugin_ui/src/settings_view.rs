@@ -1041,6 +1041,7 @@ impl PluginSettingsView {
             .unwrap_or_default();
 
         let safe_mode_card = v_flex()
+            .overflow_hidden()
             .rounded(px(8.))
             .bg(colors.surface_background)
             .border_1()
@@ -1049,8 +1050,9 @@ impl PluginSettingsView {
                 h_flex()
                     .id("plugins-safe-mode-toggle")
                     .px_4()
-                    .py_2p5()
+                    .py_3()
                     .gap_3()
+                    .items_center()
                     .justify_between()
                     .cursor_pointer()
                     .hover(|s| s.bg(colors.ghost_element_hover))
@@ -1073,8 +1075,9 @@ impl PluginSettingsView {
                 col.child(Divider::horizontal()).child(
                     h_flex()
                         .px_4()
-                        .py_2()
+                        .py_2p5()
                         .gap_2()
+                        .items_center()
                         .child(
                             Icon::new(IconName::CircleAlert)
                                 .size(IconSize::Small)
@@ -1089,42 +1092,61 @@ impl PluginSettingsView {
             });
 
         let toolbar = h_flex()
-            .flex_wrap()
+            .w_full()
+            .items_center()
+            .justify_between()
             .gap_2()
             .child(
-                Button::new("plugins-new-template", strings.plugins_new_template)
-                    .variant(ButtonVariant::Secondary)
-                    .size(ButtonSize::Sm)
-                    .icon(IconName::Plus)
-                    .on_click(cx.listener(|this, _, _, cx| this.create_sample_plugin(cx))),
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        Button::new("plugins-new-template", strings.plugins_new_template)
+                            .variant(ButtonVariant::Primary)
+                            .size(ButtonSize::Sm)
+                            .icon(IconName::Plus)
+                            .on_click(cx.listener(|this, _, _, cx| this.create_sample_plugin(cx))),
+                    )
+                    .child(
+                        Button::new("plugins-install-zip", strings.plugins_install_zip)
+                            .variant(ButtonVariant::Secondary)
+                            .size(ButtonSize::Sm)
+                            .icon(IconName::FolderOpen)
+                            .on_click(cx.listener(|this, _, _, cx| this.install_from_zip_dialog(cx))),
+                    ),
             )
             .child(
-                Button::new("plugins-install-zip", strings.plugins_install_zip)
-                    .variant(ButtonVariant::Secondary)
-                    .size(ButtonSize::Sm)
-                    .icon(IconName::FolderOpen)
-                    .on_click(cx.listener(|this, _, _, cx| this.install_from_zip_dialog(cx))),
-            )
-            .child(
-                Button::new("plugins-open-folder", strings.plugins_open_folder)
-                    .variant(ButtonVariant::Secondary)
-                    .size(ButtonSize::Sm)
-                    .icon(IconName::Folder)
-                    .on_click(cx.listener(|this, _, _, cx| this.open_plugins_folder(cx))),
-            )
-            .child(
-                Button::new("plugins-reload-all", strings.plugins_reload_all)
-                    .variant(ButtonVariant::Ghost)
-                    .size(ButtonSize::Sm)
-                    .icon(IconName::RefreshCw)
-                    .disabled(safe_mode_active)
-                    .on_click(|_, _, cx| PluginHost::reload_all_async(cx)),
+                h_flex()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        IconButton::new("plugins-open-folder", IconName::Folder)
+                            .size(px(30.))
+                            .icon_size(IconSize::Small)
+                            .icon_color(Color::IconMuted)
+                            .hover_icon_color(Color::Icon)
+                            .tooltip(Tooltip::text(strings.plugins_open_folder))
+                            .on_click(cx.listener(|this, _, _, cx| this.open_plugins_folder(cx))),
+                    )
+                    .child(
+                        IconButton::new("plugins-reload-all", IconName::RefreshCw)
+                            .size(px(30.))
+                            .icon_size(IconSize::Small)
+                            .icon_color(Color::IconMuted)
+                            .hover_icon_color(Color::Icon)
+                            .tooltip(Tooltip::text(strings.plugins_reload_all))
+                            .disabled(safe_mode_active)
+                            .when(!safe_mode_active, |btn| {
+                                btn.on_click(|_, _, cx| PluginHost::reload_all_async(cx))
+                            }),
+                    ),
             );
 
         let cards: Vec<AnyElement> = if plugins.is_empty() {
             vec![
                 div()
-                    .py_6()
+                    .w_full()
+                    .py_10()
                     .child(EmptyState::new(IconName::Layers, strings.plugins_empty))
                     .into_any_element(),
             ]
@@ -1137,7 +1159,7 @@ impl PluginSettingsView {
 
         v_flex()
             .w_full()
-            .gap_3()
+            .gap_4()
             .child(safe_mode_card)
             .child(toolbar)
             .children(cards)
@@ -1186,8 +1208,8 @@ impl PluginSettingsView {
 
         let mut card = v_flex()
             .w_full()
-            .p_3p5()
-            .gap_2p5()
+            .p_4()
+            .gap_3()
             .rounded(px(8.))
             .bg(colors.surface_background)
             .border_1()
@@ -2051,14 +2073,15 @@ impl PluginSettingsView {
 
         v_flex()
             .w_full()
-            .gap_3()
+            .gap_4()
             .child(
                 h_flex()
+                    .items_center()
                     .justify_between()
                     .child(
                         Label::new(strings.plugins_scripts)
                             .size(LabelSize::Default)
-                            .weight(FontWeight::SEMIBOLD),
+                            .weight(FontWeight::MEDIUM),
                     )
                     .child(
                         Button::new("scripts-new", strings.plugins_script_new)
@@ -2084,8 +2107,8 @@ impl PluginSettingsView {
             .child(
                 v_flex()
                     .w_full()
-                    .p_3p5()
-                    .gap_2p5()
+                    .p_4()
+                    .gap_3()
                     .rounded(px(8.))
                     .bg(colors.surface_background)
                     .border_1()
@@ -2270,8 +2293,8 @@ impl PluginSettingsView {
 
         let sources_panel = v_flex()
             .w_full()
-            .p_3()
-            .gap_2()
+            .p_4()
+            .gap_2p5()
             .rounded(px(8.))
             .bg(colors.surface_background)
             .border_1()
@@ -2398,7 +2421,8 @@ impl PluginSettingsView {
         let catalog_cards: Vec<AnyElement> = if filtered.is_empty() {
             vec![
                 div()
-                    .py_6()
+                    .w_full()
+                    .py_10()
                     .child(EmptyState::new(
                         IconName::Search,
                         if self.browse_loading {
@@ -2488,8 +2512,8 @@ impl PluginSettingsView {
 
                     v_flex()
                         .w_full()
-                        .p_3p5()
-                        .gap_2()
+                        .p_4()
+                        .gap_2p5()
                         .rounded(px(8.))
                         .bg(colors.surface_background)
                         .border_1()
@@ -2572,7 +2596,7 @@ impl PluginSettingsView {
 
         v_flex()
             .w_full()
-            .gap_3()
+            .gap_4()
             .child(sources_panel)
             .when(!self.registry_errors.is_empty(), |col| {
                 col.children(self.registry_errors.iter().map(|err| {
@@ -2726,15 +2750,19 @@ impl Render for PluginSettingsView {
                     v_flex()
                         .id("plugin-settings-vp")
                         .w_full()
+                        .pt_1()
+                        .px_6()
+                        .pb_6()
                         .gap_4()
                         .child(
                             h_flex()
+                                .items_center()
                                 .justify_between()
                                 .gap_3()
                                 .child(
                                     Label::new(strings.plugins)
                                         .size(LabelSize::Default)
-                                        .weight(FontWeight::SEMIBOLD),
+                                        .weight(FontWeight::MEDIUM),
                                 )
                                 .child(tabs),
                         )

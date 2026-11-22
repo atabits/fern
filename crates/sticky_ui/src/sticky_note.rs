@@ -1297,4 +1297,31 @@ mod tests {
         assert_eq!(store.checklist(task.id).unwrap()[0].title, "Renamed elsewhere?");
         let _ = note;
     }
+
+    #[gpui::test]
+    fn close_and_forget_marks_note_closed_and_removes_window(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            theme::init(cx);
+            cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+            let store = Rc::new(Store::open_in_memory().unwrap());
+            let task = store.add_task("Close and forget").unwrap();
+            open(store.clone(), task.id, cx);
+            assert_eq!(cx.windows().len(), 1);
+            let saved = desktop_common::sticky_windows::load(&store);
+            assert_eq!(saved.len(), 1);
+            assert_eq!(saved[0].task, task.id);
+            assert!(saved[0].open);
+
+            let handle = cx.global::<OpenNotes>().0[0];
+            handle
+                .update(cx, |note, window, cx| note.close_and_forget(window, cx))
+                .unwrap();
+
+            assert!(cx.windows().is_empty(), "close_and_forget must remove the sticky window");
+            let saved = desktop_common::sticky_windows::load(&store);
+            assert_eq!(saved.len(), 1);
+            assert_eq!(saved[0].task, task.id);
+            assert!(!saved[0].open, "close_and_forget must mark the sticky note closed");
+        });
+    }
 }

@@ -30,6 +30,28 @@ use macos as platform;
 #[cfg(windows)]
 use windows as platform;
 
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+mod platform {
+    use std::sync::{Arc, Condvar, Mutex};
+
+    use futures::channel::mpsc::UnboundedSender;
+
+    use super::{Event, Shared};
+
+    pub(super) fn start(
+        shared: Arc<Mutex<Shared>>,
+        stopped_cv: Arc<Condvar>,
+        _tx: UnboundedSender<Event>,
+    ) {
+        shared.lock().unwrap_or_else(|e| e.into_inner()).stopped = true;
+        stopped_cv.notify_all();
+    }
+
+    pub(super) fn reload(_shared: &Arc<Mutex<Shared>>) {}
+
+    pub(super) fn shutdown(_shared: &Arc<Mutex<Shared>>, _stopped_cv: &Arc<Condvar>) {}
+}
+
 /// System-wide shortcuts, in the order Settings → Shortcuts lists them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Hotkey {
@@ -74,20 +96,8 @@ impl Hotkey {
 
     const fn default_setting(self) -> &'static str {
         match self {
-            Self::QuickAdd => {
-                if cfg!(target_os = "macos") {
-                    "cmd-shift-a"
-                } else {
-                    "ctrl-shift-a"
-                }
-            }
-            Self::ShowHide => {
-                if cfg!(target_os = "macos") {
-                    "cmd-shift-e"
-                } else {
-                    "ctrl-shift-e"
-                }
-            }
+            Self::QuickAdd => "ctrl-shift-a",
+            Self::ShowHide => "ctrl-shift-e",
             Self::FocusMini => "off",
             Self::PinWindow => "off",
         }
@@ -121,10 +131,17 @@ impl Binding {
                 "ctrl" => binding.ctrl = true,
                 "alt" => binding.alt = true,
                 "shift" => binding.shift = true,
-                "win" | "cmd" | "super" => binding.win = true,
-                key => binding.key = key.to_owned(),
+                "win" | "cmd" | "super" | "meta" => binding.win = true,
+                "" => return None,
+                key => {
+                    if !binding.key.is_empty() {
+                        return None;
+                    }
+                    binding.key = key.to_owned();
+                }
             }
         }
+        (binding.ctrl || binding.alt || binding.win).then_some(())?;
         binding.virtual_key()?;
         Some(binding)
     }
@@ -151,8 +168,8 @@ impl Binding {
         for (on, name) in [
             (self.ctrl, "ctrl"),
             (self.alt, "alt"),
-            (self.shift, "shift"),
             (self.win, platform_key),
+            (self.shift, "shift"),
         ] {
             if on {
                 parts.push(name);
@@ -175,8 +192,8 @@ impl Binding {
         for (on, name) in [
             (self.ctrl, "Ctrl"),
             (self.alt, "Alt"),
-            (self.shift, "Shift"),
             (self.win, platform_label),
+            (self.shift, "Shift"),
         ] {
             if on {
                 parts.push(name.to_owned());
@@ -291,9 +308,11 @@ pub(super) struct Shared {
     pub thread: Option<u32>,
     #[cfg(target_os = "linux")]
     pub wake_window: Option<u32>,
+    #[cfg_attr(not(any(windows, target_os = "macos", target_os = "linux")), allow(dead_code))]
     pub stopped: bool,
 }
 
+#[cfg_attr(not(any(windows, target_os = "macos", target_os = "linux")), allow(dead_code))]
 pub(super) enum Event {
     Pressed(Hotkey),
     Registered,
@@ -445,6 +464,16 @@ mod tests {
     }
 
     #[test]
+    fn default_hotkeys_use_non_colliding_ctrl_shift_chords() {
+        assert_eq!(Hotkey::QuickAdd.default_setting(), "ctrl-shift-a");
+        assert_eq!(Hotkey::ShowHide.default_setting(), "ctrl-shift-e");
+        assert_eq!(Hotkey::FocusMini.default_setting(), "off");
+        assert_eq!(Hotkey::PinWindow.default_setting(), "off");
+        assert!(Binding::parse(Hotkey::QuickAdd.default_setting()).is_some());
+        assert!(Binding::parse(Hotkey::ShowHide.default_setting()).is_some());
+    }
+
+    #[test]
     fn binding_parses_formats_and_maps_all_platform_keycodes() {
         let binding = Binding::parse("ctrl-shift-a").unwrap();
         assert_eq!(binding.label(), "Ctrl+Shift+A");
@@ -460,6 +489,78 @@ mod tests {
             assert!(parsed.virtual_key().is_some(), "missing win32 vk for {key}");
             assert!(parsed.mac_key_code().is_some(), "missing macOS keycode for {key}");
             assert!(parsed.x11_keysym().is_some(), "missing X11 keysym for {key}");
+        }
+    }
+
+    #[test]
+    fn binding_parse_supports_platform_aliases_and_modifier_order() {
+        let platform_label = if cfg!(target_os = "macos") {
+            "Cmd"
+        } else if cfg!(target_os = "linux") {
+            "Super"
+        } else {
+            "Win"
+        };
+        let platform_key = if cfg!(target_os = "macos") { "cmd" } else { "win" };
+        let expected_label = format!("{platform_label}+Shift+A");
+        let expected_setting = format!("{platform_key}-shift-a");
+
+        for alias in ["cmd", "super", "win", "meta"] {
+            let parsed = Binding::parse(&format!("{alias}-shift-a")).expect(alias);
+            assert!(parsed.win && parsed.shift && !parsed.ctrl && !parsed.alt);
+            assert_eq!(parsed.key, "a");
+            assert_eq!(parsed.label(), expected_label);
+            assert_eq!(parsed.to_setting(), expected_setting);
+            assert!(!parsed.label().starts_with("Shift+"));
+
+            // Inverted input order still normalizes with platform modifier before Shift.
+            let inverted = Binding::parse(&format!("shift-{alias}-a")).expect(alias);
+            assert_eq!(inverted, parsed);
+            assert_eq!(inverted.label(), expected_label);
+            assert_eq!(inverted.to_setting(), expected_setting);
+        }
+
+        let full = Binding::parse("shift-win-alt-ctrl-f5").unwrap();
+        assert_eq!(full.label(), format!("Ctrl+Alt+{platform_label}+Shift+F5"));
+        assert_eq!(full.to_setting(), format!("ctrl-alt-{platform_key}-shift-f5"));
+    }
+
+    #[test]
+    fn binding_parse_rejects_missing_primary_modifier_or_invalid_input() {
+        for invalid in ["a", "shift-a", "off", "", "ctrl-", "ctrl-enter", "ctrl-f13", "ctrl-foo-a"] {
+            assert_eq!(Binding::parse(invalid), None, "expected {invalid:?} to be rejected");
+        }
+    }
+
+    #[test]
+    fn binding_from_keystroke_accepts_valid_combos_and_rejects_unsafe_keys() {
+        let valid = Keystroke::parse("ctrl-shift-space").unwrap();
+        let parsed = Binding::from_keystroke(&valid).expect("ctrl-shift-space must be accepted");
+        assert!(parsed.ctrl && parsed.shift && !parsed.alt && !parsed.win);
+        assert_eq!(parsed.key, "space");
+        assert_eq!(parsed.label(), "Ctrl+Shift+Space");
+
+        let platform_combo = Keystroke {
+            modifiers: gpui::Modifiers {
+                platform: true,
+                shift: true,
+                ..Default::default()
+            },
+            key: "K".to_owned(),
+            key_char: None,
+        };
+        let parsed = Binding::from_keystroke(&platform_combo).expect("platform+shift+K must be accepted");
+        assert!(parsed.win && parsed.shift && !parsed.ctrl && !parsed.alt);
+        assert_eq!(parsed.key, "k");
+        assert!(!parsed.label().starts_with("Shift+"));
+
+        for rejected in ["a", "shift-a", "space", "f1", "ctrl-enter", "ctrl-escape", "alt-tab"] {
+            let ks = Keystroke::parse(rejected).unwrap();
+            assert_eq!(
+                Binding::from_keystroke(&ks),
+                None,
+                "expected keystroke {rejected:?} to be rejected"
+            );
         }
     }
 }

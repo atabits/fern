@@ -13,6 +13,25 @@ pub(super) enum RecordingTarget {
 const PILL_WIDTH: f32 = 168.;
 const PILL_HEIGHT: f32 = 28.;
 
+fn replace_platform_modifier(text: &str, platform_key: &str) -> SharedString {
+    if platform_key == "Win" {
+        text.to_owned().into()
+    } else {
+        text.replace("Win", platform_key).into()
+    }
+}
+
+fn platform_shortcut_text(text: &str) -> SharedString {
+    let platform_key = if cfg!(target_os = "macos") {
+        "Cmd"
+    } else if cfg!(target_os = "linux") {
+        "Super"
+    } else {
+        "Win"
+    };
+    replace_platform_modifier(text, platform_key)
+}
+
 impl SettingsWindow {
     pub(super) fn open_user_keymap(&mut self, cx: &mut Context<Self>) {
         let task = cx.background_spawn(async move { keymap::ensure_user_keymap_file() });
@@ -247,7 +266,12 @@ impl SettingsWindow {
                 .gap_1()
                 .child(Label::new(title).weight(FontWeight::SEMIBOLD))
                 .when_some(hint, |el, hint| {
-                    el.child(div().text_size(px(12.)).text_color(colors.text_muted).child(hint))
+                    el.child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(colors.text_muted)
+                            .child(platform_shortcut_text(hint)),
+                    )
                 })
         };
 
@@ -355,11 +379,11 @@ impl SettingsWindow {
                 RecordingTarget::Global(hotkey) => (hotkey.label(strings), 2),
             };
             let rejected = self.recording_rejected;
-            let message = if rejected {
+            let message = platform_shortcut_text(if rejected {
                 strings.shortcut_record_rejected[rule_idx]
             } else {
                 strings.shortcut_record_hints[rule_idx]
-            };
+            });
             let accent_or_error = if rejected { error_color } else { colors.accent };
             h_flex()
                 .flex_none()
@@ -463,7 +487,8 @@ impl SettingsWindow {
         });
         let has_conflict = conflict_tip.is_some() && !recording;
         let rule_tip = strings.shortcut_rule_tips[usize::from(item.spec.allow_unmodified)];
-        let pill_tooltip = conflict_tip.or_else(|| (!recording).then(|| rule_tip.to_owned()));
+        let pill_tooltip =
+            conflict_tip.or_else(|| (!recording).then(|| platform_shortcut_text(rule_tip).to_string()));
         let pill_text = if recording {
             strings.press_shortcut.to_owned()
         } else {
@@ -559,8 +584,9 @@ impl SettingsWindow {
                     None
                 };
                 let has_conflict = conflict_tip.is_some() && !recording;
-                let pill_tooltip =
-                    conflict_tip.or_else(|| (!recording).then(|| strings.shortcut_rule_tips[2].to_owned()));
+                let pill_tooltip = conflict_tip.or_else(|| {
+                    (!recording).then(|| platform_shortcut_text(strings.shortcut_rule_tips[2]).to_string())
+                });
                 let pill_text = if recording {
                     strings.press_shortcut.to_owned()
                 } else {
@@ -736,5 +762,43 @@ impl SettingsWindow {
                 }))
                 .into_any_element(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn platform_shortcut_text_substitutes_platform_modifier_across_locales() {
+        for locale in [i18n::Locale::En, i18n::Locale::Ru, i18n::Locale::ZhCn] {
+            let strings = locale.strings();
+            for text in strings
+                .shortcut_rule_tips
+                .iter()
+                .chain(strings.shortcut_record_hints.iter())
+                .chain(strings.shortcut_record_rejected.iter())
+                .copied()
+                .chain(strings.shortcut_group_hints.iter().flatten().copied())
+            {
+                if text.contains("Win") {
+                    let mac = replace_platform_modifier(text, "Cmd");
+                    assert!(mac.contains("Cmd") && !mac.contains("Win"), "{locale:?}: {mac}");
+                    let linux = replace_platform_modifier(text, "Super");
+                    assert!(linux.contains("Super") && !linux.contains("Win"), "{locale:?}: {linux}");
+                    let win = replace_platform_modifier(text, "Win");
+                    assert_eq!(win.as_ref(), text);
+                }
+            }
+        }
+        let sample = "Ctrl, Alt, or Win + key";
+        let expected = if cfg!(target_os = "macos") {
+            "Ctrl, Alt, or Cmd + key"
+        } else if cfg!(target_os = "linux") {
+            "Ctrl, Alt, or Super + key"
+        } else {
+            sample
+        };
+        assert_eq!(platform_shortcut_text(sample).as_ref(), expected);
     }
 }

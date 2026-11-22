@@ -85,6 +85,28 @@ pub struct AppView {
 }
 
 impl AppView {
+    pub fn try_quit(main_window: gpui::WindowHandle<Self>, cx: &mut App) -> bool {
+        let can_quit = main_window
+            .update(cx, |view, window, cx| {
+                let ok = view.prepare_to_leave_calendar(window, cx);
+                if !ok {
+                    crate::tray::restore_main_window();
+                    window.activate_window();
+                }
+                ok
+            })
+            .unwrap_or(true);
+        if !can_quit {
+            return false;
+        }
+        crate::hotkeys::shutdown(cx);
+        crate::tray::prepare_quit();
+        #[cfg(windows)]
+        crate::single_instance::release();
+        cx.quit();
+        true
+    }
+
     pub fn register_window_actions(main_window: gpui::WindowHandle<Self>, cx: &mut App) {
         // Action dispatch may be using the active window. Wait until GPUI has put it back.
         cx.on_action(move |_: &CloseWindow, cx| {
@@ -113,20 +135,7 @@ impl AppView {
         });
         cx.on_action(move |_: &Quit, cx| {
             cx.defer(move |cx| {
-                let can_quit = main_window.update(cx, |view, window, cx| {
-                    let can_quit = view.prepare_to_leave_calendar(window, cx);
-                    if !can_quit {
-                        window.activate_window();
-                    }
-                    can_quit
-                }).unwrap_or(true);
-                if can_quit {
-                    crate::hotkeys::shutdown(cx);
-                    crate::tray::prepare_quit();
-                    #[cfg(windows)]
-                    crate::single_instance::release();
-                    cx.quit();
-                }
+                Self::try_quit(main_window, cx);
             });
         });
     }
@@ -1725,6 +1734,33 @@ mod tests {
             assert_eq!(tasks.len(), index + 1);
             assert!(tasks.iter().any(|task| task.title == title));
         }
+    }
+
+    #[gpui::test]
+    fn tray_quit_finishes_the_calendar_draft(cx: &mut gpui::TestAppContext) {
+        cx.update(theme::init);
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let mut app = AppView::new(store.clone(), true, window, cx);
+            app.select(Section::Calendar, window, cx);
+            app
+        });
+        let (tx, rx) = futures::channel::mpsc::unbounded();
+        cx.update(|window, cx| {
+            crate::tray::connect(rx, window.window_handle().downcast().unwrap(), store.clone(), cx);
+        });
+        cx.simulate_resize(gpui::size(px(1200.), px(650.)));
+
+        let add = cx.debug_bounds("calendar-add-frame").unwrap().center();
+        cx.simulate_click(add, gpui::Modifiers::default());
+        cx.simulate_input("Tray quit");
+        assert!(store.tasks().unwrap().is_empty());
+
+        tx.unbounded_send(crate::tray::TrayAction::Quit).unwrap();
+        cx.run_until_parked();
+        let tasks = store.tasks().unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].title, "Tray quit");
     }
 
     #[gpui::test]

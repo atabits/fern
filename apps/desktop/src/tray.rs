@@ -28,6 +28,33 @@ use macos as platform;
 #[cfg(windows)]
 use windows as platform;
 
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+mod platform {
+    use futures::channel::mpsc::UnboundedReceiver;
+    use gpui::Window;
+
+    use super::{TrayAction, TrayLabels, TrayPrefs};
+
+    pub(super) fn set_tooltip(_tip: &str) {}
+    pub(super) fn set_enabled(_is_enabled: bool) {}
+    pub(super) fn set_always_on_top(_topmost: bool) {}
+    pub(super) fn hide_to_tray() -> bool {
+        false
+    }
+    pub(super) fn hide_to_tray_if_enabled() -> bool {
+        false
+    }
+    pub(super) fn prepare_quit() {}
+    pub(super) fn restore_main_window() -> bool {
+        false
+    }
+    pub(super) fn update_labels(_labels: TrayLabels) {}
+    pub(super) fn prepare_channel() -> UnboundedReceiver<TrayAction> {
+        futures::channel::mpsc::unbounded().1
+    }
+    pub(super) fn init(_window: &Window, _prefs: TrayPrefs, _labels: TrayLabels) {}
+}
+
 const SETTING: &str = "minimize_to_tray";
 const TOPMOST_SETTING: &str = "always_on_top";
 
@@ -60,6 +87,7 @@ impl TrayPrefs {
     }
 }
 
+#[cfg_attr(not(any(windows, target_os = "macos", target_os = "linux")), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct TrayLabels {
     pub focus: &'static str,
@@ -81,6 +109,7 @@ impl TrayLabels {
     }
 }
 
+#[cfg_attr(not(any(windows, target_os = "macos", target_os = "linux")), allow(dead_code))]
 pub enum TrayAction {
     StartPomo,
     StartStopwatch,
@@ -202,14 +231,9 @@ pub fn connect(
                     });
                 }
                 TrayAction::Quit => {
-                    cx.update(|cx| {
-                        crate::hotkeys::shutdown(cx);
-                        prepare_quit();
-                        #[cfg(windows)]
-                        crate::single_instance::release();
-                        cx.quit();
-                    });
-                    break;
+                    if cx.update(|cx| AppView::try_quit(main_window, cx)) {
+                        break;
+                    }
                 }
             }
         }

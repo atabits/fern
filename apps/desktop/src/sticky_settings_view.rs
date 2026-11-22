@@ -58,7 +58,9 @@ impl SettingsWindow {
                             .hover(|s| s.bg(colors.ghost_element_hover))
                             .child(Switch::new().toggle_state(settings.hide_from_taskbar))
                             .on_click(cx.listener(|this, _, _, cx| this.update_sticky(cx, |s| s.hide_from_taskbar = !s.hide_from_taskbar))))
-                        .child(div().px_4().pb_2().child(Label::new(strings.sticky_task_view_hint).size(LabelSize::Small).color(Color::Muted))))),
+                        .when(cfg!(windows), |section| {
+                            section.child(div().px_4().pb_2().child(Label::new(strings.sticky_task_view_hint).size(LabelSize::Small).color(Color::Muted)))
+                        }))),
             )
             .children(self.sticky_error.clone().map(|message| Label::new(message).color(Color::Error)))
             .into_any_element()

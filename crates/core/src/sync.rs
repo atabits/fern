@@ -377,10 +377,18 @@ impl Store {
 
     /// Notes that the server has these files (sent from here, or fetched from it).
     pub fn mark_files_synced(&self, files: &[String]) -> Result<()> {
-        for file in files {
-            self.conn.execute("INSERT OR IGNORE INTO sync_uploaded (name) VALUES (?1)", [file])?;
+        if files.is_empty() {
+            return Ok(());
         }
-        Ok(())
+        self.in_tx(|| {
+            let mut stmt = self
+                .conn
+                .prepare_cached("INSERT OR IGNORE INTO sync_uploaded (name) VALUES (?1)")?;
+            for file in files {
+                stmt.execute([file])?;
+            }
+            Ok(())
+        })
     }
 
     /// Keeps one log entry per row, its latest: sending and conflicts only look at that one, so
@@ -509,6 +517,11 @@ impl Store {
                             };
                             decrypted_row = key.decrypt_row(&change.entity, &change.key, raw_row)?;
                             &decrypted_row
+                        } else if !passphrase.is_empty() {
+                            return Err(E2eeError::Malformed(
+                                "received unencrypted sync row while E2EE is enabled".into(),
+                            )
+                            .into());
                         } else {
                             raw_row
                         };
@@ -563,14 +576,14 @@ impl Store {
                             placeholders.join(", "),
                             keys.join(", "),
                         );
-                        self.conn.execute(&sql, params_from_iter(columns.iter().map(|c| to_sql(&row[c.as_str()]))))?;
+                        self.conn
+                            .prepare_cached(&sql)?
+                            .execute(params_from_iter(columns.iter().map(|c| to_sql(&row[c.as_str()]))))?;
                     }
                     None => {
                         let condition: Vec<String> = keys.iter().enumerate().map(|(i, k)| format!("{k} = ?{}", i + 1)).collect();
-                        self.conn.execute(
-                            &format!("DELETE FROM {} WHERE {}", change.entity, condition.join(" AND ")),
-                            params_from_iter(parts),
-                        )?;
+                        let sql = format!("DELETE FROM {} WHERE {}", change.entity, condition.join(" AND "));
+                        self.conn.prepare_cached(&sql)?.execute(params_from_iter(parts))?;
                     }
                 }
                 self.conn.prepare_cached(
@@ -1319,6 +1332,32 @@ mod tests {
         )?;
         relay(&a, pos_a2, &b);
         assert_eq!(b.task(task.id)?.unwrap().horizon, None);
+        Ok(())
+    }
+
+    #[test]
+    fn e2ee_rejects_plaintext_downgrade_injection() -> Result<()> {
+        let plain_sender = Store::open_in_memory()?;
+        let e2ee_client = Store::open_in_memory()?;
+        e2ee_client.set_sync_config(&SyncConfig {
+            server: "https://sync.example.org".into(),
+            token: "tok".into(),
+            passphrase: "correct-vault-passphrase".into(),
+        })?;
+
+        let injected = plain_sender.add_task("Injected plaintext task")?;
+        let plain_changes = plain_sender.sync_request()?.body["changes"].clone();
+        let req = e2ee_client.sync_request()?;
+        let server_answer = serde_json::json!({
+            "protocol": SYNC_PROTOCOL_VERSION,
+            "position": 5,
+            "changes": plain_changes,
+        });
+
+        let err = e2ee_client.finish_sync(&req, &server_answer).unwrap_err();
+        assert!(matches!(err.downcast_ref::<E2eeError>(), Some(E2eeError::Malformed(_))));
+        assert!(e2ee_client.task(injected.id)?.is_none());
+        assert_eq!(e2ee_client.sync_request()?.body["since"], 0);
         Ok(())
     }
 }

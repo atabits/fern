@@ -61,6 +61,20 @@ const SELECT_ALL_TASKS_SQL: &str = concat!(
 const SELECT_TASK_BY_ID_SQL: &str =
     concat!("SELECT ", task_columns!(), " FROM tasks WHERE id = ?1");
 
+const SELECT_TASKS_DUE_BETWEEN_SQL: &str = concat!(
+    "SELECT ",
+    task_columns!(),
+    " FROM tasks WHERE deleted_at IS NULL AND due_date IS NOT NULL AND due_date <= ?2 AND (due_date >= ?1 OR end_date >= ?1) ",
+    "ORDER BY completed_at IS NOT NULL, completed_at DESC, sort_order, rowid DESC"
+);
+
+const SELECT_SUBTASKS_SQL: &str = concat!(
+    "SELECT ",
+    task_columns!(),
+    " FROM tasks WHERE parent_id = ?1 AND deleted_at IS NULL ",
+    "ORDER BY completed_at IS NOT NULL, completed_at DESC, sort_order, rowid DESC"
+);
+
 const INSERT_REPEAT_SNAPSHOT_SQL: &str = concat!(
     "INSERT INTO tasks (",
     task_columns!(),
@@ -238,23 +252,62 @@ impl Store {
     pub fn tasks(&self) -> Result<Vec<Task>> {
         let mut stmt = self.conn.prepare_cached(SELECT_ALL_TASKS_SQL)?;
         let mut tasks: Vec<Task> = stmt.query_map([], task_from_row)?.collect::<Result<_, _>>()?;
+        self.hydrate_tasks_with(&mut tasks, None)?;
+        Ok(tasks)
+    }
 
+    /// Hydrates tags and checklist progress for a slice of tasks, querying only matched IDs.
+    fn hydrate_tasks(&self, tasks: &mut [Task]) -> Result<()> {
+        match tasks {
+            [] => Ok(()),
+            [task] => self.hydrate_single_task(task),
+            many => {
+                let ids: Vec<String> = many.iter().map(|t| t.id.to_string()).collect();
+                let ids_json = serde_json::to_string(&ids)?;
+                self.hydrate_tasks_with(many, Some(&ids_json))
+            }
+        }
+    }
+
+    fn hydrate_single_task(&self, task: &mut Task) -> Result<()> {
+        let id_str = task.id.to_string();
+        let mut stmt =
+            self.conn.prepare_cached("SELECT tag FROM task_tags WHERE task_id = ?1 ORDER BY tag")?;
+        task.tags = stmt.query_map([&id_str], |row| row.get(0))?.collect::<Result<_, _>>()?;
+        let (done, total): (i64, i64) = self
+            .conn
+            .prepare_cached("SELECT COUNT(completed_at), COUNT(*) FROM checklist_items WHERE task_id = ?1")?
+            .query_row([&id_str], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        task.checklist = (total > 0).then_some((done as usize, total as usize));
+        Ok(())
+    }
+
+    fn hydrate_tasks_with(&self, tasks: &mut [Task], ids_json: Option<&str>) -> Result<()> {
+        if tasks.is_empty() {
+            return Ok(());
+        }
         let mut tags: HashMap<Id, Vec<String>> = HashMap::new();
-        let mut stmt = self.conn.prepare_cached("SELECT task_id, tag FROM task_tags ORDER BY tag")?;
-        for row in stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))? {
+        let mut stmt = self.conn.prepare_cached(if ids_json.is_some() {
+            "SELECT task_id, tag FROM task_tags WHERE task_id IN (SELECT value FROM json_each(?1)) ORDER BY tag"
+        } else {
+            "SELECT task_id, tag FROM task_tags ORDER BY tag"
+        })?;
+        for row in stmt.query_map(rusqlite::params_from_iter(ids_json), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })? {
             let (task_id, tag) = row?;
             if let Ok(id) = Uuid::parse_str(&task_id) {
                 tags.entry(id).or_default().push(tag);
             }
         }
-        let progress = self.checklist_progress()?;
-        for task in &mut tasks {
+        let progress = self.checklist_progress(ids_json)?;
+        for task in tasks {
             if let Some(task_tags) = tags.remove(&task.id) {
                 task.tags = task_tags;
             }
             task.checklist = progress.get(&task.id).copied();
         }
-        Ok(tasks)
+        Ok(())
     }
 
     /// Tasks for a view. `today` is passed in so tests do not depend on the clock or time zone.
@@ -425,17 +478,42 @@ impl Store {
     /// [`Self::counts`] out of `tasks`, all of them as [`Self::tasks`] loaded them.
     pub fn counts_from(&self, tasks: &[Task], today: NaiveDate) -> Result<ViewCounts> {
         let hidden = self.hidden_lists()?;
-        let count = |view: View| {
-            let skip = |t: &Task| is_smart(&view) && t.list_id.is_some_and(|l| hidden.contains(&l));
-            tasks.iter().filter(|t| !t.is_completed() && !skip(t) && matches_view(t, &view, today)).count()
-        };
-        Ok(ViewCounts {
-            inbox: count(View::Inbox),
-            all: count(View::All),
-            today: count(View::Today),
-            tomorrow: count(View::Tomorrow),
-            next_7_days: count(View::Next7Days),
-        })
+        let tomorrow = today + Duration::days(1);
+        let next_7_end = today + Duration::days(7);
+        let current_week = Horizon::current_week(today);
+        let mut counts = ViewCounts::default();
+
+        for task in tasks {
+            if task.is_completed() || task.is_deleted() || task.is_wont_do() {
+                continue;
+            }
+            if task.list_id.is_none() {
+                counts.inbox += 1;
+            }
+            if task.list_id.is_some_and(|l| hidden.contains(&l)) {
+                continue;
+            }
+            counts.all += 1;
+            if let Some(due) = task.due_date {
+                if due < tomorrow {
+                    counts.today += 1;
+                }
+                if due == tomorrow {
+                    counts.tomorrow += 1;
+                }
+                if due < next_7_end {
+                    counts.next_7_days += 1;
+                    continue;
+                }
+            }
+            if task
+                .horizon
+                .is_some_and(|h| matches!(h, Horizon::Week { .. }) && h <= current_week)
+            {
+                counts.next_7_days += 1;
+            }
+        }
+        Ok(counts)
     }
 
     pub fn task(&self, id: Id) -> Result<Option<Task>> {
@@ -446,14 +524,7 @@ impl Store {
             .query_row([&id_str], task_from_row)
             .optional()?;
         let Some(mut task) = task else { return Ok(None) };
-        let mut stmt =
-            self.conn.prepare_cached("SELECT tag FROM task_tags WHERE task_id = ?1 ORDER BY tag")?;
-        task.tags = stmt.query_map([&id_str], |row| row.get(0))?.collect::<Result<_, _>>()?;
-        let (done, total): (i64, i64) = self
-            .conn
-            .prepare_cached("SELECT COUNT(completed_at), COUNT(*) FROM checklist_items WHERE task_id = ?1")?
-            .query_row([&id_str], |row| Ok((row.get(0)?, row.get(1)?)))?;
-        task.checklist = (total > 0).then_some((done as usize, total as usize));
+        self.hydrate_single_task(&mut task)?;
         Ok(Some(task))
     }
 
@@ -651,15 +722,15 @@ impl Store {
     /// Tasks (open and completed, not in the trash) due between `start` and `end`, inclusive,
     /// ordered by due date and time.
     pub fn tasks_due_between(&self, start: NaiveDate, end: NaiveDate) -> Result<Vec<Task>> {
-        let mut tasks: Vec<Task> = self
-            .tasks()?
-            .into_iter()
-            .filter(|t| {
-                // Durations count on every day they cover.
-                !t.is_deleted()
-                    && t.due_date.is_some_and(|d| d <= end && t.end_date.unwrap_or(d).max(d) >= start)
-            })
-            .collect();
+        let start_s = start.format(DATE_FORMAT).to_string();
+        let end_s = end.format(DATE_FORMAT).to_string();
+        let mut stmt = self.conn.prepare_cached(SELECT_TASKS_DUE_BETWEEN_SQL)?;
+        let mut tasks: Vec<Task> = stmt
+            .query_map(params![start_s, end_s], task_from_row)?
+            .collect::<Result<_, _>>()?;
+        // Durations count on every day they cover; re-check parsed dates against bounds.
+        tasks.retain(|t| t.due_date.is_some_and(|d| d <= end && t.end_date.unwrap_or(d).max(d) >= start));
+        self.hydrate_tasks(&mut tasks)?;
         // Stable sort keeps the manual order within a day; all-day tasks come first.
         tasks.sort_by_key(|t| (t.due_date, t.due_time.is_some(), t.due_time));
         Ok(tasks)
@@ -667,12 +738,12 @@ impl Store {
 
     /// Direct subtasks of `parent` that are not in the trash, oldest first.
     pub fn subtasks(&self, parent: Id) -> Result<Vec<Task>> {
-        let mut subtasks: Vec<Task> = self
-            .tasks()?
-            .into_iter()
-            .filter(|t| t.parent_id == Some(parent) && !t.is_deleted())
-            .collect();
+        let mut stmt = self.conn.prepare_cached(SELECT_SUBTASKS_SQL)?;
+        let mut subtasks: Vec<Task> = stmt
+            .query_map([parent.to_string()], task_from_row)?
+            .collect::<Result<_, _>>()?;
         subtasks.reverse();
+        self.hydrate_tasks(&mut subtasks)?;
         Ok(subtasks)
     }
 
@@ -1261,15 +1332,31 @@ impl Store {
 
     /// A new task from a template, at the top of the inbox.
     pub fn add_from_template(&self, id: Id) -> Result<Task> {
-        let template = self.templates()?.into_iter().find(|t| t.id == id).context("template not found")?;
-        let task = self.add_task(&template.title)?;
-        self.set_notes(task.id, &template.notes)?;
-        self.set_priority(task.id, template.priority)?;
-        self.set_tags(task.id, &template.tags)?;
-        for item in &template.checklist {
-            self.add_checklist_item(task.id, item, None)?;
-        }
-        self.task(task.id)?.context("task not found")
+        self.in_tx(|| {
+            let template = self.templates()?.into_iter().find(|t| t.id == id).context("template not found")?;
+            let task = self.add_task(&template.title)?;
+            self.set_notes(task.id, &template.notes)?;
+            self.set_priority(task.id, template.priority)?;
+            self.set_tags(task.id, &template.tags)?;
+            if !template.checklist.is_empty() {
+                let mut item_stmt = self.conn.prepare_cached(
+                    "INSERT INTO checklist_items (id, task_id, title, sort_order, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                )?;
+                let task_id_str = task.id.to_string();
+                let now = now_ms();
+                for (position, item) in template.checklist.iter().enumerate() {
+                    item_stmt.execute(params![
+                        Uuid::now_v7().to_string(),
+                        &task_id_str,
+                        item.trim(),
+                        position as i64,
+                        now,
+                    ])?;
+                }
+            }
+            self.task(task.id)?.context("task not found")
+        })
     }
 
     /// Sections of a list ("Add Section"), oldest first.
@@ -2327,20 +2414,77 @@ impl Store {
     /// The original's Duplicate: a copy of the list, " copy" after its name, with copies of its
     /// open tasks (subtasks, tags and checklists included), right after it.
     pub fn duplicate_list(&self, id: Id, suffix: &str) -> Result<List> {
-        let list = self.lists()?.into_iter().find(|l| l.id == id).context("list not found")?;
-        let draft = ListDraft { name: format!("{}{suffix}", list.name), ..ListDraft::of(&list) };
-        let copy = self.add_list(&draft)?;
-        self.place_list(copy.id, Some(id), list.folder)?;
-        for (name, _) in self.list_sections(Some(id))?.into_iter().map(|s| (s.name, s.id)) {
-            self.add_list_section(Some(copy.id), &name)?;
-        }
-        let tasks = self.tasks()?;
-        let roots = tasks.iter().filter(|t| t.list_id == Some(id) && t.parent_id.is_none() && !t.is_completed() && !t.is_deleted());
-        for task in roots {
-            let new = self.duplicate_task(task.id)?;
-            self.set_list(new.id, Some(copy.id))?;
-        }
-        self.lists()?.into_iter().find(|l| l.id == copy.id).context("list not found")
+        self.in_tx(|| {
+            let list = self.lists()?.into_iter().find(|l| l.id == id).context("list not found")?;
+            let draft = ListDraft { name: format!("{}{suffix}", list.name), ..ListDraft::of(&list) };
+            let copy = self.add_list(&draft)?;
+            self.place_list(copy.id, Some(id), list.folder)?;
+            for section in self.list_sections(Some(id))? {
+                self.add_list_section(Some(copy.id), &section.name)?;
+            }
+            let root_ids: Vec<String> = self
+                .conn
+                .prepare_cached(
+                    "SELECT id FROM tasks
+                     WHERE list_id = ?1 AND parent_id IS NULL AND completed_at IS NULL AND deleted_at IS NULL
+                     ORDER BY sort_order, rowid DESC",
+                )?
+                .query_map([id.to_string()], |row| row.get(0))?
+                .collect::<Result<_, _>>()?;
+            if !root_ids.is_empty() {
+                let copy_list_id = copy.id.to_string();
+                let base_sort: i64 = self.conn.query_row(
+                    "SELECT COALESCE(MAX(sort_order), 0) + 1024 FROM tasks",
+                    [],
+                    |row| row.get(0),
+                )?;
+                let mut insert_task = self.conn.prepare_cached(
+                    "INSERT INTO tasks (
+                         id, parent_id, kind, title, notes, priority, due_date, due_time,
+                         list_id, section_id, repeat, reminders, end_date, end_time,
+                         estimate, location, timezone, is_floating, constant_reminder,
+                         start_date, schedule_bucket, horizon, created_at, sort_order
+                     )
+                     SELECT
+                         ?1, parent_id, kind, title, notes, priority, due_date, due_time,
+                         ?3, NULL, repeat, reminders, end_date, end_time,
+                         estimate, location, timezone, is_floating, constant_reminder,
+                         start_date, schedule_bucket, horizon, ?4, ?5
+                     FROM tasks WHERE id = ?2",
+                )?;
+                let mut copy_tags = self.conn.prepare_cached(
+                    "INSERT INTO task_tags (task_id, tag) SELECT ?1, tag FROM task_tags WHERE task_id = ?2",
+                )?;
+                let mut read_checklist = self.conn.prepare_cached(
+                    "SELECT title, completed_at IS NOT NULL FROM checklist_items WHERE task_id = ?1 ORDER BY sort_order, rowid",
+                )?;
+                let mut insert_checklist = self.conn.prepare_cached(
+                    "INSERT INTO checklist_items (id, task_id, title, sort_order, completed_at, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                )?;
+                let now = now_ms();
+                for (idx, src_id) in root_ids.iter().enumerate() {
+                    let dst_id = Uuid::now_v7().to_string();
+                    let sort_order = base_sort + (idx as i64) * 1024;
+                    insert_task.execute(params![&dst_id, src_id, &copy_list_id, now, sort_order])?;
+                    copy_tags.execute(params![&dst_id, src_id])?;
+                    let items: Vec<(String, bool)> = read_checklist
+                        .query_map([src_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+                        .collect::<Result<_, _>>()?;
+                    for (pos, (title, completed)) in items.into_iter().enumerate() {
+                        insert_checklist.execute(params![
+                            Uuid::now_v7().to_string(),
+                            &dst_id,
+                            title,
+                            pos as i64,
+                            completed.then_some(now),
+                            now,
+                        ])?;
+                    }
+                }
+            }
+            self.lists()?.into_iter().find(|l| l.id == copy.id).context("list not found")
+        })
     }
 
     /// Moves a list right after `after` (first when `None`) and into `folder`.
@@ -2610,12 +2754,13 @@ impl Store {
 
     /// Lists whose tasks stay out of the smart lists: archived, completed projects, and those set not to show.
     fn hidden_lists(&self) -> Result<HashSet<Id>> {
-        Ok(self
-            .lists()?
-            .into_iter()
-            .filter(|l| l.archived || l.completed_at.is_some() || !l.in_smart_lists)
-            .map(|l| l.id)
-            .collect())
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT id FROM lists WHERE archived_at IS NOT NULL OR completed_at IS NOT NULL OR in_smart_lists = 0",
+        )?;
+        let ids = stmt
+            .query_map([], |row| parse_uuid(&row.get::<_, String>(0)?, 0))?
+            .collect::<Result<HashSet<Id>, _>>()?;
+        Ok(ids)
     }
 
     pub fn rename_list(&self, id: Id, name: &str) -> Result<()> {
@@ -2779,12 +2924,16 @@ impl Store {
         Ok(())
     }
 
-    fn checklist_progress(&self) -> Result<HashMap<Id, (usize, usize)>> {
-        let mut stmt = self.conn.prepare_cached(
-            "SELECT task_id, COUNT(completed_at), COUNT(*) FROM checklist_items GROUP BY task_id",
-        )?;
+    fn checklist_progress(&self, ids_json: Option<&str>) -> Result<HashMap<Id, (usize, usize)>> {
+        let mut stmt = self.conn.prepare_cached(if ids_json.is_some() {
+            "SELECT task_id, COUNT(completed_at), COUNT(*) FROM checklist_items
+             WHERE task_id IN (SELECT value FROM json_each(?1))
+             GROUP BY task_id"
+        } else {
+            "SELECT task_id, COUNT(completed_at), COUNT(*) FROM checklist_items GROUP BY task_id"
+        })?;
         let mut progress = HashMap::new();
-        for row in stmt.query_map([], |row| {
+        for row in stmt.query_map(rusqlite::params_from_iter(ids_json), |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?))
         })? {
             let (task, done, total) = row?;
@@ -3119,7 +3268,8 @@ impl Store {
     pub fn setting(&self, key: &str) -> Result<Option<String>> {
         Ok(self
             .conn
-            .query_row("SELECT value FROM settings WHERE key = ?1", [key], |row| row.get(0))
+            .prepare_cached("SELECT value FROM settings WHERE key = ?1")?
+            .query_row([key], |row| row.get(0))
             .optional()?)
     }
 
@@ -3129,11 +3279,12 @@ impl Store {
     }
 
     pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO settings (key, value) VALUES (?1, ?2)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            params![key, value],
-        )?;
+        self.conn
+            .prepare_cached(
+                "INSERT INTO settings (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            )?
+            .execute(params![key, value])?;
         Ok(())
     }
 
@@ -3397,6 +3548,5 @@ pub(crate) fn now_ms() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
 }
 
-#[cfg(test)]
 #[cfg(test)]
 mod tests;

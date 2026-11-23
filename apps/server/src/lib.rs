@@ -14,6 +14,8 @@
 use std::collections::HashSet;
 use std::fmt;
 use std::io::Read as _;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context as _, Result, bail};
@@ -108,11 +110,12 @@ impl Server {
         let plain = !name.is_empty()
             && name.len() <= MAX_FILE_KEY_BYTES
             && !name.starts_with('.')
-            && !name.contains(['/', '\\', '\0']);
+            && !name.contains(['/', '\\', ':', '\0']);
         self.files.as_ref().filter(|_| plain).map(|dir| dir.join(name))
     }
 
     fn init(conn: Connection, files: Option<std::path::PathBuf>) -> Result<Self> {
+        conn.busy_timeout(Duration::from_secs(5))?;
         // Fail fast before opening WAL or migrating if the SQLite database file is corrupt.
         let issues: Vec<String> = {
             let mut stmt = conn.prepare("PRAGMA integrity_check(10)")?;
@@ -125,6 +128,7 @@ impl Server {
 
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
+             PRAGMA synchronous = NORMAL;
              CREATE TABLE IF NOT EXISTS changes (
                  seq      INTEGER PRIMARY KEY AUTOINCREMENT,
                  entity   TEXT NOT NULL,
@@ -147,6 +151,9 @@ impl Server {
         if !has_file_key {
             conn.execute_batch("ALTER TABLE changes ADD COLUMN file_key TEXT;")?;
         }
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_changes_file_gc ON changes(entity, file_key) WHERE row IS NOT NULL;",
+        )?;
 
         if let Some(dir) = &files {
             std::fs::create_dir_all(dir)?;
@@ -189,42 +196,51 @@ impl Server {
         };
 
         let tx = self.conn.transaction()?;
-        for change in incoming {
-            let entity = change["entity"].as_str().context("a change needs an entity")?;
-            let key = change["key"].as_str().context("a change needs a key")?;
-            let at = change["at"].as_i64().context("a change needs a time")?;
-            let (row, stored_file_key) = match &change["row"] {
-                Value::Null => (None, None),
-                row @ Value::Object(map) => {
-                    let fk = change
-                        .get("file_key")
-                        .and_then(Value::as_str)
-                        .filter(|s| !s.is_empty())
-                        .map(str::to_owned)
-                        .or_else(|| extract_plaintext_file_name(entity, map).map(|name| file_key(&name)));
-                    (Some(row.to_string()), fk)
-                }
-                _ => bail!("a change's row must be an object or null"),
-            };
-            let stored: Option<i64> = tx
-                .query_row("SELECT at FROM changes WHERE entity = ?1 AND key = ?2", params![entity, key], |r| r.get(0))
-                .optional()?;
-            if stored.is_some_and(|stored| stored > at) {
-                continue;
-            }
-            // A new sequence number, so that devices that saw the old change get this one.
-            tx.execute("DELETE FROM changes WHERE entity = ?1 AND key = ?2", params![entity, key])?;
-            tx.execute(
+        {
+            let mut select_at =
+                tx.prepare_cached("SELECT at FROM changes WHERE entity = ?1 AND key = ?2")?;
+            let mut delete_change =
+                tx.prepare_cached("DELETE FROM changes WHERE entity = ?1 AND key = ?2")?;
+            let mut insert_change = tx.prepare_cached(
                 "INSERT INTO changes (entity, key, at, row, device, file_key) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![entity, key, at, row, device, stored_file_key],
             )?;
+            for change in incoming {
+                let entity = change["entity"].as_str().context("a change needs an entity")?;
+                let key = change["key"].as_str().context("a change needs a key")?;
+                let at = change["at"].as_i64().context("a change needs a time")?;
+                let (row, stored_file_key) = match &change["row"] {
+                    Value::Null => (None, None),
+                    row @ Value::Object(map) => {
+                        let fk = change
+                            .get("file_key")
+                            .and_then(Value::as_str)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_owned)
+                            .or_else(|| extract_plaintext_file_name(entity, map).map(|name| file_key(&name)));
+                        (Some(row.to_string()), fk)
+                    }
+                    _ => bail!("a change's row must be an object or null"),
+                };
+                let stored: Option<i64> = select_at
+                    .query_row(params![entity, key], |r| r.get(0))
+                    .optional()?;
+                if stored.is_some_and(|stored| stored > at) {
+                    continue;
+                }
+                // A new sequence number, so that devices that saw the old change get this one.
+                delete_change.execute(params![entity, key])?;
+                insert_change.execute(params![entity, key, at, row, device, stored_file_key])?;
+            }
         }
         tx.commit()?;
 
-        let position: i64 = self.conn.query_row("SELECT COALESCE(MAX(seq), 0) FROM changes", [], |r| r.get(0))?;
+        let position: i64 = self
+            .conn
+            .prepare_cached("SELECT COALESCE(MAX(seq), 0) FROM changes")?
+            .query_row([], |r| r.get(0))?;
         let mut stmt = self
             .conn
-            .prepare("SELECT entity, key, at, row FROM changes WHERE seq > ?1 AND device != ?2 ORDER BY seq")?;
+            .prepare_cached("SELECT entity, key, at, row FROM changes WHERE seq > ?1 AND device != ?2 ORDER BY seq")?;
         let outgoing = stmt
             .query_map(params![since, device], |r| {
                 let row: Option<String> = r.get(3)?;
@@ -448,141 +464,247 @@ pub fn serve(http: &tiny_http::Server, server: Server, token: &str) {
     serve_with_gc_grace(http, server, token, DEFAULT_GC_GRACE);
 }
 
+const WORKER_THREADS: usize = 4;
+const REQUEST_QUEUE_BOUND: usize = 32;
+
+struct SharedState {
+    server: Server,
+    syncs_since_gc: u64,
+    last_gc: Instant,
+}
+
+fn write_file_atomic(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    static NEXT_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = NEXT_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let suffix = format!(".tmp.{}.{seq}", std::process::id());
+    let tmp = if path.file_name().is_some_and(|name| name.len() + suffix.len() <= MAX_FILE_KEY_BYTES) {
+        let mut tmp_os = path.as_os_str().to_owned();
+        tmp_os.push(&suffix);
+        std::path::PathBuf::from(tmp_os)
+    } else if let Some(parent) = path.parent() {
+        parent.join(format!("upload{suffix}"))
+    } else {
+        let mut tmp_os = path.as_os_str().to_owned();
+        tmp_os.push(&suffix);
+        std::path::PathBuf::from(tmp_os)
+    };
+    if let Err(err) = std::fs::write(&tmp, data) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(err);
+    }
+    if let Err(err) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(err);
+    }
+    Ok(())
+}
+
+fn maybe_run_auto_gc(state: &Mutex<SharedState>, gc_grace: Duration) {
+    let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.syncs_since_gc >= AUTO_GC_SYNC_THRESHOLD || guard.last_gc.elapsed() >= AUTO_GC_INTERVAL {
+        let SharedState { server, syncs_since_gc, last_gc } = &mut *guard;
+        run_auto_gc(server, gc_grace, syncs_since_gc, last_gc);
+    }
+}
+
+fn handle_request(
+    mut request: tiny_http::Request,
+    state: &Mutex<SharedState>,
+    token: &str,
+    gc_grace: Duration,
+) {
+    use tiny_http::{Method, Response};
+
+    if request.method() == &Method::Get && request.url() == "/health" {
+        maybe_run_auto_gc(state, gc_grace);
+        if let Err(err) = request.respond(json_response(200, health_payload())) {
+            eprintln!("failed to answer: {err}");
+        }
+        return;
+    }
+
+    let auth = request
+        .headers()
+        .iter()
+        .find(|h| h.field.equiv("Authorization"))
+        .map(|h| h.value.as_str().to_owned());
+    if !authorized(auth.as_deref(), token) {
+        request.respond(json_response(401, r#"{"error":"unauthorized"}"#.to_owned())).ok();
+        return;
+    }
+
+    if let Some(name) = request.url().strip_prefix("/files/").map(str::to_owned) {
+        let path = state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .server
+            .file_path(&name);
+        let response = match (request.method(), path) {
+            (_, None) => Response::from_data(Vec::new()).with_status_code(400),
+            (Method::Put, Some(path)) => {
+                let mut data = Vec::new();
+                match request.as_reader().take(MAX_FILE_UPLOAD_BYTES + 1).read_to_end(&mut data) {
+                    Ok(n) if n as u64 > MAX_FILE_UPLOAD_BYTES => {
+                        Response::from_data(Vec::new()).with_status_code(413)
+                    }
+                    Ok(_) => match write_file_atomic(&path, &data) {
+                        Ok(()) => Response::from_data(Vec::new()).with_status_code(204),
+                        Err(_) => Response::from_data(Vec::new()).with_status_code(500),
+                    },
+                    Err(_) => Response::from_data(Vec::new()).with_status_code(400),
+                }
+            }
+            (Method::Get, Some(path)) => match std::fs::read(&path) {
+                Ok(data) => Response::from_data(data),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    Response::from_data(Vec::new()).with_status_code(404)
+                }
+                Err(_) => Response::from_data(Vec::new()).with_status_code(500),
+            },
+            (Method::Delete, Some(path)) => match std::fs::remove_file(&path) {
+                Ok(()) => Response::from_data(Vec::new()).with_status_code(204),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    Response::from_data(Vec::new()).with_status_code(404)
+                }
+                Err(_) => Response::from_data(Vec::new()).with_status_code(500),
+            },
+            _ => Response::from_data(Vec::new()).with_status_code(405),
+        };
+        if let Err(err) = request.respond(response) {
+            eprintln!("failed to answer: {err}");
+        }
+        return;
+    }
+
+    let mut trigger_auto_gc = false;
+    let (status, body) = match (request.method(), request.url()) {
+        (Method::Post, "/sync") => {
+            let mut text = String::new();
+            let read = request.as_reader().take(MAX_BODY as u64 + 1).read_to_string(&mut text);
+            match read {
+                Ok(n) if n > MAX_BODY => (413, r#"{"error":"too large"}"#.to_owned()),
+                Ok(_) => match serde_json::from_str::<Value>(&text) {
+                    Ok(req) => {
+                        let (sync_res, should_gc) = {
+                            let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+                            let res = guard.server.sync(&req);
+                            let should_gc = if res.is_ok() {
+                                guard.syncs_since_gc += 1;
+                                guard.syncs_since_gc >= AUTO_GC_SYNC_THRESHOLD
+                                    || guard.last_gc.elapsed() >= AUTO_GC_INTERVAL
+                            } else {
+                                false
+                            };
+                            (res, should_gc)
+                        };
+                        match sync_res {
+                            Ok(answer) => {
+                                trigger_auto_gc = should_gc;
+                                (200, answer.to_string())
+                            }
+                            Err(err) => {
+                                if let Some(mismatch) = err.downcast_ref::<ProtocolMismatchError>() {
+                                    (
+                                        426,
+                                        json!({
+                                            "error": "incompatible_protocol",
+                                            "server_protocol": mismatch.server,
+                                            "min_protocol": mismatch.min_server,
+                                            "client_protocol": mismatch.client,
+                                        })
+                                        .to_string(),
+                                    )
+                                } else {
+                                    (400, json!({ "error": format!("{err:#}") }).to_string())
+                                }
+                            }
+                        }
+                    }
+                    Err(err) => (400, json!({ "error": format!("{err:#}") }).to_string()),
+                },
+                Err(err) => (400, json!({ "error": err.to_string() }).to_string()),
+            }
+        }
+        (Method::Post, "/gc") => {
+            let mut text = String::new();
+            let read = request.as_reader().take(MAX_GC_BODY as u64 + 1).read_to_string(&mut text);
+            match read {
+                Ok(n) if n > MAX_GC_BODY => (413, r#"{"error":"too large"}"#.to_owned()),
+                Ok(_) => match parse_gc_min_age(&text, gc_grace) {
+                    Ok(min_age) => {
+                        let gc_res = {
+                            let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+                            let res = guard.server.gc_files(min_age);
+                            if res.is_ok() {
+                                guard.syncs_since_gc = 0;
+                                guard.last_gc = Instant::now();
+                            }
+                            res
+                        };
+                        match gc_res {
+                            Ok(stats) => (200, stats.to_json().to_string()),
+                            Err(err) => (500, json!({ "error": format!("{err:#}") }).to_string()),
+                        }
+                    }
+                    Err(err) => (400, json!({ "error": format!("{err:#}") }).to_string()),
+                },
+                Err(err) => (400, json!({ "error": err.to_string() }).to_string()),
+            }
+        }
+        _ => (404, r#"{"error":"not found"}"#.to_owned()),
+    };
+
+    if let Err(err) = request.respond(json_response(status, body)) {
+        eprintln!("failed to answer: {err}");
+    }
+
+    if trigger_auto_gc {
+        maybe_run_auto_gc(state, gc_grace);
+    }
+}
+
 /// Answers HTTP requests on `http` until it closes:
 /// - `GET /health` (unauthenticated)
 /// - `POST /sync` (bearer auth)
 /// - `PUT`/`GET`/`DELETE /files/<name>` (bearer auth)
 /// - `POST /gc` (bearer auth)
-pub fn serve_with_gc_grace(http: &tiny_http::Server, mut server: Server, token: &str, gc_grace: Duration) {
-    use tiny_http::{Method, Response};
+pub fn serve_with_gc_grace(http: &tiny_http::Server, server: Server, token: &str, gc_grace: Duration) {
+    let state = Arc::new(Mutex::new(SharedState {
+        server,
+        syncs_since_gc: 0,
+        last_gc: Instant::now(),
+    }));
+    let token: Arc<str> = Arc::from(token);
+    let (tx, rx) = mpsc::sync_channel::<tiny_http::Request>(REQUEST_QUEUE_BOUND);
+    let rx = Arc::new(Mutex::new(rx));
 
-    let mut syncs_since_gc: u64 = 0;
-    let mut last_gc = Instant::now();
+    let mut workers = Vec::with_capacity(WORKER_THREADS);
+    for _ in 0..WORKER_THREADS {
+        let rx = Arc::clone(&rx);
+        let state = Arc::clone(&state);
+        let token = Arc::clone(&token);
+        workers.push(std::thread::spawn(move || {
+            loop {
+                let received = {
+                    let guard = rx.lock().unwrap_or_else(|e| e.into_inner());
+                    guard.recv()
+                };
+                let Ok(request) = received else {
+                    break;
+                };
+                handle_request(request, &state, &token, gc_grace);
+            }
+        }));
+    }
 
-    for mut request in http.incoming_requests() {
-        if request.method() == &Method::Get && request.url() == "/health" {
-            if let Err(err) = request.respond(json_response(200, health_payload())) {
-                eprintln!("failed to answer: {err}");
-            }
-            if last_gc.elapsed() >= AUTO_GC_INTERVAL {
-                run_auto_gc(&server, gc_grace, &mut syncs_since_gc, &mut last_gc);
-            }
-            continue;
+    for request in http.incoming_requests() {
+        if tx.send(request).is_err() {
+            break;
         }
-
-        let auth = request
-            .headers()
-            .iter()
-            .find(|h| h.field.equiv("Authorization"))
-            .map(|h| h.value.as_str().to_owned());
-        if !authorized(auth.as_deref(), token) {
-            request.respond(json_response(401, r#"{"error":"unauthorized"}"#.to_owned())).ok();
-            continue;
-        }
-
-        if let Some(name) = request.url().strip_prefix("/files/").map(str::to_owned) {
-            let response = match (request.method(), server.file_path(&name)) {
-                (_, None) => Response::from_data(Vec::new()).with_status_code(400),
-                (Method::Put, Some(path)) => {
-                    let mut data = Vec::new();
-                    match request.as_reader().take(MAX_FILE_UPLOAD_BYTES + 1).read_to_end(&mut data) {
-                        Ok(n) if n as u64 > MAX_FILE_UPLOAD_BYTES => Response::from_data(Vec::new()).with_status_code(413),
-                        Ok(_) => match std::fs::write(&path, &data) {
-                            Ok(()) => Response::from_data(Vec::new()).with_status_code(204),
-                            Err(_) => Response::from_data(Vec::new()).with_status_code(500),
-                        },
-                        Err(_) => Response::from_data(Vec::new()).with_status_code(400),
-                    }
-                }
-                (Method::Get, Some(path)) => match std::fs::read(&path) {
-                    Ok(data) => Response::from_data(data),
-                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                        Response::from_data(Vec::new()).with_status_code(404)
-                    }
-                    Err(_) => Response::from_data(Vec::new()).with_status_code(500),
-                },
-                (Method::Delete, Some(path)) => match std::fs::remove_file(&path) {
-                    Ok(()) => Response::from_data(Vec::new()).with_status_code(204),
-                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                        Response::from_data(Vec::new()).with_status_code(404)
-                    }
-                    Err(_) => Response::from_data(Vec::new()).with_status_code(500),
-                },
-                _ => Response::from_data(Vec::new()).with_status_code(405),
-            };
-            if let Err(err) = request.respond(response) {
-                eprintln!("failed to answer: {err}");
-            }
-            continue;
-        }
-
-        let mut did_sync = false;
-        let (status, body) = match (request.method(), request.url()) {
-            (Method::Post, "/sync") => {
-                let mut text = String::new();
-                let read = request.as_reader().take(MAX_BODY as u64 + 1).read_to_string(&mut text);
-                match read {
-                    Ok(n) if n > MAX_BODY => (413, r#"{"error":"too large"}"#.to_owned()),
-                    Ok(_) => match serde_json::from_str(&text)
-                        .map_err(anyhow::Error::from)
-                        .and_then(|req| server.sync(&req))
-                    {
-                        Ok(answer) => {
-                            did_sync = true;
-                            (200, answer.to_string())
-                        }
-                        Err(err) => {
-                            if let Some(mismatch) = err.downcast_ref::<ProtocolMismatchError>() {
-                                (
-                                    426,
-                                    json!({
-                                        "error": "incompatible_protocol",
-                                        "server_protocol": mismatch.server,
-                                        "min_protocol": mismatch.min_server,
-                                        "client_protocol": mismatch.client,
-                                    })
-                                    .to_string(),
-                                )
-                            } else {
-                                (400, json!({ "error": format!("{err:#}") }).to_string())
-                            }
-                        }
-                    },
-                    Err(err) => (400, json!({ "error": err.to_string() }).to_string()),
-                }
-            }
-            (Method::Post, "/gc") => {
-                let mut text = String::new();
-                let read = request.as_reader().take(MAX_GC_BODY as u64 + 1).read_to_string(&mut text);
-                match read {
-                    Ok(n) if n > MAX_GC_BODY => (413, r#"{"error":"too large"}"#.to_owned()),
-                    Ok(_) => match parse_gc_min_age(&text, gc_grace) {
-                        Ok(min_age) => match server.gc_files(min_age) {
-                            Ok(stats) => {
-                                syncs_since_gc = 0;
-                                last_gc = Instant::now();
-                                (200, stats.to_json().to_string())
-                            }
-                            Err(err) => (500, json!({ "error": format!("{err:#}") }).to_string()),
-                        },
-                        Err(err) => (400, json!({ "error": format!("{err:#}") }).to_string()),
-                    },
-                    Err(err) => (400, json!({ "error": err.to_string() }).to_string()),
-                }
-            }
-            _ => (404, r#"{"error":"not found"}"#.to_owned()),
-        };
-
-        if let Err(err) = request.respond(json_response(status, body)) {
-            eprintln!("failed to answer: {err}");
-        }
-
-        if did_sync {
-            syncs_since_gc += 1;
-            if syncs_since_gc >= AUTO_GC_SYNC_THRESHOLD || last_gc.elapsed() >= AUTO_GC_INTERVAL {
-                run_auto_gc(&server, gc_grace, &mut syncs_since_gc, &mut last_gc);
-            }
-        }
+    }
+    drop(tx);
+    for worker in workers {
+        let _ = worker.join();
     }
 }
 
@@ -737,7 +859,7 @@ mod tests {
         let dir = unique_temp_dir("fern-server-files");
         let server = Server::open(&dir.join("server.db")).unwrap();
         assert!(server.file_path("0199-plan.txt").is_some());
-        for bad in ["", "../x", "a/b", "a\\b", ".hidden"] {
+        for bad in ["", "../x", "a/b", "a\\b", ".hidden", "C:foo", "foo:bar", "a\0b"] {
             assert!(server.file_path(bad).is_none(), "{bad:?}");
         }
         assert!(Server::open_in_memory().unwrap().file_path("x").is_none(), "no file store in memory");
@@ -1186,6 +1308,47 @@ mod tests {
         assert_eq!(stats.freed_bytes, b"enc-att-blob".len() as u64);
         assert!(!files_dir.join(&att_key).exists());
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_file_uploads_and_sync_leave_no_temp_files() {
+        let dir = unique_temp_dir("fern-server-concurrent");
+        let db_path = dir.join("fern-server.db");
+        let files_dir = dir.join("fern-server.db.files");
+        let token = "concurrent-test-token-12345";
+        let server = Server::open(&db_path).unwrap();
+        let http = TestHttpServer::start(server, token, DEFAULT_GC_GRACE);
+
+        let port = http.port;
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                std::thread::spawn(move || {
+                    let payload = format!("payload-{i}");
+                    let path = format!("/files/item-{}.txt", i % 4);
+                    assert_eq!(http_request(port, "PUT", &path, Some(token), payload.as_bytes()).0, 204);
+                    let sync_body = format!(r#"{{"protocol":2,"device":"dev-{i}","since":0,"changes":[]}}"#);
+                    assert_eq!(http_request(port, "POST", "/sync", Some(token), sync_body.as_bytes()).0, 200);
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        for k in 0..4 {
+            let (status, body) = http_request(port, "GET", &format!("/files/item-{k}.txt"), Some(token), b"");
+            assert_eq!(status, 200);
+            assert!(body.starts_with(b"payload-"));
+        }
+        let leftover_tmps: Vec<_> = std::fs::read_dir(&files_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(leftover_tmps.is_empty(), "atomic PUT must leave zero temp files: {leftover_tmps:?}");
+
+        drop(http);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

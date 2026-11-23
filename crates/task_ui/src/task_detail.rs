@@ -25,6 +25,7 @@ use crate::text_input::{Cancelled, Changed, Mode, Submitted, TextInput};
 mod comments_attachments;
 mod draft;
 mod due_popup;
+mod popup_actions;
 mod popups;
 mod render_body;
 mod render_chrome;

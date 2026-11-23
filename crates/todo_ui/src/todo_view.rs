@@ -68,6 +68,7 @@ mod layout_settings;
 mod list_render;
 mod menus;
 mod panel_dnd;
+mod panel_dnd_moves;
 mod quick_add;
 mod quick_add_popovers;
 mod timeline;

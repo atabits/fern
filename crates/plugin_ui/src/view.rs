@@ -1519,7 +1519,7 @@ impl Render for PluginView {
         }
 
         let payload = PluginHost::global(cx)
-            .and_then(|h| h.view_tree(&self.plugin_id, &self.view_id).cloned());
+            .and_then(|h| h.view_tree_arc(&self.plugin_id, &self.view_id));
         let view_error = PluginHost::global(cx).and_then(|h| {
             h.view_error(&self.plugin_id, &self.view_id)
                 .or_else(|| h.view_error(&self.plugin_id, ""))

@@ -257,6 +257,14 @@ impl gpui::Focusable for CountdownView {
 
 impl CountdownView {
     pub fn new(store: Rc<Store>, cx: &mut Context<Self>) -> Self {
+        Self::new_with_active(store, true, cx)
+    }
+
+    pub fn new_inactive(store: Rc<Store>, cx: &mut Context<Self>) -> Self {
+        Self::new_with_active(store, false, cx)
+    }
+
+    fn new_with_active(store: Rc<Store>, initial_active: bool, cx: &mut Context<Self>) -> Self {
         let mut this = Self {
             store,
             focus_handle: cx.focus_handle(),
@@ -272,10 +280,12 @@ impl CountdownView {
             show_archived: false,
             hide_group: false,
             resolved_backgrounds: HashMap::new(),
-            active: true,
-            dirty: false,
+            active: initial_active,
+            dirty: !initial_active,
         };
-        this.reload(cx);
+        if initial_active {
+            this.reload(cx);
+        }
         cx.observe_global::<DataVersion>(|this, cx| {
             if changed_elsewhere(cx.entity_id(), cx) {
                 this.sync_external(cx);
@@ -513,6 +523,9 @@ impl CountdownView {
 
     /// "Edit" in a card's "…" menu: the countdown's popover, filled in.
     pub fn start_edit(&mut self, id: Id, window: &mut Window, cx: &mut Context<Self>) {
+        if self.dirty {
+            self.reload(cx);
+        }
         let Some(countdown) = self.countdowns.iter().find(|c| c.id == id).cloned() else { return };
         self.card_menu = None;
         self.start_new(window, cx);
@@ -539,6 +552,9 @@ impl CountdownView {
     /// `menu` opens the card's "…" menu, `edit` its edit popover, with a monthly repeat.
     #[cfg(debug_assertions)]
     pub fn dev_open(&mut self, name: &str, edit: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.dirty {
+            self.reload(cx);
+        }
         let Some(id) = self.countdowns.iter().find(|c| c.name.contains(name)).map(|c| c.id) else { return };
         if edit {
             self.start_edit(id, window, cx);
@@ -1970,5 +1986,30 @@ mod tests {
         cx.update(|_, cx| view.update(cx, |v, cx| v.delete(id, cx)));
         assert_eq!(bumps.get(), 5, "delete must emit data_changed");
         assert!(store.countdowns().unwrap().is_empty());
+    }
+
+    #[gpui::test]
+    fn new_inactive_skips_initial_reload_until_activated(cx: &mut TestAppContext) {
+        use gpui::AppContext;
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let target = NaiveDate::from_ymd_opt(2026, 12, 31).unwrap();
+        store.add_countdown("Year End", target, CountdownKind::Countdown).unwrap();
+
+        cx.update(|cx| {
+            let view = cx.new(|cx| CountdownView::new_inactive(store.clone(), cx));
+            {
+                let v = view.read(cx);
+                assert!(!v.active);
+                assert!(v.dirty);
+                assert!(v.countdowns.is_empty());
+            }
+
+            view.update(cx, |v, cx| v.set_active(true, cx));
+            let v = view.read(cx);
+            assert!(v.active);
+            assert!(!v.dirty);
+            assert_eq!(v.countdowns.len(), 1);
+            assert_eq!(v.countdowns[0].name, "Year End");
+        });
     }
 }

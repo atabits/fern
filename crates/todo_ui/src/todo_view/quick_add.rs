@@ -122,10 +122,22 @@ impl TodoView {
         list: Option<Option<Id>>,
         cx: &mut Context<Self>,
     ) {
+        if self.dirty {
+            self.preferences = self.store.preferences().unwrap_or_default();
+            if let Some(lists) = self.check(self.store.lists()) {
+                self.lists = lists;
+                self.refresh_list_colors();
+            }
+        }
         let draft = AddDraft { date, priority, list, ..Default::default() };
         let result = self.add_task_as(text, &View::All, &draft);
         self.check(result);
-        self.reload(cx);
+        if self.active {
+            self.reload(cx);
+        } else {
+            crate::data_version::data_changed(cx.entity_id(), cx);
+            self.dirty = true;
+        }
     }
 
     pub fn add_quick(&mut self, text: &str, cx: &mut Context<Self>) {
@@ -1646,6 +1658,9 @@ impl TodoView {
 
     /// Focuses the quick-add field (or, in kanban view, the first column's add input).
     pub fn focus_new_task(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.dirty {
+            self.reload_inner(false, false, cx);
+        }
         if self.is_read_only_view() {
             self.set_view(View::Inbox, cx);
         }
@@ -1660,11 +1675,11 @@ impl TodoView {
                     window.focus(&input.focus_handle(cx), cx);
                     return;
                 }
-            } else if let Some((idx, col)) = columns
-                .into_iter()
+            } else if let Some((idx, target)) = columns
+                .iter()
                 .enumerate()
                 .find(|(_, c)| c.drop.as_ref().is_some_and(|t| !matches!(t, DropTarget::Complete)))
-                && let Some(target) = col.drop
+                .and_then(|(idx, col)| col.drop.clone().map(|target| (idx, target)))
             {
                 self.start_column_add(idx, target, window, cx);
                 return;

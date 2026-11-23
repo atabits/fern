@@ -14,7 +14,7 @@ use crate::actions::{
 };
 use crate::i18n;
 use crate::sticky_settings::{PALETTE, StickySettings};
-use crate::task_detail::{OpenTask, TaskDetail, TaskUpdated};
+use crate::task_detail::{OpenTask, TaskDetail, TaskTextEdited, TaskTextField, TaskUpdated};
 use crate::sticky_windows::{self, COMPACT_HEIGHT, MIN_EXPANDED_HEIGHT, MIN_WIDTH, NoteWindow};
 
 mod popup;
@@ -167,6 +167,7 @@ pub struct StickyNote {
     last_bounds: Bounds<Pixels>,
     pending_bounds: Option<Bounds<Pixels>>,
     save_bounds_task: Option<gpui::Task<()>>,
+    text_edit_sync_task: Option<gpui::Task<()>>,
 }
 
 impl StickyNote {
@@ -184,8 +185,29 @@ impl StickyNote {
             detail
         });
         cx.subscribe_in(&detail, window, |this, _, _: &TaskUpdated, window, cx| {
+            this.text_edit_sync_task = None;
             data_changed(cx.entity_id(), cx);
             this.refresh_task(window, cx);
+        })
+        .detach();
+        cx.subscribe_in(&detail, window, |this, _, edit: &TaskTextEdited, window, cx| {
+            if let TaskTextField::Title(t) = &edit.field {
+                let title = display_title(t, cx);
+                if this.title != title {
+                    window.set_window_title(&title);
+                    this.title = title;
+                    cx.notify();
+                }
+            }
+            this.text_edit_sync_task = Some(cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(300))
+                    .await;
+                let _ = this.update(cx, |this, cx| {
+                    this.text_edit_sync_task = None;
+                    data_changed(cx.entity_id(), cx);
+                });
+            }));
         })
         .detach();
         // A subtask or parent clicked in the note opens in the note.
@@ -230,6 +252,7 @@ impl StickyNote {
             last_bounds: initial_bounds,
             pending_bounds: None,
             save_bounds_task: None,
+            text_edit_sync_task: None,
         };
         this.show(note.task, window, cx);
         this.remember_bounds(initial_bounds, cx);
@@ -399,7 +422,10 @@ impl StickyNote {
         }
     }
 
-    fn forget(&mut self, cx: &mut App) {
+    fn forget(&mut self, cx: &mut Context<Self>) {
+        if self.text_edit_sync_task.take().is_some() {
+            data_changed(cx.entity_id(), cx);
+        }
         self.save_bounds_task.take();
         if let Some(bounds) = self.pending_bounds.take() {
             self.remember_bounds(bounds, cx);

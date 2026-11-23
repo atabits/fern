@@ -153,7 +153,19 @@ impl Focusable for LifeClockView {
 
 impl LifeClockView {
     pub fn new(store: Rc<Store>, cx: &mut Context<Self>) -> Self {
-        let birth_date = load_birth_date(&store);
+        Self::new_with_active(store, true, cx)
+    }
+
+    pub fn new_inactive(store: Rc<Store>, cx: &mut Context<Self>) -> Self {
+        Self::new_with_active(store, false, cx)
+    }
+
+    fn new_with_active(store: Rc<Store>, initial_active: bool, cx: &mut Context<Self>) -> Self {
+        let birth_date = if initial_active {
+            load_birth_date(&store)
+        } else {
+            None
+        };
         let palette_mode = load_palette_mode(&store);
         let today = Local::now().date_naive();
 
@@ -199,10 +211,12 @@ impl LifeClockView {
             _subscriptions: subscriptions,
             #[cfg(not(test))]
             tick_timer: None,
-            active: true,
-            dirty: false,
+            active: initial_active,
+            dirty: !initial_active,
         };
-        view.sync_date_inputs(cx);
+        if initial_active {
+            view.sync_date_inputs(cx);
+        }
         view
     }
 
@@ -265,6 +279,9 @@ impl LifeClockView {
 
     #[cfg(debug_assertions)]
     pub fn dev_set_birth_date(&mut self, date: Option<NaiveDate>, cx: &mut Context<Self>) {
+        if self.dirty {
+            self.reload(cx);
+        }
         self.invalid_date = false;
         self.persist_birth_date(date, cx);
         self.sync_date_inputs(cx);
@@ -272,6 +289,9 @@ impl LifeClockView {
 
     #[cfg(debug_assertions)]
     pub fn dev_set_palette(&mut self, mode: LifeClockPaletteMode, cx: &mut Context<Self>) {
+        if self.dirty {
+            self.reload(cx);
+        }
         self.set_palette(mode, cx);
     }
 
@@ -285,6 +305,9 @@ impl LifeClockView {
     }
 
     fn open_popover(&mut self, cx: &mut Context<Self>) {
+        if self.dirty {
+            self.reload(cx);
+        }
         if !self.popover_open {
             self.popover_open = true;
             self.invalid_date = false;
@@ -1375,5 +1398,36 @@ mod tests {
         assert_eq!(desired_frame_interval_ms(false, false), UNFOCUSED_FRAME_MS);
         assert_eq!(desired_frame_interval_ms(true, true), REDUCED_MOTION_FRAME_MS);
         assert_eq!(desired_frame_interval_ms(false, true), REDUCED_MOTION_FRAME_MS);
+    }
+
+    #[gpui::test]
+    fn new_inactive_preserves_palette_mode_and_defers_birth_date_until_activated(
+        cx: &mut TestAppContext,
+    ) {
+        use gpui::AppContext;
+        setup_app(cx);
+        let store = Rc::new(Store::open_in_memory().expect("in-memory store"));
+        store.set_setting(SETTING_PALETTE, PALETTE_VALUE_THEME).unwrap();
+        store.set_setting(SETTING_BIRTH_DATE, "1998-11-20").unwrap();
+
+        cx.update(|cx| {
+            let view = cx.new(|cx| LifeClockView::new_inactive(store.clone(), cx));
+            {
+                let v = view.read(cx);
+                assert!(!v.active);
+                assert!(v.dirty);
+                assert_eq!(v.palette_mode(), LifeClockPaletteMode::FernTheme);
+                assert_eq!(v.birth_date, None);
+                assert_eq!(v.year_input.read(cx).text(), "");
+            }
+
+            view.update(cx, |v, cx| v.set_active(true, cx));
+            let v = view.read(cx);
+            assert!(v.active);
+            assert!(!v.dirty);
+            assert_eq!(v.palette_mode(), LifeClockPaletteMode::FernTheme);
+            assert_eq!(v.birth_date, NaiveDate::from_ymd_opt(1998, 11, 20));
+            assert_eq!(v.year_input.read(cx).text(), "1998");
+        });
     }
 }

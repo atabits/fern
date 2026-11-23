@@ -152,6 +152,20 @@ enum FocusTarget {
 /// The task was changed in the panel; the list needs to reload.
 pub struct TaskUpdated;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TaskTextField {
+    Title(String),
+    Notes(String),
+    Location(Option<String>),
+}
+
+/// A text field of the shown task changed in the panel; hosts can patch in-place without a full reload.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TaskTextEdited {
+    pub id: Id,
+    pub field: TaskTextField,
+}
+
 /// The user asked to open another task (a subtask) in the panel.
 pub struct OpenTask(pub Id);
 
@@ -165,6 +179,7 @@ pub struct StartFocus(pub Id, pub String, pub bool);
 pub struct RequestDeleteForever(pub Id);
 
 impl EventEmitter<TaskUpdated> for TaskDetail {}
+impl EventEmitter<TaskTextEdited> for TaskDetail {}
 impl EventEmitter<StartFocus> for TaskDetail {}
 impl EventEmitter<Undoable> for TaskDetail {}
 impl EventEmitter<OpenTask> for TaskDetail {}
@@ -195,7 +210,7 @@ impl TaskDetail {
                     this.refresh_draft_title(cx);
                     return;
                 }
-                this.save(cx, |store, id| store.set_title(id, &text));
+                this.save_text(cx, TaskTextField::Title(text.clone()), |store, id| store.set_title(id, &text));
             }),
             cx.subscribe(&notes, |this, input, _: &Changed, cx| {
                 if this.is_read_only() {
@@ -204,7 +219,7 @@ impl TaskDetail {
                 let text = input.read(cx).text().to_owned();
                 this.word_count = fern_core::markdown::count_words(&text);
                 if this.edit_draft(cx, |task, _| task.notes = text.clone()) { return; }
-                this.save(cx, |store, id| store.set_notes(id, &text));
+                this.save_text(cx, TaskTextField::Notes(text.clone()), |store, id| store.set_notes(id, &text));
             }),
             cx.subscribe(&location_input, |this, input, _: &Changed, cx| {
                 if this.is_read_only() {
@@ -215,7 +230,9 @@ impl TaskDetail {
                 if this.edit_draft(cx, |task, _| task.location = value.clone()) {
                     return;
                 }
-                this.save(cx, |store, id| store.set_location(id, value.as_deref()));
+                this.save_text(cx, TaskTextField::Location(value.clone()), |store, id| {
+                    store.set_location(id, value.as_deref())
+                });
             }),
             cx.subscribe(&tag_input, |_, _, _: &Changed, cx| cx.notify()),
             cx.subscribe(&tz_input, |_, _, _: &Changed, cx| cx.notify()),
@@ -937,6 +954,33 @@ impl TaskDetail {
             return;
         }
         cx.emit(TaskUpdated);
+    }
+
+    fn save_text(
+        &mut self,
+        cx: &mut Context<Self>,
+        field: TaskTextField,
+        write: impl FnOnce(&Store, Id) -> anyhow::Result<()>,
+    ) {
+        if self.session.draft.is_some() {
+            return;
+        }
+        let Some(id) = self.task_id() else {
+            return;
+        };
+        if let Err(err) = write(&self.session.store, id) {
+            eprintln!("failed to save the task: {err:#}");
+            return;
+        }
+        if let Some(task) = self.session.task.as_mut() {
+            match &field {
+                TaskTextField::Title(text) => task.title = text.clone(),
+                TaskTextField::Notes(text) => task.notes = text.clone(),
+                TaskTextField::Location(value) => task.location = value.clone(),
+            }
+        }
+        cx.emit(TaskTextEdited { id, field });
+        cx.notify();
     }
 
     fn open_popup(&mut self, popup: Popup, cx: &mut Context<Self>) {

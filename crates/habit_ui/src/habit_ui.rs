@@ -171,6 +171,14 @@ impl gpui::Focusable for HabitView {
 
 impl HabitView {
     pub fn new(store: Rc<Store>, cx: &mut Context<Self>) -> Self {
+        Self::new_with_active(store, true, cx)
+    }
+
+    pub fn new_inactive(store: Rc<Store>, cx: &mut Context<Self>) -> Self {
+        Self::new_with_active(store, false, cx)
+    }
+
+    fn new_with_active(store: Rc<Store>, initial_active: bool, cx: &mut Context<Self>) -> Self {
         let list_layout = store.setting(LAYOUT_SETTING).ok().flatten().as_deref() == Some("list");
         let detail_width = store
             .setting(DETAIL_WIDTH_SETTING)
@@ -228,10 +236,12 @@ impl HabitView {
             cycles_modal: None,
             export_message: None,
             detail_notice: None,
-            active: true,
-            dirty: false,
+            active: initial_active,
+            dirty: !initial_active,
         };
-        this.reload(cx);
+        if initial_active {
+            this.reload(cx);
+        }
         this
     }
 
@@ -308,6 +318,9 @@ impl HabitView {
     }
 
     pub fn select(&mut self, habit: Id, cx: &mut Context<Self>) {
+        if self.dirty {
+            self.reload(cx);
+        }
         if let Some(found) = self.habits.iter().find(|h| h.id == habit)
             && found.archived != self.show_archived
         {
@@ -1368,6 +1381,9 @@ impl HabitView {
     #[cfg(debug_assertions)]
     pub fn dev_apply(&mut self, command: &str, window: &mut Window, cx: &mut Context<Self>) {
         use fern_core::{Goal, HabitFrequency};
+        if self.dirty {
+            self.reload(cx);
+        }
         let custom = |name: &str| self.sections.iter().find(|s| s.name == name).map(|s| s.id);
         if let Some(id) = command.strip_prefix("section-menu=").and_then(custom) {
             self.section_menu = Some(id);
@@ -1478,6 +1494,9 @@ impl HabitView {
 
     #[cfg(debug_assertions)]
     pub fn dev_select(&mut self, name: &str, cx: &mut Context<Self>) {
+        if self.dirty {
+            self.reload(cx);
+        }
         if let Some(id) = self.habits.iter().find(|h| h.name == name).map(|h| h.id) {
             self.select(id, cx);
         }
@@ -2144,6 +2163,40 @@ mod tests {
                 assert_eq!(log.habit_id, run.id);
                 assert_eq!(log.date, today);
             });
+        });
+    }
+
+    #[gpui::test]
+    fn new_inactive_defers_reload_until_activated_or_selected(cx: &mut TestAppContext) {
+        use gpui::AppContext;
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let active_habit = store.add_habit("Read").unwrap();
+        let archived_habit = store.add_habit("Run").unwrap();
+        store.set_habit_archived(archived_habit.id, true).unwrap();
+
+        cx.update(|cx| {
+            let view = cx.new(|cx| HabitView::new_inactive(store.clone(), cx));
+            {
+                let v = view.read(cx);
+                assert!(!v.active);
+                assert!(v.dirty);
+                assert!(v.habits.is_empty());
+            }
+
+            view.update(cx, |v, cx| v.set_active(true, cx));
+            let v = view.read(cx);
+            assert!(v.active);
+            assert!(!v.dirty);
+            assert_eq!(v.habits.len(), 2);
+
+            let view_select = cx.new(|cx| HabitView::new_inactive(store.clone(), cx));
+            assert!(view_select.read(cx).dirty);
+            view_select.update(cx, |v, cx| v.select(archived_habit.id, cx));
+            let vs = view_select.read(cx);
+            assert!(!vs.dirty);
+            assert!(vs.show_archived);
+            assert_eq!(vs.selected, Some(archived_habit.id));
+            assert!(vs.habits.iter().any(|h| h.id == active_habit.id));
         });
     }
 }

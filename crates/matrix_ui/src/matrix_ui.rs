@@ -255,6 +255,14 @@ impl Focusable for MatrixView {
 
 impl MatrixView {
     pub fn new(store: Rc<Store>, cx: &mut Context<Self>) -> Self {
+        Self::new_with_active(store, true, cx)
+    }
+
+    pub fn new_inactive(store: Rc<Store>, cx: &mut Context<Self>) -> Self {
+        Self::new_with_active(store, false, cx)
+    }
+
+    fn new_with_active(store: Rc<Store>, initial_active: bool, cx: &mut Context<Self>) -> Self {
         let name_input = cx.new(|cx| TextInput::new(Mode::SingleLine, "", cx).without_cancel());
         cx.subscribe(&name_input, |this, _, _: &Submitted, cx| {
             let typed = this.name_input.read(cx).text().to_owned();
@@ -302,10 +310,12 @@ impl MatrixView {
             confirm_delete_profile: None,
             pending_complete: HashSet::new(),
             submitting_quadrant_task: false,
-            active: true,
-            dirty: false,
+            active: initial_active,
+            dirty: !initial_active,
         };
-        this.reload(cx);
+        if initial_active {
+            this.reload(cx);
+        }
         cx.observe_global::<desktop_common::data_version::DataVersion>(|this, cx| {
             if desktop_common::data_version::changed_elsewhere(cx.entity_id(), cx) {
                 this.sync_external(cx);
@@ -877,6 +887,9 @@ impl MatrixView {
 
     #[cfg(debug_assertions)]
     pub fn dev_header(&mut self, what: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.dirty {
+            self.reload(cx);
+        }
         match what {
             "header-menu" => self.header_menu = true,
             "add" => self.start_add(0, window, cx),
@@ -1327,6 +1340,9 @@ impl MatrixView {
 
     #[cfg(debug_assertions)]
     pub fn dev_open(&mut self, quadrant: usize, edit: bool, cx: &mut Context<Self>) {
+        if self.dirty {
+            self.reload(cx);
+        }
         if edit {
             self.start_edit(quadrant, cx);
         } else {
@@ -2905,6 +2921,31 @@ mod tests {
                 m.drop_on(done.id, 0, cx);
                 assert!(m.notice.is_none());
             });
+        });
+    }
+
+    #[gpui::test]
+    fn new_inactive_skips_initial_reload_until_activated(cx: &mut gpui::TestAppContext) {
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let task = store.add_task("Deferred quadrant item").unwrap();
+        store.set_priority(task.id, Priority::High).unwrap();
+
+        cx.update(|cx| {
+            let matrix = cx.new(|cx| MatrixView::new_inactive(store.clone(), cx));
+            {
+                let m = matrix.read(cx);
+                assert!(!m.active);
+                assert!(m.dirty);
+                assert!(m.tasks.is_empty());
+                assert_eq!(m.cache[0].open_count, 0);
+            }
+
+            matrix.update(cx, |m, cx| m.set_active(true, cx));
+            let m = matrix.read(cx);
+            assert!(m.active);
+            assert!(!m.dirty);
+            assert_eq!(m.tasks.len(), 1);
+            assert_eq!(m.cache[0].open_count, 1);
         });
     }
 }

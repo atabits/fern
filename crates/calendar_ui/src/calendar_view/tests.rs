@@ -1626,3 +1626,64 @@ fn bucket_range_matches_per_day_queries_across_repeats_spans_and_events(cx: &mut
         }
     });
 }
+
+#[gpui::test]
+fn year_to_agenda_restores_anchor_month_and_shift_advances_agenda(cx: &mut TestAppContext) {
+    let store = Rc::new(Store::open_in_memory().unwrap());
+    let today = Local::now().date_naive();
+    let future_year = today.year() + 1;
+    let nov_day = NaiveDate::from_ymd_opt(future_year, 11, 18).unwrap();
+    let nov_month = NaiveDate::from_ymd_opt(future_year, 11, 1).unwrap();
+    let jan_day = NaiveDate::from_ymd_opt(future_year, 1, 10).unwrap();
+    let jan_task = store.add_task("Jan item").unwrap();
+    store.set_due(jan_task.id, Some(jan_day), None).unwrap();
+    let nov_task = store.add_task("Nov item").unwrap();
+    store.set_due(nov_task.id, Some(nov_day), None).unwrap();
+
+    cx.update(|cx| {
+        theme::init(cx);
+        cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+    });
+    let (view, cx) = cx.add_window_view(|window, cx| {
+        let mut cal = CalendarView::new(store.clone(), window, cx);
+        cal.anchor = nov_day;
+        cal.month = nov_month;
+        cal.set_mode(CalendarMode::Year, cx);
+        cal
+    });
+    cx.run_until_parked();
+
+    cx.update(|_, cx| {
+        let cal = view.read(cx);
+        assert_eq!(cal.month, NaiveDate::from_ymd_opt(future_year, 1, 1).unwrap());
+    });
+
+    cx.update(|_, cx| {
+        view.update(cx, |cal, cx| cal.set_mode(CalendarMode::Agenda, cx));
+    });
+    cx.run_until_parked();
+
+    cx.update(|_, cx| {
+        let cal = view.read(cx);
+        assert_eq!(cal.month, nov_month);
+        assert_eq!(cal.toolbar_month(), nov_month);
+        assert_eq!(calendar::month_start(cal.agenda_start()), nov_month);
+        assert_eq!(cal.agenda.first().map(|(d, _)| *d), Some(nov_day));
+    });
+
+    // When `month` sits before `today`, `toolbar_month` matches `agenda_start()` and `shift(1)` advances from it.
+    let current_month = calendar::month_start(today);
+    let next_month = calendar::add_months(current_month, 1);
+    cx.update(|_, cx| {
+        view.update(cx, |cal, cx| {
+            cal.month = NaiveDate::from_ymd_opt(today.year(), 1, 1).unwrap();
+            cal.selected_day = None;
+            cal.reload(cx);
+            assert_eq!(cal.toolbar_month(), current_month);
+            cal.shift(1, cx);
+            assert_eq!(cal.month, next_month);
+            assert_eq!(cal.agenda_start(), next_month);
+            assert_eq!(cal.toolbar_month(), next_month);
+        });
+    });
+}

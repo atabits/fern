@@ -295,6 +295,14 @@ impl gpui::Focusable for FocusView {
 
 impl FocusView {
     pub fn new(store: Rc<Store>, cx: &mut Context<Self>) -> Self {
+        Self::new_with_active(store, true, cx)
+    }
+
+    pub fn new_inactive(store: Rc<Store>, cx: &mut Context<Self>) -> Self {
+        Self::new_with_active(store, false, cx)
+    }
+
+    fn new_with_active(store: Rc<Store>, initial_active: bool, cx: &mut Context<Self>) -> Self {
         let strings = i18n::t(cx);
         let add_title = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.focus_record_title, cx));
         let add_start = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.focus_record_start, cx));
@@ -344,10 +352,12 @@ impl FocusView {
             stats_scroll: ScrollHandle::new(),
             open_record: None,
             record_note: cx.new(|cx| TextInput::new(Mode::MultiLine, strings.focus_note_placeholder, cx)),
-            active: true,
-            dirty: false,
+            active: initial_active,
+            dirty: !initial_active,
         };
-        this.reload(cx);
+        if initial_active {
+            this.reload(cx);
+        }
         this
     }
 
@@ -462,6 +472,7 @@ impl FocusView {
     /// Starts a Pomodoro, or a stopwatch in the stopwatch mode.
     pub fn start(&mut self, task: Option<(Id, String)>, cx: &mut Context<Self>) {
         if self.finish_prompt { return; }
+        if self.dirty { self.reload(cx); }
         self.finish(cx);
         if self.running.is_some() { return; }
         self.completed_in_chain = 0;
@@ -481,6 +492,7 @@ impl FocusView {
     /// Starts a Pomodoro (`stopwatch == false`) or stopwatch (`stopwatch == true`) without a target task.
     pub fn start_mode(&mut self, stopwatch: bool, cx: &mut Context<Self>) {
         if self.finish_prompt { return; }
+        if self.dirty { self.reload(cx); }
         self.finish(cx);
         if self.running.is_some() { return; }
         self.completed_in_chain = 0;
@@ -501,6 +513,7 @@ impl FocusView {
     /// "Start Focus" on a specific habit, linking the recorded session so time-based goals auto check in.
     pub fn start_for_habit(&mut self, habit_id: Option<Id>, title: String, stopwatch: bool, cx: &mut Context<Self>) {
         if self.finish_prompt { return; }
+        if self.dirty { self.reload(cx); }
         self.finish(cx);
         if self.running.is_some() { return; }
         self.completed_in_chain = 0;
@@ -516,6 +529,7 @@ impl FocusView {
     /// "Start Focus → Start Pomo / Start Stopwatch" for a task, in that mode.
     pub fn start_for(&mut self, task: Option<Id>, title: String, stopwatch: bool, cx: &mut Context<Self>) {
         if self.finish_prompt { return; }
+        if self.dirty { self.reload(cx); }
         self.finish(cx);
         if self.running.is_some() { return; }
         self.completed_in_chain = 0;
@@ -532,6 +546,7 @@ impl FocusView {
     /// stopwatch.
     fn start_from_timer(&mut self, timer: &fern_core::focus::FocusTimer, cx: &mut Context<Self>) {
         if self.finish_prompt { return; }
+        if self.dirty { self.reload(cx); }
         self.finish(cx);
         if self.running.is_some() { return; }
         self.completed_in_chain = 0;
@@ -971,6 +986,9 @@ impl FocusView {
 
     #[cfg(debug_assertions)]
     pub fn dev_menu(&mut self, menu: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.dirty {
+            self.reload(cx);
+        }
         let menu = match menu {
             "add" => RecordMenu::Add,
             "settings" => RecordMenu::Settings,
@@ -1338,6 +1356,9 @@ impl FocusView {
     }
 
     fn open_picker(&mut self, at_eye: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.dirty {
+            self.reload(cx);
+        }
         if self.picker.as_ref().is_some_and(|p| p.at_eye == at_eye) {
             self.picker = None;
             cx.notify();
@@ -2247,6 +2268,66 @@ mod tests {
         cx.run_until_parked();
         cx.update(|cx| {
             assert_eq!(view.read(cx).white_noise(), WhiteNoise::Off);
+        });
+    }
+
+    #[gpui::test]
+    fn new_inactive_preserves_settings_and_reloads_lazily(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext;
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        store.set_setting("focus_pomo_minutes", "40").unwrap();
+        let task = store.add_task("Deep work").unwrap();
+        store.set_due(task.id, Some(Local::now().date_naive()), None).unwrap();
+        let habit = store.add_habit("Meditate").unwrap();
+        let now = now_ms();
+        store
+            .add_focus_session_as(Some(task.id), "Deep work", now - 600_000, now, false)
+            .unwrap();
+
+        cx.update(|cx| {
+            let view = cx.new(|cx| FocusView::new_inactive(store.clone(), cx));
+            {
+                let v = view.read(cx);
+                assert!(!v.active);
+                assert!(v.dirty);
+                assert!(v.tasks.is_empty());
+                assert!(v.sessions.is_empty());
+                assert!(v.stats_data.tasks.is_empty());
+                assert_eq!(v.clock_state(now, i18n::t(cx)).0, "40:00");
+            }
+
+            view.update(cx, |v, cx| v.set_active(true, cx));
+            {
+                let v = view.read(cx);
+                assert!(v.active);
+                assert!(!v.dirty);
+                assert_eq!(v.tasks.len(), 1);
+                assert_eq!(v.sessions.len(), 1);
+                assert_eq!(v.stats_data.tasks.len(), 1);
+            }
+
+            let view_task = cx.new(|cx| FocusView::new_inactive(store.clone(), cx));
+            assert!(view_task.read(cx).dirty);
+            view_task.update(cx, |v, cx| {
+                v.start_for(Some(task.id), task.title.clone(), false, cx);
+            });
+            assert!(!view_task.read(cx).dirty);
+            assert!(view_task.read(cx).running.is_some());
+
+            let view_habit = cx.new(|cx| FocusView::new_inactive(store.clone(), cx));
+            assert!(view_habit.read(cx).dirty);
+            view_habit.update(cx, |v, cx| {
+                v.start_for_habit(Some(habit.id), habit.name.clone(), true, cx);
+            });
+            assert!(!view_habit.read(cx).dirty);
+            assert!(view_habit.read(cx).running.is_some());
+
+            let view_stats = cx.new(|cx| FocusView::new_inactive(store.clone(), cx));
+            assert!(view_stats.read(cx).dirty);
+            view_stats.update(cx, |v, cx| v.open_stats_overview(cx));
+            assert!(!view_stats.read(cx).dirty);
+            assert!(view_stats.read(cx).stats.is_some());
+            assert_eq!(view_stats.read(cx).stats_data.tasks.len(), 1);
         });
     }
 }

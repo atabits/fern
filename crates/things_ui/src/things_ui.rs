@@ -144,7 +144,20 @@ impl Focusable for ThingsView {
 }
 
 impl ThingsView {
-    pub fn new(store: Rc<Store>, _window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(store: Rc<Store>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self::new_with_active(store, window, true, cx)
+    }
+
+    pub fn new_inactive(store: Rc<Store>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self::new_with_active(store, window, false, cx)
+    }
+
+    fn new_with_active(
+        store: Rc<Store>,
+        _window: &mut Window,
+        initial_active: bool,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let mut this = Self {
             store,
             focus_handle: cx.focus_handle(),
@@ -179,10 +192,12 @@ impl ThingsView {
             folder_dialog: None,
             tag_dialog: None,
             pending_complete: HashSet::new(),
-            active: true,
-            dirty: false,
+            active: initial_active,
+            dirty: !initial_active,
         };
-        this.reload(cx);
+        if initial_active {
+            this.reload(cx);
+        }
         cx.observe_global::<data_version::DataVersion>(|this, cx| {
             if data_version::changed_elsewhere(cx.entity_id(), cx) {
                 this.sync_external(cx);
@@ -228,15 +243,23 @@ impl ThingsView {
             self.show_logged_in_project = false;
             self.reload(cx);
             window.focus(&self.focus_handle, cx);
+        } else if self.dirty {
+            self.reload(cx);
         }
     }
 
     /// Navigates to the task's appropriate view or project and expands its inline card.
     pub fn open_task(&mut self, id: Id, window: &mut Window, cx: &mut Context<Self>) {
         let Ok(Some(task)) = self.store.task(id) else {
+            if self.dirty {
+                self.reload(cx);
+            }
             return;
         };
         if task.is_deleted() {
+            if self.dirty {
+                self.reload(cx);
+            }
             return;
         }
         let today = Self::today();

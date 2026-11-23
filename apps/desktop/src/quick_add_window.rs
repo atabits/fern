@@ -521,7 +521,7 @@ impl Render for QuickAddWindow {
     }
 }
 
-pub(crate) fn active_hook_manager(cx: &App) -> Option<plugins::runtime::PluginManager> {
+pub(crate) fn active_hook_manager(cx: &App) -> Option<plugin_ui::PluginManager> {
     let host = plugin_ui::PluginHost::global(cx)?;
     if host.is_safe_mode() {
         return None;
@@ -530,7 +530,7 @@ pub(crate) fn active_hook_manager(cx: &App) -> Option<plugins::runtime::PluginMa
         p.enabled
             && p.manifest
                 .permissions
-                .contains(&plugins::permissions::Permission::HooksIntercept)
+                .contains(&plugin_ui::Permission::HooksIntercept)
     });
     if !has_hook {
         return None;
@@ -686,23 +686,23 @@ pub(crate) fn push_hook_cancel_toast(reason: &str, fallback: &str, cx: &mut App)
 /// Runs `beforeTaskComplete` off the UI thread; invokes `on_done(true, cx)` unless a plugin cancels
 /// (in which case it shows a warning toast and invokes `on_done(false, cx)`).
 pub(crate) fn run_before_task_complete(
-    mgr: plugins::runtime::PluginManager,
+    mgr: plugin_ui::PluginManager,
     task: &fern_core::Task,
     cx: &mut App,
     on_done: impl FnOnce(bool, &mut App) + 'static,
 ) {
-    let task_json = plugins::api::task_to_json(task);
+    let task_json = plugin_ui::api::task_to_json(task);
     let bg_task = cx.background_spawn(async move { mgr.run_before_task_complete(task_json) });
     cx.spawn(async move |cx| {
         let res = bg_task.await;
         cx.update(|cx| match res {
-            Ok(plugins::runtime::HookDecision::Cancel(reason)) => {
+            Ok(plugin_ui::HookDecision::Cancel(reason)) => {
                 push_hook_cancel_toast(&reason, i18n::t(cx).plugins_task_complete_cancelled, cx);
                 on_done(false, cx);
             }
             Ok(
-                plugins::runtime::HookDecision::Allow
-                | plugins::runtime::HookDecision::Modify(_),
+                plugin_ui::HookDecision::Allow
+                | plugin_ui::HookDecision::Modify(_),
             ) => {
                 on_done(true, cx);
             }
@@ -717,7 +717,7 @@ pub(crate) fn run_before_task_complete(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_quick_add_plugins(
-    mgr: plugins::runtime::PluginManager,
+    mgr: plugin_ui::PluginManager,
     main: WindowHandle<AppView>,
     lines: Vec<String>,
     date: Option<NaiveDate>,
@@ -737,16 +737,16 @@ pub(crate) fn run_quick_add_plugins(
                 .background_spawn(async move { mgr_c.run_quick_add_transform(raw_line) })
                 .await;
             let transformed = match transform {
-                Ok(plugins::runtime::HookDecision::Cancel(reason)) => {
+                Ok(plugin_ui::HookDecision::Cancel(reason)) => {
                     cx.update(|cx| {
                         push_hook_cancel_toast(&reason, i18n::t(cx).plugins_task_create_cancelled, cx);
                     });
                     continue;
                 }
-                Ok(plugins::runtime::HookDecision::Modify(val)) => {
+                Ok(plugin_ui::HookDecision::Modify(val)) => {
                     extract_transformed_text(&val).unwrap_or(line)
                 }
-                Ok(plugins::runtime::HookDecision::Allow) => line,
+                Ok(plugin_ui::HookDecision::Allow) => line,
                 Err(err) => {
                     eprintln!("plugin quickAddTransform hook failed: {err:#}");
                     line
@@ -760,13 +760,13 @@ pub(crate) fn run_quick_add_plugins(
                 .background_spawn(async move { mgr_c.run_before_task_create(draft_json) })
                 .await;
             match before_res {
-                Ok(plugins::runtime::HookDecision::Cancel(reason)) => {
+                Ok(plugin_ui::HookDecision::Cancel(reason)) => {
                     cx.update(|cx| {
                         push_hook_cancel_toast(&reason, i18n::t(cx).plugins_task_create_cancelled, cx);
                     });
                 }
-                Ok(plugins::runtime::HookDecision::Modify(modified_json)) => {
-                    match plugins::api::parse_task_draft(&modified_json) {
+                Ok(plugin_ui::HookDecision::Modify(modified_json)) => {
+                    match plugin_ui::api::parse_task_draft(&modified_json) {
                         Ok((draft, parsed_top)) => {
                             let top = if modified_json.get("top").is_some() {
                                 parsed_top
@@ -795,7 +795,7 @@ pub(crate) fn run_quick_add_plugins(
                         }
                     }
                 }
-                Ok(plugins::runtime::HookDecision::Allow) => {
+                Ok(plugin_ui::HookDecision::Allow) => {
                     if main
                         .update(cx, |view, _, cx| {
                             view.add_quick_task_with(&transformed, date, priority, list, cx);
@@ -895,7 +895,7 @@ mod tests {
             &lists,
             &Preferences::default(),
         );
-        let (draft, _) = plugins::api::parse_task_draft(&json).unwrap();
+        let (draft, _) = plugin_ui::api::parse_task_draft(&json).unwrap();
         assert_eq!(draft.priority, Priority::High);
         assert_eq!(draft.due_date, Some(due));
         assert_eq!(draft.list_id, Some(work_id));
@@ -937,7 +937,7 @@ mod tests {
             &lists,
             &prefs,
         );
-        let (defaults_draft, defaults_top) = plugins::api::parse_task_draft(&defaults_json).unwrap();
+        let (defaults_draft, defaults_top) = plugin_ui::api::parse_task_draft(&defaults_json).unwrap();
         assert_eq!(defaults_draft.title, "Review PR");
         assert_eq!(defaults_draft.due_date, Some(Local::now().date_naive()));
         assert_eq!(defaults_draft.priority, Priority::Medium);
@@ -956,7 +956,7 @@ mod tests {
             &lists,
             &prefs,
         );
-        let (typed_draft, _) = plugins::api::parse_task_draft(&typed_json).unwrap();
+        let (typed_draft, _) = plugin_ui::api::parse_task_draft(&typed_json).unwrap();
         assert_eq!(typed_draft.due_date, Some(Local::now().date_naive() + Duration::days(1)));
         assert_eq!(typed_draft.priority, Priority::High);
         assert_eq!(typed_draft.list_id, Some(home.id));
@@ -1001,7 +1001,7 @@ mod tests {
 
         // When Horizons is enabled, a horizon phrase wins over task_defaults.date and serializes "horizon".
         let json = build_quick_add_draft_json("Ship roadmap this month", None, None, None, &[], &prefs);
-        let (draft, _) = plugins::api::parse_task_draft(&json).unwrap();
+        let (draft, _) = plugin_ui::api::parse_task_draft(&json).unwrap();
         assert_eq!(draft.title, "Ship roadmap");
         assert_eq!(draft.due_date, None);
         assert_eq!(draft.horizon, Some(fern_core::Horizon::current_month(today)));
@@ -1009,7 +1009,7 @@ mod tests {
         // When Horizons is disabled, the phrase stays in the title and no horizon is parsed.
         prefs.features.horizons = false;
         let disabled_json = build_quick_add_draft_json("Ship roadmap this month", None, None, None, &[], &prefs);
-        let (disabled_draft, _) = plugins::api::parse_task_draft(&disabled_json).unwrap();
+        let (disabled_draft, _) = plugin_ui::api::parse_task_draft(&disabled_json).unwrap();
         assert_eq!(disabled_draft.title, "Ship roadmap this month");
         assert_eq!(disabled_draft.horizon, None);
         assert_eq!(disabled_draft.due_date, Some(today));

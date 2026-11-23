@@ -61,14 +61,12 @@ impl TodoView {
         match self.timeline_color_by {
             ColorBy::List => task
                 .list_id
-                .and_then(|id| self.lists.iter().find(|l| l.id == id))
-                .and_then(|l| lists_panel::parse_color(l.color.as_deref()))
+                .and_then(|id| self.list_colors.get(&id).copied())
                 .unwrap_or(accent),
             ColorBy::Tag => task
                 .tags
                 .first()
-                .and_then(|name| self.tags.iter().find(|t| t.name.eq_ignore_ascii_case(name)))
-                .and_then(|t| lists_panel::parse_color(t.color.as_deref()))
+                .and_then(|name| self.tag_color_for(name))
                 .unwrap_or(accent),
             ColorBy::Priority => task_rows::priority_color(task.priority, theme).unwrap_or(accent),
         }
@@ -587,8 +585,7 @@ impl TodoView {
         let tag_color = |task: &Task| {
             task.tags
                 .first()
-                .and_then(|name| self.tags.iter().find(|t| t.name.to_lowercase() == name.to_lowercase()))
-                .and_then(|t| lists_panel::parse_color(t.color.as_deref()))
+                .and_then(|name| self.tag_color_for(name))
                 .unwrap_or(theme.colors().accent)
         };
         let bar = |task: Task, depth: usize, cx: &mut Context<Self>| {

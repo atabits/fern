@@ -203,6 +203,9 @@ fn line_chart(
 
 impl FocusView {
     pub(super) fn open_stats(&mut self, cx: &mut Context<Self>) {
+        if self.dirty {
+            self.reload(cx);
+        }
         let today = Local::now().date_naive();
         self.record_menu = None;
         self.stats_scroll = ScrollHandle::new();

@@ -23,7 +23,6 @@ habit_ui.workspace = true
 icons.workspace = true
 life_clock_ui.workspace = true
 matrix_ui.workspace = true
-plugins.workspace = true
 plugin_ui.workspace = true
 serde.workspace = true
 serde_json.workspace = true

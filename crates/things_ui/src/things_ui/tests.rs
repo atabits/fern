@@ -1544,3 +1544,55 @@ fn title_notes_invalidate_groups_checklist_enter_focuses_next_and_invalid_when_s
     cx.run_until_parked();
     assert_eq!(store.task(task.id).unwrap().unwrap().start_date, Some(target));
 }
+
+#[gpui::test]
+fn new_inactive_skips_initial_reload_until_activated_or_opened(cx: &mut TestAppContext) {
+    let store = Rc::new(Store::open_in_memory().unwrap());
+    let today = ThingsView::today();
+    let inbox_task = store.add_task("Deferred inbox task").unwrap();
+    store
+        .create_task(
+            TaskDraft {
+                title: "Deferred today task".into(),
+                start_date: Some(today),
+                ..Default::default()
+            },
+            false,
+        )
+        .unwrap();
+
+    setup_env(cx);
+    let (view, cx) = cx.add_window_view(|window, cx| {
+        let view = ThingsView::new_inactive(store.clone(), window, cx);
+        assert!(!view.active);
+        assert!(view.dirty);
+        assert!(view.tasks().is_empty());
+        assert_eq!(view.counts, ThingsCounts::default());
+        view
+    });
+
+    cx.update(|_, cx| {
+        view.update(cx, |v, cx| v.set_active(true, cx));
+        let v = view.read(cx);
+        assert!(v.active);
+        assert!(!v.dirty);
+        assert_eq!(v.tasks().len(), 1);
+        assert_eq!(v.counts.inbox, 1);
+        assert_eq!(v.counts.today, 1);
+    });
+
+    let (view_open, cx) = cx.add_window_view(|window, cx| {
+        let mut view = ThingsView::new_inactive(store.clone(), window, cx);
+        assert!(view.dirty);
+        assert!(view.tasks().is_empty());
+        view.open_task(inbox_task.id, window, cx);
+        assert!(!view.dirty);
+        assert_eq!(view.view(), ThingsViewKind::Inbox);
+        assert_eq!(view.expanded_task(), Some(inbox_task.id));
+        view
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        assert_eq!(view_open.read(cx).tasks().len(), 1);
+    });
+}

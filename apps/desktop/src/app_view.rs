@@ -76,7 +76,7 @@ fn is_plugin_view_reachable(
     PluginHost::global(cx)
         .and_then(|host| host.plugin(plugin_id))
         .is_some_and(|info| {
-            matches!(info.status, plugins::runtime::PluginStatus::CircuitBroken { .. })
+            matches!(info.status, plugin_ui::PluginStatus::CircuitBroken { .. })
                 && info
                     .manifest
                     .contributions
@@ -275,8 +275,23 @@ impl AppView {
             }).unwrap_or(true)
         });
         set_horizons_enabled(initial_prefs.features.horizons);
-        let todo = cx.new(|cx| TodoView::new(store.clone(), window, cx));
-        let things = cx.new(|cx| ThingsView::new(store.clone(), window, cx));
+        let store_features = initial_prefs.features;
+        let rail_items = initial_prefs.rail_items.clone();
+        let initial_section = first_enabled_task_section(store_features);
+        let todo = cx.new(|cx| {
+            if initial_section == Section::Tasks {
+                TodoView::new(store.clone(), window, cx)
+            } else {
+                TodoView::new_inactive(store.clone(), window, cx)
+            }
+        });
+        let things = cx.new(|cx| {
+            if initial_section == Section::Things {
+                ThingsView::new(store.clone(), window, cx)
+            } else {
+                ThingsView::new_inactive(store.clone(), window, cx)
+            }
+        });
         cx.subscribe_in(&things, window, |this, _, event: &ThingsEvent, window, cx| match event {
             ThingsEvent::StartFocus {
                 task_id,
@@ -294,7 +309,7 @@ impl AppView {
             }
         })
         .detach();
-        let calendar = cx.new(|cx| CalendarView::new(store.clone(), window, cx));
+        let calendar = cx.new(|cx| CalendarView::new_inactive(store.clone(), window, cx));
         // A task clicked in the calendar opens in the task list with its details.
         cx.subscribe_in(&calendar, window, |this, _, calendar_view::OpenTask(id), window, cx| {
             this.open_task(*id, window, cx);
@@ -352,7 +367,7 @@ impl AppView {
             }
         })
         .detach();
-        let matrix = cx.new(|cx| MatrixView::new(store.clone(), cx));
+        let matrix = cx.new(|cx| MatrixView::new_inactive(store.clone(), cx));
         cx.subscribe_in(&matrix, window, |this, _, matrix_view::OpenTask(id), window, cx| {
             this.open_task(*id, window, cx);
         })
@@ -364,8 +379,8 @@ impl AppView {
             }
         })
         .detach();
-        let countdown = cx.new(|cx| CountdownView::new(store.clone(), cx));
-        let life_clock = cx.new(|cx| LifeClockView::new(store.clone(), cx));
+        let countdown = cx.new(|cx| CountdownView::new_inactive(store.clone(), cx));
+        let life_clock = cx.new(|cx| LifeClockView::new_inactive(store.clone(), cx));
         cx.subscribe(&life_clock, |this, _, event: &LifeClockEvent, cx| match event {
             LifeClockEvent::ToggleSidebar => {
                 this.toggle_life_clock_rail(cx);
@@ -375,7 +390,7 @@ impl AppView {
             }
         })
         .detach();
-        let habits = cx.new(|cx| HabitView::new(store.clone(), cx));
+        let habits = cx.new(|cx| HabitView::new_inactive(store.clone(), cx));
         // "Start Focus" in a habit's menu starts a Pomodoro or a stopwatch linked to it.
         cx.subscribe_in(&habits, window, |this, _, event: &crate::habit_view::StartFocus, window, cx| {
             let (habit_id, title, stopwatch) = (event.habit_id, event.title.clone(), event.stopwatch);
@@ -384,7 +399,7 @@ impl AppView {
             }
         })
         .detach();
-        let focus = cx.new(|cx| FocusView::new(store.clone(), cx));
+        let focus = cx.new(|cx| FocusView::new_inactive(store.clone(), cx));
         cx.observe(&focus, |this, focus, cx| {
             let tip = match focus.read(cx).running_clock() {
                 Some((clock, true)) => format!("Fern — {clock} (Paused)"),
@@ -408,9 +423,6 @@ impl AppView {
             cx.notify();
         })
         .detach();
-        let store_features = initial_prefs.features;
-        let rail_items = initial_prefs.rail_items.clone();
-        let initial_section = first_enabled_task_section(store_features);
         let window_handle = window.window_handle().downcast::<Self>();
         let has_sync_config = store.sync_config().ok().flatten().is_some();
         let always_on_top = crate::tray::TrayPrefs::current(&store, cx).always_on_top;

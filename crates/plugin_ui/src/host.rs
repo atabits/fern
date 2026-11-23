@@ -194,9 +194,9 @@ pub struct PluginHost {
     safe_mode: bool,
     hot_reload_enabled: bool,
     hot_reload_started: bool,
-    plugins: Vec<PluginInfo>,
+    plugins: Arc<Vec<PluginInfo>>,
     plugin_revisions: HashMap<String, u64>,
-    views: HashMap<(String, String), UiTreePayload>,
+    views: HashMap<(String, String), Arc<UiTreePayload>>,
     view_errors: HashMap<(String, String), String>,
     view_revisions: HashMap<(String, String), u64>,
     op_state: RefCell<PluginOpState>,
@@ -344,7 +344,7 @@ impl PluginHost {
             config,
             manager,
             registry_client,
-            plugins: initial_plugins,
+            plugins: Arc::new(initial_plugins),
             plugin_revisions,
             views: HashMap::new(),
             view_errors: HashMap::new(),
@@ -592,6 +592,10 @@ impl PluginHost {
         &self.plugins
     }
 
+    pub(crate) fn plugins_arc(&self) -> Arc<Vec<PluginInfo>> {
+        Arc::clone(&self.plugins)
+    }
+
     pub fn plugin(&self, plugin_id: &str) -> Option<&PluginInfo> {
         self.plugins.iter().find(|p| p.manifest.id == plugin_id)
     }
@@ -633,14 +637,25 @@ impl PluginHost {
         }
         let pid = plugin_id.to_owned();
         cx.update_global::<Self, _>(|host, _| {
-            if let Some(info) = host.plugins.iter_mut().find(|p| p.manifest.id == pid) {
+            if let Some(info) = Arc::make_mut(&mut host.plugins)
+                .iter_mut()
+                .find(|p| p.manifest.id == pid)
+            {
                 info.settings_values = settings;
             }
         });
     }
 
     pub fn view_tree(&self, plugin_id: &str, view_id: &str) -> Option<&UiTreePayload> {
-        self.views.get(&(plugin_id.to_owned(), view_id.to_owned()))
+        self.views
+            .get(&(plugin_id.to_owned(), view_id.to_owned()))
+            .map(Arc::as_ref)
+    }
+
+    pub fn view_tree_arc(&self, plugin_id: &str, view_id: &str) -> Option<Arc<UiTreePayload>> {
+        self.views
+            .get(&(plugin_id.to_owned(), view_id.to_owned()))
+            .cloned()
     }
 
     pub fn view_error(&self, plugin_id: &str, view_id: &str) -> Option<&str> {
@@ -666,7 +681,7 @@ impl PluginHost {
         cx.update_global::<Self, _>(|host, _| {
             let rev = host.plugin_revision(&key.0);
             host.view_errors.remove(&key);
-            host.views.insert(key.clone(), payload);
+            host.views.insert(key.clone(), Arc::new(payload));
             host.view_revisions.insert(key, rev);
         });
     }
@@ -1084,7 +1099,7 @@ impl PluginHost {
                                                 host.view_revisions.insert(key.clone(), rev_val);
                                                 match mount_res {
                                                     Ok(payload) => {
-                                                        host.views.insert(key, payload);
+                                                        host.views.insert(key, Arc::new(payload));
                                                     }
                                                     Err(mount_err) => {
                                                         host.view_errors.insert(
@@ -1437,7 +1452,7 @@ impl PluginHost {
         } else if sig.is_empty() {
             (Vec::new(), Vec::new())
         } else {
-            let plugins = host.plugins.clone();
+            let plugins = Arc::clone(&host.plugins);
             collect_plugin_themes(&plugins)
         };
         // Invalidate any in-flight async theme load so it cannot overwrite this synchronous sync.
@@ -1498,7 +1513,11 @@ fn apply_plugin_themes(
     });
 }
 
-fn sync_plugin_themes_async(plugins: Vec<PluginInfo>, sig: ThemeSourceSignature, cx: &mut App) {
+fn sync_plugin_themes_async(
+    plugins: Arc<Vec<PluginInfo>>,
+    sig: ThemeSourceSignature,
+    cx: &mut App,
+) {
     if !cx.has_global::<ThemeRegistry>() {
         return;
     }
@@ -1726,8 +1745,7 @@ fn apply_host_update(update: HostUpdate, cx: &mut App) {
                             | PluginStatus::NeedsApproval { .. }
                             | PluginStatus::CircuitBroken { .. }
                     );
-                    if let Some(info) = host
-                        .plugins
+                    if let Some(info) = Arc::make_mut(&mut host.plugins)
                         .iter_mut()
                         .find(|p| p.manifest.id == plugin_id)
                     {
@@ -1755,7 +1773,7 @@ fn apply_host_update(update: HostUpdate, cx: &mut App) {
                             .or_insert(0);
                         *rev = rev.wrapping_add(1);
                     }
-                    updated_plugins = Some(host.plugins.clone());
+                    updated_plugins = Some(Arc::clone(&host.plugins));
                 });
             }
             if let Some(plugins) = updated_plugins {
@@ -1793,13 +1811,14 @@ fn apply_host_update(update: HostUpdate, cx: &mut App) {
 }
 
 fn apply_registry_changed(infos: Vec<PluginInfo>, cx: &mut App) {
+    let infos = Arc::new(infos);
     let next_theme_sig = theme_contribution_signature(&infos);
     let mut should_sync_themes = false;
 
     if cx.has_global::<PluginHost>() {
         cx.update_global::<PluginHost, _>(|host, _| {
             host.registry_change_seq = host.registry_change_seq.wrapping_add(1);
-            for info in &infos {
+            for info in infos.iter() {
                 let prev = host
                     .plugins
                     .iter()
@@ -1861,7 +1880,7 @@ fn apply_registry_changed(infos: Vec<PluginInfo>, cx: &mut App) {
                 has_active_hook_plugins(host.safe_mode, host.manager.is_some(), &infos),
                 Ordering::Release,
             );
-            host.plugins = infos.clone();
+            host.plugins = Arc::clone(&infos);
         });
     }
     sync_bus_contributions(&infos, cx);

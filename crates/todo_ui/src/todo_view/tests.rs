@@ -2037,3 +2037,68 @@ fn horizons_embedded_view_quick_add_due_picker_and_feature_toggle(cx: &mut TestA
         "DuePicker must hide horizon chips when horizons_enabled is false"
     );
 }
+
+#[gpui::test]
+fn lazy_inactive_text_edit_in_place_and_kanban_cache(cx: &mut TestAppContext) {
+    let store = Rc::new(Store::open_in_memory().unwrap());
+    let list = store.create_list("Work").unwrap();
+    store
+        .update_list(
+            list.id,
+            &fern_core::ListDraft { color: Some("#6387F7".into()), ..fern_core::ListDraft::of(&list) },
+        )
+        .unwrap();
+    let task = store.add_task("Initial title").unwrap();
+    store.set_notes(task.id, "Initial note").unwrap();
+
+    cx.update(|cx| {
+        theme::init(cx);
+        cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+        assert!(crate::keymap::load_default(&assets::Assets, cx).unwrap().is_empty());
+    });
+
+    // 1. new_inactive skips initial reload and marks dirty until set_active(true).
+    let (view, cx) = cx.add_window_view(|window, cx| TodoView::new_inactive(store.clone(), window, cx));
+    cx.update(|_, cx| {
+        let v = view.read(cx);
+        assert!(!v.active);
+        assert!(v.dirty);
+        assert!(v.tasks.is_empty());
+        assert!(v.lists.is_empty());
+    });
+    cx.update(|_, cx| view.update(cx, |v, cx| v.set_active(true, cx)));
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let v = view.read(cx);
+        assert!(v.active);
+        assert!(!v.dirty);
+        assert_eq!(v.tasks.len(), 1);
+        assert!(v.list_colors.contains_key(&list.id));
+    });
+
+    // 2. Typing in TaskDetail updates `tasks` in-place via TaskTextEdited without resetting
+    //    `detail` or triggering a full reload.
+    cx.update(|_, cx| view.update(cx, |v, cx| v.select(task.id, cx)));
+    cx.run_until_parked();
+    let title_bounds = cx.debug_bounds("task-detail-title").expect("detail title visible");
+    cx.simulate_click(title_bounds.center(), Modifiers::default());
+    cx.simulate_keystrokes("end");
+    cx.simulate_input("!");
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let v = view.read(cx);
+        assert_eq!(v.tasks[0].title, "Initial title!");
+        assert_eq!(v.detail.read(cx).task_title(), Some("Initial title!"));
+    });
+    assert_eq!(store.task(task.id).unwrap().unwrap().title, "Initial title!");
+
+    // 3. board_columns returns cached Rc across repeated calls at the same rows_version.
+    cx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.set_layout(true, false, cx);
+            let a = v.board_columns(&i18n::EN);
+            let b = v.board_columns(&i18n::EN);
+            assert!(Rc::ptr_eq(&a, &b));
+        });
+    });
+}

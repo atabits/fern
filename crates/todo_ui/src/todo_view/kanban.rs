@@ -56,6 +56,21 @@ impl BoardCol {
 }
 
 
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct KanbanCacheKey {
+    version: u64,
+    sort: SortBy,
+    group: GroupBy,
+    show_completed: bool,
+    descending: bool,
+    kanban_workflow: bool,
+    completing_len: usize,
+    overdue_last: bool,
+    week_start: chrono::Weekday,
+    today: NaiveDate,
+    strings_ptr: usize,
+}
+
 impl TodoView {
     pub(super) fn ensure_kanban_sections(&mut self, strings: &Strings, cx: &mut Context<Self>) {
         if !self.kanban
@@ -122,11 +137,29 @@ impl TodoView {
         }
     }
 
-    pub(super) fn board_columns(&self, strings: &Strings) -> Vec<BoardCol> {
+    pub(super) fn board_columns(&self, strings: &Strings) -> Rc<Vec<BoardCol>> {
         let (sort, group) = self.sort_settings();
         let show_completed = self.view_flag("show_completed", true);
         let descending = self.view_flag("descending", false);
         let today = Self::today();
+        let key = KanbanCacheKey {
+            version: self.rows_version,
+            sort,
+            group,
+            show_completed,
+            descending,
+            kanban_workflow: self.kanban_workflow,
+            completing_len: self.completing.len(),
+            overdue_last: self.preferences.task_defaults.overdue_last,
+            week_start: crate::calendar::week_start(),
+            today,
+            strings_ptr: strings as *const Strings as usize,
+        };
+        if let Some((cached_key, cols)) = self.kanban_cache.borrow().as_ref()
+            && *cached_key == key
+        {
+            return Rc::clone(cols);
+        }
 
         let mut tasks = self.tasks_for_rows();
         if !show_completed {
@@ -163,7 +196,7 @@ impl TodoView {
             BoardCol { key, title, drop, pinned_cards, open_cards, completed_cards }
         };
 
-        if self.kanban_workflow {
+        let built = if self.kanban_workflow {
             let mut todo_cards = Vec::new();
             let mut in_progress_cards = Vec::new();
             let mut completed_cards = Vec::new();
@@ -176,203 +209,207 @@ impl TodoView {
                     todo_cards.push(card);
                 }
             }
-            return vec![
+            vec![
                 make_col("workflow:todo".into(), strings.col_todo.to_owned(), Some(DropTarget::Todo), todo_cards),
                 make_col("workflow:in_progress".into(), strings.in_progress.to_owned(), Some(DropTarget::InProgress), in_progress_cards),
                 make_col("workflow:completed".into(), strings.completed.to_owned(), Some(DropTarget::Complete), completed_cards),
-            ];
-        }
-
-        match group {
-            GroupBy::Custom if self.view == View::Next7Days => {
-                let week_start = crate::calendar::week_start();
-                let mut cols = Vec::new();
-                let mut overdue = Vec::new();
-                let mut by_day: Vec<Vec<(Task, Vec<Task>)>> = (0..7).map(|_| Vec::new()).collect();
-                for card in all_cards {
-                    match card.0.due_date {
-                        Some(d) if d < today => overdue.push(card),
-                        Some(d) if (d - today).num_days() < 7 => by_day[(d - today).num_days().max(0) as usize].push(card),
-                        _ => by_day[0].push(card),
+            ]
+        } else {
+            match group {
+                GroupBy::Custom if self.view == View::Next7Days => {
+                    let week_start = crate::calendar::week_start();
+                    let mut cols = Vec::new();
+                    let mut overdue = Vec::new();
+                    let mut by_day: Vec<Vec<(Task, Vec<Task>)>> = (0..7).map(|_| Vec::new()).collect();
+                    for card in all_cards {
+                        match card.0.due_date {
+                            Some(d) if d < today => overdue.push(card),
+                            Some(d) if (d - today).num_days() < 7 => by_day[(d - today).num_days().max(0) as usize].push(card),
+                            _ => by_day[0].push(card),
+                        }
                     }
-                }
-                if !overdue.is_empty() {
-                    cols.push(make_col("next7:overdue".into(), strings.group_overdue.to_owned(), None, overdue));
-                }
-                for (offset, cards) in by_day.into_iter().enumerate() {
-                    if !cards.is_empty() {
-                        let day = today + Duration::days(offset as i64);
-                        let label = task_rows::next_days_header(day, today, week_start, strings);
-                        cols.push(make_col(format!("next7:{day}"), label, Some(DropTarget::Due(Some(day))), cards));
+                    if !overdue.is_empty() {
+                        cols.push(make_col("next7:overdue".into(), strings.group_overdue.to_owned(), None, overdue));
                     }
-                }
-                cols
-            }
-            GroupBy::Custom if self.section_owner().is_some() => {
-                if self.sections.is_empty() {
-                    return vec![make_col(
-                        "sec:none".into(),
-                        strings.not_sectioned.to_owned(),
-                        Some(DropTarget::Section(None)),
-                        all_cards,
-                    )];
-                }
-                let known: HashSet<Id> = self.sections.iter().map(|s| s.id).collect();
-                let first_id = self.sections[0].id;
-                let mut buckets: HashMap<Id, Vec<(Task, Vec<Task>)>> =
-                    self.sections.iter().map(|s| (s.id, Vec::new())).collect();
-                for card in all_cards {
-                    let target_sec = card.0.section_id.filter(|s| known.contains(s)).unwrap_or(first_id);
-                    if let Some(bucket) = buckets.get_mut(&target_sec) {
-                        bucket.push(card);
+                    for (offset, cards) in by_day.into_iter().enumerate() {
+                        if !cards.is_empty() {
+                            let day = today + Duration::days(offset as i64);
+                            let label = task_rows::next_days_header(day, today, week_start, strings);
+                            cols.push(make_col(format!("next7:{day}"), label, Some(DropTarget::Due(Some(day))), cards));
+                        }
                     }
+                    cols
                 }
-                self.sections
-                    .iter()
-                    .map(|sec| {
-                        let cards = buckets.remove(&sec.id).unwrap_or_default();
-                        make_col(format!("sec:{}", sec.id), sec.name.clone(), Some(DropTarget::Section(Some(sec.id))), cards)
-                    })
-                    .collect()
-            }
-            GroupBy::Custom => {
-                let mut task_cards = Vec::new();
-                let mut note_cards = Vec::new();
-                for card in all_cards {
-                    if card.0.kind == Kind::Note {
-                        note_cards.push(card);
+                GroupBy::Custom if self.section_owner().is_some() => {
+                    if self.sections.is_empty() {
+                        vec![make_col(
+                            "sec:none".into(),
+                            strings.not_sectioned.to_owned(),
+                            Some(DropTarget::Section(None)),
+                            all_cards,
+                        )]
                     } else {
-                        task_cards.push(card);
+                        let known: HashSet<Id> = self.sections.iter().map(|s| s.id).collect();
+                        let first_id = self.sections[0].id;
+                        let mut buckets: HashMap<Id, Vec<(Task, Vec<Task>)>> =
+                            self.sections.iter().map(|s| (s.id, Vec::new())).collect();
+                        for card in all_cards {
+                            let target_sec = card.0.section_id.filter(|s| known.contains(s)).unwrap_or(first_id);
+                            if let Some(bucket) = buckets.get_mut(&target_sec) {
+                                bucket.push(card);
+                            }
+                        }
+                        self.sections
+                            .iter()
+                            .map(|sec| {
+                                let cards = buckets.remove(&sec.id).unwrap_or_default();
+                                make_col(format!("sec:{}", sec.id), sec.name.clone(), Some(DropTarget::Section(Some(sec.id))), cards)
+                            })
+                            .collect()
                     }
                 }
-                let mut cols = Vec::new();
-                if !task_cards.is_empty() {
-                    cols.push(make_col("kind:task".into(), strings.group_tasks.to_owned(), Some(DropTarget::Kind(Kind::Task)), task_cards));
-                }
-                if !note_cards.is_empty() {
-                    cols.push(make_col("kind:note".into(), strings.group_notes.to_owned(), Some(DropTarget::Kind(Kind::Note)), note_cards));
-                }
-                cols
-            }
-            GroupBy::List => {
-                let known: HashSet<Id> = self.lists.iter().map(|l| l.id).collect();
-                let mut inbox_cards = Vec::new();
-                let mut list_buckets: HashMap<Id, Vec<(Task, Vec<Task>)>> = HashMap::new();
-                for card in all_cards {
-                    match card.0.list_id.filter(|id| known.contains(id)) {
-                        Some(id) => list_buckets.entry(id).or_default().push(card),
-                        None => inbox_cards.push(card),
+                GroupBy::Custom => {
+                    let mut task_cards = Vec::new();
+                    let mut note_cards = Vec::new();
+                    for card in all_cards {
+                        if card.0.kind == Kind::Note {
+                            note_cards.push(card);
+                        } else {
+                            task_cards.push(card);
+                        }
                     }
-                }
-                let mut cols = Vec::new();
-                if !inbox_cards.is_empty() {
-                    cols.push(make_col("list:inbox".into(), strings.inbox.to_owned(), Some(DropTarget::List(None)), inbox_cards));
-                }
-                for list in &self.lists {
-                    if let Some(cards) = list_buckets.remove(&list.id)
-                        && !cards.is_empty()
-                    {
-                        cols.push(make_col(format!("list:{}", list.id), list.name.clone(), Some(DropTarget::List(Some(list.id))), cards));
+                    let mut cols = Vec::new();
+                    if !task_cards.is_empty() {
+                        cols.push(make_col("kind:task".into(), strings.group_tasks.to_owned(), Some(DropTarget::Kind(Kind::Task)), task_cards));
                     }
-                }
-                cols
-            }
-            GroupBy::Date => {
-                let overdue_last = self.preferences.task_defaults.overdue_last;
-                let mut buckets: [Vec<(Task, Vec<Task>)>; 6] = Default::default();
-                for card in all_cards {
-                    let slot = match card.0.due_date {
-                        Some(d) if d < today => 0,
-                        Some(d) if d == today => 1,
-                        Some(d) if d == today + Duration::days(1) => 2,
-                        Some(d) if d <= today + Duration::days(7) => 3,
-                        Some(_) => 4,
-                        None => 5,
-                    };
-                    buckets[slot].push(card);
-                }
-                let mut specs = vec![
-                    (if overdue_last { 6 } else { 0 }, 0usize, "date:overdue", strings.group_overdue, None),
-                    (1, 1, "date:today", strings.today, Some(DropTarget::Due(Some(today)))),
-                    (2, 2, "date:tomorrow", strings.tomorrow, Some(DropTarget::Due(Some(today + Duration::days(1))))),
-                    (3, 3, "date:next7", strings.next_7_days, Some(DropTarget::Due(Some(today + Duration::days(7))))),
-                    (4, 4, "date:later", strings.group_later, None),
-                    (5, 5, "date:none", strings.group_no_date, Some(DropTarget::Due(None))),
-                ];
-                specs.sort_by_key(|(ord, _, _, _, _)| *ord);
-                let mut cols = Vec::new();
-                for (_, slot, key, label, drop) in specs {
-                    let cards = std::mem::take(&mut buckets[slot]);
-                    if !cards.is_empty() {
-                        cols.push(make_col(key.into(), label.to_owned(), drop, cards));
+                    if !note_cards.is_empty() {
+                        cols.push(make_col("kind:note".into(), strings.group_notes.to_owned(), Some(DropTarget::Kind(Kind::Note)), note_cards));
                     }
+                    cols
                 }
-                cols
-            }
-            GroupBy::Priority => {
-                let specs = [
-                    (Priority::High, "prio:high", strings.priority_high),
-                    (Priority::Medium, "prio:medium", strings.priority_medium),
-                    (Priority::Low, "prio:low", strings.priority_low),
-                    (Priority::None, "prio:none", strings.priority_none),
-                ];
-                let mut buckets: [Vec<(Task, Vec<Task>)>; 4] = Default::default();
-                for card in all_cards {
-                    let idx = match card.0.priority {
-                        Priority::High => 0,
-                        Priority::Medium => 1,
-                        Priority::Low => 2,
-                        Priority::None => 3,
-                    };
-                    buckets[idx].push(card);
+                GroupBy::List => {
+                    let known: HashSet<Id> = self.lists.iter().map(|l| l.id).collect();
+                    let mut inbox_cards = Vec::new();
+                    let mut list_buckets: HashMap<Id, Vec<(Task, Vec<Task>)>> = HashMap::new();
+                    for card in all_cards {
+                        match card.0.list_id.filter(|id| known.contains(id)) {
+                            Some(id) => list_buckets.entry(id).or_default().push(card),
+                            None => inbox_cards.push(card),
+                        }
+                    }
+                    let mut cols = Vec::new();
+                    if !inbox_cards.is_empty() {
+                        cols.push(make_col("list:inbox".into(), strings.inbox.to_owned(), Some(DropTarget::List(None)), inbox_cards));
+                    }
+                    for list in &self.lists {
+                        if let Some(cards) = list_buckets.remove(&list.id)
+                            && !cards.is_empty()
+                        {
+                            cols.push(make_col(format!("list:{}", list.id), list.name.clone(), Some(DropTarget::List(Some(list.id))), cards));
+                        }
+                    }
+                    cols
                 }
-                specs
-                    .into_iter()
-                    .zip(buckets)
-                    .filter(|(_, cards)| !cards.is_empty())
-                    .map(|((prio, key, label), cards)| {
-                        make_col(key.into(), label.to_owned(), Some(DropTarget::Priority(prio)), cards)
-                    })
-                    .collect()
-            }
-            GroupBy::Tag => {
-                let mut tag_groups: Vec<(String, Vec<BoardCard>)> = Vec::new();
-                let mut untagged = Vec::new();
-                for card in all_cards {
-                    match card.0.tags.first().cloned() {
-                        Some(tag) => match tag_groups.iter_mut().find(|(t, _)| *t == tag) {
+                GroupBy::Date => {
+                    let overdue_last = self.preferences.task_defaults.overdue_last;
+                    let mut buckets: [Vec<(Task, Vec<Task>)>; 6] = Default::default();
+                    for card in all_cards {
+                        let slot = match card.0.due_date {
+                            Some(d) if d < today => 0,
+                            Some(d) if d == today => 1,
+                            Some(d) if d == today + Duration::days(1) => 2,
+                            Some(d) if d <= today + Duration::days(7) => 3,
+                            Some(_) => 4,
+                            None => 5,
+                        };
+                        buckets[slot].push(card);
+                    }
+                    let mut specs = vec![
+                        (if overdue_last { 6 } else { 0 }, 0usize, "date:overdue", strings.group_overdue, None),
+                        (1, 1, "date:today", strings.today, Some(DropTarget::Due(Some(today)))),
+                        (2, 2, "date:tomorrow", strings.tomorrow, Some(DropTarget::Due(Some(today + Duration::days(1))))),
+                        (3, 3, "date:next7", strings.next_7_days, Some(DropTarget::Due(Some(today + Duration::days(7))))),
+                        (4, 4, "date:later", strings.group_later, None),
+                        (5, 5, "date:none", strings.group_no_date, Some(DropTarget::Due(None))),
+                    ];
+                    specs.sort_by_key(|(ord, _, _, _, _)| *ord);
+                    let mut cols = Vec::new();
+                    for (_, slot, key, label, drop) in specs {
+                        let cards = std::mem::take(&mut buckets[slot]);
+                        if !cards.is_empty() {
+                            cols.push(make_col(key.into(), label.to_owned(), drop, cards));
+                        }
+                    }
+                    cols
+                }
+                GroupBy::Priority => {
+                    let specs = [
+                        (Priority::High, "prio:high", strings.priority_high),
+                        (Priority::Medium, "prio:medium", strings.priority_medium),
+                        (Priority::Low, "prio:low", strings.priority_low),
+                        (Priority::None, "prio:none", strings.priority_none),
+                    ];
+                    let mut buckets: [Vec<(Task, Vec<Task>)>; 4] = Default::default();
+                    for card in all_cards {
+                        let idx = match card.0.priority {
+                            Priority::High => 0,
+                            Priority::Medium => 1,
+                            Priority::Low => 2,
+                            Priority::None => 3,
+                        };
+                        buckets[idx].push(card);
+                    }
+                    specs
+                        .into_iter()
+                        .zip(buckets)
+                        .filter(|(_, cards)| !cards.is_empty())
+                        .map(|((prio, key, label), cards)| {
+                            make_col(key.into(), label.to_owned(), Some(DropTarget::Priority(prio)), cards)
+                        })
+                        .collect()
+                }
+                GroupBy::Tag => {
+                    let mut tag_groups: Vec<(String, Vec<BoardCard>)> = Vec::new();
+                    let mut untagged = Vec::new();
+                    for card in all_cards {
+                        match card.0.tags.first().cloned() {
+                            Some(tag) => match tag_groups.iter_mut().find(|(t, _)| *t == tag) {
+                                Some((_, items)) => items.push(card),
+                                None => tag_groups.push((tag, vec![card])),
+                            },
+                            None => untagged.push(card),
+                        }
+                    }
+                    tag_groups.sort_by_key(|(a, _)| a.to_lowercase());
+                    let mut cols: Vec<BoardCol> = tag_groups
+                        .into_iter()
+                        .map(|(tag, cards)| make_col(format!("tag:{tag}"), tag.clone(), Some(DropTarget::Tag(Some(tag))), cards))
+                        .collect();
+                    if !untagged.is_empty() {
+                        cols.push(make_col("tag:none".into(), strings.group_no_tags.to_owned(), Some(DropTarget::Tag(None)), untagged));
+                    }
+                    cols
+                }
+                GroupBy::Created | GroupBy::None => {
+                    let mut groups: Vec<(NaiveDate, Vec<BoardCard>)> = Vec::new();
+                    for card in all_cards {
+                        let day = task_rows::local_day(card.0.created_at).unwrap_or(today);
+                        match groups.iter_mut().find(|(d, _)| *d == day) {
                             Some((_, items)) => items.push(card),
-                            None => tag_groups.push((tag, vec![card])),
-                        },
-                        None => untagged.push(card),
+                            None => groups.push((day, vec![card])),
+                        }
                     }
+                    groups.sort_by_key(|(d, _)| std::cmp::Reverse(*d));
+                    groups
+                        .into_iter()
+                        .map(|(day, cards)| make_col(format!("created:{day}"), task_rows::day_header(day, today, strings), None, cards))
+                        .collect()
                 }
-                tag_groups.sort_by_key(|(a, _)| a.to_lowercase());
-                let mut cols: Vec<BoardCol> = tag_groups
-                    .into_iter()
-                    .map(|(tag, cards)| make_col(format!("tag:{tag}"), tag.clone(), Some(DropTarget::Tag(Some(tag))), cards))
-                    .collect();
-                if !untagged.is_empty() {
-                    cols.push(make_col("tag:none".into(), strings.group_no_tags.to_owned(), Some(DropTarget::Tag(None)), untagged));
-                }
-                cols
             }
-            GroupBy::Created | GroupBy::None => {
-                let mut groups: Vec<(NaiveDate, Vec<BoardCard>)> = Vec::new();
-                for card in all_cards {
-                    let day = task_rows::local_day(card.0.created_at).unwrap_or(today);
-                    match groups.iter_mut().find(|(d, _)| *d == day) {
-                        Some((_, items)) => items.push(card),
-                        None => groups.push((day, vec![card])),
-                    }
-                }
-                groups.sort_by_key(|(d, _)| std::cmp::Reverse(*d));
-                groups
-                    .into_iter()
-                    .map(|(day, cards)| make_col(format!("created:{day}"), task_rows::day_header(day, today, strings), None, cards))
-                    .collect()
-            }
-        }
+        };
+        let built = Rc::new(built);
+        *self.kanban_cache.borrow_mut() = Some((key, Rc::clone(&built)));
+        built
     }
 
     /// Flattens a kanban subsection's cards into visible rows preserving real multi-level
@@ -931,12 +968,7 @@ impl TodoView {
                 .and_then(|c| hex(c))
                 .or_else(|| hex(Self::KANBAN_COLUMN_COLORS[index % Self::KANBAN_COLUMN_COLORS.len()])),
             Some(DropTarget::Section(None)) => hex(Self::KANBAN_COLUMN_COLORS[index % Self::KANBAN_COLUMN_COLORS.len()]),
-            Some(DropTarget::List(Some(id))) => self
-                .lists
-                .iter()
-                .find(|l| l.id == *id)
-                .and_then(|l| lists_panel::parse_color(l.color.as_deref()))
-                .or(Some(accent)),
+            Some(DropTarget::List(Some(id))) => self.list_colors.get(id).copied().or(Some(accent)),
             Some(DropTarget::List(None)) => Some(accent),
             Some(DropTarget::Priority(p)) => match p {
                 Priority::High => hex("#F6252E"),
@@ -990,7 +1022,7 @@ impl TodoView {
         let strings = i18n::t(cx);
         let columns = self.board_columns(strings);
         let mut active_col_keys = HashSet::with_capacity(columns.len());
-        for col in &columns {
+        for col in columns.iter() {
             active_col_keys.insert(col.key.clone());
             self.kanban_col_scrolls.entry(col.key.clone()).or_default();
         }
@@ -1896,7 +1928,7 @@ impl TodoView {
         };
         let mut rendered_cols: Vec<AnyElement> = Vec::with_capacity(columns.len() + 1);
         let mut drag_cols: Vec<KanbanColRows> = Vec::with_capacity(columns.len());
-        for (i, col) in columns.into_iter().enumerate() {
+        for (i, col) in columns.iter().enumerate() {
             if inline_new_col_pos == Some(i)
                 && let Some(input) = self.new_section.clone()
             {
@@ -1904,17 +1936,20 @@ impl TodoView {
             }
             let open_count = col.open_count();
             let has_cards = col.total_count() > 0;
-            let BoardCol { key: col_key, title, drop, pinned_cards, open_cards, completed_cards } = col;
-            let drop_for_header = drop.clone();
-            let drop_for_cards = drop.clone();
-            let section_id = match drop {
+            let col_key = &col.key;
+            let drop_for_header = col.drop.clone();
+            let drop_for_cards = col.drop.clone();
+            let section_id = match col.drop {
                 Some(DropTarget::Section(Some(id))) => Some(id),
                 _ => None,
             };
-            let display_title = if title.is_empty() { strings.group_tasks.to_owned() } else { title };
-            let tint = self.kanban_column_tint(i, drop.as_ref(), &display_title, strings, tag_colors, accent);
+            let display_title = if col.title.is_empty() { strings.group_tasks.to_owned() } else { col.title.clone() };
+            let tint = self.kanban_column_tint(i, col.drop.as_ref(), &display_title, strings, tag_colors, accent);
+            let pinned_cards = &col.pinned_cards;
+            let open_cards = &col.open_cards;
+            let completed_cards = &col.completed_cards;
             let persistent_add = if self.kanban_quick_add {
-                self.kanban_quick_adds.get(&col_key).map(|(_, input)| input.clone())
+                self.kanban_quick_adds.get(col_key).map(|(_, input)| input.clone())
             } else {
                 None
             };
@@ -1982,7 +2017,7 @@ impl TodoView {
                         cx,
                     ));
                     if !pinned_folded {
-                        let rows = self.kanban_visible_rows(&pinned_cards);
+                        let rows = self.kanban_visible_rows(pinned_cards);
                         push_sub_rows(
                             &rows,
                             KanbanSub::Pinned,
@@ -2010,7 +2045,7 @@ impl TodoView {
                             cx,
                         ));
                         if !unpinned_folded {
-                            let rows = self.kanban_visible_rows(&open_cards);
+                            let rows = self.kanban_visible_rows(open_cards);
                             push_sub_rows(
                                 &rows,
                                 KanbanSub::Unpinned,
@@ -2024,7 +2059,7 @@ impl TodoView {
                         }
                     }
                 } else {
-                    let rows = self.kanban_visible_rows(&open_cards);
+                    let rows = self.kanban_visible_rows(open_cards);
                     push_sub_rows(
                         &rows,
                         KanbanSub::Unpinned,
@@ -2052,7 +2087,7 @@ impl TodoView {
                         cx,
                     ));
                     if !completed_folded {
-                        let rows = self.kanban_visible_rows(&completed_cards);
+                        let rows = self.kanban_visible_rows(completed_cards);
                         push_sub_rows(
                             &rows,
                             KanbanSub::Completed,
@@ -2071,10 +2106,10 @@ impl TodoView {
             let col_bounds = self.kanban_col_bounds.clone();
             let col_key_for_bounds = col_key.clone();
             let col_key_for_ids = col_key.clone();
-            let col_scroll_handle = self.kanban_col_scrolls.get(&col_key).cloned();
+            let col_scroll_handle = self.kanban_col_scrolls.get(col_key).cloned();
             drag_cols.push(KanbanColRows {
-                key: col_key,
-                drop,
+                key: col_key.clone(),
+                drop: drop_for_cards,
                 rows: col_plan_rows,
                 row_subs: col_row_subs,
             });

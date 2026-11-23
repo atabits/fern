@@ -95,7 +95,7 @@ fn ensure_sample_theme_file_at(dir: &Path) -> Result<PathBuf> {
     Ok(path)
 }
 
-fn enabled_theme_plugins(cx: &App) -> Vec<plugins::runtime::PluginInfo> {
+fn enabled_theme_plugins(cx: &App) -> Vec<plugin_ui::PluginInfo> {
     plugin_ui::PluginHost::global(cx)
         .map(|host| {
             host.plugins()
@@ -109,7 +109,7 @@ fn enabled_theme_plugins(cx: &App) -> Vec<plugins::runtime::PluginInfo> {
 
 fn load_user_and_plugin_themes(
     dir: &Path,
-    theme_plugins: &[plugins::runtime::PluginInfo],
+    theme_plugins: &[plugin_ui::PluginInfo],
 ) -> (Vec<Theme>, Vec<String>) {
     let (mut themes, mut errors) = theme::load_themes_from_dir(dir);
     if !theme_plugins.is_empty() {

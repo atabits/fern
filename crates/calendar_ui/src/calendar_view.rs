@@ -14,7 +14,7 @@ use crate::calendar::{self, week_axis};
 use crate::drag::{DraggedEvent, DraggedTask, ResizeEdge, ResizedTask};
 use crate::i18n;
 use crate::calendar_options_view::{CalendarOptionsDialog, OptionsEvent, Page};
-use crate::task_detail::{StartFocus, TaskDetail, TaskUpdated};
+use crate::task_detail::{StartFocus, TaskDetail, TaskTextEdited, TaskTextField, TaskUpdated};
 use crate::task_rows;
 
 #[path = "calendar_task_editor.rs"]
@@ -156,6 +156,7 @@ pub struct CalendarView {
     event_editor: Option<EventEditor>,
     pending_delete_event: Option<PendingDeleteEvent>,
     pending_complete: HashSet<Id>,
+    text_edit_sync_task: Option<gpui::Task<()>>,
     active: bool,
     dirty: bool,
 }
@@ -468,6 +469,19 @@ impl Focusable for CalendarView {
 
 impl CalendarView {
     pub fn new(store: Rc<Store>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self::new_with_active(store, window, true, cx)
+    }
+
+    pub fn new_inactive(store: Rc<Store>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self::new_with_active(store, window, false, cx)
+    }
+
+    fn new_with_active(
+        store: Rc<Store>,
+        window: &mut Window,
+        initial_active: bool,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let today = Local::now().date_naive();
         let detail = cx.new(|cx| {
             let mut detail = TaskDetail::new(store.clone(), window, cx);
@@ -482,8 +496,13 @@ impl CalendarView {
             }).detach();
         }
         cx.subscribe(&detail, |this, _, _: &TaskUpdated, cx| {
+            this.text_edit_sync_task = None;
             crate::data_version::data_changed(cx.entity_id(), cx);
             this.card_updated(cx);
+        })
+        .detach();
+        cx.subscribe(&detail, |this, _, edit: &TaskTextEdited, cx| {
+            this.apply_task_text_edit(edit, cx);
         })
         .detach();
         cx.observe_global::<crate::data_version::DataVersion>(|this, cx| {
@@ -553,10 +572,13 @@ impl CalendarView {
             event_editor: None,
             pending_delete_event: None,
             pending_complete: HashSet::new(),
-            active: true,
-            dirty: false,
+            text_edit_sync_task: None,
+            active: initial_active,
+            dirty: !initial_active,
         };
-        this.reload(cx);
+        if initial_active {
+            this.reload(cx);
+        }
         this
     }
 
@@ -1358,6 +1380,30 @@ impl CalendarView {
         }
     }
 
+    fn apply_task_text_edit(&mut self, edit: &TaskTextEdited, cx: &mut Context<Self>) {
+        if self.mode == CalendarMode::Agenda || self.dirty {
+            self.reload(cx);
+        } else {
+            for list in [&mut self.tasks, &mut self.undated, &mut self.horizon_tasks] {
+                for task in list.iter_mut().filter(|t| t.id == edit.id) {
+                    match &edit.field {
+                        TaskTextField::Title(title) => task.title = title.clone(),
+                        TaskTextField::Notes(notes) => task.notes = notes.clone(),
+                        TaskTextField::Location(location) => task.location = location.clone(),
+                    }
+                }
+            }
+            cx.notify();
+        }
+        self.text_edit_sync_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_millis(300)).await;
+            let _ = this.update(cx, |this, cx| {
+                this.text_edit_sync_task = None;
+                crate::data_version::data_changed(cx.entity_id(), cx);
+            });
+        }));
+    }
+
     /// The header's "…" menu and what it opens, for the debug-build dev state
     /// (`calendar-more=menu|options|color|color-by|style|arrange|arrange-tags|extras`).
     #[cfg(debug_assertions)]
@@ -1661,7 +1707,10 @@ impl CalendarView {
         self.year_day = None;
         self.open_event = None;
         match self.mode {
-            CalendarMode::Month | CalendarMode::Agenda => self.month = calendar::add_months(self.month, delta),
+            CalendarMode::Month => self.month = calendar::add_months(self.month, delta),
+            CalendarMode::Agenda => {
+                self.month = calendar::add_months(calendar::month_start(self.agenda_start()), delta);
+            }
             mode => {
                 let step = match mode {
                     CalendarMode::Day => 1,
@@ -1686,7 +1735,14 @@ impl CalendarView {
         if !self.finish_task_before_navigation(cx) {
             return;
         }
+        let prev_mode = self.mode;
         self.mode = mode;
+        if prev_mode == CalendarMode::Year
+            && mode != CalendarMode::Year
+            && self.anchor.year() == self.month.year()
+        {
+            self.month = calendar::month_start(self.anchor);
+        }
         self.year_day = None;
         self.year_scroll = calendar_year::YearScroll::default();
         self.year_jump = None;
@@ -3126,6 +3182,14 @@ impl CalendarView {
                     )
             }))
     }
+    fn toolbar_month(&self) -> NaiveDate {
+        match self.mode {
+            CalendarMode::Month | CalendarMode::Year => self.month,
+            CalendarMode::Agenda => calendar::month_start(self.agenda_start()),
+            CalendarMode::Week | CalendarMode::MultiWeek(_) => calendar::week_of(self.anchor)[0],
+            _ => self.anchor,
+        }
+    }
 }
 
 impl Render for CalendarView {
@@ -3145,11 +3209,7 @@ impl Render for CalendarView {
         };
 
         let arrange = self.arrange.map(|tab| self.render_arrange(tab, cx));
-        let shown_month = match self.mode {
-            CalendarMode::Month | CalendarMode::Agenda | CalendarMode::Year => self.month,
-            CalendarMode::Week | CalendarMode::MultiWeek(_) => calendar::week_of(self.anchor)[0],
-            _ => self.anchor,
-        };
+        let shown_month = self.toolbar_month();
         let title_text = match self.mode {
             // The original's Year shows just the year.
             CalendarMode::Year => self.month.year().to_string(),

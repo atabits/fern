@@ -1,7 +1,7 @@
 //! The lists column between the narrow sidebar and the task list, modeled on TickTick's.
 
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use chrono::{Datelike, Local, NaiveDate};
 use fern_core::{
@@ -192,6 +192,38 @@ pub fn render(
         highlight_target,
     } = props;
     let shows = |list: SmartList, count: usize| preferences.visibility(list).shows(count);
+    let archived_list_ids: HashSet<Id> = lists.iter().filter(|l| l.archived).map(|l| l.id).collect();
+    let folder_by_id: HashMap<Id, &ListFolder> = folders.iter().map(|f| (f.id, f)).collect();
+    let mut lists_by_folder: HashMap<Id, Vec<&List>> = HashMap::new();
+    let mut active_lists: Vec<&List> = Vec::with_capacity(lists.len());
+    let mut archived: Vec<&List> = Vec::new();
+    for list in lists {
+        if list.archived {
+            archived.push(list);
+        } else {
+            if let Some(fid) = list.folder {
+                lists_by_folder.entry(fid).or_default().push(list);
+            }
+            active_lists.push(list);
+        }
+    }
+    let tag_names: HashSet<&str> = tags.iter().map(|t| t.name.as_str()).collect();
+    let mut tag_children: HashMap<&str, Vec<&Tag>> = HashMap::new();
+    for tag in tags {
+        if let Some(parent) = tag.parent.as_deref() {
+            tag_children.entry(parent).or_default().push(tag);
+        }
+    }
+    let tag_family_counts: HashMap<&str, usize> = tags
+        .iter()
+        .map(|tag| {
+            let children_sum: usize = tag_children
+                .get(tag.name.as_str())
+                .map(|cs| cs.iter().map(|c| c.open_count).sum())
+                .unwrap_or(0);
+            (tag.name.as_str(), tag.open_count + children_sum)
+        })
+        .collect();
     let colors = cx.theme().colors();
     let accent = colors.accent;
     let active_drag = active_drag.filter(|_| cx.has_active_drag());
@@ -269,7 +301,7 @@ pub fn render(
             .on_click(move |_, window, cx| on_select(view.clone(), window, cx));
         let selector_id = id.clone();
         let accepts_task_drop = !matches!(drop_view, View::All | View::Horizons | View::Summary | View::Filter(_) | View::Search(_))
-            && !matches!(drop_view, View::List(list_id) if lists.iter().any(|l| l.id == list_id && l.archived));
+            && !matches!(drop_view, View::List(list_id) if archived_list_ids.contains(&list_id));
         div()
             .id(SharedString::from(format!("drop-{id}")))
             .debug_selector(move || format!("lists-item-{selector_id}"))
@@ -480,19 +512,18 @@ pub fn render(
             )
             .into_any_element()
     };
-    let active_lists: Vec<&List> = lists.iter().filter(|l| !l.archived).collect();
     let mut list_entries: Vec<(PanelChild, AnyElement)> = Vec::new();
     let mut shown_folders: HashSet<Id> = HashSet::new();
     for list in &active_lists {
-        match list.folder.and_then(|f| folders.iter().find(|x| x.id == f)) {
+        match list.folder.and_then(|f| folder_by_id.get(&f).copied()) {
             None => list_entries.push((PanelChild::TopList(list.id), list_entry(list, false, false))),
             Some(folder) if shown_folders.insert(folder.id) => {
-                let inside: Vec<&List> = active_lists.iter().copied().filter(|l| l.folder == Some(folder.id)).collect();
+                let inside = lists_by_folder.get(&folder.id).map(Vec::as_slice).unwrap_or(&[]);
                 let collapsed = collapsed_folders.contains(&folder.id);
                 let folder_dragged = active_drag == Some(&ActiveDragItem::Folder(folder.id));
                 list_entries.push((
                     PanelChild::FolderHeader { id: folder.id, collapsed: collapsed || folder_dragged, empty: false },
-                    folder_entry(folder, &inside),
+                    folder_entry(folder, inside),
                 ));
                 if !collapsed && !folder_dragged {
                     list_entries.extend(
@@ -512,7 +543,6 @@ pub fn render(
             folder_entry(folder, &[]),
         ));
     }
-    let archived: Vec<&List> = lists.iter().filter(|l| l.archived).collect();
     if !archived.is_empty() {
         let on_panel = on_panel.clone();
         list_entries.push((
@@ -534,7 +564,7 @@ pub fn render(
 
     // Tags as in the original: pinned ones first, sub-tags indented under their parent (which
     // folds them up), a right click for the tag's menu; the heading shows "…" and "+" on hover.
-    let family_count = |tag: &Tag| tag.open_count + tags.iter().filter(|t| t.parent.as_ref() == Some(&tag.name)).map(|t| t.open_count).sum::<usize>();
+    let family_count = |tag: &Tag| tag_family_counts.get(tag.name.as_str()).copied().unwrap_or(tag.open_count);
     let tag_entry = |tag: &Tag, indent: bool, fold: Option<bool>| -> AnyElement {
         let name = tag.name.clone();
         if active_drag.is_some_and(|d| matches!(d, ActiveDragItem::Tag(dragged) if dragged == &name)) {
@@ -623,13 +653,13 @@ pub fn render(
     };
     let mut ordered: Vec<&Tag> = tags
         .iter()
-        .filter(|t| t.parent.is_none() || !tags.iter().any(|p| Some(&p.name) == t.parent.as_ref()))
+        .filter(|t| t.parent.as_deref().is_none_or(|p| !tag_names.contains(p)))
         .collect();
     ordered.sort_by_key(|t| !t.pinned);
     let mut tag_entries: Vec<(PanelChild, AnyElement)> = Vec::new();
     if !tags_collapsed {
         for tag in ordered {
-            let children: Vec<&Tag> = tags.iter().filter(|t| t.parent.as_ref() == Some(&tag.name)).collect();
+            let children = tag_children.get(tag.name.as_str()).map(Vec::as_slice).unwrap_or(&[]);
             let is_dragged_root = active_drag.is_some_and(|d| matches!(d, ActiveDragItem::Tag(n) if n == &tag.name));
             let has_dragged_child = children.iter().any(|c| {
                 active_drag.is_some_and(|d| matches!(d, ActiveDragItem::Tag(n) if n == &c.name))
@@ -649,7 +679,7 @@ pub fn render(
                 tag_entry(tag, false, is_parent.then_some(folded)),
             ));
             if !folded && !is_dragged_root {
-                for child in children {
+                for &child in children {
                     let is_dragged_child =
                         active_drag.is_some_and(|d| matches!(d, ActiveDragItem::Tag(n) if n == &child.name));
                     if is_dragged_child || shows(SmartList::Tags, child.open_count) {

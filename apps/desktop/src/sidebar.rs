@@ -75,6 +75,7 @@ pub enum Section {
     Search,
     Matrix,
     Countdown,
+    LifeClock,
     Plugin {
         plugin_id: SharedString,
         view_id: SharedString,
@@ -92,6 +93,7 @@ impl From<RailSection> for Section {
             RailSection::Search => Section::Search,
             RailSection::Matrix => Section::Matrix,
             RailSection::Countdown => Section::Countdown,
+            RailSection::LifeClock => Section::LifeClock,
         }
     }
 }
@@ -118,6 +120,7 @@ impl Section {
             Section::Habits => features.habits,
             Section::Pomodoro => features.focus,
             Section::Countdown => features.countdown,
+            Section::LifeClock => features.life_clock,
             Section::Plugin { .. } => true,
         }
     }
@@ -132,6 +135,7 @@ impl Section {
             Section::Search => strings.section_search.into(),
             Section::Matrix => strings.section_matrix.into(),
             Section::Countdown => strings.section_countdown.into(),
+            Section::LifeClock => strings.section_life_clock.into(),
             Section::Plugin { plugin_id, .. } => plugin_id.clone(),
         }
     }
@@ -148,6 +152,7 @@ impl Section {
             Section::Search => IconName::Search,
             Section::Matrix => IconName::FernMatrix,
             Section::Countdown => IconName::FernCountdown,
+            Section::LifeClock => IconName::FernLifeClock,
             Section::Plugin { .. } => IconName::Code,
         }
     }
@@ -162,6 +167,7 @@ impl Section {
             Section::Search => "section-search".into(),
             Section::Matrix => "section-matrix".into(),
             Section::Countdown => "section-countdown".into(),
+            Section::LifeClock => "section-life-clock".into(),
             Section::Plugin { plugin_id, view_id } => {
                 format!("section-plugin-{}:{plugin_id}/{view_id}", plugin_id.len()).into()
             }
@@ -355,7 +361,7 @@ pub fn render(
             .as_deref()
             .filter(|_| !is_dragged)
             .and_then(|svg| rasterize_rail_svg(svg, icon_color, cx));
-        let tooltip_el = is_hovered.then(|| side_tooltip(entry.title, cx));
+        let tooltip_el = is_hovered.then(|| side_tooltip(entry.title, section == Section::Things, cx));
         let on_select = on_select.clone();
         let on_hover = on_hover.clone();
         let on_start_drag = on_start_drag.clone();
@@ -560,10 +566,15 @@ pub fn render(
 
 /// A tooltip at the right of a sidebar icon, level with it, shown while it is hovered, as the
 /// original's sidebar shows them.
-fn side_tooltip(text: impl Into<SharedString>, cx: &App) -> impl IntoElement {
-    let colors = cx.theme().colors();
+fn side_tooltip(text: impl Into<SharedString>, beta: bool, cx: &App) -> impl IntoElement {
+    let theme = cx.theme();
+    let colors = theme.colors();
+    let warning = theme.status().warning;
+    let beta_label = i18n::t(cx).beta_badge;
     div().absolute().left(px(46.)).top_0().h_full().flex().items_center().child(gpui::deferred(
-        div()
+        h_flex()
+            .items_center()
+            .gap_1p5()
             .px_2()
             .py_1()
             .rounded(px(6.))
@@ -574,7 +585,8 @@ fn side_tooltip(text: impl Into<SharedString>, cx: &App) -> impl IntoElement {
             .text_color(colors.text)
             .text_size(px(12.))
             .whitespace_nowrap()
-            .child(text.into()),
+            .child(text.into())
+            .when(beta, |el| el.child(Chip::new(beta_label, warning))),
     ))
 }
 

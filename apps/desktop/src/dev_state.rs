@@ -180,6 +180,36 @@ pub(crate) fn apply(this: &mut AppView, window: &mut Window, cx: &mut Context<Ap
     if state.contains("section=countdown") {
         this.select(Section::Countdown, window, cx);
     }
+    if state.contains("section=life-clock") {
+        this.select(Section::LifeClock, window, cx);
+    }
+    if let Some(raw) = state.split(';').find_map(|part| part.strip_prefix("life-clock-birth=")) {
+        let date = if raw.is_empty() || raw == "none" {
+            None
+        } else {
+            chrono::NaiveDate::parse_from_str(raw, "%Y-%m-%d").ok()
+        };
+        if raw.is_empty() || raw == "none" || date.is_some() {
+            this.life_clock.update(cx, |view, cx| view.dev_set_birth_date(date, cx));
+        }
+    }
+    if let Some(palette) = state.split(';').find_map(|part| part.strip_prefix("life-clock-palette=")) {
+        let mode = match palette {
+            "classic" => Some(crate::life_clock_view::LifeClockPaletteMode::Classic),
+            "theme" => Some(crate::life_clock_view::LifeClockPaletteMode::FernTheme),
+            _ => None,
+        };
+        if let Some(mode) = mode {
+            this.life_clock.update(cx, |view, cx| view.dev_set_palette(mode, cx));
+            this.sync_title_bar_appearance(cx);
+        }
+    }
+    if state.split(';').any(|part| matches!(part, "life-clock-popover" | "life-clock-popover=open" | "life-clock-popover=true")) {
+        this.life_clock.update(cx, |view, cx| view.dev_open_popover(true, cx));
+    }
+    if state.split(';').any(|part| matches!(part, "life-clock-hide-rail" | "life-clock-hide-rail=true")) {
+        this.set_life_clock_rail_hidden(true, cx);
+    }
     // `countdown-header=title|more`: the header's "Countdown ▾" or "…" menu.
     if let Some(menu) = state.split(';').find_map(|part| part.strip_prefix("countdown-header=")) {
         this.countdown.update(cx, |view, cx| view.dev_header_menu(menu == "more", cx));
@@ -290,6 +320,7 @@ pub(crate) fn apply(this: &mut AppView, window: &mut Window, cx: &mut Context<Ap
                 "habits" => preferences.features.habits = false,
                 "focus" => preferences.features.focus = false,
                 "countdown" => preferences.features.countdown = false,
+                "life-clock" | "life_clock" => preferences.features.life_clock = false,
                 _ => {}
             }
         }
@@ -318,12 +349,12 @@ pub(crate) fn apply(this: &mut AppView, window: &mut Window, cx: &mut Context<Ap
         });
     }
     if state.contains("statistics=open") {
-        this.open_statistics(cx);
+        this.open_statistics(window, cx);
     }
     // `statistics=task` / `statistics=focus`: the page on its Task (by day) or Focus tab.
     for (key, menu) in [("statistics=task", "stats-task-day"), ("statistics=focus", "stats-focus")] {
         if state.contains(key) {
-            this.open_statistics(cx);
+            this.open_statistics(window, cx);
             this.focus.update(cx, |view, cx| view.dev_menu(menu, window, cx));
         }
     }

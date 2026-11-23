@@ -44,6 +44,8 @@ pub fn window_options() -> (TitlebarOptions, WindowDecorations) {
 pub struct TitleBar {
     /// Linux and macOS: a press on the bar turns into a window move once the mouse moves.
     should_move: bool,
+    /// Optional contrast override for caption buttons (e.g., Life Clock Classic B&W white right half).
+    caption_appearance: Option<theme::Appearance>,
     _updates: Option<gpui::Subscription>,
 }
 
@@ -54,7 +56,27 @@ impl EventEmitter<ShowReleaseNotes> for TitleBar {}
 impl TitleBar {
     pub fn new(cx: &mut Context<Self>) -> Self {
         let updates = crate::updater::updater(cx).map(|updater| cx.observe(&updater, |_, _, cx| cx.notify()));
-        Self { should_move: false, _updates: updates }
+        Self {
+            should_move: false,
+            caption_appearance: None,
+            _updates: updates,
+        }
+    }
+
+    pub fn set_caption_appearance(
+        &mut self,
+        appearance: Option<theme::Appearance>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.caption_appearance != appearance {
+            self.caption_appearance = appearance;
+            cx.notify();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn caption_appearance(&self) -> Option<theme::Appearance> {
+        self.caption_appearance
     }
 
     /// "Restart to Update" once a new version is downloaded, or "Update to …" when it is out
@@ -127,11 +149,21 @@ impl Render for TitleBar {
         } else {
             None
         };
-        let side = |buttons: [Option<WindowButton>; 3], id: &'static str| {
-            buttons.iter().any(Option::is_some).then(|| WindowButtons { id, buttons }.into_any_element())
+        let caption_appearance = self.caption_appearance;
+        let side = |buttons: [Option<WindowButton>; 3], id: &'static str, appearance| {
+            buttons.iter().any(Option::is_some).then(|| {
+                WindowButtons {
+                    id,
+                    buttons,
+                    caption_appearance: appearance,
+                }
+                .into_any_element()
+            })
         };
-        let left_buttons = buttons.and_then(|b| side(b.left, "left-window-buttons")).filter(|_| !fullscreen);
-        let right_buttons = buttons.and_then(|b| side(b.right, "right-window-buttons")).filter(|_| !fullscreen);
+        // Only right-side buttons sit over the white future half of Life Clock Classic B&W;
+        // left-side buttons (Linux GNOME/macOS-style layout) sit over the rail / dark past half.
+        let left_buttons = buttons.and_then(|b| side(b.left, "left-window-buttons", None)).filter(|_| !fullscreen);
+        let right_buttons = buttons.and_then(|b| side(b.right, "right-window-buttons", caption_appearance)).filter(|_| !fullscreen);
 
         h_flex()
             .id("title-bar")
@@ -192,6 +224,7 @@ fn button_layout(cx: &App) -> WindowButtonLayout {
 struct WindowButtons {
     id: &'static str,
     buttons: [Option<WindowButton>; 3],
+    caption_appearance: Option<theme::Appearance>,
 }
 
 impl RenderOnce for WindowButtons {
@@ -199,6 +232,7 @@ impl RenderOnce for WindowButtons {
         let controls = window.window_controls();
         let maximized = window.is_maximized();
         let active = window.is_window_active();
+        let caption_appearance = self.caption_appearance;
         h_flex()
             .id(self.id)
             .h_full()
@@ -210,7 +244,7 @@ impl RenderOnce for WindowButtons {
                 WindowButton::Minimize => controls.minimize && window.is_minimizable(),
                 WindowButton::Maximize => controls.maximize && window.is_resizable(),
                 WindowButton::Close => true,
-            }).map(|button| window_button(button, maximized, active, cx)))
+            }).map(|button| window_button(button, maximized, active, caption_appearance, cx)))
     }
 }
 
@@ -228,7 +262,13 @@ fn windows_caption_font(cx: &App) -> &'static str {
     })
 }
 
-fn window_button(button: WindowButton, maximized: bool, active: bool, cx: &App) -> impl IntoElement {
+fn window_button(
+    button: WindowButton,
+    maximized: bool,
+    active: bool,
+    caption_appearance: Option<theme::Appearance>,
+    cx: &App,
+) -> impl IntoElement {
     let colors = cx.theme().colors();
     let area = match button {
         WindowButton::Minimize => WindowControlArea::Min,
@@ -237,8 +277,22 @@ fn window_button(button: WindowButton, maximized: bool, active: bool, cx: &App) 
     };
     let close = button == WindowButton::Close;
     let close_red: Hsla = rgb(0xe81123).into();
-    let resting = if active { colors.text } else { colors.icon_muted };
-    let hover_fg = if close { gpui::white() } else { colors.text };
+    let (resting, hover_fg, hover_bg, active_bg): (Hsla, Hsla, Hsla, Hsla) =
+        if caption_appearance == Some(theme::Appearance::Light) {
+            (
+                if active { rgb(0x1f1f1f).into() } else { rgb(0x7a7a7a).into() },
+                if close { gpui::white() } else { rgb(0x111111).into() },
+                gpui::black().opacity(0.08),
+                gpui::black().opacity(0.14),
+            )
+        } else {
+            (
+                if active { colors.text } else { colors.icon_muted },
+                if close { gpui::white() } else { colors.text },
+                colors.ghost_element_hover,
+                colors.element_hover,
+            )
+        };
     let el = h_flex()
         .id(button.id())
         .group(button.id())
@@ -248,8 +302,8 @@ fn window_button(button: WindowButton, maximized: bool, active: bool, cx: &App) 
         .occlude()
         .window_control_area(area)
         .text_color(resting)
-        .hover(|el| el.bg(if close { close_red } else { colors.ghost_element_hover }).text_color(hover_fg))
-        .active(|el| el.bg(if close { close_red.opacity(0.8) } else { colors.element_hover }).text_color(hover_fg));
+        .hover(|el| el.bg(if close { close_red } else { hover_bg }).text_color(hover_fg))
+        .active(|el| el.bg(if close { close_red.opacity(0.8) } else { active_bg }).text_color(hover_fg));
     #[cfg(target_os = "windows")]
     let el = {
         let glyph = match button {

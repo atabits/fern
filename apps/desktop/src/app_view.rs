@@ -19,6 +19,7 @@ use crate::countdown_view::CountdownView;
 use crate::focus_view::FocusView;
 use crate::habit_view::HabitView;
 use crate::i18n;
+use crate::life_clock_view::{LifeClockEvent, LifeClockPaletteMode, LifeClockView};
 use crate::matrix_view::{self, MatrixView};
 use crate::release_notes::{self, ReleaseNotes, action_button};
 use crate::reminders::{self, Notice, NoticeAction, Notices, Reply, Target};
@@ -143,6 +144,8 @@ pub struct AppView {
     pub(crate) calendar: gpui::Entity<CalendarView>,
     pub(crate) matrix: gpui::Entity<MatrixView>,
     pub(crate) countdown: gpui::Entity<CountdownView>,
+    pub(crate) life_clock: gpui::Entity<LifeClockView>,
+    pub(crate) life_clock_rail_hidden: bool,
     pub(crate) habits: gpui::Entity<HabitView>,
     pub(crate) focus: gpui::Entity<FocusView>,
     plugin_views: HashMap<(String, String), gpui::Entity<PluginView>>,
@@ -343,6 +346,16 @@ impl AppView {
         })
         .detach();
         let countdown = cx.new(|cx| CountdownView::new(store.clone(), cx));
+        let life_clock = cx.new(|cx| LifeClockView::new(store.clone(), cx));
+        cx.subscribe(&life_clock, |this, _, event: &LifeClockEvent, cx| match event {
+            LifeClockEvent::ToggleSidebar => {
+                this.toggle_life_clock_rail(cx);
+            }
+            LifeClockEvent::PaletteChanged(_) => {
+                this.sync_title_bar_appearance(cx);
+            }
+        })
+        .detach();
         let habits = cx.new(|cx| HabitView::new(store.clone(), cx));
         // "Start Focus" in a habit's menu starts a Pomodoro or a stopwatch linked to it.
         cx.subscribe_in(&habits, window, |this, _, event: &crate::habit_view::StartFocus, window, cx| {
@@ -363,8 +376,12 @@ impl AppView {
             cx.notify();
         })
         .detach();
-        cx.subscribe(&focus, |this, _, crate::focus_view::StatsClosed, cx| {
+        cx.subscribe_in(&focus, window, |this, _, crate::focus_view::StatsClosed, window, cx| {
             this.statistics_open = false;
+            if this.section == Section::LifeClock {
+                window.focus(&this.life_clock.focus_handle(cx), cx);
+            }
+            this.sync_title_bar_appearance(cx);
             cx.notify();
         })
         .detach();
@@ -417,6 +434,8 @@ impl AppView {
             calendar,
             matrix,
             countdown,
+            life_clock,
+            life_clock_rail_hidden: false,
             habits,
             focus,
             plugin_views: HashMap::new(),
@@ -456,6 +475,7 @@ impl AppView {
         .detach();
         #[cfg(debug_assertions)]
         crate::dev_state::apply(&mut this, window, cx);
+        this.sync_title_bar_appearance(cx);
         this
     }
 
@@ -487,6 +507,27 @@ impl AppView {
         false
     }
 
+    pub(crate) fn sync_title_bar_appearance(&self, cx: &mut Context<Self>) {
+        let appearance = (self.section == Section::LifeClock
+            && !self.statistics_open
+            && self.life_clock.read(cx).palette_mode() == LifeClockPaletteMode::Classic)
+            .then_some(theme::Appearance::Light);
+        self.title_bar
+            .update(cx, |bar, cx| bar.set_caption_appearance(appearance, cx));
+    }
+
+    pub(crate) fn set_life_clock_rail_hidden(&mut self, hidden: bool, cx: &mut Context<Self>) {
+        self.life_clock_rail_hidden = hidden;
+        self.life_clock
+            .update(cx, |view, cx| view.set_sidebar_hidden(hidden, cx));
+        cx.notify();
+    }
+
+    fn toggle_life_clock_rail(&mut self, cx: &mut Context<Self>) {
+        let hidden = !self.life_clock_rail_hidden;
+        self.set_life_clock_rail_hidden(hidden, cx);
+    }
+
     pub(crate) fn select(&mut self, section: Section, window: &mut Window, cx: &mut Context<Self>) -> bool {
         // Search is a popover over the current screen, as in the original.
         if section == Section::Search {
@@ -495,6 +536,11 @@ impl AppView {
         }
         if section != Section::Calendar && !self.prepare_to_leave_calendar(window, cx) {
             return false;
+        }
+        if self.section == Section::LifeClock && section != Section::LifeClock {
+            self.life_clock_rail_hidden = false;
+            self.life_clock
+                .update(cx, |view, cx| view.set_sidebar_hidden(false, cx));
         }
         if self.section != section
             && let Section::Plugin {
@@ -536,6 +582,10 @@ impl AppView {
             self.countdown.update(cx, |countdown, cx| countdown.reload(cx));
             window.focus(&self.countdown.focus_handle(cx), cx);
         }
+        if section == Section::LifeClock {
+            self.life_clock.update(cx, |life_clock, cx| life_clock.reload(cx));
+            window.focus(&self.life_clock.focus_handle(cx), cx);
+        }
         if let Section::Plugin {
             ref plugin_id,
             ref view_id,
@@ -545,6 +595,7 @@ impl AppView {
             window.focus(&view.focus_handle(cx), cx);
         }
         self.section = section;
+        self.sync_title_bar_appearance(cx);
         cx.notify();
         true
     }
@@ -768,7 +819,11 @@ impl AppView {
     }
 
     fn toggle_sidebar(&mut self, _: &ToggleSidebar, _: &mut Window, cx: &mut Context<Self>) {
-        self.todo.update(cx, |todo, cx| todo.toggle_lists(cx));
+        if self.section == Section::LifeClock {
+            self.toggle_life_clock_rail(cx);
+        } else {
+            self.todo.update(cx, |todo, cx| todo.toggle_lists(cx));
+        }
     }
 
     fn show_view(&mut self, view: fern_core::View, window: &mut Window, cx: &mut Context<Self>) {
@@ -824,7 +879,7 @@ impl AppView {
                 ListItem::new("account-statistics")
                     .start_slot(Icon::new(IconName::ChartNoAxesColumn).color(Color::Icon))
                     .child(Label::new(strings.statistics))
-                    .on_click(cx.listener(|this, _, _, cx| this.open_statistics(cx))),
+                    .on_click(cx.listener(|this, _, window, cx| this.open_statistics(window, cx))),
             )
             .child(
                 ListItem::new("account-shortcuts")
@@ -851,10 +906,12 @@ impl AppView {
             .into_any_element()
     }
 
-    pub(crate) fn open_statistics(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn open_statistics(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.account_menu_open = false;
         self.statistics_open = true;
         self.focus.update(cx, |focus, cx| focus.open_stats_overview(cx));
+        window.focus(&self.focus.focus_handle(cx), cx);
+        self.sync_title_bar_appearance(cx);
         cx.notify();
     }
 
@@ -881,6 +938,7 @@ impl AppView {
             let fallback = first_enabled_task_section(self.features);
             self.select(fallback, window, cx);
         }
+        self.sync_title_bar_appearance(cx);
         cx.notify();
     }
 
@@ -1227,6 +1285,7 @@ impl AppView {
             }
             self.statistics_open = false;
             self.focus.update(cx, |focus, cx| focus.close_stats(cx));
+            self.sync_title_bar_appearance(cx);
             cx.notify();
             return true;
         }
@@ -1247,6 +1306,16 @@ impl AppView {
             Section::Pomodoro => self.focus.update(cx, |focus, cx| focus.dismiss_transient(cx)),
             Section::Countdown => {
                 self.countdown.update(cx, |countdown, cx| countdown.dismiss_transient(cx))
+            }
+            Section::LifeClock => {
+                if self.life_clock.update(cx, |view, cx| view.dismiss_transient(cx)) {
+                    true
+                } else if self.life_clock_rail_hidden {
+                    self.set_life_clock_rail_hidden(false, cx);
+                    true
+                } else {
+                    false
+                }
             }
             Section::Plugin { .. } => false,
         }
@@ -1498,8 +1567,10 @@ impl AppView {
         self.calendar.update(cx, |view, cx| view.reload(cx));
         self.matrix.update(cx, |view, cx| view.reload(cx));
         self.countdown.update(cx, |view, cx| view.reload(cx));
+        self.life_clock.update(cx, |view, cx| view.reload(cx));
         self.habits.update(cx, |view, cx| view.reload(cx));
         self.focus.update(cx, |view, cx| view.reload(cx));
+        self.sync_title_bar_appearance(cx);
         cx.notify();
     }
 
@@ -2015,23 +2086,26 @@ impl Render for AppView {
             } else {
                 None
             };
-            let rail = sidebar::render(
-                &self.section,
-                self.nav_hovered.as_ref(),
-                &self.rail_items,
-                self.dragging_rail.as_ref(),
-                &self.rail_scroll,
-                on_nav_hover,
-                on_select,
-                on_start_rail_drag,
-                on_avatar,
-                account_menu,
-                bell,
-                sync_button,
-                focus_clock,
-                features,
-                cx,
-            );
+            let hide_rail = self.section == Section::LifeClock && self.life_clock_rail_hidden;
+            let rail = (!hide_rail).then(|| {
+                sidebar::render(
+                    &self.section,
+                    self.nav_hovered.as_ref(),
+                    &self.rail_items,
+                    self.dragging_rail.as_ref(),
+                    &self.rail_scroll,
+                    on_nav_hover,
+                    on_select,
+                    on_start_rail_drag,
+                    on_avatar,
+                    account_menu,
+                    bell,
+                    sync_button,
+                    focus_clock,
+                    features,
+                    cx,
+                )
+            });
             let body = match &self.section {
                 Section::Tasks | Section::Search => {
                     div().flex_1().min_w_0().h_full().child(self.todo.clone())
@@ -2040,6 +2114,7 @@ impl Render for AppView {
                 Section::Calendar => div().flex_1().min_w_0().h_full().child(self.calendar.clone()),
                 Section::Matrix => div().flex_1().min_w_0().h_full().child(self.matrix.clone()),
                 Section::Countdown => div().flex_1().min_w_0().h_full().child(self.countdown.clone()),
+                Section::LifeClock => div().flex_1().min_w_0().h_full().child(self.life_clock.clone()),
                 Section::Habits => div().flex_1().min_w_0().h_full().child(self.habits.clone()),
                 Section::Pomodoro => div().flex_1().min_w_0().h_full().child(self.focus.clone()),
                 Section::Plugin { .. } => {
@@ -2108,7 +2183,7 @@ impl Render for AppView {
             .bg(theme.colors().background)
             .text_color(theme.colors().text)
             .when(self.statistics_open, |el| el.child(div().size_full().child(self.focus.clone())))
-            .when_some(main_panel, |el, (rail, body)| el.child(rail).child(body))
+            .when_some(main_panel, |el, (rail, body)| el.children(rail).child(body))
             .when_some(self.search.clone(), |el, search| {
                 el.child(div().absolute().top(px(160.)).left_0().right_0().flex().justify_center().child(search))
             });
@@ -2939,5 +3014,193 @@ mod tests {
             assert!(cx.global::<PluginBus>().active_modal.is_none());
             assert!(app.read(cx).notices_open, "notices must remain open after Escape closes modal");
         });
+    }
+
+    #[gpui::test]
+    fn life_clock_title_bar_appearance_tracks_palette_section_and_statistics(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            theme::init(cx);
+            assert!(crate::keymap::load_default(&assets::Assets, cx).unwrap().is_empty());
+        });
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let (app, cx) = cx.add_window_view(|window, cx| AppView::new(store, false, window, cx));
+        cx.simulate_resize(gpui::size(px(1200.), px(700.)));
+        cx.run_until_parked();
+
+        cx.update(|_, cx| {
+            assert_eq!(app.read(cx).title_bar.read(cx).caption_appearance(), None);
+        });
+
+        // Entering Life Clock in default Classic B&W mode sets Light caption appearance.
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| assert!(app.select(Section::LifeClock, window, cx)));
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            assert_eq!(app.read(cx).section, Section::LifeClock);
+            assert_eq!(
+                app.read(cx).title_bar.read(cx).caption_appearance(),
+                Some(theme::Appearance::Light)
+            );
+        });
+
+        // Opening Statistics over Life Clock resets caption appearance; closing restores it.
+        cx.update(|window, cx| app.update(cx, |app, cx| app.open_statistics(window, cx)));
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            assert!(app.read(cx).statistics_open);
+            assert_eq!(app.read(cx).title_bar.read(cx).caption_appearance(), None);
+        });
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            assert!(!app.read(cx).statistics_open);
+            assert_eq!(
+                app.read(cx).title_bar.read(cx).caption_appearance(),
+                Some(theme::Appearance::Light)
+            );
+        });
+
+        // Switching to FernTheme clears the light override; switching back to Classic restores it.
+        cx.update(|_, cx| {
+            let lc = app.read(cx).life_clock.clone();
+            lc.update(cx, |view, cx| view.dev_set_palette(LifeClockPaletteMode::FernTheme, cx));
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            assert_eq!(app.read(cx).title_bar.read(cx).caption_appearance(), None);
+        });
+        cx.update(|_, cx| {
+            let lc = app.read(cx).life_clock.clone();
+            lc.update(cx, |view, cx| view.dev_set_palette(LifeClockPaletteMode::Classic, cx));
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            assert_eq!(
+                app.read(cx).title_bar.read(cx).caption_appearance(),
+                Some(theme::Appearance::Light)
+            );
+        });
+
+        // Leaving Life Clock clears the override.
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| assert!(app.select(Section::Tasks, window, cx)));
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            assert_eq!(app.read(cx).title_bar.read(cx).caption_appearance(), None);
+        });
+    }
+
+    #[gpui::test]
+    fn life_clock_sidebar_toggle_and_escape_restore(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            theme::init(cx);
+            assert!(crate::keymap::load_default(&assets::Assets, cx).unwrap().is_empty());
+        });
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let (app, cx) = cx.add_window_view(|window, cx| AppView::new(store, false, window, cx));
+        cx.simulate_resize(gpui::size(px(1200.), px(700.)));
+        cx.run_until_parked();
+
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| assert!(app.select(Section::LifeClock, window, cx)));
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("sidebar").is_some());
+        cx.update(|_, cx| assert!(!app.read(cx).life_clock_rail_hidden));
+
+        // ToggleSidebar action hides the left rail on Life Clock.
+        cx.update(|window, cx| window.dispatch_action(Box::new(ToggleSidebar), cx));
+        cx.run_until_parked();
+        cx.update(|_, cx| assert!(app.read(cx).life_clock_rail_hidden));
+        assert!(cx.debug_bounds("sidebar").is_none());
+
+        // Escape restores the hidden rail via DismissTransient.
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        cx.update(|_, cx| assert!(!app.read(cx).life_clock_rail_hidden));
+        assert!(cx.debug_bounds("sidebar").is_some());
+
+        // Clicking the in-view sidebar toggle emits LifeClockEvent::ToggleSidebar.
+        let toggle = cx.debug_bounds("life-clock-sidebar-toggle").unwrap();
+        cx.simulate_click(toggle.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        cx.update(|_, cx| assert!(app.read(cx).life_clock_rail_hidden));
+        assert!(cx.debug_bounds("sidebar").is_none());
+
+        // With popover open and rail hidden, first Escape closes popover and second restores rail.
+        cx.update(|_, cx| {
+            let lc = app.read(cx).life_clock.clone();
+            lc.update(cx, |view, cx| view.dev_open_popover(true, cx));
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        cx.update(|_, cx| assert!(app.read(cx).life_clock_rail_hidden));
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        cx.update(|_, cx| assert!(!app.read(cx).life_clock_rail_hidden));
+        assert!(cx.debug_bounds("sidebar").is_some());
+
+        // Leaving Life Clock while rail is hidden resets rail visibility cleanly.
+        cx.update(|window, cx| window.dispatch_action(Box::new(ToggleSidebar), cx));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("sidebar").is_none());
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| assert!(app.select(Section::Tasks, window, cx)));
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| assert!(!app.read(cx).life_clock_rail_hidden));
+        assert!(cx.debug_bounds("sidebar").is_some());
+    }
+
+    #[gpui::test]
+    fn disabling_life_clock_feature_falls_back_to_task_section(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            theme::init(cx);
+            assert!(crate::keymap::load_default(&assets::Assets, cx).unwrap().is_empty());
+        });
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let (app, cx) = cx.add_window_view(|window, cx| AppView::new(store, false, window, cx));
+        cx.simulate_resize(gpui::size(px(1200.), px(700.)));
+        cx.run_until_parked();
+
+        assert!(cx.debug_bounds("section-life-clock").is_some());
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| assert!(app.select(Section::LifeClock, window, cx)));
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            assert_eq!(app.read(cx).section, Section::LifeClock);
+            assert_eq!(
+                app.read(cx).title_bar.read(cx).caption_appearance(),
+                Some(theme::Appearance::Light)
+            );
+        });
+
+        let settings_window = cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.open_settings_page(settings_window::Page::Features, window, cx);
+                app.settings.unwrap()
+            })
+        });
+        let mut settings_cx = gpui::VisualTestContext::from_window(settings_window.into(), cx);
+        settings_cx.simulate_resize(gpui::size(px(900.), px(780.)));
+        settings_cx.run_until_parked();
+
+        let life_clock_toggle = settings_cx.debug_bounds("settings-feature-5").unwrap();
+        settings_cx.simulate_click(life_clock_toggle.center(), gpui::Modifiers::default());
+        settings_cx.run_until_parked();
+        cx.run_until_parked();
+
+        cx.update(|_, cx| {
+            assert!(!app.read(cx).features.life_clock);
+            assert_eq!(app.read(cx).section, Section::Tasks);
+            assert_eq!(app.read(cx).title_bar.read(cx).caption_appearance(), None);
+        });
+        assert!(cx.debug_bounds("section-life-clock").is_none());
     }
 }

@@ -1287,6 +1287,7 @@ impl SettingsWindow {
                         )
                         .child(
                             item("settings-plugins", IconName::Code, strings.plugins, self.page == Page::Plugins)
+                                .end_slot(Chip::new(strings.beta_badge, cx.theme().status().warning))
                                 .on_click(cx.listener(|this, _, _, cx| this.set_page(Page::Plugins, cx))),
                         )
                         .child(div().h(px(12.)))
@@ -2464,11 +2465,13 @@ impl SettingsWindow {
             }
             Page::Features => {
                 let features = self.preferences.features;
+                let warning_color = cx.theme().status().warning;
                 let frontend_row = |id: &'static str,
                                     debug_id: &'static str,
                                     (name, hint): (&'static str, &'static str),
                                     on: bool,
                                     locked: bool,
+                                    beta: bool,
                                     toggle: fn(&mut fern_core::Features)| {
                     v_flex()
                         .px_4()
@@ -2479,7 +2482,17 @@ impl SettingsWindow {
                                 .id(id)
                                 .debug_selector(move || debug_id.to_owned())
                                 .when(!locked, |el| el.cursor_pointer())
-                                .child(div().flex_1().child(Label::new(name)))
+                                .child(
+                                    h_flex()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(Label::new(name))
+                                        .when(beta, |row| {
+                                            row.child(Chip::new(strings.beta_badge, warning_color))
+                                        }),
+                                )
                                 .child(
                                     div()
                                         .when(locked, |el| el.opacity(0.6))
@@ -2504,13 +2517,21 @@ impl SettingsWindow {
                             )
                         })
                 };
-                let values = [features.calendar, features.matrix, features.habits, features.focus, features.countdown];
-                let toggles: [fn(&mut fern_core::Features); 5] = [
+                let values = [
+                    features.calendar,
+                    features.matrix,
+                    features.habits,
+                    features.focus,
+                    features.countdown,
+                    features.life_clock,
+                ];
+                let toggles: [fn(&mut fern_core::Features); 6] = [
                     |f| f.calendar = !f.calendar,
                     |f| f.matrix = !f.matrix,
                     |f| f.habits = !f.habits,
                     |f| f.focus = !f.focus,
                     |f| f.countdown = !f.countdown,
+                    |f| f.life_clock = !f.life_clock,
                 ];
                 body.child(title(strings.features))
                     .child(
@@ -2543,6 +2564,7 @@ impl SettingsWindow {
                                 strings.feature_tasks_item,
                                 features.tasks,
                                 features.tasks && !features.things,
+                                false,
                                 |f| f.tasks = !f.tasks,
                             ))
                             .child(frontend_row(
@@ -2551,6 +2573,7 @@ impl SettingsWindow {
                                 strings.feature_things_item,
                                 features.things,
                                 features.things && !features.tasks,
+                                true,
                                 |f| f.things = !f.things,
                             )),
                     )

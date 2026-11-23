@@ -1787,6 +1787,10 @@ impl PluginSettingsView {
                                             .size(LabelSize::XSmall)
                                             .color(Color::Muted),
                                     )
+                                    .when(
+                                        info.manifest.version.to_ascii_lowercase().contains("beta"),
+                                        |row| row.child(Chip::new(strings.beta_badge, theme.status().warning)),
+                                    )
                                     .child(Chip::new(status_label, status_color)),
                             )
                             .when(!info.manifest.description.is_empty(), |col| {
@@ -3127,6 +3131,14 @@ impl PluginSettingsView {
                             .into_any_element(),
                     };
 
+                    let is_beta = e.version.to_ascii_lowercase().contains("beta")
+                        || e.tags.iter().any(|t| t.eq_ignore_ascii_case("beta"));
+                    let display_tags: Vec<&String> = e
+                        .tags
+                        .iter()
+                        .filter(|t| !t.eq_ignore_ascii_case("beta"))
+                        .collect();
+
                     v_flex()
                         .w_full()
                         .p_4()
@@ -3157,6 +3169,12 @@ impl PluginSettingsView {
                                                         .size(LabelSize::XSmall)
                                                         .color(Color::Muted),
                                                 )
+                                                .when(is_beta, |row| {
+                                                    row.child(Chip::new(
+                                                        strings.beta_badge,
+                                                        theme.status().warning,
+                                                    ))
+                                                })
                                                 .when(!e.author.is_empty(), |row| {
                                                     row.child(
                                                         Label::new(e.author.clone())
@@ -3175,12 +3193,16 @@ impl PluginSettingsView {
                                 )
                                 .child(action_btn),
                         )
-                        .when(!e.tags.is_empty(), |col| {
+                        .when(!display_tags.is_empty(), |col| {
                             col.child(
                                 h_flex()
                                     .flex_wrap()
                                     .gap_1()
-                                    .children(e.tags.iter().map(|t| Chip::new(t.clone(), colors.accent))),
+                                    .children(
+                                        display_tags
+                                            .into_iter()
+                                            .map(|t| Chip::new(t.clone(), colors.accent)),
+                                    ),
                             )
                         })
                         .when(!e.permissions.is_empty(), |col| {
@@ -3321,9 +3343,14 @@ impl PluginSettingsView {
     ) -> AnyElement {
         let strings = i18n::t(cx);
         let colors = cx.theme().colors();
-        let has_settings = PluginHost::global(cx)
-            .and_then(|h| h.plugin(&page.plugin_id))
+        let plugin_info = PluginHost::global(cx).and_then(|h| h.plugin(&page.plugin_id));
+        let has_settings = plugin_info
+            .as_ref()
             .is_some_and(|p| !p.manifest.settings.is_empty());
+        let is_beta = plugin_info
+            .as_ref()
+            .is_some_and(|p| p.manifest.version.to_ascii_lowercase().contains("beta"));
+        let warning_color = cx.theme().status().warning;
         let pid_settings = page.plugin_id.clone();
         let pid_logs = page.plugin_id.clone();
         let pid_reload = page.plugin_id.clone();
@@ -3364,7 +3391,10 @@ impl PluginSettingsView {
                                     .size(LabelSize::Default)
                                     .weight(FontWeight::SEMIBOLD)
                                     .truncate(),
-                            ),
+                            )
+                            .when(is_beta, |row| {
+                                row.child(Chip::new(strings.beta_badge, warning_color))
+                            }),
                     )
                     .child(
                         h_flex()
@@ -3513,9 +3543,18 @@ impl Render for PluginSettingsView {
                                 .justify_between()
                                 .gap_3()
                                 .child(
-                                    Label::new(strings.plugins)
-                                        .size(LabelSize::Default)
-                                        .weight(FontWeight::MEDIUM),
+                                    h_flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(
+                                            Label::new(strings.plugins)
+                                                .size(LabelSize::Default)
+                                                .weight(FontWeight::MEDIUM),
+                                        )
+                                        .child(Chip::new(
+                                            strings.beta_badge,
+                                            cx.theme().status().warning,
+                                        )),
                                 )
                                 .child(tabs),
                         )

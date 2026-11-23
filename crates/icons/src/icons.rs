@@ -53,6 +53,7 @@ pub enum IconName {
     FernCountdown,
     FernFocus,
     FernHabit,
+    FernLifeClock,
     FernMatrix,
     FernTasks,
     FileText,

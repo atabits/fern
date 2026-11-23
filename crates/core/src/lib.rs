@@ -12,6 +12,7 @@ pub mod focus;
 pub mod habit;
 pub mod ical;
 pub mod import;
+pub mod life_clock;
 pub mod link;
 pub mod lunar;
 pub mod markdown;

@@ -10,6 +10,7 @@ members = [
     "crates/habit_ui",
     "crates/i18n",
     "crates/icons",
+    "crates/life_clock_ui",
     "crates/matrix_ui",
     "crates/plugin_ui",
     "crates/plugins",
@@ -46,6 +47,7 @@ fern_i18n = { path = "crates/i18n" }
 focus_ui = { path = "crates/focus_ui" }
 habit_ui = { path = "crates/habit_ui" }
 icons = { path = "crates/icons" }
+life_clock_ui = { path = "crates/life_clock_ui" }
 matrix_ui = { path = "crates/matrix_ui" }
 plugin_ui = { path = "crates/plugin_ui" }
 plugins = { path = "crates/plugins" }

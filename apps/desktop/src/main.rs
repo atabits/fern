@@ -20,6 +20,7 @@ pub(crate) use calendar_ui as calendar_view;
 pub(crate) use countdown_ui as countdown_view;
 pub(crate) use focus_ui as focus_view;
 pub(crate) use habit_ui as habit_view;
+pub(crate) use life_clock_ui as life_clock_view;
 pub(crate) use matrix_ui as matrix_view;
 pub(crate) use sticky_ui as sticky_note;
 pub(crate) use todo_ui as todo_view;

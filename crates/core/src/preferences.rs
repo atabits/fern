@@ -163,10 +163,11 @@ pub enum RailSection {
     Search,
     Matrix,
     Countdown,
+    LifeClock,
 }
 
 impl RailSection {
-    pub const ALL: [RailSection; 8] = [
+    pub const ALL: [RailSection; 9] = [
         RailSection::Tasks,
         RailSection::Calendar,
         RailSection::Pomodoro,
@@ -174,6 +175,7 @@ impl RailSection {
         RailSection::Search,
         RailSection::Matrix,
         RailSection::Countdown,
+        RailSection::LifeClock,
         RailSection::Things,
     ];
 
@@ -187,6 +189,7 @@ impl RailSection {
             Self::Search => "search",
             Self::Matrix => "matrix",
             Self::Countdown => "countdown",
+            Self::LifeClock => "life_clock",
         }
     }
 
@@ -679,6 +682,7 @@ pub struct Features {
     pub habits: bool,
     pub focus: bool,
     pub countdown: bool,
+    pub life_clock: bool,
 }
 
 impl Default for Features {
@@ -691,6 +695,7 @@ impl Default for Features {
             habits: true,
             focus: true,
             countdown: true,
+            life_clock: true,
         }
     }
 }
@@ -718,6 +723,7 @@ impl Features {
             ("habits", self.habits),
             ("focus", self.focus),
             ("countdown", self.countdown),
+            ("life_clock", self.life_clock),
         ]
         .into_iter()
         .filter(|(_, on)| !on)
@@ -739,6 +745,7 @@ impl Features {
             habits: !tokens.contains(&"habits"),
             focus: !tokens.contains(&"focus"),
             countdown: !tokens.contains(&"countdown"),
+            life_clock: !tokens.contains(&"life_clock"),
         };
         features.sanitize();
         features
@@ -1224,6 +1231,50 @@ mod tests {
         let comma_plugin = RailItemId::Plugin { plugin_id: "com.example.p".into(), view_id: "bad,id".into() };
         prefs.move_rail_item(&comma_plugin, &RailItemId::BuiltIn(RailSection::Tasks), false);
         assert_eq!(prefs.rail_items, before, "invalid comma ID must be rejected");
+        Ok(())
+    }
+
+    #[test]
+    fn life_clock_feature_and_rail_section_roundtrip_and_compat() -> Result<()> {
+        let store = Store::open_in_memory()?;
+
+        // Default placement: right after Countdown and before Things.
+        let countdown_idx = RailSection::ALL.iter().position(|s| *s == RailSection::Countdown);
+        let life_clock_idx = RailSection::ALL.iter().position(|s| *s == RailSection::LifeClock);
+        let things_idx = RailSection::ALL.iter().position(|s| *s == RailSection::Things);
+        assert_eq!(life_clock_idx, countdown_idx.map(|i| i + 1));
+        assert_eq!(things_idx, life_clock_idx.map(|i| i + 1));
+        assert_eq!(RailSection::LifeClock.code(), "life_clock");
+        assert_eq!(RailSection::from_code("life_clock"), Some(RailSection::LifeClock));
+        assert_eq!(
+            RailItemId::from_code("life_clock"),
+            Some(RailItemId::BuiltIn(RailSection::LifeClock))
+        );
+
+        // Legacy storage without `life_clock` token defaults `features.life_clock` to `true`,
+        // and legacy rail_order without `life_clock` appends it during normalization.
+        store.set_setting(FEATURES, "matrix,countdown")?;
+        store.set_setting(RAIL_ORDER, "tasks,calendar,focus,habits,search,matrix,countdown,things")?;
+        let legacy = store.preferences()?;
+        assert!(legacy.features.life_clock);
+        assert!(!legacy.features.matrix);
+        assert!(!legacy.features.countdown);
+        assert!(legacy.rail_order.contains(&RailSection::LifeClock));
+        assert!(legacy.rail_items.contains(&RailItemId::BuiltIn(RailSection::LifeClock)));
+
+        // Disabling `features.life_clock` persists cleanly across reload.
+        store.update_preferences(|p| {
+            p.features.life_clock = false;
+            p.move_rail_section(RailSection::LifeClock, RailSection::Tasks, false);
+        })?;
+        let disabled = store.preferences()?;
+        assert!(!disabled.features.life_clock);
+        assert_eq!(disabled.rail_order[0], RailSection::LifeClock);
+        assert_eq!(disabled.rail_items[0], RailItemId::BuiltIn(RailSection::LifeClock));
+
+        // Re-enabling persists back to true.
+        store.update_preferences(|p| p.features.life_clock = true)?;
+        assert!(store.preferences()?.features.life_clock);
         Ok(())
     }
 }

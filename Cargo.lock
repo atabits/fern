@@ -1746,6 +1746,7 @@ dependencies = [
  "habit_ui",
  "icons",
  "ksni",
+ "life_clock_ui",
  "matrix_ui",
  "notify-rust",
  "objc2 0.6.5",
@@ -3187,6 +3188,21 @@ dependencies = [
  "cc",
  "pkg-config",
  "vcpkg",
+]
+
+[[package]]
+name = "life_clock_ui"
+version = "0.2.0"
+dependencies = [
+ "assets",
+ "chrono",
+ "desktop_common",
+ "fern_core",
+ "fern_i18n",
+ "gpui",
+ "icons",
+ "theme",
+ "ui",
 ]
 
 [[package]]

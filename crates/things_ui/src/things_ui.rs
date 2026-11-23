@@ -2339,20 +2339,27 @@ impl ThingsView {
                             }),
                     )
                     .child(
-                        div()
+                        h_flex()
                             .flex_none()
-                            .when(cfg!(test), |el| {
-                                el.debug_selector(|| "things-header-search".to_owned())
-                            })
+                            .items_center()
+                            .gap_2()
+                            .child(Chip::new(strings.beta_badge, status.warning))
                             .child(
-                                IconButton::new("things-header-search", IconName::Search)
-                                    .size(px(28.))
-                                    .icon_size(IconSize::Small)
-                                    .icon_color(Color::Muted)
-                                    .tooltip(Tooltip::text(strings.section_search))
-                                    .on_click(cx.listener(|_, _, _, cx| {
-                                        cx.emit(ThingsEvent::OpenSearch);
-                                    })),
+                                div()
+                                    .flex_none()
+                                    .when(cfg!(test), |el| {
+                                        el.debug_selector(|| "things-header-search".to_owned())
+                                    })
+                                    .child(
+                                        IconButton::new("things-header-search", IconName::Search)
+                                            .size(px(28.))
+                                            .icon_size(IconSize::Small)
+                                            .icon_color(Color::Muted)
+                                            .tooltip(Tooltip::text(strings.section_search))
+                                            .on_click(cx.listener(|_, _, _, cx| {
+                                                cx.emit(ThingsEvent::OpenSearch);
+                                            })),
+                                    ),
                             ),
                     ),
             )

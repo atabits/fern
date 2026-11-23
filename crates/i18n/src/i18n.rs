@@ -699,7 +699,7 @@ pub struct Strings {
     pub daily_title: &'static str,
     pub daily_empty: &'static str,
     /// Settings → Features: each section's name and what it is for.
-    pub feature_items: [(&'static str, &'static str); 5],
+    pub feature_items: [(&'static str, &'static str); 6],
     pub sync_server: &'static str,
     pub sync_token: &'static str,
     pub sync_passphrase: &'static str,
@@ -1185,6 +1185,7 @@ pub struct Strings {
     pub matrix_delete_profile: &'static str,
     pub matrix_default_profile: &'static str,
     // Things frontend & multi-frontend settings.
+    pub beta_badge: &'static str,
     pub section_things: &'static str,
     pub feature_tasks_item: (&'static str, &'static str),
     pub feature_things_item: (&'static str, &'static str),
@@ -1269,6 +1270,27 @@ pub struct Strings {
     pub plugins_view_error_title: &'static str,
     pub plugins_commands: &'static str,
     pub plugins_secret_placeholder: &'static str,
+    // Life Clock.
+    pub section_life_clock: &'static str,
+    pub life_clock_months: [&'static str; 12],
+    pub life_clock_you_are: &'static str,
+    pub life_clock_age_suffix: &'static str,
+    pub life_clock_and: &'static str,
+    /// Order: years, months, days, hours, minutes, seconds; triplet `[one, few, many]`.
+    pub life_clock_units: [[&'static str; 3]; 6],
+    pub life_clock_set_birth_title: &'static str,
+    pub life_clock_set_birth_hint: &'static str,
+    pub life_clock_about_title: &'static str,
+    pub life_clock_about_body: &'static str,
+    pub life_clock_birth_date: &'static str,
+    pub life_clock_invalid_date: &'static str,
+    pub life_clock_palette: &'static str,
+    pub life_clock_palette_classic: &'static str,
+    pub life_clock_palette_theme: &'static str,
+    pub life_clock_quote_hint: &'static str,
+    pub life_clock_hide_sidebar: &'static str,
+    pub life_clock_show_sidebar: &'static str,
+    pub life_clock_help_tooltip: &'static str,
 }
 
 pub static EN: Strings = Strings {
@@ -1884,6 +1906,7 @@ pub static EN: Strings = Strings {
         ("Habit Tracker", "Develop a habit and keep track of it."),
         ("Pomodoro", "Use the Pomo timer or stopwatch to keep focus."),
         ("Countdown", "Remember every special day."),
+        ("Life Clock", "Watch time flow across past and future with your live age."),
     ],
     sync_server: "Server",
     sync_token: "Token",
@@ -2333,6 +2356,7 @@ pub static EN: Strings = Strings {
     matrix_rename_profile: "Rename Profile",
     matrix_delete_profile: "Delete Profile",
     matrix_default_profile: "Default",
+    beta_badge: "Beta",
     section_things: "Things",
     feature_tasks_item: ("Tasks (Classic View)", "Classic lists, kanban, timeline, and smart lists workspace."),
     feature_things_item: ("Things View", "Calm Things-style workspace with Inbox, Today, Evening, Anytime, Someday, and Projects."),
@@ -2416,6 +2440,32 @@ pub static EN: Strings = Strings {
     plugins_view_error_title: "Plugin view failed to render",
     plugins_commands: "Plugin Commands",
     plugins_secret_placeholder: "Saved securely in vault (enter to replace)",
+    section_life_clock: "Life Clock",
+    life_clock_months: ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"],
+    life_clock_you_are: "You are",
+    life_clock_age_suffix: " old",
+    life_clock_and: "and",
+    life_clock_units: [
+        ["year", "years", "years"],
+        ["month", "months", "months"],
+        ["day", "days", "days"],
+        ["hour", "hours", "hours"],
+        ["minute", "minutes", "minutes"],
+        ["second", "seconds", "seconds"],
+    ],
+    life_clock_set_birth_title: "Birth date",
+    life_clock_set_birth_hint: "Set your birth date to see your live age",
+    life_clock_about_title: "Life Clock",
+    life_clock_about_body: "The dark half is the past; the light half is the future. Six rows tick continuously from seconds to years.",
+    life_clock_birth_date: "Birth date",
+    life_clock_invalid_date: "Enter a valid date in the past",
+    life_clock_palette: "Appearance",
+    life_clock_palette_classic: "Classic B&W",
+    life_clock_palette_theme: "Fern theme",
+    life_clock_quote_hint: "Click the quote to show another",
+    life_clock_hide_sidebar: "Hide sidebar",
+    life_clock_show_sidebar: "Show sidebar",
+    life_clock_help_tooltip: "Settings & info",
 };
 
 pub static ZH_CN: Strings = Strings {
@@ -3030,6 +3080,7 @@ pub static ZH_CN: Strings = Strings {
         ("习惯", "培养并记录你的习惯。"),
         ("专注", "使用番茄钟或计时器保持专注。"),
         ("倒数纪念日", "铭记每一个特殊日子。"),
+        ("时间流", "以黑白时间轴直观感受时间流逝与实时年龄。"),
     ],
     sync_server: "服务端地址",
     sync_token: "令牌 Token",
@@ -3476,6 +3527,7 @@ pub static ZH_CN: Strings = Strings {
     matrix_rename_profile: "重命名方案",
     matrix_delete_profile: "删除方案",
     matrix_default_profile: "默认",
+    beta_badge: "Beta",
     section_things: "Things",
     feature_tasks_item: ("任务（经典视图）", "经典清单、看板、时间线与智能清单工作区。"),
     feature_things_item: ("Things 视图", "沉静高效的 Things 风格工作区，包含收件箱、今天、今晚、随时、某天与项目。"),
@@ -3559,6 +3611,32 @@ pub static ZH_CN: Strings = Strings {
     plugins_view_error_title: "插件视图渲染失败",
     plugins_commands: "插件命令",
     plugins_secret_placeholder: "已安全保存在密钥库（输入新值以替换）",
+    section_life_clock: "时间流",
+    life_clock_months: ["1月", "2月", "3月", "4月", "5月", "6月", "7月", "8月", "9月", "10月", "11月", "12月"],
+    life_clock_you_are: "你已经",
+    life_clock_age_suffix: "",
+    life_clock_and: "",
+    life_clock_units: [
+        ["岁", "岁", "岁"],
+        ["个月", "个月", "个月"],
+        ["天", "天", "天"],
+        ["小时", "小时", "小时"],
+        ["分钟", "分钟", "分钟"],
+        ["秒", "秒", "秒"],
+    ],
+    life_clock_set_birth_title: "出生日期",
+    life_clock_set_birth_hint: "设置出生日期以查看实时年龄",
+    life_clock_about_title: "时间流",
+    life_clock_about_body: "左侧深色代表过去，右侧浅色代表未来。从秒到年的六行刻度持续流过此刻。",
+    life_clock_birth_date: "出生日期",
+    life_clock_invalid_date: "请输入有效的过去日期",
+    life_clock_palette: "配色风格",
+    life_clock_palette_classic: "经典黑白",
+    life_clock_palette_theme: "跟随主题",
+    life_clock_quote_hint: "点击名言可切换下一句",
+    life_clock_hide_sidebar: "隐藏侧边栏",
+    life_clock_show_sidebar: "显示侧边栏",
+    life_clock_help_tooltip: "设置与说明",
 };
 
 pub static RU: Strings = Strings {
@@ -4179,6 +4257,7 @@ pub static RU: Strings = Strings {
         ("Привычки", "Вырабатывайте привычки и отмечайте их."),
         ("Помодоро", "Таймер Помодоро или секундомер для сосредоточенности."),
         ("Обратный отсчёт", "Помните о каждом важном дне."),
+        ("Ход времени", "Визуализация бега времени, вашего возраста и цитат о времени."),
     ],
     sync_server: "Сервер",
     sync_token: "Токен",
@@ -4630,6 +4709,7 @@ pub static RU: Strings = Strings {
     matrix_rename_profile: "Переименовать профиль",
     matrix_delete_profile: "Удалить профиль",
     matrix_default_profile: "Основной",
+    beta_badge: "Beta",
     section_things: "Things",
     feature_tasks_item: ("Задачи (классический вид)", "Классические списки, канбан, таймлайн и умные списки."),
     feature_things_item: ("Вид Things", "Спокойное пространство в стиле Things: Входящие, Сегодня, Вечер, В любое время, Когда-нибудь и Проекты."),
@@ -4713,7 +4793,84 @@ pub static RU: Strings = Strings {
     plugins_view_error_title: "Ошибка отображения плагина",
     plugins_commands: "Команды плагинов",
     plugins_secret_placeholder: "Сохранено в хранилище (введите для замены)",
+    section_life_clock: "Ход времени",
+    life_clock_months: ["Янв", "Фев", "Мар", "Апр", "Май", "Июн", "Июл", "Авг", "Сен", "Окт", "Ноя", "Дек"],
+    life_clock_you_are: "Вам уже",
+    life_clock_age_suffix: "",
+    life_clock_and: "и",
+    life_clock_units: [
+        ["год", "года", "лет"],
+        ["месяц", "месяца", "месяцев"],
+        ["день", "дня", "дней"],
+        ["час", "часа", "часов"],
+        ["минута", "минуты", "минут"],
+        ["секунда", "секунды", "секунд"],
+    ],
+    life_clock_set_birth_title: "Дата рождения",
+    life_clock_set_birth_hint: "Укажите дату рождения, чтобы видеть свой возраст",
+    life_clock_about_title: "Ход времени",
+    life_clock_about_body: "Тёмная половина — прошлое, светлая — будущее. Шесть шкал от секунд до лет непрерывно движутся сквозь настоящий момент.",
+    life_clock_birth_date: "Дата рождения",
+    life_clock_invalid_date: "Введите корректную дату в прошлом",
+    life_clock_palette: "Цветовая схема",
+    life_clock_palette_classic: "Классический ч/б",
+    life_clock_palette_theme: "Тема Fern",
+    life_clock_quote_hint: "Нажмите на цитату, чтобы сменить её",
+    life_clock_hide_sidebar: "Скрыть боковую панель",
+    life_clock_show_sidebar: "Показать боковую панель",
+    life_clock_help_tooltip: "Настройки и справка",
 };
+
+fn life_clock_plural_index(locale: Locale, n: u32) -> usize {
+    match locale {
+        Locale::En => usize::from(n != 1),
+        Locale::Ru => {
+            let mod100 = n % 100;
+            if (11..=14).contains(&mod100) {
+                2
+            } else {
+                match n % 10 {
+                    1 => 0,
+                    2..=4 => 1,
+                    _ => 2,
+                }
+            }
+        }
+        Locale::ZhCn => 0,
+    }
+}
+
+/// Formats a live Life Clock age breakdown in the given locale with proper pluralization.
+pub fn format_life_clock_age(
+    locale: Locale,
+    years: u32,
+    months: u32,
+    days: u32,
+    hours: u32,
+    minutes: u32,
+    seconds: u32,
+) -> String {
+    let s = locale.strings();
+    let unit = |idx: usize, n: u32| s.life_clock_units[idx][life_clock_plural_index(locale, n)];
+    let (y, mo, d, h, min, sec) = (
+        unit(0, years),
+        unit(1, months),
+        unit(2, days),
+        unit(3, hours),
+        unit(4, minutes),
+        unit(5, seconds),
+    );
+    match locale {
+        Locale::ZhCn => format!(
+            "{years} {y} {months} {mo} {days} {d} {hours} {h} {minutes} {min} {seconds} {sec}{}",
+            s.life_clock_age_suffix,
+        ),
+        Locale::En | Locale::Ru => format!(
+            "{years} {y}, {months} {mo}, {days} {d}, {hours} {h}, {minutes} {min} {} {seconds} {sec}{}",
+            s.life_clock_and, s.life_clock_age_suffix,
+        ),
+    }
+}
 
 impl Strings {
     pub fn filter_date_label(&self, rule: fern_core::DateRule) -> &'static str {
@@ -4765,5 +4922,69 @@ mod tests {
             assert!(s.plugins_metrics.contains("{mem}"), "{locale:?}");
             assert!(s.plugins_metrics.contains("{ms}"), "{locale:?}");
         }
+    }
+
+    #[test]
+    fn format_life_clock_age_english() {
+        assert_eq!(
+            format_life_clock_age(Locale::En, 28, 0, 3, 3, 53, 16),
+            "28 years, 0 months, 3 days, 3 hours, 53 minutes and 16 seconds old",
+        );
+        assert_eq!(
+            format_life_clock_age(Locale::En, 1, 1, 1, 1, 1, 1),
+            "1 year, 1 month, 1 day, 1 hour, 1 minute and 1 second old",
+        );
+        assert_eq!(
+            format_life_clock_age(Locale::En, 0, 1, 2, 11, 21, 59),
+            "0 years, 1 month, 2 days, 11 hours, 21 minutes and 59 seconds old",
+        );
+    }
+
+    #[test]
+    fn format_life_clock_age_russian() {
+        assert_eq!(
+            format_life_clock_age(Locale::Ru, 28, 0, 3, 3, 53, 16),
+            "28 лет, 0 месяцев, 3 дня, 3 часа, 53 минуты и 16 секунд",
+        );
+        assert_eq!(
+            format_life_clock_age(Locale::Ru, 1, 1, 1, 1, 1, 1),
+            "1 год, 1 месяц, 1 день, 1 час, 1 минута и 1 секунда",
+        );
+        assert_eq!(
+            format_life_clock_age(Locale::Ru, 2, 2, 2, 2, 2, 2),
+            "2 года, 2 месяца, 2 дня, 2 часа, 2 минуты и 2 секунды",
+        );
+        assert_eq!(
+            format_life_clock_age(Locale::Ru, 5, 5, 5, 5, 5, 5),
+            "5 лет, 5 месяцев, 5 дней, 5 часов, 5 минут и 5 секунд",
+        );
+        assert_eq!(
+            format_life_clock_age(Locale::Ru, 11, 11, 11, 11, 11, 11),
+            "11 лет, 11 месяцев, 11 дней, 11 часов, 11 минут и 11 секунд",
+        );
+        assert_eq!(
+            format_life_clock_age(Locale::Ru, 12, 12, 14, 13, 12, 14),
+            "12 лет, 12 месяцев, 14 дней, 13 часов, 12 минут и 14 секунд",
+        );
+        assert_eq!(
+            format_life_clock_age(Locale::Ru, 21, 1, 21, 21, 21, 21),
+            "21 год, 1 месяц, 21 день, 21 час, 21 минута и 21 секунда",
+        );
+        assert_eq!(
+            format_life_clock_age(Locale::Ru, 111, 0, 112, 113, 114, 121),
+            "111 лет, 0 месяцев, 112 дней, 113 часов, 114 минут и 121 секунда",
+        );
+    }
+
+    #[test]
+    fn format_life_clock_age_chinese() {
+        assert_eq!(
+            format_life_clock_age(Locale::ZhCn, 28, 0, 3, 3, 53, 16),
+            "28 岁 0 个月 3 天 3 小时 53 分钟 16 秒",
+        );
+        assert_eq!(
+            format_life_clock_age(Locale::ZhCn, 1, 1, 1, 1, 1, 1),
+            "1 岁 1 个月 1 天 1 小时 1 分钟 1 秒",
+        );
     }
 }

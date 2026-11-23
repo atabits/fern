@@ -77,6 +77,8 @@ pub struct SummaryView {
     editor_initial: String,
     /// Pending option change awaiting confirmation when manual edits would be overwritten.
     pending_options: Option<SummaryOptions>,
+    /// Pending summary template deletion awaiting user confirmation: `(id, name)`.
+    confirm_delete_template: Option<(fern_core::Id, String)>,
     /// Whether the editor shows (it keeps its text while hidden).
     editing: bool,
     /// The toolbar's "Heading Options" menu, while open.
@@ -233,6 +235,7 @@ impl SummaryView {
             editor: None,
             editor_initial: String::new(),
             pending_options: None,
+            confirm_delete_template: None,
             editing: false,
             heading_menu: false,
         }
@@ -365,7 +368,10 @@ impl SummaryView {
     /// Closes the top-most open dropdown or inline prompt on Escape. Returns `true` if anything
     /// was dismissed so callers can stop propagation.
     pub fn dismiss_transient(&mut self, cx: &mut Context<Self>) -> bool {
-        let dismissed = if self.pending_options.take().is_some() || self.more_side.take().is_some() {
+        let dismissed = if self.pending_options.take().is_some()
+            || self.confirm_delete_template.take().is_some()
+            || self.more_side.take().is_some()
+        {
             true
         } else {
             self.menu.take().is_some()
@@ -739,11 +745,12 @@ impl SummaryView {
                     .gap_1p5()
                     .children(templates.iter().map(|template| {
                         let selected = template.options == self.options;
-                        let (id, options) = (template.id, template.options.clone());
+                        let (id, template_name, options) = (template.id, template.name.clone(), template.options.clone());
                         let group = SharedString::from(format!("template-{id}"));
                         h_flex()
                             .id(group.clone())
                             .group(group.clone())
+                            .when(cfg!(test), |el| el.debug_selector(move || format!("template-{id}")))
                             .h(px(26.))
                             .pl_2()
                             .pr_1()
@@ -755,21 +762,23 @@ impl SummaryView {
                             .hover(|s| s.bg(colors.ghost_element_hover))
                             .child(Label::new(template.name.clone()).size(LabelSize::Small).color(if selected { Color::Accent } else { Color::Default }))
                             .child(
-                                div().when(!crate::touch::active(), |el| el.invisible()).group_hover(group, |s| s.visible()).child(
-                                    IconButton::new(SharedString::from(format!("delete-template-{id}")), IconName::X)
-                                        .size(px(16.))
-                                        .icon_size(IconSize::XSmall)
-                                        .icon_color(Color::Muted)
-                                        .hover_icon_color(Color::Error)
-                                        .tooltip(Tooltip::text(strings.delete))
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            cx.stop_propagation();
-                                            if let Err(err) = this.store.delete_summary_template(id) {
-                                                eprintln!("failed to delete the summary template: {err:#}");
-                                            }
-                                            this.refresh_templates(cx);
-                                        })),
-                                ),
+                                div()
+                                    .when(!crate::touch::active(), |el| el.invisible())
+                                    .group_hover(group, |s| s.visible())
+                                    .when(cfg!(test), |el| el.debug_selector(move || format!("delete-template-{id}")))
+                                    .child(
+                                        IconButton::new(SharedString::from(format!("delete-template-{id}")), IconName::X)
+                                            .size(px(16.))
+                                            .icon_size(IconSize::XSmall)
+                                            .icon_color(Color::Muted)
+                                            .hover_icon_color(Color::Error)
+                                            .tooltip(Tooltip::text(strings.delete))
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                this.confirm_delete_template = Some((id, template_name.clone()));
+                                                cx.notify();
+                                            })),
+                                    ),
                             )
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 let options = options.clone();
@@ -1116,35 +1125,18 @@ impl SummaryView {
                                     .gap_2()
                                     .justify_end()
                                     .child(
-                                        div()
-                                            .id("summary-custom-cancel")
-                                            .px_3()
-                                            .h(px(26.))
-                                            .flex()
-                                            .items_center()
-                                            .rounded(px(6.))
-                                            .border_1()
-                                            .border_color(colors.border)
-                                            .hover(|s| s.bg(colors.element_hover))
-                                            .cursor_pointer()
-                                            .child(Label::new(strings.cancel).size(LabelSize::Small))
+                                        Button::new("summary-custom-cancel", strings.cancel)
+                                            .variant(ButtonVariant::Secondary)
+                                            .size(ButtonSize::Sm)
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 this.custom = None;
                                                 cx.notify();
                                             })),
                                     )
                                     .child(
-                                        div()
-                                            .id("summary-custom-confirm")
-                                            .px_3()
-                                            .h(px(26.))
-                                            .flex()
-                                            .items_center()
-                                            .rounded(px(6.))
-                                            .bg(colors.accent)
-                                            .hover(|s| s.opacity(0.9))
-                                            .cursor_pointer()
-                                            .child(Label::new(strings.confirm).size(LabelSize::Small).color(Color::OnAccent))
+                                        Button::new("summary-custom-confirm", strings.confirm)
+                                            .variant(ButtonVariant::Primary)
+                                            .size(ButtonSize::Sm)
                                             .on_click(cx.listener(|this, _, _, cx| this.confirm_custom(cx))),
                                     ),
                             )
@@ -1272,16 +1264,10 @@ impl Render for SummaryView {
                             .child(div().flex_1().text_size(px(20.)).font_weight(FontWeight::SEMIBOLD).child(strings.summary))
                             .when(has_manual_edits, |el| {
                                 el.child(
-                                    h_flex()
-                                        .id("summary-reset-edits")
-                                        .px_2()
-                                        .py_1()
-                                        .gap_1()
-                                        .rounded(px(6.))
-                                        .cursor_pointer()
-                                        .hover(|s| s.bg(colors.element_hover))
-                                        .child(Icon::new(IconName::RotateCcw).size(IconSize::XSmall).color(Color::Muted))
-                                        .child(Label::new(strings.habit_reset).size(LabelSize::Small).color(Color::Muted))
+                                    Button::new("summary-reset-edits", strings.habit_reset)
+                                        .variant(ButtonVariant::Ghost)
+                                        .size(ButtonSize::Sm)
+                                        .icon(IconName::RotateCcw)
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             this.pending_options = Some(this.options.clone());
                                             cx.notify();
@@ -1443,6 +1429,34 @@ impl Render for SummaryView {
                         .on_confirm(cx.listener(move |this, _, _, cx| {
                             this.apply_options(next.clone(), cx);
                         })),
+                )
+            })
+            .when_some(self.confirm_delete_template.clone(), |el, (id, name)| {
+                el.child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .when(cfg!(test), |el| el.debug_selector(|| "summary-template-delete-modal".to_owned()))
+                        .child(
+                            ConfirmDialog::new("summary-template-delete", strings.confirm_delete_summary_template)
+                                .width(px(340.))
+                                .description(name)
+                                .cancel_label(strings.cancel)
+                                .confirm_label(strings.delete)
+                                .destructive(true)
+                                .on_cancel(cx.listener(|this, _, _, cx| {
+                                    this.confirm_delete_template = None;
+                                    cx.notify();
+                                }))
+                                .on_confirm(cx.listener(move |this, _, _, cx| {
+                                    this.confirm_delete_template = None;
+                                    if let Err(err) = this.store.delete_summary_template(id) {
+                                        eprintln!("failed to delete the summary template: {err:#}");
+                                    }
+                                    this.refresh_templates(cx);
+                                    desktop_common::data_version::data_changed(cx.entity_id(), cx);
+                                })),
+                        ),
                 )
             })
     }
@@ -1646,5 +1660,58 @@ mod tests {
         view.update(cx, |v, cx| v.set_active(true, cx));
         cx.run_until_parked();
         view.read_with(cx, |v, _| assert_eq!(v.rebuild_count, 2));
+    }
+
+    #[gpui::test]
+    fn delete_template_requires_confirmation_and_supports_escape_cancel(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            theme::init(cx);
+            cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+        });
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let template = store.save_summary_template("Weekly Review", &SummaryOptions::default()).unwrap();
+
+        let (view, cx) = cx.add_window_view(|_, _| SummaryView::new(store.clone()));
+        cx.simulate_resize(gpui::size(px(1200.), px(700.)));
+        cx.run_until_parked();
+
+        // Hover template chip to reveal the delete button, then click delete -> opens ConfirmDialog only.
+        let pill_sel: &'static str = Box::leak(format!("template-{}", template.id).into_boxed_str());
+        let delete_sel: &'static str = Box::leak(format!("delete-template-{}", template.id).into_boxed_str());
+        let pill_center = cx.debug_bounds(pill_sel).unwrap().center();
+        cx.simulate_mouse_move(pill_center, None, gpui::Modifiers::default());
+        cx.run_until_parked();
+        let delete_btn = cx.debug_bounds(delete_sel).unwrap().center();
+        cx.simulate_click(delete_btn, gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        view.read_with(cx, |v, _| {
+            assert_eq!(v.confirm_delete_template, Some((template.id, "Weekly Review".to_owned())));
+        });
+        assert!(cx.debug_bounds("summary-template-delete-modal").is_some());
+        assert_eq!(store.summary_templates().unwrap().len(), 1, "template must remain in SQLite before confirmation");
+
+        // Escape / dismiss_transient cancels without deleting.
+        view.update(cx, |v, cx| assert!(v.dismiss_transient(cx)));
+        cx.run_until_parked();
+        view.read_with(cx, |v, _| assert!(v.confirm_delete_template.is_none()));
+        assert!(cx.debug_bounds("summary-template-delete-modal").is_none());
+        assert_eq!(store.summary_templates().unwrap().len(), 1);
+
+        // Re-trigger delete and confirm -> deletes from SQLite and refreshes cache.
+        cx.simulate_mouse_move(pill_center, None, gpui::Modifiers::default());
+        cx.run_until_parked();
+        cx.simulate_click(delete_btn, gpui::Modifiers::default());
+        cx.run_until_parked();
+        let modal_bounds = cx.debug_bounds("summary-template-delete-modal").unwrap();
+        let confirm_btn = gpui::point(modal_bounds.center().x + px(120.), modal_bounds.center().y + px(34.));
+        cx.simulate_click(confirm_btn, gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        view.read_with(cx, |v, _| {
+            assert!(v.confirm_delete_template.is_none());
+            assert!(v.cache.as_ref().unwrap().templates.is_empty());
+        });
+        assert!(store.summary_templates().unwrap().is_empty());
     }
 }

@@ -286,6 +286,8 @@ pub static ZH_CN: Strings = Strings {
     countdown_switch_hint: "点击日期切换显示格式",
     countdown_empty: "暂无倒数日",
     confirm_delete_countdown: "确定要删除这个倒数日吗？",
+    confirm_delete_timer: "确定要删除这个计时器吗？",
+    confirm_delete_summary_template: "确定要删除这个汇总模板吗？",
     unit_letters: ["年", "月", "日"],
     countdown_date: None,
     dotted_dates: false,

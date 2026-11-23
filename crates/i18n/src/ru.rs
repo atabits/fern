@@ -286,6 +286,8 @@ pub static RU: Strings = Strings {
     countdown_switch_hint: "Нажмите на дату, чтобы сменить формат.",
     countdown_empty: "Пока нет отсчётов",
     confirm_delete_countdown: "Удалить этот обратный отсчёт?",
+    confirm_delete_timer: "Удалить этот таймер?",
+    confirm_delete_summary_template: "Удалить этот шаблон сводки?",
     unit_letters: ["л", "мес", "д"],
     // As the Russian original: "До 1 янв 2027 г.".
     countdown_date: Some("{d} {mon} {yyyy} г."),

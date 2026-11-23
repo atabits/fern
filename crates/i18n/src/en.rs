@@ -286,6 +286,8 @@ pub static EN: Strings = Strings {
     countdown_switch_hint: "Tap the date to switch formats.",
     countdown_empty: "No countdowns yet",
     confirm_delete_countdown: "Delete this countdown?",
+    confirm_delete_timer: "Delete this timer?",
+    confirm_delete_summary_template: "Delete this summary template?",
     unit_letters: ["Y", "M", "D"],
     countdown_date: None,
     dotted_dates: false,

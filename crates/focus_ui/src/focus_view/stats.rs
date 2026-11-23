@@ -206,6 +206,7 @@ impl FocusView {
         if self.dirty {
             self.reload(cx);
         }
+        self.ensure_stats_data();
         let today = Local::now().date_naive();
         self.record_menu = None;
         self.stats_scroll = ScrollHandle::new();

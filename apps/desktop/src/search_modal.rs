@@ -502,28 +502,6 @@ impl SearchModal {
                 }
             }
         }
-        let button = |id: &'static str, label: &'static str, primary: bool| {
-            div()
-                .id(id)
-                .flex_1()
-                .h(px(26.))
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded(px(6.))
-                .cursor_pointer()
-                .when(primary, |el| {
-                    el.bg(theme.colors().accent)
-                        .hover(|s| s.opacity(0.9))
-                        .child(Label::new(label).size(LabelSize::Small).color(Color::OnAccent))
-                })
-                .when(!primary, |el| {
-                    el.border_1()
-                        .border_color(theme.colors().border)
-                        .hover(|s| s.bg(theme.colors().element_hover))
-                        .child(Label::new(label).size(LabelSize::Small))
-                })
-        };
         popover(cx)
             .w(px(if menu == Menu::Date { 250. } else { 210. }))
             .on_mouse_down_out(cx.listener(|this, _, _, cx| {
@@ -543,23 +521,59 @@ impl SearchModal {
                     h_flex()
                         .pt_2()
                         .gap_2()
-                        .child(button("search-menu-cancel", strings.cancel, false).on_click(cx.listener(|this, _, _, cx| {
-                            this.menu = None;
-                            this.custom_open = false;
-                            cx.notify();
-                        })))
-                        .child(button("search-menu-ok", strings.ok, true).on_click(cx.listener(|this, _, _, cx| {
-                            if this.menu == Some(Menu::Date) {
-                                let strings = i18n::t(cx);
-                                let today = Local::now().date_naive();
-                                let from = crate::calendar::parse_date(this.custom_from.read(cx).text(), today, strings);
-                                let until = crate::calendar::parse_date(this.custom_until.read(cx).text(), today, strings);
-                                if let (Some(from), Some(until)) = (from, until) {
-                                    this.draft.date = DateRange::Custom(from, until);
-                                }
-                            }
-                            this.apply(cx);
-                        }))),
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .when(cfg!(test), |el| {
+                                    el.debug_selector(|| "search-menu-cancel".to_owned())
+                                })
+                                .child(
+                                    Button::new("search-menu-cancel", strings.cancel)
+                                        .variant(ButtonVariant::Secondary)
+                                        .size(ButtonSize::Sm)
+                                        .full_width()
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.menu = None;
+                                            this.custom_open = false;
+                                            cx.notify();
+                                        })),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .when(cfg!(test), |el| {
+                                    el.debug_selector(|| "search-menu-ok".to_owned())
+                                })
+                                .child(
+                                    Button::new("search-menu-ok", strings.ok)
+                                        .variant(ButtonVariant::Primary)
+                                        .size(ButtonSize::Sm)
+                                        .full_width()
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            if this.menu == Some(Menu::Date) {
+                                                let strings = i18n::t(cx);
+                                                let today = Local::now().date_naive();
+                                                let from = crate::calendar::parse_date(
+                                                    this.custom_from.read(cx).text(),
+                                                    today,
+                                                    strings,
+                                                );
+                                                let until = crate::calendar::parse_date(
+                                                    this.custom_until.read(cx).text(),
+                                                    today,
+                                                    strings,
+                                                );
+                                                if let (Some(from), Some(until)) = (from, until) {
+                                                    this.draft.date = DateRange::Custom(from, until);
+                                                }
+                                            }
+                                            this.apply(cx);
+                                        })),
+                                ),
+                        ),
                 )
             })
             .into_any_element()
@@ -816,6 +830,19 @@ impl SearchModal {
 
     fn group_heading(label: &'static str) -> impl IntoElement {
         div().px_2().pt_2().pb_1().child(Label::new(label).size(LabelSize::Small).weight(FontWeight::SEMIBOLD))
+    }
+
+    fn create_task_button_label(add_task: &str, query: &str) -> (String, bool) {
+        // `ui::Button` renders a non-truncating `Label` with `whitespace_nowrap`, so keep the
+        // displayed query bounded inside the 560px modal while emitting the full query on click.
+        const MAX_QUERY_CHARS: usize = 28;
+        let mut chars = query.chars();
+        let prefix: String = chars.by_ref().take(MAX_QUERY_CHARS).collect();
+        if chars.next().is_some() {
+            (format!("{add_task}: \"{prefix}…\""), true)
+        } else {
+            (format!("{add_task}: \"{query}\""), false)
+        }
     }
 }
 
@@ -1279,30 +1306,36 @@ impl Render for SearchModal {
                         })
                         .when(nothing, |el| {
                             let create_query = query.clone();
+                            let (create_label, truncated) =
+                                Self::create_task_button_label(strings.add_task, &create_query);
+                            let full_tooltip = truncated
+                                .then(|| format!("{}: \"{}\"", strings.add_task, create_query));
                             el.items_center()
                                 .justify_center()
                                 .gap_3()
                                 .child(Label::new(strings.nothing_found).color(Color::Muted))
                                 .child(
-                                    h_flex()
-                                        .id("search-create-task")
-                                        .px_3()
-                                        .h(px(30.))
-                                        .gap_1p5()
+                                    div()
+                                        .max_w_full()
                                         .rounded(px(6.))
                                         .bg(theme.colors().accent.opacity(0.14))
-                                        .hover(|s| s.bg(theme.colors().accent.opacity(0.22)))
-                                        .cursor_pointer()
-                                        .child(Icon::new(IconName::Plus).size(IconSize::XSmall).color(Color::Accent))
+                                        .when(cfg!(test), |el| {
+                                            el.debug_selector(|| "search-create-task".to_owned())
+                                        })
                                         .child(
-                                            Label::new(format!("{}: \"{}\"", strings.add_task, create_query))
-                                                .size(LabelSize::Small)
-                                                .color(Color::Accent)
-                                                .truncate(),
-                                        )
-                                        .on_click(cx.listener(move |_, _, _, cx| {
-                                            cx.emit(SearchEvent::CreateTask(create_query.clone()));
-                                        })),
+                                            Button::new("search-create-task", create_label)
+                                                .variant(ButtonVariant::Ghost)
+                                                .size(ButtonSize::Md)
+                                                .icon(IconName::Plus)
+                                                .when_some(full_tooltip, |btn, tip| {
+                                                    btn.tooltip(Tooltip::text(tip))
+                                                })
+                                                .on_click(cx.listener(move |_, _, _, cx| {
+                                                    cx.emit(SearchEvent::CreateTask(
+                                                        create_query.clone(),
+                                                    ));
+                                                })),
+                                        ),
                                 )
                         })
                         .when(!task_rows.is_empty(), |el| el.child(Self::group_heading(strings.group_tasks)).children(task_rows))
@@ -1681,5 +1714,80 @@ mod tests {
             SearchModal::strip_markdown_inline("Check **Markdown**, __under__, `code`, ~~old~~ & foo_bar * 2"),
             "Check Markdown, under, code, old & foo_bar * 2"
         );
+    }
+
+    #[gpui::test]
+    fn unified_menu_and_create_task_buttons_stay_bounded_and_dispatch_actions(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(theme::init);
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let created: Rc<std::cell::RefCell<Option<String>>> =
+            Rc::new(std::cell::RefCell::new(None));
+        let created_slot = created.clone();
+
+        let (modal, cx) = cx.add_window_view(|_window, cx| {
+            let entity = cx.entity();
+            cx.subscribe(&entity, move |_, _, event: &SearchEvent, _| {
+                if let SearchEvent::CreateTask(q) = event {
+                    *created_slot.borrow_mut() = Some(q.clone());
+                }
+            })
+            .detach();
+            SearchModal::new(store, cx)
+        });
+        cx.simulate_resize(gpui::size(px(900.), px(640.)));
+        cx.run_until_parked();
+
+        // Filter dropdown Cancel/OK buttons share width equally and apply/close cleanly.
+        cx.update(|_, cx| {
+            modal.update(cx, |m, cx| {
+                m.set_filter(Filter::Tasks, cx);
+                m.open_menu(Menu::Priority, cx);
+                m.draft.priorities = vec![Priority::High];
+            });
+        });
+        cx.run_until_parked();
+        let cancel_bounds = cx.debug_bounds("search-menu-cancel").unwrap();
+        let ok_bounds = cx.debug_bounds("search-menu-ok").unwrap();
+        assert!((cancel_bounds.size.width - ok_bounds.size.width).abs() <= px(1.));
+        cx.simulate_click(cancel_bounds.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            let m = modal.read(cx);
+            assert!(m.menu.is_none());
+            assert!(m.task_filter.priorities.is_empty());
+        });
+
+        cx.update(|_, cx| {
+            modal.update(cx, |m, cx| {
+                m.open_menu(Menu::Priority, cx);
+                m.draft.priorities = vec![Priority::High];
+            });
+        });
+        cx.run_until_parked();
+        let ok_bounds = cx.debug_bounds("search-menu-ok").unwrap();
+        cx.simulate_click(ok_bounds.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            let m = modal.read(cx);
+            assert!(m.menu.is_none());
+            assert_eq!(m.task_filter.priorities, vec![Priority::High]);
+        });
+
+        // Long query CreateTask button truncates label inside modal bounds while emitting full query.
+        let long_query = "Very long unmatched query ".repeat(4).trim().to_owned();
+        let (short_label, truncated) = SearchModal::create_task_button_label("Add task", &long_query);
+        assert!(truncated);
+        assert!(short_label.ends_with("…\""));
+        cx.update(|_, cx| {
+            modal.update(cx, |m, cx| m.set_query(&long_query, cx));
+        });
+        cx.run_until_parked();
+        let create_bounds = cx.debug_bounds("search-create-task").unwrap();
+        assert!(create_bounds.size.width < px(536.));
+        cx.simulate_click(create_bounds.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(created.borrow().as_deref(), Some(long_query.as_str()));
     }
 }

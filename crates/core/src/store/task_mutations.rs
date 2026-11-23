@@ -244,7 +244,7 @@ impl Store {
         // The completed occurrence owns a snapshot of the checklist. Besides preserving
         // its history, this lets Undo restore the exact checked state transactionally.
         let items = {
-            let mut statement = self.conn.prepare(
+            let mut statement = self.conn.prepare_cached(
                 "SELECT id, title, sort_order, completed_at, created_at FROM checklist_items WHERE task_id = ?1",
             )?;
             statement

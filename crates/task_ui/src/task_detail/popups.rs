@@ -839,11 +839,7 @@ impl TaskDetail {
             Popup::List => {
                 self.list_search.update(cx, |input, cx| input.set_text("", cx));
                 self.list_submenu = None;
-                self.session.list_sections.clear();
-                for list_id in std::iter::once(None).chain(self.session.lists.iter().map(|l| Some(l.id))) {
-                    let sections = self.session.store.list_sections(list_id).unwrap_or_default();
-                    self.session.list_sections.insert(list_id, sections);
-                }
+                self.session.list_sections = self.session.store.all_list_sections().unwrap_or_default();
             }
             Popup::Templates => {
                 self.session.draft_templates = self.session.store.templates().unwrap_or_default();
@@ -1046,8 +1042,31 @@ impl TaskDetail {
         }
     }
 
+    pub(super) fn dismiss_confirm_delete_attachment(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.confirm_delete_attachment.take().is_none() {
+            return false;
+        }
+        let return_focus = self
+            .confirm_return_focus
+            .take()
+            .and_then(|focus| focus.upgrade());
+        if self.focus.is_focused(window) {
+            let focus = return_focus.unwrap_or_else(|| self.title.focus_handle(cx));
+            window.focus(&focus, cx);
+        }
+        cx.notify();
+        true
+    }
+
     /// Dismisses a popover even if focus is still in the task list or calendar.
     pub fn dismiss_popup(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.dismiss_confirm_delete_attachment(window, cx) {
+            return true;
+        }
         if self.session.popup.is_none() {
             return false;
         }

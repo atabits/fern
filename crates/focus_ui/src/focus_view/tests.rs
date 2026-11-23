@@ -346,3 +346,70 @@ fn delete_all_requires_confirmation_and_record_delete_bumps_data_version(cx: &mu
     assert!(view.read_with(cx, |v, _| v.sessions.is_empty()));
     assert!(cx.update(|_, cx| desktop_common::data_version::changed_elsewhere(other.entity_id(), cx)));
 }
+
+#[gpui::test]
+fn escape_inside_record_note_and_add_inputs_closes_modal_and_restores_focus(cx: &mut gpui::TestAppContext) {
+    use gpui::{KeyBinding, size};
+
+    cx.update(|cx| {
+        theme::init(cx);
+        cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+        cx.bind_keys([
+            KeyBinding::new("escape", crate::text_input::Cancel, Some("TextInput")),
+            KeyBinding::new("escape", crate::actions::DismissTransient, None),
+        ]);
+    });
+    let store = Rc::new(Store::open_in_memory().unwrap());
+    let now = now_ms();
+    let session = store.add_focus_session(None, "Review notes", now - 600_000, now).unwrap();
+    let (view, cx) = cx.add_window_view(|_, cx| FocusView::new(store.clone(), cx));
+    cx.simulate_resize(size(px(1000.), px(700.)));
+    cx.run_until_parked();
+
+    // Opening a record focuses record_note; Escape (Cancel) saves/closes and restores FocusView focus.
+    cx.update(|window, cx| view.update(cx, |v, cx| v.open_record(session.id, window, cx)));
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        let v = view.read(cx);
+        assert_eq!(v.open_record, Some(session.id));
+        assert!(v.record_note.focus_handle(cx).is_focused(window));
+    });
+
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        let v = view.read(cx);
+        assert_eq!(v.open_record, None);
+        assert!(v.focus_handle(cx).is_focused(window));
+    });
+
+    // Opening Add Record and focusing add_title or add_start: Escape closes popover and restores focus.
+    for target_start in [false, true] {
+        cx.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                v.set_record_menu(Some(RecordMenu::Add), cx);
+                let input = if target_start { &v.add_start } else { &v.add_title };
+                window.focus(&input.focus_handle(cx), cx);
+            });
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let v = view.read(cx);
+            assert!(v.record_menu.is_none());
+            assert!(v.focus_handle(cx).is_focused(window));
+        });
+    }
+
+    // DismissTransient from FocusView also closes RecordMenu::Add cleanly without losing focus.
+    cx.update(|_, cx| view.update(cx, |v, cx| v.set_record_menu(Some(RecordMenu::Add), cx)));
+    cx.run_until_parked();
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        let v = view.read(cx);
+        assert!(v.record_menu.is_none());
+        assert!(v.focus_handle(cx).is_focused(window));
+    });
+}

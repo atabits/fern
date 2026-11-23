@@ -14,7 +14,8 @@ use crate::markdown_toolbar::ToolbarAction;
 use crate::task_rows;
 
 use super::{
-    FocusTarget, OpenTask, Popup, StickyPaletteTokens, TaskDetail, activity_text, sticky_checkbox,
+    FocusTarget, OpenTask, Popup, StickyPaletteTokens, TaskDetail, TaskUpdated, activity_text,
+    sticky_checkbox,
 };
 
 /// A text button with an icon, used for the due date and the list.
@@ -971,6 +972,7 @@ impl Render for TaskDetail {
             }
         }
         let panel = v_flex()
+            .relative()
             .size_full()
             .key_context(if self.session.draft.is_some() {
                 "TaskDetail TaskDraft"
@@ -987,6 +989,9 @@ impl Render for TaskDetail {
                 this.print_current(cx);
             }))
             .on_action(cx.listener(|this, _: &DismissTransient, window, cx| {
+                if this.dismiss_confirm_delete_attachment(window, cx) {
+                    return;
+                }
                 if !this.dismiss_popup(window, cx) {
                     if this.session.draft.is_some() {
                         this.finish_draft(cx);
@@ -1205,6 +1210,46 @@ impl Render for TaskDetail {
             // Bottom bar: list ……… formatting, comments, more; for a trashed task, as in the
             // original: Restore ……… delete forever; for an archived-list task, read-only list label.
             .child(self.render_footer_bar(&meta, window, cx))
+            .when_some(self.confirm_delete_attachment.clone(), |el, att| {
+                el.child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .track_focus(&self.focus)
+                        .when(cfg!(test), |el| {
+                            el.debug_selector(|| "task-attachment-delete-modal".to_owned())
+                        })
+                        .child(
+                            ui::ConfirmDialog::new(
+                                "task-attachment-delete",
+                                strings.confirm_delete_attachment,
+                            )
+                            .width(px(340.))
+                            .description(att.name.clone())
+                            .cancel_label(strings.cancel)
+                            .confirm_label(strings.delete)
+                            .destructive(true)
+                            .on_cancel(cx.listener(|this, _, window, cx| {
+                                this.dismiss_confirm_delete_attachment(window, cx);
+                            }))
+                            .on_confirm(cx.listener(move |this, _, window, cx| {
+                                this.dismiss_confirm_delete_attachment(window, cx);
+                                if !this.is_read_only()
+                                    && let Some(dir) = &this.session.attachments_dir
+                                {
+                                    match this.session.store.delete_attachment(&att, dir) {
+                                        Ok(()) => cx.emit(TaskUpdated),
+                                        Err(err) => {
+                                            eprintln!("failed to remove the attachment: {err:#}");
+                                        }
+                                    }
+                                    this.sync_attachments();
+                                    cx.notify();
+                                }
+                            })),
+                        ),
+                )
+            })
     }
 }
 

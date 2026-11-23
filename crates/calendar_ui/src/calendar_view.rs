@@ -1,22 +1,22 @@
 //! The calendar: tasks placed on their due dates in a month grid or a week with a time axis,
 //! matched to TickTick's Calendar section.
 
-use std::{collections::{BTreeMap, HashSet}, rc::Rc, time::Duration};
+use std::{collections::{BTreeMap, HashSet}, rc::Rc};
 
 use chrono::{Datelike, Local, NaiveDate, NaiveTime};
-use fern_core::{CalendarOptions, ColorBy, Id, Store, Task};
+use fern_core::{CalendarOptions, Id, Store, Task};
 use gpui::{EventEmitter, Focusable, FontWeight};
 use ui::prelude::*;
 use ui::{Placement, PopoverAttachment};
 
 use crate::actions::{AgendaView, CalendarToday, DayView, DismissTransient, MonthView, MultiDayMode, NewTask, NextPeriod, NextYear, PreviousPeriod, PreviousYear, PrintYear, WeekView, YearView};
 use crate::calendar::{self, week_axis};
-use crate::drag::{DraggedEvent, DraggedTask, ResizeEdge, ResizedTask};
+use crate::drag::{DraggedTask, ResizeEdge, ResizedTask};
 use crate::i18n;
 use crate::calendar_options_view::CalendarOptionsDialog;
 #[cfg(debug_assertions)]
 use crate::calendar_options_view::Page;
-use crate::task_detail::{StartFocus, TaskDetail, TaskTextEdited, TaskTextField, TaskUpdated};
+use crate::task_detail::{StartFocus, TaskDetail, TaskTextEdited, TaskUpdated};
 use crate::task_rows;
 
 #[path = "calendar_task_editor.rs"]
@@ -31,12 +31,14 @@ mod arrange;
 mod event_editor;
 mod menus;
 mod month_grid;
+mod reload;
 mod sidebar;
 mod week_grid;
 
 use event_editor::EventEditor;
 use menus::{ContextMenuState, PendingDeleteEvent};
 use month_grid::{WEEK_NUMBER_WIDTH, WEEKDAY_HEADER_HEIGHT};
+use reload::ReloadWindow;
 use sidebar::CalendarFilter;
 use week_grid::{TimedResize, task_timed_resize_edges};
 
@@ -145,137 +147,9 @@ pub struct CalendarView {
     pending_delete_event: Option<PendingDeleteEvent>,
     pending_complete: HashSet<Id>,
     text_edit_sync_task: Option<gpui::Task<()>>,
+    loaded_window: Option<ReloadWindow>,
     active: bool,
     dirty: bool,
-}
-
-fn unfold_ics_lines(ics: &str) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    for raw in ics.lines() {
-        let line = raw.strip_suffix('\r').unwrap_or(raw);
-        if let Some(rest) = line.strip_prefix(' ').or_else(|| line.strip_prefix('\t'))
-            && let Some(prev) = out.last_mut()
-        {
-            prev.push_str(rest);
-            continue;
-        }
-        out.push(line.to_owned());
-    }
-    out
-}
-
-/// Returns `true` if any top-level `VEVENT` property in `ics` defines recurrence state
-/// (`RRULE`, `RDATE`, `EXDATE`, or `RECURRENCE-ID`) that single-event `EventDraft` serialization
-/// would otherwise clobber.
-fn ics_has_recurrence(ics: &str) -> bool {
-    let mut in_vevent = false;
-    let mut nested_depth = 0usize;
-    for line in unfold_ics_lines(ics) {
-        let upper = line.to_ascii_uppercase();
-        if upper == "BEGIN:VEVENT" {
-            in_vevent = true;
-            nested_depth = 0;
-            continue;
-        }
-        if upper == "END:VEVENT" {
-            in_vevent = false;
-            continue;
-        }
-        if !in_vevent {
-            continue;
-        }
-        if upper.starts_with("BEGIN:") {
-            nested_depth += 1;
-            continue;
-        }
-        if upper.starts_with("END:") {
-            nested_depth = nested_depth.saturating_sub(1);
-            continue;
-        }
-        if nested_depth > 0 {
-            continue;
-        }
-        let prop = upper
-            .split_once(':')
-            .map_or(upper.as_str(), |(lhs, _)| lhs)
-            .split_once(';')
-            .map_or_else(
-                || upper.split_once(':').map_or(upper.as_str(), |(lhs, _)| lhs),
-                |(name, _)| name,
-            );
-        if matches!(prop, "RRULE" | "RDATE" | "EXDATE" | "RECURRENCE-ID") {
-            return true;
-        }
-    }
-    false
-}
-
-/// Extracts the IANA timezone (`TZID=...` or `UTC` for `Z`-suffixed instants) from a `VEVENT`'s
-/// `DTSTART`, returning `None` for floating local times or all-day `DATE` values.
-fn extract_ics_tzid(ics: &str) -> Option<String> {
-    let mut in_vevent = false;
-    let mut nested_depth = 0usize;
-    for line in unfold_ics_lines(ics) {
-        let upper = line.to_ascii_uppercase();
-        if upper == "BEGIN:VEVENT" {
-            in_vevent = true;
-            nested_depth = 0;
-            continue;
-        }
-        if upper == "END:VEVENT" {
-            in_vevent = false;
-            continue;
-        }
-        if !in_vevent {
-            continue;
-        }
-        if upper.starts_with("BEGIN:") {
-            nested_depth += 1;
-            continue;
-        }
-        if upper.starts_with("END:") {
-            nested_depth = nested_depth.saturating_sub(1);
-            continue;
-        }
-        if nested_depth > 0 {
-            continue;
-        }
-        let Some((lhs, value)) = line.split_once(':') else { continue };
-        let mut parts = lhs.split(';');
-        let Some(name) = parts.next() else { continue };
-        if !name.eq_ignore_ascii_case("DTSTART") {
-            continue;
-        }
-        for param in parts {
-            if let Some((k, v)) = param.split_once('=')
-                && k.eq_ignore_ascii_case("TZID")
-            {
-                let trimmed = v.trim().trim_matches('"');
-                if let Some(zone) = calendar::canonical_timezone_name(trimmed) {
-                    return Some(zone.to_owned());
-                }
-            }
-        }
-        if value.trim().ends_with('Z') {
-            return Some("UTC".to_owned());
-        }
-        return None;
-    }
-    None
-}
-
-fn dual_tz_reference_day(
-    week: &[NaiveDate],
-    selected_day: Option<NaiveDate>,
-    anchor: NaiveDate,
-    today: NaiveDate,
-) -> NaiveDate {
-    selected_day
-        .filter(|d| week.contains(d))
-        .or_else(|| week.contains(&today).then_some(today))
-        .or_else(|| week.contains(&anchor).then_some(anchor))
-        .or_else(|| week.first().copied())
-        .unwrap_or(today)
 }
 
 /// A new task stays in a draft until it is saved. A day anchors the editor to a month cell;
@@ -411,6 +285,7 @@ impl CalendarView {
             pending_delete_event: None,
             pending_complete: HashSet::new(),
             text_edit_sync_task: None,
+            loaded_window: None,
             active: initial_active,
             dirty: !initial_active,
         };
@@ -418,81 +293,6 @@ impl CalendarView {
             this.reload(cx);
         }
         this
-    }
-
-    pub fn set_active(&mut self, active: bool, cx: &mut Context<Self>) {
-        self.active = active;
-        if active && self.dirty {
-            self.dirty = false;
-            self.card_updated(cx);
-        }
-    }
-
-    pub fn sync_external(&mut self, cx: &mut Context<Self>) {
-        if self.active {
-            self.card_updated(cx);
-        } else {
-            self.dirty = true;
-        }
-    }
-
-    /// The days on the hour axis: the anchor's week, the anchor, or several days from it.
-    fn shown_days(&self) -> Vec<NaiveDate> {
-        match self.mode {
-            CalendarMode::Day => vec![self.anchor],
-            CalendarMode::MultiDay(n) => (0..n as i64).map(|i| self.anchor + chrono::Duration::days(i)).collect(),
-            _ => calendar::week_of(self.anchor).into_iter().filter(|d| self.options.shows_day(*d)).collect(),
-        }
-    }
-
-    /// The tasks a day shows, as View Options say.
-    fn tasks_on(&self, date: NaiveDate) -> Vec<&Task> {
-        self.tasks.iter().filter(|t| self.options.shows_task(t, date)).collect()
-    }
-
-    /// A task's color, by its list, first tag or priority as View Options → Color By says.
-    fn task_tint(&self, task: &Task, theme: &theme::Theme) -> gpui::Hsla {
-        let accent = theme.colors().accent;
-        match self.options.color_by {
-            ColorBy::List => task.list_id.and_then(|id| self.list_colors.get(&id).copied()).unwrap_or(accent),
-            ColorBy::Tag => task.tags.first().and_then(|t| self.tag_colors.get(&t.to_lowercase()).copied()).unwrap_or(accent),
-            ColorBy::Priority => task_rows::priority_color(task.priority, theme).unwrap_or(accent),
-        }
-    }
-
-    /// The extra items of a day, as View Options say: today's habits (as the original's calendar,
-    /// on today only), the day's focus records, and its countdowns.
-    /// The subscribed calendars' events on `date`, all-day ones first, then by time.
-    fn events_on(&self, date: NaiveDate, cx: &App) -> Vec<EventBar> {
-        self.events_between(date, date, cx)
-    }
-
-    /// The subscribed calendars' events covering any day from `from` to `to`.
-    fn events_between(&self, from: NaiveDate, to: NaiveDate, cx: &App) -> Vec<EventBar> {
-        let Some(feeds) = crate::subscriptions::feeds(cx) else { return Vec::new() };
-        let accent = cx.theme().colors().accent;
-        let mut events: Vec<EventBar> = feeds
-            .read(cx)
-            .occurrences(from, to)
-            .into_iter()
-            .map(|occurrence| EventBar {
-                key: occurrence.event.uid.clone(),
-                subscription_id: occurrence.calendar.id,
-                writable: occurrence.calendar.is_caldav() && occurrence.calendar.writable,
-                recurring: occurrence.event.repeat.is_some(),
-                title: occurrence.event.title.clone(),
-                start: occurrence.times.start,
-                end: occurrence.times.end,
-                start_time: occurrence.times.start_time,
-                end_time: occurrence.times.end_time,
-                location: occurrence.event.location.clone(),
-                notes: occurrence.event.notes.clone(),
-                calendar: occurrence.calendar.title().to_owned(),
-                color: crate::lists_panel::parse_color(occurrence.calendar.color.as_deref()).unwrap_or(accent),
-            })
-            .collect();
-        events.sort_by_key(|event| (event.start_time.is_some(), event.start_time));
-        events
     }
 
     fn dismiss_transient(&mut self, _: &DismissTransient, window: &mut Window, cx: &mut Context<Self>) {
@@ -614,41 +414,6 @@ impl CalendarView {
         self.finish_toggle_task_completed(&task, completed, cx);
     }
 
-    /// The card's task changed: the calendar shows the change, and the card closes when the task
-    /// is gone.
-    fn card_updated(&mut self, cx: &mut Context<Self>) {
-        self.reload(cx);
-        let Some((id, _)) = self.card else { return };
-        match self.store.task(id) {
-            Ok(Some(task)) if !task.is_deleted() => self.detail.update(cx, |detail, cx| detail.refresh(Some(task), cx)),
-            _ => self.close_card(cx),
-        }
-    }
-
-    fn apply_task_text_edit(&mut self, edit: &TaskTextEdited, cx: &mut Context<Self>) {
-        if self.mode == CalendarMode::Agenda || self.dirty {
-            self.reload(cx);
-        } else {
-            for list in [&mut self.tasks, &mut self.undated, &mut self.horizon_tasks] {
-                for task in list.iter_mut().filter(|t| t.id == edit.id) {
-                    match &edit.field {
-                        TaskTextField::Title(title) => task.title = title.clone(),
-                        TaskTextField::Notes(notes) => task.notes = notes.clone(),
-                        TaskTextField::Location(location) => task.location = location.clone(),
-                    }
-                }
-            }
-            cx.notify();
-        }
-        self.text_edit_sync_task = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(Duration::from_millis(300)).await;
-            let _ = this.update(cx, |this, cx| {
-                this.text_edit_sync_task = None;
-                crate::data_version::data_changed(cx.entity_id(), cx);
-            });
-        }));
-    }
-
     /// The header's "…" menu and what it opens, for the debug-build dev state
     /// (`calendar-more=menu|options|color|color-by|style|arrange|arrange-tags|extras`).
     #[cfg(debug_assertions)]
@@ -698,209 +463,6 @@ impl CalendarView {
         if let Some(task) = self.tasks.iter().find(|t| t.title.contains(needle)) {
             self.open_context(task.id, gpui::point(px(600.), px(300.)), cx);
         }
-    }
-
-    pub fn reload(&mut self, cx: &mut Context<Self>) {
-        self.dirty = false;
-        self.year_heatmap.clear();
-        self.options = self.store.calendar_options().unwrap_or_default();
-        self.preferences = self.store.preferences().unwrap_or_default();
-        let lists = self.store.lists().unwrap_or_default();
-        self.list_colors = lists.iter().filter_map(|l| crate::lists_panel::parse_color(l.color.as_deref()).map(|c| (l.id, c))).collect();
-        self.list_names = lists.iter().filter(|l| !l.archived).map(|l| (l.id, l.name.clone())).collect();
-        self.lists = lists;
-        if let Some(menu) = &mut self.context_menu {
-            match self.store.task(menu.id) {
-                Ok(Some(task)) if !task.is_deleted() => {
-                    menu.nesting = crate::task_menu::TaskNesting::of(&self.store, task.id);
-                    menu.task = task;
-                }
-                _ => {
-                    self.context_menu = None;
-                    self.context_side = None;
-                }
-            }
-        }
-        let all_tags = self.store.tags().unwrap_or_default();
-        self.tag_names = all_tags.iter().map(|t| t.name.clone()).collect();
-        self.tag_colors = all_tags
-            .into_iter()
-            .filter_map(|t| crate::lists_panel::parse_color(t.color.as_deref()).map(|c| (t.name.to_lowercase(), c)))
-            .collect();
-        self.filter = self
-            .store
-            .setting("calendar_list_filter")
-            .ok()
-            .flatten()
-            .map(|raw| CalendarFilter::parse(&raw, &self.list_names, &self.tag_names))
-            .unwrap_or_default();
-        let filter = self.filter.clone();
-        let in_scope = |task: &Task| filter.matches(task);
-        if self.mode == CalendarMode::Agenda {
-            let from = self.agenda_start();
-            self.countdowns = self.store.countdowns().unwrap_or_default();
-            match self.store.tasks() {
-                Ok(mut tasks) => {
-                    tasks.retain(in_scope);
-                    self.sidebar_busy_days = tasks
-                        .iter()
-                        .filter(|t| !t.is_closed() && !t.is_deleted())
-                        .filter_map(|t| t.due_date)
-                        .collect();
-                    let countdowns: &[fern_core::Countdown] = if self.options.show_countdowns { &self.countdowns } else { &[] };
-                    let until = from + chrono::Duration::days(AGENDA_DAYS);
-                    let holidays = self.store.holiday_dates(from, until).unwrap_or_default();
-                    self.agenda = fern_core::agenda::agenda_with_holidays(&tasks, countdowns, &holidays, from, until)
-                }
-                Err(err) => eprintln!("failed to load the agenda: {err:#}"),
-            }
-            cx.notify();
-            return;
-        }
-        let range = match self.mode {
-            CalendarMode::Month | CalendarMode::MultiWeek(_) => {
-                let weeks = self.month_grid_weeks();
-                Some((weeks[0][0], weeks[weeks.len() - 1][6]))
-            }
-            // Year navigation only moves a viewport over the same data, including repeats
-            // that started before the visible year.
-            CalendarMode::Year => None,
-            _ => {
-                let days = self.shown_days();
-                Some((days[0], days[days.len() - 1]))
-            }
-        };
-        let Ok(mut all) = self.store.tasks().inspect_err(|err| eprintln!("failed to load calendar tasks: {err:#}")) else {
-            cx.notify();
-            return;
-        };
-        all.retain(in_scope);
-        self.sidebar_busy_days = all
-            .iter()
-            .filter(|t| !t.is_closed() && !t.is_deleted())
-            .filter_map(|t| t.due_date)
-            .collect();
-        self.tasks.clear();
-        self.undated.clear();
-        self.horizon_tasks.clear();
-        let mut repeats_before_range = Vec::new();
-        for task in all.into_iter().filter(|task| !task.is_deleted()) {
-            if !task.is_closed() && task.horizon.is_some() {
-                self.horizon_tasks.push(task.clone());
-            }
-            let Some(due) = task.due_date else {
-                if !task.is_closed() && task.parent_id.is_none() {
-                    self.undated.push(task);
-                }
-                continue;
-            };
-            if range.is_none_or(|(start, end)| due <= end && task.end_date.unwrap_or(due).max(due) >= start) {
-                self.tasks.push(task);
-            } else if range.is_some_and(|(start, _)| due < start)
-                && self.options.show_repeats && task.repeat.is_some() && !task.is_closed()
-            {
-                // As before, recurring occurrences go after the sorted tasks due in range.
-                repeats_before_range.push(task);
-            }
-        }
-        self.tasks.sort_by_key(|task| (task.due_date, task.due_time.is_some(), task.due_time));
-        self.tasks.extend(repeats_before_range);
-        self.countdowns = self.store.countdowns().unwrap_or_default();
-        if self.options.show_habits {
-            self.habits = self.store.habits().unwrap_or_default();
-            self.habit_records = self.store.all_habit_checkins().unwrap_or_default();
-        } else {
-            self.habits.clear();
-            self.habit_records.clear();
-        }
-        self.focus_sessions = if self.options.show_focus { self.store.focus_sessions().unwrap_or_default() } else { Vec::new() };
-        cx.notify();
-    }
-
-    /// The Agenda starts today in the current month, and on the first day of a later one.
-    fn agenda_start(&self) -> NaiveDate {
-        self.selected_day.unwrap_or_else(|| Local::now().date_naive().max(self.month))
-    }
-
-    fn can_shift(&self, delta: i32) -> bool {
-        if self.mode != CalendarMode::Year {
-            return true;
-        }
-        calendar_year::YEAR_RANGE.contains(&(self.month.year() + delta))
-    }
-
-    fn shift(&mut self, delta: i32, cx: &mut Context<Self>) {
-        if !self.can_shift(delta) || !self.finish_task_before_navigation(cx) {
-            return;
-        }
-        if self.mode == CalendarMode::Year {
-            let january = NaiveDate::from_ymd_opt(self.month.year() + delta, 1, 1).unwrap_or(self.month);
-            self.navigate_year(january, cx);
-            return;
-        }
-        self.selected_day = None;
-        self.sidebar_month = None;
-        self.year_day = None;
-        self.open_event = None;
-        match self.mode {
-            CalendarMode::Month => self.month = calendar::add_months(self.month, delta),
-            CalendarMode::Agenda => {
-                self.month = calendar::add_months(calendar::month_start(self.agenda_start()), delta);
-            }
-            mode => {
-                let step = match mode {
-                    CalendarMode::Day => 1,
-                    CalendarMode::MultiDay(n) => n as i64,
-                    CalendarMode::MultiWeek(n) => 7 * n as i64,
-                    _ => 7,
-                };
-                self.anchor += chrono::Duration::days(step * delta as i64);
-                self.month = calendar::month_start(self.anchor);
-            }
-        }
-        self.card = None;
-        self.reload(cx);
-    }
-
-    pub fn set_mode(&mut self, mode: CalendarMode, cx: &mut Context<Self>) {
-        self.mode_menu_open = false;
-        self.apply_mode(mode, cx);
-    }
-
-    fn apply_mode(&mut self, mode: CalendarMode, cx: &mut Context<Self>) {
-        if !self.finish_task_before_navigation(cx) {
-            return;
-        }
-        let prev_mode = self.mode;
-        self.mode = mode;
-        if prev_mode == CalendarMode::Year
-            && mode != CalendarMode::Year
-            && self.anchor.year() == self.month.year()
-        {
-            self.month = calendar::month_start(self.anchor);
-        }
-        self.year_day = None;
-        self.year_scroll = calendar_year::YearScroll::default();
-        self.year_jump = None;
-        match mode {
-            CalendarMode::Year => {
-                let day = calendar_year::clamp_year_day(self.month);
-                if day != self.month {
-                    self.anchor = day;
-                    self.selected_day = None;
-                    self.sidebar_month = None;
-                }
-                self.month = NaiveDate::from_ymd_opt(day.year(), 1, 1).unwrap_or(self.month);
-            }
-            CalendarMode::MultiDay(days) => self.multi_days = days,
-            CalendarMode::MultiWeek(weeks) => self.multi_weeks = weeks,
-            _ => {}
-        }
-        if (mode.is_timed() || matches!(mode, CalendarMode::MultiWeek(_))) && calendar::month_start(self.anchor) != self.month {
-            self.anchor = self.month;
-        }
-        self.card = None;
-        self.reload(cx);
     }
 
     /// Opens a countdown's card in the Agenda, for the debug-build dev state.
@@ -1025,152 +587,6 @@ impl CalendarView {
         self.reload(cx);
     }
 
-    fn move_event_to_day(&mut self, dragged: &DraggedEvent, target_day: NaiveDate, cx: &mut Context<Self>) {
-        let range = self.events_between(self.anchor - chrono::Duration::days(365), self.anchor + chrono::Duration::days(365), cx);
-        let Some(existing) = range.into_iter().find(|e| e.subscription_id == dragged.subscription_id && e.key == dragged.uid) else {
-            return;
-        };
-        let Some(feeds) = crate::subscriptions::feeds(cx) else {
-            return;
-        };
-        let stored = feeds.read(cx).stored_event(dragged.subscription_id, &dragged.uid);
-        // Never clobber a recurring master series via single-event drag-move.
-        if existing.recurring || stored.as_ref().is_some_and(|s| ics_has_recurrence(&s.ics)) {
-            return;
-        }
-        let span = (existing.end - existing.start).num_days().max(0);
-        let target_end_day = target_day + chrono::Duration::days(span);
-        let preserved_tz = stored
-            .as_ref()
-            .and_then(|s| extract_ics_tzid(&s.ics))
-            .and_then(|z| calendar::canonical_timezone_name(&z));
-        let (start_date, start_time, end_date, end_time, timezone) = match (existing.start_time, preserved_tz) {
-            (Some(st), Some(tz)) => {
-                let et = existing.end_time.unwrap_or_else(|| {
-                    let end_dt = target_end_day.and_time(st) + chrono::Duration::hours(1);
-                    end_dt.time()
-                });
-                let adjusted_end_day = if span == 0 && et < st {
-                    target_day + chrono::Duration::days(1)
-                } else {
-                    target_end_day
-                };
-                let (z_sd, z_st) = calendar::local_to_timezone(target_day, st, tz);
-                let (z_ed, z_et) = calendar::local_to_timezone(adjusted_end_day, et, tz);
-                (z_sd, Some(z_st), z_ed.max(z_sd), Some(z_et), Some(tz.to_owned()))
-            }
-            _ => (target_day, existing.start_time, target_end_day, existing.end_time, None),
-        };
-        let draft = fern_core::ical::EventDraft {
-            uid: existing.key,
-            title: existing.title,
-            location: existing.location,
-            notes: existing.notes,
-            start_date,
-            start_time,
-            end_date,
-            end_time,
-            all_day: existing.start_time.is_none(),
-            timezone,
-        };
-        feeds.update(cx, |feeds, cx| {
-            if let Err(err) = feeds.save_event(dragged.subscription_id, &draft, cx) {
-                eprintln!("failed to move CalDAV event: {err:#}");
-            }
-        });
-        cx.notify();
-    }
-
-    fn go_to_today(&mut self, cx: &mut Context<Self>) {
-        if !self.finish_task_before_navigation(cx) {
-            return;
-        }
-        let today = Local::now().date_naive();
-        if self.mode == CalendarMode::Year {
-            self.anchor = calendar_year::clamp_year_day(today);
-            self.month = NaiveDate::from_ymd_opt(self.anchor.year(), 1, 1).unwrap_or(self.month);
-        } else {
-            self.anchor = today;
-            self.month = calendar::month_start(today);
-        }
-        self.selected_day = None;
-        self.sidebar_month = None;
-        self.year_day = None;
-        self.open_event = None;
-        self.year_scroll = calendar_year::YearScroll::default();
-        self.reload(cx);
-    }
-
-    fn select_month(&mut self, year: i32, month: u32, cx: &mut Context<Self>) {
-        if !self.finish_task_before_navigation(cx) {
-            return;
-        }
-        let today = Local::now().date_naive();
-        let first = NaiveDate::from_ymd_opt(year, month, 1).unwrap_or(self.month);
-        let target = if today.year() == year && today.month() == month { today } else { first };
-        self.month = first;
-        self.anchor = target;
-        self.selected_day = None;
-        self.sidebar_month = None;
-        self.month_picker_open = None;
-        self.year_day = None;
-        self.open_event = None;
-        self.close_card(cx);
-        self.reload(cx);
-    }
-
-    fn select_day(&mut self, day: NaiveDate, cx: &mut Context<Self>) {
-        if !self.finish_task_before_navigation(cx) {
-            return;
-        }
-        let day = if self.mode == CalendarMode::Year {
-            let day = calendar_year::clamp_year_day(day);
-            self.month = NaiveDate::from_ymd_opt(day.year(), 1, 1).unwrap_or(self.month);
-            self.year_scroll = calendar_year::YearScroll::default();
-            day
-        } else {
-            self.month = calendar::month_start(day);
-            day
-        };
-        self.selected_day = Some(day);
-        self.anchor = day;
-        self.sidebar_month = None;
-        self.year_day = None;
-        self.open_event = None;
-        self.close_card(cx);
-        self.reload(cx);
-    }
-
-    fn new_task_day(&self, today: NaiveDate) -> NaiveDate {
-        use chrono::Duration;
-        let (start, end) = match self.mode {
-            CalendarMode::Month => (self.month, calendar::add_months(self.month, 1).pred_opt().unwrap_or(self.month)),
-            CalendarMode::Year => {
-                (self.month, calendar::add_months(self.month, 12).pred_opt().unwrap_or(self.month))
-            }
-            CalendarMode::MultiWeek(count) => {
-                let start = calendar::week_of(self.anchor)[0];
-                (start, start + Duration::days(i64::from(count) * 7 - 1))
-            }
-            CalendarMode::Agenda => (self.agenda_start(), self.agenda_start() + Duration::days(AGENDA_DAYS)),
-            _ => {
-                let days = self.shown_days();
-                (days[0], days[days.len() - 1])
-            }
-        };
-        let visible = |day| (start..=end).contains(&day)
-            && (!matches!(self.mode, CalendarMode::Month | CalendarMode::Week | CalendarMode::MultiWeek(_)) || self.options.shows_day(day));
-        self.selected_day.filter(|day| visible(*day))
-            .or_else(|| visible(today).then_some(today))
-            .or_else(|| start.iter_days().take_while(|day| *day <= end).find(|day| visible(*day)))
-            .unwrap_or(start)
-    }
-
-    /// Changing the view must never detach a cell's editor while its draft is still active.
-    pub fn finish_task_before_navigation(&mut self, cx: &mut Context<Self>) -> bool {
-        self.task_editor.as_ref().is_none_or(|editor| editor.view.update(cx, |editor, cx| editor.close(cx)))
-    }
-
     fn open_task_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(editor) = &self.task_editor {
             window.focus(&editor.view.focus_handle(cx), cx);
@@ -1227,72 +643,10 @@ impl CalendarView {
         cx.notify();
     }
 
-    fn hint_if_outside_filter(&mut self, id: Id, cx: &mut Context<Self>) {
-        if self.filter.all {
-            return;
-        }
-        let Ok(Some(task)) = self.store.task(id) else {
-            return;
-        };
-        if self.filter.matches(&task) {
-            return;
-        }
-        let strings = i18n::t(cx);
-        let list = self.list_names.iter().find(|(id, _)| Some(*id) == task.list_id)
-            .map_or(strings.inbox, |(_, name)| name.as_str());
-        let message = strings.calendar_saved_outside_filter.replace("{list}", list);
-        let timeout = cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(Duration::from_secs(5)).await;
-            let _ = this.update(cx, |this, cx| {
-                this.saved_hint = None;
-                cx.notify();
-            });
-        });
-        self.saved_hint = Some((message, timeout));
-    }
-
     fn has_modal(&self) -> bool {
         self.event_editor.is_some()
             || self.options_dialog.is_some()
             || self.pending_delete_event.is_some()
-    }
-
-    /// ISO week horizon for the currently displayed week in Week view.
-    fn displayed_week_horizon(&self) -> fern_core::Horizon {
-        let week = calendar::week_of(self.anchor);
-        let ref_day = week
-            .iter()
-            .find(|d| d.weekday() == chrono::Weekday::Thu)
-            .copied()
-            .unwrap_or(week[3]);
-        fern_core::Horizon::current_week(ref_day)
-    }
-
-    /// Collects open non-deleted tasks for `target`, plus unfinished past tasks of the same
-    /// granularity when `include_past_when_current` is true and `target` is the current period.
-    /// Returns `(task, is_rollover)` pairs with exact matches first, followed by past rollovers.
-    pub(super) fn horizon_goals_for(
-        &self,
-        target: fern_core::Horizon,
-        today: NaiveDate,
-        include_past_when_current: bool,
-    ) -> Vec<(&Task, bool)> {
-        if !calendar::horizons_enabled() {
-            return Vec::new();
-        }
-        let lists: &[fern_core::List] = if self.filter.all { &self.lists } else { &[] };
-        let (in_target, past_rollover) = fern_core::horizon::horizons_bucket_partition(
-            &self.horizon_tasks,
-            lists,
-            target,
-            today,
-            false,
-        );
-        let mut out: Vec<(&Task, bool)> = in_target.into_iter().map(|t| (t, false)).collect();
-        if include_past_when_current {
-            out.extend(past_rollover.into_iter().map(|t| (t, true)));
-        }
-        out
     }
 
     /// Renders a sleek, compact horizontal banner of horizon goals with draggable task chips.
@@ -1481,15 +835,6 @@ impl CalendarView {
                 )
                 .into_any_element(),
         )
-    }
-
-    fn toolbar_month(&self) -> NaiveDate {
-        match self.mode {
-            CalendarMode::Month | CalendarMode::Year => self.month,
-            CalendarMode::Agenda => calendar::month_start(self.agenda_start()),
-            CalendarMode::Week | CalendarMode::MultiWeek(_) => calendar::week_of(self.anchor)[0],
-            _ => self.anchor,
-        }
     }
 }
 

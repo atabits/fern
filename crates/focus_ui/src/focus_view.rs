@@ -251,6 +251,7 @@ pub struct FocusView {
     /// The focus record whose dialog is open, and its note field.
     open_record: Option<Id>,
     record_note: Entity<TextInput>,
+    pending_focus: bool,
     active: bool,
     dirty: bool,
 }
@@ -274,6 +275,23 @@ impl FocusView {
         let strings = i18n::t(cx);
         let add_title = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.focus_record_title, cx));
         let add_start = cx.new(|cx| TextInput::new(Mode::SingleLine, strings.focus_record_start, cx));
+        let record_note = cx.new(|cx| TextInput::new(Mode::MultiLine, strings.focus_note_placeholder, cx));
+        cx.subscribe(&record_note, |this, _, _: &crate::text_input::Cancelled, cx| {
+            if this.open_record.is_some() {
+                this.close_record(cx);
+                this.pending_focus = true;
+            }
+        })
+        .detach();
+        for input in [&add_title, &add_start] {
+            cx.subscribe(input, |this, _, _: &crate::text_input::Cancelled, cx| {
+                if this.record_menu == Some(RecordMenu::Add) {
+                    this.set_record_menu(None, cx);
+                    this.pending_focus = true;
+                }
+            })
+            .detach();
+        }
         let settings = FocusSettings::load(&store);
         cx.observe_global::<desktop_common::data_version::DataVersion>(|this, cx| {
             if desktop_common::data_version::changed_elsewhere(cx.entity_id(), cx) {
@@ -321,7 +339,8 @@ impl FocusView {
             stats: None,
             stats_scroll: ScrollHandle::new(),
             open_record: None,
-            record_note: cx.new(|cx| TextInput::new(Mode::MultiLine, strings.focus_note_placeholder, cx)),
+            record_note,
+            pending_focus: false,
             active: initial_active,
             dirty: !initial_active,
         };
@@ -1407,7 +1426,15 @@ impl Drop for FocusView {
 }
 
 impl Render for FocusView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if std::mem::take(&mut self.pending_focus)
+            || (self.open_record.is_none() && self.record_note.focus_handle(cx).is_focused(window))
+            || (self.record_menu != Some(RecordMenu::Add)
+                && (self.add_title.focus_handle(cx).is_focused(window)
+                    || self.add_start.focus_handle(cx).is_focused(window)))
+        {
+            window.focus(&self.focus_handle, cx);
+        }
         self.sync_ambient_sound();
         if let Some(page) = self.stats {
             return self.render_stats(page, cx);

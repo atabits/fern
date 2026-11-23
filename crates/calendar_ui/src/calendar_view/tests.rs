@@ -1,5 +1,6 @@
 use super::*;
-use super::week_grid::{LanePlacement, TimedInterval, assign_timed_lanes};
+use super::week_grid::{LanePlacement, TimedInterval, assign_timed_lanes, dual_tz_reference_day};
+use crate::drag::DraggedEvent;
 use chrono::TimeZone as _;
 use gpui::{Modifiers, MouseButton, MouseDownEvent, MouseUpEvent, ScrollDelta, ScrollWheelEvent, TestAppContext, TouchPhase, point, size};
 
@@ -1684,6 +1685,49 @@ fn year_to_agenda_restores_anchor_month_and_shift_advances_agenda(cx: &mut TestA
             assert_eq!(cal.month, next_month);
             assert_eq!(cal.agenda_start(), next_month);
             assert_eq!(cal.toolbar_month(), next_month);
+        });
+    });
+}
+
+#[gpui::test]
+fn reload_skips_countdowns_when_disabled_and_loads_when_enabled(cx: &mut TestAppContext) {
+    let store = Rc::new(Store::open_in_memory().unwrap());
+    let today = Local::now().date_naive();
+    let countdown = store
+        .add_countdown("Launch", today, fern_core::CountdownKind::Countdown)
+        .unwrap();
+    let mut options = CalendarOptions {
+        show_countdowns: false,
+        ..CalendarOptions::default()
+    };
+    store.save_calendar_options(&options).unwrap();
+    cx.update(|cx| {
+        theme::init(cx);
+        cx.set_global(i18n::CurrentLocale(i18n::Locale::En));
+    });
+    let (view, cx) = cx.add_window_view(|window, cx| CalendarView::new(store.clone(), window, cx));
+
+    cx.update(|_, cx| {
+        view.update(cx, |cal, cx| {
+            assert!(cal.countdowns.is_empty());
+
+            cal.set_mode(CalendarMode::Agenda, cx);
+            assert!(cal.countdowns.is_empty());
+
+            options.show_countdowns = true;
+            store.save_calendar_options(&options).unwrap();
+            cal.reload(cx);
+            assert_eq!(cal.countdowns.len(), 1);
+            assert_eq!(cal.countdowns[0].id, countdown.id);
+
+            cal.set_mode(CalendarMode::Month, cx);
+            assert_eq!(cal.countdowns.len(), 1);
+            assert_eq!(cal.countdowns[0].id, countdown.id);
+
+            options.show_countdowns = false;
+            store.save_calendar_options(&options).unwrap();
+            cal.reload(cx);
+            assert!(cal.countdowns.is_empty());
         });
     });
 }

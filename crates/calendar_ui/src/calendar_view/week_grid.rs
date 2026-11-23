@@ -8,8 +8,22 @@ use crate::drag::{DraggedEvent, DraggedTask, ResizeEdge, ResizedTask};
 use crate::i18n;
 
 use super::{
-    CalendarView, EventBar, dual_tz_reference_day,
+    CalendarView, EventBar,
 };
+
+pub(super) fn dual_tz_reference_day(
+    week: &[NaiveDate],
+    selected_day: Option<NaiveDate>,
+    anchor: NaiveDate,
+    today: NaiveDate,
+) -> NaiveDate {
+    selected_day
+        .filter(|d| week.contains(d))
+        .or_else(|| week.contains(&today).then_some(today))
+        .or_else(|| week.contains(&anchor).then_some(anchor))
+        .or_else(|| week.first().copied())
+        .unwrap_or(today)
+}
 
 const MAX_DAY_MINUTES: i32 = 23 * 60 + 59;
 const MIN_TIMED_RESIZE_MINUTES: i32 = 15;

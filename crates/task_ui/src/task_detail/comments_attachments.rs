@@ -219,33 +219,35 @@ impl TaskDetail {
                 )
                 .when(!read_only, |el| {
                     el.child(
-                        IconButton::new(SharedString::from(format!("attachment-delete-{att_id}")), IconName::X)
-                            .size(px(20.))
-                            .icon_size(IconSize::XSmall)
-                            .when_some(sticky, |b, t| b.icon_color(t.muted).hover_color(t.surface))
-                            .hover_icon_color(delete_hover_color)
-                            .tooltip(Tooltip::text(strings.delete))
-                            .on_click(
-                            cx.listener(move |this, _, _, cx| {
-                                cx.stop_propagation();
-                                if this.is_read_only() {
-                                    return;
-                                }
-                                if let Some(draft) = &mut this.session.draft {
-                                    draft.attachments.retain(|prepared| prepared.metadata().id != removed.id);
-                                    this.sync_attachments();
-                                    cx.notify();
-                                    return;
-                                }
-                                let Some(dir) = &this.session.attachments_dir else { return };
-                                match this.session.store.delete_attachment(&removed, dir) {
-                                    Ok(()) => cx.emit(TaskUpdated),
-                                    Err(err) => eprintln!("failed to remove the attachment: {err:#}"),
-                                }
-                                this.sync_attachments();
-                                cx.notify();
-                            }),
-                        ),
+                        div()
+                            .when(cfg!(test), |el| {
+                                el.debug_selector(|| "task-attachment-delete".to_owned())
+                            })
+                            .child(
+                                IconButton::new(SharedString::from(format!("attachment-delete-{att_id}")), IconName::X)
+                                    .size(px(20.))
+                                    .icon_size(IconSize::XSmall)
+                                    .when_some(sticky, |b, t| b.icon_color(t.muted).hover_color(t.surface))
+                                    .hover_icon_color(delete_hover_color)
+                                    .tooltip(Tooltip::text(strings.delete))
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        cx.stop_propagation();
+                                        if this.is_read_only() {
+                                            return;
+                                        }
+                                        if let Some(draft) = &mut this.session.draft {
+                                            draft.attachments.retain(|prepared| prepared.metadata().id != removed.id);
+                                            this.sync_attachments();
+                                            cx.notify();
+                                            return;
+                                        }
+                                        this.confirm_delete_attachment = Some(removed.clone());
+                                        this.confirm_return_focus =
+                                            window.focused(cx).map(|handle| handle.downgrade());
+                                        window.focus(&this.focus, cx);
+                                        cx.notify();
+                                    })),
+                            ),
                     )
                 })
                 .on_click(move |_, _, cx| {

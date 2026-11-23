@@ -70,13 +70,6 @@ fn fast_forward_repeat_anchor(
 }
 
 impl CalendarView {
-    pub(super) fn month_grid_weeks(&self) -> Vec<[NaiveDate; 7]> {
-        match self.mode {
-            CalendarMode::MultiWeek(n) => calendar::weeks_from(self.anchor, n as usize),
-            _ => calendar::month_weeks(self.month),
-        }
-    }
-
     pub(super) fn bucket_range<'a>(
         &'a self,
         first: NaiveDate,

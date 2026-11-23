@@ -6,9 +6,125 @@ use ui::prelude::*;
 use ui::Switch;
 
 use crate::calendar;
+use crate::drag::DraggedEvent;
 use crate::i18n;
 
-use super::{CalendarView, EventBar, extract_ics_tzid, ics_has_recurrence};
+use super::{CalendarView, EventBar};
+
+fn unfold_ics_lines(ics: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for raw in ics.lines() {
+        let line = raw.strip_suffix('\r').unwrap_or(raw);
+        if let Some(rest) = line.strip_prefix(' ').or_else(|| line.strip_prefix('\t'))
+            && let Some(prev) = out.last_mut()
+        {
+            prev.push_str(rest);
+            continue;
+        }
+        out.push(line.to_owned());
+    }
+    out
+}
+
+/// Returns `true` if any top-level `VEVENT` property in `ics` defines recurrence state
+/// (`RRULE`, `RDATE`, `EXDATE`, or `RECURRENCE-ID`) that single-event `EventDraft` serialization
+/// would otherwise clobber.
+pub(super) fn ics_has_recurrence(ics: &str) -> bool {
+    let mut in_vevent = false;
+    let mut nested_depth = 0usize;
+    for line in unfold_ics_lines(ics) {
+        let upper = line.to_ascii_uppercase();
+        if upper == "BEGIN:VEVENT" {
+            in_vevent = true;
+            nested_depth = 0;
+            continue;
+        }
+        if upper == "END:VEVENT" {
+            in_vevent = false;
+            continue;
+        }
+        if !in_vevent {
+            continue;
+        }
+        if upper.starts_with("BEGIN:") {
+            nested_depth += 1;
+            continue;
+        }
+        if upper.starts_with("END:") {
+            nested_depth = nested_depth.saturating_sub(1);
+            continue;
+        }
+        if nested_depth > 0 {
+            continue;
+        }
+        let prop = upper
+            .split_once(':')
+            .map_or(upper.as_str(), |(lhs, _)| lhs)
+            .split_once(';')
+            .map_or_else(
+                || upper.split_once(':').map_or(upper.as_str(), |(lhs, _)| lhs),
+                |(name, _)| name,
+            );
+        if matches!(prop, "RRULE" | "RDATE" | "EXDATE" | "RECURRENCE-ID") {
+            return true;
+        }
+    }
+    false
+}
+
+/// Extracts the IANA timezone (`TZID=...` or `UTC` for `Z`-suffixed instants) from a `VEVENT`'s
+/// `DTSTART`, returning `None` for floating local times or all-day `DATE` values.
+pub(super) fn extract_ics_tzid(ics: &str) -> Option<String> {
+    let mut in_vevent = false;
+    let mut nested_depth = 0usize;
+    for line in unfold_ics_lines(ics) {
+        let upper = line.to_ascii_uppercase();
+        if upper == "BEGIN:VEVENT" {
+            in_vevent = true;
+            nested_depth = 0;
+            continue;
+        }
+        if upper == "END:VEVENT" {
+            in_vevent = false;
+            continue;
+        }
+        if !in_vevent {
+            continue;
+        }
+        if upper.starts_with("BEGIN:") {
+            nested_depth += 1;
+            continue;
+        }
+        if upper.starts_with("END:") {
+            nested_depth = nested_depth.saturating_sub(1);
+            continue;
+        }
+        if nested_depth > 0 {
+            continue;
+        }
+        let Some((lhs, value)) = line.split_once(':') else { continue };
+        let mut parts = lhs.split(';');
+        let Some(name) = parts.next() else { continue };
+        if !name.eq_ignore_ascii_case("DTSTART") {
+            continue;
+        }
+        for param in parts {
+            if let Some((k, v)) = param.split_once('=')
+                && k.eq_ignore_ascii_case("TZID")
+            {
+                let trimmed = v.trim().trim_matches('"');
+                if let Some(zone) = calendar::canonical_timezone_name(trimmed) {
+                    return Some(zone.to_owned());
+                }
+            }
+        }
+        if value.trim().ends_with('Z') {
+            return Some("UTC".to_owned());
+        }
+        return None;
+    }
+    None
+}
 
 pub(super) struct EventEditor {
     pub(super) subscription_id: Id,
@@ -400,5 +516,61 @@ impl CalendarView {
                 )
                 .into_any_element(),
         )
+    }
+
+    pub(super) fn move_event_to_day(&mut self, dragged: &DraggedEvent, target_day: NaiveDate, cx: &mut Context<Self>) {
+        let range = self.events_between(self.anchor - chrono::Duration::days(365), self.anchor + chrono::Duration::days(365), cx);
+        let Some(existing) = range.into_iter().find(|e| e.subscription_id == dragged.subscription_id && e.key == dragged.uid) else {
+            return;
+        };
+        let Some(feeds) = crate::subscriptions::feeds(cx) else {
+            return;
+        };
+        let stored = feeds.read(cx).stored_event(dragged.subscription_id, &dragged.uid);
+        // Never clobber a recurring master series via single-event drag-move.
+        if existing.recurring || stored.as_ref().is_some_and(|s| ics_has_recurrence(&s.ics)) {
+            return;
+        }
+        let span = (existing.end - existing.start).num_days().max(0);
+        let target_end_day = target_day + chrono::Duration::days(span);
+        let preserved_tz = stored
+            .as_ref()
+            .and_then(|s| extract_ics_tzid(&s.ics))
+            .and_then(|z| calendar::canonical_timezone_name(&z));
+        let (start_date, start_time, end_date, end_time, timezone) = match (existing.start_time, preserved_tz) {
+            (Some(st), Some(tz)) => {
+                let et = existing.end_time.unwrap_or_else(|| {
+                    let end_dt = target_end_day.and_time(st) + chrono::Duration::hours(1);
+                    end_dt.time()
+                });
+                let adjusted_end_day = if span == 0 && et < st {
+                    target_day + chrono::Duration::days(1)
+                } else {
+                    target_end_day
+                };
+                let (z_sd, z_st) = calendar::local_to_timezone(target_day, st, tz);
+                let (z_ed, z_et) = calendar::local_to_timezone(adjusted_end_day, et, tz);
+                (z_sd, Some(z_st), z_ed.max(z_sd), Some(z_et), Some(tz.to_owned()))
+            }
+            _ => (target_day, existing.start_time, target_end_day, existing.end_time, None),
+        };
+        let draft = fern_core::ical::EventDraft {
+            uid: existing.key,
+            title: existing.title,
+            location: existing.location,
+            notes: existing.notes,
+            start_date,
+            start_time,
+            end_date,
+            end_time,
+            all_day: existing.start_time.is_none(),
+            timezone,
+        };
+        feeds.update(cx, |feeds, cx| {
+            if let Err(err) = feeds.save_event(dragged.subscription_id, &draft, cx) {
+                eprintln!("failed to move CalDAV event: {err:#}");
+            }
+        });
+        cx.notify();
     }
 }

@@ -137,6 +137,9 @@ pub struct TaskDetail {
     /// The Add Subtask field shown while the task has no subtasks, from the "…" menu.
     subtask_open: bool,
     body_scroll: gpui::ScrollHandle,
+    focus: FocusHandle,
+    confirm_delete_attachment: Option<fern_core::Attachment>,
+    confirm_return_focus: Option<WeakFocusHandle>,
     pending_complete: Option<Id>,
     _session_subscriptions: Vec<Subscription>,
 }
@@ -297,6 +300,9 @@ impl TaskDetail {
             calendar_card: false,
             subtask_open: false,
             body_scroll: gpui::ScrollHandle::new(),
+            focus: cx.focus_handle(),
+            confirm_delete_attachment: None,
+            confirm_return_focus: None,
             pending_complete: None,
             _session_subscriptions: subscriptions,
         }
@@ -375,6 +381,8 @@ impl TaskDetail {
             self.subtask_open = false;
             self.session.popup = None;
             self.session.tag_draft = None;
+            self.confirm_delete_attachment = None;
+            self.confirm_return_focus = None;
         }
         self.sync_read_only_inputs(cx);
     }
@@ -418,6 +426,8 @@ impl TaskDetail {
         self.copied_reset = None;
         self.session.task = task;
         self.session.popup = None;
+        self.confirm_delete_attachment = None;
+        self.confirm_return_focus = None;
         self.editor_window.popup_return_focus = None;
         self.session.tag_draft = None;
         self.session.attachment_errors.clear();
@@ -665,6 +675,12 @@ impl TaskDetail {
                 self.show_checklist |= !self.checklist.is_empty();
                 self.sync_subtasks();
                 self.sync_attachments();
+                if let Some(pending) = &self.confirm_delete_attachment
+                    && !self.session.attachments.iter().any(|att| att.id == pending.id)
+                {
+                    self.confirm_delete_attachment = None;
+                    self.confirm_return_focus = None;
+                }
                 self.sync_comments();
                 self.sync_sticky_inputs(cx);
                 cx.notify();
@@ -1319,6 +1335,94 @@ mod tests {
                 "title caret on dark sticky must paint in dark_fg"
             );
         });
+    }
+
+    #[gpui::test]
+    fn persisted_attachment_delete_requires_confirmation_and_supports_escape_cancel(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = std::env::temp_dir().join(format!("fern-att-confirm-{}", uuid::Uuid::now_v7()));
+        let source = dir.join("spec.txt");
+        let attachments_dir = dir.join("attachments");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&source, "keep me").unwrap();
+
+        let store = Rc::new(Store::open_in_memory().unwrap());
+        let task = store.add_task("Task with attachment").unwrap();
+        let task_id = task.id;
+        let prepared = PreparedAttachment::copy(task_id, &source, &attachments_dir).unwrap();
+        let att = store.save_attachment(prepared, &attachments_dir).unwrap();
+        let att_path = att.path(&attachments_dir);
+        assert!(att_path.exists());
+
+        cx.update(|cx| {
+            theme::init(cx);
+            cx.set_global(CurrentLocale(i18n::Locale::En));
+            assert!(crate::keymap::load_default(&assets::Assets, cx).unwrap().is_empty());
+        });
+        let updated = Rc::new(std::cell::Cell::new(0usize));
+        let updated_sub = updated.clone();
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let mut detail = TaskDetail::new(store.clone(), window, cx);
+            detail.session.attachments_dir = Some(attachments_dir.clone());
+            detail.show(Some(task), cx);
+            detail
+        });
+        cx.update(|_, cx| {
+            cx.subscribe(&view, move |_, _: &TaskUpdated, _| {
+                updated_sub.set(updated_sub.get() + 1);
+            })
+            .detach();
+        });
+        cx.run_until_parked();
+
+        let delete_bounds = cx
+            .debug_bounds("task-attachment-delete")
+            .expect("delete button visible");
+        cx.simulate_click(delete_bounds.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        cx.update(|_, cx| {
+            assert_eq!(
+                view.read(cx).confirm_delete_attachment.as_ref().map(|a| a.id),
+                Some(att.id)
+            );
+        });
+        assert!(cx.debug_bounds("task-attachment-delete-modal").is_some());
+        assert_eq!(store.attachments(task_id).unwrap().len(), 1);
+        assert!(att_path.exists());
+        assert_eq!(updated.get(), 0);
+
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        cx.update(|_, cx| assert!(view.read(cx).confirm_delete_attachment.is_none()));
+        assert!(cx.debug_bounds("task-attachment-delete-modal").is_none());
+        assert_eq!(store.attachments(task_id).unwrap().len(), 1);
+        assert!(att_path.exists());
+        assert_eq!(updated.get(), 0);
+
+        let delete_bounds = cx
+            .debug_bounds("task-attachment-delete")
+            .expect("delete button still visible");
+        cx.simulate_click(delete_bounds.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        let modal_bounds = cx
+            .debug_bounds("task-attachment-delete-modal")
+            .expect("delete confirmation modal bounds");
+        let confirm_btn = gpui::point(
+            modal_bounds.center().x + px(120.),
+            modal_bounds.center().y + px(38.),
+        );
+        cx.simulate_click(confirm_btn, gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        cx.update(|_, cx| assert!(view.read(cx).confirm_delete_attachment.is_none()));
+        assert!(cx.debug_bounds("task-attachment-delete-modal").is_none());
+        assert!(store.attachments(task_id).unwrap().is_empty());
+        assert!(!att_path.exists());
+        assert_eq!(updated.get(), 1);
+
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
 

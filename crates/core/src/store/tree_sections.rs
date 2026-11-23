@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context as _, Result};
 use rusqlite::{OptionalExtension, params};
@@ -14,6 +14,16 @@ const SELECT_SUBTASKS_SQL: &str = concat!(
     " FROM tasks WHERE parent_id = ?1 AND deleted_at IS NULL ",
     "ORDER BY completed_at IS NOT NULL, completed_at DESC, sort_order, rowid DESC"
 );
+
+fn list_section_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<crate::model::ListSection> {
+    Ok(crate::model::ListSection {
+        id: parse_uuid(&row.get::<_, String>(0)?, 0)?,
+        list_id: row
+            .get::<_, Option<String>>(1)?
+            .and_then(|l| Uuid::parse_str(&l).ok()),
+        name: row.get(2)?,
+    })
+}
 
 impl Store {
     /// Moves a task right before (or after) `target` in the manual order, then renumbers the
@@ -120,15 +130,23 @@ impl Store {
             "SELECT id, list_id, name FROM list_sections WHERE list_id IS ?1 ORDER BY sort_order, created_at, rowid",
         )?;
         let sections = stmt
-            .query_map([list.map(|l| l.to_string())], |row| {
-                Ok(crate::model::ListSection {
-                    id: parse_uuid(&row.get::<_, String>(0)?, 0)?,
-                    list_id: row.get::<_, Option<String>>(1)?.and_then(|l| Uuid::parse_str(&l).ok()),
-                    name: row.get(2)?,
-                })
-            })?
+            .query_map([list.map(|l| l.to_string())], list_section_from_row)?
             .collect::<Result<_, _>>()?;
         Ok(sections)
+    }
+
+    /// Loads all list sections across every list (and Inbox under `None`) in a single query,
+    /// preserving each list's `sort_order, created_at, rowid` order.
+    pub fn all_list_sections(&self) -> Result<HashMap<Option<Id>, Vec<crate::model::ListSection>>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT id, list_id, name FROM list_sections ORDER BY sort_order, created_at, rowid",
+        )?;
+        let mut by_list: HashMap<Option<Id>, Vec<crate::model::ListSection>> = HashMap::new();
+        for section in stmt.query_map([], list_section_from_row)? {
+            let section = section?;
+            by_list.entry(section.list_id).or_default().push(section);
+        }
+        Ok(by_list)
     }
 
     pub fn add_list_section(&self, list: Option<Id>, name: &str) -> Result<crate::model::ListSection> {

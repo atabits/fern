@@ -51,8 +51,6 @@ pub(super) enum ListAction {
     ShowTags(fern_core::Visibility),
 }
 
-/// An entry of the task list: a row, or what the list shows around the rows.
-#[allow(clippy::large_enum_variant)]
 impl TodoView {
     pub(super) fn open_list_activity(&mut self, cx: &mut Context<Self>) {
         let list = match self.view {

@@ -27,6 +27,7 @@ mod draft;
 mod due_popup;
 mod popups;
 mod render_body;
+mod render_chrome;
 mod session;
 mod subtasks_checklist;
 mod window;

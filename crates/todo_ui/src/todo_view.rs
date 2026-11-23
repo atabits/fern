@@ -63,11 +63,13 @@ mod dialogs;
 mod filters;
 mod kanban;
 mod kanban_cards;
+mod kanban_dnd;
 mod layout_settings;
 mod list_render;
 mod menus;
 mod panel_dnd;
 mod quick_add;
+mod quick_add_popovers;
 mod timeline;
 mod today_widgets;
 #[cfg(all(test, debug_assertions))]

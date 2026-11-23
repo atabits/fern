@@ -2,6 +2,7 @@
 //! until (or since) a date; clicking the numbers switches between Y/M/D and plain days.
 
 mod modal;
+mod modal_menus;
 #[cfg(all(test, debug_assertions))]
 mod tests;
 
@@ -11,7 +12,7 @@ use std::rc::Rc;
 
 use chrono::Local;
 use fern_core::{Countdown, CountdownKind, Id, Store};
-use gpui::{FontWeight, prelude::*};
+use gpui::{Focusable as _, FontWeight, prelude::*};
 use ui::prelude::*;
 use ui::{ConfirmDialog, EmptyState, Placement, PopoverAttachment, popover};
 
@@ -27,6 +28,12 @@ const CARD_WIDTH: f32 = 289.;
 const CARD_HEIGHT: f32 = 181.;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PendingFocus {
+    View,
+    DraftName,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Filter {
     All,
     Kind(CountdownKind),
@@ -35,6 +42,7 @@ pub(crate) enum Filter {
 pub struct CountdownView {
     store: Rc<Store>,
     focus_handle: gpui::FocusHandle,
+    pub(crate) pending_focus: Option<PendingFocus>,
     pub(crate) countdowns: Vec<Countdown>,
     pub(crate) filter: Filter,
     /// Cards switched to the "days only" format.
@@ -94,6 +102,7 @@ impl CountdownView {
         let mut this = Self {
             store,
             focus_handle: cx.focus_handle(),
+            pending_focus: None,
             countdowns: Vec::new(),
             filter: Filter::All,
             days_only: HashSet::new(),
@@ -443,10 +452,25 @@ impl CountdownView {
             .into_any_element()
     }
 
+    pub(crate) fn apply_pending_focus(&mut self, window: &mut Window, cx: &mut App) {
+        match self.pending_focus.take() {
+            Some(PendingFocus::View) => window.focus(&self.focus_handle, cx),
+            Some(PendingFocus::DraftName) => {
+                if let Some(draft) = self.draft.as_ref() {
+                    window.focus(&draft.name.focus_handle(cx), cx);
+                } else {
+                    window.focus(&self.focus_handle, cx);
+                }
+            }
+            None => {}
+        }
+    }
+
     pub fn dismiss_transient(&mut self, cx: &mut Context<Self>) -> bool {
         if let Some(draft) = self.draft.as_mut()
             && draft.dismiss_popover()
         {
+            self.pending_focus = Some(PendingFocus::DraftName);
             cx.notify();
             return true;
         }
@@ -455,8 +479,11 @@ impl CountdownView {
             || std::mem::take(&mut self.header_menu)
             || self.card_menu.take().is_some()
             || self.confirm_delete.take().is_some()
-            || self.draft.take().is_some()
         {
+            cx.notify();
+            true
+        } else if self.draft.take().is_some() {
+            self.pending_focus = Some(PendingFocus::View);
             cx.notify();
             true
         } else {
@@ -467,6 +494,7 @@ impl CountdownView {
 
 impl Render for CountdownView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.apply_pending_focus(window, cx);
         let strings = i18n::t(cx);
         let theme = cx.theme().clone();
         let hide_group = self.hide_group;
@@ -495,9 +523,11 @@ impl Render for CountdownView {
             .size_full()
             .track_focus(&self.focus_handle)
             .key_context("Countdown")
-            .on_action(cx.listener(|this, _: &actions::DismissTransient, _, cx| {
+            .on_action(cx.listener(|this, _: &actions::DismissTransient, window, cx| {
                 if !this.dismiss_transient(cx) {
                     cx.propagate();
+                } else {
+                    this.apply_pending_focus(window, cx);
                 }
             }))
             .bg(theme.colors().background)

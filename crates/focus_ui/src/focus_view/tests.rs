@@ -515,3 +515,55 @@ fn single_record_delete_requires_confirmation_and_batch_custom_closes_on_escape(
         });
     }
 }
+
+#[gpui::test]
+fn ensure_stats_data_caches_habits_checkins_and_tag_colors_and_refreshes_on_reload(
+    cx: &mut gpui::TestAppContext,
+) {
+    use gpui::AppContext;
+    let store = Rc::new(Store::open_in_memory().unwrap());
+    let today = Local::now().date_naive();
+    let h1 = store.add_habit("Meditate").unwrap();
+    store.set_checkin_amount(h1.id, today, 1.0).unwrap();
+    store.add_tag("deep", Some("#EF4444"), None).unwrap();
+
+    cx.update(|cx| {
+        let view = cx.new(|cx| FocusView::new(store.clone(), cx));
+        view.update(cx, |v, cx| {
+            assert!(v.stats_data_dirty);
+            v.ensure_stats_data();
+            assert!(!v.stats_data_dirty);
+            assert_eq!(v.stats_data.all_habits.len(), 1);
+            assert_eq!(v.stats_data.all_habits[0].id, h1.id);
+            assert_eq!(v.stats_data.all_habit_checkins, vec![today]);
+            assert_eq!(
+                v.stats_data.tag_colors.get("deep").copied(),
+                crate::lists_panel::parse_color(Some("#EF4444"))
+            );
+
+            // Mutate DB while stats & picker are closed, then reload() -> clears cache & marks dirty.
+            let h2 = store.add_habit("Read").unwrap();
+            let yesterday = today - chrono::Duration::days(1);
+            store.set_checkin_amount(h2.id, yesterday, 1.0).unwrap();
+            store.add_tag("study", Some("#3B82F6"), None).unwrap();
+
+            v.reload(cx);
+            assert!(v.stats_data_dirty);
+            assert!(v.stats_data.all_habits.is_empty());
+            assert!(v.stats_data.all_habit_checkins.is_empty());
+            assert!(v.stats_data.tag_colors.is_empty());
+
+            // Next ensure_stats_data() rebuilds everything cleanly.
+            v.ensure_stats_data();
+            assert!(!v.stats_data_dirty);
+            assert_eq!(v.stats_data.all_habits.len(), 2);
+            assert_eq!(v.stats_data.all_habit_checkins.len(), 2);
+            assert!(v.stats_data.all_habit_checkins.contains(&today));
+            assert!(v.stats_data.all_habit_checkins.contains(&yesterday));
+            assert_eq!(
+                v.stats_data.tag_colors.get("study").copied(),
+                crate::lists_panel::parse_color(Some("#3B82F6"))
+            );
+        });
+    });
+}

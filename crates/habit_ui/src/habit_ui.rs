@@ -6,6 +6,7 @@ mod cards;
 mod detail;
 mod dialogs;
 mod modal;
+mod modal_popovers;
 #[cfg(all(test, debug_assertions))]
 mod tests;
 
@@ -48,6 +49,12 @@ pub(crate) const STREAK_BEST_SETTING: &str = "habit_streak_best";
 pub(crate) enum DetailSubmenu {
     StartFocus,
     CheckinStyle,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PendingFocus {
+    View,
+    EditName,
 }
 
 /// "Start Focus" on a habit: a Pomodoro or a stopwatch linked to `habit_id`.
@@ -112,6 +119,7 @@ pub struct HabitView {
     cycles_modal: Option<CompletedCyclesModal>,
     export_message: Option<String>,
     detail_notice: Option<String>,
+    pending_focus: Option<PendingFocus>,
     active: bool,
     dirty: bool,
 }
@@ -191,6 +199,7 @@ impl HabitView {
             cycles_modal: None,
             export_message: None,
             detail_notice: None,
+            pending_focus: None,
             active: initial_active,
             dirty: !initial_active,
         };
@@ -294,6 +303,39 @@ impl HabitView {
         cx.notify();
     }
 
+    pub(crate) fn focus_or_defer(
+        &mut self,
+        target: PendingFocus,
+        window: Option<&mut Window>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(window) = window {
+            self.pending_focus = None;
+            self.apply_pending_focus(target, window, cx);
+        } else {
+            self.pending_focus = Some(target);
+        }
+    }
+
+    pub(crate) fn flush_pending_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(target) = self.pending_focus.take() {
+            self.apply_pending_focus(target, window, cx);
+        }
+    }
+
+    fn apply_pending_focus(&self, target: PendingFocus, window: &mut Window, cx: &mut Context<Self>) {
+        match target {
+            PendingFocus::View => window.focus(&self.focus_handle, cx),
+            PendingFocus::EditName => {
+                if let Some(edit) = self.editing.as_ref() {
+                    window.focus(&edit.name.focus_handle(cx), cx);
+                } else {
+                    window.focus(&self.focus_handle, cx);
+                }
+            }
+        }
+    }
+
     pub fn dismiss_transient(&mut self, cx: &mut Context<Self>) -> bool {
         if self.confirm.take().is_some()
             || self.cycle_completed.take().is_some()
@@ -301,17 +343,24 @@ impl HabitView {
             || self.amount_modal.take().is_some()
             || self.log_modal.take().is_some()
         {
+            self.pending_focus = Some(if self.editing.is_some() {
+                PendingFocus::EditName
+            } else {
+                PendingFocus::View
+            });
             cx.notify();
             return true;
         }
         if let Some(edit) = self.editing.as_mut()
-            && (edit.icon_picker.take().is_some()
-                || edit.start_calendar.take().is_some()
-                || edit.new_section.take().is_some()
-                || edit.goal_days_input.take().is_some()
-                || edit.reminder_picker.take().is_some()
-                || edit.open.take().is_some())
+            && edit.dismiss_popover()
         {
+            self.pending_focus = Some(PendingFocus::EditName);
+            cx.notify();
+            return true;
+        }
+        if self.editing.take().is_some() || self.renaming_section.take().is_some() {
+            self.detail_submenu = None;
+            self.pending_focus = Some(PendingFocus::View);
             cx.notify();
             return true;
         }
@@ -321,8 +370,6 @@ impl HabitView {
             || self.section_menu.take().is_some()
             || self.card_menu.take().is_some()
             || self.day_menu.take().is_some()
-            || self.editing.take().is_some()
-            || self.renaming_section.take().is_some()
         {
             self.detail_submenu = None;
             cx.notify();
@@ -581,20 +628,23 @@ impl HabitView {
             input.set_text(current, cx);
             input
         });
-        cx.subscribe(&input, move |this, _, Submitted(text), cx| {
+        cx.subscribe_in(&input, window, move |this, _, Submitted(text), window, cx| {
             if let Err(err) = this.store.rename_habit_section(id, text) {
                 eprintln!("failed to rename section: {err:#}");
             }
             this.renaming_section = None;
+            this.focus_or_defer(PendingFocus::View, Some(window), cx);
             this.notify_data_changed(cx);
             this.reload(cx);
         })
         .detach();
-        cx.subscribe(&input, |this, _, _: &Cancelled, cx| {
+        cx.subscribe_in(&input, window, |this, _, _: &Cancelled, window, cx| {
             this.renaming_section = None;
+            this.focus_or_defer(PendingFocus::View, Some(window), cx);
             cx.notify();
         })
         .detach();
+        self.pending_focus = None;
         window.focus(&input.focus_handle(cx), cx);
         self.section_menu = None;
         self.renaming_section = Some((id, input));
@@ -915,6 +965,7 @@ impl HabitView {
 
 impl Render for HabitView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.flush_pending_focus(window, cx);
         let strings = i18n::t(cx);
         let theme = cx.theme().clone();
         let today = Local::now().date_naive();
@@ -1280,9 +1331,11 @@ impl Render for HabitView {
             .size_full()
             .track_focus(&self.focus_handle)
             .key_context("Habits")
-            .on_action(cx.listener(|this, _: &actions::DismissTransient, _, cx| {
+            .on_action(cx.listener(|this, _: &actions::DismissTransient, window, cx| {
                 if !this.dismiss_transient(cx) {
                     cx.propagate();
+                } else {
+                    this.flush_pending_focus(window, cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &actions::SelectNextHabit, _, cx| {

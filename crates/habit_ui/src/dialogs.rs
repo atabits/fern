@@ -12,7 +12,7 @@ use desktop_common::habit_helpers::mood_emoji;
 use desktop_common::text_input::{Cancelled, Mode, Submitted, TextInput};
 use fern_i18n as i18n;
 
-use crate::HabitView;
+use crate::{HabitView, PendingFocus};
 
 /// Modal for creating or editing a day's Habit Log (mood + note).
 pub(crate) struct HabitLogModal {
@@ -80,11 +80,13 @@ impl HabitView {
             input.set_text(initial_note, cx);
             input
         });
-        cx.subscribe(&note_input, |this, _, _: &Cancelled, cx| {
+        cx.subscribe_in(&note_input, window, |this, _, _: &Cancelled, window, cx| {
             this.log_modal = None;
+            this.focus_or_defer(PendingFocus::View, Some(window), cx);
             cx.notify();
         })
         .detach();
+        self.pending_focus = None;
         window.focus(&note_input.focus_handle(cx), cx);
         self.log_modal = Some(HabitLogModal {
             habit_id,
@@ -101,6 +103,7 @@ impl HabitView {
 
     pub(crate) fn save_log_modal(&mut self, cx: &mut Context<Self>) {
         let Some(modal) = self.log_modal.take() else { return };
+        self.pending_focus = Some(PendingFocus::View);
         let note = modal.note_input.read(cx).text().to_owned();
         if let Err(err) = self.store.set_checkin_log(modal.habit_id, modal.date, Some(&note), modal.mood) {
             eprintln!("failed to save habit log: {err:#}");
@@ -146,11 +149,13 @@ impl HabitView {
             this.submit_amount_modal(Some(window), cx);
         })
         .detach();
-        cx.subscribe(&input, |this, _, _: &Cancelled, cx| {
+        cx.subscribe_in(&input, window, |this, _, _: &Cancelled, window, cx| {
             this.amount_modal = None;
+            this.focus_or_defer(PendingFocus::View, Some(window), cx);
             cx.notify();
         })
         .detach();
+        self.pending_focus = None;
         window.focus(&input.focus_handle(cx), cx);
         self.amount_modal = Some(AmountModal { habit_id, date, increase, input });
         self.day_menu = None;
@@ -158,7 +163,7 @@ impl HabitView {
         cx.notify();
     }
 
-    pub(crate) fn submit_amount_modal(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
+    pub(crate) fn submit_amount_modal(&mut self, mut window: Option<&mut Window>, cx: &mut Context<Self>) {
         let Some(modal) = self.amount_modal.as_ref() else { return };
         let habit_id = modal.habit_id;
         let date = modal.date;
@@ -175,6 +180,7 @@ impl HabitView {
             return;
         };
         self.amount_modal = None;
+        self.pending_focus = Some(PendingFocus::View);
         let was_done = self.checkins.get(&habit_id).is_some_and(|d| d.contains(&date));
         let res = if increase {
             self.store.add_checkin_amount(habit_id, date, amount).map(|_| ())
@@ -190,7 +196,10 @@ impl HabitView {
         self.reload(cx);
         let now_done = self.checkins.get(&habit_id).is_some_and(|d| d.contains(&date));
         if !was_done && now_done {
-            self.after_checkin_completed(habit_id, date, window, cx);
+            self.after_checkin_completed(habit_id, date, window.as_deref_mut(), cx);
+        }
+        if let Some(window) = window {
+            self.flush_pending_focus(window, cx);
         }
     }
 
@@ -227,8 +236,9 @@ impl HabitView {
                     .child(
                         IconButton::new("log-modal-close", IconName::X)
                             .tooltip(Tooltip::text(strings.close))
-                            .on_click(cx.listener(|this, _, _, cx| {
+                            .on_click(cx.listener(|this, _, window, cx| {
                                 this.log_modal = None;
+                                this.focus_or_defer(PendingFocus::View, Some(window), cx);
                                 cx.notify();
                             })),
                     ),
@@ -322,15 +332,19 @@ impl HabitView {
                     .child(
                         Button::new("log-modal-cancel", strings.cancel)
                             .variant(ButtonVariant::Secondary)
-                            .on_click(cx.listener(|this, _, _, cx| {
+                            .on_click(cx.listener(|this, _, window, cx| {
                                 this.log_modal = None;
+                                this.focus_or_defer(PendingFocus::View, Some(window), cx);
                                 cx.notify();
                             })),
                     )
                     .child(
                         Button::new("log-modal-save", strings.save)
                             .variant(ButtonVariant::Primary)
-                            .on_click(cx.listener(|this, _, _, cx| this.save_log_modal(cx))),
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.save_log_modal(cx);
+                                this.flush_pending_focus(window, cx);
+                            })),
                     ),
             )
             .into_any_element()
@@ -368,8 +382,9 @@ impl HabitView {
                     .child(
                         IconButton::new("amt-close", IconName::X)
                             .tooltip(Tooltip::text(strings.close))
-                            .on_click(cx.listener(|this, _, _, cx| {
+                            .on_click(cx.listener(|this, _, window, cx| {
                                 this.amount_modal = None;
+                                this.focus_or_defer(PendingFocus::View, Some(window), cx);
                                 cx.notify();
                             })),
                     ),
@@ -407,8 +422,9 @@ impl HabitView {
                     .child(
                         Button::new("amt-cancel", strings.cancel)
                             .variant(ButtonVariant::Secondary)
-                            .on_click(cx.listener(|this, _, _, cx| {
+                            .on_click(cx.listener(|this, _, window, cx| {
                                 this.amount_modal = None;
+                                this.focus_or_defer(PendingFocus::View, Some(window), cx);
                                 cx.notify();
                             })),
                     )
@@ -437,16 +453,22 @@ impl HabitView {
             .cancel_label(strings.cancel)
             .confirm_label(confirm_label)
             .destructive(destructive)
-            .on_cancel(cx.listener(|this, _, _, cx| {
+            .on_cancel(cx.listener(|this, _, window, cx| {
                 this.confirm = None;
+                let target = if this.editing.is_some() { PendingFocus::EditName } else { PendingFocus::View };
+                this.focus_or_defer(target, Some(window), cx);
                 cx.notify();
             }))
-            .on_confirm(cx.listener(|this, _, _, cx| this.execute_confirm(cx)))
+            .on_confirm(cx.listener(|this, _, window, cx| {
+                this.execute_confirm(cx);
+                this.flush_pending_focus(window, cx);
+            }))
             .into_any_element()
     }
 
     pub(crate) fn execute_confirm(&mut self, cx: &mut Context<Self>) {
         let Some(action) = self.confirm.take() else { return };
+        self.pending_focus = Some(PendingFocus::View);
         match action {
             ConfirmAction::ResetCheckin { habit_id, date } => {
                 if let Err(err) = self.store.reset_checkin(habit_id, date, true) {
@@ -514,16 +536,18 @@ impl HabitView {
                     .child(
                         Button::new("cycle-archive", strings.habit_end_and_archive)
                             .variant(ButtonVariant::Secondary)
-                            .on_click(cx.listener(move |this, _, _, cx| {
+                            .on_click(cx.listener(move |this, _, window, cx| {
                                 this.cycle_completed = None;
+                                this.focus_or_defer(PendingFocus::View, Some(window), cx);
                                 this.set_archived(habit_id, true, cx);
                             })),
                     )
                     .child(
                         Button::new("cycle-continue", strings.habit_continue_cycle)
                             .variant(ButtonVariant::Primary)
-                            .on_click(cx.listener(|this, _, _, cx| {
+                            .on_click(cx.listener(|this, _, window, cx| {
                                 this.cycle_completed = None;
+                                this.focus_or_defer(PendingFocus::View, Some(window), cx);
                                 cx.notify();
                             })),
                     ),
@@ -542,8 +566,9 @@ impl HabitView {
         Modal::new("habit-cycles-list-modal")
             .width(px(380.))
             .max_height(px(460.))
-            .on_dismiss(cx.listener(|this, _, _, cx| {
+            .on_dismiss(cx.listener(|this, _, window, cx| {
                 this.cycles_modal = None;
+                this.focus_or_defer(PendingFocus::View, Some(window), cx);
                 cx.notify();
             }))
             .child(
@@ -558,8 +583,9 @@ impl HabitView {
                     .child(
                         IconButton::new("cycles-list-close", IconName::X)
                             .tooltip(Tooltip::text(strings.close))
-                            .on_click(cx.listener(|this, _, _, cx| {
+                            .on_click(cx.listener(|this, _, window, cx| {
                                 this.cycles_modal = None;
+                                this.focus_or_defer(PendingFocus::View, Some(window), cx);
                                 cx.notify();
                             })),
                     ),

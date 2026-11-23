@@ -311,3 +311,151 @@ fn modal_blocks_background_habit_keyboard_actions(cx: &mut TestAppContext) {
         assert!(v.editing.is_none());
     });
 }
+
+#[gpui::test]
+fn habit_modal_escape_restores_focus_from_popovers_to_name_then_view(cx: &mut TestAppContext) {
+    use gpui::KeyBinding;
+
+    cx.update(|cx| {
+        theme::init(cx);
+        cx.bind_keys([
+            KeyBinding::new("escape", desktop_common::text_input::Cancel, Some("TextInput")),
+            KeyBinding::new("escape", actions::DismissTransient, None),
+        ]);
+    });
+    let store = Rc::new(Store::open_in_memory().unwrap());
+    let (view, cx) = cx.add_window_view(|_, cx| HabitView::new(store.clone(), cx));
+    cx.simulate_resize(size(px(1000.), px(720.)));
+    cx.run_until_parked();
+
+    view.update_in(cx, |v, window, cx| {
+        v.open_create_modal(HabitSection::Others, window, cx);
+        assert!(v.editing.as_ref().unwrap().name.focus_handle(cx).is_focused(window));
+    });
+    cx.run_until_parked();
+
+    let assert_name_focused = |cx: &mut gpui::VisualTestContext| {
+        cx.update(|window, cx| {
+            let v = view.read(cx);
+            let edit = v.editing.as_ref().expect("modal must remain open");
+            assert!(edit.name.focus_handle(cx).is_focused(window), "focus must return to edit.name");
+        });
+    };
+
+    // 1. reminder_input Escape closes reminder_picker and restores focus to edit.name.
+    view.update_in(cx, |v, window, cx| {
+        v.open_reminder_picker(None, window, cx);
+        assert!(v.editing.as_ref().unwrap().reminder_input.focus_handle(cx).is_focused(window));
+    });
+    cx.run_until_parked();
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    view.read_with(cx, |v, _| assert!(v.editing.as_ref().unwrap().reminder_picker.is_none()));
+    assert_name_focused(cx);
+
+    // 2. icon_text Escape closes icon_picker and restores focus to edit.name.
+    view.update_in(cx, |v, window, cx| {
+        v.update_edit(cx, |e| e.icon_picker = Some(2));
+        let icon_text = v.editing.as_ref().unwrap().icon_text.clone();
+        window.focus(&icon_text.focus_handle(cx), cx);
+    });
+    cx.run_until_parked();
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    view.read_with(cx, |v, _| assert!(v.editing.as_ref().unwrap().icon_picker.is_none()));
+    assert_name_focused(cx);
+
+    // 3. Goal amount_input Escape closes EditRow::Goal popover and restores focus to edit.name.
+    view.update_in(cx, |v, window, cx| {
+        v.update_edit(cx, |e| {
+            e.open = Some(modal::EditRow::Goal);
+            e.has_goal = true;
+        });
+        let amt = v.editing.as_ref().unwrap().amount_input.clone();
+        window.focus(&amt.focus_handle(cx), cx);
+    });
+    cx.run_until_parked();
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    view.read_with(cx, |v, _| assert!(v.editing.as_ref().unwrap().open.is_none()));
+    assert_name_focused(cx);
+
+    // 4. goal_days_input Escape closes custom input -> edit.name, then second Escape closes popover -> edit.name.
+    view.update_in(cx, |v, window, cx| {
+        v.update_edit(cx, |e| e.open = Some(modal::EditRow::GoalDays));
+        v.open_goal_days_input(window, cx);
+        assert!(v.editing.as_ref().unwrap().goal_days_input.as_ref().unwrap().focus_handle(cx).is_focused(window));
+    });
+    cx.run_until_parked();
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    view.read_with(cx, |v, _| {
+        let edit = v.editing.as_ref().unwrap();
+        assert!(edit.goal_days_input.is_none());
+        assert_eq!(edit.open, Some(modal::EditRow::GoalDays));
+    });
+    assert_name_focused(cx);
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    view.read_with(cx, |v, _| assert!(v.editing.as_ref().unwrap().open.is_none()));
+    assert_name_focused(cx);
+
+    // 5. new_section Escape closes inline input -> edit.name, then second Escape closes popover -> edit.name.
+    view.update_in(cx, |v, window, cx| {
+        v.update_edit(cx, |e| e.open = Some(modal::EditRow::Section));
+        v.open_new_section_input(window, cx);
+        assert!(v.editing.as_ref().unwrap().new_section.as_ref().unwrap().focus_handle(cx).is_focused(window));
+    });
+    cx.run_until_parked();
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    view.read_with(cx, |v, _| {
+        let edit = v.editing.as_ref().unwrap();
+        assert!(edit.new_section.is_none());
+        assert_eq!(edit.open, Some(modal::EditRow::Section));
+    });
+    assert_name_focused(cx);
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    view.read_with(cx, |v, _| assert!(v.editing.as_ref().unwrap().open.is_none()));
+    assert_name_focused(cx);
+
+    // 6. Escape on edit.name with no open popovers closes modal and restores focus to HabitView.
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        let v = view.read(cx);
+        assert!(v.editing.is_none());
+        assert!(v.focus_handle(cx).is_focused(window));
+    });
+
+    // 7. Saving or cancelling/closing modal also returns focus to HabitView.
+    view.update_in(cx, |v, window, cx| {
+        v.open_create_modal(HabitSection::Others, window, cx);
+        v.editing.as_ref().unwrap().name.update(cx, |inp, cx| inp.set_text("Hydrate", cx));
+        v.request_save_edit(cx);
+    });
+    cx.run_until_parked();
+    let saved_id = cx.update(|window, cx| {
+        let v = view.read(cx);
+        assert!(v.editing.is_none());
+        assert!(v.focus_handle(cx).is_focused(window));
+        v.selected.unwrap()
+    });
+
+    view.update_in(cx, |v, window, cx| {
+        v.open_edit_modal(saved_id, window, cx);
+        v.close_edit_modal(Some(window), cx);
+        assert!(v.editing.is_none());
+        assert!(v.focus_handle(cx).is_focused(window));
+
+        v.open_edit_modal(saved_id, window, cx);
+        assert!(v.dismiss_transient(cx));
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        let v = view.read(cx);
+        assert!(v.editing.is_none());
+        assert!(v.focus_handle(cx).is_focused(window));
+    });
+}

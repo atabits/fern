@@ -25,6 +25,7 @@ mod focus_review;
 mod modals;
 mod picker;
 mod stats;
+mod stats_charts;
 #[cfg(test)]
 mod tests;
 mod timer;
@@ -377,23 +378,51 @@ impl FocusView {
             return;
         }
         let habit_records = self.store.all_habit_checkins().unwrap_or_default();
+        let all_habits = self.store.habits().unwrap_or_default();
+        let habits: Vec<(fern_core::Habit, HashSet<NaiveDate>)> = all_habits
+            .iter()
+            .map(|h| {
+                let done = habit_records
+                    .get(&h.id)
+                    .map(|recs| fern_core::habit::done_dates(recs))
+                    .unwrap_or_default();
+                (h.clone(), done)
+            })
+            .collect();
+        let all_habit_checkins = habits
+            .iter()
+            .flat_map(|(_, done)| done.iter().copied())
+            .collect();
+        let lists = self.store.lists().unwrap_or_default();
+        let list_lookup = lists
+            .iter()
+            .map(|l| {
+                (
+                    l.id,
+                    (
+                        SharedString::from(l.name.clone()),
+                        crate::lists_panel::parse_color(l.color.as_deref()),
+                    ),
+                )
+            })
+            .collect();
+        let tag_colors = self
+            .store
+            .tags()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|t| {
+                crate::lists_panel::parse_color(t.color.as_deref()).map(|c| (t.name, c))
+            })
+            .collect();
         self.stats_data = StatsData {
             tasks: self.store.tasks().unwrap_or_default(),
-            lists: self.store.lists().unwrap_or_default(),
-            tags: self.store.tags().unwrap_or_default(),
-            habits: self
-                .store
-                .habits()
-                .unwrap_or_default()
-                .into_iter()
-                .map(|h| {
-                    let done = habit_records
-                        .get(&h.id)
-                        .map(|recs| fern_core::habit::done_dates(recs))
-                        .unwrap_or_default();
-                    (h, done)
-                })
-                .collect(),
+            lists,
+            list_lookup,
+            tag_colors,
+            all_habits,
+            all_habit_checkins,
+            habits,
             habit_records,
         };
         self.stats_data_dirty = false;
@@ -414,6 +443,7 @@ impl FocusView {
         self.session_summary = SessionSummaryCache::build(&self.sessions, today);
         self.timers = self.store.focus_timers(self.archived_tab).unwrap_or_default();
         self.stats_data_dirty = true;
+        self.stats_data = StatsData::default();
         if self.stats.is_some() || self.picker.is_some() {
             self.ensure_stats_data();
             self.tasks = self

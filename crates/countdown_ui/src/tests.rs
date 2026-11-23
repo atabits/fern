@@ -338,3 +338,68 @@ fn custom_reminder_escape_closes_form_and_confirm_adds_weeks_reminder(cx: &mut T
     assert_eq!(countdowns[0].custom_reminders.len(), 1);
     assert_eq!(countdowns[0].custom_reminders[0].0, 14);
 }
+
+#[gpui::test]
+fn escape_from_custom_reminder_restores_name_focus_and_escape_from_name_restores_view_focus(
+    cx: &mut TestAppContext,
+) {
+    let store = Rc::new(Store::open_in_memory().unwrap());
+    cx.update(|cx| {
+        theme::init(cx);
+        assert!(keymap::load_default(&assets::Assets, cx).unwrap().is_empty());
+    });
+    let (view, cx) = cx.add_window_view(|_, cx| CountdownView::new(store, cx));
+    cx.simulate_resize(size(px(900.), px(700.)));
+
+    cx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.start_new_kind(CountdownKind::Countdown, window, cx);
+            v.dev_open_row("reminder", cx);
+            v.open_custom_reminder(window, cx);
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        let count = &view.read(cx).draft.as_ref().unwrap().custom.as_ref().unwrap().count;
+        assert!(count.focus_handle(cx).is_focused(window));
+    });
+
+    // Escape in custom reminder closes it and restores focus to draft.name.
+    cx.simulate_keystrokes("escape");
+    cx.update(|window, cx| {
+        let draft = view.read(cx).draft.as_ref().expect("draft must remain open");
+        assert!(draft.custom.is_none());
+        assert!(draft.open.is_some());
+        assert!(draft.name.focus_handle(cx).is_focused(window));
+    });
+
+    // Escape from draft.name dismisses the reminder popover first, keeping focus on draft.name.
+    cx.simulate_keystrokes("escape");
+    cx.update(|window, cx| {
+        let draft = view.read(cx).draft.as_ref().expect("draft must remain open");
+        assert!(draft.open.is_none());
+        assert!(draft.name.focus_handle(cx).is_focused(window));
+    });
+
+    // Next Escape from draft.name closes the modal and restores focus to CountdownView.
+    cx.simulate_keystrokes("escape");
+    cx.update(|window, cx| {
+        let v = view.read(cx);
+        assert!(v.draft.is_none());
+        assert!(v.focus_handle(cx).is_focused(window));
+    });
+
+    // Re-open draft and close via dismiss_transient(cx): render consumes pending_focus for CountdownView.
+    cx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.start_new(window, cx);
+            assert!(v.dismiss_transient(cx));
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        let v = view.read(cx);
+        assert!(v.draft.is_none());
+        assert!(v.focus_handle(cx).is_focused(window));
+    });
+}
